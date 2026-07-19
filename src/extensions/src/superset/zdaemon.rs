@@ -132,6 +132,10 @@ fn start() -> Result<ExitCode> {
     let worker_path = path.clone();
     thread::spawn(move || worker_loop(rx, worker_path));
 
+    // Autonomous, config-gated passes: keep every clean repo at origin/main and
+    // (optionally) forward-bump submodule pointers, with no manual command.
+    spawn_autonomous_passes();
+
     // Accept loop: one reader thread per connection, each holding a Sender clone.
     for incoming in listener.incoming() {
         let stream = match incoming {
@@ -143,6 +147,43 @@ fn start() -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Spawn the `[zvcs]`-gated background timer threads. Reads config from the repo
+/// the daemon was started in; spawns nothing if no autonomous behavior is
+/// enabled. Each pass opens the repo fresh so it always sees current state.
+fn spawn_autonomous_passes() {
+    let Ok(repo) = gix::discover(".") else {
+        return;
+    };
+    let cfg = crate::config::ZvcsConfig::load(&repo);
+    if !cfg.any_autonomous() {
+        return;
+    }
+    let interval = cfg.interval;
+
+    if cfg.autoreconcile {
+        thread::spawn(move || loop {
+            thread::sleep(interval);
+            let Ok(repo) = gix::discover(".") else {
+                continue;
+            };
+            for (label, status) in crate::superset::reconcile_tree(&repo) {
+                // Log only actionable outcomes; skip steady-state noise.
+                if status.starts_with("synced") || status.starts_with("error") {
+                    println!("[zvcs reconcile] {label}: {status}");
+                }
+            }
+        });
+    }
+
+    if cfg.autobump {
+        thread::spawn(move || loop {
+            thread::sleep(interval);
+            // zbump prints its own per-submodule lines (-> daemon log); ignore rc.
+            let _ = crate::superset::zbump(&[]);
+        });
+    }
 }
 
 /// The critical-section owner. Grants the lock to exactly one holder at a time

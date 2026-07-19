@@ -4,6 +4,8 @@
 //! the engine as a library lets integration tests drive the coordination layer
 //! (e.g. [`lock::RepoLock`] against a live `zdaemon`) directly.
 
+pub mod autostart;
+pub mod config;
 pub mod dispatch;
 pub mod lock;
 pub mod porcelain;
@@ -20,6 +22,13 @@ pub fn run() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let rest = &args[1..];
+
+    // Bring up the per-repo coordinator when `[zvcs]` autonomy is configured, so
+    // the user never starts it by hand. Skipped for `zdaemon` (it would self-race).
+    if sub != "zdaemon" {
+        autostart::ensure_if_configured();
+    }
+
     match dispatch::run(sub, rest) {
         Ok(code) => code,
         Err(e) => {

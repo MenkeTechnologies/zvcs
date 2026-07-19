@@ -22,6 +22,11 @@ use gix::refs::{FullName, Target};
 /// This function performs no terminal output; it returns the status string and
 /// leaves printing to the caller.
 pub fn reconcile_repo(repo: &gix::Repository) -> Result<String> {
+    // Serialize the whole check-fetch-ff-write through the repo coordinator, so an
+    // autonomous reconcile can't race a concurrent writer. Held for the function;
+    // a no-op if no daemon is running (ff-only + skip-dirty still protect).
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+
     // (a) Mainline detection: prefer origin/main, else origin/master. Neither is
     // an error — the repo simply has no mainline to track.
     let mainline = if repo.try_find_reference("refs/remotes/origin/main")?.is_some() {

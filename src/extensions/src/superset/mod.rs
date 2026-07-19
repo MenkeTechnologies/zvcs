@@ -13,10 +13,12 @@
 //!   * [`zbump`]   — forward-only submodule gitlink bumps: stage a submodule
 //!     pointer only when the new SHA is a descendant of the recorded one.
 
+mod reconcile;
 mod zbump;
 mod zdaemon;
 mod zsync;
 
+pub use reconcile::reconcile_tree;
 pub use zbump::zbump;
 pub use zdaemon::zdaemon;
 pub use zsync::{reconcile_repo, zsync};

@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="zvcs — a git-shadowing superset VCS. A single Rust binary named git shadows stock git on PATH and serves subcommands natively via vendored gitoxide — no fork/exec. On top it adds a superset coordination layer: a fair FIFO index-lock daemon, reconcile-to-mainline submodule attaching, and forward-only gitlink bumps, for meta-repos driven by many concurrent agents. MIT licensed.">
+  <title>zvcs — Documentation</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="hud-static.css">
+  <link rel="stylesheet" href="tutorial.css">
+  <style>
+    .tutorial-main { max-width: 68rem; }
+    .docs-build-line { margin: 0.35rem 0 0; font-family: 'Share Tech Mono', ui-monospace, monospace; font-size: 11px; color: var(--text-dim); letter-spacing: 0.03em; max-width: 48rem; opacity: 0.75; }
+    .hub-scheme-strip { border-bottom: 1px dashed var(--border); background: color-mix(in srgb, var(--bg-secondary) 85%, transparent); padding: 0.55rem 1.5rem 0.65rem; position: relative; }
+    .hub-scheme-strip-inner { max-width: 68rem; margin: 0 auto; display: flex; align-items: center; gap: 0.85rem; }
+    .hub-scheme-strip .hud-scheme-label { flex: 0 0 auto; font-family: 'Orbitron', sans-serif; font-size: 9px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; color: var(--accent); text-align: left; }
+    .hub-scheme-strip .scheme-grid { flex: 1 1 auto; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
+    @media (max-width: 720px) { .hub-scheme-strip-inner { flex-direction: column; align-items: stretch; } .hub-scheme-strip .scheme-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    .cat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); gap: 0.6rem; margin: 0.7rem 0; }
+    .cat-card { border: 1px solid var(--border); border-left: 2px solid var(--cyan); padding: 0.6rem 0.8rem; background: color-mix(in srgb, var(--bg-card) 92%, transparent); border-radius: 2px; }
+    .cat-card h4 { font-family: 'Orbitron', sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: var(--cyan); margin: 0 0 0.35rem; }
+    .cat-card p { margin: 0; font-size: 11.5px; color: var(--text-dim); line-height: 1.5; }
+    .cat-card code { font-size: 11px; color: var(--accent-light); }
+    .reflection-table { width: 100%; border-collapse: collapse; margin: 0.6rem 0 0.2rem; font-size: 12px; }
+    .reflection-table th { background: var(--bg-secondary); color: var(--cyan); font-family: 'Orbitron', sans-serif; font-size: 10px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; text-align: left; padding: 6px 10px; border: 1px solid var(--border); }
+    .reflection-table td { padding: 6px 10px; border: 1px solid var(--border); color: var(--text-dim); vertical-align: top; }
+    .reflection-table td code { color: var(--accent-light); background: var(--bg); }
+    .status-pill { display: inline-block; font-family: 'Orbitron', sans-serif; font-size: 9px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; padding: 2px 7px; border-radius: 2px; border: 1px solid var(--border); }
+    .status-implemented { color: var(--green); border-color: var(--green); }
+    .status-progress { color: var(--accent-light); }
+    .status-planned { color: var(--text-muted); }
+  </style>
+</head>
+<body>
+  <div class="app tutorial-app" id="docsApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand">// ZVCS — GIT-SHADOWING SUPERSET VCS</h1>
+          <nav class="tutorial-crumbs" aria-label="Breadcrumb">
+            <span class="current">Docs</span>
+            <span class="sep">/</span>
+            <a href="report.html">Engineering Report</a>
+            <span class="sep">/</span>
+            <a href="https://github.com/MenkeTechnologies/zvcs" target="_blank" rel="noopener noreferrer">GitHub</a>
+          </nav>
+          <p class="docs-build-line">zvcs v0.1.0 · one Rust binary named <code>git</code> · shadows stock git on PATH, no fork/exec · git-compat served via vendored gitoxide · superset: fair FIFO index-lock daemon, reconcile-to-mainline attaching, forward-only gitlink bumps · MIT · in active development</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="report.html">Report</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/zvcs" target="_blank" rel="noopener noreferrer">GitHub</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/zvcs/issues" target="_blank" rel="noopener noreferrer">Issues</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="hub-scheme-strip">
+      <div class="hub-scheme-strip-inner">
+        <span class="hud-scheme-label">// Color scheme</span>
+        <div class="scheme-grid" id="hudSchemeGrid"></div>
+      </div>
+    </div>
+
+    <main class="tutorial-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>ZVCS REFERENCE</h2>
+      <p class="tutorial-subtitle">A git-shadowing superset VCS in Rust. A single binary named <code>git</code> shadows stock git on <code>PATH</code> and serves subcommands natively via vendored <a href="https://github.com/GitoxideLabs/gitoxide">gitoxide</a> — there is <strong>no fork/exec of stock git</strong>. On top of git compatibility it adds the zvcs <strong>superset</strong>: coordination verbs stock git structurally cannot have, aimed at driving a large meta-repo of submodules under many concurrent automated agents. <strong>Early, in active development.</strong></p>
+
+      <section class="tutorial-section">
+        <h2>What it is</h2>
+        <p><code>zvcs</code> is a from-source VCS, not a wrapper. The <code>git</code> binary discovers and reads the same on-disk <code>.git</code> directory stock git does, so tools already on <code>PATH</code> (RustRover, <code>gh</code>, <code>cargo</code>) see identical behavior. Git-compat porcelain is ported incrementally on top of the vendored gitoxide (<code>gix</code>) library; when a subcommand is not yet ported the binary errors terse rather than falling through to stock git.</p>
+        <p>The world's-first leg is not "git in Rust" — <a href="https://github.com/GitoxideLabs/gitoxide">gitoxide</a> is already that. It is the superset coordination layer: a fair FIFO index-lock daemon, a reconcile-to-mainline submodule attacher, and forward-only gitlink bumps, served from the same binary that answers <code>rev-parse</code>.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>The problem it solves</h2>
+        <p>The meta-repo zvcs targets is a shell of git submodules driven by up to 16 concurrent automated agents. Stock git handles that topology poorly in three specific, reproducible ways, and each superset verb closes one of them:</p>
+        <div class="cat-grid">
+          <div class="cat-card"><h4>index.lock contention</h4><p>Git guards index writes with an <code>O_EXCL</code> lockfile; a contended writer does not wait, it <em>fails</em>. <code>zdaemon</code> replaces the flock with a FIFO userspace barrier — a contended writer waits its turn and is answered <code>GRANTED</code>, first-come-first-served.</p></div>
+          <div class="cat-card"><h4>Detached HEAD by default</h4><p><code>git submodule update</code> leaves every submodule detached, orphaning committed work. <code>zsync</code> reconciles each submodule to its mainline (<code>origin/main</code>/<code>origin/master</code>) and leaves <code>HEAD</code> <em>attached</em>.</p></div>
+          <div class="cat-card"><h4>Regressed pointers</h4><p>A blanket <code>git add</code> of a stale submodule worktree can move the recorded gitlink backwards. <code>zbump</code> stages a pointer only when the new HEAD is a descendant of the recorded one — forward-only.</p></div>
+          <div class="cat-card"><h4>No fork/exec</h4><p>Every subcommand runs in-process against the vendored gitoxide crates. There is no shelling out to stock git and no shim; unported subcommands error terse instead of falling through.</p></div>
+        </div>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Architecture</h2>
+        <p>Two namespaces share one dispatch table (<code>src/extensions/src/dispatch.rs</code>):</p>
+        <pre>git &lt;subcommand&gt;  →  dispatch  ┬─  superset verbs (z*)      →  zdaemon / zsync / zbump
+                               └─  git-compat porcelain     →  gitoxide (gix) library</pre>
+        <div class="cat-grid">
+          <div class="cat-card"><h4>Vendored gitoxide</h4><p><code>src/ported</code> holds the <code>gix</code> + <code>gix-*</code> crates in-tree as a self-contained workspace, excluded from the root and consumed as a path dependency. The <code>gix</code>/<code>ein</code> CLIs and <code>gitoxide-core</code> are removed; <code>git</code> is the only binary.</p></div>
+          <div class="cat-card"><h4>The shadow binary</h4><p><code>src/extensions</code> is the zvcs crate whose one binary is named <code>git</code>. It shadows stock git on <code>PATH</code> and routes every subcommand through <code>dispatch::run</code>.</p></div>
+          <div class="cat-card"><h4>RAII lock client</h4><p><code>RepoLock::acquire</code> (<code>src/extensions/src/lock.rs</code>) routes index-mutating ops through the daemon's FIFO and releases on drop. No reachable daemon degrades to a no-op guard.</p></div>
+          <div class="cat-card"><h4>Pure-Rust TLS fetch</h4><p><code>gix</code> is built with <code>blocking-http-transport-reqwest-rust-tls</code> so <code>zsync</code>'s reconcile fetch runs over HTTPS with no curl/openssl C toolchain.</p></div>
+        </div>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>The zdaemon coordinator</h2>
+        <p><code>zdaemon</code> is the linchpin of the concurrency story — a fair replacement for <code>index.lock</code>. A single worker thread owns the abstract critical section and drains an mpsc channel of requests <em>in arrival order</em>; that arrival order is the fairness guarantee. Release is automatic (RAII on the client, socket-EOF on the daemon), so a crashed holder can never wedge the repo. The wire protocol is line-based over the unix socket at <code>&lt;git-dir&gt;/zvcs.sock</code>:</p>
+        <table class="reflection-table">
+          <thead><tr><th>Line</th><th>Direction</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>ACQUIRE &lt;id&gt;</code></td><td>client → daemon</td><td>Enqueue a lock request; answered <code>GRANTED</code> at the FIFO head.</td></tr>
+            <tr><td><code>RELEASE &lt;id&gt;</code></td><td>client → daemon</td><td>Current holder releases; the next waiter is granted.</td></tr>
+            <tr><td><code>STATUS</code></td><td>client → daemon</td><td>Reply <code>holder=&lt;id|none&gt; queue=&lt;depth&gt;</code>, then close.</td></tr>
+            <tr><td><code>STOP</code></td><td>client → daemon</td><td>Reply <code>STOPPING</code>, remove the socket, exit.</td></tr>
+            <tr><td><code>GRANTED</code></td><td>daemon → client</td><td>The lock is now yours (answer to <code>ACQUIRE</code>).</td></tr>
+            <tr><td><code>ERR &lt;reason&gt;</code></td><td>daemon → client</td><td>Malformed request.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Usage</h2>
+<pre># build (produces target/debug/git)
+cargo build
+
+# git-compat: resolve HEAD against the on-disk .git via gitoxide
+./target/debug/git rev-parse HEAD
+./target/debug/git rev-parse --abbrev-ref HEAD
+
+# superset: the per-repo fair-lock coordinator
+./target/debug/git zdaemon start
+./target/debug/git zdaemon status      # holder=&lt;id|none&gt; queue=&lt;depth&gt;
+./target/debug/git zdaemon stop
+
+# superset: reconcile submodules to mainline, kept attached (fast-forward only)
+./target/debug/git zsync                # all submodules
+./target/debug/git zsync path/to/sub    # a named subset
+
+# superset: forward-only submodule gitlink bumps
+./target/debug/git zbump                # all submodules
+./target/debug/git zbump path/to/sub    # a named subset</pre>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Status &amp; roadmap</h2>
+        <p>Early and in active development. The table reflects the current state of the tree.</p>
+        <table class="reflection-table">
+          <thead><tr><th>Component</th><th>State</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>The <code>git</code> shadow binary + dispatch</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Single binary named <code>git</code>; two-namespace dispatch table, terse zsh-style errors (<code>src/main.rs</code>, <code>src/dispatch.rs</code>).</td></tr>
+            <tr><td>Vendored gitoxide (<code>src/ported</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>In-tree <code>gix</code> + <code>gix-*</code> crates, own excluded workspace; <code>gix</code>/<code>ein</code>/<code>gitoxide-core</code> removed.</td></tr>
+            <tr><td><code>zdaemon</code> — fair FIFO index-lock coordinator</td><td><span class="status-pill status-implemented">Implemented</span></td><td><code>start</code>/<code>stop</code>/<code>status</code>; mpsc arrival-order barrier, socket-EOF auto-release (<code>src/superset/zdaemon.rs</code>, <code>src/lock.rs</code>).</td></tr>
+            <tr><td><code>zsync</code> — reconcile-to-mainline attacher</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Fast-forward only; skips dirty worktrees; re-attaches <code>HEAD</code> and moves only changed files (<code>src/superset/zsync.rs</code>).</td></tr>
+            <tr><td><code>zbump</code> — forward-only gitlink bumps</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Descendant check before staging; parent index opened + staged once (<code>src/superset/zbump.rs</code>).</td></tr>
+            <tr><td><code>rev-parse</code></td><td><span class="status-pill status-progress">Partial</span></td><td>Resolves <code>HEAD</code> and <code>--abbrev-ref HEAD</code> only (<code>src/porcelain.rs</code>).</td></tr>
+            <tr><td>Git-compat porcelain surface</td><td><span class="status-pill status-planned">Planned</span></td><td><code>status</code>, <code>add</code>, <code>commit</code>, <code>log</code>, and the rest ported incrementally on top of gitoxide.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Building from source</h2>
+        <p>zvcs builds as a standalone Rust workspace:</p>
+<pre># clone
+git clone https://github.com/MenkeTechnologies/zvcs
+cd zvcs
+
+# build (produces target/debug/git)
+cargo build
+
+# smoke-test git-compat against this repo's own .git
+./target/debug/git rev-parse HEAD</pre>
+        <p><code>src/ported</code> is a self-contained workspace excluded from the root and consumed by <code>src/extensions</code> as a path dependency. <code>gix</code> is built with the <code>blocking-http-transport-reqwest-rust-tls</code> feature so <code>zsync</code> can fetch over HTTPS with a pure-Rust TLS stack.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>License</h2>
+        <p>zvcs is <strong>MIT licensed</strong> — free and open source. See <a href="https://github.com/MenkeTechnologies/zvcs/blob/master/LICENSE">LICENSE</a>.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Repository &amp; links</h2>
+        <ul>
+          <li><strong>Engineering report</strong> — <a href="report.html">report.html</a> (architecture, the superset layer, value posture, roadmap)</li>
+          <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/zvcs">github.com/MenkeTechnologies/zvcs</a></li>
+          <li><strong>Issues</strong> — <a href="https://github.com/MenkeTechnologies/zvcs/issues">github.com/MenkeTechnologies/zvcs/issues</a></li>
+          <li><strong>gitoxide</strong> — <a href="https://github.com/GitoxideLabs/gitoxide">github.com/GitoxideLabs/gitoxide</a> (the ported git library)</li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <script src="hud-theme.js"></script>
+</body>
+</html>

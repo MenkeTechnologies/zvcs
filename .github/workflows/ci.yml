@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: Build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The workspace member is the `zvcs` package (the `git` shadow binary +
+      # coordination layer); src/ported gitoxide is a separate excluded
+      # workspace. Build the binary, then run the coordination test that proves
+      # the zdaemon FIFO barrier holds peak critical-section occupancy at 1.
+      - name: Build
+        run: cargo build --release --locked --bin git
+      - name: Test
+        run: cargo test --release --locked

@@ -1,0 +1,198 @@
+name: Release
+
+# On a `v*` tag push: build the single `git` shadow binary for each target,
+# publish a GitHub Release, then regenerate + push the Homebrew formula
+# (Formula/zvcs.rb) into MenkeTechnologies/homebrew-menketech.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    # Per-target failures are tolerated on the musl variants so the publish +
+    # tap job ships from whichever targets built. `needs: build` is satisfied
+    # either way. zvcs uses gitoxide with pure-Rust TLS (reqwest-rust-tls),
+    # so there is no gmp/openssl C toolchain to bootstrap per target.
+    continue-on-error: ${{ matrix.allow_failure || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            allow_failure: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            allow_failure: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The `git` binary lives in the `zvcs` package (src/extensions); the root
+      # is a workspace whose only member is that package (src/ported gitoxide
+      # is a separate, excluded workspace pulled in by path).
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin git
+
+      - name: Package
+        shell: bash
+        run: |
+          # Tarball keeps the `zvcs-` name (the release/repo is zvcs);
+          # the binary inside it is `git` (the git-shadowing superset).
+          cd target/${{ matrix.target }}/release
+          strip git 2>/dev/null || true
+          tar czf ../../../zvcs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz git
+          cd ../../..
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: zvcs-${{ matrix.target }}
+          path: zvcs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            artifacts/*.tar.gz
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compute SHA256 sums
+        id: sha
+        shell: bash
+        run: |
+          for f in artifacts/*.tar.gz; do
+            base=$(basename "$f")
+            sum=$(sha256sum "$f" | awk '{print $1}')
+            # zvcs-vX.Y.Z-aarch64-apple-darwin.tar.gz -> aarch64_apple_darwin
+            key=$(echo "$base" | sed 's/zvcs-v[^-]*-//; s/\.tar\.gz//; s/-/_/g; s/\./_/g')
+            echo "${key}=${sum}" >> "$GITHUB_OUTPUT"
+          done
+
+      - uses: actions/checkout@v6
+        with:
+          repository: MenkeTechnologies/homebrew-menketech
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+          SHA_ARM_MACOS: ${{ steps.sha.outputs.aarch64_apple_darwin }}
+          SHA_X86_LINUX: ${{ steps.sha.outputs.x86_64_unknown_linux_gnu }}
+          SHA_ARM_LINUX: ${{ steps.sha.outputs.aarch64_unknown_linux_gnu }}
+          SHA_X86_LINUX_MUSL: ${{ steps.sha.outputs.x86_64_unknown_linux_musl }}
+          SHA_ARM_LINUX_MUSL: ${{ steps.sha.outputs.aarch64_unknown_linux_musl }}
+        run: |
+          set -eu
+          V="${VERSION#v}"
+          BASE="https://github.com/MenkeTechnologies/zvcs/releases/download/v${V}"
+          emit() { local guard="$1" arch="$2" sha="$3"; [ -n "$sha" ] || return 0; printf '    %s do\n      url "%s/zvcs-v%s-%s.tar.gz"\n      sha256 "%s"\n    end\n' "$guard" "$BASE" "$V" "$arch" "$sha"; }
+          mac_blocks=$( emit on_arm aarch64-apple-darwin "$SHA_ARM_MACOS" )
+          linux_blocks=$( { emit on_intel x86_64-unknown-linux-gnu "$SHA_X86_LINUX"; emit on_arm aarch64-unknown-linux-gnu "$SHA_ARM_LINUX"; } )
+          {
+            printf 'class Zvcs < Formula\n'
+            printf '  desc "git-shadowing superset VCS: lock-free many-writer git over submodules via a zdaemon FIFO coordinator"\n'
+            printf '  homepage "https://github.com/MenkeTechnologies/zvcs"\n'
+            printf '  license "MIT"\n'
+            printf '  version "%s"\n\n' "$V"
+            if [ -n "$mac_blocks" ]; then
+              printf '  on_macos do\n%s\n  end\n\n' "$mac_blocks"
+            fi
+            if [ -n "$linux_blocks" ]; then
+              printf '  on_linux do\n%s\n  end\n\n' "$linux_blocks"
+            fi
+            printf '  def install\n'
+            # The built binary is named `git` (it shadows stock git). Install it
+            # as `zvcs` so it never clobbers the git formula; users opt into
+            # shadowing via the caveat below.
+            printf '    bin.install "git" => "zvcs"\n'
+            printf '  end\n\n'
+            printf '  def caveats\n'
+            printf '    <<~EOS\n'
+            printf '      zvcs installs the git-shadowing binary as `zvcs`.\n'
+            printf '      To shadow stock git (serve `git` from zvcs), put it ahead of git on PATH:\n'
+            printf '        alias git="#{opt_bin}/zvcs"\n'
+            printf '      or symlink it (replaces git; reversible):\n'
+            printf '        ln -sf #{opt_bin}/zvcs "$(brew --prefix)/bin/git"\n'
+            printf '    EOS\n'
+            printf '  end\n\n'
+            printf '  test do\n'
+            # Any unported subcommand bails listing the superset verbs; a cheap,
+            # network-free smoke test that the binary runs.
+            printf '    assert_match "superset verbs", shell_output("#{bin}/zvcs __brew_test__ 2>&1", 1)\n'
+            printf '  end\n'
+            if [ -n "$SHA_X86_LINUX_MUSL" ] || [ -n "$SHA_ARM_LINUX_MUSL" ]; then
+              printf '\n  # Static musl tarballs also published at this release:\n'
+              [ -n "$SHA_X86_LINUX_MUSL" ] && printf '  #   zvcs-v%s-x86_64-unknown-linux-musl.tar.gz  sha256: %s\n' "$V" "$SHA_X86_LINUX_MUSL"
+              [ -n "$SHA_ARM_LINUX_MUSL" ] && printf '  #   zvcs-v%s-aarch64-unknown-linux-musl.tar.gz  sha256: %s\n' "$V" "$SHA_ARM_LINUX_MUSL"
+            fi
+            printf 'end\n'
+          } > tap/Formula/zvcs.rb
+
+      - name: Push formula update
+        run: |
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/zvcs.rb
+          if git diff --cached --quiet; then
+            echo "no changes — formula already up to date"
+            exit 0
+          fi
+          git commit -m "zvcs: bump to ${{ github.ref_name }}"
+          git push

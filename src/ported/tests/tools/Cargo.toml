@@ -1,0 +1,55 @@
+lints.workspace = true
+
+[package]
+name = "gix-testtools"
+description = "Shared code for gitoxide crates to facilitate testing"
+version = "0.20.0"
+authors = ["Sebastian Thiel <sebastian.thiel@icloud.com>"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+include = ["/src/**/*", "/LICENSE-*"]
+rust-version = "1.85"
+
+[[bin]]
+name = "jtt"
+path = "src/main.rs"
+
+[lib]
+doctest = true
+
+[features]
+default = ["worktree-exclusions"]
+## Use the current repository's ignore rules to decide if generated fixture archives should be written.
+worktree-exclusions = ["dep:gix-discover", "dep:gix-worktree", "dep:gix-fs"]
+## Use instead of plain `tar` files, compress these to produce `tar.xz` files instead.
+## This is useful if archives are uploaded into `git-lfs`, which doesn't have built-in compression
+## and metering counts towards uncompressed bytes transferred.
+xz = ["dep:xz2"]
+
+[dependencies]
+gix-hash = { version = "^0.25.1", path = "../../gix-hash", features = ["sha1", "sha256"] }
+gix-lock = { version = "^23.0.0", path = "../../gix-lock" }
+gix-discover = { version = "^0.53.0", path = "../../gix-discover", optional = true }
+gix-worktree = { version = "^0.54.0", path = "../../gix-worktree", optional = true, features = ["parallel"] }
+gix-fs = { version = "^0.21.2", path = "../../gix-fs", optional = true }
+gix-tempfile = { version = "^23.0.0", path = "../../gix-tempfile", default-features = false, features = ["signals"] }
+
+fastrand = "2.0.0"
+bstr = { version = "1.12.0", default-features = false }
+crc = "3.4.0"
+tempfile = "3.26.0"
+fs_extra = "1.2.0"
+parking_lot = { version = "0.12.4" }
+is_ci = "1.1.1"
+io-close = "0.3.7"
+tar = { version = "0.4.46", default-features = false }
+xz2 = { version = "0.1.6", optional = true }
+
+document-features = { version = "0.2.1", optional = true }
+
+[dev-dependencies]
+serial_test = { version = "3.4.0", default-features = false }
+
+[package.metadata.docs.rs]
+all-features = true
+features = ["document-features"]

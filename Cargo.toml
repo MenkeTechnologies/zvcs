@@ -1,0 +1,7 @@
+# zvcs — git-shadowing superset VCS.
+#   src/ported     : vendored gitoxide crates (own every line; own workspace, excluded here)
+#   src/extensions : the zvcs superset — the single `git` shadow binary + coordination layer
+[workspace]
+resolver = "2"
+members = ["src/extensions"]
+exclude = ["src/ported"]

@@ -1,0 +1,17 @@
+[package]
+name = "zvcs"
+description = "git-shadowing superset VCS: the shadow `git` binary and coordination layer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+# The one and only binary: `git`. It shadows stock git on PATH and serves every
+# subcommand natively via the vendored gitoxide crates — no fork/exec of old git.
+[[bin]]
+name = "git"
+path = "src/main.rs"
+
+[dependencies]
+# Vendored gitoxide, in-tree at src/ported. Default features include sha1 + max-performance.
+gix = { path = "../ported/gix" }
+anyhow = "1"

@@ -1,0 +1,17 @@
+lints.workspace = true
+
+[package]
+name = "gix-note"
+version = "0.0.0"
+repository = "https://github.com/GitoxideLabs/gitoxide"
+license = "MIT OR Apache-2.0"
+description = "A crate of the gitoxide project dealing with git notes"
+authors = ["Sebastian Thiel <sebastian.thiel@icloud.com>"]
+edition = "2024"
+rust-version = "1.85"
+include = ["/src/**/*", "/LICENSE-*"]
+
+[lib]
+doctest = false
+
+[dependencies]

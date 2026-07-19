@@ -1,5 +1,248 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use std::collections::{HashMap, HashSet};
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
+
+use gix::bstr::BString;
+use gix::hash::ObjectId;
+use gix::index::entry::{Mode, Stat};
+use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+use gix::refs::{FullName, Target};
+
+/// Reconcile a single already-open repository (a submodule or a top-level repo)
+/// to its tracked mainline and return a one-line human status.
+///
+/// The mainline is `origin/main`, falling back to `origin/master`. The operation
+/// is fast-forward only and never touches a dirty worktree, so an unpushed local
+/// commit is never regressed or clobbered. On a genuine fast-forward the local
+/// mainline branch is advanced, `HEAD` is (re)attached to it, and the clean
+/// worktree plus index are moved to the new tree by writing only the files that
+/// actually changed.
+///
+/// This function performs no terminal output; it returns the status string and
+/// leaves printing to the caller.
+pub fn reconcile_repo(repo: &gix::Repository) -> Result<String> {
+    // (a) Mainline detection: prefer origin/main, else origin/master. Neither is
+    // an error — the repo simply has no mainline to track.
+    let mainline = if repo.try_find_reference("refs/remotes/origin/main")?.is_some() {
+        "main"
+    } else if repo.try_find_reference("refs/remotes/origin/master")?.is_some() {
+        "master"
+    } else {
+        return Ok("no origin/main or origin/master, skipped".to_string());
+    };
+
+    // (b) Clean check — never touch a dirty worktree.
+    if repo.is_dirty()? {
+        return Ok("dirty, skipped".to_string());
+    }
+
+    // (c) Fetch origin so the remote-tracking ref is current (blocking fetch).
+    let should_interrupt = AtomicBool::new(false);
+    let remote = repo
+        .find_remote("origin")
+        .context("a configured `origin` remote is required to fetch")?;
+    remote
+        .connect(gix::remote::Direction::Fetch)?
+        .prepare_fetch(gix::progress::Discard, gix::remote::ref_map::Options::default())?
+        .receive(gix::progress::Discard, &should_interrupt)?;
+
+    // (d) Fast-forward decision. `local` is the commit HEAD currently resolves to
+    // (the actual clean worktree state); `remote` is the freshly-fetched tip.
+    let mut head = repo.head()?;
+    let local_id = match head.try_peel_to_id()? {
+        Some(id) => id.detach(),
+        None => return Ok("unborn HEAD, skipped".to_string()),
+    };
+    let remote_ref_name = format!("refs/remotes/origin/{mainline}");
+    let remote_id = repo
+        .find_reference(&remote_ref_name)?
+        .into_fully_peeled_id()?
+        .detach();
+
+    if local_id == remote_id {
+        return Ok(format!("up to date (origin/{mainline})"));
+    }
+    // A true fast-forward requires the local tip to be an ancestor of the remote
+    // tip, i.e. their merge-base is the local tip itself. Anything else (local
+    // ahead, or diverged) is left untouched.
+    let base = repo.merge_base(local_id, remote_id)?.detach();
+    if base != local_id {
+        return Ok(format!("local ahead/diverged of origin/{mainline}, skipped"));
+    }
+
+    // Capture the current (clean) index BEFORE mutating any ref. It mirrors the
+    // worktree and the old tree, and carries real filesystem stats we can reuse
+    // for the files that don't change.
+    let old = repo.index_or_load_from_head()?.into_owned();
+
+    // (e) Advance the local mainline branch to the remote tip, then attach HEAD
+    // to that branch so the repository is left on `main`/`master`, not detached.
+    let branch_name: FullName = format!("refs/heads/{mainline}")
+        .try_into()
+        .map_err(|e| anyhow!("invalid branch name refs/heads/{mainline}: {e}"))?;
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: format!("zsync: fast-forward {mainline} to origin/{mainline}").into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(remote_id),
+        },
+        name: branch_name.clone(),
+        deref: false,
+    })?;
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: format!("zsync: attach HEAD to {mainline}").into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Symbolic(branch_name),
+        },
+        name: "HEAD"
+            .try_into()
+            .map_err(|e| anyhow!("invalid ref name HEAD: {e}"))?,
+        deref: false,
+    })?;
+
+    // Update the clean worktree + index to the new tree.
+    update_clean_worktree(repo, &old, remote_id, &should_interrupt)?;
+
+    Ok(format!(
+        "synced origin/{mainline} {}..{}",
+        local_id.to_hex_with_len(12),
+        remote_id.to_hex_with_len(12)
+    ))
+}
+
+/// Move a clean worktree and its index from the state captured in `old` to the
+/// tree of commit `new_commit`, writing only the files that changed.
+///
+/// The change set is derived by comparing two flattened tree-indices — the old
+/// `HEAD` tree (`old`) against the new tree — rather than `gix_diff`, because a
+/// tree diff can report directory-granular additions/deletions, whereas the
+/// worktree write needs per-file granularity. Comparing the two indices yields
+/// exactly the file-level added/modified/deleted set, independent of how a tree
+/// diff would choose to recurse.
+///
+/// Added/modified files (content or mode changed) are checked out through
+/// `gix-worktree-state`, which applies the correct mode, symlink and filter
+/// handling. Removed files are deleted from disk. The new index is written with
+/// fresh stats for the changed files and the previous stats reused for the
+/// unchanged ones, so a later status check stays cheap.
+fn update_clean_worktree(
+    repo: &gix::Repository,
+    old: &gix::index::File,
+    new_commit: ObjectId,
+    should_interrupt: &AtomicBool,
+) -> Result<()> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| anyhow!("bare repository has no worktree to update"))?
+        .to_owned();
+
+    let new_tree_id = repo.find_object(new_commit)?.peel_to_tree()?.id;
+
+    // Index by path of the current entries, for change detection and stat reuse.
+    let mut old_map: HashMap<BString, (ObjectId, Mode, Stat)> =
+        HashMap::with_capacity(old.entries().len());
+    {
+        let backing = old.path_backing();
+        for e in old.entries() {
+            old_map.insert(e.path_in(backing).to_owned(), (e.id, e.mode, e.stat));
+        }
+    }
+
+    // The full target index (all new-tree entries, stats zeroed) — this is what
+    // is eventually written to disk. It is exactly the new tree, so deletions are
+    // naturally absent from it.
+    let mut new_index = repo.index_from_tree(&new_tree_id)?;
+
+    // A second copy reduced to just the changed entries (added, or content/mode
+    // differs from `old`) — the subset actually checked out to the worktree.
+    let mut subset = repo.index_from_tree(&new_tree_id)?;
+    subset.remove_entries(|_, path, entry| match old_map.get(&path.to_owned()) {
+        // Present before with identical content and mode → unchanged, drop it.
+        Some((oid, mode, _)) => *oid == entry.id && *mode == entry.mode,
+        // Absent before → an addition, keep it.
+        None => false,
+    });
+
+    // Write the changed files into the (clean) worktree, overwriting in place.
+    let mut opts =
+        repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
+    opts.destination_is_initially_empty = false;
+    opts.overwrite_existing = true;
+    let odb = repo.objects.clone().into_arc()?;
+    let discard_files = gix::progress::Discard;
+    let discard_bytes = gix::progress::Discard;
+    gix::worktree::state::checkout(
+        &mut subset,
+        workdir.as_path(),
+        odb,
+        &discard_files,
+        &discard_bytes,
+        should_interrupt,
+        opts,
+    )?;
+
+    // Remove files present in the old tree but not the new one.
+    let new_paths: HashSet<BString> = {
+        let backing = new_index.path_backing();
+        new_index
+            .entries()
+            .iter()
+            .map(|e| e.path_in(backing).to_owned())
+            .collect()
+    };
+    {
+        let backing = old.path_backing();
+        for e in old.entries() {
+            let path = e.path_in(backing);
+            if !new_paths.contains(&path.to_owned()) {
+                if let Some(full) = repo.workdir_path(path) {
+                    let _ = std::fs::remove_file(full);
+                }
+            }
+        }
+    }
+
+    // Fresh stats produced by the checkout for the changed entries.
+    let mut subset_stats: HashMap<BString, Stat> = HashMap::with_capacity(subset.entries().len());
+    {
+        let backing = subset.path_backing();
+        for e in subset.entries() {
+            subset_stats.insert(e.path_in(backing).to_owned(), e.stat);
+        }
+    }
+
+    // Fill in the target index stats: checked-out (changed) entries get their
+    // fresh stat; unchanged entries reuse the previous stat.
+    {
+        let backing = new_index.path_backing().to_owned();
+        for e in new_index.entries_mut() {
+            let path = e.path_in(&backing).to_owned();
+            if let Some(stat) = subset_stats.get(&path) {
+                e.stat = *stat;
+            } else if let Some((oid, mode, stat)) = old_map.get(&path) {
+                if *oid == e.id && *mode == e.mode {
+                    e.stat = *stat;
+                }
+            }
+        }
+    }
+
+    // Drop any stale cache-tree extension before persisting.
+    new_index.remove_tree();
+    new_index.write(Default::default())?;
+
+    Ok(())
+}
 
 /// `git zsync [<submodule-path>...]` — reconcile submodules to their tracked
 /// mainline, kept ATTACHED, fast-forward only, skipping any dirty worktree.
@@ -9,12 +252,11 @@ use std::process::ExitCode;
 /// back to `origin/master`. A submodule with local modifications is never
 /// touched — it is reported and skipped.
 ///
-/// Reconciling requires the remote-tracking ref to be current, i.e. a network
-/// fetch, which in turn needs the `blocking-network-client` gix feature. That
-/// feature is not compiled in, so the fetch (and the fast-forward + attach +
-/// worktree update that follow it) cannot run; every non-network step is still
-/// performed and reported, and the command bails at the fetch step naming the
-/// exact feature required rather than faking a fetch.
+/// Each submodule is reconciled by [`reconcile_repo`], which fetches `origin`,
+/// fast-forwards the local mainline, re-attaches `HEAD`, and updates the clean
+/// worktree. One status line is printed per target. A single submodule failing
+/// is reported and does not abort the others; the command exits non-zero if any
+/// target errored.
 pub fn zsync(args: &[String]) -> Result<ExitCode> {
     let parent = gix::discover(".")?;
 
@@ -52,7 +294,6 @@ pub fn zsync(args: &[String]) -> Result<ExitCode> {
     }
 
     let mut any_error = false;
-    let mut clean_pending: Vec<String> = Vec::new();
 
     for (sm, path) in &items {
         // Restrict to the requested set when paths were given.
@@ -69,49 +310,13 @@ pub fn zsync(args: &[String]) -> Result<ExitCode> {
             }
         };
 
-        // (2a) Mainline detection: prefer origin/main, else origin/master.
-        let mainline = if sm_repo
-            .try_find_reference("refs/remotes/origin/main")?
-            .is_some()
-        {
-            "main"
-        } else if sm_repo
-            .try_find_reference("refs/remotes/origin/master")?
-            .is_some()
-        {
-            "master"
-        } else {
-            println!("{path}: no origin/main or origin/master, skipped");
-            any_error = true;
-            continue;
-        };
-
-        // (2c) Clean check — never touch a dirty worktree. `is_dirty()` reports
-        // index-vs-worktree and tree-vs-index changes (untracked files, which a
-        // fast-forward checkout would not clobber, are intentionally ignored).
-        if sm_repo.is_dirty()? {
-            println!("{path}: dirty, skipped");
-            continue;
+        match reconcile_repo(&sm_repo) {
+            Ok(status) => println!("{path}: {status}"),
+            Err(err) => {
+                println!("{path}: error: {err:#}");
+                any_error = true;
+            }
         }
-
-        // Clean and resolvable. The remaining work — (2b) fetch origin so the
-        // remote-tracking ref is current, then (2d) fast-forward the local
-        // mainline branch, re-attach HEAD, and update the worktree — all hinges
-        // on the fetch, which is unavailable in this build. Report the
-        // clean-check for this submodule and defer the bail until every target
-        // has been inspected.
-        println!("{path}: clean, needs fetch (origin/{mainline})");
-        clean_pending.push(path.clone());
-    }
-
-    // (2b) The fetch step. Bail precisely — do not fake a fetch.
-    if !clean_pending.is_empty() {
-        bail!(
-            "fetch requires gix feature `blocking-network-client` (not compiled in); \
-             {} clean submodule(s) ready to sync once enabled: {}",
-            clean_pending.len(),
-            clean_pending.join(", ")
-        );
     }
 
     if any_error {

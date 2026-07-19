@@ -19,4 +19,4 @@ mod zsync;
 
 pub use zbump::zbump;
 pub use zdaemon::zdaemon;
-pub use zsync::zsync;
+pub use zsync::{reconcile_repo, zsync};

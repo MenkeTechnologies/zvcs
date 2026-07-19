@@ -13,5 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Vendored gitoxide, in-tree at src/ported. Default features include sha1 + max-performance.
-gix = { path = "../ported/gix" }
+# blocking-http-transport-reqwest-rust-tls enables blocking fetch over https with a
+# pure-Rust TLS stack (no curl/openssl C toolchain) — used by zsync's reconcile.
+gix = { path = "../ported/gix", features = ["blocking-http-transport-reqwest-rust-tls"] }
 anyhow = "1"

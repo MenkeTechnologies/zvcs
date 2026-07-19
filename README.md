@@ -150,19 +150,40 @@ Wire protocol — line-based, one request per line, over the unix socket at
 | `GRANTED` | daemon → client | The lock is now yours. |
 | `ERR <reason>` | daemon → client | Malformed request. |
 
+### Autonomous mode
+
+The superset verbs also run automatically, gated by `[zvcs]` gitconfig, so they
+never have to be typed:
+
+```gitconfig
+[zvcs]
+    autoreconcile = true   ; keep every clean repo (this one + submodules) at origin/main
+    autobump      = true   ; forward-only submodule gitlink bumps
+    interval      = 30     ; seconds between passes (default 30)
+```
+
+When any autonomy is enabled, any `git` invocation auto-spawns the per-repo
+daemon (detached, output to `<git-dir>/zvcs.log`); its background timer threads
+run `reconcile_tree` (fast-forward every clean repo to its mainline) and/or
+`zbump` on `interval`. A dirty worktree or a diverged/ahead local branch is
+always skipped — autonomy never regresses or clobbers in-flight work.
+
 ## [0x06] LAYOUT
 
 | Path | Contents |
 |------|----------|
 | `src/ported` | Vendored gitoxide crates (`gix` + the `gix-*` library crates), in-tree. A self-contained workspace, excluded from the root and consumed as a path dependency. The `gix`/`ein` CLI binaries and their `gitoxide-core` backend are removed; `git` is the only binary. |
-| `src/extensions` | The zvcs crate: `main.rs` (the `git` shadow binary), `dispatch.rs` (routing), `porcelain.rs` (git-compat), `lock.rs` (the daemon client), and `superset/` (`zdaemon.rs`, `zsync.rs`, `zbump.rs`). |
+| `src/extensions` | The zvcs crate (a library + the `git` binary): `main.rs`/`lib.rs` (entry), `dispatch.rs` (routing), `porcelain.rs` (git-compat), `lock.rs` (daemon client), `config.rs` (`[zvcs]` settings), `autostart.rs` (daemon auto-spawn), and `superset/` (`zdaemon.rs`, `zsync.rs`, `zbump.rs`, `reconcile.rs`). |
 
 ## [0x07] STATUS & ROADMAP
 
 Early and in active development. Implemented today: the `git` shadow binary and
-dispatch, `rev-parse` (`HEAD` / `--abbrev-ref`), and all three superset verbs
-(`zdaemon`, `zsync`, `zbump`) with the `RepoLock` daemon client. Git-compat
-porcelain is ported one subcommand at a time on top of the vendored gitoxide.
+dispatch, `rev-parse` (`HEAD` / `--abbrev-ref`), all three superset verbs
+(`zdaemon`, `zsync`, `zbump`) with the `RepoLock` daemon client, and the
+autonomous `[zvcs]` mode (config-gated auto-spawn + background reconcile/bump).
+FCFS lock serialization and the fetch→ff→attach→worktree reconcile are covered
+by tests. Git-compat porcelain is ported one subcommand at a time on top of the
+vendored gitoxide.
 
 ## [0x08] DOCUMENTATION
 

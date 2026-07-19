@@ -15,6 +15,11 @@ pub fn zbump(args: &[String]) -> Result<ExitCode> {
     // 1. Parent repo.
     let repo = gix::discover(".")?;
 
+    // Serialize the whole index read-modify-write through the repo coordinator,
+    // so concurrent zvcs writers queue FCFS instead of racing `index.lock`. Held
+    // for the rest of the function; a no-op if no daemon is running.
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+
     // 2. Target submodules: all of them, or the ones named on the command line.
     let submodules: Vec<_> = match repo.submodules()? {
         Some(iter) => iter.collect(),

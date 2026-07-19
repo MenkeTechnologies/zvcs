@@ -5,6 +5,11 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 
+# The engine as a library, so integration tests can drive it directly.
+[lib]
+name = "zvcs"
+path = "src/lib.rs"
+
 # The one and only binary: `git`. It shadows stock git on PATH and serves every
 # subcommand natively via the vendored gitoxide crates — no fork/exec of old git.
 [[bin]]

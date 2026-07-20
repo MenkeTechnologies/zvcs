@@ -492,7 +492,7 @@ fn walk(
     let mut opts: gix::dir::walk::Options<'_> = options.into();
     // Linked worktrees inside our own worktree are marked tracked so a deletion
     // walk cannot wander into them, exactly as `Repository::dirwalk` does.
-    let worktree_dirs: Vec<BString> = if opts.for_deletion.is_some() {
+    let worktree_dirs: std::collections::BTreeSet<BString> = if opts.for_deletion.is_some() {
         let real_workdir = gix::path::realpath(workdir)?;
         repo.worktrees()?
             .into_iter()
@@ -501,9 +501,9 @@ fn walk(
             .map(|rela| {
                 gix::path::to_unix_separators_on_windows(gix::path::into_bstr(rela)).into_owned()
             })
-            .collect()
+            .collect::<std::collections::BTreeSet<_>>()
     } else {
-        Vec::new()
+        std::collections::BTreeSet::new()
     };
     if !worktree_dirs.is_empty() {
         opts.worktree_relative_worktree_dirs = Some(&worktree_dirs);

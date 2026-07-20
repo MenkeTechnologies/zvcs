@@ -610,8 +610,13 @@ fn summary_changes(
         if let Some(wd) = workdir {
             for (path, oid) in dst.iter_mut() {
                 let sm = wd.join(&*gix::path::from_bstr(path.as_bstr()));
-                if let Some(head) = gix::open(sm).ok().and_then(|r| r.head_id().ok()) {
-                    *oid = head.detach();
+                // Detach inside the closure: `head_id` borrows the repository,
+                // which is owned by the closure and dropped on return.
+                if let Some(head) = gix::open(sm)
+                    .ok()
+                    .and_then(|r| r.head_id().ok().map(|id| id.detach()))
+                {
+                    *oid = head;
                 }
             }
         }

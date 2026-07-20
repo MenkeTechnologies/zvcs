@@ -667,7 +667,10 @@ fn looks_like_pathspec(arg: &str) -> bool {
 /// affected and `--textconv` cannot change a single byte of the output.
 fn has_textconv_driver(repo: &gix::Repository) -> bool {
     let snapshot = repo.config_snapshot();
-    snapshot
+    // Reduced to a bool while `snapshot` is still alive: the section iterator
+    // borrows it, and returning the expression directly would let the borrow
+    // outlive the binding.
+    let found = snapshot
         .plumbing()
         .sections_by_name("diff")
         .into_iter()
@@ -678,7 +681,8 @@ fn has_textconv_driver(repo: &gix::Repository) -> bool {
                 .subsection_name()
                 .is_some_and(|name| !name.is_empty())
                 && section.value("textconv").is_some()
-        })
+        });
+    found
 }
 
 /// Collect every file under `specs` for `--no-index`, which searches the

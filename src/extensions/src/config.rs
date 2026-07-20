@@ -34,6 +34,11 @@ pub struct ZvcsConfig {
     /// Maintain each watched repo's cached status in the db on ref-change
     /// (`zvcs.autostatus`), so `git zstatus --all` is instant. Off by default.
     pub autostatus: bool,
+    /// Watch every indexed repo and fire each repo's *own* `zvcs.hook` on
+    /// ref-change (`zvcs.autohook`). This is the master switch that makes
+    /// **per-repo (local) hooks** work without also setting a hook on the
+    /// daemon's repo. Off by default.
+    pub autohook: bool,
 }
 
 impl ZvcsConfig {
@@ -66,6 +71,7 @@ impl ZvcsConfig {
                 .map(|s| s.to_string())
                 .filter(|s| !s.trim().is_empty()),
             autostatus: snap.boolean("zvcs.autostatus").unwrap_or(false),
+            autohook: snap.boolean("zvcs.autohook").unwrap_or(false),
         }
     }
 
@@ -77,12 +83,18 @@ impl ZvcsConfig {
     /// Whether the daemon should run the watch loop at all — autonomy, hooks, or
     /// status maintenance.
     pub fn should_watch(&self) -> bool {
-        self.any_autonomous() || self.hook.is_some() || self.autostatus
+        self.any_autonomous() || self.hooks_enabled() || self.autostatus
     }
 
     /// Whether the watcher should cover every indexed repo (not just working
     /// submodules): needed for machine-wide hooks or status.
     pub fn watch_all_repos(&self) -> bool {
-        self.hook.is_some() || self.autostatus
+        self.hooks_enabled() || self.autostatus
+    }
+
+    /// Whether hooks should fire: a hook set here, or the `autohook` master
+    /// switch (which fires each repo's own local hook).
+    pub fn hooks_enabled(&self) -> bool {
+        self.hook.is_some() || self.autohook
     }
 }

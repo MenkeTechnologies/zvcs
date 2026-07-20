@@ -120,9 +120,10 @@ fn run(cfg: ZvcsConfig) {
                 }
             }
         }
-        if cfg.hook.is_some() {
+        if cfg.hooks_enabled() {
             for t in &targets {
                 if affected.contains(&t.git_dir) {
+                    // hooks::run reads each repo's own zvcs.hook (no-op if none).
                     crate::superset::hooks::run(&t.git_dir, &t.workdir);
                 }
             }

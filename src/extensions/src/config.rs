@@ -31,6 +31,9 @@ pub struct ZvcsConfig {
     /// the daemon watches every indexed repo (not just the working submodules)
     /// and fires the hook per repo. `None` means no hooks.
     pub hook: Option<String>,
+    /// Maintain each watched repo's cached status in the db on ref-change
+    /// (`zvcs.autostatus`), so `git zstatus --all` is instant. Off by default.
+    pub autostatus: bool,
 }
 
 impl ZvcsConfig {
@@ -62,6 +65,7 @@ impl ZvcsConfig {
                 .string("zvcs.hook")
                 .map(|s| s.to_string())
                 .filter(|s| !s.trim().is_empty()),
+            autostatus: snap.boolean("zvcs.autostatus").unwrap_or(false),
         }
     }
 
@@ -70,8 +74,15 @@ impl ZvcsConfig {
         self.autoreconcile || self.autobump
     }
 
-    /// Whether the daemon should run the watch loop at all — autonomy or hooks.
+    /// Whether the daemon should run the watch loop at all — autonomy, hooks, or
+    /// status maintenance.
     pub fn should_watch(&self) -> bool {
-        self.any_autonomous() || self.hook.is_some()
+        self.any_autonomous() || self.hook.is_some() || self.autostatus
+    }
+
+    /// Whether the watcher should cover every indexed repo (not just working
+    /// submodules): needed for machine-wide hooks or status.
+    pub fn watch_all_repos(&self) -> bool {
+        self.hook.is_some() || self.autostatus
     }
 }

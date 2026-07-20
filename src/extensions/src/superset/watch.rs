@@ -55,6 +55,15 @@ fn run(cfg: ZvcsConfig) {
 
     let targets = build_targets(&cfg);
 
+    // Populate status for every watched repo on start (instant `zstatus --all`).
+    if cfg.autostatus {
+        if let Ok(conn) = crate::db::open_rw() {
+            for t in &targets {
+                crate::superset::status::record(&conn, &t.git_dir, &t.workdir);
+            }
+        }
+    }
+
     let (tx, rx) = mpsc::channel();
     let mut watcher = match notify::recommended_watcher(move |res| {
         let _ = tx.send(res);
@@ -98,9 +107,18 @@ fn run(cfg: ZvcsConfig) {
             }
         }
 
-        // Autonomy (working tree), then per-repo hooks for the repos that changed.
+        // Autonomy (working tree), then per-repo status + hooks for repos changed.
         if cfg.any_autonomous() {
             react(&cfg);
+        }
+        if cfg.autostatus {
+            if let Ok(conn) = crate::db::open_rw() {
+                for t in &targets {
+                    if affected.contains(&t.git_dir) {
+                        crate::superset::status::record(&conn, &t.git_dir, &t.workdir);
+                    }
+                }
+            }
         }
         if cfg.hook.is_some() {
             for t in &targets {
@@ -145,8 +163,8 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
         }
     }
 
-    // Every indexed repo, for hooks.
-    if cfg.hook.is_some() {
+    // Every indexed repo, for hooks and/or status maintenance.
+    if cfg.watch_all_repos() {
         if let Ok(conn) = crate::db::open_ro() {
             if let Ok(repos) = crate::db::list_repos(&conn) {
                 for r in repos {

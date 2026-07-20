@@ -17,6 +17,7 @@ pub mod attach;
 pub mod claim;
 pub mod hooks;
 pub mod ledger;
+pub mod status;
 pub mod queue;
 mod reconcile;
 pub mod repl;
@@ -27,6 +28,7 @@ mod zsync;
 
 pub use attach::{ensure_attached, Attached};
 pub use claim::{zclaim, zunclaim, zwho};
+pub use status::zstatus;
 pub use ledger::{zjob, zjobs, zreindex, zrepos};
 pub use queue::{zcommit, zpush};
 pub use repl::zrepl;

@@ -50,6 +50,14 @@ CREATE TABLE IF NOT EXISTS claims (
     workdir    TEXT,
     claimed_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS repo_status (
+    repo_id    INTEGER PRIMARY KEY REFERENCES repos(id),
+    dirty      INTEGER,
+    detached   INTEGER,
+    sync       TEXT,
+    head       TEXT,
+    updated_at INTEGER
+);
 ";
 
 /// `~/.zvcs/db.sqlite` (honors `ZVCS_HOME`).
@@ -297,6 +305,55 @@ pub fn restart_job(conn: &Connection, id: i64) -> Result<Option<(i64, String)>> 
         rusqlite::params![repo_id, kind, spec, session, id, now()],
     )?;
     Ok(Some((conn.last_insert_rowid(), spec)))
+}
+
+/// Insert or refresh a repo's cached status.
+pub fn upsert_status(
+    conn: &Connection,
+    repo_id: i64,
+    dirty: bool,
+    detached: bool,
+    sync: &str,
+    head: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO repo_status (repo_id, dirty, detached, sync, head, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(repo_id) DO UPDATE SET
+             dirty=?2, detached=?3, sync=?4, head=?5, updated_at=?6",
+        rusqlite::params![repo_id, dirty as i64, detached as i64, sync, head, now()],
+    )?;
+    Ok(())
+}
+
+/// One cached status row: `(path, dirty, detached, sync, head)`.
+pub struct StatusRow {
+    pub path: String,
+    pub dirty: bool,
+    pub detached: bool,
+    pub sync: String,
+    pub head: String,
+}
+
+/// All cached repo statuses, joined with the repo path.
+pub fn list_status(conn: &Connection) -> Result<Vec<StatusRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(r.workdir, r.git_dir), s.dirty, s.detached, s.sync, s.head
+         FROM repo_status s JOIN repos r ON r.id = s.repo_id
+         ORDER BY r.workdir",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(StatusRow {
+                path: r.get(0)?,
+                dirty: r.get::<_, i64>(1)? != 0,
+                detached: r.get::<_, i64>(2)? != 0,
+                sync: r.get(3)?,
+                head: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Outcome of a claim attempt.

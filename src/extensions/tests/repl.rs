@@ -25,15 +25,15 @@ fn zrepl_runs_piped_commands_then_quits() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"zrepos\nquit\n")
+        .write_all(b"zjobs\nquit\n")
         .unwrap();
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     assert!(out.status.success(), "zrepl exited non-zero");
     assert!(
-        stdout.to_lowercase().contains("no repo"),
-        "zrepl did not run the piped `zrepos`; stdout:\n{stdout}"
+        stdout.to_lowercase().contains("no jobs"),
+        "zrepl did not run the piped `zjobs`; stdout:\n{stdout}"
     );
 
     let _ = std::fs::remove_dir_all(&home);

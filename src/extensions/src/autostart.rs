@@ -15,7 +15,7 @@ pub fn ensure_if_configured() {
     let Ok(repo) = gix::discover(".") else {
         return;
     };
-    if !crate::config::ZvcsConfig::load(&repo).any_autonomous() {
+    if !crate::config::ZvcsConfig::load(&repo).should_watch() {
         return;
     }
 

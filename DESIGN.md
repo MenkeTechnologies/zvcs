@@ -226,7 +226,25 @@ lock and no autonomy.
     interval      = 2               ; debounce window (seconds) for coalescing bump/attach bursts
     autocrawl     = true            ; background repo-index crawl on daemon start (opt-in)
     crawlroots    = ~/src ~/work    ; roots for the crawler (whitespace/comma separated; default $HOME)
+    hook          = ~/bin/on-change ; run on ref-change in any indexed repo (see §5.6)
 ```
+
+### 5.6 Hooks — filesystem-driven, across every indexed repo
+
+Because every repo is indexed in the ledger, the daemon can watch them all and
+run a **per-repo hook** on ref-change — a hook system with nothing installed in
+any `.git/hooks`. Set `[zvcs] hook` (merged config, so a single `~/.gitconfig`
+value applies everywhere; a repo may override in its own `.git/config`). When a
+hook is configured, `should_watch()` is true and the watcher additionally watches
+every indexed repo (deduped, capped at `MAX_WATCHED` with a logged warning — no
+silent truncation). On a debounced ref-change the hook runs via `sh -c` with:
+
+- cwd = the repo working directory,
+- `ZVCS_REPO` = working dir, `ZVCS_GIT_DIR` = git dir, `ZVCS_EVENT` = `ref-change`.
+
+Hook output goes to `~/.zvcs/zvcs.log`; a failing hook is recorded in the ledger
+and surfaced by notify-on-next-command. `zdaemon` starts automatically when a
+hook is set, even without other autonomy (`autostart` gates on `should_watch()`).
 
 - `ZvcsConfig::load` (`src/extensions/src/config.rs:28`) reads these; absent keys
   default to `false` (`interval` defaults to a small debounce). `any_autonomous()`
@@ -351,7 +369,8 @@ commits/pushes that should not block.
 | Reactive reconcile on remote-tracking change (`reconcile_repo_local`) | built |
 | Failure log + notify-on-next-command (`db.rs`, `lib.rs`) | built |
 | SQLite `jobs` + `repos` (rusqlite bundled, WAL) (`db.rs`) | built |
-| Crawler + `zreindex`/`zrepos` (`crawler.rs`, `ledger.rs`) | built |
+| Crawler + `zreindex`/`zrepos` (pipe-clean, prunes deleted) (`crawler.rs`, `ledger.rs`) | built |
+| Filesystem hooks across all indexed repos (`hooks.rs`, `watch.rs`, `zvcs.hook`) | built |
 | `zcommit`/`zpush` async via daemon `SUBMIT` (`queue.rs`, `jobrun.rs`) | built |
 | `zjobs`/`zjob` + `zrepl` (`ledger.rs`, `repl.rs`) | built |
 

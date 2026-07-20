@@ -1,49 +1,60 @@
-//! Reactive, file-watcher-driven autonomy — the daemon's autobump / attach /
-//! reconcile passes, triggered by **local** ref changes and never by a timer or
-//! a remote poll.
+//! Reactive, file-watcher-driven autonomy **and** hooks — triggered by local ref
+//! changes, never by a timer or a remote poll.
 //!
-//! A `git commit`/`git pull` inside a submodule rewrites that submodule's
-//! `logs/HEAD` and `refs/*`; `notify` fires; the daemon reacts. It never contacts
-//! a remote — reconcile here is the fetch-free ([`reconcile_repo_local`]) fast
-//! forward to whatever `origin/main` a prior local pull already fetched.
+//! A `git commit`/`git pull` rewrites a repo's `logs/HEAD` and `refs/*`;
+//! `notify` fires; the daemon reacts. Two kinds of reaction, both coalesced over
+//! a debounce window:
 //!
-//! What each reaction does, coalesced over a debounce window:
-//!   * **attach** every submodule off any detached HEAD ([`ensure_attached`]) —
-//!     ends the stash/attach/pop dance;
-//!   * **autobump** (if `[zvcs] autobump`) — forward-only local pointer bumps
-//!     committed into the parent, clearing the `(new commits)` markers;
-//!   * **reconcile-local** (if `[zvcs] autoreconcile`) — fetch-free ff of each
-//!     clean submodule to its already-present `origin/main`.
+//!   * **autonomy** (working tree) — attach detached submodules, fetch-free
+//!     reconcile, and forward-only autobump, when `[zvcs]` autonomy is enabled;
+//!   * **hooks** (any indexed repo) — when `[zvcs] hook` is set, every repo in
+//!     the ledger is watched and its per-repo hook runs on ref-change. Because
+//!     all repos are indexed in the db, this is a filesystem-driven hook system
+//!     with nothing installed in any `.git/hooks`.
+//!
+//! Reconcile here is the fetch-free [`reconcile_repo_local`] fast-forward to
+//! whatever `origin/main` a prior local pull already fetched; the daemon never
+//! contacts a remote.
 
-use notify::{RecursiveMode, Watcher};
+use notify::{Event, RecursiveMode, Watcher};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
-use std::time::Duration;
 
 use crate::config::ZvcsConfig;
 
-/// Spawn the watch loop iff the discovered repo has `[zvcs]` autonomy enabled.
-/// Runs entirely on a background thread; a no-op otherwise.
+/// A watched repository: its git directory (watched) and working directory
+/// (passed to hooks).
+struct Target {
+    git_dir: PathBuf,
+    workdir: PathBuf,
+}
+
+/// Cap on watched repos, so a whole-device index can't exhaust inotify watches.
+const MAX_WATCHED: usize = 1024;
+
+/// Spawn the watch loop iff `[zvcs]` autonomy or a hook is configured.
 pub fn spawn_if_configured() {
     let Ok(repo) = gix::discover(".") else {
         return;
     };
     let cfg = ZvcsConfig::load(&repo);
-    if !cfg.any_autonomous() {
+    if !cfg.should_watch() {
         return;
     }
     thread::spawn(move || run(cfg));
 }
 
 fn run(cfg: ZvcsConfig) {
-    // 1. Converge on start: attach every submodule off detached HEAD, then a
-    //    first autobump/reconcile pass so current state is consistent before any
-    //    event arrives (a detached-but-current submodule generates no events).
-    react(&cfg);
+    // Converge autonomy on start (attach detached submodules, first bump pass).
+    if cfg.any_autonomous() {
+        react(&cfg);
+    }
 
-    // 2. Watch each submodule's ref/reflog trees for local changes.
+    let targets = build_targets(&cfg);
+
     let (tx, rx) = mpsc::channel();
     let mut watcher = match notify::recommended_watcher(move |res| {
         let _ = tx.send(res);
@@ -56,42 +67,126 @@ fn run(cfg: ZvcsConfig) {
     };
 
     let mut watched = 0usize;
-    for dir in watch_dirs() {
-        if watcher.watch(&dir, RecursiveMode::Recursive).is_ok() {
-            watched += 1;
+    for t in &targets {
+        for sub in ["refs", "logs"] {
+            let p = t.git_dir.join(sub);
+            if p.exists() && watcher.watch(&p, RecursiveMode::Recursive).is_ok() {
+                watched += 1;
+            }
         }
     }
-    println!("[zvcs watch] watching {watched} ref tree(s), debounce={:?}", cfg.interval);
+    println!(
+        "[zvcs watch] watching {} repo(s) ({watched} ref tree(s)), hooks={}, debounce={:?}",
+        targets.len(),
+        cfg.hook.is_some(),
+        cfg.interval
+    );
 
-    // 3. Debounced event loop: block for an event, drain the burst until a quiet
-    //    gap of `interval`, then act once (coalescing).
     let debounce = cfg.interval;
     loop {
-        if rx.recv().is_err() {
-            return; // watcher dropped
-        }
+        let first = match rx.recv() {
+            Ok(ev) => ev,
+            Err(_) => return,
+        };
+        let mut affected: HashSet<PathBuf> = HashSet::new();
+        collect(&first, &targets, &mut affected);
         loop {
             match rx.recv_timeout(debounce) {
-                Ok(_) => continue,               // more events in the burst
-                Err(RecvTimeoutError::Timeout) => break, // quiet -> act
+                Ok(ev) => collect(&ev, &targets, &mut affected),
+                Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
-        react(&cfg);
+
+        // Autonomy (working tree), then per-repo hooks for the repos that changed.
+        if cfg.any_autonomous() {
+            react(&cfg);
+        }
+        if cfg.hook.is_some() {
+            for t in &targets {
+                if affected.contains(&t.git_dir) {
+                    crate::superset::hooks::run(&t.git_dir, &t.workdir);
+                }
+            }
+        }
     }
 }
 
-/// One coalesced reaction: attach, then (config-gated) reconcile-local and
-/// autobump. Re-opens the repo so it always sees current state.
+/// Record which watched repos an event touched (its paths live under a repo's
+/// git dir).
+fn collect(ev: &notify::Result<Event>, targets: &[Target], affected: &mut HashSet<PathBuf>) {
+    let Ok(ev) = ev else { return };
+    for path in &ev.paths {
+        for t in targets {
+            if path.starts_with(&t.git_dir) {
+                affected.insert(t.git_dir.clone());
+            }
+        }
+    }
+}
+
+/// The repos to watch: the working repo's submodules (for autonomy) plus, when a
+/// hook is configured, every indexed repo (for hooks). Deduped by git dir and
+/// capped at [`MAX_WATCHED`].
+fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut targets: Vec<Target> = Vec::new();
+
+    // Working repo submodules (autonomy is keyed off their HEAD moves).
+    if let Ok(repo) = gix::discover(".") {
+        if let Ok(Some(subs)) = repo.submodules() {
+            for sm in subs {
+                if let Ok(Some(sub)) = sm.open() {
+                    if let Some(wd) = sub.workdir() {
+                        add_target(&mut seen, &mut targets, sub.git_dir().to_path_buf(), wd.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+
+    // Every indexed repo, for hooks.
+    if cfg.hook.is_some() {
+        if let Ok(conn) = crate::db::open_ro() {
+            if let Ok(repos) = crate::db::list_repos(&conn) {
+                for r in repos {
+                    let wd = r
+                        .workdir
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from(&r.git_dir));
+                    add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd);
+                    if targets.len() >= MAX_WATCHED {
+                        println!(
+                            "[zvcs watch] capped at {MAX_WATCHED} watched repos; \
+                             narrow `zvcs.crawlroots` to watch fewer"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    targets
+}
+
+/// Add a repo to the watch set, canonicalizing and deduping by git dir.
+fn add_target(seen: &mut HashSet<PathBuf>, targets: &mut Vec<Target>, git_dir: PathBuf, workdir: PathBuf) {
+    let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
+    if seen.insert(git_dir.clone()) {
+        targets.push(Target { git_dir, workdir });
+    }
+}
+
+/// One coalesced autonomy reaction: attach, then (config-gated) reconcile-local
+/// and autobump. Re-opens the repo so it always sees current state.
 fn react(cfg: &ZvcsConfig) {
     let Ok(repo) = gix::discover(".") else {
         return;
     };
 
-    // Attach every submodule (+ top) off any detached HEAD. Local, no-clobber.
     attach_all(&repo);
 
-    // Fetch-free ff of each clean submodule to its already-present origin/main.
     if cfg.autoreconcile {
         if let Ok(Some(subs)) = repo.submodules() {
             for sm in subs {
@@ -99,8 +194,6 @@ fn react(cfg: &ZvcsConfig) {
                     if let Err(e) = crate::superset::reconcile_repo_local(&sub) {
                         let path = sm.path().map(|p| p.to_string()).unwrap_or_default();
                         println!("[zvcs reconcile] {path}: error: {e:#}");
-                        // Record for notify-on-next-command (headless failure has
-                        // no exit code to return to a caller).
                         let _ = crate::db::record_failure(
                             sub.git_dir(),
                             "reconcile",
@@ -112,8 +205,6 @@ fn react(cfg: &ZvcsConfig) {
         }
     }
 
-    // Forward-only local pointer bumps, committed (clears the markers). Record
-    // any refusals (e.g. a rewound/diverged submodule) for notify-on-next-command.
     if cfg.autobump {
         match crate::superset::zbump_run(&[]) {
             Ok(outcome) => {
@@ -143,30 +234,4 @@ fn attach_all(repo: &gix::Repository) {
             }
         }
     }
-}
-
-/// Ref/reflog directories to watch: each **submodule's** `refs/` and `logs/`.
-///
-/// The top repo is deliberately not watched: autobump commits into it, and
-/// watching it would re-trigger the reaction on the daemon's own writes.
-/// Reactions are keyed off submodule HEAD moves (a bot committing/pulling).
-fn watch_dirs() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(repo) = gix::discover(".") else {
-        return out;
-    };
-    if let Ok(Some(subs)) = repo.submodules() {
-        for sm in subs {
-            if let Ok(Some(sub)) = sm.open() {
-                let gd = sub.git_dir();
-                for sub_dir in ["refs", "logs"] {
-                    let p = gd.join(sub_dir);
-                    if p.exists() {
-                        out.push(p);
-                    }
-                }
-            }
-        }
-    }
-    out
 }

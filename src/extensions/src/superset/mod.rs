@@ -14,6 +14,7 @@
 //!     pointer only when the new SHA is a descendant of the recorded one.
 
 pub mod attach;
+pub mod hooks;
 pub mod ledger;
 pub mod queue;
 mod reconcile;

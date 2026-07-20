@@ -27,6 +27,10 @@ pub struct ZvcsConfig {
     /// Crawl the configured roots for git repos in the background on daemon start
     /// (`zvcs.autocrawl`). Off by default — a whole-device scan is opt-in.
     pub autocrawl: bool,
+    /// A `zvcs.hook` command to run on ref-change in any watched repo. When set,
+    /// the daemon watches every indexed repo (not just the working submodules)
+    /// and fires the hook per repo. `None` means no hooks.
+    pub hook: Option<String>,
 }
 
 impl ZvcsConfig {
@@ -54,11 +58,20 @@ impl ZvcsConfig {
             interval: Duration::from_secs(interval),
             crawlroots,
             autocrawl: snap.boolean("zvcs.autocrawl").unwrap_or(false),
+            hook: snap
+                .string("zvcs.hook")
+                .map(|s| s.to_string())
+                .filter(|s| !s.trim().is_empty()),
         }
     }
 
-    /// Whether any autonomous behavior is enabled (i.e. a daemon is worth running).
+    /// Whether any autonomous (working-tree) behavior is enabled.
     pub fn any_autonomous(&self) -> bool {
         self.autoreconcile || self.autobump
+    }
+
+    /// Whether the daemon should run the watch loop at all — autonomy or hooks.
+    pub fn should_watch(&self) -> bool {
+        self.any_autonomous() || self.hook.is_some()
     }
 }

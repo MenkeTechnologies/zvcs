@@ -240,12 +240,14 @@ struct Filter {
 }
 
 /// The `--dirstat` parameter block.
-struct DirStat {
+///
+/// Shared with `diff-index`, which drives the same `gather_dirstat()` port.
+pub(crate) struct DirStat {
     /// Minimum share, in permille, for a directory to be listed.
-    permille: u32,
-    by_file: bool,
-    by_line: bool,
-    cumulative: bool,
+    pub(crate) permille: u32,
+    pub(crate) by_file: bool,
+    pub(crate) by_line: bool,
+    pub(crate) cumulative: bool,
 }
 
 impl Default for DirStat {
@@ -2465,7 +2467,9 @@ fn dirstat_damage(deltas: &[Delta], analyses: &[Analysis], opts: &Opts) -> Vec<(
 }
 
 /// `conclude_dirstat()` + `gather_dirstat()`.
-fn render_dirstat(out: &mut Vec<u8>, mut files: Vec<(BString, u64)>, ds: &DirStat) {
+///
+/// Shared with `diff-index`, whose `--dirstat` renders through this same walk.
+pub(crate) fn render_dirstat(out: &mut Vec<u8>, mut files: Vec<(BString, u64)>, ds: &DirStat) {
     let changed: u64 = files.iter().map(|(_, d)| *d).sum();
     if changed == 0 {
         return;
@@ -2534,8 +2538,16 @@ fn gather_dirstat(
 /// `diffcore_count_changes()` from diffcore-delta.c: chunk both buffers on LF or
 /// 64 bytes, hash each chunk, and compare the per-hash byte totals.
 fn count_changes(src: &[u8], dst: &[u8], binary: bool) -> (u64, u64) {
-    let s = hash_chars(src, !binary);
-    let d = hash_chars(dst, !binary);
+    count_changes_sides(src, !binary, dst, !binary)
+}
+
+/// `diffcore_count_changes()` with the two `hash_chars()` calls given their own
+/// `is_text` flags, which is how git derives them: `diff_filespec_is_binary()` is
+/// asked about each filespec separately. `diff-index` needs that split because it
+/// classifies the two sides independently.
+pub(crate) fn count_changes_sides(src: &[u8], src_text: bool, dst: &[u8], dst_text: bool) -> (u64, u64) {
+    let s = hash_chars(src, src_text);
+    let d = hash_chars(dst, dst_text);
 
     let mut sc: u64 = 0;
     let mut la: u64 = 0;

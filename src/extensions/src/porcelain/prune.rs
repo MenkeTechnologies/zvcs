@@ -521,7 +521,7 @@ fn collect_recent_roots(
 
 /// `lstat()`'s `st_mtime`, in whole seconds, which is what git compares against
 /// `expire`. `None` when the file cannot be stat'ed.
-fn mtime_of(path: &Path) -> Option<i64> {
+pub(super) fn mtime_of(path: &Path) -> Option<i64> {
     use std::os::unix::fs::MetadataExt;
     fs::symlink_metadata(path).ok().map(|md| md.mtime())
 }
@@ -547,14 +547,14 @@ fn prune_tmp_file(path: &Path, shown: &Path, expire: i64, dry_run: bool, verbose
 /// Whether a fan-out directory entry names an object: `hexsz - 2` hex digits,
 /// which is precisely `for_each_file_in_obj_subdir()`'s `hex_to_bytes()` test.
 /// Everything else is cruft.
-fn is_object_name(name: &str, name_len: usize) -> bool {
+pub(super) fn is_object_name(name: &str, name_len: usize) -> bool {
     name.len() == name_len && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Directory entries in raw `readdir` order — deliberately unsorted, because
 /// git's own scan is unsorted and stdout order has to match. `None` when the
 /// directory does not exist or cannot be read, so no `rmdir` is attempted.
-fn read_dir_raw(dir: &Path) -> Option<Vec<OsString>> {
+pub(super) fn read_dir_raw(dir: &Path) -> Option<Vec<OsString>> {
     let read = fs::read_dir(dir).ok()?;
     Some(read.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
 }
@@ -577,7 +577,7 @@ fn display_objdir(repo: &gix::Repository, objdir: &Path) -> PathBuf {
 
 /// Seed `roots` the way `mark_reachable_objects()` does: index entries and
 /// cache-tree ids, every ref under `refs/`, `HEAD`, and every reflog entry.
-fn collect_roots(repo: &gix::Repository, roots: &mut Vec<ObjectId>) -> Result<()> {
+pub(super) fn collect_roots(repo: &gix::Repository, roots: &mut Vec<ObjectId>) -> Result<()> {
     // Index blobs (gitlinks excluded, as `do_add_index_objects_to_pending()`
     // skips `S_ISGITLINK`) plus the cache-tree, whose invalid sections git skips
     // via `entry_count >= 0` — gitoxide models that as `num_entries: None`.
@@ -671,7 +671,7 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// parents, tags their target, trees their non-gitlink entries. Objects that
 /// cannot be found or decoded are dropped from the walk but stay in the set, so
 /// a corrupt object is never mistaken for an unreachable one.
-fn close_over(repo: &gix::Repository, roots: Vec<ObjectId>) -> HashSet<ObjectId> {
+pub(super) fn close_over(repo: &gix::Repository, roots: Vec<ObjectId>) -> HashSet<ObjectId> {
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut stack: Vec<ObjectId> = Vec::new();
     for id in roots {
@@ -732,7 +732,7 @@ fn close_over(repo: &gix::Repository, roots: Vec<ObjectId>) -> HashSet<ObjectId>
 /// those of each alternate — which together define `has_object_pack()`, the test
 /// `prune-packed` uses. A pack whose `.pack` is missing or whose index cannot be
 /// opened is skipped, as `prepare_packed_git_one()` skips it.
-fn pack_indices(repo: &gix::Repository, objdir: &Path) -> Vec<pack::index::File> {
+pub(super) fn pack_indices(repo: &gix::Repository, objdir: &Path) -> Vec<pack::index::File> {
     let hash = repo.object_hash();
     let mut dirs = vec![objdir.to_path_buf()];
     if let Ok(alternates) = repo.objects.store_ref().alternate_db_paths() {

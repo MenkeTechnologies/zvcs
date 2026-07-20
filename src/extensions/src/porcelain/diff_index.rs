@@ -31,6 +31,12 @@
 //!     applied are dropped, and the surviving worktree side is hashed so the real object
 //!     id shows up in the raw record instead of the null id, as git does.
 //!   * `-S<s>`, `-G<s>`, `--pickaxe-all`, `--pickaxe-regex` — the pickaxe filters.
+//!   * `--dirstat[=<params>]` / `-X[<params>]`, `--dirstat-by-file[=<params>]`,
+//!     `--cumulative` — the per-directory damage listing. Damage is scored by git's
+//!     `diffcore_count_changes()` (shared with `diff-files`), by file, or by changed
+//!     line count, and rendered through the same `gather_dirstat()` walk. Like git,
+//!     `--dirstat` on its own replaces the raw listing, while `--raw --dirstat`
+//!     prints both, and `--name-only`, `--name-status` and `-s` suppress it entirely.
 //!   * `[--] <path>...`                 — pathspec limiting, resolved relative to the cwd
 //!     while output paths stay repository-root relative, as git does. Without a `--`
 //!     separator a pathspec has to exist on disk (git's `verify_filename`), so a
@@ -56,9 +62,6 @@
 //!   content-driven in git, so when no pair survives the content comparison the correct
 //!   output is nothing at all and that is what is emitted; a run that would have produced
 //!   real patch or stat bytes is refused instead of approximated.
-//! * `--dirstat` and friends (`--cumulative`, `--dirstat-by-file`) need git's
-//!   `diffcore_count_changes` damage estimate, which the vendored gitoxide does not
-//!   provide. Refused unless the pair list is empty.
 //! * Rename/copy detection is off, which is git's default for `diff-index`. `-M`/`-C`
 //!   and friends are accepted for their *observable* side effect on this listing — git
 //!   hashes rename candidates, so an added path gains its real object id — but no rename
@@ -84,6 +87,8 @@ use std::process::ExitCode;
 use gix::bstr::BString;
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
+
+use super::diff_files::{count_changes_sides, render_dirstat, DirStat};
 
 /// The file-type bits of a mode, as in `<sys/stat.h>`.
 const S_IFMT: u32 = 0o170000;
@@ -144,6 +149,12 @@ struct Opts {
     pickaxe: Option<Pickaxe>,
     pickaxe_all: bool,
     detect_rename: bool, // -M/-C: git hashes rename candidates, so additions gain real ids
+    /// `--dirstat`/`-X`/`--dirstat-by-file`/`--cumulative`, once any of them is seen.
+    dirstat: Option<DirStat>,
+    /// Whether the pair listing itself is printed. git defaults `output_format` to
+    /// `DIFF_FORMAT_RAW` only when nothing else was asked for, so a bare `--dirstat`
+    /// prints directories alone while `--raw --dirstat` prints both.
+    emit_pairs: bool,
 }
 
 /// One file-level change, already reduced to the columns git's raw format prints.
@@ -193,7 +204,8 @@ struct IdxInfo {
 const PORTED: &str = "--cached, --merge-base, -m, --raw, --name-only, --name-status, -z, \
                       --abbrev[=<n>], --no-abbrev, --full-index, --exit-code, --quiet, \
                       -s/--no-patch, -R, --diff-filter=, --line-prefix=, --relative[=], \
-                      -w/-b/--ignore-*-space*, -I, -S, -G";
+                      -w/-b/--ignore-*-space*, -I, -S, -G, --dirstat[=], -X, \
+                      --dirstat-by-file[=], --cumulative";
 
 /// Stock `git diff-index`'s usage text, reproduced byte for byte (including the
 /// trailing blank line) because it is written to stderr on every usage error.
@@ -235,8 +247,9 @@ common diff options:
 /// and without the option, both in a repository whose only differences are stat-dirty
 /// (so every pair has a null destination id) and in one with real additions, deletions
 /// and modifications. All of them leave those bytes and the exit status untouched.
-/// Deliberately absent: `-U<n>`, `--unified=<n>`, `--binary`, `--check`, the stat family
-/// and the dirstat family, which look like rendering knobs but replace the raw listing.
+/// Deliberately absent: `-U<n>`, `--unified=<n>`, `--binary`, `--check` and the stat
+/// family, which look like rendering knobs but replace the raw listing. The dirstat
+/// family also replaces it and is handled for real, in `apply_dirstat`.
 fn render_only_option(a: &str) -> bool {
     const EXACT: &[&str] = &[
         "-a",
@@ -309,9 +322,9 @@ fn render_only_option(a: &str) -> bool {
 }
 
 /// Options that select a patch-, stat- or check-style rendering this module does not
-/// produce. The boolean says whether git derives that rendering from file *contents*
-/// (so an all-clean pair list renders as nothing) or from the pair list alone.
-fn unsupported_format(a: &str) -> Option<bool> {
+/// produce. Every one of them is derived from file *contents* in git, so an all-clean
+/// pair list still renders as nothing and only a run with surviving pairs is refused.
+fn unsupported_format(a: &str) -> bool {
     const CONTENT_EXACT: &[&str] = &[
         "-p",
         "-u",
@@ -327,20 +340,10 @@ fn unsupported_format(a: &str) -> Option<bool> {
         "--summary",
     ];
     const CONTENT_PREFIX: &[&str] = &["--stat=", "--stat-width=", "--stat-name-width=", "--stat-count=", "--unified="];
-    const DIRSTAT_EXACT: &[&str] = &["--cumulative", "--dirstat", "--dirstat-by-file"];
-    const DIRSTAT_PREFIX: &[&str] = &["--dirstat=", "--dirstat-by-file="];
-
-    if CONTENT_EXACT.contains(&a) || CONTENT_PREFIX.iter().any(|p| a.starts_with(*p)) {
-        return Some(true);
-    }
     // `-U<n>` sets the context count *and* selects the patch format.
-    if a.len() > 2 && a.starts_with("-U") {
-        return Some(true);
-    }
-    if DIRSTAT_EXACT.contains(&a) || DIRSTAT_PREFIX.iter().any(|p| a.starts_with(*p)) {
-        return Some(false);
-    }
-    None
+    CONTENT_EXACT.contains(&a)
+        || CONTENT_PREFIX.iter().any(|p| a.starts_with(*p))
+        || (a.len() > 2 && a.starts_with("-U"))
 }
 
 /// Short options whose value may be written as a separate argument (`-S fn` as well as
@@ -386,9 +389,14 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         pickaxe: None,
         pickaxe_all: false,
         detect_rename: false,
+        dirstat: None,
+        emit_pairs: true,
     };
     let mut quiet = false;
     let mut merge_base = false;
+    // `--raw` given explicitly, which is what makes git print the pair listing
+    // alongside `--dirstat` instead of only the directories.
+    let mut raw_explicit = false;
     // `-S`/`-G` share one slot (the last one wins, as in git); `-I` composes with them.
     let mut pickaxe_arg: Option<(u8, Vec<u8>)> = None;
     let mut ignore_arg: Option<Vec<u8>> = None;
@@ -406,8 +414,18 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     // does in stock git, and only a run that would otherwise have produced output is
     // refused.
     let mut unsupported: Option<String> = None;
-    // A patch/stat rendering, plus whether git derives it from file contents.
-    let mut bad_format: Option<(String, bool)> = None;
+    // The first patch/stat rendering asked for, which this module cannot produce.
+    let mut bad_format: Option<String> = None;
+
+    // git `die()`s on a bad dirstat parameter the moment it parses it, before it looks
+    // at anything else on the command line, so each call site returns straight away.
+    macro_rules! dirstat {
+        ($params:expr) => {
+            if let Some(code) = apply_dirstat(&mut opts, $params) {
+                return Ok(code);
+            }
+        };
+    }
 
     let mut i = 0;
     while i < args.len() {
@@ -422,7 +440,10 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             "--cached" => opts.cached = true,
             "--merge-base" => merge_base = true,
             "-m" => opts.match_missing = true,
-            "--raw" => opts.format = Format::Raw,
+            "--raw" => {
+                opts.format = Format::Raw;
+                raw_explicit = true;
+            }
             "--name-only" => opts.format = Format::NameOnly,
             "--name-status" => opts.format = Format::NameStatus,
             "-s" | "--no-patch" => opts.format = Format::Silent,
@@ -441,6 +462,14 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             "--ignore-cr-at-eol" => opts.ws.cr = true,
             "--pickaxe-all" => opts.pickaxe_all = true,
             "--pickaxe-regex" => pickaxe_regex = true,
+            // `diff_opt_dirstat()`: `--cumulative` and `--dirstat-by-file` are spelled
+            // as parameter lists, and every spelling also turns the format on.
+            "--dirstat" | "-X" => dirstat!(""),
+            "--cumulative" => dirstat!("cumulative"),
+            "--dirstat-by-file" => {
+                dirstat!("files");
+                dirstat!("");
+            }
             "--relative" => opts.relative = Some(BString::default()),
             "--no-relative" => opts.relative = None,
             "-M" | "-C" | "--find-renames" | "--find-copies" | "--find-copies-harder" => {
@@ -458,6 +487,14 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                     pickaxe_arg = Some((a.as_bytes()[1], value.as_bytes().to_vec()));
                 }
             }
+            s if s.starts_with("--dirstat=") => dirstat!(&s["--dirstat=".len()..]),
+            s if s.starts_with("--dirstat-by-file=") => {
+                dirstat!("files");
+                dirstat!(&s["--dirstat-by-file=".len()..]);
+            }
+            // `-X` takes its parameters attached only; a following argument is a
+            // positional, which is why `-X 10 HEAD` makes git complain about `10`.
+            s if s.len() > 2 && s.starts_with("-X") => dirstat!(&s[2..]),
             s if s.starts_with("--find-renames=") || s.starts_with("--find-copies=") => {
                 opts.detect_rename = true;
             }
@@ -491,10 +528,8 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 opts.detect_rename = true;
             }
             s => {
-                if let Some(content_driven) = unsupported_format(s) {
-                    if bad_format.is_none() {
-                        bad_format = Some((s.to_owned(), content_driven));
-                    }
+                if unsupported_format(s) {
+                    bad_format.get_or_insert_with(|| s.to_owned());
                 } else if render_only_option(s) {
                     // Accepted and ignored.
                 } else if s.starts_with('-') && s.len() > 1 {
@@ -513,6 +548,15 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     }
     if quiet {
         opts.format = Format::Silent;
+    }
+    // `diff_setup_done()`: `--name-only`, `--name-status` and `-s` clear every other
+    // output format, and the raw listing is only defaulted in when nothing else was
+    // asked for — so `--dirstat` alone prints directories only.
+    if opts.dirstat.is_some() {
+        match opts.format {
+            Format::NameOnly | Format::NameStatus | Format::Silent => opts.dirstat = None,
+            Format::Raw => opts.emit_pairs = raw_explicit,
+        }
     }
     // `-s`/`--quiet` mean "no output at all", which is exactly what an unrenderable
     // patch or stat format would have produced here anyway.
@@ -651,7 +695,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let content_driven = opts.ws.any()
         || opts.ignore_lines.is_some()
         || opts.pickaxe.is_some()
-        || matches!(&bad_format, Some((_, true)));
+        || bad_format.is_some();
     if content_driven {
         apply_content_filter(&repo, &mut deltas, &opts)?;
         apply_pickaxe(&repo, &mut deltas, &opts)?;
@@ -676,12 +720,27 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         deltas.retain(|d| passes_filter(d.status(), &opts));
     }
 
-    if let Some((flag, _)) = &bad_format {
+    if let Some(flag) = &bad_format {
         if !deltas.is_empty() {
             bail!("unsupported output format {flag:?} (ported: {PORTED})");
         }
-    } else if opts.format != Format::Silent {
-        let text = render(&repo, &deltas, &opts)?;
+    } else {
+        // git's `diff_flush()` order: the pair listing first, then the dirstat block.
+        let mut text = if opts.format != Format::Silent && opts.emit_pairs {
+            render(&repo, &deltas, &opts)?
+        } else {
+            Vec::new()
+        };
+        if let Some(ds) = &opts.dirstat {
+            let files = dirstat_damage(&repo, &deltas, &opts, ds)?;
+            let mut block = Vec::new();
+            render_dirstat(&mut block, files, ds);
+            // `diff_line_prefix()` goes in front of every dirstat line too.
+            for line in block.split_inclusive(|&b| b == b'\n') {
+                text.extend_from_slice(&opts.line_prefix);
+                text.extend_from_slice(line);
+            }
+        }
         let stdout = std::io::stdout();
         stdout.lock().write_all(&text)?;
     }
@@ -691,6 +750,152 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// `parse_dirstat_opt()`: fold one parameter list into the accumulated `--dirstat`
+/// state, turning the format on. Returns git's exit code when a parameter is bad,
+/// having already written the `die()` text `parse_dirstat_params()` builds.
+fn apply_dirstat(opts: &mut Opts, params: &str) -> Option<ExitCode> {
+    let ds = opts.dirstat.get_or_insert_with(DirStat::default);
+    let mut errors = String::new();
+    // An empty list is not split at all, so `--dirstat=` is simply the default.
+    if !params.is_empty() {
+        for p in params.split(',') {
+            match p {
+                "changes" => {
+                    ds.by_line = false;
+                    ds.by_file = false;
+                }
+                "lines" => {
+                    ds.by_line = true;
+                    ds.by_file = false;
+                }
+                "files" => {
+                    ds.by_line = false;
+                    ds.by_file = true;
+                }
+                "noncumulative" => ds.cumulative = false,
+                "cumulative" => ds.cumulative = true,
+                _ => match parse_permille(p) {
+                    Some(permille) => ds.permille = permille,
+                    // git only reaches its `strtoul` when the first byte is a digit;
+                    // anything else is an unknown parameter rather than a bad number.
+                    None if p.as_bytes().first().is_some_and(u8::is_ascii_digit) => {
+                        errors.push_str(&format!("  Failed to parse dirstat cut-off percentage '{p}'\n"));
+                    }
+                    None => errors.push_str(&format!("  Unknown dirstat parameter '{p}'\n")),
+                },
+            }
+        }
+    }
+    if errors.is_empty() {
+        return None;
+    }
+    eprint!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n");
+    Some(ExitCode::from(128))
+}
+
+/// A dirstat cut-off percentage: a whole number plus at most one significant decimal
+/// digit, with any further digits read and discarded, and nothing left over — exactly
+/// what `parse_dirstat_params()`'s `strtoul` walk accepts.
+fn parse_permille(p: &str) -> Option<u32> {
+    let b = p.as_bytes();
+    if !b.first().is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let end = b.iter().position(|c| !c.is_ascii_digit()).unwrap_or(b.len());
+    // git reads this with `strtoul`, which saturates rather than failing; a threshold
+    // that large simply never matches.
+    let whole: u32 = p[..end].parse().unwrap_or(u32::MAX / 10);
+    let mut permille = whole.saturating_mul(10);
+    let mut rest = &b[end..];
+    if rest.first() == Some(&b'.') && rest.get(1).is_some_and(u8::is_ascii_digit) {
+        permille = permille.saturating_add(u32::from(rest[1] - b'0'));
+        rest = &rest[2..];
+        let extra = rest.iter().position(|c| !c.is_ascii_digit()).unwrap_or(rest.len());
+        rest = &rest[extra..];
+    }
+    rest.is_empty().then_some(permille)
+}
+
+/// `show_dirstat()` and `show_dirstat_by_line()`: the damage each path contributes.
+fn dirstat_damage(
+    repo: &gix::Repository,
+    deltas: &[Delta],
+    opts: &Opts,
+    ds: &DirStat,
+) -> Result<Vec<(BString, u64)>> {
+    let workdir = repo.workdir().map(Path::to_path_buf);
+    let mut out = Vec::with_capacity(deltas.len());
+    for d in deltas {
+        if ds.by_line {
+            // The by-line variant charges the diffstat's added plus deleted lines, and
+            // an unmerged pair never gets counts of its own.
+            let damage = if d.unmerged {
+                0
+            } else {
+                let one = side_content(repo, workdir.as_deref(), d, true)?.unwrap_or_default();
+                let two = side_content(repo, workdir.as_deref(), d, false)?.unwrap_or_default();
+                if buffer_is_binary(&one) || buffer_is_binary(&two) {
+                    // Binary files count bytes, which git normalises at 64 per "line".
+                    ((one.len() + two.len()) as u64).div_ceil(64)
+                } else {
+                    let (added, deleted) = line_counts(&one, &two, opts);
+                    added + deleted
+                }
+            };
+            out.push((d.path.clone(), damage));
+            continue;
+        }
+        // Two recorded, equal ids settle it: the content cannot have changed.
+        if !d.src_id.is_null() && !d.dst_id.is_null() && d.src_id == d.dst_id {
+            out.push((d.path.clone(), 0));
+            continue;
+        }
+        if ds.by_file {
+            out.push((d.path.clone(), 1));
+            continue;
+        }
+        // `side_content` already answers `None` for a side with no mode, which is
+        // exactly git's `DIFF_FILE_VALID` test.
+        let one = side_content(repo, workdir.as_deref(), d, true)?;
+        let two = side_content(repo, workdir.as_deref(), d, false)?;
+        // Removed material is the original minus what survived, added is the new
+        // material; both are damage done to the preimage.
+        let damage = match (&one, &two) {
+            (Some(one), Some(two)) => {
+                let (copied, added) =
+                    count_changes_sides(one, !buffer_is_binary(one), two, !buffer_is_binary(two));
+                (one.len() as u64).saturating_sub(copied) + added
+            }
+            (Some(one), None) => one.len() as u64,
+            (None, Some(two)) => two.len() as u64,
+            // Neither side exists — nothing to charge, and no entry at all.
+            (None, None) => continue,
+        };
+        // A zero score with a changed id still counts as one unit of damage.
+        out.push((d.path.clone(), if damage == 0 { 1 } else { damage }));
+    }
+    Ok(out)
+}
+
+/// git's `buffer_is_binary()`: a NUL byte within the first 8000 bytes.
+fn buffer_is_binary(buf: &[u8]) -> bool {
+    buf[..buf.len().min(8000)].contains(&0)
+}
+
+/// The added and removed line counts a diffstat would report for the two sides.
+fn line_counts(one: &[u8], two: &[u8], opts: &Opts) -> (u64, u64) {
+    use gix::diff::blob::{Algorithm, Diff, InternedInput};
+
+    let before = split_lines(one);
+    let after = split_lines(two);
+    let fold = opts.ws.any();
+    let mut input: InternedInput<Vec<u8>> = InternedInput::default();
+    input.update_before(before.iter().map(|l| if fold { fold_line(l, opts.ws) } else { l.to_vec() }));
+    input.update_after(after.iter().map(|l| if fold { fold_line(l, opts.ws) } else { l.to_vec() }));
+    let diff = Diff::compute(Algorithm::Myers, &input);
+    (u64::from(diff.count_additions()), u64::from(diff.count_removals()))
 }
 
 /// `--diff-filter=<letters>`: upper-case selects, lower-case excludes. Returns `false`

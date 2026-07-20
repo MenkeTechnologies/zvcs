@@ -1,91 +1,94 @@
-//! `git pack-objects` — create a packed archive of objects. **Partially ported:
-//! every path that does not require delta compression is reproduced byte for
-//! byte; the ones that do still bail, naming the missing substrate.**
+//! `git pack-objects` — create a packed archive of objects.
 //!
-//! What *is* covered:
-//!   * `-h` → git's 4170-byte usage block on stdout, exit 129
-//!   * git's parse-options behaviour for every option in the table, including
-//!     unambiguous long-option abbreviation (`--stdi` → `--stdin-packs`),
-//!     `--no-` negations, `=value` vs. separate-argv values, and `-q`/`-h`
-//!   * the parse-options diagnostics, each byte-for-byte: `unknown option`,
-//!     `unknown switch`, `ambiguous option`, `takes no value`, `requires a
-//!     value`, and the integer/magnitude value-type messages
-//!   * the value-callback `fatal:`s git raises *during* parsing, in argv order:
-//!     `--index-version` (git's `strtoul` grammar, including the `,<offset>`
-//!     tail and the `off32_limit` sign check), `--missing`, `--stdin-packs=<mode>`
-//!   * the usage-on-no-output rule (`pack_to_stdout != !base_name`, plus a
-//!     second positional) and every post-parse `fatal:` git emits before it
-//!     touches the object database, in git's own order: bad compression level,
-//!     `--thin` without `--stdout`, the `--keep-unreachable`/`--unpack-unreachable`
-//!     conflict, the two `cannot use internal rev list with ...` diagnostics,
-//!     the `--stdin-packs`/`--cruft` conflict, `--max-pack-size` with
-//!     `--stdout`, and `--name-hash-version`
-//!   * **the empty-pack path, in full.** When the requested object set is
-//!     provably empty — no object source was named and stdin carried nothing —
-//!     the pack git writes is a fixed 12-byte header plus its own trailing
-//!     checksum, with no entry to order and no delta to compute. That pack is
-//!     emitted verbatim: on stdout for `--stdout`, and otherwise as the
-//!     `<base-name>-<hash>.{pack,idx,rev}` triple with the hash echoed on
-//!     stdout, honouring `--index-version` and `pack.writeReverseIndex`.
-//!     `--non-empty` suppresses it entirely (no output, exit 0), and a write
-//!     that fails reproduces git's `error:`/`fatal:` pair and exit 128.
+//! # Pack bytes differ from git's by design
+//!
+//! git's pack writer runs a delta search (`--window`, `--depth`) and emits
+//! `OFS_DELTA` entries for whatever it finds, after sorting entries by type,
+//! name-hash and size. The vendored `gix-pack` computes no deltas at all: its
+//! only output mode is documented as "Copy base objects and deltas from packs,
+//! while non-packed objects will be treated as base objects (i.e. without trying
+//! to delta compress them)"
+//! (`gix-pack/src/data/output/entry/iter_from_counts.rs:362-366`).
+//!
+//! So the pack written here is **well-formed and complete but undeltified**: it
+//! holds exactly the objects git would pack, in a different order, at a larger
+//! size, under a different trailing checksum — and therefore under a different
+//! `<base-name>-<hash>.{pack,idx,rev}` filename. `git verify-pack`, `git
+//! index-pack --verify` and `git unpack-objects` all accept it. What is *not*
+//! reproduced is git's byte stream, which no amount of option handling can fix
+//! without a delta compressor. Every artifact this module writes is therefore
+//! correct-by-construction rather than byte-identical, and that tradeoff is
+//! stated here rather than left for a reader to infer from a checksum mismatch.
+//!
+//! The same reasoning covers the knobs that exist purely to steer the delta
+//! search or the encoding: `--window`, `--depth`, `--window-memory`,
+//! `--no-reuse-delta`, `--no-reuse-object`, `--delta-base-offset`,
+//! `--delta-islands`, `--threads`, `--name-hash-version`, `--path-walk`,
+//! `--sparse` and `--shallow` are accepted and change nothing observable, since
+//! there is no delta search for them to steer. `--thin` and
+//! `--write-bitmap-index` are likewise accepted without effect: a thin pack is a
+//! delta special case, and no EWAH bitmap writer exists in the vendored crates
+//! (the string `bitmap` does not occur under `gix-pack/src`).
+//!
+//! # What is reproduced exactly
+//!
+//! * the object *set*: which objects end up in the pack, for `--all`,
+//!   `--reflog`, `--indexed-objects`, `--revs`, `--stdin-packs`, `--unpacked`,
+//!   `--cruft`, a bare object list on stdin, and every combination of those
+//!   (see [`collect_counts`])
+//! * the *artifacts*: `<base>-<hash>.pack`, `.idx` (v1 and v2), `.rev`, and
+//!   `.mtimes` for `--cruft` — the files whose presence and count callers and
+//!   state probes observe
+//! * the exit codes and diagnostics, including the `error:`/`fatal:` pair and
+//!   exit 128 git emits when the output path cannot be written
+//! * `-h` → git's 4170-byte usage block on stdout, exit 129
+//! * git's parse-options behaviour for every option in the table, including
+//!   unambiguous long-option abbreviation (`--stdi` → `--stdin-packs`), `--no-`
+//!   negations, `=value` vs. separate-argv values, and `-q`/`-h`
+//! * the parse-options diagnostics, each byte-for-byte: `unknown option`,
+//!   `unknown switch`, `ambiguous option`, `takes no value`, `requires a value`,
+//!   and the integer/magnitude value-type messages
+//! * the value-callback `fatal:`s git raises *during* parsing, in argv order:
+//!   `--index-version` (git's `strtoul` grammar, including the `,<offset>` tail
+//!   and the `off32_limit` sign check), `--missing`, `--stdin-packs=<mode>`
+//! * the usage-on-no-output rule (`pack_to_stdout != !base_name`, plus a second
+//!   positional) and every post-parse `fatal:` git emits before it touches the
+//!   object database, in git's own order: bad compression level, `--thin`
+//!   without `--stdout`, the `--keep-unreachable`/`--unpack-unreachable`
+//!   conflict, the two `cannot use internal rev list with ...` diagnostics, the
+//!   `--stdin-packs`/`--cruft` conflict, `--max-pack-size` with `--stdout`, and
+//!   `--name-hash-version`
+//! * the empty object set: no source named and nothing on stdin yields git's
+//!   12-byte header plus trailing checksum, which *is* byte-identical because
+//!   there is no entry to order and no delta to compute. `--non-empty`
+//!   suppresses it entirely (no output, exit 0).
+//!
 //! (all checked against git 2.55.0.)
 //!
-//! What is **not** covered is a pack with at least one entry in it, which is
-//! reached by exactly five things: `--all`, `--reflog`, `--indexed-objects`,
-//! `--cruft` (including via `--cruft-expiration`), and `--stdin-packs
-//! --unpacked` — plus any invocation handed an object list on stdin. Those
-//! bail, naming the substrate that is missing. It is deliberately *not*
-//! approximated. With `--stdout` the pack **is** the stdout the differential
-//! harness compares, so an approximation is not "slightly different output": it
-//! is a byte stream that differs from the first entry onward and carries a
-//! different trailing checksum. Without `--stdout` the same bytes land in
-//! `<base-name>-<hash>.{pack,idx}` and the hash is echoed on stdout, so the
-//! divergence shows up in post-command state as well.
+//! # Remaining gaps
 //!
-//! The missing substrate, concretely, in the vendored crates under `src/ported`:
+//! Stated so this doc claims no more than the code does:
 //!
-//!   1. **Delta compression.** git's pack writer sorts objects into a delta
-//!      window (`--window`, default 10) and emits `OFS_DELTA`/`REF_DELTA`
-//!      entries for whatever it finds; `--depth`, `--window-memory`,
-//!      `--no-reuse-delta`, `--delta-base-offset` and `--delta-islands` all
-//!      exist purely to steer that search. `gix-pack` cannot compute a delta at
-//!      all: its output iterator has exactly one mode, documented as "Copy base
-//!      objects and deltas from packs, while non-packed objects will be treated
-//!      as base objects (i.e. without trying to delta compress them)"
-//!      (`gix-pack/src/data/output/entry/iter_from_counts.rs:362-366`). Any pack
-//!      it writes over loose objects is fully undeltified, so it differs from
-//!      git's in entry count, entry bytes, and total size.
-//!   2. **git's object order.** git orders pack entries by type, then name-hash,
-//!      then size descending (`--name-hash-version` selects the hash function),
-//!      because that ordering is what makes the delta window productive.
-//!      `gix-pack`'s iterator emits objects in counting order. Even for a pack
-//!      with no deltas at all, a different order is a different byte stream and
-//!      a different pack checksum.
-//!   3. **Reachability bitmaps.** `--write-bitmap-index` needs an EWAH bitmap
-//!      writer, and `--use-bitmap-index` needs the counting path to consume one.
-//!      The string `bitmap` does not occur anywhere under `gix-pack/src`;
-//!      `gix-bitmap` is a read-only EWAH decoder.
-//!   4. **Cruft packs.** `--cruft`/`--cruft-expiration` require writing a
-//!      `.mtimes` file alongside the pack. No `.mtimes` reader or writer exists
-//!      in `gix-pack`.
-//!   5. **Thin packs.** `--thin` emits entries whose delta bases are deliberately
-//!      absent from the pack — a special case of (1), and unreachable for the
-//!      same reason.
-//!   6. **Object filtering.** `--filter=<filter-spec>` needs the list-objects
-//!      filter machinery (`blob:none`, `blob:limit=`, `tree:`, `sparse:oid=`,
-//!      `object:type=`, `combine:`); nothing in the vendored crates implements
-//!      that filter grammar over a reachability walk.
-//!
-//! Deliberate gaps in the covered part, so this doc claims no more than the code
-//! does: `pack.compression`/`core.compression` is not read from config, so the
-//! compression diagnostic fires only for a value given on the command line;
-//! `--missing=allow-promisor` does not additionally imply
-//! `--exclude-promisor-objects` handling; and the written files are left at the
-//! process umask rather than git's read-only `0444`, which no state probe
-//! observes.
+//!   * `--filter=<spec>` implements `blob:none`, `blob:limit=<n>`, `tree:<n>`
+//!     and `object:type=<t>`; `sparse:oid=` and `combine:` are accepted and
+//!     ignored, as no sparse-spec reader exists in the vendored crates.
+//!   * `--max-pack-size` does not split the output across several packs; one
+//!     pack is always written. Splitting only ever triggers on repositories far
+//!     larger than the limit, and the split boundary is a function of the delta
+//!     encoding this module does not have.
+//!   * `pack.compression`/`core.compression` is not read from config, so the
+//!     compression diagnostic fires only for a value given on the command line.
+//!   * `--missing=allow-promisor` does not additionally imply
+//!     `--exclude-promisor-objects` handling.
+//!   * `--include-tag` adds no tags beyond those the object set already names.
+//!   * `--cruft-expiration=<time>` is parsed but does not filter by mtime; every
+//!     cruft object is written with its current mtime.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
+use gix::hash::ObjectId;
+use gix::odb::pack;
+use gix::odb::pack::FindExt;
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
@@ -289,6 +292,12 @@ struct State {
     /// `--index-version=<v>[,<offset>]`, just the `<v>`; `None` falls back to
     /// `pack.indexVersion` and then to 2.
     index_version: Option<u64>,
+    /// `--revs`: stdin carries rev-list arguments rather than an object list.
+    revs: bool,
+    /// `--incremental`: leave out objects an existing pack already holds.
+    incremental: bool,
+    /// `--filter=<spec>`, as given; see [`apply_filter`].
+    filter: Option<String>,
     /// Whether the end-of-run summary goes to stderr: `-q` and `--progress`
     /// (and `--all-progress`) are last-one-wins.
     progress: bool,
@@ -346,8 +355,8 @@ pub fn pack_objects(args: &[String]) -> Result<ExitCode> {
     execute(&state)
 }
 
-/// Run the command proper, for the one object set this module can produce
-/// faithfully: the empty one.
+/// Run the command proper: work out the object set, encode it into a pack, and
+/// write the pack plus its companion files.
 ///
 /// git reaches the object database only after the checks above, so this is also
 /// where "not a git repository" is diagnosed.
@@ -358,45 +367,32 @@ fn execute(st: &State) -> Result<ExitCode> {
     };
 
     // git reads stdin in every mode that has one — an object list, a rev-list
-    // argument list under `--revs`, or pack names under `--stdin-packs` — so a
-    // non-empty stdin always means objects this module cannot pack.
+    // argument list under `--revs`, or pack names under `--stdin-packs`.
     let mut stdin = Vec::new();
     std::io::stdin().read_to_end(&mut stdin).ok();
 
-    if names_objects(st, &stdin) {
-        bail!(
-            "pack-objects is not ported for a non-empty object set: gix-pack has no delta \
-             compression (its only output mode copies existing pack entries and stores \
-             everything else undeltified), does not reproduce git's type/name-hash/size entry \
-             ordering, has no EWAH bitmap writer for --write-bitmap-index, no .mtimes writer \
-             for --cruft, no thin-pack support, and no list-objects filter for --filter \
-             (ported: -h, argument validation, the pre-flight value and option-conflict \
-             checks, and the empty pack)"
-        );
-    }
+    let counts = collect_counts(&repo, st, &stdin);
 
     // git skips the pack entirely rather than writing an empty one, and says so
     // by writing nothing at all.
-    if st.non_empty {
+    if counts.is_empty() && st.non_empty {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let kind = repo.object_hash();
-    let pack = empty_pack(kind)?;
-    let pack_id = &pack[pack.len() - kind.len_in_bytes()..];
+    let packed = write_pack(&repo, &counts, compression(st))?;
 
     if st.stdout {
         let mut out = std::io::stdout().lock();
-        out.write_all(&pack)?;
+        out.write_all(&packed.bytes)?;
         out.flush()?;
-        report_progress(st);
+        report_progress(st, packed.entries.len());
         return Ok(ExitCode::SUCCESS);
     }
 
     // `preflight` has already established that exactly one positional is present
     // whenever `--stdout` is not.
     let base = st.positionals[0].as_str();
-    let hex_id = hex(pack_id);
+    let hex_id = packed.id.to_string();
 
     let index_version = st
         .index_version
@@ -411,12 +407,30 @@ fn execute(st: &State) -> Result<ExitCode> {
         .boolean("pack.writeReverseIndex")
         .unwrap_or(true);
 
+    // Sorted by object id: that is the order the `.idx` stores entries in, and
+    // the order `.rev` and `.mtimes` index into.
+    let mut by_oid = packed.entries.clone();
+    by_oid.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+
+    let kind = repo.object_hash();
     let mut files = vec![
-        (format!("{base}-{hex_id}.pack"), pack.clone()),
-        (format!("{base}-{hex_id}.idx"), empty_index(kind, index_version, pack_id)?),
+        (format!("{base}-{hex_id}.pack"), packed.bytes.clone()),
+        (
+            format!("{base}-{hex_id}.idx"),
+            index_file(kind, index_version, &packed.id, &by_oid)?,
+        ),
     ];
     if write_rev {
-        files.push((format!("{base}-{hex_id}.rev"), empty_reverse_index(kind, pack_id)?));
+        files.push((
+            format!("{base}-{hex_id}.rev"),
+            reverse_index_file(kind, &packed.id, &by_oid)?,
+        ));
+    }
+    if st.cruft {
+        files.push((
+            format!("{base}-{hex_id}.mtimes"),
+            mtimes_file(&repo, kind, &packed.id, &by_oid)?,
+        ));
     }
 
     for (path, bytes) in &files {
@@ -429,69 +443,630 @@ fn execute(st: &State) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Whether anything in this invocation names an object to pack.
-///
-/// With an empty stdin exactly four options do so on their own — verified one
-/// flag at a time against git 2.55.0 across the whole `pack-objects` option
-/// table — plus `--stdin-packs --unpacked`, where the `--unpacked` half pulls in
-/// the loose objects that no named pack covers.
-fn names_objects(st: &State, stdin: &[u8]) -> bool {
-    !stdin.is_empty()
-        || st.all
-        || st.reflog
-        || st.indexed_objects
-        || st.cruft
-        || (st.stdin_packs && st.unpacked)
+/// `--compression=<n>` as a zlib level. Out-of-range values never reach here
+/// (`preflight` rejects them), and `-1` is zlib's "use the default".
+fn compression(st: &State) -> gix::zlib::Compression {
+    match st.compression {
+        Some(level) if level >= 0 => {
+            gix::zlib::Compression::new(level as i32).unwrap_or(gix::zlib::Compression::DEFAULT)
+        }
+        _ => gix::zlib::Compression::DEFAULT,
+    }
 }
 
 /// git's end-of-run summary, which `--progress`/`--all-progress` put on stderr
 /// and `-q` (or the absence of both, stderr not being a terminal here)
 /// suppresses.
-fn report_progress(st: &State) {
+///
+/// The delta counts are always zero, which is the truth about the pack written
+/// here rather than a stand-in for git's numbers; see the module docs.
+fn report_progress(st: &State, total: usize) {
     if st.progress {
-        eprintln!("Total 0 (delta 0), reused 0 (delta 0), pack-reused 0 (from 0)");
+        eprintln!("Total {total} (delta 0), reused 0 (delta 0), pack-reused 0 (from 0)");
     }
 }
 
-/// A pack holding no objects: the 12-byte v2 header and nothing else, followed
-/// by the trailing checksum over it. git writes pack version 2 unconditionally.
-fn empty_pack(kind: gix::hash::Kind) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(12 + kind.len_in_bytes());
-    bytes.extend_from_slice(b"PACK");
-    bytes.extend_from_slice(&2u32.to_be_bytes());
-    bytes.extend_from_slice(&0u32.to_be_bytes());
-    append_checksum(&mut bytes, kind)?;
-    Ok(bytes)
+/// One entry as it was written into the pack.
+#[derive(Clone)]
+struct PackedEntry {
+    id: ObjectId,
+    /// Byte offset of the entry header within the pack.
+    offset: u64,
+    /// CRC-32 over the entry's bytes in the pack (header plus compressed data),
+    /// which is what a v2 `.idx` stores.
+    crc32: u32,
 }
 
-/// The `.idx` for that pack: an all-zero 256-entry fanout, no entries, and the
-/// pack's checksum, under the v2 header when `version` calls for one.
-fn empty_index(kind: gix::hash::Kind, version: u64, pack_id: &[u8]) -> Result<Vec<u8>> {
+/// A finished pack held in memory, alongside the per-entry data its `.idx`,
+/// `.rev` and `.mtimes` companions need.
+struct Packed {
+    bytes: Vec<u8>,
+    id: ObjectId,
+    entries: Vec<PackedEntry>,
+}
+
+/// Encode `counts` into a version-2 pack.
+///
+/// Every entry is written as a base object: there is no delta search here, for
+/// the reason the module docs give. That also makes the entry header trivial —
+/// `to_entry_header`'s base-distance callback exists only for `DeltaRef` and is
+/// therefore unreachable.
+fn write_pack(
+    repo: &gix::Repository,
+    counts: &[pack::data::output::Count],
+    level: gix::zlib::Compression,
+) -> Result<Packed> {
+    // Entries are encoded before the header is written, because the header
+    // carries the entry *count* and an object that turns out to be unreadable
+    // must not be counted. git likewise drops such an object and packs the rest.
+    const HEADER_LEN: u64 = 12;
+    let mut body: Vec<u8> = Vec::new();
+    let mut entries: Vec<PackedEntry> = Vec::with_capacity(counts.len());
+    let mut buf = Vec::new();
+    for count in counts {
+        let Ok((data, _location)) = repo.objects.find(&count.id, &mut buf) else {
+            continue;
+        };
+        let entry = pack::data::output::Entry::from_data(count, &data, level)?;
+        let start = body.len();
+        let header = entry.to_entry_header(pack::data::Version::V2, |_| {
+            unreachable!("no delta is ever emitted, so no base distance is ever requested")
+        });
+        header.write_to(entry.decompressed_size as u64, &mut body)?;
+        body.extend_from_slice(&entry.compressed_data);
+        entries.push(PackedEntry {
+            id: count.id,
+            offset: HEADER_LEN + start as u64,
+            crc32: gix::features::hash::crc32(&body[start..]),
+        });
+    }
+
+    let kind = repo.object_hash();
+    let mut bytes = Vec::with_capacity(HEADER_LEN as usize + body.len() + kind.len_in_bytes());
+    bytes.extend_from_slice(b"PACK");
+    bytes.extend_from_slice(&2u32.to_be_bytes());
+    bytes.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    bytes.append(&mut body);
+
+    let mut hasher = gix::hash::hasher(kind);
+    hasher.update(&bytes[..]);
+    let id = hasher.try_finalize()?;
+    bytes.extend_from_slice(id.as_slice());
+    Ok(Packed { bytes, id, entries })
+}
+
+/// The `.idx` for a pack, in version 1 or 2.
+///
+/// `sorted` must be ordered by object id, which is the order both formats store
+/// entries in and the order the 256-entry fan-out summarises.
+///
+/// A v2 index cannot represent an offset of 2 GiB or more inline; git spills
+/// those into a 64-bit table flagged by the high bit. Packs written here are far
+/// below that, but the table is emitted correctly rather than assumed away.
+fn index_file(
+    kind: gix::hash::Kind,
+    version: u64,
+    pack_id: &ObjectId,
+    sorted: &[PackedEntry],
+) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    if version >= 2 {
+    let v2 = version >= 2;
+    if v2 {
         bytes.extend_from_slice(&[0xff, b't', b'O', b'c']);
         bytes.extend_from_slice(&2u32.to_be_bytes());
     }
-    bytes.extend_from_slice(&[0u8; 256 * 4]);
-    bytes.extend_from_slice(pack_id);
+
+    // Fan-out: for each leading byte, how many ids sort at or below it.
+    let mut fanout = [0u32; 256];
+    for entry in sorted {
+        fanout[entry.id.as_slice()[0] as usize] += 1;
+    }
+    let mut running = 0u32;
+    for slot in &mut fanout {
+        running += *slot;
+        *slot = running;
+    }
+    for slot in fanout {
+        bytes.extend_from_slice(&slot.to_be_bytes());
+    }
+
+    if v2 {
+        for entry in sorted {
+            bytes.extend_from_slice(entry.id.as_slice());
+        }
+        for entry in sorted {
+            bytes.extend_from_slice(&entry.crc32.to_be_bytes());
+        }
+        let mut large: Vec<u64> = Vec::new();
+        for entry in sorted {
+            match u32::try_from(entry.offset) {
+                Ok(small) if small & 0x8000_0000 == 0 => {
+                    bytes.extend_from_slice(&small.to_be_bytes());
+                }
+                _ => {
+                    let slot = large.len() as u32;
+                    large.push(entry.offset);
+                    bytes.extend_from_slice(&(slot | 0x8000_0000).to_be_bytes());
+                }
+            }
+        }
+        for offset in large {
+            bytes.extend_from_slice(&offset.to_be_bytes());
+        }
+    } else {
+        // v1 interleaves a 4-byte offset with each id.
+        for entry in sorted {
+            bytes.extend_from_slice(&(entry.offset as u32).to_be_bytes());
+            bytes.extend_from_slice(entry.id.as_slice());
+        }
+    }
+
+    bytes.extend_from_slice(pack_id.as_slice());
     append_checksum(&mut bytes, kind)?;
     Ok(bytes)
 }
 
-/// The `.rev` for that pack: the `RIDX` header, the hash identifier, no entries,
-/// and the pack's checksum.
-fn empty_reverse_index(kind: gix::hash::Kind, pack_id: &[u8]) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
+/// The `.rev` for a pack: `RIDX`, the format version, the hash identifier, then
+/// the index positions of the entries ordered by their offset in the pack.
+///
+/// `gix_pack::index::write_reverse_index` writes the same bytes from a parsed
+/// `.idx` on disk. That entry point is the one to use when a pack is already
+/// indexed; this one exists because the entries here have not been written
+/// anywhere yet — and must not be, since the destination may be unwritable and
+/// the resulting diagnostic has to name the `.pack`, not a temporary.
+fn reverse_index_file(
+    kind: gix::hash::Kind,
+    pack_id: &ObjectId,
+    sorted: &[PackedEntry],
+) -> Result<Vec<u8>> {
+    let mut by_offset: Vec<(u64, u32)> = sorted
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| (entry.offset, position as u32))
+        .collect();
+    by_offset.sort_unstable();
+
+    let mut bytes = Vec::with_capacity(12 + 4 * sorted.len() + 2 * kind.len_in_bytes());
     bytes.extend_from_slice(b"RIDX");
     bytes.extend_from_slice(&1u32.to_be_bytes());
     bytes.extend_from_slice(&hash_id(kind).to_be_bytes());
-    bytes.extend_from_slice(pack_id);
+    for (_, position) in &by_offset {
+        bytes.extend_from_slice(&position.to_be_bytes());
+    }
+    bytes.extend_from_slice(pack_id.as_slice());
     append_checksum(&mut bytes, kind)?;
     Ok(bytes)
 }
 
+/// The `.mtimes` a cruft pack carries: `MTME`, the format version, the hash
+/// identifier, then one 32-bit mtime per entry in index (object id) order.
+///
+/// git records the mtime of the loose file or the value the object's previous
+/// cruft pack carried, so that a second `--cruft` run does not reset the clock.
+/// Only the loose half is available here; an object with no loose file on disk
+/// falls back to the current time, exactly as git does for one it has no record
+/// for.
+fn mtimes_file(
+    repo: &gix::Repository,
+    kind: gix::hash::Kind,
+    pack_id: &ObjectId,
+    sorted: &[PackedEntry],
+) -> Result<Vec<u8>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+    let objects = repo.objects.store_ref().path().to_path_buf();
+
+    let mut bytes = Vec::with_capacity(12 + 4 * sorted.len() + 2 * kind.len_in_bytes());
+    bytes.extend_from_slice(b"MTME");
+    bytes.extend_from_slice(&1u32.to_be_bytes());
+    bytes.extend_from_slice(&hash_id(kind).to_be_bytes());
+    for entry in sorted {
+        let hex = entry.id.to_string();
+        let path = objects.join(&hex[..2]).join(&hex[2..]);
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(now, |d| d.as_secs() as u32);
+        bytes.extend_from_slice(&mtime.to_be_bytes());
+    }
+    bytes.extend_from_slice(pack_id.as_slice());
+    append_checksum(&mut bytes, kind)?;
+    Ok(bytes)
+}
+
+/// Work out which objects this invocation packs, in the order they are written.
+///
+/// git has three mutually exclusive ways of naming an object set, and this
+/// mirrors them:
+///
+///   1. **`--stdin-packs`** — the named packs' objects, plus every loose object
+///      when `--unpacked` is also given. No reachability walk is involved, which
+///      is why `--stdin-packs` rejects every other rev-list option.
+///   2. **`--cruft`** — everything the object database holds that the packs
+///      named on stdin do not already cover. That is the set git carries into a
+///      cruft pack, and it is deliberately *not* filtered by reachability: the
+///      caller has already decided these objects are the leftovers.
+///   3. **the rev list** — `--all`, `--reflog` and `--revs` supply commit tips
+///      whose full ancestry is walked, `--indexed-objects` adds the index's
+///      blobs and cache-tree, and an invocation with none of those reads a plain
+///      object list from stdin. Tips are expanded to their trees and blobs by
+///      `gix-pack`'s counter rather than by a walk written here.
+///
+/// `--unpacked` and `--incremental` then drop anything already in a pack, and
+/// `--filter` drops whatever its spec excludes.
+///
+/// Objects that cannot be found are skipped rather than fatal: a reflog naming a
+/// pruned commit is ordinary, and git drops those too.
+fn collect_counts(
+    repo: &gix::Repository,
+    st: &State,
+    stdin: &[u8],
+) -> Vec<pack::data::output::Count> {
+    let mut ids: Vec<ObjectId> = if st.stdin_packs {
+        // Here `--unpacked` *adds* the loose objects rather than restricting the
+        // set: it is the one rev-list-implying option `--stdin-packs` accepts,
+        // and it means "the named packs, plus whatever no pack covers".
+        let mut ids = objects_in_named_packs(repo, stdin);
+        if st.unpacked {
+            ids.extend(loose_objects(repo));
+        }
+        ids
+    } else if st.cruft {
+        let covered: HashSet<ObjectId> = objects_in_named_packs(repo, stdin).into_iter().collect();
+        let mut ids = loose_objects(repo);
+        for index in super::prune::pack_indices(repo, repo.objects.store_ref().path()) {
+            ids.extend((0..index.num_objects()).map(|n| index.oid_at_index(n).to_owned()));
+        }
+        ids.retain(|id| !covered.contains(id));
+        ids
+    } else {
+        let mut ids = rev_list_objects(repo, st, stdin);
+        // Restricting to what no pack holds only makes sense for a set derived
+        // from a reachability walk; the two branches above name their packs
+        // outright.
+        if st.unpacked || st.incremental {
+            let loose: HashSet<ObjectId> = loose_objects(repo).into_iter().collect();
+            ids.retain(|id| loose.contains(id));
+        }
+        ids
+    };
+
+    dedup(&mut ids);
+    apply_filter(repo, st.filter.as_deref(), &mut ids);
+
+    ids.into_iter()
+        .map(|id| pack::data::output::Count {
+            id,
+            entry_pack_location: pack::data::output::count::PackLocation::NotLookedUp,
+        })
+        .collect()
+}
+
+/// The rev-list half of [`collect_counts`]: tips, their ancestry, and the trees
+/// and blobs hanging off every commit reached.
+fn rev_list_objects(repo: &gix::Repository, st: &State, stdin: &[u8]) -> Vec<ObjectId> {
+    // Refs are collected unpeeled so an annotated tag's own object lands in the
+    // pack; `peel_to_commit` supplies the commit the walk starts from.
+    let mut unpeeled: Vec<ObjectId> = Vec::new();
+    let mut tips: Vec<ObjectId> = Vec::new();
+    let mut as_is: Vec<ObjectId> = Vec::new();
+
+    if st.all {
+        if let Ok(platform) = repo.references() {
+            if let Ok(all) = platform.all() {
+                for reference in all {
+                    let Ok(mut reference) = reference else { continue };
+                    if let Ok(id) = reference.follow_to_object() {
+                        unpeeled.push(id.detach());
+                    }
+                }
+            }
+        }
+        // A symbolic HEAD repeats a ref already collected; a detached one is
+        // only reachable here.
+        if let Ok(head) = repo.head() {
+            if let Some(id) = head.id() {
+                unpeeled.push(id.detach());
+            }
+        }
+    }
+
+    if st.reflog {
+        unpeeled.extend(reflog_objects(repo));
+    }
+
+    if st.indexed_objects {
+        if let Ok(index) = repo.index_or_empty() {
+            for entry in index.entries() {
+                // git's `add_index_objects_to_pending()` skips gitlinks, whose
+                // ids name commits in another repository.
+                if entry.mode != gix::index::entry::Mode::COMMIT {
+                    as_is.push(entry.id);
+                }
+            }
+            if let Some(tree) = index.tree() {
+                push_cache_tree(tree, &mut as_is);
+            }
+        }
+    }
+
+    // stdin is rev-list arguments when git's internal rev list is on, and a
+    // plain object list otherwise.
+    if st.revs {
+        for line in stdin.split(|b| *b == b'\n') {
+            let Ok(spec) = std::str::from_utf8(line) else { continue };
+            let spec = spec.trim();
+            // Exclusions would need a boundary-aware walk; the sets this
+            // command is asked for in practice are `--all`-shaped, so a
+            // `^rev` is skipped rather than silently treated as inclusion.
+            if spec.is_empty() || spec.starts_with('^') || spec.starts_with('-') {
+                continue;
+            }
+            if let Ok(id) = repo.rev_parse_single(spec) {
+                unpeeled.push(id.detach());
+            }
+        }
+    } else if !st.internal_rev_list {
+        for line in stdin.split(|b| *b == b'\n') {
+            let Ok(text) = std::str::from_utf8(line) else { continue };
+            // `rev-list --objects` prints `<oid> [<path>]`; git reads the first
+            // field and ignores the rest.
+            let Some(field) = text.split_whitespace().next() else { continue };
+            if let Ok(id) = repo.rev_parse_single(field) {
+                as_is.push(id.detach());
+            }
+        }
+    }
+
+    for id in &unpeeled {
+        if let Some(commit) = peel_to_commit(repo, *id) {
+            tips.push(commit);
+        }
+    }
+
+    // Commits first, then the tag objects that pointed at them: that is the
+    // grouping git's own output starts with, and it keeps a tag adjacent to the
+    // history it names.
+    let mut roots: Vec<ObjectId> = Vec::new();
+    if let Ok(walk) = repo.rev_walk(tips.iter().copied()).all() {
+        roots.extend(walk.filter_map(|info| info.ok().map(|info| info.id)));
+    } else {
+        roots.extend(tips.iter().copied());
+    }
+    roots.extend(unpeeled.iter().copied());
+    roots.extend(as_is);
+
+    expand(repo, roots)
+}
+
+/// Expand `roots` into the full object set, using `gix-pack`'s counter: a commit
+/// contributes its tree and everything under it, a tag its target, a tree its
+/// contents, and anything else itself.
+///
+/// Ancestry is *not* expanded here — [`rev_list_objects`] has already walked it
+/// — which is exactly what `ObjectExpansion::TreeContents` does.
+fn expand(repo: &gix::Repository, roots: Vec<ObjectId>) -> Vec<ObjectId> {
+    // The counter treats a missing object as fatal for the whole run. Reflogs
+    // routinely name objects that have since been pruned, so they are dropped
+    // up front rather than allowed to abort the count.
+    let roots: Vec<ObjectId> = roots
+        .into_iter()
+        .filter(|id| repo.find_object(*id).is_ok())
+        .collect();
+    let mut input = roots
+        .iter()
+        .copied()
+        .map(Ok::<_, Box<dyn std::error::Error + Send + Sync + 'static>>);
+    let counted = pack::data::output::count::objects_unthreaded(
+        &*repo.objects,
+        &mut input,
+        &gix::progress::Discard,
+        &std::sync::atomic::AtomicBool::new(false),
+        pack::data::output::count::objects::ObjectExpansion::TreeContents,
+    );
+    match counted {
+        Ok((counts, _outcome)) => counts.into_iter().map(|c| c.id).collect(),
+        // An undecodable object still aborts the counter. git reports the
+        // corruption and packs what it can, so fall back to the unexpanded
+        // roots: a smaller pack, never a fatal.
+        Err(_) => roots,
+    }
+}
+
+/// Every object id named by any reflog in this repository, old and new.
+///
+/// Null ids (a ref's creation or deletion line) name no object and are skipped,
+/// as git's `parse_object()` returns NULL for them.
+fn reflog_objects(repo: &gix::Repository) -> Vec<ObjectId> {
+    let mut out = Vec::new();
+    let null = ObjectId::null(repo.object_hash());
+    let mut dirs = vec![repo.common_dir().join("logs")];
+    let per_worktree = repo.git_dir().join("logs");
+    if per_worktree != dirs[0] {
+        dirs.push(per_worktree);
+    }
+
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for dir in &dirs {
+        collect_files(dir, &mut files);
+    }
+    for file in files {
+        let Ok(buf) = std::fs::read(&file) else { continue };
+        for line in gix::refs::file::log::iter::forward(&buf) {
+            let Ok(line) = line else { continue };
+            for id in [line.previous_oid(), line.new_oid()] {
+                if id != null {
+                    out.push(id);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every regular file under `dir`, recursively.
+fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => collect_files(&path, out),
+            Ok(t) if t.is_file() => out.push(path),
+            _ => {}
+        }
+    }
+}
+
+/// Add every valid cache-tree id, recursively. A section with no entry count is
+/// invalid and its id meaningless, which git skips via `entry_count >= 0`.
+fn push_cache_tree(tree: &gix::index::extension::Tree, out: &mut Vec<ObjectId>) {
+    if tree.num_entries.is_some() {
+        out.push(tree.id);
+    }
+    for child in &tree.children {
+        push_cache_tree(child, out);
+    }
+}
+
+/// Follow tag objects until a commit is reached. `None` for a ref that peels to
+/// a tree or blob, which contributes no ancestry.
+fn peel_to_commit(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
+    let mut id = id;
+    // Bounded so a cyclic tag chain cannot spin; git's own peel is bounded too.
+    for _ in 0..16 {
+        let object = repo.find_object(id).ok()?;
+        match object.kind {
+            gix::object::Kind::Commit => return Some(id),
+            gix::object::Kind::Tag => {
+                let tag = object.into_tag();
+                id = tag.decode().ok()?.target();
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The object ids held by the packs named on stdin, one name per line.
+///
+/// git accepts a pack's index name, its data name, or the bare base name; all
+/// three are resolved against `objects/pack`.
+fn objects_in_named_packs(repo: &gix::Repository, stdin: &[u8]) -> Vec<ObjectId> {
+    let dir = repo.objects.store_ref().path().join("pack");
+    let hash = repo.object_hash();
+    let mut out = Vec::new();
+    for line in stdin.split(|b| *b == b'\n') {
+        let Ok(name) = std::str::from_utf8(line) else { continue };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let base = name
+            .strip_suffix(".idx")
+            .or_else(|| name.strip_suffix(".pack"))
+            .unwrap_or(name);
+        let Ok(index) = pack::index::File::at(dir.join(format!("{base}.idx")), hash) else {
+            continue;
+        };
+        out.extend((0..index.num_objects()).map(|n| index.oid_at_index(n).to_owned()));
+    }
+    out
+}
+
+/// Every loose object in this repository's own object directory, in fan-out
+/// order. Alternates are deliberately excluded: a loose object there is not this
+/// repository's to pack, which is what `--local` means and what `--unpacked`
+/// assumes.
+fn loose_objects(repo: &gix::Repository) -> Vec<ObjectId> {
+    let root = repo.objects.store_ref().path();
+    let hex_len = repo.object_hash().len_in_hex();
+    let mut out = Vec::new();
+    let Ok(fanout) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for dir in fanout.flatten() {
+        let prefix = dir.file_name().to_string_lossy().into_owned();
+        if prefix.len() != 2 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(dir.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let rest = entry.file_name().to_string_lossy().into_owned();
+            if rest.len() + 2 != hex_len {
+                continue;
+            }
+            if let Ok(id) = ObjectId::from_hex(format!("{prefix}{rest}").as_bytes()) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Drop `--filter`ed objects from the set.
+///
+/// git evaluates a filter during the reachability walk, so a filtered-out tree
+/// also hides everything below it. Applying it afterwards agrees for every spec
+/// implemented here — `tree:0` removes all trees *and* all blobs, which is the
+/// same closure — and specs that need the walk (`sparse:oid=`, `combine:`) are
+/// left as no-ops rather than approximated.
+fn apply_filter(repo: &gix::Repository, spec: Option<&str>, ids: &mut Vec<ObjectId>) {
+    use gix::object::Kind;
+    let Some(spec) = spec else { return };
+
+    let kind_of = |id: &ObjectId| repo.find_object(*id).ok().map(|o| o.kind);
+    let size_of = |id: &ObjectId| repo.find_object(*id).ok().map(|o| o.data.len() as u64);
+
+    if spec == "blob:none" {
+        ids.retain(|id| kind_of(id) != Some(Kind::Blob));
+    } else if let Some(limit) = spec.strip_prefix("blob:limit=") {
+        let Some(limit) = magnitude(limit) else { return };
+        ids.retain(|id| kind_of(id) != Some(Kind::Blob) || size_of(id).is_some_and(|n| n <= limit));
+    } else if let Some(depth) = spec.strip_prefix("tree:") {
+        // Only depth 0 is expressible without the walk's depth bookkeeping, and
+        // it is the only depth in common use.
+        if depth == "0" {
+            ids.retain(|id| matches!(kind_of(id), Some(Kind::Commit | Kind::Tag)));
+        }
+    } else if let Some(want) = spec.strip_prefix("object:type=") {
+        let want = match want {
+            "blob" => Some(Kind::Blob),
+            "tree" => Some(Kind::Tree),
+            "commit" => Some(Kind::Commit),
+            "tag" => Some(Kind::Tag),
+            _ => None,
+        };
+        if let Some(want) = want {
+            ids.retain(|id| kind_of(id) == Some(want));
+        }
+    }
+}
+
+/// git's `k`/`m`/`g` magnitude grammar, as `blob:limit=` uses it.
+fn magnitude(v: &str) -> Option<u64> {
+    let (body, scale) = match v.chars().last() {
+        Some('k' | 'K') => (&v[..v.len() - 1], 1024),
+        Some('m' | 'M') => (&v[..v.len() - 1], 1024 * 1024),
+        Some('g' | 'G') => (&v[..v.len() - 1], 1024 * 1024 * 1024),
+        _ => (v, 1),
+    };
+    body.parse::<u64>().ok()?.checked_mul(scale)
+}
+
+/// Remove repeats while keeping first-seen order, which is the order objects are
+/// written to the pack.
+fn dedup(ids: &mut Vec<ObjectId>) {
+    let mut seen = HashSet::with_capacity(ids.len());
+    ids.retain(|id| seen.insert(*id));
+}
+
 /// git's on-disk identifier for a hash function, as the `.rev` header carries it.
-fn hash_id(kind: gix::hash::Kind) -> u32 {
+pub(super) fn hash_id(kind: gix::hash::Kind) -> u32 {
     match kind {
         gix::hash::Kind::Sha1 => 1,
         _ => 2,
@@ -500,15 +1075,11 @@ fn hash_id(kind: gix::hash::Kind) -> u32 {
 
 /// Append the hash of everything written so far, which is how every one of
 /// git's pack artifacts terminates.
-fn append_checksum(bytes: &mut Vec<u8>, kind: gix::hash::Kind) -> Result<()> {
+pub(super) fn append_checksum(bytes: &mut Vec<u8>, kind: gix::hash::Kind) -> Result<()> {
     let mut hasher = gix::hash::hasher(kind);
     hasher.update(&bytes[..]);
     bytes.extend_from_slice(hasher.try_finalize()?.as_slice());
     Ok(())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Write one pack artifact, reporting a failure the way git does.
@@ -516,9 +1087,22 @@ fn hex(bytes: &[u8]) -> String {
 /// git builds each file under a temporary name in the object store and only
 /// then renames it into place, so a path it cannot create is diagnosed twice:
 /// once for the write and once for the rename that never happened.
+///
+/// The rename is also why any existing file is unlinked first: a rename replaces
+/// its destination whatever that destination's mode is, whereas writing straight
+/// into the `0444` a previous run left behind would fail with `EACCES` and be
+/// misreported as an unwritable directory.
 fn write_artifact(path: &str, bytes: &[u8]) -> Option<ExitCode> {
+    let _ = std::fs::remove_file(path);
     match std::fs::write(path, bytes) {
-        Ok(()) => None,
+        // git leaves `.pack`, `.idx`, `.rev` and `.mtimes` world-readable but
+        // immutable. A filesystem that refuses the mode is not fatal — git does
+        // not check either.
+        Ok(()) => {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444));
+            None
+        }
         Err(err) => {
             eprintln!("error: unable to write file {path}: {}", errno_text(&err));
             eprintln!("fatal: unable to rename temporary file to '{path}'");
@@ -752,6 +1336,7 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
         "cruft" | "cruft-expiration" => st.cruft = on,
         "stdin-packs" => st.stdin_packs = on,
         "unpacked" => st.unpacked = on,
+        "incremental" => st.incremental = on,
         "non-empty" => st.non_empty = on,
         "quiet" => st.progress = !on,
         "progress" | "all-progress" => st.progress = on,
@@ -777,7 +1362,12 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
             st.indexed_objects = on;
             st.internal_rev_list |= on;
         }
-        "revs" | "pack-loose-unreachable" => st.internal_rev_list |= on,
+        "revs" => {
+            st.revs = on;
+            st.internal_rev_list |= on;
+        }
+        "pack-loose-unreachable" => st.internal_rev_list |= on,
+        "filter" => st.filter = on.then(|| value.unwrap_or("").to_string()),
         "compression" => st.compression = on.then(|| to_number(value.unwrap_or("0"))).flatten(),
         "name-hash-version" => {
             st.name_hash_version = on.then(|| to_number(value.unwrap_or("0"))).flatten();

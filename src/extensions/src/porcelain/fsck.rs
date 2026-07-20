@@ -48,7 +48,10 @@ const ERROR_REACHABLE: u8 = 2;
 ///                                       suppresses `--root` and `--tags` output,
 ///                                       as in git.
 ///   * `--progress` / `--no-progress` — progress on stderr, defaulting to
-///                                       `isatty(2)`.
+///                                       `isatty(2)`, and forced off by
+///                                       `--verbose` as `cmd_fsck` does.
+///   * `--verbose` / `-v` / `--no-verbose` — the `Checking ...` trace on stderr;
+///                                       see divergence 9.
 ///   * `--name-objects`               — accepted; see divergence 6.
 ///   * `--references` / `--no-references` — accepted; see divergence 2.
 ///   * `--full` / `--no-full`         — accepted; `check_full` only gates
@@ -56,7 +59,7 @@ const ERROR_REACHABLE: u8 = 2;
 ///                                       do either way.
 ///   * `--strict` / `--no-strict`     — accepted; see divergence 1.
 ///
-/// `--verbose` and `--lost-found` still `bail!` rather than being ignored.
+/// `--lost-found` still `bail!`s rather than being ignored.
 ///
 /// ### Known divergences from stock git — read before trusting a clean result
 ///
@@ -97,6 +100,27 @@ const ERROR_REACHABLE: u8 = 2;
 ///    <oid>` / `to <type> <oid>` pair in addition to the `missing` line. This
 ///    port prints only the `missing` line, so a repository with a severed link
 ///    gets the right exit code (2) and a shorter report.
+/// 9. **The `--verbose` trace is approximate in ordering and in one block.**
+///    `--verbose` changes nothing on stdout and nothing about the exit code —
+///    every one of its lines is a `Checking ...` line on stderr — so the flag is
+///    implemented rather than refused. Three caveats about that trace, none of
+///    which reach stdout:
+///      * the `Checking <type> <oid>` block comes from `fsck_source()`'s raw
+///        `readdir()` walk of `.git/objects/??`; this port emits it in the odb
+///        iterator's order instead, and emits the `Checking object directory`
+///        header once rather than once per odb source;
+///      * `Checking <oid>` under `Checking connectivity` is emitted in the
+///        `obj_hash` slot order reconstructed below, with ties broken by id.
+///        The report itself still refuses to guess when that order is
+///        ambiguous, so only the trace can be off, and only within one
+///        collision cluster. Its ids are bare: git runs them through
+///        `describe_object()`, which appends a path under `--name-objects`
+///        (divergence 6);
+///      * git shells out to `git refs verify --verbose`, whose
+///        `Checking references consistency` / `Checking <ref>` /
+///        `Checking packed-refs file <path>` lines follow its own
+///        `Checking ref database`. Per divergence 2 that child is not run, so
+///        those lines are absent while `Checking ref database` is printed.
 ///
 /// ### Output ordering
 ///
@@ -146,10 +170,14 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         bail!("repositories with linked worktrees are not supported: their HEAD and index are heads too");
     }
 
-    let show_progress = match opt.progress {
-        Some(explicit) => explicit,
-        None => std::io::stderr().is_terminal(),
-    };
+    // `cmd_fsck`: the `isatty(2)` default is resolved first, then `--verbose`
+    // unconditionally clears it — the two traces share stderr and git shows only
+    // the verbose one.
+    let show_progress = !opt.verbose
+        && match opt.progress {
+            Some(explicit) => explicit,
+            None => std::io::stderr().is_terminal(),
+        };
     if show_progress {
         // Each additional odb source gets its own "Checking object directories"
         // block, and `--full` adds a "Checking objects" block per pack.
@@ -165,8 +193,13 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     let mut state = State::default();
 
     // ---- 1. reference-database check ---------------------------------------
-    if opt.check_references && show_progress {
-        progress_block("Checking ref database", 1);
+    if opt.check_references {
+        if show_progress {
+            progress_block("Checking ref database", 1);
+        }
+        if opt.verbose {
+            eprintln!("Checking ref database");
+        }
     }
 
     // ---- 2. explicit <object> arguments ------------------------------------
@@ -216,11 +249,20 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // sees as used. `dangling` is precisely "unreachable and never used", so
     // this pass has to cover unreachable objects too.
     let mut scan_lines: Vec<(ObjectId, String)> = Vec::new();
+    // `fsck_source()` announces the directory once per odb source before walking
+    // it; `--connectivity-only` skips `fsck_source()` altogether.
+    if opt.verbose && !opt.connectivity_only {
+        eprintln!("Checking object directory");
+    }
     for &id in &all {
         let kind = match repo.find_header(id) {
             Ok(h) => h.kind(),
             Err(e) => return Ok(fatal_corrupt(id, &e)),
         };
+        // `fsck_obj()`'s own line, which covers blobs too.
+        if opt.verbose && !opt.connectivity_only {
+            eprintln!("Checking {kind} {id}");
+        }
         if kind == Kind::Blob {
             continue;
         }
@@ -281,7 +323,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         default_refs += collect_default_heads(&repo, &mut state, &mut heads)?;
     }
     if opt.include_reflogs {
-        errors |= collect_reflog_heads(&repo, &mut state, &mut heads)?;
+        errors |= collect_reflog_heads(&repo, &mut state, &mut heads, opt.verbose)?;
     }
     if default_refs == 0 {
         eprintln!("notice: No default references");
@@ -292,7 +334,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
 
     // ---- 5. index entries as heads -----------------------------------------
     if !explicit_heads || opt.keep_cache_objects {
-        collect_index_heads(&repo, &mut state, &mut heads);
+        collect_index_heads(&repo, &mut state, &mut heads, opt.verbose);
     }
 
     // ---- 6. reachability ----------------------------------------------------
@@ -368,6 +410,21 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     }
     lines.sort_by_key(|(id, _)| order.home_of(id));
 
+    if opt.verbose {
+        // `check_connectivity()` announces `get_max_object_index()`, which is the
+        // size of `obj_hash` rather than the number of objects in it, then walks
+        // every occupied slot in order.
+        eprintln!(
+            "Checking connectivity ({} objects)",
+            obj_hash_size(state.known.len())
+        );
+        let mut walked: Vec<ObjectId> = state.known.iter().copied().collect();
+        walked.sort_by_key(|id| (order.home_of(id), *id));
+        for id in walked {
+            eprintln!("Checking {id}");
+        }
+    }
+
     let mut out = String::new();
     for (_, line) in &scan_lines {
         out.push_str(line);
@@ -394,6 +451,7 @@ struct Options {
     check_references: bool,
     keep_cache_objects: bool,
     name_objects: bool,
+    verbose: bool,
     progress: Option<bool>,
     objects: Vec<String>,
 }
@@ -411,6 +469,7 @@ impl Default for Options {
             check_references: true,
             keep_cache_objects: false,
             name_objects: false,
+            verbose: false,
             progress: None,
             objects: Vec::new(),
         }
@@ -451,18 +510,17 @@ impl Options {
                 "--full" | "--no-full" => self.check_full = a == "--full",
                 "--references" | "--no-references" => self.check_references = a == "--references",
                 "--strict" | "--no-strict" => {}
-                "--verbose" | "-v" => bail!(
-                    "--verbose is not ported: its per-object \"Checking ...\" trace lists the odb in \
-                     readdir() order and the object table in a slot order this port cannot always resolve"
-                ),
+                // `OPT__VERBOSE` gives all three spellings.
+                "--verbose" | "-v" => self.verbose = true,
+                "--no-verbose" => self.verbose = false,
                 "--lost-found" => bail!(
                     "--lost-found is not ported: it writes dangling objects into .git/lost-found/"
                 ),
                 s if s.starts_with('-') && s.len() > 1 => bail!(
                     "unsupported flag {s:?} (ported: --unreachable, --dangling, --no-dangling, \
                      --root, --tags, --cache, --reflogs, --no-reflogs, --connectivity-only, --full, \
-                     --no-full, --references, --no-references, --strict, --name-objects, --progress, \
-                     --no-progress)"
+                     --no-full, --references, --no-references, --strict, --name-objects, --verbose, \
+                     --no-verbose, --progress, --no-progress)"
                 ),
                 s => self.objects.push(s.to_string()),
             }
@@ -600,6 +658,7 @@ fn collect_reflog_heads(
     repo: &gix::Repository,
     state: &mut State,
     heads: &mut Vec<ObjectId>,
+    verbose: bool,
 ) -> Result<u8> {
     let mut errors = 0u8;
     let logs_root = repo.common_dir().join("logs");
@@ -614,6 +673,15 @@ fn collect_reflog_heads(
         };
         for line in iter {
             let line = line?;
+            // `fsck_handle_reflog_ent()` announces the entry before either end
+            // of it is handled, null ids included.
+            if verbose {
+                eprintln!(
+                    "Checking reflog {}->{}",
+                    line.previous_oid(),
+                    line.new_oid()
+                );
+            }
             for id in [line.previous_oid(), line.new_oid()] {
                 if id.is_null() {
                     continue;
@@ -633,7 +701,12 @@ fn collect_reflog_heads(
 
 /// Index entries and cache-tree ids as heads, which is `fsck_index()`. Gitlink
 /// entries are skipped, matching git's `S_ISGITLINK` guard.
-fn collect_index_heads(repo: &gix::Repository, state: &mut State, heads: &mut Vec<ObjectId>) {
+fn collect_index_heads(
+    repo: &gix::Repository,
+    state: &mut State,
+    heads: &mut Vec<ObjectId>,
+    verbose: bool,
+) {
     let Ok(index) = repo.index_or_empty() else {
         return;
     };
@@ -645,8 +718,20 @@ fn collect_index_heads(repo: &gix::Repository, state: &mut State, heads: &mut Ve
         heads.push(entry.id);
     }
     if let Some(tree) = index.tree() {
-        collect_cache_tree(repo, tree, state, heads);
+        let path = verbose.then(|| index_path_label(repo));
+        collect_cache_tree(repo, tree, state, heads, path.as_deref());
     }
+}
+
+/// The index path as `fsck_index()` names it — git runs from the top of the
+/// worktree, so its `.git/index` is the worktree-relative spelling.
+fn index_path_label(repo: &gix::Repository) -> String {
+    let path = repo.index_path();
+    let rela = repo
+        .workdir()
+        .and_then(|work| path.strip_prefix(work).ok())
+        .unwrap_or(path.as_path());
+    rela.display().to_string()
 }
 
 /// `fsck_cache_tree()`: an entry with a valid count names a tree that is a head.
@@ -657,13 +742,19 @@ fn collect_cache_tree(
     tree: &gix::index::extension::Tree,
     state: &mut State,
     heads: &mut Vec<ObjectId>,
+    verbose_index_path: Option<&str>,
 ) {
+    // `fsck_cache_tree()` announces itself once per node, subtrees included, and
+    // before the entry-count guard below.
+    if let Some(path) = verbose_index_path {
+        eprintln!("Checking cache tree of {path}");
+    }
     if tree.num_entries.is_some() && repo.has_object(tree.id) {
         state.note(tree.id);
         heads.push(tree.id);
     }
     for child in &tree.children {
-        collect_cache_tree(repo, child, state, heads);
+        collect_cache_tree(repo, child, state, heads, verbose_index_path);
     }
 }
 

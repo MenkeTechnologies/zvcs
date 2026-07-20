@@ -484,7 +484,7 @@ impl TreeNodes {
     ) -> bool {
         conflict
             .change_idx()
-            .is_none_or(|idx| our_changes[idx].inner != *theirs)
+            .is_none_or(|idx| !is_same_change_ignoring_relation(&our_changes[idx].inner, theirs))
     }
 
     pub fn remove_existing_leaf(&mut self, location: &BStr) {
@@ -544,6 +544,90 @@ impl TreeNodes {
         );
         cursor.change_idx = Some(new_change_idx);
         cursor.location = ChangeLocation::CurrentLocation;
+    }
+}
+
+/// Compare `ours` and `theirs` for having exactly the same effect, ignoring every
+/// [`Relation`](gix_diff::tree::visit::Relation) id they carry.
+///
+/// The ids behind `Relation::Parent`/`ChildOfParent` come from a counter that
+/// `gix_diff::tree` bumps once per added or deleted directory as it walks a *single* diff
+/// — `ChangeId` is documented as "unique only within one diff operation". *Our* changes and
+/// *their* changes come from two independent diffs against the merge base, so the same
+/// change can, and routinely does, carry different ids on the two sides: one extra directory
+/// sorting ahead of another shifts every following id by one.
+///
+/// Deriving equality from `PartialEq` therefore reports two byte-identical additions as
+/// differing, which the caller turns into a conflict. Comparing location, mode and object id
+/// — everything that actually lands in the merged tree — is what "same change" means here.
+fn is_same_change_ignoring_relation(ours: &Change, theirs: &Change) -> bool {
+    match (ours, theirs) {
+        (
+            Change::Addition {
+                location: our_location,
+                entry_mode: our_mode,
+                id: our_id,
+                relation: _,
+            },
+            Change::Addition {
+                location: their_location,
+                entry_mode: their_mode,
+                id: their_id,
+                relation: _,
+            },
+        )
+        | (
+            Change::Deletion {
+                location: our_location,
+                entry_mode: our_mode,
+                id: our_id,
+                relation: _,
+            },
+            Change::Deletion {
+                location: their_location,
+                entry_mode: their_mode,
+                id: their_id,
+                relation: _,
+            },
+        ) => our_location == their_location && our_mode == their_mode && our_id == their_id,
+        (
+            Change::Rewrite {
+                source_location: our_source_location,
+                source_entry_mode: our_source_mode,
+                source_id: our_source_id,
+                diff: our_diff,
+                entry_mode: our_mode,
+                id: our_id,
+                location: our_location,
+                copy: our_copy,
+                source_relation: _,
+                relation: _,
+            },
+            Change::Rewrite {
+                source_location: their_source_location,
+                source_entry_mode: their_source_mode,
+                source_id: their_source_id,
+                diff: their_diff,
+                entry_mode: their_mode,
+                id: their_id,
+                location: their_location,
+                copy: their_copy,
+                source_relation: _,
+                relation: _,
+            },
+        ) => {
+            our_source_location == their_source_location
+                && our_source_mode == their_source_mode
+                && our_source_id == their_source_id
+                && our_diff == their_diff
+                && our_mode == their_mode
+                && our_id == their_id
+                && our_location == their_location
+                && our_copy == their_copy
+        }
+        // `Modification` carries no relation, so its derived equality is already correct,
+        // and any mismatched pair of variants is genuinely a different change.
+        (ours, theirs) => ours == theirs,
     }
 }
 

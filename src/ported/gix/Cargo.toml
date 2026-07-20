@@ -350,8 +350,13 @@ gix-hash = { version = "^0.25.1", path = "../gix-hash" }
 gix-shallow = { version = "^0.12.1", path = "../gix-shallow" }
 gix-object = { version = "^0.62.0", path = "../gix-object" }
 gix-actor = { version = "^0.41.1", path = "../gix-actor" }
+# `generate` exposes `gix_pack::data::output`: the object counter and pack-entry
+# encoder that `git pack-objects`, `repack` and `gc` build a new pack with. It is
+# on by default upstream and pulls in no dependency `gix` does not already carry
+# (gix-traverse, gix-diff, gix-hashtable, parking_lot).
 gix-pack = { version = "^0.72.0", path = "../gix-pack", default-features = false, features = [
     "object-cache-dynamic",
+    "generate",
 ] }
 gix-revision = { version = "^0.47.0", path = "../gix-revision", default-features = false }
 gix-revwalk = { version = "^0.33.0", path = "../gix-revwalk" }

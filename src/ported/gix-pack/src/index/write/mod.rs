@@ -2,6 +2,8 @@ pub use error::Error;
 
 mod error;
 
+pub mod reverse;
+
 pub(crate) struct TreeEntry {
     pub id: gix_hash::ObjectId,
     pub crc32: u32,

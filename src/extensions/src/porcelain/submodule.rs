@@ -95,6 +95,11 @@ const SUBCOMMANDS: &[&str] = &[
 ///     `Entering '<displaypath>'` first unless quiet. A failing command aborts
 ///     the walk with git's `run_command returned non-zero status` fatal and 128.
 ///
+/// `--quiet` is accepted in front of every subcommand, but `--cached` is only
+/// declared by `status` and `summary`, so a leading `--cached` in front of any
+/// other subcommand is a usage error exiting 1 — `--quiet` does not suppress the
+/// usage block. A bare `git submodule --cached` is valid, resolving to `status`.
+///
 /// The `<rev-name>` suffix is git's `compute_rev_name`, which shells out to
 /// `git describe` four times in order: bare, `--tags`, `--contains`, and
 /// `--all --always`. Stages 1, 2 and 4 are backed by gitoxide's describe
@@ -141,6 +146,16 @@ pub fn submodule(args: &[String]) -> Result<ExitCode> {
         Some(a) if SUBCOMMANDS.contains(&a.as_str()) => (a.as_str(), &args[i + 1..]),
         Some(_) => return usage_exit(),
     };
+
+    // Only `status` and `summary` declare `--cached` in their option parsers, so
+    // a global `--cached` in front of any other subcommand falls through to
+    // `usage_with_options`. This is checked before the subcommand's own argument
+    // parsing runs: `git submodule --cached foreach` prints the usage block
+    // rather than foreach's missing-<command> error. A bare `git submodule
+    // --cached` is fine — it resolves to `status`, which accepts the flag.
+    if cached && !matches!(name, "status" | "summary") {
+        return usage_exit();
+    }
 
     match name {
         "status" => status(tail, quiet, cached),

@@ -31,6 +31,34 @@ pub fn installation_config_prefix() -> Option<&'static Path> {
     installation_config().map(git::config_to_base_path)
 }
 
+/// Like [`installation_config()`], but ignoring the `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_NOSYSTEM`
+/// runtime overrides.
+///
+/// [`installation_config()`] deliberately honours those variables, because it answers "which file
+/// is the highest-scoped configuration currently in effect" — see the note on
+/// `auxiliary::git_for_windows_root()`. This function answers the different question "where is git
+/// installed", which neither variable changes: they relocate or switch off the system config
+/// *scope*, they do not move the installation.
+///
+/// It exists for the paths git compiles in relative to its own prefix and then reports regardless
+/// of config scoping — `etc/gitattributes`, which `git var GIT_ATTR_SYSTEM` prints even under
+/// `GIT_CONFIG_NOSYSTEM=1`, being the motivating case. Do not use it to locate configuration to
+/// load; use [`installation_config()`] for that.
+///
+/// ### Performance
+///
+/// This invokes the git binary which is slow on windows. The result is cached separately from
+/// [`installation_config()`], so both may spawn git once.
+pub fn installation_config_unsuppressed() -> Option<&'static Path> {
+    git::install_config_path_unsuppressed().and_then(|p| crate::try_from_byte_slice(p).ok())
+}
+
+/// The directory containing [`installation_config_unsuppressed()`], i.e. git's installed `etc`
+/// directory, or `None` if it could not be determined.
+pub fn installation_config_prefix_unsuppressed() -> Option<&'static Path> {
+    installation_config_unsuppressed().map(git::config_to_base_path)
+}
+
 /// Return the shell that Git would use, the shell to execute commands from.
 ///
 /// On Windows, this is the full path to `sh.exe` bundled with Git for Windows if we can find it.

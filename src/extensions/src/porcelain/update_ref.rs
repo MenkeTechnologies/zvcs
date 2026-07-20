@@ -187,7 +187,9 @@ fn parse_args(args: &[String]) -> Result<Opts, ExitCode> {
     let mut o = Opts::default();
     let mut end_of_opts = false;
 
-    let mut i = 1;
+    // `args` arrives without the subcommand (dispatch::run is handed `&args[1..]`),
+    // so the first element is already the first option or positional.
+    let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if end_of_opts || !a.starts_with('-') || a == "-" {

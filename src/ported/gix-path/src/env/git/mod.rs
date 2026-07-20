@@ -101,7 +101,21 @@ pub(super) const EXE_NAME: &str = "git";
 /// Invoke the git executable to obtain the origin configuration, which is cached and returned.
 ///
 /// The git executable is the one found in `PATH` or an alternative location.
-pub(super) static GIT_HIGHEST_SCOPE_CONFIG_PATH: LazyLock<Option<BString>> = LazyLock::new(exe_info);
+pub(super) static GIT_HIGHEST_SCOPE_CONFIG_PATH: LazyLock<Option<BString>> =
+    LazyLock::new(|| exe_info(ScopeOverrides::Honor));
+
+/// The same probe, but with the system-scope environment overrides neutralized, so the answer
+/// describes the git *installation* rather than the configuration currently in effect.
+static GIT_INSTALLATION_CONFIG_PATH: LazyLock<Option<BString>> = LazyLock::new(|| exe_info(ScopeOverrides::Ignore));
+
+/// Whether a config-path probe lets `GIT_CONFIG_SYSTEM` / `GIT_CONFIG_NOSYSTEM` affect its answer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScopeOverrides {
+    /// Report the highest-scoped configuration actually in effect, overrides included.
+    Honor,
+    /// Report git's own installed configuration, as if neither override were set.
+    Ignore,
+}
 
 // There are a number of ways to refer to the null device on Windows, but they are not all equally
 // well supported. Git for Windows rejects `\\.\NUL` and `\\.\nul`. On Windows 11 ARM64 (and maybe
@@ -112,8 +126,8 @@ const NULL_DEVICE: &str = "nul";
 #[cfg(not(windows))]
 const NULL_DEVICE: &str = "/dev/null";
 
-fn exe_info() -> Option<BString> {
-    let mut cmd = git_cmd(EXE_NAME.into());
+fn exe_info(overrides: ScopeOverrides) -> Option<BString> {
+    let mut cmd = git_cmd(EXE_NAME.into(), overrides);
     gix_trace::debug!(cmd = ?cmd, "invoking git for installation config path");
     let cmd_output = match cmd.output() {
         Ok(out) => out.stdout,
@@ -124,7 +138,7 @@ fn exe_info() -> Option<BString> {
                 candidate.is_file().then_some(candidate)
             })?;
             gix_trace::debug!(cmd = ?cmd, "invoking git for installation config path in alternate location");
-            git_cmd(executable).output().ok()?.stdout
+            git_cmd(executable, overrides).output().ok()?.stdout
         }
         Err(_) => return None,
     };
@@ -132,7 +146,7 @@ fn exe_info() -> Option<BString> {
     first_file_from_config_with_origin(cmd_output.as_slice().into()).map(ToOwned::to_owned)
 }
 
-fn git_cmd(executable: PathBuf) -> Command {
+fn git_cmd(executable: PathBuf, overrides: ScopeOverrides) -> Command {
     let mut cmd = Command::new(executable);
     #[cfg(windows)]
     {
@@ -175,6 +189,14 @@ fn git_cmd(executable: PathBuf) -> Command {
         .env("GIT_WORK_TREE", NULL_DEVICE) // Avoid confusion when debugging.
         .stdin(Stdio::null())
         .stderr(Stdio::null());
+    if overrides == ScopeOverrides::Ignore {
+        // These relocate (`GIT_CONFIG_SYSTEM`) or suppress (`GIT_CONFIG_NOSYSTEM`) the system
+        // config scope at runtime. A caller asking where git is *installed* must not have its
+        // answer changed by them, so the probe runs as if neither were set. `GIT_CONFIG_GLOBAL`
+        // is deliberately left alone: it can only ever point below the system scope, so it cannot
+        // displace the first entry, and clearing it would let a real `~/.gitconfig` do so.
+        cmd.env_remove("GIT_CONFIG_SYSTEM").env_remove("GIT_CONFIG_NOSYSTEM");
+    }
     cmd
 }
 
@@ -194,15 +216,44 @@ pub(super) fn install_config_path() -> Option<&'static BStr> {
     static PATH: LazyLock<Option<BString>> = LazyLock::new(|| {
         // Shortcut: Specifically in Git for Windows 'Git Bash' shells, this variable is set. It
         // may let us deduce the installation directory, so we can save the `git` invocation.
-        #[cfg(windows)]
-        if let Some(mut exec_path) = std::env::var_os("EXEPATH").map(PathBuf::from) {
-            exec_path.push("etc");
-            exec_path.push("gitconfig");
-            return crate::os_string_into_bstring(exec_path.into()).ok();
+        if let Some(path) = exepath_config() {
+            return Some(path);
         }
         GIT_HIGHEST_SCOPE_CONFIG_PATH.clone()
     });
     PATH.as_ref().map(AsRef::as_ref)
+}
+
+/// Like [`install_config_path()`], but unaffected by `GIT_CONFIG_SYSTEM` / `GIT_CONFIG_NOSYSTEM`.
+///
+/// See `gix_path::env::installation_config_unsuppressed()` for why this distinction exists. The
+/// Git for Windows `EXEPATH` shortcut is shared, as it already describes the installation and so
+/// gives the same answer under either policy.
+pub(super) fn install_config_path_unsuppressed() -> Option<&'static BStr> {
+    let _span = gix_trace::detail!("gix_path::git::install_config_path_unsuppressed()");
+    static PATH: LazyLock<Option<BString>> = LazyLock::new(|| {
+        if let Some(path) = exepath_config() {
+            return Some(path);
+        }
+        GIT_INSTALLATION_CONFIG_PATH.clone()
+    });
+    PATH.as_ref().map(AsRef::as_ref)
+}
+
+/// The `etc/gitconfig` implied by Git for Windows' `EXEPATH`, saving a `git` invocation.
+///
+/// Always `None` off Windows, where the variable has no such meaning.
+#[cfg(windows)]
+fn exepath_config() -> Option<BString> {
+    let mut exec_path = std::env::var_os("EXEPATH").map(PathBuf::from)?;
+    exec_path.push("etc");
+    exec_path.push("gitconfig");
+    crate::os_string_into_bstring(exec_path.into()).ok()
+}
+
+#[cfg(not(windows))]
+fn exepath_config() -> Option<BString> {
+    None
 }
 
 /// Given `config_path` as obtained from `install_config_path()`, return the path of the git installation base.

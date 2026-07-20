@@ -47,7 +47,9 @@ const USAGE: &str = "usage: git mergetool [--tool=tool] [--tool-help] [-y|--no-p
 ///
 /// Exit codes: 0 for `-h` and for `No files need merging`, 1 for a usage error.
 pub fn mergetool(args: &[String]) -> Result<ExitCode> {
-    let rest = args.get(1..).unwrap_or(&[]);
+    // `args` is already the post-subcommand argument vector (`dispatch::run` is
+    // handed `&argv[1..]` with the verb split off), so it *is* the script's `"$@"`.
+    let rest = args;
 
     // `git-sh-setup` inspects `$1` only, before any repository setup, and the
     // script sets NONGIT_OK=Yes — so this works outside a repository too.

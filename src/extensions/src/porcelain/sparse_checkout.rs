@@ -23,9 +23,16 @@ use gix::index::entry::{Flags, Mode};
 /// path evaluated through every one of its directory prefixes the way git's
 /// hierarchical index walk does.
 ///
+/// Applying cone-mode sparsity also refreshes the cache tree, writing the
+/// index's root tree and every sub-tree into the object database — git gets
+/// there via `clean_tracked_sparse_directories()`, which returns early on a
+/// non-cone pattern list, so non-cone `set` and `disable` deposit nothing.
+/// `clean` writes the same trees on its way to the directory list.
+///
 /// Applying sparsity walks the index: entries outside the sparsity get the
 /// `SKIP_WORKTREE` bit (and are deleted from disk, pruning directories that
-/// become empty), entries inside get it cleared and — only if they were skipped
+/// become empty — including the parents of a path the user had already deleted
+/// themselves), entries inside get it cleared and — only if they were skipped
 /// before — are materialised through gitoxide's worktree checkout. Files with
 /// local modifications are left alone and keep their bit clear, matching git's
 /// refusal to sparsify dirty paths; unmerged entries are left entirely alone
@@ -400,10 +407,19 @@ fn cmd_check_rules(args: &[String]) -> Result<ExitCode> {
 /// beneath it are still on disk; if any is, the directory is descended into
 /// instead, so a single stubborn path does not pin its siblings. Untracked
 /// directories are never candidates: git only cleans what the index knows.
+///
+/// Cone mode is a hard precondition — git's directory candidates *are* the
+/// sparse-index directory entries, which only exist in cone mode.
 fn cmd_clean(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
     if !is_sparse(&repo)? {
         eprintln!("fatal: must be in a sparse-checkout to clean directories");
+        return Ok(ExitCode::from(128));
+    }
+    // Both premises are checked ahead of `parse_options`, so a bad switch in a
+    // non-cone worktree still reports the dialect rather than the switch.
+    if !is_cone(&repo)? {
+        eprintln!("fatal: must be in a cone-mode sparse-checkout to clean directories");
         return Ok(ExitCode::from(128));
     }
     let mut dry_run = false;
@@ -432,6 +448,13 @@ fn cmd_clean(args: &[String]) -> Result<ExitCode> {
         .to_owned();
     let sparsity = load_sparsity(&repo)?;
     let index = repo.open_index()?;
+    // Serialize the odb append below against the other zvcs writers.
+    let lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    // git reaches the directory list through `convert_to_sparse()`, which
+    // refreshes the cache tree first — so `clean` deposits the same tree objects
+    // `set` does, dry run or not.
+    write_cache_tree(&repo, &index)?;
+    drop(lock);
     let mut paths: Vec<String> = {
         let backing = index.path_backing();
         index
@@ -1042,15 +1065,28 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
                 // EXTENDED is what makes the skip bit survive serialization
                 // (and forces index version 3, exactly as git does).
                 entry.flags.insert(Flags::SKIP_WORKTREE | Flags::EXTENDED);
-                if exists {
-                    to_remove.push(snap.path.clone());
-                }
+                // Queued whether or not the file is still there: git's
+                // `unlink_entry()` prunes the entry's now-empty parent
+                // directories even when the unlink itself finds nothing, so a
+                // path the user had already deleted still takes its directory
+                // with it.
+                to_remove.push(snap.path.clone());
             }
         }
     }
 
     index.remove_tree();
     index.write(Default::default())?;
+
+    // Cone mode alone refreshes the cache tree: git finishes
+    // `update_working_directory()` with `clean_tracked_sparse_directories()`,
+    // which bails immediately on a non-cone pattern list and otherwise builds an
+    // in-memory sparse index — and that conversion runs `cache_tree_update()`,
+    // depositing the index's root tree and every sub-tree in the odb. `disable`
+    // installs a non-cone `/*` list precisely so it does not reach this.
+    if matches!(sparsity, Sparsity::Cone(_)) {
+        write_cache_tree(repo, &index)?;
+    }
 
     if !to_materialize.is_empty() {
         // Re-open so the checkout sees the freshly cleared skip bits (entries
@@ -1080,6 +1116,36 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
         eprint!("{msg}");
     }
 
+    Ok(())
+}
+
+/// Write the index's cache tree — its root tree and every sub-tree — into the
+/// odb, the side effect git's `cache_tree_update(WRITE_TREE_MISSING_OK)` has.
+///
+/// `MISSING_OK` means no odb presence check on the entries, so an index naming
+/// an absent blob still produces its trees. `WRITE_TREE_SILENT` means the
+/// refresh gives up without a word when the index cannot be turned into a tree
+/// — an unmerged entry, or a mode the tree format cannot express — leaving the
+/// odb untouched, which is why a conflicted worktree gains no objects here.
+fn write_cache_tree(repo: &gix::Repository, index: &gix::index::File) -> Result<()> {
+    let entries = index.entries();
+    if entries.is_empty() || entries.iter().any(|e| e.stage_raw() != 0) {
+        return Ok(());
+    }
+    let backing = index.path_backing();
+    let mut editor =
+        gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, repo.object_hash());
+    for entry in entries {
+        let Some(mode) = entry.mode.to_tree_entry_mode() else {
+            return Ok(());
+        };
+        editor.upsert(
+            entry.path_in(backing).split(|&b| b == b'/').map(|c| c.as_bstr()),
+            mode.kind(),
+            entry.id,
+        )?;
+    }
+    editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
     Ok(())
 }
 

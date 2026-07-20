@@ -44,12 +44,19 @@
 //!   no such fallback (see `gix/src/repository/identity.rs`, "Deviation"), and
 //!   there is no passwd/gethostname substrate to port it onto. Rather than invent
 //!   a different ident, this errors out (exit 128) with a precise message.
-//! * `GIT_ATTR_SYSTEM` and `GIT_CONFIG_SYSTEM` derive from
-//!   `gix_path::env::system_prefix()`, which is `/` on every non-Windows target.
-//!   Stock git uses its *compile-time* prefix, so a git installed under a prefix
-//!   other than `/` (e.g. Homebrew's `/opt/homebrew`) reports a different path.
-//!   This is a property of the vendored crate, not something this module can fix
-//!   without hardcoding a foreign installation layout.
+//! * `GIT_ATTR_SYSTEM` and `GIT_CONFIG_SYSTEM` hang off git's *compile-time*
+//!   prefix, which is not derivable from the filesystem: `gix_path::env::system_prefix()`
+//!   is a flat `/` off Windows, and `--exec-path` bears no fixed relation to it
+//!   (Homebrew pairs an exec path of `<prefix>/opt/git/libexec/git-core` with a
+//!   prefix of `<prefix>`). Both therefore resolve through
+//!   `gix_path::env::installation_config_prefix_unsuppressed()`, which reads the
+//!   installation's own `etc/gitconfig` location — the one place the prefix is
+//!   observable at runtime — and falls back to `system_prefix()` when no git
+//!   installation can be found at all. Unlike the plain
+//!   `installation_config_prefix()`, it ignores `GIT_CONFIG_SYSTEM` and
+//!   `GIT_CONFIG_NOSYSTEM`, which relocate or switch off the system config *scope*
+//!   without moving the installation — matching git, which keeps printing
+//!   `GIT_ATTR_SYSTEM` under `GIT_CONFIG_NOSYSTEM=1`.
 //! * `init.defaultBranch` is not run through git's `check_refname_format`, so an
 //!   invalid branch name is echoed rather than rejected.
 
@@ -186,7 +193,7 @@ fn resolve(name: &str, cfg: &ConfigFile) -> Result<Option<Vec<BString>>> {
         "GIT_SHELL_PATH" => Ok(Some(vec![os_bytes(gix::path::env::shell())])),
         "GIT_ATTR_SYSTEM" => Ok(attr_system().map(|v| vec![v])),
         "GIT_ATTR_GLOBAL" => Ok(attr_global(cfg)?.map(|v| vec![v])),
-        "GIT_CONFIG_SYSTEM" => Ok(config_paths(&[Source::System])),
+        "GIT_CONFIG_SYSTEM" => Ok(config_system().map(|v| vec![v])),
         "GIT_CONFIG_GLOBAL" => Ok(config_paths(&[Source::Git, Source::User])),
         _ => unreachable!("variable names are validated against VARS before resolve"),
     }
@@ -270,16 +277,28 @@ fn pager(cfg: &ConfigFile) -> String {
     }
 }
 
-/// `GIT_ATTR_SYSTEM` — `<system prefix>/etc/gitattributes`, unless disabled.
+/// `GIT_ATTR_SYSTEM` — `<installation prefix>/etc/gitattributes`, unless disabled.
 ///
 /// Suppressed entirely by a true `GIT_ATTR_NOSYSTEM`, matching git's
-/// `git_attr_system_is_enabled()`.
+/// `git_attr_system_is_enabled()`. Note that this is the *only* switch that
+/// suppresses it: git derives the path from its compile-time prefix, so
+/// `GIT_CONFIG_NOSYSTEM=1` and a redirected `GIT_CONFIG_SYSTEM` leave it intact.
+///
+/// The prefix is the directory holding git's own installed `gitconfig`, since git
+/// hangs `etc/gitconfig` and `etc/gitattributes` off the same prefix. Asking the
+/// installation is the only way to recover it: it is baked in at build time and
+/// bears no derivable relation to `--exec-path` (Homebrew reports an exec path of
+/// `<prefix>/opt/git/libexec/git-core` against a prefix of `<prefix>`).
+/// `gix_path::env::system_prefix()` is the fallback, but it is a flat `/` on every
+/// non-Windows target and so only correct for a git installed under `/`.
 fn attr_system() -> Option<BString> {
     if env_bool("GIT_ATTR_NOSYSTEM") {
         return None;
     }
-    let prefix = gix::path::env::system_prefix()?;
-    Some(path_bytes(prefix.join("etc/gitattributes")))
+    let path = gix::path::env::installation_config_prefix_unsuppressed()
+        .map(|etc| etc.join("gitattributes"))
+        .or_else(|| gix::path::env::system_prefix().map(|p| p.join("etc/gitattributes")))?;
+    Some(path_bytes(path))
 }
 
 /// `GIT_ATTR_GLOBAL` — `core.attributesFile` if set, else the XDG attributes path.
@@ -296,6 +315,25 @@ fn attr_global(cfg: &ConfigFile) -> Result<Option<BString>> {
         return Ok(Some(path_bytes(expanded)));
     }
     Ok(gix::path::env::xdg_config("attributes", &mut gix::path::env::var).map(path_bytes))
+}
+
+/// `GIT_CONFIG_SYSTEM` — git's `git_system_config()`.
+///
+/// `GIT_CONFIG_NOSYSTEM` suppresses it outright; failing that `GIT_CONFIG_SYSTEM`
+/// names the file directly; failing that it is `etc/gitconfig` under git's
+/// installation prefix. That last branch is the same prefix `GIT_ATTR_SYSTEM`
+/// resolves, recovered the same way and for the same reason — `system_prefix()` is
+/// a flat `/` off Windows, which is only right for a git installed under `/`.
+fn config_system() -> Option<BString> {
+    if env_bool("GIT_CONFIG_NOSYSTEM") {
+        return None;
+    }
+    if let Some(configured) = std::env::var_os("GIT_CONFIG_SYSTEM") {
+        return Some(path_bytes(std::path::PathBuf::from(configured)));
+    }
+    gix::path::env::installation_config_unsuppressed()
+        .map(path_bytes)
+        .or_else(|| gix::path::env::system_prefix().map(|p| path_bytes(p.join("etc/gitconfig"))))
 }
 
 /// The storage locations of the given config `sources`, highest priority first.

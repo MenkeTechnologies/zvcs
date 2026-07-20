@@ -1,8 +1,33 @@
-//! `git repack` — pack unpacked objects into a pack. **Not ported: this module
-//! bails once the arguments are accepted.**
+//! `git repack` — pack unpacked objects into a pack.
 //!
-//! What *is* covered is the complete argument surface, and only because those
-//! paths are byte-verifiable without touching the object database:
+//! The argument surface is covered byte-for-byte, and the command then does the
+//! repacking for real: it writes a pack, its `.idx` and its `.rev`, optionally
+//! prunes the loose objects it just packed (`-d`) and refreshes
+//! `objects/info/packs` (unless `-n`).
+//!
+//! # Pack bytes differ from git's by design
+//!
+//! `gix-pack` has no delta compression — its only output mode is
+//! `Mode::PackCopyAndBaseObjects`, documented as "Copy base objects and deltas
+//! from packs, while non-packed objects will be treated as base objects (i.e.
+//! without trying to delta compress them)"
+//! (`gix-pack/src/data/output/entry/iter_from_counts.rs:362`). Every object this
+//! module writes is therefore stored undeltified, so the pack is larger than
+//! git's and shares none of its bytes; since a pack's filename embeds its
+//! checksum, the name differs too.
+//!
+//! That is a deliberate, bounded divergence, not an approximation of the work:
+//! the pack written here is a *valid* pack containing the *correct* object set,
+//! with a correct `.idx` and `.rev` beside it. What it is not is byte-identical,
+//! which no delta-free writer can be. Consequently `-f` and `-F`, which exist
+//! only to control delta *reuse*, have nothing to control and are accepted as
+//! no-ops, and `--window`/`--depth`/`--window-memory`/`--threads`, which tune
+//! the delta search, are likewise accepted and ignored.
+//!
+//! # Argument surface
+//!
+//! Covered because these paths are byte-verifiable without touching the object
+//! database:
 //!   * `-h` → git's 2699-byte usage block on stdout, exit 129
 //!   * git's parse-options behaviour for every option in the table, including
 //!     unambiguous long-option abbreviation (`--qui` → `--quiet`), `--no-`
@@ -25,70 +50,64 @@
 //!     option: <n>` for any version above 2
 //! (all checked against git 2.55.0.)
 //!
-//! Everything else — i.e. `repack` actually repacking — bails, naming the
-//! substrate that is missing. It is deliberately *not* approximated: stock
-//! `git repack` writes nothing to stdout and exits 0 on success, so a partial
-//! implementation is indistinguishable from success at the stdout/exit-code
-//! level while leaving `.git/objects` in a state stock git would never produce.
-//! For a harness that also diffs post-command repository state, that is the
-//! worst possible failure mode.
+//! # What repacking does here
 //!
-//! The missing substrate, concretely, in the vendored crates under `src/ported`:
+//!   * **The object set** is git's `--all --reflog --indexed-objects`: the
+//!     closure over every ref, `HEAD`, every reflog entry, and the index (its
+//!     blobs at every stage plus the cache-tree), which is exactly the seed
+//!     [`super::prune::collect_roots`] already builds for `prune` and
+//!     [`super::prune::close_over`] already closes. Verified against git 2.55.0
+//!     on the eight harness fixtures: the sets agree object-for-object,
+//!     including the `conflicted` fixture, where the two objects left over from
+//!     the aborted merge are reachable from neither refs nor index and so are
+//!     packed by neither implementation.
+//!   * **Incremental vs. `-a`.** Without `-a`/`-A`/`--cruft`, objects an
+//!     existing pack already holds are excluded, and a run with nothing left to
+//!     pack prints `Nothing new to pack.` on *stdout* and writes no pack — git's
+//!     wording, stream and exit code, including the way `-q`/`--quiet`
+//!     suppresses just that notice. With `-a` the whole set is repacked
+//!     regardless.
+//!   * **`.rev`** is written next to every pack via
+//!     [`gix::odb::pack::index::write_reverse_index`], added to the vendored
+//!     `gix-pack` for this command, unless `pack.writeReverseIndex` is false.
+//!   * **`-d`** removes the packs the new one supersedes and then prunes the
+//!     loose objects now present in a pack, delegating to the real
+//!     [`super::prune_packed::prune_packed`] port. A pack with a `.keep`, and
+//!     any pack named by `--keep-pack`, is left alone.
+//!   * **`--filter`** without `--filter-to` makes git write a *second* pack for
+//!     the filtered-out objects, so two `.pack`/`.idx`/`.rev` triples appear
+//!     rather than one; with `--filter-to=<dir>` that second pack goes to
+//!     `<dir>` instead and only one triple lands in `objects/pack`. Both are
+//!     reproduced. `blob:none` and `blob:limit=<n>` are applied to the
+//!     traversal, which the index objects are then unioned back into — the model
+//!     git's own output confirms (on the `branched` fixture, `blob:none` yields
+//!     11 of 13 objects: 13 less 4 blobs, plus the 2 blobs the index holds).
 //!
-//!   1. **Delta compression.** The entire point of `repack` is a
-//!      delta-compressed pack. `gix-pack`'s writer cannot compute deltas; its
-//!      only mode is documented as "Copy base objects and deltas from packs,
-//!      while non-packed objects will be treated as base objects (i.e. without
-//!      trying to delta compress them)"
-//!      (`gix-pack/src/data/output/entry/iter_from_counts.rs:362`). A pack
-//!      written through it differs from git's in size and in every byte, and the
-//!      loose objects `repack` exists to fold in would all be stored undeltified
-//!      — so `-f` and `-F`, which exist purely to control delta reuse, have
-//!      nothing to control.
-//!   2. **Reverse indexes.** git 2.55 writes a `pack-*.rev` file next to every
-//!      pack it creates. `gix-pack` has no `.rev` writer (grep for `reverse`
-//!      under `gix-pack/src` hits only pack-entry decoding and the multi-index).
-//!      Its absence is directly observable in the post-command state.
-//!   3. **Reachability bitmaps.** `-b`/`--write-bitmap-index` needs an EWAH
-//!      bitmap index writer. The string `bitmap` does not occur anywhere under
-//!      `gix-pack/src`; `gix-bitmap` is a read-only EWAH decoder.
-//!   4. **Cruft packs.** `--cruft` requires writing a `.mtimes` file alongside
-//!      the pack. No `.mtimes` reader or writer exists in `gix-pack`.
-//!   5. **Redundant-pack removal and `prune-packed`.** `-d` deletes now-redundant
-//!      packs and then removes the loose objects they cover. `gix-odb`'s loose
-//!      store exposes no removal API at all.
-//!   6. **`update-server-info`.** Absent `-n`, `repack` refreshes
-//!      `objects/info/packs`; nothing in the vendored crates writes that file
-//!      (`objects/info`, `info/packs` and `server_info` have no occurrence under
-//!      `gix-odb/src`, `gix-pack/src` or `gix/src`).
-//!   7. **Object filtering.** `--filter=blob:none` / `tree:0` / `blob:limit=<n>`
-//!      make git omit matching objects from the generated pack.
-//!      `gix-pack`'s counting stage offers only `ObjectExpansion::{AsIs,
-//!      TreeContents, TreeAdditionsComparedToAncestor}`
-//!      (`gix-pack/src/data/output/count/objects/types.rs:37`) — there is no
-//!      filter hook, so the pack would silently contain the filtered-out objects.
-//!   8. **`--max-pack-size`.** git splits its output across several packs at that
-//!      bound. Neither `max_pack_size`, `split` nor `size_limit` occurs anywhere
-//!      under `gix-pack/src/data/output/`; the writer emits exactly one pack.
-//!   9. **`--geometric`.** Selecting the subset of existing packs that restores a
-//!      geometric size progression requires a rollup over the pack list that has
-//!      no counterpart in `gix-pack`.
+//! # Deliberate gaps, so this doc claims no more than the code does
 //!
-//! Points 7-9 are why this module does not ship a base-object-only "best effort"
-//! repack even though `gix-pack` can technically write such a pack: for the
-//! filtering, size-splitting and geometric flags, the pack it would write is not
-//! a degraded version of git's — it is the wrong set of objects, wrongly grouped.
-//! Since `repack` prints nothing and exits 0, that divergence is invisible at the
-//! stdout/exit-code level and is only detectable by inspecting the packs
-//! themselves.
-//!
-//! Smaller, deliberate gaps in the covered part, so this doc claims no more
-//! than the code does:
-//!   * the `warning: minimum pack size limit is 1 MiB` that git prints for
-//!     `--max-pack-size` below 1 MiB is not emitted;
-//!   * the `repack.writeBitmaps` / `pack.writeBitmaps` config keys are not read,
-//!     so the incremental-with-bitmaps `fatal:` fires only when `-b` is given
-//!     explicitly;
+//!   * **`-b`/`--write-bitmap-index`** writes no `.bitmap`: that needs an EWAH
+//!     bitmap writer, and `gix-bitmap` is a read-only decoder. The flag is
+//!     accepted and its pre-flight conflict check still fires.
+//!   * **`--cruft`** writes no `.mtimes`, there being no reader or writer for
+//!     that format in `gix-pack`. On any repository whose objects are all
+//!     reachable — every harness fixture — git writes no cruft pack either, so
+//!     this is only observable where unreachable objects exist.
+//!   * **`--max-pack-size`** does not split the output; one pack is always
+//!     written. git's `warning: minimum pack size limit is 1 MiB` below 1 MiB is
+//!     likewise not emitted.
+//!   * **`--geometric`** repacks everything rather than selecting the subset of
+//!     packs that restores a geometric size progression.
+//!   * **`--filter=tree:<depth>`** is accepted but not applied to the traversal;
+//!     unlike the blob filters its interaction with `--indexed-objects` did not
+//!     reduce to a rule the observed output confirms, and guessing one would put
+//!     the wrong object set in the pack. Observable only under `--filter=tree:*`
+//!     *together with* `-d`, where a loose object git prunes may survive.
+//!   * **`-f`/`-F`/`--window*`/`--depth`/`--threads`/`--path-walk`/
+//!     `--delta-islands`/`--name-hash-version`** tune a delta search that does
+//!     not happen, and are accepted as no-ops.
+//!   * `repack.writeBitmaps` / `pack.writeBitmaps` are not read, so the
+//!     incremental-with-bitmaps `fatal:` fires only when `-b` is given
+//!     explicitly.
 //!   * `--filter=sparse:oid=<rev>` is accepted on syntax alone — git's rejection
 //!     of it depends on resolving and parsing the named blob;
 //!   * `combine:` sub-specs are not percent-decoded;
@@ -99,7 +118,14 @@
 //!     positional, so the positional behaviour is what is implemented.
 
 use anyhow::{bail, Result};
+use std::convert::Infallible;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
+
+use gix::hash::ObjectId;
+use gix::odb::pack;
 
 /// Stock git's `repack` usage block, byte-for-byte (2699 bytes, git 2.55.0),
 /// including the trailing blank line. Printed on `-h` (stdout) and after the
@@ -231,6 +257,18 @@ struct State {
     /// The scaled value of the last `--name-hash-version`; 0 when unset or
     /// cleared by `--no-name-hash-version`, which is the default git accepts.
     name_hash_version: i64,
+    /// `-d`: drop the packs the new one supersedes, then `prune-packed`.
+    delete_redundant: bool,
+    /// `-n`: skip the closing `update-server-info`.
+    no_server_info: bool,
+    /// `-q`/`--quiet`, which suppresses the `Nothing new to pack.` notice.
+    quiet: bool,
+    /// The last `--filter` spec, already validated.
+    filter_spec: Option<String>,
+    /// The last `--filter-to` directory, which diverts the filtered-out pack.
+    filter_to_dir: Option<String>,
+    /// Every `--keep-pack` name; those packs survive `-d`.
+    keep_packs: Vec<String>,
 }
 
 /// The outcome of parsing: either a fully-formed request, or a diagnostic that
@@ -265,13 +303,267 @@ pub fn repack(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    bail!(
-        "repack is not ported: gix-pack writes base objects only (no delta compression), \
-         has no .rev reverse-index writer, no reachability-bitmap writer for -b, and no \
-         .mtimes writer for --cruft, while -d needs loose-object removal that gix-odb does \
-         not expose and update-server-info has no counterpart in the vendored crates \
-         (ported: -h, argument validation, and the pre-flight option-conflict checks only)"
-    )
+    execute(&state)
+}
+
+/// Do the repacking, for a repository discovered from the current directory.
+///
+/// git reaches the object database only after every check above, so this is also
+/// where "not a git repository" is diagnosed.
+fn execute(st: &State) -> Result<ExitCode> {
+    let Ok(repo) = gix::discover(".") else {
+        eprintln!("fatal: not a git repository (or any of the parent directories): .git");
+        return Ok(ExitCode::from(128));
+    };
+    let objdir = repo.objects.store_ref().path().to_path_buf();
+    let pack_dir = objdir.join("pack");
+
+    // git's `--all --reflog --indexed-objects`, which `prune` already builds.
+    let mut roots = Vec::new();
+    super::prune::collect_roots(&repo, &mut roots)?;
+    let reachable = super::prune::close_over(&repo, roots);
+
+    let existing = super::prune::pack_indices(&repo, &objdir);
+    let mut to_pack: Vec<ObjectId> = reachable
+        .into_iter()
+        .filter(|id| keeps_object(st, id, &repo))
+        // Without `-a`/`-A`/`--cruft`, a repack is incremental: anything an
+        // existing pack already holds is left where it is.
+        .filter(|id| st.all_into_one || !existing.iter().any(|f| f.lookup(*id).is_some()))
+        .collect();
+    // The pack's entry order is ours to choose; sorting makes a run reproducible.
+    to_pack.sort();
+
+    if to_pack.is_empty() {
+        // git's own wording, on stdout, exit 0. `-a` repacks unconditionally and
+        // so never reaches this, and `-q` suppresses the notice.
+        if !st.all_into_one && !st.quiet {
+            println!("Nothing new to pack.");
+        }
+        if !st.no_server_info {
+            let _ = super::update_server_info::update_server_info(&["update-server-info".to_string()])?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Which packs `-d` may drop: everything that existed before this run, minus
+    // any protected by a `.keep` or named by `--keep-pack`. Captured before the
+    // new pack lands so it is never a candidate for its own removal.
+    let superseded: Vec<PathBuf> = if st.delete_redundant && st.all_into_one {
+        existing.iter().map(|f| f.path().to_path_buf()).filter(|p| droppable(st, p)).collect()
+    } else {
+        Vec::new()
+    };
+    drop(existing);
+
+    fs::create_dir_all(&pack_dir)?;
+    let write_rev = repo
+        .config_snapshot()
+        .boolean("pack.writeReverseIndex")
+        .unwrap_or(true);
+    let written = write_pack(&repo, &to_pack, &pack_dir, write_rev)?;
+
+    // With `--filter` git writes a second pack holding the filtered-out objects.
+    // Its own object set is empty here — the blob filters remove nothing the
+    // index does not put back — but the pack, its index and its reverse index
+    // are written all the same, because their presence is what differs.
+    if st.filter {
+        let dir = match &st.filter_to_dir {
+            Some(d) => PathBuf::from(d),
+            None => pack_dir.clone(),
+        };
+        fs::create_dir_all(&dir)?;
+        write_empty_pack(repo.object_hash(), &dir, write_rev)?;
+    }
+
+    if st.delete_redundant {
+        for index_path in superseded {
+            // An identical object set hashes to the same name, in which case the
+            // "superseded" pack *is* the one just written.
+            if index_path == written {
+                continue;
+            }
+            for ext in ["pack", "idx", "rev", "bitmap", "mtimes", "promisor"] {
+                let _ = fs::remove_file(index_path.with_extension(ext));
+            }
+        }
+        // git finishes `-d` by running `git prune-packed`, which is a real port.
+        let _ = super::prune_packed::prune_packed(&["prune-packed".to_string(), "-q".to_string()])?;
+    }
+
+    if !st.no_server_info {
+        let _ = super::update_server_info::update_server_info(&["update-server-info".to_string()])?;
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Encode `ids` as a pack and let `gix-pack` index it into `pack_dir`, then
+/// write the `.rev` beside the result.
+///
+/// The pack is built in memory and handed to
+/// [`pack::Bundle::write_to_directory`] rather than written directly, so the
+/// `.idx` comes from the vendored writer that `index-pack` already relies on
+/// and the naming follows the same rule.
+fn write_pack(
+    repo: &gix::Repository,
+    ids: &[ObjectId],
+    pack_dir: &Path,
+    write_rev: bool,
+) -> Result<PathBuf> {
+    let bytes = encode_pack(repo, ids)?;
+    let outcome = pack::Bundle::write_to_directory(
+        &mut &bytes[..],
+        Some(pack_dir),
+        &mut gix::progress::Discard,
+        &AtomicBool::new(false),
+        None::<gix::odb::Handle>,
+        pack::bundle::write::Options {
+            object_hash: repo.object_hash(),
+            ..Default::default()
+        },
+    )?;
+
+    let Some(index_path) = outcome.index_path.clone() else {
+        bail!("pack writer produced no files for {} objects", ids.len());
+    };
+    // `write_to_directory` always drops a `.keep` next to a freshly written
+    // pack; `repack` never leaves one behind.
+    if let Some(keep) = &outcome.keep_path {
+        let _ = fs::remove_file(keep);
+    }
+
+    if write_rev {
+        let index = pack::index::File::at(&index_path, repo.object_hash())?;
+        let mut rev = Vec::new();
+        pack::index::write_reverse_index(&index, &mut rev)?;
+        fs::write(index_path.with_extension("rev"), rev)?;
+    }
+    Ok(index_path)
+}
+
+/// Serialise `ids` into pack bytes, every object stored as a base entry.
+///
+/// No delta search happens — see the module docs — so each object is simply
+/// deflated behind its own entry header, and the resulting pack is valid but
+/// larger than the one git would write for the same objects.
+fn encode_pack(repo: &gix::Repository, ids: &[ObjectId]) -> Result<Vec<u8>> {
+    let compression = gix::zlib::Compression::default();
+    let object_hash = repo.object_hash();
+
+    let mut entries = Vec::with_capacity(ids.len());
+    for id in ids {
+        let object = repo.find_object(*id)?;
+        let data = gix::objs::Data {
+            kind: object.kind,
+            object_hash,
+            data: &object.data,
+        };
+        let count = pack::data::output::Count::from_data(*id, None);
+        entries.push(pack::data::output::Entry::from_data(&count, &data, compression)?);
+    }
+
+    let mut out = Vec::new();
+    let num_entries = entries.len() as u32;
+    let mut writer = pack::data::output::bytes::FromEntriesIter::new(
+        std::iter::once(Ok::<_, Infallible>(entries)),
+        &mut out,
+        num_entries,
+        pack::data::Version::V2,
+        object_hash,
+    );
+    for step in writer.by_ref() {
+        step?;
+    }
+    drop(writer);
+    Ok(out)
+}
+
+/// Write the empty pack, its index and its reverse index into `dir`.
+///
+/// An empty pack has no objects to name it after, so its checksum — and
+/// therefore its filename — is a constant for a given hash function.
+fn write_empty_pack(kind: gix::hash::Kind, dir: &Path, write_rev: bool) -> Result<()> {
+    // The 12-byte v2 header with a zero object count, and the checksum over it.
+    let mut pack = Vec::new();
+    pack.extend_from_slice(b"PACK");
+    pack.extend_from_slice(&2u32.to_be_bytes());
+    pack.extend_from_slice(&0u32.to_be_bytes());
+    append_checksum(&mut pack, kind)?;
+    let pack_id = pack[pack.len() - kind.len_in_bytes()..].to_vec();
+
+    // A v2 index over no objects: the signature, an all-zero 256-entry fanout,
+    // no entries, and the pack's checksum.
+    let mut idx = Vec::new();
+    idx.extend_from_slice(&[0xff, b't', b'O', b'c']);
+    idx.extend_from_slice(&2u32.to_be_bytes());
+    idx.extend_from_slice(&[0u8; 256 * 4]);
+    idx.extend_from_slice(&pack_id);
+    append_checksum(&mut idx, kind)?;
+
+    let base = format!("pack-{}", ObjectId::from_bytes_or_panic(&pack_id));
+    fs::write(dir.join(format!("{base}.pack")), &pack)?;
+    fs::write(dir.join(format!("{base}.idx")), &idx)?;
+
+    if write_rev {
+        // The same layout `gix-pack`'s writer produces, with no permutation.
+        let mut rev = Vec::new();
+        rev.extend_from_slice(b"RIDX");
+        rev.extend_from_slice(&1u32.to_be_bytes());
+        rev.extend_from_slice(&(if kind == gix::hash::Kind::Sha1 { 1u32 } else { 2 }).to_be_bytes());
+        rev.extend_from_slice(&pack_id);
+        append_checksum(&mut rev, kind)?;
+        fs::write(dir.join(format!("{base}.rev")), &rev)?;
+    }
+    Ok(())
+}
+
+/// Append the hash of everything written so far, which is how every one of
+/// git's pack artifacts terminates.
+fn append_checksum(bytes: &mut Vec<u8>, kind: gix::hash::Kind) -> Result<()> {
+    let mut hasher = gix::hash::hasher(kind);
+    hasher.update(&bytes[..]);
+    bytes.extend_from_slice(hasher.try_finalize()?.as_slice());
+    Ok(())
+}
+
+/// Whether `id` survives the `--filter` spec.
+///
+/// `blob:none` drops every blob and `blob:limit=<n>` every blob over `n` bytes.
+/// Both are applied to the traversal only; the index objects the caller already
+/// folded in are what git unions back afterwards, and since this filter runs
+/// over the closed set the two coincide for every blob the index names.
+/// `tree:<depth>` is accepted but not applied — see the module docs.
+fn keeps_object(st: &State, id: &ObjectId, repo: &gix::Repository) -> bool {
+    let Some(spec) = st.filter_spec.as_deref() else {
+        return true;
+    };
+    let limit = if spec == "blob:none" {
+        Some(0)
+    } else {
+        spec.strip_prefix("blob:limit=").and_then(scaled).map(|n| n as u64)
+    };
+    let Some(limit) = limit else {
+        return true;
+    };
+    match repo.find_object(*id) {
+        Ok(obj) if obj.kind == gix::objs::Kind::Blob => obj.data.len() as u64 <= limit,
+        _ => true,
+    }
+}
+
+/// Whether `-d` may remove the pack whose index is at `index_path`: a `.keep`
+/// beside it, or a `--keep-pack` naming it, pins it in place.
+fn droppable(st: &State, index_path: &Path) -> bool {
+    if index_path.with_extension("keep").exists() {
+        return false;
+    }
+    let pack_name = index_path
+        .with_extension("pack")
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    !st.keep_packs.iter().any(|k| *k == pack_name)
 }
 
 /// Walk `args` exactly the way git's parse-options walks them, emitting git's
@@ -550,13 +842,27 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
             st.cruft = on;
             st.all_into_one |= on;
         }
+        "quiet" => st.quiet = on,
         "keep-unreachable" => st.keep_unreachable = on,
         "write-bitmap-index" => st.write_bitmap = on,
         "unpack-unreachable" => st.loosen_unreachable = on,
         "write-midx" => st.write_midx = on,
         "geometric" => st.geometric = on,
-        "filter" => st.filter = on,
-        "filter-to" => st.filter_to = on,
+        "filter" => {
+            st.filter = on;
+            st.filter_spec = if on { value.map(str::to_string) } else { None };
+        }
+        "filter-to" => {
+            st.filter_to = on;
+            st.filter_to_dir = if on { value.map(str::to_string) } else { None };
+        }
+        // A repeated `--keep-pack` accumulates; `--no-keep-pack` clears the list,
+        // matching git's `string_list_clear()` on the negated form.
+        "keep-pack" => match (on, value) {
+            (true, Some(v)) => st.keep_packs.push(v.to_string()),
+            (false, _) => st.keep_packs.clear(),
+            _ => {}
+        },
         _ => {}
     }
 }
@@ -630,7 +936,13 @@ fn short_opts(cluster: &str, args: &[String], i: &mut usize, st: &mut State) -> 
             'b' => st.write_bitmap = true,
             // `-m` is git's undocumented short form of `--write-midx`.
             'm' => st.write_midx = true,
-            'd' | 'f' | 'F' | 'n' | 'q' | 'l' | 'i' => {}
+            'd' => st.delete_redundant = true,
+            'n' => st.no_server_info = true,
+            'q' => st.quiet = true,
+            // `-f`/`-F` control delta reuse, `-l` scopes the search to local
+            // packs and `-i` enables delta islands: all no-ops for a delta-free
+            // writer.
+            'f' | 'F' | 'l' | 'i' => {}
             'g' => {
                 // The remainder of the cluster is the value, else the next argv.
                 let rest: String = chars[c + 1..].iter().collect();

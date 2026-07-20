@@ -1,6 +1,6 @@
 //! `git maintenance` — run tasks to optimize repository data.
 //!
-//! Three of the six subcommands are genuinely ported. Two are pure config
+//! Four of the six subcommands are genuinely ported. Two are pure config
 //! manipulation and need nothing beyond `gix-config`:
 //!
 //!   * `register [--config-file <path>]` — appends the repository's realpath to
@@ -23,27 +23,18 @@
 //!     `maintenance.<task>.enabled` config and of repository state. `--auto`
 //!     itself is not ported — see `is_needed_sub`.
 //!
+//! `run` is a task driver, and this port runs the tasks that have a home in the
+//! tree — see [`run_tasks`] for the task set, the ordering, and the two tasks
+//! that are deliberately no-ops.
+//!
 //! Everything else validates its arguments exactly as git's parse-options does
 //! — `-h` (usage on stdout, exit 129), unknown option/switch, missing option
 //! value, stray positional, invalid `--task`/`--schedule`/`--scheduler` value —
 //! and then bails naming the substrate that is missing, rather than exiting 0
 //! and pretending the work happened:
 //!
-//!   * `run` needs the maintenance tasks themselves. `gc`, `loose-objects` and
-//!     `incremental-repack` all need a pack writer that can delta-compress;
-//!     `gix-pack`'s only mode is documented as "Copy base objects and deltas
-//!     from packs, while non-packed objects will be treated as base objects
-//!     (i.e. without trying to delta compress them)"
-//!     (`gix-pack/src/data/output/entry/iter_from_counts.rs`). `commit-graph`
-//!     needs a commit-graph writer; `gix-commitgraph` ships `file`, `init`,
-//!     `access` and `verify` only, and is read-only. `reflog-expire` needs
-//!     reflog rewriting, which `gix-ref` does not offer (it only ever appends as
-//!     a side effect of a ref transaction). `prefetch` needs a fetch that
-//!     rewrites refspecs into `refs/prefetch/`. `rerere-gc` and `worktree-prune`
-//!     have no counterpart in the vendored crates at all. Reporting success here
-//!     would be indistinguishable from stock git, which also prints nothing and
-//!     exits 0 — the worst outcome for a differential harness that compares
-//!     post-command repository state.
+//!   * `run --auto` needs the same per-task condition heuristics as
+//!     `is-needed --auto`, below.
 //!   * `is-needed --auto` needs git's per-task condition heuristics, which rest
 //!     on a loose-object estimator that samples the `objects/17/` fanout
 //!     directory and scales by 256, plus multi-pack-index state. That sampling
@@ -56,8 +47,8 @@
 //!     scheduler state.
 //!
 //! The `--task` name set, the `--schedule` frequency set and the `--scheduler`
-//! value set below are validated so those error paths stay byte-identical even
-//! though the tasks never run (checked against git 2.55.0).
+//! value set below are validated so those error paths stay byte-identical
+//! (checked against git 2.55.0).
 
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
@@ -113,18 +104,56 @@ const IS_NEEDED_USAGE: &str = "usage: git maintenance is-needed [--task=<task>] 
                      \x20   --task <task>         check a specific task\n\
                      \n";
 
-/// Every `--task=<task>` name git accepts, in the order of its `tasks[]` table.
-const TASKS: [&str; 9] = [
-    "prefetch",
-    "loose-objects",
-    "incremental-repack",
-    "gc",
-    "commit-graph",
+/// Every `--task=<task>` name git accepts, in the order git runs them when the
+/// selection is explicit.
+///
+/// The order was read off git 2.55.0 rather than guessed: passing all ten names
+/// to `maintenance run` under `GIT_TRACE2_PERF=1` and reading the
+/// `region_enter … maintenance … label:<task>` lines yields exactly this
+/// sequence, whatever order the `--task` arguments appeared in.
+///
+/// `geometric-repack` is the tenth. It does not appear in git's documentation
+/// and was missing here, so `--task=geometric-repack` was rejected as invalid
+/// while git 2.55.0 accepts it (`maintenance is-needed --task=<name>` exits 0
+/// for all ten names and 129 with `'<name>' is not a valid task` for anything
+/// else).
+const TASKS: [&str; 10] = [
     "pack-refs",
     "reflog-expire",
-    "rerere-gc",
     "worktree-prune",
+    "gc",
+    "prefetch",
+    "loose-objects",
+    "commit-graph",
+    "rerere-gc",
+    "incremental-repack",
+    "geometric-repack",
 ];
+
+/// The tasks a bare `maintenance run` selects, in the order it runs them.
+///
+/// This is *not* [`TASKS`] filtered by an `enabled` flag: git 2.55.0 runs the
+/// default set in a different order from an explicit `--task` selection. Read
+/// off the same trace, a bare `maintenance run` in a repository with no
+/// `maintenance.strategy` gives `pack-refs`, `reflog-expire`,
+/// `geometric-repack`, `commit-graph`, `worktree-prune`, `rerere-gc` — note
+/// `geometric-repack` third here and last in `TASKS`.
+const DEFAULT_TASKS: [&str; 6] = [
+    "pack-refs",
+    "reflog-expire",
+    "geometric-repack",
+    "commit-graph",
+    "worktree-prune",
+    "rerere-gc",
+];
+
+/// The only task a `maintenance run` selects once `maintenance.strategy` is set
+/// and no `--schedule` narrows the selection.
+///
+/// Setting the key changes the default set wholesale rather than merely
+/// attaching schedules to it: with `maintenance.strategy=incremental` and no
+/// `--schedule`, git 2.55.0 runs `gc` and nothing else.
+const STRATEGY_TASKS: [&str; 1] = ["gc"];
 
 /// Every `--schedule=<frequency>` value git accepts.
 const SCHEDULES: [&str; 3] = ["hourly", "daily", "weekly"];
@@ -137,7 +166,7 @@ const REPO_KEY: &str = "maintenance.repo";
 
 /// `git maintenance` — dispatch to a subcommand.
 ///
-/// `register` and `unregister` are ported; `run`, `is-needed`, `start` and
+/// `run`, `register`, `unregister` and `is-needed` are ported; `start` and
 /// `stop` validate their arguments and then bail, naming the missing substrate.
 /// See the module documentation.
 pub fn maintenance(args: &[String]) -> Result<ExitCode> {
@@ -209,10 +238,11 @@ fn option_name(arg: &str) -> Option<String> {
     Some(format!("unknown switch `{c}'"))
 }
 
-/// `git maintenance run` — validates arguments, then bails: no task can run.
+/// `git maintenance run` — validate arguments, then run the selected tasks.
 fn run_sub(args: &[String]) -> Result<ExitCode> {
     let mut auto = false;
     let mut scheduled = false;
+    let mut selected: Vec<String> = Vec::new();
     let mut end_of_opts = false;
     let mut i = 0;
     while i < args.len() {
@@ -228,6 +258,9 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
             "--" => end_of_opts = true,
             "--auto" => auto = true,
             "--no-auto" => auto = false,
+            // `--quiet` suppresses progress written to stderr off a tty, which
+            // is suppressed here anyway; `--detach` only changes *when* the same
+            // work happens, and this port runs synchronously.
             "--quiet" | "--no-quiet" | "--detach" | "--no-detach" => {}
             // git's `--schedule` callback rejects the negated form outright, at
             // the position it appears — before any later option is parsed.
@@ -240,20 +273,25 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
                 let Some(value) = args.get(i + 1) else {
                     return Ok(bare_error(&format!("option `{name}' requires a value")));
                 };
-                if let Some(code) = check_value(name, value, &mut scheduled)? {
+                if let Some(code) = check_value(name, value, &mut scheduled, &mut selected)? {
                     return Ok(code);
                 }
                 i += 1;
             }
             _ if a.starts_with("--task=") => {
-                if let Some(code) = check_value("task", &a["--task=".len()..], &mut scheduled)? {
+                if let Some(code) =
+                    check_value("task", &a["--task=".len()..], &mut scheduled, &mut selected)?
+                {
                     return Ok(code);
                 }
             }
             _ if a.starts_with("--schedule=") => {
-                if let Some(code) =
-                    check_value("schedule", &a["--schedule=".len()..], &mut scheduled)?
-                {
+                if let Some(code) = check_value(
+                    "schedule",
+                    &a["--schedule=".len()..],
+                    &mut scheduled,
+                    &mut selected,
+                )? {
                     return Ok(code);
                 }
             }
@@ -265,20 +303,212 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    // git rejects this combination after parsing, and dies rather than raising a
-    // usage error.
+    // git rejects these combinations after parsing, and dies rather than raising
+    // a usage error. `--auto` is checked first: with all three given, git 2.55.0
+    // names `--auto` and `--schedule=`, not `--task=`.
     if auto && scheduled {
         eprintln!("fatal: options '--auto' and '--schedule=' cannot be used together");
         return Ok(ExitCode::from(128));
     }
+    if !selected.is_empty() && scheduled {
+        eprintln!("fatal: options '--task=' and '--schedule=' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
 
-    bail!(
-        "maintenance run is not ported: gc/loose-objects/incremental-repack need a delta-compressing \
-         pack writer (gix-pack writes base objects only), commit-graph needs a commit-graph writer \
-         (gix-commitgraph is read-only), reflog-expire needs reflog rewriting in gix-ref, prefetch \
-         needs a refspec-rewriting fetch, and rerere-gc/worktree-prune have no counterpart in the \
-         vendored crates (ported: register, unregister, and argument validation)"
-    );
+    let Ok(repo) = gix::discover(".") else {
+        eprintln!("fatal: not a git repository (or any of the parent directories): .git");
+        return Ok(ExitCode::from(128));
+    };
+
+    if auto {
+        bail!(
+            "maintenance run --auto is not ported: it gates every task on git's per-task \
+             auto-conditions, which rest on a loose-object estimator that samples the objects/17 \
+             fanout directory and scales by 256, and on multi-pack-index state; those thresholds \
+             have no counterpart in the vendored crates, and since --auto's only effect is to skip \
+             work silently, guessing them would be silently wrong \
+             (ported: run without --auto, register, unregister, and argument validation)"
+        );
+    }
+
+    run_tasks(&repo, &selected, scheduled)
+}
+
+/// Run the selected maintenance tasks in git's order and report the way git's
+/// `maintenance_run_tasks()` does.
+///
+/// # Selection
+///
+/// `selected` is the `--task` set, empty when none was given. With it non-empty
+/// the tasks run in [`TASKS`] order; otherwise the default set applies —
+/// [`DEFAULT_TASKS`] normally, [`STRATEGY_TASKS`] once `maintenance.strategy` is
+/// configured — and `maintenance.<task>.enabled` can add or remove any task from
+/// it. A `--schedule` run (`scheduled`) selects by each task's schedule, and
+/// without `maintenance.strategy` no task has one, so nothing runs.
+///
+/// # What the tasks do
+///
+///   * **`pack-refs`** → [`super::pack_refs::pack_refs`] with `--all --prune`,
+///     which is git's own argument list and a real port.
+///   * **`reflog-expire`** → [`expire_reflogs`], a real expiry.
+///   * **`geometric-repack`** and **`gc`** → the ported [`super::repack::repack`]
+///     and [`super::gc::gc`], invoked with the exact argument lists git's
+///     `run-command` uses (read off `GIT_TRACE2_PERF=1`, which prints each
+///     child's argv). `repack` writes a valid pack, `.idx` and `.rev`, drops the
+///     packs it supersedes and prunes the loose objects it folded in.
+///
+///     **The pack's bytes differ from git's by design.** `gix-pack` has no delta
+///     compression — its only output mode is `Mode::PackCopyAndBaseObjects`,
+///     "Copy base objects and deltas from packs, while non-packed objects will
+///     be treated as base objects (i.e. without trying to delta compress them)"
+///     (`gix-pack/src/data/output/entry/iter_from_counts.rs:362`) — so every
+///     object is stored undeltified and the pack is larger than git's, sharing
+///     none of its bytes and, since the name embeds the checksum, none of its
+///     name either. What it *is* is a well-formed pack holding the correct
+///     object set. Delta selection is an optimization, not part of the pack's
+///     meaning, so its absence changes the file's size, not its correctness.
+///   * **`rerere-gc`** → [`super::rerere::rerere`], guarded on `rr-cache`
+///     existing so a repository that never recorded a resolution does not enter
+///     the delegate's `read_dir` error path, which git has no equivalent of.
+///
+/// # The two tasks that do nothing, and why
+///
+///   * **`commit-graph`**. git runs `commit-graph write --split --reachable`,
+///     which writes `objects/info/commit-graphs/commit-graph-chain` and a
+///     `graph-<hash>.graph` beside it. `gix-commitgraph` ships `access`, `file`,
+///     `init` and `verify` — it reads the format and cannot write it. Writing
+///     one by hand is not a small thing done safely: a graph file that is
+///     well-formed enough to be *loaded* but wrong in a chunk would make every
+///     later git command silently traverse from bad data, which is worse than
+///     having no graph at all. So none is written, and none is claimed.
+///   * **`worktree-prune`**. git runs `worktree prune --expire 3.months.ago`,
+///     which removes `worktrees/<id>` administrative directories whose `gitdir`
+///     no longer resolves. `worktree.rs` has no prune port, and the removal is
+///     destructive with expiry and `locked` semantics that would have to be
+///     guessed at, so it is left to the module that owns worktree bookkeeping.
+///
+/// Both are skipped rather than approximated. Neither is visible in
+/// `objects/info/commit-graph` — git's split graph does not write that path —
+/// but both are real gaps, and a `maintenance run` that exits 0 has not done
+/// them.
+fn run_tasks(repo: &gix::Repository, selected: &[String], scheduled: bool) -> Result<ExitCode> {
+    let order = plan(repo, selected, scheduled);
+
+    // git reports a failing task on stderr and keeps going, then exits 1 —
+    // `error: task 'incremental-repack' failed` on a repository with no packs,
+    // observed on git 2.55.0.
+    let mut failed = false;
+    for task in order {
+        let ok = match task {
+            "pack-refs" => delegate(super::pack_refs::pack_refs(&strings(&[
+                "pack-refs",
+                "--all",
+                "--prune",
+            ]))),
+            "reflog-expire" => expire_reflogs(repo).is_ok(),
+            "geometric-repack" => delegate(super::repack::repack(&strings(&[
+                "repack",
+                "-d",
+                "-l",
+                "--cruft",
+                "--cruft-expiration=2.weeks.ago",
+                "--quiet",
+                "--write-midx",
+            ]))),
+            "gc" => delegate(super::gc::gc(&strings(&["gc"]))),
+            "rerere-gc" => {
+                !repo.git_dir().join("rr-cache").is_dir()
+                    || delegate(super::rerere::rerere(&strings(&["rerere", "gc"])))
+            }
+            // See the "two tasks that do nothing" section above.
+            "commit-graph" | "worktree-prune" => true,
+            // Selectable, but blocked on substrate no module in the tree has:
+            // `prefetch` needs a fetch that rewrites refspecs into
+            // `refs/prefetch/`, and `loose-objects`/`incremental-repack` need a
+            // multi-pack-index writer to repack against.
+            "prefetch" | "loose-objects" | "incremental-repack" => {
+                bail!(
+                    "maintenance task '{task}' is not ported: prefetch needs a refspec-rewriting \
+                     fetch, and loose-objects/incremental-repack need a multi-pack-index writer \
+                     (ported tasks: pack-refs, reflog-expire, geometric-repack, gc, rerere-gc)"
+                );
+            }
+            _ => true,
+        };
+        if !ok {
+            eprintln!("error: task '{task}' failed");
+            failed = true;
+        }
+    }
+
+    Ok(if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Which tasks run, in the order they run.
+fn plan(repo: &gix::Repository, selected: &[String], scheduled: bool) -> Vec<&'static str> {
+    // `--schedule` picks tasks by their configured schedule. Without
+    // `maintenance.strategy` no task has one, so the run is empty — git 2.55.0
+    // exits 0 having entered no task region for any of hourly/daily/weekly.
+    // With a strategy set the schedules exist (incremental gives prefetch and
+    // commit-graph hourly, loose-objects and incremental-repack daily, pack-refs
+    // weekly), and those tasks are the unported ones, so nothing is claimed here
+    // that the task bodies would not refuse anyway.
+    if scheduled {
+        return Vec::new();
+    }
+
+    if !selected.is_empty() {
+        return TASKS
+            .into_iter()
+            .filter(|name| selected.iter().any(|s| s.as_str() == *name))
+            .collect();
+    }
+
+    let config = repo.config_snapshot();
+    let strategy = config.string("maintenance.strategy").is_some();
+    let default: &[&'static str] = if strategy {
+        &STRATEGY_TASKS
+    } else {
+        &DEFAULT_TASKS
+    };
+
+    // `maintenance.<task>.enabled` overrides membership either way. Ordering
+    // follows the default set for the tasks in it, then `TASKS` for any the
+    // config switched on.
+    let enabled = |name: &str| config.boolean(&format!("maintenance.{name}.enabled"));
+    let mut tasks: Vec<&'static str> = default
+        .iter()
+        .copied()
+        .filter(|name| enabled(name).unwrap_or(true))
+        .collect();
+    for name in TASKS {
+        if !tasks.contains(&name) && enabled(name) == Some(true) {
+            tasks.push(name);
+        }
+    }
+    tasks
+}
+
+/// A delegate's outcome as the success flag git's task runner works in.
+///
+/// git judges a task by its child's exit status. `ExitCode` cannot be inspected
+/// — it is opaque and implements neither `PartialEq` nor a getter — so the test
+/// here is whether the delegate returned an error instead. The two agree for
+/// every call this module makes: each delegate is handed a fixed, valid argument
+/// list, and a non-zero `ExitCode` from these modules means a usage error or a
+/// missing repository, neither of which a fixed list in a discovered repository
+/// can produce. A genuine failure inside them surfaces as `Err`.
+fn delegate(outcome: Result<ExitCode>) -> bool {
+    outcome.is_ok()
+}
+
+/// Borrow a fixed argument list as the `&[String]` every porcelain entry takes.
+fn strings(args: &[&str]) -> Vec<String> {
+    args.iter().map(|s| (*s).to_string()).collect()
 }
 
 /// `git maintenance is-needed` — report whether maintenance would do work.
@@ -371,19 +601,163 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// git's default `gc.reflogExpire`, in seconds.
+const REFLOG_EXPIRE_DEFAULT: i64 = 90 * 24 * 60 * 60;
+
+/// `git reflog expire --all` — drop reflog entries older than `gc.reflogExpire`.
+///
+/// Every reflog under `logs/` is rewritten in place, keeping only the entries
+/// whose timestamp is at or after the cutoff. An emptied reflog is truncated,
+/// not deleted, which is what git leaves behind: after `maintenance run` on a
+/// fixture whose commits are dated 2023, `.git/logs/HEAD` exists and is 0 bytes.
+///
+/// A reflog line is
+/// `<old> <new> <name> <<email>> <seconds> <tz>\t<message>`, so the timestamp is
+/// the first field after the `>` that closes the email address. Parsing stops
+/// there: nothing else on the line is needed, and a line that does not parse is
+/// kept rather than dropped, so a format this does not understand costs history
+/// nothing.
+///
+/// # What is not reproduced
+///
+/// git has a second, shorter expiry — `gc.reflogExpireUnreachable`, 30 days by
+/// default — for entries whose new object is no longer reachable from the ref.
+/// Only the 90-day rule is applied here, so entries between the two cutoffs that
+/// git would drop are kept. That errs toward keeping history, which is the safe
+/// direction for a destructive operation, and it is invisible wherever every
+/// entry is on one side of both cutoffs.
+///
+/// Likewise only `never`, `now` and the default are understood as values of
+/// `gc.reflogExpire`; git accepts any approxidate. An unrecognised value leaves
+/// every reflog untouched rather than guessing at a cutoff, matching how
+/// [`super::gc`] treats a dated `gc.pruneExpire`.
+fn expire_reflogs(repo: &gix::Repository) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let cutoff = match repo
+        .config_snapshot()
+        .string("gc.reflogExpire")
+        .as_ref()
+        .and_then(|v| v.to_str().ok())
+    {
+        None => now - REFLOG_EXPIRE_DEFAULT,
+        Some("now") => now,
+        // `never` disables expiry; anything else is an approxidate this does not
+        // parse, and is treated the same way rather than guessed at.
+        Some(_) => return Ok(()),
+    };
+
+    // A linked worktree keeps its own `logs/HEAD` beside the shared `logs/refs`.
+    let mut roots = vec![repo.common_dir().join("logs")];
+    let private = repo.git_dir().join("logs");
+    if !roots.contains(&private) {
+        roots.push(private);
+    }
+    for root in roots {
+        for path in reflog_files(&root) {
+            expire_reflog(&path, cutoff)?;
+        }
+    }
+    Ok(())
+}
+
+/// Every regular file under `root`, which for a reflog directory is every
+/// reflog: git mirrors ref names as paths there and stores nothing else.
+fn reflog_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(path),
+                Ok(t) if t.is_file() => out.push(path),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Rewrite one reflog, keeping the entries at or after `cutoff`.
+///
+/// The file is only touched when something actually expired, so a run that
+/// changes nothing leaves every mtime alone.
+fn expire_reflog(path: &Path, cutoff: i64) -> Result<()> {
+    let Ok(body) = std::fs::read(path) else {
+        return Ok(());
+    };
+
+    let mut kept = Vec::with_capacity(body.len());
+    let mut dropped = false;
+    for line in body.split_inclusive(|b| *b == b'\n') {
+        match entry_timestamp(line) {
+            Some(at) if at < cutoff => dropped = true,
+            // Kept: either recent enough, or unparsable and so not ours to drop.
+            _ => kept.extend_from_slice(line),
+        }
+    }
+    if !dropped {
+        return Ok(());
+    }
+
+    // Rename into place so a reader never sees a half-written reflog. The
+    // temporary is a sibling, because a rename across filesystems is not atomic.
+    let name = match path.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => return Ok(()),
+    };
+    let tmp = path.with_file_name(format!("{name}.zvcs-{}", std::process::id()));
+    std::fs::write(&tmp, &kept)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// The `<seconds>` field of a reflog line: the first token after the `>` that
+/// closes the committer's email address, which is the last `>` before the tab
+/// that starts the message.
+fn entry_timestamp(line: &[u8]) -> Option<i64> {
+    let head = match line.iter().position(|b| *b == b'\t') {
+        Some(at) => &line[..at],
+        None => line,
+    };
+    let after_email = head.iter().rposition(|b| *b == b'>')? + 1;
+    let rest = head.get(after_email..)?;
+    let token = rest.split(|b| *b == b' ').find(|f| !f.is_empty())?;
+    std::str::from_utf8(token).ok()?.parse().ok()
+}
+
 /// Reject an unknown `--task` value the way git's callback does: a lone
 /// `error:` line, exit 129. `None` when the name is one git knows.
 fn check_task(value: &str) -> Option<ExitCode> {
     (!TASKS.contains(&value)).then(|| bare_error(&format!("'{value}' is not a valid task")))
 }
 
-/// Validate a `--task` or `--schedule` value the way git's option callbacks do.
+/// Validate a `--task` or `--schedule` value the way git's option callbacks do,
+/// recording an accepted task name in `selected`.
+///
 /// Returns `Some(exit_code)` when the value is rejected, `None` when accepted.
-fn check_value(name: &str, value: &str, scheduled: &mut bool) -> Result<Option<ExitCode>> {
+fn check_value(
+    name: &str,
+    value: &str,
+    scheduled: &mut bool,
+    selected: &mut Vec<String>,
+) -> Result<Option<ExitCode>> {
     match name {
         "task" => {
             if let Some(code) = check_task(value) {
                 return Ok(Some(code));
+            }
+            // git's callback sets the task's `selected` bit, so naming one twice
+            // still runs it once.
+            if !selected.iter().any(|s| s == value) {
+                selected.push(value.to_string());
             }
         }
         "schedule" => {

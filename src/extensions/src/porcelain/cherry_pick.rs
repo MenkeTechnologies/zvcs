@@ -63,11 +63,13 @@
 //!   `dropping <oid> <subject> -- patch contents already upstream` line on
 //!   stderr under `--empty=drop`, and stops under the default `--empty=stop`.
 //!
-//! Stopping writes `CHERRY_PICK_HEAD` and `MERGE_MSG`, prints git's
-//! cherry-pick-in-progress status block on stdout and its advice on stderr, and
-//! exits 1 — matching stock git, whose worktree is necessarily clean at that
-//! point, so the `nothing to commit, working tree clean` tail is unconditional.
-//! `AUTO_MERGE` is not written; it names a tree git only needs for `--continue`.
+//! Stopping writes `CHERRY_PICK_HEAD`, `AUTO_MERGE` and `MERGE_MSG`, prints
+//! git's cherry-pick-in-progress status block on stdout and its advice on
+//! stderr, and exits 1 — matching stock git, whose worktree is necessarily clean
+//! at that point, so the `nothing to commit, working tree clean` tail is
+//! unconditional. `AUTO_MERGE` holds the merge result, which in this state is
+//! `HEAD`'s own tree. git's `MERGE_RR` is not written: it is rerere bookkeeping,
+//! and rerere does not participate here.
 //!
 //! ## Supported flags
 //!
@@ -718,7 +720,7 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
                     );
                     continue;
                 }
-                return stop_empty(&repo, pick_id, head_id, &message);
+                return stop_empty(&repo, pick_id, head_id, tree_id, &message);
             }
         }
 
@@ -820,19 +822,25 @@ fn handle_verb(verb: Verb, opts: &Opts<'_>) -> Result<ExitCode> {
     })
 }
 
-/// git's stopped-on-empty state: record `CHERRY_PICK_HEAD` and `MERGE_MSG`, print
-/// the in-progress status block on stdout and the advice on stderr, exit 1.
+/// git's stopped-on-empty state: record `CHERRY_PICK_HEAD`, `AUTO_MERGE` and
+/// `MERGE_MSG`, print the in-progress status block on stdout and the advice on
+/// stderr, exit 1.
 ///
 /// The worktree is necessarily clean here — the merged tree equalled `HEAD`'s —
-/// so the status block's body is fixed rather than derived from a diff.
+/// so the status block's body is fixed rather than derived from a diff. git still
+/// records the merge result as `AUTO_MERGE`, which in this state is that same
+/// tree; `merged_tree` is passed rather than re-derived so the file says what was
+/// actually merged.
 fn stop_empty(
     repo: &gix::Repository,
     pick_id: ObjectId,
     head_id: ObjectId,
+    merged_tree: ObjectId,
     message: &BString,
 ) -> Result<ExitCode> {
     let git_dir = repo.git_dir();
     std::fs::write(git_dir.join("CHERRY_PICK_HEAD"), format!("{pick_id}\n"))?;
+    std::fs::write(git_dir.join("AUTO_MERGE"), format!("{merged_tree}\n"))?;
     std::fs::write(git_dir.join("MERGE_MSG"), &message[..])?;
 
     match repo.head_name()? {

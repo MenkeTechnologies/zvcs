@@ -25,11 +25,12 @@
 //!   are not emitted — gitoxide's unified-diff writer does not compute them.
 //! * Magic pathspecs (`:(...)`) and glob pathspecs bail; literal path / directory-prefix
 //!   filtering is supported.
-//! * `git diff` on an unmerged path renders the combined (`--cc`) patch; `--cached` renders
-//!   git's `* Unmerged path` line.
+//! * `git diff` on an unmerged path renders the combined (`--cc`) patch, and only that —
+//!   the duplicate stage-2-vs-worktree pair the raw/name/stat formats also report is not
+//!   given a `diff --git` section. `--cached` renders git's `* Unmerged path` line.
 
 use anyhow::{bail, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -329,7 +330,17 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             if separator {
                 out.push(b'\n');
             }
+            // `run_diff_files()` queues an unmerged path twice — once as the `U`
+            // pair and once as the ordinary stage-2-vs-worktree modification — and
+            // the raw/name/stat formats above print both. The patch format prints
+            // only the combined (`--cc`) patch for such a path; the duplicate pair
+            // contributes no `diff --git` section of its own.
+            let unmerged: BTreeSet<&BString> =
+                deltas.iter().filter(|d| d.unmerged).map(|d| &d.path).collect();
             for (delta, an) in deltas.iter().zip(&analyses) {
+                if !delta.unmerged && unmerged.contains(&delta.path) {
+                    continue;
+                }
                 render_patch(&mut out, &repo, delta, an, ctx)?;
             }
         }

@@ -7,10 +7,15 @@
 //! The hook is `[zvcs] hook` in the repo's **merged** config, so a single
 //! `~/.gitconfig` `zvcs.hook` applies to every watched repo, and any repo may
 //! override it in its own `.git/config`. The command runs via `sh -c` with the
-//! repo as cwd and these environment variables set:
+//! repo as cwd and a **typed** event context in the environment — enough to write
+//! cross-repo reactive rules ("on `commit` in this repo, do X in repo Y"):
 //!   * `ZVCS_REPO`    — the repo working directory
 //!   * `ZVCS_GIT_DIR` — the repo git directory
-//!   * `ZVCS_EVENT`   — the event kind (currently `ref-change`)
+//!   * `ZVCS_EVENT`   — the operation, typed from the reflog: `commit`,
+//!     `checkout`, `merge`, `pull`, `rebase`, `reset`, `clone`, … (`ref-change` if
+//!     it can't be classified)
+//!   * `ZVCS_OLD_SHA` / `ZVCS_NEW_SHA` — HEAD before/after the change
+//!   * `ZVCS_REF`     — the current branch (or `HEAD` if detached)
 //!
 //! Hook output goes to the daemon log; a failing hook is recorded in the ledger
 //! so it surfaces via notify-on-next-command.
@@ -32,13 +37,25 @@ pub fn run(git_dir: &Path, workdir: &Path) {
     let Some(cmd) = hook_for(workdir) else {
         return;
     };
+    // Typed event context from the reflog.
+    let (old, new, kind) = crate::superset::oplog::latest_head_event(git_dir)
+        .unwrap_or_else(|| (String::new(), String::new(), "ref-change".to_string()));
+    let refname = gix::open(git_dir)
+        .ok()
+        .and_then(|r| r.head_name().ok().flatten())
+        .map(|n| n.shorten().to_string())
+        .unwrap_or_else(|| "HEAD".to_string());
+
     let out = Command::new("sh")
         .arg("-c")
         .arg(&cmd)
         .current_dir(workdir)
         .env("ZVCS_REPO", workdir)
         .env("ZVCS_GIT_DIR", git_dir)
-        .env("ZVCS_EVENT", "ref-change")
+        .env("ZVCS_EVENT", &kind)
+        .env("ZVCS_OLD_SHA", &old)
+        .env("ZVCS_NEW_SHA", &new)
+        .env("ZVCS_REF", &refname)
         .output();
 
     match out {

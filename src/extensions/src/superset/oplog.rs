@@ -41,6 +41,22 @@ fn read_head_reflog(git_dir: &Path) -> Vec<Entry> {
     }
 }
 
+/// The most recent HEAD event as `(old_sha, new_sha, kind)`, where `kind` is the
+/// operation typed from the reflog message (`commit`, `checkout`, `merge`,
+/// `pull`, `rebase`, `reset`, `clone`, …). Used to give hooks a typed event.
+pub(crate) fn latest_head_event(git_dir: &Path) -> Option<(String, String, String)> {
+    let entries = read_head_reflog(git_dir);
+    let e = entries.last()?;
+    let kind = e
+        .msg
+        .split([':', ' ', '('])
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    let kind = if kind.is_empty() { "ref-change".to_string() } else { kind };
+    Some((e.old.clone(), e.new.clone(), kind))
+}
+
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
 }

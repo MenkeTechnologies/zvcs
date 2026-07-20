@@ -45,6 +45,16 @@ impl Rng {
     fn chance(&mut self, num: u64, denom: u64) -> bool {
         self.next() % denom < num
     }
+
+    /// A count biased toward the low end but with a real tail: most draws are
+    /// small, yet `max` still comes up often enough to exercise deep stacking.
+    fn count_upto(&mut self, max: usize) -> usize {
+        // Two rolls, take the min — triangular, tail toward 0, but the full
+        // range is reachable. Deep combinations stay rare without being absent.
+        let a = self.below(max + 1);
+        let b = self.below(max + 1);
+        a.min(b).max(if self.chance(1, 6) { max } else { 0 })
+    }
 }
 
 /// What a subcommand accepts, as a grammar the generator samples from.
@@ -70,13 +80,35 @@ const ALL_SHAPES: &[Shape] = &[
 ];
 
 /// Rev-specs worth throwing at anything that resolves one. Includes forms that
-/// *should* fail, because agreeing on rejection is also parity.
+/// *should* fail, because agreeing on rejection is also parity, and the hard
+/// forms git's own `rev-parse` grammar allows: peels, ranges, reflog walks,
+/// `:path` object specs, `:/text` searches, and raw oids.
 const REVS: &[&str] = &[
-    "HEAD", "HEAD^", "HEAD~1", "HEAD~2", "main", "@", "HEAD@{0}",
-    "HEAD^{tree}", "HEAD^{commit}", "does-not-exist", "",
+    "HEAD", "HEAD^", "HEAD^^", "HEAD^2", "HEAD~1", "HEAD~2", "HEAD~3",
+    "HEAD^0", "HEAD^{}", "HEAD^{tree}", "HEAD^{commit}", "HEAD^{tag}",
+    "main", "@", "@~1", "@{-1}", "HEAD@{0}", "HEAD@{1}", "HEAD@{now}",
+    "main..HEAD", "main...HEAD", "HEAD~2..HEAD", "^HEAD",
+    "HEAD:README.md", ":/fixture", ":0:src/lib.rs", "refs/heads/main",
+    "0000000000000000000000000000000000000000", "deadbeef",
+    "does-not-exist", "@{999}", "HEAD~999", "",
 ];
 
-const PATHS: &[&str] = &["README.md", "src/lib.rs", "src", ".", "*.md", "no/such/path"];
+/// Path arguments including magic pathspecs, which have their own parser in git
+/// and are a rich source of divergence.
+const PATHS: &[&str] = &[
+    "README.md", "src/lib.rs", "src", "src/", ".", "./README.md", "..",
+    "*.md", "**/*.rs", "no/such/path",
+    ":(glob)**/*.rs", ":(icase)readme.md", ":!src", ":(exclude)*.md",
+    ":(top)README.md", ":(attr:text)", "with space.txt", "üñïçødé.txt",
+];
+
+/// Replacement values for `--flag=value` mutation: empty, boundary, overflow,
+/// and garbage. A parser that only ever saw well-formed values in the corpus
+/// meets malformed ones here.
+const VALUES: &[&str] = &[
+    "", "0", "1", "-1", "999999999", "99999999999999999999999999",
+    "abc", "true", "false", "v1", "=", "%H%n", "\t", "0x10",
+];
 
 /// Read-only grammars only. Fuzzing mutating commands with random flags
 /// produces cases whose *stock* behavior is itself ambiguous (interactive
@@ -214,33 +246,84 @@ pub fn generate(seed: u64, per_cmd: usize) -> Vec<Case> {
     out
 }
 
+/// Replace the `=value` of a `--flag=value` token with an edge-case value, or
+/// return the flag unchanged. Flags without `=` are left alone. This is how a
+/// value parser meets empty / overflow / garbage inputs it never saw curated.
+fn mutate_value(rng: &mut Rng, flag: &str) -> String {
+    match flag.split_once('=') {
+        Some((name, _)) if rng.chance(1, 3) => format!("{name}={}", rng.pick(VALUES)),
+        _ => flag.to_string(),
+    }
+}
+
+/// Build one invocation. Far more aggressive than a flag or two: it stacks
+/// **repeated** flags (deep enough to trip re-parse and last-wins bugs), mutates
+/// flag values, supplies **multiple** positionals, interleaves flags and
+/// positionals in argument order, and injects a `--` separator — every degree
+/// of freedom a real caller eventually exercises and none of which the corpus
+/// covers. Still a pure function of the RNG, so any failure replays from its
+/// seed.
 fn sample(rng: &mut Rng, g: &Grammar) -> Case {
+    // Up to 6 flags, WITH repetition allowed. Repeats are not dilution: a
+    // re-declared flag is exactly what surfaces last-wins and re-parse bugs.
+    let mut flag_tokens: Vec<String> = Vec::new();
+    if !g.flags.is_empty() {
+        for _ in 0..rng.count_upto(6) {
+            let flag = *rng.pick(g.flags);
+            flag_tokens.push(mutate_value(rng, flag));
+        }
+    }
+
+    // Up to 3 positionals, repetition allowed (`git log HEAD HEAD` is valid and
+    // has its own behavior). Empty positionals are dropped, not emitted.
+    let mut pos_tokens: Vec<String> = Vec::new();
+    if !g.positionals.is_empty() {
+        for _ in 0..rng.count_upto(3) {
+            let p = *rng.pick(g.positionals);
+            if !p.is_empty() {
+                pos_tokens.push(p.to_string());
+            }
+        }
+    }
+
     let mut args = vec![g.cmd.to_string()];
 
-    // 0..=3 flags, drawn without replacement so a combination is never diluted
-    // into "the same flag three times".
-    let n_flags = rng.below(4);
-    let mut chosen: Vec<&str> = Vec::new();
-    for _ in 0..n_flags {
-        if g.flags.is_empty() {
-            break;
+    // Ordering: usually flags-then-positionals as a caller writes it, but a
+    // fraction of the time interleave them, which tests that option parsing does
+    // not depend on flags preceding operands (git's does not; a buggy port's
+    // might). A `--` separator is injected before the positionals sometimes,
+    // both with and without interleaving.
+    let sep = !pos_tokens.is_empty() && rng.chance(1, 4);
+    if rng.chance(1, 3) && !flag_tokens.is_empty() && !pos_tokens.is_empty() {
+        // Interleave by draining the two lists in a random order.
+        let mut fi = flag_tokens.into_iter().peekable();
+        let mut pi = pos_tokens.into_iter().peekable();
+        let mut sep_done = !sep;
+        while fi.peek().is_some() || pi.peek().is_some() {
+            let take_flag = match (fi.peek().is_some(), pi.peek().is_some()) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => rng.chance(1, 2),
+            };
+            if take_flag {
+                args.push(fi.next().unwrap());
+            } else {
+                if !sep_done {
+                    args.push("--".to_string());
+                    sep_done = true;
+                }
+                args.push(pi.next().unwrap());
+            }
         }
-        let f = *rng.pick(g.flags);
-        if !chosen.contains(&f) {
-            chosen.push(f);
+        if !sep_done {
+            // No positional was emitted after all; nothing to separate.
         }
-    }
-    for f in &chosen {
-        args.push((*f).to_string());
-    }
-
-    // Positionals are optional: many of these commands have meaningfully
-    // different no-argument behavior, and that path deserves coverage too.
-    if !g.positionals.is_empty() && rng.chance(3, 4) {
-        let p = *rng.pick(g.positionals);
-        if !p.is_empty() {
-            args.push(p.to_string());
+    } else {
+        args.extend(flag_tokens);
+        if sep {
+            args.push("--".to_string());
         }
+        args.extend(pos_tokens);
     }
 
     Case { cmd: g.cmd, args, shape: *rng.pick(g.shapes) }

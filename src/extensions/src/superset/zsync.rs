@@ -66,6 +66,14 @@ pub fn reconcile_repo(repo: &gix::Repository) -> Result<String> {
         .detach();
 
     if local_id == remote_id {
+        // Already current — but a detached HEAD (the state `git submodule update`
+        // leaves, and the single most common one) must still be re-attached, or
+        // this early return would leave it detached forever. Local, no-clobber.
+        if repo.head_name()?.is_none() {
+            if let crate::superset::Attached::Attached { .. } = crate::superset::ensure_attached(repo)? {
+                return Ok(format!("up to date, re-attached to {mainline}"));
+            }
+        }
         return Ok(format!("up to date (origin/{mainline})"));
     }
     // A true fast-forward requires the local tip to be an ancestor of the remote

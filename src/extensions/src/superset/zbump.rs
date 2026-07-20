@@ -40,6 +40,7 @@ pub fn zbump(args: &[String]) -> Result<ExitCode> {
     // Owned, mutable copy of the parent index; staged once at the end.
     let mut index = repo.open_index()?;
     let mut staged = false;
+    let mut bumped = 0usize;
     let mut had_failure = false;
     let mut seen: Vec<String> = Vec::new();
 
@@ -118,6 +119,7 @@ pub fn zbump(args: &[String]) -> Result<ExitCode> {
         }
         entry.id = new;
         staged = true;
+        bumped += 1;
         println!(
             "bumped {path_str}: {}..{}",
             old.to_hex_with_len(12),
@@ -138,9 +140,19 @@ pub fn zbump(args: &[String]) -> Result<ExitCode> {
     // 4. Persist the index once if anything was staged. The tree-cache extension
     // is written as-is by `File::write`, so drop it after mutating entries or a
     // later commit could capture the stale subtree (see gix File::write docs).
+    //
+    // Then close the loop: record the bumped pointers in a commit. Staging alone
+    // leaves the parent's `modified: <sub> (new commits)` marker in place (it
+    // only moves from unstaged to staged); committing is what clears it. The
+    // commit is local, forward-only, and coalesces every bump into one revision.
     if staged {
         index.remove_tree();
         index.write(gix::index::write::Options::default())?;
+
+        let plural = if bumped == 1 { "" } else { "s" };
+        let message = format!("zvcs: autobump {bumped} submodule pointer{plural}");
+        let commit_id = crate::index_commit::commit_index(&repo, &index, &message)?;
+        println!("committed {} ({} pointer{})", commit_id.to_hex_with_len(12), bumped, plural);
     }
 
     Ok(if had_failure {

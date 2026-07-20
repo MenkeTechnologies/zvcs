@@ -7,6 +7,7 @@
 pub mod autostart;
 pub mod config;
 pub mod dispatch;
+pub mod index_commit;
 pub mod lock;
 pub mod porcelain;
 pub mod superset;

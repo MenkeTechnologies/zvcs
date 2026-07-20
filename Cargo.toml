@@ -3,5 +3,5 @@
 #   src/extensions : the zvcs superset — the single `git` shadow binary + coordination layer
 [workspace]
 resolver = "2"
-members = ["src/extensions"]
+members = ["src/extensions", "src/parity"]
 exclude = ["src/ported"]

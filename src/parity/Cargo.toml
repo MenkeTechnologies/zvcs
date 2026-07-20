@@ -1,0 +1,14 @@
+[package]
+name = "zvcs-parity"
+description = "Differential parity + fuzz harness: zvcs `git` vs stock git"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+# Measurement tool only — never linked into the shipped `git` binary.
+[[bin]]
+name = "zvcs-parity"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"

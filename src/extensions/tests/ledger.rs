@@ -58,6 +58,38 @@ fn crawler_indexes_repos_and_zrepos_lists_them() {
     let listed = zvcs(&home, &root, &["zrepos"]);
     assert!(listed.contains("alpha"), "zrepos missing alpha:\n{listed}");
     assert!(listed.contains("beta"), "zrepos missing beta:\n{listed}");
+    // Pipe-clean: no count/hint on stdout (piped, non-tty).
+    assert!(
+        !listed.contains("repo(s)"),
+        "zrepos stdout must be pipe-clean (no count line):\n{listed}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn zreindex_prunes_deleted_repos() {
+    let home = tmp("prune-home");
+    let root = tmp("prune-root");
+    for name in ["keep", "gone"] {
+        let r = root.join(name);
+        std::fs::create_dir_all(&r).unwrap();
+        git(&r, &["init", "-q", "-b", "main"]);
+    }
+
+    zvcs(&home, &root, &["zreindex", root.to_str().unwrap()]);
+    let before = zvcs(&home, &root, &["zrepos"]);
+    assert!(before.contains("keep") && before.contains("gone"), "both indexed:\n{before}");
+
+    // Delete one repo from disk, then reindex → it must be pruned.
+    std::fs::remove_dir_all(root.join("gone")).unwrap();
+    let out = zvcs(&home, &root, &["zreindex", root.to_str().unwrap()]);
+    assert!(out.contains("pruned 1"), "expected 1 pruned, got: {out}");
+
+    let after = zvcs(&home, &root, &["zrepos"]);
+    assert!(after.contains("keep"), "kept repo must remain:\n{after}");
+    assert!(!after.contains("gone"), "deleted repo must be pruned:\n{after}");
 
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&root);
@@ -70,7 +102,11 @@ fn zjobs_and_zrepos_are_empty_without_a_ledger() {
 
     // No db exists under this fresh ZVCS_HOME → graceful empties, not errors.
     assert!(zvcs(&home, &cwd, &["zjobs"]).contains("no jobs"));
-    assert!(zvcs(&home, &cwd, &["zrepos"]).to_lowercase().contains("no repo"));
+    // zrepos is pipe-clean: empty stdout when there's nothing (hint → stderr/tty).
+    assert!(
+        zvcs(&home, &cwd, &["zrepos"]).trim().is_empty(),
+        "empty zrepos must produce clean (empty) stdout"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&cwd);

@@ -76,6 +76,25 @@ pub fn open_ro() -> Result<Connection> {
     Ok(conn)
 }
 
+/// Remove repos whose git-dir no longer exists on disk (deleted since indexing).
+/// Returns the number pruned. Old jobs keep their `repo_id` (the join tolerates a
+/// missing repo), so history is preserved.
+pub fn prune_missing(conn: &Connection) -> Result<usize> {
+    let mut stmt = conn.prepare("SELECT id, git_dir FROM repos")?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut removed = 0;
+    for (id, git_dir) in rows {
+        if !std::path::Path::new(&git_dir).exists() {
+            conn.execute("DELETE FROM repos WHERE id=?1", [id])?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// Insert or refresh a repo row, returning its id.
 pub fn upsert_repo(conn: &Connection, git_dir: &Path, workdir: Option<&Path>) -> Result<i64> {
     let gd = git_dir.to_string_lossy();

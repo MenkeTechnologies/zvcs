@@ -5,35 +5,38 @@
 //! `zreindex` performs the crawl inline (writing the repo index).
 
 use anyhow::Result;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 /// `git zrepos` — list every repository in the index.
 pub fn zrepos(_args: &[String]) -> Result<ExitCode> {
+    // One clean path per line on stdout — safe to pipe into fzf/xargs. The count
+    // and any hints go to stderr, and only when interactive, so scripts see just
+    // the list.
+    let interactive = std::io::stdout().is_terminal();
     let conn = match crate::db::open_ro() {
         Ok(c) => c,
         Err(_) => {
-            println!("no repo index yet (run `git zreindex`)");
+            if interactive {
+                eprintln!("zvcs: no repo index yet (run `git zreindex`)");
+            }
             return Ok(ExitCode::SUCCESS);
         }
     };
     let repos = crate::db::list_repos(&conn)?;
-    if repos.is_empty() {
-        println!("no repos indexed (run `git zreindex`)");
-        return Ok(ExitCode::SUCCESS);
-    }
     for r in &repos {
-        match &r.workdir {
-            Some(wd) => println!("{}", wd),
-            None => println!("{}", r.git_dir),
-        }
+        println!("{}", r.workdir.as_deref().unwrap_or(&r.git_dir));
     }
-    println!("{} repo(s)", repos.len());
+    if interactive {
+        eprintln!("{} repo(s)", repos.len());
+    }
     Ok(ExitCode::SUCCESS)
 }
 
-/// `git zreindex [<path>...]` — (re)crawl for git repos and refresh the index.
-/// With no argument, crawls the configured roots (`[zvcs] crawlroots`, else
-/// `$HOME`); with paths, crawls exactly those.
+/// `git zreindex [<path>...]` — (re)crawl for git repos and refresh the index,
+/// pruning repos that have since been deleted. With no argument, crawls the
+/// configured roots (`[zvcs] crawlroots`, else `$HOME`); with paths, crawls
+/// exactly those.
 pub fn zreindex(args: &[String]) -> Result<ExitCode> {
     let roots: Vec<std::path::PathBuf> = if args.is_empty() {
         crate::crawler::configured_roots()
@@ -41,7 +44,11 @@ pub fn zreindex(args: &[String]) -> Result<ExitCode> {
         args.iter().map(std::path::PathBuf::from).collect()
     };
     let n = crate::crawler::crawl_into_db(&roots)?;
-    println!("indexed {n} repo(s)");
+    let pruned = {
+        let conn = crate::db::open_rw()?;
+        crate::db::prune_missing(&conn)?
+    };
+    println!("indexed {n} repo(s), pruned {pruned}");
     Ok(ExitCode::SUCCESS)
 }
 

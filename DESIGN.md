@@ -470,11 +470,28 @@ and session attribution. All tested.
   repo and every nested submodule to `origin/main`, attached, skipping
   dirty/diverged (reuses `reconcile_repo`; `zsync` is submodules-only). Test:
   `zup.rs`.
+- **Fan-out over all/subset** — `zforeach [selectors] -- <cmd>` runs a command
+  across the selected indexed repos in parallel (bounded pool), lane-aware by
+  composition (a zvcs write acquires its own lane). Shared `select` module:
+  `--repo`/`--dirty`/`--ahead`/`--behind`/`--claimed`/`--session`, all fast db
+  queries. Test: `zforeach.rs`. This is the general "do anything, everywhere"
+  primitive; the machine-wide read verbs (`zrepos`/`zstatus --all`/`zlog`)
+  complete the coverage.
+- **Hook management + fix** — `zhook set/unset/show/list/test` manage `zvcs.hook`
+  and fire it once for testing. Fixes a real bug: **per-repo (local) hooks never
+  fired** unless a hook was also set on the daemon's repo, because the watch-all
+  gate keyed on the daemon's config. New `zvcs.autohook` master switch makes the
+  watcher cover every indexed repo and fire each repo's *own* hook. Tests:
+  `zhook.rs`, `hook_event.rs`.
 
-**New `[zvcs]` config keys:** `autostatus` (maintain `zstatus --all`), plus the
-existing `autoreconcile`/`autobump`/`hook`/`autocrawl`/`crawlroots`/`interval`.
-`zvcs.hook` and claims/snapshots/oplog work without any daemon (client-side db);
-`zstatus --all` freshness and typed hooks need the daemon watching.
+**New `[zvcs]` config keys:** `autostatus` (maintain `zstatus --all`) and
+`autohook` (fire per-repo local hooks), plus the existing
+`autoreconcile`/`autobump`/`hook`/`autocrawl`/`crawlroots`/`interval`/`worktreebase`.
+`zvcs.hook` and claims/snapshots/oplog/zforeach work without a daemon (client-side
+db); `zstatus --all` freshness and hook firing need the daemon watching.
+
+A forked zsh completion (`completions/_git`) shadows the system `_git`, adding a
+`zvcs_commands` group and `_git-z*` argument completers for all verbs.
 
 ## 13. Isolated worktrees per agent (`zworktree`)
 

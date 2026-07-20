@@ -107,6 +107,8 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Observability | `zstatus [--all]` `zlog` `zundo` | instant machine-wide status; cross-repo timeline; one-step rewind |
 | Snapshots | `zsnapshot` `zrestore` `zsnapshots` | tree-wide restore points across all submodules |
 | Worktrees | `zworktree add/list/remove` | per-agent isolated, object-sharing worktree of the whole tree |
+| Fan-out | `zforeach [selectors] -- <cmd>` | run a command across all/subset of indexed repos, in parallel (selectors: `--repo`/`--dirty`/`--ahead`/`--behind`/`--claimed`/`--session`) |
+| Hooks | `zhook set/unset/show/list/test` | manage & test ref-change hooks (`zvcs.hook`); `zvcs.autohook` fires each repo's own local hook |
 | Console | `zrepl` | interactive line console over the verbs |
 | git-compat | every stock subcommand | dispatched natively; depth varies — see the parity report |
 
@@ -219,6 +221,7 @@ the dev environment and nowhere else. Enable it in `~/.gitconfig` or a repo's
     crawlroots    = /abs/src /abs/wk ; crawler roots (absolute; default $HOME)
     autostatus    = true            ; maintain zstatus --all
     hook          = /abs/on-change  ; run on ref-change in any indexed repo (typed event env)
+    autohook      = true            ; fire each repo's own local zvcs.hook (no global hook needed)
     worktreebase  = /abs/worktrees  ; base for zworktree (default ~/.zvcs/worktrees)
 ```
 
@@ -278,6 +281,7 @@ the read-only ones rather than as evidence of correctness.
 
 - **Docs hub** — <https://menketechnologies.github.io/zvcs/>
 - **Design document** — [DESIGN.md](DESIGN.md) — daemon architecture, concurrency model, autonomous behaviors, ledger/queue
+- **zsh completion** — [completions/_git](completions/_git) — the stock zsh `_git` forked with the `z*` verbs; put the dir first on `fpath` to shadow the system `_git`
 - **Engineering report** — <https://menketechnologies.github.io/zvcs/report.html>
 - **gitoxide** — <https://github.com/GitoxideLabs/gitoxide> (the ported library)
 - **Source** — <https://github.com/MenkeTechnologies/zvcs>

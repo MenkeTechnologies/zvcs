@@ -106,22 +106,31 @@ fn run_job(id: i64, spec_json: String) {
 
     registry().lock().unwrap().remove(&id);
 
-    if let Ok(conn) = crate::db::open_rw() {
-        let state = if result.cancelled {
-            "stopped"
-        } else if result.ok {
-            "done"
-        } else {
-            "failed"
-        };
-        let exit = if result.ok { 0 } else { 1 };
-        let _ = crate::db::job_finished(
-            &conn,
-            id,
-            state,
-            exit,
-            &result.output,
-            result.sha_after.as_deref(),
-        );
+    // `ok` wins over `cancelled`: a job whose commit/push actually succeeded is
+    // `done`, even if a `zjob stop` raced in after the work completed. (A stop
+    // that lands *during* a step already forces `ok=false` via `run`, so a truly
+    // cancelled job is `!ok` → `stopped`.) Reporting a landed commit/push as
+    // `stopped` would make the user re-submit it → duplicate commit/push.
+    let state = if result.ok {
+        "done"
+    } else if result.cancelled {
+        "stopped"
+    } else {
+        "failed"
+    };
+    let exit = if result.ok { 0 } else { 1 };
+
+    // Retry the finalize so transient lock contention (SQLITE_BUSY — expected with
+    // many concurrent instances) can't strand the row in `running` forever with
+    // its output/sha lost. open_rw already carries a 5s busy-timeout; this adds a
+    // few more attempts on top for a hard-contended finalize.
+    for attempt in 0..5u32 {
+        let wrote = crate::db::open_rw().and_then(|conn| {
+            crate::db::job_finished(&conn, id, state, exit, &result.output, result.sha_after.as_deref())
+        });
+        if wrote.is_ok() || attempt == 4 {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(100));
     }
 }

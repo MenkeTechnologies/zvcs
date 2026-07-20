@@ -160,3 +160,49 @@ fn zup_refuses_to_overwrite_untracked_file() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn zup_skips_dir_to_file_change_without_moving_refs() {
+    // origin replaces a tracked directory `d/` (holding d/a.txt) with a FILE `d`.
+    // The reconcile can't apply that in-place; it must skip WITHOUT moving refs and
+    // WITHOUT mislabeling the fully-tracked directory as "untracked".
+    let root = std::env::temp_dir().join(format!("zvcs-dir2file-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+
+    let bare = root.join("remote.git");
+    git(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    git(&root, &["clone", "-q", bare.to_str().unwrap(), "work"]);
+    let work = root.join("work");
+    git(&work, &["checkout", "-q", "-B", "main"]);
+    std::fs::create_dir_all(work.join("d")).unwrap();
+    std::fs::write(work.join("d/a.txt"), b"inside\n").unwrap();
+    git(&work, &["add", "d/a.txt"]);
+    git(&work, &["commit", "-q", "-m", "c0"]);
+    git(&work, &["push", "-q", "origin", "main"]);
+    let c0 = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
+
+    // Remote: turn `d/` into a file `d`.
+    git(&root, &["clone", "-q", bare.to_str().unwrap(), "work2"]);
+    let work2 = root.join("work2");
+    git(&work2, &["checkout", "-q", "main"]);
+    git(&work2, &["rm", "-q", "d/a.txt"]);
+    std::fs::write(work2.join("d"), b"now a file\n").unwrap();
+    git(&work2, &["add", "d"]);
+    git(&work2, &["commit", "-q", "-m", "c1 dir->file"]);
+    git(&work2, &["push", "-q", "origin", "main"]);
+
+    let out = Command::new(BIN).args(["zup"]).current_dir(&work).env("ZVCS_HOME", &home).output().unwrap();
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(report.contains("dir->file") && report.contains("skipped"), "should honestly report a skipped dir->file change:\n{report}");
+    assert!(!report.contains("untracked"), "must not mislabel a tracked directory as untracked:\n{report}");
+
+    // Refs must not have moved, and the tracked directory must be intact.
+    let head_now = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
+    assert_eq!(head_now, c0, "HEAD must stay at the old commit when the ff is skipped");
+    assert_eq!(std::fs::read_to_string(work.join("d/a.txt")).unwrap(), "inside\n", "tracked directory content must be preserved");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

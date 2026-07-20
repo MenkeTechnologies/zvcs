@@ -90,13 +90,22 @@ pub fn ensure_attached(repo: &gix::Repository) -> Result<Attached> {
 /// Mainline branch name for `repo`: `main` if a local `refs/heads/main` or a
 /// `refs/remotes/origin/main` exists, else `master` on the same test, else none.
 fn mainline_name(repo: &gix::Repository) -> Result<Option<String>> {
+    // Prefer a name backed by a LOCAL branch (the repo's actual mainline) before
+    // falling back to remote-only evidence, so a repo whose real mainline is
+    // `master` isn't attached to a fresh `main` conjured from a stray
+    // refs/remotes/origin/main.
     for name in ["main", "master"] {
         if repo
             .try_find_reference(&format!("refs/heads/{name}"))?
             .is_some()
-            || repo
-                .try_find_reference(&format!("refs/remotes/origin/{name}"))?
-                .is_some()
+        {
+            return Ok(Some(name.to_string()));
+        }
+    }
+    for name in ["main", "master"] {
+        if repo
+            .try_find_reference(&format!("refs/remotes/origin/{name}"))?
+            .is_some()
         {
             return Ok(Some(name.to_string()));
         }
@@ -146,4 +155,46 @@ fn attach_symbolic(repo: &gix::Repository, mainline: &str) -> Result<()> {
         deref: false,
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mainline_name;
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        assert!(Command::new("git").args(args).current_dir(dir).status().unwrap().success(), "git {args:?}");
+    }
+
+    #[test]
+    fn prefers_local_master_over_stray_remote_main() {
+        let dir = std::env::temp_dir().join(format!("zvcs-mainline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        git(&dir, &["init", "-q", "-b", "master"]);
+        git(&dir, &["-c", "user.email=t@e.x", "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "c0"]);
+        let head = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&dir).output().unwrap().stdout).unwrap().trim().to_string();
+        // A stray remote-tracking origin/main with NO local main and NO origin/master.
+        git(&dir, &["update-ref", "refs/remotes/origin/main", &head]);
+
+        let repo = gix::open(&dir).unwrap();
+        // The real mainline is the local `master`; a bare "prefer main" would pick
+        // the stray remote ref and attach to the wrong branch.
+        assert_eq!(mainline_name(&repo).unwrap().as_deref(), Some("master"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefers_local_main_when_present() {
+        let dir = std::env::temp_dir().join(format!("zvcs-mainline2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["-c", "user.email=t@e.x", "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "c0"]);
+        let repo = gix::open(&dir).unwrap();
+        assert_eq!(mainline_name(&repo).unwrap().as_deref(), Some("main"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

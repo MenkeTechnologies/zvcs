@@ -121,11 +121,22 @@ fn reconcile_repo_inner(repo: &gix::Repository, do_fetch: bool) -> Result<String
         let backing = new_index.path_backing();
         for e in new_index.entries() {
             let path = e.path_in(backing);
-            // Only additions can collide with an untracked path; modified/deleted
+            // Only additions can collide with an on-disk path; modified/deleted
             // paths were tracked and clean.
             if !old_paths.contains(&path.to_owned()) {
                 if let Some(full) = repo.workdir_path(path) {
                     if full.exists() {
+                        // Distinguish a genuine untracked clobber from a dir->file
+                        // change (the addition lands on a directory that only holds
+                        // tracked files). Both are skipped without moving refs, but
+                        // don't mislabel a fully-tracked directory as "untracked".
+                        let mut prefix = path.to_owned();
+                        prefix.push(b'/');
+                        let tracked_dir = full.is_dir()
+                            && old_paths.iter().any(|op| op.starts_with(prefix.as_slice()));
+                        if tracked_dir {
+                            return Ok(format!("dir->file change at '{path}' unsupported, skipped"));
+                        }
                         return Ok(format!("would overwrite untracked '{path}', skipped"));
                     }
                 }
@@ -133,8 +144,16 @@ fn reconcile_repo_inner(repo: &gix::Repository, do_fetch: bool) -> Result<String
         }
     }
 
-    // (e) Advance the local mainline branch to the remote tip, then attach HEAD
-    // to that branch so the repository is left on `main`/`master`, not detached.
+    // (e) Update the clean worktree + index to the new tree FIRST, and advance the
+    // refs only once it succeeds. If the checkout fails part-way (a file<->dir
+    // transition, a read-only tracked file, ENOSPC, …), the branch/HEAD stay at the
+    // old commit — leaving the repo self-consistent (refs match the still-old
+    // index; at worst an ordinary dirty worktree) instead of pointing the refs at
+    // the new commit over a stale/partial worktree the daemon never repairs.
+    update_clean_worktree(repo, &old, remote_id, &should_interrupt)?;
+
+    // Advance the local mainline branch to the remote tip, then attach HEAD to that
+    // branch so the repository is left on `main`/`master`, not detached.
     let branch_name: FullName = format!("refs/heads/{mainline}")
         .try_into()
         .map_err(|e| anyhow!("invalid branch name refs/heads/{mainline}: {e}"))?;
@@ -166,9 +185,6 @@ fn reconcile_repo_inner(repo: &gix::Repository, do_fetch: bool) -> Result<String
             .map_err(|e| anyhow!("invalid ref name HEAD: {e}"))?,
         deref: false,
     })?;
-
-    // Update the clean worktree + index to the new tree.
-    update_clean_worktree(repo, &old, remote_id, &should_interrupt)?;
 
     Ok(format!(
         "synced origin/{mainline} {}..{}",

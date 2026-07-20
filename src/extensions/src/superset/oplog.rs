@@ -62,13 +62,67 @@ pub(crate) fn latest_head_event(git_dir: &Path) -> Option<(String, String, Strin
 /// bookkeeping commits/ref-updates.
 pub(crate) fn head_authored_by_zvcs(git_dir: &Path) -> bool {
     match read_head_reflog(git_dir).last() {
-        Some(e) => e.msg.contains("zvcs") || e.msg.contains("zsync"),
+        // Match the SPECIFIC messages zvcs writes for its own HEAD moves, not a
+        // bare "zvcs" substring — the latter misclassifies any user commit whose
+        // subject mentions zvcs (e.g. this repo's own `zvcs: …` history), which
+        // would permanently suppress hooks on real commits. zvcs's own writes are:
+        //   attach ref-edits   → "zvcs attach: …"   (attach.rs)
+        //   zsync ff/attach     → "zsync: …"          (zsync.rs)
+        //   autobump commit     → subject "zvcs: autobump …" (zbump.rs), whose
+        //                         reflog line is "commit: zvcs: autobump …"
+        Some(e) => {
+            let m = e.msg.as_str();
+            m.starts_with("zvcs attach:")
+                || m.starts_with("zsync:")
+                || m.contains("zvcs: autobump")
+        }
         None => false,
     }
 }
 
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::head_authored_by_zvcs;
+
+    /// Write a `logs/HEAD` whose last entry carries `msg`, then classify it.
+    fn classify(msg: &str) -> bool {
+        let dir = std::env::temp_dir().join(format!("zvcs-oplog-{}-{}", std::process::id(), msg.len()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let z = "0000000000000000000000000000000000000000";
+        let o = "1111111111111111111111111111111111111111";
+        // Two entries so we also prove only the LAST is consulted.
+        let body = format!(
+            "{z} {o} T <t@e.x> 1700000000 +0000\tcommit: earlier work\n\
+             {o} {o} T <t@e.x> 1700000001 +0000\t{msg}\n"
+        );
+        std::fs::write(dir.join("logs/HEAD"), &body).unwrap();
+        let r = head_authored_by_zvcs(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    }
+
+    #[test]
+    fn zvcs_own_writes_are_recognized() {
+        assert!(classify("zsync: fast-forward main to origin/main"));
+        assert!(classify("zsync: attach HEAD to main"));
+        assert!(classify("zvcs attach: point main at HEAD"));
+        assert!(classify("zvcs attach: HEAD -> main"));
+        assert!(classify("commit: zvcs: autobump 2 submodule pointers"));
+    }
+
+    #[test]
+    fn user_commits_mentioning_zvcs_are_not_suppressed() {
+        // The exact class the bare-substring guard broke: this repo's own history.
+        assert!(!classify("commit: zvcs: async z-verbs (zcommit/zpush)"));
+        assert!(!classify("commit: zvcs: SQLite ledger + repo index"));
+        assert!(!classify("commit: zsync should be faster"));
+        assert!(!classify("commit: ordinary user work"));
+    }
 }
 
 /// `git zlog [-n N]` — machine-wide reflog timeline across all indexed repos

@@ -1041,6 +1041,7 @@ version = "0.72.0"
 dependencies = [
  "clru",
  "gix-chunk",
+ "gix-diff",
  "gix-error",
  "gix-features",
  "gix-hash",
@@ -1048,6 +1049,7 @@ dependencies = [
  "gix-object",
  "gix-path",
  "gix-tempfile",
+ "gix-traverse",
  "gix-zlib",
  "memmap2",
  "parking_lot",

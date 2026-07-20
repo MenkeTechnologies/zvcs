@@ -14,6 +14,7 @@
 //!     pointer only when the new SHA is a descendant of the recorded one.
 
 pub mod attach;
+pub mod ledger;
 mod reconcile;
 pub mod watch;
 mod zbump;
@@ -21,6 +22,7 @@ pub mod zdaemon;
 mod zsync;
 
 pub use attach::{ensure_attached, Attached};
+pub use ledger::{zjob, zjobs, zreindex, zrepos};
 pub use reconcile::reconcile_tree;
 pub use zbump::zbump;
 pub use zdaemon::zdaemon;

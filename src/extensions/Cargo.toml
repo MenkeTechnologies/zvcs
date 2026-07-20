@@ -33,3 +33,5 @@ notify = "6"
 # Job ledger + repo index. Bundled SQLite for cross-arch reproducibility
 # (macOS aarch64 / Linux x86_64+aarch64); WAL, single daemon writer thread.
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Fast parallel filesystem walk for the repo crawler (whole-device `.git` scan).
+ignore = "0.4"

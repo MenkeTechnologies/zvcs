@@ -6,6 +6,8 @@
 
 pub mod autostart;
 pub mod config;
+pub mod crawler;
+pub mod db;
 pub mod dispatch;
 pub mod index_commit;
 pub mod lock;
@@ -24,7 +26,15 @@ pub fn run() -> ExitCode {
     };
     let rest = &args[1..];
 
-    // Bring up the per-repo coordinator when `[zvcs]` autonomy is configured, so
+    // Surface any headless autonomous-op failures recorded since last time, on
+    // this next `git` invocation. Async/daemon failures carry no exit code back,
+    // so this at-least-once notification is their only channel. stderr only, so
+    // `$(git …)` capture stays clean. Skipped for `zdaemon` to avoid self-noise.
+    if sub != "zdaemon" {
+        surface_pending_failures();
+    }
+
+    // Bring up the singleton coordinator when `[zvcs]` autonomy is configured, so
     // the user never starts it by hand. Skipped for `zdaemon` (it would self-race).
     if sub != "zdaemon" {
         autostart::ensure_if_configured();
@@ -37,4 +47,38 @@ pub fn run() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Print (once) any unnotified failed autonomous jobs for the current repo, then
+/// mark them notified. Cheap no-op when there is no ledger or no failures; never
+/// creates the ledger (only reads/updates one the daemon already made).
+fn surface_pending_failures() {
+    if !db::db_path().exists() {
+        return;
+    }
+    let Ok(repo) = gix::discover(".") else {
+        return;
+    };
+    let git_dir = match repo.git_dir().canonicalize() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let Ok(conn) = db::open_rw() else {
+        return;
+    };
+    let Ok(pending) = db::pending_failures(&conn, &git_dir) else {
+        return;
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let ids: Vec<i64> = pending.iter().map(|(id, _, _)| *id).collect();
+    for (_, kind, reason) in &pending {
+        if reason.is_empty() {
+            eprintln!("zvcs: {kind} failed");
+        } else {
+            eprintln!("zvcs: {kind} failed: {reason}");
+        }
+    }
+    let _ = db::mark_notified(&conn, &ids);
 }

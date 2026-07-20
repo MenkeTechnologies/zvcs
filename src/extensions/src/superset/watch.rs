@@ -99,6 +99,13 @@ fn react(cfg: &ZvcsConfig) {
                     if let Err(e) = crate::superset::reconcile_repo_local(&sub) {
                         let path = sm.path().map(|p| p.to_string()).unwrap_or_default();
                         println!("[zvcs reconcile] {path}: error: {e:#}");
+                        // Record for notify-on-next-command (headless failure has
+                        // no exit code to return to a caller).
+                        let _ = crate::db::record_failure(
+                            sub.git_dir(),
+                            "reconcile",
+                            &format!("{path}: {e:#}"),
+                        );
                     }
                 }
             }

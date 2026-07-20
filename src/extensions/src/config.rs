@@ -10,6 +10,7 @@
 //!     interval      = 30     ; seconds between autonomous passes (default 30)
 //! ```
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Resolved `[zvcs]` settings for a repository.
@@ -18,8 +19,11 @@ pub struct ZvcsConfig {
     pub autoreconcile: bool,
     /// Forward-only submodule gitlink bumps on `interval`.
     pub autobump: bool,
-    /// Delay between autonomous passes.
+    /// Debounce window for coalescing watch-driven reaction bursts.
     pub interval: Duration,
+    /// Roots for the repo crawler (`zvcs.crawlroots`, whitespace/comma separated).
+    /// Empty means "use `$HOME`".
+    pub crawlroots: Vec<PathBuf>,
 }
 
 impl ZvcsConfig {
@@ -31,10 +35,21 @@ impl ZvcsConfig {
             .integer("zvcs.interval")
             .filter(|s| *s > 0)
             .unwrap_or(30) as u64;
+        let crawlroots = snap
+            .string("zvcs.crawlroots")
+            .map(|s| {
+                s.to_string()
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|t| !t.is_empty())
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             autoreconcile: snap.boolean("zvcs.autoreconcile").unwrap_or(false),
             autobump: snap.boolean("zvcs.autobump").unwrap_or(false),
             interval: Duration::from_secs(interval),
+            crawlroots,
         }
     }
 

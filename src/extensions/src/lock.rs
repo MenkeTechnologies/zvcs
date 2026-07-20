@@ -51,13 +51,20 @@ impl RepoLock {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        let sock = git_dir.join("zvcs.sock");
+        // Single machine-wide daemon; the repo is identified by its git-dir so
+        // the daemon serializes each repo on its own lane. Canonicalize so every
+        // caller for the same repo produces the same lane key.
+        let sock = crate::superset::zdaemon::socket_path();
+        let repo = git_dir.canonicalize().unwrap_or_else(|_| git_dir.to_path_buf());
 
         let mut stream = match UnixStream::connect(&sock) {
             Ok(s) => s,
             Err(_) => return Self::unlocked(id),
         };
-        if stream.write_all(format!("ACQUIRE {id}\n").as_bytes()).is_err() || stream.flush().is_err()
+        if stream
+            .write_all(format!("ACQUIRE {id} {}\n", repo.display()).as_bytes())
+            .is_err()
+            || stream.flush().is_err()
         {
             return Self::unlocked(id);
         }

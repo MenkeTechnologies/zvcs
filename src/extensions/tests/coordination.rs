@@ -46,7 +46,13 @@ fn daemon_serializes_concurrent_writers() {
         "git init failed"
     );
     let git_dir: PathBuf = tmp.join(".git");
-    let sock = git_dir.join("zvcs.sock");
+
+    // Isolate the singleton socket to this test via ZVCS_SOCK, so the shared
+    // ~/.zvcs/zvcs.sock is never touched and parallel test binaries don't collide.
+    // Both this process's RepoLock and the spawned daemon read the same override
+    // (the child inherits the env).
+    let sock = tmp.join("zvcs-test.sock");
+    std::env::set_var("ZVCS_SOCK", &sock);
 
     // Start the coordinator.
     let mut daemon: Child = Command::new(BIN)

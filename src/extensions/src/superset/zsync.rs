@@ -22,6 +22,18 @@ use gix::refs::{FullName, Target};
 /// This function performs no terminal output; it returns the status string and
 /// leaves printing to the caller.
 pub fn reconcile_repo(repo: &gix::Repository) -> Result<String> {
+    reconcile_repo_inner(repo, true)
+}
+
+/// Reconcile WITHOUT fetching — fast-forward the local mainline to the
+/// **already-present** `origin/main` remote-tracking ref. This is the reactive,
+/// no-network path the daemon watcher uses after a local `git pull` updated the
+/// remote-tracking ref; the daemon never contacts a remote itself.
+pub fn reconcile_repo_local(repo: &gix::Repository) -> Result<String> {
+    reconcile_repo_inner(repo, false)
+}
+
+fn reconcile_repo_inner(repo: &gix::Repository, do_fetch: bool) -> Result<String> {
     // Serialize the whole check-fetch-ff-write through the repo coordinator, so an
     // autonomous reconcile can't race a concurrent writer. Held for the function;
     // a no-op if no daemon is running (ff-only + skip-dirty still protect).
@@ -43,14 +55,18 @@ pub fn reconcile_repo(repo: &gix::Repository) -> Result<String> {
     }
 
     // (c) Fetch origin so the remote-tracking ref is current (blocking fetch).
+    // Skipped on the reactive path: the watcher only runs after a local pull has
+    // already updated the remote-tracking ref, and the daemon must never poll.
     let should_interrupt = AtomicBool::new(false);
-    let remote = repo
-        .find_remote("origin")
-        .context("a configured `origin` remote is required to fetch")?;
-    remote
-        .connect(gix::remote::Direction::Fetch)?
-        .prepare_fetch(gix::progress::Discard, gix::remote::ref_map::Options::default())?
-        .receive(gix::progress::Discard, &should_interrupt)?;
+    if do_fetch {
+        let remote = repo
+            .find_remote("origin")
+            .context("a configured `origin` remote is required to fetch")?;
+        remote
+            .connect(gix::remote::Direction::Fetch)?
+            .prepare_fetch(gix::progress::Discard, gix::remote::ref_map::Options::default())?
+            .receive(gix::progress::Discard, &should_interrupt)?;
+    }
 
     // (d) Fast-forward decision. `local` is the commit HEAD currently resolves to
     // (the actual clean worktree state); `remote` is the freshly-fetched tip.

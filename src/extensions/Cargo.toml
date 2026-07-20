@@ -27,3 +27,9 @@ gix = { path = "../ported/gix", features = [
     "merge",
 ] }
 anyhow = "1"
+# File-watch autonomy: the daemon reacts to local ref changes (a `git pull`/commit
+# updates `logs/HEAD` / remote-tracking refs) and never polls a remote.
+notify = "6"
+# Job ledger + repo index. Bundled SQLite for cross-arch reproducibility
+# (macOS aarch64 / Linux x86_64+aarch64); WAL, single daemon writer thread.
+rusqlite = { version = "0.31", features = ["bundled"] }

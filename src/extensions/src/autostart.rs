@@ -20,8 +20,8 @@ pub fn ensure_if_configured() {
     }
 
     let git_dir = repo.git_dir();
-    let sock = git_dir.join("zvcs.sock");
-    // Already listening? A successful connect means a live daemon owns the socket.
+    let sock = crate::superset::zdaemon::socket_path();
+    // Already listening? A successful connect means the singleton daemon is up.
     if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
         return;
     }
@@ -36,11 +36,11 @@ pub fn ensure_if_configured() {
         .current_dir(&workdir)
         .stdin(Stdio::null());
 
-    // Route daemon output to a log; never the terminal (no chatter).
+    // Route daemon output to the singleton log; never the terminal (no chatter).
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(git_dir.join("zvcs.log"))
+        .open(crate::superset::zdaemon::zvcs_home().join("zvcs.log"))
     {
         Ok(out) => match out.try_clone() {
             Ok(err) => {

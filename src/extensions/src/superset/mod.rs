@@ -15,12 +15,13 @@
 
 pub mod attach;
 mod reconcile;
+pub mod watch;
 mod zbump;
-mod zdaemon;
+pub mod zdaemon;
 mod zsync;
 
 pub use attach::{ensure_attached, Attached};
 pub use reconcile::reconcile_tree;
 pub use zbump::zbump;
 pub use zdaemon::zdaemon;
-pub use zsync::{reconcile_repo, zsync};
+pub use zsync::{reconcile_repo, reconcile_repo_local, zsync};

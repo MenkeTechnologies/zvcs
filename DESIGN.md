@@ -221,9 +221,11 @@ lock and no autonomy.
 
 ```gitconfig
 [zvcs]
-    autoreconcile = true   ; auto-zsync: keep clean submodules attached at origin/main (reactive)
-    autobump      = true   ; auto-zbump: forward-only local pointer bumps + commit (kills the marker)
-    interval      = 2      ; debounce window (seconds) for coalescing bump/attach bursts
+    autoreconcile = true            ; auto-zsync: keep clean submodules attached at origin/main (reactive)
+    autobump      = true            ; auto-zbump: forward-only local pointer bumps + commit (kills the marker)
+    interval      = 2               ; debounce window (seconds) for coalescing bump/attach bursts
+    autocrawl     = true            ; background repo-index crawl on daemon start (opt-in)
+    crawlroots    = ~/src ~/work    ; roots for the crawler (whitespace/comma separated; default $HOME)
 ```
 
 - `ZvcsConfig::load` (`src/extensions/src/config.rs:28`) reads these; absent keys
@@ -353,21 +355,33 @@ commits/pushes that should not block.
 | `zcommit`/`zpush` async via daemon `SUBMIT` (`queue.rs`, `jobrun.rs`) | built |
 | `zjobs`/`zjob` + `zrepl` (`ledger.rs`, `repl.rs`) | built |
 
-**Known partials / deliberate simplifications** (honest scope):
-- **`zpush` pre-flight is network-free** — it compares HEAD to the already-fetched
-  `origin/main` remote-tracking ref, not a live `ls-refs`. It catches the common
-  stale case; a remote that moved since the last local fetch is caught by the
-  push itself → ledger → notify. A live `ls-refs` pre-flight is a refinement.
-- **Crawler whole-device scan is on-demand** (`git zreindex`), not run
-  automatically on daemon start (keeps startup lean; avoids scanning `$HOME` on
-  every boot).
-- **Job control** (`zjob stop`/`restart`, cooperative cancel) and a **bounded**
-  job pool are not yet wired — jobs run to completion on a thread-per-job.
-- **autobump *refusal* notify** surfaces via the daemon log; only reconcile
-  errors are recorded as ledger failures so far (the notify plumbing exists).
-- **Interop `index.lock` via `gix-lock`**: index writes go through gix's own
-  index writer; auditing that every write path emits the on-disk `index.lock`
-  for external-tool interop is not yet verified end-to-end.
+**Resolved partials** (all landed with tests):
+- **`zpush` pre-flight is a live `ls-refs`** (`queue.rs`) — one ref advertisement
+  (no packfile) reads the remote's current tip; falls back to the network-free
+  remote-tracking comparison when the remote is unreachable. Test:
+  `push_preflight.rs` (both the live and fallback paths).
+- **Crawl-on-start** is available, config-gated by `[zvcs] autocrawl`
+  (`crawler.rs`); `git zreindex` still triggers an on-demand rescan. Test:
+  `autocrawl.rs`.
+- **Job control** (`jobpool.rs`): a **bounded** worker pool (cores, capped)
+  executes jobs; `zjob stop` cancels a running job (kills its child) or marks a
+  queued one `stopped`; `zjob restart` clones a job parent-linked and re-enqueues
+  it. Test: `jobctl.rs`.
+- **autobump refusals** are recorded to the ledger (`watch.rs` →
+  `db::record_failure`) and surfaced by notify-on-next-command. `zbump_run`
+  returns structured refusals. Delivery tested in `notify.rs`.
+- **Interop `index.lock`**: verified — `gix::index::File::write` acquires
+  `<index>.lock` via `gix_lock` (`Fail::Immediately`) and renames over `index`,
+  so every index-writing path emits the on-disk lockfile and respects an
+  external one.
+
+**Remaining minor notes** (intentional / low-risk):
+- On an **external** process holding `index.lock`, a zvcs index write fails
+  fast (matching git) rather than bounded-waiting; zvcs-vs-zvcs fairness is the
+  daemon FIFO, and external contention is rare.
+- `zjob stop` of a *mid-run* job (child-kill path) is implemented but not covered
+  by a deterministic test (jobs finish too fast to race reliably); the
+  queued-stop and finished-stop paths are tested.
 
 ## 11. Implementation phases (all landed — see §10 for partials)
 

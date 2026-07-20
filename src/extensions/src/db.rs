@@ -234,6 +234,46 @@ pub fn pending_failures(conn: &Connection, git_dir: &Path) -> Result<Vec<(i64, S
     Ok(rows)
 }
 
+/// Current state of a job, if it exists.
+pub fn job_state(conn: &Connection, id: i64) -> Result<Option<String>> {
+    let state = conn
+        .query_row("SELECT state FROM jobs WHERE id=?1", [id], |r| r.get(0))
+        .optional()?;
+    Ok(state)
+}
+
+/// Flip a still-`queued` job to `stopped` (a stop that arrives before the worker
+/// picks it up). Returns true if a queued job was actually stopped.
+pub fn stop_if_queued(conn: &Connection, id: i64) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE jobs SET state='stopped', finished_at=?2 WHERE id=?1 AND state='queued'",
+        rusqlite::params![id, now()],
+    )?;
+    Ok(n > 0)
+}
+
+/// Clone a job into a new `queued` row linked by `parent_job_id`, for restart.
+/// Returns `(new_id, spec_json)` to enqueue, or `None` if the job is unknown.
+pub fn restart_job(conn: &Connection, id: i64) -> Result<Option<(i64, String)>> {
+    let row: Option<(Option<i64>, String, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT repo_id, kind, spec, session_key FROM jobs WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((repo_id, kind, spec, session)) = row else {
+        return Ok(None);
+    };
+    let spec = spec.unwrap_or_default();
+    conn.execute(
+        "INSERT INTO jobs (repo_id, kind, spec, session_key, state, parent_job_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6)",
+        rusqlite::params![repo_id, kind, spec, session, id, now()],
+    )?;
+    Ok(Some((conn.last_insert_rowid(), spec)))
+}
+
 pub fn mark_notified(conn: &Connection, ids: &[i64]) -> Result<()> {
     let ts = now();
     for id in ids {

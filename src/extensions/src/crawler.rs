@@ -68,6 +68,25 @@ pub fn crawl_into_db(roots: &[PathBuf]) -> Result<usize> {
     Ok(repos.len())
 }
 
+/// Spawn a one-shot background crawl of the configured roots on daemon start,
+/// iff `[zvcs] autocrawl` is enabled. A no-op otherwise (a whole-device scan is
+/// opt-in; `git zreindex` triggers it on demand regardless).
+pub fn spawn_if_configured() {
+    let Ok(repo) = gix::discover(".") else {
+        return;
+    };
+    if !crate::config::ZvcsConfig::load(&repo).autocrawl {
+        return;
+    }
+    std::thread::spawn(|| {
+        let roots = configured_roots();
+        match crawl_into_db(&roots) {
+            Ok(n) => println!("[zvcs crawl] indexed {n} repo(s)"),
+            Err(e) => println!("[zvcs crawl] error: {e:#}"),
+        }
+    });
+}
+
 /// The configured crawl roots: `[zvcs] crawlroots` (whitespace/comma separated),
 /// else `$HOME`, else the current directory.
 pub fn configured_roots() -> Vec<PathBuf> {

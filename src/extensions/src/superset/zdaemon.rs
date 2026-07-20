@@ -138,9 +138,19 @@ fn start() -> Result<ExitCode> {
     let worker_path = path.clone();
     thread::spawn(move || worker_loop(rx, worker_path));
 
+    // Bounded async-job pool (zcommit/zpush execution). Concurrency = cores,
+    // capped so a burst can't spawn unbounded threads.
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4);
+    crate::jobpool::init(workers);
+
     // Reactive autonomy: file-watcher driven, never polled (§ watch). Spawns
     // nothing unless `[zvcs]` autonomy is configured for the discovered repo.
     crate::superset::watch::spawn_if_configured();
+
+    // Background repo crawl on start, iff `[zvcs] autocrawl` is enabled.
+    crate::crawler::spawn_if_configured();
 
     for incoming in listener.incoming() {
         let stream = match incoming {
@@ -263,6 +273,21 @@ fn conn_loop(stream: &UnixStream, tx: &Sender<Cmd>, held: &mut Option<(PathBuf, 
                 }
                 return; // single-shot
             }
+            Req::JobStop(id) => {
+                if crate::jobpool::stop(id) {
+                    reply(stream, "OK");
+                } else {
+                    reply(stream, &format!("ERR no stoppable job #{id}"));
+                }
+                return;
+            }
+            Req::JobRestart(id) => {
+                match handle_restart(id) {
+                    Some(new_id) => reply(stream, &format!("JOB {new_id}")),
+                    None => reply(stream, &format!("ERR no job #{id}")),
+                }
+                return;
+            }
             Req::Status => {
                 if let Ok(s) = stream.try_clone() {
                     let _ = tx.send(Cmd::Status { stream: s });
@@ -284,6 +309,8 @@ enum Req {
     Acquire { id: String, repo: PathBuf },
     Release { id: String },
     Submit(String),
+    JobStop(i64),
+    JobRestart(i64),
     Status,
     Stop,
     Err(String),
@@ -323,6 +350,14 @@ fn parse(line: &str) -> Req {
                 Req::Submit(rest.to_string())
             }
         }
+        "JOBSTOP" => match rest.parse() {
+            Ok(id) => Req::JobStop(id),
+            Err(_) => Req::Err("JOBSTOP needs a job id".into()),
+        },
+        "JOBRESTART" => match rest.parse() {
+            Ok(id) => Req::JobRestart(id),
+            Err(_) => Req::Err("JOBRESTART needs a job id".into()),
+        },
         "STATUS" => Req::Status,
         "STOP" => Req::Stop,
         other => Req::Err(format!("unknown verb {other:?}")),
@@ -349,32 +384,21 @@ fn handle_submit(json: &str) -> Option<i64> {
     let id = crate::db::insert_job(&conn, repo_id, kind, json, session).ok()?;
     drop(conn);
 
-    // Execute off the connection/worker threads. The child porcelain the job
-    // spawns will acquire its repo's lane itself, so ordering is preserved.
-    let json_owned = json.to_string();
-    thread::spawn(move || {
-        if let Ok(conn) = crate::db::open_rw() {
-            let _ = crate::db::job_running(&conn, id);
-        }
-        let spec: serde_json::Value = match serde_json::from_str(&json_owned) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-        let result = crate::jobrun::execute(&spec);
-        if let Ok(conn) = crate::db::open_rw() {
-            let state = if result.ok { "done" } else { "failed" };
-            let exit = if result.ok { 0 } else { 1 };
-            let _ = crate::db::job_finished(
-                &conn,
-                id,
-                state,
-                exit,
-                &result.output,
-                result.sha_after.as_deref(),
-            );
-        }
-    });
+    // Hand to the bounded pool. The child porcelain each job spawns acquires its
+    // repo's lane itself, so ordering is preserved; the pool caps concurrency and
+    // makes the job cancellable via `zjob stop`.
+    crate::jobpool::submit(id, json.to_string());
     Some(id)
+}
+
+/// Restart a finished/failed job: clone it (parent-linked) and enqueue the copy.
+/// Returns the new job id.
+fn handle_restart(id: i64) -> Option<i64> {
+    let conn = crate::db::open_rw().ok()?;
+    let (new_id, spec) = crate::db::restart_job(&conn, id).ok()??;
+    drop(conn);
+    crate::jobpool::submit(new_id, spec);
+    Some(new_id)
 }
 
 /// `git zdaemon status` — one-shot STATUS query. Not running is not an error.

@@ -24,6 +24,9 @@ pub struct ZvcsConfig {
     /// Roots for the repo crawler (`zvcs.crawlroots`, whitespace/comma separated).
     /// Empty means "use `$HOME`".
     pub crawlroots: Vec<PathBuf>,
+    /// Crawl the configured roots for git repos in the background on daemon start
+    /// (`zvcs.autocrawl`). Off by default — a whole-device scan is opt-in.
+    pub autocrawl: bool,
 }
 
 impl ZvcsConfig {
@@ -50,6 +53,7 @@ impl ZvcsConfig {
             autobump: snap.boolean("zvcs.autobump").unwrap_or(false),
             interval: Duration::from_secs(interval),
             crawlroots,
+            autocrawl: snap.boolean("zvcs.autocrawl").unwrap_or(false),
         }
     }
 

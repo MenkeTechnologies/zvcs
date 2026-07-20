@@ -80,7 +80,7 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
             Some(id) => id,
             None => {
                 println!("{path_str}: refused (not recorded in parent HEAD)");
-                had_failure = true;
+                refusals.push((path_str.clone(), "not recorded in parent HEAD".into()));
                 continue;
             }
         };
@@ -90,7 +90,7 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
             Some(r) => r,
             None => {
                 println!("{path_str}: refused (submodule not initialized)");
-                had_failure = true;
+                refusals.push((path_str.clone(), "submodule not initialized".into()));
                 continue;
             }
         };
@@ -108,7 +108,7 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
             Ok(id) => id.detach(),
             Err(err) => {
                 println!("{path_str}: refused (cannot compute merge-base: {err})");
-                had_failure = true;
+                refusals.push((path_str.clone(), format!("cannot compute merge-base: {err}")));
                 continue;
             }
         };
@@ -118,7 +118,7 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
                 old.to_hex_with_len(12),
                 new.to_hex_with_len(12)
             );
-            had_failure = true;
+            refusals.push((path_str.clone(), "not a fast-forward".into()));
             continue;
         }
 
@@ -127,14 +127,14 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
             Ok(idx) => idx,
             Err(_) => {
                 println!("{path_str}: refused (no index entry at path)");
-                had_failure = true;
+                refusals.push((path_str.clone(), "no index entry at path".into()));
                 continue;
             }
         };
         let entry = &mut index.entries_mut()[idx];
         if entry.mode != gix::index::entry::Mode::COMMIT {
             println!("{path_str}: refused (index entry is not a gitlink)");
-            had_failure = true;
+            refusals.push((path_str.clone(), "index entry is not a gitlink".into()));
             continue;
         }
         entry.id = new;
@@ -152,7 +152,7 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
         for a in w {
             if !seen.contains(a) {
                 println!("{a}: refused (no such submodule)");
-                had_failure = true;
+                refusals.push((a.clone(), "no such submodule".into()));
             }
         }
     }
@@ -175,9 +175,5 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
         println!("committed {} ({} pointer{})", commit_id.to_hex_with_len(12), bumped, plural);
     }
 
-    Ok(if had_failure {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
+    Ok(BumpOutcome { bumped, refusals })
 }

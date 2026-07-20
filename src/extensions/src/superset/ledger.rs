@@ -78,11 +78,17 @@ pub fn zjobs(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `git zjob <id>` — show one job in full (state, exit, output, resulting sha).
+/// `git zjob <id>` — show one job; `git zjob stop|restart <id>` — control it.
 pub fn zjob(args: &[String]) -> Result<ExitCode> {
+    match args.first().map(String::as_str) {
+        Some("stop") => return zjob_control("JOBSTOP", args.get(1)),
+        Some("restart") => return zjob_control("JOBRESTART", args.get(1)),
+        _ => {}
+    }
+
     let id: i64 = match args.first().and_then(|s| s.parse().ok()) {
         Some(id) => id,
-        None => anyhow::bail!("usage: git zjob <id>"),
+        None => anyhow::bail!("usage: git zjob <id> | git zjob stop|restart <id>"),
     };
     let conn = crate::db::open_ro()?;
     let job = match crate::db::get_job(&conn, id)? {
@@ -107,4 +113,33 @@ pub fn zjob(args: &[String]) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Send a one-shot job control request (`JOBSTOP`/`JOBRESTART <id>`) to the
+/// daemon and print its reply. Requires a running daemon.
+fn zjob_control(verb: &str, id_arg: Option<&String>) -> Result<ExitCode> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let id: i64 = match id_arg.and_then(|s| s.parse().ok()) {
+        Some(id) => id,
+        None => anyhow::bail!("usage: git zjob {} <id>", verb.trim_start_matches("JOB").to_lowercase()),
+    };
+    let sock = crate::superset::zdaemon::socket_path();
+    let mut stream = UnixStream::connect(&sock)
+        .map_err(|_| anyhow::anyhow!("daemon not running (job control needs the daemon)"))?;
+    writeln!(stream, "{verb} {id}")?;
+    stream.flush()?;
+    let mut reply = String::new();
+    BufReader::new(&stream).read_line(&mut reply)?;
+    let reply = reply.trim();
+    if let Some(new_id) = reply.strip_prefix("JOB ") {
+        println!("restarted as job #{new_id}");
+        Ok(ExitCode::SUCCESS)
+    } else if reply == "OK" {
+        println!("stopped job #{id}");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        anyhow::bail!("{}", reply.strip_prefix("ERR ").unwrap_or(reply));
+    }
 }

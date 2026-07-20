@@ -241,7 +241,7 @@ fn try_submit(spec: &Value) -> Option<i64> {
 /// Execute the job in this process and record it in the ledger.
 fn run_inline(spec: &Value) -> Result<ExitCode> {
     let (id, _) = record_queued(spec);
-    let result = crate::jobrun::execute(spec);
+    let result = crate::jobrun::execute(spec, &crate::jobrun::Cancel::none());
     finalize(id, &result, spec);
 
     print!("{}", result.output);

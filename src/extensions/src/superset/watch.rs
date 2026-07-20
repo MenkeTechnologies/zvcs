@@ -112,10 +112,23 @@ fn react(cfg: &ZvcsConfig) {
         }
     }
 
-    // Forward-only local pointer bumps, committed (clears the markers).
+    // Forward-only local pointer bumps, committed (clears the markers). Record
+    // any refusals (e.g. a rewound/diverged submodule) for notify-on-next-command.
     if cfg.autobump {
-        if let Err(e) = crate::superset::zbump(&[]) {
-            println!("[zvcs autobump] error: {e:#}");
+        match crate::superset::zbump_run(&[]) {
+            Ok(outcome) => {
+                for (path, reason) in &outcome.refusals {
+                    let _ = crate::db::record_failure(
+                        repo.git_dir(),
+                        "autobump",
+                        &format!("{path}: {reason}"),
+                    );
+                }
+            }
+            Err(e) => {
+                println!("[zvcs autobump] error: {e:#}");
+                let _ = crate::db::record_failure(repo.git_dir(), "autobump", &format!("{e:#}"));
+            }
         }
     }
 }

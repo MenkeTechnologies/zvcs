@@ -28,6 +28,6 @@ pub use ledger::{zjob, zjobs, zreindex, zrepos};
 pub use queue::{zcommit, zpush};
 pub use repl::zrepl;
 pub use reconcile::reconcile_tree;
-pub use zbump::zbump;
+pub use zbump::{zbump, zbump_run, BumpOutcome};
 pub use zdaemon::zdaemon;
 pub use zsync::{reconcile_repo, reconcile_repo_local, zsync};

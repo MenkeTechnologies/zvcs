@@ -28,6 +28,13 @@ pub fn zstash(args: &[String]) -> Result<ExitCode> {
     let name = stash_name(args);
     let repo = gix::discover(".")?;
     let conn = crate::db::open_rw()?;
+    // Refuse to reuse a live name: `stash_begin` clears the db rows, but the
+    // per-repo `git stash` entries the previous run pushed would be orphaned
+    // (recoverable only via raw `git stash list`). Pop it first.
+    let existing = crate::db::stash_entries(&conn, &name)?;
+    if !existing.is_empty() {
+        bail!("stash '{name}' already exists ({} repo(s)); `git zunstash {name}` first", existing.len());
+    }
     crate::db::stash_begin(&conn, &name)?;
     let exe = std::env::current_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))?;
     let mut n = 0usize;

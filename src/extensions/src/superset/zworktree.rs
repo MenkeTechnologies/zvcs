@@ -30,6 +30,17 @@ pub fn zworktree(args: &[String]) -> Result<ExitCode> {
     }
 }
 
+/// A worktree name must be a simple path segment — no separators, no `..`, not
+/// empty. Both `add` and `remove` gate on this: `remove` joins the name onto the
+/// base dir and `remove_dir_all`s the result, so an unvalidated `../../x` would
+/// delete an arbitrary directory outside the worktree base.
+fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name == ".." || name == "." {
+        bail!("worktree name must be a simple identifier (no path separators or `..`)");
+    }
+    Ok(())
+}
+
 /// Worktree base dir: `zvcs.worktreebase` else `~/.zvcs/worktrees`.
 fn base_dir() -> PathBuf {
     if let Ok(repo) = gix::discover(".") {
@@ -48,12 +59,18 @@ fn add(args: &[String]) -> Result<ExitCode> {
     let name = positional
         .first()
         .ok_or_else(|| anyhow!("usage: git zworktree add <name> [<dest>]"))?;
-    if name.contains('/') || name.is_empty() {
-        bail!("worktree name must be a simple identifier");
-    }
+    validate_name(name)?;
+    // Absolutize `dest`: git records an absolute path in each linked worktree's
+    // `gitdir` bookkeeping, so a cwd-relative `<dest>` would make `git worktree
+    // list`/`prune`/repair resolve it wrong from any other directory.
     let dest = match positional.get(1) {
         Some(d) => PathBuf::from(d),
         None => base_dir().join(name),
+    };
+    let dest = if dest.is_absolute() {
+        dest
+    } else {
+        std::env::current_dir()?.join(dest)
     };
     if dest.exists() {
         bail!("{} already exists", dest.display());
@@ -180,6 +197,7 @@ fn remove(args: &[String]) -> Result<ExitCode> {
         .iter()
         .find(|a| !a.starts_with('-'))
         .ok_or_else(|| anyhow!("usage: git zworktree remove <name>"))?;
+    validate_name(name)?;
     let path = match crate::db::open_ro().ok().and_then(|c| crate::db::worktree_path(&c, name).ok().flatten()) {
         Some(p) => PathBuf::from(p),
         None => base_dir().join(name),
@@ -197,7 +215,7 @@ fn remove(args: &[String]) -> Result<ExitCode> {
                 let meta = PathBuf::from(rest.trim());
                 // meta = <G>/worktrees/<name>  ->  G = meta/../..
                 if let Some(g) = meta.parent().and_then(|p| p.parent()) {
-                    let _ = std::fs::remove_file(g.join("refs/heads/zwt").join(name));
+                    delete_branch(g, name);
                 }
                 let _ = std::fs::remove_dir_all(&meta);
             }
@@ -209,6 +227,28 @@ fn remove(args: &[String]) -> Result<ExitCode> {
     }
     println!("removed worktree '{name}'");
     Ok(ExitCode::SUCCESS)
+}
+
+/// Delete the `zwt/<name>` branch from the common git dir at `g`, via a ref
+/// transaction so a *packed* ref is removed too (unlinking the loose file leaves
+/// a packed ref behind, leaking the branch and its reflog).
+fn delete_branch(g: &Path, name: &str) {
+    let full = format!("refs/heads/zwt/{name}");
+    if let Ok(repo) = gix::open(g) {
+        if let Ok(fname) = TryInto::<FullName>::try_into(full.clone()) {
+            let _ = repo.edit_reference(RefEdit {
+                change: Change::Delete {
+                    expected: PreviousValue::Any,
+                    log: RefLog::AndReference,
+                },
+                name: fname,
+                deref: false,
+            });
+            return;
+        }
+    }
+    // Fallback: best-effort loose unlink if the repo won't open.
+    let _ = std::fs::remove_file(g.join("refs/heads/zwt").join(name));
 }
 
 /// Collect `.git` *files* (linked-worktree pointers) under `dir`, not descending

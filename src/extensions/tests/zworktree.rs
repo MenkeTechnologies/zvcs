@@ -95,3 +95,56 @@ fn zworktree_isolated_tree_add_and_remove() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn zworktree_remove_rejects_path_traversal() {
+    // `remove <name>` joins the name onto the base dir and remove_dir_all's it.
+    // A name with `../` must be refused before any filesystem deletion.
+    let root = std::env::temp_dir().join(format!("zvcs-zwttrav-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+
+    // A victim directory that base_dir().join("../../victim") would resolve to:
+    // ZVCS_HOME/worktrees/../../victim == root/victim.
+    let victim = root.join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("keep.txt"), b"precious\n").unwrap();
+
+    let ok = zvcs(&home, &root, &["zworktree", "remove", "../../victim"]);
+    assert!(!ok, "traversal name must be rejected (non-zero exit)");
+    assert!(victim.join("keep.txt").exists(), "victim directory was deleted via path traversal!");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn zworktree_add_writes_absolute_gitdir_for_relative_dest() {
+    // git records an ABSOLUTE path in worktrees/<name>/gitdir. A relative <dest>
+    // must be absolutized, or `git worktree list`/prune resolve it wrong.
+    let root = std::env::temp_dir().join(format!("zvcs-zwtabs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), b"a\n").unwrap();
+    git(&repo, &["add", "a.txt"]);
+    git(&repo, &["commit", "-q", "-m", "c0"]);
+
+    // Relative dest from the repo cwd.
+    assert!(zvcs(&home, &repo, &["zworktree", "add", "rel", "../wt_rel"]), "zworktree add (relative dest) failed");
+
+    let gitdir_meta = repo.join(".git/worktrees/rel/gitdir");
+    let content = std::fs::read_to_string(&gitdir_meta).unwrap();
+    assert!(content.starts_with('/'), "gitdir bookkeeping must be absolute, got: {content:?}");
+    // And git itself must recognize the linked worktree.
+    let list = out(&repo, &["worktree", "list"]);
+    assert!(list.contains("wt_rel") || list.contains("[zwt/rel]"), "git must recognize the worktree:\n{list}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

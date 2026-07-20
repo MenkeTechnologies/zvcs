@@ -94,7 +94,16 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
                 continue;
             }
         };
-        let new = subrepo.head_id()?.detach();
+        let new = match subrepo.head_id() {
+            Ok(id) => id.detach(),
+            Err(_) => {
+                // Unborn submodule HEAD (freshly init'd, no commits). Refuse this
+                // path only — don't abort the whole bump pass (daemon autobump).
+                println!("{path_str}: refused (submodule HEAD unborn)");
+                refusals.push((path_str.clone(), "submodule HEAD unborn".into()));
+                continue;
+            }
+        };
 
         if new == old {
             println!("{path_str}: already up to date");

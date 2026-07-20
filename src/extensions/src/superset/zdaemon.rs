@@ -237,14 +237,17 @@ fn worker_loop(rx: Receiver<Cmd>, sock_path: PathBuf) {
 /// Per-connection reader. On EOF/error it auto-releases whatever lock this
 /// connection acquired so a crashed holder can never wedge its repo.
 fn handle_conn(stream: UnixStream, tx: Sender<Cmd>) {
-    let mut held: Option<(PathBuf, String)> = None;
+    // A connection may acquire more than one lane; EOF must release *every* one,
+    // or an un-released lane wedges its repo forever. (A scalar released only the
+    // last acquire — the exact wedge the FIFO design exists to prevent.)
+    let mut held: Vec<(PathBuf, String)> = Vec::new();
     conn_loop(&stream, &tx, &mut held);
-    if let Some((repo, id)) = held {
+    for (repo, id) in held {
         let _ = tx.send(Cmd::Release { repo, id });
     }
 }
 
-fn conn_loop(stream: &UnixStream, tx: &Sender<Cmd>, held: &mut Option<(PathBuf, String)>) {
+fn conn_loop(stream: &UnixStream, tx: &Sender<Cmd>, held: &mut Vec<(PathBuf, String)>) {
     let reader_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
@@ -271,21 +274,27 @@ fn conn_loop(stream: &UnixStream, tx: &Sender<Cmd>, held: &mut Option<(PathBuf, 
                     Ok(s) => s,
                     Err(_) => return,
                 };
-                *held = Some((repo.clone(), id.clone()));
+                held.push((repo.clone(), id.clone()));
                 if tx.send(Cmd::Acquire { repo, id, stream: s }).is_err() {
                     return;
                 }
             }
-            Req::Release { id: _wire_id } => {
+            Req::Release { id: wire_id } => {
                 // Release the (repo, id) this connection actually acquired — not
-                // the id echoed on the wire — so an explicit RELEASE behaves
-                // identically to the EOF auto-release path.
-                if let Some((repo, held_id)) = held.clone() {
+                // blindly the id echoed on the wire — so an explicit RELEASE
+                // behaves like the EOF auto-release path. Prefer the entry whose
+                // id matches the wire; fall back to the sole hold when there is
+                // exactly one (a lone RELEASE always means "the one I hold").
+                let pos = held
+                    .iter()
+                    .position(|(_, hid)| *hid == wire_id)
+                    .or(if held.len() == 1 { Some(0) } else { None });
+                if let Some(p) = pos {
+                    let (repo, held_id) = held.remove(p);
                     if tx.send(Cmd::Release { repo, id: held_id }).is_err() {
                         return;
                     }
                 }
-                *held = None;
             }
             Req::Submit(json) => {
                 match handle_submit(&json) {
@@ -456,6 +465,12 @@ fn restart() -> Result<ExitCode> {
             break;
         }
         thread::sleep(Duration::from_millis(40));
+    }
+    // Only unlink a *stale* socket. If a daemon is still answering (STOP was slow
+    // or failed), removing its socket would orphan it and a fresh daemon would
+    // bind empty lane state — split-brain, two holders for one repo. Abort instead.
+    if ping(&path) {
+        anyhow::bail!("daemon still running (STOP did not take); not restarting");
     }
     let _ = std::fs::remove_file(&path);
 

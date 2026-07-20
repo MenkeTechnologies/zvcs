@@ -62,3 +62,79 @@ fn selector_dirty_and_claimed_filters() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn record_failure_preserves_workdir_mapping() {
+    // A failing `zforeach` records a failure via record_failure(git_dir, None).
+    // That must NOT null the repo's known workdir — doing so breaks
+    // --claimed/--session selection and the zstatus path column.
+    let root = std::env::temp_dir().join(format!("zvcs-wdpreserve-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+
+    let a = root.join("alpha");
+    std::fs::create_dir_all(&a).unwrap();
+    git(&a, &["init", "-q", "-b", "main"]);
+    git(&a, &["commit", "--allow-empty", "-q", "-m", "c0"]);
+    zvcs(&home, None, &root, &["zreindex", root.to_str().unwrap()]);
+
+    // Index recorded the workdir → zrepos shows the workdir path, not the git_dir.
+    let before = zvcs(&home, None, &root, &["zrepos"]);
+    assert!(before.lines().any(|l| l.ends_with("/alpha")), "precondition: workdir recorded:\n{before}");
+
+    // A foreach that fails in alpha → record_failure(alpha, None).
+    zvcs(&home, None, &root, &["zforeach", "--", "git", "rev-parse", "--verify", "--quiet", "no-such-ref"]);
+
+    // Workdir mapping must survive: still the workdir path, never ".../.git".
+    let after = zvcs(&home, None, &root, &["zrepos"]);
+    assert!(after.lines().any(|l| l.ends_with("/alpha")), "workdir was nulled by record_failure:\n{after}");
+    assert!(!after.lines().any(|l| l.ends_with("/.git")), "repo path regressed to git_dir:\n{after}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn status_filters_intersect_with_and() {
+    // `--dirty --ahead` must select repos that are BOTH dirty AND ahead (AND),
+    // not their union (OR). Per the selector's documented "all must match".
+    let root = std::env::temp_dir().join(format!("zvcs-andsel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+
+    // "both": ahead of origin/main AND dirty.
+    let bare = root.join("both.git");
+    git(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    git(&root, &["clone", "-q", bare.to_str().unwrap(), "both"]);
+    let both = root.join("both");
+    git(&both, &["checkout", "-q", "-B", "main"]);
+    std::fs::write(both.join("f.txt"), b"1\n").unwrap();
+    git(&both, &["add", "f.txt"]);
+    git(&both, &["commit", "-q", "-m", "c0"]);
+    git(&both, &["push", "-q", "origin", "main"]);
+    std::fs::write(both.join("f.txt"), b"2\n").unwrap();
+    git(&both, &["commit", "-qam", "c1"]);          // now ahead by one
+    std::fs::write(both.join("f.txt"), b"3\n").unwrap(); // now also dirty
+
+    // "dirtyonly": dirty, but no upstream → not ahead.
+    let dirtyonly = root.join("dirtyonly");
+    std::fs::create_dir_all(&dirtyonly).unwrap();
+    git(&dirtyonly, &["init", "-q", "-b", "main"]);
+    std::fs::write(dirtyonly.join("g.txt"), b"1\n").unwrap();
+    git(&dirtyonly, &["add", "g.txt"]);
+    git(&dirtyonly, &["commit", "-q", "-m", "c0"]);
+    std::fs::write(dirtyonly.join("g.txt"), b"2\n").unwrap();
+
+    zvcs(&home, None, &root, &["zreindex", root.to_str().unwrap()]);
+    zvcs(&home, None, &both, &["zstatus"]);       // cache status
+    zvcs(&home, None, &dirtyonly, &["zstatus"]);
+
+    let sel = zvcs(&home, None, &root, &["zforeach", "--dirty", "--ahead", "--", "git", "rev-parse", "HEAD"]);
+    assert!(sel.contains("both"), "--dirty --ahead must include the both-dirty-and-ahead repo:\n{sel}");
+    assert!(!sel.contains("dirtyonly"), "--dirty --ahead must EXCLUDE dirty-but-not-ahead (OR bug):\n{sel}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

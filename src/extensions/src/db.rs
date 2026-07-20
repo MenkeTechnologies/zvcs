@@ -142,7 +142,7 @@ pub fn upsert_repo(conn: &Connection, git_dir: &Path, workdir: Option<&Path>) ->
     conn.execute(
         "INSERT INTO repos (git_dir, workdir, discovered_at, last_seen)
          VALUES (?1, ?2, ?3, ?3)
-         ON CONFLICT(git_dir) DO UPDATE SET last_seen = ?3, workdir = ?2",
+         ON CONFLICT(git_dir) DO UPDATE SET last_seen = ?3, workdir = COALESCE(?2, workdir)",
         rusqlite::params![gd, wd, ts],
     )?;
     let id: i64 = conn.query_row(

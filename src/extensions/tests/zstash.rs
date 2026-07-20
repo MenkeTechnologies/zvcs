@@ -56,3 +56,32 @@ fn zstash_parks_and_zunstash_restores() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn zstash_refuses_reusing_a_live_name() {
+    // Re-stashing under a live name would orphan the first run's per-repo git
+    // stashes (stash_begin clears the db rows). It must refuse instead.
+    let root = std::env::temp_dir().join(format!("zvcs-zstashdup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), b"1\n").unwrap();
+    git(&repo, &["add", "a.txt"]);
+    git(&repo, &["commit", "-q", "-m", "c0"]);
+
+    std::fs::write(repo.join("a.txt"), b"2\n").unwrap();
+    let (out1, ok1) = zvcs(&home, &repo, &["zstash"]);
+    assert!(ok1 && out1.contains("stashed 1 repo"), "first zstash: {out1}");
+
+    // Dirty again and try to reuse the same name → must refuse.
+    std::fs::write(repo.join("a.txt"), b"3\n").unwrap();
+    let (_out2, ok2) = zvcs(&home, &repo, &["zstash"]);
+    assert!(!ok2, "second zstash under live name 'wip' must fail, not orphan the first");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -63,9 +63,12 @@ impl Selector {
         let status_set: Option<HashSet<String>> = if self.dirty || self.ahead || self.behind {
             let mut set = HashSet::new();
             for s in crate::db::list_status(&conn)? {
-                let hit = (self.dirty && s.dirty)
-                    || (self.ahead && s.sync == "ahead")
-                    || (self.behind && s.sync == "behind");
+                // Filters compose with AND (per the module contract), so every
+                // enabled status flag must hold. `--ahead --behind` is then
+                // unsatisfiable, which is correct — a repo is never both.
+                let hit = (!self.dirty || s.dirty)
+                    && (!self.ahead || s.sync == "ahead")
+                    && (!self.behind || s.sync == "behind");
                 if hit {
                     set.insert(s.path);
                 }

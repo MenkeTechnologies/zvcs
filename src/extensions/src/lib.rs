@@ -10,6 +10,7 @@ pub mod crawler;
 pub mod db;
 pub mod dispatch;
 pub mod index_commit;
+pub mod jobrun;
 pub mod lock;
 pub mod porcelain;
 pub mod superset;

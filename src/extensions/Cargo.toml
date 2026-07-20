@@ -35,3 +35,5 @@ notify = "6"
 rusqlite = { version = "0.31", features = ["bundled"] }
 # Fast parallel filesystem walk for the repo crawler (whole-device `.git` scan).
 ignore = "0.4"
+# Job spec encoding over the daemon socket (async z-verbs).
+serde_json = "1"

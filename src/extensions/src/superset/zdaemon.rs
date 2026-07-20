@@ -256,6 +256,13 @@ fn conn_loop(stream: &UnixStream, tx: &Sender<Cmd>, held: &mut Option<(PathBuf, 
                 }
                 *held = None;
             }
+            Req::Submit(json) => {
+                match handle_submit(&json) {
+                    Some(id) => reply(stream, &format!("JOB {id}")),
+                    None => reply(stream, "ERR could not queue job"),
+                }
+                return; // single-shot
+            }
             Req::Status => {
                 if let Ok(s) = stream.try_clone() {
                     let _ = tx.send(Cmd::Status { stream: s });
@@ -276,6 +283,7 @@ fn conn_loop(stream: &UnixStream, tx: &Sender<Cmd>, held: &mut Option<(PathBuf, 
 enum Req {
     Acquire { id: String, repo: PathBuf },
     Release { id: String },
+    Submit(String),
     Status,
     Stop,
     Err(String),
@@ -308,10 +316,65 @@ fn parse(line: &str) -> Req {
                 Req::Release { id: rest.to_string() }
             }
         }
+        "SUBMIT" => {
+            if rest.is_empty() {
+                Req::Err("SUBMIT needs a job spec".into())
+            } else {
+                Req::Submit(rest.to_string())
+            }
+        }
         "STATUS" => Req::Status,
         "STOP" => Req::Stop,
         other => Req::Err(format!("unknown verb {other:?}")),
     }
+}
+
+/// Queue an async job: record it, spawn its executor off the lock worker, and
+/// return the job id. Returns `None` if the spec is unusable or the ledger is
+/// unavailable.
+fn handle_submit(json: &str) -> Option<i64> {
+    let spec: serde_json::Value = serde_json::from_str(json).ok()?;
+    let git_dir = spec.get("git_dir").and_then(|v| v.as_str())?;
+    let kind = spec.get("kind").and_then(|v| v.as_str())?;
+    let workdir = spec.get("workdir").and_then(|v| v.as_str());
+    let session = spec.get("session").and_then(|v| v.as_str());
+
+    let conn = crate::db::open_rw().ok()?;
+    let repo_id = crate::db::upsert_repo(
+        &conn,
+        Path::new(git_dir),
+        workdir.map(Path::new),
+    )
+    .ok()?;
+    let id = crate::db::insert_job(&conn, repo_id, kind, json, session).ok()?;
+    drop(conn);
+
+    // Execute off the connection/worker threads. The child porcelain the job
+    // spawns will acquire its repo's lane itself, so ordering is preserved.
+    let json_owned = json.to_string();
+    thread::spawn(move || {
+        if let Ok(conn) = crate::db::open_rw() {
+            let _ = crate::db::job_running(&conn, id);
+        }
+        let spec: serde_json::Value = match serde_json::from_str(&json_owned) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let result = crate::jobrun::execute(&spec);
+        if let Ok(conn) = crate::db::open_rw() {
+            let state = if result.ok { "done" } else { "failed" };
+            let exit = if result.ok { 0 } else { 1 };
+            let _ = crate::db::job_finished(
+                &conn,
+                id,
+                state,
+                exit,
+                &result.output,
+                result.sha_after.as_deref(),
+            );
+        }
+    });
+    Some(id)
 }
 
 /// `git zdaemon status` — one-shot STATUS query. Not running is not an error.

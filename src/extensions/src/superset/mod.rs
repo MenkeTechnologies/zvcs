@@ -15,7 +15,9 @@
 
 pub mod attach;
 pub mod ledger;
+pub mod queue;
 mod reconcile;
+pub mod repl;
 pub mod watch;
 mod zbump;
 pub mod zdaemon;
@@ -23,6 +25,8 @@ mod zsync;
 
 pub use attach::{ensure_attached, Attached};
 pub use ledger::{zjob, zjobs, zreindex, zrepos};
+pub use queue::{zcommit, zpush};
+pub use repl::zrepl;
 pub use reconcile::reconcile_tree;
 pub use zbump::zbump;
 pub use zdaemon::zdaemon;

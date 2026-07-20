@@ -221,6 +221,7 @@ the read-only ones rather than as evidence of correctness.
 ## [0x08] DOCUMENTATION
 
 - **Docs hub** — <https://menketechnologies.github.io/zvcs/>
+- **Design document** — [DESIGN.md](DESIGN.md) — daemon architecture, concurrency model, autonomous behaviors, ledger/queue
 - **Engineering report** — <https://menketechnologies.github.io/zvcs/report.html>
 - **gitoxide** — <https://github.com/GitoxideLabs/gitoxide> (the ported library)
 - **Source** — <https://github.com/MenkeTechnologies/zvcs>

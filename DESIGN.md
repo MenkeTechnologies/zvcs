@@ -341,36 +341,53 @@ commits/pushes that should not block.
 | Faithful git subcommands (`porcelain/`) | built |
 | Fair FIFO lock under git writes (`lock.rs`, wired across porcelain) | built |
 | `zsync` submodule reconcile / attach-on-ff (`zsync.rs`) | built |
-| `zbump` forward-only coalesced staging (`zbump.rs`) | built (stages only) |
-| Per-repo daemon + FIFO worker (`zdaemon.rs`) | built (to become singleton) |
-| Singleton daemon in `~/.zvcs`, per-repo lanes | to do |
-| `notify` watch layer (submodule `logs/HEAD` + remote-tracking) | to do |
-| Detached-HEAD attach-scan + in-place attach + early-return fix | to do |
-| autobump stage→commit gap + debounce | to do |
-| Reactive reconcile on remote-tracking change | to do |
-| Failure log + notify-on-next-command | to do |
-| SQLite `jobs` + `repos` (rusqlite bundled, WAL, sole writer) | to do |
-| Crawler (whole-device repo index) + `zreindex`/`zrepos` | to do |
-| `zcommit`/`zpush` async + ls-refs pre-flight | to do |
-| `zjobs`/`zjob` + `zrepl` | to do |
+| `zbump` forward-only coalesced bump **+ commit** (`zbump.rs`, `index_commit.rs`) | built |
+| Singleton daemon in `~/.zvcs`, per-repo lanes (`zdaemon.rs`) | built |
+| `notify` watch layer (submodule `refs`/`logs`) (`watch.rs`) | built |
+| Detached-HEAD attach-scan + in-place attach + early-return fix (`attach.rs`) | built |
+| autobump stage→commit gap + debounce (`watch.rs`, `zbump.rs`) | built |
+| Reactive reconcile on remote-tracking change (`reconcile_repo_local`) | built |
+| Failure log + notify-on-next-command (`db.rs`, `lib.rs`) | built |
+| SQLite `jobs` + `repos` (rusqlite bundled, WAL) (`db.rs`) | built |
+| Crawler + `zreindex`/`zrepos` (`crawler.rs`, `ledger.rs`) | built |
+| `zcommit`/`zpush` async via daemon `SUBMIT` (`queue.rs`, `jobrun.rs`) | built |
+| `zjobs`/`zjob` + `zrepl` (`ledger.rs`, `repl.rs`) | built |
 
-## 11. Implementation phases
+**Known partials / deliberate simplifications** (honest scope):
+- **`zpush` pre-flight is network-free** — it compares HEAD to the already-fetched
+  `origin/main` remote-tracking ref, not a live `ls-refs`. It catches the common
+  stale case; a remote that moved since the last local fetch is caught by the
+  push itself → ledger → notify. A live `ls-refs` pre-flight is a refinement.
+- **Crawler whole-device scan is on-demand** (`git zreindex`), not run
+  automatically on daemon start (keeps startup lean; avoids scanning `$HOME` on
+  every boot).
+- **Job control** (`zjob stop`/`restart`, cooperative cancel) and a **bounded**
+  job pool are not yet wired — jobs run to completion on a thread-per-job.
+- **autobump *refusal* notify** surfaces via the daemon log; only reconcile
+  errors are recorded as ledger failures so far (the notify plumbing exists).
+- **Interop `index.lock` via `gix-lock`**: index writes go through gix's own
+  index writer; auditing that every write path emits the on-disk `index.lock`
+  for external-tool interop is not yet verified end-to-end.
 
-- **P1 — Singleton daemon + watch layer + detached-HEAD healing.** Fixed socket
-  `~/.zvcs/zvcs.sock`; shatter the single critical section into per-repo lanes
-  (`ACQUIRE <git-dir> <client-id>`); delete the timer loops
-  (`zdaemon.rs:155-187`); `notify` watches; attach-scan on start + watcher
-  re-attach (clean ff / dirty in-place); reconcile early-return fix.
-- **P2 — Debounced autobump + commit (marker killer).** Close the `zbump`
-  stage→commit gap (local, coalesced, `gix-lock` interop write); debounce window
-  from `interval`.
-- **P3 — Reactive reconcile + failure surfacing.** Remote-tracking event →
-  `reconcile_repo`; failure log + notify-on-next-command in `run()`.
-- **P4 — SQLite ledger + repo index.** `jobs` + `repos` tables, DB-writer
-  thread, crawler, `zrepos`/`zreindex`.
-- **P5 — Async write-verbs.** `zcommit`/`zpush` (+ ls-refs pre-flight),
-  `zjobs`/`zjob`, job lifecycle/cancel/restart.
-- **P6 — `zrepl`** and extended `zdaemon status`.
+## 11. Implementation phases (all landed — see §10 for partials)
+
+- **P1 — Singleton daemon + watch layer + detached-HEAD healing.** ✅ Fixed
+  socket `~/.zvcs/zvcs.sock` (`ZVCS_SOCK` override); per-repo lanes
+  (`ACQUIRE <client-id> <git-dir>`); timer loops deleted; `notify` watches;
+  attach-scan on start + watcher re-attach (clean ff / dirty in-place);
+  reconcile early-return fix. Tests: `attach.rs`, `coordination.rs`.
+- **P2 — Debounced autobump + commit (marker killer).** ✅ `zbump` commits the
+  coalesced bumps (`index_commit.rs`); debounce window from `interval`. Test:
+  `autonomy.rs` (submodule commit → autobump clears the marker).
+- **P3 — Reactive reconcile + failure surfacing.** ✅ Remote-tracking event →
+  `reconcile_repo_local` (fetch-free); notify-on-next-command in `run()`. Test:
+  `notify.rs`.
+- **P4 — SQLite ledger + repo index.** ✅ `jobs` + `repos` (WAL), crawler,
+  `zrepos`/`zreindex`. Test: `ledger.rs`.
+- **P5 — Async write-verbs.** ✅ `zcommit`/`zpush` via daemon `SUBMIT`,
+  `zjobs`/`zjob`, network-free push pre-flight. Tests: `queue.rs`,
+  `push_preflight.rs`. (`zjob stop`/`restart` still to wire — §10.)
+- **P6 — `zrepl`.** ✅ Interactive verb console. Test: `repl.rs`.
 
 **Rollback:** autonomous behaviors stay behind `[zvcs]` config flags — off →
 the daemon reverts to a pure fair-lock coordinator (current behavior). The

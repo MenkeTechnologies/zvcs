@@ -50,7 +50,7 @@
             <span class="sep">/</span>
             <a href="https://github.com/MenkeTechnologies/zvcs" target="_blank" rel="noopener noreferrer">GitHub</a>
           </nav>
-          <p class="docs-build-line">zvcs v0.1.0 · one Rust binary named <code>git</code> · shadows stock git on PATH, no fork/exec · git-compat served via vendored gitoxide · superset: fair FIFO index-lock daemon, reconcile-to-mainline attaching, forward-only gitlink bumps · MIT · in active development</p>
+          <p class="docs-build-line">zvcs v0.1.0 · one Rust binary named <code>git</code> · shadows stock git on PATH, no fork/exec · git-compat served via vendored gitoxide · superset: singleton per-repo-lane daemon, reactive autonomy, SQLite ledger + async queue, machine-wide status, cross-repo timeline/undo, tree snapshots, per-agent isolated worktrees · MIT · in active development</p>
         </div>
         <div class="tutorial-toolbar">
           <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
@@ -84,17 +84,21 @@
         <h2>The problem it solves</h2>
         <p>The meta-repo zvcs targets is a shell of git submodules driven by up to 16 concurrent automated agents. Stock git handles that topology poorly in three specific, reproducible ways, and each superset verb closes one of them:</p>
         <div class="cat-grid">
-          <div class="cat-card"><h4>index.lock contention</h4><p>Git guards index writes with an <code>O_EXCL</code> lockfile; a contended writer does not wait, it <em>fails</em>. <code>zdaemon</code> replaces the flock with a FIFO userspace barrier — a contended writer waits its turn and is answered <code>GRANTED</code>, first-come-first-served.</p></div>
-          <div class="cat-card"><h4>Detached HEAD by default</h4><p><code>git submodule update</code> leaves every submodule detached, orphaning committed work. <code>zsync</code> reconciles each submodule to its mainline (<code>origin/main</code>/<code>origin/master</code>) and leaves <code>HEAD</code> <em>attached</em>.</p></div>
-          <div class="cat-card"><h4>Regressed pointers</h4><p>A blanket <code>git add</code> of a stale submodule worktree can move the recorded gitlink backwards. <code>zbump</code> stages a pointer only when the new HEAD is a descendant of the recorded one — forward-only.</p></div>
-          <div class="cat-card"><h4>No fork/exec</h4><p>Every subcommand runs in-process against the vendored gitoxide crates. There is no shelling out to stock git and no shim; unported subcommands error terse instead of falling through.</p></div>
+          <div class="cat-card"><h4>index.lock contention</h4><p>Git's <code>O_EXCL</code> lockfile fails a contended writer instead of queuing it. One machine-wide <code>zdaemon</code> with a <em>per-repo FIFO lane</em> serializes writers first-come-first-served; unrelated repos run fully in parallel.</p></div>
+          <div class="cat-card"><h4>Detached HEAD by default</h4><p><code>git submodule update</code> leaves submodules detached, orphaning work. <code>zsync</code> + the daemon's attach-scan keep every submodule <em>attached</em> to its mainline — even a dirty detached HEAD is rescued in place (no-clobber).</p></div>
+          <div class="cat-card"><h4>Constant pointer markers</h4><p>Every submodule commit dirties the parent's gitlink. <code>zbump</code> + autobump do forward-only pointer bumps <em>and commit them</em> (clearing the <code>(new commits)</code> marker), coalesced on a file-watch, so agents never touch the root.</p></div>
+          <div class="cat-card"><h4>Agents colliding on one tree</h4><p>N agents editing one meta tree collide on files, index, and HEAD. <code>zworktree</code> gives each agent a private, object-sharing worktree of the whole submodule tree — complete isolation, no re-clone.</p></div>
         </div>
       </section>
 
       <section class="tutorial-section">
         <h2>Architecture</h2>
         <p>Two namespaces share one dispatch table (<code>src/extensions/src/dispatch.rs</code>):</p>
-        <pre>git &lt;subcommand&gt;  →  dispatch  ┬─  superset verbs (z*)      →  zdaemon / zsync / zbump
+        <pre>git &lt;subcommand&gt;  →  dispatch  ┬─  superset verbs (z*)      →  coordination · queue · ledger
+                               │                              (zdaemon zsync zbump zcommit zpush
+                               │                               zjobs zjob zrepos zreindex zstatus
+                               │                               zlog zundo zclaim zwho zsnapshot
+                               │                               zrestore zworktree zrepl …)
                                └─  git-compat porcelain     →  gitoxide (gix) library</pre>
         <div class="cat-grid">
           <div class="cat-card"><h4>Vendored gitoxide</h4><p><code>src/ported</code> holds the <code>gix</code> + <code>gix-*</code> crates in-tree as a self-contained workspace, excluded from the root and consumed as a path dependency. The <code>gix</code>/<code>ein</code> CLIs and <code>gitoxide-core</code> are removed; <code>git</code> is the only binary.</p></div>
@@ -106,18 +110,18 @@
 
       <section class="tutorial-section">
         <h2>The zdaemon coordinator</h2>
-        <p><code>zdaemon</code> is the linchpin of the concurrency story — a fair replacement for <code>index.lock</code>. A single worker thread owns the abstract critical section and drains an mpsc channel of requests <em>in arrival order</em>; that arrival order is the fairness guarantee. Release is automatic (RAII on the client, socket-EOF on the daemon), so a crashed holder can never wedge the repo. The wire protocol is line-based over the unix socket at <code>&lt;git-dir&gt;/zvcs.sock</code>:</p>
+        <p>One machine-wide <code>zdaemon</code> (state under <code>~/.zvcs/</code>, socket <code>~/.zvcs/zvcs.sock</code>) is the fair replacement for <code>index.lock</code> plus the host for reactive autonomy, the SQLite ledger, and the async job queue. The lock is <em>per-repo</em> — unrelated repos run in parallel; only same-repo writers serialize, first-come-first-served. It is reactive (<strong>no timers, no polling</strong>): a <code>git pull</code>/commit updates local refs, a <code>notify</code> file-watch fires, and the daemon reacts (attach, autobump, reconcile, status, hooks). Release is automatic (RAII on the client, socket-EOF on the daemon). Index writes also go through <code>index.lock</code> via <code>gix-lock</code> for stock-git interop. The wire protocol is line-based over the unix socket:</p>
         <table class="reflection-table">
           <thead><tr><th>Line</th><th>Direction</th><th>Meaning</th></tr></thead>
           <tbody>
-            <tr><td><code>ACQUIRE &lt;id&gt;</code></td><td>client → daemon</td><td>Enqueue a lock request; answered <code>GRANTED</code> at the FIFO head.</td></tr>
+            <tr><td><code>ACQUIRE &lt;id&gt; &lt;git-dir&gt;</code></td><td>client → daemon</td><td>Enqueue on that repo's lane; answered <code>GRANTED</code> at its head.</td></tr>
             <tr><td><code>RELEASE &lt;id&gt;</code></td><td>client → daemon</td><td>Current holder releases; the next waiter is granted.</td></tr>
-            <tr><td><code>STATUS</code></td><td>client → daemon</td><td>Reply <code>holder=&lt;id|none&gt; queue=&lt;depth&gt;</code>, then close.</td></tr>
-            <tr><td><code>STOP</code></td><td>client → daemon</td><td>Reply <code>STOPPING</code>, remove the socket, exit.</td></tr>
-            <tr><td><code>GRANTED</code></td><td>daemon → client</td><td>The lock is now yours (answer to <code>ACQUIRE</code>).</td></tr>
-            <tr><td><code>ERR &lt;reason&gt;</code></td><td>daemon → client</td><td>Malformed request.</td></tr>
+            <tr><td><code>SUBMIT &lt;json&gt;</code></td><td>client → daemon</td><td>Queue an async job (zcommit/zpush); answered <code>JOB &lt;id&gt;</code>.</td></tr>
+            <tr><td><code>JOBSTOP / JOBRESTART &lt;id&gt;</code></td><td>client → daemon</td><td>Cancel / re-enqueue a job.</td></tr>
+            <tr><td><code>STATUS</code> / <code>STOP</code></td><td>client → daemon</td><td>Snapshot / shut the daemon down.</td></tr>
           </tbody>
         </table>
+        <p>All autonomy is gated by <code>[zvcs]</code> gitconfig and defaults off: <code>autoreconcile</code>, <code>autobump</code>, <code>autocrawl</code>, <code>autostatus</code>, <code>hook</code>, plus <code>interval</code> (debounce), <code>crawlroots</code>, and <code>worktreebase</code>. Headless failures are recorded in the ledger and surfaced on your next <code>git</code> command.</p>
       </section>
 
       <section class="tutorial-section">
@@ -129,18 +133,33 @@ cargo build
 ./target/debug/git rev-parse HEAD
 ./target/debug/git rev-parse --abbrev-ref HEAD
 
-# superset: the per-repo fair-lock coordinator
+# superset: the singleton fair-lock coordinator
 ./target/debug/git zdaemon start
-./target/debug/git zdaemon status      # holder=&lt;id|none&gt; queue=&lt;depth&gt;
+./target/debug/git zdaemon status
 ./target/debug/git zdaemon stop
 
-# superset: reconcile submodules to mainline, kept attached (fast-forward only)
+# coordination: reconcile submodules to mainline (attached, ff-only) + bump pointers
 ./target/debug/git zsync                # all submodules
-./target/debug/git zsync path/to/sub    # a named subset
+./target/debug/git zbump                # forward-only gitlink bumps (+ commit)
 
-# superset: forward-only submodule gitlink bumps
-./target/debug/git zbump                # all submodules
-./target/debug/git zbump path/to/sub    # a named subset</pre>
+# repo index + machine-wide status
+./target/debug/git zreindex             # crawl for git repos
+./target/debug/git zrepos               # list them (pipe-clean)
+./target/debug/git zstatus --all        # instant status across every indexed repo
+
+# async queue + ledger
+./target/debug/git zcommit file.rs -m "msg" --push
+./target/debug/git zjobs                # recent jobs
+./target/debug/git zjob 42              # one job (zjob stop|restart 42)
+
+# multi-agent, timeline, snapshots, isolated worktrees
+./target/debug/git zclaim               # lease this repo for $ZVCS_SESSION
+./target/debug/git zwho                 # who holds what
+./target/debug/git zlog                 # cross-repo reflog timeline
+./target/debug/git zundo                # rewind this repo one step
+./target/debug/git zsnapshot before     # tree-wide restore point
+./target/debug/git zrestore before      # restore the whole tree
+./target/debug/git zworktree add agent3 # private isolated tree for an agent</pre>
       </section>
 
       <section class="tutorial-section">
@@ -149,13 +168,14 @@ cargo build
         <table class="reflection-table">
           <thead><tr><th>Component</th><th>State</th><th>Notes</th></tr></thead>
           <tbody>
-            <tr><td>The <code>git</code> shadow binary + dispatch</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Single binary named <code>git</code>; two-namespace dispatch table, terse zsh-style errors (<code>src/main.rs</code>, <code>src/dispatch.rs</code>).</td></tr>
-            <tr><td>Vendored gitoxide (<code>src/ported</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>In-tree <code>gix</code> + <code>gix-*</code> crates, own excluded workspace; <code>gix</code>/<code>ein</code>/<code>gitoxide-core</code> removed.</td></tr>
-            <tr><td><code>zdaemon</code> — fair FIFO index-lock coordinator</td><td><span class="status-pill status-implemented">Implemented</span></td><td><code>start</code>/<code>stop</code>/<code>status</code>; mpsc arrival-order barrier, socket-EOF auto-release (<code>src/superset/zdaemon.rs</code>, <code>src/lock.rs</code>).</td></tr>
-            <tr><td><code>zsync</code> — reconcile-to-mainline attacher</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Fast-forward only; skips dirty worktrees; re-attaches <code>HEAD</code> and moves only changed files (<code>src/superset/zsync.rs</code>).</td></tr>
-            <tr><td><code>zbump</code> — forward-only gitlink bumps</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Descendant check before staging; parent index opened + staged once (<code>src/superset/zbump.rs</code>).</td></tr>
-            <tr><td><code>rev-parse</code></td><td><span class="status-pill status-progress">Partial</span></td><td>Resolves <code>HEAD</code> and <code>--abbrev-ref HEAD</code> only (<code>src/porcelain.rs</code>).</td></tr>
-            <tr><td>Git-compat porcelain surface</td><td><span class="status-pill status-planned">Planned</span></td><td><code>status</code>, <code>add</code>, <code>commit</code>, <code>log</code>, and the rest ported incrementally on top of gitoxide.</td></tr>
+            <tr><td>Shadow <code>git</code> binary + vendored gitoxide</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Single binary named <code>git</code>; two-namespace dispatch; in-tree <code>gix</code>/<code>gix-*</code> workspace.</td></tr>
+            <tr><td>Singleton daemon + per-repo FIFO lanes</td><td><span class="status-pill status-implemented">Implemented</span></td><td><code>~/.zvcs/</code>; parallel across repos; socket-EOF auto-release; reactive file-watch, no polling.</td></tr>
+            <tr><td>Coordination — <code>zsync</code> / <code>zbump</code> / attach</td><td><span class="status-pill status-implemented">Implemented</span></td><td>ff-only reconcile; forward-only bump + commit; detached-HEAD attach-scan (dirty-safe).</td></tr>
+            <tr><td>SQLite ledger + repo index + crawler</td><td><span class="status-pill status-implemented">Implemented</span></td><td><code>zrepos</code>/<code>zreindex</code> (pipe-clean, prunes deleted); WAL ledger; notify-on-next-command.</td></tr>
+            <tr><td>Async queue — <code>zcommit</code>/<code>zpush</code>/<code>zjob(s)</code></td><td><span class="status-pill status-implemented">Implemented</span></td><td>Bounded job pool; ls-refs push pre-flight; <code>zjob stop</code>/<code>restart</code>; sync fallback.</td></tr>
+            <tr><td>Multi-agent, status, timeline, snapshots</td><td><span class="status-pill status-implemented">Implemented</span></td><td><code>zclaim</code>/<code>zwho</code>; <code>zstatus --all</code>; <code>zlog</code>/<code>zundo</code>; <code>zsnapshot</code>/<code>zrestore</code>; typed hooks.</td></tr>
+            <tr><td>Per-agent isolated worktrees (<code>zworktree</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Object-sharing linked worktrees of the whole submodule tree; stock-git interop verified.</td></tr>
+            <tr><td>Git-compat parity</td><td><span class="status-pill status-progress">Ongoing</span></td><td>Every subcommand dispatches natively; per-flag parity with stock git is measured by the harness and is the work that remains — see the report.</td></tr>
           </tbody>
         </table>
       </section>

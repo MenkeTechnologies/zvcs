@@ -426,3 +426,36 @@ commits/pushes that should not block.
 the daemon reverts to a pure fair-lock coordinator (current behavior). The
 socket-path move keeps a fallback to `<git-dir>/zvcs.sock` if `~/.zvcs` cannot be
 created. autobump commits are ordinary commits (`git revert`/`reset`).
+
+## 12. Novel superset features (built on the daemon/db substrate)
+
+These are capabilities stock git has no equivalent for — each exists only because
+zvcs has a machine-wide daemon, a db of every repo, file-watchers, an op ledger,
+and session attribution. All tested.
+
+- **Multi-agent claim/lease** — `zclaim` / `zunclaim` / `zwho`. An advisory,
+  session-attributed lease (one per repo, race-safe via the db PK) so N agents
+  signal "I'm working this repo." `claims` table. Test: `claim.rs`.
+- **Machine-wide instant status** — `zstatus` (live for the cwd repo) /
+  `zstatus --all` (every indexed repo, from the db). The daemon maintains each
+  watched repo's dirty/detached/sync/head in `repo_status` on ref-change
+  (`zvcs.autostatus`), so `--all` is a pre-computed, zero-walk read. `sync` is
+  merge-base derived (up-to-date/ahead/behind/diverged). Dirtiness is tracked-
+  change based (like `git diff`) and refreshed on ref events, not worktree edits.
+  Tests: `status.rs`, `status_daemon.rs`.
+- **Cross-repo op ledger + rewind** — `zlog` merges every indexed repo's HEAD
+  reflog into one time-ordered, machine-wide timeline; `zundo` rewinds a repo one
+  step (`reset --hard` to the previous HEAD, refuses on dirty). Test: `oplog.rs`.
+- **Typed cross-repo hooks** — the hook (`zvcs.hook`) fires with a typed event
+  classified from the reflog (`ZVCS_EVENT` = commit/checkout/merge/pull/rebase/
+  reset/…) plus `ZVCS_OLD_SHA`/`ZVCS_NEW_SHA`/`ZVCS_REF`, enabling "on commit in
+  X, do Y in repo Z" rules. Test: `hook_event.rs`.
+- **Tree-wide snapshot/restore** — `zsnapshot <name>` records the HEAD of the
+  repo + every nested submodule as one restore point; `zrestore <name>` resets
+  the whole tree back (`reset --hard` per repo, keeps untracked); `zsnapshots`
+  lists them. `snapshots` table. Test: `snapshot.rs`.
+
+**New `[zvcs]` config keys:** `autostatus` (maintain `zstatus --all`), plus the
+existing `autoreconcile`/`autobump`/`hook`/`autocrawl`/`crawlroots`/`interval`.
+`zvcs.hook` and claims/snapshots/oplog work without any daemon (client-side db);
+`zstatus --all` freshness and typed hooks need the daemon watching.

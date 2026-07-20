@@ -25,8 +25,11 @@
 //!   with `GIT_ATTR_SYSTEM`, `GIT_CONFIG_NOSYSTEM=1` with `GIT_CONFIG_SYSTEM`,
 //!   a dumb terminal and no editor set with `GIT_EDITOR`, …)
 //! * `git var -l` — the merged configuration as `key=value` (git's `config list`
-//!   order and normalisation), followed by the logical variables in git's own
-//!   table order, skipping any that have no value
+//!   order and normalisation, multivars in file order rather than grouped by
+//!   key), followed by the logical variables in git's own table order, skipping
+//!   any that have no value. The `gitoxide.*` layers `gix` synthesizes from the
+//!   ambient environment and from zvcs' API-scope defaults are not git
+//!   configuration and are excluded, exactly as `git config --list` excludes them
 //! * `-h` — git's usage line on stdout, exit 129; no argument, an unknown
 //!   variable, or more than one argument — the same line on stderr, exit 129
 //! * `GIT_CONFIG_GLOBAL` correctly collapses to a single line when the
@@ -314,34 +317,53 @@ fn config_paths(sources: &[Source]) -> Option<Vec<BString>> {
     (!paths.is_empty()).then_some(paths)
 }
 
+/// Config layers that exist only inside gitoxide and have no counterpart in
+/// stock git, so `git var -l` must not print them.
+///
+/// `gix` synthesizes a `Source::EnvOverride` layer from the ambient environment
+/// (`GIT_COMMITTER_NAME` → `gitoxide.committer.nameFallback`,
+/// `GIT_TERMINAL_PROMPT` → `gitoxide.credentials.terminalPrompt`, …), and zvcs
+/// injects its own defaults through `Source::Api`. Neither is git configuration.
+/// `Source::Env` (`GIT_CONFIG_COUNT`) and `Source::Cli` (`git -c`) are real and
+/// stay visible. Same rule as `git config --list` applies in `config.rs`.
+fn is_synthetic(source: Source) -> bool {
+    matches!(source, Source::EnvOverride | Source::Api)
+}
+
 /// `git var -l`'s configuration half — every `key=value` from the merged config
 /// in file order, with section and value names lower-cased (git-normalized) and
-/// subsection case preserved. Same rendering as `git config --list`.
+/// subsection case preserved. Verified byte-identical to `git config --list`,
+/// which is what `builtin/var.c` delegates this half to.
 fn list_config(cfg: &ConfigFile, out: &mut impl Write) -> Result<()> {
     for section in cfg.sections() {
+        if is_synthetic(section.meta().source) {
+            continue;
+        }
         let header = section.header();
         let section_name = header.name().to_string().to_lowercase();
         let subsection = header.subsection_name().map(ToString::to_string);
 
-        // Preserve first-seen order but visit each value name once; a multivar's
-        // values are then emitted together via `values(name)`.
-        let mut seen: Vec<String> = Vec::new();
+        // Multivars keep their *file* order, not a per-key grouping: git prints
+        // `foo.a=1 / foo.b=2 / foo.a=3` for a body in that order. `value_names()`
+        // walks the body and repeats a name once per occurrence, so the nth
+        // occurrence of a name pairs with `values(name)[n]`.
+        let mut occurrence: Vec<(String, usize)> = Vec::new();
         for raw_name in section.value_names() {
             let lname = raw_name.to_lowercase();
-            if !seen.iter().any(|s| s == &lname) {
-                seen.push(lname);
-            }
+            let nth = occurrence.iter().filter(|(n, _)| *n == lname).count();
+            occurrence.push((lname, nth));
         }
 
-        for value_name in &seen {
-            for value in section.values(value_name) {
-                match &subsection {
-                    Some(sub) => write!(out, "{section_name}.{sub}.{value_name}=")?,
-                    None => write!(out, "{section_name}.{value_name}=")?,
-                }
-                out.write_all(&value)?;
-                out.write_all(b"\n")?;
+        for (value_name, nth) in &occurrence {
+            let Some(value) = section.values(value_name).into_iter().nth(*nth) else {
+                continue;
+            };
+            match &subsection {
+                Some(sub) => write!(out, "{section_name}.{sub}.{value_name}=")?,
+                None => write!(out, "{section_name}.{value_name}=")?,
             }
+            out.write_all(&value)?;
+            out.write_all(b"\n")?;
         }
     }
     Ok(())

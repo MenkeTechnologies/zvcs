@@ -22,7 +22,7 @@
 //!      `Removing stale temporary file <path>` on stdout when `-n` or `-v`,
 //!      unlinked unless `-n`.
 //!
-//! Reachability mirrors `reachable.c`'s `mark_reachable_objects(revs, 1, 0, _)`:
+//! Reachability mirrors `reachable.c`'s `mark_reachable_objects(revs, 1, expire, _)`:
 //! roots are every index entry's blob plus the valid cache-tree ids, every ref
 //! under `refs/` (symrefs followed, tags left unpeeled so the tag object itself
 //! survives), `HEAD`, every entry of every reflog under `logs/`, and any
@@ -31,15 +31,43 @@
 //! Missing links are ignored rather than fatal, as git sets
 //! `revs->ignore_missing_links`.
 //!
+//! `--expire <time>` is `expire` in `builtin/prune.c`, and it does two distinct
+//! things, both ported:
+//!   * Every unlink is gated on `st_mtime > expire` keeping the file — that gate
+//!     covers unreachable loose objects (`prune_object()`) *and* stale
+//!     temporaries (`prune_tmp_file()`), but never `prune_packed_objects()`,
+//!     which git runs unconditionally.
+//!   * A non-zero `expire` also becomes `mark_recent`, so
+//!     `add_unseen_recent_objects_to_traversal()` seeds the closure with every
+//!     local object written after `expire` — loose objects by their own mtime,
+//!     packed objects by their `.pack`'s mtime. That is what keeps an *old*
+//!     object alive because a *recent* unreachable commit still points at it.
+//!
+//! Values go through `parse_expiry_date()`'s two special cases first: `never`
+//! and `false` are `0` (prune nothing, no recent traversal), `all` and `now` are
+//! `TIME_MAX` (prune every unreachable object, no grace). Anything else is a
+//! date, parsed by `gix::date::parse` after git's approxidate tokenisation is
+//! approximated by splitting digit/letter runs and treating `.` as a separator,
+//! so `2.weeks.ago`, `2weeks ago` and `2 weeks` all reach the same span. A value
+//! that no form parses is `fatal: malformed expiration date '<value>'`, exit 128.
+//!
+//! Deviation: a bare `YYYY-MM-DD` resolves to UTC midnight, where git's
+//! approxidate uses *local* midnight — up to ~14h apart. The vendored crates
+//! expose no local-timezone lookup (`gix-date` keeps `jiff` private), so there is
+//! nothing here to read the system offset from.
+//!
 //! Paths are printed the way git does after it chdir's to the top level: the
 //! object directory relative to the worktree (`.git/objects/...`), or relative to
 //! the current directory for a bare repository (`objects/...`).
 //!
 //! Supported: `-n`/`--dry-run`/`--no-dry-run`, `-v`/`--verbose`/`--no-verbose`,
-//! clustered short flags (`-nv`), `--progress`/`--no-progress`, `--`,
-//! `<head>...`, and `-h`. Exit codes match stock git: 129 with git's usage block
-//! for `-h` and for a bad option, 128 with `fatal: unrecognized argument: <name>`
-//! for a `<head>` that does not resolve, 0 otherwise.
+//! clustered short flags (`-nv`), `--progress`/`--no-progress`,
+//! `--expire <time>`/`--expire=<time>`/`--no-expire`, `--`, `<head>...`, and
+//! `-h`. Exit codes match stock git: 129 with git's usage block for `-h` and for
+//! an unknown option, 129 *without* the usage block for parse-options' value
+//! complaints (`option \`expire' requires a value`, `option \`<name>' takes no
+//! value`), 128 with `fatal: unrecognized argument: <name>` for a `<head>` that
+//! does not resolve, 0 otherwise.
 //!
 //! `--progress` is accepted and deliberately produces nothing. Git's own
 //! progress is a *delayed* progress written to stderr and suppressed off a tty,
@@ -47,11 +75,6 @@
 //! exit code, or the resulting repository state.
 //!
 //! Not ported, and rejected with a precise reason rather than approximated:
-//!   * `--expire <time>` (and `--no-expire`). Two pieces of substrate are
-//!     missing: git's approxidate parser, and the second traversal
-//!     `add_unseen_recent_objects_to_traversal()` performs to keep objects
-//!     *referenced by* recently-written unreachable objects alive. Guessing
-//!     either one deletes objects git would have kept.
 //!   * `--exclude-promisor-objects`, which needs promisor-pack awareness that
 //!     the vendored `gix-pack` does not model.
 //!   * A shallow repository, because git additionally rewrites `.git/shallow`
@@ -103,9 +126,14 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
     let mut verbose = false;
     let mut end_of_opts = false;
     let mut heads: Vec<&str> = Vec::new();
+    // `builtin/prune.c` initialises `expire = TIME_MAX`, i.e. every unreachable
+    // object is old enough to go and no object is recent enough to rescue one.
+    let mut expire: i64 = i64::MAX;
 
-    for a in args {
-        let a = a.as_str();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
         if end_of_opts {
             heads.push(a);
             continue;
@@ -122,20 +150,38 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
             "--no-verbose" => verbose = false,
             // Delayed, stderr-only, tty-gated in git; nothing observable to emit.
             "--progress" | "--no-progress" => {}
-            "--expire" | "--no-expire" => bail!(
-                "unsupported flag {a:?}: --expire needs git's approxidate parser and the \
-                 recent-object grace traversal, neither of which exists in the vendored crates \
-                 (ported: -n, -v, --progress, --, <head>..., -h)"
-            ),
-            _ if a.starts_with("--expire=") => bail!(
-                "unsupported flag {a:?}: --expire needs git's approxidate parser and the \
-                 recent-object grace traversal, neither of which exists in the vendored crates \
-                 (ported: -n, -v, --progress, --, <head>..., -h)"
-            ),
+            // `--no-expire` is `parse_opt_expiry_date_cb()` with `unset`, which
+            // substitutes the literal "never".
+            "--no-expire" => expire = 0,
+            "--expire" => {
+                // parse-options takes the following argument whatever it looks
+                // like, so `--expire --verbose` complains about the date.
+                let Some(value) = args.get(i) else {
+                    return Ok(option_error("option `expire' requires a value"));
+                };
+                i += 1;
+                match parse_expiry_date(value) {
+                    Some(t) => expire = t,
+                    None => return Ok(malformed_date(value)),
+                }
+            }
+            _ if a.starts_with("--expire=") => {
+                let value = &a["--expire=".len()..];
+                match parse_expiry_date(value) {
+                    Some(t) => expire = t,
+                    None => return Ok(malformed_date(value)),
+                }
+            }
             "--exclude-promisor-objects" | "--no-exclude-promisor-objects" => bail!(
                 "unsupported flag {a:?}: promisor packs are not modelled by the vendored gix-pack \
-                 (ported: -n, -v, --progress, --, <head>..., -h)"
+                 (ported: -n, -v, --progress, --expire, --, <head>..., -h)"
             ),
+            // A switch that takes no argument, given one. parse-options reports
+            // this with the spelling the user typed and no usage block.
+            _ if a.starts_with("--") && a.contains('=') && takes_no_value(a) => {
+                let name = a[2..].split('=').next().unwrap_or_default();
+                return Ok(option_error(&format!("option `{name}' takes no value")));
+            }
             _ if a.starts_with("--") => {
                 return Ok(usage_error(Some(&format!("unknown option `{}'", &a[2..]))));
             }
@@ -191,9 +237,11 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
     }
 
     collect_roots(&repo, &mut roots)?;
-    let reachable = close_over(&repo, roots);
 
     let objdir = repo.objects.store_ref().path().to_path_buf();
+    collect_recent_roots(&objdir, repo.object_hash(), expire, &mut roots);
+    let reachable = close_over(&repo, roots);
+
     let display_root = display_objdir(&repo, &objdir);
     let name_len = repo.object_hash().len_in_hex() - 2;
 
@@ -211,7 +259,7 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
 
             if !is_object_name(&name, name_len) {
                 if name.starts_with("tmp_obj_") {
-                    prune_tmp_file(&path, &shown, dry_run, verbose);
+                    prune_tmp_file(&path, &shown, expire, dry_run, verbose);
                 } else {
                     eprintln!("bad sha1 file: {}", shown.display());
                 }
@@ -223,8 +271,13 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
             if reachable.contains(&oid) {
                 continue;
             }
-            if fs::symlink_metadata(&path).is_err() {
+            let Some(mtime) = mtime_of(&path) else {
                 eprintln!("error: Could not stat '{}'", shown.display());
+                continue;
+            };
+            // `st.st_mtime > expire` keeps the object: it is younger than the
+            // cutoff, so this run is not allowed to remove it.
+            if mtime > expire {
                 continue;
             }
             if dry_run || verbose {
@@ -297,7 +350,13 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
         for name in names {
             let name = name.to_string_lossy().into_owned();
             if name.starts_with("tmp_") {
-                prune_tmp_file(&dir.join(&name), &shown_dir.join(&name), dry_run, verbose);
+                prune_tmp_file(
+                    &dir.join(&name),
+                    &shown_dir.join(&name),
+                    expire,
+                    dry_run,
+                    verbose,
+                );
             }
         }
     }
@@ -315,10 +374,166 @@ fn usage_error(msg: Option<&str>) -> ExitCode {
     ExitCode::from(129)
 }
 
-/// `prune_tmp_file()`: report under `-n`/`-v`, unlink unless `-n`, and stay
-/// silent for a file that has vanished between the scan and here.
-fn prune_tmp_file(path: &Path, shown: &Path, dry_run: bool, verbose: bool) {
-    if fs::symlink_metadata(path).is_err() {
+/// git's parse-options complaints about an option's *value*, which — unlike an
+/// unknown option — print no usage block: just `error: <msg>` and exit 129.
+fn option_error(msg: &str) -> ExitCode {
+    eprintln!("error: {msg}");
+    ExitCode::from(129)
+}
+
+/// `parse_expiry_date()` failing is fatal in `builtin/prune.c`, not a usage
+/// error, so it reports on stderr and exits 128.
+fn malformed_date(value: &str) -> ExitCode {
+    eprintln!("fatal: malformed expiration date '{value}'");
+    ExitCode::from(128)
+}
+
+/// The long options `prune` declares with no argument. Given `--<name>=<value>`
+/// parse-options rejects them by the spelling that was typed.
+fn takes_no_value(arg: &str) -> bool {
+    matches!(
+        arg[2..].split('=').next().unwrap_or_default(),
+        "dry-run"
+            | "no-dry-run"
+            | "verbose"
+            | "no-verbose"
+            | "progress"
+            | "no-progress"
+            | "no-expire"
+            | "exclude-promisor-objects"
+            | "no-exclude-promisor-objects"
+    )
+}
+
+/// `parse_expiry_date()`: the two literal cases first, then a date.
+///
+/// `never`/`false` disable pruning entirely (`0`, which no file's mtime can be
+/// older than), and `all`/`now` are deliberately *not* the current time but
+/// `TIME_MAX`, so everything unreachable goes and nothing counts as recent.
+fn parse_expiry_date(value: &str) -> Option<i64> {
+    match value {
+        "never" | "false" => return Some(0),
+        "all" | "now" => return Some(i64::MAX),
+        _ => {}
+    }
+    // `parse_date()`'s escape hatch for a raw epoch value, which approxidate
+    // itself would read as a year.
+    if let Some(seconds) = value.strip_prefix('@') {
+        return seconds.trim().parse::<i64>().ok();
+    }
+    let now = std::time::SystemTime::now();
+    for candidate in approxidate_forms(value) {
+        if let Ok(time) = gix::date::parse(&candidate, Some(now)) {
+            return Some(time.seconds);
+        }
+    }
+    None
+}
+
+/// The spellings to try for a date, in order. git's approxidate tokenises on
+/// any non-alphanumeric run and on digit/letter boundaries, and treats a bare
+/// `<n> <unit>` as being in the past; `gix::date::parse` wants the canonical
+/// `<n> <unit> ago`. So `2.weeks.ago`, `2weeks.ago` and `2.weeks` all end up as
+/// `2 weeks ago`, while an unmangled form like `1979-02-26` is tried first and
+/// never reaches the rewriting.
+fn approxidate_forms(value: &str) -> Vec<String> {
+    let mut split = String::with_capacity(value.len() + 8);
+    let mut prev = '\0';
+    for c in value.chars() {
+        if c == '.' || c == '_' || c == '/' || c == ',' {
+            split.push(' ');
+        } else {
+            if prev.is_ascii_digit() != c.is_ascii_digit() && prev.is_ascii_alphanumeric() {
+                split.push(' ');
+            }
+            split.push(c);
+        }
+        prev = c;
+    }
+    let split = split.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let mut forms = vec![value.to_owned()];
+    let with_ago = format!("{split} ago");
+    for form in [split, with_ago] {
+        if !form.is_empty() && !forms.contains(&form) {
+            forms.push(form);
+        }
+    }
+    forms
+}
+
+/// `add_unseen_recent_objects_to_traversal()`: with a non-zero cutoff, every
+/// *local* object written after it becomes a traversal root, so the closure also
+/// keeps whatever it points at. Loose objects are dated by their own mtime,
+/// packed ones by their `.pack`'s, exactly as `add_recent_loose()` and
+/// `add_recent_packed()` do.
+fn collect_recent_roots(
+    objdir: &Path,
+    hash: gix::hash::Kind,
+    expire: i64,
+    roots: &mut Vec<ObjectId>,
+) {
+    // `mark_recent == 0` is git's "no grace period at all"; `TIME_MAX` is the
+    // other end, where no mtime can compare greater.
+    if expire == 0 || expire == i64::MAX {
+        return;
+    }
+
+    let name_len = hash.len_in_hex() - 2;
+    for fanout in 0u16..256 {
+        let prefix = format!("{fanout:02x}");
+        let sub = objdir.join(&prefix);
+        let Some(names) = read_dir_raw(&sub) else {
+            continue;
+        };
+        for name in names {
+            let name = name.to_string_lossy().into_owned();
+            if !is_object_name(&name, name_len) {
+                continue;
+            }
+            if !matches!(mtime_of(&sub.join(&name)), Some(mtime) if mtime > expire) {
+                continue;
+            }
+            if let Ok(oid) = ObjectId::from_hex(format!("{prefix}{name}").as_bytes()) {
+                roots.push(oid);
+            }
+        }
+    }
+
+    let pack_dir = objdir.join("pack");
+    let Some(names) = read_dir_raw(&pack_dir) else {
+        return;
+    };
+    for name in names {
+        let name = name.to_string_lossy().into_owned();
+        let Some(base) = name.strip_suffix(".idx") else {
+            continue;
+        };
+        if !matches!(mtime_of(&pack_dir.join(format!("{base}.pack"))), Some(mtime) if mtime > expire)
+        {
+            continue;
+        }
+        if let Ok(index) = pack::index::File::at(pack_dir.join(&name), hash) {
+            roots.extend(index.iter().map(|entry| entry.oid));
+        }
+    }
+}
+
+/// `lstat()`'s `st_mtime`, in whole seconds, which is what git compares against
+/// `expire`. `None` when the file cannot be stat'ed.
+fn mtime_of(path: &Path) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).ok().map(|md| md.mtime())
+}
+
+/// `prune_tmp_file()`: keep anything younger than `expire`, otherwise report
+/// under `-n`/`-v` and unlink unless `-n`. A file that has vanished between the
+/// scan and here is silently skipped, as the `lstat()` guard does.
+fn prune_tmp_file(path: &Path, shown: &Path, expire: i64, dry_run: bool, verbose: bool) {
+    let Some(mtime) = mtime_of(path) else {
+        return;
+    };
+    if mtime > expire {
         return;
     }
     if dry_run || verbose {

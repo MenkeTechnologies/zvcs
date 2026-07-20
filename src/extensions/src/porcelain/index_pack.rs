@@ -141,7 +141,13 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
 
     // git's own loop: anything starting with '-' is a flag (so a bare "-" and
     // "--" are both usage errors), anything else is the single pack name.
-    let mut i = 1;
+    //
+    // `args` holds only the arguments; `dispatch::run` takes the `index-pack`
+    // verb as a separate parameter and never passes it through here, so the
+    // scan starts at 0. Starting at 1 silently dropped the first argument,
+    // which turned every `index-pack <pack-file>` into a "no pack name" usage
+    // error instead of the fatal git reports for the path.
+    let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
 

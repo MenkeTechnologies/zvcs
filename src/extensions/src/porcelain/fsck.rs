@@ -117,9 +117,13 @@ const ERROR_REACHABLE: u8 = 2;
 /// share a cluster that contains a repeated home slot — and only then does this
 /// command `bail!` instead of guessing.
 ///
-/// `root` and `tagged` lines come from the object-directory scan instead, whose
-/// order is that same unreproducible `readdir()` sequence. One such line is
-/// unambiguous; more than one makes the command `bail!`.
+/// `root` and `tagged` lines come from the object-directory scan instead.
+/// `for_each_loose_file_in_source()` (`object-file.c`) walks the 256 subdirectories
+/// in numeric order and only the entries within one of them by raw `readdir()`, so
+/// these lines are ordered by the first byte of the id. That much is reproducible;
+/// two lines sharing a first byte, or any pack at all (`verify_pack()` re-runs
+/// `fsck_obj()` over packed objects afterwards, in pack-index order), makes the
+/// command `bail!` instead of guessing.
 pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // Tolerate the subcommand being present at index 0 regardless of how the
     // dispatcher slices argv.
@@ -191,10 +195,18 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     }
 
     // ---- 3. every object in the odb ----------------------------------------
+    //
+    // `all` is the odb's contents, so membership must not depend on whether the
+    // id was already `note`d: an `<object>` argument resolves in step 2 and
+    // enters `known` there, but `fsck_object_dir()` still visits it, still
+    // reports its `root`/`tagged` line, and still marks its children `used`.
     let mut all: Vec<ObjectId> = Vec::new();
+    let mut in_odb: HashSet<ObjectId> = HashSet::new();
     for id in repo.objects.iter()? {
         let id = id?;
-        if state.note(id) {
+        state.note(id);
+        // The odb iterator can yield the same id from more than one source.
+        if in_odb.insert(id) {
             all.push(id);
         }
     }
@@ -203,7 +215,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // object in the odb, not just the reachable ones, and marks each child it
     // sees as used. `dangling` is precisely "unreachable and never used", so
     // this pass has to cover unreachable objects too.
-    let mut scan_lines: Vec<String> = Vec::new();
+    let mut scan_lines: Vec<(ObjectId, String)> = Vec::new();
     for &id in &all {
         let kind = match repo.find_header(id) {
             Ok(h) => h.kind(),
@@ -230,20 +242,35 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             continue;
         }
         if opt.show_root && decoded.is_root_commit {
-            scan_lines.push(format!("root {id}"));
+            scan_lines.push((id, format!("root {id}")));
         }
         if opt.show_tags {
             if let Some((target_kind, target, name)) = decoded.tag {
-                scan_lines.push(format!("tagged {target_kind} {target} ({name}) in {id}"));
+                scan_lines.push((id, format!("tagged {target_kind} {target} ({name}) in {id}")));
             }
         }
     }
+    // `for_each_loose_file_in_source()` walks the 256 subdirectories in numeric
+    // order and only the entries *within* one of them in raw `readdir()` order
+    // (`object-file.c`). So these lines are ordered by the first byte of the id,
+    // and only a pair sharing a first byte is unresolvable.
+    //
+    // A pack breaks the argument outright: `verify_pack()` re-runs `fsck_obj()`
+    // over packed objects after every loose one, in pack-index order.
     if scan_lines.len() > 1 {
-        bail!(
-            "refusing to guess the output order: git emits these {} lines during its object-directory \
-             scan, whose order is the raw readdir() sequence of .git/objects/??",
-            scan_lines.len()
-        );
+        let mut by_subdir: HashSet<u8> = HashSet::new();
+        let collides = scan_lines
+            .iter()
+            .any(|(id, _)| !by_subdir.insert(id.as_bytes()[0]));
+        if collides || has_packs(&repo) {
+            bail!(
+                "refusing to guess the output order: git emits these {} lines during its \
+                 object-directory scan, and two of them share the raw readdir() sequence of one \
+                 .git/objects/?? subdirectory",
+                scan_lines.len()
+            );
+        }
+        scan_lines.sort_by_key(|(id, _)| id.as_bytes()[0]);
     }
     if show_progress && !opt.connectivity_only {
         progress_block("Checking object directories", 256);
@@ -342,8 +369,8 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     lines.sort_by_key(|(id, _)| order.home_of(id));
 
     let mut out = String::new();
-    for line in scan_lines {
-        out.push_str(&line);
+    for (_, line) in &scan_lines {
+        out.push_str(line);
         out.push('\n');
     }
     for (_, line) in &lines {

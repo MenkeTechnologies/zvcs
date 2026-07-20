@@ -30,11 +30,16 @@ use std::io::Read as _;
 use std::process::ExitCode;
 
 /// git's usage block, printed verbatim for `-h` and on a usage error.
+///
+/// `parse_options` ends the block with a blank line after the last option, so the
+/// text finishes with two newlines; both the `-h` (stdout) and usage-error (stderr)
+/// paths emit it byte for byte.
 const USAGE: &str = "\
 usage: git show-index [--object-format=<hash-algorithm>] < <pack-idx-file>
 
     --[no-]object-format <hash-algorithm>
                           specify the hash algorithm to use
+
 ";
 
 /// The `\xfftOc` magic that marks an index of version 2 or newer.

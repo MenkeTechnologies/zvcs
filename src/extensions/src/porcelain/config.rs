@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use gix::config::{File as ConfigFile, KeyRef, Source};
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum Mode {
     Auto,
     Get,
@@ -13,6 +13,44 @@ enum Mode {
     Add,
     Unset,
     UnsetAll,
+}
+
+impl Mode {
+    /// The long option that selects this mode, used verbatim in git's
+    /// "cannot be used together" diagnostic.
+    fn flag(self) -> &'static str {
+        match self {
+            Mode::Auto => "",
+            Mode::Get => "--get",
+            Mode::GetAll => "--get-all",
+            Mode::List => "--list",
+            Mode::Add => "--add",
+            Mode::Unset => "--unset",
+            Mode::UnsetAll => "--unset-all",
+        }
+    }
+}
+
+/// Exit 129 — git's usage-error code — after emitting `error: <msg>` on stderr.
+///
+/// `anyhow::bail!` would collapse to exit 1, so every usage diagnostic has to
+/// report itself and return the code explicitly.
+fn usage_error(msg: &str) -> Result<ExitCode> {
+    eprintln!("error: {msg}");
+    Ok(ExitCode::from(129))
+}
+
+/// Config that stock git would never surface.
+///
+/// `gix` synthesizes a config layer from the ambient environment
+/// (`GIT_COMMITTER_NAME` → `gitoxide.committer.nameFallback`,
+/// `GIT_TERMINAL_PROMPT` → `gitoxide.credentials.terminalPrompt`, …) and zvcs
+/// injects its own defaults through the API scope. Neither exists as far as
+/// `git config` is concerned, so both are hidden from reads and from `--list`.
+/// `Source::Env` (`GIT_CONFIG_COUNT`) and `Source::Cli` (`git -c`) are real
+/// git config and stay visible.
+fn is_synthetic(source: Source) -> bool {
+    matches!(source, Source::EnvOverride | Source::Api)
 }
 
 /// `git config` — get/set/list configuration values, backed by gitoxide.
@@ -31,18 +69,45 @@ enum Mode {
 ///   * `git config --add <name> <value>`      → append a multivar entry, local
 ///   * `git config --unset <name>`            → drop the value, exit 5 if absent
 ///   * `git config --unset-all <name>`        → drop every value of the key
+///   * `--name-only`                          → with `--list`, keys without values
+///
+/// Usage errors (conflicting action flags, a misplaced `--name-only`, a wrong
+/// argument count) report `error: …` on stderr and exit 129, as git's
+/// parse-options layer does; they never travel as `anyhow` errors, which would
+/// collapse to exit 1.
 pub fn config(args: &[String]) -> Result<ExitCode> {
     let mut mode = Mode::Auto;
+    let mut name_only = false;
     let mut positional: Vec<&str> = Vec::new();
 
     for a in args {
+        let action = match a.as_str() {
+            "-l" | "--list" => Some(Mode::List),
+            "--get" => Some(Mode::Get),
+            "--get-all" => Some(Mode::GetAll),
+            "--add" => Some(Mode::Add),
+            "--unset" => Some(Mode::Unset),
+            "--unset-all" => Some(Mode::UnsetAll),
+            _ => None,
+        };
+
+        // Action flags are git's `OPT_CMDMODE`: they all write one slot, and a
+        // second *different* one is rejected the moment it is parsed — before
+        // any post-parse validation gets a chance to complain.
+        if let Some(new) = action {
+            if mode != Mode::Auto && mode != new {
+                return usage_error(&format!(
+                    "options '{}' and '{}' cannot be used together",
+                    new.flag(),
+                    mode.flag()
+                ));
+            }
+            mode = new;
+            continue;
+        }
+
         match a.as_str() {
-            "-l" | "--list" => set_mode(&mut mode, Mode::List)?,
-            "--get" => set_mode(&mut mode, Mode::Get)?,
-            "--get-all" => set_mode(&mut mode, Mode::GetAll)?,
-            "--add" => set_mode(&mut mode, Mode::Add)?,
-            "--unset" => set_mode(&mut mode, Mode::Unset)?,
-            "--unset-all" => set_mode(&mut mode, Mode::UnsetAll)?,
+            "--name-only" => name_only = true,
             // Default (repository-local) scope is the only writable target.
             "--local" => {}
             "--global" | "--system" | "--worktree" => {
@@ -54,22 +119,44 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // Post-parse validation, in git's own order and — like git — ahead of any
+    // repository lookup, so a usage error reports the same way outside a repo.
+    //
+    // An entirely actionless invocation is reported first. Without an action
+    // flag the form is `<name> [value [value-pattern]]`, and git recognizes no
+    // action at all outside that 1..=3 window, the zero-argument case included.
+    if mode == Mode::Auto && !(1..=3).contains(&positional.len()) {
+        return usage_error("no action specified");
+    }
+    if name_only && mode != Mode::List {
+        return usage_error("--name-only is only applicable to --list or --get-regexp");
+    }
+    match mode {
+        Mode::List if !positional.is_empty() => {
+            return usage_error("wrong number of arguments, should be 0");
+        }
+        Mode::Get | Mode::GetAll if !(1..=2).contains(&positional.len()) => {
+            return usage_error("wrong number of arguments, should be from 1 to 2");
+        }
+        _ => {}
+    }
+
     let repo = gix::discover(".")?;
 
     match mode {
-        Mode::List => list(&repo),
-        Mode::Get | Mode::Auto if positional.len() == 1 => get(&repo, positional[0], false),
-        Mode::Get => {
-            let name = one_name(&positional)?;
-            get(&repo, name, false)
+        Mode::List => list(&repo, name_only),
+        // `<name> <value-pattern>` filters values by an ERE; no regex engine is
+        // vendored, so the two-argument form is refused rather than faked.
+        Mode::Get | Mode::GetAll if positional.len() == 2 => {
+            bail!("value-pattern filtering is not supported")
         }
-        Mode::GetAll => {
-            let name = one_name(&positional)?;
-            get(&repo, name, true)
-        }
-        // No action flag with two positionals is a plain set.
+        Mode::Get => get(&repo, positional[0], false),
+        Mode::GetAll => get(&repo, positional[0], true),
+        // No action flag: one positional reads, two set the value.
+        Mode::Auto if positional.len() == 1 => get(&repo, positional[0], false),
         Mode::Auto if positional.len() == 2 => write_local(&repo, positional[0], positional[1], WriteOp::Set),
-        Mode::Auto => bail!("wrong number of arguments, expected `<name>` or `<name> <value>`"),
+        // `<name> <value> <value-pattern>` replaces only matching values.
+        Mode::Auto => bail!("value-pattern filtering is not supported"),
         Mode::Add => {
             let (name, value) = name_and_value(&positional)?;
             write_local(&repo, name, value, WriteOp::Add)
@@ -83,16 +170,6 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             write_local(&repo, name, "", WriteOp::UnsetAll)
         }
     }
-}
-
-/// Install an action mode, rejecting a second action flag rather than silently
-/// letting the last one win. Only the initial `Auto` may be replaced.
-fn set_mode(slot: &mut Mode, new: Mode) -> Result<()> {
-    if *slot != Mode::Auto {
-        bail!("only one action at a time");
-    }
-    *slot = new;
-    Ok(())
 }
 
 fn one_name<'a>(positional: &[&'a str]) -> Result<&'a str> {
@@ -128,8 +205,10 @@ fn get(repo: &gix::Repository, name: &str, all: bool) -> Result<ExitCode> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
+    let visible = |meta: &gix::config::file::Metadata| !is_synthetic(meta.source);
+
     if all {
-        match file.raw_values_by(key.section_name, key.subsection_name, key.value_name) {
+        match file.raw_values_filter_by(key.section_name, key.subsection_name, key.value_name, visible) {
             Ok(values) => {
                 for v in values {
                     out.write_all(&v)?;
@@ -140,7 +219,7 @@ fn get(repo: &gix::Repository, name: &str, all: bool) -> Result<ExitCode> {
             Err(_) => Ok(ExitCode::from(1)),
         }
     } else {
-        match file.raw_value_by(key.section_name, key.subsection_name, key.value_name) {
+        match file.raw_value_filter_by(key.section_name, key.subsection_name, key.value_name, visible) {
             Ok(v) => {
                 out.write_all(&v)?;
                 out.write_all(b"\n")?;
@@ -153,8 +232,13 @@ fn get(repo: &gix::Repository, name: &str, all: bool) -> Result<ExitCode> {
 
 /// `git config -l` — emit every `key=value` from the merged snapshot, in file
 /// order. Section and value names are lower-cased (git-normalized); subsection
-/// case is preserved.
-fn list(repo: &gix::Repository) -> Result<ExitCode> {
+/// case is preserved. With `name_only`, the `=value` half is dropped, one line
+/// per value occurrence.
+///
+/// Entries are emitted in the order they appear in their file, multivars
+/// included: an `a=1 / b=2 / a=3` section lists as `a=1`, `b=2`, `a=3`, not with
+/// the two `a`s collapsed together.
+fn list(repo: &gix::Repository, name_only: bool) -> Result<ExitCode> {
     let snapshot = repo.config_snapshot();
     let file = snapshot.plumbing();
 
@@ -162,29 +246,35 @@ fn list(repo: &gix::Repository) -> Result<ExitCode> {
     let mut out = stdout.lock();
 
     for section in file.sections() {
+        if is_synthetic(section.meta().source) {
+            continue;
+        }
         let header = section.header();
         let section_name = header.name().to_string().to_lowercase();
         let subsection = header.subsection_name().map(ToString::to_string);
 
-        // Preserve first-seen order but visit each value name once; a multivar's
-        // values are then emitted together via `values(name)`.
-        let mut seen: Vec<String> = Vec::new();
+        // `value_names()` walks the body in order, repeating a multivar's name
+        // once per occurrence; the nth occurrence pairs with `values(name)[n]`.
+        let mut occurrence: Vec<(String, usize)> = Vec::new();
         for raw_name in section.value_names() {
             let lname = raw_name.to_lowercase();
-            if !seen.iter().any(|s| s == &lname) {
-                seen.push(lname);
-            }
+            let nth = occurrence.iter().filter(|(n, _)| *n == lname).count();
+            occurrence.push((lname, nth));
         }
 
-        for value_name in &seen {
-            for value in section.values(value_name) {
-                match &subsection {
-                    Some(sub) => write!(out, "{section_name}.{sub}.{value_name}=")?,
-                    None => write!(out, "{section_name}.{value_name}=")?,
-                }
-                out.write_all(&value)?;
-                out.write_all(b"\n")?;
+        for (value_name, nth) in &occurrence {
+            let Some(value) = section.values(value_name).into_iter().nth(*nth) else {
+                continue;
+            };
+            match &subsection {
+                Some(sub) => write!(out, "{section_name}.{sub}.{value_name}")?,
+                None => write!(out, "{section_name}.{value_name}")?,
             }
+            if !name_only {
+                out.write_all(b"=")?;
+                out.write_all(&value)?;
+            }
+            out.write_all(b"\n")?;
         }
     }
 

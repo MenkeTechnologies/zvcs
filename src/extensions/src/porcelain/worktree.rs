@@ -14,8 +14,13 @@ use gix::refs::FullName;
 ///   * `git worktree list -v|--verbose`         → lock/prune reasons on indented lines
 ///   * `git worktree list --porcelain`          → machine-readable records
 ///   * `git worktree list --porcelain -z`       → same, NUL-terminated
+///   * `git worktree list --expire <date>`      → narrow the `prunable` window
 ///   * `git worktree lock [--reason <s>] <wt>`  → create `worktrees/<id>/locked`
 ///   * `git worktree unlock <wt>`               → remove it
+///
+/// `git worktree` itself takes no options, so any dash-prefixed token ahead of
+/// the subcommand is a usage error (exit 129) — `--foo` reports an unknown
+/// option, `-x` an unknown switch, and `--` reports the missing subcommand.
 ///
 /// The listing reproduces git's `get_worktrees()`: the main worktree first (its
 /// path is `realpath(common_dir)` with a trailing `/.git` stripped), then the
@@ -23,35 +28,64 @@ use gix::refs::FullName;
 /// path. Abbreviated ids honour `core.abbrev` through gitoxide's disambiguating
 /// `Id::shorten()`, and the two output columns are padded to the widest value,
 /// exactly as `measure_widths()` does. `prunable` is annotated when the `gitdir`
-/// file points at a `.git` entry that no longer exists and the worktree is not
-/// locked — the only reason reachable from `list`, since git skips a worktree
-/// whose `gitdir` file is missing or empty and `list` passes an infinite expiry.
+/// file points at a `.git` entry that no longer exists, the worktree is not
+/// locked, and its administrative `index` is no newer than the expiry threshold
+/// — the only reason reachable from `list`, since git skips a worktree whose
+/// `gitdir` file is missing or empty. `list` defaults that threshold to TIME_MAX,
+/// so a missing checkout is prunable unless `--expire` narrows the window.
 ///
 /// NOT ported, and reported as such rather than approximated: `add`, `move`,
 /// `remove`, `prune` and `repair`. Those mutate the worktree administrative
 /// files and, for `add`/`remove`, need a full checkout/removal of a working
 /// tree; the vendored crates expose the pieces (`gix_worktree_state::checkout`)
 /// but not git's worktree bookkeeping, so a faithful port is not possible here.
-/// `git worktree list --expire <date>` also bails: it needs git's approxidate
-/// parser, which is not part of the vendored substrate.
 ///
 /// Paths are rendered as lossy UTF-8; git writes the raw bytes. Column widths
 /// use `char` counts where git uses `utf8_strwidth()`, so a path containing
 /// double-width characters can pad differently. Both are byte-identical for the
 /// ASCII paths that occur in practice.
 pub fn worktree(args: &[String]) -> Result<ExitCode> {
-    let Some(sub) = args.get(1) else {
+    // Dispatch hands us the tail *after* the verb, so the subcommand is at index
+    // 0. Tolerate a leading `worktree` as well, matching the other multi-verb
+    // porcelain modules, so either wiring convention works.
+    let args: &[String] = match args.first() {
+        Some(a) if a == "worktree" => &args[1..],
+        _ => args,
+    };
+
+    let Some(sub) = args.first().map(String::as_str) else {
         return usage(Some("error: need a subcommand"), MAIN_USAGE);
     };
-    match sub.as_str() {
+
+    // `git worktree` itself defines no options: parse_options() rejects every
+    // dash-prefixed token before the subcommand. `--` ends option parsing without
+    // ever producing one, so it reports the missing subcommand instead. A lone
+    // `-` is not an option and falls through as a (bogus) subcommand name.
+    match sub {
+        // git's parse_options prints `-h` help on stdout and still exits 129.
+        // `--help` is intercepted by the `git` wrapper and shows the man page,
+        // which this binary has no equivalent for; the usage block is the
+        // closest honest substitute.
         "-h" | "--help" => {
-            // git's parse_options prints `-h` help on stdout and still exits 129.
             print!("{MAIN_USAGE}");
-            Ok(ExitCode::from(129))
+            return Ok(ExitCode::from(129));
         }
-        "list" => list(&args[2..]),
-        "lock" => lock(&args[2..]),
-        "unlock" => unlock(&args[2..]),
+        "--" => return usage(Some("error: need a subcommand"), MAIN_USAGE),
+        _ => {}
+    }
+    if let Some(long) = sub.strip_prefix("--") {
+        return usage(Some(&format!("error: unknown option `{long}'")), MAIN_USAGE);
+    }
+    if let Some(short) = sub.strip_prefix('-').filter(|s| !s.is_empty()) {
+        // git names only the offending character, not the whole cluster.
+        let c = short.chars().next().unwrap_or('-');
+        return usage(Some(&format!("error: unknown switch `{c}'")), MAIN_USAGE);
+    }
+
+    match sub {
+        "list" => list(&args[1..]),
+        "lock" => lock(&args[1..]),
+        "unlock" => unlock(&args[1..]),
         "add" => bail!("`worktree add` is not ported (no worktree bookkeeping in the vendored crates)"),
         "move" => bail!("`worktree move` is not ported (no worktree bookkeeping in the vendored crates)"),
         "remove" => {
@@ -197,7 +231,7 @@ fn head_info(repo: &gix::Repository) -> HeadInfo {
 
 /// Enumerate the main worktree followed by every linked worktree, sorted by
 /// path — git's `get_worktrees()` plus its trailing `QSORT(list + 1, ...)`.
-fn collect(repo: &gix::Repository) -> Result<Vec<Wt>> {
+fn collect(repo: &gix::Repository, expire: u64) -> Result<Vec<Wt>> {
     let common = gix::path::realpath(repo.common_dir())?;
 
     // The main worktree's path is the common dir with a trailing `/.git` cut off,
@@ -265,8 +299,19 @@ fn collect(repo: &gix::Repository) -> Result<Vec<Wt>> {
                 .map(|b| String::from_utf8_lossy(rtrim(&b)).into_owned())
                 .unwrap_or_default()
         });
-        // A locked worktree is never reported prunable.
-        let prunable = (locked.is_none() && missing)
+        // A locked worktree is never reported prunable. Otherwise git only
+        // annotates a missing checkout once it has gone stale: the administrative
+        // `index` must be no newer than the expiry threshold. An unreadable
+        // `index` counts as stale, matching the `stat()`-failure branch.
+        let stale = || {
+            let mtime = std::fs::metadata(admin.join("index"))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            mtime.is_none_or(|m| m <= expire)
+        };
+        let prunable = (locked.is_none() && missing && stale())
             .then(|| "gitdir file points to non-existent location".to_owned());
 
         let head = match repo.worktree_proxy_by_id(BStr::new(id.as_str())) {
@@ -300,9 +345,14 @@ fn list(args: &[String]) -> Result<ExitCode> {
     let mut porcelain = false;
     let mut verbose = false;
     let mut nul = false;
+    // `list` seeds the expiry at TIME_MAX, so every worktree whose `.git` entry
+    // is gone counts as prunable unless `--expire` narrows the window.
+    let mut expire = u64::MAX;
 
-    for a in args {
-        match a.as_str() {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
             "-h" | "--help" => {
                 print!("{LIST_USAGE}");
                 return Ok(ExitCode::from(129));
@@ -312,14 +362,48 @@ fn list(args: &[String]) -> Result<ExitCode> {
             "-v" | "--verbose" => verbose = true,
             "--no-verbose" => verbose = false,
             "-z" => nul = true,
-            "--expire" | "--no-expire" => {
-                bail!("`worktree list --expire` is not ported (needs git's approxidate parser)")
+            // A bare `--no-expire` resets the threshold to 0, which suppresses
+            // the annotation entirely — the same value `--expire=never` yields.
+            "--no-expire" => expire = 0,
+            "--expire" => {
+                let Some(v) = args.get(i + 1) else {
+                    return usage(Some("error: option `expire' requires a value"), LIST_USAGE);
+                };
+                let Some(parsed) = parse_expiry(v) else {
+                    return die(&format!("malformed expiration date '{v}'"));
+                };
+                expire = parsed;
+                i += 1;
             }
             _ if a.starts_with("--expire=") => {
-                bail!("`worktree list --expire` is not ported (needs git's approxidate parser)")
+                let v = &a["--expire=".len()..];
+                let Some(parsed) = parse_expiry(v) else {
+                    return die(&format!("malformed expiration date '{v}'"));
+                };
+                expire = parsed;
             }
+            // `--` ends option parsing; `list` takes no positionals, so anything
+            // after it is a usage error and a trailing `--` is simply ignored.
+            "--" => {
+                if i + 1 < args.len() {
+                    return usage(None, LIST_USAGE);
+                }
+                break;
+            }
+            _ if a.starts_with("--") => {
+                return usage(
+                    Some(&format!("error: unknown option `{}'", &a[2..])),
+                    LIST_USAGE,
+                );
+            }
+            _ if a.starts_with('-') && a.len() > 1 => {
+                let c = a[1..].chars().next().unwrap_or('-');
+                return usage(Some(&format!("error: unknown switch `{c}'")), LIST_USAGE);
+            }
+            // `list` takes no positionals; git prints the bare usage block.
             _ => return usage(None, LIST_USAGE),
         }
+        i += 1;
     }
 
     // git checks these in this order, before touching the repository.
@@ -331,7 +415,7 @@ fn list(args: &[String]) -> Result<ExitCode> {
     }
 
     let repo = gix::discover(".")?;
-    let worktrees = collect(&repo)?;
+    let worktrees = collect(&repo, expire)?;
 
     let out = if porcelain {
         render_porcelain(&worktrees, nul)
@@ -431,6 +515,25 @@ fn render_plain(repo: &gix::Repository, worktrees: &[Wt], verbose: bool) -> Stri
         out.push('\n');
     }
     out
+}
+
+/// git's `parse_expiry_date()`: two keyword pairs bracket the range before
+/// approxidate sees the string. `never`/`false` expire nothing (threshold 0),
+/// `all`/`now` expire everything (threshold TIME_MAX) — the latter reads
+/// backwards but is deliberate, since the caller wants everything already in the
+/// past. `None` means the date was malformed.
+fn parse_expiry(text: &str) -> Option<u64> {
+    match text {
+        "never" | "false" => return Some(0),
+        "all" | "now" => return Some(u64::MAX),
+        _ => {}
+    }
+    let now = Some(std::time::SystemTime::now());
+    // approxidate treats `.` as a word separator, so `1.day.ago` is relative.
+    let parsed = gix::date::parse(text, now)
+        .or_else(|_| gix::date::parse(text.replace('.', " ").trim(), now))
+        .ok()?;
+    Some(parsed.seconds.max(0) as u64)
 }
 
 /// git's `find_unique_abbrev()`: the shortest unambiguous prefix at least
@@ -533,7 +636,7 @@ fn lock(args: &[String]) -> Result<ExitCode> {
     };
 
     let repo = gix::discover(".")?;
-    let worktrees = collect(&repo)?;
+    let worktrees = collect(&repo, u64::MAX)?;
     let Some(wt) = find_worktree(&worktrees, arg) else {
         return die(&format!("'{arg}' is not a working tree"));
     };
@@ -579,7 +682,7 @@ fn unlock(args: &[String]) -> Result<ExitCode> {
     };
 
     let repo = gix::discover(".")?;
-    let worktrees = collect(&repo)?;
+    let worktrees = collect(&repo, u64::MAX)?;
     let Some(wt) = find_worktree(&worktrees, arg) else {
         return die(&format!("'{arg}' is not a working tree"));
     };

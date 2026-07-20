@@ -35,17 +35,20 @@
 //!
 //! Each pick is a three-way tree merge with *base* = the picked commit's
 //! mainline parent (`-m`, default the first), *ours* = the current `HEAD` tree
-//! and *theirs* = the picked commit's tree. This port resolves the merge at
-//! **file granularity only**: a path is taken from *theirs* when *ours* still
-//! matches *base*, kept from *ours* when *theirs* matches *base*, and kept when
-//! both sides made the identical change.
+//! and *theirs* = the picked commit's tree. A commit with no parents is replayed
+//! against the empty tree, exactly as `do_pick_commit` does, and `-m` is not
+//! consulted for it at all. The merge itself is `gix`'s tree merge, so renames
+//! and hunk-level content merges are served rather than approximated.
 //!
-//! When a path was changed differently on both sides a *content* (hunk-level)
-//! merge is required, which would have to write conflict markers, stage 1/2/3
-//! index entries, `MERGE_MSG` and `AUTO_MERGE`. None of that is implemented, so
-//! that case `bail!`s with the path named rather than producing a wrong tree.
-//! `--continue`, `--skip` and `--abort` are refused for the same reason: this
-//! port can enter the stopped state but not resume from it.
+//! A pick that cannot be resolved stops the way git's does: the merge result —
+//! conflict markers included — is checked out, the conflicting paths are given
+//! stage 1/2/3 index entries, `CHERRY_PICK_HEAD`, `AUTO_MERGE` and a `MERGE_MSG`
+//! carrying git's `# Conflicts:` hint are written, an `Auto-merging` and a
+//! `CONFLICT (...)` line go to stdout, and the exit status is 1.
+//!
+//! `--continue`, `--skip` and `--abort` against a genuinely stopped pick are
+//! still refused: this port can enter the stopped state but not resume from it,
+//! which needs the `.git/sequencer` todo-list machinery.
 //!
 //! ## Empty results
 //!
@@ -96,7 +99,7 @@ use std::collections::{HashMap, HashSet};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-use gix::bstr::{BString, ByteSlice};
+use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::index::entry::{Mode, Stat};
 use gix::objs::tree::EntryMode;
@@ -261,8 +264,15 @@ fn parse_empty(value: &str) -> Result<Empty, ExitCode> {
 
 /// `-m`'s value must be a positive integer; git rejects everything else with one
 /// message regardless of whether it was unparsable or zero.
+///
+/// git reads it with `strtol()`, which *skips leading whitespace* and then
+/// requires the remainder of the string to be consumed. That is load-bearing:
+/// `-m 1` arriving as a single argument gives the callback `" 1"`, which stock
+/// git accepts as 1. A plain `str::parse` rejects it.
 fn parse_mainline(value: &str) -> Result<u32, ExitCode> {
-    match value.parse::<u32>() {
+    let trimmed = value.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let digits = trimmed.strip_prefix('+').unwrap_or(trimmed);
+    match digits.parse::<u32>() {
         Ok(n) if n > 0 => Ok(n),
         _ => Err(opt_error("option `mainline' expects a number greater than zero")),
     }
@@ -444,7 +454,9 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
             Err(_) => return Ok(fatal(&format!("bad revision '{spec}'"))),
         };
         match parsed.single() {
-            Some(id) => picks.push(id.detach()),
+            // A revision may name an annotated tag (`v0.2.0`); git peels every
+            // commit-ish it is handed before replaying it.
+            Some(id) => picks.push(id.object()?.peel_to_commit()?.id),
             // Both endpoints resolved, so this is a genuine range. Enumerating it
             // is unported, and silently picking one end would be wrong.
             None => anyhow::bail!(
@@ -506,80 +518,113 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
 
         // --- pick the base (mainline) parent ------------------------------
         let parents: Vec<ObjectId> = pick.parent_ids().map(|id| id.detach()).collect();
-        let base_id = match opts.mainline {
-            // `-m N` is legal on a non-merge as long as parent N exists, so a
-            // plain commit accepts `-m 1` and behaves exactly as without it.
-            Some(n) => match parents.get(n as usize - 1) {
-                Some(id) => *id,
-                None => {
-                    return Ok(sequencer_failed(&format!(
-                        "commit {pick_id} does not have parent {n}"
-                    )));
-                }
-            },
-            None => match parents.len() {
-                0 => anyhow::bail!("cannot cherry-pick the root commit {spec}"),
-                1 => parents[0],
-                _ => {
-                    return Ok(sequencer_failed(&format!(
-                        "commit {pick_id} is a merge but no -m option was given."
-                    )));
-                }
-            },
+        let base_id: Option<ObjectId> = if parents.is_empty() {
+            // git's `do_pick_commit` tests `!commit->parents` *first*: a root
+            // commit is replayed against the empty tree and `-m` is never
+            // consulted, so `-m 1 <root>` is accepted rather than rejected.
+            None
+        } else {
+            match opts.mainline {
+                // `-m N` is legal on a non-merge as long as parent N exists, so a
+                // plain commit accepts `-m 1` and behaves exactly as without it.
+                Some(n) => match parents.get(n as usize - 1) {
+                    Some(id) => Some(*id),
+                    None => {
+                        return Ok(sequencer_failed(&format!(
+                            "commit {pick_id} does not have parent {n}"
+                        )));
+                    }
+                },
+                None => match parents.len() {
+                    1 => Some(parents[0]),
+                    _ => {
+                        return Ok(sequencer_failed(&format!(
+                            "commit {pick_id} is a merge but no -m option was given."
+                        )));
+                    }
+                },
+            }
         };
 
         let pick_tree = pick.tree_id()?.detach();
-        let base_tree = repo.find_commit(base_id)?.tree_id()?.detach();
+        let base_tree = match base_id {
+            Some(id) => repo.find_commit(id)?.tree_id()?.detach(),
+            None => ObjectId::empty_tree(hash),
+        };
         let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
 
         // `--ff`: HEAD is exactly the picked commit's parent, so replaying the
         // change is a fast-forward. git prints nothing in this case.
-        if opts.allow_ff && head_id == base_id {
+        if opts.allow_ff && base_id == Some(head_id) {
             advance_head(&repo, head_id, pick_id, "cherry-pick: fast-forward".into())?;
-            index = update_clean_worktree(&repo, &index, pick_id, &should_interrupt)?;
+            index = update_clean_worktree(&repo, &index, pick_tree, &should_interrupt)?;
             head_id = pick_id;
             continue;
         }
 
-        // --- three-way tree merge, file granularity ----------------------
-        let base = flatten(&repo, base_tree)?;
-        let ours = flatten(&repo, head_tree)?;
-        let theirs = flatten(&repo, pick_tree)?;
+        // --- three-way tree merge -----------------------------------------
+        //
+        // Labels come from `get_message()` in git's `sequencer.c`: *ours* is the
+        // literal `HEAD`, *theirs* is `<abbrev> (<subject>)`, and the ancestor is
+        // that same string prefixed with `parent of `. They are what ends up in
+        // the `<<<<<<<` / `>>>>>>>` marker lines, so they are computed from the
+        // picked commit's *own* message, before `-x`/`--signoff` rewrite it.
+        let pick_subject = gix::objs::commit::MessageRef::from_bytes(pick.message_raw()?)
+            .summary()
+            .to_str_lossy()
+            .into_owned();
+        let pick_short = pick_id.attach(&repo).shorten_or_id().to_string();
+        let other_label = format!("{pick_short} ({pick_subject})");
+        let ancestor_label = format!("parent of {other_label}");
 
-        let mut paths: Vec<&BString> = base.keys().chain(ours.keys()).chain(theirs.keys()).collect();
-        paths.sort_unstable();
-        paths.dedup();
+        let mut merge = repo.merge_trees(
+            base_tree,
+            head_tree,
+            pick_tree,
+            gix::merge::blob::builtin_driver::text::Labels {
+                ancestor: Some(BStr::new(ancestor_label.as_bytes())),
+                current: Some(BStr::new("HEAD")),
+                other: Some(BStr::new(other_label.as_bytes())),
+            },
+            repo.tree_merge_options()?,
+        )?;
+        let tree_id = merge.tree.write()?.detach();
 
-        let mut resolved: Vec<(BString, EntryMode, ObjectId)> = Vec::with_capacity(paths.len());
-        for path in paths {
-            let (b, o, t) = (base.get(path), ours.get(path), theirs.get(path));
-            let keep = if t == b {
-                // The pick did not touch this path — our side stands.
-                o
-            } else if o == b {
-                // We did not touch it — take the pick's version.
-                t
-            } else if o == t {
-                // Both sides made the identical change.
-                o
-            } else {
-                anyhow::bail!(
-                    "cherry-picking {} needs a three-way content merge for {path}; writing conflict markers, staged index entries and MERGE_MSG is unported, so only trivially-resolvable picks are served",
-                    pick_id.to_hex_with_len(7)
-                );
-            };
-            if let Some((mode, id)) = keep {
-                resolved.push((path.clone(), *mode, *id));
+        // git's merge-ort emits messages grouped per path: an `Auto-merging`
+        // line for every attempted blob merge, then a `CONFLICT (...)` line for
+        // the ones it could not resolve. Identical changes on both sides resolve
+        // trivially and are reported by neither, which is why picking a commit
+        // that is already applied stays silent.
+        let unresolved = gix::merge::tree::TreatAsUnresolved::git();
+        let mut conflicted: Vec<BString> = Vec::new();
+        for conflict in &merge.conflicts {
+            let path = conflict.changes_in_resolution().0.location().to_owned();
+            if conflict.content_merge().is_some() {
+                println!("Auto-merging {path}");
             }
+            if !conflict.is_unresolved(unresolved) {
+                continue;
+            }
+            // merge-ort's `filemask == 6`: no ancestor stage means both sides
+            // added the path, which it reports as `add/add` rather than
+            // `content`.
+            let kind = if conflict.entries()[0].is_none() {
+                "add/add"
+            } else {
+                "content"
+            };
+            println!("CONFLICT ({kind}): Merge conflict in {path}");
+            conflicted.push(path);
         }
 
-        // Build the merged tree with the plumbing editor, exactly like `commit`
-        // builds a tree from the index.
-        let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
-        for (path, mode, id) in &resolved {
-            editor.upsert(path.split(|&b| b == b'/').map(|c| c.as_bstr()), mode.kind(), *id)?;
-        }
-        let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
+        // The merged tree is the state of every path after the merge, conflict
+        // markers included; the diffstat and the empty-result test both read it
+        // back rather than tracking resolutions as they are made.
+        let mut resolved: Vec<(BString, EntryMode, ObjectId)> = flatten(&repo, tree_id)?
+            .into_iter()
+            .map(|(path, (mode, id))| (path, mode, id))
+            .collect();
+        resolved.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         // --- message -----------------------------------------------------
         let mut message: BString = pick.message_raw()?.to_owned();
@@ -615,6 +660,49 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
             .summary()
             .to_str_lossy()
             .into_owned();
+
+        // --- stopped on conflict ------------------------------------------
+        //
+        // Checked before the empty-result guards, as git does: a conflicted pick
+        // never reaches the point where emptiness would be decided.
+        if !conflicted.is_empty() {
+            let mut new_index =
+                update_clean_worktree(&repo, &index, tree_id, &should_interrupt)?;
+            merge.index_changed_after_applying_conflicts(
+                &mut new_index,
+                unresolved,
+                gix::merge::tree::apply_index_entries::RemovalMode::Prune,
+            );
+            new_index.write(Default::default())?;
+
+            let git_dir = repo.git_dir();
+            std::fs::write(git_dir.join("CHERRY_PICK_HEAD"), format!("{pick_id}\n"))?;
+            // git records the merge result — conflict markers and all — as
+            // `AUTO_MERGE` so `--continue` can diff against it later.
+            std::fs::write(git_dir.join("AUTO_MERGE"), format!("{tree_id}\n"))?;
+
+            // git's `append_conflicts_hint`: a blank line, then one commented
+            // line per conflicted path, appended to the message it would have
+            // committed.
+            let mut merge_msg = message.clone();
+            merge_msg.push(b'\n');
+            merge_msg.extend_from_slice(b"# Conflicts:\n");
+            for path in &conflicted {
+                merge_msg.extend_from_slice(b"#\t");
+                merge_msg.extend_from_slice(&path[..]);
+                merge_msg.push(b'\n');
+            }
+            std::fs::write(git_dir.join("MERGE_MSG"), &merge_msg[..])?;
+
+            eprintln!("error: could not apply {pick_short}... {pick_subject}");
+            eprintln!("hint: After resolving the conflicts, mark them with");
+            eprintln!("hint: \"git add/rm <pathspec>\", then run");
+            eprintln!("hint: \"git cherry-pick --continue\".");
+            eprintln!("hint: You can instead skip this commit with \"git cherry-pick --skip\".");
+            eprintln!("hint: To abort and get back to the state before \"git cherry-pick\",");
+            eprintln!("hint: run \"git cherry-pick --abort\".");
+            return Ok(ExitCode::from(1));
+        }
 
         // --- empty-result guards -----------------------------------------
         if tree_id == head_tree {
@@ -652,7 +740,7 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
 
         let reflog = gix::reference::log::message("cherry-pick", message.as_bstr(), 1);
         advance_head(&repo, head_id, new_id, reflog)?;
-        index = update_clean_worktree(&repo, &index, new_id, &should_interrupt)?;
+        index = update_clean_worktree(&repo, &index, tree_id, &should_interrupt)?;
 
         // --- summary, matching git's `print_commit_summary` ----------------
         let branch_label = match repo.head_name()? {
@@ -976,9 +1064,9 @@ fn has_conforming_footer(msg: &[u8]) -> bool {
     saw_trailer
 }
 
-/// Move a clean worktree and its index from the state captured in `old` to the
-/// tree of commit `new_commit`, writing only the files that changed, and return
-/// the index that was persisted.
+/// Move a clean worktree and its index from the state captured in `old` to
+/// `new_tree_id`, writing only the files that changed, and return the index that
+/// was persisted.
 ///
 /// Verbatim port of `porcelain::merge`'s helper: added/modified files are
 /// checked out via `gix-worktree-state`, removed files are deleted, and the new
@@ -986,15 +1074,13 @@ fn has_conforming_footer(msg: &[u8]) -> bool {
 fn update_clean_worktree(
     repo: &gix::Repository,
     old: &gix::index::File,
-    new_commit: ObjectId,
+    new_tree_id: ObjectId,
     should_interrupt: &AtomicBool,
 ) -> Result<gix::index::File> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| anyhow::anyhow!("bare repository has no worktree to update"))?
         .to_owned();
-
-    let new_tree_id = repo.find_object(new_commit)?.peel_to_tree()?.id;
 
     let mut old_map: HashMap<BString, (ObjectId, Mode, Stat)> =
         HashMap::with_capacity(old.entries().len());

@@ -13,17 +13,18 @@
 //! are matched with `wildmatch` in git's mode 0, so `*` crosses `/` — which is
 //! why `refs/tags/*` packs `refs/tags/a/b`.
 //!
-//! Not covered, and rejected with an error rather than approximated: `--auto`.
-//! Its threshold heuristic lives in git's ref backends, is explicitly documented
-//! as subject to change, and has no counterpart in the vendored `gix-ref`;
-//! guessing it would silently pack (or not pack) at the wrong times.
+//! `--auto` is implemented as a direct port of `should_pack_refs()` in git's
+//! files backend: the run is skipped entirely unless the number of packable
+//! loose refs reaches `max(16, log2(packed_refs_size / 100) * 5)`. When the
+//! threshold is not met git returns before opening the packed transaction, so
+//! no `packed-refs` file is created either.
 //!
 //! Two behaviours git has that `gix-ref`'s packed transaction does not are
 //! reproduced here explicitly: git removes the now-empty parent directories left
 //! behind by pruning (but never `refs/<top>` itself), and git always leaves a
 //! `packed-refs` file behind — header-only when nothing was packed.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -57,10 +58,11 @@ const USAGE: &str = "usage: git pack-refs [--all] [--no-prune] [--auto] [--inclu
 
 /// Parsed command-line options for a single `pack-refs` invocation.
 struct Opts {
-    all: bool,               // --all: add `*` to the include set
-    prune: bool,             // --prune (default): delete the loose ref once packed
-    includes: Vec<String>,   // --include: accumulated inclusion patterns
-    excludes: Vec<String>,   // --exclude: accumulated exclusion patterns
+    all: bool,             // --all: add `*` to the include set
+    prune: bool,           // --prune (default): delete the loose ref once packed
+    auto: bool,            // --auto: only pack once the loose-ref threshold is reached
+    includes: Vec<String>, // --include: accumulated inclusion patterns
+    excludes: Vec<String>, // --exclude: accumulated exclusion patterns
 }
 
 /// `git pack-refs` — see the module docs for the covered surface.
@@ -68,13 +70,30 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
     let mut opts = Opts {
         all: false,
         prune: true,
+        auto: false,
         includes: Vec::new(),
         excludes: Vec::new(),
     };
 
-    let mut i = 1;
+    // `dispatch::run` splits the subcommand off and hands us only the arguments,
+    // so parsing starts at index 0. The two in-tree callers — `gc` and
+    // `refs optimize` — instead pass their own verb as `args[0]`, so that one
+    // token is skipped when it is literally `pack-refs` or `optimize`. Neither
+    // word is a valid `pack-refs` argument (stock git answers both with the
+    // usage block), so no argument git would accept is swallowed by this.
+    let mut i = usize::from(matches!(
+        args.first().map(String::as_str),
+        Some("pack-refs" | "optimize")
+    ));
+    // Everything after a literal `--` is a positional, and `pack-refs` accepts
+    // none, so it is a usage error rather than a flag.
+    let mut positional_only = false;
     while i < args.len() {
         let a = args[i].as_str();
+        if positional_only {
+            eprint!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
         match a {
             "-h" => {
                 print!("{USAGE}");
@@ -84,9 +103,9 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
             "--no-all" => opts.all = false,
             "--prune" => opts.prune = true,
             "--no-prune" => opts.prune = false,
-            "--no-auto" => {} // the default; nothing to do
-            "--auto" => bail!("unsupported flag \"--auto\" (ported: --all, --no-all, --prune, --no-prune, --include, --no-include, --exclude, --no-exclude)"),
-            "--" => {} // end of options; `pack-refs` takes no positionals anyway
+            "--auto" => opts.auto = true,
+            "--no-auto" => opts.auto = false,
+            "--" => positional_only = true,
             "--no-include" => opts.includes.clear(),
             "--no-exclude" => opts.excludes.clear(),
             "--include" | "--exclude" => {
@@ -169,6 +188,16 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
         packed_names.push(reference.name);
     }
 
+    // `should_pack_refs()`: under `--auto` a run below the threshold returns
+    // before the packed transaction is opened, so nothing is written or pruned
+    // and no `packed-refs` file is created.
+    if opts.auto {
+        let packed_refs = store.packed_refs_path();
+        if edits.len() < auto_limit(&packed_refs) {
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+
     if !edits.is_empty() {
         let objects: Box<dyn gix::objs::Find + '_> = Box::new(&repo.objects);
         let mode = if opts.prune {
@@ -205,6 +234,27 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// The number of packable loose refs `--auto` requires before it packs at all,
+/// ported from `should_pack_refs()` in git's files backend.
+///
+/// git weighs the cost of rewriting `packed-refs` against how much churn a
+/// repository sees, estimating the packed ref count as `size / 100` and allowing
+/// `log2(count) * 5` loose refs on top of it — roughly 16 more per factor of ten
+/// — with a floor of 16. A missing `packed-refs` file counts as size 0.
+fn auto_limit(packed_refs: &Path) -> usize {
+    let size = std::fs::metadata(packed_refs).map_or(0, |m| m.len() as usize);
+    (log2u(size / 100) * 5).max(16)
+}
+
+/// git's `log2u()`: the floor of the base-2 logarithm, with `log2u(0) == 0`.
+fn log2u(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        usize::BITS as usize - 1 - n.leading_zeros() as usize
+    }
 }
 
 /// Report a usage error the way git's option parser does, then exit 129.

@@ -1,11 +1,12 @@
-//! `git multi-pack-index` — write and verify a multi-pack-index (MIDX).
+//! `git multi-pack-index` — write, verify, expire and compact a multi-pack-index (MIDX).
 //!
-//! Covered: the `write` and `verify` sub-commands in their default (v1,
-//! non-incremental, non-bitmap) form, the global `--object-dir=<dir>` /
-//! `--object-dir <dir>` / `--no-object-dir` and `--progress` / `--no-progress`
-//! options, and the `-h` usage blocks for the top level and for `write`,
-//! `verify`, `expire` and `repack` — each reproduced byte-for-byte along with
-//! git's exit code 129. `write` and `verify` print nothing on success, so the
+//! Covered: the `write`, `verify` and `expire` sub-commands in their default
+//! (v1, non-incremental, non-bitmap) form, `compact`'s argument handling and
+//! chain lookup, the global `--object-dir=<dir>` / `--object-dir <dir>` /
+//! `--no-object-dir` and `--progress` / `--no-progress` options, and the `-h`
+//! usage blocks for the top level and for `write`, `verify`, `expire`,
+//! `repack` and `compact` — each reproduced byte-for-byte along with git's exit
+//! code 129. `write`, `verify` and `expire` print nothing on success, so the
 //! interesting comparison is the on-disk artifact: the MIDX produced here is
 //! byte-identical to stock git's for the default case, because
 //! `gix_pack::multi_index::write_from_index_paths` emits the same header
@@ -16,6 +17,23 @@
 //! (highest `.idx` mtime wins, ties broken by ascending pack index) that
 //! `midx-write.c`'s `midx_oid_compare()` uses when no preferred pack is given.
 //!
+//! `expire` is a direct port of `midx.c`'s `expire_midx_packs()`: tally how many
+//! MIDX entries name each pack, drop every pack with a zero tally unless it is
+//! `.keep`-protected or a cruft pack (`.mtimes`), unlink those pack files, and
+//! only then rewrite the MIDX from what is left — leaving the MIDX untouched
+//! when nothing was dropped, which is what git does and what a differential
+//! state comparison notices.
+//!
+//! `compact <from> <to>` collapses a range of MIDX chain layers. Its argument
+//! handling and endpoint lookup are ported exactly (wrong argument count →
+//! usage block and 129; an endpoint that names no layer → `fatal: could not
+//! find MIDX: <arg>` and 128, `from` checked before `to`; identical endpoints →
+//! `fatal: MIDX compaction endpoints must be unique` and 128). The lookup set is
+//! the `multi-pack-index.d/multi-pack-index-chain` layer list when a chain
+//! exists, and otherwise the flat MIDX's own trailing checksum, matching git's
+//! treatment of a flat MIDX as a one-layer chain. Only the compaction itself is
+//! unported — see below.
+//!
 //! Not covered — these `bail!` rather than producing a diverging artifact:
 //!
 //!   * `write --bitmap` / `--preferred-pack=` / `--refs-snapshot=` — the
@@ -24,17 +42,19 @@
 //!     but no bitmap module), and `--preferred-pack` only has an observable
 //!     effect through bitmap generation and duplicate tie-breaking that the
 //!     writer does not expose.
-//!   * `write --incremental` / `--base=` / `--write-chain-file`, and the
-//!     `compact` sub-command — these produce MIDX chains under
-//!     `<objdir>/pack/multi-pack-index.d/`; `gix_pack::multi_index::Version`
-//!     has only `V1` and the writer always emits zero base files, so there is
-//!     no chain substrate to build on.
+//!   * `write --incremental` / `--base=` / `--write-chain-file`, and the actual
+//!     collapsing step of `compact` once both endpoints resolve — these read and
+//!     write MIDX chain layers under `<objdir>/pack/multi-pack-index.d/`.
+//!     `gix_pack::multi_index::Version` has only `V1`, the writer always emits
+//!     zero base files, and the reader discards the base-file count outright
+//!     (`multi_index/init.rs:100`: `let (_num_base_files, data) = data.split_at(1);
+//!     // TODO: handle base files once it's clear what this does`), so a layer
+//!     cannot even be read back correctly, let alone merged.
 //!   * `write --stdin-packs` — the writer takes a path list, so this could be
 //!     fed, but git's cruft-pack handling for the stdin set is not modelled and
 //!     a wrong pack set is a silently wrong index.
-//!   * `expire` and `repack` — both delete or create pack files and then
-//!     rewrite the MIDX; `gix-pack` has no pack-repacking driver, and getting
-//!     either wrong destroys objects.
+//!   * `repack` — it creates new pack files from batched old ones and then
+//!     rewrites the MIDX; `gix-pack` has no pack-repacking driver.
 //!
 //! `verify` uses `verify_integrity_fast`, which is the exact scope of git's
 //! `verify_midx_file`: trailing checksum, fan-out monotonicity, OID ordering,
@@ -116,6 +136,25 @@ usage: git multi-pack-index [<options>] expire
 
 ";
 
+/// `git multi-pack-index compact -h` (622 bytes). Note the option order: git
+/// lists `base` before `bitmap` here, the reverse of the `write` block.
+const COMPACT_USAGE: &str = "\
+usage: git multi-pack-index [<options>] compact [--[no-]incremental]
+         [--[no-]bitmap] [--base=<checksum>] [--[no-]write-chain-file]
+         <from> <to>
+
+    --[no-]object-dir <directory>
+                          object directory containing set of packfile and pack-index pairs
+    --[no-]progress       force progress reporting
+    --[no-]base <checksum>
+                          base MIDX for incremental writes
+    --[no-]bitmap         write multi-pack bitmap
+    --[no-]incremental    write a new incremental MIDX
+    --[no-]write-chain-file
+                          write the multi-pack-index chain file
+
+";
+
 /// `git multi-pack-index repack -h`.
 const REPACK_USAGE: &str = "\
 usage: git multi-pack-index [<options>] repack [--batch-size=<size>]
@@ -127,18 +166,22 @@ usage: git multi-pack-index [<options>] repack [--batch-size=<size>]
 
 ";
 
-/// `git multi-pack-index` — write or verify the multi-pack-index.
+/// `git multi-pack-index` — write, verify, expire and compact the multi-pack-index.
 ///
 /// Supported forms (stdout, exit code and resulting MIDX file matching stock git):
-///   * `git multi-pack-index write`                    → `<objdir>/pack/multi-pack-index`
-///   * `git multi-pack-index verify`                   → silent, exit 0 (exit 1 on damage)
-///   * `--object-dir=<dir>` / `--object-dir <dir>` / `--no-object-dir` on either
+///   * `git multi-pack-index write`      → `<objdir>/pack/multi-pack-index`
+///   * `git multi-pack-index verify`     → silent, exit 0 (exit 1 on damage)
+///   * `git multi-pack-index expire`     → silent, exit 0; drops packs the MIDX
+///     no longer resolves any object to and rewrites the MIDX if it dropped any
+///   * `git multi-pack-index compact <from> <to>` → endpoint resolution and its
+///     two `fatal:` exits; the collapsing step itself is unported
+///   * `--object-dir=<dir>` / `--object-dir <dir>` / `--no-object-dir` on any
 ///   * `--progress` / `--no-progress` (accepted; progress is discarded, git's
 ///     own progress goes to stderr and never to stdout)
-///   * `-h` at the top level and on `write` / `verify` / `expire` / `repack`
+///   * `-h` at the top level and on every sub-command
 ///
-/// Every other flag and the `compact` / `expire` / `repack` sub-commands
-/// `bail!` — see the module docs for the specific missing substrate.
+/// The `repack` sub-command and the `write` flags that need a bitmap or chain
+/// writer `bail!` — see the module docs for the specific missing substrate.
 pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
     // Dispatch includes the verb at index 0.
     let args = match args.first().map(String::as_str) {
@@ -170,8 +213,9 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
             print!("{USAGE}");
             return Ok(ExitCode::from(129));
         }
+        // git's `unknown option` names everything after the `--`, including any
+        // `=<value>`: `--base=deadbeef` reports ``unknown option `base=deadbeef'``.
         if let Some(name) = a.strip_prefix("--") {
-            let name = name.split('=').next().unwrap_or(name);
             return Ok(usage_error(Some(&format!("unknown option `{name}'")), USAGE));
         }
         if a.len() > 1 && a.starts_with('-') {
@@ -185,24 +229,16 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
         None => Ok(usage_error(Some("need a subcommand"), USAGE)),
         Some("write") => write(&rest, object_dir),
         Some("verify") => verify(&rest, object_dir),
-        // These three parse cleanly but have no implementation behind them; a
-        // usage block would misrepresent that, so only `-h` is honoured.
-        Some("expire") => {
-            if rest.iter().any(|a| *a == "-h") {
-                print!("{EXPIRE_USAGE}");
-                return Ok(ExitCode::from(129));
-            }
-            bail!("unsupported subcommand \"expire\" (ported: write, verify) — deleting packs and rewriting the MIDX needs a pack-expiry driver that gix-pack does not provide")
-        }
+        Some("expire") => expire(&rest, object_dir),
+        Some("compact") => compact(&rest, object_dir),
+        // `repack` parses cleanly but has no implementation behind it; a usage
+        // block would misrepresent that, so only `-h` is honoured.
         Some("repack") => {
             if rest.iter().any(|a| *a == "-h") {
                 print!("{REPACK_USAGE}");
                 return Ok(ExitCode::from(129));
             }
-            bail!("unsupported subcommand \"repack\" (ported: write, verify) — batched repacking needs a pack writer that gix-pack does not provide")
-        }
-        Some("compact") => {
-            bail!("unsupported subcommand \"compact\" (ported: write, verify) — MIDX chains need a v2 incremental writer; gix_pack::multi_index::Version has only V1")
+            bail!("unsupported subcommand \"repack\" (ported: write, verify, expire, compact) — batched repacking needs a pack writer that gix-pack does not provide")
         }
         Some(other) => Ok(usage_error(
             Some(&format!("unknown subcommand: `{other}'")),
@@ -252,9 +288,8 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
                 "unsupported flag {a:?} (ported: --object-dir, --progress) — requires incremental MIDX layers, which gix-pack cannot write"
             ),
             _ if a.starts_with("--") => {
-                let name = a.trim_start_matches('-').split('=').next().unwrap_or(a);
                 return Ok(usage_error(
-                    Some(&format!("unknown option `{name}'")),
+                    Some(&format!("unknown option `{}'", &a[2..])),
                     WRITE_USAGE,
                 ));
             }
@@ -262,27 +297,29 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         }
     }
 
-    let repo = gix::discover(".")?;
-    let objdir = object_dir.unwrap_or_else(|| repo.objects.store_ref().path().to_path_buf());
-    let pack_dir = objdir.join("pack");
+    let (repo, pack_dir) = object_store(object_dir)?;
+    reject_chain(&pack_dir)?;
 
-    // An existing MIDX chain would have to be torn down and rewritten; we do
-    // not model that, and silently leaving it beside a fresh flat MIDX would
-    // leave the repository in a state git never produces.
-    if pack_dir.join("multi-pack-index.d").exists() {
-        bail!("an incremental multi-pack-index chain is present at {:?}; rewriting it is unported", pack_dir.join("multi-pack-index.d"));
-    }
-
-    let index_paths = pack_indices(&pack_dir);
-    if index_paths.is_empty() {
+    if !write_midx(&pack_dir, repo.object_hash())? {
         // `midx-write.c`: `error(_("no pack files to index."))`, and cmd_* hands
         // the -1 straight back to git, which exits 255.
         eprintln!("error: no pack files to index.");
         return Ok(ExitCode::from(255));
     }
+    Ok(ExitCode::SUCCESS)
+}
 
-    // git writes through `multi-pack-index.lock` and renames on success, so a
-    // failed write never replaces a good index.
+/// Rewrite `<pack_dir>/multi-pack-index` from every pack currently present in
+/// `pack_dir`, returning `false` when there is nothing to index.
+///
+/// git writes through `multi-pack-index.lock` and renames on success, so a
+/// failed write never replaces a good index; this does the same.
+fn write_midx(pack_dir: &Path, object_hash: gix::hash::Kind) -> Result<bool> {
+    let index_paths = pack_indices(pack_dir);
+    if index_paths.is_empty() {
+        return Ok(false);
+    }
+
     let lock = pack_dir.join("multi-pack-index.lock");
     let file = fs::OpenOptions::new()
         .write(true)
@@ -296,9 +333,7 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         &mut out,
         &mut gix::progress::Discard,
         &AtomicBool::new(false),
-        multi_index::write::Options {
-            object_hash: repo.object_hash(),
-        },
+        multi_index::write::Options { object_hash },
     );
 
     let flushed = out.flush();
@@ -315,13 +350,14 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
 
     // `clear_midx_files_ext()`: a MIDX written without a bitmap invalidates any
     // bitmap and reverse index left over from an earlier `write --bitmap`.
-    for name in dir_names(&pack_dir) {
-        if name.starts_with("multi-pack-index-") && (name.ends_with(".bitmap") || name.ends_with(".rev")) {
+    for name in dir_names(pack_dir) {
+        if name.starts_with("multi-pack-index-")
+            && (name.ends_with(".bitmap") || name.ends_with(".rev"))
+        {
             fs::remove_file(pack_dir.join(name)).ok();
         }
     }
-
-    Ok(ExitCode::SUCCESS)
+    Ok(true)
 }
 
 /// `verify`: check the MIDX against the pack indices it references.
@@ -344,9 +380,8 @@ fn verify(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
                 return Ok(ExitCode::from(129));
             }
             _ if a.starts_with("--") => {
-                let name = a.trim_start_matches('-').split('=').next().unwrap_or(a);
                 return Ok(usage_error(
-                    Some(&format!("unknown option `{name}'")),
+                    Some(&format!("unknown option `{}'", &a[2..])),
                     VERIFY_USAGE,
                 ));
             }
@@ -356,9 +391,8 @@ fn verify(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         }
     }
 
-    let repo = gix::discover(".")?;
-    let objdir = object_dir.unwrap_or_else(|| repo.objects.store_ref().path().to_path_buf());
-    let midx = objdir.join("pack").join("multi-pack-index");
+    let (_repo, pack_dir) = object_store(object_dir)?;
+    let midx = pack_dir.join("multi-pack-index");
 
     // No MIDX is not an error for git: `verify_midx_file()` returns 0 silently.
     if !midx.exists() {
@@ -374,6 +408,226 @@ fn verify(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
             Ok(ExitCode::from(1))
         }
     }
+}
+
+/// `expire`: drop every pack the MIDX no longer names an object in.
+///
+/// A port of `midx.c`'s `expire_midx_packs()`. Note the ordering that a state
+/// comparison is sensitive to: the pack files are unlinked first, and the MIDX
+/// is rewritten only if at least one pack was actually dropped — an expire that
+/// finds nothing to do leaves the existing MIDX byte-for-byte untouched.
+fn expire(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
+    let mut it = rest.iter().copied();
+    while let Some(a) = it.next() {
+        match take_common(a, &mut it, &mut object_dir)? {
+            Common::Consumed => continue,
+            Common::MissingValue(name) => {
+                return Ok(usage_error(
+                    Some(&format!("option `{name}' requires a value")),
+                    EXPIRE_USAGE,
+                ))
+            }
+            Common::NotCommon => {}
+        }
+        match a {
+            "-h" => {
+                print!("{EXPIRE_USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            _ if a.starts_with("--") => {
+                return Ok(usage_error(
+                    Some(&format!("unknown option `{}'", &a[2..])),
+                    EXPIRE_USAGE,
+                ));
+            }
+            _ => return Ok(usage_error(None, EXPIRE_USAGE)),
+        }
+    }
+
+    let (repo, pack_dir) = object_store(object_dir)?;
+    reject_chain(&pack_dir)?;
+
+    // `expire_midx_packs()` opens the MIDX with `load_multi_pack_index()` and
+    // returns 0 without a word when there is none.
+    let midx = pack_dir.join("multi-pack-index");
+    if !midx.exists() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let file = multi_index::File::at(&midx, None)?;
+
+    // `count[pack_int_id]++` over every entry: a pack no entry resolves to is a
+    // pack whose objects are all reachable through some other pack in the MIDX.
+    // A pack id past the end of the name list means the MIDX is damaged; that is
+    // `verify`'s business, and expire must not delete packs on the strength of a
+    // tally it could not complete.
+    let mut counts = vec![0u32; file.num_indices() as usize];
+    for entry in 0..file.num_objects() {
+        let (pack, _offset) = file.pack_id_and_pack_offset_at_index(entry);
+        match counts.get_mut(pack as usize) {
+            Some(count) => *count += 1,
+            None => bail!(
+                "multi-pack-index entry {entry} names pack {pack}, but only {} packs are recorded",
+                counts.len()
+            ),
+        }
+    }
+
+    let mut dropped = false;
+    for (i, index_name) in file.index_names().iter().enumerate() {
+        if counts[i] != 0 {
+            continue;
+        }
+        let Some(base) = index_name.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // `unlink_pack_path()` refuses a `.keep` pack, and `expire_midx_packs()`
+        // skips cruft packs (`.mtimes`) outright — both hold objects that are
+        // not represented anywhere else even though the MIDX prefers a copy.
+        if pack_dir.join(format!("{base}.keep")).exists()
+            || pack_dir.join(format!("{base}.mtimes")).exists()
+        {
+            continue;
+        }
+        for ext in ["pack", "idx", "rev", "bitmap", "promisor"] {
+            fs::remove_file(pack_dir.join(format!("{base}.{ext}"))).ok();
+        }
+        dropped = true;
+    }
+
+    if dropped {
+        drop(file);
+        // `write_midx_internal(object_dir, NULL, &packs_to_drop, ...)` rescans the
+        // pack directory, which by now no longer holds the dropped packs.
+        if !write_midx(&pack_dir, repo.object_hash())? {
+            // Every pack went away, so there is nothing left to index and git's
+            // `clear_midx_files()` takes the MIDX with it.
+            fs::remove_file(&midx).ok();
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `compact <from> <to>`: collapse the MIDX chain layers between two endpoints.
+///
+/// Argument handling and endpoint resolution are ported; the collapsing step
+/// itself is not — see the module docs for the missing `gix-pack` substrate.
+fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
+    let mut positional: Vec<&str> = Vec::new();
+    let mut it = rest.iter().copied();
+    while let Some(a) = it.next() {
+        match take_common(a, &mut it, &mut object_dir)? {
+            Common::Consumed => continue,
+            Common::MissingValue(name) => {
+                return Ok(usage_error(
+                    Some(&format!("option `{name}' requires a value")),
+                    COMPACT_USAGE,
+                ))
+            }
+            Common::NotCommon => {}
+        }
+        match a {
+            "-h" => {
+                print!("{COMPACT_USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            // Accepted by git's compact option array; each only steers the write
+            // of the compacted layer, which is unported and bails below anyway.
+            "--bitmap"
+            | "--no-bitmap"
+            | "--incremental"
+            | "--no-incremental"
+            | "--write-chain-file"
+            | "--no-write-chain-file"
+            | "--no-base" => {}
+            "--base" => match it.next() {
+                Some(_) => {}
+                None => {
+                    return Ok(usage_error(
+                        Some("option `base' requires a value"),
+                        COMPACT_USAGE,
+                    ))
+                }
+            },
+            _ if a.starts_with("--base=") => {}
+            _ if a.starts_with("--") => {
+                return Ok(usage_error(
+                    Some(&format!("unknown option `{}'", &a[2..])),
+                    COMPACT_USAGE,
+                ));
+            }
+            _ => positional.push(a),
+        }
+    }
+
+    // `<from> <to>` are both required and there is no third form; anything else
+    // is a bare usage block on stderr with no `error:` line.
+    if positional.len() != 2 {
+        return Ok(usage_error(None, COMPACT_USAGE));
+    }
+    let (from, to) = (positional[0], positional[1]);
+
+    let (_repo, pack_dir) = object_store(object_dir)?;
+    let layers = midx_chain_layers(&pack_dir);
+
+    // git resolves `from` first, then `to`, and only then compares them: with
+    // both endpoints bogus and equal it still reports the lookup failure.
+    for endpoint in [from, to] {
+        if !layers.iter().any(|l| l == endpoint) {
+            eprintln!("fatal: could not find MIDX: {endpoint}");
+            return Ok(ExitCode::from(128));
+        }
+    }
+    if from == to {
+        eprintln!("fatal: MIDX compaction endpoints must be unique");
+        return Ok(ExitCode::from(128));
+    }
+
+    bail!("compacting MIDX chain layers {from}..{to} is unported — gix-pack reads and writes v1 MIDX with zero base files only (multi_index/init.rs discards the base-file count), so a chain layer cannot be read back, let alone merged")
+}
+
+/// Checksums of the MIDX layers `compact` can name, newest last.
+///
+/// A chain lists its layers in `multi-pack-index.d/multi-pack-index-chain`; a
+/// flat MIDX is treated by git as a one-layer chain identified by its own
+/// trailing checksum.
+fn midx_chain_layers(pack_dir: &Path) -> Vec<String> {
+    let chain = pack_dir
+        .join("multi-pack-index.d")
+        .join("multi-pack-index-chain");
+    if let Ok(text) = fs::read_to_string(&chain) {
+        return text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+    let flat = pack_dir.join("multi-pack-index");
+    match multi_index::File::at(&flat, None) {
+        Ok(file) => vec![file.checksum().to_string()],
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The repository and its `<objdir>/pack` directory, honouring `--object-dir`.
+fn object_store(object_dir: Option<PathBuf>) -> Result<(gix::Repository, PathBuf)> {
+    let repo = gix::discover(".")?;
+    let objdir = object_dir.unwrap_or_else(|| repo.objects.store_ref().path().to_path_buf());
+    let pack_dir = objdir.join("pack");
+    Ok((repo, pack_dir))
+}
+
+/// Refuse to operate on a repository whose MIDX is a chain.
+///
+/// Tearing one down and replacing it with a flat MIDX is not modelled, and
+/// leaving a fresh flat MIDX beside a live chain would put the repository in a
+/// state git never produces.
+fn reject_chain(pack_dir: &Path) -> Result<()> {
+    let chain = pack_dir.join("multi-pack-index.d");
+    if chain.exists() {
+        bail!("an incremental multi-pack-index chain is present at {chain:?}; rewriting it is unported");
+    }
+    Ok(())
 }
 
 /// Outcome of trying to interpret `a` as one of the two options every
@@ -477,7 +731,14 @@ mod tests {
                           object directory containing set of packfile and pack-index pairs
     --[no-]progress       force progress reporting
 ";
-        for block in [USAGE, WRITE_USAGE, VERIFY_USAGE, EXPIRE_USAGE, REPACK_USAGE] {
+        for block in [
+            USAGE,
+            WRITE_USAGE,
+            VERIFY_USAGE,
+            EXPIRE_USAGE,
+            REPACK_USAGE,
+            COMPACT_USAGE,
+        ] {
             assert!(block.contains(COMMON), "block missing common options:\n{block}");
             assert!(block.ends_with("\n\n"), "block must end with a blank line:\n{block}");
         }
@@ -493,5 +754,34 @@ mod tests {
         assert_eq!(VERIFY_USAGE.len(), 225);
         assert_eq!(EXPIRE_USAGE.len(), 225);
         assert_eq!(REPACK_USAGE.len(), 366);
+        assert_eq!(COMPACT_USAGE.len(), 622);
+    }
+
+    /// `compact`'s option list is its own: git lists `base` before `bitmap`
+    /// there and omits the three `write`-only options entirely. Copying the
+    /// `write` block over it would still pass the common-options check above.
+    #[test]
+    fn compact_usage_lists_its_own_options_in_gits_order() {
+        let base = COMPACT_USAGE.find("--[no-]base").expect("base option listed");
+        let bitmap = COMPACT_USAGE.find("--[no-]bitmap ").expect("bitmap option listed");
+        assert!(base < bitmap, "compact lists base before bitmap");
+        for absent in ["--[no-]stdin-packs", "--[no-]preferred-pack", "--[no-]refs-snapshot"] {
+            assert!(
+                !COMPACT_USAGE.contains(absent),
+                "compact must not list {absent}"
+            );
+        }
+        assert!(COMPACT_USAGE.contains("<from> <to>"), "compact takes two endpoints");
+    }
+
+    /// A flat MIDX is a one-layer chain for `compact`'s purposes, so an object
+    /// store with neither a chain file nor a MIDX offers no endpoints at all —
+    /// which is what turns `compact a b` into `could not find MIDX: a`.
+    #[test]
+    fn no_midx_means_no_compaction_endpoints() {
+        let dir = std::env::temp_dir().join(format!("zvcs-midx-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("scratch dir");
+        assert!(midx_chain_layers(&dir).is_empty());
+        fs::remove_dir_all(&dir).ok();
     }
 }

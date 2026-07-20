@@ -1,40 +1,106 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::process::ExitCode;
 
 use gix::hash::ObjectId;
 use gix::object::tree::{EntryKind, EntryMode};
 use gix::prelude::ObjectIdExt;
 
+/// The exact usage block stock `git ls-tree` prints (parse-options generated).
+///
+/// Emitted verbatim on `-h`, on an unknown option, and when `<tree-ish>` is
+/// missing — git terminates all three with exit 129.
+const USAGE: &str = "\
+usage: git ls-tree [<options>] <tree-ish> [<path>...]
+
+    -d                    only show trees
+    -r                    recurse into subtrees
+    -t                    show trees when recursing
+    -z                    terminate entries with NUL byte
+    -l, --long            include object size
+    --name-only           list only filenames
+    --name-status         list only filenames
+    --object-only         list only objects
+    --[no-]full-name      use full path names
+    --[no-]full-tree      list entire tree; not just current directory (implies --full-name)
+    --format <format>     format to use for the output
+    --[no-]abbrev[=<n>]   use <n> digits to display object names
+
+";
+
+/// git's `MINIMUM_ABBREV` — any non-zero `--abbrev` below this is raised to it.
+const MINIMUM_ABBREV: usize = 4;
+
+/// How the object-id column is rendered.
+#[derive(Clone, Copy, PartialEq)]
+enum Abbrev {
+    /// Full hex id (the default, and what `--no-abbrev` / `--abbrev=0` select).
+    Full,
+    /// `--abbrev` with no value: shortest unambiguous prefix.
+    Auto,
+    /// `--abbrev=<n>`: exactly `n` hex digits (clamped to the hash width).
+    Len(usize),
+}
+
+/// The mutually exclusive output modes. git declares these with `OPT_CMDMODE`,
+/// so two *different* modes on one command line is a usage error while the same
+/// mode repeated is accepted.
+#[derive(Clone, Copy, PartialEq)]
+enum CmdMode {
+    NameOnly,
+    NameStatus,
+    ObjectOnly,
+    Long,
+}
+
 /// Parsed command-line options for a single `ls-tree` invocation.
 struct Opts {
-    recurse: bool,     // -r: descend into sub-trees
-    show_trees: bool,  // -t: emit tree lines even while recursing into them
-    dirs_only: bool,   // -d: list tree entries only, never their contents
-    long: bool,        // -l/--long: append the blob size column
-    nul: bool,         // -z: terminate records with NUL instead of newline
-    name_only: bool,   // --name-only/--name-status: print the path alone
+    recurse: bool,    // -r: descend into sub-trees
+    show_trees: bool, // -t: emit tree lines even while recursing into them
+    dirs_only: bool,  // -d: list tree entries only, never their contents
+    long: bool,       // -l/--long: append the blob size column
+    nul: bool,        // -z: terminate records with NUL instead of newline
+    name_only: bool,  // --name-only/--name-status: print the path alone
     object_only: bool, // --object-only: print the object id alone
-    abbrev: Option<Option<usize>>, // --abbrev[=N]: None=full, Some(None)=auto, Some(Some(n))=N
+    abbrev: Abbrev,   // --abbrev[=N] / --no-abbrev
+    format: Option<String>, // --format=<fmt>: custom per-entry template
     paths: Vec<String>, // path filters (empty = whole tree)
+}
+
+/// Fatal usage error: `git` prints the message, a blank line, then the usage
+/// block, and exits 129.
+fn usage_msg_opt(msg: &str) -> ExitCode {
+    eprint!("fatal: {msg}\n\n{USAGE}");
+    ExitCode::from(129)
+}
+
+/// Option-parsing error: `git` prints just the `error:` line, then the usage
+/// block, and exits 129.
+fn error_with_usage(msg: &str) -> ExitCode {
+    eprint!("error: {msg}\n{USAGE}");
+    ExitCode::from(129)
+}
+
+/// Option-parsing error that git reports *without* the usage block.
+fn error_only(msg: &str) -> ExitCode {
+    eprintln!("error: {msg}");
+    ExitCode::from(129)
+}
+
+/// Fatal runtime error (bad object name, non-tree object): exit 128.
+fn fatal(msg: &str) -> ExitCode {
+    eprintln!("fatal: {msg}");
+    ExitCode::from(128)
 }
 
 /// `git ls-tree` — list the contents of a tree object.
 ///
-/// Supported forms (matching stock `git ls-tree` output byte-for-byte for these):
-///   * `git ls-tree <tree-ish>`               → immediate children
-///   * `git ls-tree -r <tree-ish>`            → recurse, leaves only
-///   * `git ls-tree -r -t <tree-ish>`         → recurse, include tree lines
-///   * `git ls-tree -d <tree-ish>`            → tree entries only
-///   * `-l`/`--long`, `-z`, `--name-only`/`--name-status`, `--object-only`
-///   * `--abbrev[=N]`, `--full-name`/`--full-tree` (accepted; output is already root-relative)
-///   * trailing `[--] <path>...` filters (exact file, or a directory prefix)
-///
 /// `<tree-ish>` is resolved through `rev_parse_single`, so commits, tags, refs,
-/// raw tree ids and `<rev>:<path>` all peel to the tree they name.
+/// raw tree ids and `<rev>:<path>` all peel to the tree they name; anything that
+/// fails to resolve or does not peel to a tree is a fatal (128) error, matching
+/// git's `Not a valid object name` / `not a tree object`.
 ///
-/// Unsupported: `--format=<fmt>` (custom output templates) and pathspec magic
-/// (globs, `:(...)` prefixes) — these `bail!` with a precise message rather than
-/// producing output that would silently diverge from git.
+/// Not honoured: pathspec magic (`:(glob)` and friends) — that would silently
+/// select a different entry set than git, so it is rejected outright.
 pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
     let mut opts = Opts {
         recurse: false,
@@ -44,37 +110,71 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         nul: false,
         name_only: false,
         object_only: false,
-        abbrev: None,
+        abbrev: Abbrev::Full,
+        format: None,
         paths: Vec::new(),
     };
 
+    // The active `OPT_CMDMODE` value plus the spelling the user typed, which is
+    // what git quotes back in the "cannot be used together" diagnostic.
+    let mut cmdmode: Option<(CmdMode, String)> = None;
     let mut treeish: Option<&str> = None;
     let mut positionals: Vec<&str> = Vec::new();
     let mut no_more_opts = false;
 
-    for a in args {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         if !no_more_opts && a == "--" {
             no_more_opts = true;
             continue;
         }
         if !no_more_opts && a.len() > 1 && a.starts_with('-') {
             if let Some(long_opt) = a.strip_prefix("--") {
-                match long_opt {
-                    "long" => opts.long = true,
-                    "name-only" | "name-status" => opts.name_only = true,
-                    "object-only" => opts.object_only = true,
-                    "full-name" | "full-tree" => {} // already root-relative here
-                    "abbrev" => opts.abbrev = Some(None),
-                    _ if long_opt.starts_with("abbrev=") => {
-                        let n: usize = long_opt["abbrev=".len()..]
-                            .parse()
-                            .map_err(|_| anyhow::anyhow!("invalid --abbrev value in {a:?}"))?;
-                        opts.abbrev = Some(Some(n));
+                // `--<name>=<value>` splits here; a bare `--<name>` has no value.
+                let (name, inline) = match long_opt.split_once('=') {
+                    Some((n, v)) => (n, Some(v)),
+                    None => (long_opt, None),
+                };
+                match name {
+                    "long" | "name-only" | "name-status" | "object-only" => {
+                        let mode = match name {
+                            "long" => CmdMode::Long,
+                            "name-only" => CmdMode::NameOnly,
+                            "name-status" => CmdMode::NameStatus,
+                            _ => CmdMode::ObjectOnly,
+                        };
+                        if let Some(code) = set_cmdmode(&mut cmdmode, mode, a) {
+                            return Ok(code);
+                        }
                     }
-                    _ if long_opt == "format" || long_opt.starts_with("format=") => {
-                        bail!("custom --format is not supported")
+                    "full-name" | "full-tree" | "no-full-name" | "no-full-tree" => {
+                        // Output here is always root-relative already.
                     }
-                    _ => bail!("unknown option {a:?}"),
+                    "abbrev" => {
+                        opts.abbrev = match inline {
+                            None => Abbrev::Auto,
+                            Some(v) => match parse_abbrev(v) {
+                                Some(x) => x,
+                                None => {
+                                    return Ok(error_only("option `abbrev' expects a numerical value"))
+                                }
+                            },
+                        };
+                    }
+                    "no-abbrev" => opts.abbrev = Abbrev::Full,
+                    "format" => {
+                        let value = match inline {
+                            Some(v) => v.to_string(),
+                            None => match it.next() {
+                                Some(v) => v.clone(),
+                                None => {
+                                    return Ok(error_with_usage("option `format' requires a value"))
+                                }
+                            },
+                        };
+                        opts.format = Some(value);
+                    }
+                    _ => return Ok(error_with_usage(&format!("unknown option `{name}'"))),
                 }
             } else {
                 // Grouped short flags, e.g. `-rt`.
@@ -83,9 +183,17 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
                         'r' => opts.recurse = true,
                         't' => opts.show_trees = true,
                         'd' => opts.dirs_only = true,
-                        'l' => opts.long = true,
                         'z' => opts.nul = true,
-                        _ => bail!("unknown option -{c}"),
+                        'l' => {
+                            if let Some(code) = set_cmdmode(&mut cmdmode, CmdMode::Long, "-l") {
+                                return Ok(code);
+                            }
+                        }
+                        'h' => {
+                            print!("{USAGE}");
+                            return Ok(ExitCode::from(129));
+                        }
+                        _ => return Ok(error_with_usage(&format!("unknown switch `{c}'"))),
                     }
                 }
             }
@@ -98,25 +206,82 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // git rejects `--format` alongside any cmdmode before it looks at operands.
+    if opts.format.is_some() && cmdmode.is_some() {
+        return Ok(usage_msg_opt(
+            "--format can't be combined with other format-altering options",
+        ));
+    }
+
+    match cmdmode.map(|(m, _)| m) {
+        Some(CmdMode::NameOnly) | Some(CmdMode::NameStatus) => opts.name_only = true,
+        Some(CmdMode::ObjectOnly) => opts.object_only = true,
+        Some(CmdMode::Long) => opts.long = true,
+        None => {}
+    }
+
     let Some(spec) = treeish else {
-        bail!("missing <tree-ish> argument");
+        eprint!("{USAGE}");
+        return Ok(ExitCode::from(129));
     };
 
     // Path filters: reject pathspec magic we don't honour, strip one trailing '/'.
     for p in &positionals {
         if p.starts_with(':') {
-            bail!("pathspec magic is not supported: {p:?}");
+            return Ok(fatal(&format!("pathspec magic is not supported: {p}")));
         }
         opts.paths.push(p.trim_end_matches('/').to_string());
     }
 
     let repo = gix::discover(".")?;
-    let tree = repo.rev_parse_single(spec)?.object()?.peel_to_tree()?;
+    let Ok(id) = repo.rev_parse_single(spec) else {
+        return Ok(fatal(&format!("Not a valid object name {spec}")));
+    };
+    let Ok(object) = id.object() else {
+        return Ok(fatal(&format!("Not a valid object name {spec}")));
+    };
+    let Ok(tree) = object.peel_to_tree() else {
+        return Ok(fatal("not a tree object"));
+    };
 
     let mut out = String::new();
     walk(&repo, tree, "", &opts, &mut out)?;
     print!("{out}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// Apply an `OPT_CMDMODE`-style flag, rejecting a switch to a *different* mode.
+///
+/// git quotes the option just seen first and the one already in effect second:
+/// `--name-only --name-status` reports `'--name-status' and '--name-only'`.
+/// Repeating the same mode is accepted silently.
+fn set_cmdmode(
+    current: &mut Option<(CmdMode, String)>,
+    mode: CmdMode,
+    spelling: &str,
+) -> Option<ExitCode> {
+    if let Some((prev, prev_name)) = current {
+        if *prev != mode {
+            return Some(error_only(&format!(
+                "options '{spelling}' and '{prev_name}' cannot be used together"
+            )));
+        }
+        return None;
+    }
+    *current = Some((mode, spelling.to_string()));
+    None
+}
+
+/// Parse an `--abbrev=<n>` value the way git's `parse_opt_abbrev_cb` does:
+/// non-numeric is an error, `0` disables abbreviation, and any other value below
+/// `MINIMUM_ABBREV` (including negatives) is raised to it.
+fn parse_abbrev(v: &str) -> Option<Abbrev> {
+    let n: i64 = v.parse().ok()?;
+    Some(match n {
+        0 => Abbrev::Full,
+        n if n < MINIMUM_ABBREV as i64 => Abbrev::Len(MINIMUM_ABBREV),
+        n => Abbrev::Len(n as usize),
+    })
 }
 
 /// Recursively render `tree` (rooted at `prefix`, e.g. `"dir/"`) into `out`.
@@ -133,13 +298,7 @@ fn walk(
         .decode()?
         .entries
         .iter()
-        .map(|e| {
-            (
-                e.mode,
-                e.filename.to_string(),
-                e.oid.to_owned(),
-            )
-        })
+        .map(|e| (e.mode, e.filename.to_string(), e.oid.to_owned()))
         .collect();
 
     for (mode, filename, oid) in entries {
@@ -188,8 +347,8 @@ fn should_descend(name: &str, opts: &Opts) -> bool {
             .any(|p| p.starts_with(&format!("{name}/")))
 }
 
-/// Render one entry line into `out`, honouring `--name-only`, `--object-only`,
-/// `--long` and `-z`.
+/// Render one entry into `out`, honouring `--format`, `--name-only`,
+/// `--object-only`, `--long` and `-z`.
 fn write_entry(
     repo: &gix::Repository,
     out: &mut String,
@@ -199,6 +358,12 @@ fn write_entry(
     opts: &Opts,
 ) -> Result<()> {
     let term = if opts.nul { '\0' } else { '\n' };
+
+    if let Some(fmt) = &opts.format {
+        expand_format(repo, fmt, out, mode, oid, name, opts)?;
+        out.push(term);
+        return Ok(());
+    }
 
     if opts.name_only {
         out.push_str(name);
@@ -216,12 +381,7 @@ fn write_entry(
     let oid_str = object_id_str(repo, oid, opts)?;
 
     if opts.long {
-        // Blobs (incl. symlinks) carry a size; trees and submodule commits show '-'.
-        let size = if mode.is_blob_or_symlink() {
-            repo.find_header(*oid)?.size().to_string()
-        } else {
-            "-".to_string()
-        };
+        let size = entry_size(repo, mode, oid)?;
         out.push_str(&format!(
             "{mode_str} {type_str} {oid_str} {size:>7}\t{name}{term}"
         ));
@@ -229,6 +389,85 @@ fn write_entry(
         out.push_str(&format!("{mode_str} {type_str} {oid_str}\t{name}{term}"));
     }
     Ok(())
+}
+
+/// Expand one `--format` template for a single entry.
+///
+/// Supports the atoms stock `git ls-tree` documents — `%(objectmode)`,
+/// `%(objecttype)`, `%(objectname)`, `%(objectsize)`, `%(objectsize:padded)`,
+/// `%(path)` — plus `%%` and `%x<hh>` byte escapes. An unrecognised `%(...)`
+/// atom is copied through verbatim.
+fn expand_format(
+    repo: &gix::Repository,
+    fmt: &str,
+    out: &mut String,
+    mode: EntryMode,
+    oid: &ObjectId,
+    name: &str,
+    opts: &Opts,
+) -> Result<()> {
+    let bytes: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != '%' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        // `%` at end of string is literal.
+        let Some(&next) = bytes.get(i + 1) else {
+            out.push('%');
+            break;
+        };
+        if next == '%' {
+            out.push('%');
+            i += 2;
+            continue;
+        }
+        if next == 'x' && i + 3 < bytes.len() {
+            let hex: String = bytes[i + 2..i + 4].iter().collect();
+            if let Ok(b) = u8::from_str_radix(&hex, 16) {
+                out.push(b as char);
+                i += 4;
+                continue;
+            }
+        }
+        if next == '(' {
+            if let Some(close) = bytes[i + 2..].iter().position(|&c| c == ')') {
+                let atom: String = bytes[i + 2..i + 2 + close].iter().collect();
+                match atom.as_str() {
+                    "objectmode" => out.push_str(git_mode(mode)),
+                    "objecttype" => out.push_str(git_type(mode)),
+                    "objectname" => out.push_str(&object_id_str(repo, oid, opts)?),
+                    "objectsize" => out.push_str(&entry_size(repo, mode, oid)?),
+                    "objectsize:padded" => {
+                        out.push_str(&format!("{:>7}", entry_size(repo, mode, oid)?))
+                    }
+                    "path" => out.push_str(name),
+                    other => {
+                        out.push_str("%(");
+                        out.push_str(other);
+                        out.push(')');
+                    }
+                }
+                i += 2 + close + 1;
+                continue;
+            }
+        }
+        out.push('%');
+        i += 1;
+    }
+    Ok(())
+}
+
+/// The size column: blobs (including symlinks) report their byte count, trees
+/// and submodule commits report `-`, exactly as git does.
+fn entry_size(repo: &gix::Repository, mode: EntryMode, oid: &ObjectId) -> Result<String> {
+    Ok(if mode.is_blob_or_symlink() {
+        repo.find_header(*oid)?.size().to_string()
+    } else {
+        "-".to_string()
+    })
 }
 
 /// The 6-digit octal mode exactly as stock `git ls-tree` prints it.
@@ -254,8 +493,8 @@ fn git_type(mode: EntryMode) -> &'static str {
 /// The object id column, full or abbreviated per `--abbrev`.
 fn object_id_str(repo: &gix::Repository, oid: &ObjectId, opts: &Opts) -> Result<String> {
     Ok(match opts.abbrev {
-        None => oid.to_hex().to_string(),
-        Some(Some(n)) => oid.to_hex_with_len(n).to_string(),
-        Some(None) => oid.attach(repo).shorten_or_id().to_string(),
+        Abbrev::Full => oid.to_hex().to_string(),
+        Abbrev::Len(n) => oid.to_hex_with_len(n.min(oid.kind().len_in_hex())).to_string(),
+        Abbrev::Auto => oid.attach(repo).shorten_or_id().to_string(),
     })
 }

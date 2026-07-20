@@ -5,47 +5,172 @@ use std::process::ExitCode;
 use gix::bstr::BString;
 use gix::hash::ObjectId;
 
+/// The exact usage block stock `git status` prints on a usage error (exit 129).
+const USAGE: &str = "usage: git status [<options>] [--] [<pathspec>...]
+
+    -v, --[no-]verbose    be verbose
+    -s, --[no-]short      show status concisely
+    -b, --[no-]branch     show branch information
+    --[no-]show-stash     show stash information
+    --[no-]ahead-behind   compute full ahead/behind values
+    --[no-]porcelain[=<version>]
+                          machine-readable output
+    --[no-]long           show status in long format (default)
+    -z, --[no-]null       terminate entries with NUL
+    -u, --[no-]untracked-files[=<mode>]
+                          show untracked files, optional modes: all, normal, no. (Default: all)
+    --[no-]ignored[=<mode>]
+                          show ignored files, optional modes: traditional, matching, no. (Default: traditional)
+    --[no-]ignore-submodules[=<when>]
+                          ignore changes to submodules, optional when: all, dirty, untracked. (Default: all)
+    --[no-]column[=<style>]
+                          list untracked files in columns
+    --no-renames          do not detect renames
+    --renames             opposite of --no-renames
+    -M, --find-renames[=<n>]
+                          detect renames, optionally set similarity index
+";
+
+/// How untracked files are reported, mirroring git's `--untracked-files` modes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Untracked {
+    /// `-uno` — no directory walk at all.
+    No,
+    /// `-unormal` (git's default) — collapse wholly-untracked directories.
+    Normal,
+    /// `-uall` — list every untracked file individually.
+    All,
+}
+
 /// `git status` — working-tree status vs the index and `HEAD`.
 ///
 /// Backed entirely by gitoxide's `Repository::status()` platform, which fans a
 /// tree↔index diff (the staged changes) and an index↔worktree diff (the
-/// unstaged changes plus the directory walk for untracked files) into a single
-/// iterator. From those items we reconstruct git's own output.
+/// unstaged changes plus the directory walk for untracked and ignored files)
+/// into a single iterator. From those items we reconstruct git's own output.
 ///
 /// Supported invocations (output byte-for-byte matches stock `git status`):
-///   * `git status`                — default long format.
-///   * `git status -s|--short`     — short format.
-///   * `git status --porcelain`    — porcelain v1 (identical to short here as we
-///                                    never colorize and resolve paths repo-root
-///                                    relative).
+///   * `git status`                      — default long format.
+///   * `git status -s|--short`           — short format.
+///   * `git status --porcelain[=v1]`     — porcelain v1.
+///   * `git status -b|--branch`          — the `## <branch>...<upstream> [ahead N, behind M]`
+///                                          short-format header.
+///   * `git status -u<mode>`             — all three `--untracked-files` modes.
+///   * `git status --ignored[=<mode>]`   — the `!!` / `Ignored files:` listing.
+///   * `git status --no-renames | --renames | -M | --find-renames[=<n>]`.
+///   * unmerged (conflicted) paths, in both long and short form.
 ///
 /// Faithfully unsupported cases `bail!` with a precise reason rather than
-/// emitting wrong output: merge/unmerged (conflicted) paths, intent-to-add
-/// entries, `--porcelain=v2`, `-z`, the `-b`/`--branch` short header,
-/// `--ignored`, non-default `--untracked-files` modes, and pathspec-limited
-/// status.
+/// emitting wrong output: `--porcelain=v2`, `-z`, intent-to-add entries, and
+/// pathspec-limited status.
 pub fn status(args: &[String]) -> Result<ExitCode> {
     let mut short = false;
+    let mut branch_header = false;
+    // `None` until a flag names a mode, so `status.showUntrackedFiles` still wins
+    // when the caller stays silent, exactly as git resolves it.
+    let mut untracked_flag: Option<Untracked> = None;
+    let mut show_ignored = false;
+    // `None` keeps git's configured default (`status.renames`/`diff.renames`).
+    let mut renames: Option<Option<gix::diff::Rewrites>> = None;
+
     for a in args {
-        match a.as_str() {
+        let s = a.as_str();
+        match s {
             "-s" | "--short" => short = true,
             "--porcelain" | "--porcelain=v1" => short = true,
             "--long" => short = false,
             "--porcelain=v2" => anyhow::bail!("porcelain v2 format is not supported"),
-            "-z" => anyhow::bail!("NUL-terminated output (-z) is not supported"),
-            "-b" | "--branch" => {
-                anyhow::bail!("the -b/--branch short-format header is not supported")
+            "-z" | "--null" => anyhow::bail!("NUL-terminated output (-z) is not supported"),
+            "-b" | "--branch" => branch_header = true,
+            "--no-branch" => branch_header = false,
+            "--ignored" | "--ignored=traditional" | "--ignored=matching" => show_ignored = true,
+            "--ignored=no" | "--no-ignored" => show_ignored = false,
+            "-u" | "--untracked-files" | "-uall" | "--untracked-files=all" => {
+                untracked_flag = Some(Untracked::All);
             }
-            "--ignored" | "--ignored=traditional" | "--ignored=matching" | "--ignored=no" => {
-                anyhow::bail!("listing ignored files (--ignored) is not supported")
+            "-uno" | "--untracked-files=no" | "--no-untracked-files" => {
+                untracked_flag = Some(Untracked::No);
             }
-            "-u" | "-uall" | "-uno" | "-unormal" => {
-                anyhow::bail!("non-default --untracked-files mode is not supported")
+            "-unormal" | "--untracked-files=normal" => {
+                untracked_flag = Some(Untracked::Normal);
             }
-            _ if a.starts_with("--untracked-files") => {
-                anyhow::bail!("non-default --untracked-files mode is not supported")
+            // Everything after `--` is a pathspec; the pathspec arm below rejects
+            // any that follow, and a trailing `--` on its own is a no-op.
+            "--" => {}
+            "--no-renames" => renames = Some(None),
+            "--renames" | "-M" | "--find-renames" => {
+                renames = Some(Some(gix::diff::Rewrites::default()));
             }
-            _ if a.starts_with('-') => anyhow::bail!("unsupported option {a:?}"),
+            _ if s.starts_with("--untracked-files=") => {
+                let mode = &s["--untracked-files=".len()..];
+                eprintln!("fatal: Invalid untracked files mode '{mode}'");
+                return Ok(ExitCode::from(128));
+            }
+            _ if s.starts_with("--ignored=") => {
+                let mode = &s["--ignored=".len()..];
+                eprintln!("fatal: Invalid ignored mode '{mode}'");
+                return Ok(ExitCode::from(128));
+            }
+            _ if s.starts_with("--find-renames=") || s.starts_with("-M") => {
+                let raw = s
+                    .strip_prefix("--find-renames=")
+                    .unwrap_or_else(|| s.trim_start_matches("-M"));
+                match parse_similarity(raw) {
+                    Some(rewrites) => renames = Some(Some(rewrites)),
+                    None => {
+                        eprintln!("error: unknown option `{}'", s.trim_start_matches('-'));
+                        eprint!("{USAGE}");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            _ if s.starts_with("--") => {
+                eprintln!("error: unknown option `{}'", &s[2..]);
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            // A cluster of short flags, e.g. `-sb`. `-u` and `-M` swallow the
+            // remainder of the argument as their optional value, as git does.
+            _ if s.starts_with('-') && s.len() > 1 => {
+                let mut chars = s[1..].chars();
+                while let Some(c) = chars.next() {
+                    let rest = chars.as_str();
+                    match c {
+                        's' => short = true,
+                        'b' => branch_header = true,
+                        'v' => {}
+                        'z' => anyhow::bail!("NUL-terminated output (-z) is not supported"),
+                        'u' => {
+                            untracked_flag = Some(match rest {
+                                "" | "all" => Untracked::All,
+                                "no" => Untracked::No,
+                                "normal" => Untracked::Normal,
+                                mode => {
+                                    eprintln!("fatal: Invalid untracked files mode '{mode}'");
+                                    return Ok(ExitCode::from(128));
+                                }
+                            });
+                            break;
+                        }
+                        'M' => {
+                            match parse_similarity(rest) {
+                                Some(rewrites) => renames = Some(Some(rewrites)),
+                                None => {
+                                    eprintln!("error: unknown option `{}'", &s[1..]);
+                                    eprint!("{USAGE}");
+                                    return Ok(ExitCode::from(129));
+                                }
+                            }
+                            break;
+                        }
+                        other => {
+                            eprintln!("error: unknown switch `{other}'");
+                            eprint!("{USAGE}");
+                            return Ok(ExitCode::from(129));
+                        }
+                    }
+                }
+            }
             _ => anyhow::bail!("pathspec-limited status ({a:?}) is not supported"),
         }
     }
@@ -69,13 +194,44 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     };
     drop(head);
 
-    // Collect the three change classes from the unified status iterator.
+    // `MERGE_HEAD` is what makes git treat the run as "from merge": it both
+    // enables the in-progress banner and suppresses the unstage hint.
+    let merging = repo.git_dir().join("MERGE_HEAD").exists();
+
+    let untracked = untracked_flag.unwrap_or_else(|| configured_untracked(&repo));
+
+    // Collect the four change classes from the unified status iterator.
     let mut staged: Vec<(StageKind, BString, Option<BString>)> = Vec::new();
     let mut unstaged: Vec<(WorkKind, BString)> = Vec::new();
-    let mut untracked: Vec<BString> = Vec::new();
+    let mut unmerged: Vec<(u8, BString)> = Vec::new();
+    let mut untracked_paths: Vec<BString> = Vec::new();
+    let mut ignored_paths: Vec<BString> = Vec::new();
+
+    let mut platform = repo
+        .status(gix::progress::Discard)?
+        .untracked_files(match untracked {
+            Untracked::No => gix::status::UntrackedFiles::None,
+            Untracked::Normal => gix::status::UntrackedFiles::Collapsed,
+            Untracked::All => gix::status::UntrackedFiles::Files,
+        });
+    if show_ignored {
+        // git lists ignored entries at the same granularity as untracked ones.
+        let mode = if untracked == Untracked::All {
+            gix::dir::walk::EmissionMode::Matching
+        } else {
+            gix::dir::walk::EmissionMode::CollapseDirectory
+        };
+        platform = platform.dirwalk_options(|opts| opts.emit_ignored(Some(mode)));
+    }
+    if let Some(rewrites) = renames {
+        platform = platform.tree_index_track_renames(match rewrites {
+            Some(r) => gix::status::tree_index::TrackRenames::Given(r),
+            None => gix::status::tree_index::TrackRenames::Disabled,
+        });
+    }
 
     let patterns: Vec<BString> = Vec::new();
-    for item in repo.status(gix::progress::Discard)?.into_iter(patterns)? {
+    for item in platform.into_iter(patterns)? {
         match item? {
             gix::status::Item::TreeIndex(change) => {
                 use gix::diff::index::ChangeRef;
@@ -116,11 +272,23 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             }
             gix::status::Item::IndexWorktree(iw) => {
                 use gix::status::index_worktree::Item;
-                use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
+                use gix::status::plumbing::index_as_worktree::{Change, Conflict, EntryStatus};
                 match iw {
                     Item::Modification { rela_path, status, .. } => match status {
-                        EntryStatus::Conflict { .. } => {
-                            anyhow::bail!("unmerged (conflicted) paths are not supported")
+                        // gitoxide already folds the up-to-three conflict stages
+                        // of one path into a single summary, which maps 1:1 onto
+                        // git's stagemask.
+                        EntryStatus::Conflict { summary, .. } => {
+                            let mask = match summary {
+                                Conflict::BothDeleted => 1,
+                                Conflict::AddedByUs => 2,
+                                Conflict::DeletedByThem => 3,
+                                Conflict::AddedByThem => 4,
+                                Conflict::DeletedByUs => 5,
+                                Conflict::BothAdded => 6,
+                                Conflict::BothModified => 7,
+                            };
+                            unmerged.push((mask, rela_path));
                         }
                         EntryStatus::IntentToAdd => {
                             anyhow::bail!("intent-to-add entries (git add -N) are not supported")
@@ -134,11 +302,15 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                             }
                         },
                     },
-                    Item::DirectoryContents { entry, .. } => {
-                        if matches!(entry.status, gix::dir::entry::Status::Untracked) {
-                            untracked.push(entry.rela_path);
+                    Item::DirectoryContents { entry, .. } => match entry.status {
+                        gix::dir::entry::Status::Untracked => {
+                            untracked_paths.push(walk_path(&entry));
                         }
-                    }
+                        gix::dir::entry::Status::Ignored(_) => {
+                            ignored_paths.push(walk_path(&entry));
+                        }
+                        _ => {}
+                    },
                     // Rename tracking is disabled for the index↔worktree pass in the
                     // default status platform, so this never fires; ignore defensively.
                     Item::Rewrite { .. } => {}
@@ -147,32 +319,121 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // git orders each section (and the short listing) by path.
+    // git orders each section (and each short-format block) by path.
     staged.sort_by(|a, b| a.1.cmp(&b.1));
     unstaged.sort_by(|a, b| a.1.cmp(&b.1));
-    untracked.sort();
+    unmerged.sort_by(|a, b| a.1.cmp(&b.1));
+    untracked_paths.sort();
+    ignored_paths.sort();
+
+    let tracking = if unborn {
+        None
+    } else {
+        tracking_info(&repo)?
+    };
 
     if short {
-        print!("{}", render_short(staged, unstaged, untracked));
+        let mut out = String::new();
+        if branch_header {
+            out.push_str(&short_branch_header(&head_state, tracking.as_ref()));
+        }
+        out.push_str(&render_short(
+            staged,
+            unstaged,
+            unmerged,
+            &untracked_paths,
+            &ignored_paths,
+        ));
+        print!("{out}");
     } else {
-        let tracking = if unborn {
-            String::new()
-        } else {
-            tracking_lines(&repo)?
-        };
         print!(
             "{}",
-            render_long(&head_state, &tracking, unborn, &staged, &unstaged, &untracked)
+            render_long(
+                &head_state,
+                &tracking_lines(tracking.as_ref()),
+                unborn,
+                merging,
+                untracked,
+                show_ignored,
+                &staged,
+                &unstaged,
+                &unmerged,
+                &untracked_paths,
+                &ignored_paths,
+            )
         );
     }
 
     Ok(ExitCode::SUCCESS)
 }
 
+/// Resolve `status.showUntrackedFiles`, which stands in for an absent
+/// `--untracked-files` flag. Anything unrecognised falls back to git's default.
+fn configured_untracked(repo: &gix::Repository) -> Untracked {
+    let Some(value) = repo.config_snapshot().string("status.showUntrackedFiles") else {
+        return Untracked::Normal;
+    };
+    match value.as_slice() {
+        b"no" => Untracked::No,
+        b"all" => Untracked::All,
+        _ => Untracked::Normal,
+    }
+}
+
+/// Parse the `<n>` of `-M<n>` / `--find-renames=<n>` into a similarity fraction.
+/// git accepts a bare percentage (`-M50`) or a fraction (`-M0.5`).
+fn parse_similarity(raw: &str) -> Option<gix::diff::Rewrites> {
+    let (body, had_percent) = match raw.strip_suffix('%') {
+        Some(body) => (body, true),
+        None => (raw, false),
+    };
+    if body.is_empty() {
+        return Some(gix::diff::Rewrites::default());
+    }
+    let value: f32 = body.parse().ok()?;
+    // git reads a bare integer as a percentage (`-M50`) and a decimal as a
+    // fraction (`-M0.5`); an explicit `%` always means a percentage.
+    let percentage = if had_percent || !body.contains('.') {
+        value / 100.0
+    } else {
+        value
+    };
+    if !(0.0..=1.0).contains(&percentage) {
+        return None;
+    }
+    Some(gix::diff::Rewrites {
+        percentage: Some(percentage),
+        ..Default::default()
+    })
+}
+
+/// The repo-relative path a dirwalk entry should be displayed as: git suffixes a
+/// `/` on directories (and nested repositories) it reports as a single entry.
+fn walk_path(entry: &gix::dir::Entry) -> BString {
+    let mut path = entry.rela_path.clone();
+    if matches!(
+        entry.disk_kind,
+        Some(gix::dir::entry::Kind::Directory) | Some(gix::dir::entry::Kind::Repository)
+    ) {
+        path.push(b'/');
+    }
+    path
+}
+
 enum HeadState {
     Branch(String),
     Detached(String),
     Unborn(String),
+}
+
+/// Upstream relationship of the current branch, as git's `stat_tracking_info`
+/// computes it.
+struct Tracking {
+    upstream: String,
+    /// The configured upstream ref no longer exists.
+    gone: bool,
+    ahead: usize,
+    behind: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -245,55 +506,111 @@ fn quote_path(path: impl AsRef<[u8]>) -> String {
     out
 }
 
-/// Build the tracking header line(s) for a born, attached branch, matching git's
-/// `format_tracking_info` output including advice hints. Returns an empty string
-/// when there is no upstream configured.
-fn tracking_lines(repo: &gix::Repository) -> Result<String> {
+/// Resolve the upstream of the current branch and how far it has diverged.
+/// Returns `None` when no upstream is configured, matching git's "no tracking
+/// information at all" case.
+fn tracking_info(repo: &gix::Repository) -> Result<Option<Tracking>> {
     use gix::bstr::ByteSlice;
 
     let Some(branch_ref) = repo.head_ref()? else {
-        return Ok(String::new());
+        return Ok(None);
     };
     let Some(Ok(upstream_name)) = branch_ref.remote_tracking_ref_name(gix::remote::Direction::Fetch)
     else {
-        return Ok(String::new());
+        return Ok(None);
     };
-    let upstream_short = upstream_name.shorten().to_str_lossy().into_owned();
+    let upstream = upstream_name.shorten().to_str_lossy().into_owned();
     let upstream_full = upstream_name.as_bstr().to_str_lossy().into_owned();
 
     let upstream_ref = match repo.try_find_reference(upstream_full.as_str())? {
         Some(r) => r,
         None => {
-            return Ok(format!(
-                "Your branch is based on '{upstream_short}', but the upstream is gone.\n  (use \"git branch --unset-upstream\" to fixup)\n"
-            ));
+            return Ok(Some(Tracking {
+                upstream,
+                gone: true,
+                ahead: 0,
+                behind: 0,
+            }));
         }
     };
 
     let upstream_id = upstream_ref.into_fully_peeled_id()?.detach();
     let local_id = repo.head_id()?.detach();
 
-    let ahead = count_commits(repo, local_id, upstream_id)?;
-    let behind = count_commits(repo, upstream_id, local_id)?;
+    Ok(Some(Tracking {
+        upstream,
+        gone: false,
+        ahead: count_commits(repo, local_id, upstream_id)?,
+        behind: count_commits(repo, upstream_id, local_id)?,
+    }))
+}
 
-    let line = if ahead == 0 && behind == 0 {
-        format!("Your branch is up to date with '{upstream_short}'.\n")
+/// Build the tracking header line(s) for the long format, matching git's
+/// `format_tracking_info` output including advice hints. Empty when there is no
+/// upstream configured.
+fn tracking_lines(tracking: Option<&Tracking>) -> String {
+    let Some(t) = tracking else {
+        return String::new();
+    };
+    let upstream = &t.upstream;
+    if t.gone {
+        return format!(
+            "Your branch is based on '{upstream}', but the upstream is gone.\n  (use \"git branch --unset-upstream\" to fixup)\n"
+        );
+    }
+    let (ahead, behind) = (t.ahead, t.behind);
+    if ahead == 0 && behind == 0 {
+        format!("Your branch is up to date with '{upstream}'.\n")
     } else if behind == 0 {
         let noun = if ahead == 1 { "commit" } else { "commits" };
         format!(
-            "Your branch is ahead of '{upstream_short}' by {ahead} {noun}.\n  (use \"git push\" to publish your local commits)\n"
+            "Your branch is ahead of '{upstream}' by {ahead} {noun}.\n  (use \"git push\" to publish your local commits)\n"
         )
     } else if ahead == 0 {
         let noun = if behind == 1 { "commit" } else { "commits" };
         format!(
-            "Your branch is behind '{upstream_short}' by {behind} {noun}, and can be fast-forwarded.\n  (use \"git pull\" to update your local branch)\n"
+            "Your branch is behind '{upstream}' by {behind} {noun}, and can be fast-forwarded.\n  (use \"git pull\" to update your local branch)\n"
         )
     } else {
         format!(
-            "Your branch and '{upstream_short}' have diverged,\nand have {ahead} and {behind} different commits each, respectively.\n  (use \"git pull\" if you want to integrate the remote branch with yours)\n"
+            "Your branch and '{upstream}' have diverged,\nand have {ahead} and {behind} different commits each, respectively.\n  (use \"git pull\" if you want to integrate the remote branch with yours)\n"
         )
+    }
+}
+
+/// The `## …` line of `git status -sb`, per git's `wt_shortstatus_print_tracking`.
+fn short_branch_header(head_state: &HeadState, tracking: Option<&Tracking>) -> String {
+    let mut out = String::from("## ");
+    match head_state {
+        HeadState::Detached(_) => {
+            out.push_str("HEAD (no branch)\n");
+            return out;
+        }
+        HeadState::Unborn(name) => {
+            // An unborn branch has no commits to compare, so git stops at the name.
+            out.push_str(&format!("No commits yet on {name}\n"));
+            return out;
+        }
+        HeadState::Branch(name) => out.push_str(name),
+    }
+
+    let Some(t) = tracking else {
+        out.push('\n');
+        return out;
     };
-    Ok(line)
+    out.push_str("...");
+    out.push_str(&t.upstream);
+    if t.gone {
+        out.push_str(" [gone]");
+    } else if t.ahead > 0 && t.behind > 0 {
+        out.push_str(&format!(" [ahead {}, behind {}]", t.ahead, t.behind));
+    } else if t.ahead > 0 {
+        out.push_str(&format!(" [ahead {}]", t.ahead));
+    } else if t.behind > 0 {
+        out.push_str(&format!(" [behind {}]", t.behind));
+    }
+    out.push('\n');
+    out
 }
 
 /// Count commits reachable from `tip` but not from `hidden` — i.e. the ahead/
@@ -306,36 +623,62 @@ fn count_commits(repo: &gix::Repository, tip: ObjectId, hidden: ObjectId) -> Res
     Ok(walk.take_while(Result::is_ok).count())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_long(
     head_state: &HeadState,
     tracking: &str,
     unborn: bool,
+    merging: bool,
+    untracked_mode: Untracked,
+    show_ignored: bool,
     staged: &[(StageKind, BString, Option<BString>)],
     unstaged: &[(WorkKind, BString)],
+    unmerged: &[(u8, BString)],
     untracked: &[BString],
+    ignored: &[BString],
 ) -> String {
     let mut out = String::new();
 
     match head_state {
         HeadState::Branch(name) => out.push_str(&format!("On branch {name}\n")),
         HeadState::Detached(short) => out.push_str(&format!("HEAD detached at {short}\n")),
-        HeadState::Unborn(name) => out.push_str(&format!("On branch {name}\n\nNo commits yet\n")),
+        HeadState::Unborn(name) => out.push_str(&format!("On branch {name}\n")),
     }
 
-    // git prints a trailing blank line after the header block only when tracking
-    // info or the "No commits yet" note was emitted; a plain branch/detached
-    // header runs straight into the first section.
+    // git prints a blank line after the tracking block and after each
+    // in-progress-operation block; a plain branch/detached header runs straight
+    // into the first section.
     out.push_str(tracking);
-    if !tracking.is_empty() || unborn {
+    if !tracking.is_empty() {
         out.push('\n');
+    }
+
+    if merging {
+        if unmerged.is_empty() {
+            out.push_str("All conflicts fixed but you are still merging.\n");
+            out.push_str("  (use \"git commit\" to conclude merge)\n");
+        } else {
+            out.push_str("You have unmerged paths.\n");
+            out.push_str("  (fix conflicts and run \"git commit\")\n");
+            out.push_str("  (use \"git merge --abort\" to abort the merge)\n");
+        }
+        out.push('\n');
+    }
+
+    if unborn {
+        out.push_str("\nNo commits yet\n\n");
     }
 
     if !staged.is_empty() {
         out.push_str("Changes to be committed:\n");
-        if unborn {
-            out.push_str("  (use \"git rm --cached <file>...\" to unstage)\n");
-        } else {
-            out.push_str("  (use \"git restore --staged <file>...\" to unstage)\n");
+        // Mid-merge git offers no unstage hint, as `git restore --staged` is not
+        // the right advice while `MERGE_HEAD` is around.
+        if !merging {
+            if unborn {
+                out.push_str("  (use \"git rm --cached <file>...\" to unstage)\n");
+            } else {
+                out.push_str("  (use \"git restore --staged <file>...\" to unstage)\n");
+            }
         }
         for (kind, path, orig) in staged {
             let label = stage_label(*kind);
@@ -347,6 +690,16 @@ fn render_long(
                 )),
                 None => out.push_str(&format!("\t{label:<12}{}\n", quote_path(path))),
             }
+        }
+        out.push('\n');
+    }
+
+    if !unmerged.is_empty() {
+        out.push_str("Unmerged paths:\n");
+        out.push_str(unmerged_hint(unmerged));
+        for (mask, path) in unmerged {
+            let label = unmerged_label(*mask);
+            out.push_str(&format!("\t{label:<17}{}\n", quote_path(path)));
         }
         out.push('\n');
     }
@@ -366,28 +719,47 @@ fn render_long(
         out.push('\n');
     }
 
-    if !untracked.is_empty() {
-        out.push_str("Untracked files:\n");
-        out.push_str("  (use \"git add <file>...\" to include in what will be committed)\n");
-        for path in untracked {
-            out.push_str(&format!("\t{}\n", quote_path(path)));
+    let committable = !staged.is_empty();
+
+    if untracked_mode == Untracked::No {
+        // git only mentions the suppressed listing when the run is committable —
+        // otherwise the trailing summary already carries the `-u` hint.
+        if committable {
+            out.push_str("Untracked files not listed (use -u option to show untracked files)\n");
         }
-        out.push('\n');
+    } else {
+        if !untracked.is_empty() {
+            out.push_str("Untracked files:\n");
+            out.push_str("  (use \"git add <file>...\" to include in what will be committed)\n");
+            for path in untracked {
+                out.push_str(&format!("\t{}\n", quote_path(path)));
+            }
+            out.push('\n');
+        }
+        if show_ignored && !ignored.is_empty() {
+            out.push_str("Ignored files:\n");
+            out.push_str("  (use \"git add -f <file>...\" to include in what will be committed)\n");
+            for path in ignored {
+                out.push_str(&format!("\t{}\n", quote_path(path)));
+            }
+            out.push('\n');
+        }
     }
 
     // Trailing summary — omitted entirely when there is anything staged
     // (git's "committable" state), matching stock output.
-    if staged.is_empty() {
-        let summary = if unstaged.is_empty() && untracked.is_empty() {
-            if unborn {
-                "nothing to commit (create/copy files and use \"git add\" to track)"
-            } else {
-                "nothing to commit, working tree clean"
-            }
-        } else if !unstaged.is_empty() {
+    if !committable {
+        let workdir_dirty = !unstaged.is_empty() || !unmerged.is_empty();
+        let summary = if workdir_dirty {
             "no changes added to commit (use \"git add\" and/or \"git commit -a\")"
-        } else {
+        } else if !untracked.is_empty() {
             "nothing added to commit but untracked files present (use \"git add\" to track)"
+        } else if unborn {
+            "nothing to commit (create/copy files and use \"git add\" to track)"
+        } else if untracked_mode == Untracked::No {
+            "nothing to commit (use -u to show untracked files)"
+        } else {
+            "nothing to commit, working tree clean"
         };
         out.push_str(summary);
         out.push('\n');
@@ -399,7 +771,9 @@ fn render_long(
 fn render_short(
     staged: Vec<(StageKind, BString, Option<BString>)>,
     unstaged: Vec<(WorkKind, BString)>,
-    untracked: Vec<BString>,
+    unmerged: Vec<(u8, BString)>,
+    untracked: &[BString],
+    ignored: &[BString],
 ) -> String {
     struct Short {
         x: u8,
@@ -407,8 +781,10 @@ fn render_short(
         orig: Option<BString>,
     }
 
-    // Merge both change streams per path: X is the staged (index) column, Y the
-    // worktree column; a file can carry both (e.g. "MM").
+    // Merge the change streams per path: X is the staged (index) column, Y the
+    // worktree column; a file can carry both (e.g. "MM"). Untracked and ignored
+    // entries are *not* merged in — git prints them as separate trailing blocks
+    // rather than interleaving them by path.
     let mut map: BTreeMap<BString, Short> = BTreeMap::new();
     for (kind, path, orig) in staged {
         let e = map.entry(path).or_insert(Short {
@@ -429,12 +805,9 @@ fn render_short(
         });
         e.y = work_char(kind);
     }
-    for path in untracked {
-        map.entry(path).or_insert(Short {
-            x: b'?',
-            y: b'?',
-            orig: None,
-        });
+    for (mask, path) in unmerged {
+        let (x, y) = unmerged_chars(mask);
+        map.insert(path, Short { x, y, orig: None });
     }
 
     let mut out = String::new();
@@ -447,7 +820,66 @@ fn render_short(
             None => out.push_str(&format!("{x}{y} {}\n", quote_path(path))),
         }
     }
+    for path in untracked {
+        out.push_str(&format!("?? {}\n", quote_path(path)));
+    }
+    for path in ignored {
+        out.push_str(&format!("!! {}\n", quote_path(path)));
+    }
     out
+}
+
+/// git picks the resolution hint from which conflict flavours are present:
+/// pure both-deleted conflicts want `git rm`, mixed delete/modify ones want
+/// either, and everything else wants `git add`.
+fn unmerged_hint(unmerged: &[(u8, BString)]) -> &'static str {
+    let mut both_deleted = false;
+    let mut del_mod_conflict = false;
+    let mut not_deleted = false;
+    for (mask, _) in unmerged {
+        match mask {
+            1 => both_deleted = true,
+            3 | 5 => del_mod_conflict = true,
+            _ => not_deleted = true,
+        }
+    }
+    if !both_deleted {
+        if del_mod_conflict {
+            "  (use \"git add/rm <file>...\" as appropriate to mark resolution)\n"
+        } else {
+            "  (use \"git add <file>...\" to mark resolution)\n"
+        }
+    } else if !del_mod_conflict && !not_deleted {
+        "  (use \"git rm <file>...\" to mark resolution)\n"
+    } else {
+        "  (use \"git add/rm <file>...\" as appropriate to mark resolution)\n"
+    }
+}
+
+/// Long-format label for a conflict stagemask (bit 0 = base, 1 = ours, 2 = theirs).
+fn unmerged_label(mask: u8) -> &'static str {
+    match mask {
+        1 => "both deleted:",
+        2 => "added by us:",
+        3 => "deleted by them:",
+        4 => "added by them:",
+        5 => "deleted by us:",
+        6 => "both added:",
+        _ => "both modified:",
+    }
+}
+
+/// Short-format two-letter code for a conflict stagemask.
+fn unmerged_chars(mask: u8) -> (u8, u8) {
+    match mask {
+        1 => (b'D', b'D'),
+        2 => (b'A', b'U'),
+        3 => (b'U', b'D'),
+        4 => (b'U', b'A'),
+        5 => (b'D', b'U'),
+        6 => (b'A', b'A'),
+        _ => (b'U', b'U'),
+    }
 }
 
 fn stage_label(kind: StageKind) -> &'static str {

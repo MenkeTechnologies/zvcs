@@ -14,31 +14,49 @@
 //!   * `--chmod=(+|-)x`
 //!   * `--assume-unchanged` / `--no-assume-unchanged`
 //!   * `--skip-worktree` / `--no-skip-worktree`
+//!   * `--fsmonitor-valid` / `--no-fsmonitor-valid`
 //!   * `--stdin` (must be the last argument, as in git) and `-z`
-//!   * `--show-index-version`, `--verbose`, `--`, and `<file>...`
+//!   * `-g`/`--again` and `--unresolve`, both of which swallow the remaining
+//!     arguments as a pathspec exactly as git's callbacks do
+//!   * `--clear-resolve-undo`, `--force-write-index`
+//!   * `--index-version <n>` / `--show-index-version` (one shared variable in
+//!     git, so a trailing `--show-index-version` cancels a bad `--index-version`)
+//!   * `--split-index`, `--untracked-cache` and friends, `--fsmonitor`
+//!   * `--verbose`, `--`, and `<file>...`
 //!
 //! Faithfully reproduced behaviours: git's `prefix_path` normalisation and its
 //! "is outside repository" refusal, `verify_path` (the `Ignoring path <p>` note
-//! for `.git` components and stray trailing slashes), the up-to-date short
+//! for `.git` components and any trailing slash), the up-to-date short
 //! circuit in `add_one_path`, the file/directory conflict diagnostics, gitlink
-//! (submodule) registration for directory arguments, and the `refresh_cache_ent`
-//! decision ladder — including that `--refresh` honours the skip-worktree bit
-//! always and the assume-unchanged bit unless `--really-refresh` is given, and
-//! that `-q` suppresses the `<path>: needs update` lines and the exit-1 with
-//! them, while still reporting `<path>: needs merge` for conflicted paths.
+//! (submodule) registration for directory arguments, git's `PARSE_OPT_NOARG`
+//! rejection of `--<flag>=<value>` on every non-value option, and the
+//! `refresh_cache_ent` decision ladder — including that `--refresh` honours the
+//! skip-worktree bit always and the assume-unchanged bit unless
+//! `--really-refresh` is given, and that `-q` suppresses the
+//! `<path>: needs update` lines and the exit-1 with them, while still reporting
+//! `<path>: needs merge` for conflicted paths. `--test-untracked-cache` runs the
+//! real filesystem probe and, like git, returns before the index is written.
 //!
-//! Deliberately NOT ported — each bails with a precise reason rather than
-//! producing an index that merely looks right:
-//!   * `--index-info` (a whole second input grammar), `--unresolve`,
-//!     `-g`/`--again`, `--clear-resolve-undo`, `--force-write-index`
-//!   * `--index-version <n>`: `gix_index` picks V2/V3 from the entry flags and
-//!     cannot emit V4 or be pinned, so honouring the flag is impossible here.
-//!   * `--split-index`, `--untracked-cache` and friends, `--fsmonitor`,
-//!     `--fsmonitor-valid`: the corresponding index extensions are not writable
-//!     through the vendored crates.
+//! Deliberately NOT ported:
+//!   * `--index-info` (a whole second input grammar), which bails with a precise
+//!     reason rather than producing an index that merely looks right.
 //!   * `core.ignoreStat=true`, which would silently flip the assume-unchanged
 //!     bit on every entry git writes.
 //!   * C-quoted paths on `--stdin` (git's `unquote_c_style` input form).
+//!
+//! Accepted but not represented on disk, because the vendored `gix_index` writes
+//! neither the extension nor a pinned header version. Each is invisible to
+//! `git status` / `git ls-files`, so behaviour observable through git itself is
+//! unaffected, but the index bytes differ from stock git's:
+//!   * `--index-version <n>`: the range check and the resulting index write are
+//!     performed, but `gix_index` derives V2/V3 from the entry flags and cannot
+//!     emit V4 or be pinned.
+//!   * `--split-index`, `--untracked-cache`, `--fsmonitor`: the `link`, `UNTR`
+//!     and `FSMN` extensions are not writable through the vendored crates.
+//!   * `--unresolve` restores nothing when the index actually carries a `REUC`
+//!     extension: `gix_index` decodes it but exposes no accessors on
+//!     `resolve_undo::ResolvePath`, so the recorded stages cannot be read back.
+//!     That case bails rather than silently doing nothing.
 //!
 //! Also note that content filters (`.gitattributes` clean/smudge, `autocrlf`)
 //! are not applied when hashing worktree files, matching this port's `git add`.
@@ -82,6 +100,8 @@ struct Ctx {
     tree_stale: bool,
     /// `--refresh` reported at least one path; the command exits 1.
     has_errors: bool,
+    /// `--force-write-index`: persist the index even when nothing changed.
+    force_write: bool,
 
     allow_add: bool,
     allow_remove: bool,
@@ -98,6 +118,7 @@ struct Ctx {
 
     mark_valid: Option<Mark>,
     mark_skip_worktree: Option<Mark>,
+    mark_fsmonitor: Option<Mark>,
     set_executable_bit: Option<char>,
 
     /// `core.fileMode`; when false the executable bit of worktree files is ignored.
@@ -160,6 +181,7 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         dirty: false,
         tree_stale: false,
         has_errors: false,
+        force_write: false,
         allow_add: false,
         allow_remove: false,
         allow_replace: false,
@@ -173,6 +195,7 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         ignore_submodules: false,
         mark_valid: None,
         mark_skip_worktree: None,
+        mark_fsmonitor: None,
         set_executable_bit: None,
         trust_executable_bit,
         stat_opts,
@@ -181,8 +204,9 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
     match run(&mut ctx, args)? {
         Outcome::Die => Ok(ExitCode::from(128)),
         Outcome::Usage => Ok(ExitCode::from(129)),
+        Outcome::Exit(code) => Ok(ExitCode::from(code)),
         Outcome::Done => {
-            if ctx.dirty {
+            if ctx.dirty || ctx.force_write {
                 if ctx.tree_stale {
                     ctx.index.remove_tree();
                 }
@@ -204,14 +228,32 @@ enum Outcome {
     Die,
     /// git's option parser rejected the command line: exit 129.
     Usage,
+    /// git returned before reaching the index write (`--test-untracked-cache`).
+    Exit(u8),
+}
+
+/// git's `untracked_cache` enum: which of the mutually exclusive
+/// untracked-cache options won the left-to-right scan.
+#[derive(Clone, Copy, PartialEq)]
+enum UntrackedCache {
+    Unspecified,
+    Disable,
+    Enable,
+    Force,
+    Test,
 }
 
 /// The left-to-right option/path scan, mirroring `cmd_update_index`.
 fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
-    let mut show_index_version = false;
+    // git keeps `--index-version <n>` and `--show-index-version` in one
+    // variable: 0 = neither, -1 = report, n > 0 = write that format. Whichever
+    // comes last therefore wins, and a trailing `--show-index-version` really
+    // does cancel an out-of-range `--index-version`.
+    let mut preferred_index_format: i32 = 0;
+    let mut untracked_cache = UntrackedCache::Unspecified;
     let mut nul_term_line = false;
     let mut end_of_opts = false;
-    let mut i = 1; // args[0] is the subcommand name
+    let mut i = 0;
 
     while i < args.len() {
         let a = args[i].as_str();
@@ -221,104 +263,184 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
             i += 1;
             continue;
         }
-        if !end_of_opts && a.len() > 1 && a.starts_with('-') {
-            // `--stdin` must be last; everything after it would be ignored, so git
-            // refuses rather than silently dropping arguments.
-            if a == "--stdin" {
-                if i + 1 != args.len() {
-                    eprintln!("error: option 'stdin' must be the last argument");
-                    return Ok(Outcome::Usage);
+
+        // Short options, including clusters like `-qz`.
+        if !end_of_opts && a.len() > 1 && a.starts_with('-') && !a.starts_with("--") {
+            let mut swallowed_rest = false;
+            for c in a[1..].chars() {
+                match c {
+                    'z' => nul_term_line = true,
+                    'q' => ctx.refresh_quiet = true,
+                    'g' => {
+                        if do_reupdate(ctx, &args[i + 1..])?.is_err() {
+                            return Ok(Outcome::Die);
+                        }
+                        swallowed_rest = true;
+                        break;
+                    }
+                    _ => {
+                        eprintln!("error: unknown switch `{c}'");
+                        return Ok(Outcome::Usage);
+                    }
                 }
-                if let Err(Die) = read_stdin_paths(ctx, nul_term_line)? {
-                    return Ok(Outcome::Die);
-                }
-                i += 1;
-                continue;
+            }
+            i = if swallowed_rest { args.len() } else { i + 1 };
+            continue;
+        }
+
+        if !end_of_opts && a.starts_with("--") && a.len() > 2 {
+            let long = &a[2..];
+            let (name, attached) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+
+            // Every option but these two is `PARSE_OPT_NOARG`, and git rejects an
+            // attached value on those outright rather than ignoring it.
+            if attached.is_some() && !matches!(name, "chmod" | "index-version") {
+                eprintln!("error: option `{name}' takes no value");
+                return Ok(Outcome::Usage);
             }
 
-            match a {
-                "-z" => nul_term_line = true,
-                "-q" => ctx.refresh_quiet = true,
-                "--verbose" => ctx.verbose = true,
-                "--no-verbose" => ctx.verbose = false,
-                "--add" => ctx.allow_add = true,
-                "--no-add" => ctx.allow_add = false,
-                "--remove" => ctx.allow_remove = true,
-                "--no-remove" => ctx.allow_remove = false,
-                "--replace" => ctx.allow_replace = true,
-                "--no-replace" => ctx.allow_replace = false,
-                "--force-remove" => {
+            match name {
+                // `--stdin` must be last; everything after it would be ignored,
+                // so git refuses rather than silently dropping arguments.
+                "stdin" => {
+                    if i + 1 != args.len() {
+                        eprintln!("error: option 'stdin' must be the last argument");
+                        return Ok(Outcome::Usage);
+                    }
+                    if let Err(Die) = read_stdin_paths(ctx, nul_term_line)? {
+                        return Ok(Outcome::Die);
+                    }
+                }
+
+                "verbose" => ctx.verbose = true,
+                "no-verbose" => ctx.verbose = false,
+                "add" => ctx.allow_add = true,
+                "no-add" => ctx.allow_add = false,
+                "remove" => ctx.allow_remove = true,
+                "no-remove" => ctx.allow_remove = false,
+                "replace" => ctx.allow_replace = true,
+                "no-replace" => ctx.allow_replace = false,
+                "force-remove" => {
                     ctx.force_remove = true;
                     ctx.allow_remove = true;
                 }
-                "--no-force-remove" => ctx.force_remove = false,
-                "--info-only" => ctx.info_only = true,
-                "--no-info-only" => ctx.info_only = false,
-                "--unmerged" => ctx.allow_unmerged = true,
-                "--no-unmerged" => ctx.allow_unmerged = false,
-                "--ignore-missing" => ctx.ignore_missing = true,
-                "--no-ignore-missing" => ctx.ignore_missing = false,
-                "--ignore-submodules" => ctx.ignore_submodules = true,
-                "--no-ignore-submodules" => ctx.ignore_submodules = false,
-                "--ignore-skip-worktree-entries" => ctx.ignore_skip_worktree_entries = true,
-                "--no-ignore-skip-worktree-entries" => ctx.ignore_skip_worktree_entries = false,
-                "--show-index-version" => show_index_version = true,
-                "--no-show-index-version" => show_index_version = false,
+                "no-force-remove" => ctx.force_remove = false,
+                "info-only" => ctx.info_only = true,
+                "no-info-only" => ctx.info_only = false,
+                "unmerged" => ctx.allow_unmerged = true,
+                "no-unmerged" => ctx.allow_unmerged = false,
+                "ignore-missing" => ctx.ignore_missing = true,
+                "no-ignore-missing" => ctx.ignore_missing = false,
+                "ignore-submodules" => ctx.ignore_submodules = true,
+                "no-ignore-submodules" => ctx.ignore_submodules = false,
+                "ignore-skip-worktree-entries" => ctx.ignore_skip_worktree_entries = true,
+                "no-ignore-skip-worktree-entries" => ctx.ignore_skip_worktree_entries = false,
+                "force-write-index" => ctx.force_write = true,
+                "no-force-write-index" => ctx.force_write = false,
 
-                "--assume-unchanged" => ctx.mark_valid = Some(Mark { flag: Flags::ASSUME_VALID, set: true }),
-                "--no-assume-unchanged" => {
+                "show-index-version" => preferred_index_format = -1,
+                "no-show-index-version" | "no-index-version" => preferred_index_format = 0,
+                "index-version" => {
+                    let (value, consumed) = match attached {
+                        Some(v) => (v, 1),
+                        None => match args.get(i + 1) {
+                            Some(v) => (v.as_str(), 2),
+                            None => {
+                                eprintln!("error: option `index-version' requires a value");
+                                return Ok(Outcome::Usage);
+                            }
+                        },
+                    };
+                    match value.trim().parse::<i32>() {
+                        Ok(n) => preferred_index_format = n,
+                        Err(_) => {
+                            eprintln!(
+                                "error: option `index-version' expects a numerical value"
+                            );
+                            return Ok(Outcome::Usage);
+                        }
+                    }
+                    i += consumed;
+                    continue;
+                }
+
+                "assume-unchanged" => {
+                    ctx.mark_valid = Some(Mark { flag: Flags::ASSUME_VALID, set: true })
+                }
+                "no-assume-unchanged" => {
                     ctx.mark_valid = Some(Mark { flag: Flags::ASSUME_VALID, set: false })
                 }
-                "--skip-worktree" => {
+                "skip-worktree" => {
                     ctx.mark_skip_worktree = Some(Mark { flag: Flags::SKIP_WORKTREE, set: true })
                 }
-                "--no-skip-worktree" => {
+                "no-skip-worktree" => {
                     ctx.mark_skip_worktree = Some(Mark { flag: Flags::SKIP_WORKTREE, set: false })
                 }
+                "fsmonitor-valid" => {
+                    ctx.mark_fsmonitor = Some(Mark { flag: Flags::FSMONITOR_VALID, set: true })
+                }
+                "no-fsmonitor-valid" => {
+                    ctx.mark_fsmonitor = Some(Mark { flag: Flags::FSMONITOR_VALID, set: false })
+                }
 
-                "--refresh" => {
+                "refresh" => {
                     if refresh(ctx, false)?.is_err() {
                         return Ok(Outcome::Die);
                     }
                 }
-                "--really-refresh" => {
+                "really-refresh" => {
                     if refresh(ctx, true)?.is_err() {
                         return Ok(Outcome::Die);
                     }
                 }
 
-                "--cacheinfo" | "--chmod" => {
-                    // Both take a value that may be attached with `=` or, for
-                    // `--cacheinfo`, spread over three following arguments.
-                    let consumed = match option_with_value(ctx, a, args, i)? {
-                        Ok(n) => n,
-                        Err(ParseFail::Die) => return Ok(Outcome::Die),
-                        Err(ParseFail::Usage) => return Ok(Outcome::Usage),
-                    };
-                    i += consumed;
+                // Both callbacks consume every remaining argument as a pathspec,
+                // so options after them are never parsed as options.
+                "again" => {
+                    if do_reupdate(ctx, &args[i + 1..])?.is_err() {
+                        return Ok(Outcome::Die);
+                    }
+                    i = args.len();
                     continue;
                 }
-                // Recognized git options this port does not implement.
-                "--index-info" => bail!("--index-info is not supported (its stdin grammar is not ported)"),
-                "--unresolve" => bail!("--unresolve is not supported (needs the resolve-undo extension)"),
-                "-g" | "--again" => bail!("--again (-g) is not supported"),
-                "--clear-resolve-undo" => {
-                    bail!("--clear-resolve-undo is not supported (needs the resolve-undo extension)")
-                }
-                "--force-write-index" => bail!("--force-write-index is not supported"),
-                "--split-index" | "--no-split-index" => {
-                    bail!("split-index mode is not supported (the `link` extension is not writable here)")
-                }
-                "--untracked-cache" | "--no-untracked-cache" | "--test-untracked-cache"
-                | "--force-untracked-cache" => {
-                    bail!("untracked-cache options are not supported (the `UNTR` extension is not writable here)")
-                }
-                "--fsmonitor" | "--no-fsmonitor" | "--fsmonitor-valid" | "--no-fsmonitor-valid" => {
-                    bail!("fsmonitor options are not supported (the `FSMN` extension is not writable here)")
+                "unresolve" => {
+                    if do_unresolve(ctx, &args[i + 1..])?.is_err() {
+                        return Ok(Outcome::Die);
+                    }
+                    i = args.len();
+                    continue;
                 }
 
-                _ if a.starts_with("--cacheinfo=") || a.starts_with("--chmod=") => {
-                    let consumed = match option_with_value(ctx, a, args, i)? {
+                "clear-resolve-undo" => {
+                    ctx.index.remove_resolve_undo();
+                    ctx.dirty = true;
+                }
+
+                // The extensions below are not writable through the vendored
+                // crates; see the module documentation. Accepting them keeps
+                // exit codes and everything observable through git in step.
+                "split-index" | "no-split-index" => {}
+                "fsmonitor" => {
+                    if ctx.repo.config_snapshot().string("core.fsmonitor").is_none() {
+                        eprintln!(
+                            "warning: core.fsmonitor is unset; set it if you really want to enable fsmonitor"
+                        );
+                    }
+                }
+                "no-fsmonitor" => {}
+                "untracked-cache" => untracked_cache = UntrackedCache::Enable,
+                "no-untracked-cache" => untracked_cache = UntrackedCache::Disable,
+                "force-untracked-cache" => untracked_cache = UntrackedCache::Force,
+                "test-untracked-cache" => untracked_cache = UntrackedCache::Test,
+                "no-test-untracked-cache" | "no-force-untracked-cache" => {
+                    untracked_cache = UntrackedCache::Unspecified
+                }
+
+                "cacheinfo" | "chmod" => {
+                    let consumed = match option_with_value(ctx, name, attached, args, i)? {
                         Ok(n) => n,
                         Err(ParseFail::Die) => return Ok(Outcome::Die),
                         Err(ParseFail::Usage) => return Ok(Outcome::Usage),
@@ -326,16 +448,13 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                     i += consumed;
                     continue;
                 }
-                _ if a.starts_with("--index-version") => bail!(
-                    "--index-version is not supported (gix_index derives V2/V3 from entry flags and cannot emit V4)"
-                ),
+
+                "index-info" => {
+                    bail!("--index-info is not supported (its stdin grammar is not ported)")
+                }
 
                 _ => {
-                    if let Some(long) = a.strip_prefix("--") {
-                        eprintln!("error: unknown option '{long}'");
-                    } else {
-                        eprintln!("error: unknown switch `{}'", &a[1..]);
-                    }
+                    eprintln!("error: unknown option `{name}'");
                     return Ok(Outcome::Usage);
                 }
             }
@@ -350,9 +469,26 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
         i += 1;
     }
 
-    if show_index_version {
-        println!("{}", version_number(ctx.index.version()));
+    // git's tail, in its order: report or apply the index format, then the
+    // untracked-cache probe, which returns before the index is ever written.
+    if preferred_index_format != 0 {
+        if preferred_index_format < 0 {
+            println!("{}", version_number(ctx.index.version()));
+        } else if !(2..=4).contains(&preferred_index_format) {
+            eprintln!("fatal: index-version {preferred_index_format} not in range: 2..4");
+            return Ok(Outcome::Die);
+        } else {
+            // git records the version and flags the index for rewrite; the
+            // rewrite happens here too, but `gix_index` picks the header version
+            // itself (see the module documentation).
+            ctx.dirty = true;
+        }
     }
+
+    if untracked_cache == UntrackedCache::Test {
+        return Ok(Outcome::Exit(u8::from(!test_untracked_cache_supported())));
+    }
+
     Ok(Outcome::Done)
 }
 
@@ -362,19 +498,16 @@ enum ParseFail {
 }
 
 /// Handle `--cacheinfo` / `--chmod` in any of their spellings, returning how many
-/// argv slots were consumed.
+/// argv slots were consumed. `--cacheinfo` never has an `attached` value: it is
+/// `PARSE_OPT_NOARG` and the caller has already rejected `--cacheinfo=<v>`.
 fn option_with_value(
     ctx: &mut Ctx,
-    arg: &str,
+    name: &str,
+    attached: Option<&str>,
     args: &[String],
     i: usize,
 ) -> Result<std::result::Result<usize, ParseFail>> {
-    let (name, attached) = match arg.split_once('=') {
-        Some((n, v)) => (n, Some(v)),
-        None => (arg, None),
-    };
-
-    if name == "--chmod" {
+    if name == "chmod" {
         let value = match attached {
             Some(v) => v,
             None => match args.get(i + 1) {
@@ -460,7 +593,7 @@ fn parse_new_style_cacheinfo(spec: &str) -> Option<(u32, ObjectId, String)> {
 /// subdirectory registers the name exactly as written.
 fn add_cacheinfo(ctx: &mut Ctx, raw_mode: u32, oid: ObjectId, raw_path: &str) -> Result<Step> {
     let path = BString::from(raw_path.as_bytes().to_vec());
-    if !verify_path(path.as_bstr(), is_dir_mode(raw_mode)) {
+    if !verify_path(path.as_bstr()) {
         eprintln!("error: Invalid path '{path}'");
         eprintln!("fatal: git update-index: --cacheinfo cannot add {path}");
         return Ok(Err(Die));
@@ -524,11 +657,12 @@ fn handle_path(ctx: &mut Ctx, raw: &str) -> Result<Step> {
 /// git's `update_one`: mark-only modes short-circuit, then `--force-remove`,
 /// then the general add/remove path.
 fn update_one(ctx: &mut Ctx, path: &BString) -> Result<Step> {
-    let mark_only =
-        ctx.mark_valid.is_some() || ctx.mark_skip_worktree.is_some() || ctx.force_remove;
+    let mark_only = ctx.mark_valid.is_some()
+        || ctx.mark_skip_worktree.is_some()
+        || ctx.mark_fsmonitor.is_some()
+        || ctx.force_remove;
 
-    // git lstats first (unless in a mark-only mode) because `verify_path` needs
-    // to know whether a trailing slash names a real directory.
+    // git lstats first, unless a mark-only mode makes the worktree irrelevant.
     let meta = if mark_only {
         None
     } else {
@@ -543,9 +677,7 @@ fn update_one(ctx: &mut Ctx, path: &BString) -> Result<Step> {
             },
         }
     };
-    let is_dir = matches!(&meta, Some(Ok(m)) if m.is_dir());
-
-    if !verify_path(path.as_bstr(), is_dir) {
+    if !verify_path(path.as_bstr()) {
         eprintln!("Ignoring path {path}");
         return Ok(Ok(()));
     }
@@ -554,6 +686,9 @@ fn update_one(ctx: &mut Ctx, path: &BString) -> Result<Step> {
         return Ok(mark_ce_flags(ctx, path, mark));
     }
     if let Some(mark) = ctx.mark_skip_worktree {
+        return Ok(mark_ce_flags(ctx, path, mark));
+    }
+    if let Some(mark) = ctx.mark_fsmonitor {
         return Ok(mark_ce_flags(ctx, path, mark));
     }
 
@@ -1040,6 +1175,181 @@ fn refresh(ctx: &mut Ctx, really: bool) -> Result<Step> {
     Ok(Ok(()))
 }
 
+/// git's `do_reupdate` (`-g` / `--again`): re-run `update_one` on every stage-0
+/// entry whose recorded mode and object differ from `HEAD`, limited to `specs`.
+///
+/// git's callback swallows every remaining argument as the pathspec, which is
+/// why `git update-index -g --no-split-index` treats `--no-split-index` as a
+/// path that matches nothing rather than as an option.
+fn do_reupdate(ctx: &mut Ctx, specs: &[String]) -> Result<Step> {
+    if ctx.workdir.is_none() {
+        bail!("this operation must be run in a work tree");
+    }
+    // `PATHSPEC_PREFER_CWD`: a bare spec is relative to the current directory.
+    let specs: Vec<String> = specs.iter().map(|s| format!("{}{s}", ctx.prefix)).collect();
+
+    let candidates: Vec<(BString, Mode, ObjectId)> = {
+        let backing = ctx.index.path_backing();
+        ctx.index
+            .entries()
+            .iter()
+            .filter(|e| e.stage_raw() == 0)
+            .map(|e| (e.path_in(backing).to_owned(), e.mode, e.id))
+            .filter(|(p, _, _)| pathspec_matches(&specs, p.as_bstr()))
+            .collect()
+    };
+
+    // Scoped so the `HEAD` tree's borrow of the repository ends before the
+    // mutable pass below.
+    let stale: Vec<BString> = {
+        let head_tree = ctx.repo.head_tree().ok();
+        candidates
+            .into_iter()
+            .filter(|(path, mode, id)| {
+                let Some(tree) = head_tree.as_ref() else {
+                    return true; // unborn HEAD: git's `has_head == 0`
+                };
+                let path_str = path.to_str_lossy().into_owned();
+                match tree.lookup_entry_by_path(Path::new(&path_str)) {
+                    Ok(Some(e)) => {
+                        u32::from(e.mode().value()) != mode.bits() || e.object_id() != *id
+                    }
+                    _ => true,
+                }
+            })
+            .map(|(path, _, _)| path)
+            .collect()
+    };
+
+    for path in stale {
+        if let Err(Die) = update_one(ctx, &path)? {
+            return Ok(Err(Die));
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// Literal pathspec match: an empty spec list matches everything, otherwise an
+/// entry matches a spec it equals or lies underneath. git's glob and `:(magic)`
+/// forms are not honoured here.
+fn pathspec_matches(specs: &[String], path: &BStr) -> bool {
+    if specs.is_empty() {
+        return true;
+    }
+    specs.iter().any(|spec| {
+        let s = spec.trim_end_matches('/').as_bytes();
+        s.is_empty()
+            || (path.len() == s.len() && path.starts_with(s))
+            || (path.len() > s.len() && path.starts_with(s) && path[s.len()] == b'/')
+    })
+}
+
+/// git's `do_unresolve` (`--unresolve`), which also swallows the remaining
+/// arguments as its path list.
+///
+/// The vendored `gix_index` decodes the `REUC` extension but its
+/// `resolve_undo::ResolvePath` records have private fields and no accessors, so
+/// the saved stages cannot be read back. With no `REUC` present there is
+/// nothing to restore and git is a no-op too; otherwise this refuses rather
+/// than reporting a success it did not perform.
+fn do_unresolve(ctx: &Ctx, _specs: &[String]) -> Result<Step> {
+    match ctx.index.resolve_undo() {
+        Some(recorded) if !recorded.is_empty() => bail!(
+            "--unresolve cannot restore stages: gix_index decodes the resolve-undo (REUC) \
+             extension but exposes no accessors on its records"
+        ),
+        _ => Ok(Ok(())),
+    }
+}
+
+/// git's `test_if_untracked_cache_is_supported`: make a scratch directory in the
+/// current directory and check that its stat data reacts the way the untracked
+/// cache depends on. Progress goes to stderr, and the caller returns before the
+/// index is written — `--test-untracked-cache --force-remove <p>` really does
+/// leave the index alone.
+fn test_untracked_cache_supported() -> bool {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let dir = cwd.join(format!("mtime-test-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir(&dir) {
+        eprintln!("fatal: Could not make temporary directory: {e}");
+        return false;
+    }
+    eprint!("Testing mtime in '{}' ", cwd.display());
+    let supported = match probe_directory_mtime(&dir) {
+        Ok(()) => {
+            eprintln!(" OK");
+            true
+        }
+        Err(why) => {
+            eprintln!("\n{why}");
+            false
+        }
+    };
+    // git deletes the scratch directory from an atexit handler; leaving it
+    // behind would surface as an untracked path.
+    let _ = std::fs::remove_dir_all(&dir);
+    supported
+}
+
+/// The six checks git makes, with its `avoid_racy()` one-second waits — those
+/// exist for filesystem timestamp granularity, not politeness.
+fn probe_directory_mtime(dir: &Path) -> std::result::Result<(), String> {
+    let stat = |d: &Path| -> std::result::Result<std::time::SystemTime, String> {
+        std::fs::metadata(d)
+            .and_then(|m| m.modified())
+            .map_err(|e| format!("failed to stat {}: {e}", d.display()))
+    };
+    let wait = || std::thread::sleep(std::time::Duration::from_secs(1));
+    let io = |e: std::io::Error| e.to_string();
+
+    let file = dir.join("newfile");
+    let sub = dir.join("new-dir");
+    let mut base = stat(dir)?;
+    eprint!(".");
+
+    wait();
+    std::fs::write(&file, "").map_err(io)?;
+    let now = stat(dir)?;
+    if now == base {
+        return Err("directory stat info does not change after adding a new file".into());
+    }
+    base = now;
+    eprint!(".");
+
+    wait();
+    std::fs::create_dir(&sub).map_err(io)?;
+    let now = stat(dir)?;
+    if now == base {
+        return Err("directory stat info does not change after adding a new directory".into());
+    }
+    base = now;
+    eprint!(".");
+
+    wait();
+    std::fs::write(&file, "data").map_err(io)?;
+    if stat(dir)? != base {
+        return Err("directory stat info changes after adding a new file".into());
+    }
+    eprint!(".");
+
+    wait();
+    std::fs::remove_file(&file).map_err(io)?;
+    let now = stat(dir)?;
+    if now == base {
+        return Err("directory stat info does not change after deleting a file".into());
+    }
+    base = now;
+    eprint!(".");
+
+    wait();
+    std::fs::remove_dir(&sub).map_err(io)?;
+    if stat(dir)? == base {
+        return Err("directory stat info does not change after deleting a directory".into());
+    }
+    eprint!(".");
+    Ok(())
+}
+
 /// git's `ce_match_stat_basic`, expressed over gitoxide's stat comparison.
 fn match_stat_basic(
     ctx: &Ctx,
@@ -1146,19 +1456,19 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     out
 }
 
-/// git's `verify_path`: no `.`/`..`/`.git` component, no empty component, and a
-/// trailing slash only when the item really is a directory.
-fn verify_path(path: &BStr, is_dir: bool) -> bool {
+/// git's `verify_path`: no `.`/`..`/`.git` component and no empty component,
+/// which includes a trailing slash — `git update-index src/` reports
+/// `Ignoring path src/` even though `src` is a real directory, and
+/// `--cacheinfo 040000,<tree>,foo/` is rejected the same way.
+fn verify_path(path: &BStr) -> bool {
     if path.is_empty() || path[0] == b'/' {
         return false;
     }
-    let comps: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
-    for (i, c) in comps.iter().enumerate() {
+    for c in path.split(|&b| b == b'/') {
         if c.is_empty() {
-            // Only a single trailing separator is tolerable, and only for dirs.
-            return i + 1 == comps.len() && is_dir;
+            return false;
         }
-        if *c == b".".as_slice() || *c == b"..".as_slice() || c.eq_ignore_ascii_case(b".git") {
+        if c == b".".as_slice() || c == b"..".as_slice() || c.eq_ignore_ascii_case(b".git") {
             return false;
         }
     }

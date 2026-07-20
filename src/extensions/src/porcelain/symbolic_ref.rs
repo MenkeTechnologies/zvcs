@@ -10,7 +10,8 @@
 //!
 //! Exit codes and stdout bytes match stock git: `0` on success, `1` for the
 //! quiet "not a symbolic ref" case, `128` for the `fatal:` paths and `129` for
-//! usage errors.
+//! usage errors. Note that `-q` only silences "not a symbolic ref" — a name git
+//! cannot resolve at all still dies with `No such ref` and `128`.
 //!
 //! Not covered: symbolic targets that are not fully-qualified reference names
 //! (git accepts `git symbolic-ref FOO bar`, gitoxide's `FullName` does not), and
@@ -141,25 +142,18 @@ pub fn symbolic_ref(args: &[String]) -> Result<ExitCode> {
 
 /// One-argument form: print what `name` points at.
 fn read_symref(repo: &gix::Repository, name: &str, opts: &Opts) -> Result<ExitCode> {
-    let Some(first) = symbolic_target(repo, BStr::new(name))? else {
-        return not_a_symbolic_ref(name, opts.quiet);
-    };
-
-    let resolved = if opts.recurse {
-        match resolve_chain(repo, first)? {
-            Some(full) => full,
-            // Exceeded SYMREF_MAXDEPTH: git's resolver yields nothing, and the
-            // caller reports the same "not a symbolic ref" failure.
-            None => return not_a_symbolic_ref(name, opts.quiet),
-        }
-    } else {
-        first
+    let resolved = match resolve_ref(repo, name, opts.recurse)? {
+        Resolution::Symbolic(full) => full,
+        Resolution::NotSymbolic => return not_a_symbolic_ref(name, opts.quiet),
+        // git dies here whether or not `-q` was given: the ref could not be
+        // resolved at all, which is a different failure from "not symbolic".
+        Resolution::NoSuchRef => return fatal(&format!("No such ref: {name}")),
     };
 
     let out = if opts.short {
         shorten_unambiguous(repo, resolved.as_bstr())
     } else {
-        resolved.as_bstr().to_owned()
+        resolved
     };
 
     let mut stdout = std::io::stdout().lock();
@@ -252,22 +246,104 @@ fn symbolic_target(repo: &gix::Repository, name: &BStr) -> Result<Option<FullNam
     })
 }
 
-/// Follow a chain of symbolic refs to the last name in it — the first one that
-/// stores an object id, or the first one that does not exist (git reports the
-/// dangling name rather than failing). `None` once `SYMREF_MAXDEPTH` is hit.
-fn resolve_chain(repo: &gix::Repository, first: FullName) -> Result<Option<FullName>> {
-    let mut current = first;
+/// The outcome of git's `resolve_ref_unsafe` as far as `check_symref` cares.
+enum Resolution {
+    /// The chain ended at this name, and `REF_ISSYMREF` was seen along the way.
+    /// The flag word is cumulative in git, so one symbolic hop anywhere makes the
+    /// whole resolution symbolic.
+    Symbolic(BString),
+    /// The name resolved without ever traversing a symbolic ref — including the
+    /// case where it does not exist at all, which git reports the same way.
+    NotSymbolic,
+    /// `resolve_ref_unsafe` returned `NULL`: an unusable name, an unusable
+    /// symbolic target, or `SYMREF_MAXDEPTH` indirections without termination.
+    NoSuchRef,
+}
+
+/// Port of git's `refs_werrres_ref_unsafe` loop for the flags `symbolic-ref`
+/// passes (`0`, or `RESOLVE_REF_NO_RECURSE`). Each iteration reads exactly one
+/// reference, so the whole resolution must terminate within `SYMREF_MAXDEPTH`
+/// reads — counting the starting name.
+fn resolve_ref(repo: &gix::Repository, name: &str, recurse: bool) -> Result<Resolution> {
+    if !valid_refname(name) {
+        return Ok(Resolution::NoSuchRef);
+    }
+
+    let mut current = BString::from(name);
+    let mut saw_symref = false;
     for _ in 0..SYMREF_MAXDEPTH {
-        let found = find_exact(repo, current.as_bstr())?;
-        match found {
-            Some(reference) => match reference.target {
-                Target::Symbolic(next) => current = next,
-                Target::Object(_) => return Ok(Some(current)),
-            },
-            None => return Ok(Some(current)),
+        let Some(reference) = find_exact(repo, current.as_bstr())? else {
+            // A missing ref is not a failure here: git hands the name back with
+            // a null id, which is how a dangling symref still prints its target.
+            return Ok(terminal(saw_symref, current));
+        };
+        match reference.target {
+            Target::Object(_) => return Ok(terminal(saw_symref, current)),
+            Target::Symbolic(next) => {
+                saw_symref = true;
+                current = next.as_bstr().to_owned();
+                if !recurse {
+                    return Ok(Resolution::Symbolic(current));
+                }
+                // git re-validates every target it steps onto and gives up when
+                // one is unusable, since `RESOLVE_REF_ALLOW_BAD_NAME` is unset.
+                let Ok(next) = current.to_str() else {
+                    return Ok(Resolution::NoSuchRef);
+                };
+                if !valid_refname(next) {
+                    return Ok(Resolution::NoSuchRef);
+                }
+            }
         }
     }
-    Ok(None)
+    // ELOOP.
+    Ok(Resolution::NoSuchRef)
+}
+
+fn terminal(saw_symref: bool, name: BString) -> Resolution {
+    if saw_symref {
+        Resolution::Symbolic(name)
+    } else {
+        Resolution::NotSymbolic
+    }
+}
+
+/// Port of `check_refname_component`. `*` is always rejected because
+/// `REFNAME_REFSPEC_PATTERN` is never set on this path.
+fn valid_refname_component(component: &str) -> bool {
+    let bytes = component.as_bytes();
+    let mut last = 0u8;
+    for &ch in bytes {
+        match ch {
+            b'\0'..=b'\x1F' | b'\x7F' | b' ' | b'~' | b'^' | b':' | b'?' | b'[' | b'\\' | b'*' => {
+                return false
+            }
+            b'.' if last == b'.' => return false,
+            b'{' if last == b'@' => return false,
+            _ => {}
+        }
+        last = ch;
+    }
+    // A zero-length component covers the empty name, a leading or trailing
+    // slash, and a doubled slash.
+    !bytes.is_empty() && bytes[0] != b'.' && !component.ends_with(".lock")
+}
+
+/// Port of `check_refname_format(refname, REFNAME_ALLOW_ONELEVEL)`. Only the
+/// last component is checked for a trailing dot, matching git — `refs/heads./x`
+/// is a legal name.
+fn valid_refname(name: &str) -> bool {
+    if name == "@" {
+        return false;
+    }
+    let mut last = "";
+    for component in name.split('/') {
+        if !valid_refname_component(component) {
+            return false;
+        }
+        last = component;
+    }
+    !last.ends_with('.')
 }
 
 /// The object id stored in the leaf of `name`'s symref chain, if any. This is

@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use gix::bstr::ByteSlice;
 use gix::date::time::Format as TimeFormat;
-use gix::date::time::format as tfmt;
+use gix::date::time::{CustomFormat, format as tfmt};
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
 
@@ -59,8 +59,10 @@ use gix::prelude::ObjectIdExt;
 /// gains a trailing `/*`, matching `normalize_glob_ref()`.
 ///
 /// Selector display: `--date=<fmt>` for `default`, `raw`, `unix`, `short`, `iso`,
-/// `iso8601`, `iso-strict`, `iso8601-strict`, `rfc`, `rfc2822`. A `<ref>@{<date>}`
-/// argument also switches the selector to date form, as git does.
+/// `iso8601`, `iso-strict`, `iso8601-strict`, `rfc`, `rfc2822`, `local`, and the
+/// `-local` variant of each. A `<ref>@{<date>}` argument also switches the selector
+/// to date form, as git does. `local` re-anchors the entry's timestamp to the zone
+/// named by `$TZ` (or `/etc/localtime`), read straight out of the TZif database.
 ///
 /// Filtering: `--merges`, `--no-merges` (by parent count of the entry's commit).
 ///
@@ -69,15 +71,30 @@ use gix::prelude::ObjectIdExt;
 /// plus the `oneline` built-in. Empty formats print nothing at all, and a format
 /// string is newline-terminated per entry, both matching git.
 ///
+/// # Diff output
+///
+/// `--numstat`, `--summary`, `--shortstat`, `--name-only` and `--name-status` render
+/// the diff of each entry's commit against its first parent (the empty tree for a
+/// root commit). Merge commits produce no diff, matching `git log`'s default of not
+/// diffing a merge at all. Paths go through git's `quote_c_style()`, honouring
+/// `core.quotePath`, and renames through its `pprint_rename()` brace compaction.
+///
+/// git's output-format bits behave in a specific, order-sensitive way that is
+/// reproduced here (verified against git 2.55.0): `--name-only`, `--name-status`,
+/// `--numstat`, `--summary` and `--shortstat` each *add* a bit, while `-s`/
+/// `--no-patch` *assigns* "no output", clearing every bit set before it. After the
+/// scan, more than one of `--name-only`/`--name-status`/`-s` is fatal, and either
+/// name format suppresses the stat family. So `--numstat -s` prints nothing while
+/// `-s --numstat` prints the numstat.
+///
 /// # Options recognized but deliberately not implemented
 ///
 /// These bail with a terse reason rather than being ignored, because ignoring them
 /// would print a wrong answer that looks like success:
 ///
-///   * Diff output — `-p`, `--patch`, `--stat`, `--shortstat`, `--numstat`, `--raw`,
-///     `--name-only`, `--name-status`, `--summary`, `--dirstat`. Rendering these
-///     needs git's diff driver (rename detection, `core.quotePath` octal escaping,
-///     stat-width scaling); none of that is reproduced here.
+///   * Diff output that needs the rest of git's diff driver — `-p`, `--patch`,
+///     `--stat` (column-width scaling against the terminal width), `--raw`,
+///     `--dirstat`.
 ///   * Message filtering — `--grep=<pat>` and the commit-date limiters `--since=`,
 ///     `--after=`, `--before=`, `--until=`. `--grep` needs git's regex dialect
 ///     selection; the limiters need approxidate over the *reflog entry* timestamp.
@@ -85,9 +102,8 @@ use gix::prelude::ObjectIdExt;
 ///     `%C(...)`, `--color=always`.
 ///   * The multi-line `--pretty` built-ins (`short`, `medium`, `full`, `fuller`,
 ///     `raw`, `reference`, `email`) and bare `--pretty`.
-///   * `--date=relative`, `--date=human`, `--date=format:...` and every `-local`
-///     variant — these need the current time or the local zone, neither of which
-///     `gix-date` exposes for formatting.
+///   * `--date=relative`, `--date=human`, `--date=format:...` — these need the
+///     current time or strftime-style user formats, which `gix-date` does not expose.
 ///   * Pathspecs (`--` and anything after it).
 ///
 /// # Known divergences
@@ -103,6 +119,9 @@ use gix::prelude::ObjectIdExt;
 ///     and the id falls back to a plain [`abbrev_len`]-length prefix, and the
 ///     commit-derived placeholders (`%s`, `%an`, …) render empty instead of git's
 ///     fatal error.
+///   * A rename below 100% similarity reports `gix-diff`'s byte-ratio score, while
+///     git reports its own `estimate_similarity()` score over hashed chunks. The two
+///     agree at 100% (identical blob ids) and can differ by a percent otherwise.
 pub fn reflog(args: &[String]) -> Result<ExitCode> {
     // Tolerate the subcommand being present at index 0 regardless of how the
     // dispatcher slices argv.
@@ -164,12 +183,83 @@ enum Abbrev {
     Full,
 }
 
+/// A `--date=` selection: which layout, and whether to re-anchor to the local zone.
+#[derive(Clone, Copy)]
+struct DateFormat {
+    fmt: TimeFormat,
+    local: bool,
+}
+
+impl DateFormat {
+    fn plain(fmt: impl Into<TimeFormat>) -> Self {
+        DateFormat {
+            fmt: fmt.into(),
+            local: false,
+        }
+    }
+
+    /// Render `time`, first moving it into the local zone when `--date=…-local`.
+    fn render(self, time: gix::date::Time) -> String {
+        let time = if self.local {
+            gix::date::Time::new(time.seconds, local_offset(time.seconds))
+        } else {
+            time
+        };
+        time.format_or_unix(self.fmt)
+    }
+}
+
+/// git's `DEFAULT` layout without the trailing ` %z`, which is what every `-local`
+/// rendering of the default mode prints.
+const DEFAULT_LOCAL: CustomFormat = CustomFormat::new("%a %b %-d %H:%M:%S %Y");
+
+/// git's `output_format` bits, minus the ones this module does not render.
+#[derive(Default, Clone, Copy)]
+struct DiffFormats {
+    name_only: bool,
+    name_status: bool,
+    numstat: bool,
+    shortstat: bool,
+    summary: bool,
+    /// git's `DIFF_FORMAT_NO_OUTPUT`, set by `-s`/`--no-patch`. It renders nothing
+    /// itself but still counts towards the "cannot be used together" check.
+    no_output: bool,
+}
+
+impl DiffFormats {
+    fn any(self) -> bool {
+        self.name_only || self.name_status || self.numstat || self.shortstat || self.summary
+    }
+
+    /// `-s` / `--no-patch` assigns "no output", dropping every bit set before it.
+    fn set_no_output(&mut self) {
+        *self = DiffFormats {
+            no_output: true,
+            ..DiffFormats::default()
+        };
+    }
+
+    /// The bits git's `HAS_MULTI_BITS()` check counts.
+    fn exclusive_bits(self) -> usize {
+        usize::from(self.name_only) + usize::from(self.name_status) + usize::from(self.no_output)
+    }
+
+    /// git's `diff_setup_done()`: either name format outranks the stat family.
+    fn resolve(&mut self) {
+        if self.name_only || self.name_status {
+            self.numstat = false;
+            self.shortstat = false;
+            self.summary = false;
+        }
+    }
+}
+
 struct Opts {
     max_count: Option<usize>,
     skip: usize,
     abbrev: Abbrev,
     /// Set by `--date=<fmt>`.
-    date: Option<TimeFormat>,
+    date: Option<DateFormat>,
     /// Set by a `<ref>@{<date>}` argument, which switches selectors to date form.
     date_from_selector: bool,
     /// `--format=`/`--pretty=` string; `None` is git's default oneline layout.
@@ -177,6 +267,9 @@ struct Opts {
     parents: bool,
     /// `Some(true)` for `--merges`, `Some(false)` for `--no-merges`.
     merges: Option<bool>,
+    diff: DiffFormats,
+    /// `core.quotePath`, which decides whether bytes >= 0x80 are octal-escaped.
+    quote_high: bool,
 }
 
 impl Default for Opts {
@@ -190,6 +283,8 @@ impl Default for Opts {
             format: None,
             parents: false,
             merges: None,
+            diff: DiffFormats::default(),
+            quote_high: true,
         }
     }
 }
@@ -205,7 +300,13 @@ fn note_first(slot: &mut Option<String>, what: String) {
 /// `git reflog show` — render the log of each `<ref>` (default `HEAD`).
 fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
     let full_hex = repo.object_hash().len_in_hex();
-    let mut opts = Opts::default();
+    let mut opts = Opts {
+        quote_high: repo
+            .config_snapshot()
+            .boolean("core.quotePath")
+            .unwrap_or(true),
+        ..Opts::default()
+    };
     let mut sections: Vec<Section> = Vec::new();
     let mut excludes: Vec<String> = Vec::new();
     // Whether argv named any reflog to read; if not, `show` defaults to HEAD.
@@ -333,17 +434,26 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
             | "--author-date-order" => limited = true,
             "--reverse" => reverse = true,
 
+            // ---- diff output ------------------------------------------------
+            "--name-only" => opts.diff.name_only = true,
+            "--name-status" => opts.diff.name_status = true,
+            "--numstat" => opts.diff.numstat = true,
+            "--shortstat" => opts.diff.shortstat = true,
+            "--summary" => opts.diff.summary = true,
+            // git assigns `DIFF_FORMAT_NO_OUTPUT` here rather than or-ing a bit, so
+            // this drops every diff format named to its left.
+            "--no-patch" | "-s" => opts.diff.set_no_output(),
+
             // ---- recognized, no effect on reflog output ---------------------
             // Each of these was verified byte-identical to plain `git reflog`.
             "--walk-reflogs" | "-g" | "--single-worktree" | "--first-parent" | "--boundary"
-            | "--source" | "--no-patch" | "-s" | "--decorate=no" | "--no-decorate"
-            | "--color=never" | "--color=auto" | "--no-color" | "--invert-grep"
-            | "--all-match" | "--regexp-ignore-case" | "-i" | "--fixed-strings" | "-F"
-            | "--basic-regexp" | "--extended-regexp" | "-E" | "--perl-regexp" | "-P" => {}
+            | "--source" | "--decorate=no" | "--no-decorate" | "--color=never"
+            | "--color=auto" | "--no-color" | "--invert-grep" | "--all-match"
+            | "--regexp-ignore-case" | "-i" | "--fixed-strings" | "-F" | "--basic-regexp"
+            | "--extended-regexp" | "-E" | "--perl-regexp" | "-P" => {}
 
             // ---- recognized, deliberately unimplemented ---------------------
-            "-p" | "--patch" | "-u" | "--stat" | "--shortstat" | "--numstat" | "--raw"
-            | "--name-only" | "--name-status" | "--summary" | "--dirstat"
+            "-p" | "--patch" | "-u" | "--stat" | "--raw" | "--dirstat"
             | "--patch-with-stat" | "--decorate" | "--decorate=full" | "--decorate=short"
             | "--color" | "--color=always" | "--" => {
                 note_first(&mut unimplemented, a.to_owned());
@@ -379,6 +489,17 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
         }
         i += 1;
     }
+
+    // git's `diff_setup_done()` rejects more than one of these before any of the
+    // revision-walk conflicts below, and before the unrecognized-argument report.
+    if opts.diff.exclusive_bits() > 1 {
+        eprintln!(
+            "fatal: options '--name-only', '--name-status', '--check', and '-s' \
+             cannot be used together"
+        );
+        return Ok(ExitCode::from(128));
+    }
+    opts.diff.resolve();
 
     if limited {
         eprintln!("fatal: cannot combine --walk-reflogs with history-limiting options");
@@ -428,15 +549,21 @@ fn render(
 ) -> Result<ExitCode> {
     let fallback_len = abbrev_len(repo, full_hex);
     // No `--date` and no date selector means the classic `@{<n>}` numbering.
-    let selector_fmt: Option<TimeFormat> = opts
+    let selector_fmt: Option<DateFormat> = opts
         .date
-        .or_else(|| opts.date_from_selector.then(|| tfmt::DEFAULT.into()));
-    let field_fmt: TimeFormat = opts.date.unwrap_or_else(|| tfmt::DEFAULT.into());
+        .or_else(|| opts.date_from_selector.then(|| DateFormat::plain(tfmt::DEFAULT)));
+    let field_fmt: DateFormat = opts.date.unwrap_or_else(|| DateFormat::plain(tfmt::DEFAULT));
 
     let mut skipped = 0usize;
     let mut printed = 0usize;
     let budget = opts.max_count.unwrap_or(usize::MAX);
     let mut out: Vec<u8> = Vec::new();
+    // Built once and reused: it caches decoded blobs across every entry's diff.
+    let mut diff_cache = opts
+        .diff
+        .any()
+        .then(|| repo.diff_resource_cache_for_tree_diff().ok())
+        .flatten();
 
     'outer: for section in sections {
         for (n, entry) in section.entries.iter().enumerate().skip(section.start) {
@@ -453,8 +580,14 @@ fn render(
                 break 'outer;
             }
             let selector = match selector_fmt {
-                Some(f) => entry.time.format_or_unix(f),
+                Some(f) => f.render(entry.time),
                 None => n.to_string(),
+            };
+            // git diffs each entry's commit against its first parent, whatever the
+            // reflog message says the entry was.
+            let changes = match diff_cache.as_mut() {
+                Some(cache) => collect_changes(repo, entry.oid, cache),
+                None => Vec::new(),
             };
             match &opts.format {
                 Some(fmt) => {
@@ -473,6 +606,12 @@ fn render(
                     if !line.is_empty() {
                         out.extend_from_slice(&line);
                         out.push(b'\n');
+                        // A user format is separated from the diff by a blank line,
+                        // emitted whenever the diff queue is non-empty — even when
+                        // the selected format renders none of those changes.
+                        if !changes.is_empty() {
+                            out.push(b'\n');
+                        }
                     }
                 }
                 None => {
@@ -494,6 +633,7 @@ fn render(
                     out.push(b'\n');
                 }
             }
+            append_diff(&mut out, &changes, opts.diff, opts.quote_high);
             printed += 1;
         }
     }
@@ -837,7 +977,7 @@ fn bracket_match(pattern: &[u8], open: usize, c: u8) -> Option<usize> {
 // ---------------------------------------------------------------------------
 
 enum DateMode {
-    Known(TimeFormat),
+    Known(DateFormat),
     Unimplemented,
     Unknown,
 }
@@ -851,7 +991,15 @@ fn parse_date_mode(value: &str) -> DateMode {
         Some(base) => (base, true),
         None => (value, false),
     };
-    let known: TimeFormat = match base {
+    // Bare `local` is git's shorthand for the default layout in the local zone.
+    let (base, local) = if base == "local" {
+        ("default", true)
+    } else {
+        (base, local)
+    };
+    let fmt: TimeFormat = match base {
+        // The local rendering of the default layout drops the zone offset.
+        "" | "default" if local => DEFAULT_LOCAL.into(),
         "" | "default" => tfmt::DEFAULT.into(),
         "raw" => tfmt::RAW,
         "unix" => tfmt::UNIX,
@@ -859,16 +1007,12 @@ fn parse_date_mode(value: &str) -> DateMode {
         "iso" | "iso8601" => tfmt::ISO8601.into(),
         "iso-strict" | "iso8601-strict" => tfmt::ISO8601_STRICT.into(),
         "rfc" | "rfc2822" => tfmt::RFC2822.into(),
-        // Recognized by git, but formatting them needs the current time or the
-        // local zone, which gix-date does not expose.
-        "relative" | "human" | "local" => return DateMode::Unimplemented,
+        // Recognized by git, but these need the current time, which is not a
+        // property of the entry being rendered.
+        "relative" | "human" => return DateMode::Unimplemented,
         _ => return DateMode::Unknown,
     };
-    if local {
-        DateMode::Unimplemented
-    } else {
-        DateMode::Known(known)
-    }
+    DateMode::Known(DateFormat { fmt, local })
 }
 
 enum Pretty {
@@ -953,7 +1097,7 @@ fn expand_format(
     entry: &Entry,
     selector: &str,
     opts: &Opts,
-    field_fmt: TimeFormat,
+    field_fmt: DateFormat,
     fallback_len: usize,
 ) -> Vec<u8> {
     let commit = repo.find_commit(entry.oid).ok();
@@ -1008,7 +1152,7 @@ fn expand_format(
                         b'e' => out.extend_from_slice(sig.email),
                         _ => {
                             let t = sig.time().ok().unwrap_or_default();
-                            out.extend_from_slice(t.format_or_unix(field_fmt).as_bytes());
+                            out.extend_from_slice(field_fmt.render(t).as_bytes());
                         }
                     }
                 }
@@ -1096,6 +1240,677 @@ fn parents_of(repo: &gix::Repository, id: ObjectId) -> Vec<ObjectId> {
 
 fn is_merge(repo: &gix::Repository, id: ObjectId) -> bool {
     parents_of(repo, id).len() >= 2
+}
+
+// ---------------------------------------------------------------------------
+// diff output
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChangeKind {
+    Added,
+    Deleted,
+    Modified,
+    Renamed,
+    Copied,
+}
+
+impl ChangeKind {
+    fn letter(self) -> u8 {
+        match self {
+            ChangeKind::Added => b'A',
+            ChangeKind::Deleted => b'D',
+            ChangeKind::Modified => b'M',
+            ChangeKind::Renamed => b'R',
+            ChangeKind::Copied => b'C',
+        }
+    }
+}
+
+/// One entry of git's diff queue, reduced to what the implemented formats print.
+struct FileChange {
+    /// The destination path, which is also the sort key git orders the queue by.
+    path: Vec<u8>,
+    /// The source path of a rename or copy.
+    source: Option<Vec<u8>>,
+    kind: ChangeKind,
+    old_mode: Option<u16>,
+    new_mode: Option<u16>,
+    /// `(insertions, deletions)`, or `None` when either side is binary.
+    counts: Option<(u32, u32)>,
+    /// Rename/copy similarity in percent.
+    score: u32,
+}
+
+/// The diff of `oid` against its first parent, as git's diff queue would hold it.
+///
+/// Empty for a merge (`git log` does not diff merges unless asked with `-m`/`-c`,
+/// and `git reflog` never asks) and for an object that is not a readable commit.
+fn collect_changes(
+    repo: &gix::Repository,
+    oid: ObjectId,
+    cache: &mut gix::diff::blob::Platform,
+) -> Vec<FileChange> {
+    let Ok(commit) = repo.find_commit(oid) else {
+        return Vec::new();
+    };
+    let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
+    if parents.len() > 1 {
+        return Vec::new();
+    }
+    let Ok(new_tree) = commit.tree() else {
+        return Vec::new();
+    };
+    let old_tree = match parents.first() {
+        Some(parent) => {
+            let Ok(parent) = repo.find_commit(*parent) else {
+                return Vec::new();
+            };
+            match parent.tree() {
+                Ok(tree) => tree,
+                Err(_) => return Vec::new(),
+            }
+        }
+        // A root commit is diffed against the empty tree.
+        None => repo.empty_tree(),
+    };
+
+    let Ok(mut platform) = old_tree.changes() else {
+        return Vec::new();
+    };
+    let mut changes: Vec<FileChange> = Vec::new();
+    let walked = platform.for_each_to_obtain_tree(&new_tree, |change| {
+        if let Some(file) = to_file_change(change, cache) {
+            changes.push(file);
+        }
+        cache.clear_resource_cache_keep_allocation();
+        Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()))
+    });
+    if walked.is_err() {
+        return Vec::new();
+    }
+    // git walks both trees in tree order, which orders full paths by raw bytes,
+    // and rename detection leaves the pair in its destination's slot.
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    changes
+}
+
+/// Reduce one gitoxide change to a queue entry, dropping the tree entries that
+/// gitoxide reports alongside their contents but git's recursive diff never shows.
+fn to_file_change(
+    change: gix::object::tree::diff::Change<'_, '_, '_>,
+    cache: &mut gix::diff::blob::Platform,
+) -> Option<FileChange> {
+    use gix::object::tree::diff::Change as TreeChange;
+
+    match change {
+        TreeChange::Addition {
+            location,
+            entry_mode,
+            ..
+        } => {
+            if entry_mode.is_tree() {
+                return None;
+            }
+            Some(FileChange {
+                path: location.to_vec(),
+                source: None,
+                kind: ChangeKind::Added,
+                old_mode: None,
+                new_mode: Some(entry_mode.value()),
+                counts: if entry_mode.is_commit() {
+                    Some((1, 0))
+                } else {
+                    blob_counts(&change, cache)
+                },
+                score: 0,
+            })
+        }
+        TreeChange::Deletion {
+            location,
+            entry_mode,
+            ..
+        } => {
+            if entry_mode.is_tree() {
+                return None;
+            }
+            Some(FileChange {
+                path: location.to_vec(),
+                source: None,
+                kind: ChangeKind::Deleted,
+                old_mode: Some(entry_mode.value()),
+                new_mode: None,
+                counts: if entry_mode.is_commit() {
+                    Some((0, 1))
+                } else {
+                    blob_counts(&change, cache)
+                },
+                score: 0,
+            })
+        }
+        TreeChange::Modification {
+            location,
+            previous_entry_mode,
+            entry_mode,
+            ..
+        } => {
+            if entry_mode.is_tree() || previous_entry_mode.is_tree() {
+                return None;
+            }
+            Some(FileChange {
+                path: location.to_vec(),
+                source: None,
+                kind: ChangeKind::Modified,
+                old_mode: Some(previous_entry_mode.value()),
+                new_mode: Some(entry_mode.value()),
+                counts: if entry_mode.is_commit() || previous_entry_mode.is_commit() {
+                    // A gitlink diffs as the single line `Subproject commit <id>`.
+                    Some((1, 1))
+                } else {
+                    blob_counts(&change, cache)
+                },
+                score: 0,
+            })
+        }
+        TreeChange::Rewrite {
+            source_location,
+            source_entry_mode,
+            source_id,
+            entry_mode,
+            location,
+            id,
+            diff,
+            copy,
+            ..
+        } => {
+            if entry_mode.is_tree() || source_entry_mode.is_tree() {
+                return None;
+            }
+            let identical = source_id.detach() == id.detach();
+            Some(FileChange {
+                path: location.to_vec(),
+                source: Some(source_location.to_vec()),
+                kind: if copy {
+                    ChangeKind::Copied
+                } else {
+                    ChangeKind::Renamed
+                },
+                old_mode: Some(source_entry_mode.value()),
+                new_mode: Some(entry_mode.value()),
+                counts: if entry_mode.is_commit() || source_entry_mode.is_commit() {
+                    Some(if identical { (0, 0) } else { (1, 1) })
+                } else {
+                    blob_counts(&change, cache)
+                },
+                // `diff` is absent exactly when both sides are the same object.
+                score: diff.map_or(100, |d| (d.similarity * 100.0) as u32),
+            })
+        }
+    }
+}
+
+/// Line counts for a blob-backed change; `None` when either side is binary, which
+/// is what git renders as `-` in `--numstat`.
+fn blob_counts(
+    change: &gix::object::tree::diff::Change<'_, '_, '_>,
+    cache: &mut gix::diff::blob::Platform,
+) -> Option<(u32, u32)> {
+    let mut platform = change.diff(cache).ok()?;
+    let stats = platform.line_counts().ok().flatten()?;
+    Some((stats.insertions, stats.removals))
+}
+
+/// Write the diff of one reflog entry in every selected format, in git's order:
+/// the name formats first, then numstat, then shortstat, then summary.
+fn append_diff(out: &mut Vec<u8>, changes: &[FileChange], fmts: DiffFormats, quote_high: bool) {
+    if changes.is_empty() {
+        return;
+    }
+
+    if fmts.name_only {
+        for change in changes {
+            out.extend_from_slice(&quote_path(&change.path, quote_high));
+            out.push(b'\n');
+        }
+    }
+
+    if fmts.name_status {
+        for change in changes {
+            match &change.source {
+                Some(source) => {
+                    out.push(change.kind.letter());
+                    out.extend_from_slice(format!("{:03}\t", change.score).as_bytes());
+                    out.extend_from_slice(&quote_path(source, quote_high));
+                    out.push(b'\t');
+                }
+                None => {
+                    out.push(change.kind.letter());
+                    out.push(b'\t');
+                }
+            }
+            out.extend_from_slice(&quote_path(&change.path, quote_high));
+            out.push(b'\n');
+        }
+    }
+
+    if fmts.numstat {
+        for change in changes {
+            match change.counts {
+                Some((insertions, deletions)) => {
+                    out.extend_from_slice(format!("{insertions}\t{deletions}\t").as_bytes());
+                }
+                None => out.extend_from_slice(b"-\t-\t"),
+            }
+            out.extend_from_slice(&display_name(change, quote_high));
+            out.push(b'\n');
+        }
+    }
+
+    if fmts.shortstat {
+        let files = changes.len();
+        let (insertions, deletions) = changes
+            .iter()
+            .filter_map(|c| c.counts)
+            .fold((0u64, 0u64), |(i, d), (ci, cd)| {
+                (i + u64::from(ci), d + u64::from(cd))
+            });
+        let mut line = format!(" {files} file{} changed", plural(files as u64));
+        // git prints a zero count only when it would otherwise print neither.
+        if insertions > 0 || deletions == 0 {
+            line.push_str(&format!(
+                ", {insertions} insertion{}(+)",
+                plural(insertions)
+            ));
+        }
+        if deletions > 0 || insertions == 0 {
+            line.push_str(&format!(", {deletions} deletion{}(-)", plural(deletions)));
+        }
+        out.extend_from_slice(line.as_bytes());
+        out.push(b'\n');
+    }
+
+    if fmts.summary {
+        for change in changes {
+            match change.kind {
+                ChangeKind::Added => {
+                    append_mode_name(out, "create", change.new_mode, &change.path, quote_high);
+                }
+                ChangeKind::Deleted => {
+                    append_mode_name(out, "delete", change.old_mode, &change.path, quote_high);
+                }
+                ChangeKind::Renamed | ChangeKind::Copied => {
+                    let verb = if change.kind == ChangeKind::Renamed {
+                        "rename"
+                    } else {
+                        "copy"
+                    };
+                    out.extend_from_slice(format!(" {verb} ").as_bytes());
+                    out.extend_from_slice(&display_name(change, quote_high));
+                    out.extend_from_slice(format!(" ({}%)\n", change.score).as_bytes());
+                    // git names the file only on a standalone mode change.
+                    append_mode_change(out, change, None, quote_high);
+                }
+                ChangeKind::Modified => {
+                    append_mode_change(out, change, Some(&change.path), quote_high);
+                }
+            }
+        }
+    }
+}
+
+fn plural(n: u64) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// ` create mode 100644 <path>`, git's `show_file_mode_name()`.
+fn append_mode_name(out: &mut Vec<u8>, verb: &str, mode: Option<u16>, path: &[u8], high: bool) {
+    match mode {
+        Some(mode) => out.extend_from_slice(format!(" {verb} mode {mode:06o} ").as_bytes()),
+        None => out.extend_from_slice(format!(" {verb} ").as_bytes()),
+    }
+    out.extend_from_slice(&quote_path(path, high));
+    out.push(b'\n');
+}
+
+/// git's `show_mode_change()`: only when both sides have a mode and they differ.
+fn append_mode_change(out: &mut Vec<u8>, change: &FileChange, name: Option<&[u8]>, high: bool) {
+    let (Some(old), Some(new)) = (change.old_mode, change.new_mode) else {
+        return;
+    };
+    if old == new {
+        return;
+    }
+    out.extend_from_slice(format!(" mode change {old:06o} => {new:06o}").as_bytes());
+    if let Some(name) = name {
+        out.push(b' ');
+        out.extend_from_slice(&quote_path(name, high));
+    }
+    out.push(b'\n');
+}
+
+/// The name a change is shown under: the compacted `a => b` form for a rename or
+/// copy, the quoted path otherwise.
+fn display_name(change: &FileChange, quote_high: bool) -> Vec<u8> {
+    match &change.source {
+        Some(source) => pprint_rename(source, &change.path, quote_high),
+        None => quote_path(&change.path, quote_high),
+    }
+}
+
+/// git's `pprint_rename()`. When neither side needs quoting it factors out the
+/// common directory prefix and the common suffix into `pfx{old => new}sfx`;
+/// otherwise it falls back to two separately quoted names.
+fn pprint_rename(a: &[u8], b: &[u8], quote_high: bool) -> Vec<u8> {
+    if needs_quoting(a, quote_high) || needs_quoting(b, quote_high) {
+        let mut out = quote_path(a, quote_high);
+        out.extend_from_slice(b" => ");
+        out.extend_from_slice(&quote_path(b, quote_high));
+        return out;
+    }
+
+    // The common prefix only counts up to the last slash inside it.
+    let mut prefix = 0usize;
+    let mut i = 0usize;
+    while i < a.len() && i < b.len() && a[i] == b[i] {
+        if a[i] == b'/' {
+            prefix = i + 1;
+        }
+        i += 1;
+    }
+
+    // Walk backwards from the terminator. When a prefix was found it ends in a
+    // slash, and git lets this loop run one byte into it to see that same slash.
+    let mut suffix = 0usize;
+    let floor = prefix.saturating_sub(usize::from(prefix > 0));
+    let (mut ai, mut bi) = (a.len(), b.len());
+    loop {
+        if ai < floor || bi < floor {
+            break;
+        }
+        // Index `len` stands for the NUL terminator git compares first.
+        let ca = a.get(ai).copied().unwrap_or(0);
+        let cb = b.get(bi).copied().unwrap_or(0);
+        if ca != cb {
+            break;
+        }
+        if ca == b'/' {
+            suffix = a.len() - ai;
+        }
+        if ai == 0 || bi == 0 {
+            break;
+        }
+        ai -= 1;
+        bi -= 1;
+    }
+
+    let a_mid = a.len().saturating_sub(prefix + suffix);
+    let b_mid = b.len().saturating_sub(prefix + suffix);
+    let mut out = Vec::with_capacity(prefix + a_mid + b_mid + suffix + 7);
+    let braced = prefix + suffix > 0;
+    if braced {
+        out.extend_from_slice(&a[..prefix]);
+        out.push(b'{');
+    }
+    out.extend_from_slice(&a[prefix..prefix + a_mid]);
+    out.extend_from_slice(b" => ");
+    out.extend_from_slice(&b[prefix..prefix + b_mid]);
+    if braced {
+        out.push(b'}');
+        out.extend_from_slice(&a[a.len() - suffix..]);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// path quoting
+// ---------------------------------------------------------------------------
+
+/// How git's `cq_lookup` table classifies one byte.
+enum Quoted {
+    /// Emitted as-is.
+    Literal,
+    /// Emitted as a backslash followed by this byte.
+    Escaped(u8),
+    /// Emitted as a three-digit octal escape.
+    Octal,
+}
+
+/// `quote_high` is `core.quotePath`, which decides whether bytes >= 0x80 are
+/// octal-escaped or passed through.
+fn classify_byte(byte: u8, quote_high: bool) -> Quoted {
+    match byte {
+        0x07 => Quoted::Escaped(b'a'),
+        0x08 => Quoted::Escaped(b'b'),
+        0x09 => Quoted::Escaped(b't'),
+        0x0a => Quoted::Escaped(b'n'),
+        0x0b => Quoted::Escaped(b'v'),
+        0x0c => Quoted::Escaped(b'f'),
+        0x0d => Quoted::Escaped(b'r'),
+        b'"' => Quoted::Escaped(b'"'),
+        b'\\' => Quoted::Escaped(b'\\'),
+        b if b < 0x20 || b == 0x7f => Quoted::Octal,
+        b if b >= 0x80 && quote_high => Quoted::Octal,
+        _ => Quoted::Literal,
+    }
+}
+
+fn needs_quoting(path: &[u8], quote_high: bool) -> bool {
+    path.iter()
+        .any(|&b| !matches!(classify_byte(b, quote_high), Quoted::Literal))
+}
+
+/// git's `quote_c_style()`: a path that needs no escape is printed bare, and one
+/// that needs any is wrapped in double quotes with C-style escapes throughout.
+fn quote_path(path: &[u8], quote_high: bool) -> Vec<u8> {
+    if !needs_quoting(path, quote_high) {
+        return path.to_vec();
+    }
+    let mut out = Vec::with_capacity(path.len() + 2);
+    out.push(b'"');
+    for &byte in path {
+        match classify_byte(byte, quote_high) {
+            Quoted::Literal => out.push(byte),
+            Quoted::Escaped(c) => {
+                out.push(b'\\');
+                out.push(c);
+            }
+            Quoted::Octal => out.extend_from_slice(format!("\\{byte:03o}").as_bytes()),
+        }
+    }
+    out.push(b'"');
+    out
+}
+
+// ---------------------------------------------------------------------------
+// local timezone
+// ---------------------------------------------------------------------------
+
+/// The UTC offset in seconds that `$TZ` (or `/etc/localtime`) prescribes for the
+/// instant `seconds`, which is what `--date=…-local` renders in. Zero when no
+/// timezone database can be read, which is also the right answer for UTC.
+fn local_offset(seconds: i64) -> i32 {
+    static ZONE: std::sync::OnceLock<Option<Zone>> = std::sync::OnceLock::new();
+    ZONE.get_or_init(load_zone)
+        .as_ref()
+        .map_or(0, |zone| zone.offset_at(seconds))
+}
+
+/// The parts of a TZif file that matter for formatting a timestamp.
+struct Zone {
+    /// `(transition instant, index into `types`)`, ascending.
+    transitions: Vec<(i64, usize)>,
+    /// `(UTC offset in seconds, is_dst)` per local time type.
+    types: Vec<(i32, bool)>,
+}
+
+impl Zone {
+    fn offset_at(&self, seconds: i64) -> i32 {
+        let index = match self
+            .transitions
+            .binary_search_by_key(&seconds, |&(when, _)| when)
+        {
+            Ok(i) => self.transitions[i].1,
+            // Before the first transition RFC 8536 prescribes the first
+            // non-DST type, falling back to the first type of any kind.
+            Err(0) => {
+                return self
+                    .types
+                    .iter()
+                    .find(|&&(_, dst)| !dst)
+                    .or_else(|| self.types.first())
+                    .map_or(0, |&(offset, _)| offset);
+            }
+            Err(i) => self.transitions[i - 1].1,
+        };
+        self.types.get(index).map_or(0, |&(offset, _)| offset)
+    }
+}
+
+/// Resolve `$TZ` the way libc does and parse the TZif file it names.
+fn load_zone() -> Option<Zone> {
+    let tz = std::env::var("TZ").unwrap_or_default();
+    let tz = tz.strip_prefix(':').unwrap_or(&tz);
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if tz.is_empty() {
+        candidates.push(PathBuf::from("/etc/localtime"));
+    } else if tz.starts_with('/') {
+        candidates.push(PathBuf::from(tz));
+    } else if !tz.split('/').any(|part| part == ".." || part.is_empty()) {
+        for root in [
+            "/usr/share/zoneinfo",
+            "/var/db/timezone/zoneinfo",
+            "/etc/zoneinfo",
+        ] {
+            candidates.push(Path::new(root).join(tz));
+        }
+    }
+
+    for path in candidates {
+        if let Some(zone) = std::fs::read(&path).ok().as_deref().and_then(parse_tzif) {
+            return Some(zone);
+        }
+    }
+    // No file matched. A bare POSIX `<name><offset>` string still has an answer.
+    posix_zone(tz)
+}
+
+/// A POSIX `TZ` string with no DST rule, e.g. `UTC0` or `EST5`. The POSIX offset
+/// counts west of Greenwich, the opposite of the sign every other layer uses.
+fn posix_zone(tz: &str) -> Option<Zone> {
+    let rest = tz.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+    if rest.is_empty() && tz.is_empty() {
+        return None;
+    }
+    let (sign, digits) = match rest.strip_prefix('-') {
+        Some(d) => (-1i32, d),
+        None => (1i32, rest.strip_prefix('+').unwrap_or(rest)),
+    };
+    let mut parts = digits.split(':');
+    let hours: i32 = parts.next()?.parse().ok()?;
+    let minutes: i32 = parts.next().map_or(Ok(0), str::parse).ok()?;
+    let secs: i32 = parts.next().map_or(Ok(0), str::parse).ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let west = sign * (hours * 3600 + minutes * 60 + secs);
+    Some(Zone {
+        transitions: Vec::new(),
+        types: vec![(-west, false)],
+    })
+}
+
+/// Header counts of a TZif block, in file order.
+struct TzCounts {
+    isutcnt: usize,
+    isstdcnt: usize,
+    leapcnt: usize,
+    timecnt: usize,
+    typecnt: usize,
+    charcnt: usize,
+}
+
+/// Parse a TZif file (RFC 8536), preferring the 64-bit block of a v2+ file.
+fn parse_tzif(data: &[u8]) -> Option<Zone> {
+    if data.get(..4)? != b"TZif" {
+        return None;
+    }
+    let version = *data.get(4)?;
+    let mut pos = 20;
+    let counts = read_counts(data, &mut pos)?;
+
+    if version >= b'2' {
+        // Skip the legacy 32-bit block and the second header it precedes.
+        pos = pos.checked_add(block_len(&counts, 4)?)?;
+        if data.get(pos..pos.checked_add(4)?)? != b"TZif" {
+            return None;
+        }
+        pos = pos.checked_add(20)?;
+        let counts = read_counts(data, &mut pos)?;
+        read_block(data, pos, &counts, 8)
+    } else {
+        read_block(data, pos, &counts, 4)
+    }
+}
+
+fn read_counts(data: &[u8], pos: &mut usize) -> Option<TzCounts> {
+    let mut next = || -> Option<usize> {
+        let raw: [u8; 4] = data.get(*pos..*pos + 4)?.try_into().ok()?;
+        *pos += 4;
+        Some(u32::from_be_bytes(raw) as usize)
+    };
+    Some(TzCounts {
+        isutcnt: next()?,
+        isstdcnt: next()?,
+        leapcnt: next()?,
+        timecnt: next()?,
+        typecnt: next()?,
+        charcnt: next()?,
+    })
+}
+
+/// The byte length of a data block whose transition times are `time_size` wide.
+fn block_len(counts: &TzCounts, time_size: usize) -> Option<usize> {
+    counts
+        .timecnt
+        .checked_mul(time_size + 1)?
+        .checked_add(counts.typecnt.checked_mul(6)?)?
+        .checked_add(counts.charcnt)?
+        .checked_add(counts.leapcnt.checked_mul(time_size + 4)?)?
+        .checked_add(counts.isstdcnt)?
+        .checked_add(counts.isutcnt)
+}
+
+fn read_block(data: &[u8], mut pos: usize, counts: &TzCounts, time_size: usize) -> Option<Zone> {
+    let mut times: Vec<i64> = Vec::with_capacity(counts.timecnt);
+    for _ in 0..counts.timecnt {
+        let raw = data.get(pos..pos.checked_add(time_size)?)?;
+        times.push(match time_size {
+            8 => i64::from_be_bytes(raw.try_into().ok()?),
+            _ => i64::from(i32::from_be_bytes(raw.try_into().ok()?)),
+        });
+        pos += time_size;
+    }
+    let indices = data.get(pos..pos.checked_add(counts.timecnt)?)?.to_vec();
+    pos += counts.timecnt;
+
+    let mut types: Vec<(i32, bool)> = Vec::with_capacity(counts.typecnt);
+    for _ in 0..counts.typecnt {
+        let raw = data.get(pos..pos.checked_add(6)?)?;
+        let offset = i32::from_be_bytes(raw[..4].try_into().ok()?);
+        types.push((offset, raw[4] != 0));
+        pos += 6;
+    }
+    if types.is_empty() {
+        return None;
+    }
+
+    let transitions = times
+        .into_iter()
+        .zip(indices)
+        .map(|(when, index)| (when, usize::from(index)))
+        .collect();
+    Some(Zone { transitions, types })
 }
 
 // ---------------------------------------------------------------------------

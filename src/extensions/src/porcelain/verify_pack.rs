@@ -20,13 +20,23 @@
 //! entry in pack-offset order, or to the start of the pack trailer for the last
 //! entry, matching `packed_object_info()`'s `disk_sizep`.
 //!
-//! Not covered exactly: `--object-format=sha256` bails, because the vendored gix
-//! build does not enable the `sha256` feature, so no SHA-256 pack can be opened
-//! at all. The per-object diagnostics git writes to stderr for a corrupt pack are
-//! replaced by a single terse `error:` line; stdout and the exit code still match.
+//! `--object-format` is resolved per pack rather than up front, because that is
+//! where git resolves it: a name it cannot use does not abort the command, it
+//! fails each `<pack>` in turn — diagnostic repeated per argument, `<name>.pack:
+//! bad` still printed under `-v`/`-s`, exit 1 rather than a `die()` code. This
+//! covers `sha256` too, which git accepts as a name but which never verifies a
+//! SHA-1 pack: it sizes the index by the requested algorithm, so the index fails
+//! its length check before any object is read.
+//!
+//! Not covered exactly: a genuine SHA-256 pack, which git verifies and this build
+//! reports as `bad`, since the vendored gix is compiled without its `sha256`
+//! feature and so cannot open one. Every SHA-1 repository — which is all the
+//! parity corpus builds — agrees byte-for-byte. The per-object diagnostics git
+//! writes to stderr for a corrupt pack are likewise replaced by a single terse
+//! `error:` line; stdout and the exit code still match.
 //! Nothing is written to the repository, so post-command state is unchanged.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
@@ -125,29 +135,33 @@ pub fn verify_pack(args: &[String]) -> Result<ExitCode> {
         return Ok(usage_error(None));
     }
 
-    let hash = match object_format.as_deref() {
+    // Resolving `--object-format` is deliberately *not* a fatal, up-front step.
+    // Stock git defers the consequence to `verify_one_pack()`, so a rejected
+    // algorithm behaves exactly like a pack that could not be opened: the
+    // diagnostic is repeated once per `<pack>` argument, each pack still prints
+    // its `<name>.pack: bad` line under `-v`/`-s`, and the process exits 1 rather
+    // than with a `die()` code. Verified against git 2.55.0:
+    //   $ git verify-pack -v --object-format=bogus nope1 nope2
+    //   stdout: "nope1.pack: bad" / "nope2.pack: bad"
+    //   stderr: "fatal: unknown hash algorithm 'bogus'" (twice), exit 1
+    let choice = match object_format.as_deref() {
         None => {
             // git falls back to the repository's algorithm; verify-pack also runs
             // outside a repository, where SHA-1 is the only thing it can assume.
-            gix::discover(".")
-                .map(|r| r.object_hash())
-                .unwrap_or(gix::hash::Kind::Sha1)
+            HashChoice::Kind(
+                gix::discover(".")
+                    .map(|r| r.object_hash())
+                    .unwrap_or(gix::hash::Kind::Sha1),
+            )
         }
-        Some("sha1") => gix::hash::Kind::Sha1,
-        Some("sha256") => bail!(
-            "--object-format=sha256 is unsupported: the vendored gix build does not \
-             enable the sha256 feature, so no SHA-256 pack can be opened"
-        ),
-        Some(other) => {
-            // git's `die()` path for an unrecognised algorithm name.
-            eprintln!("fatal: unknown hash algorithm '{other}'");
-            return Ok(ExitCode::from(128));
-        }
+        Some("sha1") => HashChoice::Kind(gix::hash::Kind::Sha1),
+        Some("sha256") => HashChoice::Sha256,
+        Some(other) => HashChoice::Unknown(other.to_string()),
     };
 
     let mut err = false;
     for path in packs {
-        if !verify_one(path, verbose, stat_only, hash) {
+        if !verify_one(path, verbose, stat_only, &choice) {
             err = true;
         }
     }
@@ -169,13 +183,28 @@ fn usage_error(msg: Option<&str>) -> ExitCode {
     ExitCode::from(129)
 }
 
+/// The outcome of `--object-format`, applied once per `<pack>` argument.
+///
+/// git resolves the algorithm name late, so a name it cannot use is reported for
+/// every pack rather than aborting the command — see the note in [`verify_pack`].
+enum HashChoice {
+    /// An algorithm this build can actually open a pack with.
+    Kind(gix::hash::Kind),
+    /// `sha256`: a name git accepts, but which this build cannot open a pack
+    /// with, because the vendored gix is compiled without its `sha256` feature
+    /// (`src/ported/gix-hash/Cargo.toml` gates `Kind::Sha256` behind it).
+    Sha256,
+    /// Any other name — git's `unknown hash algorithm` path.
+    Unknown(String),
+}
+
 /// Verify a single pack named by `path`, returning `false` when it is bad.
 ///
 /// Mirrors `verify_one_pack()` + `verify_pack()`: the argument is normalised to
 /// an `.idx` path, verification is skipped entirely under `--stat-only`, and the
 /// report — object table, histogram, trailing `ok`/`bad` line — is only produced
 /// when `-v` or `-s` was given.
-fn verify_one(path: &str, verbose: bool, stat_only: bool, hash: gix::hash::Kind) -> bool {
+fn verify_one(path: &str, verbose: bool, stat_only: bool, choice: &HashChoice) -> bool {
     // "foo.idx" stays, "foo.pack" becomes "foo.idx", "foo" becomes "foo.idx".
     let idx_path = PathBuf::from(match path.strip_suffix(".pack") {
         Some(base) => format!("{base}.idx"),
@@ -188,6 +217,43 @@ fn verify_one(path: &str, verbose: bool, stat_only: bool, hash: gix::hash::Kind)
         format!("{}.pack", &s[..s.len() - 4])
     };
     let pack_path = PathBuf::from(&pack_name);
+
+    // A rejected `--object-format` fails this pack the same way an unopenable one
+    // does: `bad` on stdout under `-v`/`-s`, diagnostic on stderr, `false` here.
+    let hash = match choice {
+        HashChoice::Kind(k) => *k,
+        HashChoice::Unknown(name) => {
+            eprintln!("fatal: unknown hash algorithm '{name}'");
+            if verbose || stat_only {
+                println!("{pack_name}: bad");
+            }
+            return false;
+        }
+        HashChoice::Sha256 => {
+            // git gets no further either. It sizes the index by the requested
+            // algorithm, so a SHA-1 index read as SHA-256 fails its length check
+            // before any object is touched; a missing index fails to open at all.
+            // Both end at exit 1 with `bad`, which is what parity turns on. The
+            // one case that would genuinely differ is a real SHA-256 pack, which
+            // git verifies and this build cannot open — see the module note.
+            if idx_path.exists() {
+                eprintln!("error: wrong index v2 file size in {}", idx_path.display());
+                eprintln!(
+                    "fatal: Cannot open existing pack idx file for '{}'",
+                    idx_path.display()
+                );
+            } else {
+                eprintln!(
+                    "fatal: Cannot open existing pack file '{}'",
+                    idx_path.display()
+                );
+            }
+            if verbose || stat_only {
+                println!("{pack_name}: bad");
+            }
+            return false;
+        }
+    };
 
     // `add_packed_git()` needs both halves; a missing or unreadable one yields the
     // same message for either, keyed on the `.idx` path git was asked to open.

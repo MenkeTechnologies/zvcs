@@ -1,7 +1,7 @@
 //! `git maintenance` — run tasks to optimize repository data.
 //!
-//! Two of the six subcommands are genuinely ported, because they are pure
-//! config manipulation and need nothing beyond `gix-config`:
+//! Three of the six subcommands are genuinely ported. Two are pure config
+//! manipulation and need nothing beyond `gix-config`:
 //!
 //!   * `register [--config-file <path>]` — appends the repository's realpath to
 //!     `maintenance.repo` in the global config (or `--config-file`), sets
@@ -13,6 +13,15 @@
 //!     (git's `git_config_set` does the same). Silent, exit 0; without
 //!     `--force` an unregistered repository yields git's
 //!     `fatal: repository '<path>' is not registered` on stderr, exit 128.
+//!
+//! The third needs no substrate at all, once git's actual rule is pinned down:
+//!
+//!   * `is-needed` (without `--auto`) answers "maintenance is needed", exit 0,
+//!     silently and without touching the repository. git only consults a task's
+//!     `auto_condition` under `--auto`; absent the flag every selected task
+//!     counts as needed, so the answer is independent of the task set, of the
+//!     `maintenance.<task>.enabled` config and of repository state. `--auto`
+//!     itself is not ported — see `is_needed_sub`.
 //!
 //! Everything else validates its arguments exactly as git's parse-options does
 //! — `-h` (usage on stdout, exit 129), unknown option/switch, missing option
@@ -35,10 +44,11 @@
 //!     would be indistinguishable from stock git, which also prints nothing and
 //!     exits 0 — the worst outcome for a differential harness that compares
 //!     post-command repository state.
-//!   * `is-needed` needs git's per-task condition heuristics (`gc.auto`,
-//!     `gc.autoPackLimit`, `maintenance.loose-objects.batchSize`,
-//!     multi-pack-index state), whose thresholds the manual explicitly declines
-//!     to fully specify, and whose answer is carried entirely by the exit code.
+//!   * `is-needed --auto` needs git's per-task condition heuristics, which rest
+//!     on a loose-object estimator that samples the `objects/17/` fanout
+//!     directory and scales by 256, plus multi-pack-index state. That sampling
+//!     is observable rather than incidental, and the answer is carried entirely
+//!     by the exit code, so a wrong guess would be silent.
 //!   * `start` and `stop` are OS scheduler integration — writing launchd plists,
 //!     crontab stanzas, systemd units or schtasks entries and invoking
 //!     `launchctl`/`crontab`/`systemctl`. None of that is repository work, none
@@ -218,7 +228,13 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
             "--" => end_of_opts = true,
             "--auto" => auto = true,
             "--no-auto" => auto = false,
-            "--quiet" | "--no-quiet" | "--detach" | "--no-detach" | "--no-schedule" => {}
+            "--quiet" | "--no-quiet" | "--detach" | "--no-detach" => {}
+            // git's `--schedule` callback rejects the negated form outright, at
+            // the position it appears — before any later option is parsed.
+            "--no-schedule" => {
+                eprintln!("fatal: --no-schedule is not allowed");
+                return Ok(ExitCode::from(128));
+            }
             "--task" | "--schedule" => {
                 let name = &a[2..];
                 let Some(value) = args.get(i + 1) else {
@@ -265,9 +281,37 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
     );
 }
 
-/// `git maintenance is-needed` — validates arguments, then bails.
+/// `git maintenance is-needed` — report whether maintenance would do work.
+///
+/// Exit 0 means "needed", exit 1 means "not needed"; nothing is ever printed and
+/// nothing in the repository is touched. A repository is still required, but
+/// only after parse-options has run: outside one git reports `fatal: not a git
+/// repository ...` and exits 128, while `is-needed --task=bogus` outside a
+/// repository reports the bad task name instead.
+///
+/// Without `--auto` the answer is unconditionally 0. git only consults a task's
+/// `auto_condition` when `--auto` is given; with the flag absent every selected
+/// task counts as needed, so the reply does not depend on the task set, on the
+/// `maintenance.<task>.enabled` config, or on the state of the repository. That
+/// was checked against git 2.55.0 in an empty repo, a bare repo, a freshly
+/// `gc`-ed repo and a detached HEAD, for each of the nine task names and with
+/// every task explicitly disabled — 0 in every case.
+///
+/// `--auto` is the part that is not ported. Its per-task conditions rest on
+/// git's loose-object estimator, which counts the entries of the single
+/// `objects/17/` fanout directory and multiplies by 256, then compares against
+/// `gc.auto` scaled by the same factor. That sampling is observable: with 300
+/// loose objects and `gc.auto=10` git answers "not needed" because the sampled
+/// directory happens to be empty, while 900 loose objects and `gc.auto=1`
+/// answers "needed". Reproducing the thresholds without git's source would be
+/// guesswork, and since the answer is carried by the exit code alone a wrong
+/// guess is silent.
+///
+/// Note that `--schedule` is *not* accepted here despite appearing in git's own
+/// usage block — the option belongs to `run`, and `is-needed --schedule=daily`
+/// reports ``unknown option `schedule=daily'``.
 fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
-    let mut scheduled = false;
+    let mut auto = false;
     let mut end_of_opts = false;
     let mut i = 0;
     while i < args.len() {
@@ -281,26 +325,19 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(129));
             }
             "--" => end_of_opts = true,
-            "--auto" | "--no-auto" | "--no-schedule" => {}
-            "--task" | "--schedule" => {
-                let name = &a[2..];
+            "--auto" => auto = true,
+            "--no-auto" => auto = false,
+            "--task" => {
                 let Some(value) = args.get(i + 1) else {
-                    return Ok(bare_error(&format!("option `{name}' requires a value")));
+                    return Ok(bare_error("option `task' requires a value"));
                 };
-                if let Some(code) = check_value(name, value, &mut scheduled)? {
+                if let Some(code) = check_task(value) {
                     return Ok(code);
                 }
                 i += 1;
             }
             _ if a.starts_with("--task=") => {
-                if let Some(code) = check_value("task", &a["--task=".len()..], &mut scheduled)? {
-                    return Ok(code);
-                }
-            }
-            _ if a.starts_with("--schedule=") => {
-                if let Some(code) =
-                    check_value("schedule", &a["--schedule=".len()..], &mut scheduled)?
-                {
+                if let Some(code) = check_task(&a["--task=".len()..]) {
                     return Ok(code);
                 }
             }
@@ -312,13 +349,32 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    bail!(
-        "maintenance is-needed is not ported: it needs git's per-task condition heuristics \
-         (gc.auto, gc.autoPackLimit, maintenance.loose-objects.batchSize, multi-pack-index state), \
-         which have no counterpart in the vendored crates; the answer is carried by the exit code \
-         alone, so guessing it would be silently wrong \
-         (ported: register, unregister, and argument validation)"
-    );
+    // git checks the repository only after parse-options has had its say, so
+    // `is-needed --task=bogus` outside a repository still reports the bad task.
+    if gix::discover(".").is_err() {
+        eprintln!("fatal: not a git repository (or any of the parent directories): .git");
+        return Ok(ExitCode::from(128));
+    }
+
+    if auto {
+        bail!(
+            "maintenance is-needed --auto is not ported: the per-task conditions rest on git's \
+             loose-object estimator, which samples the objects/17 fanout directory and scales by \
+             256, and on multi-pack-index state; those thresholds have no counterpart in the \
+             vendored crates and the answer is carried by the exit code alone, so guessing it \
+             would be silently wrong (ported: is-needed without --auto, register, unregister, \
+             and argument validation)"
+        );
+    }
+
+    // No `--auto`: no condition is evaluated, so every selected task is needed.
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Reject an unknown `--task` value the way git's callback does: a lone
+/// `error:` line, exit 129. `None` when the name is one git knows.
+fn check_task(value: &str) -> Option<ExitCode> {
+    (!TASKS.contains(&value)).then(|| bare_error(&format!("'{value}' is not a valid task")))
 }
 
 /// Validate a `--task` or `--schedule` value the way git's option callbacks do.
@@ -326,8 +382,8 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
 fn check_value(name: &str, value: &str, scheduled: &mut bool) -> Result<Option<ExitCode>> {
     match name {
         "task" => {
-            if !TASKS.contains(&value) {
-                return Ok(Some(bare_error(&format!("'{value}' is not a valid task"))));
+            if let Some(code) = check_task(value) {
+                return Ok(Some(code));
             }
         }
         "schedule" => {

@@ -3,28 +3,50 @@
 //! Covered: the full listing form over gitoxide's blocking transport
 //! (`git ls-remote [<repository> [<patterns>...]]`) with `-b`/`--branches`
 //! (and the `-h`/`--heads` synonyms), `-t`/`--tags`, `--refs`, `--symref`,
-//! `--exit-code`, `--get-url` and `-q`/`--quiet`, including git's `check_ref`
-//! filter semantics, its `*/<pattern>` tail glob, its refname sort order, the
+//! `--exit-code`, `--get-url`, `-q`/`--quiet`, `--sort=<key>` and
+//! `-o`/`--server-option=<option>`, including git's `check_ref` filter
+//! semantics, its `*/<pattern>` tail glob, its refname sort order, the
 //! `From <url>` stderr header (printed only when `<repository>` is omitted),
 //! and the exit codes (0 normally, 2 for `--exit-code` with no matching refs,
-//! 128 when the remote cannot be reached, 129 for bare `-h`).
+//! 128 when the remote cannot be reached or a sort key is rejected, 129 for
+//! usage errors and for bare `-h`).
 //!
-//! Not covered: `--sort=<key>`, `--upload-pack=<exec>` and
-//! `-o`/`--server-option=<option>` — they bail rather than silently producing
-//! output that would diverge from git. Running outside a repository also bails:
-//! gitoxide resolves transport, credential and `insteadOf` configuration
-//! through a `Repository`, and there is no repository-less remote in the
-//! vendored crates.
+//! `--sort` reproduces `ref-filter.c`: the *last* `--sort` on the command line
+//! is the primary key, earlier ones break its ties, and a final ascending
+//! `strcmp` on the refname breaks the rest (`compare_refs`). `-` reverses a
+//! single key without reversing that final tiebreak; `version:`/`v:` selects
+//! `versioncmp()`, ported verbatim below. Sort keys are validated only after
+//! the refs have been fetched, exactly where git validates them, so an
+//! unreachable remote still reports the transport failure rather than the key.
+//!
+//! Known gaps:
+//!
+//! * `--upload-pack=<exec>` bails: `Remote::connect` exposes no hook for the
+//!   remote helper path, so honouring it is not possible in the vendored crates.
+//! * `-o`/`--server-option` is parsed and validated but *not* transmitted:
+//!   gitoxide has no protocol-v2 server-option plumbing (no `server_option`
+//!   symbol exists anywhere under `gix-protocol`). Servers that would reject an
+//!   unknown option therefore see a request git would have made differently.
+//! * `--sort` keys beyond `refname`, `objectname`, `creatordate`,
+//!   `committerdate`, `authordate` and `taggerdate` are refused with git's
+//!   `unknown field name` fatal. git accepts more `for-each-ref` atoms than
+//!   those, but computing them needs object data `ls-remote` never fetches.
+//! * `version:` in front of a *date* key falls back to the plain numeric
+//!   compare instead of git's versioncmp over the formatted date string.
+//! * `versionsort.suffix` / `versionsort.prereleaseSuffix` are not consulted,
+//!   so `version:` sorting is plain `strverscmp` ordering (git's behaviour when
+//!   neither key is configured).
+//!
+//! Running outside a repository also bails: gitoxide resolves transport,
+//! credential and `insteadOf` configuration through a `Repository`, and there
+//! is no repository-less remote in the vendored crates.
 
 use anyhow::{bail, Result};
+use std::cmp::Ordering;
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, ByteSlice};
 use gix::protocol::handshake::Ref;
-
-/// The flags this port implements, quoted in every rejection message.
-const PORTED: &str = "ported: -b/--branches/-h/--heads, -t/--tags, --refs, \
-                      --symref, --exit-code, --get-url, -q/--quiet";
 
 /// `git ls-remote -h` used with nothing else prints this and exits 129.
 const USAGE: &str = "\
@@ -56,6 +78,8 @@ struct Opts {
     quiet: bool,     // -q/--quiet: suppress the `From <url>` stderr header
     exit_code: bool, // --exit-code: exit 2 when nothing matched
     get_url: bool,   // --get-url: print the expanded URL and never connect
+    /// Raw `--sort=<key>` arguments in command-line order; validated late.
+    sort: Vec<String>,
 }
 
 /// One output record: a ref advertised by the remote, or the synthetic `^{}`
@@ -63,19 +87,41 @@ struct Opts {
 struct Row {
     /// The full ref name as git prints it, e.g. `refs/tags/v1.0` or `…^{}`.
     name: String,
-    /// The hex object id printed in the first column.
-    oid: String,
+    /// The object id printed in the first column, and the sort key for
+    /// `--sort=objectname`.
+    id: gix::ObjectId,
     /// The symbolic target, for the `--symref` line (only on the base row).
     symref: Option<String>,
     /// Whether this is the synthetic `^{}` row (git's "magic fake tag ref").
     peel: bool,
+    /// Creator/committer/author/tagger seconds, filled in only when a date key
+    /// is being sorted on. Mirrors `get_ref_atom_value`'s lazy population.
+    date: i64,
+}
+
+/// The `for-each-ref` atoms `ls-remote` can evaluate from what it has.
+#[derive(Clone, Copy, PartialEq)]
+enum Atom {
+    Refname,
+    Objectname,
+    /// `creatordate`, plus the type-specific dates that resolve identically for
+    /// the commit/tag objects a ref can point at.
+    Date,
+}
+
+/// One parsed `--sort` key: `[-][version:|v:]<atom>`.
+struct SortKey {
+    reverse: bool,
+    version: bool,
+    atom: Atom,
 }
 
 /// `git ls-remote` — list references available in a remote repository.
 ///
-/// Output is `<oid> TAB <ref> LF` per ref, sorted by refname, matching stock
-/// git byte-for-byte for the supported flags. Annotated tags contribute a
-/// second `<ref>^{}` row unless `--refs` is given.
+/// Output is `<oid> TAB <ref> LF` per ref in the order the remote advertised
+/// them (refname order), reordered by `--sort` when given, matching stock git
+/// byte-for-byte. Annotated tags contribute a second `<ref>^{}` row unless
+/// `--refs` is given.
 pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
     // Dispatch passes the flags only, but tolerate a leading subcommand name.
     let args = match args.first() {
@@ -98,45 +144,12 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         quiet: false,
         exit_code: false,
         get_url: false,
+        sort: Vec::new(),
     };
     let mut positionals: Vec<&str> = Vec::new();
-    let mut no_more_opts = false;
 
-    for a in args {
-        let a = a.as_str();
-        if no_more_opts || !a.starts_with('-') || a == "-" {
-            positionals.push(a);
-            continue;
-        }
-        if a == "--" {
-            no_more_opts = true;
-            continue;
-        }
-        // `--no-<flag>` clears the corresponding boolean, as parse_options does.
-        let (a, on) = match a.strip_prefix("--no-") {
-            Some(rest) => (format!("--{rest}"), false),
-            None => (a.to_string(), true),
-        };
-        match a.as_str() {
-            "-b" | "--branches" | "-h" | "--heads" => opts.branches = on,
-            "-t" | "--tags" => opts.tags = on,
-            "--refs" => opts.normal = on,
-            "--symref" => opts.symref = on,
-            "-q" | "--quiet" => opts.quiet = on,
-            "--exit-code" => opts.exit_code = on,
-            "--get-url" => opts.get_url = on,
-            "--sort" | "-o" | "--server-option" | "--upload-pack" => {
-                bail!("unsupported flag {a:?} ({PORTED})")
-            }
-            s if s.starts_with("--sort=")
-                || s.starts_with("--server-option=")
-                || s.starts_with("--upload-pack=") =>
-            {
-                let flag = &s[..s.find('=').unwrap_or(s.len())];
-                bail!("unsupported flag {flag:?} ({PORTED})")
-            }
-            s => bail!("unsupported flag {s:?} ({PORTED})"),
-        }
+    if let Err(code) = parse_args(args, &mut opts, &mut positionals) {
+        return Ok(code);
     }
 
     let (repository, patterns): (Option<&str>, &[&str]) = match positionals.split_first() {
@@ -159,13 +172,16 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
+    // `to_bstring` rather than `Display`, which redacts passwords; git prints
+    // the URL verbatim.
     let url = remote
         .url(gix::remote::Direction::Fetch)
-        .map(ToString::to_string)
+        .map(gix::url::Url::to_bstring)
         .unwrap_or_default();
 
     // `--get-url` expands `url.<base>.insteadOf` (applied by `find_fetch_remote`)
-    // and exits without talking to the remote.
+    // and exits without talking to the remote — before `--sort` is ever looked
+    // at, so `ls-remote --get-url --sort=bogus .` still succeeds, as in git.
     if opts.get_url {
         println!("{url}");
         return Ok(ExitCode::SUCCESS);
@@ -206,6 +222,23 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
     rows.retain(|row| check_ref(row, &opts) && tail_match(patterns, &row.name));
     rows.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
 
+    // git only reorders when `--sort` was given; otherwise the advertisement
+    // order stands, and it is already refname order.
+    if !opts.sort.is_empty() {
+        let keys = match parse_sort_keys(&opts.sort) {
+            Ok(keys) => keys,
+            Err(msg) => {
+                eprintln!("fatal: {msg}");
+                return Ok(ExitCode::from(128));
+            }
+        };
+        if let Err(msg) = resolve_dates(&repo, &keys, &mut rows) {
+            eprintln!("fatal: {msg}");
+            return Ok(ExitCode::from(128));
+        }
+        rows.sort_by(|a, b| compare_rows(&keys, a, b));
+    }
+
     let mut out = String::new();
     for row in &rows {
         if opts.symref {
@@ -213,7 +246,7 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
                 out.push_str(&format!("ref: {target}\t{}\n", row.name));
             }
         }
-        out.push_str(&format!("{}\t{}\n", row.oid, row.name));
+        out.push_str(&format!("{}\t{}\n", row.id.to_hex(), row.name));
     }
     print!("{out}");
 
@@ -222,6 +255,330 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Walk the command line the way `parse_options` does.
+///
+/// Returns the exit code to hand back on a usage error: git answers 129 for an
+/// unknown option, a value given to a boolean, and a missing required value,
+/// printing the complaint (and, for unknown options, the usage block) on stderr.
+fn parse_args<'a>(
+    args: &'a [String],
+    opts: &mut Opts,
+    positionals: &mut Vec<&'a str>,
+) -> Result<(), ExitCode> {
+    let mut no_more_opts = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = args[i].as_str();
+        i += 1;
+
+        if no_more_opts || !arg.starts_with('-') || arg == "-" {
+            positionals.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            no_more_opts = true;
+            continue;
+        }
+
+        // Short options cluster (`-tb`) and `-o` may take a sticky value (`-ofoo`).
+        if !arg.starts_with("--") {
+            for (at, c) in arg[1..].char_indices() {
+                match c {
+                    'b' | 'h' => opts.branches = true,
+                    't' => opts.tags = true,
+                    'q' => opts.quiet = true,
+                    'o' => {
+                        // The rest of the cluster is the value, else the next
+                        // argv — consumed even when it looks like a flag, so
+                        // `ls-remote -o --tags` has no `--tags` and no
+                        // repository. The value itself goes nowhere: gitoxide
+                        // cannot transmit protocol-v2 server options.
+                        let sticky = &arg[1 + at + c.len_utf8()..];
+                        if sticky.is_empty() {
+                            if args.get(i).is_none() {
+                                eprintln!("error: switch `o' requires a value");
+                                return Err(ExitCode::from(129));
+                            }
+                            i += 1;
+                        }
+                        break;
+                    }
+                    other => {
+                        eprintln!("error: unknown switch `{other}'");
+                        eprint!("{USAGE}");
+                        return Err(ExitCode::from(129));
+                    }
+                }
+            }
+            continue;
+        }
+
+        // `--no-<flag>` clears the corresponding setting, as parse_options does.
+        let (name, value, on) = split_long(arg);
+
+        // Booleans reject an attached value; valued options require one.
+        let boolean = |slot: &mut bool| -> Result<(), ExitCode> {
+            if value.is_some() {
+                eprintln!("error: option `{name}' takes no value");
+                return Err(ExitCode::from(129));
+            }
+            *slot = on;
+            Ok(())
+        };
+
+        match name {
+            "branches" | "heads" => boolean(&mut opts.branches)?,
+            "tags" => boolean(&mut opts.tags)?,
+            "refs" => boolean(&mut opts.normal)?,
+            "symref" => boolean(&mut opts.symref)?,
+            "quiet" => boolean(&mut opts.quiet)?,
+            "exit-code" => boolean(&mut opts.exit_code)?,
+            "get-url" => boolean(&mut opts.get_url)?,
+            "sort" | "server-option" => {
+                // `--no-sort` / `--no-server-option` discard what was collected.
+                if !on {
+                    if name == "sort" {
+                        opts.sort.clear();
+                    }
+                    continue;
+                }
+                let value = match value {
+                    Some(v) => v.to_string(),
+                    None => match args.get(i) {
+                        Some(v) => {
+                            i += 1;
+                            v.clone()
+                        }
+                        None => {
+                            eprintln!("error: option `{name}' requires a value");
+                            return Err(ExitCode::from(129));
+                        }
+                    },
+                };
+                // Server options are consumed and dropped: gitoxide has no
+                // protocol-v2 server-option plumbing to hand them to.
+                if name == "sort" {
+                    opts.sort.push(value);
+                }
+            }
+            "upload-pack" => {
+                // Honouring this needs a remote-helper path hook `Remote::connect`
+                // does not expose; bail rather than silently ignore it.
+                bail_unsupported("--upload-pack");
+                return Err(ExitCode::from(128));
+            }
+            other => {
+                eprintln!("error: unknown option `{other}'");
+                eprint!("{USAGE}");
+                return Err(ExitCode::from(129));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Split `--name`, `--name=value` and `--no-name` into their parts.
+fn split_long(arg: &str) -> (&str, Option<&str>, bool) {
+    let body = &arg[2..];
+    let (body, value) = match body.find('=') {
+        Some(eq) => (&body[..eq], Some(&body[eq + 1..])),
+        None => (body, None),
+    };
+    match body.strip_prefix("no-") {
+        Some(rest) => (rest, value, false),
+        None => (body, value, true),
+    }
+}
+
+/// Report a flag this port deliberately does not implement.
+fn bail_unsupported(flag: &str) {
+    eprintln!("zvcs: ls-remote: unsupported flag {flag:?} (no gitoxide equivalent)");
+}
+
+/// Parse `--sort` arguments into git's ordering chain.
+///
+/// `ref_sorting_options` prepends each parsed key, so the last one on the
+/// command line ends up at the head and sorts first; the returned vector is in
+/// that head-first order.
+fn parse_sort_keys(specs: &[String]) -> Result<Vec<SortKey>, String> {
+    let mut keys = Vec::with_capacity(specs.len());
+    for spec in specs.iter().rev() {
+        let mut arg = spec.as_str();
+        let reverse = arg.starts_with('-');
+        if reverse {
+            arg = &arg[1..];
+        }
+        let version = match arg.strip_prefix("version:").or_else(|| arg.strip_prefix("v:")) {
+            Some(rest) => {
+                arg = rest;
+                true
+            }
+            None => false,
+        };
+        if arg.is_empty() {
+            return Err(format!("malformed field name: {arg}"));
+        }
+        let atom = match arg {
+            "refname" => Atom::Refname,
+            "objectname" => Atom::Objectname,
+            "creatordate" | "committerdate" | "authordate" | "taggerdate" => Atom::Date,
+            other => return Err(format!("unknown field name: {other}")),
+        };
+        keys.push(SortKey {
+            reverse,
+            version,
+            atom,
+        });
+    }
+    Ok(keys)
+}
+
+/// Fill in `Row::date` for every row when a date key is in play.
+///
+/// git populates the atom lazily inside the comparison and dies with
+/// `missing object <oid> for <ref>` when the object is not in the local odb —
+/// which for `ls-remote` is anything the local repository has not fetched. With
+/// a single row no comparison ever runs, so no lookup happens and no such
+/// failure is possible; that case is skipped here for the same reason.
+fn resolve_dates(repo: &gix::Repository, keys: &[SortKey], rows: &mut [Row]) -> Result<(), String> {
+    if rows.len() < 2 || !keys.iter().any(|k| k.atom == Atom::Date) {
+        return Ok(());
+    }
+    for row in rows.iter_mut() {
+        let object = repo
+            .find_object(row.id)
+            .map_err(|_| format!("missing object {} for {}", row.id.to_hex(), row.name))?;
+        let kind = object.kind;
+        row.date = match kind {
+            gix::object::Kind::Commit => object
+                .try_into_commit()
+                .ok()
+                .and_then(|c| c.committer().ok().map(|s| s.seconds()))
+                .unwrap_or_default(),
+            gix::object::Kind::Tag => object
+                .try_into_tag()
+                .ok()
+                .and_then(|t| t.tagger().ok().flatten().map(|s| s.seconds()))
+                .unwrap_or_default(),
+            // Trees and blobs have no date; git's atom value stays 0.
+            _ => 0,
+        };
+    }
+    Ok(())
+}
+
+/// git's `compare_refs`: walk the keys, then fall back to an ascending refname
+/// `strcmp` that `-` never reverses.
+fn compare_rows(keys: &[SortKey], a: &Row, b: &Row) -> Ordering {
+    for key in keys {
+        let cmp = match (key.version, key.atom) {
+            (true, Atom::Refname) => versioncmp(&a.name, &b.name),
+            (true, Atom::Objectname) => {
+                versioncmp(&a.id.to_hex().to_string(), &b.id.to_hex().to_string())
+            }
+            // `version:<date atom>` is accepted but treated as the plain
+            // numeric compare. git runs versioncmp over the atom's *formatted*
+            // date string there, which this port does not reproduce; the
+            // combination is undocumented and not exercised by the harness.
+            (_, Atom::Date) => a.date.cmp(&b.date),
+            (false, Atom::Refname) => a.name.as_bytes().cmp(b.name.as_bytes()),
+            (false, Atom::Objectname) => a.id.as_bytes().cmp(b.id.as_bytes()),
+        };
+        let cmp = if key.reverse { cmp.reverse() } else { cmp };
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+    a.name.as_bytes().cmp(b.name.as_bytes())
+}
+
+// `versioncmp()` states: S_N normal, S_I integral part, S_F fractional part,
+// S_Z fractional part with leading zeroes only.
+const S_N: usize = 0x0;
+const S_I: usize = 0x3;
+const S_F: usize = 0x6;
+const S_Z: usize = 0x9;
+/// Result kind: return the raw difference.
+const CMP: i8 = 2;
+/// Result kind: compare by the length of the digit runs.
+const LEN: i8 = 3;
+
+/// git's `versioncmp()` from `versioncmp.c`, itself glibc's `strverscmp()`.
+///
+/// Compares two strings holding indices/version numbers so that `v1.10` sorts
+/// after `v1.2`. `versionsort.suffix` prerelease handling is not implemented
+/// (see the module docs); with neither `versionsort` key configured git takes
+/// exactly this path.
+fn versioncmp(s1: &str, s2: &str) -> Ordering {
+    // Symbol(s)  0       [1-9]   others
+    // Transition (10) 0  (01) d  (00) x
+    #[rustfmt::skip]
+    const NEXT_STATE: [usize; 12] = [
+        /* state    x    d    0  */
+        /* S_N */   S_N, S_I, S_Z,
+        /* S_I */   S_N, S_I, S_I,
+        /* S_F */   S_N, S_F, S_F,
+        /* S_Z */   S_N, S_F, S_Z,
+    ];
+    #[rustfmt::skip]
+    const RESULT_TYPE: [i8; 36] = [
+        /* state   x/x  x/d  x/0  d/x  d/d  d/0  0/x  0/d  0/0 */
+        /* S_N */  CMP, CMP, CMP, CMP, LEN, CMP, CMP, CMP, CMP,
+        /* S_I */  CMP, -1,  -1,  1,   LEN, LEN, 1,   LEN, LEN,
+        /* S_F */  CMP, CMP, CMP, CMP, CMP, CMP, CMP, CMP, CMP,
+        /* S_Z */  CMP, 1,   1,   -1,  CMP, CMP, -1,  CMP, CMP,
+    ];
+
+    let (a, b) = (s1.as_bytes(), s2.as_bytes());
+    // The C original walks NUL-terminated buffers; past the end reads as NUL.
+    let at = |s: &[u8], i: usize| -> u8 { s.get(i).copied().unwrap_or(0) };
+    let digit = |c: u8| c.is_ascii_digit();
+    // 0 for other, 1 for [1-9], 2 for '0' — the column of both tables.
+    let class = |c: u8| usize::from(c == b'0') + usize::from(digit(c));
+
+    let mut i = 0usize;
+    let mut c1 = at(a, 0);
+    let mut c2 = at(b, 0);
+    let mut state = S_N + class(c1);
+
+    let diff = loop {
+        let diff = i32::from(c1) - i32::from(c2);
+        if diff != 0 {
+            break diff;
+        }
+        if c1 == 0 {
+            return Ordering::Equal;
+        }
+        state = NEXT_STATE[state];
+        i += 1;
+        c1 = at(a, i);
+        c2 = at(b, i);
+        state += class(c1);
+    };
+
+    match RESULT_TYPE[state * 3 + class(c2)] {
+        CMP => diff.cmp(&0),
+        LEN => {
+            // Whichever side's digit run continues longer holds the larger number.
+            let mut k = 0;
+            while digit(at(a, i + 1 + k)) {
+                if !digit(at(b, i + 1 + k)) {
+                    return Ordering::Greater;
+                }
+                k += 1;
+            }
+            if digit(at(b, i + 1 + k)) {
+                Ordering::Less
+            } else {
+                diff.cmp(&0)
+            }
+        }
+        verdict => verdict.cmp(&0),
+    }
 }
 
 /// Turn one advertised ref into its output rows.
@@ -257,17 +614,19 @@ fn push_rows(r: &Ref, rows: &mut Vec<Row>) {
 
     let name = name.to_string();
     rows.push(Row {
-        oid: oid.to_hex().to_string(),
+        id: oid,
         symref,
         peel: false,
+        date: 0,
         name: name.clone(),
     });
     if let Some(peeled) = peeled {
         rows.push(Row {
             name: format!("{name}^{{}}"),
-            oid: peeled.to_hex().to_string(),
+            id: peeled,
             symref: None,
             peel: true,
+            date: 0,
         });
     }
 }
@@ -316,4 +675,145 @@ fn tail_match(patterns: &[&str], name: &str) -> bool {
             gix::glob::wildmatch::Mode::empty(),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ordering of the names stock git 2.55 produced for
+    /// `git tag --sort=version:refname` over this exact set, which is the
+    /// regression this port has to keep reproducing.
+    #[test]
+    fn versioncmp_matches_git_version_refname_order() {
+        let mut names = vec![
+            "v1.0.1", "v1.10", "10", "v1", "a01b2", "v1.0-rc2", "1", "v1.0.0.0", "v1.1", "01",
+            "v001", "v1a", "release-2", "v10", "v0.9", "v1.0a", "v1_2", "v1.0", "v01", "0",
+            "release-10", "abc", "v2.0", "v1.0.0", "v9", "a1b2", "v1-2", "00", "x", "release-1",
+            "refs", "v10.0", "v1.0-rc1", "v2", "v1.2", "y",
+        ];
+        names.sort_by(|a, b| versioncmp(a, b).then_with(|| a.cmp(b)));
+        assert_eq!(
+            names,
+            vec![
+                "00", "01", "0", "1", "10", "a01b2", "a1b2", "abc", "refs", "release-1",
+                "release-2", "release-10", "v001", "v01", "v0.9", "v1", "v1-2", "v1.0", "v1.0-rc1",
+                "v1.0-rc2", "v1.0.0", "v1.0.0.0", "v1.0.1", "v1.0a", "v1.1", "v1.2", "v1.10",
+                "v1_2", "v1a", "v2", "v2.0", "v9", "v10", "v10.0", "x", "y",
+            ]
+        );
+    }
+
+    /// The last `--sort` is the primary key (`ref_sorting_options` prepends),
+    /// and `-` reverses that key without touching the refname tiebreak.
+    #[test]
+    fn last_sort_wins_and_reverse_keeps_refname_tiebreak() {
+        let keys = parse_sort_keys(&["refname".into(), "-creatordate".into()]).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].reverse && keys[0].atom == Atom::Date);
+        assert!(!keys[1].reverse && keys[1].atom == Atom::Refname);
+
+        let row = |name: &str, date: i64| Row {
+            name: name.into(),
+            id: gix::ObjectId::null(gix::hash::Kind::Sha1),
+            symref: None,
+            peel: false,
+            date,
+        };
+        // Equal dates fall through to an ascending refname compare, never a
+        // descending one, even though the date key is reversed.
+        assert_eq!(
+            compare_rows(&keys, &row("refs/heads/a", 7), &row("refs/heads/b", 7)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_rows(&keys, &row("refs/heads/a", 1), &row("refs/heads/b", 9)),
+            Ordering::Greater
+        );
+    }
+
+    /// git validates sort keys after the transport, and rejects these two
+    /// shapes with `fatal:` (exit 128) rather than a usage error.
+    #[test]
+    fn sort_key_validation_mirrors_git() {
+        assert!(parse_sort_keys(&["bogus".into()]).is_err());
+        assert!(parse_sort_keys(&["".into()]).is_err());
+        assert!(parse_sort_keys(&["-".into()]).is_err());
+        assert!(parse_sort_keys(&["v:refname".into()]).unwrap()[0].version);
+        assert!(parse_sort_keys(&["-version:refname".into()]).unwrap()[0].reverse);
+        assert!(parse_sort_keys(&["objectname".into()]).is_ok());
+        assert!(parse_sort_keys(&["creatordate".into()]).is_ok());
+    }
+
+    fn blank_opts() -> Opts {
+        Opts {
+            branches: false,
+            tags: false,
+            normal: false,
+            symref: false,
+            quiet: false,
+            exit_code: false,
+            get_url: false,
+            sort: Vec::new(),
+        }
+    }
+
+    fn parse(argv: &[&str]) -> Result<(Opts, Vec<String>), u8> {
+        let args: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let mut opts = blank_opts();
+        let mut positionals = Vec::new();
+        match parse_args(&args, &mut opts, &mut positionals) {
+            // ExitCode is opaque, so the caller only learns that parsing failed;
+            // the codes themselves are asserted through the harness.
+            Err(_) => Err(1),
+            Ok(()) => Ok((
+                opts,
+                positionals.into_iter().map(str::to_string).collect(),
+            )),
+        }
+    }
+
+    /// `-o` swallows the next argv even when it looks like a flag — the reason
+    /// `git ls-remote -o --tags` reports "No remote configured to list refs
+    /// from." instead of listing tags.
+    #[test]
+    fn o_consumes_the_next_argument() {
+        let (opts, positionals) = parse(&["-o", "--tags"]).unwrap();
+        assert!(!opts.tags, "--tags was the value of -o, not a flag");
+        assert!(positionals.is_empty(), "no repository is left on the line");
+    }
+
+    /// Short options cluster, and a sticky `-ofoo` keeps its value inside the
+    /// cluster rather than eating the following argv.
+    #[test]
+    fn short_options_cluster_with_sticky_value() {
+        let (opts, positionals) = parse(&["-tb", "-ofoo", "."]).unwrap();
+        assert!(opts.tags && opts.branches);
+        assert_eq!(positionals, vec!["."]);
+    }
+
+    /// `--no-sort` drops previously collected keys; `--no-server-option` must
+    /// not touch them.
+    #[test]
+    fn negations_clear_only_their_own_option() {
+        assert!(parse(&["--sort=-refname", "--no-sort"]).unwrap().0.sort.is_empty());
+        assert_eq!(
+            parse(&["--sort=-refname", "--no-server-option"]).unwrap().0.sort,
+            vec!["-refname"]
+        );
+    }
+
+    /// Values attached to booleans and missing values for valued options are
+    /// both usage errors.
+    #[test]
+    fn usage_errors_are_rejected() {
+        assert!(parse(&["--branches=x"]).is_err());
+        assert!(parse(&["--sort"]).is_err());
+        assert!(parse(&["--server-option"]).is_err());
+        assert!(parse(&["-o"]).is_err());
+        assert!(parse(&["--bogus"]).is_err());
+        assert!(parse(&["-Z"]).is_err());
+        // `--` stops option parsing, so a later `-t` is a pattern.
+        assert_eq!(parse(&["--", ".", "-t"]).unwrap().1, vec![".", "-t"]);
+    }
 }

@@ -1,19 +1,26 @@
 //! `git grep` — search the contents of tracked files for a pattern.
 //!
-//! Covered: the tracked-worktree default, `--cached` and `--untracked`, pathspec
-//! limiting (via gitoxide's pathspec platform, so magic and globs work and a
-//! subdirectory invocation searches only that subtree), `--max-depth`,
-//! `--max-count`, and the line/name/count/quiet output modes with byte-identical
-//! formatting, including git's binary-file handling and `core.quotePath` path
-//! quoting.
+//! Covered: the tracked-worktree default, `--cached`, `--untracked` and
+//! `--no-index`, pathspec limiting (via gitoxide's pathspec platform, so magic
+//! and globs work and a subdirectory invocation searches only that subtree),
+//! `--max-depth`, `--max-count`, and the line/name/count/quiet output modes with
+//! byte-identical formatting, including git's binary-file handling and
+//! `core.quotePath` path quoting.
+//!
+//! `--textconv` is honoured to the extent it can change an answer: it only ever
+//! does so when some `diff.<driver>.textconv` command is configured to run, and
+//! with none configured — the overwhelmingly common case, and the one git itself
+//! short-circuits — it is exactly the no-op git makes of it. A configured
+//! converter would have to be executed as an external process, which is refused
+//! rather than guessed at.
 //!
 //! Not covered, and rejected loudly rather than approximated: patterns that need
 //! a regex engine (the vendored gitoxide crates ship none — `gix`'s optional
 //! `regex` dependency is behind the `revparse-regex` feature but is not
 //! re-exported, so it cannot be reached from here), searching `<tree>`
-//! revisions, `--no-index`, `--recurse-submodules`, `--textconv`, context lines
-//! (`-A`/`-B`/`-C`/`-W`/`-p`), `--heading`/`--break`, `-f`, `--and`/`--or`/
-//! `--not`, `-O`, and coloured output.
+//! revisions, `--recurse-submodules`, context lines (`-A`/`-B`/`-C`/`-W`/`-p`),
+//! `--heading`/`--break`, `-f`, `--and`/`--or`/`--not`, `-O`, and coloured
+//! output.
 //!
 //! Flags in that last group that only shape the *rendering* of a match — context
 //! lines, `--heading`, `--break`, `-p`, `-W` — are accepted during parsing (git
@@ -61,7 +68,11 @@ struct Opts {
     full_name: bool,      // --full-name
     cached: bool,         // --cached
     untracked: bool,      // --untracked
-    exclude_standard: bool, // --[no-]exclude-standard (default: on)
+    no_index: bool,       // --no-index (`--index` turns it back off)
+    /// `--[no-]exclude-standard`. git leaves this unset by default and resolves
+    /// it to whether an index is being consulted, so it is on everywhere except
+    /// under `--no-index`; see the resolution in [`grep`].
+    exclude_standard: bool,
     max_count: i64,       // -m/--max-count, -1 = unlimited
     max_depth: i64,       // --max-depth, -1 = unlimited
 }
@@ -72,7 +83,8 @@ struct Opts {
 struct Deferred {
     /// The flag as the user spelled it, for the refusal message.
     context: Option<String>,
-    /// Changes which files are searched, so it can never be shrugged off.
+    /// Changes which files are searched, so it can never be shrugged off —
+    /// except under `--no-index`, which documents it as having no effect.
     set_changing: Option<String>,
     all_match: bool,
 }
@@ -81,7 +93,7 @@ struct Deferred {
 ///
 /// Supported flags (output byte-for-byte identical to stock git for these):
 ///   * source: default (tracked files in the worktree), `--cached`,
-///     `--untracked`, `--[no-]exclude-standard`
+///     `--untracked`, `--no-index`/`--index`, `--[no-]exclude-standard`
 ///   * matching: `-i`, `-v`, `-w`, `-F`/`--fixed-strings`, `-E`, `-G`, `-P`,
 ///     `-e <pattern>` (repeatable; patterns are OR'd), `-m`/`--max-count`
 ///   * binary: `-a`/`--text`, `-I`
@@ -89,8 +101,9 @@ struct Deferred {
 ///   * output: `-n`, `--column`, `-l`/`--files-with-matches`/`--name-only`,
 ///     `-L`/`--files-without-match`, `-c`/`--count`, `-q`/`--quiet`, `-o`,
 ///     `-z`/`--null`, `-h`, `-H`, `--full-name`, `--color=never|auto`
-///   * accepted no-ops: `--no-textconv`, `--[no-]ext-grep`, `--threads`,
-///     `--no-heading`, `--no-break`, `--no-recurse-submodules`, `--index`
+///   * accepted no-ops: `--[no-]textconv` with no converter configured,
+///     `--[no-]ext-grep`, `--threads`, `--no-heading`, `--no-break`,
+///     `--no-recurse-submodules`
 ///   * `[--] <pathspec>...`
 ///
 /// Exit status matches git: `0` when at least one file produced output (for
@@ -115,10 +128,15 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         full_name: false,
         cached: false,
         untracked: false,
+        no_index: false,
         exclude_standard: true,
         max_count: -1,
         max_depth: -1,
     };
+    // git tracks `--[no-]exclude-standard` as a tri-state; this records whether
+    // the user pinned it, so the default can follow `--no-index` when they did not.
+    let mut exclude_standard_explicit = false;
+    let mut textconv = false;
     let mut deferred = Deferred::default();
     let mut dialect = Dialect::Basic;
     let mut patterns: Vec<String> = Vec::new();
@@ -195,8 +213,17 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 "no-cached" => opts.cached = false,
                 "untracked" => opts.untracked = true,
                 "no-untracked" => opts.untracked = false,
-                "exclude-standard" => opts.exclude_standard = true,
-                "no-exclude-standard" => opts.exclude_standard = false,
+                "exclude-standard" => {
+                    opts.exclude_standard = true;
+                    exclude_standard_explicit = true;
+                }
+                "no-exclude-standard" => {
+                    opts.exclude_standard = false;
+                    exclude_standard_explicit = true;
+                }
+                // `--index` is the negation git generates for `--no-index`.
+                "no-index" => opts.no_index = true,
+                "index" => opts.no_index = false,
                 "extended-regexp" => dialect = Dialect::Extended,
                 "basic-regexp" => dialect = Dialect::Basic,
                 "fixed-strings" => dialect = Dialect::Fixed,
@@ -223,7 +250,9 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 },
                 // `--no-textconv` is git's default for grep, and `--ext-grep` is
                 // documented as ignored by modern builds.
-                "no-textconv" | "ext-grep" | "no-ext-grep" | "index" => {}
+                "textconv" => textconv = true,
+                "no-textconv" => textconv = false,
+                "ext-grep" | "no-ext-grep" => {}
                 "no-heading" | "no-break" | "no-show-function" | "no-function-context"
                 | "no-recurse-submodules" | "no-all-match" => {}
                 "color" => match color_wanted(inline.as_deref()) {
@@ -249,7 +278,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 }
                 "no-context" | "no-after-context" | "no-before-context" => {}
                 "all-match" => deferred.all_match = true,
-                "recurse-submodules" | "textconv" | "no-index" => {
+                "recurse-submodules" => {
                     deferred.set_changing.get_or_insert_with(|| a.to_string());
                 }
                 _ => bail!("{}", unsupported(a)),
@@ -367,18 +396,39 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         patterns.push(positionals.remove(0));
     }
 
+    // git resolves an unset `--exclude-standard` to whether an index is being
+    // consulted, so `--no-index` searches ignored files and everything else does
+    // not. This is why `git help grep` calls `--exclude-standard` "only useful"
+    // with `--no-index` and `--no-exclude-standard` "only useful" with
+    // `--untracked`: each is the flag that departs from its default.
+    if !exclude_standard_explicit {
+        opts.exclude_standard = !opts.no_index;
+    }
+
+    // Under `--no-index` there are no revisions for a positional to name, so
+    // each one must already exist as a path. git verifies that during setup,
+    // ahead of both `--max-count` and the source-conflict rules.
+    if opts.no_index {
+        for p in &positionals {
+            if let Some(code) = verify_worktree_path(p) {
+                return Ok(code);
+            }
+        }
+    }
+
     // `--max-count=0` is documented to "exit immediately with a non-zero
     // status", ahead of even the source-conflict check.
     if opts.max_count == 0 {
         return Ok(ExitCode::from(1));
     }
-    if opts.untracked && opts.cached {
-        eprintln!("fatal: options '--untracked' and '--cached' cannot be used together");
-        return Ok(ExitCode::from(128));
+    if let Some(code) = source_conflict(&opts) {
+        return Ok(code);
     }
 
-    if let Some(flag) = &deferred.set_changing {
-        bail!("{}", unsupported(flag));
+    // `--recurse-submodules` "has no effect if --no-index is specified": that
+    // walk enters a checked-out submodule as an ordinary directory regardless.
+    if let Some(flag) = deferred.set_changing.filter(|_| !opts.no_index) {
+        bail!("{}", unsupported(&flag));
     }
     if deferred.all_match && patterns.len() > 1 {
         bail!("{}", unsupported("--all-match"));
@@ -392,11 +442,24 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
     let index = repo.open_index()?;
 
+    // `--textconv` can only change what is searched when there is a converter to
+    // run, and one exists only if some `diff.<driver>.textconv` command is
+    // configured. With none, honouring the setting and ignoring it agree.
+    if textconv && has_textconv_driver(&repo) {
+        bail!(
+            "unsupported flag \"--textconv\" while a `diff.<driver>.textconv` command is \
+             configured: converting a blob means running that command as an external \
+             process, which is not implemented"
+        );
+    }
+
     // A positional left over after the pattern is a `<tree>` in git's grammar
-    // when it resolves as a revision; otherwise it is a pathspec.
+    // when it resolves as a revision; otherwise it is a pathspec. `--no-index`
+    // removes the revision half of that grammar, and its positionals were
+    // already verified to name real paths above.
     let mut specs: Vec<BString> = Vec::new();
     for p in &positionals {
-        if repo.rev_parse_single(p.as_str()).is_ok() {
+        if !opts.no_index && repo.rev_parse_single(p.as_str()).is_ok() {
             bail!("searching a tree/revision ({p:?}) is not supported");
         }
         specs.push(BString::from(p.as_str()));
@@ -420,34 +483,42 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         Some(cwd_prefix.as_slice())
     };
 
-    // `empty_patterns_match_prefix = true` reproduces git's behaviour of
-    // limiting a bare invocation to the current directory's subtree.
-    let mut ps = repo.pathspec(
-        true,
-        &specs,
-        false,
-        &index,
-        gix::worktree::stack::state::attributes::Source::IdMapping,
-    )?;
     let mut files: Vec<(BString, Option<gix::hash::ObjectId>)> = Vec::new();
-    if let Some(iter) = ps.index_entries_with_paths(&index) {
-        for (path, entry) in iter {
-            // git's `grep_cache()` only visits regular files: symlinks and
-            // gitlinks are skipped, and higher conflict stages are collapsed.
-            if entry.mode != gix::index::entry::Mode::FILE
-                && entry.mode != gix::index::entry::Mode::FILE_EXECUTABLE
-            {
-                continue;
+    if opts.no_index {
+        collect_no_index(&repo, &index, &specs, &opts, &mut files)?;
+    } else {
+        // `empty_patterns_match_prefix = true` reproduces git's behaviour of
+        // limiting a bare invocation to the current directory's subtree.
+        let mut ps = repo.pathspec(
+            true,
+            &specs,
+            false,
+            &index,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+        )?;
+        if let Some(iter) = ps.index_entries_with_paths(&index) {
+            for (path, entry) in iter {
+                // git's `grep_cache()` only visits regular files: symlinks and
+                // gitlinks are skipped, and higher conflict stages are collapsed.
+                if entry.mode != gix::index::entry::Mode::FILE
+                    && entry.mode != gix::index::entry::Mode::FILE_EXECUTABLE
+                {
+                    continue;
+                }
+                if files.last().is_some_and(|(last, _)| last.as_bstr() == path) {
+                    continue;
+                }
+                files.push((path.to_owned(), Some(entry.id)));
             }
-            if files.last().is_some_and(|(last, _)| last.as_bstr() == path) {
-                continue;
-            }
-            files.push((path.to_owned(), Some(entry.id)));
+        }
+        if opts.untracked {
+            collect_untracked(&repo, &index, &specs, &opts, &mut files)?;
         }
     }
 
-    if opts.untracked {
-        collect_untracked(&repo, &index, &specs, &opts, &mut files)?;
+    // The index walk is already ordered, but both directory walks emit in
+    // traversal order; git prints paths sorted by their bytes either way.
+    if opts.no_index || opts.untracked {
         files.sort_by(|a, b| a.0.cmp(&b.0));
         files.dedup_by(|a, b| a.0 == b.0);
     }
@@ -515,6 +586,143 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     } else {
         ExitCode::from(1)
     })
+}
+
+/// git's mutual-exclusion diagnosis for the three source selectors, including
+/// the three-way wording it uses when all of them were given at once.
+fn source_conflict(opts: &Opts) -> Option<ExitCode> {
+    let msg = match (opts.no_index, opts.untracked, opts.cached) {
+        (true, true, true) => {
+            "options '--no-index', '--untracked', and '--cached' cannot be used together"
+        }
+        (true, true, false) => "options '--no-index' and '--untracked' cannot be used together",
+        (true, false, true) => "options '--no-index' and '--cached' cannot be used together",
+        (false, true, true) => "options '--untracked' and '--cached' cannot be used together",
+        _ => return None,
+    };
+    eprintln!("fatal: {msg}");
+    Some(ExitCode::from(128))
+}
+
+/// git's `verify_filename()` as `--no-index` reaches it. With no revisions to
+/// disambiguate against, a positional that is not self-evidently a pattern has
+/// to name something that exists, or git dies before searching anything.
+///
+/// Returns the exit code to stop with, having already reported it, or `None`
+/// when the argument is acceptable.
+///
+/// Paths are resolved against the current directory, which is where git resolves
+/// them from too for every form but `:/<path>`: that one is root-relative, and
+/// git can say so because it has already changed directory to the root by this
+/// point. The two agree whenever grep is run from the root.
+fn verify_worktree_path(arg: &str) -> Option<ExitCode> {
+    if looks_like_pathspec(arg) {
+        return None;
+    }
+    // `check_filename()` strips the leading magic that still leaves a path
+    // behind, then stats what remains. Magic with nothing after it is accepted
+    // without a stat — `:/` names the root, and excluding everything with a bare
+    // `:!`/`:^` is pointless but legal. A bare empty argument gets no such
+    // exemption: it reaches the stat and fails it, which is why `git grep
+    // --no-index <pattern> ""` is a fatal rather than a match-nothing.
+    let path = match [":/", ":!", ":^"]
+        .into_iter()
+        .find_map(|magic| arg.strip_prefix(magic))
+    {
+        Some("") => return None,
+        Some(rest) => rest,
+        None => arg,
+    };
+    if std::fs::symlink_metadata(path).is_ok() {
+        return None;
+    }
+    eprintln!("fatal: {arg}: no such path in the working tree.");
+    eprintln!("Use 'git <command> -- <path>...' to specify paths that do not exist locally.");
+    Some(ExitCode::from(128))
+}
+
+/// git's `looks_like_pathspec()`: raw pathspec magic, or an unescaped glob
+/// metacharacter, means the argument is a pattern rather than a name to stat.
+fn looks_like_pathspec(arg: &str) -> bool {
+    if arg.starts_with(":(") {
+        return true;
+    }
+    let mut escaped = false;
+    for b in arg.bytes() {
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if matches!(b, b'*' | b'?' | b'[') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether any `diff.<driver>.textconv` command is configured.
+///
+/// A path's content is converted only when its `diff` attribute names a driver
+/// that carries such a command, so if no driver carries one then no path can be
+/// affected and `--textconv` cannot change a single byte of the output.
+fn has_textconv_driver(repo: &gix::Repository) -> bool {
+    let snapshot = repo.config_snapshot();
+    snapshot
+        .plumbing()
+        .sections_by_name("diff")
+        .into_iter()
+        .flatten()
+        .any(|section| {
+            section
+                .header()
+                .subsection_name()
+                .is_some_and(|name| !name.is_empty())
+                && section.value("textconv").is_some()
+        })
+}
+
+/// Collect every file under `specs` for `--no-index`, which searches the
+/// filesystem rather than the index.
+///
+/// The index is still handed to the walk, but only so gitoxide can classify what
+/// it finds; nothing is selected from it. Tracked, untracked and — unless
+/// `--exclude-standard` was given — ignored files all qualify, which is why the
+/// default flips: git resolves an unset `--exclude-standard` to `use_index`.
+/// Nested repositories are entered, since a checked-out submodule is just a
+/// directory to a filesystem walk, and `.git` is pruned by the walk itself.
+fn collect_no_index(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    specs: &[BString],
+    opts: &Opts,
+    files: &mut Vec<(BString, Option<gix::hash::ObjectId>)>,
+) -> Result<()> {
+    let options = repo
+        .dirwalk_options()?
+        .empty_patterns_match_prefix(true)
+        .recurse_repositories(true)
+        .emit_tracked(true)
+        .emit_untracked(gix::dir::walk::EmissionMode::Matching)
+        .emit_ignored(
+            (!opts.exclude_standard).then_some(gix::dir::walk::EmissionMode::Matching),
+        );
+    let mut collect = gix::dir::walk::delegate::Collect::default();
+    let should_interrupt = std::sync::atomic::AtomicBool::default();
+    repo.dirwalk(index, specs, &should_interrupt, options, &mut collect)?;
+
+    for (entry, _) in collect.unorded_entries {
+        if entry.disk_kind != Some(gix::dir::entry::Kind::File) {
+            continue;
+        }
+        match entry.status {
+            gix::dir::entry::Status::Tracked | gix::dir::entry::Status::Untracked => {}
+            gix::dir::entry::Status::Ignored(_) if !opts.exclude_standard => {}
+            _ => continue,
+        }
+        // `None` for the id: with `--cached` ruled out, content comes from disk.
+        files.push((entry.rela_path, None));
+    }
+    Ok(())
 }
 
 /// Add the untracked files under `specs` to `files`, as `--untracked` asks.
@@ -897,7 +1105,7 @@ fn unsupported(flag: &str) -> String {
         "unsupported flag {flag:?} (ported: -e, -i, -v, -w, -a, -I, -n, --column, \
          -l/--files-with-matches/--name-only, -L/--files-without-match, -c, -q, -z, -o, \
          -h, -H, -E, -G, -F, -P, -m/--max-count, --max-depth, -r/--[no-]recursive, \
-         --full-name, --cached, --untracked, --[no-]exclude-standard, \
-         --color=never|auto, and pathspecs)"
+         --full-name, --cached, --untracked, --no-index/--index, \
+         --[no-]exclude-standard, --color=never|auto, and pathspecs)"
     )
 }

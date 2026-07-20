@@ -7,8 +7,9 @@
 //! the blob bytes into it, and prints the file name followed by a newline.
 //!
 //! Not covered: nothing — `unpack-file` has no options. `-h` (and any wrong
-//! argument count) prints git's usage line and exits 129; an unresolvable name
-//! or a non-blob object is a fatal error and exits 128.
+//! argument count) prints git's usage line and exits 129, on stdout for a lone
+//! `-h` and on stderr otherwise; an unresolvable name or a non-blob object is a
+//! fatal error and exits 128.
 //!
 //! The six `X` characters are random by construction, so the printed name
 //! differs from stock git run-for-run; the format, file mode, location, exit
@@ -47,7 +48,8 @@ const MAX_ATTEMPTS: u32 = 238_328;
 ///
 /// Exit codes match stock git: 0 on success, 129 for the usage error (no
 /// argument, more than one argument, or `-h`), 128 for a name that does not
-/// resolve or an object that is not a blob.
+/// resolve or an object that is not a blob. A lone `-h` writes the usage line
+/// to stdout; the other 129 paths write it to stderr.
 pub fn unpack_file(args: &[String]) -> Result<ExitCode> {
     // Dispatch passes the subcommand itself at index 0.
     let args = match args.first() {
@@ -57,7 +59,22 @@ pub fn unpack_file(args: &[String]) -> Result<ExitCode> {
 
     // git checks `argc != 2 || !strcmp(argv[1], "-h")` before anything else, so
     // even `--foo` is treated as an object name rather than an unknown option.
-    if args.len() != 1 || args[0] == "-h" {
+    //
+    // Both arms exit 129 but they use different streams. A lone `-h` is
+    // intercepted by git.c as an explicit help request and printed to stdout;
+    // every other usage error reaches the builtin's own `usage()`, which writes
+    // to stderr. Verified against git 2.55.0:
+    //
+    //   git unpack-file -h          -> stdout, 129
+    //   git unpack-file             -> stderr, 129
+    //   git unpack-file -h extra    -> stderr, 129
+    //   git unpack-file -- <blob>   -> stderr, 129
+    let help_requested = args.len() == 1 && args[0] == "-h";
+    if help_requested {
+        println!("{USAGE}");
+        return Ok(ExitCode::from(129));
+    }
+    if args.len() != 1 {
         eprintln!("{USAGE}");
         return Ok(ExitCode::from(129));
     }
@@ -65,11 +82,33 @@ pub fn unpack_file(args: &[String]) -> Result<ExitCode> {
 
     let repo = gix::discover(".")?;
 
-    let Ok(id) = repo.rev_parse_single(spec) else {
-        eprintln!("fatal: Not a valid object name {spec}");
-        return Ok(ExitCode::from(128));
+    // git's `get_oid` takes a *full-length* hex string verbatim and never checks
+    // that the object exists, so a well-formed but bogus id survives resolution
+    // and fails later at the blob read. gix's `rev_parse_single` looks the object
+    // up instead, so full-length hex is decoded directly to preserve git's
+    // diagnostic. Abbreviated hex still has to resolve, in both implementations.
+    // Verified against git 2.55.0:
+    //
+    //   git unpack-file deadbeef…deadbeef  -> fatal: unable to read blob object deadbeef…
+    //   git unpack-file deadbeef           -> fatal: Not a valid object name deadbeef
+    //
+    // Uppercase input is accepted and echoed back lowercased, hence the fold.
+    let full_hex = spec.len() == repo.object_hash().len_in_hex()
+        && spec.bytes().all(|b| b.is_ascii_hexdigit());
+    let direct = full_hex
+        .then(|| ObjectId::from_hex(spec.to_ascii_lowercase().as_bytes()).ok())
+        .flatten();
+
+    let oid: ObjectId = match direct {
+        Some(oid) => oid,
+        None => {
+            let Ok(id) = repo.rev_parse_single(spec) else {
+                eprintln!("fatal: Not a valid object name {spec}");
+                return Ok(ExitCode::from(128));
+            };
+            id.detach()
+        }
     };
-    let oid: ObjectId = id.detach();
 
     // The object must be a blob, and the diagnostic names the resolved id — not
     // the spec the user typed.

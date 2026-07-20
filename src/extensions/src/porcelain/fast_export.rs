@@ -4,7 +4,10 @@
 //! stock git's `rev-list --topo-order --reverse`, produced by
 //! `gix_traverse::commit::topo` (a port of git's `sort_in_topological_order`);
 //! the per-commit ref label is git's `--source` decoration, propagated over a
-//! commit-date-ordered walk exactly as `add_parents_to_list` does it. The
+//! commit-date-ordered walk exactly as `add_parents_to_list` does it. Both of
+//! those break ties by the order `revs->pending` was filled in, so that order is
+//! preserved rather than sorted, and the topo seed is reversed to stand in for
+//! the `prio_queue_reverse` gix's queue does not do. The
 //! tree-vs-tree walk is implemented here rather than through
 //! `gix::Repository::diff_tree_to_tree` so the change order matches git's
 //! recursive `diff_tree_oid` emission order, which the stream's `M`/`D` line
@@ -476,13 +479,6 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         bail!("--refspec is not supported");
     }
 
-    // `--reflog` contributes tips with no name at all; git prints an empty
-    // refname for commits it reaches only that way.
-    let mut tips: Vec<ObjectId> = sel.tips.clone();
-    if use_reflog {
-        collect_reflog_tips(&repo, &mut tips)?;
-    }
-
     // ---- Ref bookkeeping, mirroring `get_tags_and_duplicates`. ----
     // `sources` is git's `--source` decoration: the ref name a commit is printed
     // under. The first cmdline ref reaching a commit wins; later ones become
@@ -494,6 +490,12 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     // updated eventually, whether through a commit or manually at the end".
     let mut commit_refs: Vec<(BString, ObjectId)> = Vec::new();
     let mut tag_refs: Vec<(BString, ObjectId)> = Vec::new();
+
+    // `revs->pending`, in the order `setup_revisions` filled it. The order is
+    // load-bearing twice over, so it is kept rather than sorted: `--source` hands
+    // a shared ancestor the name of the *first* pending tip to reach it, and
+    // `sort_in_topological_order` seeds its queue from this same list.
+    let mut tips: Vec<ObjectId> = Vec::new();
 
     for (name, target) in &cmdline {
         let object = repo.find_object(*target)?;
@@ -510,8 +512,27 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         sources.entry(commit_id).or_insert_with(|| name.clone());
         tips.push(commit_id);
     }
-    tips.sort();
-    tips.dedup();
+    // Positional revisions that named no ref (a raw commit id) still contribute
+    // history, behind the refs `--all` and friends put in front of them.
+    tips.extend(sel.tips.iter().copied());
+
+    // `--reflog` contributes tips with no name at all: git adds every object a
+    // reflog mentions to the pending list under an empty name, so a commit
+    // reached that way prints under an empty refname instead of inheriting a
+    // branch's. Claiming the source here rather than leaving the entry vacant is
+    // what stops the propagation walk below from labelling it.
+    if use_reflog {
+        let mut reflog_tips: Vec<ObjectId> = Vec::new();
+        collect_reflog_tips(&repo, &mut reflog_tips)?;
+        for id in &reflog_tips {
+            sources.entry(*id).or_default();
+        }
+        tips.extend(reflog_tips);
+    }
+
+    // git dedupes pending objects through the `SEEN` flag: the first mention of
+    // an object wins and the order of the rest is left alone.
+    dedup_first_wins(&mut tips);
 
     let hidden = sel.hidden.clone();
 
@@ -542,9 +563,21 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     // ---- Emission order: `rev-list [--topo-order|--date-order] --reverse`. ----
     let mut order_list: Vec<gix::traverse::commit::Info> = Vec::new();
     if !tips.is_empty() {
+        // git seeds `sort_in_topological_order` from the pending list and then
+        // calls `prio_queue_reverse` on it, so that tips sharing a commit date
+        // come back out in pending order. gix's topo queue keeps the seed order
+        // and pops from the back without that reversal, so the reversal is
+        // applied to the seed instead. Only ties are affected: once the commit
+        // dates differ the queue's own sort decides and the seed order stops
+        // mattering. `--date-order` uses a comparison queue, which git leaves
+        // un-reversed.
+        let seed: Vec<ObjectId> = match order {
+            Order::Topo => tips.iter().rev().copied().collect(),
+            Order::Date => tips.clone(),
+        };
         let topo = gix::traverse::commit::topo::Builder::from_iters(
             &repo.objects,
-            tips.clone(),
+            seed,
             Some(hidden.clone()),
         )
         .sorting(match order {
@@ -615,9 +648,14 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         st.out.extend_from_slice(b"reset ");
         st.out.extend_from_slice(&printed);
         match mark {
-            Some(mark) => st
-                .out
-                .extend_from_slice(format!("\nfrom :{mark}\n\n").as_bytes()),
+            Some(mark) => {
+                st.out
+                    .extend_from_slice(format!("\nfrom :{mark}\n\n").as_bytes());
+                // `handle_tags_and_duplicates` counts a re-pointed ref as an
+                // exported object; the null-oid arm below `continue`s past the
+                // same `show_progress()` call, so only this one ticks.
+                st.tick(&opts);
+            }
             // The commit was excluded from this export; git points the ref at the
             // null oid, which fast-import reads as "delete this branch".
             None => st
@@ -710,6 +748,16 @@ fn add_rev_token(
         add_positive(repo, tok, id, sel);
     }
     Ok(())
+}
+
+/// Drop repeated ids, keeping the first occurrence and the surrounding order.
+///
+/// git gets this from the `SEEN` flag it sets while draining `revs->pending`:
+/// the first mention of an object is the one that counts, and the pending order
+/// the tie-breaks depend on survives.
+fn dedup_first_wins(ids: &mut Vec<ObjectId>) {
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(*id));
 }
 
 /// An omitted range endpoint means `HEAD`, as in `..main` or `main..`.

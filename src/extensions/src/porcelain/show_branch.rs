@@ -24,19 +24,24 @@ use gix::prelude::ObjectIdExt;
 ///   * `--more[=<n>]`, `--list`, `--independent`, `--merge-base`
 ///   * `--topo-order`, `--date-order`, `--sparse`, `--topics`
 ///   * `--no-name`, `--sha1-name`
+///   * `-g`/`--reflog[=<n>[,<base>]]`, including `dwim_ref` name expansion,
+///     `read_ref_at`'s reflog-by-index lookup rebuilt over `gix_ref`'s reflog
+///     iterator, and a port of `show_date_relative`
 ///   * `--color[=<when>]`, `--no-color` (`column_colors_ansi`, with
 ///     `color.showbranch`/`color.ui` honoured and `auto` resolved against
 ///     `isatty(1)` and `TERM`)
+///   * the `--no-*` negations `parse_options` synthesizes for every `OPT_BOOL`
 ///   * the multi-valued `showbranch.default` config, used when no argument is given
 ///
-/// Not covered, rejected with a precise message rather than wrong output:
-///   * `-g`/`--reflog` — needs `read_ref_at` reflog-by-index lookup plus git's
-///     relative-date renderer, neither of which the vendored `gix-ref` exposes
-///   * `--no-*` negations and unique-prefix abbreviations of long options
+/// Not covered: unique-prefix abbreviations of long options.
 ///
-/// Known deviation: commits carrying an `encoding` header are not run through
-/// `logmsg_reencode` (no iconv substrate here), so their subject is emitted
-/// verbatim rather than transcoded to the log output encoding.
+/// Known deviations:
+///   * commits carrying an `encoding` header are not run through
+///     `logmsg_reencode` (no iconv substrate here), so their subject is emitted
+///     verbatim rather than transcoded to the log output encoding
+///   * a non-numeric `<base>` in `--reflog=<n>,<base>` is resolved with
+///     `gix_date`'s parser rather than git's `approxidate`, which accepts a
+///     wider set of fuzzy spellings
 pub fn show_branch(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
@@ -54,17 +59,41 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
     }
 
     let mut opts = Opts::new();
-    let revs = parse_args(&argv, &mut opts)?;
+    let revs = match parse_args(&argv, &mut opts) {
+        Ok(revs) => revs,
+        Err(fail) => {
+            if let Some(msg) = fail {
+                eprintln!("{msg}");
+            }
+            eprint!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+    };
 
     if opts.all_heads {
         opts.all_remotes = true;
     }
-    if opts.extra != 0 && (opts.independent || opts.merge_base) {
-        eprintln!(
-            "usage: git show-branch [-a | --all] [-r | --remotes] [--topo-order | --date-order]"
-        );
-        return Ok(ExitCode::from(129));
+    if opts.extra != 0 || opts.reflog != 0 {
+        // "Listing" mode is incompatible with the independent and merge-base modes.
+        if opts.independent || opts.merge_base {
+            eprint!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+        // `--more` in reflog mode makes no sense (`--list` is fine), and neither
+        // does asking for every head at once.
+        if opts.reflog != 0 && (opts.extra > 0 || opts.all_heads || opts.all_remotes) {
+            eprintln!(
+                "fatal: options '--reflog' and \
+                 '--all/--remotes/--independent/--merge-base' cannot be used together"
+            );
+            return Ok(ExitCode::from(128));
+        }
     }
+    if opts.with_current_branch && opts.reflog != 0 {
+        eprintln!("fatal: options '--reflog' and '--current' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
+
     // With no positional revs (one is allowed under --topics), default to all heads.
     if revs.len() <= usize::from(opts.topics) && !opts.all_heads && !opts.all_remotes {
         opts.all_heads = true;
@@ -74,11 +103,36 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
 
     // ---- collect the ref names to show, in git's order ----
     let mut names: Vec<String> = Vec::new();
-    for rev in &revs {
-        append_one_rev(&repo, rev, &mut names)?;
-    }
-    if opts.all_heads || opts.all_remotes {
-        snarf_refs(&repo, opts.all_heads, opts.all_remotes, &mut names);
+    // Reflog mode resolves each `<ref>@{n}` to an object up front; the ordinary
+    // path leaves resolution to the `repo_get_oid(ref_name[i])` loop below.
+    let mut reflog_oids: Vec<ObjectId> = Vec::new();
+    let mut reflog_msgs: Vec<String> = Vec::new();
+
+    if opts.reflog != 0 {
+        match collect_reflog(
+            &repo,
+            &revs,
+            &opts,
+            &mut names,
+            &mut reflog_oids,
+            &mut reflog_msgs,
+        ) {
+            Ok(()) => {}
+            Err(fatal) => {
+                eprintln!("fatal: {fatal}");
+                return Ok(ExitCode::from(128));
+            }
+        }
+    } else {
+        for rev in &revs {
+            if !append_one_rev(&repo, rev, &mut names)? {
+                eprintln!("fatal: bad sha1 reference {rev}");
+                return Ok(ExitCode::from(128));
+            }
+        }
+        if opts.all_heads || opts.all_remotes {
+            snarf_refs(&repo, opts.all_heads, opts.all_remotes, &mut names);
+        }
     }
 
     // `head` is what `resolve_refdup("HEAD")` yields: the full ref name for an
@@ -96,7 +150,10 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
         if let Some(h) = head_name.as_deref() {
             if !names.iter().any(|n| rev_is_head(h, n)) {
                 let short = h.strip_prefix("refs/heads/").unwrap_or(h).to_string();
-                append_one_rev(&repo, &short, &mut names)?;
+                if !append_one_rev(&repo, &short, &mut names)? {
+                    eprintln!("fatal: bad sha1 reference {short}");
+                    return Ok(ExitCode::from(128));
+                }
             }
         }
     }
@@ -113,7 +170,11 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
     let mut rev_ids: Vec<ObjectId> = Vec::with_capacity(names.len());
 
     for (i, name) in names.iter().enumerate() {
-        let Some(id) = resolve_commit(&repo, name) else {
+        let resolved = match reflog_oids.get(i) {
+            Some(&id) => Some(id),
+            None => resolve_commit(&repo, name),
+        };
+        let Some(id) = resolved else {
             eprintln!("fatal: '{name}' is not a valid ref.");
             return Ok(ExitCode::from(128));
         };
@@ -175,7 +236,15 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
                     .as_bytes(),
                 );
             }
-            show_one_commit(&g, rev_ids[i], true, &mut out);
+            match reflog_msgs.get(i) {
+                // Reflog mode replaces the subject with `(<relative date>) <msg>`.
+                Some(msg) => {
+                    out.extend_from_slice(msg.as_bytes());
+                    out.push(b'\n');
+                }
+                // Header lines never need a name.
+                None => show_one_commit(&g, rev_ids[i], true, &mut out),
+            }
             if is_head {
                 head_at = i as i32;
             }
@@ -248,10 +317,41 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
 }
 
 /// `UNINTERESTING` and `REV_SHIFT` from `builtin/show-branch.c`; `MAX_REVS` is
-/// `FLAG_BITS - REV_SHIFT`, i.e. 28 - 2.
+/// `FLAG_BITS - REV_SHIFT`, i.e. 29 - 2.
 const UNINTERESTING: u32 = 1;
 const REV_SHIFT: u32 = 2;
-const MAX_REVS: usize = 26;
+const MAX_REVS: usize = 27;
+/// `DEFAULT_REFLOG` — how many entries a bare `-g`/`--reflog` asks for.
+const DEFAULT_REFLOG: i32 = 4;
+
+/// `show_branch_usage` plus the option list `usage_with_options` renders under it.
+const USAGE: &str = "\
+usage: git show-branch [-a | --all] [-r | --remotes] [--topo-order | --date-order]
+                       [--current] [--color[=<when>] | --no-color] [--sparse]
+                       [--more=<n> | --list | --independent | --merge-base]
+                       [--no-name | --sha1-name] [--topics]
+                       [(<rev> | <glob>)...]
+   or: git show-branch (-g | --reflog)[=<n>[,<base>]] [--list] [<ref>]
+
+    -a, --[no-]all        show remote-tracking and local branches
+    -r, --[no-]remotes    show remote-tracking branches
+    --[no-]color[=<when>] color '*!+-' corresponding to the branch
+    --[no-]more[=<n>]     show <n> more commits after the common ancestor
+    --[no-]list           synonym to more=-1
+    --no-name             suppress naming strings
+    --name                opposite of --no-name
+    --[no-]current        include the current branch
+    --[no-]sha1-name      name commits with their object names
+    --[no-]merge-base     show possible merge bases
+    --[no-]independent    show refs unreachable from any other ref
+    --topo-order          show commits in topological order
+    --[no-]topics         show only commits not on the first branch
+    --[no-]sparse         show merges reachable from only one tip
+    --date-order          topologically sort, maintaining date order where possible
+    -g, --reflog[=<n>[,<base>]]
+                          show <n> most recent ref-log entries starting at base
+
+";
 
 struct Opts {
     all_heads: bool,
@@ -269,6 +369,11 @@ struct Opts {
     date_order: bool,
     /// `--more=<n>`; `--list` is `--more=-1`.
     extra: i32,
+    /// How many reflog entries `-g`/`--reflog` asked for; 0 means the flag was
+    /// never given, which is what git tests for.
+    reflog: i32,
+    /// The `<base>` half of `--reflog=<n>,<base>`: an index, or a date spec.
+    reflog_base: Option<String>,
     /// `None` = unset (fall back to config), `Some(true)` = always, `Some(false)` = never.
     color: Option<bool>,
 }
@@ -287,23 +392,45 @@ impl Opts {
             dense: true,
             date_order: false,
             extra: 0,
+            reflog: 0,
+            reflog_base: None,
             color: None,
         }
     }
 }
 
-/// The flags this port implements, quoted back in every rejection message.
-const SUPPORTED: &str = "-a/--all, -r/--remotes, --current, --more[=<n>], --list, --independent, \
-                         --merge-base, --topo-order, --date-order, --sparse, --topics, --no-name, \
-                         --sha1-name, --color[=<when>], --no-color";
+/// A rejected command line: the `error:` line `parse_options` prints before the
+/// usage block, if it printed one at all.
+type ParseFail = Option<String>;
 
-/// The `-g`/`--reflog` rejection: an honest statement of the missing substrate.
-const NO_REFLOG: &str = "--reflog needs read_ref_at reflog-by-index lookup and git's \
-                         relative-date renderer, neither present in the vendored gix-ref";
+/// `OPT__COLOR`'s rejection of an unknown `<when>`.
+const BAD_COLOR: &str = "error: option `color' expects \"always\", \"auto\", or \"never\"";
+
+/// `OPTION_INTEGER`'s rejection of a non-numeric `--more` value.
+const BAD_MORE: &str =
+    "error: option `more' expects an integer value with an optional k/m/g suffix";
+
+/// `parse_reflog_param()` — `<n>[,<base>]`, with an absent or zero `<n>` meaning
+/// `DEFAULT_REFLOG`. The leading digit run is read `strtoul`-style, so anything
+/// after it must be the `,<base>` separator.
+fn parse_reflog_param(arg: &str, opts: &mut Opts) -> Result<(), ParseFail> {
+    let end = arg.find(|c: char| !c.is_ascii_digit()).unwrap_or(arg.len());
+    let n: i32 = arg[..end].parse().unwrap_or(0);
+    let rest = &arg[end..];
+    if let Some(base) = rest.strip_prefix(',') {
+        opts.reflog_base = Some(base.to_string());
+    } else if !rest.is_empty() {
+        return Err(Some(format!("error: unrecognized reflog param '{arg}'")));
+    } else {
+        opts.reflog_base = None;
+    }
+    opts.reflog = if n == 0 { DEFAULT_REFLOG } else { n };
+    Ok(())
+}
 
 /// `parse_options(..., PARSE_OPT_STOP_AT_NON_OPTION)` — option parsing stops at
 /// the first non-option word; the rest is the `<rev>`/`<glob>` list.
-fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>> {
+fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>, ParseFail> {
     let mut i = 0;
     while i < argv.len() {
         let a = argv[i].as_str();
@@ -317,48 +444,69 @@ fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>> {
         if let Some(long) = a.strip_prefix("--") {
             match long {
                 "all" => opts.all_heads = true,
+                "no-all" => opts.all_heads = false,
                 "remotes" => opts.all_remotes = true,
+                "no-remotes" => opts.all_remotes = false,
                 "current" => opts.with_current_branch = true,
+                "no-current" => opts.with_current_branch = false,
                 "merge-base" => opts.merge_base = true,
+                "no-merge-base" => opts.merge_base = false,
                 "independent" => opts.independent = true,
+                "no-independent" => opts.independent = false,
                 "no-name" => opts.no_name = true,
+                "name" => opts.no_name = false,
                 "sha1-name" => opts.sha1_name = true,
+                "no-sha1-name" => opts.sha1_name = false,
                 "topics" => opts.topics = true,
+                "no-topics" => opts.topics = false,
                 "sparse" => opts.dense = false,
+                "no-sparse" => opts.dense = true,
                 "topo-order" => opts.date_order = false,
                 "date-order" => opts.date_order = true,
                 "list" => opts.extra = -1,
+                "no-list" | "no-more" => opts.extra = 0,
                 // PARSE_OPT_OPTARG: bare `--more` means 1; only `--more=<n>` takes a value.
                 "more" => opts.extra = 1,
                 "no-color" => opts.color = Some(false),
                 "color" => opts.color = Some(true),
-                "reflog" => bail!("unsupported flag {a:?}: {NO_REFLOG} (ported: {SUPPORTED})"),
+                "reflog" => parse_reflog_param("", opts)?,
+                "no-reflog" => {
+                    opts.reflog = 0;
+                    opts.reflog_base = None;
+                }
                 _ if long.starts_with("reflog=") => {
-                    bail!("unsupported flag {a:?}: {NO_REFLOG} (ported: {SUPPORTED})")
+                    parse_reflog_param(&long["reflog=".len()..], opts)?;
                 }
                 _ if long.starts_with("more=") => {
                     let n = &long["more=".len()..];
-                    opts.extra = n
-                        .parse::<i32>()
-                        .map_err(|_| anyhow::anyhow!("invalid value {n:?} for --more"))?;
+                    opts.extra = n.parse::<i32>().map_err(|_| Some(BAD_MORE.to_string()))?;
                 }
                 _ if long.starts_with("color=") => {
                     opts.color = match &long["color=".len()..] {
                         "always" => Some(true),
                         "never" => Some(false),
                         "auto" => None,
-                        w => bail!("invalid color value {w:?}"),
+                        _ => return Err(Some(BAD_COLOR.to_string())),
                     };
                 }
-                _ => bail!("unsupported flag {a:?} (ported: {SUPPORTED})"),
+                _ => {
+                    let name = long.split('=').next().unwrap_or(long);
+                    return Err(Some(format!("error: unknown option `{name}'")));
+                }
             }
         } else {
-            for c in a[1..].chars() {
+            for (at, c) in a[1..].char_indices() {
                 match c {
                     'a' => opts.all_heads = true,
                     'r' => opts.all_remotes = true,
-                    'g' => bail!("unsupported flag \"-g\": {NO_REFLOG} (ported: {SUPPORTED})"),
-                    _ => bail!("unsupported flag \"-{c}\" (ported: {SUPPORTED})"),
+                    // PARSE_OPT_OPTARG on a short option: the value, if any, is
+                    // the rest of the cluster (`-g3`), never a separate word.
+                    'g' => {
+                        let arg = &a[1 + at + c.len_utf8()..];
+                        parse_reflog_param(arg, opts)?;
+                        break;
+                    }
+                    _ => return Err(Some(format!("error: unknown switch `{c}'"))),
                 }
             }
         }
@@ -1040,11 +1188,11 @@ fn snarf_refs(repo: &gix::Repository, heads: bool, remotes: bool, names: &mut Ve
 }
 
 /// `append_one_rev()` — a literal revision if it resolves, else a glob matched
-/// against every ref, else a fatal error.
-fn append_one_rev(repo: &gix::Repository, av: &str, names: &mut Vec<String>) -> Result<()> {
+/// against every ref. `false` means git's `die("bad sha1 reference %s")`.
+fn append_one_rev(repo: &gix::Repository, av: &str, names: &mut Vec<String>) -> Result<bool> {
     if repo.rev_parse_single(av).is_ok() {
         append_ref(repo, av, names);
-        return Ok(());
+        return Ok(true);
     }
     if av.contains(['*', '?', '[']) {
         let start = names.len();
@@ -1053,9 +1201,9 @@ fn append_one_rev(repo: &gix::Repository, av: &str, names: &mut Vec<String>) -> 
             eprintln!("error: no matching refs with {av}");
         }
         names[start..].sort_by(|a, b| version_cmp(a.as_bytes(), b.as_bytes()).cmp(&0));
-        return Ok(());
+        return Ok(true);
     }
-    bail!("bad sha1 reference {av}");
+    Ok(false)
 }
 
 /// `append_matching_ref()` — the pattern is matched against the tail of the ref
@@ -1124,6 +1272,215 @@ fn resolve_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     let id = repo.rev_parse_single(spec).ok()?;
     let object = id.object().ok()?;
     object.peel_to_commit().ok().map(|c| c.id)
+}
+
+// ---------------------------------------------------------------------------
+// reflog mode (`-g`/`--reflog`): dwim_ref + read_ref_at + show_date_relative
+// ---------------------------------------------------------------------------
+
+/// `ref_rev_parse_rules` from `refs.c`, with `{}` standing in for `%.*s`.
+const REF_REV_PARSE_RULES: [&str; 6] = [
+    "{}",
+    "refs/{}",
+    "refs/tags/{}",
+    "refs/heads/{}",
+    "refs/remotes/{}",
+    "refs/remotes/{}/HEAD",
+];
+
+/// `repo_dwim_ref()` — expand a short name through `ref_rev_parse_rules` and
+/// return the *resolved* full ref name (symrefs followed) with its object id.
+fn dwim_ref(repo: &gix::Repository, name: &str) -> Option<(String, ObjectId)> {
+    'rules: for rule in REF_REV_PARSE_RULES {
+        let full = rule.replace("{}", name);
+        let Ok(mut reference) = repo.find_reference(full.as_str()) else {
+            continue;
+        };
+        // `refs_resolve_ref_unsafe` reports the name it landed on, not the one
+        // it was handed, so a symbolic ref names its ultimate target. A dangling
+        // symref resolves to nothing and the next rule gets its turn.
+        loop {
+            let next = match reference.follow() {
+                Some(Ok(next)) => next,
+                Some(Err(_)) => continue 'rules,
+                None => break,
+            };
+            reference = next;
+        }
+        let resolved = reference.name().as_bstr().to_string();
+        let gix::refs::TargetRef::Object(id) = reference.target() else {
+            continue;
+        };
+        return Some((resolved, id.to_owned()));
+    }
+    None
+}
+
+/// Every reflog entry of `full`, newest first — the order
+/// `refs_for_each_reflog_ent_reverse` feeds `read_ref_at_ent`.
+fn reflog_entries(repo: &gix::Repository, full: &str) -> Vec<gix::refs::log::Line> {
+    let Ok(reference) = repo.find_reference(full) else {
+        return Vec::new();
+    };
+    let mut platform = reference.log_iter();
+    let mut lines: Vec<gix::refs::log::Line> = Vec::new();
+    if let Ok(Some(iter)) = platform.all() {
+        for line in iter {
+            let Ok(line) = line else { break };
+            lines.push(line.to_owned());
+        }
+    }
+    lines.reverse();
+    lines
+}
+
+/// The `<base>` of `--reflog=<n>,<base>`: an index outright, or — as git does
+/// with `approxidate` plus `read_ref_at(at_time, -1)` — the position of the
+/// newest entry no younger than the given date.
+fn reflog_base_index(base: Option<&str>, entries: &[gix::refs::log::Line]) -> i32 {
+    let Some(base) = base else { return 0 };
+    let end = base
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(base.len());
+    if end == base.len() {
+        return base.parse().unwrap_or(0);
+    }
+    let Ok(at) = gix::date::parse(base, Some(std::time::SystemTime::now())) else {
+        return 0;
+    };
+    entries
+        .iter()
+        .position(|e| e.signature.time.seconds <= at.seconds)
+        .map_or(0, |i| i as i32)
+}
+
+/// The reflog half of `cmd_show_branch`: turn `<ref>` into a run of
+/// `<ref>@{n}` pseudo-refs with their object ids and `(<date>) <msg>` captions.
+/// `Err` carries the text of git's `die()`.
+fn collect_reflog(
+    repo: &gix::Repository,
+    revs: &[String],
+    opts: &Opts,
+    names: &mut Vec<String>,
+    oids: &mut Vec<ObjectId>,
+    msgs: &mut Vec<String>,
+) -> Result<(), String> {
+    // With no argument at all git substitutes the ref HEAD resolves to.
+    let mut av: Vec<String> = revs.to_vec();
+    if av.is_empty() {
+        let head = repo.head().map_err(|e| e.to_string())?;
+        let fake = match &head.kind {
+            gix::head::Kind::Symbolic(r) => r.name.as_bstr().to_string(),
+            gix::head::Kind::Detached { .. } => "HEAD".to_string(),
+            gix::head::Kind::Unborn(_) => {
+                return Err("no branches given, and HEAD is not valid".into())
+            }
+        };
+        av.push(fake);
+    }
+    if av.len() != 1 {
+        return Err("--reflog option needs one branch name".into());
+    }
+    if opts.reflog > MAX_REVS as i32 {
+        return Err(format!("only {MAX_REVS} entries can be shown at one time."));
+    }
+    let Some((full, dwim_oid)) = dwim_ref(repo, &av[0]) else {
+        return Err(format!("no such ref {}", av[0]));
+    };
+
+    let entries = reflog_entries(repo, &full);
+    let base = reflog_base_index(opts.reflog_base.as_deref(), &entries);
+
+    for i in 0..opts.reflog {
+        let nth = base + i;
+        // `read_ref_at` only tolerates an empty log for `@{0}`, where the ref's
+        // own value is the documented fallback; past that it is fatal.
+        if entries.is_empty() {
+            if nth == 0 {
+                break;
+            }
+            return Err(format!("log for {full} is empty"));
+        }
+        let Some(entry) = usize::try_from(nth).ok().and_then(|n| entries.get(n)) else {
+            break;
+        };
+        // At `@{0}` git keeps the id `dwim_ref` produced rather than the one the
+        // log records; the two only diverge on a corrupt log.
+        let oid = if nth == 0 { dwim_oid } else { entry.new_oid };
+        // `append_ref()` drops anything that does not peel to a commit.
+        if resolve_commit(repo, &oid.to_string()).is_none() {
+            continue;
+        }
+        if names.len() >= MAX_REVS {
+            eprintln!(
+                "warning: ignoring {}@{{{nth}}}; cannot handle more than {MAX_REVS} refs",
+                av[0]
+            );
+            break;
+        }
+        // git truncates the log message at the first newline and substitutes
+        // "(none)" for an empty one.
+        let raw = entry.message.to_str_lossy();
+        let first = raw.split('\n').next().unwrap_or("");
+        let msg = if first.is_empty() { "(none)" } else { first };
+        msgs.push(format!(
+            "({}) {msg}",
+            show_date_relative(entry.signature.time.seconds)
+        ));
+        names.push(format!("{}@{{{nth}}}", av[0]));
+        oids.push(oid);
+    }
+    Ok(())
+}
+
+/// `show_date_relative()` from `date.c`, verbatim thresholds and roundings.
+fn show_date_relative(secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    if now < secs {
+        return "in the future".to_string();
+    }
+    let mut diff = now - secs;
+    if diff < 90 {
+        return ago(diff, "second");
+    }
+    diff = (diff + 30) / 60;
+    if diff < 90 {
+        return ago(diff, "minute");
+    }
+    diff = (diff + 30) / 60;
+    if diff < 36 {
+        return ago(diff, "hour");
+    }
+    // Everything below is counted in days.
+    diff = (diff + 12) / 24;
+    if diff < 14 {
+        return ago(diff, "day");
+    }
+    if diff < 70 {
+        return ago((diff + 3) / 7, "week");
+    }
+    if diff < 365 {
+        return ago((diff + 15) / 30, "month");
+    }
+    if diff < 1825 {
+        let total_months = (diff * 12 * 2 + 365) / (365 * 2);
+        let years = total_months / 12;
+        let months = total_months % 12;
+        if months != 0 {
+            let plural = if years == 1 { "" } else { "s" };
+            return format!("{years} year{plural}, {}", ago(months, "month"));
+        }
+        return ago(years, "year");
+    }
+    ago((diff + 183) / 365, "year")
+}
+
+/// The `Q_("%d <unit> ago", "%d <unit>s ago", n)` half of `show_date_relative`.
+fn ago(n: i64, unit: &str) -> String {
+    let plural = if n == 1 { "" } else { "s" };
+    format!("{n} {unit}{plural} ago")
 }
 
 /// `find_digit_prefix()` — consume a run of digits at `i`, returning its value.

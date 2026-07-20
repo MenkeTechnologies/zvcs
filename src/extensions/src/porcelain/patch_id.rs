@@ -21,8 +21,12 @@
 //! * `git log` / `format-patch` prefixes (`commit <oid>`, `From <oid>`), the bare
 //!   object-name headers of `diff-tree --stdin`, binary diffs (`GIT binary patch`
 //!   and `Binary files ... differ`), and `\ No newline at end of file` lines
-//! * `-h` — usage on stdout, exit 129; an unknown option or switch — usage on
-//!   stderr, exit 129; two different mode flags — exit 129
+//! * `parse_options` long-option spelling: an exact name, or any unambiguous
+//!   prefix of one (`--u`, `--stab`, `--verb`), with `=value` rejected as
+//!   `option `<name>' takes no value`
+//! * `-h` (alone or heading a bundle) — usage on stdout, exit 129; an unknown
+//!   option, unknown switch or ambiguous prefix — message plus usage on stderr,
+//!   exit 129; two different mode flags — the conflict message, exit 129
 //! * positional arguments and anything after `--` are ignored, because upstream's
 //!   `parse_options` collects them and `cmd_patch_id` never looks at what is left
 //!
@@ -76,7 +80,9 @@ pub fn patch_id(args: &[String]) -> Result<ExitCode> {
     let mut set_by = "";
     let mut no_more_opts = false;
 
-    for a in args.iter().skip(1) {
+    // `dispatch::run` is handed the subcommand separately, so `args` already
+    // excludes the `patch-id` verb: every element here is an argument to parse.
+    for a in args.iter() {
         let s = a.as_str();
         if no_more_opts {
             continue;
@@ -86,24 +92,38 @@ pub fn patch_id(args: &[String]) -> Result<ExitCode> {
                 no_more_opts = true;
                 continue;
             }
-            "--unstable" => (1u8, "--unstable"),
-            "--stable" => (2u8, "--stable"),
-            "--verbatim" => (3u8, "--verbatim"),
-            "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
-            }
             "--help" => anyhow::bail!(
                 "unsupported flag \"--help\" (ported: -h, --stable, --unstable, --verbatim)"
             ),
-            _ if s.starts_with("--") => {
-                eprintln!("error: unknown option `{}'", &s[2..]);
-                eprint!("{USAGE}");
-                return Ok(ExitCode::from(129));
-            }
+            _ if s.starts_with("--") => match resolve_long(&s[2..]) {
+                Long::Mode(val, name) => (val, name),
+                // `parse_options` rejects a value on a flag with the bare option
+                // name, however it was spelled, and prints no usage block.
+                Long::TakesNoValue(bare) => {
+                    eprintln!("error: option `{bare}' takes no value");
+                    return Ok(ExitCode::from(129));
+                }
+                Long::Ambiguous(a, b) => {
+                    eprintln!("error: ambiguous option: {} (could be {a} or {b})", &s[2..]);
+                    eprint!("{USAGE}");
+                    return Ok(ExitCode::from(129));
+                }
+                Long::Unknown => {
+                    eprintln!("error: unknown option `{}'", &s[2..]);
+                    eprint!("{USAGE}");
+                    return Ok(ExitCode::from(129));
+                }
+            },
             // A lone "-" is a non-option to git's parse_options, like any other.
+            // Otherwise the bundle is scanned left to right; `patch-id` registers
+            // no short option but the `-h` that `parse_options` adds itself, so the
+            // first byte decides: `h` shows the usage, anything else is unknown.
             _ if s.starts_with('-') && s.len() > 1 => {
                 let c = s[1..].chars().next().unwrap_or('?');
+                if c == 'h' {
+                    print!("{USAGE}");
+                    return Ok(ExitCode::from(129));
+                }
                 eprintln!("error: unknown switch `{c}'");
                 eprint!("{USAGE}");
                 return Ok(ExitCode::from(129));
@@ -129,6 +149,69 @@ pub fn patch_id(args: &[String]) -> Result<ExitCode> {
     let mut lines = Lines::from_stdin()?;
     generate_id_list(&mut lines, stable, verbatim, kind)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The three mode options: bare name, spelling used in messages, and the
+/// `OPT_CMDMODE` value upstream stores for it.
+static MODES: [(&str, &str, u8); 3] = [
+    ("unstable", "--unstable", 1),
+    ("stable", "--stable", 2),
+    ("verbatim", "--verbatim", 3),
+];
+
+/// What a `--…` argument resolved to.
+enum Long {
+    /// A mode flag: its `OPT_CMDMODE` value and its full spelling.
+    Mode(u8, &'static str),
+    /// A mode flag given `=value`; carries the bare name for the error.
+    TakesNoValue(&'static str),
+    /// The prefix matched several options; carries the pair upstream names.
+    Ambiguous(&'static str, &'static str),
+    Unknown,
+}
+
+/// Resolve the text after `--` the way `parse_options` does.
+///
+/// The name is the run up to the first `=`; an exact match wins, otherwise an
+/// unambiguous prefix stands for the whole option, so `--u`, `--stab` and
+/// `--verb` all work. Any `=value` is rejected afterwards, since all three flags
+/// are `OPT_CMDMODE` and take none.
+///
+/// When several options share the prefix, upstream reports the *last two* it
+/// walked past — `abbrev_option` holds the most recent match and
+/// `ambiguous_option` the one before it — so the scan keeps both rather than a
+/// count. For this option set that is only reachable with an empty name (`--=`),
+/// since the three names start with different letters.
+fn resolve_long(rest: &str) -> Long {
+    let (name, has_value) = match rest.find('=') {
+        Some(i) => (&rest[..i], true),
+        None => (rest, false),
+    };
+
+    let mut abbrev: Option<usize> = None;
+    let mut ambiguous: Option<usize> = None;
+    for (i, (bare, ..)) in MODES.iter().enumerate() {
+        if bare.starts_with(name) {
+            ambiguous = abbrev;
+            abbrev = Some(i);
+        }
+    }
+
+    let idx = match MODES.iter().position(|(bare, ..)| *bare == name) {
+        Some(exact) => exact,
+        None => match (ambiguous, abbrev) {
+            (Some(a), Some(b)) => return Long::Ambiguous(MODES[a].1, MODES[b].1),
+            (None, Some(b)) => b,
+            _ => return Long::Unknown,
+        },
+    };
+
+    let (bare, full, val) = MODES[idx];
+    if has_value {
+        Long::TakesNoValue(bare)
+    } else {
+        Long::Mode(val, full)
+    }
 }
 
 /// The `patchid.stable` / `patchid.verbatim` defaults and the hash to use.

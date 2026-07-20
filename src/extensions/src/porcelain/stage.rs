@@ -274,6 +274,47 @@ fn open_index(repo: &gix::Repository) -> Result<gix::index::File> {
     })
 }
 
+/// True for the pathspecs that mean "everything at the current prefix": `.`,
+/// `./`, `./.`. Anything carrying magic (a leading `:`) is left alone.
+fn denotes_prefix_dir(spec: &str) -> bool {
+    let trimmed = spec.trim_end_matches('/');
+    !trimmed.is_empty() && trimmed.split('/').all(|c| c == ".")
+}
+
+/// The pathspec strings to hand to gix, with `.` rewritten into a form gix can
+/// actually match.
+///
+/// gix derives one search-wide common prefix from the glob text of the patterns
+/// and then requires every candidate path to start with it
+/// (gix-pathspec/src/search/init.rs:60, search/matching.rs:41). Normalizing `.`
+/// leaves its path as the literal `"."` (gix-pathspec/src/pattern.rs:110), so the
+/// common prefix becomes `"."` and no worktree path can ever clear that check —
+/// `git stage .` then behaves as if every pathspec matched nothing. git resolves
+/// `.` to "the directory I was run in", so state that directly instead: the
+/// all-matching nil spec `:` at the top of the worktree, and an explicit
+/// directory spec below it.
+fn pathspec_patterns(repo: &gix::Repository, o: &Opts) -> Result<Vec<BString>> {
+    let prefix = repo.prefix()?.unwrap_or_else(|| std::path::Path::new(""));
+    let prefix = gix::path::to_unix_separators_on_windows(gix::path::into_bstr(prefix)).into_owned();
+
+    Ok(o.pathspecs
+        .iter()
+        .map(|s| {
+            if !denotes_prefix_dir(s) {
+                return BString::from(s.as_bytes());
+            }
+            if prefix.is_empty() {
+                return BString::from(":");
+            }
+            // `:(top)` keeps gix from prepending the prefix a second time.
+            let mut out = BString::from(":(top)");
+            out.extend_from_slice(&prefix);
+            out.push(b'/');
+            out
+        })
+        .collect())
+}
+
 /// A pathspec that carries `:(exclude)`/`:!` magic never has to match anything,
 /// so it is exempt from the "did not match any files" check.
 fn is_exclude_spec(spec: &str) -> bool {
@@ -354,7 +395,7 @@ fn unmatched_pathspec_exit(
 /// a header plus one `M`/`D` line per still-unstaged path on stdout.
 fn refresh(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let index = open_index(repo)?;
-    let patterns: Vec<BString> = o.pathspecs.iter().map(|s| BString::from(s.as_bytes())).collect();
+    let patterns = pathspec_patterns(repo, o)?;
 
     let mut ps = repo.pathspec(
         true,
@@ -505,7 +546,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             .collect()
     };
 
-    let patterns: Vec<BString> = o.pathspecs.iter().map(|s| BString::from(s.as_bytes())).collect();
+    let patterns = pathspec_patterns(repo, o)?;
 
     // --- directory walk over the worktree, filtered by the pathspecs --------
     // Ignored entries are emitted too so a path that is both tracked and

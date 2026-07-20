@@ -58,7 +58,29 @@
 //!      packs and then removes the loose objects they cover. `gix-odb`'s loose
 //!      store exposes no removal API at all.
 //!   6. **`update-server-info`.** Absent `-n`, `repack` refreshes
-//!      `objects/info/packs`; nothing in the vendored crates writes that file.
+//!      `objects/info/packs`; nothing in the vendored crates writes that file
+//!      (`objects/info`, `info/packs` and `server_info` have no occurrence under
+//!      `gix-odb/src`, `gix-pack/src` or `gix/src`).
+//!   7. **Object filtering.** `--filter=blob:none` / `tree:0` / `blob:limit=<n>`
+//!      make git omit matching objects from the generated pack.
+//!      `gix-pack`'s counting stage offers only `ObjectExpansion::{AsIs,
+//!      TreeContents, TreeAdditionsComparedToAncestor}`
+//!      (`gix-pack/src/data/output/count/objects/types.rs:37`) — there is no
+//!      filter hook, so the pack would silently contain the filtered-out objects.
+//!   8. **`--max-pack-size`.** git splits its output across several packs at that
+//!      bound. Neither `max_pack_size`, `split` nor `size_limit` occurs anywhere
+//!      under `gix-pack/src/data/output/`; the writer emits exactly one pack.
+//!   9. **`--geometric`.** Selecting the subset of existing packs that restores a
+//!      geometric size progression requires a rollup over the pack list that has
+//!      no counterpart in `gix-pack`.
+//!
+//! Points 7-9 are why this module does not ship a base-object-only "best effort"
+//! repack even though `gix-pack` can technically write such a pack: for the
+//! filtering, size-splitting and geometric flags, the pack it would write is not
+//! a degraded version of git's — it is the wrong set of objects, wrongly grouped.
+//! Since `repack` prints nothing and exits 0, that divergence is invisible at the
+//! stdout/exit-code level and is only detectable by inspecting the packs
+//! themselves.
 //!
 //! Smaller, deliberate gaps in the covered part, so this doc claims no more
 //! than the code does:

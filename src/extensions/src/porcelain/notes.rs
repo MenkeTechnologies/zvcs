@@ -27,7 +27,14 @@ use gix::refs::Target;
 ///   * `copy [-f] <from> [<to>]`        — non-`--stdin` form
 ///   * `show [<object>]`                — the note text verbatim
 ///   * `remove [--ignore-missing] [<object>...]`
+///   * `prune [-n] [-v]`                — drop notes whose object is gone
 ///   * `get-ref`
+///
+/// Top-level parsing mirrors git's `parse_options()`: `--ref`/`--no-ref` (and
+/// any unambiguous prefix of either) are the only options, `--` ends option
+/// parsing *and* subcommand recognition, `-h` prints the usage block on stdout,
+/// and every unknown option, missing option value or unknown subcommand exits
+/// 129 with the usage block on stderr.
 ///
 /// Supported options: `--ref=<ref>` (before the subcommand, as git requires),
 /// `-f`/`--force`, `-m`/`--message`, `-F`/`--file` (incl. `-` for stdin),
@@ -38,33 +45,80 @@ use gix::refs::Target;
 /// Not ported, and rejected with a precise message rather than guessed at:
 /// every editor-driven path (`edit`, a bare `add`/`append` with no message,
 /// `-e`, `-c`/`--reedit-message`), `merge` (needs the notes-merge worktree and
-/// conflict resolvers), `prune` (needs reachability over the whole odb),
-/// `--stdin`/`--for-rewrite` batch input, and `-n`/`-v`/`-q`/`-s`.
+/// conflict resolvers), and `--stdin`/`--for-rewrite` batch input.
 pub fn notes(args: &[String]) -> Result<ExitCode> {
-    // `--ref` is a top-level option: git's parser stops at the first
-    // non-option, so it is only accepted ahead of the subcommand.
-    let rest: &[String] = args.get(1..).unwrap_or_default();
+    // `dispatch::run` hands us the arguments after the `notes` verb, so `args`
+    // starts at the first top-level option.
     let mut override_ref: Option<String> = None;
     let mut i = 0;
-    while i < rest.len() {
-        let a = rest[i].as_str();
-        if a == "--ref" {
+    // git registers the subcommands as options, so a `--` both ends option
+    // parsing and disables subcommand recognition for what follows.
+    let mut dashdash = false;
+
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            dashdash = true;
             i += 1;
-            override_ref = Some(
-                rest.get(i)
-                    .ok_or_else(|| anyhow!("option `--ref` requires a value"))?
-                    .clone(),
-            );
-        } else if let Some(v) = a.strip_prefix("--ref=") {
-            override_ref = Some(v.to_string());
-        } else {
             break;
+        }
+        if a == "-h" {
+            print_usage(&mut std::io::stdout())?;
+            return Ok(ExitCode::from(129));
+        }
+        // A lone `-` is a non-option, and so is anything not starting with `-`.
+        if !a.starts_with('-') || a == "-" {
+            break;
+        }
+
+        let Some(body) = a.strip_prefix("--") else {
+            // No short option exists at this level, so the first character
+            // after the dash is always the one git names.
+            let switch = a[1..].chars().next().unwrap_or(' ');
+            return top_usage(&format!("unknown switch `{switch}'"));
+        };
+        let (name, value) = match body.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (body, None),
+        };
+
+        // git's parse-options accepts any unambiguous prefix of a long name,
+        // and `--ref` is the only one here, negation included.
+        if is_prefix_of(name, "ref") {
+            override_ref = Some(match value {
+                Some(v) => v.to_string(),
+                None => {
+                    i += 1;
+                    match args.get(i) {
+                        Some(v) => v.clone(),
+                        None => return top_usage("option `ref' requires a value"),
+                    }
+                }
+            });
+        } else if name
+            .strip_prefix("no-")
+            .is_some_and(|n| is_prefix_of(n, "ref"))
+        {
+            if value.is_some() {
+                return top_usage("option `no-ref' takes no value");
+            }
+            // `--no-ref` clears the override, falling back to git's own
+            // environment/config precedence rather than pinning a ref.
+            override_ref = None;
+        } else {
+            return top_usage(&format!("unknown option `{body}'"));
         }
         i += 1;
     }
 
-    let sub = rest.get(i).map(String::as_str).unwrap_or("list");
-    let sub_args: &[String] = if i < rest.len() { &rest[i + 1..] } else { &[] };
+    let sub = match args.get(i) {
+        // After `--` nothing is a subcommand any more, so a name that would
+        // otherwise dispatch is reported as unknown instead.
+        Some(s) if dashdash => return top_usage(&format!("unknown subcommand: `{s}'")),
+        Some(s) => s.as_str(),
+        None => "list",
+    };
+    let sub_args: &[String] = if i < args.len() { &args[i + 1..] } else { &[] };
 
     let repo = gix::discover(".")?;
     let notes_ref = resolve_notes_ref(&repo, override_ref.as_deref());
@@ -83,15 +137,53 @@ pub fn notes(args: &[String]) -> Result<ExitCode> {
         "append" => append(&repo, &notes_ref, sub_args),
         "copy" => copy(&repo, &notes_ref, sub_args),
         "remove" => remove(&repo, &notes_ref, sub_args),
+        "prune" => prune(&repo, &notes_ref, sub_args),
         "edit" => bail!("`edit` is not supported (it requires an interactive editor)"),
         "merge" => bail!("`merge` is not supported (it requires the notes-merge worktree)"),
-        "prune" => bail!("`prune` is not supported (it requires odb-wide reachability)"),
-        _ => {
-            eprintln!("error: unknown subcommand: `{sub}'");
-            eprintln!("usage: git notes [--ref <notes-ref>] [list [<object>]]");
-            Ok(ExitCode::from(129))
-        }
+        _ => top_usage(&format!("unknown subcommand: `{sub}'")),
     }
+}
+
+/// True when `s` is a non-empty prefix of `full` — git's long-option prefix
+/// matching, which is unambiguous here because `--ref` is the only long option.
+fn is_prefix_of(s: &str, full: &str) -> bool {
+    !s.is_empty() && full.starts_with(s)
+}
+
+/// `git_notes_usage[]` plus the one top-level option, as
+/// `usage_with_options()` lays it out.
+const NOTES_USAGE: &[&str] = &[
+    "git notes [--ref <notes-ref>] [list [<object>]]",
+    "git notes [--ref <notes-ref>] add [-f] [--allow-empty] [--[no-]separator|--separator=<paragraph-break>] [--[no-]stripspace] [-m <msg> | -F <file> | (-c | -C) <object>] [<object>] [-e]",
+    "git notes [--ref <notes-ref>] copy [-f] <from-object> <to-object>",
+    "git notes [--ref <notes-ref>] append [--allow-empty] [--[no-]separator|--separator=<paragraph-break>] [--[no-]stripspace] [-m <msg> | -F <file> | (-c | -C) <object>] [<object>] [-e]",
+    "git notes [--ref <notes-ref>] edit [--allow-empty] [<object>]",
+    "git notes [--ref <notes-ref>] show [<object>]",
+    "git notes [--ref <notes-ref>] merge [-v | -q] [-s <strategy>] <notes-ref>",
+    "git notes merge --commit [-v | -q]",
+    "git notes merge --abort [-v | -q]",
+    "git notes [--ref <notes-ref>] remove [<object>...]",
+    "git notes [--ref <notes-ref>] prune [-n] [-v]",
+    "git notes [--ref <notes-ref>] get-ref",
+];
+
+fn print_usage(out: &mut impl std::io::Write) -> Result<()> {
+    for (n, l) in NOTES_USAGE.iter().enumerate() {
+        writeln!(out, "{} {l}", if n == 0 { "usage:" } else { "   or:" })?;
+    }
+    writeln!(out)?;
+    writeln!(out, "    --[no-]ref <notes-ref>")?;
+    writeln!(out, "                          use notes from <notes-ref>")?;
+    writeln!(out)?;
+    Ok(())
+}
+
+/// A top-level usage error: `error:` then the whole usage block on stderr,
+/// exit 129.
+fn top_usage(msg: &str) -> Result<ExitCode> {
+    eprintln!("error: {msg}");
+    print_usage(&mut std::io::stderr())?;
+    Ok(ExitCode::from(129))
 }
 
 // ---------------------------------------------------------------------------
@@ -145,9 +237,15 @@ struct Notes {
 
 /// Read the notes ref and load the tree it points at (empty when unborn).
 fn load(repo: &gix::Repository, notes_ref: &str) -> Result<(Notes, Option<ObjectId>)> {
-    let tip = match repo.try_find_reference(notes_ref)? {
-        Some(r) => Some(r.into_fully_peeled_id()?.detach()),
-        None => None,
+    let tip = match repo.try_find_reference(notes_ref) {
+        Ok(Some(r)) => Some(r.into_fully_peeled_id()?.detach()),
+        Ok(None) => None,
+        // A notes ref that is not even a valid name — `--ref=` expands to the
+        // bare `refs/notes/` — reads as absent, the way git's `read_ref()` does.
+        Err(gix::reference::find::Error::Find(
+            gix::refs::file::find::Error::RefnameValidation(_),
+        )) => None,
+        Err(e) => return Err(e.into()),
     };
     let mut notes = Notes {
         map: BTreeMap::new(),
@@ -901,6 +999,74 @@ fn copy(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exit
         parent,
         "Notes added by 'git notes copy'",
     )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `builtin/notes.c:prune()` — drop every note whose annotated object is no
+/// longer in the object database. `notes.c:prune_notes()` reports each pruned
+/// object on stdout when verbose, and `-n` implies verbose because git ORs
+/// `NOTES_PRUNE_VERBOSE` into the dry-run flags.
+fn prune(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<ExitCode> {
+    let mut dry_run = false;
+    let mut verbose = false;
+    let mut literal = false;
+    for a in args {
+        if literal {
+            return usage(&["git notes prune [<options>]"], "too many arguments");
+        }
+        match a.as_str() {
+            // `--` ends option parsing; prune takes no positional, so anything
+            // after it is one argument too many.
+            "--" => literal = true,
+            "-n" | "--dry-run" => dry_run = true,
+            "-v" | "--verbose" => verbose = true,
+            s if s.starts_with("--") => {
+                return usage(
+                    &["git notes prune [<options>]"],
+                    &format!("unknown option `{}'", &s[2..]),
+                )
+            }
+            s if s.starts_with('-') && s != "-" => {
+                let switch = s[1..].chars().next().unwrap_or(' ');
+                return usage(
+                    &["git notes prune [<options>]"],
+                    &format!("unknown switch `{switch}'"),
+                );
+            }
+            _ => return usage(&["git notes prune [<options>]"], "too many arguments"),
+        }
+    }
+    if let Some(code) = check_writable(notes_ref, "prune")? {
+        return Ok(code);
+    }
+
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let (mut notes, parent) = load(repo, notes_ref)?;
+
+    let dead: Vec<ObjectId> = notes
+        .map
+        .keys()
+        .filter(|id| !repo.has_object(**id))
+        .copied()
+        .collect();
+    for id in &dead {
+        if verbose || dry_run {
+            println!("{id}");
+        }
+        if !dry_run {
+            notes.map.remove(id);
+        }
+    }
+
+    if !dry_run && !dead.is_empty() {
+        commit_notes(
+            repo,
+            notes_ref,
+            &notes,
+            parent,
+            "Notes removed by 'git notes prune'",
+        )?;
+    }
     Ok(ExitCode::SUCCESS)
 }
 

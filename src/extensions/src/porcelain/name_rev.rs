@@ -8,25 +8,37 @@
 //! stock git for the covered forms.
 //!
 //! Covered: `<commit-ish>...`, `--tags`, `--refs=<pattern>`, `--exclude=<pattern>`,
-//! `--no-refs`, `--no-exclude`, `--name-only`, `--annotate-stdin` (and the
-//! deprecated `--stdin`), `--undefined`/`--no-undefined`, `--always`, plus the
-//! "Skipping." / `undefined` / `fatal: cannot describe` failure paths and their
-//! exit codes (0 / 0 / 128).
+//! `--no-refs`, `--no-exclude`, `--name-only`, `--all`, `--peel-tag`,
+//! `--annotate-stdin` (and the deprecated `--stdin`), `--undefined`/
+//! `--no-undefined`, `--always`, `-h`, plus the "Skipping." / `undefined` /
+//! `fatal: cannot describe` failure paths and their exit codes (0 / 0 / 128) and
+//! the usage errors (129).
 //!
-//! Not covered, and rejected rather than approximated:
-//!   * `--all` — git emits one line per commit in the order of its *internal
-//!     parsed-object hash table* (`get_indexed_object`), whose layout depends on
-//!     which trees/tags/commits git happened to parse and on the table's growth
-//!     history. gitoxide has no such structure, so the line order cannot be
-//!     reproduced; any ordering we invented would silently differ.
-//!   * `--peel-tag` — an undocumented internal flag with no stable contract.
+//! `--all` prints one line per commit in the order of git's *parsed-object hash
+//! table* (`builtin/name-rev.c`'s `get_indexed_object` loop). That table is not
+//! an implementation detail we can ignore: it is the output order. It is however
+//! fully determined by the objects git parses and the order it parses them in,
+//! so `Pool` below reproduces `object.c` exactly — `hash_obj` (the first four
+//! bytes of the object id read as a native `unsigned int`, masked), the linear
+//! probe, the move-to-home-slot swap in `lookup_object`, the `size - 1 <= nr * 2`
+//! growth rule and its rehash — and the naming pass drives it through the same
+//! `parse_object` / `repo_parse_commit` call sequence git uses. The pool doubles
+//! as the commit cache, so each object is still read at most once.
 //!
-//! Known deviation: git prefers commit-graph generation numbers over commit
-//! dates when deciding the traversal cutoff. gitoxide's walk here is date-based
-//! only, so in a repository with a commit-graph *and* badly skewed commit dates
-//! the pruned set can differ. Without a commit-graph the two are identical.
+//! The commit-graph changes that table: `repo_parse_commit` served from the
+//! graph never allocates the commit's tree object, which moves every later slot,
+//! so `Pool::parse_commit` skips the tree for exactly the commits the graph
+//! covers. Known deviation: git also prefers commit-graph generation numbers
+//! over commit dates when deciding the traversal cutoff, whereas the walk here
+//! is date-based only, so a repository with a commit-graph *and* badly skewed
+//! commit dates can prune a different set.
+//!
+//! One further tie-break is git's and not reproducible in principle: `name_tips`
+//! orders the tip table with `QSORT`, which is unstable, so tips with the same
+//! `from_tag` and the same tagger date are visited in an order libc chooses. The
+//! stable sort used here is one of the orders git may pick.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufWriter, Write};
 use std::process::ExitCode;
@@ -71,6 +83,7 @@ usage: git name-rev [<options>] <commit>...
     --[no-]annotate-stdin annotate text from stdin
     --[no-]undefined      allow to print `undefined` names (default)
     --[no-]always         show abbreviated commit object as fallback
+
 ";
 
 /// git's `struct rev_name`: the best name found so far for one commit.
@@ -91,18 +104,268 @@ struct Tip {
     oid: ObjectId,
     /// The ref name as git prints it (`master`, `tags/v1`, `remotes/origin/x`).
     refname: String,
-    /// The commit the ref peels to, if any; tips without one never name anything.
-    commit: Option<ObjectId>,
+    /// Pool slot of the commit the ref peels to, if any; tips without one never
+    /// name anything.
+    commit: Option<usize>,
     taggerdate: i64,
     from_tag: bool,
     /// Whether an annotated tag was dereferenced to reach `commit` (adds `^0`).
     deref: bool,
 }
 
-/// Decoded commit facts, cached so each object is read at most once.
-struct CommitInfo {
+/// git's `struct object`, plus the decoded facts of the kinds we parse.
+struct Obj {
+    oid: ObjectId,
+    kind: Kind,
+    parsed: bool,
+    /// Committer date for a commit, tagger date for a tag, `0` otherwise.
     date: i64,
-    parents: Vec<ObjectId>,
+    /// Pool slots of the parents, in order (commits only).
+    parents: Vec<usize>,
+    /// Pool slot of the tagged object (tags only).
+    tagged: Option<usize>,
+}
+
+/// git's `struct parsed_object_pool`: the open-addressed object hash table from
+/// `object.c`, whose slot order *is* the `--all` output order.
+struct Pool {
+    /// Every object created, in creation order. Slots hold indices into this.
+    objs: Vec<Obj>,
+    /// The hash table itself; length is always a power of two, or zero.
+    slots: Vec<Option<usize>>,
+    /// git's `nr_objs`, kept signed to mirror the growth comparison exactly.
+    nr: i64,
+    /// Side index for lookups that git performs on a pointer it already holds,
+    /// so they cannot perturb `slots` the way `lookup_object` would.
+    index: HashMap<ObjectId, usize>,
+    /// The commit-graph, when one exists and `core.commitGraph` allows it.
+    /// `repo_parse_commit` served from it never allocates the commit's tree.
+    graph: Option<gix::commitgraph::Graph>,
+}
+
+/// git's `hash_obj`: the first `sizeof(unsigned int)` bytes of the object id,
+/// read with the machine's byte order, masked to the table size.
+fn hash_obj(oid: &ObjectId, size: usize) -> usize {
+    let b = oid.as_bytes();
+    u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) as usize & (size - 1)
+}
+
+impl Pool {
+    fn new(repo: &gix::Repository) -> Self {
+        Pool {
+            objs: Vec::new(),
+            slots: Vec::new(),
+            nr: 0,
+            index: HashMap::new(),
+            graph: repo.commit_graph_if_enabled().ok().flatten(),
+        }
+    }
+
+    /// git's `lookup_object`, including the swap that moves a found object back
+    /// to its home slot — that swap reorders the table, so it must be replayed.
+    fn lookup(&mut self, oid: &ObjectId) -> Option<usize> {
+        let size = self.slots.len();
+        if size == 0 {
+            return None;
+        }
+        let first = hash_obj(oid, size);
+        let mut i = first;
+        let mut found = None;
+        while let Some(ix) = self.slots[i] {
+            if &self.objs[ix].oid == oid {
+                found = Some(ix);
+                break;
+            }
+            i += 1;
+            if i == size {
+                i = 0;
+            }
+        }
+        if found.is_some() && i != first {
+            self.slots.swap(i, first);
+        }
+        found
+    }
+
+    /// Non-mutating lookup, for the reporting paths where git already holds the
+    /// object pointer and performs no table access at all.
+    fn find(&self, oid: &ObjectId) -> Option<usize> {
+        self.index.get(oid).copied()
+    }
+
+    /// git's `grow_object_hash`: reinsert every live entry, walking the old
+    /// table in slot order, which is what makes the new layout deterministic.
+    fn grow(&mut self) {
+        let new_size = if self.slots.len() < 32 {
+            32
+        } else {
+            self.slots.len() * 2
+        };
+        let mut new_slots: Vec<Option<usize>> = vec![None; new_size];
+        for slot in &self.slots {
+            let Some(ix) = *slot else { continue };
+            let mut j = hash_obj(&self.objs[ix].oid, new_size);
+            while new_slots[j].is_some() {
+                j += 1;
+                if j >= new_size {
+                    j = 0;
+                }
+            }
+            new_slots[j] = Some(ix);
+        }
+        self.slots = new_slots;
+    }
+
+    /// git's `create_object`, growth rule included.
+    fn create(&mut self, oid: ObjectId, kind: Kind) -> usize {
+        if self.slots.len() as i64 - 1 <= self.nr * 2 {
+            self.grow();
+        }
+        let ix = self.objs.len();
+        self.objs.push(Obj {
+            oid,
+            kind,
+            parsed: false,
+            date: 0,
+            parents: Vec::new(),
+            tagged: None,
+        });
+        let size = self.slots.len();
+        let mut j = hash_obj(&oid, size);
+        while self.slots[j].is_some() {
+            j += 1;
+            if j >= size {
+                j = 0;
+            }
+        }
+        self.slots[j] = Some(ix);
+        self.nr += 1;
+        self.index.insert(oid, ix);
+        ix
+    }
+
+    /// git's `lookup_commit` / `lookup_tree` / `lookup_blob` / `lookup_tag`.
+    fn lookup_typed(&mut self, oid: ObjectId, kind: Kind) -> usize {
+        match self.lookup(&oid) {
+            Some(ix) => ix,
+            None => self.create(oid, kind),
+        }
+    }
+
+    /// git's `parse_object`, whose side effect — creating the tree and parent
+    /// objects a commit names, or the object a tag names — is what fills the
+    /// table.
+    fn parse_object(&mut self, repo: &gix::Repository, oid: ObjectId) -> Option<usize> {
+        let existing = self.lookup(&oid);
+        if let Some(ix) = existing {
+            if self.objs[ix].parsed {
+                return Some(ix);
+            }
+        }
+
+        // git streams blobs rather than reading them, and re-looks-up the result.
+        let blob_like = existing.is_none_or(|ix| self.objs[ix].kind == Kind::Blob);
+        if blob_like && matches!(repo.find_header(oid), Ok(h) if h.kind() == Kind::Blob) {
+            let ix = self.lookup_typed(oid, Kind::Blob);
+            self.objs[ix].parsed = true;
+            return self.lookup(&oid);
+        }
+
+        let object = repo.find_object(oid).ok()?;
+        let ix = self.lookup_typed(oid, object.kind);
+        match object.kind {
+            // `parse_object` never consults the commit-graph, so the tree is
+            // always created here.
+            Kind::Commit => self.parse_commit_buffer(ix, &object.data, true),
+            Kind::Tag => self.parse_tag_buffer(ix, &object.data),
+            _ => self.objs[ix].parsed = true,
+        }
+        Some(ix)
+    }
+
+    /// git's `parse_commit_buffer`: the tree object is created first, then each
+    /// parent in order. A commit that will not decode stays unparsed, exactly as
+    /// git leaves it after `error("bogus commit object")`.
+    ///
+    /// `create_tree` is false for the commit-graph path, where git's
+    /// `fill_commit_in_graph` sets the tree to NULL instead of looking it up.
+    fn parse_commit_buffer(&mut self, ix: usize, data: &[u8], create_tree: bool) {
+        if self.objs[ix].parsed {
+            return;
+        }
+        let hash = self.objs[ix].oid.kind();
+        let Ok(commit) = gix::objs::CommitRef::from_bytes(data, hash) else {
+            return;
+        };
+        let tree = commit.tree();
+        let parents: Vec<ObjectId> = commit.parents().collect();
+        let date = commit.committer().ok().map_or(0, |s| s.seconds());
+
+        if create_tree {
+            self.lookup_typed(tree, Kind::Tree);
+        }
+        let parents: Vec<usize> = parents
+            .into_iter()
+            .map(|p| self.lookup_typed(p, Kind::Commit))
+            .collect();
+
+        let obj = &mut self.objs[ix];
+        obj.parents = parents;
+        obj.date = date;
+        obj.parsed = true;
+    }
+
+    /// git's `parse_tag_buffer`: creates the tagged object with the type the tag
+    /// header claims, and records the tagger date (`0` when there is no tagger).
+    fn parse_tag_buffer(&mut self, ix: usize, data: &[u8]) {
+        if self.objs[ix].parsed {
+            return;
+        }
+        let hash = self.objs[ix].oid.kind();
+        let Ok(tag) = gix::objs::TagRef::from_bytes(data, hash) else {
+            return;
+        };
+        let date = tag.tagger().ok().flatten().map_or(0, |t| t.seconds());
+        let tagged = self.lookup_typed(tag.target(), tag.target_kind);
+
+        let obj = &mut self.objs[ix];
+        obj.tagged = Some(tagged);
+        obj.date = date;
+        obj.parsed = true;
+    }
+
+    /// git's `repo_parse_commit`: the walk holds the commit already, so no table
+    /// lookup happens — only the parse, and the objects it creates.
+    ///
+    /// Unlike `parse_object`, this path is served from the commit-graph when one
+    /// covers the commit. The parents and the date are the same either way; what
+    /// differs is that no tree object is created, which changes the table.
+    fn parse_commit(&mut self, repo: &gix::Repository, ix: usize) {
+        if self.objs[ix].parsed {
+            return;
+        }
+        let oid = self.objs[ix].oid;
+        let in_graph = self.graph.as_ref().is_some_and(|g| g.lookup(oid).is_some());
+        if let Ok(object) = repo.find_object(oid) {
+            if object.kind == Kind::Commit {
+                self.parse_commit_buffer(ix, &object.data, !in_graph);
+            }
+        }
+    }
+
+    /// git's `deref_tag`: follow the tag chain to the object it finally names.
+    fn deref_tag(&mut self, repo: &gix::Repository, start: usize) -> Option<usize> {
+        let mut current = Some(start);
+        while let Some(ix) = current {
+            if self.objs[ix].kind != Kind::Tag {
+                break;
+            }
+            let tagged = self.objs[ix].tagged?;
+            let oid = self.objs[tagged].oid;
+            current = self.parse_object(repo, oid);
+        }
+        current
+    }
 }
 
 /// `git name-rev` — see the module docs for the covered surface.
@@ -121,6 +384,7 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
     let mut annotate_stdin = false;
     let mut allow_undefined = true;
     let mut always = false;
+    let mut peel_tag = false;
     let mut revs: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -134,6 +398,11 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
         }
         match a {
             "--" => no_more_opts = true,
+            "-h" => {
+                // git's `parse_options` prints the usage on stdout and exits 129.
+                print!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
             "--name-only" => name_only = true,
             "--no-name-only" => name_only = false,
             "--tags" => tags_only = true,
@@ -158,9 +427,11 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
             "--no-exclude" => exclude_filters.clear(),
             "--refs" | "--exclude" => {
                 i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("option `{a}` requires a value"))?;
+                let Some(v) = args.get(i) else {
+                    // git's `parse_options`: the message alone, no usage block.
+                    eprintln!("error: option `{}' requires a value", &a[2..]);
+                    return Ok(ExitCode::from(129));
+                };
                 if a == "--refs" {
                     ref_filters.push(v.clone());
                 } else {
@@ -171,13 +442,23 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--exclude=") => {
                 exclude_filters.push(a["--exclude=".len()..].to_string())
             }
-            "--peel-tag" | "--no-peel-tag" => {
-                bail!("--peel-tag is an internal git flag and is not ported")
+            "--peel-tag" => peel_tag = true,
+            "--no-peel-tag" => peel_tag = false,
+            _ => {
+                // git's `parse_options` rejects the token itself, then prints the
+                // usage block, and exits 129.
+                match a.strip_prefix("--") {
+                    Some(rest) => eprintln!("error: unknown option `{rest}'"),
+                    // Short options are parsed one at a time, so only the first
+                    // character of the cluster is named.
+                    None => {
+                        let c = a.chars().nth(1).unwrap_or('-');
+                        eprintln!("error: unknown switch `{c}'");
+                    }
+                }
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
             }
-            _ => bail!(
-                "unsupported flag {a:?} (ported: --name-only, --tags, --refs, --exclude, \
-                 --annotate-stdin, --undefined, --always)"
-            ),
         }
         i += 1;
     }
@@ -189,21 +470,13 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    if all {
-        bail!(
-            "--all is not ported: git orders its output by the layout of its internal \
-             parsed-object hash table, which gitoxide has no equivalent for \
-             (ported: <commit-ish>..., --annotate-stdin)"
-        );
-    }
-
     let repo = gix::discover(".")?;
     let hexsz = repo.object_hash().len_in_hex();
 
-    // git disables the cutoff entirely for --annotate-stdin (and --all).
-    let mut cutoff: i64 = if annotate_stdin { 0 } else { TIME_MAX };
+    // git disables the cutoff entirely for --all and --annotate-stdin.
+    let mut cutoff: i64 = if all || annotate_stdin { 0 } else { TIME_MAX };
 
-    let mut cache: HashMap<ObjectId, Rc<CommitInfo>> = HashMap::new();
+    let mut pool = Pool::new(&repo);
     let mut out = BufWriter::new(std::io::stdout().lock());
 
     // Resolve the requested revisions, and lower the cutoff to the oldest of them.
@@ -215,18 +488,28 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
             continue;
         };
         let oid = id.detach();
-        let Ok(object) = repo.find_object(oid) else {
+        let Some(ix) = pool.parse_object(&repo, oid) else {
             eprintln!("Could not get object for {spec}. Skipping.");
             continue;
         };
-        let kind = object.kind;
-        if let Some(commit) = peel_to_commit(&repo, oid) {
-            let date = commit_info(&repo, &mut cache, commit).date;
+        let peeled = pool.deref_tag(&repo, ix);
+        let commit = peeled.filter(|&c| pool.objs[c].kind == Kind::Commit);
+        if let Some(c) = commit {
+            let date = pool.objs[c].date;
             if cutoff > date {
                 cutoff = date;
             }
         }
-        targets.push((spec.clone(), oid, kind));
+        // `--peel-tag` reports the commit a tag names in place of the tag.
+        if peel_tag {
+            let Some(c) = commit else {
+                eprintln!("Could not get commit for {spec}. Skipping.");
+                continue;
+            };
+            targets.push((spec.clone(), pool.objs[c].oid, Kind::Commit));
+            continue;
+        }
+        targets.push((spec.clone(), oid, pool.objs[ix].kind));
     }
 
     // Apply the clock-skew slop (git's `adjust_cutoff_timestamp_for_slop`).
@@ -234,7 +517,14 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
         cutoff = cutoff.saturating_sub(CUTOFF_DATE_SLOP);
     }
 
-    let tips = collect_tips(&repo, tags_only, name_only, &ref_filters, &exclude_filters)?;
+    let tips = collect_tips(
+        &repo,
+        &mut pool,
+        tags_only,
+        name_only,
+        &ref_filters,
+        &exclude_filters,
+    )?;
 
     // "Try to set better names first, so that worse ones spread less."
     let mut order: Vec<usize> = (0..tips.len()).collect();
@@ -245,11 +535,11 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
             .then(a.taggerdate.cmp(&b.taggerdate))
     });
 
-    let mut names: HashMap<ObjectId, RevName> = HashMap::new();
+    let mut names: HashMap<usize, RevName> = HashMap::new();
     for ix in order {
         let tip = &tips[ix];
         if let Some(commit) = tip.commit {
-            walk_from_tip(&repo, &mut cache, &mut names, commit, tip, cutoff);
+            walk_from_tip(&repo, &mut pool, &mut names, commit, tip, cutoff);
         }
     }
 
@@ -264,8 +554,38 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
             .map(|ix| by_oid[ix].1.to_string())
     };
 
+    // git's `get_rev_name`: a commit is named by the walk, anything else only by
+    // an exact ref match.
+    let rev_name = |oid: &ObjectId, kind: Kind| -> Option<String> {
+        if kind == Kind::Commit {
+            pool.find(oid).and_then(|ix| names.get(&ix)).map(render_name)
+        } else {
+            exact(oid)
+        }
+    };
+
     if annotate_stdin {
-        annotate(&mut out, hexsz, name_only, &names, &exact)?;
+        annotate(&mut out, hexsz, name_only, &pool, &names, &exact)?;
+        out.flush()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if all {
+        // git walks its object hash table in slot order, so this is the order.
+        for slot in &pool.slots {
+            let Some(ix) = *slot else { continue };
+            if pool.objs[ix].kind != Kind::Commit {
+                continue;
+            }
+            let oid = pool.objs[ix].oid;
+            if !name_only {
+                write!(out, "{oid} ")?;
+            }
+            let name = names.get(&ix).map(render_name);
+            if !emit_name(&mut out, &repo, oid, name, allow_undefined, always)? {
+                return Ok(ExitCode::from(128));
+            }
+        }
         out.flush()?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -274,23 +594,9 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
         if !name_only {
             write!(out, "{caller} ")?;
         }
-        let name = if *kind == Kind::Commit {
-            names.get(oid).map(render_name)
-        } else {
-            exact(oid)
-        };
-        match name {
-            Some(name) => writeln!(out, "{name}")?,
-            None if allow_undefined => writeln!(out, "undefined")?,
-            None if always => {
-                let short = oid.attach(&repo).shorten_or_id();
-                writeln!(out, "{short}")?;
-            }
-            None => {
-                out.flush()?;
-                eprintln!("fatal: cannot describe '{oid}'");
-                return Ok(ExitCode::from(128));
-            }
+        let name = rev_name(oid, *kind);
+        if !emit_name(&mut out, &repo, *oid, name, allow_undefined, always)? {
+            return Ok(ExitCode::from(128));
         }
     }
 
@@ -298,28 +604,74 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The tail of git's `show_name`: the name, or the `undefined` / abbreviated /
+/// `fatal` fallbacks in git's order. Returns `false` where git would have died,
+/// after emitting the message it dies with.
+fn emit_name<W: Write>(
+    out: &mut W,
+    repo: &gix::Repository,
+    oid: ObjectId,
+    name: Option<String>,
+    allow_undefined: bool,
+    always: bool,
+) -> Result<bool> {
+    match name {
+        Some(name) => writeln!(out, "{name}")?,
+        None if allow_undefined => writeln!(out, "undefined")?,
+        None if always => {
+            let short = oid.attach(repo).shorten_or_id();
+            writeln!(out, "{short}")?;
+        }
+        None => {
+            // git dies with the partial line already written to stdout.
+            out.flush()?;
+            eprintln!("fatal: cannot describe '{oid}'");
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Build the tip table: one entry per ref that survives the `--tags`,
 /// `--exclude` and `--refs` filters, mirroring git's `name_ref`.
 fn collect_tips(
     repo: &gix::Repository,
+    pool: &mut Pool,
     tags_only: bool,
     name_only: bool,
     ref_filters: &[String],
     exclude_filters: &[String],
 ) -> Result<Vec<Tip>> {
-    // `shorten_unambiguous` needs to test candidate ref names for existence, so
-    // materialise the full set of ref names up front.
-    let mut all_names: HashSet<String> = HashSet::new();
-    for reference in repo.references()?.all()? {
-        let reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
-        all_names.insert(reference.name().as_bstr().to_string());
+    // git's ref iterator yields refs in byte order, and with `--all` that order
+    // reaches the output through the object table, so sort rather than trust the
+    // backend. `shorten_unambiguous` also needs the full set of names up front.
+    let platform = repo.references()?;
+    let mut refs = Vec::new();
+    for reference in platform.all()? {
+        refs.push(reference.map_err(|e| anyhow::anyhow!("{e}"))?);
     }
+    refs.sort_by(|a, b| a.name().as_bstr().cmp(b.name().as_bstr()));
+    let all_names: HashSet<String> = refs
+        .iter()
+        .map(|r| r.name().as_bstr().to_string())
+        .collect();
 
     let mut tips = Vec::new();
-    for reference in repo.references()?.all()? {
-        let mut reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
+    for reference in &mut refs {
         let full = reference.name().as_bstr().to_string();
         let is_tag_ref = full.starts_with("refs/tags/");
+
+        // Symbolic refs are followed; refs whose object is missing are still
+        // recorded (git keeps them in the tip table with no commit).
+        let Ok(id) = reference.follow_to_object() else {
+            continue;
+        };
+        let oid = id.detach();
+
+        // git parses the ref's object before any filter runs, and the objects
+        // that parse creates are part of the `--all` table even when the ref
+        // itself is filtered out.
+        let peeled = pool.parse_object(repo, oid);
 
         if tags_only && !is_tag_ref {
             continue;
@@ -353,38 +705,33 @@ fn collect_tips(
             }
         }
 
-        // Symbolic refs are followed; refs whose object is missing are still
-        // recorded (git keeps them in the tip table with no commit).
-        let Ok(id) = reference.follow_to_object() else {
-            continue;
-        };
-        let oid = id.detach();
-
-        // Peel the tag chain, remembering the innermost tagger date.
+        // Peel the tag chain, remembering the innermost tagger date. A tag whose
+        // target is unreadable stops the chain on the tag itself, as git's
+        // `break` on a missing `t->tagged` does.
         let mut taggerdate = TIME_MAX;
         let mut deref = false;
-        let mut peeled = repo.find_object(oid).ok();
-        while matches!(&peeled, Some(o) if o.kind == Kind::Tag) {
-            let object = peeled.take().expect("matched Some just above");
-            let Ok(tag) = gix::objs::TagRef::from_bytes(&object.data, object.id.kind()) else {
+        let mut peeled = peeled;
+        while let Some(ix) = peeled {
+            if pool.objs[ix].kind != Kind::Tag {
+                break;
+            }
+            let Some(tagged) = pool.objs[ix].tagged else {
                 break;
             };
-            taggerdate = tag.tagger().ok().flatten().map_or(0, |t| t.seconds());
+            taggerdate = pool.objs[ix].date;
             deref = true;
-            peeled = repo.find_object(tag.target()).ok();
+            let target = pool.objs[tagged].oid;
+            peeled = pool.parse_object(repo, target);
         }
 
         let mut commit = None;
         let mut from_tag = false;
-        if let Some(object) = &peeled {
-            if object.kind == Kind::Commit {
-                commit = Some(object.id);
+        if let Some(ix) = peeled {
+            if pool.objs[ix].kind == Kind::Commit {
+                commit = Some(ix);
                 from_tag = is_tag_ref;
                 if taggerdate == TIME_MAX {
-                    taggerdate = gix::objs::CommitRef::from_bytes(&object.data, object.id.kind())
-                        .ok()
-                        .and_then(|c| c.committer().ok().map(|s| s.seconds()))
-                        .unwrap_or(0);
+                    taggerdate = pool.objs[ix].date;
                 }
             }
         }
@@ -415,13 +762,14 @@ fn collect_tips(
 /// priority, which is what makes `~<n>` chains follow the mainline.
 fn walk_from_tip(
     repo: &gix::Repository,
-    cache: &mut HashMap<ObjectId, Rc<CommitInfo>>,
-    names: &mut HashMap<ObjectId, RevName>,
-    start: ObjectId,
+    pool: &mut Pool,
+    names: &mut HashMap<usize, RevName>,
+    start: usize,
     tip: &Tip,
     cutoff: i64,
 ) {
-    if commit_info(repo, cache, start).date < cutoff {
+    pool.parse_commit(repo, start);
+    if pool.objs[start].date < cutoff {
         return;
     }
     if !is_better_name(names.get(&start), tip.taggerdate, 0, 0, tip.from_tag) {
@@ -444,18 +792,20 @@ fn walk_from_tip(
     );
 
     let mut stack = vec![start];
-    let mut pending: Vec<ObjectId> = Vec::new();
+    let mut pending: Vec<usize> = Vec::new();
     while let Some(commit) = stack.pop() {
         let Some(name) = names.get(&commit) else {
             continue;
         };
         let (cur_tip, cur_gen, cur_dist) = (name.tip_name.clone(), name.generation, name.distance);
-        let parents = commit_info(repo, cache, commit).parents.clone();
+        let parents = pool.objs[commit].parents.clone();
 
         pending.clear();
         for (ix, parent) in parents.iter().enumerate() {
             let parent_number = ix as i32 + 1;
-            if commit_info(repo, cache, *parent).date < cutoff {
+            let parent = *parent;
+            pool.parse_commit(repo, parent);
+            if pool.objs[parent].date < cutoff {
                 continue;
             }
             let (generation, distance) = if parent_number > 1 {
@@ -464,7 +814,7 @@ fn walk_from_tip(
                 (cur_gen.saturating_add(1), cur_dist.saturating_add(1))
             };
             if !is_better_name(
-                names.get(parent),
+                names.get(&parent),
                 tip.taggerdate,
                 generation,
                 distance,
@@ -478,7 +828,7 @@ fn walk_from_tip(
                 cur_tip.clone()
             };
             names.insert(
-                *parent,
+                parent,
                 RevName {
                     tip_name: parent_tip,
                     taggerdate: tip.taggerdate,
@@ -487,7 +837,7 @@ fn walk_from_tip(
                     from_tag: tip.from_tag,
                 },
             );
-            pending.push(*parent);
+            pending.push(parent);
         }
 
         // "The first parent must come out first from the stack."
@@ -560,54 +910,6 @@ fn render_name(name: &RevName) -> String {
     }
 }
 
-/// Peel `oid` through any chain of tag objects and return the commit it names.
-fn peel_to_commit(repo: &gix::Repository, oid: ObjectId) -> Option<ObjectId> {
-    let mut current = repo.find_object(oid).ok()?;
-    loop {
-        match current.kind {
-            Kind::Commit => return Some(current.id),
-            Kind::Tag => {
-                let target = gix::objs::TagRef::from_bytes(&current.data, current.id.kind())
-                    .ok()?
-                    .target();
-                current = repo.find_object(target).ok()?;
-            }
-            _ => return None,
-        }
-    }
-}
-
-/// Read (and memoise) the committer date and parents of `oid`. Objects that are
-/// missing or undecodable behave like git's failed `parse_commit`: date 0, no
-/// parents.
-fn commit_info(
-    repo: &gix::Repository,
-    cache: &mut HashMap<ObjectId, Rc<CommitInfo>>,
-    oid: ObjectId,
-) -> Rc<CommitInfo> {
-    if let Some(hit) = cache.get(&oid) {
-        return hit.clone();
-    }
-    let info = repo
-        .find_object(oid)
-        .ok()
-        .filter(|o| o.kind == Kind::Commit)
-        .and_then(|o| {
-            let commit = gix::objs::CommitRef::from_bytes(&o.data, oid.kind()).ok()?;
-            Some(CommitInfo {
-                date: commit.committer().ok().map_or(0, |s| s.seconds()),
-                parents: commit.parents().collect(),
-            })
-        })
-        .unwrap_or_else(|| CommitInfo {
-            date: 0,
-            parents: Vec::new(),
-        });
-    let info = Rc::new(info);
-    cache.insert(oid, info.clone());
-    info
-}
-
 /// git's `subpath_matches`: try `filter` against `path` and against every
 /// sub-path starting after a `/`, returning the offset of the first match.
 ///
@@ -676,7 +978,8 @@ fn annotate<W: Write>(
     out: &mut W,
     hexsz: usize,
     name_only: bool,
-    names: &HashMap<ObjectId, RevName>,
+    pool: &Pool,
+    names: &HashMap<usize, RevName>,
     exact: &dyn Fn(&ObjectId) -> Option<String>,
 ) -> Result<()> {
     let ishex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
@@ -716,7 +1019,8 @@ fn annotate<W: Write>(
             let Ok(oid) = ObjectId::from_hex(hex) else {
                 continue;
             };
-            let Some(name) = names.get(&oid).map(render_name).or_else(|| exact(&oid)) else {
+            let named = pool.find(&oid).and_then(|ix| names.get(&ix)).map(render_name);
+            let Some(name) = named.or_else(|| exact(&oid)) else {
                 continue;
             };
             if name_only {

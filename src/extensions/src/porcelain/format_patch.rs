@@ -29,6 +29,14 @@
 //!     `-p`/`--no-stat`, `--root`, `-q`/`--quiet`, `--filename-max-length`,
 //!     `--cover-letter`, `-U`/`--unified`, `-a`/`--text`, `--minimal`,
 //!     `--histogram`, `--diff-algorithm=myers|minimal|histogram`.
+//!   * alternate diffstat formats — `--stat`, `--summary`, `--numstat`,
+//!     `--shortstat`, and the whole dirstat family (`--dirstat[=<params>]`,
+//!     `-X<params>`, `--dirstat-by-file`, `--cumulative`), selected the way
+//!     git's `diff_flush()` selects them and separated the way `log_tree_diff()`
+//!     separates them (`---` only when the diffstat and the patch are both on).
+//!   * `-I<regex>`/`--ignore-matching-lines=<regex>`, via a vendored POSIX ERE
+//!     engine (`regcomp(REG_EXTENDED | REG_NEWLINE)` semantics) and a port of
+//!     xdiff's `xdl_get_hunk()` hunk selection.
 //!
 //! Flags git accepts that are *not* ported are recorded during parsing and
 //! rejected only once it is clear a patch would actually be emitted. That
@@ -48,18 +56,24 @@
 //!     commit list is fatal.
 //!   * threading, MIME attach/inline, signoff, `--keep-subject`, extra headers
 //!     (`--to`/`--cc`/`--in-reply-to`), notes, interdiff and range-diff,
-//!     `--ignore-if-in-upstream`, the alternate diffstat formats (`--numstat`,
-//!     `--shortstat`, `--dirstat`, `--compact-summary`, `--stat=<width>`),
-//!     whitespace-insensitive diffing, `-I<regex>` (no regex engine is vendored),
-//!     patience diff (imara-diff has Myers, MyersMinimal and Histogram only),
-//!     and rename/copy detection.
+//!     `--ignore-if-in-upstream`, `--compact-summary`, the width-tuned diffstat
+//!     (`--stat=<width>`, `--stat-width`, `--stat-name-width`, `--stat-count`),
+//!     whitespace-insensitive diffing, patience diff (imara-diff has Myers,
+//!     MyersMinimal and Histogram only), and rename/copy detection.
 //!
-//! Known deviation, stated rather than hidden: rename/copy detection is
+//! Known deviations, stated rather than hidden: rename/copy detection is
 //! disabled (as elsewhere in this crate), so a commit that renames a file
 //! renders as a delete plus an add instead of git's `rename from`/`rename to`
 //! and `old => new` stat line. Column widths are computed in Unicode scalar
 //! values, so East-Asian wide characters in a path measure 1 rather than 2. The
-//! cover letter's shortlog does not wrap long subjects at 76 columns.
+//! cover letter's shortlog does not wrap long subjects at 76 columns. The ERE
+//! engine matches over Unicode scalar values decoded from the line (invalid
+//! UTF-8 bytes decode to themselves), where a C library in a `C` locale would
+//! match byte-wise; the two agree for every ASCII pattern. It is also permissive
+//! about the constructs POSIX leaves undefined and the C libraries disagree on —
+//! an empty alternation branch (`(a|)b`), a stacked repetition (`a**`) and a
+//! dangling range (`[a-c-e]`) compile here and under glibc, while BSD `regcomp`
+//! rejects all three; every pattern both accept produces the same answer.
 
 use anyhow::{anyhow, bail, Result};
 use std::io::Write;
@@ -96,6 +110,31 @@ const ENCODING: &str = "UTF-8";
 const COVER_SUBJECT: &str = "*** SUBJECT HERE ***";
 const COVER_BLURB: &str = "*** BLURB HERE ***";
 
+/// git's `DIFF_FORMAT_*` bits, restricted to the ones format-patch can emit.
+/// `DIFF_FORMAT_PATCH` is not tracked: format-patch always ORs it in, so it
+/// would be a constant.
+const FMT_DIFFSTAT: u32 = 1 << 0;
+const FMT_NUMSTAT: u32 = 1 << 1;
+const FMT_SHORTSTAT: u32 = 1 << 2;
+const FMT_DIRSTAT: u32 = 1 << 3;
+const FMT_SUMMARY: u32 = 1 << 4;
+
+/// git's `diff_dirstat_permille_default` — the 3.0% cut-off.
+const DIRSTAT_PERMILLE_DEFAULT: u32 = 30;
+
+/// The dirstat knobs `parse_dirstat_params()` (diff.c) sets.
+#[derive(Clone, Copy)]
+struct Dirstat {
+    /// `lines`: damage is counted in diffstat lines rather than in bytes.
+    by_line: bool,
+    /// `files`: every changed file contributes exactly one unit of damage.
+    by_file: bool,
+    /// `cumulative`: a directory that is reported still counts toward its parent.
+    cumulative: bool,
+    /// The reporting cut-off, in tenths of a percent.
+    permille: u32,
+}
+
 struct Opts {
     // Output shape.
     to_stdout: bool,
@@ -108,7 +147,11 @@ struct Opts {
     reroll: Option<String>,
     signature: String,
     zero_commit: bool,
-    no_stat: bool,
+    /// `-p`/`--no-stat`: suppress git's `DIFFSTAT|SUMMARY` default entirely.
+    use_patch_format: bool,
+    /// The `DIFF_FORMAT_*` bits the caller asked for, before the default fills in.
+    output_format: u32,
+    dirstat: Dirstat,
     quiet: bool,
     name_max: usize,
     cover_letter: bool,
@@ -127,6 +170,9 @@ struct Opts {
     context: u32,
     algorithm: Algorithm,
     text: bool,
+    /// `-I<regex>`: change groups whose every line matches one of these are
+    /// marked ignorable before hunks are assembled.
+    ignore_regex: Vec<Regex>,
 
     /// Flags git accepts that this module has not ported, in the spelling the
     /// caller used. Reported only when a patch would actually be emitted.
@@ -247,8 +293,8 @@ enum Parsed {
 /// Flags whose effect is already this module's behavior, so accepting them
 /// changes nothing: the slider heuristic is what the blob diff runs, rename
 /// detection is off, color and progress are never rendered, `a/`+`b/` are the
-/// prefixes emitted, the stat+summary block is the default, and format-patch
-/// implies `--binary` (binary content is rejected either way).
+/// prefixes emitted, and format-patch implies `--binary` (binary content is
+/// rejected either way).
 const NO_OP: &[&str] = &[
     "--indent-heuristic",
     "--no-renames",
@@ -270,8 +316,6 @@ const NO_OP: &[&str] = &[
     "--default-prefix",
     "--ita-invisible-in-index",
     "--binary",
-    "--stat",
-    "--summary",
 ];
 
 /// Flags git accepts that this module has not ported. Matched as `--flag` or
@@ -302,12 +346,7 @@ const DEFERRED: &[&str] = &[
     "--commit-list-format",
     "--always",
     "--ignore-if-in-upstream",
-    "--numstat",
-    "--shortstat",
     "--compact-summary",
-    "--dirstat",
-    "--dirstat-by-file",
-    "--cumulative",
     "--stat-width",
     "--stat-name-width",
     "--stat-count",
@@ -328,7 +367,6 @@ const DEFERRED: &[&str] = &[
     "--ignore-space-change",
     "--ignore-all-space",
     "--ignore-blank-lines",
-    "--ignore-matching-lines",
     "--inter-hunk-context",
     "--function-context",
     "--textconv",
@@ -349,8 +387,8 @@ const DEFERRED: &[&str] = &[
     "-W",
 ];
 
-/// Short options that carry an attached value, e.g. `-I^$` or `-M50%`.
-const DEFERRED_SHORT: &[&str] = &["-I", "-l", "-M", "-C", "-B", "-O", "-S", "-G", "-X"];
+/// Short options that carry an attached value, e.g. `-M50%` or `-S<string>`.
+const DEFERRED_SHORT: &[&str] = &["-l", "-M", "-C", "-B", "-O", "-S", "-G"];
 
 /// True when `arg` is exactly `name` or the `name=<value>` form.
 fn is_flag(arg: &str, name: &str) -> bool {
@@ -374,7 +412,14 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             .and_then(|v| v.to_str().ok().map(str::to_owned))
             .unwrap_or_else(|| SIGNATURE_VERSION.to_owned()),
         zero_commit: false,
-        no_stat: false,
+        use_patch_format: false,
+        output_format: 0,
+        dirstat: Dirstat {
+            by_line: false,
+            by_file: false,
+            cumulative: false,
+            permille: DIRSTAT_PERMILLE_DEFAULT,
+        },
         quiet: false,
         name_max: NAME_MAX_DEFAULT,
         cover_letter: false,
@@ -390,6 +435,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         context: 3,
         algorithm: Algorithm::Myers,
         text: false,
+        ignore_regex: Vec::new(),
         deferred: Vec::new(),
     };
 
@@ -435,7 +481,26 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "--no-signature" => o.signature.clear(),
             "--zero-commit" => o.zero_commit = true,
             "--no-zero-commit" => o.zero_commit = false,
-            "-p" | "--no-stat" => o.no_stat = true,
+            "-p" | "--no-stat" => o.use_patch_format = true,
+            // Each of these ORs its own `DIFF_FORMAT_*` bit in, which is what
+            // makes them *replace* format-patch's `DIFFSTAT|SUMMARY` default
+            // rather than add to it.
+            "--stat" => o.output_format |= FMT_DIFFSTAT,
+            "--summary" => o.output_format |= FMT_SUMMARY,
+            "--numstat" => o.output_format |= FMT_NUMSTAT,
+            "--shortstat" => o.output_format |= FMT_SHORTSTAT,
+            "--cumulative" => {
+                if let Err(code) = set_dirstat(&mut o, "cumulative") {
+                    return Ok(Parsed::Exit(code));
+                }
+            }
+            "-I" | "--ignore-matching-lines" => {
+                i += 1;
+                let pat = value_at(args, i, a)?;
+                if let Err(code) = push_ignore_regex(&mut o, &pat) {
+                    return Ok(Parsed::Exit(code));
+                }
+            }
             "--root" => o.root = true,
             "-q" | "--quiet" => o.quiet = true,
             "--filename-max-length" => {
@@ -552,6 +617,48 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             s if s.starts_with("--stat=") || s.starts_with("--relative=") => {
                 o.deferred.push(a.to_owned());
             }
+            // `--dirstat`, `-X` and `--dirstat-by-file` all take an *optional*
+            // value, so only the attached form carries parameters; a bare
+            // `-X foo` leaves `foo` to be read as a revision, as git does.
+            "--dirstat" | "-X" => {
+                if let Err(code) = set_dirstat(&mut o, "") {
+                    return Ok(Parsed::Exit(code));
+                }
+            }
+            "--dirstat-by-file" => {
+                if let Err(code) = set_dirstat(&mut o, "files") {
+                    return Ok(Parsed::Exit(code));
+                }
+            }
+            s if s.starts_with("--dirstat=") || s.starts_with("-X") => {
+                let params = match s.strip_prefix("--dirstat=") {
+                    Some(p) => p,
+                    None => &s[2..],
+                };
+                if let Err(code) = set_dirstat(&mut o, params) {
+                    return Ok(Parsed::Exit(code));
+                }
+            }
+            s if s.starts_with("--dirstat-by-file=") => {
+                if let Err(code) = set_dirstat(&mut o, "files") {
+                    return Ok(Parsed::Exit(code));
+                }
+                if let Err(code) = set_dirstat(&mut o, &s["--dirstat-by-file=".len()..]) {
+                    return Ok(Parsed::Exit(code));
+                }
+            }
+            s if s.starts_with("--ignore-matching-lines=") => {
+                let pat = s["--ignore-matching-lines=".len()..].to_owned();
+                if let Err(code) = push_ignore_regex(&mut o, &pat) {
+                    return Ok(Parsed::Exit(code));
+                }
+            }
+            s if s.len() > 2 && s.starts_with("-I") => {
+                let pat = s[2..].to_owned();
+                if let Err(code) = push_ignore_regex(&mut o, &pat) {
+                    return Ok(Parsed::Exit(code));
+                }
+            }
             s if s.len() > 2 && s.starts_with("-o") => o.outdir = Some(s[2..].to_owned()),
             s if s.len() > 2
                 && s.starts_with("-v")
@@ -578,7 +685,89 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         i += 1;
     }
 
+    // builtin/log.c: the stat+summary block is format-patch's default, but only
+    // when the caller asked for no output format of its own — that is what makes
+    // `--numstat` (and friends) *replace* it rather than add to it.
+    if !o.use_patch_format && o.output_format == 0 {
+        o.output_format = FMT_DIFFSTAT | FMT_SUMMARY;
+    }
+
     Ok(Parsed::Ready(Box::new(o)))
+}
+
+/// Port of `parse_dirstat_params()` (diff.c), plus `parse_dirstat_opt()`'s
+/// "and now DIRSTAT is one of the output formats" side effect.
+///
+/// git `die()`s with the accumulated message and exit 128; `bail!` would collapse
+/// that to 1, so the message goes to stderr here and the code comes back as an
+/// error the caller turns into an exit.
+fn set_dirstat(o: &mut Opts, params: &str) -> std::result::Result<(), ExitCode> {
+    let mut errmsg = String::new();
+    if !params.is_empty() {
+        for p in params.split(',') {
+            match p {
+                "changes" => {
+                    o.dirstat.by_line = false;
+                    o.dirstat.by_file = false;
+                }
+                "lines" => {
+                    o.dirstat.by_line = true;
+                    o.dirstat.by_file = false;
+                }
+                "files" => {
+                    o.dirstat.by_line = false;
+                    o.dirstat.by_file = true;
+                }
+                "noncumulative" => o.dirstat.cumulative = false,
+                "cumulative" => o.dirstat.cumulative = true,
+                _ if p.starts_with(|c: char| c.is_ascii_digit()) => match parse_permille(p) {
+                    Some(permille) => o.dirstat.permille = permille,
+                    None => errmsg.push_str(&format!(
+                        "  Failed to parse dirstat cut-off percentage '{p}'\n"
+                    )),
+                },
+                _ => errmsg.push_str(&format!("  Unknown dirstat parameter '{p}'\n")),
+            }
+        }
+    }
+    if !errmsg.is_empty() {
+        return Err(fatal(&format!(
+            "Failed to parse --dirstat/-X option parameter:\n{errmsg}"
+        )));
+    }
+    o.output_format |= FMT_DIRSTAT;
+    Ok(())
+}
+
+/// git's dirstat percentage grammar: whole percent, then at most one significant
+/// fractional digit — `12.375` is 123 permille, and any trailing junk is fatal.
+fn parse_permille(p: &str) -> Option<u32> {
+    let digits = p.len() - p.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let (whole, rest) = p.split_at(digits);
+    let mut permille = whole.parse::<u32>().ok()?.checked_mul(10)?;
+    let rest = match rest.strip_prefix('.') {
+        Some(frac) if frac.starts_with(|c: char| c.is_ascii_digit()) => {
+            permille += u32::from(frac.as_bytes()[0] - b'0');
+            frac.trim_start_matches(|c: char| c.is_ascii_digit())
+        }
+        _ => rest,
+    };
+    rest.is_empty().then_some(permille)
+}
+
+/// Port of `diff_opt_ignore_regex()` (diff.c): `regcomp` failure is an
+/// `error()`, which makes `parse_options` exit 129 with only that one line.
+fn push_ignore_regex(o: &mut Opts, pattern: &str) -> std::result::Result<(), ExitCode> {
+    match Regex::compile(pattern) {
+        Ok(re) => {
+            o.ignore_regex.push(re);
+            Ok(())
+        }
+        Err(_) => {
+            eprintln!("error: invalid regex given to -I: '{pattern}'");
+            Err(ExitCode::from(129))
+        }
+    }
 }
 
 fn parse_num(s: &str) -> Result<usize> {
@@ -948,18 +1137,64 @@ fn render_message(
             stats.push(emit_change(repo, &mut patch, change, abbrev, opts)?);
         }
 
-        if opts.no_stat {
-            out.push(b'\n');
-        } else {
-            out.extend_from_slice(b"---\n");
-            emit_stats(out, &stats)?;
-            emit_summary(out, &changes)?;
-            out.push(b'\n');
-        }
+        emit_stat_blocks(repo, out, &changes, &stats, opts)?;
         out.extend_from_slice(&patch);
     }
 
     write_signature(out, opts);
+    Ok(())
+}
+
+/// Everything git prints between the commit message and the patch.
+///
+/// Two ports meet here. `log_tree_diff()` (log-tree.c) writes the blank line
+/// that separates log from diff, prefixing it with `---` only when the diffstat
+/// and the patch are *both* being shown. `diff_flush()` (diff.c) then writes the
+/// selected stat blocks in a fixed order and, if any of them set its `separator`
+/// counter, one more blank line before the patch. Plain (non-`lines`) dirstat is
+/// deliberately outside that counter in git, which is why `--dirstat` alone
+/// leaves no blank line before the patch while `--dirstat=lines` does.
+fn emit_stat_blocks(
+    repo: &gix::Repository,
+    out: &mut Vec<u8>,
+    changes: &[ChangeDetached],
+    stats: &[StatEntry],
+    opts: &Opts,
+) -> Result<()> {
+    if opts.output_format & FMT_DIFFSTAT != 0 {
+        out.extend_from_slice(b"---");
+    }
+    out.push(b'\n');
+
+    let dirstat_by_line = opts.output_format & FMT_DIRSTAT != 0 && opts.dirstat.by_line;
+    let mut separator = false;
+
+    if opts.output_format & (FMT_DIFFSTAT | FMT_NUMSTAT | FMT_SHORTSTAT) != 0 || dirstat_by_line {
+        if opts.output_format & FMT_NUMSTAT != 0 {
+            emit_numstat(out, stats)?;
+        }
+        if opts.output_format & FMT_DIFFSTAT != 0 {
+            emit_stats(out, stats)?;
+        }
+        if opts.output_format & FMT_SHORTSTAT != 0 {
+            emit_stat_summary(out, stats)?;
+        }
+        if dirstat_by_line {
+            emit_dirstat_by_line(out, stats, &opts.dirstat)?;
+        }
+        separator = true;
+    }
+    if opts.output_format & FMT_DIRSTAT != 0 && !dirstat_by_line {
+        emit_dirstat(repo, out, changes, &opts.dirstat)?;
+    }
+    if opts.output_format & FMT_SUMMARY != 0 && !is_summary_empty(changes) {
+        emit_summary(out, changes)?;
+        separator = true;
+    }
+
+    if separator {
+        out.push(b'\n');
+    }
     Ok(())
 }
 
@@ -1023,7 +1258,10 @@ fn render_cover_letter(
         Some(pid) => Some(pid.object()?.try_into_commit()?.tree()?),
         None => None,
     };
-    if let (Some(base), false) = (base, opts.no_stat) {
+    // `show_diffstat()` (builtin/log.c) builds its own `diff_options` with a
+    // hard-coded `DIFF_FORMAT_SUMMARY | DIFF_FORMAT_DIFFSTAT`, so the cover
+    // letter keeps the stat+summary block whatever the series was asked for.
+    if let Some(base) = base {
         let newest_tree = repo.find_object(newest)?.try_into_commit()?.tree()?;
         let abbrev = newest_tree.id().shorten()?.hex_len();
         let changes = tree_changes(repo, Some(&base), Some(&newest_tree))?;
@@ -1430,9 +1668,11 @@ fn wrap_text(buf: &mut String, text: &str, indent1: i64, indent2: i64, width: i6
 // Diffstat and summary (diff.c)
 // ---------------------------------------------------------------------------
 
-/// One diffstat row: the quoted path and its line counts.
+/// One diffstat row: the quoted path and its line counts. `raw_name` is the
+/// unquoted path, which is what git's `dirstat` groups on.
 struct StatEntry {
     name: String,
+    raw_name: Vec<u8>,
     added: u64,
     deleted: u64,
 }
@@ -1497,12 +1737,7 @@ fn emit_stats(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
         }
     }
 
-    let mut adds: u64 = 0;
-    let mut dels: u64 = 0;
     for f in files {
-        adds += f.added;
-        dels += f.deleted;
-
         // Scale the filename: elide the head, then resume at a path separator.
         let mut len = name_width;
         let mut prefix = "";
@@ -1564,6 +1799,23 @@ fn emit_stats(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
         out.push(b'\n');
     }
 
+    emit_stat_summary(out, files)
+}
+
+/// Port of `print_stat_summary_inserts_deletes()` (diff.c) — the trailing
+/// ` N files changed, …` line, which is also the whole of `--shortstat`.
+///
+/// Every file this module reaches is "interesting" in git's sense
+/// (`is_interesting = p->status != DIFF_STATUS_UNKNOWN`) and binary content is
+/// refused outright, so `show_stats()` and `show_shortstats()` count the same
+/// way and share this one implementation.
+fn emit_stat_summary(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let adds: u64 = files.iter().map(|f| f.added).sum();
+    let dels: u64 = files.iter().map(|f| f.deleted).sum();
+
     let n = files.len();
     let mut line = format!(" {n} {} changed", if n == 1 { "file" } else { "files" });
     if adds > 0 || dels == 0 {
@@ -1588,6 +1840,340 @@ fn emit_stats(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
     }
     writeln!(out, "{line}")?;
     Ok(())
+}
+
+/// Port of `show_numstat()` (diff.c): tab-separated counts and the C-quoted path.
+fn emit_numstat(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
+    for f in files {
+        writeln!(out, "{}\t{}\t{}", f.added, f.deleted, f.name)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Dirstat (diff.c, diffcore-delta.c)
+// ---------------------------------------------------------------------------
+
+/// One entry of git's `struct dirstat_dir`: a path and its damage.
+struct DirstatFile {
+    name: Vec<u8>,
+    changed: u64,
+}
+
+/// Port of `show_dirstat()` (diff.c). Damage is measured in bytes of the
+/// pre-image that did not survive plus bytes that are new, except in
+/// `--dirstat-by-file` mode where every changed file counts as exactly one.
+fn emit_dirstat(
+    repo: &gix::Repository,
+    out: &mut Vec<u8>,
+    changes: &[ChangeDetached],
+    cfg: &Dirstat,
+) -> Result<()> {
+    let mut files: Vec<DirstatFile> = Vec::new();
+    let mut changed: u64 = 0;
+
+    for change in changes {
+        let damage = match change {
+            // An unchanged blob id means identical content, whatever else moved.
+            ChangeDetached::Modification {
+                previous_id, id, ..
+            } if previous_id == id => 0,
+            _ if cfg.by_file => 1,
+            ChangeDetached::Modification {
+                previous_entry_mode,
+                previous_id,
+                entry_mode,
+                id,
+                ..
+            } => {
+                let old = content_of(repo, *previous_id, previous_entry_mode.is_commit())?;
+                let new = content_of(repo, *id, entry_mode.is_commit())?;
+                let (copied, added) = count_changes(&old, &new);
+                // Original minus copied is the removed material; `added` is the
+                // new material. Both are damage done to the pre-image, and a
+                // changed id always means at least one unit of it.
+                ((old.len() as u64 - copied) + added).max(1)
+            }
+            ChangeDetached::Deletion {
+                entry_mode, id, ..
+            } => content_of(repo, *id, entry_mode.is_commit())?.len() as u64,
+            ChangeDetached::Addition {
+                entry_mode, id, ..
+            } => content_of(repo, *id, entry_mode.is_commit())?.len() as u64,
+            ChangeDetached::Rewrite { .. } => bail!("rename/copy detection is not supported"),
+        };
+        files.push(DirstatFile {
+            name: change_path(change).to_vec(),
+            changed: damage,
+        });
+        changed += damage;
+    }
+
+    conclude_dirstat(out, files, changed, cfg)
+}
+
+/// Port of `show_dirstat_by_line()` (diff.c): the same report, with damage taken
+/// from the diffstat's line counts instead of from the blob contents.
+fn emit_dirstat_by_line(out: &mut Vec<u8>, stats: &[StatEntry], cfg: &Dirstat) -> Result<()> {
+    if stats.is_empty() {
+        return Ok(());
+    }
+    let mut changed: u64 = 0;
+    let files: Vec<DirstatFile> = stats
+        .iter()
+        .map(|f| {
+            let damage = f.added + f.deleted;
+            changed += damage;
+            DirstatFile {
+                name: f.raw_name.clone(),
+                changed: damage,
+            }
+        })
+        .collect();
+    conclude_dirstat(out, files, changed, cfg)
+}
+
+/// Port of `conclude_dirstat()` (diff.c): sort by path, then walk.
+fn conclude_dirstat(
+    out: &mut Vec<u8>,
+    mut files: Vec<DirstatFile>,
+    changed: u64,
+    cfg: &Dirstat,
+) -> Result<()> {
+    if changed == 0 {
+        return Ok(());
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut cursor = 0usize;
+    gather_dirstat(out, &files, &mut cursor, changed, 0, cfg)?;
+    Ok(())
+}
+
+/// Port of `gather_dirstat()` (diff.c).
+///
+/// `cursor` is git's consuming `dir->files++`/`dir->nr--`: the recursion walks
+/// the sorted list once, and each level reports the directory named by the first
+/// `baselen` bytes of the entry that opened it. A directory is silent at the top
+/// level and whenever everything under it came from a single subdirectory
+/// (`sources == 1`), which is what keeps the report to the branch points.
+fn gather_dirstat(
+    out: &mut Vec<u8>,
+    files: &[DirstatFile],
+    cursor: &mut usize,
+    changed: u64,
+    baselen: usize,
+    cfg: &Dirstat,
+) -> Result<u64> {
+    let mut sum_changes: u64 = 0;
+    let mut sources = 0u32;
+    // The base is a prefix of the entry that opened this level; borrowing it
+    // across the recursion would alias `files`, so it is captured up front.
+    let base: Vec<u8> = files
+        .get(*cursor)
+        .map(|f| f.name[..baselen.min(f.name.len())].to_vec())
+        .unwrap_or_default();
+
+    while *cursor < files.len() {
+        let name = &files[*cursor].name;
+        if name.len() < baselen || name[..baselen] != base[..] {
+            break;
+        }
+        let changes = match name[baselen..].iter().position(|&b| b == b'/') {
+            Some(slash) => {
+                let newbaselen = baselen + slash + 1;
+                sources += 1;
+                gather_dirstat(out, files, cursor, changed, newbaselen, cfg)?
+            }
+            None => {
+                let changes = files[*cursor].changed;
+                *cursor += 1;
+                sources += 2;
+                changes
+            }
+        };
+        sum_changes += changes;
+    }
+
+    if baselen > 0 && sources != 1 && sum_changes > 0 {
+        let permille = sum_changes * 1000 / changed;
+        if permille >= u64::from(cfg.permille) {
+            write!(out, "{:4}.{}% ", permille / 10, permille % 10)?;
+            out.extend_from_slice(&base);
+            out.push(b'\n');
+            if !cfg.cumulative {
+                return Ok(0);
+            }
+        }
+    }
+    Ok(sum_changes)
+}
+
+/// Port of `diffcore_count_changes()` (diffcore-delta.c): returns
+/// `(src_copied, literal_added)` for the byte-level dirstat.
+///
+/// Both buffers are cut into chunks that end at an LF or after 64 bytes,
+/// whichever comes first, and the chunks are hashed into counting buckets. A
+/// chunk the destination has at least as many of as the source was copied; the
+/// surplus on either side is what changed.
+fn count_changes(src: &[u8], dst: &[u8]) -> (u64, u64) {
+    let src_count = hash_chars(src);
+    let dst_count = hash_chars(dst);
+
+    let (mut sc, mut la) = (0u64, 0u64);
+    let (mut s, mut d) = (0usize, 0usize);
+    while s < src_count.len() && src_count[s].1 != 0 {
+        while d < dst_count.len() && dst_count[d].1 != 0 {
+            if dst_count[d].0 >= src_count[s].0 {
+                break;
+            }
+            la += u64::from(dst_count[d].1);
+            d += 1;
+        }
+        let src_cnt = src_count[s].1;
+        let mut dst_cnt = 0u32;
+        if d < dst_count.len() && dst_count[d].1 != 0 && dst_count[d].0 == src_count[s].0 {
+            dst_cnt = dst_count[d].1;
+            d += 1;
+        }
+        if src_cnt < dst_cnt {
+            la += u64::from(dst_cnt - src_cnt);
+            sc += u64::from(src_cnt);
+        } else {
+            sc += u64::from(dst_cnt);
+        }
+        s += 1;
+    }
+    while d < dst_count.len() && dst_count[d].1 != 0 {
+        la += u64::from(dst_count[d].1);
+        d += 1;
+    }
+    (sc, la)
+}
+
+/// git's `HASHBASE`: a prime chosen so the table never has to grow past 2^18.
+const HASHBASE: u32 = 107_927;
+
+/// git's `INITIAL_HASH_SIZE`.
+const INITIAL_HASH_LOG2: u32 = 9;
+
+/// git's `INITIAL_FREE`: leave proportionally more slack in a small table.
+fn initial_free(log2: u32) -> i64 {
+    i64::from((1u32 << log2) * (log2 - 3) / log2)
+}
+
+/// Port of `hash_chars()` (diffcore-delta.c): the chunked rolling hash, returned
+/// as git leaves it — a power-of-two table sorted so that live buckets come
+/// first, in hash order, and empty ones sort to the end.
+fn hash_chars(buf: &[u8]) -> Vec<(u32, u32)> {
+    // `is_text` only controls CRLF folding; binary content never reaches here.
+    let mut table: Vec<(u32, u32)> = vec![(0, 0); 1 << INITIAL_HASH_LOG2];
+    let mut log2 = INITIAL_HASH_LOG2;
+    let mut free = initial_free(log2);
+
+    let (mut accum1, mut accum2) = (0u32, 0u32);
+    let mut n = 0u32;
+    let mut i = 0usize;
+    while i < buf.len() {
+        let c = buf[i];
+        i += 1;
+        // Ignore CR in a CRLF sequence.
+        if c == b'\r' && buf.get(i) == Some(&b'\n') {
+            continue;
+        }
+        let old_1 = accum1;
+        accum1 = (accum1 << 7) ^ (accum2 >> 25);
+        accum2 = (accum2 << 7) ^ (old_1 >> 25);
+        accum1 = accum1.wrapping_add(u32::from(c));
+        n += 1;
+        if n < 64 && c != b'\n' {
+            continue;
+        }
+        let hashval = accum1.wrapping_add(accum2.wrapping_mul(0x61)) % HASHBASE;
+        add_spanhash(&mut table, &mut log2, &mut free, hashval, n);
+        n = 0;
+        accum1 = 0;
+        accum2 = 0;
+    }
+    if n > 0 {
+        let hashval = accum1.wrapping_add(accum2.wrapping_mul(0x61)) % HASHBASE;
+        add_spanhash(&mut table, &mut log2, &mut free, hashval, n);
+    }
+
+    // git's `spanhash_cmp`: empty buckets last, live ones by hash value.
+    table.sort_by(|a, b| match (a.1 == 0, b.1 == 0) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => a.0.cmp(&b.0),
+    });
+    table
+}
+
+/// Port of `add_spanhash()` + `spanhash_rehash()` (diffcore-delta.c): linear
+/// probing, and a doubling rehash once the free budget is spent.
+fn add_spanhash(table: &mut Vec<(u32, u32)>, log2: &mut u32, free: &mut i64, hashval: u32, cnt: u32) {
+    let lim = 1usize << *log2;
+    let mut bucket = (hashval as usize) & (lim - 1);
+    loop {
+        let slot = &mut table[bucket];
+        bucket += 1;
+        if slot.1 == 0 {
+            *slot = (hashval, cnt);
+            *free -= 1;
+            if *free < 0 {
+                spanhash_rehash(table, log2, free);
+            }
+            return;
+        }
+        if slot.0 == hashval {
+            slot.1 += cnt;
+            return;
+        }
+        if lim <= bucket {
+            bucket = 0;
+        }
+    }
+}
+
+fn spanhash_rehash(table: &mut Vec<(u32, u32)>, log2: &mut u32, free: &mut i64) {
+    let sz = 1usize << (*log2 + 1);
+    let mut grown: Vec<(u32, u32)> = vec![(0, 0); sz];
+    *log2 += 1;
+    *free = initial_free(*log2);
+    for &(hashval, cnt) in table.iter() {
+        if cnt == 0 {
+            continue;
+        }
+        let mut bucket = (hashval as usize) & (sz - 1);
+        loop {
+            let slot = &mut grown[bucket];
+            bucket += 1;
+            if slot.1 == 0 {
+                *slot = (hashval, cnt);
+                *free -= 1;
+                break;
+            }
+            if sz <= bucket {
+                bucket = 0;
+            }
+        }
+    }
+    *table = grown;
+}
+
+/// Port of `is_summary_empty()` (diff.c): whether `--summary` would print
+/// nothing, which decides whether it counts toward `diff_flush()`'s separator.
+fn is_summary_empty(changes: &[ChangeDetached]) -> bool {
+    !changes.iter().any(|c| match c {
+        ChangeDetached::Addition { .. }
+        | ChangeDetached::Deletion { .. }
+        | ChangeDetached::Rewrite { .. } => true,
+        ChangeDetached::Modification {
+            previous_entry_mode,
+            entry_mode,
+            ..
+        } => previous_entry_mode.value() != entry_mode.value(),
+    })
 }
 
 /// Port of `diff_summary()` (diff.c): the `create`/`delete`/`mode change` lines
@@ -1730,6 +2316,7 @@ fn emit_change(
     }
     Ok(StatEntry {
         name: quote_path(change_path(change)),
+        raw_name: change_path(change).to_vec(),
         added: counts.0,
         deleted: counts.1,
     })
@@ -1805,6 +2392,12 @@ fn emit_text_hunks(
     let input = InternedInput::new(old, new);
     let diff = diff_with_slider_heuristics(opts.algorithm, &input);
     let before_lines: Vec<&[u8]> = input.before.iter().map(|&t| input.interner[t]).collect();
+
+    if !opts.ignore_regex.is_empty() {
+        let after_lines: Vec<&[u8]> = input.after.iter().map(|&t| input.interner[t]).collect();
+        return emit_hunks_with_ignorable(out, &diff, &before_lines, &after_lines, opts);
+    }
+
     let writer = HunkWriter {
         out,
         before_lines,
@@ -1819,6 +2412,170 @@ fn emit_text_hunks(
     )
     .consume()?;
     Ok(counts)
+}
+
+/// One entry of xdiff's edit script (`struct xdchange`).
+struct Change {
+    i1: u32,
+    chg1: u32,
+    i2: u32,
+    chg2: u32,
+    ignore: bool,
+}
+
+/// Port of `xdl_emit_diff()` (xdiff/xemit.c) without `XDL_EMIT_FUNCCONTEXT`,
+/// used only when `-I` is in play.
+///
+/// gix's `UnifiedDiff` groups every change into a hunk, which is right until a
+/// change can be *ignorable*: git marks those in `xdl_mark_ignorable_regex()`
+/// and then lets `xdl_get_hunk()` drop the ones that no real change is holding
+/// in place. An ignorable change close to a real one is still printed — the
+/// regex suppresses hunks, not lines — so the two must be decided together.
+fn emit_hunks_with_ignorable(
+    out: &mut Vec<u8>,
+    diff: &gix::diff::blob::Diff,
+    before_lines: &[&[u8]],
+    after_lines: &[&[u8]],
+    opts: &Opts,
+) -> Result<(u64, u64)> {
+    let matches_all = |lines: &[&[u8]]| -> bool {
+        lines
+            .iter()
+            .all(|line| opts.ignore_regex.iter().any(|re| re.is_match(line)))
+    };
+    let changes: Vec<Change> = diff
+        .hunks()
+        .map(|h| Change {
+            i1: h.before.start,
+            chg1: h.before.end - h.before.start,
+            i2: h.after.start,
+            chg2: h.after.end - h.after.start,
+            // A group is ignorable when every line it touches, on both sides,
+            // matches; `xdl_mark_ignorable_regex()` starts from `ignore = 1`, so
+            // an empty side simply does not object.
+            ignore: matches_all(&before_lines[h.before.start as usize..h.before.end as usize])
+                && matches_all(&after_lines[h.after.start as usize..h.after.end as usize]),
+        })
+        .collect();
+
+    let ctx = i64::from(opts.context);
+    let nrec1 = before_lines.len() as i64;
+    let nrec2 = after_lines.len() as i64;
+
+    let mut writer = HunkWriter {
+        out,
+        before_lines: before_lines.to_vec(),
+        added: 0,
+        deleted: 0,
+    };
+
+    let mut idx = 0usize;
+    while idx < changes.len() {
+        let mut start = idx;
+        let Some(last) = get_hunk(&changes, &mut start, ctx) else {
+            break;
+        };
+        let (first, last) = (start, last);
+        let (f, e) = (&changes[first], &changes[last]);
+
+        let s1 = (i64::from(f.i1) - ctx).max(0);
+        let s2 = (i64::from(f.i2) - ctx).max(0);
+        // Trailing context stops at whichever file runs out first.
+        let lctx = ctx
+            .min(nrec1 - i64::from(e.i1 + e.chg1))
+            .min(nrec2 - i64::from(e.i2 + e.chg2));
+        let e1 = i64::from(e.i1 + e.chg1) + lctx;
+        let e2 = i64::from(e.i2 + e.chg2) + lctx;
+
+        let mut lines: Vec<(DiffLineKind, &[u8])> = Vec::new();
+        // Leading context, taken from the post-image as xdiff does.
+        for l in s2..i64::from(f.i2) {
+            lines.push((DiffLineKind::Context, after_lines[l as usize]));
+        }
+        let (mut c1, mut c2) = (i64::from(f.i1), i64::from(f.i2));
+        for k in first..=last {
+            let ch = &changes[k];
+            // Context bridging this change and the previous one in the hunk.
+            while c1 < i64::from(ch.i1) && c2 < i64::from(ch.i2) {
+                lines.push((DiffLineKind::Context, after_lines[c2 as usize]));
+                c1 += 1;
+                c2 += 1;
+            }
+            for l in ch.i1..ch.i1 + ch.chg1 {
+                lines.push((DiffLineKind::Remove, before_lines[l as usize]));
+            }
+            for l in ch.i2..ch.i2 + ch.chg2 {
+                lines.push((DiffLineKind::Add, after_lines[l as usize]));
+            }
+            c1 = i64::from(ch.i1 + ch.chg1);
+            c2 = i64::from(ch.i2 + ch.chg2);
+        }
+        for l in i64::from(e.i2 + e.chg2)..e2 {
+            lines.push((DiffLineKind::Context, after_lines[l as usize]));
+        }
+
+        let header = HunkHeader {
+            before_hunk_start: (s1 + 1) as u32,
+            before_hunk_len: (e1 - s1) as u32,
+            after_hunk_start: (s2 + 1) as u32,
+            after_hunk_len: (e2 - s2) as u32,
+        };
+        writer.consume_hunk(header, &lines)?;
+
+        idx = last + 1;
+    }
+
+    Ok(writer.finish())
+}
+
+/// Port of `xdl_get_hunk()` (xdiff/xemit.c) with `interhunkctxlen` zero.
+///
+/// Advances `start` past leading ignorable changes that no following change is
+/// close enough to rescue, then returns the index of the last change that
+/// belongs in the same hunk — or `None` once nothing is left to show.
+fn get_hunk(changes: &[Change], start: &mut usize, ctxlen: i64) -> Option<usize> {
+    let max_common = ctxlen + ctxlen;
+    let max_ignorable = ctxlen;
+    let end_of = |i: usize| i64::from(changes[i].i1 + changes[i].chg1);
+
+    let mut p = *start;
+    while p < changes.len() && changes[p].ignore {
+        let next = p + 1;
+        if next >= changes.len() || i64::from(changes[next].i1) - end_of(p) >= max_ignorable {
+            *start = next;
+        }
+        p = next;
+    }
+    if *start >= changes.len() {
+        return None;
+    }
+
+    let mut ignored: i64 = 0;
+    let mut last = *start;
+    let mut prev = *start;
+    let mut cur = *start + 1;
+    while cur < changes.len() {
+        let distance = i64::from(changes[cur].i1) - end_of(prev);
+        if distance > max_common {
+            break;
+        }
+        if distance < max_ignorable && (!changes[cur].ignore || last == prev) {
+            last = cur;
+            ignored = 0;
+        } else if distance < max_ignorable && changes[cur].ignore {
+            ignored += i64::from(changes[cur].chg2);
+        } else if last != prev && i64::from(changes[cur].i1) + ignored - end_of(last) > max_common {
+            break;
+        } else if !changes[cur].ignore {
+            last = cur;
+            ignored = 0;
+        } else {
+            ignored += i64::from(changes[cur].chg2);
+        }
+        prev = cur;
+        cur += 1;
+    }
+    Some(last)
 }
 
 /// Writes hunks in git's unified-diff style and tallies changed lines.
@@ -1993,4 +2750,534 @@ fn quote_two(prefix: &str, path: &[u8]) -> Vec<u8> {
     c_escape_into(&mut out, path);
     out.push('"');
     out.into_bytes()
+}
+
+// ---------------------------------------------------------------------------
+// POSIX extended regular expressions (`regcomp(REG_EXTENDED | REG_NEWLINE)`)
+// ---------------------------------------------------------------------------
+//
+// git compiles each `-I<regex>` with `REG_EXTENDED | REG_NEWLINE` and asks only
+// whether the record matches anywhere, so this engine answers a boolean and
+// keeps no capture state. `REG_NEWLINE` is the part that surprises: `^` also
+// matches immediately after a newline and `$` immediately before one, so on a
+// record like `deep\n` the position past the newline satisfies both at once and
+// the pattern `^$` matches every line that ends in a newline — which is exactly
+// what stock git does with `-I^$`.
+//
+// The program is a Thompson NFA run as a parallel state set, so a pattern like
+// `(a*)*b` costs O(len × program) instead of backtracking exponentially.
+
+/// A parsed regular expression, before it is flattened into a program.
+enum Node {
+    Empty,
+    /// One character drawn from a set: a literal, `.`, or a bracket expression.
+    Set(CharSet),
+    /// `^` — start of buffer, or just after a newline.
+    Bol,
+    /// `$` — end of buffer, or just before a newline.
+    Eol,
+    Cat(Vec<Node>),
+    Alt(Vec<Node>),
+    Repeat {
+        node: Box<Node>,
+        min: u32,
+        /// `None` is an unbounded tail, as in `*`, `+` and `{n,}`.
+        max: Option<u32>,
+    },
+}
+
+/// A bracket expression, `.`, or a single literal.
+#[derive(Clone)]
+struct CharSet {
+    negated: bool,
+    ranges: Vec<(char, char)>,
+    classes: Vec<Class>,
+}
+
+/// The POSIX character classes usable as `[:name:]`.
+#[derive(Clone, Copy, PartialEq)]
+enum Class {
+    Alnum,
+    Alpha,
+    Blank,
+    Cntrl,
+    Digit,
+    Graph,
+    Lower,
+    Print,
+    Punct,
+    Space,
+    Upper,
+    Xdigit,
+}
+
+impl Class {
+    fn parse(name: &str) -> Option<Class> {
+        Some(match name {
+            "alnum" => Class::Alnum,
+            "alpha" => Class::Alpha,
+            "blank" => Class::Blank,
+            "cntrl" => Class::Cntrl,
+            "digit" => Class::Digit,
+            "graph" => Class::Graph,
+            "lower" => Class::Lower,
+            "print" => Class::Print,
+            "punct" => Class::Punct,
+            "space" => Class::Space,
+            "upper" => Class::Upper,
+            "xdigit" => Class::Xdigit,
+            _ => return None,
+        })
+    }
+
+    fn matches(self, c: char) -> bool {
+        match self {
+            Class::Alnum => c.is_alphanumeric(),
+            Class::Alpha => c.is_alphabetic(),
+            Class::Blank => c == ' ' || c == '\t',
+            Class::Cntrl => c.is_control(),
+            Class::Digit => c.is_ascii_digit(),
+            Class::Graph => !c.is_whitespace() && !c.is_control(),
+            Class::Lower => c.is_lowercase(),
+            Class::Print => !c.is_control(),
+            Class::Punct => c.is_ascii_punctuation(),
+            Class::Space => c.is_whitespace(),
+            Class::Upper => c.is_uppercase(),
+            Class::Xdigit => c.is_ascii_hexdigit(),
+        }
+    }
+}
+
+impl CharSet {
+    /// A single literal character.
+    fn literal(c: char) -> CharSet {
+        CharSet {
+            negated: false,
+            ranges: vec![(c, c)],
+            classes: Vec::new(),
+        }
+    }
+
+    /// `.` — under `REG_NEWLINE` this is "anything but a newline", which is what
+    /// an empty negated set already means.
+    fn any() -> CharSet {
+        CharSet {
+            negated: true,
+            ranges: Vec::new(),
+            classes: Vec::new(),
+        }
+    }
+
+    fn matches(&self, c: char) -> bool {
+        let listed = self.ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi)
+            || self.classes.iter().any(|cl| cl.matches(c));
+        if self.negated {
+            // REG_NEWLINE: a non-matching list never matches a newline.
+            !listed && c != '\n'
+        } else {
+            listed
+        }
+    }
+}
+
+/// One instruction of the compiled NFA. Every instruction that does not branch
+/// falls through to the next one.
+enum Inst {
+    Char(CharSet),
+    Split(usize, usize),
+    Jump(usize),
+    Bol,
+    Eol,
+    Match,
+}
+
+/// A compiled regular expression.
+struct Regex {
+    prog: Vec<Inst>,
+}
+
+/// Anything `regcomp` would reject. git only reports that it happened, never
+/// which rule was broken, so the reason is not carried.
+struct RegexError;
+
+impl Regex {
+    fn compile(pattern: &str) -> std::result::Result<Regex, RegexError> {
+        let chars: Vec<char> = pattern.chars().collect();
+        let mut parser = Parser { chars, pos: 0 };
+        let node = parser.parse_alt()?;
+        if parser.pos != parser.chars.len() {
+            // A `)` with no `(` is all that can be left over.
+            return Err(RegexError);
+        }
+        let mut prog = Vec::new();
+        emit_node(&node, &mut prog);
+        prog.push(Inst::Match);
+        Ok(Regex { prog })
+    }
+
+    /// Whether the pattern matches anywhere in `text` — git's `regexec_buf()`
+    /// call passes the whole record, trailing newline included, and only looks
+    /// at the return code.
+    fn is_match(&self, text: &[u8]) -> bool {
+        let chars = decode_chars(text);
+        let n = chars.len();
+
+        let mut current: Vec<usize> = Vec::new();
+        let mut next: Vec<usize> = Vec::new();
+        let mut seen = vec![usize::MAX; self.prog.len()];
+
+        for pos in 0..=n {
+            // A fresh thread at every position is what makes the search
+            // unanchored, as `regexec` without `REG_STARTEND` anchoring is.
+            let mut stack = std::mem::take(&mut current);
+            stack.push(0);
+
+            while let Some(pc) = stack.pop() {
+                if seen[pc] == pos {
+                    continue;
+                }
+                seen[pc] = pos;
+                match &self.prog[pc] {
+                    Inst::Jump(t) => stack.push(*t),
+                    Inst::Split(a, b) => {
+                        stack.push(*a);
+                        stack.push(*b);
+                    }
+                    Inst::Bol => {
+                        if pos == 0 || chars[pos - 1] == '\n' {
+                            stack.push(pc + 1);
+                        }
+                    }
+                    Inst::Eol => {
+                        if pos == n || chars[pos] == '\n' {
+                            stack.push(pc + 1);
+                        }
+                    }
+                    Inst::Match => return true,
+                    Inst::Char(set) => {
+                        if pos < n && set.matches(chars[pos]) {
+                            next.push(pc + 1);
+                        }
+                    }
+                }
+            }
+            current = std::mem::take(&mut next);
+        }
+        false
+    }
+}
+
+/// Decode `text` into characters. Well-formed UTF-8 decodes as itself; any byte
+/// that does not start a valid sequence stands for the character of the same
+/// value, so no input is ever rejected.
+fn decode_chars(text: &[u8]) -> Vec<char> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        let width = match text[i] {
+            0x00..=0x7f => 1,
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => 0,
+        };
+        let decoded = (width > 1 && i + width <= text.len())
+            .then(|| std::str::from_utf8(&text[i..i + width]).ok())
+            .flatten()
+            .and_then(|s| s.chars().next());
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                i += width;
+            }
+            None => {
+                out.push(char::from(text[i]));
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Flatten the parse tree into the NFA program.
+fn emit_node(node: &Node, prog: &mut Vec<Inst>) {
+    match node {
+        Node::Empty => {}
+        Node::Set(set) => prog.push(Inst::Char(set.clone())),
+        Node::Bol => prog.push(Inst::Bol),
+        Node::Eol => prog.push(Inst::Eol),
+        Node::Cat(parts) => {
+            for part in parts {
+                emit_node(part, prog);
+            }
+        }
+        Node::Alt(branches) => {
+            // Each branch gets a split that either enters it or moves on, and
+            // ends with a jump to the common exit, patched once all are placed.
+            let mut jumps = Vec::new();
+            for (i, branch) in branches.iter().enumerate() {
+                if i + 1 == branches.len() {
+                    emit_node(branch, prog);
+                    break;
+                }
+                let split = prog.len();
+                prog.push(Inst::Split(0, 0));
+                emit_node(branch, prog);
+                jumps.push(prog.len());
+                prog.push(Inst::Jump(0));
+                let next = prog.len();
+                prog[split] = Inst::Split(split + 1, next);
+            }
+            let exit = prog.len();
+            for j in jumps {
+                prog[j] = Inst::Jump(exit);
+            }
+        }
+        Node::Repeat { node, min, max } => {
+            for _ in 0..*min {
+                emit_node(node, prog);
+            }
+            match max {
+                None => {
+                    // `X*`: split into the body or past it, and loop back.
+                    let split = prog.len();
+                    prog.push(Inst::Split(0, 0));
+                    emit_node(node, prog);
+                    prog.push(Inst::Jump(split));
+                    let exit = prog.len();
+                    prog[split] = Inst::Split(split + 1, exit);
+                }
+                Some(max) => {
+                    // `X{n,m}`: the surplus copies are each independently optional.
+                    let mut splits = Vec::new();
+                    for _ in *min..*max {
+                        splits.push(prog.len());
+                        prog.push(Inst::Split(0, 0));
+                        emit_node(node, prog);
+                    }
+                    let exit = prog.len();
+                    for s in splits {
+                        prog[s] = Inst::Split(s + 1, exit);
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct Parser {
+    chars: Vec<char>,
+    pos: usize,
+}
+
+impl Parser {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    /// `alt := concat ('|' concat)*`
+    fn parse_alt(&mut self) -> std::result::Result<Node, RegexError> {
+        let mut branches = vec![self.parse_concat()?];
+        while self.peek() == Some('|') {
+            self.pos += 1;
+            branches.push(self.parse_concat()?);
+        }
+        Ok(if branches.len() == 1 {
+            branches.pop().expect("just checked the length")
+        } else {
+            Node::Alt(branches)
+        })
+    }
+
+    /// `concat := repeat*`, stopping at `|` or the `)` that closes a group.
+    fn parse_concat(&mut self) -> std::result::Result<Node, RegexError> {
+        let mut parts = Vec::new();
+        while let Some(c) = self.peek() {
+            if c == '|' || c == ')' {
+                break;
+            }
+            parts.push(self.parse_repeat()?);
+        }
+        Ok(match parts.len() {
+            0 => Node::Empty,
+            1 => parts.pop().expect("just checked the length"),
+            _ => Node::Cat(parts),
+        })
+    }
+
+    /// `repeat := atom ('*' | '+' | '?' | '{n,m}')*`
+    fn parse_repeat(&mut self) -> std::result::Result<Node, RegexError> {
+        let mut node = self.parse_atom()?;
+        loop {
+            let (min, max) = match self.peek() {
+                Some('*') => (0, None),
+                Some('+') => (1, None),
+                Some('?') => (0, Some(1)),
+                Some('{') => match self.parse_interval()? {
+                    Some(bounds) => {
+                        node = Node::Repeat {
+                            node: Box::new(node),
+                            min: bounds.0,
+                            max: bounds.1,
+                        };
+                        continue;
+                    }
+                    // Not a valid interval, so `{` was an ordinary character and
+                    // `parse_interval` left the position untouched.
+                    None => break,
+                },
+                _ => break,
+            };
+            self.pos += 1;
+            node = Node::Repeat {
+                node: Box::new(node),
+                min,
+                max,
+            };
+        }
+        Ok(node)
+    }
+
+    /// `{n}`, `{n,}` or `{n,m}`. Returns `None` — without consuming anything —
+    /// when what follows is not an interval, which leaves `{` an ordinary
+    /// character as the C libraries treat it.
+    fn parse_interval(&mut self) -> std::result::Result<Option<(u32, Option<u32>)>, RegexError> {
+        let save = self.pos;
+        self.pos += 1;
+        let Some(min) = self.parse_bound() else {
+            self.pos = save;
+            return Ok(None);
+        };
+        let max = match self.peek() {
+            Some('}') => Some(min),
+            Some(',') => {
+                self.pos += 1;
+                if self.peek() == Some('}') {
+                    None
+                } else {
+                    match self.parse_bound() {
+                        Some(max) => Some(max),
+                        None => {
+                            self.pos = save;
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+            _ => {
+                self.pos = save;
+                return Ok(None);
+            }
+        };
+        if self.peek() != Some('}') {
+            self.pos = save;
+            return Ok(None);
+        }
+        self.pos += 1;
+        if max.is_some_and(|max| max < min) {
+            return Err(RegexError);
+        }
+        Ok(Some((min, max)))
+    }
+
+    fn parse_bound(&mut self) -> Option<u32> {
+        let start = self.pos;
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        if start == self.pos {
+            return None;
+        }
+        self.chars[start..self.pos]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .ok()
+    }
+
+    fn parse_atom(&mut self) -> std::result::Result<Node, RegexError> {
+        let Some(c) = self.peek() else {
+            return Err(RegexError);
+        };
+        self.pos += 1;
+        Ok(match c {
+            '^' => Node::Bol,
+            '$' => Node::Eol,
+            '.' => Node::Set(CharSet::any()),
+            '(' => {
+                let inner = self.parse_alt()?;
+                if self.peek() != Some(')') {
+                    return Err(RegexError);
+                }
+                self.pos += 1;
+                inner
+            }
+            '[' => Node::Set(self.parse_bracket()?),
+            // A repetition operator with nothing to repeat is `REG_BADRPT`.
+            '*' | '+' | '?' => return Err(RegexError),
+            ')' => return Err(RegexError),
+            '\\' => match self.peek() {
+                Some(esc) => {
+                    self.pos += 1;
+                    Node::Set(CharSet::literal(esc))
+                }
+                None => return Err(RegexError),
+            },
+            other => Node::Set(CharSet::literal(other)),
+        })
+    }
+
+    /// A bracket expression. POSIX gives backslash no special meaning in here,
+    /// `]` first is a literal, and `-` first or last is a literal.
+    fn parse_bracket(&mut self) -> std::result::Result<CharSet, RegexError> {
+        let mut set = CharSet {
+            negated: false,
+            ranges: Vec::new(),
+            classes: Vec::new(),
+        };
+        if self.peek() == Some('^') {
+            set.negated = true;
+            self.pos += 1;
+        }
+        let mut first = true;
+        loop {
+            let Some(c) = self.peek() else {
+                // Unterminated: this is what rejects `-I'['`.
+                return Err(RegexError);
+            };
+            if c == ']' && !first {
+                self.pos += 1;
+                return Ok(set);
+            }
+            first = false;
+
+            if c == '[' && self.chars.get(self.pos + 1) == Some(&':') {
+                let rest: String = self.chars[self.pos + 2..].iter().collect();
+                let Some(end) = rest.find(":]") else {
+                    return Err(RegexError);
+                };
+                let Some(class) = Class::parse(&rest[..end]) else {
+                    return Err(RegexError);
+                };
+                set.classes.push(class);
+                self.pos += 2 + rest[..end].chars().count() + 2;
+                continue;
+            }
+
+            self.pos += 1;
+            // `a-z`, unless the `-` is the last character before `]`.
+            if self.peek() == Some('-') && self.chars.get(self.pos + 1).is_some_and(|&n| n != ']') {
+                let Some(&hi) = self.chars.get(self.pos + 1) else {
+                    return Err(RegexError);
+                };
+                if hi < c {
+                    return Err(RegexError);
+                }
+                set.ranges.push((c, hi));
+                self.pos += 2;
+            } else {
+                set.ranges.push((c, c));
+            }
+        }
+    }
 }

@@ -5,17 +5,20 @@
 //! `--create-reflog`, plus `--stdin` (and `--stdin -z`) with the `update`,
 //! `create`, `delete`, `verify`, `symref-update`, `symref-create`,
 //! `symref-delete`, `symref-verify`, `option no-deref`, `start`, `commit` and
-//! `abort` commands. Every batch is applied through a single gitoxide ref
-//! transaction, so it is all-or-nothing exactly like stock git. Stock git
-//! prints nothing on success; so does this, and exit codes match (0 on
-//! success, 128 on a fatal failure, 1 for a failed `-d`).
+//! `abort` commands. A batch without `--batch-updates` is applied through a
+//! single gitoxide ref transaction, so it is all-or-nothing exactly like stock
+//! git. Stock git prints nothing on success; so does this, and exit codes match
+//! (0 on success, 128 on a fatal failure, 129 on a usage error, 1 for a failed
+//! `-d`).
 //!
-//! Not covered, and rejected with an error rather than approximated:
-//! `--batch-updates` (needs per-update rejection inside one transaction, which
-//! the vendored `gix-ref` transaction does not expose) and the `--stdin`
-//! `prepare` command (needs ref locks held across commands). One-level
-//! lowercase ref names such as `foo` are rejected by `gix-validate`, where
-//! stock git would write `.git/foo`.
+//! `--batch-updates` is accepted: outside `--stdin` it is the fatal error git
+//! reports, and with `--stdin` each staged edit is applied on its own so one
+//! rejection no longer aborts the rest.
+//!
+//! Not covered, and rejected with an error rather than approximated: the
+//! `--stdin` `prepare` command (needs ref locks held across commands).
+//! One-level lowercase ref names such as `foo` are rejected by `gix-validate`,
+//! where stock git would write `.git/foo`.
 
 use anyhow::{anyhow, bail, Result};
 use std::io::Read;
@@ -35,87 +38,109 @@ enum Val {
     Oid(ObjectId),
 }
 
+/// git's `-h` / `usage_with_options()` block, byte for byte.
+const USAGE: &str = "\
+usage: git update-ref [<options>] -d <refname> [<old-oid>]
+   or: git update-ref [<options>]    <refname> <new-oid> [<old-oid>]
+   or: git update-ref [<options>] --stdin [-z] [--batch-updates]
+
+    -m <reason>           reason of the update
+    -d                    delete the reference
+    --no-deref            update <refname> not the one it points to
+    --deref               opposite of --no-deref
+    -z                    stdin has NUL-terminated arguments
+    --[no-]stdin          read updates from stdin
+    --[no-]create-reflog  create a reflog
+    -0, --[no-]batch-updates
+                          batch reference updates
+
+";
+
+/// Every long option name git accepts, including the auto-generated negations.
+const LONG_NAMES: &[&str] = &[
+    "no-deref",
+    "deref",
+    "stdin",
+    "no-stdin",
+    "create-reflog",
+    "no-create-reflog",
+    "batch-updates",
+    "no-batch-updates",
+];
+
+/// The parsed command line, mirroring the variables in git's `cmd_update_ref`.
+#[derive(Default)]
+struct Opts {
+    msg: Option<String>,
+    delete: bool,
+    no_deref: bool,
+    end_null: bool,
+    read_stdin: bool,
+    create_reflog: bool,
+    batch_updates: bool,
+    positionals: Vec<String>,
+}
+
 /// `git update-ref` — see the module docs for the covered surface.
 pub fn update_ref(args: &[String]) -> Result<ExitCode> {
-    let mut msg: Option<String> = None;
-    let mut delete = false;
-    let mut deref = true;
-    let mut stdin_mode = false;
-    let mut nul = false;
-    let mut create_reflog = false;
-    let mut positionals: Vec<String> = Vec::new();
-    let mut end_of_opts = false;
+    let opts = match parse_args(args) {
+        Ok(o) => o,
+        Err(code) => return Ok(code),
+    };
 
-    let mut i = 1;
-    while i < args.len() {
-        let a = args[i].as_str();
-        if end_of_opts || !a.starts_with('-') || a == "-" {
-            positionals.push(a.to_string());
-            i += 1;
-            continue;
-        }
-        match a {
-            "--" => end_of_opts = true,
-            "-d" | "--delete" => delete = true,
-            "--no-deref" => deref = false,
-            "--deref" => deref = true,
-            "--stdin" => stdin_mode = true,
-            "-z" => nul = true,
-            "--create-reflog" => create_reflog = true,
-            "--batch-updates" | "-0" => {
-                bail!("unsupported flag \"--batch-updates\" (ported: -m, -d, --no-deref, --deref, --stdin, -z, --create-reflog)")
-            }
-            "-m" => {
-                i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or_else(|| anyhow!("switch `m' requires a value"))?;
-                msg = Some(v.clone());
-            }
-            _ if a.starts_with("-m") => msg = Some(a[2..].to_string()),
-            _ => bail!("unsupported flag {a:?} (ported: -m, -d, --no-deref, --deref, --stdin, -z, --create-reflog)"),
-        }
-        i += 1;
-    }
-
-    if nul && !stdin_mode {
-        bail!("-z requires --stdin");
-    }
-    if delete && create_reflog {
-        bail!("--create-reflog does not make sense without <new-oid>");
+    // git: `if (msg && !*msg) die(...)`, before every other consistency check.
+    if opts.msg.as_deref() == Some("") {
+        return fatal(anyhow!("Refusing to perform update with empty message."));
     }
 
     let repo = gix::discover(".")?;
+    let deref = !opts.no_deref;
 
-    if stdin_mode {
-        if !positionals.is_empty() {
-            bail!("--stdin takes no positional arguments");
+    if opts.read_stdin {
+        // git rejects `-d` and positionals here, before looking at `-z`.
+        if opts.delete || !opts.positionals.is_empty() {
+            return usage();
         }
-        return run_stdin(&repo, nul, deref, create_reflog, msg.as_deref());
+        return run_stdin(
+            &repo,
+            opts.end_null,
+            deref,
+            opts.create_reflog,
+            opts.batch_updates,
+            opts.msg.as_deref(),
+        );
     }
 
+    // Both of these outrank the argument-count check in git's source order.
+    if opts.batch_updates {
+        return fatal(anyhow!("--batch-updates can only be used with --stdin"));
+    }
+    if opts.end_null {
+        return usage();
+    }
+
+    let p = &opts.positionals;
     // Command-line form: build exactly one edit.
-    let (name, new_spec, old_spec) = if delete {
-        match positionals.len() {
-            1 => (positionals[0].as_str(), None, None),
-            2 => (positionals[0].as_str(), None, Some(positionals[1].as_str())),
+    let (name, new_spec, old_spec) = if opts.delete {
+        match p.len() {
+            1 => (p[0].as_str(), None, None),
+            2 => (p[0].as_str(), None, Some(p[1].as_str())),
             _ => return usage(),
         }
     } else {
-        match positionals.len() {
-            2 => (
-                positionals[0].as_str(),
-                Some(positionals[1].as_str()),
-                None,
-            ),
-            3 => (
-                positionals[0].as_str(),
-                Some(positionals[1].as_str()),
-                Some(positionals[2].as_str()),
-            ),
+        match p.len() {
+            2 => (p[0].as_str(), Some(p[1].as_str()), None),
+            3 => (p[0].as_str(), Some(p[1].as_str()), Some(p[2].as_str())),
             _ => return usage(),
         }
     };
+
+    // A deletion only requires a "safe" name, not a well-formed one, and a bad
+    // one is an `error:` with exit 1 rather than a fatal.
+    if opts.delete && !refname_is_safe(name) {
+        eprintln!("error: refusing to update ref with bad name '{name}'");
+        return Ok(ExitCode::from(1));
+    }
 
     // Value parsing failures are `fatal:` in git and exit 128, not usage errors.
     let new = match parse_val(&repo, new_spec, false) {
@@ -127,16 +152,24 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
         Err(e) => return fatal(e),
     };
 
-    let edit = match build_edit(name, &new, &old, deref, create_reflog, msg.as_deref()) {
+    let edit = match build_edit(name, &new, &old, deref, opts.create_reflog, opts.msg.as_deref()) {
         Ok(e) => e,
-        Err(e) => return fatal(e),
+        // `gix-validate` is stricter than git's `refname_is_safe`; a deletion
+        // git would accept targets a ref that cannot exist, so it is a no-op.
+        Err(_) if opts.delete => return Ok(ExitCode::SUCCESS),
+        Err(_) => {
+            eprintln!(
+                "fatal: update_ref failed for ref '{name}': refusing to update ref with bad name '{name}'"
+            );
+            return Ok(ExitCode::from(128));
+        }
     };
 
     match repo.edit_reference(edit) {
         Ok(_) => Ok(ExitCode::SUCCESS),
         Err(e) => {
             // `-d` reports `error:` and exits 1; the update form dies with 128.
-            if delete {
+            if opts.delete {
                 eprintln!("error: {e}");
                 Ok(ExitCode::from(1))
             } else {
@@ -147,11 +180,126 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
     }
 }
 
+/// Parse the command line the way git's `parse_options()` does for this command:
+/// long options accept unique abbreviations and `--no-` negations, short options
+/// cluster, and any error is reported then exits 129.
+fn parse_args(args: &[String]) -> Result<Opts, ExitCode> {
+    let mut o = Opts::default();
+    let mut end_of_opts = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if end_of_opts || !a.starts_with('-') || a == "-" {
+            o.positionals.push(a.to_string());
+            i += 1;
+            continue;
+        }
+        if a == "--" {
+            end_of_opts = true;
+            i += 1;
+            continue;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            // git splits `--name=value` first; none of these options take one.
+            let stem = long.split('=').next().unwrap_or(long);
+            match resolve_long(stem) {
+                Some(name) => apply_long(&mut o, name),
+                None => {
+                    eprintln!("error: unknown option `{stem}'");
+                    eprint!("{USAGE}");
+                    return Err(ExitCode::from(129));
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // A short-option cluster such as `-dz` or `-mreason`.
+        let cluster: Vec<char> = a[1..].chars().collect();
+        let mut c = 0;
+        while c < cluster.len() {
+            match cluster[c] {
+                'd' => o.delete = true,
+                'z' => o.end_null = true,
+                '0' => o.batch_updates = true,
+                'h' => {
+                    print!("{USAGE}");
+                    return Err(ExitCode::from(129));
+                }
+                'm' => {
+                    let rest: String = cluster[c + 1..].iter().collect();
+                    if rest.is_empty() {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => o.msg = Some(v.clone()),
+                            None => {
+                                eprintln!("error: switch `m' requires a value");
+                                return Err(ExitCode::from(129));
+                            }
+                        }
+                    } else {
+                        o.msg = Some(rest);
+                    }
+                    break; // `-m` swallows the rest of the cluster
+                }
+                other => {
+                    eprintln!("error: unknown switch `{other}'");
+                    eprint!("{USAGE}");
+                    return Err(ExitCode::from(129));
+                }
+            }
+            c += 1;
+        }
+        i += 1;
+    }
+    Ok(o)
+}
+
+/// Resolve one long option name, allowing any unambiguous abbreviation.
+fn resolve_long(stem: &str) -> Option<&'static str> {
+    if let Some(exact) = LONG_NAMES.iter().find(|n| **n == stem) {
+        return Some(*exact);
+    }
+    let mut hits = LONG_NAMES.iter().filter(|n| n.starts_with(stem));
+    let first = hits.next()?;
+    hits.next().is_none().then_some(*first)
+}
+
+/// Set the flag a resolved long option controls.
+fn apply_long(o: &mut Opts, name: &str) {
+    match name {
+        "no-deref" => o.no_deref = true,
+        "deref" => o.no_deref = false,
+        "stdin" => o.read_stdin = true,
+        "no-stdin" => o.read_stdin = false,
+        "create-reflog" => o.create_reflog = true,
+        "no-create-reflog" => o.create_reflog = false,
+        "batch-updates" => o.batch_updates = true,
+        "no-batch-updates" => o.batch_updates = false,
+        _ => unreachable!("resolve_long only yields known names"),
+    }
+}
+
+/// git's `refname_is_safe()`: the weaker check a deletion has to pass.
+fn refname_is_safe(name: &str) -> bool {
+    match name.strip_prefix("refs/") {
+        Some(rest) => {
+            !rest.is_empty()
+                && !rest.starts_with('/')
+                && !rest.ends_with('/')
+                // `normalize_path_copy()` must leave the remainder unchanged.
+                && rest
+                    .split('/')
+                    .all(|c| !c.is_empty() && c != "." && c != "..")
+        }
+        None => !name.is_empty() && name.bytes().all(|b| b.is_ascii_uppercase() || b == b'_'),
+    }
+}
+
 /// Print git's usage block to stderr and return its exit code (129).
 fn usage() -> Result<ExitCode> {
-    eprintln!("usage: git update-ref [<options>] -d <refname> [<old-oid>]");
-    eprintln!("   or: git update-ref [<options>]    <refname> <new-oid> [<old-oid>]");
-    eprintln!("   or: git update-ref [<options>] --stdin [-z] [--batch-updates]");
+    eprint!("{USAGE}");
     Ok(ExitCode::from(129))
 }
 
@@ -267,6 +415,7 @@ fn run_stdin(
     nul: bool,
     deref: bool,
     create_reflog: bool,
+    batch_updates: bool,
     msg: Option<&str>,
 ) -> Result<ExitCode> {
     let mut input = String::new();
@@ -302,7 +451,7 @@ fn run_stdin(
                 open_txn = true;
             }
             "commit" => {
-                if let Err(e) = apply(repo, std::mem::take(&mut batch)) {
+                if let Err(e) = apply(repo, std::mem::take(&mut batch), batch_updates) {
                     return fatal(e);
                 }
                 open_txn = false;
@@ -312,7 +461,9 @@ fn run_stdin(
                 open_txn = false;
             }
             "prepare" => {
-                bail!("stdin command \"prepare\" is not supported (gix-ref cannot hold locks across commands)")
+                return fatal(anyhow!(
+                    "stdin command \"prepare\" is not supported (gix-ref cannot hold locks across commands)"
+                ))
             }
             "option" => {
                 let [opt] = args else {
@@ -348,14 +499,18 @@ fn run_stdin(
     if open_txn {
         return Ok(ExitCode::SUCCESS);
     }
-    if let Err(e) = apply(repo, batch) {
+    if let Err(e) = apply(repo, batch, batch_updates) {
         return fatal(e);
     }
     Ok(ExitCode::SUCCESS)
 }
 
-/// Commit one accumulated batch: absence checks first, then the ref transaction.
-fn apply(repo: &gix::Repository, batch: Batch) -> Result<()> {
+/// Commit one accumulated batch: absence checks first, then the ref edits.
+///
+/// Without `--batch-updates` the edits go through one all-or-nothing gitoxide
+/// transaction. With it, each edit is applied on its own so that a rejection
+/// leaves the rest of the batch in place, which is the whole point of the flag.
+fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()> {
     for name in &batch.absent {
         refname(name)?; // reject malformed names the same way an edit would
         if repo.try_find_reference(name.as_str())?.is_some() {
@@ -365,8 +520,43 @@ fn apply(repo: &gix::Repository, batch: Batch) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
-    repo.edit_references(batch.edits)?;
+    if !batch_updates {
+        repo.edit_references(batch.edits)?;
+        return Ok(());
+    }
+    let zero = ObjectId::null(repo.object_hash());
+    for edit in batch.edits {
+        let name = edit.name.to_string();
+        let (new, old) = edit_oids(&edit, &zero);
+        if let Err(e) = repo.edit_reference(edit) {
+            eprintln!("error: {e}");
+            println!("rejected {name} {new} {old} {e}");
+        }
+    }
     Ok(())
+}
+
+/// The `<new-oid>`/`<old-oid>` pair a `rejected` line reports for one edit.
+fn edit_oids(edit: &RefEdit, zero: &ObjectId) -> (String, String) {
+    let (new, expected) = match &edit.change {
+        Change::Update { new, expected, .. } => (target_oid(new, zero), expected),
+        Change::Delete { expected, .. } => (zero.to_string(), expected),
+    };
+    let old = match expected {
+        PreviousValue::MustExistAndMatch(t) | PreviousValue::ExistingMustMatch(t) => {
+            target_oid(t, zero)
+        }
+        _ => zero.to_string(),
+    };
+    (new, old)
+}
+
+/// Render a ref target as the oid a `rejected` line wants, zero for a symref.
+fn target_oid(target: &Target, zero: &ObjectId) -> String {
+    match target {
+        Target::Object(id) => id.to_string(),
+        Target::Symbolic(_) => zero.to_string(),
+    }
 }
 
 /// Stage `update`/`create`/`delete`/`verify`.

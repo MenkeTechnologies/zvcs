@@ -1,82 +1,92 @@
 //! `git diff-index` — compare a tree object against the working tree or the index.
 //!
-//! Backed entirely by the vendored gitoxide (`src/ported`). The `--cached` form is a
-//! plain tree↔index diff (`Repository::tree_index_status`). The default form overlays
-//! gitoxide's index↔worktree status pass on top of that same tree↔index diff, which
-//! reproduces git's `oneway_diff`: an index entry whose worktree file is stat-dirty
-//! contributes the null object id and the mode derived from `lstat`, a missing
-//! worktree file turns the pair into a deletion, and everything else is taken
-//! straight from the index.
+//! Backed entirely by the vendored gitoxide (`src/ported`). The pair list is produced by
+//! a direct port of git's `oneway_diff` (`diff-lib.c`): the tree is flattened, the index
+//! is grouped by path, and every path in the union of the two is resolved into at most
+//! one raw record. Against the working tree the destination side comes from `lstat` via
+//! git's `ce_match_stat_basic`/`match_stat_data` rules, which is why a merely *touched*
+//! file — same bytes, new inode or ctime — is reported as `M` with the null object id,
+//! exactly as stock git reports it.
 //!
 //! Supported invocations (stdout is byte-identical to stock `git diff-index`):
 //!
 //!   * `git diff-index <tree-ish>`      — the default raw format:
 //!     `:<srcmode> <dstmode> <srcsha> <dstsha> <status>\t<path>`.
 //!   * `--cached`                       — compare `<tree-ish>` against the index only.
+//!   * `--merge-base`                   — diff against `merge-base(HEAD, <commit>)`.
 //!   * `-m`                             — treat files missing from the worktree as up
 //!     to date instead of reporting them deleted.
 //!   * `--raw`, `--name-only`, `--name-status` — output selection.
 //!   * `-z`                             — NUL field/record terminators, paths unquoted.
-//!   * `--abbrev[=<n>]`, `--no-abbrev`  — abbreviated / full object ids.
+//!   * `--abbrev[=<n>]`, `--no-abbrev`, `--full-index` — abbreviated / full object ids.
 //!   * `--exit-code`, `--quiet`         — exit 1 when differences exist (`--quiet` is silent).
 //!   * `-s` / `--no-patch`              — suppress output, exit 0 unless `--exit-code`.
+//!   * `-R`                             — swap the two sides of every pair.
+//!   * `--diff-filter=<letters>`        — include upper-case, exclude lower-case statuses.
+//!   * `--line-prefix=<s>`              — prefix every emitted record.
+//!   * `--relative[=<path>]`, `--no-relative` — limit to a subdirectory and strip it.
+//!   * `-w`, `-b`, `--ignore-all-space`, `--ignore-space-change`,
+//!     `--ignore-space-at-eol`, `--ignore-cr-at-eol`, `-I<s>`/`--ignore-matching-lines=<s>`
+//!     — content comparison: pairs whose contents match once the requested folding is
+//!     applied are dropped, and the surviving worktree side is hashed so the real object
+//!     id shows up in the raw record instead of the null id, as git does.
+//!   * `-S<s>`, `-G<s>`, `--pickaxe-all`, `--pickaxe-regex` — the pickaxe filters.
 //!   * `[--] <path>...`                 — pathspec limiting, resolved relative to the cwd
-//!     while output paths stay repository-root relative, as git does.
+//!     while output paths stay repository-root relative, as git does. Without a `--`
+//!     separator a pathspec has to exist on disk (git's `verify_filename`), so a
+//!     mistyped revision exits 128 with the `ambiguous argument` text rather than
+//!     silently matching nothing.
 //!
 //! Status letters produced: `A`, `D`, `T` (the `S_IFMT` bits of the two modes differ,
-//! e.g. file ↔ symlink) and `M`.
+//! e.g. file ↔ symlink), `M`, and `U` for unmerged paths under `--cached`.
 //!
 //! Options that only steer patch, stat or colour rendering (`--color[=<when>]`, `-D`,
 //! `--ws-error-highlight=`, `--src-prefix=`/`--dst-prefix=`/`--no-prefix`,
 //! `--diff-algorithm=`, `--anchored=`, `--color-moved[=]`, `--word-diff[=]`,
-//! `--submodule[=]`, `-a`/`--text`, `-W`, …) are accepted and ignored: stock git's raw,
-//! `--name-only` and `--name-status` bytes are identical with and without them. The full
-//! list is `render_only_option`. `-U<n>`, `--unified=<n>` and `--binary` are *not* in it
-//! — despite looking like rendering knobs they switch the output format to a patch.
+//! `--submodule[=]`, `--ignore-submodules[=]`, `--skip-to=`, `--rotate-to=`,
+//! `--ignore-blank-lines`, `-B`, `-l<n>`, `-a`/`--text`, `-W`, …) are accepted and
+//! ignored: stock git's raw, `--name-only` and `--name-status` bytes are identical with
+//! and without them. The full list is `render_only_option`.
 //!
 //! ### Honest limitations (bailed on with a precise message, never faked)
 //!
-//! * Patch and stat output (`-p`/`-u`/`--patch`, `-U<n>`/`--unified`, `--binary`,
-//!   `--stat`, `--numstat`, `--shortstat`, `--dirstat`, `--summary`, `--compact-summary`,
-//!   `--patch-with-raw`) is not produced here.
-//! * Rename/copy/rewrite detection (`-M`, `-C`, `-B`) is off, which is git's default for
-//!   `diff-index` as well, so `--no-renames` is accepted as a no-op.
-//! * `--merge-base`, `--diff-filter`, the pickaxe (`-S`/`-G`), `-R`, `--relative`,
-//!   `--line-prefix=` and the combined-merge selectors (`-c`/`--cc`) are unimplemented.
-//! * The whitespace-insensitive comparisons (`-w`, `-b`, `--ignore-space-change`,
-//!   `--ignore-all-space`, `--ignore-space-at-eol`, `--ignore-cr-at-eol`,
-//!   `--ignore-blank-lines`, `-I<regex>`) are unimplemented. They are not cosmetic for
-//!   the raw format: git sets `diff_from_contents` for them, which both drops pairs whose
-//!   content matches once whitespace is folded and replaces the null worktree object id
-//!   with the hash git had to compute to decide that.
-//! * An unimplemented option is held until after the tree-ish has been resolved, so a
-//!   missing tree-ish still exits 129 with git's usage text and an unresolvable one still
-//!   exits 128 with git's `ambiguous argument` text, as stock git does.
-//! * Unmerged (conflicted) index entries bail. Stock git emits
-//!   `:<mode> 000000 <stage-2-id> <null> U` for them under `--cached`, and against the
-//!   worktree it emits an ordinary `M` record whose source is the stage-2 entry; neither
-//!   is reproduced here rather than approximated.
+//! * Patch and stat rendering (`-p`/`-u`/`--patch`, `-U<n>`/`--unified`, `--binary`,
+//!   `--stat`, `--numstat`, `--shortstat`, `--summary`, `--compact-summary`, `--check`,
+//!   `--patch-with-raw`, `--patch-with-stat`) is not produced. These formats *are*
+//!   content-driven in git, so when no pair survives the content comparison the correct
+//!   output is nothing at all and that is what is emitted; a run that would have produced
+//!   real patch or stat bytes is refused instead of approximated.
+//! * `--dirstat` and friends (`--cumulative`, `--dirstat-by-file`) need git's
+//!   `diffcore_count_changes` damage estimate, which the vendored gitoxide does not
+//!   provide. Refused unless the pair list is empty.
+//! * Rename/copy detection is off, which is git's default for `diff-index`. `-M`/`-C`
+//!   and friends are accepted for their *observable* side effect on this listing — git
+//!   hashes rename candidates, so an added path gains its real object id — but no rename
+//!   is ever reported.
+//! * `-S`/`-G`/`-I` take literal strings here. A pattern containing regular-expression
+//!   metacharacters is refused rather than matched as a literal.
+//! * A locally modified but committed-clean submodule is reported as unchanged; git also
+//!   inspects the submodule worktree and would report it.
 //! * With a bare `--abbrev` and no `core.abbrev` set, the length comes from gitoxide's
 //!   unique-prefix computation for the first real id (falling back to 7); git derives it
 //!   from the packed object count, so the two can differ on large packed repositories.
-//!   An explicit `--abbrev=<n>` truncates to `n` without git's disambiguation lengthening.
 //! * Magic (`:(...)`) and glob pathspecs bail; literal paths and directory prefixes work.
-//!
-//! ### Known deviation
-//!
-//! When a tracked file is replaced by a *directory*, gitoxide reports the entry as
-//! removed and this prints `D`, whereas git prints a mode change. Everything else in
-//! the worktree overlay maps one-to-one onto git's behaviour.
+//! * An unimplemented option is held until after the tree-ish has been resolved, so a
+//!   missing tree-ish still exits 129 with git's usage text and an unresolvable one still
+//!   exits 128 with git's `ambiguous argument` text, as stock git does.
 
 use anyhow::{bail, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gix::bstr::BString;
 use gix::hash::ObjectId;
-use gix::index::entry::stat::Options as StatOptions;
 use gix::prelude::ObjectIdExt;
+
+/// The file-type bits of a mode, as in `<sys/stat.h>`.
+const S_IFMT: u32 = 0o170000;
 
 /// How the change list should be rendered.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -91,6 +101,31 @@ enum Format {
     Silent,
 }
 
+/// Which whitespace differences the content comparison should fold away.
+#[derive(Clone, Copy, Default)]
+struct Ws {
+    /// `-w` / `--ignore-all-space`
+    all: bool,
+    /// `-b` / `--ignore-space-change`
+    change: bool,
+    /// `--ignore-space-at-eol`
+    at_eol: bool,
+    /// `--ignore-cr-at-eol`
+    cr: bool,
+}
+
+impl Ws {
+    fn any(self) -> bool {
+        self.all || self.change || self.at_eol || self.cr
+    }
+}
+
+/// The pickaxe: `-S` compares occurrence counts, `-G` greps the changed lines.
+enum Pickaxe {
+    Occurrences(Vec<u8>),
+    Grep(Vec<u8>),
+}
+
 /// Parsed command-line options for a single `diff-index` invocation.
 struct Opts {
     cached: bool,                  // --cached: compare against the index, ignore the worktree
@@ -99,6 +134,16 @@ struct Opts {
     nul: bool,                     // -z: NUL field/record terminators, no path quoting
     abbrev: Option<Option<usize>>, // --abbrev[=N]: None=full, Some(None)=auto, Some(Some(n))=N
     exit_code: bool,               // --exit-code/--quiet: exit 1 when anything differs
+    reverse: bool,                 // -R: swap the two sides
+    line_prefix: Vec<u8>,          // --line-prefix=<s>
+    relative: Option<BString>,     // --relative[=<dir>], repository-root relative, no trailing '/'
+    filter_include: Vec<u8>,       // --diff-filter upper-case letters
+    filter_exclude: Vec<u8>,       // --diff-filter lower-case letters, upper-cased
+    ws: Ws,
+    ignore_lines: Option<Vec<u8>>, // -I<s> / --ignore-matching-lines=<s>
+    pickaxe: Option<Pickaxe>,
+    pickaxe_all: bool,
+    detect_rename: bool, // -M/-C: git hashes rename candidates, so additions gain real ids
 }
 
 /// One file-level change, already reduced to the columns git's raw format prints.
@@ -108,32 +153,47 @@ struct Delta {
     dst_mode: u32,
     src_id: ObjectId,
     dst_id: ObjectId,
-    status: u8,
+    /// An unmerged (conflicted) index entry, reported as `U` under `--cached`.
+    unmerged: bool,
     /// Repository-root relative path.
     path: BString,
 }
 
-/// A tree↔index difference for one path.
-enum TreeChange {
-    Added { mode: u32, id: ObjectId },
-    Deleted { mode: u32, id: ObjectId },
-    Modified { old_mode: u32, old_id: ObjectId, new_mode: u32, new_id: ObjectId },
+impl Delta {
+    /// git's `diff_resolve_rename_copy` letter: absent source is an addition, absent
+    /// destination a deletion, differing `S_IFMT` bits a type change, otherwise a
+    /// modification. Unmerged pairs short-circuit to `U`.
+    fn status(&self) -> u8 {
+        if self.unmerged {
+            b'U'
+        } else if self.src_mode == 0 {
+            b'A'
+        } else if self.dst_mode == 0 {
+            b'D'
+        } else if (self.src_mode & S_IFMT) != (self.dst_mode & S_IFMT) {
+            b'T'
+        } else {
+            b'M'
+        }
+    }
 }
 
-/// How the worktree deviates from the index entry for one path.
-enum Wt {
-    /// The worktree file is gone.
-    Removed,
-    /// The worktree file exists but differs from the index; git records this mode and
-    /// the null object id because the content was never written to the odb.
-    NewMode(u32),
-    /// A checked-out submodule with local changes; git still emits the index id.
-    SubmoduleDirty,
+/// What the index knows about one path, with the stages collapsed the way git's
+/// `oneway_diff` sees them: stage 2 wins when a path is unmerged, and the stat data of
+/// an unmerged entry is all zeroes, which is what makes it always compare dirty.
+struct IdxInfo {
+    mode: u32,
+    id: ObjectId,
+    stat: gix::index::entry::Stat,
+    intent_to_add: bool,
+    unmerged: bool,
 }
 
 /// The flag list quoted back at the user when an unimplemented option shows up.
-const PORTED: &str = "--cached, -m, --raw, --name-only, --name-status, -z, --abbrev[=<n>], \
-                      --no-abbrev, --full-index, --exit-code, --quiet, -s/--no-patch, --no-renames";
+const PORTED: &str = "--cached, --merge-base, -m, --raw, --name-only, --name-status, -z, \
+                      --abbrev[=<n>], --no-abbrev, --full-index, --exit-code, --quiet, \
+                      -s/--no-patch, -R, --diff-filter=, --line-prefix=, --relative[=], \
+                      -w/-b/--ignore-*-space*, -I, -S, -G";
 
 /// Stock `git diff-index`'s usage text, reproduced byte for byte (including the
 /// trailing blank line) because it is written to stderr on every usage error.
@@ -171,16 +231,19 @@ common diff options:
 /// Options that steer only patch, stat or colour rendering — never the raw,
 /// `--name-only` or `--name-status` listings this module emits.
 ///
-/// Each entry was checked against stock git by diffing `git diff-index HEAD` with and
-/// without the option in a repository holding a worktree modification; all of them
-/// leave those bytes and the exit status untouched. Deliberately absent: `-U<n>`,
-/// `--unified=<n>` and `--binary`, which look like rendering knobs but switch the
-/// output format to a patch, and `--line-prefix=`, which prefixes every raw record.
+/// Each entry was checked against stock `git diff-index` by diffing the raw output with
+/// and without the option, both in a repository whose only differences are stat-dirty
+/// (so every pair has a null destination id) and in one with real additions, deletions
+/// and modifications. All of them leave those bytes and the exit status untouched.
+/// Deliberately absent: `-U<n>`, `--unified=<n>`, `--binary`, `--check`, the stat family
+/// and the dirstat family, which look like rendering knobs but replace the raw listing.
 fn render_only_option(a: &str) -> bool {
     const EXACT: &[&str] = &[
         "-a",
+        "-B",
         "-D",
         "-W",
+        "--break-rewrites",
         "--color",
         "--color-moved",
         "--color-words",
@@ -189,8 +252,11 @@ fn render_only_option(a: &str) -> bool {
         "--full-index",
         "--function-context",
         "--histogram",
+        "--ignore-blank-lines",
+        "--ignore-submodules",
         "--indent-heuristic",
         "--irreversible-delete",
+        "--ita-invisible-in-index",
         "--ita-visible-in-index",
         "--minimal",
         "--no-color",
@@ -201,13 +267,10 @@ fn render_only_option(a: &str) -> bool {
         "--no-function-context",
         "--no-indent-heuristic",
         "--no-prefix",
-        "--no-relative",
         "--no-rename-empty",
         "--no-renames",
         "--no-textconv",
         "--patience",
-        "--pickaxe-all",
-        "--pickaxe-regex",
         "--rename-empty",
         "--submodule",
         "--text",
@@ -216,30 +279,86 @@ fn render_only_option(a: &str) -> bool {
     ];
     const WITH_VALUE: &[&str] = &[
         "--anchored=",
+        "--break-rewrites=",
         "--color=",
         "--color-moved=",
         "--color-moved-ws=",
         "--diff-algorithm=",
         "--diff-merges=",
         "--dst-prefix=",
+        "--ignore-submodules=",
         "--inter-hunk-context=",
         "--output-indicator-context=",
         "--output-indicator-new=",
         "--output-indicator-old=",
+        "--rotate-to=",
+        "--skip-to=",
         "--src-prefix=",
         "--submodule=",
         "--word-diff=",
         "--word-diff-regex=",
         "--ws-error-highlight=",
     ];
-    EXACT.contains(&a) || WITH_VALUE.iter().any(|p| a.starts_with(*p))
+    if EXACT.contains(&a) || WITH_VALUE.iter().any(|p| a.starts_with(*p)) {
+        return true;
+    }
+    // `-B<n>` / `-B<n>/<m>` (break rewrites) and `-l<n>` (rename limit) carry a numeric
+    // tail; neither changes this listing.
+    let b = a.as_bytes();
+    b.len() > 2 && b[0] == b'-' && (b[1] == b'B' || b[1] == b'l')
+}
+
+/// Options that select a patch-, stat- or check-style rendering this module does not
+/// produce. The boolean says whether git derives that rendering from file *contents*
+/// (so an all-clean pair list renders as nothing) or from the pair list alone.
+fn unsupported_format(a: &str) -> Option<bool> {
+    const CONTENT_EXACT: &[&str] = &[
+        "-p",
+        "-u",
+        "--patch",
+        "--patch-with-raw",
+        "--patch-with-stat",
+        "--binary",
+        "--check",
+        "--compact-summary",
+        "--numstat",
+        "--shortstat",
+        "--stat",
+        "--summary",
+    ];
+    const CONTENT_PREFIX: &[&str] = &["--stat=", "--stat-width=", "--stat-name-width=", "--stat-count=", "--unified="];
+    const DIRSTAT_EXACT: &[&str] = &["--cumulative", "--dirstat", "--dirstat-by-file"];
+    const DIRSTAT_PREFIX: &[&str] = &["--dirstat=", "--dirstat-by-file="];
+
+    if CONTENT_EXACT.contains(&a) || CONTENT_PREFIX.iter().any(|p| a.starts_with(*p)) {
+        return Some(true);
+    }
+    // `-U<n>` sets the context count *and* selects the patch format.
+    if a.len() > 2 && a.starts_with("-U") {
+        return Some(true);
+    }
+    if DIRSTAT_EXACT.contains(&a) || DIRSTAT_PREFIX.iter().any(|p| a.starts_with(*p)) {
+        return Some(false);
+    }
+    None
 }
 
 /// Short options whose value may be written as a separate argument (`-S fn` as well as
-/// `-Sfn`). All of them are unimplemented here, but the value still has to be consumed
-/// so it is not mistaken for the tree-ish.
+/// `-Sfn`).
 fn short_option_takes_value(a: &str) -> bool {
     matches!(a, "-S" | "-G" | "-I" | "-O" | "-U" | "-l")
+}
+
+/// `true` when a pickaxe/ignore pattern would need a real regular-expression engine.
+/// Anything free of metacharacters is matched literally, which is what git does for a
+/// plain `-S<string>` and what a metacharacter-free `-G`/`-I` regex degenerates to.
+fn is_literal(pat: &[u8]) -> bool {
+    !pat.iter().any(|&c| {
+        matches!(
+            c,
+            b'.' | b'*' | b'+' | b'?' | b'[' | b']' | b'(' | b')' | b'{' | b'}' | b'|' | b'^' | b'$' | b'\\'
+        )
+    })
 }
 
 pub fn diff_index(args: &[String]) -> Result<ExitCode> {
@@ -257,10 +376,29 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         nul: false,
         abbrev: None,
         exit_code: false,
+        reverse: false,
+        line_prefix: Vec::new(),
+        relative: None,
+        filter_include: Vec::new(),
+        filter_exclude: Vec::new(),
+        ws: Ws::default(),
+        ignore_lines: None,
+        pickaxe: None,
+        pickaxe_all: false,
+        detect_rename: false,
     };
     let mut quiet = false;
+    let mut merge_base = false;
+    // `-S`/`-G` share one slot (the last one wins, as in git); `-I` composes with them.
+    let mut pickaxe_arg: Option<(u8, Vec<u8>)> = None;
+    let mut ignore_arg: Option<Vec<u8>> = None;
+    let mut pickaxe_regex = false;
     let mut treeish: Option<&str> = None;
     let mut paths: Vec<BString> = Vec::new();
+    // Positionals given without a `--` separator. git's `verify_filename` insists that
+    // each one names something that exists in the working tree, so that a mistyped
+    // revision is reported instead of silently becoming a pathspec that matches nothing.
+    let mut unseparated: Vec<&str> = Vec::new();
     let mut after_dashdash = false;
     // The first option git understands but this module does not. Held back rather than
     // raised immediately: git parses the whole command line before it looks at the
@@ -268,6 +406,8 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     // does in stock git, and only a run that would otherwise have produced output is
     // refused.
     let mut unsupported: Option<String> = None;
+    // A patch/stat rendering, plus whether git derives it from file contents.
+    let mut bad_format: Option<(String, bool)> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -280,6 +420,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         match a {
             "--" => after_dashdash = true,
             "--cached" => opts.cached = true,
+            "--merge-base" => merge_base = true,
             "-m" => opts.match_missing = true,
             "--raw" => opts.format = Format::Raw,
             "--name-only" => opts.format = Format::NameOnly,
@@ -293,25 +434,109 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 opts.exit_code = true;
                 quiet = true;
             }
+            "-R" => opts.reverse = true,
+            "-w" | "--ignore-all-space" => opts.ws.all = true,
+            "-b" | "--ignore-space-change" => opts.ws.change = true,
+            "--ignore-space-at-eol" => opts.ws.at_eol = true,
+            "--ignore-cr-at-eol" => opts.ws.cr = true,
+            "--pickaxe-all" => opts.pickaxe_all = true,
+            "--pickaxe-regex" => pickaxe_regex = true,
+            "--relative" => opts.relative = Some(BString::default()),
+            "--no-relative" => opts.relative = None,
+            "-M" | "-C" | "--find-renames" | "--find-copies" | "--find-copies-harder" => {
+                opts.detect_rename = true;
+            }
+            "-S" | "-G" | "-I" => {
+                let Some(value) = args.get(i) else {
+                    eprint!("{}", USAGE);
+                    return Ok(ExitCode::from(129));
+                };
+                i += 1;
+                if a == "-I" {
+                    ignore_arg = Some(value.as_bytes().to_vec());
+                } else {
+                    pickaxe_arg = Some((a.as_bytes()[1], value.as_bytes().to_vec()));
+                }
+            }
+            s if s.starts_with("--find-renames=") || s.starts_with("--find-copies=") => {
+                opts.detect_rename = true;
+            }
+            s if s.starts_with("--relative=") => {
+                opts.relative = Some(trim_slashes(&s["--relative=".len()..]));
+            }
+            s if s.starts_with("--line-prefix=") => {
+                opts.line_prefix = s["--line-prefix=".len()..].as_bytes().to_vec();
+            }
+            s if s.starts_with("--ignore-matching-lines=") => {
+                ignore_arg = Some(s["--ignore-matching-lines=".len()..].as_bytes().to_vec());
+            }
+            s if s.starts_with("--diff-filter=") => {
+                if !parse_filter(&s["--diff-filter=".len()..], &mut opts) {
+                    unsupported.get_or_insert_with(|| s.to_owned());
+                }
+            }
             s if s.starts_with("--abbrev=") => {
                 let n: usize = s["--abbrev=".len()..]
                     .parse()
                     .map_err(|_| anyhow::anyhow!("invalid --abbrev value in {s:?}"))?;
                 opts.abbrev = Some(Some(n));
             }
-            s if render_only_option(s) => {}
-            s if s.starts_with('-') && s.len() > 1 => {
-                if short_option_takes_value(s) {
-                    i += 1;
-                }
-                unsupported.get_or_insert_with(|| s.to_owned());
+            s if s.len() > 2 && s.starts_with("-I") => {
+                ignore_arg = Some(s[2..].as_bytes().to_vec());
             }
-            s if treeish.is_none() => treeish = Some(s),
-            s => paths.push(s.into()),
+            s if s.len() > 2 && (s.starts_with("-S") || s.starts_with("-G")) => {
+                pickaxe_arg = Some((s.as_bytes()[1], s[2..].as_bytes().to_vec()));
+            }
+            s if s.len() > 2 && (s.starts_with("-M") || s.starts_with("-C")) => {
+                opts.detect_rename = true;
+            }
+            s => {
+                if let Some(content_driven) = unsupported_format(s) {
+                    if bad_format.is_none() {
+                        bad_format = Some((s.to_owned(), content_driven));
+                    }
+                } else if render_only_option(s) {
+                    // Accepted and ignored.
+                } else if s.starts_with('-') && s.len() > 1 {
+                    if short_option_takes_value(s) {
+                        i += 1;
+                    }
+                    unsupported.get_or_insert_with(|| s.to_owned());
+                } else if treeish.is_none() {
+                    treeish = Some(s);
+                } else {
+                    unseparated.push(s);
+                    paths.push(s.into());
+                }
+            }
         }
     }
     if quiet {
         opts.format = Format::Silent;
+    }
+    // `-s`/`--quiet` mean "no output at all", which is exactly what an unrenderable
+    // patch or stat format would have produced here anyway.
+    if opts.format == Format::Silent {
+        bad_format = None;
+    }
+    if let Some((kind, pat)) = pickaxe_arg {
+        // `-S` takes a literal string unless `--pickaxe-regex` turns it into a pattern;
+        // `-G` is always a pattern, so it only works here on a metacharacter-free one.
+        let needs_regex = if kind == b'S' { pickaxe_regex } else { true };
+        if needs_regex && !is_literal(&pat) {
+            unsupported.get_or_insert_with(|| format!("-{}<regex>", kind as char));
+        } else if kind == b'S' {
+            opts.pickaxe = Some(Pickaxe::Occurrences(pat));
+        } else {
+            opts.pickaxe = Some(Pickaxe::Grep(pat));
+        }
+    }
+    if let Some(pat) = ignore_arg {
+        if !is_literal(&pat) {
+            unsupported.get_or_insert_with(|| "-I<regex>".to_owned());
+        } else {
+            opts.ignore_lines = Some(pat);
+        }
     }
 
     let Some(spec) = treeish else {
@@ -321,10 +546,41 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
 
     let repo = gix::discover(".")?;
 
+    let Some(resolved) = repo.rev_parse_single(spec).ok().map(|id| id.detach()) else {
+        eprintln!(
+            "fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree.\n\
+             Use '--' to separate paths from revisions, like this:\n\
+             'git <command> [<revision>...] -- [<file>...]'"
+        );
+        return Ok(ExitCode::from(128));
+    };
+
+    let base = if merge_base {
+        let head = match repo.head_id() {
+            Ok(id) => id.detach(),
+            Err(_) => {
+                eprintln!("fatal: no merge base found");
+                return Ok(ExitCode::from(128));
+            }
+        };
+        match repo.merge_base(head, resolved) {
+            Ok(id) => id.detach(),
+            Err(_) => {
+                if !object_is_commit(&repo, &resolved) {
+                    eprintln!("error: object {resolved} is a tree, not a commit");
+                }
+                eprintln!("fatal: no merge base found");
+                return Ok(ExitCode::from(128));
+            }
+        }
+    } else {
+        resolved
+    };
+
     let tree_id = match repo
-        .rev_parse_single(spec)
+        .find_object(base)
         .map_err(anyhow::Error::from)
-        .and_then(|id| Ok(id.object()?.peel_to_tree()?.id))
+        .and_then(|o| Ok(o.peel_to_tree()?.id))
     {
         Ok(id) => id,
         Err(_) => {
@@ -336,6 +592,19 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
+
+    // git's `verify_filename`: a positional that follows the tree-ish without a `--`
+    // has to exist on disk, or it was meant to be a revision and is reported as one.
+    for arg in &unseparated {
+        if std::fs::symlink_metadata(arg).is_err() {
+            eprintln!(
+                "fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree.\n\
+                 Use '--' to separate paths from revisions, like this:\n\
+                 'git <command> [<revision>...] -- [<file>...]'"
+            );
+            return Ok(ExitCode::from(128));
+        }
+    }
 
     if let Some(flag) = unsupported {
         bail!("unsupported flag {flag:?} (ported: {PORTED})");
@@ -369,10 +638,49 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     if !paths.is_empty() {
         deltas.retain(|d| paths.iter().any(|p| path_matches(&d.path, p)));
     }
+    if let Some(rel) = &opts.relative {
+        if !rel.is_empty() {
+            deltas.retain(|d| path_matches(&d.path, rel));
+        }
+    }
     // git emits index order, which is a plain byte-wise sort of the paths.
     deltas.sort_by(|a, b| a.path.cmp(&b.path));
 
-    if opts.format != Format::Silent {
+    // git's `diffcore_std`: content comparison first (which also fills in the object id
+    // it had to compute), then the pickaxe, then `--diff-filter`.
+    let content_driven = opts.ws.any()
+        || opts.ignore_lines.is_some()
+        || opts.pickaxe.is_some()
+        || matches!(&bad_format, Some((_, true)));
+    if content_driven {
+        apply_content_filter(&repo, &mut deltas, &opts)?;
+        apply_pickaxe(&repo, &mut deltas, &opts)?;
+    } else if opts.detect_rename {
+        // git hashes every rename candidate; the only visible effect on this listing is
+        // that a created path shows its real object id instead of the null id.
+        fill_added_ids(&repo, &mut deltas, &opts)?;
+    }
+
+    if opts.reverse {
+        for d in &mut deltas {
+            if d.unmerged {
+                // `diff_unmerge` builds its pair outside `diff_change`, which is where
+                // git applies `-R`, so unmerged records are never swapped.
+                continue;
+            }
+            std::mem::swap(&mut d.src_mode, &mut d.dst_mode);
+            std::mem::swap(&mut d.src_id, &mut d.dst_id);
+        }
+    }
+    if !opts.filter_include.is_empty() || !opts.filter_exclude.is_empty() {
+        deltas.retain(|d| passes_filter(d.status(), &opts));
+    }
+
+    if let Some((flag, _)) = &bad_format {
+        if !deltas.is_empty() {
+            bail!("unsupported output format {flag:?} (ported: {PORTED})");
+        }
+    } else if opts.format != Format::Silent {
         let text = render(&repo, &deltas, &opts)?;
         let stdout = std::io::stdout();
         stdout.lock().write_all(&text)?;
@@ -385,293 +693,574 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     })
 }
 
+/// `--diff-filter=<letters>`: upper-case selects, lower-case excludes. Returns `false`
+/// on a letter git does not know.
+fn parse_filter(spec: &str, opts: &mut Opts) -> bool {
+    const KNOWN: &[u8] = b"ACDMRTUXB*";
+    for c in spec.bytes() {
+        let upper = c.to_ascii_uppercase();
+        if !KNOWN.contains(&upper) {
+            return false;
+        }
+        if c.is_ascii_lowercase() {
+            opts.filter_exclude.push(upper);
+        } else {
+            opts.filter_include.push(upper);
+        }
+    }
+    true
+}
+
+fn passes_filter(status: u8, opts: &Opts) -> bool {
+    if opts.filter_exclude.contains(&status) {
+        return false;
+    }
+    opts.filter_include.is_empty() || opts.filter_include.contains(&b'*') || opts.filter_include.contains(&status)
+}
+
+fn trim_slashes(s: &str) -> BString {
+    BString::from(s.trim_matches('/').as_bytes().to_vec())
+}
+
+fn object_is_commit(repo: &gix::Repository, id: &ObjectId) -> bool {
+    repo.find_object(*id).map(|o| o.kind == gix::objs::Kind::Commit).unwrap_or(false)
+}
+
 /// Diff `tree_id` against the index, then (unless `--cached`) fold in how the worktree
 /// deviates from that index, exactly as git's `oneway_diff` does.
 fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Vec<Delta>> {
     let null = ObjectId::null(repo.object_hash());
+    let mut tree: BTreeMap<BString, (u32, ObjectId)> = BTreeMap::new();
+    flatten_tree(repo, tree_id, &BString::default(), &mut tree)?;
+
     let index = repo.index_or_empty()?;
     let index_state: &gix::index::State = &index;
 
-    if index_state.entries().iter().any(|e| e.stage_raw() != 0) {
-        bail!("unmerged (conflicted) index entries are not supported");
-    }
-
-    let tree_changes = tree_index_changes(repo, tree_id, index_state)?;
-
-    if opts.cached {
-        let mut deltas = Vec::with_capacity(tree_changes.len());
-        for (path, change) in tree_changes {
-            let (src_mode, src_id, dst_mode, dst_id) = match change {
-                TreeChange::Added { mode, id } => (0, null, mode, id),
-                TreeChange::Deleted { mode, id } => (mode, id, 0, null),
-                TreeChange::Modified {
-                    old_mode,
-                    old_id,
-                    new_mode,
-                    new_id,
-                } => (old_mode, old_id, new_mode, new_id),
-            };
-            deltas.push(make_delta(src_mode, src_id, dst_mode, dst_id, path));
+    let mut idx: BTreeMap<BString, IdxInfo> = BTreeMap::new();
+    for e in index_state.entries() {
+        let path = BString::from(e.path(index_state).to_vec());
+        let stage = e.stage_raw();
+        match idx.get_mut(&path) {
+            Some(slot) => {
+                slot.unmerged = true;
+                // Stage 2 ("ours") is the entry git's one-way merge keeps.
+                if stage == 2 {
+                    slot.mode = e.mode.bits();
+                    slot.id = e.id;
+                    slot.stat = e.stat;
+                }
+            }
+            None => {
+                idx.insert(
+                    path,
+                    IdxInfo {
+                        mode: e.mode.bits(),
+                        id: e.id,
+                        stat: e.stat,
+                        intent_to_add: e.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD),
+                        unmerged: stage != 0,
+                    },
+                );
+            }
         }
-        return Ok(deltas);
     }
 
-    if repo.workdir().is_none() {
+    let workdir: Option<PathBuf> = repo.workdir().map(Path::to_path_buf);
+    if !opts.cached && workdir.is_none() {
         bail!("this operation must be run in a work tree");
     }
-    let wt = worktree_deviations(repo)?;
+    let index_timestamp = index_state.timestamp().unix_seconds();
 
+    let all: BTreeSet<&BString> = tree.keys().chain(idx.keys()).collect();
     let mut deltas = Vec::new();
-    for (path, change) in &tree_changes {
-        // `force` covers the one case where both sides are identical yet git still
-        // reports a change: a submodule that is checked out and locally dirty.
-        let (src, dst, force) = match change {
-            // The path is absent from the index, so the worktree never enters into it.
-            TreeChange::Deleted { mode, id } => ((*mode, *id), (0, null), false),
-            TreeChange::Added { mode, id } => match wt.get(path) {
-                None => ((0, null), (*mode, *id), false),
-                Some((Wt::Removed, ..)) => {
-                    if opts.match_missing {
-                        ((0, null), (*mode, *id), false)
-                    } else {
-                        // git's `get_stat_data` fails here and `show_new_file` prints
-                        // nothing at all for a staged addition that is gone on disk.
-                        continue;
-                    }
-                }
-                Some((Wt::NewMode(m), ..)) => ((0, null), (*m, null), false),
-                Some((Wt::SubmoduleDirty, ..)) => ((0, null), (*mode, *id), false),
-            },
-            TreeChange::Modified {
-                old_mode,
-                old_id,
-                new_mode,
-                new_id,
-            } => {
-                let src = (*old_mode, *old_id);
-                match wt.get(path) {
-                    None => (src, (*new_mode, *new_id), false),
-                    Some((Wt::Removed, ..)) => {
-                        if opts.match_missing {
-                            (src, (*new_mode, *new_id), false)
-                        } else {
-                            (src, (0, null), false)
-                        }
-                    }
-                    Some((Wt::NewMode(m), ..)) => (src, (*m, null), false),
-                    Some((Wt::SubmoduleDirty, ..)) => (src, (*new_mode, *new_id), true),
-                }
-            }
-        };
-        if !force && src == dst {
+    for path in all {
+        let src = tree.get(path).copied();
+        let Some(info) = idx.get(path) else {
+            // In the tree but gone from the index: a plain deletion.
+            let (mode, id) = src.expect("path came from one of the two maps");
+            deltas.push(Delta {
+                src_mode: mode,
+                src_id: id,
+                dst_mode: 0,
+                dst_id: null,
+                unmerged: false,
+                path: path.clone(),
+            });
             continue;
-        }
-        deltas.push(make_delta(src.0, src.1, dst.0, dst.1, path.clone()));
-    }
+        };
 
-    // Paths where tree and index agree: the index entry is also the tree entry, so it
-    // supplies the source side of a worktree-only difference.
-    for (path, (w, entry_mode, entry_id)) in &wt {
-        if tree_changes.contains_key(path) {
+        if info.unmerged && opts.cached {
+            // git's `diff_unmerge`: one record with the tree side and an empty
+            // destination, whatever the stages hold.
+            let (mode, id) = src.unwrap_or((0, null));
+            deltas.push(Delta {
+                src_mode: mode,
+                src_id: id,
+                dst_mode: 0,
+                dst_id: null,
+                unmerged: true,
+                path: path.clone(),
+            });
             continue;
         }
-        let src = (*entry_mode, *entry_id);
-        let (dst, force) = match w {
-            Wt::Removed => {
-                if opts.match_missing {
-                    continue;
+
+        // git's `get_stat_data`.
+        let mut dst_mode = info.mode;
+        let mut dst_id = info.id;
+        if !opts.cached {
+            let workdir = workdir.as_deref().expect("checked above");
+            let full = worktree_path(workdir, path);
+            match std::fs::symlink_metadata(&full) {
+                Ok(md) if md.is_dir() && (info.mode & S_IFMT) != 0o160000 => {
+                    // A tracked file replaced by a directory counts as removed.
+                    if !opts.match_missing {
+                        if src.is_none() {
+                            continue;
+                        }
+                        dst_mode = 0;
+                        dst_id = null;
+                    }
                 }
-                ((0, null), false)
+                Ok(md) => {
+                    // Submodules are left alone: deciding whether a checked-out
+                    // submodule is dirty needs a full status of its own worktree.
+                    if (info.mode & S_IFMT) != 0o160000
+                        && (info.intent_to_add
+                            || entry_is_dirty(repo, info, &md, index_timestamp, &full))
+                    {
+                        dst_mode = mode_from_stat(&md);
+                        dst_id = null;
+                    }
+                }
+                Err(_) => {
+                    if !opts.match_missing {
+                        if src.is_none() {
+                            // git's `show_new_file` prints nothing for a staged
+                            // addition whose worktree file is gone.
+                            continue;
+                        }
+                        dst_mode = 0;
+                        dst_id = null;
+                    }
+                }
             }
-            Wt::NewMode(m) => ((*m, null), false),
-            Wt::SubmoduleDirty => (src, true),
-        };
-        if !force && src == dst {
+        }
+
+        let (src_mode, src_id) = src.unwrap_or((0, null));
+        if src_mode == dst_mode && src_id == dst_id {
             continue;
         }
-        deltas.push(make_delta(src.0, src.1, dst.0, dst.1, path.clone()));
+        deltas.push(Delta {
+            src_mode,
+            src_id,
+            dst_mode,
+            dst_id,
+            unmerged: false,
+            path: path.clone(),
+        });
     }
 
     Ok(deltas)
 }
 
-/// Every tree↔index difference, keyed by repository-relative path.
-fn tree_index_changes(
+/// Flatten `tree_id` into `out`, keyed by repository-root relative path.
+fn flatten_tree(
     repo: &gix::Repository,
     tree_id: &ObjectId,
-    index_state: &gix::index::State,
-) -> Result<HashMap<BString, TreeChange>> {
-    use gix::diff::index::ChangeRef;
-    use gix::status::tree_index::TrackRenames;
-
-    let mut changes: HashMap<BString, TreeChange> = HashMap::new();
-    repo.tree_index_status(
-        tree_id,
-        index_state,
-        None,
-        TrackRenames::Disabled,
-        |change, _tree_index, _worktree_index| -> Result<_, std::convert::Infallible> {
-            match change {
-                ChangeRef::Addition {
-                    location,
-                    entry_mode,
-                    id,
-                    ..
-                } => {
-                    changes.insert(
-                        location.into_owned(),
-                        TreeChange::Added {
-                            mode: entry_mode.bits(),
-                            id: id.into_owned(),
-                        },
-                    );
-                }
-                ChangeRef::Deletion {
-                    location,
-                    entry_mode,
-                    id,
-                    ..
-                } => {
-                    changes.insert(
-                        location.into_owned(),
-                        TreeChange::Deleted {
-                            mode: entry_mode.bits(),
-                            id: id.into_owned(),
-                        },
-                    );
-                }
-                ChangeRef::Modification {
-                    location,
-                    previous_entry_mode,
-                    previous_id,
-                    entry_mode,
-                    id,
-                    ..
-                } => {
-                    changes.insert(
-                        location.into_owned(),
-                        TreeChange::Modified {
-                            old_mode: previous_entry_mode.bits(),
-                            old_id: previous_id.into_owned(),
-                            new_mode: entry_mode.bits(),
-                            new_id: id.into_owned(),
-                        },
-                    );
-                }
-                // Rename tracking is disabled above, so this never fires.
-                ChangeRef::Rewrite { .. } => {}
-            }
-            Ok(gix::diff::index::Action::Continue(()))
-        },
-    )?;
-    Ok(changes)
+    prefix: &BString,
+    out: &mut BTreeMap<BString, (u32, ObjectId)>,
+) -> Result<()> {
+    let tree = repo.find_object(*tree_id)?.into_tree();
+    let decoded = tree.decode()?;
+    let entries: Vec<(BString, u32, ObjectId)> = decoded
+        .entries
+        .iter()
+        .map(|e| {
+            let mut path = prefix.clone();
+            path.extend_from_slice(e.filename);
+            (path, u32::from(e.mode.value()), e.oid.to_owned())
+        })
+        .collect();
+    for (path, mode, id) in entries {
+        if (mode & S_IFMT) == 0o040000 {
+            let mut sub = path;
+            sub.push(b'/');
+            flatten_tree(repo, &id, &sub, out)?;
+        } else {
+            out.insert(path, (mode, id));
+        }
+    }
+    Ok(())
 }
 
-/// How the worktree deviates from each index entry, along with that entry's mode and id.
-fn worktree_deviations(
+/// git's `ie_match_stat` reduced to what `diff-index` needs: the entry is dirty when
+/// its recorded type/permissions or any of its stat fields disagree with `lstat`.
+fn entry_is_dirty(
     repo: &gix::Repository,
-) -> Result<HashMap<BString, (Wt, u32, ObjectId)>> {
-    use gix::status::UntrackedFiles;
-    use gix::status::index_worktree::Item;
-    use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
-
-    let mut out: HashMap<BString, (Wt, u32, ObjectId)> = HashMap::new();
-
-    let iter = repo
-        .status(gix::progress::Discard)?
-        // Untracked paths are invisible to `diff-index`, so skip the directory walk.
-        .untracked_files(UntrackedFiles::None)
-        .into_index_worktree_iter(Vec::new())?;
-
-    for item in iter {
-        let Item::Modification {
-            entry,
-            rela_path,
-            status,
-            ..
-        } = item?
-        else {
-            // Rewrites need rename tracking (off by default) and directory contents
-            // need the dirwalk (disabled above); neither can occur here.
-            continue;
-        };
-        let entry_mode = entry.mode.bits();
-
-        let w = match status {
-            EntryStatus::Conflict { .. } => {
-                bail!("unmerged (conflicted) paths are not supported")
-            }
-            EntryStatus::NeedsUpdate(new_stat) => {
-                // gitoxide reports this both for a stat-dirty entry whose content turned
-                // out to match and for a racily-clean one. git only ever re-reads content
-                // in the racy case, so a genuine stat mismatch is still a difference to
-                // it — that is why `git diff-index HEAD` flags merely touched files.
-                if new_stat.matches(&entry.stat, StatOptions::default()) {
-                    continue;
-                }
-                Wt::NewMode(entry_mode)
-            }
-            // An `--intent-to-add` entry has no content in the odb; against the worktree
-            // git shows the null id on both sides.
-            EntryStatus::IntentToAdd => Wt::NewMode(entry_mode),
-            EntryStatus::Change(Change::Removed) => Wt::Removed,
-            EntryStatus::Change(Change::Type { worktree_mode }) => {
-                Wt::NewMode(worktree_mode.bits())
-            }
-            EntryStatus::Change(Change::Modification {
-                executable_bit_changed,
-                ..
-            }) => Wt::NewMode(if executable_bit_changed {
-                toggle_exec(entry_mode)
-            } else {
-                entry_mode
-            }),
-            EntryStatus::Change(Change::SubmoduleModification(_)) => Wt::SubmoduleDirty,
-        };
-        out.insert(rela_path, (w, entry_mode, entry.id));
+    info: &IdxInfo,
+    md: &std::fs::Metadata,
+    index_timestamp: i64,
+    full: &Path,
+) -> bool {
+    if mode_changed(info.mode, md) || stat_data_changed(&info.stat, md) {
+        return true;
     }
-    Ok(out)
-}
-
-fn make_delta(
-    src_mode: u32,
-    src_id: ObjectId,
-    dst_mode: u32,
-    dst_id: ObjectId,
-    path: BString,
-) -> Delta {
-    Delta {
-        src_mode,
-        dst_mode,
-        src_id,
-        dst_id,
-        status: status_letter(src_mode, dst_mode),
-        path,
+    // git's racy-timestamp rule: an entry whose mtime is at or after the index's own
+    // timestamp cannot be trusted on stat alone, so the content has to decide. An index
+    // with no timestamp of its own (never written) is never racy, as in `is_racy_stat`.
+    if index_timestamp == 0 || i64::from(info.stat.mtime.secs) < index_timestamp {
+        return false;
+    }
+    match std::fs::read(full) {
+        Ok(data) => gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &data)
+            .map(|id| id != info.id)
+            .unwrap_or(true),
+        Err(_) => true,
     }
 }
 
-/// git's `diff_resolve_rename_copy` letter: absent source is an addition, absent
-/// destination a deletion, differing `S_IFMT` bits a type change, otherwise a
-/// modification.
-fn status_letter(src_mode: u32, dst_mode: u32) -> u8 {
-    const S_IFMT: u32 = 0o170000;
-    if src_mode == 0 {
-        b'A'
-    } else if dst_mode == 0 {
-        b'D'
-    } else if (src_mode & S_IFMT) != (dst_mode & S_IFMT) {
-        b'T'
+/// git's `ce_match_stat_basic` type and permission comparison.
+fn mode_changed(entry_mode: u32, md: &std::fs::Metadata) -> bool {
+    match entry_mode & S_IFMT {
+        0o100000 => {
+            if !md.is_file() {
+                return true;
+            }
+            // Only the owner's execute bit is considered a mode change.
+            (entry_mode ^ fs_mode(md)) & 0o100 != 0
+        }
+        0o120000 => !md.is_symlink(),
+        0o160000 => !md.is_dir(),
+        _ => true,
+    }
+}
+
+/// git's `ce_mode_from_stat`/`create_ce_mode` with `trust_executable_bit` on.
+fn mode_from_stat(md: &std::fs::Metadata) -> u32 {
+    if md.is_symlink() {
+        0o120000
+    } else if md.is_dir() {
+        0o160000
+    } else if fs_mode(md) & 0o100 != 0 {
+        0o100755
     } else {
-        b'M'
+        0o100644
     }
 }
 
-/// Flip the executable bit of a regular-file mode, leaving anything else alone.
-fn toggle_exec(mode: u32) -> u32 {
-    match mode {
-        0o100644 => 0o100755,
-        0o100755 => 0o100644,
-        other => other,
+/// The absolute path of the worktree file for a repository-root relative `path`.
+fn worktree_path(workdir: &Path, path: &BString) -> PathBuf {
+    workdir.join(&*gix::path::from_bstr(path))
+}
+
+#[cfg(unix)]
+fn fs_mode(md: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    md.mode()
+}
+
+#[cfg(not(unix))]
+fn fs_mode(_md: &std::fs::Metadata) -> u32 {
+    0
+}
+
+/// git's `match_stat_data` with its defaults (`core.trustctime` and `core.checkStat`
+/// both on, nanoseconds and `st_dev` both off). Every comparison truncates to 32 bits
+/// because that is the width the index stores.
+#[cfg(unix)]
+fn stat_data_changed(sd: &gix::index::entry::Stat, md: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    sd.mtime.secs != md.mtime() as u32
+        || sd.ctime.secs != md.ctime() as u32
+        || sd.uid != md.uid()
+        || sd.gid != md.gid()
+        || sd.ino != md.ino() as u32
+        || sd.size != md.size() as u32
+}
+
+#[cfg(not(unix))]
+fn stat_data_changed(sd: &gix::index::entry::Stat, md: &std::fs::Metadata) -> bool {
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+    sd.mtime.secs != mtime || sd.size != md.len() as u32
+}
+
+/// Drop every pair whose two sides carry the same content once the requested folding is
+/// applied, and give the surviving worktree side the object id git had to compute in
+/// order to decide that.
+fn apply_content_filter(repo: &gix::Repository, deltas: &mut Vec<Delta>, opts: &Opts) -> Result<()> {
+    let null = ObjectId::null(repo.object_hash());
+    let workdir = repo.workdir().map(Path::to_path_buf);
+    let mut keep = Vec::with_capacity(deltas.len());
+    for d in deltas.drain(..) {
+        if d.unmerged {
+            keep.push(d);
+            continue;
+        }
+        let same = d.src_mode != 0
+            && d.dst_mode != 0
+            && d.src_mode == d.dst_mode
+            && sides_match(repo, workdir.as_deref(), &d, opts)?;
+        if same {
+            continue;
+        }
+        let mut d = d;
+        if d.dst_id == null && d.dst_mode != 0 {
+            if let Some(id) = hash_worktree(repo, workdir.as_deref(), &d.path)? {
+                d.dst_id = id;
+            }
+        }
+        keep.push(d);
+    }
+    *deltas = keep;
+    Ok(())
+}
+
+/// `-M`/`-C` make git hash the rename candidates; the visible consequence for this
+/// listing is that a created path carries its real object id.
+fn fill_added_ids(repo: &gix::Repository, deltas: &mut [Delta], _opts: &Opts) -> Result<()> {
+    let null = ObjectId::null(repo.object_hash());
+    let workdir = repo.workdir().map(Path::to_path_buf);
+    for d in deltas.iter_mut() {
+        if d.src_mode == 0 && d.dst_mode != 0 && d.dst_id == null {
+            if let Some(id) = hash_worktree(repo, workdir.as_deref(), &d.path)? {
+                d.dst_id = id;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The pickaxe (`-S` counts occurrences, `-G` greps the changed lines).
+fn apply_pickaxe(repo: &gix::Repository, deltas: &mut Vec<Delta>, opts: &Opts) -> Result<()> {
+    let Some(pickaxe) = &opts.pickaxe else {
+        return Ok(());
+    };
+    let workdir = repo.workdir().map(Path::to_path_buf);
+    let mut hits = Vec::with_capacity(deltas.len());
+    for d in deltas.iter() {
+        let one = side_content(repo, workdir.as_deref(), d, true)?;
+        let two = side_content(repo, workdir.as_deref(), d, false)?;
+        let hit = match pickaxe {
+            Pickaxe::Occurrences(needle) => {
+                let a = one.as_deref().map(|b| count_occurrences(b, needle)).unwrap_or(0);
+                let b = two.as_deref().map(|b| count_occurrences(b, needle)).unwrap_or(0);
+                a != b
+            }
+            Pickaxe::Grep(needle) => match (one.as_deref(), two.as_deref()) {
+                (None, None) => false,
+                (None, Some(t)) | (Some(t), None) => contains(t, needle),
+                (Some(a), Some(b)) => changed_lines_hit(a, b, needle),
+            },
+        };
+        hits.push(hit);
+    }
+    if opts.pickaxe_all && hits.iter().any(|h| *h) {
+        return Ok(());
+    }
+    let mut it = hits.into_iter();
+    deltas.retain(|_| it.next().unwrap_or(false));
+    Ok(())
+}
+
+/// The bytes of one side of a pair, or `None` when that side does not exist.
+fn side_content(
+    repo: &gix::Repository,
+    workdir: Option<&Path>,
+    d: &Delta,
+    source: bool,
+) -> Result<Option<Vec<u8>>> {
+    let null = ObjectId::null(repo.object_hash());
+    let (mode, id) = if source { (d.src_mode, d.src_id) } else { (d.dst_mode, d.dst_id) };
+    if mode == 0 {
+        return Ok(None);
+    }
+    if (mode & S_IFMT) == 0o160000 {
+        // A submodule has no blob to compare; git uses its recorded commit id.
+        return Ok(Some(id.to_string().into_bytes()));
+    }
+    if id != null {
+        return Ok(Some(repo.find_object(id)?.data.clone()));
+    }
+    let Some(workdir) = workdir else {
+        return Ok(None);
+    };
+    Ok(read_worktree(workdir, &d.path))
+}
+
+/// `true` when the two sides of `d` hold the same content under the requested folding.
+fn sides_match(repo: &gix::Repository, workdir: Option<&Path>, d: &Delta, opts: &Opts) -> Result<bool> {
+    let null = ObjectId::null(repo.object_hash());
+    // Identical recorded ids settle it without reading anything.
+    if d.src_id != null && d.dst_id != null {
+        if d.src_id == d.dst_id {
+            return Ok(true);
+        }
+        if !opts.ws.any() && opts.ignore_lines.is_none() {
+            return Ok(false);
+        }
+    }
+    let (Some(one), Some(two)) = (
+        side_content(repo, workdir, d, true)?,
+        side_content(repo, workdir, d, false)?,
+    ) else {
+        return Ok(false);
+    };
+    Ok(contents_match(&one, &two, opts))
+}
+
+/// The hash the worktree file at `path` would get as a blob.
+fn hash_worktree(repo: &gix::Repository, workdir: Option<&Path>, path: &BString) -> Result<Option<ObjectId>> {
+    let Some(workdir) = workdir else {
+        return Ok(None);
+    };
+    let Some(data) = read_worktree(workdir, path) else {
+        return Ok(None);
+    };
+    Ok(Some(gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &data)?))
+}
+
+/// The bytes git would hash for the worktree entry at `path`: file contents, or the
+/// target of a symlink.
+fn read_worktree(workdir: &Path, path: &BString) -> Option<Vec<u8>> {
+    let full = worktree_path(workdir, path);
+    let md = std::fs::symlink_metadata(&full).ok()?;
+    if md.is_symlink() {
+        let target = std::fs::read_link(&full).ok()?;
+        Some(gix::path::into_bstr(target).into_owned().into())
+    } else {
+        std::fs::read(&full).ok()
+    }
+}
+
+/// Occurrences of `needle` in `haystack`, counted without overlap, as git's kwset does.
+fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut at = 0;
+    while at + needle.len() <= haystack.len() {
+        if &haystack[at..at + needle.len()] == needle {
+            count += 1;
+            at += needle.len();
+        } else {
+            at += 1;
+        }
+    }
+    count
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    count_occurrences(haystack, needle) > 0
+}
+
+/// git's `-G`: does any line the diff adds or removes contain `needle`?
+fn changed_lines_hit(one: &[u8], two: &[u8], needle: &[u8]) -> bool {
+    let before = split_lines(one);
+    let after = split_lines(two);
+    let mut hit = false;
+    for_each_changed_line(&before, &after, |line| {
+        if contains(line, needle) {
+            hit = true;
+        }
+    });
+    hit
+}
+
+/// `true` when the two blobs carry the same content once `opts`' whitespace folding and
+/// `-I` line filtering are applied.
+fn contents_match(one: &[u8], two: &[u8], opts: &Opts) -> bool {
+    if !opts.ws.any() && opts.ignore_lines.is_none() {
+        return one == two;
+    }
+    let before: Vec<Vec<u8>> = split_lines(one).into_iter().map(|l| fold_line(l, opts.ws)).collect();
+    let after: Vec<Vec<u8>> = split_lines(two).into_iter().map(|l| fold_line(l, opts.ws)).collect();
+    if before == after {
+        return true;
+    }
+    let Some(pattern) = &opts.ignore_lines else {
+        return false;
+    };
+    // `-I` drops a hunk whose every changed line matches, so the two sides count as
+    // equal exactly when no changed line falls outside the pattern.
+    let raw_before = split_lines(one);
+    let raw_after = split_lines(two);
+    let mut all_match = true;
+    for_each_changed_line(&raw_before, &raw_after, |line| {
+        if !contains(line, pattern) {
+            all_match = false;
+        }
+    });
+    all_match
+}
+
+/// Split into lines, each keeping its terminator, as xdiff records them.
+fn split_lines(data: &[u8]) -> Vec<&[u8]> {
+    data.split_inclusive(|&c| c == b'\n').collect()
+}
+
+/// Apply one line's worth of git's `XDF_IGNORE_*` folding.
+fn fold_line(line: &[u8], ws: Ws) -> Vec<u8> {
+    let mut s = line;
+    if s.last() == Some(&b'\n') {
+        s = &s[..s.len() - 1];
+    }
+    if ws.cr && s.last() == Some(&b'\r') {
+        s = &s[..s.len() - 1];
+    }
+    if ws.all {
+        return s.iter().copied().filter(|c| *c != b' ' && *c != b'\t').collect();
+    }
+    if ws.change {
+        let mut out = Vec::with_capacity(s.len());
+        let mut pending_blank = false;
+        for &c in s {
+            if c == b' ' || c == b'\t' {
+                pending_blank = true;
+            } else {
+                if pending_blank && !out.is_empty() {
+                    out.push(b' ');
+                }
+                pending_blank = false;
+                out.push(c);
+            }
+        }
+        return out;
+    }
+    if ws.at_eol {
+        let mut end = s.len();
+        while end > 0 && (s[end - 1] == b' ' || s[end - 1] == b'\t') {
+            end -= 1;
+        }
+        return s[..end].to_vec();
+    }
+    s.to_vec()
+}
+
+/// Run a line diff and hand every added or removed line to `visit`.
+fn for_each_changed_line(before: &[&[u8]], after: &[&[u8]], mut visit: impl FnMut(&[u8])) {
+    use gix::diff::blob::{Algorithm, Diff, InternedInput};
+
+    let one: Vec<u8> = before.concat();
+    let two: Vec<u8> = after.concat();
+    let input = InternedInput::new(one.as_slice(), two.as_slice());
+    let diff = Diff::compute(Algorithm::Myers, &input);
+    for hunk in diff.hunks() {
+        for i in hunk.before.clone() {
+            if let Some(line) = before.get(i as usize) {
+                visit(line);
+            }
+        }
+        for i in hunk.after.clone() {
+            if let Some(line) = after.get(i as usize) {
+                visit(line);
+            }
+        }
     }
 }
 
@@ -709,14 +1298,22 @@ fn render(repo: &gix::Repository, deltas: &[Delta], opts: &Opts) -> Result<Vec<u
 
     // Field separator (between status and path) and record terminator.
     let (sep, term): (u8, u8) = if opts.nul { (0, 0) } else { (b'\t', b'\n') };
+    // `--relative=<dir>` reports paths relative to that directory.
+    let strip = opts
+        .relative
+        .as_ref()
+        .filter(|r| !r.is_empty())
+        .map(|r| r.len() + 1)
+        .unwrap_or(0);
 
     let mut out = Vec::new();
     for d in deltas {
+        out.extend_from_slice(&opts.line_prefix);
         match opts.format {
             Format::Silent => unreachable!("silent output is short-circuited by the caller"),
             Format::NameOnly => {}
             Format::NameStatus => {
-                out.push(d.status);
+                out.push(d.status());
                 out.push(sep);
             }
             Format::Raw => {
@@ -730,14 +1327,15 @@ fn render(repo: &gix::Repository, deltas: &[Delta], opts: &Opts) -> Result<Vec<u
                     )
                     .as_bytes(),
                 );
-                out.push(d.status);
+                out.push(d.status());
                 out.push(sep);
             }
         }
+        let path = &d.path.as_slice()[strip.min(d.path.len())..];
         if opts.nul {
-            out.extend_from_slice(d.path.as_ref());
+            out.extend_from_slice(path);
         } else {
-            out.extend_from_slice(quote_path(&d.path).as_bytes());
+            out.extend_from_slice(quote_path(path).as_bytes());
         }
         out.push(term);
     }

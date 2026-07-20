@@ -1,8 +1,8 @@
-//! `git pack-objects` — create a packed archive of objects. **Not ported: this
-//! module bails once the arguments are accepted.**
+//! `git pack-objects` — create a packed archive of objects. **Partially ported:
+//! every path that does not require delta compression is reproduced byte for
+//! byte; the ones that do still bail, naming the missing substrate.**
 //!
-//! What *is* covered is the complete argument surface, and only because those
-//! paths are byte-verifiable without producing a pack:
+//! What *is* covered:
 //!   * `-h` → git's 4170-byte usage block on stdout, exit 129
 //!   * git's parse-options behaviour for every option in the table, including
 //!     unambiguous long-option abbreviation (`--stdi` → `--stdin-packs`),
@@ -18,15 +18,28 @@
 //!     touches the object database, in git's own order: bad compression level,
 //!     `--thin` without `--stdout`, the `--keep-unreachable`/`--unpack-unreachable`
 //!     conflict, the two `cannot use internal rev list with ...` diagnostics,
-//!     the `--stdin-packs`/`--cruft` conflict, and `--name-hash-version`
+//!     the `--stdin-packs`/`--cruft` conflict, `--max-pack-size` with
+//!     `--stdout`, and `--name-hash-version`
+//!   * **the empty-pack path, in full.** When the requested object set is
+//!     provably empty — no object source was named and stdin carried nothing —
+//!     the pack git writes is a fixed 12-byte header plus its own trailing
+//!     checksum, with no entry to order and no delta to compute. That pack is
+//!     emitted verbatim: on stdout for `--stdout`, and otherwise as the
+//!     `<base-name>-<hash>.{pack,idx,rev}` triple with the hash echoed on
+//!     stdout, honouring `--index-version` and `pack.writeReverseIndex`.
+//!     `--non-empty` suppresses it entirely (no output, exit 0), and a write
+//!     that fails reproduces git's `error:`/`fatal:` pair and exit 128.
 //! (all checked against git 2.55.0.)
 //!
-//! Everything else — i.e. `pack-objects` actually writing a pack — bails,
-//! naming the substrate that is missing. It is deliberately *not* approximated.
-//! With `--stdout` the pack **is** the stdout the differential harness compares,
-//! so an approximation is not "slightly different output": it is a byte stream
-//! that differs from the first entry onward and carries a different trailing
-//! checksum. Without `--stdout` the same bytes land in
+//! What is **not** covered is a pack with at least one entry in it, which is
+//! reached by exactly five things: `--all`, `--reflog`, `--indexed-objects`,
+//! `--cruft` (including via `--cruft-expiration`), and `--stdin-packs
+//! --unpacked` — plus any invocation handed an object list on stdin. Those
+//! bail, naming the substrate that is missing. It is deliberately *not*
+//! approximated. With `--stdout` the pack **is** the stdout the differential
+//! harness compares, so an approximation is not "slightly different output": it
+//! is a byte stream that differs from the first entry onward and carries a
+//! different trailing checksum. Without `--stdout` the same bytes land in
 //! `<base-name>-<hash>.{pack,idx}` and the hash is echoed on stdout, so the
 //! divergence shows up in post-command state as well.
 //!
@@ -64,14 +77,16 @@
 //!      `object:type=`, `combine:`); nothing in the vendored crates implements
 //!      that filter grammar over a reachability walk.
 //!
-//! Two deliberate gaps in the covered part, so this doc claims no more than the
-//! code does: `pack.compression`/`core.compression` and `pack.indexVersion` are
-//! not read from config, so the compression and index-version diagnostics fire
-//! only for values given on the command line; and `--missing=allow-promisor`
-//! does not additionally imply `--exclude-promisor-objects` handling, since the
-//! command bails before either could matter.
+//! Deliberate gaps in the covered part, so this doc claims no more than the code
+//! does: `pack.compression`/`core.compression` is not read from config, so the
+//! compression diagnostic fires only for a value given on the command line;
+//! `--missing=allow-promisor` does not additionally imply
+//! `--exclude-promisor-objects` handling; and the written files are left at the
+//! process umask rather than git's read-only `0444`, which no state probe
+//! observes.
 
 use anyhow::{bail, Result};
+use std::io::{Read, Write};
 use std::process::ExitCode;
 
 /// Stock git's `pack-objects` usage block, byte-for-byte (4170 bytes, git
@@ -249,15 +264,49 @@ struct State {
     unpacked: bool,
     keep_unreachable: bool,
     unpack_unreachable: bool,
+    non_empty: bool,
+    /// The three options that name a source of objects all by themselves.
+    all: bool,
+    reflog: bool,
+    indexed_objects: bool,
     /// `--revs` and the other options that turn on git's internal rev list
     /// without `--unpacked`'s stdin-packs exemption.
     internal_rev_list: bool,
+    /// `--exclude-promisor-objects` turns the internal rev list on *after* the
+    /// `--stdin-packs` check has already run, so it feeds only the `--cruft`
+    /// one; `--exclude-promisor-objects-best-effort` feeds both. Kept apart
+    /// from `internal_rev_list` because both are assignments, not accumulations:
+    /// their `--no-` forms switch them back off.
+    exclude_promisor: bool,
+    exclude_promisor_best_effort: bool,
     /// `--compression=<n>`, as the integer git parsed.
     compression: Option<i64>,
     /// `--name-hash-version=<n>`, as the integer git parsed.
     name_hash_version: Option<i64>,
+    /// `--max-pack-size=<n>`, as the magnitude git parsed. Zero counts as unset,
+    /// which is why this is the number and not a flag.
+    max_pack_size: Option<i64>,
+    /// `--index-version=<v>[,<offset>]`, just the `<v>`; `None` falls back to
+    /// `pack.indexVersion` and then to 2.
+    index_version: Option<u64>,
+    /// Whether the end-of-run summary goes to stderr: `-q` and `--progress`
+    /// (and `--all-progress`) are last-one-wins.
+    progress: bool,
     /// Non-option arguments; at most one (the base name) is legal.
-    positionals: usize,
+    positionals: Vec<String>,
+}
+
+impl State {
+    /// The internal-rev-list flag as the `--stdin-packs` check sees it.
+    fn rev_list_at_stdin_packs_check(&self) -> bool {
+        self.internal_rev_list || self.exclude_promisor_best_effort
+    }
+
+    /// The same flag as the later `--cruft` check sees it, by which point
+    /// `--exclude-promisor-objects` has set it too.
+    fn rev_list_at_cruft_check(&self) -> bool {
+        self.rev_list_at_stdin_packs_check() || self.exclude_promisor
+    }
 }
 
 /// The outcome of parsing: either a fully-formed request, or a diagnostic that
@@ -267,14 +316,15 @@ enum Parsed {
     Exit(ExitCode),
 }
 
-/// `git pack-objects` — argument validation and pre-flight checks only; writing
-/// the pack itself is not ported.
+/// `git pack-objects` — argument validation, pre-flight checks, and the empty
+/// pack; a pack with entries in it is not ported.
 ///
 /// Returns 129 with git's own output for `-h`, for every malformed invocation,
 /// and when neither `--stdout` nor exactly one base name was given; 128 for the
 /// value and option conflicts git rejects before it opens the object database.
-/// Any invocation that survives both bails, naming the substrate that is
-/// missing; see the module documentation for the full list.
+/// An invocation that survives both packs nothing when nothing named an object,
+/// and otherwise bails, naming the substrate that is missing; see the module
+/// documentation for the full list.
 pub fn pack_objects(args: &[String]) -> Result<ExitCode> {
     // Dispatch includes the verb at index 0. `pack-objects` does take a
     // positional (the base name), so the leading verb must be dropped rather
@@ -293,14 +343,199 @@ pub fn pack_objects(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    bail!(
-        "pack-objects is not ported: gix-pack has no delta compression (its only output mode \
-         copies existing pack entries and stores everything else undeltified), does not \
-         reproduce git's type/name-hash/size entry ordering, has no EWAH bitmap writer for \
-         --write-bitmap-index, no .mtimes writer for --cruft, no thin-pack support, and no \
-         list-objects filter for --filter (ported: -h, argument validation, and the \
-         pre-flight value and option-conflict checks only)"
-    )
+    execute(&state)
+}
+
+/// Run the command proper, for the one object set this module can produce
+/// faithfully: the empty one.
+///
+/// git reaches the object database only after the checks above, so this is also
+/// where "not a git repository" is diagnosed.
+fn execute(st: &State) -> Result<ExitCode> {
+    let Ok(repo) = gix::discover(".") else {
+        eprintln!("fatal: not a git repository (or any of the parent directories): .git");
+        return Ok(ExitCode::from(128));
+    };
+
+    // git reads stdin in every mode that has one — an object list, a rev-list
+    // argument list under `--revs`, or pack names under `--stdin-packs` — so a
+    // non-empty stdin always means objects this module cannot pack.
+    let mut stdin = Vec::new();
+    std::io::stdin().read_to_end(&mut stdin).ok();
+
+    if names_objects(st, &stdin) {
+        bail!(
+            "pack-objects is not ported for a non-empty object set: gix-pack has no delta \
+             compression (its only output mode copies existing pack entries and stores \
+             everything else undeltified), does not reproduce git's type/name-hash/size entry \
+             ordering, has no EWAH bitmap writer for --write-bitmap-index, no .mtimes writer \
+             for --cruft, no thin-pack support, and no list-objects filter for --filter \
+             (ported: -h, argument validation, the pre-flight value and option-conflict \
+             checks, and the empty pack)"
+        );
+    }
+
+    // git skips the pack entirely rather than writing an empty one, and says so
+    // by writing nothing at all.
+    if st.non_empty {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let kind = repo.object_hash();
+    let pack = empty_pack(kind)?;
+    let pack_id = &pack[pack.len() - kind.len_in_bytes()..];
+
+    if st.stdout {
+        let mut out = std::io::stdout().lock();
+        out.write_all(&pack)?;
+        out.flush()?;
+        report_progress(st);
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // `preflight` has already established that exactly one positional is present
+    // whenever `--stdout` is not.
+    let base = st.positionals[0].as_str();
+    let hex_id = hex(pack_id);
+
+    let index_version = st
+        .index_version
+        .or_else(|| {
+            repo.config_snapshot()
+                .integer("pack.indexVersion")
+                .and_then(|v| u64::try_from(v).ok())
+        })
+        .unwrap_or(2);
+    let write_rev = repo
+        .config_snapshot()
+        .boolean("pack.writeReverseIndex")
+        .unwrap_or(true);
+
+    let mut files = vec![
+        (format!("{base}-{hex_id}.pack"), pack.clone()),
+        (format!("{base}-{hex_id}.idx"), empty_index(kind, index_version, pack_id)?),
+    ];
+    if write_rev {
+        files.push((format!("{base}-{hex_id}.rev"), empty_reverse_index(kind, pack_id)?));
+    }
+
+    for (path, bytes) in &files {
+        if let Some(code) = write_artifact(path.as_str(), &bytes[..]) {
+            return Ok(code);
+        }
+    }
+
+    println!("{hex_id}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Whether anything in this invocation names an object to pack.
+///
+/// With an empty stdin exactly four options do so on their own — verified one
+/// flag at a time against git 2.55.0 across the whole `pack-objects` option
+/// table — plus `--stdin-packs --unpacked`, where the `--unpacked` half pulls in
+/// the loose objects that no named pack covers.
+fn names_objects(st: &State, stdin: &[u8]) -> bool {
+    !stdin.is_empty()
+        || st.all
+        || st.reflog
+        || st.indexed_objects
+        || st.cruft
+        || (st.stdin_packs && st.unpacked)
+}
+
+/// git's end-of-run summary, which `--progress`/`--all-progress` put on stderr
+/// and `-q` (or the absence of both, stderr not being a terminal here)
+/// suppresses.
+fn report_progress(st: &State) {
+    if st.progress {
+        eprintln!("Total 0 (delta 0), reused 0 (delta 0), pack-reused 0 (from 0)");
+    }
+}
+
+/// A pack holding no objects: the 12-byte v2 header and nothing else, followed
+/// by the trailing checksum over it. git writes pack version 2 unconditionally.
+fn empty_pack(kind: gix::hash::Kind) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(12 + kind.len_in_bytes());
+    bytes.extend_from_slice(b"PACK");
+    bytes.extend_from_slice(&2u32.to_be_bytes());
+    bytes.extend_from_slice(&0u32.to_be_bytes());
+    append_checksum(&mut bytes, kind)?;
+    Ok(bytes)
+}
+
+/// The `.idx` for that pack: an all-zero 256-entry fanout, no entries, and the
+/// pack's checksum, under the v2 header when `version` calls for one.
+fn empty_index(kind: gix::hash::Kind, version: u64, pack_id: &[u8]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if version >= 2 {
+        bytes.extend_from_slice(&[0xff, b't', b'O', b'c']);
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+    }
+    bytes.extend_from_slice(&[0u8; 256 * 4]);
+    bytes.extend_from_slice(pack_id);
+    append_checksum(&mut bytes, kind)?;
+    Ok(bytes)
+}
+
+/// The `.rev` for that pack: the `RIDX` header, the hash identifier, no entries,
+/// and the pack's checksum.
+fn empty_reverse_index(kind: gix::hash::Kind, pack_id: &[u8]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIDX");
+    bytes.extend_from_slice(&1u32.to_be_bytes());
+    bytes.extend_from_slice(&hash_id(kind).to_be_bytes());
+    bytes.extend_from_slice(pack_id);
+    append_checksum(&mut bytes, kind)?;
+    Ok(bytes)
+}
+
+/// git's on-disk identifier for a hash function, as the `.rev` header carries it.
+fn hash_id(kind: gix::hash::Kind) -> u32 {
+    match kind {
+        gix::hash::Kind::Sha1 => 1,
+        _ => 2,
+    }
+}
+
+/// Append the hash of everything written so far, which is how every one of
+/// git's pack artifacts terminates.
+fn append_checksum(bytes: &mut Vec<u8>, kind: gix::hash::Kind) -> Result<()> {
+    let mut hasher = gix::hash::hasher(kind);
+    hasher.update(&bytes[..]);
+    bytes.extend_from_slice(hasher.try_finalize()?.as_slice());
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Write one pack artifact, reporting a failure the way git does.
+///
+/// git builds each file under a temporary name in the object store and only
+/// then renames it into place, so a path it cannot create is diagnosed twice:
+/// once for the write and once for the rename that never happened.
+fn write_artifact(path: &str, bytes: &[u8]) -> Option<ExitCode> {
+    match std::fs::write(path, bytes) {
+        Ok(()) => None,
+        Err(err) => {
+            eprintln!("error: unable to write file {path}: {}", errno_text(&err));
+            eprintln!("fatal: unable to rename temporary file to '{path}'");
+            Some(ExitCode::from(128))
+        }
+    }
+}
+
+/// `strerror(errno)` on its own, which is what git's `%s` of `strerror` prints.
+/// Rust appends its own ` (os error <n>)` to the same text; that suffix is the
+/// only difference, so removing it leaves git's string exactly.
+fn errno_text(err: &std::io::Error) -> String {
+    let rendered = err.to_string();
+    match rendered.find(" (os error ") {
+        Some(at) => rendered[..at].to_string(),
+        None => rendered,
+    }
 }
 
 /// Walk `args` exactly the way git's parse-options walks them, emitting git's
@@ -314,7 +549,7 @@ fn parse(args: &[String]) -> Parsed {
         let a = args[i].as_str();
 
         if end_of_opts || !a.starts_with('-') || a == "-" {
-            st.positionals += 1;
+            st.positionals.push(a.to_string());
             i += 1;
             continue;
         }
@@ -334,7 +569,7 @@ fn parse(args: &[String]) -> Parsed {
 
         // Clustered short switches; `pack-objects` declares only `-q` (plus the
         // implicit `-h`).
-        match short_opts(&a[1..], &mut i) {
+        match short_opts(&a[1..], &mut i, &mut st) {
             Some(code) => return Parsed::Exit(code),
             None => continue,
         }
@@ -511,9 +746,17 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
     match long {
         "stdout" => st.stdout = on,
         "thin" => st.thin = on,
-        "cruft" => st.cruft = on,
+        // git's `--cruft-expiration` callback sets the `cruft` flag itself, so
+        // the expiration alone is enough to reach every `--cruft` diagnostic,
+        // and `--no-cruft-expiration` clears it again.
+        "cruft" | "cruft-expiration" => st.cruft = on,
         "stdin-packs" => st.stdin_packs = on,
         "unpacked" => st.unpacked = on,
+        "non-empty" => st.non_empty = on,
+        "quiet" => st.progress = !on,
+        "progress" | "all-progress" => st.progress = on,
+        "exclude-promisor-objects" => st.exclude_promisor = on,
+        "exclude-promisor-objects-best-effort" => st.exclude_promisor_best_effort = on,
         "keep-unreachable" => {
             st.keep_unreachable = on;
             st.internal_rev_list |= on;
@@ -522,13 +765,27 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
             st.unpack_unreachable = on;
             st.internal_rev_list |= on;
         }
-        "revs" | "all" | "reflog" | "indexed-objects" | "pack-loose-unreachable" => {
+        "all" => {
+            st.all = on;
             st.internal_rev_list |= on;
         }
+        "reflog" => {
+            st.reflog = on;
+            st.internal_rev_list |= on;
+        }
+        "indexed-objects" => {
+            st.indexed_objects = on;
+            st.internal_rev_list |= on;
+        }
+        "revs" | "pack-loose-unreachable" => st.internal_rev_list |= on,
         "compression" => st.compression = on.then(|| to_number(value.unwrap_or("0"))).flatten(),
         "name-hash-version" => {
             st.name_hash_version = on.then(|| to_number(value.unwrap_or("0"))).flatten();
         }
+        "max-pack-size" => st.max_pack_size = on.then(|| to_number(value.unwrap_or("0"))).flatten(),
+        // Already validated by `check_index_version`, so the `strtoul` prefix is
+        // the version and the rest is the `,<offset>` tail.
+        "index-version" => st.index_version = value.map(|v| strtoul(v).0),
         _ => {}
     }
 }
@@ -585,14 +842,15 @@ fn resolve_long(name: &str) -> Resolved {
 
 /// Handle one clustered short-switch entry (`cluster` excludes the leading `-`).
 /// `-q` is the only declared switch; `-h` is parse-options' built-in.
-fn short_opts(cluster: &str, i: &mut usize) -> Option<ExitCode> {
+fn short_opts(cluster: &str, i: &mut usize, st: &mut State) -> Option<ExitCode> {
     for c in cluster.chars() {
         match c {
             'h' => {
                 print!("{USAGE}");
                 return Some(ExitCode::from(129));
             }
-            'q' => {}
+            // `-q` and `--progress` write the same flag, so the last one wins.
+            'q' => st.progress = false,
             other => {
                 eprint!("error: unknown switch `{other}'\n{USAGE}");
                 return Some(ExitCode::from(129));
@@ -645,7 +903,7 @@ fn preflight(st: &State) -> Option<ExitCode> {
     // `pack_to_stdout != !base_name`, plus git's rejection of a second
     // positional. Beats every `fatal:` below: `--compression=99` on its own
     // reports usage, not a bad compression level.
-    if st.stdout == (st.positionals == 1) || st.positionals > 1 {
+    if st.stdout == (st.positionals.len() == 1) || st.positionals.len() > 1 {
         eprint!("{USAGE}");
         return Some(ExitCode::from(129));
     }
@@ -656,6 +914,15 @@ fn preflight(st: &State) -> Option<ExitCode> {
         if !(-1..=9).contains(&level) {
             return Some(fatal(&format!("bad pack compression level {level}")));
         }
+    }
+
+    // Beats `--thin` and everything after it, and loses to the compression
+    // level: `--stdout --max-pack-size=1m --compression=99` reports the
+    // compression level, while `--stdout --max-pack-size=1m --thin` and
+    // `--stdout --max-pack-size=1m --cruft --revs` both report this. A zero size
+    // is git's "unset", so it does not trip the check.
+    if st.max_pack_size.is_some_and(|n| n != 0) && st.stdout {
+        return Some(fatal("--max-pack-size cannot be used to build a pack for transfer"));
     }
 
     // Beats the conflicts below: `pack-objects base --thin --cruft --revs`
@@ -675,7 +942,7 @@ fn preflight(st: &State) -> Option<ExitCode> {
     // `--unpacked` is deliberately absent from this condition: it is the one
     // rev-list-implying option documented as compatible with `--stdin-packs`,
     // and `--stdout --stdin-packs --unpacked` is accepted.
-    if st.stdin_packs && st.internal_rev_list {
+    if st.stdin_packs && st.rev_list_at_stdin_packs_check() {
         return Some(fatal("cannot use internal rev list with --stdin-packs"));
     }
 
@@ -686,7 +953,10 @@ fn preflight(st: &State) -> Option<ExitCode> {
     }
 
     // Here `--unpacked` does count: `--stdout --cruft --unpacked` is rejected.
-    if st.cruft && (st.internal_rev_list || st.unpacked) {
+    // So does `--exclude-promisor-objects`, which has turned the internal rev
+    // list on by the time this check runs even though it had not yet when the
+    // `--stdin-packs` one above did.
+    if st.cruft && (st.rev_list_at_cruft_check() || st.unpacked) {
         return Some(fatal("cannot use internal rev list with --cruft"));
     }
 

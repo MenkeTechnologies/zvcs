@@ -8,14 +8,20 @@
 //! precedence and the same "a parent directory is excluded" short-circuit.
 //!
 //! Covered, byte-for-byte against stock git: the whole documented flag set
-//! (`-q`, `-v`, `-n`, `-z`, `--stdin`, `--no-index`, `--`), both output formats
+//! (`-q`, `-v`, `-n`, `-z`, `--stdin`, `--no-index`, `--`) plus the negations
+//! `parse-options` generates for each of them (`--no-quiet`, `--no-verbose`,
+//! `--no-non-matching`, `--no-stdin`, and both `--no-no-index` and `--index`
+//! for the `no-`-prefixed one), both output formats
 //! (`<source>:<line>:<pattern>\t<path>` and its NUL-delimited variant), C-style
 //! path quoting, the "non-matching" `::\t` records, the fatal argument-validation
-//! errors (exit 128), and the 0/1 exit convention.
+//! errors (exit 128), the usage block with its unknown-option/unknown-switch and
+//! `-h` exits (129), and the 0/1 exit convention.
 //!
 //! Not covered — refused, never faked: pathspec magic (`:(glob)…`) and pathspecs
 //! containing wildcards, both of which git resolves through the full pathspec
-//! machinery against the index before it ever consults the exclude stack.
+//! machinery against the index before it ever consults the exclude stack; and
+//! unique-prefix option abbreviation (`--verb`), whose ambiguity diagnostics
+//! depend on `parse-options`' internal candidate ordering.
 
 use anyhow::{bail, Result};
 use std::io::{Read, Write};
@@ -67,15 +73,70 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
             no_more_flags = true;
             continue;
         }
+        // A bare `-` is a pathname, not an option, exactly as in parse-options.
         if !no_more_flags && a.len() > 1 && a.starts_with('-') {
             if let Some(long) = a.strip_prefix("--") {
-                match long {
-                    "quiet" => o.quiet = true,
-                    "verbose" => o.verbose = true,
-                    "non-matching" => o.non_matching = true,
-                    "stdin" => o.stdin = true,
-                    "no-index" => o.no_index = true,
-                    _ => bail!("unsupported flag {a:?} (ported: -q/--quiet, -v/--verbose, -n/--non-matching, -z, --stdin, --no-index)"),
+                // `--opt=value`: every option here is a boolean, so any attached
+                // value is an error naming the option's canonical spelling.
+                let (name, has_value) = match long.split_once('=') {
+                    Some((n, _)) => (n, true),
+                    None => (long, false),
+                };
+                // Each arm yields the name git echoes in diagnostics: the
+                // option's own `long_name`, prefixed with `no-` when the
+                // spelling is parse-options' generated negation.
+                let canonical = match name {
+                    "quiet" => {
+                        o.quiet = true;
+                        "quiet"
+                    }
+                    "no-quiet" => {
+                        o.quiet = false;
+                        "no-quiet"
+                    }
+                    "verbose" => {
+                        o.verbose = true;
+                        "verbose"
+                    }
+                    "no-verbose" => {
+                        o.verbose = false;
+                        "no-verbose"
+                    }
+                    "non-matching" => {
+                        o.non_matching = true;
+                        "non-matching"
+                    }
+                    "no-non-matching" => {
+                        o.non_matching = false;
+                        "no-non-matching"
+                    }
+                    "stdin" => {
+                        o.stdin = true;
+                        "stdin"
+                    }
+                    "no-stdin" => {
+                        o.stdin = false;
+                        "no-stdin"
+                    }
+                    "no-index" => {
+                        o.no_index = true;
+                        "no-index"
+                    }
+                    // Both the explicit double negation and the `--index` form
+                    // parse-options derives from a `no-`-prefixed long name.
+                    "no-no-index" | "index" => {
+                        o.no_index = false;
+                        "no-no-index"
+                    }
+                    // `--help` is not handled here: stock git intercepts it above
+                    // the builtin and renders the man page, which this layer
+                    // cannot reproduce, so it is left to fall through.
+                    _ => return Ok(usage_error(&format!("unknown option `{name}'"))),
+                };
+                if has_value {
+                    return Ok(usage_error(&format!(
+                        "option `{canonical}' takes no value"
+                    )));
                 }
             } else {
                 // Short flags may be bundled, e.g. `-vn`.
@@ -85,7 +146,8 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
                         'v' => o.verbose = true,
                         'n' => o.non_matching = true,
                         'z' => o.nul = true,
-                        _ => bail!("unsupported flag {:?} (ported: -q/--quiet, -v/--verbose, -n/--non-matching, -z, --stdin, --no-index)", format!("-{c}")),
+                        'h' => return Ok(show_usage()),
+                        _ => return Ok(usage_error(&format!("unknown switch `{c}'"))),
                     }
                 }
             }
@@ -120,7 +182,10 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
     }
 
     let originals = if o.stdin {
-        read_stdin_paths(o.nul)?
+        match read_stdin_paths(o.nul)? {
+            Some(paths) => paths,
+            None => return Ok(fatal("line is badly quoted")),
+        }
     } else {
         cli_paths
     };
@@ -231,9 +296,46 @@ fn fatal(msg: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
+/// git's `parse-options` usage block for this command, laid out in the same
+/// two-column form (descriptions start at column 26, an option whose flag list
+/// reaches that column wraps onto its own line) and ending in a blank line.
+const USAGE: &str = "\
+usage: git check-ignore [<options>] <pathname>...
+   or: git check-ignore [<options>] --stdin
+
+    -q, --[no-]quiet      suppress progress reporting
+    -v, --[no-]verbose    be verbose
+
+    --[no-]stdin          read file names from stdin
+    -z                    terminate input and output records by a NUL character
+    -n, --[no-]non-matching
+                          show non-matching input paths
+    --no-index            ignore index when checking
+    --index               opposite of --no-index
+
+";
+
+/// `-h`/`--help`: the usage block goes to standard output, and the exit code is
+/// still the usage-error 129.
+fn show_usage() -> ExitCode {
+    print!("{USAGE}");
+    let _ = std::io::stdout().flush();
+    ExitCode::from(129)
+}
+
+/// A command-line parsing error: the `error:` line and the usage block both go
+/// to standard error, with git's usage exit code.
+fn usage_error(msg: &str) -> ExitCode {
+    eprint!("error: {msg}\n{USAGE}");
+    ExitCode::from(129)
+}
+
 /// Read the path list from standard input: NUL-separated with `-z`, otherwise
 /// one per line with `"…"`-quoted lines decoded, matching git's `--stdin`.
-fn read_stdin_paths(nul: bool) -> Result<Vec<BString>> {
+///
+/// `None` signals a line that opens a quote it never closes — git's
+/// `fatal: line is badly quoted`.
+fn read_stdin_paths(nul: bool) -> Result<Option<Vec<BString>>> {
     let mut buf = Vec::new();
     std::io::stdin().lock().read_to_end(&mut buf)?;
     let sep = if nul { b'\0' } else { b'\n' };
@@ -257,13 +359,13 @@ fn read_stdin_paths(nul: bool) -> Result<Vec<BString>> {
                         paths.push(p);
                         continue;
                     }
-                    None => bail!("line is badly quoted"),
+                    None => return Ok(None),
                 }
             }
         }
         paths.push(BString::from(line));
     }
-    Ok(paths)
+    Ok(Some(paths))
 }
 
 /// Decode a `"…"`-wrapped C-quoted path (git's `unquote_c_style`).

@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::process::ExitCode;
 
 use gix::bstr::{BString, ByteSlice};
+use gix::index::entry::{Flags, Mode, Stage, Stat};
 use gix::objs::tree::EntryMode;
 use gix::ObjectId;
 
@@ -12,6 +13,8 @@ use gix::ObjectId;
 ///   * `git commit -m <msg>` (repeatable; paragraphs joined by a blank line)
 ///   * `--message=<msg>` / `-m<msg>` (attached value)
 ///   * `--allow-empty`, `--allow-empty-message`, `-q`/`--quiet`
+///   * `-a`/`--all` (auto-stage tracked modifications and deletions)
+///   * bundled short flags, e.g. `-am <msg>` / `-qam <msg>`
 ///
 /// The tree is built from the current index (staging area), the commit is
 /// written with `author`/`committer` from configuration, and `HEAD` is advanced
@@ -23,9 +26,9 @@ use gix::ObjectId;
 /// (a rename is reported as a delete plus a create), and binary blobs contribute
 /// `0` insertions/deletions to the short-stat, just as `git` does.
 ///
-/// Options that change staging or history semantics (`-a`, `--amend`, `-F`,
-/// `-C`, `--author`, `-p`, `-S`, pathspec-limited commits, editor mode, …) are
-/// not backed by this port and fail with a precise message rather than silently
+/// Options that change staging or history semantics (`--amend`, `-F`, `-C`,
+/// `--author`, `-p`, `-S`, pathspec-limited commits, editor mode, …) are not
+/// backed by this port and fail with a precise message rather than silently
 /// doing the wrong thing.
 pub fn commit(args: &[String]) -> Result<ExitCode> {
     // --- argument parsing ------------------------------------------------
@@ -33,6 +36,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut allow_empty = false;
     let mut allow_empty_message = false;
     let mut quiet = false;
+    let mut all = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -48,18 +52,42 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "--allow-empty" => allow_empty = true,
             "--allow-empty-message" => allow_empty_message = true,
             "-q" | "--quiet" => quiet = true,
+            "-a" | "--all" => all = true,
             "--" => {
                 if i + 1 < args.len() {
                     anyhow::bail!("pathspec-limited commits are not supported");
                 }
             }
-            "-a" | "--all" => {
-                anyhow::bail!("`-a`/`--all` (auto-stage tracked files) is not supported; stage with `git add` first")
-            }
             "--amend" => anyhow::bail!("`--amend` is not supported"),
             s if s.starts_with("--message=") => messages.push(s["--message=".len()..].to_string()),
-            s if s.starts_with("-m") && s.len() > 2 => messages.push(s[2..].to_string()),
-            s if s.starts_with('-') => anyhow::bail!("unsupported option `{s}`"),
+            s if s.starts_with("--") => anyhow::bail!("unsupported option `{s}`"),
+            // A bundled short-flag cluster, e.g. `-am <msg>`, `-qam <msg>`,
+            // `-amMSG`. git's parse-options treats every char as its own option;
+            // the first one that takes a value consumes the rest of the cluster,
+            // or the next argv element when the cluster ends there.
+            s if s.len() > 1 && s.starts_with('-') => {
+                let cluster = &s[1..];
+                for (at, c) in cluster.char_indices() {
+                    match c {
+                        'a' => all = true,
+                        'q' => quiet = true,
+                        'm' => {
+                            let rest = &cluster[at + c.len_utf8()..];
+                            if rest.is_empty() {
+                                i += 1;
+                                let m = args.get(i).ok_or_else(|| {
+                                    anyhow::anyhow!("option `-m` requires a value")
+                                })?;
+                                messages.push(m.clone());
+                            } else {
+                                messages.push(rest.to_string());
+                            }
+                            break;
+                        }
+                        _ => anyhow::bail!("unsupported option `-{c}`"),
+                    }
+                }
+            }
             _ => anyhow::bail!("pathspec-limited commits are not supported"),
         }
         i += 1;
@@ -85,6 +113,13 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     let hash = repo.object_hash();
+
+    // --- `-a`/`--all`: auto-stage tracked modifications and deletions -----
+    // Runs under the same lock, and writes the index through before the tree is
+    // built so the on-disk index and the commit agree even if we bail later.
+    if all {
+        stage_tracked_changes(&repo)?;
+    }
 
     // --- build a tree object from the index ------------------------------
     let index = repo.open_index()?;
@@ -241,6 +276,116 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Stage every *tracked* path whose worktree state diverges from the index —
+/// `git commit -a`, which is `git add -u` over the whole worktree.
+///
+/// Only stage-0 entries participate: conflicted stages are left for the caller's
+/// unmerged-files check to reject, and submodule gitlinks are never re-read from
+/// the worktree here. Untracked files are deliberately not added, which is the
+/// whole distinction between `-a` and `git add -A`.
+///
+/// Content filters (`autocrlf`, `clean`/`smudge`) are not applied, matching the
+/// same deviation `git add` carries in this port.
+fn stage_tracked_changes(repo: &gix::Repository) -> Result<()> {
+    if repo.workdir().is_none() {
+        anyhow::bail!("this operation must be run in a work tree");
+    }
+    if !repo.index_path().exists() {
+        return Ok(());
+    }
+    let index = repo.open_index()?;
+
+    /// A tracked path whose worktree content or mode moved.
+    struct Staged {
+        path: BString,
+        id: ObjectId,
+        mode: Mode,
+        stat: Stat,
+    }
+    let mut staged: Vec<Staged> = Vec::new();
+    let mut deletions: Vec<BString> = Vec::new();
+
+    {
+        let backing = index.path_backing();
+        for e in index.entries() {
+            if e.stage() != Stage::Unconflicted || e.mode == Mode::COMMIT {
+                continue;
+            }
+            let path = e.path_in(backing).to_owned();
+            let Some(abs) = repo.workdir_path(&path) else {
+                continue;
+            };
+            // A vanished (or unreadable) tracked path stages as a deletion.
+            let Ok(md) = gix::index::fs::Metadata::from_path_no_follow(&abs) else {
+                deletions.push(path);
+                continue;
+            };
+            // A tracked file replaced by a directory is not stageable content;
+            // leave the index entry untouched rather than guessing.
+            if md.is_dir() {
+                continue;
+            }
+
+            let (bytes, mode) = if md.is_symlink() {
+                let target = std::fs::read_link(&abs)?;
+                #[cfg(unix)]
+                let bytes = {
+                    use std::os::unix::ffi::OsStrExt;
+                    target.as_os_str().as_bytes().to_vec()
+                };
+                #[cfg(not(unix))]
+                let bytes = target.to_string_lossy().into_owned().into_bytes();
+                (bytes, Mode::SYMLINK)
+            } else {
+                let bytes = std::fs::read(&abs)?;
+                let mode = if md.is_executable() {
+                    Mode::FILE_EXECUTABLE
+                } else {
+                    Mode::FILE
+                };
+                (bytes, mode)
+            };
+
+            // Hash first, write only on a real change: an unmodified worktree
+            // must not churn the index or touch the object database.
+            let id = gix::objs::compute_hash(repo.object_hash(), gix::object::Kind::Blob, &bytes)?;
+            if id == e.id && mode == e.mode {
+                continue;
+            }
+            let id = repo.write_blob(&bytes)?.detach();
+            staged.push(Staged {
+                path,
+                id,
+                mode,
+                stat: Stat::from_fs(&md)?,
+            });
+        }
+    }
+
+    if staged.is_empty() && deletions.is_empty() {
+        return Ok(());
+    }
+
+    // Replace every touched path wholesale, then restore sort order. The
+    // tree-cache extension is dropped so the tree build below cannot pick up a
+    // stale subtree for a path that just moved.
+    let mut index = repo.open_index()?;
+    let remove: HashSet<BString> = staged
+        .iter()
+        .map(|s| s.path.clone())
+        .chain(deletions.iter().cloned())
+        .collect();
+    index.remove_entries(|_, path, _| remove.contains(&path.to_owned()));
+    for s in &staged {
+        index.dangerously_push_entry(s.stat, s.id, Flags::empty(), s.mode, s.path.as_ref());
+    }
+    index.sort_entries();
+    index.remove_tree();
+    index.write(gix::index::write::Options::default())?;
+
+    Ok(())
 }
 
 /// The git-internal octal representation of a tree entry mode, e.g. `100644`.

@@ -8,12 +8,17 @@
 //!
 //! Covered flags: `-p`/`--stdout`, `-q`/`--quiet`, `-L <label>` (up to three),
 //! `--diff3`, `--zdiff3`, `--ours`, `--theirs`, `--union`, `--marker-size=<n>`,
-//! `--diff-algorithm=<myers|minimal|histogram>`, `--object-id`, `--` and the
-//! `--no-` negations parse-options accepts, plus the `merge.conflictStyle`
-//! config default. Unique-prefix abbreviation of long options is *not*
-//! accepted, and `--diff-algorithm=patience` is refused: the vendored
-//! `imara-diff` has no patience implementation, and silently substituting
-//! another algorithm would change the merge result.
+//! `--diff-algorithm=<myers|minimal|patience|histogram>`, `--object-id`, `--`
+//! and the `--no-` negations parse-options accepts, plus the
+//! `merge.conflictStyle` config default. Unique-prefix abbreviation of long
+//! options is *not* accepted.
+//!
+//! `patience` is accepted as a *value* exactly as git accepts it, so command
+//! lines that name it and then fail for an unrelated reason (a bad operand
+//! count, a later bad `--diff-algorithm`, a missing file) fail identically to
+//! git. Only a merge that would actually be computed with patience is refused:
+//! the vendored `imara-diff` has no patience implementation, and silently
+//! substituting another algorithm would change the merge result.
 //!
 //! The three-way line merge itself is a port of the built-in text driver from
 //! the vendored `gix-merge` crate (`blob/builtin_driver/text`), inlined here.
@@ -69,7 +74,7 @@ enum ConflictStyle {
 /// What to do when both sides changed the same region.
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum Conflict {
-    Keep { style: ConflictStyle, marker_size: u8 },
+    Keep { style: ConflictStyle, marker_size: usize },
     Ours,
     Theirs,
     Union,
@@ -94,8 +99,9 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
     let mut favor: Option<Conflict> = None;
     // Same for the two style flags.
     let mut style: Option<ConflictStyle> = None;
-    let mut marker_size: u8 = 7;
-    let mut algorithm = Algorithm::Myers;
+    // git stores this in a C `int` and only clamps it (to 7) at merge time.
+    let mut marker_size: i64 = 7;
+    let mut algorithm = DiffAlgorithm::Imara(Algorithm::Myers);
     let mut label_args: Vec<String> = Vec::new();
     let mut operands: Vec<&str> = Vec::new();
     let mut no_more_opts = false;
@@ -121,7 +127,7 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
             };
             // Boolean options reject `--opt=v` the way parse-options does.
             if value.is_some() && !matches!(name, "marker-size" | "diff-algorithm") {
-                return Ok(usage_error(&format!("option `{name}' takes no value")));
+                return Ok(option_error(&format!("option `{name}' takes no value")));
             }
             match name {
                 "stdout" => to_stdout = true,
@@ -139,29 +145,32 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
                 "no-ours" | "no-theirs" | "no-union" => favor = None,
                 "marker-size" => {
                     let Some(v) = value.or_else(|| next_value(argv, &mut i)) else {
-                        return Ok(usage_error("option `marker-size' requires a value"));
+                        return Ok(option_error("option `marker-size' requires a value"));
                     };
-                    match v.parse::<u8>() {
-                        Ok(n) => marker_size = n,
-                        Err(_) => {
-                            return Ok(usage_error("option `marker-size' expects a numerical value"))
-                        }
+                    match parse_int_arg(v) {
+                        Ok(Some(n)) => marker_size = n,
+                        Ok(None) => return Ok(option_error(&format!(
+                            "value {v} for option `marker-size' not in range [-2147483648,2147483647]"
+                        ))),
+                        Err(()) => return Ok(option_error(
+                            "option `marker-size' expects an integer value with an optional k/m/g suffix",
+                        )),
                     }
                 }
-                "no-marker-size" => marker_size = 7,
+                "no-marker-size" => marker_size = 0,
                 "diff-algorithm" => {
                     let Some(v) = value.or_else(|| next_value(argv, &mut i)) else {
-                        return Ok(usage_error("option `diff-algorithm' requires a value"));
+                        return Ok(option_error("option `diff-algorithm' requires a value"));
                     };
                     algorithm = match v {
-                        "myers" | "default" => Algorithm::Myers,
-                        "minimal" => Algorithm::MyersMinimal,
-                        "histogram" => Algorithm::Histogram,
-                        "patience" => anyhow::bail!(
-                            "--diff-algorithm=patience is unsupported (ported: myers, minimal, histogram)"
-                        ),
-                        other => {
-                            return Ok(usage_error(&format!("option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\", got \"{other}\"")))
+                        "myers" | "default" => DiffAlgorithm::Imara(Algorithm::Myers),
+                        "minimal" => DiffAlgorithm::Imara(Algorithm::MyersMinimal),
+                        "histogram" => DiffAlgorithm::Imara(Algorithm::Histogram),
+                        "patience" => DiffAlgorithm::Patience,
+                        _ => {
+                            return Ok(option_error(
+                                "option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\"",
+                            ))
                         }
                     };
                 }
@@ -186,7 +195,7 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
                     let value = if rest.is_empty() {
                         match next_value(argv, &mut i) {
                             Some(v) => v.to_string(),
-                            None => return Ok(usage_error("switch `L' requires a value")),
+                            None => return Ok(option_error("switch `L' requires a value")),
                         }
                     } else {
                         rest.to_string()
@@ -216,6 +225,8 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
         Some(style) => style,
         None => repo.as_ref().map_or(ConflictStyle::Merge, config_style),
     };
+    // git's `xdl_merge` substitutes the default for any non-positive size.
+    let marker_size = if marker_size <= 0 { 7 } else { marker_size as usize };
     let conflict = favor.unwrap_or(Conflict::Keep { style, marker_size });
 
     // Read the three operands, in the order git reports errors for them.
@@ -250,6 +261,15 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
         other: Some(label_args.get(2).map_or(operands[2], String::as_str).as_bytes()),
     };
 
+    // Every failure git reports before it diffs has been reproduced by now, so
+    // this is the first point at which the missing algorithm actually matters.
+    let algorithm = match algorithm {
+        DiffAlgorithm::Imara(algorithm) => algorithm,
+        DiffAlgorithm::Patience => anyhow::bail!(
+            "--diff-algorithm=patience is unsupported (ported: myers, minimal, histogram)"
+        ),
+    };
+
     let (merged, conflicts) = three_way_merge(
         &contents[0],
         &contents[1],
@@ -278,12 +298,100 @@ fn next_value<'a>(argv: &'a [String], i: &mut usize) -> Option<&'a str> {
     Some(value)
 }
 
-/// Report a bad command line the way parse-options does: reason then usage on
-/// stderr, exit 129.
+/// Which diff implementation the merge should run on.
+///
+/// `patience` is a value git accepts, so it has to survive option parsing even
+/// though nothing can execute it; see the module docs.
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum DiffAlgorithm {
+    Imara(Algorithm),
+    Patience,
+}
+
+/// Report an unrecognised option the way parse-options does: reason *and*
+/// usage on stderr, exit 129.
 fn usage_error(reason: &str) -> ExitCode {
     eprintln!("error: {reason}");
     eprint!("{USAGE}");
     ExitCode::from(129)
+}
+
+/// Report a bad option *value*. parse-options prints no usage block for these
+/// — only the reason — and still exits 129.
+fn option_error(reason: &str) -> ExitCode {
+    eprintln!("error: {reason}");
+    ExitCode::from(129)
+}
+
+/// Port of git's `git_parse_signed` as `OPT_INTEGER` uses it: `strtoimax` with
+/// base detection (`0x` hex, leading `0` octal), then one optional `k`/`m`/`g`
+/// suffix, then end of string.
+///
+/// `Err(())` is malformed input, `Ok(None)` a value outside a C `int`.
+fn parse_int_arg(text: &str) -> std::result::Result<Option<i64>, ()> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while matches!(bytes.get(at), Some(c) if c.is_ascii_whitespace()) {
+        at += 1;
+    }
+    let negative = match bytes.get(at) {
+        Some(b'-') => {
+            at += 1;
+            true
+        }
+        Some(b'+') => {
+            at += 1;
+            false
+        }
+        _ => false,
+    };
+
+    let radix = if bytes[at..].starts_with(b"0x") || bytes[at..].starts_with(b"0X") {
+        at += 2;
+        16
+    } else if bytes.get(at) == Some(&b'0') {
+        8
+    } else {
+        10
+    };
+
+    let digits_start = at;
+    let mut value: i64 = 0;
+    while let Some(digit) = bytes.get(at).and_then(|c| (*c as char).to_digit(radix)) {
+        let Some(next) = value
+            .checked_mul(i64::from(radix))
+            .and_then(|v| v.checked_add(i64::from(digit)))
+        else {
+            return Ok(None);
+        };
+        value = next;
+        at += 1;
+    }
+    if at == digits_start {
+        return Err(());
+    }
+
+    let factor: i64 = match bytes.get(at) {
+        Some(b'k' | b'K') => 1024,
+        Some(b'm' | b'M') => 1024 * 1024,
+        Some(b'g' | b'G') => 1024 * 1024 * 1024,
+        _ => 1,
+    };
+    if factor != 1 {
+        at += 1;
+    }
+    if at != bytes.len() {
+        return Err(());
+    }
+
+    let Some(value) = value.checked_mul(factor) else {
+        return Ok(None);
+    };
+    let value = if negative { -value } else { value };
+    if value < i64::from(i32::MIN) || value > i64::from(i32::MAX) {
+        return Ok(None);
+    }
+    Ok(Some(value))
 }
 
 /// The `merge.conflictStyle` default; unknown values fall back to `merge`.
@@ -935,11 +1043,11 @@ fn write_conflict_marker(
     out: &mut Vec<u8>,
     marker: u8,
     label: Option<&[u8]>,
-    marker_size: u8,
+    marker_size: usize,
     nl: &[u8],
 ) {
     assure_ends_with_nl(out, nl);
-    out.extend(std::iter::repeat(marker).take(marker_size as usize));
+    out.extend(std::iter::repeat(marker).take(marker_size));
     if let Some(label) = label {
         out.push(b' ');
         out.extend_from_slice(label);

@@ -25,8 +25,14 @@
 //! * `-u` (with `-m`/`--reset`/`--prefix`) — update the worktree for the paths whose
 //!   index entry actually changed, and delete files the read drops. `--reset -u`
 //!   additionally restores tracked files that are dirty or missing.
-//! * `-i`, `-n`/`--dry-run`, `-q`/`--quiet`, `-v`, `--index-output=<file>`,
-//!   `--no-sparse-checkout`, `--no-recurse-submodules`.
+//! * `-i`, `-n`/`--dry-run`, `-q`/`--quiet`, `-v`/`--verbose`,
+//!   `--index-output=<file>`, `--exclude-per-directory=<file>`,
+//!   `--[no-]sparse-checkout`, `--[no-]recurse-submodules`, `--[no-]debug-unpack`.
+//!
+//! Options are parsed the way `parse-options` does: short switches cluster (`-mu`),
+//! value-taking options accept both `--name=<v>` and `--name <v>`, every boolean has
+//! its `--no-` form, `--` ends the option scan, and a usage error prints git's usage
+//! block and exits 129.
 //!
 //! ## Not ported
 //!
@@ -34,8 +40,8 @@
 //! `read-tree`'s merge machinery — the "carry forward" table in `git-read-tree(1)` —
 //! and are not implemented; supplying more than one tree with `-m`/`--reset`/
 //! `--prefix` bails rather than writing a wrong index. `--trivial` and `--aggressive`
-//! only tune that three-way merge, and `--recurse-submodules` needs submodule
-//! checkout substrate, so all three bail as well.
+//! are accepted and ignored because they only tune that three-way merge, which is
+//! unreachable here.
 //!
 //! ## Known deviations
 //!
@@ -46,6 +52,14 @@
 //!   adds; git additionally permits it when the file is `.gitignore`d.
 //! * The cache-tree (`TREE`) extension is dropped on write, as everywhere else in
 //!   zvcs, because gitoxide cannot recompute it (`gix_index::File::write`).
+//! * `--sparse-checkout` is accepted but never applies a sparse filter, and
+//!   `--recurse-submodules` never descends into submodules — both need substrate
+//!   this port does not have, so they behave as their `--no-` counterparts.
+//! * `--exclude-per-directory` reproduces git's "meaningless unless -u" gate but the
+//!   ignore file it names is not consulted, since `-u` here never overwrites an
+//!   existing untracked file in the first place.
+//! * `--debug-unpack` is accepted and silent; there is no `unpack-trees` to trace.
+//! * `read-tree --help` renders a man page under stock git and is not reproduced.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -84,10 +98,68 @@ impl Opts {
     }
 }
 
+/// git's own `read-tree` usage block, byte for byte (`git read-tree -h`).
+///
+/// Reproduced verbatim because `parse-options` prints it on every usage error, and
+/// parity compares stderr bytes. The trailing blank line is part of git's output.
+const USAGE: &str = "\
+usage: git read-tree [(-m [--trivial] [--aggressive] | --reset | --prefix=<prefix>)
+                     [-u | -i]] [--index-output=<file>] [--no-sparse-checkout]
+                     (--empty | <tree-ish1> [<tree-ish2> [<tree-ish3>]])
+
+    --index-output <file> write resulting index to <file>
+    --[no-]empty          only empty the index
+    -v, --[no-]verbose    be verbose
+
+Merging
+    -m                    perform a merge in addition to a read
+    --[no-]trivial        3-way merge if no file level merging required
+    --[no-]aggressive     3-way merge in presence of adds and removes
+    --[no-]reset          same as -m, but discard unmerged entries
+    --prefix <subdirectory>/
+                          read the tree into the index under <subdirectory>/
+    -u                    update working tree with merge result
+    --exclude-per-directory <gitignore>
+                          allow explicitly ignored files to be overwritten
+    -i                    don't check the working tree after merging
+    -n, --[no-]dry-run    don't update the index or the work tree
+    --no-sparse-checkout  skip applying sparse checkout filter
+    --sparse-checkout     opposite of --no-sparse-checkout
+    --[no-]debug-unpack   debug unpack-trees
+    --[no-]recurse-submodules[=<checkout>]
+                          control recursive updating of submodules
+    -q, --[no-]quiet      suppress feedback messages
+
+";
+
 /// Report a git-style fatal and return git's exit code for it.
 fn fatal(msg: impl std::fmt::Display) -> Result<ExitCode> {
     eprintln!("fatal: {msg}");
     Ok(ExitCode::from(128))
+}
+
+/// An unrecognised option: an `error:` line, the usage block, and 129.
+fn usage_err(msg: impl std::fmt::Display) -> Result<ExitCode> {
+    eprintln!("error: {msg}");
+    eprint!("{USAGE}");
+    Ok(ExitCode::from(129))
+}
+
+/// A malformed value for a *known* option. Still 129, but `parse-options` prints only
+/// the `error:` line here — the usage block is reserved for unrecognised options.
+fn opt_err(msg: impl std::fmt::Display) -> Result<ExitCode> {
+    eprintln!("error: {msg}");
+    Ok(ExitCode::from(129))
+}
+
+/// git's `git_parse_maybe_bool` spelling set, used by `--recurse-submodules=<v>`.
+/// The empty string is false, matching `git_parse_maybe_bool_text`.
+fn parse_maybe_bool(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "yes" | "on" | "true" | "1" => Some(true),
+        "no" | "off" | "false" | "0" | "" => Some(false),
+        _ => None,
+    }
 }
 
 /// Report a git-style `error:` line and return git's exit code for it.
@@ -104,37 +176,128 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
     };
 
     let mut o = Opts::default();
-    for a in argv {
-        match a.as_str() {
-            "-m" => o.merge = true,
-            "--reset" => o.reset = true,
-            "-u" => o.update = true,
-            "-i" => o.index_only = true,
-            "-n" | "--dry-run" => o.dry_run = true,
-            // Progress and feedback: this port emits neither, so both are no-ops.
-            "-v" | "-q" | "--quiet" => {}
-            "--empty" => o.read_empty = true,
-            // Sparse checkout is never applied by this port, so disabling it is a no-op.
-            "--no-sparse-checkout" => {}
-            "--no-recurse-submodules" => {}
-            "--trivial" | "--aggressive" => bail!(
-                "unsupported flag {a:?} (it only tunes the three-way merge, which is not ported; \
-                 ported: -m, --reset, -u, -i, -n, -q, -v, --empty, --prefix=, --index-output=)"
-            ),
-            "--recurse-submodules" => {
-                bail!("unsupported flag {a:?} (recursive submodule checkout is not ported)")
+    let mut only_positionals = false;
+    let mut i = 0usize;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        i += 1;
+
+        if only_positionals || a == "-" || !a.starts_with('-') {
+            o.trees.push(a.to_string());
+            continue;
+        }
+        if a == "--" {
+            only_positionals = true;
+            continue;
+        }
+
+        // ---- Short option clusters (`-mu` is accepted by parse-options). ----
+        if !a.starts_with("--") {
+            for c in a[1..].chars() {
+                match c {
+                    'm' => o.merge = true,
+                    'u' => o.update = true,
+                    'i' => o.index_only = true,
+                    'n' => o.dry_run = true,
+                    // Progress and feedback: this port emits neither, so both no-op.
+                    'v' | 'q' => {}
+                    'h' => {
+                        print!("{USAGE}");
+                        return Ok(ExitCode::from(129));
+                    }
+                    _ => return usage_err(format!("unknown switch `{c}'")),
+                }
             }
-            "--prefix" | "--index-output" => {
-                bail!("{a:?} requires an inline value, e.g. {a}=<value>")
+            continue;
+        }
+
+        // ---- Long options: `--name` or `--name=<value>`. ----
+        let body = &a[2..];
+        let (name, inline) = match body.find('=') {
+            Some(eq) => (&body[..eq], Some(&body[eq + 1..])),
+            None => (body, None),
+        };
+
+        // Every arm below that takes no argument rejects an inline `=value`, which is
+        // what parse-options does for OPTION_SET_INT / OPTION_BOOL.
+        macro_rules! no_value {
+            () => {
+                if inline.is_some() {
+                    return opt_err(format!("option `{name}' takes no value"));
+                }
+            };
+        }
+        // A value-taking option accepts `--name=<v>` or `--name <v>`.
+        macro_rules! value {
+            () => {
+                match inline {
+                    Some(v) => v.to_string(),
+                    None => match argv.get(i) {
+                        Some(next) => {
+                            i += 1;
+                            next.clone()
+                        }
+                        None => return opt_err(format!("option `{name}' requires a value")),
+                    },
+                }
+            };
+        }
+
+        match name {
+            "reset" => {
+                no_value!();
+                o.reset = true;
             }
-            _ if a.starts_with("--prefix=") => {
-                o.prefix = Some(a["--prefix=".len()..].to_string());
+            "no-reset" => {
+                no_value!();
+                o.reset = false;
             }
-            _ if a.starts_with("--index-output=") => {
-                o.index_output = Some(PathBuf::from(&a["--index-output=".len()..]));
+            "dry-run" => {
+                no_value!();
+                o.dry_run = true;
             }
-            _ if a.starts_with('-') && a != "-" => bail!("unknown option {a:?}"),
-            _ => o.trees.push(a.clone()),
+            "no-dry-run" => {
+                no_value!();
+                o.dry_run = false;
+            }
+            "empty" => {
+                no_value!();
+                o.read_empty = true;
+            }
+            "no-empty" => {
+                no_value!();
+                o.read_empty = false;
+            }
+            // Feedback-only switches: this port is silent either way.
+            "verbose" | "no-verbose" | "quiet" | "no-quiet" => no_value!(),
+            // `--trivial`/`--aggressive` only tune the two- and three-tree merges,
+            // which are not reachable here, so they carry no behaviour of their own.
+            "trivial" | "no-trivial" | "aggressive" | "no-aggressive" => no_value!(),
+            // Sparse checkout is never applied by this port, so both directions no-op.
+            "sparse-checkout" | "no-sparse-checkout" => no_value!(),
+            // `unpack-trees` tracing has no analogue here.
+            "debug-unpack" | "no-debug-unpack" => no_value!(),
+            "no-recurse-submodules" => no_value!(),
+            "recurse-submodules" => {
+                // The optional value is a boolean; anything else is fatal in git.
+                if let Some(v) = inline {
+                    if parse_maybe_bool(v).is_none() {
+                        return fatal(format!("bad recurse-submodules argument: {v}"));
+                    }
+                }
+            }
+            "prefix" => o.prefix = Some(value!()),
+            "index-output" => o.index_output = Some(PathBuf::from(value!())),
+            "exclude-per-directory" => {
+                let _ignore_file = value!();
+                // git checks this inside the option callback, so it fires during the
+                // scan — before the tree-ishes are resolved, and it only sees the
+                // `-u` seen so far.
+                if !o.update {
+                    return fatal("--exclude-per-directory is meaningless unless -u");
+                }
+            }
+            _ => return usage_err(format!("unknown option `{name}'")),
         }
     }
 

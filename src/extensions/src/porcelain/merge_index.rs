@@ -24,7 +24,9 @@
 //!   * Option parsing is strictly positional, exactly as in `cmd_merge_index`:
 //!     `-o` is only recognised as the first argument and `-q` only as the next
 //!     one, so `git merge-index -q -o prog -a` takes `-o` as the *program*.
-//!   * Fewer than two arguments prints the usage line and exits 129.
+//!   * Fewer than two arguments (git's `argc < 3`, counting the `merge-index`
+//!     verb that `dispatch::run` has already stripped from `args`) prints the
+//!     usage line and exits 129.
 //!   * A path that is not in the index at all is
 //!     `fatal: git merge-index: <path> not in the cache`, exit 128; a path
 //!     present at stage 0 is already merged and is silently skipped.
@@ -89,15 +91,16 @@ struct Ctx {
 /// `git merge-index` — run a merge for files needing merging.
 pub fn merge_index(args: &[String]) -> Result<ExitCode> {
     // git checks this before touching the repository, so an argument-starved
-    // invocation is a usage error even outside a repository.
-    if args.len() < 3 {
+    // invocation is a usage error even outside a repository. `args` excludes the
+    // `merge-index` verb, so git's `argc < 3` is `args.len() < 2` here.
+    if args.len() < 2 {
         eprintln!("{USAGE}");
         return Ok(ExitCode::from(129));
     }
 
     // Positional option scan, mirroring cmd_merge_index exactly: `-o` may only
     // appear first, `-q` only second, and whatever follows is the program.
-    let mut i = 1usize;
+    let mut i = 0usize;
     let mut one_shot = false;
     let mut quiet = false;
     if args[i] == "-o" {

@@ -48,10 +48,22 @@
 //!     head to replay your work on top of it...` then `Fast-forwarded <b> to
 //!     <onto>.`, both on stdout, with the same ref/reflog dance and no
 //!     `Successfully rebased` line.
+//! * The one replay that is a re-commit rather than a merge: **`can_fast_forward()`
+//!   holds but `REBASE_FORCE` is set**, i.e. `git rebase -f`/`--no-ff`/
+//!   `--ignore-date`/`--committer-date-is-author-date` over a range already
+//!   sitting on `<onto>`. Both backends rewrite the range's metadata there —
+//!   the committer always, the author date under `--ignore-date` — while every
+//!   tree stays byte-identical. See the `exact_replay` comment below for why
+//!   that is exact rather than an approximation. This covers `Applying: <first
+//!   line>` per commit on stdout for the apply backend, `Rebasing (n/m)` on
+//!   stderr for the merge backend, the `rebase (pick)` reflog entries, and the
+//!   branch landing on the rewritten tip.
 //!
 //! ### What is NOT ported, and why
 //!
-//! Anything that replays a commit. Two independent blockers stand in the way:
+//! Any replay that is a genuine pick, i.e. one where `<onto>` is *not* already
+//! `<head>`'s ancestor along a linear first-parent path. Two independent
+//! blockers stand in the way:
 //!
 //! 1. **No three-way tree merge wired up here.** A pick is a merge of the picked
 //!    commit's tree against `HEAD`'s over the commit's first parent.
@@ -63,8 +75,10 @@
 //!    pre-rendered diff text). Getting this wrong silently *keeps* commits git
 //!    would have dropped — duplicated history that looks like success.
 //!
-//! So the replay is refused rather than approximated, and so are the few
-//! non-replay features that still need substrate this module does not have:
+//! Neither blocker has anything to bite on in the `exact_replay` case above,
+//! which is why that one is ported and the general one is not. Elsewhere the
+//! replay is refused rather than approximated, and so are the few non-replay
+//! features that still need substrate this module does not have:
 //! `--continue`/`--skip`/`--abort`/`--quit`/`--edit-todo`/`--show-current-patch`
 //! (the `.git/rebase-merge` state directory), `--root` (it mints a root commit),
 //! `--fork-point` (`get_fork_point()` walks the upstream reflog), `--autostash`
@@ -78,7 +92,7 @@ use std::collections::{HashMap, HashSet};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-use gix::bstr::BString;
+use gix::bstr::{BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::index::entry::{Mode, Stat};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
@@ -188,6 +202,16 @@ impl ModeOption {
             ModeOption::ShowCurrentPatch => "--show-current-patch",
         }
     }
+}
+
+/// One commit of an exact replay, resolved up front so a refusal further down
+/// still leaves the repository untouched. `parent_tree` is only read to spot the
+/// empty commits `git format-patch` would drop.
+struct Replay {
+    tree: ObjectId,
+    parent_tree: ObjectId,
+    message: BString,
+    author: gix::actor::Signature,
 }
 
 /// git's `imply_merge()`: a merge-only option either selects the merge backend
@@ -1036,8 +1060,8 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
 
     // --- can_fast_forward() ------------------------------------------------
     let branch_base = merge_base_unique(&repo, onto_oid, head_oid)?;
-    if allow_preemptive_ff && can_fast_forward(&repo, branch_base, onto_oid, upstream_oid, head_oid)?
-    {
+    let can_ff = can_fast_forward(&repo, branch_base, onto_oid, upstream_oid, head_oid)?;
+    if allow_preemptive_ff && can_ff {
         if flags & FORCE == 0 {
             if flags & NO_QUIET != 0 {
                 if branch_name == "HEAD" {
@@ -1074,7 +1098,51 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     }
 
     let apply_backend = ty == Backend::Apply;
-    if apply_backend {
+
+    // `can_fast_forward()` holding over a *non-empty* range is the one shape in
+    // which a replay is exactly a re-commit rather than a merge: `<onto>` is the
+    // merge base of `<onto>`/`<head>` *and* of `<upstream>`/`<head>`, and
+    // `<onto>..<head>` is linear. Every picked commit therefore lands on the very
+    // parent it already had, so its patch applies to a byte-identical tree and
+    // reproduces that commit's tree verbatim. Both blockers named in the module
+    // header are vacuous here — there is nothing to three-way merge, and nothing
+    // in the range can already be in `<upstream>`, so patch-id equivalence has no
+    // work to do. What git rewrites is the commit *metadata*: always the
+    // committer, plus the author date under `--ignore-date`. That is why it does
+    // not simply leave the branch alone.
+    //
+    // Reaching this with `can_ff` set implies `REBASE_FORCE` is set: without it
+    // the up-to-date exit above already returned.
+    let exact_replay = allow_preemptive_ff && can_ff && !todo.is_empty();
+
+    // Resolve every step before anything is written, so a refusal below still
+    // leaves the repository untouched.
+    //
+    // `is_linear_history()` stops at a root as well as at `<onto>`, so the walk
+    // below re-establishes what the replay actually needs — that `<onto>` really
+    // is reachable by first parents — and yields `None` if it is not, falling
+    // through to the refusals rather than replaying a range it did not verify.
+    let plan = if exact_replay {
+        first_parent_plan(&repo, head_oid, onto_oid)?
+    } else {
+        None
+    };
+    let exact_replay = plan.is_some();
+    let plan = plan.unwrap_or_default();
+
+    if exact_replay {
+        // `git format-patch` emits nothing for a commit that changes no tree, so
+        // the apply backend stops at one with `Patch is empty.` and leaves a
+        // half-finished `.git/rebase-apply` behind. Reproducing that interrupted
+        // state is out of scope. The merge backend keeps such commits — its picks
+        // are trees, not patches — and needs no guard.
+        if apply_backend && plan.iter().any(|s| s.tree == s.parent_tree) {
+            bail!(
+                "replaying an empty commit with the apply backend is not ported: `git am` stops \
+                 with `Patch is empty.` and leaves a .git/rebase-apply state directory behind"
+            );
+        }
+    } else if apply_backend {
         // The apply backend detaches first and only then notices it merely
         // fast-forwarded. Deciding here keeps a refused rebase from mutating
         // anything.
@@ -1100,7 +1168,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         bail!("unsupported flag \"--exec\" (exec lines run inside the sequencer)");
     }
 
-    // --- the no-replay finish ---------------------------------------------
+    // --- the finish --------------------------------------------------------
     // Serialize the whole read-modify-write through the repo coordinator (a
     // no-op when no daemon is running), matching the merge/zsync write path.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
@@ -1140,10 +1208,78 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     )?;
 
     // ... moves the worktree and index onto the new tree, ...
+    //
+    // ... except during an exact replay, which ends on `<head>`'s own tree — the
+    // tree the worktree and index already hold. The round trip down to `<onto>`
+    // and back would rewrite every differing file twice to land exactly where it
+    // started, so it is skipped rather than performed and undone.
     let should_interrupt = AtomicBool::new(false);
-    update_clean_worktree(&repo, &old_index, onto_oid, &should_interrupt)?;
+    if !exact_replay {
+        update_clean_worktree(&repo, &old_index, onto_oid, &should_interrupt)?;
+    }
 
-    if apply_backend {
+    // ... replays each commit onto the growing tip, ...
+    let mut tip = onto_oid;
+    if exact_replay {
+        // One `now` for the whole run: git caches `ident_default_date()` per
+        // process, so every commit `--ignore-date` restamps gets one value.
+        let now = gix::date::Time::now_local_or_utc();
+        let committer = repo
+            .committer()
+            .ok_or_else(|| anyhow!("committer identity is not configured"))??
+            .to_owned()?;
+        let total = plan.len();
+        for (n, step) in plan.iter().enumerate() {
+            if flags & NO_QUIET != 0 {
+                if apply_backend {
+                    // `git am` announces each patch by the first line of its
+                    // message — not the folded summary the reflog gets.
+                    let subject = match step.message.find_byte(b'\n') {
+                        Some(p) => &step.message[..p],
+                        None => &step.message[..],
+                    };
+                    println!("Applying: {}", subject.as_bstr());
+                } else {
+                    eprint!(
+                        "Rebasing ({}/{total}){}",
+                        n + 1,
+                        if flags & VERBOSE != 0 { "\n" } else { "\r" }
+                    );
+                }
+            }
+
+            // `--ignore-date`/`--reset-author-date` drops the recorded author
+            // date for the current time; `--committer-date-is-author-date` then
+            // copies whichever author date survived onto the committer.
+            let mut author = step.author.clone();
+            if ignore_date {
+                author.time = now;
+            }
+            let mut committer = committer.clone();
+            if committer_date_is_author_date {
+                committer.time = author.time;
+            }
+
+            let new = repo
+                .write_object(&gix::objs::Commit {
+                    message: step.message.clone(),
+                    tree: step.tree,
+                    author,
+                    committer,
+                    encoding: None,
+                    parents: std::iter::once(tip).collect(),
+                    extra_headers: Default::default(),
+                })?
+                .detach();
+            set_head(
+                &repo,
+                Target::Object(new),
+                &gix::reference::log::message("rebase (pick)", step.message.as_bstr(), 1)
+                    .to_string(),
+            )?;
+            tip = new;
+        }
+    } else if apply_backend {
         println!("Fast-forwarded {branch_name} to {onto_spec}.");
     } else if flags & FORCE != 0 && flags & NO_QUIET != 0 {
         // `complete_action()` appends a `noop` item to an empty todo list, and
@@ -1168,7 +1304,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                         message: format!("rebase (finish): {name} onto {onto_oid}").into(),
                     },
                     expected: PreviousValue::MustExistAndMatch(Target::Object(head_oid)),
-                    new: Target::Object(onto_oid),
+                    new: Target::Object(tip),
                 },
                 name: b.clone(),
                 deref: false,
@@ -1189,6 +1325,37 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         eprintln!("Successfully rebased and updated {label}.");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Resolve `onto..head` into replay steps by walking first parents from `head`
+/// down to `onto`, oldest first — the order both backends replay in.
+///
+/// `None` means `onto` was not reached: a root or a merge came first, so the
+/// range is not the plain re-commit the caller is about to perform.
+fn first_parent_plan(
+    repo: &gix::Repository,
+    head: ObjectId,
+    onto: ObjectId,
+) -> Result<Option<Vec<Replay>>> {
+    let mut plan = Vec::new();
+    let mut cur = head;
+    while cur != onto {
+        let commit = repo.find_commit(cur)?;
+        let mut parents = commit.parent_ids();
+        let (Some(parent), None) = (parents.next(), parents.next()) else {
+            return Ok(None);
+        };
+        let parent = parent.detach();
+        plan.push(Replay {
+            tree: commit.tree_id()?.detach(),
+            parent_tree: repo.find_commit(parent)?.tree_id()?.detach(),
+            message: commit.message_raw()?.to_owned(),
+            author: commit.author()?.to_owned()?,
+        });
+        cur = parent;
+    }
+    plan.reverse();
+    Ok(Some(plan))
 }
 
 /// git's `can_fast_forward()`: `<head>` already sits on top of `<onto>` and

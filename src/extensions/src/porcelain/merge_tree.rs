@@ -13,11 +13,27 @@
 //!   * `-z`, `--name-only`, `--messages`/`--no-messages`, `--quiet`,
 //!     `--allow-unrelated-histories`, `--merge-base=<tree-ish>`,
 //!     `--write-tree` (the default mode), `--`
+//!   * the whole option grammar, including every `-X`/`--strategy-option`
+//!     spelling git accepts, `--no-strategy-option`, `--trivial-merge`'s
+//!     "incompatible with all other options" rule, and git's usage/`error:`
+//!     diagnostics with their 128/129 exit codes
+//!   * the strategy options `ours`, `theirs`, `no-renames`, `find-renames`,
+//!     `find-renames=<n>`, `rename-threshold=<n>`, `histogram`,
+//!     `diff-algorithm=myers|default|minimal|histogram`, and the no-op
+//!     `no-renormalize`
 //!
 //! Not covered, and refused rather than approximated:
-//!   * `--stdin` (multi-merge batch protocol) and the deprecated
-//!     `--trivial-merge` mode
-//!   * `-X`/`--strategy-option`
+//!   * `--stdin` (multi-merge batch protocol) and actually *running* the
+//!     deprecated `--trivial-merge` mode (its option-compatibility rules are
+//!     enforced; the legacy three-tree walk with its embedded unified diff is
+//!     not ported)
+//!   * the strategy options `subtree[=<path>]`, `renormalize`, `patience`,
+//!     `diff-algorithm=patience`, `ignore-space-change`, `ignore-all-space`,
+//!     `ignore-space-at-eol` and `ignore-cr-at-eol` — `gix-merge`'s text driver
+//!     exposes no whitespace-insensitive tokenizer, no renormalizing pipeline
+//!     and no subtree shift, and `gix-imara-diff` has no patience algorithm.
+//!     They parse and validate exactly as git does; only performing such a
+//!     merge is refused.
 //!   * message rendering for conflict classes outside the content family —
 //!     rename/rename, rename/delete, modify/delete, directory/file, submodule
 //!     and binary conflicts. `gix-merge` reports these as structured
@@ -25,7 +41,7 @@
 //!     inventing text. Those merges still work under `--no-messages` and
 //!     `--quiet`, where no message text is emitted at all.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -34,10 +50,10 @@ use gix::diff::tree_with_rewrites::Change;
 use gix::hash::ObjectId;
 use gix::merge::blob::builtin_driver::text::Labels;
 use gix::merge::tree::apply_index_entries::RemovalMode;
-use gix::merge::tree::{Conflict, Resolution, TreatAsUnresolved};
+use gix::merge::tree::{Conflict, FileFavor, Resolution, TreatAsUnresolved};
 
-/// Verbatim `git merge-tree` usage text, printed to stderr when the two
-/// revisions are missing (git exits 129 in that case).
+/// Verbatim `git merge-tree` usage text, printed to stderr for usage errors
+/// (git exits 129 in those cases).
 const USAGE: &str = "\
 usage: git merge-tree [--write-tree] [<options>] <branch1> <branch2>
    or: git merge-tree [--trivial-merge] <base-tree> <branch1> <branch2>
@@ -55,7 +71,23 @@ usage: git merge-tree [--write-tree] [<options>] <branch1> <branch2>
                           specify a merge-base for the merge
     -X, --[no-]strategy-option <option=value>
                           option for selected merge strategy
+
 ";
+
+/// git's internal full-similarity score; `-X` rename percentages are expressed
+/// as a fraction of it (see `MAX_SCORE` in git's `diffcore.h`).
+const MAX_SCORE: u64 = 60000;
+
+/// Which of `merge-tree`'s two mutually exclusive modes was requested.
+///
+/// `Unknown` means neither mode flag was given, in which case git picks the
+/// mode from the number of positional arguments.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Unknown,
+    Real,
+    Trivial,
+}
 
 /// One informational message, in both the human and the `-z` shape.
 ///
@@ -68,61 +100,184 @@ struct Message {
     text: String,
 }
 
-/// `git merge-tree --write-tree <branch1> <branch2>`.
+/// The parsed `-X`/`--strategy-option` state, mirroring the subset of git's
+/// `struct merge_options` that `parse_merge_opt()` can touch.
+#[derive(Default)]
+struct StrategyOptions {
+    /// `ours` / `theirs`.
+    favor: Option<FileFavor>,
+    /// `subtree` (empty shift) or `subtree=<path>`.
+    subtree: Option<String>,
+    /// The requested diff algorithm, already normalized to lowercase.
+    diff_algorithm: Option<String>,
+    /// The first whitespace-insensitivity option seen, kept for the diagnostic.
+    ignore_whitespace: Option<String>,
+    /// `renormalize` / `no-renormalize`; `None` leaves the configured default.
+    renormalize: Option<bool>,
+    /// `no-renames` clears this, `find-renames`/`rename-threshold` set it.
+    detect_renames: Option<bool>,
+    /// A rename score out of [`MAX_SCORE`]; `0` means "git's default".
+    rename_score: Option<u32>,
+}
+
+/// `git merge-tree [--write-tree] [<options>] <branch1> <branch2>`.
 pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     let mut nul = false;
     let mut name_only = false;
     let mut quiet = false;
     let mut allow_unrelated = false;
+    let mut use_stdin = false;
+    let mut mode = Mode::Unknown;
     // `None` = git's default (show messages iff the merge is conflicted).
     let mut show_messages: Option<bool> = None;
     let mut merge_base: Option<String> = None;
-    let mut revs: Vec<&str> = Vec::new();
+    let mut xopts: Vec<String> = Vec::new();
+    let mut revs: Vec<String> = Vec::new();
     let mut no_more_opts = false;
+
+    // git remembers how many arguments it started with so that `--trivial-merge`
+    // can insist that nothing else was passed alongside it.
+    let original_argc = args.len().saturating_sub(1);
 
     let mut i = 1; // args[0] is the subcommand name
     while i < args.len() {
         let a = args[i].as_str();
         if no_more_opts || !a.starts_with('-') || a == "-" {
-            revs.push(a);
+            revs.push(a.to_string());
             i += 1;
             continue;
         }
-        match a {
-            "--" => no_more_opts = true,
-            "--write-tree" => {} // the only mode we implement; already the default
-            "-z" => nul = true,
-            "--name-only" => name_only = true,
-            "--quiet" => quiet = true,
-            "--messages" => show_messages = Some(true),
-            "--no-messages" => show_messages = Some(false),
-            "--allow-unrelated-histories" => allow_unrelated = true,
-            "--no-merge-base" => merge_base = None,
-            "--merge-base" => {
+
+        if let Some(long) = a.strip_prefix("--") {
+            if long.is_empty() {
+                no_more_opts = true;
                 i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or_else(|| anyhow!("option `--merge-base` requires a value"))?;
-                merge_base = Some(v.clone());
+                continue;
             }
-            "--stdin" => bail!("unsupported flag \"--stdin\" (ported: --write-tree, -z, --name-only, --messages, --no-messages, --quiet, --allow-unrelated-histories, --merge-base)"),
-            "--trivial-merge" => bail!("unsupported flag \"--trivial-merge\" (deprecated mode; ported: --write-tree)"),
-            _ if a.starts_with("--merge-base=") => {
-                merge_base = Some(a["--merge-base=".len()..].to_string());
+            let (name, inline) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (long, None),
+            };
+            match name {
+                "write-tree" => {
+                    if let Some(code) = set_mode(&mut mode, Mode::Real, "--write-tree") {
+                        return Ok(code);
+                    }
+                }
+                "trivial-merge" => {
+                    if let Some(code) = set_mode(&mut mode, Mode::Trivial, "--trivial-merge") {
+                        return Ok(code);
+                    }
+                }
+                "messages" => show_messages = Some(true),
+                "no-messages" => show_messages = Some(false),
+                "quiet" => quiet = true,
+                "name-only" => name_only = true,
+                "allow-unrelated-histories" => allow_unrelated = true,
+                "stdin" => use_stdin = true,
+                "no-merge-base" => merge_base = None,
+                "no-strategy-option" => xopts.clear(),
+                "merge-base" => match take_value(args, &mut i, inline) {
+                    Some(v) => merge_base = Some(v),
+                    None => return Ok(requires_value("option `merge-base'")),
+                },
+                "strategy-option" => match take_value(args, &mut i, inline) {
+                    Some(v) => xopts.push(v),
+                    None => return Ok(requires_value("option `strategy-option'")),
+                },
+                _ => {
+                    eprintln!("error: unknown option `{name}'");
+                    eprint!("{USAGE}");
+                    return Ok(ExitCode::from(129));
+                }
             }
-            _ if a == "-X" || a.starts_with("-X") || a.starts_with("--strategy-option") => {
-                bail!("unsupported flag {a:?} (merge strategy options are not ported)")
+            i += 1;
+            continue;
+        }
+
+        // A short-option cluster: git's parse-options walks it byte by byte,
+        // and `-X` swallows the remainder of the token as its value.
+        let cluster = a[1..].to_string();
+        let bytes = cluster.as_bytes();
+        let mut c = 0;
+        while c < bytes.len() {
+            match bytes[c] {
+                b'z' => {
+                    nul = true;
+                    c += 1;
+                }
+                b'X' => {
+                    let rest = &cluster[c + 1..];
+                    let inline = (!rest.is_empty()).then(|| rest.to_string());
+                    match take_value(args, &mut i, inline) {
+                        Some(v) => xopts.push(v),
+                        None => return Ok(requires_value("switch `X'")),
+                    }
+                    c = bytes.len();
+                }
+                other => {
+                    eprintln!("error: unknown switch `{}'", other as char);
+                    eprint!("{USAGE}");
+                    return Ok(ExitCode::from(129));
+                }
             }
-            _ => bail!("unsupported flag {a:?} (ported: --write-tree, -z, --name-only, --messages, --no-messages, --quiet, --allow-unrelated-histories, --merge-base)"),
         }
         i += 1;
     }
 
-    if revs.len() != 2 {
-        eprint!("{USAGE}");
-        return Ok(ExitCode::from(129));
+    // How many argv slots parse-options consumed as options. `--trivial-merge`
+    // tolerates exactly one — itself — and nothing more.
+    let options_consumed = original_argc - revs.len();
+    if mode == Mode::Trivial && options_consumed > 1 {
+        return Ok(trivial_merge_is_exclusive());
     }
-    let (spec1, spec2) = (revs[0], revs[1]);
+
+    // git validates the collected strategy options before it even looks at how
+    // many revisions it was given.
+    let mut strategy = StrategyOptions::default();
+    for xopt in &xopts {
+        if !strategy.absorb(xopt) {
+            eprintln!("fatal: unknown strategy option: -X{xopt}");
+            return Ok(ExitCode::from(128));
+        }
+    }
+
+    match mode {
+        Mode::Unknown => match revs.len() {
+            2 => mode = Mode::Real,
+            3 => {
+                if options_consumed > 0 {
+                    return Ok(trivial_merge_is_exclusive());
+                }
+                mode = Mode::Trivial;
+            }
+            _ => {
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+        },
+        Mode::Real => {
+            if revs.len() != 2 {
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+        }
+        Mode::Trivial => {
+            if revs.len() != 3 {
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+        }
+    }
+
+    if use_stdin {
+        bail!("unsupported flag \"--stdin\" (the multi-merge batch protocol is not ported)");
+    }
+    if mode == Mode::Trivial {
+        bail!("unsupported mode \"--trivial-merge\" (git's deprecated three-tree walk is not ported; use --write-tree)");
+    }
+
+    let (spec1, spec2) = (revs[0].as_str(), revs[1].as_str());
 
     let repo = gix::discover(".")?;
     let labels = Labels {
@@ -130,15 +285,25 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
         current: Some(BStr::new(spec1)),
         other: Some(BStr::new(spec2)),
     };
-    let tree_options = repo.tree_merge_options()?;
+    let tree_options = strategy.apply(repo.tree_merge_options()?)?;
 
     // Both branches below produce the same tree-merge outcome; only how the
     // ancestor is chosen differs.
     let mut outcome: gix::merge::tree::Outcome<'_> = if let Some(base_spec) = &merge_base {
-        // With an explicit base, git accepts plain trees for all three sides.
-        let base = peel_tree(&repo, base_spec)?;
-        let ours = peel_tree(&repo, spec1)?;
-        let theirs = peel_tree(&repo, spec2)?;
+        // With an explicit base, git accepts plain trees for all three sides,
+        // and reports any side that will not peel to one as a fatal error.
+        let (Some(base), Some(ours), Some(theirs)) = (
+            peel_tree(&repo, base_spec),
+            peel_tree(&repo, spec1),
+            peel_tree(&repo, spec2),
+        ) else {
+            let bad = [base_spec.as_str(), spec1, spec2]
+                .into_iter()
+                .find(|s| peel_tree(&repo, s).is_none())
+                .unwrap_or_default();
+            eprintln!("fatal: could not parse as tree '{bad}'");
+            return Ok(ExitCode::from(128));
+        };
         repo.merge_trees(base, ours, theirs, labels, tree_options)?
     } else {
         let Some(ours) = peel_commit(&repo, spec1) else {
@@ -194,11 +359,7 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
                 last_path = Some(path.to_owned());
                 buf.extend_from_slice(&render_path(path, nul));
             } else {
-                let line = format!(
-                    "{:06o} {} {stage}\t",
-                    entry.mode.bits(),
-                    entry.id.to_hex()
-                );
+                let line = format!("{:06o} {} {stage}\t", entry.mode.bits(), entry.id.to_hex());
                 buf.extend_from_slice(line.as_bytes());
                 buf.extend_from_slice(&render_path(path, nul));
             }
@@ -233,6 +394,193 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     Ok(exit_code(conflicted))
 }
 
+/// Select `wanted` as the command mode, reporting git's parse-options clash
+/// diagnostic when a different mode was already chosen.
+///
+/// git names the option it is currently looking at first, then the one already
+/// in effect, and exits 129 without printing the usage block.
+fn set_mode(mode: &mut Mode, wanted: Mode, flag: &str) -> Option<ExitCode> {
+    let existing = match *mode {
+        Mode::Unknown => {
+            *mode = wanted;
+            return None;
+        }
+        Mode::Real => "--write-tree",
+        Mode::Trivial => "--trivial-merge",
+    };
+    if *mode == wanted {
+        return None;
+    }
+    eprintln!("error: options '{flag}' and '{existing}' cannot be used together");
+    Some(ExitCode::from(129))
+}
+
+/// Take an option's value: the `=`-attached one when present, otherwise the
+/// next argument, advancing `i` onto it. `None` when the value is missing.
+fn take_value(args: &[String], i: &mut usize, inline: Option<String>) -> Option<String> {
+    if let Some(v) = inline {
+        return Some(v);
+    }
+    let v = args.get(*i + 1)?.clone();
+    *i += 1;
+    Some(v)
+}
+
+/// git's bare "requires a value" diagnostic — no usage block, exit 129.
+fn requires_value(what: &str) -> ExitCode {
+    eprintln!("error: {what} requires a value");
+    ExitCode::from(129)
+}
+
+/// git's refusal to combine `--trivial-merge` with anything else.
+fn trivial_merge_is_exclusive() -> ExitCode {
+    eprintln!("fatal: --trivial-merge is incompatible with all other options");
+    ExitCode::from(128)
+}
+
+impl StrategyOptions {
+    /// Absorb one `-X` value, returning `false` for anything git's
+    /// `parse_merge_opt()` rejects. Later values win, exactly as in git.
+    fn absorb(&mut self, s: &str) -> bool {
+        match s {
+            "ours" => self.favor = Some(FileFavor::Ours),
+            "theirs" => self.favor = Some(FileFavor::Theirs),
+            "subtree" => self.subtree = Some(String::new()),
+            "patience" => self.diff_algorithm = Some("patience".into()),
+            "histogram" => self.diff_algorithm = Some("histogram".into()),
+            "ignore-space-change"
+            | "ignore-all-space"
+            | "ignore-space-at-eol"
+            | "ignore-cr-at-eol" => self.ignore_whitespace = Some(s.to_string()),
+            "renormalize" => self.renormalize = Some(true),
+            "no-renormalize" => self.renormalize = Some(false),
+            "no-renames" => self.detect_renames = Some(false),
+            "find-renames" => {
+                self.detect_renames = Some(true);
+                self.rename_score = Some(0);
+            }
+            _ => {
+                if let Some(path) = s.strip_prefix("subtree=") {
+                    self.subtree = Some(path.to_string());
+                } else if let Some(name) = s.strip_prefix("diff-algorithm=") {
+                    let name = name.to_ascii_lowercase();
+                    if !matches!(
+                        name.as_str(),
+                        "myers" | "default" | "minimal" | "patience" | "histogram"
+                    ) {
+                        return false;
+                    }
+                    self.diff_algorithm = Some(name);
+                } else if let Some(score) = s
+                    .strip_prefix("find-renames=")
+                    .or_else(|| s.strip_prefix("rename-threshold="))
+                {
+                    let Some(score) = parse_rename_score(score) else {
+                        return false;
+                    };
+                    self.rename_score = Some(score);
+                    self.detect_renames = Some(true);
+                } else {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Fold the strategy options into the merge options, refusing the ones
+    /// `gix-merge` has no way to express rather than silently ignoring them.
+    fn apply(&self, options: gix::merge::tree::Options) -> Result<gix::merge::tree::Options> {
+        if let Some(flag) = &self.ignore_whitespace {
+            bail!("unsupported strategy option \"{flag}\" (gix-merge's text driver has no whitespace-insensitive tokenizer)");
+        }
+        if let Some(path) = &self.subtree {
+            let shown = if path.is_empty() {
+                "subtree".to_string()
+            } else {
+                format!("subtree={path}")
+            };
+            bail!("unsupported strategy option \"{shown}\" (gix-merge has no subtree shift)");
+        }
+        if self.renormalize == Some(true) {
+            bail!("unsupported strategy option \"renormalize\" (gix-merge's blob pipeline is not driven in renormalizing mode here)");
+        }
+
+        let algorithm = match self.diff_algorithm.as_deref() {
+            None => None,
+            Some("myers" | "default") => Some(gix::diff::blob::Algorithm::Myers),
+            Some("minimal") => Some(gix::diff::blob::Algorithm::MyersMinimal),
+            Some("histogram") => Some(gix::diff::blob::Algorithm::Histogram),
+            Some(other) => bail!(
+                "unsupported strategy option \"{other}\" diff algorithm (gix-imara-diff implements myers, minimal and histogram only)"
+            ),
+        };
+
+        // The rewrite and blob-merge knobs only exist on the plumbing options,
+        // so round-trip through them before applying the builder-level ones.
+        let mut plumbing: gix::merge::plumbing::tree::Options = options.into();
+        if let Some(algorithm) = algorithm {
+            plumbing.blob_merge.text.diff_algorithm = algorithm;
+        }
+        if self.detect_renames == Some(false) {
+            plumbing.rewrites = None;
+        } else if let Some(score) = self.rename_score {
+            let mut rewrites = plumbing.rewrites.unwrap_or_default();
+            // A score of zero is git's "just use the default threshold".
+            if score > 0 {
+                rewrites.percentage = Some(score as f32 / MAX_SCORE as f32);
+            }
+            plumbing.rewrites = Some(rewrites);
+        }
+
+        let options = gix::merge::tree::Options::from(plumbing);
+        Ok(match self.favor {
+            Some(favor) => options.with_file_favor(Some(favor)),
+            None => options,
+        })
+    }
+}
+
+/// Port of git's `parse_rename_score()`: a decimal number, optionally
+/// fractional and optionally `%`-suffixed, scaled onto [`MAX_SCORE`].
+///
+/// `None` when anything is left over after the number, which is how git
+/// distinguishes `-Xfind-renames=50` from `-Xfind-renames=abc`.
+fn parse_rename_score(s: &str) -> Option<u32> {
+    let bytes = s.as_bytes();
+    let (mut num, mut scale, mut dot) = (0u64, 1u64, false);
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'.' if !dot => {
+                scale = 1;
+                dot = true;
+            }
+            b'%' => {
+                scale = scale.saturating_mul(100);
+                i += 1;
+                break;
+            }
+            c if c.is_ascii_digit() => {
+                num = num.saturating_mul(10).saturating_add(u64::from(c - b'0'));
+                if dot {
+                    scale = scale.saturating_mul(10);
+                }
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+    if i != bytes.len() {
+        return None;
+    }
+    Some(if num >= scale {
+        MAX_SCORE as u32
+    } else {
+        (MAX_SCORE.saturating_mul(num) / scale) as u32
+    })
+}
+
 /// `1` when the merge had unresolved conflicts, `0` otherwise — git's contract.
 fn exit_code(conflicted: bool) -> ExitCode {
     if conflicted {
@@ -242,9 +590,18 @@ fn exit_code(conflicted: bool) -> ExitCode {
     }
 }
 
-/// Resolve `spec` to the tree it names (commits and tags peel through).
-fn peel_tree(repo: &gix::Repository, spec: &str) -> Result<ObjectId> {
-    Ok(repo.rev_parse_single(spec)?.object()?.peel_to_tree()?.id)
+/// Resolve `spec` to the tree it names (commits and tags peel through), or
+/// `None` when git would say it could not parse it as a tree.
+fn peel_tree(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    Some(
+        repo.rev_parse_single(spec)
+            .ok()?
+            .object()
+            .ok()?
+            .peel_to_tree()
+            .ok()?
+            .id,
+    )
 }
 
 /// Resolve `spec` to a commit id, or `None` when it is not something git would

@@ -31,9 +31,18 @@
 //!   * `merge.branchdesc` (`branch.<name>.description`, rendered as `  : ` lines).
 //!   * `-F`/`--file <path>` (`-` means stdin), lines marked `not-for-merge`, and
 //!     tips already reachable from `HEAD`, which `reduce_heads` drops.
-//!   * exit codes: 0 on success, 128 for a malformed input line and for an
-//!     unborn `HEAD`, 129 for `-h` (usage on stdout) and for a bad or extra
-//!     argument (usage on stderr).
+//!   * the negated spellings `parse_options` derives from the option table:
+//!     `--no-message` and `--no-into-name` clear their value, `--no-log` /
+//!     `--no-summary` set the length to zero, and `--no-file` is accepted but
+//!     leaves `inpath` alone — git's `OPTION_FILENAME` does not reset it, so
+//!     `--file=x --no-file` still opens `x` (checked against git 2.55, and
+//!     against `git commit -F x --no-file`, which behaves the same way).
+//!   * exit codes: 0 on success, 128 for a malformed input line, for an input
+//!     file that cannot be opened, and for an unborn `HEAD`; 129 for `-h`
+//!     (usage on stdout) and for a bad or extra argument (usage on stderr).
+//!     A positional argument is diagnosed after the whole command line is
+//!     parsed but before the input file is opened, as `parse_options`' `argc`
+//!     check runs there.
 //!
 //! Not covered — these `bail!` rather than emitting output that would diverge:
 //!   * signed tags. git runs the payload through `check_signature()` and
@@ -44,8 +53,9 @@
 //!   * option abbreviation (`--int` for `--into-name`) is not accepted; git's
 //!     `parse_options` allows unambiguous prefixes, and `--help` is rejected as
 //!     an unknown option rather than opening the manual page.
-//!   * the wording of the `error: ...` diagnostics that precede the usage block
-//!     is approximate; only stderr is affected, and the exit code still matches.
+//!   * the wording of the `error: ...` diagnostics is approximate for the
+//!     unknown-option and missing-value cases; only stderr is affected, and the
+//!     exit code still matches.
 //!   * `merge.log` and `merge.summary` are resolved as "last `merge.log` wins,
 //!     otherwise last `merge.summary`". git lets the two interleave in a single
 //!     configuration order, so a `merge.summary` written after a `merge.log`
@@ -75,6 +85,7 @@ usage: git fmt-merge-msg [-m <message>] [--log[=<n>] | --no-log] [--file <file>]
                           use <name> instead of the real target branch
     -F, --[no-]file <file>
                           file to read from
+
 ";
 
 /// Signature block openers `parse_signed_buffer()` recognises.
@@ -129,7 +140,9 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
     let mut shortlog_len: i64 = -1;
 
     // `handle_builtin()` answers a lone `-h` before any repository setup.
-    if args.len() == 2 && args[1] == "-h" {
+    // `dispatch::run` strips the `fmt-merge-msg` verb, so `args` is git's
+    // `argv[1..]` and the lone `-h` is the whole of it.
+    if args.len() == 1 && args[0] == "-h" {
         print!("{USAGE}");
         return Ok(ExitCode::from(129));
     }
@@ -138,7 +151,10 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
     // missing repository.
     let repo = gix::discover(".")?;
 
-    let mut i = 1;
+    // What `parse_options()` leaves in `argv`; `fmt-merge-msg` accepts none.
+    let mut positional = false;
+
+    let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         match a {
@@ -150,11 +166,18 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
             "--no-log" | "--no-summary" => shortlog_len = 0,
             _ if a.starts_with("--log=") || a.starts_with("--summary=") => {
                 let (flag, value) = a.split_once('=').expect("checked above");
-                let Ok(n) = value.parse::<i64>() else {
-                    return Ok(usage_error(&format!(
-                        "options `{}' expects a numerical value",
-                        flag.trim_start_matches('-')
-                    )));
+                let flag = flag.trim_start_matches('-');
+                let Some(n) = parse_integer(value) else {
+                    // `OPTION_INTEGER`'s two diagnostics; neither prints usage.
+                    if value.is_empty() {
+                        eprintln!("error: option `{flag}' expects a numerical value");
+                    } else {
+                        eprintln!(
+                            "error: option `{flag}' expects an integer value \
+                             with an optional k/m/g suffix"
+                        );
+                    }
+                    return Ok(ExitCode::from(129));
                 };
                 shortlog_len = n;
             }
@@ -165,6 +188,7 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
                 };
                 message = Some(v.clone());
             }
+            "--no-message" => message = None,
             _ if a.starts_with("--message=") => message = Some(a["--message=".len()..].into()),
             _ if a.starts_with("-m") && a.len() > 2 => message = Some(a[2..].into()),
             "--into-name" => {
@@ -174,6 +198,7 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
                 };
                 into_name = Some(v.clone());
             }
+            "--no-into-name" => into_name = None,
             _ if a.starts_with("--into-name=") => {
                 into_name = Some(a["--into-name=".len()..].into());
             }
@@ -184,14 +209,15 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
                 };
                 inpath = Some(v.clone());
             }
+            // Accepted, and deliberately inert: `OPTION_FILENAME` does not clear
+            // the value on the negated form, so a preceding `--file` survives.
+            "--no-file" => {}
             _ if a.starts_with("--file=") => inpath = Some(a["--file=".len()..].into()),
             _ if a.starts_with("-F") && a.len() > 2 => inpath = Some(a[2..].into()),
             "--" => {
-                // parse_options stops here; anything left is a positional, and
-                // `fmt-merge-msg` takes none.
-                if i + 1 < args.len() {
-                    return Ok(usage(&mut std::io::stderr()));
-                }
+                // parse_options stops here; everything left is a positional.
+                positional |= i + 1 < args.len();
+                break;
             }
             _ if a.starts_with("--") => {
                 return Ok(usage_error(&format!("unknown option `{}'", &a[2..])));
@@ -200,10 +226,16 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
                 let c = a[1..].chars().next().expect("non-empty");
                 return Ok(usage_error(&format!("unknown switch `{c}'")));
             }
-            // `argc > 0` after parse_options.
-            _ => return Ok(usage(&mut std::io::stderr())),
+            // Collected, not rejected on sight: without PARSE_OPT_STOP_AT_NON_OPTION
+            // git keeps parsing, so `HEAD --log=x` reports the bad value first.
+            _ => positional = true,
         }
         i += 1;
+    }
+
+    // `if (argc > 0) usage_with_options(...)`, ahead of opening the input.
+    if positional {
+        return Ok(usage(&mut std::io::stderr()));
     }
 
     let config = merge_config(&repo);
@@ -218,8 +250,14 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
     let mut input = Vec::new();
     match inpath.as_deref() {
         Some(path) if path != "-" => {
-            let mut file = std::fs::File::open(path)
-                .map_err(|e| anyhow::anyhow!("cannot open '{path}': {e}"))?;
+            // `xfopen()` dies; `die()` is exit 128, not anyhow's 1.
+            let mut file = match std::fs::File::open(path) {
+                Ok(file) => file,
+                Err(e) => {
+                    eprintln!("fatal: cannot open '{path}': {}", strerror(&e));
+                    return Ok(ExitCode::from(128));
+                }
+            };
             file.read_to_end(&mut input)?;
         }
         _ => {
@@ -1017,6 +1055,30 @@ fn strip_prefix(value: &BStr, prefix: &[u8]) -> BString {
     match value.strip_prefix(prefix) {
         Some(rest) => rest.into(),
         None => value.to_owned(),
+    }
+}
+
+/// git's `git_parse_signed()` as `OPTION_INTEGER` reaches it: a decimal number
+/// with an optional binary `k`/`m`/`g` scale suffix.
+fn parse_integer(value: &str) -> Option<i64> {
+    // `chars.as_str()` after `next_back()` is the prefix, so a multi-byte final
+    // character can never be sliced through.
+    let mut chars = value.chars();
+    let (digits, scale) = match chars.next_back() {
+        Some('k' | 'K') => (chars.as_str(), 1024i64),
+        Some('m' | 'M') => (chars.as_str(), 1024 * 1024),
+        Some('g' | 'G') => (chars.as_str(), 1024 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    digits.parse::<i64>().ok()?.checked_mul(scale)
+}
+
+/// `strerror(errno)`: the bare message, without Rust's ` (os error <n>)` tail.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(at) => text[..at].to_owned(),
+        None => text,
     }
 }
 

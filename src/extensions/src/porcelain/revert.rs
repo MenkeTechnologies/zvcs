@@ -38,6 +38,11 @@
 //!   * the summary block (`[<branch> <short-oid>] <subject>`, the ` Date:` line
 //!     the sequencer always prints, the short-stat — gitlink changes included,
 //!     which the blob differ cannot see — and create/delete/mode lines)
+//!   * `--no-commit` merging against the index rather than `HEAD`, so a
+//!     pre-existing staged change is carried through and repeated `-n` steps
+//!     stack; the index tree and the merge result tree are written to the object
+//!     database before the checkout, as git's do, so even a refused `-n` revert
+//!     leaves the same objects behind
 //!   * the `revert: <subject>` reflog message, and the `REVERT_HEAD`,
 //!     `MERGE_MSG` and `AUTO_MERGE` files written by `--no-commit`
 //!   * the refusal paths in git's own order: bad revision, an unmerged index,
@@ -57,11 +62,6 @@
 //!     the base needs a real blob merge and is refused. Rename detection is part
 //!     of the same missing substrate, so a reverted path that was later renamed
 //!     lands in that refused set too.
-//!   * `--no-commit` on top of a **pre-existing** staged change that the revert
-//!     does not itself collide with. git merges into the index as it stands;
-//!     this port merges trees, so it refuses instead. Several `-n` reverts in
-//!     one invocation do stack correctly — each step merges against the tree
-//!     the previous one staged.
 //!   * resuming a sequence: `--continue`, and `--abort`/`--skip` when a revert
 //!     really is in progress, all need `git reset --merge`, which is not ported.
 //!   * `-S`/`--gpg-sign` — bails, since nothing here can produce a signature.
@@ -365,13 +365,12 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    // With `-n` nothing is committed between steps, so each further revert must
-    // stack onto the tree the previous one produced rather than onto `HEAD`.
-    let mut staged_tree: Option<ObjectId> = None;
+    // With `-n` nothing is committed between steps; each further revert stacks
+    // because it re-reads the index the previous one left behind.
     for id in commits {
-        match revert_one(&repo, id, &o, cleanup, staged_tree)? {
+        match revert_one(&repo, id, &o, cleanup)? {
             Step::Failed(code) => return Ok(code),
-            Step::Done { staged } => staged_tree = staged,
+            Step::Done => {}
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -506,22 +505,22 @@ fn peel_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 enum Step {
     /// git reported a refusal itself (text already on stderr); stop with `code`.
     Failed(ExitCode),
-    /// Applied. `staged` carries the tree a `--no-commit` step left in the index,
-    /// which the next operand merges against.
-    Done { staged: Option<ObjectId> },
+    /// Applied.
+    Done,
 }
 
 /// Revert a single commit, advancing `HEAD` unless `--no-commit` is set.
 ///
-/// `staged_tree` is the tree a previous `--no-commit` step left in the index; it
-/// replaces the `HEAD` tree as the *ours* side when present. `Err` is reserved
-/// for the cases this port genuinely cannot serve.
+/// Under `--no-commit` the *ours* side is the current index written out as a
+/// tree, exactly as git's `write_index_as_tree` does — so a pre-existing staged
+/// change is merged through, and repeated `-n` steps stack on what the previous
+/// one left staged. `Err` is reserved for the cases this port genuinely cannot
+/// serve.
 fn revert_one(
     repo: &gix::Repository,
     target_id: ObjectId,
     o: &Options,
     cleanup: Option<Cleanup>,
-    staged_tree: Option<ObjectId>,
 ) -> Result<Step> {
     let target = repo.find_commit(target_id)?;
     let parents: Vec<ObjectId> = target.parent_ids().map(|id| id.detach()).collect();
@@ -542,29 +541,39 @@ fn revert_one(
     let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
 
     // git checks the index before it even looks at the commit's parents, so an
-    // unmerged or dirty index outranks "is a merge but no -m was given".
+    // unmerged or dirty index outranks "is a merge but no -m was given". Under
+    // `--no-commit` the only demand is that the index be merged, because the
+    // index itself then becomes the *ours* side and a staged change is fine.
     let index_state = read_index_state(repo, head_tree)?;
-    // A `--no-commit` step of our own already made the index differ from `HEAD`;
-    // that is expected and `ours_tree` accounts for it.
-    if staged_tree.is_none() {
-        if o.no_commit {
-            if index_state.unmerged {
-                eprintln!("error: your index file is unmerged.");
-                return Ok(Step::Failed(ExitCode::from(128)));
-            }
-        } else if index_state.unmerged {
-            eprintln!("error: Reverting is not possible because you have unmerged files.");
-            eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
-            eprintln!("hint: as appropriate to mark resolution and make a commit.");
-            eprintln!("fatal: revert failed");
-            return Ok(Step::Failed(ExitCode::from(128)));
-        } else if index_state.differs_from_head {
-            eprintln!("error: your local changes would be overwritten by revert.");
-            eprintln!("hint: commit your changes or stash them to proceed.");
-            eprintln!("fatal: revert failed");
+    if o.no_commit {
+        if index_state.unmerged {
+            eprintln!("error: your index file is unmerged.");
             return Ok(Step::Failed(ExitCode::from(128)));
         }
+    } else if index_state.unmerged {
+        eprintln!("error: Reverting is not possible because you have unmerged files.");
+        eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
+        eprintln!("hint: as appropriate to mark resolution and make a commit.");
+        eprintln!("fatal: revert failed");
+        return Ok(Step::Failed(ExitCode::from(128)));
+    } else if index_state.differs_from_head {
+        eprintln!("error: your local changes would be overwritten by revert.");
+        eprintln!("hint: commit your changes or stash them to proceed.");
+        eprintln!("fatal: revert failed");
+        return Ok(Step::Failed(ExitCode::from(128)));
     }
+
+    // *ours* is `HEAD`, or — under `--no-commit` — the index written out as a
+    // tree. git does this here, before it even looks at the commit's parents, so
+    // the tree object lands in the object database even on the refusals below.
+    let ours_tree = if o.no_commit {
+        match &index_state.staged {
+            Some(staged) => write_tree(repo, staged)?,
+            None => head_tree,
+        }
+    } else {
+        head_tree
+    };
 
     // Parent selection — git's rules, including `-m 1` being a silent no-op on a
     // non-merge commit and `-m N>1` there being an error.
@@ -599,16 +608,15 @@ fn revert_one(
     };
 
     // --- the merge --------------------------------------------------------
-    // *ours* is `HEAD`, or the tree a previous `--no-commit` step already staged.
-    let ours_tree = staged_tree.unwrap_or(head_tree);
     let base = flatten(repo, base_tree)?;
     let ours = flatten(repo, ours_tree)?;
     let theirs = flatten(repo, theirs_tree)?;
     let merged = merge_trivially(&base, &ours, &theirs, target_id)?;
+    // The merge machinery writes its result tree before anything is checked out,
+    // so the object exists even when the checkout below is refused.
+    let merged_tree = write_tree(repo, &merged)?;
 
     // --- refuse to clobber ------------------------------------------------
-    // Everything below runs before a single object is written, so a refusal
-    // leaves the object database exactly as it was.
     let changed: Vec<BString> = ours
         .keys()
         .chain(merged.keys())
@@ -657,14 +665,6 @@ fn revert_one(
         eprintln!("fatal: revert failed");
         return Ok(Step::Failed(ExitCode::from(128)));
     }
-    if o.no_commit && staged_tree.is_none() && index_state.differs_from_head {
-        // git would merge into the index as it stands, which needs the index
-        // itself as a merge side — not modelled by this tree-only path.
-        bail!("--no-commit with pre-existing staged changes is not supported (the revert is computed against HEAD, not the index)");
-    }
-
-    let merged_tree = write_tree(repo, &merged)?;
-
     // --- message ----------------------------------------------------------
     let committer = repo
         .committer()
@@ -688,9 +688,7 @@ fn revert_one(
         std::fs::write(git_dir.join("REVERT_HEAD"), format!("{target_id}\n"))?;
         std::fs::write(git_dir.join("MERGE_MSG"), &message)?;
         std::fs::write(git_dir.join("AUTO_MERGE"), format!("{merged_tree}\n"))?;
-        return Ok(Step::Done {
-            staged: Some(merged_tree),
-        });
+        return Ok(Step::Done);
     }
 
     // A revert that changes nothing produces no commit; git reports this via the
@@ -744,7 +742,7 @@ fn revert_one(
     }
 
     print_summary(repo, new_id, &subject, &author_time, ours_tree, merged_tree)?;
-    Ok(Step::Done { staged: None })
+    Ok(Step::Done)
 }
 
 /// `-m <n>` value parsing with `strtol` semantics: leading blanks are skipped,
@@ -793,6 +791,9 @@ struct IndexState {
     unmerged: bool,
     /// The index does not match the `HEAD` tree.
     differs_from_head: bool,
+    /// The index flattened the same way a tree is, so `--no-commit` can write it
+    /// out as the *ours* side. `None` when there is no readable index at all.
+    staged: Option<Flat>,
 }
 
 fn read_index_state(repo: &gix::Repository, head_tree: ObjectId) -> Result<IndexState> {
@@ -800,6 +801,7 @@ fn read_index_state(repo: &gix::Repository, head_tree: ObjectId) -> Result<Index
         return Ok(IndexState {
             unmerged: false,
             differs_from_head: false,
+            staged: None,
         });
     };
     let unmerged = index
@@ -810,6 +812,7 @@ fn read_index_state(repo: &gix::Repository, head_tree: ObjectId) -> Result<Index
         return Ok(IndexState {
             unmerged: true,
             differs_from_head: true,
+            staged: None,
         });
     }
     let backing = index.path_backing();
@@ -825,6 +828,7 @@ fn read_index_state(repo: &gix::Repository, head_tree: ObjectId) -> Result<Index
     Ok(IndexState {
         unmerged: false,
         differs_from_head: staged != head,
+        staged: Some(staged),
     })
 }
 

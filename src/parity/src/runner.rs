@@ -179,7 +179,73 @@ fn probe_state(repo: &Path, home: &Path) -> String {
         };
         digest.push_str(&format!("# {}\n{}", probe.join(" "), rendered));
     }
+    digest.push_str(&probe_storage(repo));
     digest
+}
+
+/// Object *storage layout*, which the command probes above cannot see.
+///
+/// Every probe above reports the logical object and ref set. `repack` without
+/// `-d` deletes nothing, so it leaves that set invariant — meaning a `repack`
+/// that does nothing at all was indistinguishable from one that works, and
+/// scored full marks. The same held for `gc` and `pack-objects`. This closes
+/// that hole.
+///
+/// Deliberately compares **counts and presence, not bytes**. A pack's filename
+/// embeds its checksum, and the vendored gitoxide cannot reproduce git's exact
+/// pack bytes: `gix-pack` offers a single output mode,
+/// `Mode::PackCopyAndBaseObjects`, with no delta compression
+/// (`gix-pack/src/data/output/entry/iter_from_counts.rs:362`). Comparing names
+/// or bytes would fail every valid-but-different pack, which measures the
+/// wrong thing. Counting detects the no-op — the failure that was actually
+/// hiding — without demanding byte-identical packs.
+///
+/// This is a known, bounded relaxation: a pack that is well-formed but differs
+/// from git's grouping still passes. It is recorded here rather than left for a
+/// reader to infer from a number.
+fn probe_storage(repo: &Path) -> String {
+    let objects = repo.join(".git").join("objects");
+    let pack_dir = objects.join("pack");
+
+    let count_ext = |ext: &str| -> usize {
+        std::fs::read_dir(&pack_dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .filter(|e| e.path().extension().is_some_and(|x| x == ext))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+
+    // Loose objects live in the 256 fan-out directories; everything else under
+    // `objects/` (pack/, info/) is not a loose object.
+    let loose = std::fs::read_dir(&objects)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.len() == 2 && name.chars().all(|c| c.is_ascii_hexdigit())
+                })
+                .map(|e| {
+                    std::fs::read_dir(e.path())
+                        .map(|inner| inner.filter_map(Result::ok).count())
+                        .unwrap_or(0)
+                })
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+
+    format!(
+        "# storage-layout\nloose {}\npack {}\nidx {}\nrev {}\nmtimes {}\ncommit-graph {}\ninfo-packs {}\n",
+        loose,
+        count_ext("pack"),
+        count_ext("idx"),
+        count_ext("rev"),
+        count_ext("mtimes"),
+        objects.join("info").join("commit-graph").exists(),
+        objects.join("info").join("packs").exists(),
+    )
 }
 
 /// Strip the two things that legitimately differ between two copies of the same

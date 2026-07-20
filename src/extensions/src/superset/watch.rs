@@ -140,10 +140,17 @@ fn run(cfg: ZvcsConfig) {
 fn collect(ev: &notify::Result<Event>, targets: &[Target], affected: &mut HashSet<PathBuf>) {
     let Ok(ev) = ev else { return };
     for path in &ev.paths {
-        for t in targets {
-            if path.starts_with(&t.git_dir) {
-                affected.insert(t.git_dir.clone());
-            }
+        // Attribute each event to the SINGLE deepest matching repo. A submodule's
+        // git dir lives under its parent's (`<parent>/.git/modules/<name>`), so a
+        // plain prefix match would also mark the parent — firing the parent's hook
+        // and recomputing its status on a submodule-only ref change. Longest
+        // matching git_dir wins.
+        if let Some(t) = targets
+            .iter()
+            .filter(|t| path.starts_with(&t.git_dir))
+            .max_by_key(|t| t.git_dir.as_os_str().len())
+        {
+            affected.insert(t.git_dir.clone());
         }
     }
 }
@@ -214,6 +221,13 @@ fn react(cfg: &ZvcsConfig) {
     attach_all(&repo);
 
     if cfg.autoreconcile {
+        // The top-level repo too — `autoreconcile` is documented as "this one +
+        // submodules". reconcile_repo_local is ff-only and skips a dirty worktree,
+        // so this is safe (and usually a no-op while bots leave gitlinks dirty).
+        if let Err(e) = crate::superset::reconcile_repo_local(&repo) {
+            println!("[zvcs reconcile] (top): error: {e:#}");
+            let _ = crate::db::record_failure(repo.git_dir(), "reconcile", &format!("{e:#}"));
+        }
         if let Ok(Some(subs)) = repo.submodules() {
             for sm in subs {
                 if let Ok(Some(sub)) = sm.open() {
@@ -259,5 +273,38 @@ fn attach_all(repo: &gix::Repository) {
                 let _ = crate::superset::ensure_attached(&sub);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect, Target};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    #[test]
+    fn collect_attributes_event_to_deepest_repo_only() {
+        // A submodule's git dir lives under its parent's; a plain prefix match would
+        // mark BOTH. collect must attribute each event to the single deepest repo.
+        let parent = PathBuf::from("/x/.git");
+        let sub = PathBuf::from("/x/.git/modules/foo");
+        let targets = vec![
+            Target { git_dir: parent.clone(), workdir: PathBuf::from("/x") },
+            Target { git_dir: sub.clone(), workdir: PathBuf::from("/x/foo") },
+        ];
+
+        // Event under the submodule → only the submodule is marked.
+        let ev = notify::Event::new(notify::EventKind::Any).add_path(sub.join("refs/heads/main"));
+        let mut affected = HashSet::new();
+        collect(&Ok(ev), &targets, &mut affected);
+        assert!(affected.contains(&sub), "submodule must be marked");
+        assert!(!affected.contains(&parent), "parent must NOT be marked for a submodule-only event");
+
+        // Event directly under the parent (not the submodule) → only the parent.
+        let ev2 = notify::Event::new(notify::EventKind::Any).add_path(parent.join("refs/heads/main"));
+        let mut a2 = HashSet::new();
+        collect(&Ok(ev2), &targets, &mut a2);
+        assert!(a2.contains(&parent), "parent must be marked for a parent event");
+        assert!(!a2.contains(&sub), "submodule must NOT be marked for a parent event");
     }
 }

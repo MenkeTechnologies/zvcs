@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Requests handed from per-connection reader threads to the single worker
 /// thread that owns all critical sections.
@@ -135,28 +135,52 @@ fn ping(path: &Path) -> bool {
 }
 
 /// Best-effort exclusive lock across the start sequence. Two concurrent starters
-/// (the 16-instance workload autostarts freely) must not both unlink a *stale*
-/// socket and bind their own — that leaves two live daemons (duplicated autonomy
-/// + a leaked process). Held only across check-remove-bind; the bound socket
-/// itself serializes everyone after (a non-stale second bind gets EADDRINUSE).
-/// Returns None if the lock can't be taken (then we proceed anyway — no worse than
-/// an unlocked start); a lock left by a hard-killed starter is stolen so it can't
-/// wedge startup permanently.
+/// (the 16-instance workload autostarts freely) must not both unlink a socket and
+/// bind their own — that leaves two live daemons (duplicated autonomy + a leaked
+/// process). Held across check-remove-bind. Polls to acquire for up to 6s (longer
+/// than the worst-case guarded section) so a live-but-slow holder is waited for,
+/// not stolen from; only a lock left by a hard-killed starter (held past the
+/// window) is stolen, so a crash can't wedge startup permanently. Returns None if
+/// even the steal fails (then we proceed anyway — no worse than an unlocked start).
 fn hold_start_lock(at: &Path) -> Option<gix::lock::Marker> {
     use gix::lock::{acquire::Fail, Marker};
-    if let Ok(m) = Marker::acquire_to_hold_resource(at, Fail::Immediately, None) {
-        return Some(m);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        if let Ok(m) = Marker::acquire_to_hold_resource(at, Fail::Immediately, None) {
+            return Some(m);
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
     }
-    // Contended: wait briefly for the other starter to finish (bind is ms-fast),
-    // then retry. Still locked → treat as stale (crashed mid-start) and steal it.
-    thread::sleep(Duration::from_millis(250));
-    if let Ok(m) = Marker::acquire_to_hold_resource(at, Fail::Immediately, None) {
-        return Some(m);
-    }
+    // Held past the window → treat as a crashed starter's stale lock and steal it.
     let mut stale = at.as_os_str().to_owned();
     stale.push(".lock");
     let _ = std::fs::remove_file(PathBuf::from(stale));
     Marker::acquire_to_hold_resource(at, Fail::Immediately, None).ok()
+}
+
+/// Whether a daemon is actually serving on `path`. `connect` distinguishes a stale
+/// socket *file* (whose daemon died → connect refused) from a bound one (live, or
+/// mid-startup with the request sitting in the listen backlog). A bound socket is
+/// NEVER treated as stale: removing it would let this starter bind a second daemon
+/// while the first is still coming up. Only a socket that stays connectable but
+/// never answers STATUS within the window is a zombie worth replacing.
+fn socket_is_live(path: &Path) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if UnixStream::connect(path).is_err() {
+            return false; // nothing bound → stale/absent, safe to remove
+        }
+        if ping(path) {
+            return true; // bound AND answering → a real daemon
+        }
+        if Instant::now() >= deadline {
+            return false; // bound but never answered → zombie worker, take over
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn start() -> Result<ExitCode> {
@@ -165,7 +189,10 @@ fn start() -> Result<ExitCode> {
     let listener = {
         let _marker = hold_start_lock(&zvcs_home().join("daemon-start"));
         if path.exists() {
-            if ping(&path) {
+            // Only remove a socket that is genuinely dead. A still-starting daemon
+            // is bound (connectable) but may not answer STATUS for a moment;
+            // reply-based staleness would falsely remove it → two live daemons.
+            if socket_is_live(&path) {
                 anyhow::bail!("daemon already running");
             }
             let _ = std::fs::remove_file(&path);

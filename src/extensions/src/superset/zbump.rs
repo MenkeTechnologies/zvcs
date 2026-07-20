@@ -11,7 +11,27 @@ use std::process::ExitCode;
 
 use gix::bstr::BStr;
 
+/// Outcome of a bump pass: how many pointers advanced, and any refusals as
+/// `(submodule-path, reason)` — the daemon records refusals for
+/// notify-on-next-command.
+pub struct BumpOutcome {
+    pub bumped: usize,
+    pub refusals: Vec<(String, String)>,
+}
+
+/// `git zbump` — exit-code wrapper over [`zbump_run`].
 pub fn zbump(args: &[String]) -> Result<ExitCode> {
+    let outcome = zbump_run(args)?;
+    Ok(if outcome.refusals.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// Forward-only submodule gitlink bumps, coalesced and committed. Returns the
+/// [`BumpOutcome`] so callers (the watcher) can surface refusals.
+pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
     // 1. Parent repo.
     let repo = gix::discover(".")?;
 
@@ -41,7 +61,7 @@ pub fn zbump(args: &[String]) -> Result<ExitCode> {
     let mut index = repo.open_index()?;
     let mut staged = false;
     let mut bumped = 0usize;
-    let mut had_failure = false;
+    let mut refusals: Vec<(String, String)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
 
     for sub in submodules {

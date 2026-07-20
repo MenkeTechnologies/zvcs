@@ -100,36 +100,117 @@ fn session() -> String {
     std::env::var("ZVCS_SESSION").unwrap_or_else(|_| format!("pid-{}", std::os::unix::process::parent_id()))
 }
 
-/// Network-free push pre-flight: refuse if the remote-tracking ref is ahead of
-/// or diverged from HEAD (a prior fetch already told us so). Skipped when there
-/// is no remote-tracking ref to compare against.
+/// A push pre-flight verdict.
+enum Verdict {
+    /// Fast-forwardable (or new branch / up to date) — push may proceed.
+    Ok,
+    /// Non-fast-forward — refuse before enqueue, with a reason.
+    Refuse(String),
+    /// Could not determine (offline, no remote, detached HEAD) — try the next
+    /// source or, ultimately, let the push itself decide.
+    Unknown,
+}
+
+/// Push pre-flight: prefer a live `ls-refs` against the remote (the accurate,
+/// current tip); fall back to the network-free remote-tracking comparison when
+/// the remote can't be reached. Refuse a non-fast-forward before enqueue.
 fn preflight_push() -> Result<()> {
     let repo = gix::discover(".")?;
-    let Some(branch) = repo.head_name()? else {
-        return Ok(()); // detached HEAD: let the push itself decide
+    let verdict = match lsrefs_verdict(&repo) {
+        Verdict::Unknown => local_verdict(&repo),
+        v => v,
     };
+    match verdict {
+        Verdict::Refuse(msg) => Err(anyhow!(msg)),
+        Verdict::Ok | Verdict::Unknown => Ok(()),
+    }
+}
+
+/// The current branch short name and HEAD commit, or `None` if detached/unborn.
+fn head_branch(repo: &gix::Repository) -> Option<(String, gix::hash::ObjectId)> {
+    let branch = repo.head_name().ok().flatten()?;
     let short = branch.shorten().to_string();
-    let local = match repo.head()?.try_peel_to_id()? {
-        Some(id) => id.detach(),
-        None => return Ok(()),
+    let local = repo.head().ok()?.try_peel_to_id().ok()??.detach();
+    Some((short, local))
+}
+
+/// Given the remote's tip for our branch, decide fast-forwardability locally.
+fn verdict_against_remote(
+    repo: &gix::Repository,
+    short: &str,
+    local: gix::hash::ObjectId,
+    remote: gix::hash::ObjectId,
+) -> Verdict {
+    if local == remote {
+        return Verdict::Ok; // up to date
+    }
+    // If we don't even have the remote's commit, the remote is strictly ahead of
+    // our knowledge — a non-fast-forward.
+    if repo.find_object(remote).is_err() {
+        return Verdict::Refuse(format!("origin/{short} has commits you don't have; pull first"));
+    }
+    // Otherwise ff-able iff the remote tip is an ancestor of local.
+    match repo.merge_base(local, remote) {
+        Ok(base) if base.detach() == remote => Verdict::Ok,
+        _ => Verdict::Refuse(format!("origin/{short} has diverged from your branch; pull first")),
+    }
+}
+
+/// Live `ls-refs` verdict: one ref advertisement (no packfile) to read the
+/// remote's current tip for our branch. `Unknown` on any connection error.
+fn lsrefs_verdict(repo: &gix::Repository) -> Verdict {
+    let Some((short, local)) = head_branch(repo) else {
+        return Verdict::Unknown;
+    };
+    let Ok(remote) = repo.find_remote("origin") else {
+        return Verdict::Unknown;
+    };
+    let conn = match remote.connect(gix::remote::Direction::Fetch) {
+        Ok(c) => c,
+        Err(_) => return Verdict::Unknown,
+    };
+    let refmap = match conn.ref_map(gix::progress::Discard, gix::remote::ref_map::Options::default())
+    {
+        Ok((rm, _handshake)) => rm,
+        Err(_) => return Verdict::Unknown,
+    };
+
+    let target = format!("refs/heads/{short}");
+    let remote_oid = refmap.remote_refs.iter().find_map(|r| {
+        use gix::protocol::handshake::Ref::*;
+        match r {
+            Direct { full_ref_name, object }
+            | Peeled { full_ref_name, object, .. }
+            | Symbolic { full_ref_name, object, .. }
+                if full_ref_name.to_string() == target =>
+            {
+                Some(*object)
+            }
+            _ => None,
+        }
+    });
+
+    match remote_oid {
+        None => Verdict::Ok, // remote lacks the branch → push creates it
+        Some(remote) => verdict_against_remote(repo, &short, local, remote),
+    }
+}
+
+/// Network-free verdict: compare HEAD to the already-fetched `origin/<branch>`
+/// remote-tracking ref. `Unknown` when there's nothing to compare against.
+fn local_verdict(repo: &gix::Repository) -> Verdict {
+    let Some((short, local)) = head_branch(repo) else {
+        return Verdict::Unknown;
     };
     let tracking = format!("refs/remotes/origin/{short}");
-    let remote = match repo.try_find_reference(&tracking)? {
-        Some(r) => r.into_fully_peeled_id()?.detach(),
-        None => return Ok(()), // never fetched: nothing to compare
+    let remote = match repo.try_find_reference(&tracking) {
+        Ok(Some(r)) => match r.into_fully_peeled_id() {
+            Ok(id) => id.detach(),
+            Err(_) => return Verdict::Unknown,
+        },
+        _ => return Verdict::Unknown, // never fetched
     };
-    if local == remote {
-        return Ok(()); // up to date; push is a no-op / safe
-    }
-    // ff-able iff the remote tip is an ancestor of local (merge-base == remote).
-    let ff = matches!(repo.merge_base(local, remote), Ok(base) if base.detach() == remote);
-    if ff {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "origin/{short} has commits you don't have; pull first"
-        ))
-    }
+    verdict_against_remote(repo, &short, local, remote)
 }
 
 /// Submit `spec` to the daemon; on success print the job number to stderr.

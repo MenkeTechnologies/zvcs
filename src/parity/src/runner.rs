@@ -13,8 +13,10 @@
 use crate::env;
 use crate::fixture::{Shape, Templates};
 use anyhow::{Context, Result};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// One invocation to compare.
 #[derive(Clone, Debug)]
@@ -57,6 +59,9 @@ pub enum Verdict {
     StateDiff,
     /// zvcs crashed (signal, or a panic surfacing as a Rust backtrace).
     Crash,
+    /// zvcs did not exit within the case timeout while stock git did. Tracked
+    /// apart from Crash: a hang is usually a wait on input git does not want.
+    Hang,
 }
 
 impl Verdict {
@@ -72,6 +77,7 @@ impl Verdict {
             Verdict::ExitDiff => "EXIT-DIFF",
             Verdict::StateDiff => "STATE-DIFF",
             Verdict::Crash => "CRASH",
+            Verdict::Hang => "HANG",
         }
     }
 }
@@ -81,6 +87,7 @@ struct Side {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     code: Option<i32>,
+    timed_out: bool,
 }
 
 /// Full record of a compared case, retained so failures can be printed with
@@ -98,14 +105,51 @@ pub struct Outcome {
     pub zvcs_state: String,
 }
 
+/// Ceiling on a single invocation. Fuzzing reaches commands that wait on input
+/// or spin; without a bound, one such case stalls the whole run rather than
+/// being reported as the defect it is.
+const CASE_TIMEOUT: Duration = Duration::from_secs(20);
+
 fn run_side(bin: &Path, repo: &Path, home: &Path, args: &[String]) -> Result<Side> {
     let mut cmd = Command::new(bin);
     env::harden(&mut cmd, home);
-    cmd.current_dir(repo).args(args);
-    let out = cmd
-        .output()
+    cmd.current_dir(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("spawn {} {:?}", bin.display(), args))?;
-    Ok(Side { stdout: out.stdout, stderr: out.stderr, code: out.status.code() })
+
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if start.elapsed() >= CASE_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    // Pipes are drained after exit; every fixture case produces bounded output,
+    // so this cannot deadlock on a full pipe buffer in practice.
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut h) = child.stdout.take() {
+        let _ = h.read_to_end(&mut stdout);
+    }
+    if let Some(mut h) = child.stderr.take() {
+        let _ = h.read_to_end(&mut stderr);
+    }
+
+    match status {
+        Some(s) => Ok(Side { stdout, stderr, code: s.code(), timed_out: false }),
+        None => Ok(Side { stdout, stderr, code: None, timed_out: true }),
+    }
 }
 
 /// Probe repository state with **stock** git, so the probe itself is never the
@@ -200,7 +244,9 @@ pub fn run_case(
 
     // Ordering matters: a crash outranks a gap, and a gap outranks the ordinary
     // diffs it would otherwise masquerade as.
-    let verdict = if looks_like_panic(&zvcs_stderr) || zvcs.code.is_none() {
+    let verdict = if zvcs.timed_out {
+        Verdict::Hang
+    } else if looks_like_panic(&zvcs_stderr) || zvcs.code.is_none() {
         Verdict::Crash
     } else if is_unsupported(&zvcs_stderr) {
         Verdict::Unsupported

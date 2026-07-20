@@ -67,11 +67,18 @@ pub struct Tally {
     pub exit_diff: usize,
     pub state_diff: usize,
     pub crash: usize,
+    pub hang: usize,
 }
 
 impl Tally {
     pub fn total(&self) -> usize {
-        self.matched + self.unsupported + self.stdout_diff + self.exit_diff + self.state_diff + self.crash
+        self.matched
+            + self.unsupported
+            + self.stdout_diff
+            + self.exit_diff
+            + self.state_diff
+            + self.crash
+            + self.hang
     }
 
     fn record(&mut self, v: Verdict) {
@@ -82,6 +89,7 @@ impl Tally {
             Verdict::ExitDiff => self.exit_diff += 1,
             Verdict::StateDiff => self.state_diff += 1,
             Verdict::Crash => self.crash += 1,
+            Verdict::Hang => self.hang += 1,
         }
     }
 
@@ -138,12 +146,13 @@ impl Report {
             self.overall.pct()
         );
         println!(
-            "           unsupported={} stdout-diff={} exit-diff={} state-diff={} crash={}",
+            "           unsupported={} stdout-diff={} exit-diff={} state-diff={} crash={} hang={}",
             self.overall.unsupported,
             self.overall.stdout_diff,
             self.overall.exit_diff,
             self.overall.state_diff,
-            self.overall.crash
+            self.overall.crash,
+            self.overall.hang
         );
 
         println!("\n--- per subcommand ---");

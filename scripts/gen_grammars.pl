@@ -6,11 +6,16 @@
 # agrees. So a thin grammar narrows coverage but can never turn a failure into
 # a pass — which is why generating them is safe to fan out.
 #
-# Mutating commands are excluded from the fuzz set: random flag combinations on
-# a command that writes to the repo produce cases whose *stock* behavior is
-# itself ambiguous (editors, prompts), which yields noise instead of findings.
-# Every exclusion is printed, because a silently dropped command reads as
-# covered when it is not.
+# Mutating commands ARE included. Each case runs in a pristine copy of the
+# fixture and the harness pins GIT_EDITOR/GIT_SEQUENCE_EDITOR to `true`, so the
+# behavior that made them ambiguous to fuzz — blocking on an editor or a prompt
+# — no longer occurs. They are marked so the report can distinguish them, since
+# a mutating command is judged mostly on resulting repository state rather than
+# on stdout.
+#
+# Commands with no offline-testable surface (daemons, credential helpers,
+# network verbs) still drop out, and every exclusion is printed: a silently
+# dropped command reads as covered when it is not.
 
 use strict;
 use warnings;
@@ -47,7 +52,7 @@ sub rs_str {
     return "\"$s\"";
 }
 
-my (@entries, @skipped_mutating, @skipped_empty, @bad);
+my (@entries, @mutating, @skipped_empty, @bad);
 
 for my $f (@files) {
     my $path = "$dir/$f";
@@ -61,7 +66,7 @@ for my $f (@files) {
     my $cmd = $g->{command};
     unless (defined $cmd && length $cmd) { push @bad, "$f: missing \"command\""; next; }
 
-    if ($g->{mutating}) { push @skipped_mutating, $cmd; next; }
+    push @mutating, $cmd if $g->{mutating};
 
     my @flags = @{ $g->{flags}       // [] };
     my @pos   = @{ $g->{positionals} // [] };
@@ -119,7 +124,7 @@ print $ofh "    ]\n}\n";
 close($ofh);
 
 printf "generated %d grammars -> %s\n", scalar(@entries), $out;
-printf "skipped %d mutating: %s\n", scalar(@skipped_mutating), join(' ', sort @skipped_mutating)
-    if @skipped_mutating;
+printf "  of which %d mutating (fuzzed in pristine copies, non-interactive editors)\n",
+    scalar(@mutating) if @mutating;
 printf "skipped %d with no fuzzable surface: %s\n", scalar(@skipped_empty), join(' ', sort @skipped_empty)
     if @skipped_empty;

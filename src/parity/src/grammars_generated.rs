@@ -12,9 +12,21 @@ use crate::fuzz::Grammar;
 pub fn generated() -> Vec<Grammar> {
     vec![
         Grammar {
+            cmd: "am",
+            flags: &["-s", "--signoff", "-k", "--keep", "--keep-non-patch", "--keep-cr", "--no-keep-cr", "-c", "--scissors", "--no-scissors", "--quoted-cr=nowarn", "--quoted-cr=warn", "--quoted-cr=strip", "--empty=drop", "--empty=keep", "--empty=stop", "-m", "--message-id", "--no-message-id", "-q", "--quiet", "-u", "--utf8", "--no-utf8", "-3", "--3way", "--no-3way", "--rerere-autoupdate", "--no-rerere-autoupdate", "--ignore-space-change", "--ignore-whitespace", "--whitespace=nowarn", "--whitespace=warn", "--whitespace=fix", "--whitespace=error", "--whitespace=error-all", "-C1", "-C2", "-p0", "-p1", "-p2", "--directory=sub", "--exclude=src/lib.rs", "--include=README.md", "--reject", "--patch-format=mbox", "--patch-format=mboxrd", "--patch-format=stgit", "--patch-format=stgit-series", "--patch-format=hg", "--patch-format=bogus", "--verify", "-n", "--no-verify", "--committer-date-is-author-date", "--ignore-date", "--no-gpg-sign", "--continue", "-r", "--resolved", "--skip", "--abort", "--quit", "--retry", "--allow-empty", "--show-current-patch", "--show-current-patch=raw", "--show-current-patch=diff"],
+            positionals: &["", "README.md", "src/lib.rs", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths],
+        },
+        Grammar {
             cmd: "annotate",
             flags: &["-b", "--root", "--no-root", "--show-stats", "--incremental", "--score-debug", "-f", "--show-name", "-n", "--show-number", "-p", "--porcelain", "--line-porcelain", "-c", "-t", "-l", "-s", "-e", "--show-email", "-w", "--abbrev=8", "--abbrev=40", "--diff-algorithm=myers", "--diff-algorithm=patience", "--diff-algorithm=histogram", "--diff-algorithm=minimal", "-M", "-C", "-CC", "-M40", "-C40", "-L1,2", "-L2,", "-L,3", "-L1,+2", "-L/fn/,+3", "-L:main", "--ignore-rev=HEAD", "--ignore-revs-file=does-not-exist", "--no-progress", "--color-lines", "--color-by-age", "--contents=README.md", "--reverse"],
             positionals: &["README.md", "src/lib.rs", "HEAD", "HEAD README.md", "HEAD -- README.md", "main -- src/lib.rs", "feature -- README.md", "v0.1.0 -- README.md", "v0.2.0 -- src/lib.rs", "HEAD~1 -- README.md", "-- README.md", "does-not-exist", "HEAD -- does-not-exist", "does-not-exist -- README.md", ""],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "apply",
+            flags: &["--stat", "--numstat", "--summary", "--check", "--index", "--cached", "-N", "--intent-to-add", "-3", "--3way", "--ours", "--theirs", "--union", "--build-fake-ancestor=.git/parity-fake-ancestor", "-R", "--reverse", "--reject", "-z", "-p0", "-p1", "-p2", "-C0", "-C1", "-C3", "--unidiff-zero", "--apply", "--no-add", "--binary", "--allow-binary-replacement", "--exclude=src/*", "--exclude=does-not-match/*", "--include=README.md", "--include=src/*", "--ignore-space-change", "--ignore-whitespace", "--whitespace=nowarn", "--whitespace=warn", "--whitespace=fix", "--whitespace=error", "--whitespace=error-all", "--inaccurate-eof", "--recount", "--directory=sub", "--unsafe-paths", "--allow-empty", "-v", "--verbose", "-q", "--quiet"],
+            positionals: &["/dev/null", "README.md", "src/lib.rs", "does-not-exist"],
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
         Grammar {
@@ -28,6 +40,12 @@ pub fn generated() -> Vec<Grammar> {
             flags: &["--min-batch-size=1", "--min-batch-size=50000", "--min-batch-size=1k", "--min-batch-size=abc", "--min-batch-size=-1", "--sparse", "--no-sparse", "--include-edges", "--no-include-edges", "--first-parent", "--since=2020-01-01", "--max-count=1", "--all", "--reverse", "--not", "--bogus-flag"],
             positionals: &["", "HEAD", "main", "feature", "v0.1.0", "v0.2.0", "HEAD~1", "main..feature", "main...feature", "README.md", "src/lib.rs", "does-not-exist"],
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "bisect",
+            flags: &["--no-checkout", "--first-parent", "--term-new=slow", "--term-old=fast", "--term-bad=broken", "--term-good=works", "--term-new=reset", "--term-good", "--term-old", "--term-bad", "--term-new", "--bogus-flag"],
+            positionals: &["", "start", "log", "terms", "next", "skip", "reset", "good", "bad", "old", "new", "help", "HEAD", "main", "feature", "v0.1.0", "v0.2.0", "does-not-exist", "bogus-subcommand"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
         Grammar {
             cmd: "bundle",
@@ -60,10 +78,34 @@ pub fn generated() -> Vec<Grammar> {
             shapes: &[Shape::Linear, Shape::Branched, Shape::Detached],
         },
         Grammar {
+            cmd: "cherry-pick",
+            flags: &["--no-edit", "-n", "--no-commit", "--commit", "-s", "--signoff", "--no-signoff", "-x", "-r", "--ff", "--no-ff", "--no-gpg-sign", "--allow-empty", "--no-allow-empty", "--allow-empty-message", "--keep-redundant-commits", "--empty=drop", "--empty=keep", "--empty=stop", "--empty=bogus", "--cleanup=verbatim", "--cleanup=whitespace", "--cleanup=strip", "--cleanup=scissors", "--cleanup=default", "--cleanup=bogus", "-m 1", "-m 2", "--mainline=1", "--mainline=0", "--strategy=ort", "--strategy=recursive", "--strategy=resolve", "--strategy=octopus", "--strategy=nonexistent-strategy", "-Xtheirs", "-Xours", "--strategy-option=ignore-space-change", "--strategy-option=bogus-option", "--rerere-autoupdate", "--no-rerere-autoupdate", "--abort", "--quit", "--skip"],
+            positionals: &["HEAD", "HEAD~1", "HEAD~2", "HEAD^", "main", "feature", "feature~1", "v0.1.0", "v0.2.0", "main..feature", "HEAD~2..HEAD", "README.md", "does-not-exist", ""],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
             cmd: "cherry",
             flags: &["-v", "--verbose", "--no-verbose", "--abbrev", "--abbrev=4", "--abbrev=7", "--abbrev=12", "--abbrev=40", "--no-abbrev"],
             positionals: &["", "main", "feature", "HEAD", "v0.1.0", "v0.2.0", "main feature", "feature main", "main HEAD", "main feature v0.1.0", "v0.2.0 feature", "HEAD HEAD", "main^", "main~1 feature", "does-not-exist", "main does-not-exist", "README.md"],
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached, Shape::Dirty],
+        },
+        Grammar {
+            cmd: "clean",
+            flags: &["-n", "--dry-run", "--no-dry-run", "-f", "--force", "--no-force", "-q", "--quiet", "--no-quiet", "-d", "-x", "-X", "-nd", "-nx", "-nX", "-ndx", "-ndX", "-fd", "-fx", "-fX", "-fdx", "-fdX", "-ff", "-ffd", "-nxX", "-fxX", "-e *.tmp", "-e build", "-e !README.md", "--exclude=*.tmp", "--exclude=src/*", "--exclude=", "--exclude=[", "--no-interactive", "--"],
+            positionals: &["", ".", "src", "src/", "src/lib.rs", "README.md", "*.tmp", ":/", ":(glob)**/*.tmp", ":(icase)README.MD", ":(exclude)src", ":(top)src", ":!src", "./src/../src", "path with spaces", "does-not-exist", "src/does-not-exist.rs", "../outside-repo", ":(bogusmagic)src"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "commit-graph",
+            flags: &["--reachable", "--append", "--changed-paths", "--no-changed-paths", "--split", "--split=no-merge", "--split=replace", "--max-commits=1", "--max-commits=1000", "--size-multiple=2", "--max-new-filters=0", "--max-new-filters=-1", "--no-max-new-filters", "--expire-time=1970-01-01", "--progress", "--no-progress", "--shallow", "--object-dir=.git/objects", "--object-dir=does-not-exist"],
+            positionals: &["write", "verify", "", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached, Shape::Dirty, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "commit-tree",
+            flags: &["-m x", "-m", "-m first -m second", "-m first -m second -m third", "-m trailing-newline-check", "-F README.md", "-F src/lib.rs", "-F does-not-exist", "-m x -F README.md", "-F README.md -m x", "-p HEAD -m x", "-p main -m x", "-p feature -m x", "-p v0.1.0 -m x", "-p v0.2.0 -m x", "-p HEAD -p feature -m x", "-p HEAD -p HEAD -m x", "-p HEAD^{tree} -m x", "-p does-not-exist -m x", "-p HEAD -m x -F README.md", "--no-gpg-sign -m x", "--no-gpg-sign -p HEAD -m x", "-m x --"],
+            positionals: &["HEAD^{tree}", "main^{tree}", "feature^{tree}", "v0.1.0^{tree}", "v0.2.0^{tree}", "HEAD~1^{tree}", "HEAD:src", "4b825dc642cb6eb9a060e54bf8d69288fbee4904", "HEAD", "HEAD:README.md", "", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
         Grammar {
             cmd: "count-objects",
@@ -96,6 +138,12 @@ pub fn generated() -> Vec<Grammar> {
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
         Grammar {
+            cmd: "fast-import",
+            flags: &["--force", "--quiet", "--stats", "--allow-unsafe-features", "--done", "--signed-tags=verbatim", "--signed-tags=warn-verbatim", "--signed-tags=strip", "--signed-tags=warn-strip", "--signed-tags=abort", "--signed-commits=verbatim", "--signed-commits=warn-verbatim", "--signed-commits=strip", "--signed-commits=warn-strip", "--signed-commits=abort", "--date-format=raw", "--date-format=raw-permissive", "--date-format=rfc2822", "--date-format=now", "--date-format=bogus-format", "--cat-blob-fd=1", "--export-marks=marks.out", "--import-marks=marks.in", "--import-marks-if-exists=marks.in", "--import-marks-if-exists=does-not-exist.marks", "--relative-marks", "--no-relative-marks", "--export-pack-edges=edges.txt", "--active-branches=1", "--active-branches=5", "--big-file-threshold=1024", "--depth=1", "--depth=50", "--max-pack-size=1m", "--rewrite-submodules-from=sub:from.marks", "--rewrite-submodules-to=sub:to.marks", "--no-such-flag"],
+            positionals: &["", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
             cmd: "fmt-merge-msg",
             flags: &["--log", "--log=1", "--log=20", "--log=0", "--no-log", "--summary", "--no-summary", "--message=Merge feature into main", "--no-message", "--into-name=main", "--into-name=feature", "--no-into-name", "--file=README.md", "--file=src/lib.rs", "--file=does-not-exist", "--no-file", "--log=not-a-number", "--bogus-flag"],
             positionals: &["", "HEAD", "does-not-exist"],
@@ -120,6 +168,12 @@ pub fn generated() -> Vec<Grammar> {
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
         Grammar {
+            cmd: "gc",
+            flags: &["--aggressive", "--auto", "--no-detach", "--cruft", "--no-cruft", "--max-cruft-size=1024", "--prune=now", "--prune=2.weeks.ago", "--no-prune", "--quiet", "--force", "--keep-largest-pack"],
+            positionals: &["", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
             cmd: "grep",
             flags: &["--cached", "--no-cached", "--untracked", "--no-untracked", "--no-index", "--index", "--exclude-standard", "--no-exclude-standard", "--recurse-submodules", "--no-recurse-submodules", "-a", "--text", "-I", "--textconv", "--no-textconv", "-i", "--ignore-case", "-w", "--word-regexp", "-v", "--invert-match", "-r", "--recursive", "--no-recursive", "--max-depth=0", "--max-depth=1", "--max-depth=-1", "-E", "--extended-regexp", "-G", "--basic-regexp", "-F", "--fixed-strings", "-P", "--perl-regexp", "-n", "--line-number", "--no-line-number", "--column", "--no-column", "-h", "-H", "--full-name", "--no-full-name", "-l", "--files-with-matches", "--name-only", "-L", "--files-without-match", "-z", "--null", "-o", "--only-matching", "-c", "--count", "--color=always", "--color=never", "--color=auto", "--no-color", "--break", "--no-break", "--heading", "--no-heading", "-p", "--show-function", "-W", "--function-context", "-C1", "-2", "--context=3", "-A2", "--after-context=1", "-B2", "--before-context=1", "--threads=1", "--threads=4", "-m1", "--max-count=0", "--max-count=2", "--max-count=-1", "-q", "--quiet", "--no-quiet", "--all-match", "--no-all-match", "--ext-grep", "--no-ext-grep"],
             positionals: &["fn", "TODO", "README", "lib", "^", "[a-z]+", "does-not-exist-pattern", "", "HEAD", "main", "feature", "v0.1.0", "v0.2.0", "HEAD~1", "--", "README.md", "src/lib.rs", "src/", "*.rs", ":^src", "does-not-exist"],
@@ -130,6 +184,12 @@ pub fn generated() -> Vec<Grammar> {
             flags: &["-tblob", "-tcommit", "-ttree", "-ttag", "-tbogus", "-t", "--literally", "--no-literally", "--literally -tcommit", "--literally -ttree", "--literally -ttag", "--literally -tbogus", "--no-filters", "--filters", "--no-filters --literally", "--path=README.md", "--path=src/lib.rs", "--path=does-not-exist", "--path=../outside", "--path=", "--path", "--path=README.md --filters", "--path=README.md --no-filters", "--path=README.md -tblob", "--no-filters -tblob", "--", "--bogus-flag"],
             positionals: &["", "README.md", "./README.md", "src/lib.rs", "./src/lib.rs", "src", ".", "/dev/null", ".git/HEAD", ".git/config", "README.md src/lib.rs", "README.md README.md", "README.md does-not-exist", "does-not-exist", "README.md/", "-README.md", "sub"],
             shapes: &[Shape::Linear, Shape::Dirty, Shape::Conflicted, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "index-pack",
+            flags: &["-v", "--verify", "--rev-index", "--no-rev-index", "--keep", "--keep=parity-harness", "--strict", "--strict=missingEmail=ignore,badTagName=error", "--fsck-objects", "--fsck-objects=missingEmail=ignore", "--check-self-contained-and-connected", "--promisor", "--promisor=parity", "--threads=1", "--threads=0", "--index-version=2", "--max-input-size=1", "--max-input-size=1073741824", "--object-format=sha1"],
+            positionals: &["", ".git/objects/pack/pack-does-not-exist.pack", "README.md", "does-not-exist.pack", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached],
         },
         Grammar {
             cmd: "interpret-trailers",
@@ -144,16 +204,58 @@ pub fn generated() -> Vec<Grammar> {
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
         Grammar {
+            cmd: "maintenance",
+            flags: &["--auto", "--quiet", "--schedule=hourly", "--schedule=daily", "--schedule=weekly", "--task=commit-graph", "--task=gc", "--task=loose-objects", "--task=incremental-repack", "--task=pack-refs", "--task=reflog-expire", "--task=rerere-gc", "--task=worktree-prune", "--task=bogus-task"],
+            positionals: &["run", "is-needed", "", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Detached, Shape::Submodule],
+        },
+        Grammar {
             cmd: "merge-base",
             flags: &["-a", "--all", "--octopus", "--independent", "--is-ancestor", "--fork-point"],
             positionals: &["HEAD", "main", "feature", "main feature", "HEAD feature", "main feature HEAD", "v0.1.0", "v0.2.0", "v0.1.0 v0.2.0", "HEAD~1", "HEAD HEAD", "main main", "HEAD~1 HEAD", "does-not-exist", "main does-not-exist", "README.md", ""],
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached],
         },
         Grammar {
+            cmd: "merge-file",
+            flags: &["-p", "--stdout", "-q", "--quiet", "--diff3", "--no-diff3", "--zdiff3", "--ours", "--theirs", "--union", "--marker-size=7", "--marker-size=32", "--marker-size=0", "--diff-algorithm=myers", "--diff-algorithm=minimal", "--diff-algorithm=patience", "--diff-algorithm=histogram", "--diff-algorithm=bogus", "--object-id", "--no-object-id", "-L mine", "-L base", "-L theirs"],
+            positionals: &["README.md", "src/lib.rs", "does-not-exist", ""],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::AwkwardPaths],
+        },
+        Grammar {
             cmd: "merge-index",
             flags: &["-o", "-q", "-a", "--"],
             positionals: &["cat", "true", "false", "echo", "README.md", "src/lib.rs", "does-not-exist", ""],
             shapes: &[Shape::Conflicted, Shape::Merged, Shape::Linear, Shape::Dirty, Shape::AwkwardPaths],
+        },
+        Grammar {
+            cmd: "merge-tree",
+            flags: &["--write-tree", "--trivial-merge", "--name-only", "--messages", "--no-messages", "--quiet", "-z", "--allow-unrelated-histories", "--merge-base=main", "--merge-base=HEAD~1", "--merge-base=v0.1.0", "--merge-base=does-not-exist", "--no-merge-base", "-Xours", "-Xtheirs", "-Xno-renames", "-Xfind-renames=50", "-Xrename-threshold=75", "-Xignore-space-change", "-Xignore-all-space", "-Xignore-space-at-eol", "-Xignore-cr-at-eol", "-Xrenormalize", "-Xno-renormalize", "-Xdiff-algorithm=histogram", "-Xdiff-algorithm=minimal", "-Xdiff-algorithm=myers", "-Xdiff-algorithm=patience", "-Xpatience", "-Xhistogram", "-Xsubtree", "-Xsubtree=src", "--strategy-option=ours", "--strategy-option=theirs", "--strategy-option=no-renames", "--strategy-option=diff-algorithm=patience", "--no-strategy-option"],
+            positionals: &["main", "feature", "HEAD", "HEAD~1", "HEAD^", "v0.1.0", "v0.2.0", "main^{tree}", "feature^{tree}", "does-not-exist", ""],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "mergetool",
+            flags: &["--tool-help"],
+            positionals: &["", "README.md", "src/lib.rs", "src", "does-not-exist"],
+            shapes: &[Shape::Conflicted, Shape::Linear, Shape::Merged],
+        },
+        Grammar {
+            cmd: "mktag",
+            flags: &["--strict", "--no-strict"],
+            positionals: &["", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached],
+        },
+        Grammar {
+            cmd: "mktree",
+            flags: &["-z", "--missing", "--batch"],
+            positionals: &["", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "multi-pack-index",
+            flags: &["--object-dir=.git/objects", "--progress", "--no-progress", "--bitmap", "--no-bitmap", "--incremental", "--no-incremental", "--write-chain-file", "--no-write-chain-file", "--base=none", "--base=deadbeef", "--preferred-pack=does-not-exist.idx", "--refs-snapshot=/dev/null", "--batch-size=0", "--batch-size=1048576", "--object-dir=does-not-exist"],
+            positionals: &["write", "verify", "expire", "repack", "compact", "", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached, Shape::Submodule],
         },
         Grammar {
             cmd: "name-rev",
@@ -174,16 +276,46 @@ pub fn generated() -> Vec<Grammar> {
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
         Grammar {
+            cmd: "pack-refs",
+            flags: &["--all", "--no-all", "--prune", "--no-prune", "--auto", "--no-auto", "--include=refs/heads/*", "--include=refs/tags/*", "--include=refs/heads/feature", "--include=refs/does-not-exist/*", "--no-include", "--exclude=refs/heads/*", "--exclude=refs/tags/*", "--exclude=refs/heads/main", "--exclude=refs/does-not-exist/*", "--no-exclude"],
+            positionals: &["", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached, Shape::Submodule],
+        },
+        Grammar {
             cmd: "patch-id",
             flags: &["--stable", "--unstable", "--verbatim"],
             positionals: &["", "does-not-exist"],
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached, Shape::AwkwardPaths],
         },
         Grammar {
+            cmd: "prune-packed",
+            flags: &["-n", "--dry-run", "--no-dry-run", "-q", "--quiet", "--no-quiet"],
+            positionals: &["", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Detached],
+        },
+        Grammar {
+            cmd: "prune",
+            flags: &["-n", "--dry-run", "-v", "--verbose", "--progress", "--expire=now", "--expire=never", "--expire=2.weeks.ago", "--expire=1979-02-26", "--"],
+            positionals: &["", "HEAD", "main", "feature", "v0.1.0", "v0.2.0", "HEAD^", "refs/heads/main", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
             cmd: "range-diff",
             flags: &["--no-dual-color", "--dual-color", "--creation-factor=30", "--creation-factor=60", "--creation-factor=100", "--left-only", "--right-only", "--diff-merges=off", "--diff-merges=on", "--diff-merges=first-parent", "--diff-merges=separate", "--diff-merges=combined", "--diff-merges=dense-combined", "--diff-merges=remerge", "--remerge-diff", "--notes", "--no-notes", "--color=never", "--color=always", "--no-color", "--patch", "--no-patch", "--raw", "--stat", "--stat-width=80", "--numstat", "--shortstat", "--compact-summary", "--summary", "--dirstat", "--name-only", "--name-status", "--check", "--unified=0", "--unified=5", "-U1", "--inter-hunk-context=2", "--function-context", "--minimal", "--patience", "--histogram", "--diff-algorithm=myers", "--diff-algorithm=minimal", "--diff-algorithm=patience", "--diff-algorithm=histogram", "--anchored=fn", "--indent-heuristic", "--no-indent-heuristic", "--find-renames", "--find-copies", "--no-renames", "--break-rewrites", "--irreversible-delete", "--ignore-space-change", "--ignore-all-space", "--ignore-space-at-eol", "--ignore-cr-at-eol", "--ignore-blank-lines", "--text", "--binary", "--full-index", "--abbrev=8", "--no-prefix", "--default-prefix", "--src-prefix=old/", "--dst-prefix=new/", "--line-prefix=| ", "--output-indicator-new=Y", "--output-indicator-old=X", "--ws-error-highlight=all", "--word-diff=plain", "--word-diff=porcelain", "--relative", "--pickaxe-all", "--no-ext-diff", "--textconv", "--no-textconv", "--submodule=log", "--submodule=diff", "--submodule=short", "--exit-code", "--quiet", "-R"],
             positionals: &["", "main...feature", "feature...main", "main..feature", "feature..main", "main", "feature", "HEAD", "HEAD~1...HEAD", "v0.1.0...v0.2.0", "v0.2.0...feature", "v0.1.0..feature", "HEAD^!", "--", "README.md", "src/lib.rs", "does-not-exist", "does-not-exist...feature", "main...does-not-exist"],
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "read-tree",
+            flags: &["-m", "--reset", "-u", "-i", "-n", "--dry-run", "-v", "--verbose", "-q", "--quiet", "--trivial", "--aggressive", "--empty", "--no-empty", "--sparse-checkout", "--no-sparse-checkout", "--recurse-submodules", "--no-recurse-submodules", "--prefix=sub/", "--index-output=.git/parity-index", "--exclude-per-directory=.gitignore"],
+            positionals: &["HEAD", "", "main", "feature", "v0.1.0", "v0.2.0", "HEAD^{tree}", "HEAD~1", "main feature", "HEAD main feature", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "rebase",
+            flags: &["--abort", "--quit", "--skip", "--onto", "--keep-base", "--apply", "--merge", "-m", "--empty=drop", "--empty=keep", "--empty=stop", "--keep-empty", "--no-keep-empty", "--reapply-cherry-picks", "--no-reapply-cherry-picks", "--allow-empty-message", "--strategy=ort", "--strategy=recursive", "--strategy-option=ours", "--strategy-option=theirs", "-Xignore-space-change", "--rerere-autoupdate", "--no-rerere-autoupdate", "--no-gpg-sign", "-q", "--quiet", "-v", "--verbose", "--stat", "-n", "--no-stat", "--no-verify", "--verify", "-C3", "--no-ff", "--force-rebase", "-f", "--fork-point", "--no-fork-point", "--ignore-whitespace", "--whitespace=nowarn", "--whitespace=fix", "--whitespace=warn", "--whitespace=error", "--committer-date-is-author-date", "--ignore-date", "--reset-author-date", "--signoff", "--trailer=Acked-by:tester", "--rebase-merges", "--rebase-merges=rebase-cousins", "--rebase-merges=no-rebase-cousins", "--no-rebase-merges", "--exec=true", "--root", "--autosquash", "--no-autosquash", "--autostash", "--no-autostash", "--reschedule-failed-exec", "--no-reschedule-failed-exec", "--update-refs", "--no-update-refs"],
+            positionals: &["", "main", "feature", "main feature", "feature main", "HEAD", "HEAD~1", "HEAD~2", "v0.1.0", "v0.2.0", "main...feature", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
         Grammar {
             cmd: "reflog",
@@ -198,6 +330,18 @@ pub fn generated() -> Vec<Grammar> {
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
         Grammar {
+            cmd: "repack",
+            flags: &["-a", "-A", "-d", "-l", "-f", "-F", "-n", "-q", "--quiet", "--no-quiet", "-k", "--keep-unreachable", "--no-keep-unreachable", "-i", "--delta-islands", "--no-delta-islands", "--cruft", "--cruft-expiration=now", "--cruft-expiration=2.weeks.ago", "--max-cruft-size=1m", "--max-cruft-size=1024", "--combine-cruft-below-size=1m", "--combine-cruft-below-size=1024", "--window=10", "--window=0", "--depth=50", "--depth=4095", "--depth=0", "--window-memory=10m", "--window-memory=0", "--max-pack-size=1m", "--threads=1", "--threads=2", "--pack-kept-objects", "--no-pack-kept-objects", "--keep-pack=pack-123.pack", "--unpack-unreachable=now", "--unpack-unreachable=2.weeks.ago", "--filter=blob:none", "--filter=blob:limit=1k", "--filter=tree:0", "--filter=bogus:spec", "-b", "--write-bitmap-index", "--no-write-bitmap-index", "-m", "--write-midx", "--write-midx=incremental", "--write-midx=default", "--write-midx=bogus", "--geometric=2", "--geometric=0", "--name-hash-version=1", "--name-hash-version=2", "--name-hash-version=3", "--path-walk", "--no-path-walk"],
+            positionals: &["", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "replace",
+            flags: &["-f", "--force", "-d", "--delete", "-l", "--list", "--format=short", "--format=medium", "--format=long", "--graft", "--convert-graft-file"],
+            positionals: &["", "HEAD", "HEAD~1", "HEAD^{tree}", "main", "feature", "v0.1.0", "v0.2.0", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached, Shape::Dirty],
+        },
+        Grammar {
             cmd: "repo",
             flags: &["--keys", "--all", "-z", "--format=lines", "--format=nul", "--format=table"],
             positionals: &["info", "structure", "info layout.bare", "info layout.shallow", "info object.format", "info references.format", "info layout.bare layout.shallow", "info references.format object.format layout.bare layout.shallow", "info does-not-exist", "structure extra-arg", "does-not-exist", ""],
@@ -208,6 +352,18 @@ pub fn generated() -> Vec<Grammar> {
             flags: &["-p"],
             positionals: &["v0.1.0 .", "v0.1.0 . HEAD", "v0.1.0 . main", "v0.2.0 . feature", "v0.1.0 . main:for-upstream", "HEAD~1 . HEAD", "main .", "v0.1.0 ./ HEAD", "v0.1.0 /nonexistent/repo.git HEAD", "does-not-exist . HEAD", "v0.1.0 . does-not-exist", "v0.1.0", ""],
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Detached],
+        },
+        Grammar {
+            cmd: "rerere",
+            flags: &["--rerere-autoupdate", "--no-rerere-autoupdate", "-h", "--bogus-flag"],
+            positionals: &["", "clear", "diff", "status", "remaining", "gc", "forget", "README.md", "src/lib.rs", "does-not-exist", "bogus-subcommand"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "revert",
+            flags: &["--no-edit", "-n", "--no-commit", "-s", "--signoff", "--no-gpg-sign", "--reference", "--cleanup=verbatim", "--cleanup=whitespace", "--cleanup=strip", "--cleanup=scissors", "--cleanup=default", "--cleanup=bogus", "-m 1", "-m 2", "--mainline=1", "--mainline=0", "--strategy=ort", "--strategy=recursive", "--strategy=resolve", "--strategy=octopus", "--strategy=nonexistent-strategy", "-Xtheirs", "-Xours", "--strategy-option=ignore-space-change", "--strategy-option=bogus-option", "--rerere-autoupdate", "--no-rerere-autoupdate", "--abort", "--quit", "--skip"],
+            positionals: &["HEAD", "HEAD~1", "HEAD~2", "HEAD^", "main", "feature", "v0.1.0", "v0.2.0", "HEAD~2..HEAD", "does-not-exist", ""],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
         Grammar {
             cmd: "shortlog",
@@ -234,6 +390,18 @@ pub fn generated() -> Vec<Grammar> {
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
         Grammar {
+            cmd: "sparse-checkout",
+            flags: &["--cone", "--no-cone", "--sparse-index", "--no-sparse-index", "--skip-checks", "-z", "--dry-run", "-n", "--force", "-f", "--verbose", "-v"],
+            positionals: &["", "list", "init", "init --cone", "set", "set src", "set src --no-cone", "set /src/", "set README.md", "add", "add src", "add does-not-exist", "reapply", "check-rules", "clean", "disable", "does-not-exist", "src", "README.md"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "stage",
+            flags: &["-n", "--dry-run", "-v", "--verbose", "-f", "--force", "-u", "--update", "--no-update", "--renormalize", "-N", "--intent-to-add", "-A", "--all", "--no-all", "--ignore-removal", "--no-ignore-removal", "--refresh", "--ignore-errors", "--ignore-missing", "--sparse", "--no-sparse", "--chmod=+x", "--chmod=-x", "--pathspec-file-nul", "--"],
+            positionals: &["", ".", "README.md", "src/lib.rs", "src/", "*.md", ":/", ":(exclude)README.md", ":!src/lib.rs", "does-not-exist", "src/does-not-exist.rs"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Dirty, Shape::Conflicted, Shape::Merged, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
             cmd: "stripspace",
             flags: &["-s", "--strip-comments", "-c", "--comment-lines"],
             positionals: &["", "does-not-exist"],
@@ -250,6 +418,36 @@ pub fn generated() -> Vec<Grammar> {
             flags: &["", "-q", "--quiet", "--short", "--recurse", "--no-recurse", "-q --short", "--quiet --short", "--short --no-recurse", "-q --no-recurse", "--short --recurse", "--quiet --short --no-recurse"],
             positionals: &["HEAD", "refs/heads/main", "refs/heads/feature", "refs/tags/v0.1.0", "refs/tags/v0.2.0", "refs/remotes/origin/HEAD", "MERGE_HEAD", "ORIG_HEAD", "does-not-exist", "refs/heads/does-not-exist", "bad..name", ""],
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "unpack-file",
+            flags: &["-h"],
+            positionals: &["", "HEAD:README.md", "HEAD:src/lib.rs", "main:README.md", "feature:README.md", "feature:src/lib.rs", "v0.1.0:README.md", "v0.2.0:src/lib.rs", ":README.md", ":0:src/lib.rs", "HEAD^{tree}", "HEAD", "HEAD:does-not-exist", "does-not-exist", "0000000000000000000000000000000000000000"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "unpack-objects",
+            flags: &["-n", "-q", "-r", "-n -q", "-q -r", "-n -r", "--strict", "-q --strict", "-n --strict", "--max-input-size=0", "--max-input-size=1", "--max-input-size=1024", "--max-input-size=1048576", "-q --max-input-size=1048576", "-n -q -r --strict"],
+            positionals: &["", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached],
+        },
+        Grammar {
+            cmd: "update-index",
+            flags: &["--add", "--no-add", "--remove", "--no-remove", "--force-remove", "--replace", "--refresh", "--really-refresh", "-q", "--unmerged", "--no-unmerged", "--ignore-missing", "--ignore-submodules", "--info-only", "--no-info-only", "--chmod=+x", "--chmod=-x", "--assume-unchanged", "--no-assume-unchanged", "--skip-worktree", "--no-skip-worktree", "--ignore-skip-worktree-entries", "--no-ignore-skip-worktree-entries", "--fsmonitor-valid", "--no-fsmonitor-valid", "--fsmonitor", "--no-fsmonitor", "--again", "-g", "--unresolve", "--clear-resolve-undo", "--verbose", "--no-verbose", "--force-write-index", "--show-index-version", "--index-version=2", "--index-version=3", "--index-version=4", "--index-version=1", "--split-index", "--no-split-index", "--untracked-cache", "--no-untracked-cache", "--test-untracked-cache", "--force-untracked-cache", "--cacheinfo=100644,0000000000000000000000000000000000000000,README.md", "--cacheinfo=100644,e69de29bb2d1d6434b8b29ae775ad8c2e48c5391,newfile.txt", "--cacheinfo=bogus,bogus,bogus", "--"],
+            positionals: &["", "README.md", "src/lib.rs", "src", "./README.md", "src/", "does-not-exist", "src/does-not-exist.rs", "-not-a-flag"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "update-ref",
+            flags: &["-d", "-m", "-z", "--deref", "--no-deref", "--create-reflog", "--no-create-reflog", "--no-stdin", "--batch-updates", "--no-batch-updates", "-0"],
+            positionals: &["", "HEAD", "main", "feature", "refs/heads/main", "refs/heads/feature", "refs/heads/fuzz-tmp", "refs/tags/v0.1.0", "refs/tags/v0.2.0", "v0.1.0", "v0.2.0", "HEAD^{commit}", "0000000000000000000000000000000000000000", "refs/heads/does-not-exist", "refs/heads/bad..name", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Detached],
+        },
+        Grammar {
+            cmd: "update-server-info",
+            flags: &["-f", "--force", "--no-force"],
+            positionals: &["", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
         Grammar {
             cmd: "var",
@@ -285,6 +483,12 @@ pub fn generated() -> Vec<Grammar> {
             cmd: "worktree",
             flags: &["--porcelain", "--no-porcelain", "-z", "-v", "--verbose", "--no-verbose", "--expire=now", "--expire=1.day.ago", "--expire=never", "-n", "--dry-run"],
             positionals: &["list", "", "does-not-exist", "--bogus-option"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
+            cmd: "write-tree",
+            flags: &["--missing-ok", "--prefix=src/", "--prefix=does-not-exist/", "--prefix=README.md/", "--missing-ok --prefix=src/"],
+            positionals: &["", "does-not-exist", "HEAD"],
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
     ]

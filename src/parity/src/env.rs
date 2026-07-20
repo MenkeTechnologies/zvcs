@@ -38,6 +38,14 @@ pub fn harden(cmd: &mut Command, home: &Path) {
         .env("PAGER", "cat")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "true")
+        // Neutralize every interactive hook. Without these, a mutating command
+        // that opens an editor blocks forever, which is why mutating verbs were
+        // previously unfuzzable; `true` accepts the supplied message and exits 0.
+        .env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true")
+        .env("EDITOR", "true")
+        .env("VISUAL", "true")
+        .env("GIT_MERGE_AUTOEDIT", "no")
         .env("LC_ALL", "C")
         .env("LANG", "C")
         .env("TZ", "UTC");

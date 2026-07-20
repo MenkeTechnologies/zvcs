@@ -139,8 +139,9 @@ cargo build
 ./target/debug/git zdaemon stop
 
 # coordination: reconcile submodules to mainline (attached, ff-only) + bump pointers
-./target/debug/git zsync                # all submodules
+./target/debug/git zsync                # reconcile submodules
 ./target/debug/git zbump                # forward-only gitlink bumps (+ commit)
+./target/debug/git zup                  # bring the whole tree to latest origin/main
 
 # repo index + machine-wide status
 ./target/debug/git zreindex             # crawl for git repos
@@ -157,8 +158,10 @@ cargo build
 ./target/debug/git zwho                 # who holds what
 ./target/debug/git zlog                 # cross-repo reflog timeline
 ./target/debug/git zundo                # rewind this repo one step
-./target/debug/git zsnapshot before     # tree-wide restore point
+./target/debug/git zsnapshot before     # tree-wide restore point (committed HEADs)
 ./target/debug/git zrestore before      # restore the whole tree
+./target/debug/git zstash               # park uncommitted work across the tree
+./target/debug/git zunstash             # restore it (LIFO)
 ./target/debug/git zworktree add agent3 # private isolated tree for an agent</pre>
       </section>
 

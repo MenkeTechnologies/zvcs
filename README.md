@@ -99,7 +99,8 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 
 | Verb group | Verbs | What it does |
 |---|---|---|
-| Coordination | `zdaemon` `zsync` `zbump` | singleton daemon; reconcile-to-mainline; forward-only pointer bumps |
+| Coordination | `zdaemon` `zsync` `zbump` `zup` | singleton daemon; reconcile submodules; forward-only bumps; `zup` brings the whole tree (parent + nested submodules) to latest `origin/main` |
+| Stash | `zstash` `zunstash` `zstashes` | park/restore uncommitted work across the whole submodule tree as one unit |
 | Repo index | `zrepos` `zreindex` | machine-wide index of every git repo (retires a shell repo-list) |
 | Async queue | `zcommit` `zpush` `zjobs` `zjob` | fire-and-forget commit/push jobs + ledger (`zjob stop`/`restart`) |
 | Multi-agent | `zclaim` `zunclaim` `zwho` | advisory per-repo leases so agents don't collide |
@@ -132,7 +133,15 @@ mainline (`origin/main`, else `origin/master`), fast-forward only, leaving `HEAD
 attached; a dirty worktree is skipped. `git zbump [<path>...]` advances the
 parent's gitlink to each submodule's HEAD **only** on a fast-forward, then
 **commits** the coalesced bumps (clearing the `(new commits)` marker). `git
-zdaemon <start|stop|status>` controls the singleton coordinator (below).
+zdaemon <start|stop|status>` controls the singleton coordinator (below). `git
+zup` brings the whole tree — the top-level repo **and** every nested submodule —
+to latest `origin/main` (fetch + fast-forward, attached; dirty/diverged skipped).
+
+**Stash.** `git zstash [<name>]` parks uncommitted work across every dirty repo
+in the tree as one named unit, `git zunstash [<name>]` restores it (LIFO), and
+`git zstashes` lists them. Restore applies onto the same commits it was stashed
+on (3-way apply onto a moved HEAD is the not-yet-ported porcelain territory; a
+repo whose HEAD moved is reported and its stash kept intact).
 
 **Repo index.** `git zreindex [<path>...]` crawls for git repositories and
 records them in the ledger, pruning ones deleted from disk; `git zrepos` lists

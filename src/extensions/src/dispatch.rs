@@ -13,7 +13,7 @@ use std::process::ExitCode;
 pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
     "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
-    "zsnapshots", "zworktree",
+    "zsnapshots", "zworktree", "zstash", "zunstash", "zstashes", "zup",
 ];
 
 pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
@@ -39,6 +39,10 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zrestore" => superset::zrestore(args),
         "zsnapshots" => superset::zsnapshots(args),
         "zworktree" => superset::zworktree(args),
+        "zstash" => superset::zstash(args),
+        "zunstash" => superset::zunstash(args),
+        "zstashes" => superset::zstashes(args),
+        "zup" => superset::zup(args),
 
         // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----
         "add" => porcelain::add(args),

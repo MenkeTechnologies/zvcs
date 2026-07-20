@@ -454,6 +454,14 @@ and session attribution. All tested.
   repo + every nested submodule as one restore point; `zrestore <name>` resets
   the whole tree back (`reset --hard` per repo, keeps untracked); `zsnapshots`
   lists them. `snapshots` table. Test: `snapshot.rs`.
+- **Tree-wide stash** — `zstash [<name>]` parks uncommitted work across every
+  dirty repo in the tree as one unit; `zunstash` restores it (LIFO); `zstashes`
+  lists them. `stashes` table. Restore is same-HEAD only (3-way apply onto a
+  moved HEAD is unported; the stash is kept, never lost). Test: `zstash.rs`.
+- **Bring-tree-to-latest** — `zup [<path>]` fetches + fast-forwards the top-level
+  repo and every nested submodule to `origin/main`, attached, skipping
+  dirty/diverged (reuses `reconcile_repo`; `zsync` is submodules-only). Test:
+  `zup.rs`.
 
 **New `[zvcs]` config keys:** `autostatus` (maintain `zstatus --all`), plus the
 existing `autoreconcile`/`autobump`/`hook`/`autocrawl`/`crawlroots`/`interval`.

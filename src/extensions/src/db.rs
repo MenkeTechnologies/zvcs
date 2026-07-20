@@ -71,6 +71,13 @@ CREATE TABLE IF NOT EXISTS worktrees (
     path       TEXT NOT NULL,
     created_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS stashes (
+    name       TEXT NOT NULL,
+    git_dir    TEXT NOT NULL,
+    workdir    TEXT NOT NULL,
+    created_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS stashes_name ON stashes(name);
 ";
 
 /// `~/.zvcs/db.sqlite` (honors `ZVCS_HOME`).
@@ -395,6 +402,49 @@ pub fn load_snapshot(conn: &Connection, name: &str) -> Result<Vec<(String, Strin
 /// List snapshot names with their repo count.
 pub fn list_snapshots(conn: &Connection) -> Result<Vec<(String, i64)>> {
     let mut stmt = conn.prepare("SELECT name, COUNT(*) FROM snapshots GROUP BY name ORDER BY name")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Clear any existing stash records for `name` (start a fresh tree-wide stash).
+pub fn stash_begin(conn: &Connection, name: &str) -> Result<()> {
+    conn.execute("DELETE FROM stashes WHERE name=?1", [name])?;
+    Ok(())
+}
+
+/// Record that `workdir` was stashed under `name`.
+pub fn stash_add(conn: &Connection, name: &str, git_dir: &str, workdir: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO stashes (name, git_dir, workdir, created_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![name, git_dir, workdir, now()],
+    )?;
+    Ok(())
+}
+
+/// The workdirs stashed under `name` (most-recently-added first, so pop is LIFO).
+pub fn stash_entries(conn: &Connection, name: &str) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT workdir FROM stashes WHERE name=?1 ORDER BY rowid DESC")?;
+    let rows = stmt
+        .query_map([name], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Remove one repo's stash record under `name`.
+pub fn stash_remove_entry(conn: &Connection, name: &str, workdir: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM stashes WHERE name=?1 AND workdir=?2",
+        rusqlite::params![name, workdir],
+    )?;
+    Ok(())
+}
+
+/// List stash names with their repo counts.
+pub fn list_stashes(conn: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare("SELECT name, COUNT(*) FROM stashes GROUP BY name ORDER BY name")?;
     let rows = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;

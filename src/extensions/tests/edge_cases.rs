@@ -73,3 +73,25 @@ fn zbump_refuses_non_fast_forward() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn zhook_test_fires_even_after_a_zvcs_authored_commit() {
+    // The "skip zvcs-authored commits" rule lives only in the watcher; the manual
+    // `zhook test` must always fire, even if the latest commit looks zvcs-made.
+    let root = tmp("hooktest");
+    let home = root.join("home");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "--allow-empty", "-q", "-m", "zvcs: autobump 1 pointer"]);
+
+    let marker = root.join("m.txt");
+    let cmd = format!("echo ran > {}", marker.display());
+    let ok = Command::new(BIN).args(["zhook", "set", &cmd]).current_dir(&repo).env("ZVCS_HOME", &home).status().unwrap().success();
+    assert!(ok, "zhook set failed");
+    let t = Command::new(BIN).args(["zhook", "test"]).current_dir(&repo).env("ZVCS_HOME", &home).status().unwrap().success();
+    assert!(t, "zhook test failed");
+    assert!(marker.exists(), "manual `zhook test` must fire regardless of the last commit author");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

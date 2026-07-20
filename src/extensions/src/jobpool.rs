@@ -75,16 +75,24 @@ pub fn stop(id: i64) -> bool {
 }
 
 fn run_job(id: i64, spec_json: String) {
-    // A stop that arrived while queued flips the row to `stopped` — honor it.
-    if let Ok(conn) = crate::db::open_rw() {
-        if crate::db::job_state(&conn, id).ok().flatten().as_deref() == Some("stopped") {
-            return;
-        }
-        let _ = crate::db::job_running(&conn, id);
-    }
-
+    // Register the cancel handle FIRST, so a `zjob stop` arriving during startup
+    // finds it (and its flag is honored by `execute`), then atomically claim the
+    // job `queued` → `running`. If the claim fails, a stop already flipped it to
+    // `stopped` while it was queued — bail without running it.
     let cancel = Cancel::default();
     registry().lock().unwrap().insert(id, cancel.clone());
+    match crate::db::open_rw() {
+        Ok(conn) => {
+            if !crate::db::claim_running(&conn, id).unwrap_or(false) {
+                registry().lock().unwrap().remove(&id);
+                return; // was stopped-while-queued (or vanished)
+            }
+        }
+        Err(_) => {
+            registry().lock().unwrap().remove(&id);
+            return;
+        }
+    }
 
     let result = match serde_json::from_str::<Value>(&spec_json) {
         Ok(spec) => jobrun::execute(&spec, &cancel),

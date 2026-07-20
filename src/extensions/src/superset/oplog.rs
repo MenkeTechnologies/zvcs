@@ -57,6 +57,16 @@ pub(crate) fn latest_head_event(git_dir: &Path) -> Option<(String, String, Strin
     Some((e.old.clone(), e.new.clone(), kind))
 }
 
+/// True if the most recent HEAD change was authored by zvcs itself (autobump,
+/// attach, or zsync reconcile), so hooks don't fire on the daemon's own
+/// bookkeeping commits/ref-updates.
+pub(crate) fn head_authored_by_zvcs(git_dir: &Path) -> bool {
+    match read_head_reflog(git_dir).last() {
+        Some(e) => e.msg.contains("zvcs") || e.msg.contains("zsync"),
+        None => false,
+    }
+}
+
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
 }

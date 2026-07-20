@@ -163,7 +163,8 @@ fn execute_inner(spec: &Value, cancel: &Cancel) -> Result<JobResult> {
                 ok &= p_ok;
             }
 
-            let sha_after = head_sha(&exe, workdir);
+            // Only report the resulting HEAD when the commit actually succeeded.
+            let sha_after = if ok { head_sha(&exe, workdir) } else { None };
             Ok(JobResult { ok, output, sha_after, cancelled: false })
         }
         "push" => {

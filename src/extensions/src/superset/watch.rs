@@ -122,8 +122,12 @@ fn run(cfg: ZvcsConfig) {
         }
         if cfg.hooks_enabled() {
             for t in &targets {
-                if affected.contains(&t.git_dir) {
-                    // hooks::run reads each repo's own zvcs.hook (no-op if none).
+                // Skip the daemon's own bookkeeping (autobump/attach/reconcile) —
+                // fire only on user/agent ref changes. (`zhook test` still fires
+                // manually.) hooks::run reads each repo's own hook (no-op if none).
+                if affected.contains(&t.git_dir)
+                    && !crate::superset::oplog::head_authored_by_zvcs(&t.git_dir)
+                {
                     crate::superset::hooks::run(&t.git_dir, &t.workdir);
                 }
             }
@@ -190,8 +194,11 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
 }
 
 /// Add a repo to the watch set, canonicalizing and deduping by git dir.
+/// Both paths are canonicalized so the daemon's `status::record`/`upsert_repo`
+/// stores the same canonical `workdir` other verbs (claims, selector) key on.
 fn add_target(seen: &mut HashSet<PathBuf>, targets: &mut Vec<Target>, git_dir: PathBuf, workdir: PathBuf) {
     let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
+    let workdir = workdir.canonicalize().unwrap_or(workdir);
     if seen.insert(git_dir.clone()) {
         targets.push(Target { git_dir, workdir });
     }

@@ -122,6 +122,11 @@ pub fn prune_missing(conn: &Connection) -> Result<usize> {
     let mut removed = 0;
     for (id, git_dir) in rows {
         if !std::path::Path::new(&git_dir).exists() {
+            // Delete rows keyed by repo_id first: SQLite reuses rowids and FKs are
+            // off, so an orphaned claim/status could otherwise silently reattach
+            // to a newly-indexed repo that reuses this id.
+            conn.execute("DELETE FROM claims WHERE repo_id=?1", [id])?;
+            conn.execute("DELETE FROM repo_status WHERE repo_id=?1", [id])?;
             conn.execute("DELETE FROM repos WHERE id=?1", [id])?;
             removed += 1;
         }
@@ -191,6 +196,17 @@ pub fn job_running(conn: &Connection, id: i64) -> Result<()> {
         rusqlite::params![id, now()],
     )?;
     Ok(())
+}
+
+/// Atomically claim a job for running: transition `queued` → `running`. Returns
+/// false if the row was not `queued` (e.g. a `zjob stop` already set `stopped`),
+/// so the worker can bail instead of running a cancelled job.
+pub fn claim_running(conn: &Connection, id: i64) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE jobs SET state='running', started_at=?2 WHERE id=?1 AND state='queued'",
+        rusqlite::params![id, now()],
+    )?;
+    Ok(n > 0)
 }
 
 /// Finalize a job: `done` or `failed`, with output/exit captured.

@@ -66,6 +66,11 @@ CREATE TABLE IF NOT EXISTS snapshots (
     created_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS snapshots_name ON snapshots(name);
+CREATE TABLE IF NOT EXISTS worktrees (
+    name       TEXT PRIMARY KEY,
+    path       TEXT NOT NULL,
+    created_at INTEGER
+);
 ";
 
 /// `~/.zvcs/db.sqlite` (honors `ZVCS_HOME`).
@@ -394,6 +399,37 @@ pub fn list_snapshots(conn: &Connection) -> Result<Vec<(String, i64)>> {
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Record a zvcs-managed worktree.
+pub fn add_worktree(conn: &Connection, name: &str, path: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO worktrees (name, path, created_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(name) DO UPDATE SET path=?2, created_at=?3",
+        rusqlite::params![name, path, now()],
+    )?;
+    Ok(())
+}
+
+/// List zvcs-managed worktrees as `(name, path)`.
+pub fn list_worktrees(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT name, path FROM worktrees ORDER BY name")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The recorded path of a worktree, if any.
+pub fn worktree_path(conn: &Connection, name: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT path FROM worktrees WHERE name=?1", [name], |r| r.get(0))
+        .optional()?)
+}
+
+pub fn remove_worktree(conn: &Connection, name: &str) -> Result<()> {
+    conn.execute("DELETE FROM worktrees WHERE name=?1", [name])?;
+    Ok(())
 }
 
 /// Outcome of a claim attempt.

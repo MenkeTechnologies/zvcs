@@ -459,3 +459,24 @@ and session attribution. All tested.
 existing `autoreconcile`/`autobump`/`hook`/`autocrawl`/`crawlroots`/`interval`.
 `zvcs.hook` and claims/snapshots/oplog work without any daemon (client-side db);
 `zstatus --all` freshness and typed hooks need the daemon watching.
+
+## 13. Isolated worktrees per agent (`zworktree`)
+
+The multi-agent collision fix: instead of N agents sharing one meta tree, each
+gets a **private physical checkout**. `git zworktree add <name>` provisions a
+complete isolated worktree of the current repo + every nested submodule at
+`<base>/<name>/` (`zvcs.worktreebase`, default `~/.zvcs/worktrees`). `list` and
+`remove <name>` manage them (tracked in a `worktrees` table).
+
+Each repo in the tree becomes a **linked git worktree** — separate index + HEAD +
+working directory on a fresh `zwt/<name>` branch — that **shares the object
+store** (the worktree's `.git` is a pointer file; no re-clone, unlike
+`git submodule update` which clones each submodule per agent). gix has no
+worktree-create API, so zvcs writes git's exact bookkeeping directly
+(`<gitdir>/worktrees/<name>/{HEAD,commondir,gitdir,index}` + the `.git` pointer),
+which stock git recognizes (`git worktree list`/`fsck`). Verified: a commit in a
+worktree does not move the original; the worktree has no own object store.
+
+Ergonomics: one command from the meta root replaces `git worktree add` for the
+parent plus one per submodule; the agent is launched in its private tree and
+works normally across submodules with zero cross-agent collisions.

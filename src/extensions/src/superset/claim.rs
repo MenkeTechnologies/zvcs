@@ -48,17 +48,29 @@ pub fn zclaim(args: &[String]) -> Result<ExitCode> {
     }
 }
 
-/// `git zunclaim [<path>]` — release this session's lease on a repo.
+/// `git zunclaim [--force] [<path>]` — release a lease on a repo. Without
+/// `--force` only this session's own claim is released; `--force` (`-f`) clears
+/// whoever holds it — the escape hatch for a lease left by a dead agent, since
+/// claims have no TTL.
 pub fn zunclaim(args: &[String]) -> Result<ExitCode> {
+    let force = args.iter().any(|a| a == "--force" || a == "-f");
     let (git_dir, workdir) = target(args)?;
     let session = crate::session_key();
     let conn = crate::db::open_rw()?;
     let repo_id = crate::db::upsert_repo(&conn, &git_dir, Some(&workdir))?;
-    if crate::db::unclaim(&conn, repo_id, &session)? {
+    let released = if force {
+        crate::db::unclaim_force(&conn, repo_id)?
+    } else {
+        crate::db::unclaim(&conn, repo_id, &session)?
+    };
+    if released {
         println!("released {}", workdir.display());
         Ok(ExitCode::SUCCESS)
+    } else if force {
+        eprintln!("zvcs: no claim to release here");
+        Ok(ExitCode::FAILURE)
     } else {
-        eprintln!("zvcs: no claim of yours to release here");
+        eprintln!("zvcs: no claim of yours to release here (use --force to clear another session's)");
         Ok(ExitCode::FAILURE)
     }
 }

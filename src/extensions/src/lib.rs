@@ -80,8 +80,13 @@ pub fn run() -> ExitCode {
 /// if set (export `ZVCS_SESSION=$$` per shell), else the parent process id. Used
 /// by claims, job submission, and the op ledger.
 pub fn session_key() -> String {
+    // Treat a set-but-EMPTY `ZVCS_SESSION` as unset. `env::var` returns `Ok("")`
+    // for it, which would otherwise collapse every such shell to the one session
+    // key `""` — cross-session claim release / false "already mine".
     std::env::var("ZVCS_SESSION")
-        .unwrap_or_else(|_| format!("pid-{}", std::os::unix::process::parent_id()))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("pid-{}", std::os::unix::process::parent_id()))
 }
 
 /// Print (once) any unnotified failed autonomous jobs for the current repo, then

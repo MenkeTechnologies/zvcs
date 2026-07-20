@@ -49,6 +49,11 @@ pub struct RepoLock {
     /// to clear on drop. `None` for a *reentrant* guard (an outer guard on this
     /// thread already owns the key, and will clear it).
     held_key: Option<PathBuf>,
+    /// Makes `RepoLock` `!Send`: the reentrancy set is thread-local, so a guard
+    /// moved to another thread would strand its key (and a later same-repo acquire
+    /// on the origin thread would get a no-op guard with NO exclusion). Binding the
+    /// guard to its acquiring thread turns that footgun into a compile error.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl RepoLock {
@@ -89,7 +94,7 @@ impl RepoLock {
         // same thread is blocked in `read_line` (self-deadlock). A *different*
         // thread/process still goes to the daemon and serializes normally.
         if HELD.with(|h| h.borrow().contains(&repo)) {
-            return Self { stream: None, id, held_key: None };
+            return Self { stream: None, id, held_key: None, _not_send: std::marker::PhantomData };
         }
         HELD.with(|h| {
             h.borrow_mut().insert(repo.clone());
@@ -121,6 +126,7 @@ impl RepoLock {
                 stream: Some(stream),
                 id,
                 held_key: Some(repo),
+                _not_send: std::marker::PhantomData,
             },
             _ => Self::unlocked(id, repo),
         }
@@ -129,7 +135,7 @@ impl RepoLock {
     /// No-op guard for the no-daemon / handshake-failed path. We already inserted
     /// `repo` into `HELD`, so this guard owns the key and clears it on drop.
     fn unlocked(id: String, repo: PathBuf) -> Self {
-        Self { stream: None, id, held_key: Some(repo) }
+        Self { stream: None, id, held_key: Some(repo), _not_send: std::marker::PhantomData }
     }
 
     /// Whether this guard is backed by a live daemon (vs. the no-op fallback).

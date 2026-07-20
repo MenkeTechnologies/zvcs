@@ -9,7 +9,7 @@
 use anyhow::Result;
 use std::process::ExitCode;
 
-use gix::bstr::BStr;
+use gix::bstr::{BStr, BString};
 
 /// Outcome of a bump pass: how many pointers advanced, and any refusals as
 /// `(submodule-path, reason)` — the daemon records refusals for
@@ -63,6 +63,9 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
     let mut bumped = 0usize;
     let mut refusals: Vec<(String, String)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
+    // The gitlink paths + new oids actually bumped, so the commit tree can be built
+    // from HEAD + only these — never the full on-disk index (see the commit step).
+    let mut bumps: Vec<(BString, gix::ObjectId)> = Vec::new();
 
     for sub in submodules {
         let path = sub.path()?; // repo-relative, slash-separated (BString)
@@ -149,6 +152,7 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
         entry.id = new;
         staged = true;
         bumped += 1;
+        bumps.push((path.clone(), new));
         println!(
             "bumped {path_str}: {}..{}",
             old.to_hex_with_len(12),
@@ -175,12 +179,37 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
     // only moves from unstaged to staged); committing is what clears it. The
     // commit is local, forward-only, and coalesces every bump into one revision.
     if staged {
+        // Persist the on-disk index (gitlink staged) so `git status` shows the
+        // submodule clean; any of the user's OTHER staged changes stay staged.
         index.remove_tree();
         index.write(gix::index::write::Options::default())?;
 
         let plural = if bumped == 1 { "" } else { "s" };
         let message = format!("zvcs: autobump {bumped} submodule pointer{plural}");
-        let commit_id = crate::index_commit::commit_index(&repo, &index, &message)?;
+
+        // Build the commit's tree from HEAD + ONLY the bumped gitlinks — NOT the
+        // full on-disk index. autobump runs autonomously in the daemon, so
+        // committing the raw index would silently sweep a developer's unrelated
+        // `git add`ed files (or staged deletions) into the "autobump" commit.
+        let head_tree_id: Option<gix::ObjectId> = match repo.head()?.try_peel_to_id()? {
+            Some(id) => Some(repo.find_object(id)?.peel_to_tree()?.id),
+            None => None,
+        };
+        let commit_id = match head_tree_id {
+            Some(tree_id) => {
+                let mut ci = repo.index_from_tree(&tree_id)?;
+                for (p, oid) in &bumps {
+                    if let Ok(i) = ci.entry_index_by_path(BStr::new(p)) {
+                        ci.entries_mut()[i].id = *oid;
+                    }
+                }
+                crate::index_commit::commit_index(&repo, &ci, &message)?
+            }
+            // Unborn parent HEAD can't have a recorded gitlink to bump (head_id
+            // would have refused), so this arm is unreachable in practice; commit
+            // the index as a safe fallback.
+            None => crate::index_commit::commit_index(&repo, &index, &message)?,
+        };
         println!("committed {} ({} pointer{})", commit_id.to_hex_with_len(12), bumped, plural);
     }
 

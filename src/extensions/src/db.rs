@@ -548,6 +548,14 @@ pub fn unclaim(conn: &Connection, repo_id: i64, session: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// Release `repo_id`'s claim regardless of which session holds it — the escape
+/// hatch for a lease left behind by a dead agent (no TTL/expiry otherwise).
+/// Returns true if a claim was removed.
+pub fn unclaim_force(conn: &Connection, repo_id: i64) -> Result<bool> {
+    let n = conn.execute("DELETE FROM claims WHERE repo_id=?1", [repo_id])?;
+    Ok(n > 0)
+}
+
 /// All active claims as `(path, session, claimed_at)` — `path` is the workdir,
 /// falling back to the git dir.
 pub fn list_claims(conn: &Connection) -> Result<Vec<(String, String, i64)>> {

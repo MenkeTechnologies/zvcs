@@ -13,6 +13,21 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Expand a leading `~` / `~/` to `$HOME` (git expands `~` for path-typed config
+/// keys; `zvcs.crawlroots` is read as a raw string, so we do it here).
+fn expand_tilde(tok: &str) -> PathBuf {
+    if tok == "~" {
+        if let Some(h) = std::env::var_os("HOME") {
+            return PathBuf::from(h);
+        }
+    } else if let Some(rest) = tok.strip_prefix("~/") {
+        if let Some(h) = std::env::var_os("HOME") {
+            return PathBuf::from(h).join(rest);
+        }
+    }
+    PathBuf::from(tok)
+}
+
 /// Resolved `[zvcs]` settings for a repository.
 pub struct ZvcsConfig {
     /// Reconcile every clean repo (top-level + submodules) to origin/main on `interval`.
@@ -56,7 +71,7 @@ impl ZvcsConfig {
                 s.to_string()
                     .split(|c: char| c == ',' || c.is_whitespace())
                     .filter(|t| !t.is_empty())
-                    .map(PathBuf::from)
+                    .map(expand_tilde)
                     .collect()
             })
             .unwrap_or_default();

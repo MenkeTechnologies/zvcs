@@ -114,3 +114,49 @@ fn zup_skips_dirty_worktree_without_clobbering() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn zup_refuses_to_overwrite_untracked_file() {
+    // The new tree adds a tracked file that collides with an UNTRACKED file on
+    // disk. is_dirty() ignores untracked files, so reconcile must refuse the ff
+    // rather than silently clobber it (headless data loss).
+    let root = std::env::temp_dir().join(format!("zvcs-untracked-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+
+    let bare = root.join("remote.git");
+    git(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    git(&root, &["clone", "-q", bare.to_str().unwrap(), "work"]);
+    let work = root.join("work");
+    git(&work, &["checkout", "-q", "-B", "main"]);
+    std::fs::write(work.join("a.txt"), b"1\n").unwrap();
+    git(&work, &["add", "a.txt"]);
+    git(&work, &["commit", "-q", "-m", "c0"]);
+    git(&work, &["push", "-q", "origin", "main"]);
+    let c0 = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
+
+    // Remote adds a tracked file `new.txt`.
+    git(&root, &["clone", "-q", bare.to_str().unwrap(), "work2"]);
+    let work2 = root.join("work2");
+    git(&work2, &["checkout", "-q", "main"]);
+    std::fs::write(work2.join("new.txt"), b"FROM REMOTE\n").unwrap();
+    git(&work2, &["add", "new.txt"]);
+    git(&work2, &["commit", "-q", "-m", "c1"]);
+    git(&work2, &["push", "-q", "origin", "main"]);
+
+    // Locally, an UNTRACKED new.txt exists with the user's content.
+    std::fs::write(work.join("new.txt"), b"MY UNTRACKED WORK\n").unwrap();
+
+    let out = Command::new(BIN).args(["zup"]).current_dir(&work).env("ZVCS_HOME", &home).output().unwrap();
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(report.contains("would overwrite untracked") || report.contains("skipped"), "reconcile should refuse:\n{report}");
+
+    // The untracked file must be intact and HEAD must not have moved.
+    assert_eq!(std::fs::read_to_string(work.join("new.txt")).unwrap(), "MY UNTRACKED WORK\n", "untracked file was clobbered!");
+    let head_now = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
+    assert_eq!(head_now, c0, "HEAD must not move when the ff is refused");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

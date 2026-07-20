@@ -62,3 +62,44 @@ fn crawler_indexes_submodule_git_file_and_nested_repo() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn crawlroots_tilde_expands_to_home() {
+    // `zvcs.crawlroots = ~/target` must expand to $HOME/target and crawl it. A
+    // raw `~` would match nothing (silent no-op) — the bug this guards.
+    let root = std::env::temp_dir().join(format!("zvcs-crawltilde-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let zvcs_home = root.join("zhome");
+
+    // $HOME for the child: contains the target repo we want found via `~/target`.
+    let fake_home = root.join("fakehome");
+    let target = fake_home.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    git(&target, &["init", "-q", "-b", "main"]);
+    git(&target, &["commit", "--allow-empty", "-q", "-m", "t0"]);
+
+    // The cwd repo carries the config the crawler reads (discover(".")).
+    let cwd = root.join("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    git(&cwd, &["init", "-q", "-b", "main"]);
+    git(&cwd, &["config", "zvcs.crawlroots", "~/target"]);
+
+    // No path arg → configured_roots() → expand_tilde against the child's HOME.
+    let out = Command::new(BIN)
+        .args(["zreindex"])
+        .current_dir(&cwd)
+        .env("HOME", &fake_home)
+        .env("ZVCS_HOME", &zvcs_home)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "zreindex failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let repos = String::from_utf8(
+        Command::new(BIN).args(["zrepos"]).current_dir(&cwd).env("HOME", &fake_home).env("ZVCS_HOME", &zvcs_home).output().unwrap().stdout,
+    ).unwrap();
+    assert!(repos.lines().any(|l| l.ends_with("/target")), "~/target did not expand/crawl:\n{repos}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

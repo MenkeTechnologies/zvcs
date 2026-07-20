@@ -120,6 +120,9 @@ fn pid_path() -> PathBuf {
 fn ping(path: &Path) -> bool {
     match UnixStream::connect(path) {
         Ok(mut stream) => {
+            // Bound the wait: a listener whose worker thread has died would accept
+            // the connection but never answer, hanging `read_line` forever.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             if stream.write_all(b"STATUS\n").is_err() || stream.flush().is_err() {
                 return false;
             }
@@ -273,9 +276,12 @@ fn conn_loop(stream: &UnixStream, tx: &Sender<Cmd>, held: &mut Option<(PathBuf, 
                     return;
                 }
             }
-            Req::Release { id } => {
-                if let Some((repo, _)) = held.clone() {
-                    if tx.send(Cmd::Release { repo, id }).is_err() {
+            Req::Release { id: _wire_id } => {
+                // Release the (repo, id) this connection actually acquired — not
+                // the id echoed on the wire — so an explicit RELEASE behaves
+                // identically to the EOF auto-release path.
+                if let Some((repo, held_id)) = held.clone() {
+                    if tx.send(Cmd::Release { repo, id: held_id }).is_err() {
                         return;
                     }
                 }
@@ -499,7 +505,11 @@ fn log_cmd(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
     let log = zvcs_home().join("zvcs.log");
-    let content = std::fs::read_to_string(&log).unwrap_or_default();
+    // Lossy decode: a subprocess could have written a non-UTF-8 byte to the log,
+    // which would make `read_to_string` error and drop the whole file.
+    let content = std::fs::read(&log)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
     let lines: Vec<&str> = content.lines().collect();
     let start = lines.len().saturating_sub(n);
     for l in &lines[start..] {

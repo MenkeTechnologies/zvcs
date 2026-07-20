@@ -105,6 +105,34 @@ fn reconcile_repo_inner(repo: &gix::Repository, do_fetch: bool) -> Result<String
     // for the files that don't change.
     let old = repo.index_or_load_from_head()?.into_owned();
 
+    // Refuse the fast-forward BEFORE moving any ref if applying the new tree would
+    // overwrite an untracked path on disk. `is_dirty()` (the clean gate above)
+    // ignores untracked files, so without this a headless reconcile would clobber
+    // an untracked file the new tree happens to add — silent data loss. This also
+    // catches a dir->file change (the new file path already exists as a directory),
+    // which would otherwise fail the checkout *after* the refs had already moved.
+    {
+        let new_tree_id = repo.find_object(remote_id)?.peel_to_tree()?.id;
+        let new_index = repo.index_from_tree(&new_tree_id)?;
+        let old_paths: HashSet<BString> = {
+            let backing = old.path_backing();
+            old.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
+        };
+        let backing = new_index.path_backing();
+        for e in new_index.entries() {
+            let path = e.path_in(backing);
+            // Only additions can collide with an untracked path; modified/deleted
+            // paths were tracked and clean.
+            if !old_paths.contains(&path.to_owned()) {
+                if let Some(full) = repo.workdir_path(path) {
+                    if full.exists() {
+                        return Ok(format!("would overwrite untracked '{path}', skipped"));
+                    }
+                }
+            }
+        }
+    }
+
     // (e) Advance the local mainline branch to the remote tip, then attach HEAD
     // to that branch so the repository is left on `main`/`master`, not detached.
     let branch_name: FullName = format!("refs/heads/{mainline}")

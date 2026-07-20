@@ -15,6 +15,7 @@ pub mod jobrun;
 pub mod lock;
 pub mod porcelain;
 pub mod superset;
+pub mod worktree;
 
 use std::process::ExitCode;
 

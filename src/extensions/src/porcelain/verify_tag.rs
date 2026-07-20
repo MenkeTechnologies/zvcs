@@ -8,8 +8,12 @@
 //!
 //! Implemented:
 //!   * `git verify-tag <tag>...`   → verify each, stderr carries gpg's output
-//!   * `-v` / `--verbose`          → write the tag payload to stdout first
+//!   * `-v` / `--verbose`          → write the tag payload to stdout
 //!   * `--raw`                     → emit gpg's `--status-fd` lines instead
+//!   * `--format=<fmt>` / `--format <fmt>` / `--no-format` → render the tag
+//!     through the ref-filter atoms handled by `render_format`, after a
+//!     successful verification only, and suppress gpg's own output — including
+//!     the `-v` payload — the way git's `GPG_VERIFY_OMIT_STATUS` does
 //!   * `--no-verbose`, `--no-raw`, `--`, `-h`
 //!   * the pre-gpg failure paths, verbatim: unresolvable name, non-tag object,
 //!     and a tag carrying no signature block
@@ -18,9 +22,12 @@
 //! 129 for usage errors.
 //!
 //! Not covered (each bails rather than producing a plausible-looking result):
-//! `--format=<fmt>` (needs the ref-filter formatter), x509/gpgsm and SSH
-//! signatures (git drives `gpgsm` / `ssh-keygen` for those), and a configured
-//! `gpg.minTrustLevel` (its trust-level gate is not ported).
+//! ref-filter atoms outside the supported set (git has roughly eighty; only the
+//! tag-object atoms below are ported, and an unsupported one bails at render
+//! time rather than at git's up-front `verify_ref_format` position, so git's
+//! `fatal: unknown field name: <name>` / exit 128 path is NOT reproduced),
+//! x509/gpgsm and SSH signatures (git drives `gpgsm` / `ssh-keygen` for those),
+//! and a configured `gpg.minTrustLevel` (its trust-level gate is not ported).
 
 use anyhow::{bail, Result};
 use std::io::Write;
@@ -58,6 +65,7 @@ enum SigKind {
 pub fn verify_tag(args: &[String]) -> Result<ExitCode> {
     let mut verbose = false;
     let mut raw = false;
+    let mut format: Option<&str> = None;
     let mut names: Vec<&str> = Vec::new();
     let mut operands_only = false;
 
@@ -80,12 +88,22 @@ pub fn verify_tag(args: &[String]) -> Result<ExitCode> {
                 print!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }
-            // Accepted by git but only applied after a successful verification;
-            // rendering it needs the ref-filter formatter, so refuse precisely.
-            "--format" | "--no-format" => bail!("unsupported flag {a:?} (ported: -v, --raw)"),
-            _ if a.starts_with("--format=") => {
-                bail!("unsupported flag {a:?} (ported: -v, --raw)")
-            }
+            // `OPT_STRING`: the separate-argument spelling swallows the next
+            // argv entry even when that entry looks like an operand, and
+            // running out of arguments is git's own "requires a value" error.
+            "--format" => match args.get(i) {
+                Some(v) => {
+                    format = Some(v.as_str());
+                    i += 1;
+                }
+                None => {
+                    eprintln!("error: option `format' requires a value");
+                    eprint!("{USAGE}");
+                    return Ok(ExitCode::from(129));
+                }
+            },
+            "--no-format" => format = None,
+            _ if a.starts_with("--format=") => format = Some(&a["--format=".len()..]),
             _ => {
                 // git's parse-options wording, then the usage block.
                 let (kind, name) = match a.strip_prefix("--") {
@@ -99,16 +117,29 @@ pub fn verify_tag(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // git checks for missing operands before it validates the format, so a
+    // format that is both operand-less and malformed reports only the usage.
     if names.is_empty() {
         eprint!("{USAGE}");
         return Ok(ExitCode::from(129));
     }
 
+    // `verify_ref_format` runs once, up front, and a syntax error there is a
+    // usage error rather than a per-tag failure.
+    let format = match format.map(parse_format).transpose() {
+        Ok(f) => f,
+        Err(unterminated) => {
+            eprintln!("error: malformed format string {unterminated}");
+            eprint!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+    };
+
     let repo = gix::discover(".")?;
 
     let mut had_error = false;
     for name in names {
-        if !verify_one(&repo, name, verbose, raw)? {
+        if !verify_one(&repo, name, verbose, raw, format.as_deref())? {
             had_error = true;
         }
     }
@@ -122,7 +153,13 @@ pub fn verify_tag(args: &[String]) -> Result<ExitCode> {
 
 /// Verify a single named tag. Returns `false` when git would count it as a
 /// failure; diagnostics go to stderr exactly as git words them.
-fn verify_one(repo: &gix::Repository, name: &str, verbose: bool, raw: bool) -> Result<bool> {
+fn verify_one(
+    repo: &gix::Repository,
+    name: &str,
+    verbose: bool,
+    raw: bool,
+    format: Option<&[Token]>,
+) -> Result<bool> {
     let Ok(id) = repo.rev_parse_single(name) else {
         eprintln!("error: tag '{name}' not found.");
         return Ok(false);
@@ -163,20 +200,159 @@ fn verify_one(repo: &gix::Repository, name: &str, verbose: bool, raw: bool) -> R
         bail!("gpg.minTrustLevel is not supported");
     }
 
-    if verbose {
-        std::io::stdout().write_all(payload)?;
-    }
-
     let gpg = run_gpg(repo, payload, signature)?;
 
-    // git prints gpg's stderr by default, or its `--status-fd` stream under
-    // --raw; either way verbatim, on stderr.
-    let shown = if raw { &gpg.status } else { &gpg.output };
-    std::io::stderr().write_all(shown)?;
+    // `print_signature_buffer` runs after the check, and `--format` sets
+    // GPG_VERIFY_OMIT_STATUS, which skips the whole thing — so under --format
+    // even `-v` prints no payload here (an unsigned tag still does, above,
+    // because that path returns before the omit-status gate).
+    if format.is_none() {
+        if verbose {
+            std::io::stdout().write_all(payload)?;
+        }
+        // gpg's stderr by default, or its `--status-fd` stream under --raw;
+        // either way verbatim, on stderr.
+        let shown = if raw { &gpg.status } else { &gpg.output };
+        std::io::stderr().write_all(shown)?;
+    }
 
     // A verification counts as good only when gpg exited cleanly and its status
     // stream reported GOODSIG.
-    Ok(gpg.exit_ok && status_result(&gpg.status) == Some(b'G'))
+    let ok = gpg.exit_ok && status_result(&gpg.status) == Some(b'G');
+
+    // git renders the format only for tags that verified.
+    if let Some(tokens) = format.filter(|_| ok) {
+        let tag = object
+            .try_to_tag_ref()
+            .map_err(|e| anyhow::anyhow!("could not decode tag {name:?}: {e}"))?;
+        let mut line = render_format(tokens, &tag, &object.id)?;
+        line.push(b'\n');
+        std::io::stdout().write_all(&line)?;
+    }
+
+    Ok(ok)
+}
+
+/// One piece of a parsed `--format` string: literal bytes or a `%(...)` atom.
+enum Token {
+    Literal(Vec<u8>),
+    Atom(String),
+}
+
+/// Split a `--format` string into literals and atoms.
+///
+/// `%%` is a literal percent and a `%` that does not open an atom stays
+/// literal; an unterminated `%(` is git's "malformed format string", and the
+/// error carries the remainder git echoes back, starting at that `%(`.
+fn parse_format(fmt: &str) -> std::result::Result<Vec<Token>, String> {
+    let bytes = fmt.as_bytes();
+    let mut tokens = Vec::new();
+    let mut literal: Vec<u8> = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            literal.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        match bytes.get(i + 1) {
+            Some(b'%') => {
+                literal.push(b'%');
+                i += 2;
+            }
+            Some(b'(') => {
+                let Some(end) = bytes[i + 2..].iter().position(|&b| b == b')') else {
+                    return Err(fmt[i..].to_string());
+                };
+                let end = i + 2 + end;
+                if !literal.is_empty() {
+                    tokens.push(Token::Literal(std::mem::take(&mut literal)));
+                }
+                tokens.push(Token::Atom(fmt[i + 2..end].to_string()));
+                i = end + 1;
+            }
+            _ => {
+                literal.push(b'%');
+                i += 1;
+            }
+        }
+    }
+    if !literal.is_empty() {
+        tokens.push(Token::Literal(literal));
+    }
+    Ok(tokens)
+}
+
+/// Expand the parsed format against a verified tag object.
+///
+/// Only the tag-object atoms are ported; anything else git accepts bails rather
+/// than rendering a plausible-looking substitute.
+fn render_format(
+    tokens: &[Token],
+    tag: &gix::objs::TagRef<'_>,
+    id: &gix::hash::ObjectId,
+) -> Result<Vec<u8>> {
+    let tagger = tag.tagger().ok().flatten();
+    let mut out = Vec::new();
+
+    for token in tokens {
+        match token {
+            Token::Literal(bytes) => out.extend_from_slice(bytes),
+            Token::Atom(name) => match name.as_str() {
+                "tag" => out.extend_from_slice(tag.name),
+                "objectname" => out.extend_from_slice(id.to_hex().to_string().as_bytes()),
+                // The atom describes the object being verified, which this far
+                // in is always the tag object itself.
+                "objecttype" => out.extend_from_slice(b"tag"),
+                "taggername" => {
+                    if let Some(t) = &tagger {
+                        out.extend_from_slice(t.name);
+                    }
+                }
+                // git wraps the address in angle brackets; gix strips them.
+                "taggeremail" => {
+                    if let Some(t) = &tagger {
+                        out.push(b'<');
+                        out.extend_from_slice(t.email);
+                        out.push(b'>');
+                    }
+                }
+                "contents:subject" => out.extend_from_slice(&subject(tag.message)),
+                _ => bail!("unsupported format atom \"%({name})\" (ported: tag, objectname, objecttype, taggername, taggeremail, contents:subject)"),
+            },
+        }
+    }
+    Ok(out)
+}
+
+/// git's `copy_subject`: the message up to the first blank line, with the
+/// newlines inside it folded to spaces and CR dropped before LF.
+fn subject(message: &[u8]) -> Vec<u8> {
+    let start = message
+        .iter()
+        .position(|&b| b != b'\n')
+        .unwrap_or(message.len());
+    let body = &message[start..];
+
+    let mut end = body
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .unwrap_or(body.len());
+    while end > 0 && body[end - 1] == b'\n' {
+        end -= 1;
+    }
+    let region = &body[..end];
+
+    let mut out = Vec::with_capacity(region.len());
+    for (i, &b) in region.iter().enumerate() {
+        match b {
+            b'\r' if region.get(i + 1) == Some(&b'\n') => {}
+            b'\n' => out.push(b' '),
+            _ => out.push(b),
+        }
+    }
+    out
 }
 
 /// Byte offset at which the signature block starts, plus the backend it names.

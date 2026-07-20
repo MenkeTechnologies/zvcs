@@ -26,16 +26,36 @@
 //! Status letters produced: `A`, `D`, `T` (the `S_IFMT` bits of the two modes differ,
 //! e.g. file ↔ symlink) and `M`.
 //!
+//! Options that only steer patch, stat or colour rendering (`--color[=<when>]`, `-D`,
+//! `--ws-error-highlight=`, `--src-prefix=`/`--dst-prefix=`/`--no-prefix`,
+//! `--diff-algorithm=`, `--anchored=`, `--color-moved[=]`, `--word-diff[=]`,
+//! `--submodule[=]`, `-a`/`--text`, `-W`, …) are accepted and ignored: stock git's raw,
+//! `--name-only` and `--name-status` bytes are identical with and without them. The full
+//! list is `render_only_option`. `-U<n>`, `--unified=<n>` and `--binary` are *not* in it
+//! — despite looking like rendering knobs they switch the output format to a patch.
+//!
 //! ### Honest limitations (bailed on with a precise message, never faked)
 //!
-//! * Patch and stat output (`-p`/`-u`/`--patch`, `--stat`, `--numstat`, `--shortstat`,
-//!   `--dirstat`, `--summary`, `--patch-with-raw`) is not produced here.
+//! * Patch and stat output (`-p`/`-u`/`--patch`, `-U<n>`/`--unified`, `--binary`,
+//!   `--stat`, `--numstat`, `--shortstat`, `--dirstat`, `--summary`, `--compact-summary`,
+//!   `--patch-with-raw`) is not produced here.
 //! * Rename/copy/rewrite detection (`-M`, `-C`, `-B`) is off, which is git's default for
 //!   `diff-index` as well, so `--no-renames` is accepted as a no-op.
-//! * `--merge-base`, `--diff-filter`, the pickaxe (`-S`/`-G`), `-R` and the combined-merge
-//!   selectors (`-c`/`--cc`) are unimplemented.
-//! * Unmerged (conflicted) index entries bail rather than emit an approximation of git's
-//!   `U` records.
+//! * `--merge-base`, `--diff-filter`, the pickaxe (`-S`/`-G`), `-R`, `--relative`,
+//!   `--line-prefix=` and the combined-merge selectors (`-c`/`--cc`) are unimplemented.
+//! * The whitespace-insensitive comparisons (`-w`, `-b`, `--ignore-space-change`,
+//!   `--ignore-all-space`, `--ignore-space-at-eol`, `--ignore-cr-at-eol`,
+//!   `--ignore-blank-lines`, `-I<regex>`) are unimplemented. They are not cosmetic for
+//!   the raw format: git sets `diff_from_contents` for them, which both drops pairs whose
+//!   content matches once whitespace is folded and replaces the null worktree object id
+//!   with the hash git had to compute to decide that.
+//! * An unimplemented option is held until after the tree-ish has been resolved, so a
+//!   missing tree-ish still exits 129 with git's usage text and an unresolvable one still
+//!   exits 128 with git's `ambiguous argument` text, as stock git does.
+//! * Unmerged (conflicted) index entries bail. Stock git emits
+//!   `:<mode> 000000 <stage-2-id> <null> U` for them under `--cached`, and against the
+//!   worktree it emits an ordinary `M` record whose source is the stage-2 entry; neither
+//!   is reproduced here rather than approximated.
 //! * With a bare `--abbrev` and no `core.abbrev` set, the length comes from gitoxide's
 //!   unique-prefix computation for the first real id (falling back to 7); git derives it
 //!   from the packed object count, so the two can differ on large packed repositories.
@@ -115,6 +135,113 @@ enum Wt {
 const PORTED: &str = "--cached, -m, --raw, --name-only, --name-status, -z, --abbrev[=<n>], \
                       --no-abbrev, --full-index, --exit-code, --quiet, -s/--no-patch, --no-renames";
 
+/// Stock `git diff-index`'s usage text, reproduced byte for byte (including the
+/// trailing blank line) because it is written to stderr on every usage error.
+const USAGE: &str = r"usage: git diff-index [-m] [--cached] [--merge-base] [<common-diff-options>] <tree-ish> [<path>...]
+
+common diff options:
+  -z            output diff-raw with lines terminated with NUL.
+  -p            output patch format.
+  -u            synonym for -p.
+  --patch-with-raw
+                output both a patch and the diff-raw format.
+  --stat        show diffstat instead of patch.
+  --numstat     show numeric diffstat instead of patch.
+  --patch-with-stat
+                output a patch and prepend its diffstat.
+  --name-only   show only names of changed files.
+  --name-status show names and status of changed files.
+  --full-index  show full object name on index lines.
+  --abbrev=<n>  abbreviate object names in diff-tree header and diff-raw.
+  -R            swap input file pairs.
+  -B            detect complete rewrites.
+  -M            detect renames.
+  -C            detect copies.
+  --find-copies-harder
+                try unchanged files as candidate for copy detection.
+  -l<n>         limit rename attempts up to <n> paths.
+  -O<file>      reorder diffs according to the <file>.
+  -S<string>    find filepair whose only one side contains the string.
+  --pickaxe-all
+                show all files diff when -S is used and hit is found.
+  -a  --text    treat all files as text.
+
+";
+
+/// Options that steer only patch, stat or colour rendering — never the raw,
+/// `--name-only` or `--name-status` listings this module emits.
+///
+/// Each entry was checked against stock git by diffing `git diff-index HEAD` with and
+/// without the option in a repository holding a worktree modification; all of them
+/// leave those bytes and the exit status untouched. Deliberately absent: `-U<n>`,
+/// `--unified=<n>` and `--binary`, which look like rendering knobs but switch the
+/// output format to a patch, and `--line-prefix=`, which prefixes every raw record.
+fn render_only_option(a: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "-a",
+        "-D",
+        "-W",
+        "--color",
+        "--color-moved",
+        "--color-words",
+        "--default-prefix",
+        "--ext-diff",
+        "--full-index",
+        "--function-context",
+        "--histogram",
+        "--indent-heuristic",
+        "--irreversible-delete",
+        "--ita-visible-in-index",
+        "--minimal",
+        "--no-color",
+        "--no-color-moved",
+        "--no-color-moved-ws",
+        "--no-diff-merges",
+        "--no-ext-diff",
+        "--no-function-context",
+        "--no-indent-heuristic",
+        "--no-prefix",
+        "--no-relative",
+        "--no-rename-empty",
+        "--no-renames",
+        "--no-textconv",
+        "--patience",
+        "--pickaxe-all",
+        "--pickaxe-regex",
+        "--rename-empty",
+        "--submodule",
+        "--text",
+        "--textconv",
+        "--word-diff",
+    ];
+    const WITH_VALUE: &[&str] = &[
+        "--anchored=",
+        "--color=",
+        "--color-moved=",
+        "--color-moved-ws=",
+        "--diff-algorithm=",
+        "--diff-merges=",
+        "--dst-prefix=",
+        "--inter-hunk-context=",
+        "--output-indicator-context=",
+        "--output-indicator-new=",
+        "--output-indicator-old=",
+        "--src-prefix=",
+        "--submodule=",
+        "--word-diff=",
+        "--word-diff-regex=",
+        "--ws-error-highlight=",
+    ];
+    EXACT.contains(&a) || WITH_VALUE.iter().any(|p| a.starts_with(*p))
+}
+
+/// Short options whose value may be written as a separate argument (`-S fn` as well as
+/// `-Sfn`). All of them are unimplemented here, but the value still has to be consumed
+/// so it is not mistaken for the tree-ish.
+fn short_option_takes_value(a: &str) -> bool {
+    matches!(a, "-S" | "-G" | "-I" | "-O" | "-U" | "-l")
+}
+
 pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     // Dispatch passes the subcommand at index 0; tolerate its absence so the entry
     // point behaves the same either way.
@@ -135,13 +262,22 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let mut treeish: Option<&str> = None;
     let mut paths: Vec<BString> = Vec::new();
     let mut after_dashdash = false;
+    // The first option git understands but this module does not. Held back rather than
+    // raised immediately: git parses the whole command line before it looks at the
+    // tree-ish, so a missing or unresolvable revision still has to win, exactly as it
+    // does in stock git, and only a run that would otherwise have produced output is
+    // refused.
+    let mut unsupported: Option<String> = None;
 
-    for a in args {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
         if after_dashdash {
-            paths.push(a.as_str().into());
+            paths.push(a.into());
             continue;
         }
-        match a.as_str() {
+        match a {
             "--" => after_dashdash = true,
             "--cached" => opts.cached = true,
             "-m" => opts.match_missing = true,
@@ -157,18 +293,18 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 opts.exit_code = true;
                 quiet = true;
             }
-            // Accepted no-ops: these describe behaviour zvcs already produces. Raw
-            // output always carries whole ids, and rename detection is off anyway.
-            "--full-index" | "--no-renames" | "--no-color" | "--color=never"
-            | "--indent-heuristic" | "--no-indent-heuristic" => {}
             s if s.starts_with("--abbrev=") => {
                 let n: usize = s["--abbrev=".len()..]
                     .parse()
                     .map_err(|_| anyhow::anyhow!("invalid --abbrev value in {s:?}"))?;
                 opts.abbrev = Some(Some(n));
             }
+            s if render_only_option(s) => {}
             s if s.starts_with('-') && s.len() > 1 => {
-                bail!("unsupported flag {s:?} (ported: {PORTED})")
+                if short_option_takes_value(s) {
+                    i += 1;
+                }
+                unsupported.get_or_insert_with(|| s.to_owned());
             }
             s if treeish.is_none() => treeish = Some(s),
             s => paths.push(s.into()),
@@ -179,11 +315,31 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     }
 
     let Some(spec) = treeish else {
-        eprintln!(
-            "usage: git diff-index [-m] [--cached] [--merge-base] [<common-diff-options>] <tree-ish> [<path>...]"
-        );
+        eprint!("{}", USAGE);
         return Ok(ExitCode::from(129));
     };
+
+    let repo = gix::discover(".")?;
+
+    let tree_id = match repo
+        .rev_parse_single(spec)
+        .map_err(anyhow::Error::from)
+        .and_then(|id| Ok(id.object()?.peel_to_tree()?.id))
+    {
+        Ok(id) => id,
+        Err(_) => {
+            eprintln!(
+                "fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree.\n\
+                 Use '--' to separate paths from revisions, like this:\n\
+                 'git <command> [<revision>...] -- [<file>...]'"
+            );
+            return Ok(ExitCode::from(128));
+        }
+    };
+
+    if let Some(flag) = unsupported {
+        bail!("unsupported flag {flag:?} (ported: {PORTED})");
+    }
 
     // Match the house line on pathspecs: literal paths and directory prefixes are
     // honoured, magic and glob prefixes are refused rather than silently matching
@@ -196,22 +352,6 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             bail!("glob pathspecs are not supported: {p:?}");
         }
     }
-
-    let repo = gix::discover(".")?;
-
-    let tree_id = match repo
-        .rev_parse_single(spec)
-        .map_err(anyhow::Error::from)
-        .and_then(|id| Ok(id.object()?.peel_to_tree()?.id))
-    {
-        Ok(id) => id,
-        Err(_) => {
-            eprintln!(
-                "fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree."
-            );
-            return Ok(ExitCode::from(128));
-        }
-    };
 
     // Pathspecs are cwd-relative in git while output paths are root-relative, so lift
     // every pattern into repository-root space before matching.

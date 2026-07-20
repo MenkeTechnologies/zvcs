@@ -236,7 +236,7 @@ fn reset_worktree_hard(
     let odb = repo.objects.clone().into_arc()?;
     let discard_files = gix::progress::Discard;
     let discard_bytes = gix::progress::Discard;
-    gix::worktree::state::checkout(
+    crate::worktree::checkout_subset(
         &mut new_index,
         workdir.as_path(),
         odb,

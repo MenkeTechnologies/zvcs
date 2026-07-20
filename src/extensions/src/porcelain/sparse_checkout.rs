@@ -672,7 +672,7 @@ fn checkout_subset(repo: &gix::Repository, index: &mut gix::index::File) -> Resu
     opts.overwrite_existing = true;
     let odb = repo.objects.clone().into_arc()?;
     let should_interrupt = AtomicBool::new(false);
-    gix::worktree::state::checkout(
+    crate::worktree::checkout_subset(
         index,
         workdir.as_path(),
         odb,

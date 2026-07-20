@@ -12,6 +12,11 @@
 //!   * `git checkout <path>…`                  → restore paths from the index (bare pathspec form)
 //!   * `-q`/`--quiet` suppress the transition messages
 //!
+//! Every transition message (`Switched to …`, `Already on …`, `Reset branch …`,
+//! `HEAD is now at …`, `Previous HEAD position was …`, `Updated N path(s) …`,
+//! and the `advice.detachedHead` block) goes to **stderr**, as in stock git —
+//! `git checkout` writes nothing to stdout on success.
+//!
 //! Deviations (honest, conservative — never corrupting):
 //!   * A branch/commit switch that changes the working tree requires a clean
 //!     tracked worktree. Stock git also permits a switch when the dirty files do
@@ -20,8 +25,6 @@
 //!     Switches whose target tree equals the current tree (e.g. `-b` at HEAD, or
 //!     two branches on the same commit) carry local changes and are never
 //!     refused. Untracked files are ignored for the clean check, matching git.
-//!   * The multi-line `advice.detachedHead` help block is not printed; the
-//!     functional `HEAD is now at …` / `Previous HEAD position was …` lines are.
 //!   * Pathspecs match literal files and directory prefixes (and `.`); general
 //!     glob magic is left to the shell.
 //!   * `-m`/`--merge`, `-p`/`--patch`, `--ours`/`--theirs`, `-t`/`--track`,
@@ -122,7 +125,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         }
         if let Ok(id) = repo.rev_parse_single(spec) {
             let commit = id.object()?.peel_to_commit()?;
-            return detached_checkout(&repo, spec, commit, quiet);
+            return detached_checkout(&repo, spec, commit, quiet, detach);
         }
         // Not a ref/rev — treat as a path restore from the index (bare form).
         return restore_from_index(&repo, &pre, true, quiet);
@@ -143,7 +146,7 @@ fn switch_to_branch(repo: &gix::Repository, spec: &str, quiet: bool) -> Result<E
     if let Some(cur) = repo.head_name()? {
         if cur.shorten().to_string() == spec {
             if !quiet {
-                println!("Already on '{spec}'");
+                eprintln!("Already on '{spec}'");
             }
             return Ok(ExitCode::SUCCESS);
         }
@@ -171,23 +174,28 @@ fn switch_to_branch(repo: &gix::Repository, spec: &str, quiet: bool) -> Result<E
     set_head_symbolic(repo, branch_full, &format!("checkout: moving from {old_label} to {spec}"))?;
 
     if !quiet {
+        // git only reports the abandoned detached position when it actually
+        // moves (checkout.c: `!old->path && old->commit != new->commit`).
         if old_detached {
-            if let Some(id) = old_id {
+            if let Some(id) = old_id.filter(|id| *id != commit.id) {
                 let (abbrev, summary) = describe(repo, id)?;
-                println!("Previous HEAD position was {abbrev} {summary}");
+                eprintln!("Previous HEAD position was {abbrev} {summary}");
             }
         }
-        println!("Switched to branch '{spec}'");
+        eprintln!("Switched to branch '{spec}'");
     }
     Ok(ExitCode::SUCCESS)
 }
 
 /// Detach `HEAD` at `commit`, updating the worktree when the target tree differs.
+/// `force_detach` is true for an explicit `--detach`, which suppresses the
+/// `advice.detachedHead` block just as git's `opts->force_detach` does.
 fn detached_checkout(
     repo: &gix::Repository,
     spec: &str,
     commit: gix::Commit<'_>,
     quiet: bool,
+    force_detach: bool,
 ) -> Result<ExitCode> {
     let target_id = commit.id;
     let target_tree = commit.tree_id()?.detach();
@@ -215,13 +223,40 @@ fn detached_checkout(
         if old_detached {
             if let (Some(old), true) = (old_id, old_id != Some(target_id)) {
                 let (abbrev, summary) = describe(repo, old)?;
-                println!("Previous HEAD position was {abbrev} {summary}");
+                eprintln!("Previous HEAD position was {abbrev} {summary}");
             }
+        } else if !force_detach
+            && repo.config_snapshot().boolean("advice.detachedHead") != Some(false)
+        {
+            // Leaving an attached HEAD without an explicit --detach: git warns.
+            print_detached_head_advice(spec);
         }
         let (abbrev, summary) = describe(repo, target_id)?;
-        println!("HEAD is now at {abbrev} {summary}");
+        eprintln!("HEAD is now at {abbrev} {summary}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The `advice.detachedHead` block git prints when a bare `git checkout <commit>`
+/// moves off a branch, verbatim (git 2.55.0, `builtin/checkout.c`).
+fn print_detached_head_advice(spec: &str) {
+    eprintln!("Note: switching to '{spec}'.\n");
+    eprintln!(
+        "You are in 'detached HEAD' state. You can look around, make experimental\n\
+         changes and commit them, and you can discard any commits you make in this\n\
+         state without impacting any branches by switching back to a branch.\n\
+         \n\
+         If you want to create a new branch to retain commits you create, you may\n\
+         do so (now or later) by using -c with the switch command. Example:\n\
+         \n\
+         \x20 git switch -c <new-branch-name>\n\
+         \n\
+         Or undo this operation with:\n\
+         \n\
+         \x20 git switch -\n\
+         \n\
+         Turn off this advice by setting config variable advice.detachedHead to false\n"
+    );
 }
 
 /// Create (`-b`) or create-or-reset (`-B`) `refs/heads/<name>` at `start`, then
@@ -292,18 +327,18 @@ fn create_and_switch(
     if !quiet {
         // Reset-in-place (-B on the current branch) prints only "Reset branch".
         if existed && already_on {
-            println!("Reset branch '{name}'");
+            eprintln!("Reset branch '{name}'");
         } else {
             if old_detached {
-                if let Some(id) = old_id {
+                if let Some(id) = old_id.filter(|id| *id != start_id) {
                     let (abbrev, summary) = describe(repo, id)?;
-                    println!("Previous HEAD position was {abbrev} {summary}");
+                    eprintln!("Previous HEAD position was {abbrev} {summary}");
                 }
             }
             if existed {
-                println!("Switched to and reset branch '{name}'");
+                eprintln!("Switched to and reset branch '{name}'");
             } else {
-                println!("Switched to a new branch '{name}'");
+                eprintln!("Switched to a new branch '{name}'");
             }
         }
     }
@@ -347,7 +382,7 @@ fn restore_from_index(
 
     if bare && !quiet {
         let n = matched.len();
-        println!("Updated {n} path{} from the index", if n == 1 { "" } else { "s" });
+        eprintln!("Updated {n} path{} from the index", if n == 1 { "" } else { "s" });
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -506,7 +541,7 @@ fn checkout_subset(
     opts.destination_is_initially_empty = false;
     opts.overwrite_existing = true;
     let odb = repo.objects.clone().into_arc()?;
-    gix::worktree::state::checkout(
+    crate::worktree::checkout_subset(
         index,
         workdir.as_path(),
         odb,

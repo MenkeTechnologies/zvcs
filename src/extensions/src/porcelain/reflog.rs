@@ -2,8 +2,11 @@ use anyhow::{anyhow, bail, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::SystemTime;
 
 use gix::bstr::ByteSlice;
+use gix::date::time::Format as TimeFormat;
+use gix::date::time::format as tfmt;
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
 
@@ -14,40 +17,92 @@ use gix::prelude::ObjectIdExt;
 /// log directory for the subcommands that are defined in terms of the files
 /// themselves.
 ///
-/// Ported subcommands (stdout is byte-identical to stock git for these):
+/// # Subcommands
+///
 ///   * `git reflog [show] [<options>] [<ref>...]` — `show` is the default, and a
-///     missing `<ref>` defaults to `HEAD`. Each entry prints as
-///     `<abbrev-oid> <ref-as-typed>@{<n>}: <message>`, newest first, exactly as
-///     `git log -g --abbrev-commit --pretty=oneline` renders it.
-///     A `<ref>@{<n>}` argument starts the listing at entry `n` and keeps
-///     numbering from `n`, matching git.
-///   * `git reflog list`   — every ref that has a reflog, in git's directory-tree
-///     order (per-directory name sort, so `refs/heads/a/b` precedes `refs/heads/a-c`).
+///     missing `<ref>` defaults to `HEAD`.
+///   * `git reflog list` — every ref that has a reflog, in git's directory-tree
+///     order (per-directory name sort).
 ///   * `git reflog exists <ref>` — exit 0 if `$GIT_DIR/logs/<ref>` is a file, else 1.
-///     Like git this is a literal path test, so `exists master` is 1 while
-///     `exists refs/heads/master` is 0.
+///   * `write`, `delete`, `drop`, `expire` bail: `gix-ref` appends to a reflog only
+///     as a side effect of a ref transaction and exposes no rewrite/truncate API.
 ///
-/// Exit codes follow stock git: 128 for the `fatal:` paths (unknown revision,
-/// out-of-range `@{n}`, malformed refname), 129 for the `exists` usage error,
-/// 1 for `exists` on a ref without a reflog.
+/// # Argument grammar for `show`
 ///
-/// Ported `show` options: `-n <n>`, `-n<n>`, `-<n>`, `--max-count=<n>` (a single
-/// budget shared across all `<ref>` arguments, as in git). Every other option
-/// bails rather than being ignored.
+/// `git reflog show` is `git log -g --abbrev-commit --pretty=oneline`, so it takes
+/// the whole `git log` option vocabulary. Stock git processes argv strictly left to
+/// right and resolves every non-option argument as a revision *as it is scanned*,
+/// which fixes the error precedence reproduced here (verified against git 2.55.0):
 ///
-/// Not ported, and rejected with a precise reason instead of wrong output:
-///   * `write`, `delete`, `drop`, `expire` — these rewrite or truncate log files;
-///     `gix-ref` only appends to a reflog as a side effect of a ref transaction
-///     and exposes no rewrite/truncate/expiry API.
-///   * `--all` for `show` — git orders and de-duplicates that walk through the
-///     revision machinery, which this direct log reader does not reproduce.
-///   * date-based selectors (`<ref>@{yesterday}`), the bare `@{<n>}` form,
-///     pathspecs, and every `git log` formatting option other than the count limit.
+///   1. `--date=<bogus>` / `--pretty=<bogus>` fail where they appear in argv.
+///   2. A non-option argument that is not a revision fails at its own position —
+///      *before* any option-validation error later in argv. `git reflog --verbose
+///      does-not-exist` reports the ambiguous argument, not the bad flag.
+///   3. Only after the whole scan: `--graph`/`--children`/`--topo-order`/
+///      `--date-order`/`--author-date-order` report "cannot combine --walk-reflogs
+///      with history-limiting options", which outranks `--reverse`'s own conflict.
+///   4. Then `--reverse` reports its conflict with `--walk-reflogs`.
+///   5. Then the first unrecognized option reports `unrecognized argument: <arg>`.
 ///
-/// One known divergence: when a reflog entry names an object that is no longer in
-/// the odb, gitoxide's disambiguating `shorten()` fails and the id is abbreviated
-/// to the plain `core.abbrev` length ([`abbrev_len`]) without git's uniqueness
-/// extension. Entries whose objects are present abbreviate identically to git.
+/// All five paths exit 128. `exists` without exactly one argument exits 129.
+///
+/// # Implemented `show` options
+///
+/// Counting: `-n <n>`, `-n<n>`, `-<n>`, `--max-count=<n>`, `--skip=<n>` — one budget
+/// shared across every ref, applied after filtering, as in git.
+///
+/// Abbreviation: `--abbrev=<n>`, `--no-abbrev`, `--abbrev-commit`, `--no-abbrev-commit`.
+///
+/// Ref sets: `--all`, `--branches[=<pat>]`, `--tags[=<pat>]`, `--remotes[=<pat>]`,
+/// `--glob=<pat>`, `--exclude=<pat>` (applies to the ref-set options that follow it).
+/// Patterns use git's wildmatch with `*` crossing `/`, and a pattern without a `*`
+/// gains a trailing `/*`, matching `normalize_glob_ref()`.
+///
+/// Selector display: `--date=<fmt>` for `default`, `raw`, `unix`, `short`, `iso`,
+/// `iso8601`, `iso-strict`, `iso8601-strict`, `rfc`, `rfc2822`. A `<ref>@{<date>}`
+/// argument also switches the selector to date form, as git does.
+///
+/// Filtering: `--merges`, `--no-merges` (by parent count of the entry's commit).
+///
+/// Output: `--parents`, and `--format=`/`--pretty=` for the placeholders
+/// `%H %h %T %P %p %s %an %ae %ad %cn %ce %cd %gd %gD %gn %ge %gs %n %% %x<hh>`
+/// plus the `oneline` built-in. Empty formats print nothing at all, and a format
+/// string is newline-terminated per entry, both matching git.
+///
+/// # Options recognized but deliberately not implemented
+///
+/// These bail with a terse reason rather than being ignored, because ignoring them
+/// would print a wrong answer that looks like success:
+///
+///   * Diff output — `-p`, `--patch`, `--stat`, `--shortstat`, `--numstat`, `--raw`,
+///     `--name-only`, `--name-status`, `--summary`, `--dirstat`. Rendering these
+///     needs git's diff driver (rename detection, `core.quotePath` octal escaping,
+///     stat-width scaling); none of that is reproduced here.
+///   * Message filtering — `--grep=<pat>` and the commit-date limiters `--since=`,
+///     `--after=`, `--before=`, `--until=`. `--grep` needs git's regex dialect
+///     selection; the limiters need approxidate over the *reflog entry* timestamp.
+///   * Decoration — `--decorate`, `--decorate=short`, `--decorate=full`, `%d`, `%D`,
+///     `%C(...)`, `--color=always`.
+///   * The multi-line `--pretty` built-ins (`short`, `medium`, `full`, `fuller`,
+///     `raw`, `reference`, `email`) and bare `--pretty`.
+///   * `--date=relative`, `--date=human`, `--date=format:...` and every `-local`
+///     variant — these need the current time or the local zone, neither of which
+///     `gix-date` exposes for formatting.
+///   * Pathspecs (`--` and anything after it).
+///
+/// # Known divergences
+///
+///   * `--all` and `--glob` group entries per ref, in ref-name order, with `HEAD`
+///     last. Git feeds all reflogs through its date-ordered revision walk, so when
+///     reflogs of different refs interleave in time the orders differ. They agree
+///     whenever each ref's entries form one contiguous run, which is the common case.
+///   * `--abbrev=<n>` emits exactly `n` hex characters; git would lengthen the
+///     prefix further if `n` were not unique. Automatic abbreviation (the default)
+///     does go through gitoxide's disambiguating `shorten()`.
+///   * When a reflog entry names an object missing from the odb, `shorten()` fails
+///     and the id falls back to a plain [`abbrev_len`]-length prefix, and the
+///     commit-derived placeholders (`%s`, `%an`, …) render empty instead of git's
+///     fatal error.
 pub fn reflog(args: &[String]) -> Result<ExitCode> {
     // Tolerate the subcommand being present at index 0 regardless of how the
     // dispatcher slices argv.
@@ -78,44 +133,272 @@ pub fn reflog(args: &[String]) -> Result<ExitCode> {
     }
 }
 
+/// One reflog line, already flipped into git's newest-first order.
+struct Entry {
+    oid: ObjectId,
+    who_name: Vec<u8>,
+    who_email: Vec<u8>,
+    time: gix::date::Time,
+    message: Vec<u8>,
+}
+
+/// One ref's worth of reflog, plus how it should be named in the output.
+struct Section {
+    /// The ref as it should be printed: as typed for an explicit argument, the
+    /// full name for `--all`/`--glob`, the short name for `--branches` and friends.
+    display: String,
+    /// The full ref name, for `%gD`.
+    full: String,
+    /// Index of the first entry to print (a `@{<n>}` or `@{<date>}` start point).
+    start: usize,
+    entries: Vec<Entry>,
+}
+
+/// How commit ids are rendered.
+enum Abbrev {
+    /// git's automatic length: the shortest unique prefix, at least `core.abbrev`.
+    Auto,
+    /// Exactly this many hex characters.
+    Len(usize),
+    /// The whole hash.
+    Full,
+}
+
+struct Opts {
+    max_count: Option<usize>,
+    skip: usize,
+    abbrev: Abbrev,
+    /// Set by `--date=<fmt>`.
+    date: Option<TimeFormat>,
+    /// Set by a `<ref>@{<date>}` argument, which switches selectors to date form.
+    date_from_selector: bool,
+    /// `--format=`/`--pretty=` string; `None` is git's default oneline layout.
+    format: Option<String>,
+    parents: bool,
+    /// `Some(true)` for `--merges`, `Some(false)` for `--no-merges`.
+    merges: Option<bool>,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Opts {
+            max_count: None,
+            skip: 0,
+            abbrev: Abbrev::Auto,
+            date: None,
+            date_from_selector: false,
+            format: None,
+            parents: false,
+            merges: None,
+        }
+    }
+}
+
+/// Record the first option that is recognized but not rendered here. Only the
+/// first matters: git would have failed on it before reaching any later one.
+fn note_first(slot: &mut Option<String>, what: String) {
+    if slot.is_none() {
+        *slot = Some(what);
+    }
+}
+
 /// `git reflog show` — render the log of each `<ref>` (default `HEAD`).
 fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
-    let mut max_count: Option<usize> = None;
-    let mut specs: Vec<&str> = Vec::new();
+    let full_hex = repo.object_hash().len_in_hex();
+    let mut opts = Opts::default();
+    let mut sections: Vec<Section> = Vec::new();
+    let mut excludes: Vec<String> = Vec::new();
+    // Whether argv named any reflog to read; if not, `show` defaults to HEAD.
+    let mut saw_ref_source = false;
+    let mut limited = false;
+    let mut reverse = false;
+    let mut unrecognized: Option<String> = None;
+    let mut unimplemented: Option<String> = None;
 
     let mut i = 0;
     while i < rest.len() {
         let a = rest[i].as_str();
         match a {
-            "-n" | "--max-count" => {
+            // ---- counting -------------------------------------------------
+            "-n" | "--max-count" | "--skip" => {
                 i += 1;
-                let n = rest
-                    .get(i)
-                    .ok_or_else(|| anyhow!("option `{a}` requires a value"))?;
-                max_count = Some(parse_count(n, a)?);
+                let Some(v) = rest.get(i) else {
+                    if a == "-n" {
+                        eprintln!("error: -n requires an argument");
+                    } else {
+                        eprintln!("error: option `{}' requires a value", &a[2..]);
+                    }
+                    return Ok(ExitCode::from(128));
+                };
+                let Ok(n) = v.parse::<usize>() else {
+                    eprintln!("fatal: '{v}': not an integer");
+                    return Ok(ExitCode::from(128));
+                };
+                if a == "--skip" {
+                    opts.skip = n;
+                } else {
+                    opts.max_count = Some(n);
+                }
             }
-            "--" => bail!("pathspec filtering is not supported"),
-            s if s.starts_with("--max-count=") => {
-                max_count = Some(parse_count(&s["--max-count=".len()..], "--max-count")?);
+            s if s.starts_with("--max-count=") || s.starts_with("--skip=") => {
+                let (key, v) = s.split_once('=').expect("checked for `=` above");
+                let Ok(n) = v.parse::<usize>() else {
+                    eprintln!("fatal: '{v}': not an integer");
+                    return Ok(ExitCode::from(128));
+                };
+                if key == "--skip" {
+                    opts.skip = n;
+                } else {
+                    opts.max_count = Some(n);
+                }
             }
             s if s.len() > 2 && s.starts_with("-n") && all_digits(&s[2..]) => {
-                max_count = Some(parse_count(&s[2..], "-n")?);
+                opts.max_count = Some(s[2..].parse().expect("all digits"));
             }
             s if s.len() > 1 && s.starts_with('-') && all_digits(&s[1..]) => {
-                max_count = Some(parse_count(&s[1..], "-<n>")?);
+                opts.max_count = Some(s[1..].parse().expect("all digits"));
             }
-            s if s.starts_with('-') => bail!(
-                "unsupported flag {s:?} (ported: -n <n>, -n<n>, -<n>, --max-count=<n>)"
-            ),
-            s => specs.push(s),
+
+            // ---- abbreviation ---------------------------------------------
+            "--abbrev" | "--abbrev-commit" => opts.abbrev = Abbrev::Auto,
+            "--no-abbrev" | "--no-abbrev-commit" => opts.abbrev = Abbrev::Full,
+            s if s.starts_with("--abbrev=") => {
+                // git clamps to [4, hash-len] and treats garbage as the minimum.
+                let n = s["--abbrev=".len()..].parse::<usize>().unwrap_or(0);
+                opts.abbrev = Abbrev::Len(n.clamp(4, full_hex));
+            }
+
+            // ---- selector date format -------------------------------------
+            s if s.starts_with("--date=") => match parse_date_mode(&s["--date=".len()..]) {
+                DateMode::Known(f) => opts.date = Some(f),
+                DateMode::Unimplemented => note_first(&mut unimplemented, s.to_owned()),
+                DateMode::Unknown => {
+                    eprintln!("fatal: unknown date format {}", &s["--date=".len()..]);
+                    return Ok(ExitCode::from(128));
+                }
+            },
+            "--relative-date" => note_first(&mut unimplemented, a.to_owned()),
+
+            // ---- output format --------------------------------------------
+            "--oneline" => opts.format = None,
+            "--pretty" | "--format" => note_first(&mut unimplemented, a.to_owned()),
+            s if s.starts_with("--pretty=") || s.starts_with("--format=") => {
+                let v = s.split_once('=').expect("checked for `=` above").1;
+                match classify_pretty(v) {
+                    Pretty::Oneline => opts.format = None,
+                    Pretty::Custom(f) => match unsupported_placeholder(&f) {
+                        Some(p) => {
+                            note_first(&mut unimplemented, format!("{s} (placeholder {p})"));
+                        }
+                        None => opts.format = Some(f),
+                    },
+                    Pretty::Unimplemented => note_first(&mut unimplemented, s.to_owned()),
+                    Pretty::Invalid => {
+                        eprintln!("fatal: invalid --pretty format: {v}");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+            }
+
+            // ---- ref sets --------------------------------------------------
+            "--all" => {
+                saw_ref_source = true;
+                sections.extend(expand_all(repo, &excludes)?);
+            }
+            "--branches" | "--tags" | "--remotes" => {
+                saw_ref_source = true;
+                sections.extend(expand_prefixed(repo, ref_prefix(a), None, &excludes)?);
+            }
+            s if s.starts_with("--branches=")
+                || s.starts_with("--tags=")
+                || s.starts_with("--remotes=") =>
+            {
+                saw_ref_source = true;
+                let (key, pat) = s.split_once('=').expect("checked for `=` above");
+                sections.extend(expand_prefixed(repo, ref_prefix(key), Some(pat), &excludes)?);
+            }
+            s if s.starts_with("--glob=") => {
+                saw_ref_source = true;
+                sections.extend(expand_glob(repo, &s["--glob=".len()..], &excludes)?);
+            }
+            s if s.starts_with("--exclude=") => excludes.push(s["--exclude=".len()..].to_owned()),
+
+            // ---- filtering / extra columns ---------------------------------
+            "--merges" => opts.merges = Some(true),
+            "--no-merges" => opts.merges = Some(false),
+            "--parents" => opts.parents = true,
+
+            // ---- post-scan conflicts ---------------------------------------
+            "--graph" | "--children" | "--topo-order" | "--date-order"
+            | "--author-date-order" => limited = true,
+            "--reverse" => reverse = true,
+
+            // ---- recognized, no effect on reflog output ---------------------
+            // Each of these was verified byte-identical to plain `git reflog`.
+            "--walk-reflogs" | "-g" | "--single-worktree" | "--first-parent" | "--boundary"
+            | "--source" | "--no-patch" | "-s" | "--decorate=no" | "--no-decorate"
+            | "--color=never" | "--color=auto" | "--no-color" | "--invert-grep"
+            | "--all-match" | "--regexp-ignore-case" | "-i" | "--fixed-strings" | "-F"
+            | "--basic-regexp" | "--extended-regexp" | "-E" | "--perl-regexp" | "-P" => {}
+
+            // ---- recognized, deliberately unimplemented ---------------------
+            "-p" | "--patch" | "-u" | "--stat" | "--shortstat" | "--numstat" | "--raw"
+            | "--name-only" | "--name-status" | "--summary" | "--dirstat"
+            | "--patch-with-stat" | "--decorate" | "--decorate=full" | "--decorate=short"
+            | "--color" | "--color=always" | "--" => {
+                note_first(&mut unimplemented, a.to_owned());
+            }
+            s if s.starts_with("--grep=")
+                || s.starts_with("--since=")
+                || s.starts_with("--after=")
+                || s.starts_with("--before=")
+                || s.starts_with("--until=")
+                || s.starts_with("--stat=")
+                || s.starts_with("--dirstat=") =>
+            {
+                note_first(&mut unimplemented, s.to_owned());
+            }
+
+            // ---- unknown option --------------------------------------------
+            s if s.starts_with('-') => {
+                if unrecognized.is_none() {
+                    unrecognized = Some(s.to_owned());
+                }
+            }
+
+            // ---- revision ---------------------------------------------------
+            s => {
+                saw_ref_source = true;
+                match resolve_spec(repo, s, &mut opts)? {
+                    Resolved::Section(section) => sections.push(section),
+                    // Resolves to an object but owns no reflog: git prints nothing.
+                    Resolved::Empty => {}
+                    Resolved::Fatal(code) => return Ok(code),
+                }
+            }
         }
         i += 1;
     }
 
+    if limited {
+        eprintln!("fatal: cannot combine --walk-reflogs with history-limiting options");
+        return Ok(ExitCode::from(128));
+    }
+    if reverse {
+        eprintln!("fatal: options '--reverse' and '--walk-reflogs' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
+    if let Some(arg) = unrecognized {
+        eprintln!("fatal: unrecognized argument: {arg}");
+        return Ok(ExitCode::from(128));
+    }
+    if let Some(what) = unimplemented {
+        bail!("`reflog show {what}` is not ported");
+    }
+
     // Bare `git reflog` on an unborn HEAD has its own fatal message in git,
     // distinct from the "ambiguous argument" one an explicit `HEAD` produces.
-    let defaulted = specs.is_empty();
-    if defaulted {
+    if !saw_ref_source {
         if let Ok(head) = repo.head() {
             if head.is_unborn() {
                 let branch = head
@@ -126,75 +409,698 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(128));
             }
         }
-        specs.push("HEAD");
+        match resolve_spec(repo, "HEAD", &mut opts)? {
+            Resolved::Section(section) => sections.push(section),
+            Resolved::Empty => {}
+            Resolved::Fatal(code) => return Ok(code),
+        }
     }
 
-    let fallback_len = abbrev_len(repo);
-    let mut remaining = max_count.unwrap_or(usize::MAX);
+    render(repo, &sections, &opts, full_hex)
+}
+
+/// Walk the collected sections and write git's output for them.
+fn render(
+    repo: &gix::Repository,
+    sections: &[Section],
+    opts: &Opts,
+    full_hex: usize,
+) -> Result<ExitCode> {
+    let fallback_len = abbrev_len(repo, full_hex);
+    // No `--date` and no date selector means the classic `@{<n>}` numbering.
+    let selector_fmt: Option<TimeFormat> = opts
+        .date
+        .or_else(|| opts.date_from_selector.then(|| tfmt::DEFAULT.into()));
+    let field_fmt: TimeFormat = opts.date.unwrap_or_else(|| tfmt::DEFAULT.into());
+
+    let mut skipped = 0usize;
+    let mut printed = 0usize;
+    let budget = opts.max_count.unwrap_or(usize::MAX);
     let mut out: Vec<u8> = Vec::new();
 
-    for spec in specs {
-        let (base, selector) = split_selector(spec)?;
-
-        // Read the whole log, then flip it: the file is oldest-first, git prints
-        // newest-first with @{0} as the most recent entry.
-        let mut entries: Vec<(ObjectId, Vec<u8>)> = Vec::new();
-        let mut has_reflog = false;
-        if let Some(reference) = repo.try_find_reference(base).ok().flatten() {
-            let mut platform = reference.log_iter();
-            if let Some(iter) = platform.all()? {
-                has_reflog = true;
-                for line in iter {
-                    let line = line.map_err(|e| anyhow!("{base}: bad reflog line: {e}"))?;
-                    entries.push((line.new_oid(), line.message.to_vec()));
-                }
-            }
-        }
-        entries.reverse();
-
-        let start = match selector {
-            // `<ref>@{n}` is resolved by git's revision parser, which needs the
-            // reflog to exist and to be long enough.
-            Some(n) => {
-                if !has_reflog || entries.is_empty() {
-                    return Ok(fatal_ambiguous(spec));
-                }
-                if n >= entries.len() {
-                    eprintln!("fatal: log for '{base}' only has {} entries", entries.len());
-                    return Ok(ExitCode::from(128));
-                }
-                n
-            }
-            // Without a selector a ref that simply has no log prints nothing, but
-            // an argument that is not a revision at all is fatal.
-            None => {
-                if !has_reflog {
-                    if repo.rev_parse_single(base).is_err() {
-                        return Ok(fatal_ambiguous(spec));
-                    }
+    'outer: for section in sections {
+        for (n, entry) in section.entries.iter().enumerate().skip(section.start) {
+            if let Some(want_merge) = opts.merges {
+                if is_merge(repo, entry.oid) != want_merge {
                     continue;
                 }
-                0
             }
-        };
-
-        for (n, (id, message)) in entries.iter().enumerate().skip(start) {
-            if remaining == 0 {
-                break;
+            if skipped < opts.skip {
+                skipped += 1;
+                continue;
             }
-            out.extend_from_slice(short_id(repo, *id, fallback_len).as_bytes());
-            out.push(b' ');
-            out.extend_from_slice(base.as_bytes());
-            out.extend_from_slice(format!("@{{{n}}}: ").as_bytes());
-            out.extend_from_slice(message);
-            out.push(b'\n');
-            remaining -= 1;
+            if printed >= budget {
+                break 'outer;
+            }
+            let selector = match selector_fmt {
+                Some(f) => entry.time.format_or_unix(f),
+                None => n.to_string(),
+            };
+            match &opts.format {
+                Some(fmt) => {
+                    let line = expand_format(
+                        repo,
+                        fmt,
+                        section,
+                        entry,
+                        &selector,
+                        opts,
+                        field_fmt,
+                        fallback_len,
+                    );
+                    // git prints nothing at all for an empty expansion, and
+                    // terminates a non-empty one with a newline.
+                    if !line.is_empty() {
+                        out.extend_from_slice(&line);
+                        out.push(b'\n');
+                    }
+                }
+                None => {
+                    out.extend_from_slice(
+                        abbrev_id(repo, entry.oid, &opts.abbrev, fallback_len).as_bytes(),
+                    );
+                    if opts.parents {
+                        for parent in parents_of(repo, entry.oid) {
+                            out.push(b' ');
+                            out.extend_from_slice(
+                                abbrev_id(repo, parent, &opts.abbrev, fallback_len).as_bytes(),
+                            );
+                        }
+                    }
+                    out.push(b' ');
+                    out.extend_from_slice(section.display.as_bytes());
+                    out.extend_from_slice(format!("@{{{selector}}}: ").as_bytes());
+                    out.extend_from_slice(&entry.message);
+                    out.push(b'\n');
+                }
+            }
+            printed += 1;
         }
     }
 
     std::io::stdout().write_all(&out)?;
     Ok(ExitCode::SUCCESS)
 }
+
+/// The outcome of resolving one non-option argument.
+enum Resolved {
+    Section(Section),
+    Empty,
+    Fatal(ExitCode),
+}
+
+/// Resolve a `<ref>`, `<ref>@{<n>}` or `<ref>@{<date>}` argument the way git's
+/// revision parser does, reporting git's own fatal text at the failure points.
+fn resolve_spec(repo: &gix::Repository, spec: &str, opts: &mut Opts) -> Result<Resolved> {
+    let (base, selector) = split_selector(spec);
+
+    let entries = read_entries(repo, base)?;
+
+    match selector {
+        None => {
+            let Some(entries) = entries else {
+                // Not a ref with a log. Still fine if it names an object at all.
+                return Ok(if repo.rev_parse_single(base).is_ok() {
+                    Resolved::Empty
+                } else {
+                    Resolved::Fatal(fatal_ambiguous(spec))
+                });
+            };
+            Ok(Resolved::Section(Section {
+                display: base.to_owned(),
+                full: full_name(repo, base),
+                start: 0,
+                entries,
+            }))
+        }
+        Some(Selector::Index(n)) => {
+            let Some(entries) = entries else {
+                return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
+            };
+            if entries.is_empty() {
+                return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
+            }
+            if n >= entries.len() {
+                eprintln!("fatal: log for '{base}' only has {} entries", entries.len());
+                return Ok(Resolved::Fatal(ExitCode::from(128)));
+            }
+            Ok(Resolved::Section(Section {
+                display: base.to_owned(),
+                full: full_name(repo, base),
+                start: n,
+                entries,
+            }))
+        }
+        Some(Selector::Date(text)) => {
+            let Some(entries) = entries else {
+                return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
+            };
+            // git's `@{...}` accepts dots where approxidate wants spaces.
+            let normalized = text.replace('.', " ");
+            let Ok(target) = gix::date::parse(&normalized, Some(SystemTime::now())) else {
+                return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
+            };
+            // Any date selector switches the printed selector to date form.
+            opts.date_from_selector = true;
+
+            // Entries are newest-first; the answer is the newest one that was
+            // already current at `target`.
+            let start = entries
+                .iter()
+                .position(|e| e.time.seconds <= target.seconds)
+                .unwrap_or(entries.len());
+            if start == entries.len() {
+                if let Some(oldest) = entries.last() {
+                    eprintln!(
+                        "warning: log for '{base}' only goes back to {}",
+                        oldest.time.format_or_unix(tfmt::RFC2822)
+                    );
+                }
+            }
+            Ok(Resolved::Section(Section {
+                display: base.to_owned(),
+                full: full_name(repo, base),
+                start,
+                entries,
+            }))
+        }
+    }
+}
+
+/// Read a ref's whole reflog, flipped into git's newest-first order.
+/// `None` means the ref has no log file (or does not exist).
+fn read_entries(repo: &gix::Repository, name: &str) -> Result<Option<Vec<Entry>>> {
+    let Some(reference) = repo.try_find_reference(name).ok().flatten() else {
+        return Ok(None);
+    };
+    let mut platform = reference.log_iter();
+    let Some(iter) = platform.all()? else {
+        return Ok(None);
+    };
+    let mut entries: Vec<Entry> = Vec::new();
+    for line in iter {
+        let line = line.map_err(|e| anyhow!("{name}: bad reflog line: {e}"))?;
+        entries.push(Entry {
+            oid: line.new_oid(),
+            who_name: line.signature.name.to_vec(),
+            who_email: line.signature.email.to_vec(),
+            time: line.signature.time().ok().unwrap_or_default(),
+            message: line.message.to_vec(),
+        });
+    }
+    entries.reverse();
+    Ok(Some(entries))
+}
+
+/// The full ref name behind a ref as typed, for `%gD`. Falls back to the input.
+fn full_name(repo: &gix::Repository, name: &str) -> String {
+    match repo.try_find_reference(name).ok().flatten() {
+        Some(r) => r.name().as_bstr().to_str_lossy().into_owned(),
+        None => name.to_owned(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ref sets
+// ---------------------------------------------------------------------------
+
+/// Every full ref name in the repository, sorted, whatever its kind.
+fn all_ref_names(repo: &gix::Repository) -> Result<Vec<String>> {
+    let platform = repo.references()?;
+    let mut names: Vec<String> = Vec::new();
+    for reference in platform.all()? {
+        let Ok(reference) = reference else { continue };
+        names.push(reference.name().as_bstr().to_str_lossy().into_owned());
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// `--all`: every ref that owns a reflog, then `HEAD`.
+fn expand_all(repo: &gix::Repository, excludes: &[String]) -> Result<Vec<Section>> {
+    let mut sections = Vec::new();
+    for name in all_ref_names(repo)? {
+        if excluded(&name, excludes) {
+            continue;
+        }
+        if let Some(entries) = read_entries(repo, &name)? {
+            sections.push(Section {
+                display: name.clone(),
+                full: name,
+                start: 0,
+                entries,
+            });
+        }
+    }
+    if let Some(entries) = read_entries(repo, "HEAD")? {
+        sections.push(Section {
+            display: "HEAD".to_owned(),
+            full: "HEAD".to_owned(),
+            start: 0,
+            entries,
+        });
+    }
+    Ok(sections)
+}
+
+/// `--branches`/`--tags`/`--remotes`: names are printed with the prefix stripped.
+fn expand_prefixed(
+    repo: &gix::Repository,
+    prefix: &str,
+    pattern: Option<&str>,
+    excludes: &[String],
+) -> Result<Vec<Section>> {
+    let normalized = pattern.map(normalize_glob);
+    let mut sections = Vec::new();
+    for name in all_ref_names(repo)? {
+        let Some(short) = name.strip_prefix(prefix).map(str::to_owned) else {
+            continue;
+        };
+        if excluded(&name, excludes) {
+            continue;
+        }
+        if let Some(pat) = &normalized {
+            if !wildmatch(pat.as_bytes(), short.as_bytes()) {
+                continue;
+            }
+        }
+        if let Some(entries) = read_entries(repo, &name)? {
+            sections.push(Section {
+                display: short,
+                full: name,
+                start: 0,
+                entries,
+            });
+        }
+    }
+    Ok(sections)
+}
+
+/// `--glob=<pat>`: matched against the full ref name, which is also what prints.
+fn expand_glob(
+    repo: &gix::Repository,
+    pattern: &str,
+    excludes: &[String],
+) -> Result<Vec<Section>> {
+    let normalized = normalize_glob(pattern);
+    let mut sections = Vec::new();
+    for name in all_ref_names(repo)? {
+        if excluded(&name, excludes) {
+            continue;
+        }
+        if !wildmatch(normalized.as_bytes(), name.as_bytes()) {
+            continue;
+        }
+        if let Some(entries) = read_entries(repo, &name)? {
+            sections.push(Section {
+                display: name.clone(),
+                full: name,
+                start: 0,
+                entries,
+            });
+        }
+    }
+    Ok(sections)
+}
+
+fn ref_prefix(flag: &str) -> &'static str {
+    match flag {
+        "--tags" => "refs/tags/",
+        "--remotes" => "refs/remotes/",
+        _ => "refs/heads/",
+    }
+}
+
+/// `--exclude=` patterns are matched verbatim, without the `/*` completion that
+/// `--glob` applies — that is how git's `ref_excluded()` behaves.
+fn excluded(name: &str, excludes: &[String]) -> bool {
+    excludes
+        .iter()
+        .any(|pat| wildmatch(pat.as_bytes(), name.as_bytes()))
+}
+
+/// git's `normalize_glob_ref()`: a pattern with no `*` matches a whole subtree.
+fn normalize_glob(pattern: &str) -> String {
+    if !pattern.contains('*') {
+        format!("{}/*", pattern.trim_end_matches('/'))
+    } else if pattern.ends_with('/') {
+        format!("{pattern}*")
+    } else {
+        pattern.to_owned()
+    }
+}
+
+/// git's wildmatch without `WM_PATHNAME`, so `*` also matches `/`.
+fn wildmatch(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0usize, 0usize);
+    // Backtrack point for the most recent `*`.
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                star = Some((p, t));
+                p += 1;
+            }
+            Some(b'?') => {
+                p += 1;
+                t += 1;
+            }
+            Some(b'[') => match bracket_match(pattern, p, text[t]) {
+                Some(next) => {
+                    p = next;
+                    t += 1;
+                }
+                None => match star {
+                    Some((sp, st)) => {
+                        p = sp + 1;
+                        t = st + 1;
+                        star = Some((sp, st + 1));
+                    }
+                    None => return false,
+                },
+            },
+            Some(&c) if c == text[t] => {
+                p += 1;
+                t += 1;
+            }
+            _ => match star {
+                Some((sp, st)) => {
+                    p = sp + 1;
+                    t = st + 1;
+                    star = Some((sp, st + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    while pattern.get(p) == Some(&b'*') {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+/// Match one `[...]` class at `open` against `c`, returning the index just past
+/// the closing `]` on success.
+fn bracket_match(pattern: &[u8], open: usize, c: u8) -> Option<usize> {
+    let mut i = open + 1;
+    let negated = matches!(pattern.get(i), Some(b'!') | Some(b'^'));
+    if negated {
+        i += 1;
+    }
+    let mut hit = false;
+    let mut first = true;
+    while i < pattern.len() {
+        if pattern[i] == b']' && !first {
+            return (hit != negated).then_some(i + 1);
+        }
+        first = false;
+        let lo = pattern[i];
+        if pattern.get(i + 1) == Some(&b'-') && pattern.get(i + 2).is_some_and(|&h| h != b']') {
+            let hi = pattern[i + 2];
+            if (lo..=hi).contains(&c) {
+                hit = true;
+            }
+            i += 3;
+        } else {
+            if lo == c {
+                hit = true;
+            }
+            i += 1;
+        }
+    }
+    // Unterminated class: git treats the `[` as a literal.
+    (c == b'[').then_some(open + 1)
+}
+
+// ---------------------------------------------------------------------------
+// option value parsing
+// ---------------------------------------------------------------------------
+
+enum DateMode {
+    Known(TimeFormat),
+    Unimplemented,
+    Unknown,
+}
+
+/// Classify a `--date=` value. Anything git would reject outright is `Unknown`.
+fn parse_date_mode(value: &str) -> DateMode {
+    if value.starts_with("format:") || value.starts_with("format-local:") {
+        return DateMode::Unimplemented;
+    }
+    let (base, local) = match value.strip_suffix("-local") {
+        Some(base) => (base, true),
+        None => (value, false),
+    };
+    let known: TimeFormat = match base {
+        "" | "default" => tfmt::DEFAULT.into(),
+        "raw" => tfmt::RAW,
+        "unix" => tfmt::UNIX,
+        "short" => tfmt::SHORT.into(),
+        "iso" | "iso8601" => tfmt::ISO8601.into(),
+        "iso-strict" | "iso8601-strict" => tfmt::ISO8601_STRICT.into(),
+        "rfc" | "rfc2822" => tfmt::RFC2822.into(),
+        // Recognized by git, but formatting them needs the current time or the
+        // local zone, which gix-date does not expose.
+        "relative" | "human" | "local" => return DateMode::Unimplemented,
+        _ => return DateMode::Unknown,
+    };
+    if local {
+        DateMode::Unimplemented
+    } else {
+        DateMode::Known(known)
+    }
+}
+
+enum Pretty {
+    Oneline,
+    Custom(String),
+    Unimplemented,
+    Invalid,
+}
+
+/// Classify a `--pretty=`/`--format=` value the way git's `get_commit_format()` does.
+fn classify_pretty(value: &str) -> Pretty {
+    if let Some(rest) = value
+        .strip_prefix("format:")
+        .or_else(|| value.strip_prefix("tformat:"))
+    {
+        return Pretty::Custom(rest.to_owned());
+    }
+    match value {
+        "oneline" => Pretty::Oneline,
+        "short" | "medium" | "full" | "fuller" | "raw" | "reference" | "email" | "mboxrd" => {
+            Pretty::Unimplemented
+        }
+        v if v.is_empty() || v.contains('%') => Pretty::Custom(v.to_owned()),
+        _ => Pretty::Invalid,
+    }
+}
+
+/// The first placeholder in `fmt` that this renderer does not implement.
+fn unsupported_placeholder(fmt: &str) -> Option<String> {
+    let b = fmt.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        let Some(&next) = b.get(i + 1) else {
+            return Some("%".to_owned());
+        };
+        match next {
+            b'n' | b'%' => i += 2,
+            b'H' | b'T' | b'P' | b'p' | b'h' | b's' => i += 2,
+            b'x' => {
+                if b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
+                    && b.get(i + 3).is_some_and(u8::is_ascii_hexdigit)
+                {
+                    i += 4;
+                } else {
+                    return Some("%x".to_owned());
+                }
+            }
+            b'a' | b'c' | b'g' => {
+                let Some(&third) = b.get(i + 2) else {
+                    return Some(format!("%{}", next as char));
+                };
+                let ok = match next {
+                    b'g' => matches!(third, b'd' | b'D' | b'n' | b'e' | b's'),
+                    _ => matches!(third, b'n' | b'e' | b'd'),
+                };
+                if ok {
+                    i += 3;
+                } else {
+                    return Some(format!("%{}{}", next as char, third as char));
+                }
+            }
+            other => return Some(format!("%{}", other as char)),
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// rendering
+// ---------------------------------------------------------------------------
+
+/// Expand a validated `--format` string for one entry.
+#[allow(clippy::too_many_arguments)]
+fn expand_format(
+    repo: &gix::Repository,
+    fmt: &str,
+    section: &Section,
+    entry: &Entry,
+    selector: &str,
+    opts: &Opts,
+    field_fmt: TimeFormat,
+    fallback_len: usize,
+) -> Vec<u8> {
+    let commit = repo.find_commit(entry.oid).ok();
+    let b = fmt.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(fmt.len() + 32);
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'%' {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        // Indexing stays on bytes so a multi-byte literal in the format string
+        // can never split a `char` boundary. `unsupported_placeholder` already
+        // rejected every sequence not handled below.
+        let one = b.get(i + 1).copied();
+        let two = b.get(i + 2).copied();
+        match (one, two) {
+            (Some(b'g'), Some(kind @ (b'd' | b'D'))) => {
+                let name = if kind == b'd' {
+                    &section.display
+                } else {
+                    &section.full
+                };
+                out.extend_from_slice(name.as_bytes());
+                out.extend_from_slice(format!("@{{{selector}}}").as_bytes());
+                i += 3;
+            }
+            (Some(b'g'), Some(b'n')) => {
+                out.extend_from_slice(&entry.who_name);
+                i += 3;
+            }
+            (Some(b'g'), Some(b'e')) => {
+                out.extend_from_slice(&entry.who_email);
+                i += 3;
+            }
+            (Some(b'g'), Some(b's')) => {
+                out.extend_from_slice(&entry.message);
+                i += 3;
+            }
+            (Some(who @ (b'a' | b'c')), Some(field @ (b'n' | b'e' | b'd'))) => {
+                // Bound the signature to `commit` explicitly: it borrows the
+                // commit's decoded buffer, so it cannot escape a closure.
+                let sig = match &commit {
+                    Some(c) if who == b'a' => c.author().ok(),
+                    Some(c) => c.committer().ok(),
+                    None => None,
+                };
+                if let Some(sig) = sig {
+                    match field {
+                        b'n' => out.extend_from_slice(sig.name),
+                        b'e' => out.extend_from_slice(sig.email),
+                        _ => {
+                            let t = sig.time().ok().unwrap_or_default();
+                            out.extend_from_slice(t.format_or_unix(field_fmt).as_bytes());
+                        }
+                    }
+                }
+                i += 3;
+            }
+            (Some(b'%'), _) => {
+                out.push(b'%');
+                i += 2;
+            }
+            (Some(b'n'), _) => {
+                out.push(b'\n');
+                i += 2;
+            }
+            (Some(b'H'), _) => {
+                out.extend_from_slice(entry.oid.to_string().as_bytes());
+                i += 2;
+            }
+            (Some(b'h'), _) => {
+                out.extend_from_slice(
+                    abbrev_id(repo, entry.oid, &opts.abbrev, fallback_len).as_bytes(),
+                );
+                i += 2;
+            }
+            (Some(b'T'), _) => {
+                let tree = match &commit {
+                    Some(c) => c.tree_id().ok(),
+                    None => None,
+                };
+                if let Some(tree) = tree {
+                    out.extend_from_slice(tree.detach().to_string().as_bytes());
+                }
+                i += 2;
+            }
+            (Some(kind @ (b'P' | b'p')), _) => {
+                let abbreviate = kind == b'p';
+                for (k, parent) in parents_of(repo, entry.oid).into_iter().enumerate() {
+                    if k > 0 {
+                        out.push(b' ');
+                    }
+                    if abbreviate {
+                        out.extend_from_slice(
+                            abbrev_id(repo, parent, &opts.abbrev, fallback_len).as_bytes(),
+                        );
+                    } else {
+                        out.extend_from_slice(parent.to_string().as_bytes());
+                    }
+                }
+                i += 2;
+            }
+            (Some(b's'), _) => {
+                let summary = match &commit {
+                    Some(c) => c.message().ok().map(|m| m.summary().to_vec()),
+                    None => None,
+                };
+                if let Some(summary) = summary {
+                    out.extend_from_slice(&summary);
+                }
+                i += 2;
+            }
+            (Some(b'x'), _) if i + 4 <= b.len() => {
+                if let Ok(hex) = std::str::from_utf8(&b[i + 2..i + 4]) {
+                    if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                        out.push(byte);
+                    }
+                }
+                i += 4;
+            }
+            _ => {
+                out.push(b'%');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The parent ids of the commit an entry points at, empty when it is not a
+/// readable commit.
+fn parents_of(repo: &gix::Repository, id: ObjectId) -> Vec<ObjectId> {
+    match repo.find_commit(id) {
+        Ok(commit) => commit.parent_ids().map(|p| p.detach()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn is_merge(repo: &gix::Repository, id: ObjectId) -> bool {
+    parents_of(repo, id).len() >= 2
+}
+
+// ---------------------------------------------------------------------------
+// list / exists
+// ---------------------------------------------------------------------------
 
 /// `git reflog list` — every ref under `$GIT_DIR/logs` that owns a log file.
 fn list(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
@@ -241,6 +1147,10 @@ fn exists(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// shared helpers
+// ---------------------------------------------------------------------------
+
 /// Emit git's "unknown revision" fatal block verbatim and return its exit code.
 fn fatal_ambiguous(spec: &str) -> ExitCode {
     eprintln!(
@@ -251,28 +1161,39 @@ fn fatal_ambiguous(spec: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
-/// Split `<ref>@{<n>}` into the ref name as typed and the starting entry index.
+enum Selector<'a> {
+    Index(usize),
+    Date(&'a str),
+}
+
+/// Split `<ref>@{<selector>}` into the ref name as typed and its selector.
 /// A spec without a trailing `@{...}` yields `(spec, None)`.
-fn split_selector(spec: &str) -> Result<(&str, Option<usize>)> {
+fn split_selector(spec: &str) -> (&str, Option<Selector<'_>>) {
     let Some(open) = spec.rfind("@{") else {
-        return Ok((spec, None));
+        return (spec, None);
     };
-    if !spec.ends_with('}') {
-        return Ok((spec, None));
-    }
-    if open == 0 {
-        bail!("the bare `@{{<n>}}` form is not supported, name the ref explicitly");
+    if !spec.ends_with('}') || open == 0 {
+        return (spec, None);
     }
     let inner = &spec[open + 2..spec.len() - 1];
     match inner.parse::<usize>() {
-        Ok(n) => Ok((&spec[..open], Some(n))),
-        Err(_) => bail!("non-numeric reflog selector {spec:?} (only `<ref>@{{<n>}}` is ported)"),
+        Ok(n) => (&spec[..open], Some(Selector::Index(n))),
+        Err(_) => (&spec[..open], Some(Selector::Date(inner))),
     }
 }
 
-/// Abbreviate `id` the way git does: the shortest unique prefix at least
-/// `core.abbrev` long. Falls back to a plain `core.abbrev`-length prefix when the
-/// object is missing from the odb and no unique prefix can be computed.
+/// Abbreviate `id` according to the `--abbrev` family of options.
+fn abbrev_id(repo: &gix::Repository, id: ObjectId, abbrev: &Abbrev, fallback_len: usize) -> String {
+    match abbrev {
+        Abbrev::Full => id.to_string(),
+        Abbrev::Len(n) => id.to_hex_with_len(*n).to_string(),
+        Abbrev::Auto => short_id(repo, id, fallback_len),
+    }
+}
+
+/// Abbreviate `id` the way git does by default: the shortest unique prefix at
+/// least `core.abbrev` long. Falls back to a plain `core.abbrev`-length prefix
+/// when the object is missing from the odb.
 fn short_id(repo: &gix::Repository, id: ObjectId, fallback_len: usize) -> String {
     match id.attach(repo).shorten() {
         Ok(prefix) => prefix.to_string(),
@@ -283,8 +1204,7 @@ fn short_id(repo: &gix::Repository, id: ObjectId, fallback_len: usize) -> String
 /// The configured abbreviation length: `core.abbrev` when set to a number, the
 /// full hash for `no`/`false`, otherwise git's automatic length derived from the
 /// packed object count (`max(7, ceil(bits(count) / 2))`).
-fn abbrev_len(repo: &gix::Repository) -> usize {
-    let full = repo.object_hash().len_in_hex();
+fn abbrev_len(repo: &gix::Repository, full: usize) -> usize {
     if let Some(value) = repo.config_snapshot().string("core.abbrev") {
         match value.to_str_lossy().as_ref() {
             "no" | "false" => return full,
@@ -344,10 +1264,4 @@ fn collect_logs(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<()> {
 
 fn all_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
-}
-
-fn parse_count(value: &str, flag: &str) -> Result<usize> {
-    value
-        .parse::<usize>()
-        .map_err(|_| anyhow!("invalid count `{value}` for `{flag}`"))
 }

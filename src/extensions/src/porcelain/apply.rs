@@ -14,7 +14,12 @@
 //!   * `-p<n>`, `-R`/`--reverse`, `--check`, `--numstat`, `-z`, `--apply`,
 //!     `--allow-empty`, `--unidiff-zero`, `--binary`/`--allow-binary-replacement`
 //!     (accepted, no-op as in modern git), `-q`/`--quiet`,
-//!     `--whitespace=warn|nowarn`, `--`
+//!     `--whitespace=warn|nowarn`, `--recount`, `--directory=<root>`, `--`,
+//!     and the `--no-` form of each of git's negatable options
+//!   * usage errors: unknown option/switch (git's own usage block on stderr,
+//!     exit 129), a missing or non-integer option value, an unrecognised
+//!     `--whitespace` action, and `--ours`/`--theirs`/`--union` without `--3way`
+//!     (`fatal:`, exit 128)
 //!   * patch kinds: modification, creation, deletion, rename, mode change, and
 //!     symlink blobs; git-style (`diff --git`) and traditional `---`/`+++` diffs
 //!
@@ -24,17 +29,34 @@
 //! process umask, not the old file's), leading directories are created for new
 //! paths, and directories emptied by a deletion or rename are pruned.
 //!
+//! Argument parsing covers git's whole `apply` option table, because git's own
+//! ordering makes that observable: it finishes parsing, runs its usage-level
+//! validations, *then* opens the patch files, *then* parses them. A flag this
+//! port cannot honour is therefore recorded during parsing and only reported
+//! once the input is known to contain at least one patch — the first moment
+//! ignoring it could change a result. Until that moment git has not consulted it
+//! either, so `git apply --stat missing-file` and `git apply --3way not-a-patch`
+//! report what git reports (`can't open patch` / `No valid patches in input`,
+//! exit 128) rather than a premature unsupported-flag error.
+//!
 //! Not implemented — these `bail!` rather than produce plausible-looking wrong
-//! results: `--index`/`--cached`/`-3`/`--3way` (index mutation and 3-way merge),
-//! `--reject`, `--stat`/`--summary` (git's scaled diffstat renderer),
-//! `--exclude`/`--include`/`--directory`/`--build-fake-ancestor`, `-C<n>` and
-//! `--recount` (context reduction / hunk recounting), whitespace-fixing
-//! `--whitespace` actions, `--ignore-whitespace`, copy patches, binary patches,
-//! non-UTF-8 paths, and running from a subdirectory of the worktree (git
-//! reinterprets patch paths against the repo prefix there).
+//! results: `--index`/`--cached`/`-N`/`--intent-to-add` (index mutation),
+//! `-3`/`--3way` and `--ours`/`--theirs`/`--union` (3-way merge), `--reject`,
+//! `--stat`/`--summary` (git's scaled diffstat renderer), `--exclude`/`--include`
+//! (path filtering), `--build-fake-ancestor`, `-C<n>` (context reduction),
+//! `--no-add`, `--allow-overlap`, `--inaccurate-eof`, `--unsafe-paths`,
+//! `-v`/`--verbose`, the whitespace-fixing `--whitespace` actions
+//! (`fix`/`strip`/`error`/`error-all`), `--ignore-whitespace`/
+//! `--ignore-space-change`, copy patches, binary patches, non-UTF-8 paths, and
+//! running from a subdirectory of the worktree (git reinterprets patch paths
+//! against the repo prefix there).
 //!
 //! Whitespace-error warnings (git's default `--whitespace=warn`) are not
 //! emitted; they go to stderr only and never alter the applied content.
+//!
+//! `-q`/`--quiet` silences every `error:` diagnostic, matching git, where they
+//! all go through `error()`; exit codes are unaffected, and `fatal:` messages and
+//! usage errors are not silenced.
 
 use anyhow::{bail, Result};
 use std::collections::HashMap;
@@ -45,76 +67,423 @@ use std::process::ExitCode;
 /// The flag set this port honours, quoted verbatim in the unsupported-flag error.
 const PORTED: &str = "-p<n>, -R/--reverse, --check, --numstat, -z, --apply, \
                       --allow-empty, --unidiff-zero, --binary, -q/--quiet, \
-                      --whitespace=warn|nowarn";
+                      --whitespace=warn|nowarn, --recount, --directory=<root>";
 
-/// Parsed command-line options for a single `apply` invocation.
+/// git's `apply` usage block, printed after `unknown option`/`unknown switch` on
+/// stderr with exit 129 (`parse-options`' `PARSE_OPT_ERROR`).
+const USAGE: &str = r"usage: git apply [<options>] [<patch>...]
+
+    --exclude <path>      don't apply changes matching the given path
+    --include <path>      apply changes matching the given path
+    -p <num>              remove <num> leading slashes from traditional diff paths
+    --no-add              ignore additions made by the patch
+    --add                 opposite of --no-add
+    --[no-]stat           instead of applying the patch, output diffstat for the input
+    --[no-]numstat        show number of added and deleted lines in decimal notation
+    --[no-]summary        instead of applying the patch, output a summary for the input
+    --[no-]check          instead of applying the patch, see if the patch is applicable
+    --[no-]index          make sure the patch is applicable to the current index
+    -N, --[no-]intent-to-add
+                          mark new files with `git add --intent-to-add`
+    --[no-]cached         apply a patch without touching the working tree
+    --[no-]unsafe-paths   accept a patch that touches outside the working area
+    --[no-]apply          also apply the patch (use with --stat/--summary/--check)
+    -3, --[no-]3way       attempt three-way merge, fall back on normal patch if that fails
+    --ours                for conflicts, use our version
+    --theirs              for conflicts, use their version
+    --union               for conflicts, use a union version
+    --[no-]build-fake-ancestor <file>
+                          build a temporary index based on embedded index information
+    -z                    paths are separated with NUL character
+    -C <n>                ensure at least <n> lines of context match
+    --[no-]whitespace <action>
+                          detect new or modified lines that have whitespace errors
+    --[no-]ignore-space-change
+                          ignore changes in whitespace when finding context
+    --[no-]ignore-whitespace
+                          ignore changes in whitespace when finding context
+    -R, --[no-]reverse    apply the patch in reverse
+    --[no-]unidiff-zero   don't expect at least one line of context
+    --[no-]reject         leave the rejected hunks in corresponding *.rej files
+    --[no-]allow-overlap  allow overlapping hunks
+    -v, --[no-]verbose    be more verbose
+    -q, --[no-]quiet      be more quiet
+    --[no-]inaccurate-eof tolerate incorrectly detected missing new-line at the end of file
+    --[no-]recount        do not trust the line counts in the hunk headers
+    --[no-]directory <root>
+                          prepend <root> to all filenames
+    --[no-]allow-empty    don't return error for empty patches
+
+";
+
+// Reasons quoted back in the deferred unsupported-flag error.
+const R_INDEX: &str = "index mutation is not implemented";
+const R_3WAY: &str = "3-way merge is not implemented";
+const R_REJECT: &str = "reject files are not implemented";
+const R_STAT: &str = "the diffstat renderer is not implemented";
+const R_PATHSPEC: &str = "path filtering is not implemented";
+const R_CONTEXT: &str = "context reduction is not implemented";
+const R_WS: &str = "whitespace fixing is not implemented";
+const R_IGNORE_WS: &str = "whitespace-insensitive matching is not implemented";
+const R_EOF: &str = "EOF-newline fudging is not implemented";
+const R_NOADD: &str = "dropping additions is not implemented";
+const R_OVERLAP: &str = "overlapping hunks are not implemented";
+const R_VERBOSE: &str = "verbose progress output is not implemented";
+const R_ANCESTOR: &str = "building a fake ancestor index is not implemented";
+const R_UNSAFE: &str = "paths outside the working area are not implemented";
+
+/// A flag git accepts that this port parses but cannot honour: the spelling as
+/// the user wrote it, plus why. `key` exists so a later `--no-<flag>` cancels the
+/// right entry; the vector keeps argv order, so the flag reported is the first
+/// unhonoured one on the command line.
+struct Unhonoured {
+    key: &'static str,
+    spelling: String,
+    why: &'static str,
+}
+
+fn mark(v: &mut Vec<Unhonoured>, key: &'static str, spelling: &str, why: &'static str) {
+    v.retain(|u| u.key != key);
+    v.push(Unhonoured {
+        key,
+        spelling: spelling.to_owned(),
+        why,
+    });
+}
+
+fn unmark(v: &mut Vec<Unhonoured>, key: &'static str) {
+    v.retain(|u| u.key != key);
+}
+
+/// Parsed command-line options for a single `apply` invocation. Only the flags
+/// this port honours get a field; the rest live in the `Unhonoured` list.
 struct Opts {
-    strip: usize,       // -p<n>: leading path components to drop (default 1)
-    reverse: bool,      // -R/--reverse: swap pre- and post-image
-    check: bool,        // --check: validate only, never write
-    numstat: bool,      // --numstat: machine-readable added/deleted counts
-    nul: bool,          // -z: NUL-terminate --numstat records
-    unidiff_zero: bool, // --unidiff-zero: relax the begin/end anchoring
-    allow_empty: bool,  // --allow-empty: an input with no patches is not an error
-    apply: bool,        // whether the patch is actually applied
+    strip: usize,               // -p<n>: leading path components to drop (default 1)
+    reverse: bool,              // -R/--reverse: swap pre- and post-image
+    check: bool,                // --check: validate only, never write
+    numstat: bool,              // --numstat: machine-readable added/deleted counts
+    nul: bool,                  // -z: NUL-terminate --numstat records
+    unidiff_zero: bool,         // --unidiff-zero: relax the begin/end anchoring
+    allow_empty: bool,          // --allow-empty: an input with no patches is not an error
+    quiet: bool,                // -q/--quiet: silence `error:` diagnostics
+    recount: bool,              // --recount: derive hunk sizes from the body, not the header
+    directory: Option<String>,  // --directory=<root>: prepend <root> to every path
+    apply_override: Option<bool>, // --apply / --no-apply
+    apply: bool,                // whether the patch is actually applied
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Opts {
+            strip: 1,
+            reverse: false,
+            check: false,
+            numstat: false,
+            nul: false,
+            unidiff_zero: false,
+            allow_empty: false,
+            quiet: false,
+            recount: false,
+            directory: None,
+            apply_override: None,
+            apply: true,
+        }
+    }
+}
+
+/// `error:` diagnostics, which `-q` silences in git.
+fn err(quiet: bool, msg: &str) {
+    if !quiet {
+        eprintln!("{msg}");
+    }
+}
+
+/// Fetch the value of a long option, from `--name=value` or the following argv
+/// entry.
+fn long_value(
+    args: &[String],
+    i: &mut usize,
+    name: &str,
+    inline: Option<&str>,
+) -> Result<String, ExitCode> {
+    if let Some(v) = inline {
+        return Ok(v.to_owned());
+    }
+    match args.get(*i) {
+        Some(v) => {
+            *i += 1;
+            Ok(v.clone())
+        }
+        None => {
+            eprintln!("error: option `{name}' requires a value");
+            Err(ExitCode::from(129))
+        }
+    }
+}
+
+/// Parse the whole option table. Diagnostics are printed here; the returned
+/// `ExitCode` is git's for that failure (129 for usage errors, 128 for the two
+/// `fatal:` paths).
+fn parse_opts(
+    args: &[String],
+    o: &mut Opts,
+    sources: &mut Vec<String>,
+    unhonoured: &mut Vec<Unhonoured>,
+) -> Result<(), ExitCode> {
+    let mut three_way = false;
+    let mut conflict_given = false;
+    let mut no_more_opts = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        let a = args[i].clone();
+        i += 1;
+
+        if no_more_opts || a == "-" || !a.starts_with('-') {
+            sources.push(a);
+            continue;
+        }
+        if a == "--" {
+            no_more_opts = true;
+            continue;
+        }
+
+        if let Some(long) = a.strip_prefix("--") {
+            let (given, inline) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            // `--no-add` is an option in its own right, not the negation of
+            // `--add`, so it must not be split here.
+            let (name, neg) = match given.strip_prefix("no-") {
+                Some(rest) if given != "no-add" => (rest, true),
+                _ => (given, false),
+            };
+
+            match name {
+                // ---- honoured ----
+                "numstat" => o.numstat = !neg,
+                "check" => o.check = !neg,
+                "reverse" => o.reverse = !neg,
+                "unidiff-zero" => o.unidiff_zero = !neg,
+                "allow-empty" => o.allow_empty = !neg,
+                "quiet" => o.quiet = !neg,
+                "recount" => o.recount = !neg,
+                "apply" => o.apply_override = Some(!neg),
+                "directory" => {
+                    o.directory = if neg {
+                        None
+                    } else {
+                        Some(long_value(args, &mut i, name, inline)?)
+                    }
+                }
+                "whitespace" => {
+                    if neg {
+                        unmark(unhonoured, "whitespace");
+                    } else {
+                        let v = long_value(args, &mut i, name, inline)?;
+                        match v.as_str() {
+                            // Neither warns nor alters the applied bytes, and we
+                            // emit no whitespace warnings.
+                            "warn" | "nowarn" => unmark(unhonoured, "whitespace"),
+                            "fix" | "strip" | "error" | "error-all" => {
+                                mark(unhonoured, "whitespace", &a, R_WS)
+                            }
+                            _ => {
+                                eprintln!("error: unrecognized whitespace option '{v}'");
+                                return Err(ExitCode::from(129));
+                            }
+                        }
+                    }
+                }
+                // Hidden legacy spellings: binary application needs no opt-in in
+                // modern git, so both are genuine no-ops.
+                "binary" | "allow-binary-replacement" if !neg => {}
+                // `--add` is the default, so it really is a no-op.
+                "add" if !neg => unmark(unhonoured, "no-add"),
+
+                // ---- parsed, validated, reported before they could matter ----
+                "no-add" if !neg => mark(unhonoured, "no-add", &a, R_NOADD),
+                "exclude" | "include" if !neg => {
+                    long_value(args, &mut i, name, inline)?;
+                    mark(unhonoured, "pathspec", &a, R_PATHSPEC);
+                }
+                "ours" | "theirs" | "union" if !neg => conflict_given = true,
+                "3way" => {
+                    three_way = !neg;
+                    if neg {
+                        unmark(unhonoured, "3way");
+                    } else {
+                        mark(unhonoured, "3way", &a, R_3WAY);
+                    }
+                }
+                "stat" | "summary" => {
+                    let key = if name == "stat" { "stat" } else { "summary" };
+                    if neg {
+                        unmark(unhonoured, key);
+                    } else {
+                        mark(unhonoured, key, &a, R_STAT);
+                    }
+                }
+                "index" | "cached" => {
+                    let key = if name == "index" { "index" } else { "cached" };
+                    if neg {
+                        unmark(unhonoured, key);
+                    } else {
+                        mark(unhonoured, key, &a, R_INDEX);
+                    }
+                }
+                "intent-to-add" => {
+                    if neg {
+                        unmark(unhonoured, "intent-to-add");
+                    } else {
+                        mark(unhonoured, "intent-to-add", &a, R_INDEX)
+                    }
+                }
+                "unsafe-paths" => {
+                    if neg {
+                        unmark(unhonoured, "unsafe-paths");
+                    } else {
+                        mark(unhonoured, "unsafe-paths", &a, R_UNSAFE)
+                    }
+                }
+                "reject" => {
+                    if neg {
+                        unmark(unhonoured, "reject");
+                    } else {
+                        mark(unhonoured, "reject", &a, R_REJECT)
+                    }
+                }
+                "allow-overlap" => {
+                    if neg {
+                        unmark(unhonoured, "allow-overlap");
+                    } else {
+                        mark(unhonoured, "allow-overlap", &a, R_OVERLAP)
+                    }
+                }
+                "verbose" => {
+                    if neg {
+                        unmark(unhonoured, "verbose");
+                    } else {
+                        mark(unhonoured, "verbose", &a, R_VERBOSE)
+                    }
+                }
+                "inaccurate-eof" => {
+                    if neg {
+                        unmark(unhonoured, "inaccurate-eof");
+                    } else {
+                        mark(unhonoured, "inaccurate-eof", &a, R_EOF)
+                    }
+                }
+                "ignore-space-change" | "ignore-whitespace" => {
+                    if neg {
+                        unmark(unhonoured, "ignore-whitespace");
+                    } else {
+                        mark(unhonoured, "ignore-whitespace", &a, R_IGNORE_WS)
+                    }
+                }
+                "build-fake-ancestor" => {
+                    if neg {
+                        unmark(unhonoured, "build-fake-ancestor");
+                    } else {
+                        long_value(args, &mut i, name, inline)?;
+                        mark(unhonoured, "build-fake-ancestor", &a, R_ANCESTOR);
+                    }
+                }
+
+                // `given`, not `name`: git names the option as it was written.
+                _ => {
+                    eprintln!("error: unknown option `{given}'");
+                    eprint!("{USAGE}");
+                    return Err(ExitCode::from(129));
+                }
+            }
+            continue;
+        }
+
+        // Short options, which cluster (`-qR`) and may carry their value glued on
+        // (`-p2`) or as the next argv entry (`-p 2`).
+        let chars: Vec<char> = a[1..].chars().collect();
+        let mut k = 0;
+        while k < chars.len() {
+            let c = chars[k];
+            k += 1;
+            match c {
+                'p' | 'C' => {
+                    let glued: String = chars[k..].iter().collect();
+                    k = chars.len();
+                    let v = if !glued.is_empty() {
+                        glued
+                    } else {
+                        match args.get(i) {
+                            Some(v) => {
+                                i += 1;
+                                v.clone()
+                            }
+                            None => {
+                                eprintln!("error: switch `{c}' requires a value");
+                                return Err(ExitCode::from(129));
+                            }
+                        }
+                    };
+                    if c == 'p' {
+                        // git parses -p itself, so its rejection is `fatal:`/128,
+                        // not parse-options' `error:`/129.
+                        match v.parse::<usize>() {
+                            Ok(n) => o.strip = n,
+                            Err(_) => {
+                                eprintln!(
+                                    "fatal: option -p expects a non-negative integer, got '{v}'"
+                                );
+                                return Err(ExitCode::from(128));
+                            }
+                        }
+                    } else if v.parse::<usize>().is_err() {
+                        eprintln!(
+                            "error: switch `C' expects a non-negative integer value with an optional k/m/g suffix"
+                        );
+                        return Err(ExitCode::from(129));
+                    } else {
+                        mark(unhonoured, "context", &format!("-C{v}"), R_CONTEXT);
+                    }
+                }
+                'z' => o.nul = true,
+                'R' => o.reverse = true,
+                'q' => o.quiet = true,
+                'N' => mark(unhonoured, "intent-to-add", "-N", R_INDEX),
+                'v' => mark(unhonoured, "verbose", "-v", R_VERBOSE),
+                '3' => {
+                    three_way = true;
+                    mark(unhonoured, "3way", "-3", R_3WAY);
+                }
+                _ => {
+                    eprintln!("error: unknown switch `{c}'");
+                    eprint!("{USAGE}");
+                    return Err(ExitCode::from(129));
+                }
+            }
+        }
+    }
+
+    // git's one post-parse usage check, run before it opens any patch file.
+    if conflict_given && !three_way {
+        eprintln!("fatal: --ours, --theirs, and --union require --3way");
+        return Err(ExitCode::from(128));
+    }
+
+    // --check and --numstat turn applying off; --apply turns it back on.
+    o.apply = o.apply_override.unwrap_or(!(o.check || o.numstat));
+    Ok(())
 }
 
 pub fn apply(args: &[String]) -> Result<ExitCode> {
-    let mut o = Opts {
-        strip: 1,
-        reverse: false,
-        check: false,
-        numstat: false,
-        nul: false,
-        unidiff_zero: false,
-        allow_empty: false,
-        apply: true,
-    };
-    let mut forced_apply = false;
+    let mut o = Opts::default();
     let mut sources: Vec<String> = Vec::new();
-    let mut no_more_opts = false;
+    let mut unhonoured: Vec<Unhonoured> = Vec::new();
 
-    for a in args {
-        if no_more_opts {
-            sources.push(a.clone());
-            continue;
-        }
-        match a.as_str() {
-            "--" => no_more_opts = true,
-            "-" => sources.push(a.clone()),
-            "-R" | "--reverse" => o.reverse = true,
-            "--check" => o.check = true,
-            "--numstat" => o.numstat = true,
-            "-z" => o.nul = true,
-            "--apply" => forced_apply = true,
-            "--allow-empty" => o.allow_empty = true,
-            "--unidiff-zero" => o.unidiff_zero = true,
-            // Binary application needs no opt-in in modern git; these are no-ops.
-            "--binary" | "--allow-binary-replacement" => {}
-            // We print nothing beyond the requested output, so quiet is a no-op.
-            "-q" | "--quiet" => {}
-            // We never emit whitespace warnings (stderr-only in git), and neither
-            // of these actions changes the applied bytes.
-            "--whitespace=warn" | "--whitespace=nowarn" => {}
-            "--index" | "--cached" => {
-                bail!("unsupported flag {a:?}: index mutation is not implemented (ported: {PORTED})")
-            }
-            "-3" | "--3way" => {
-                bail!("unsupported flag {a:?}: 3-way merge is not implemented (ported: {PORTED})")
-            }
-            _ if a.starts_with("-p") && a.len() > 2 => {
-                o.strip = a[2..]
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("invalid -p value in {a:?}"))?;
-            }
-            _ if a.starts_with('-') && a.len() > 1 => {
-                bail!("unsupported flag {a:?} (ported: {PORTED})")
-            }
-            _ => sources.push(a.clone()),
-        }
+    if let Err(code) = parse_opts(args, &mut o, &mut sources, &mut unhonoured) {
+        return Ok(code);
     }
-    // --check and --numstat turn applying off; --apply turns it back on.
-    o.apply = forced_apply || !(o.check || o.numstat);
 
     // ---- read the patch text ------------------------------------------------
     let mut buf: Vec<u8> = Vec::new();
@@ -129,20 +498,38 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             match std::fs::read(src) {
                 Ok(b) => buf.extend_from_slice(&b),
                 Err(e) => {
-                    eprintln!("error: can't open patch '{src}': {}", io_msg(&e));
+                    err(
+                        o.quiet,
+                        &format!("error: can't open patch '{src}': {}", io_msg(&e)),
+                    );
                     return Ok(ExitCode::from(128));
                 }
             }
         }
     }
 
-    let mut patches = parse_patches(&split_lines(&buf), o.strip)?;
+    let mut patches = parse_patches(&split_lines(&buf), o.strip, o.recount)?;
     if patches.is_empty() {
         if o.allow_empty {
             return Ok(ExitCode::SUCCESS);
         }
-        eprintln!("error: No valid patches in input (allow with \"--allow-empty\")");
+        err(
+            o.quiet,
+            "error: No valid patches in input (allow with \"--allow-empty\")",
+        );
         return Ok(ExitCode::from(128));
+    }
+
+    // Past here a flag we cannot honour would change the result, so report it.
+    if let Some(u) = unhonoured.first() {
+        let (flag, why) = (&u.spelling, u.why);
+        bail!("unsupported flag {flag:?}: {why} (ported: {PORTED})");
+    }
+
+    if let Some(root) = &o.directory {
+        for p in &mut patches {
+            prefix_names(p, root)?;
+        }
     }
     if o.reverse {
         for p in &mut patches {
@@ -185,7 +572,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         // destination.
         if let Some(new) = &p.new_name {
             if (p.is_new || p.is_rename) && exists(&staged, new) {
-                eprintln!("error: {new}: already exists in working directory");
+                err(o.quiet, &format!("error: {new}: already exists in working directory"));
                 failed = true;
                 continue;
             }
@@ -198,7 +585,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             match read_current(&staged, old) {
                 Some(bytes) => split_lines(&bytes).into_iter().map(|l| l.to_vec()).collect(),
                 None => {
-                    eprintln!("error: {old}: No such file or directory");
+                    err(o.quiet, &format!("error: {old}: No such file or directory"));
                     failed = true;
                     continue;
                 }
@@ -206,15 +593,15 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         };
 
         if let Err(old_pos) = apply_hunks(&mut image, p, o.unidiff_zero) {
-            eprintln!("error: patch failed: {label}:{old_pos}");
-            eprintln!("error: {label}: patch does not apply");
+            err(o.quiet, &format!("error: patch failed: {label}:{old_pos}"));
+            err(o.quiet, &format!("error: {label}: patch does not apply"));
             failed = true;
             continue;
         }
 
         if p.is_delete {
             if !image.is_empty() {
-                eprintln!("error: removal patch leaves file contents");
+                err(o.quiet, "error: removal patch leaves file contents");
                 failed = true;
                 continue;
             }
@@ -444,19 +831,19 @@ fn txt(line: &[u8]) -> String {
 
 /// Scan the whole input for patch headers, skipping any surrounding prose
 /// (commit messages, mail headers) as git does.
-fn parse_patches(lines: &[&[u8]], strip: usize) -> Result<Vec<Patch>> {
+fn parse_patches(lines: &[&[u8]], strip: usize, recount: bool) -> Result<Vec<Patch>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let l = txt(lines[i]);
         if l.starts_with("diff --git ") {
-            let (p, next) = parse_one(lines, i, strip, true)?;
+            let (p, next) = parse_one(lines, i, strip, true, recount)?;
             i = next;
             out.push(p);
         } else if l.starts_with("--- ")
             && lines.get(i + 1).map(|n| txt(n).starts_with("+++ ")) == Some(true)
         {
-            let (p, next) = parse_one(lines, i, strip, false)?;
+            let (p, next) = parse_one(lines, i, strip, false, recount)?;
             i = next;
             out.push(p);
         } else {
@@ -468,7 +855,13 @@ fn parse_patches(lines: &[&[u8]], strip: usize) -> Result<Vec<Patch>> {
 
 /// Parse one file's patch beginning at `start`, returning it and the index of
 /// the first line after it.
-fn parse_one(lines: &[&[u8]], start: usize, strip: usize, git_style: bool) -> Result<(Patch, usize)> {
+fn parse_one(
+    lines: &[&[u8]],
+    start: usize,
+    strip: usize,
+    git_style: bool,
+    recount: bool,
+) -> Result<(Patch, usize)> {
     let mut p = Patch {
         old_name: None,
         new_name: None,
@@ -546,7 +939,7 @@ fn parse_one(lines: &[&[u8]], start: usize, strip: usize, git_style: bool) -> Re
     }
 
     while i < lines.len() && txt(lines[i]).starts_with("@@ ") {
-        let (h, added, deleted, next) = parse_hunk(lines, i)?;
+        let (h, added, deleted, next) = parse_hunk(lines, i, recount)?;
         p.added += added;
         p.deleted += deleted;
         p.hunks.push(h);
@@ -578,7 +971,15 @@ fn normalise(mut p: Patch) -> Result<Patch> {
 }
 
 /// Parse an `@@ -a,b +c,d @@` fragment and its body.
-fn parse_hunk(lines: &[&[u8]], start: usize) -> Result<(Hunk, usize, usize, usize)> {
+///
+/// `recount` is `--recount`: the counts in the header are not trusted, so the
+/// body runs until the first line that is not a body line instead of until the
+/// header's counts are exhausted, and a mismatch is not an error.
+fn parse_hunk(
+    lines: &[&[u8]],
+    start: usize,
+    recount: bool,
+) -> Result<(Hunk, usize, usize, usize)> {
     let header = txt(lines[start]);
     let (old_pos, mut old_rem, new_pos, mut new_rem) =
         hunk_range(&header).ok_or_else(|| anyhow::anyhow!("corrupt hunk header {header:?}"))?;
@@ -611,7 +1012,7 @@ fn parse_hunk(lines: &[&[u8]], start: usize) -> Result<(Hunk, usize, usize, usiz
             i += 1;
             continue;
         }
-        if old_rem == 0 && new_rem == 0 {
+        if !recount && old_rem == 0 && new_rem == 0 {
             break;
         }
         // A context line whose single leading space was stripped in transit is
@@ -648,7 +1049,7 @@ fn parse_hunk(lines: &[&[u8]], start: usize) -> Result<(Hunk, usize, usize, usiz
         i += 1;
     }
 
-    if old_rem != 0 || new_rem != 0 {
+    if !recount && (old_rem != 0 || new_rem != 0) {
         bail!("corrupt patch: truncated hunk {header:?}");
     }
     Ok((h, added, deleted, i))
@@ -744,10 +1145,33 @@ fn strip_path(name: &[u8], n: usize) -> Result<String> {
     }
     let out = String::from_utf8(s.to_vec())
         .map_err(|_| anyhow::anyhow!("non-UTF-8 paths in patches are not supported"))?;
+    check_path(out)
+}
+
+/// Reject anything that would escape the working tree. `--unsafe-paths`, which
+/// is what lets git through this gate, is not honoured, so this is unconditional.
+fn check_path(out: String) -> Result<String> {
     if out.is_empty() || out.starts_with('/') || out.split('/').any(|c| c == "..") {
         bail!("refusing to apply to path {out:?} outside the working tree");
     }
     Ok(out)
+}
+
+/// `--directory=<root>`: git's `prefix_one()` — prepend `root` to every patch
+/// path, after `-p<n>` has done its stripping. A `/dev/null` side is `None` here
+/// (a creation's pre-image, a deletion's post-image) and stays that way.
+fn prefix_names(p: &mut Patch, root: &str) -> Result<()> {
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return Ok(());
+    }
+    for name in [&mut p.old_name, &mut p.new_name] {
+        if let Some(n) = name {
+            let joined = format!("{root}/{n}");
+            *n = check_path(joined)?;
+        }
+    }
+    Ok(())
 }
 
 /// Undo git's C-style quoting when a header path is wrapped in double quotes.

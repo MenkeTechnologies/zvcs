@@ -17,21 +17,45 @@
 //! Command line: `--force`, `--quiet`, `--stats`, `--done`, `--date-format=`,
 //! `--export-marks=`, `--import-marks=`, `--import-marks-if-exists=`,
 //! `--relative-marks`, `--no-relative-marks`, `--cat-blob-fd=`,
-//! `--allow-unsafe-features`, and the pack-tuning knobs `--depth=`,
-//! `--active-branches=`, `--big-file-threshold=` and `--max-pack-size=`, which
-//! are accepted and ignored because they only steer packing. Refs are updated at
-//! EOF (and at `checkpoint`) with the reflog message `fast-import`; without
-//! `--force` a branch that would lose commits is left alone with git's
+//! `--signed-commits=`, `--signed-tags=`, `--allow-unsafe-features`, and the
+//! pack-tuning knobs `--depth=`, `--active-branches=`, `--big-file-threshold=`
+//! and `--max-pack-size=`, which are validated the way git validates them and
+//! then ignored because they only steer packing. Refs are updated at EOF (and at
+//! `checkpoint`) with the reflog message `fast-import`; without `--force` a
+//! branch that would lose commits is left alone with git's
 //! `warning: not updating …` and the run exits 1.
 //!
+//! git has three distinct failure contracts here and this module reproduces all
+//! three. An argument that is not an option, or an option value outside the set
+//! git names, ends the run with git's one-line `usage:` text and exit 129 having
+//! touched nothing. Anything else fatal prints `fatal: <reason>` and exits 128 —
+//! and, as git's `die_nicely` does, still writes the `--export-marks` file on the
+//! way out, unless an `--import-marks` file was named and never successfully
+//! read, in which case `dump_marks` declines to overwrite an export from a
+//! half-loaded table. Options take effect strictly left to right, so a failure
+//! leaves every option to its left already applied — which is what decides
+//! whether the marks file exists after a fatal.
+//!
+//! Signatures follow git's `--signed-commits=`/`--signed-tags=` modes:
+//! `verbatim` and `warn-verbatim` keep them (a commit's `gpgsig`/`gpgsig-sha256`
+//! header is folded exactly as git folds it, one space per continuation line),
+//! `strip` and `warn-strip` drop them, and `abort` refuses. The three
+//! `-if-invalid` modes are accepted on the command line, as git accepts them,
+//! and refused at the first signature they would have to verify: verification
+//! needs a gpg driver the vendored crates do not provide.
+//!
 //! Not covered, each rejected with a precise message rather than guessed at:
-//!   * `--date-format=rfc2822` / `now` — only `raw` and `raw-permissive` are
-//!     ported, so a stream in another date format fails instead of storing a
-//!     timestamp that might not be git's.
-//!   * `gpgsig` in a commit — the signature header layout is documented as
-//!     experimental and would change the commit bytes if guessed wrong.
-//!   * `--signed-commits=`/`--signed-tags=` in any mode but `verbatim`.
-//!   * `--rewrite-submodules-from/-to` and `--export-pack-edges`.
+//!   * `--date-format=rfc2822` / `now` — accepted on the command line, as git
+//!     accepts them, and refused at the first identity line that would have to
+//!     be parsed in them. Only `raw` and `raw-permissive` are ported, so a
+//!     stream in another date format fails instead of storing a timestamp that
+//!     might not be git's.
+//!   * `--rewrite-submodules-from/-to=<name>:<file>` — the marks file is read
+//!     where git reads it, so a missing or corrupt one fails identically, but a
+//!     stream that actually carries a gitlink to rewrite is refused.
+//!   * `--export-pack-edges=<file>` — the file is created where git creates it
+//!     and a stream that would write objects is refused, because this port has
+//!     no packs and so no pack edges to record.
 //!   * `N` once a notes ref would exceed 255 notes, where git re-fans-out the
 //!     whole notes tree.
 //!
@@ -41,7 +65,8 @@
 //! `fastimport.unpackLimit`, which defaults to 100), and the `--stats` block —
 //! stderr only, and full of allocator and pack-window counters that have no
 //! equivalent here — is never printed. No crash report is dumped on a fatal
-//! error either; the `fast_import_crash_<pid>` file could never match anyway.
+//! error either; the `fast_import_crash_<pid>` file could never match anyway,
+//! and it lives inside `.git` where nothing observes it.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -53,13 +78,100 @@ use gix::objs::{Kind, Write as _};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
-/// Which `--date-format` the stream uses. Only the two `raw` variants are ported.
+/// git's one-line `fast-import` usage summary, byte-for-byte including its LF.
+const USAGE: &str = concat!(
+    "usage: git fast-import [--date-format=<f>] [--max-pack-size=<n>]",
+    " [--big-file-threshold=<n>] [--depth=<n>] [--active-branches=<n>]",
+    " [--export-marks=<marks.file>]\n",
+);
+
+/// A command line git rejects through `usage()` — stderr, exit 129, and none of
+/// the cleanup `die_nicely` runs — rather than through `die()`.
+///
+/// Carries the complete stderr text, trailing LF included, because git uses two
+/// shapes: the bare option summary for an argument it cannot place at all, and
+/// `usage: <complaint>` for an option value outside the set it names.
+#[derive(Debug)]
+struct UsageError(String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.trim_end())
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+/// The bare option summary, for an argument that is not an option at all.
+fn usage() -> anyhow::Error {
+    UsageError(USAGE.to_string()).into()
+}
+
+/// Which `--date-format` the stream uses.
 #[derive(Clone, Copy, PartialEq)]
 enum DateFormat {
     /// `<seconds> SP <±hhmm>`, with git's sanity checks on the offset.
     Raw,
     /// The same syntax with the offset sanity check relaxed.
     RawPermissive,
+    /// Accepted so the command line parses as git's does, then refused at the
+    /// first identity line: parsing RFC 2822 dates means reimplementing git's
+    /// date parser, and a near-miss silently stores the wrong timestamp.
+    Rfc2822,
+    /// Likewise accepted and then refused. `now` ignores the stream's timestamp
+    /// and takes the wall clock, which no reproducible import can rely on.
+    Now,
+}
+
+impl DateFormat {
+    /// The spelling this format has on the command line, for error text.
+    fn name(self) -> &'static str {
+        match self {
+            DateFormat::Raw => "raw",
+            DateFormat::RawPermissive => "raw-permissive",
+            DateFormat::Rfc2822 => "rfc2822",
+            DateFormat::Now => "now",
+        }
+    }
+}
+
+/// `--signed-commits=`/`--signed-tags=`: what to do with a signature in the stream.
+#[derive(Clone, Copy, PartialEq)]
+enum SignedMode {
+    /// Import the signature silently. git's default.
+    Verbatim,
+    /// Import it, after a warning.
+    WarnVerbatim,
+    /// Drop the signature silently.
+    Strip,
+    /// Drop it, after a warning.
+    WarnStrip,
+    /// Die on the first signature.
+    Abort,
+    /// `strip-if-invalid`, `abort-if-invalid` and `sign-if-invalid[=<keyid>]`.
+    /// All three decide by *verifying* the signature, which needs a gpg driver
+    /// the vendored crates do not provide, so they are accepted here — git
+    /// accepts them — and refused at the first signature rather than guessed at.
+    NeedsVerification,
+}
+
+/// Map a `--signed-commits=`/`--signed-tags=` value onto a mode, rejecting an
+/// unknown one through `usage()` as git does.
+fn signed_mode(flag: &str, value: &str) -> Result<SignedMode> {
+    Ok(match value {
+        "verbatim" => SignedMode::Verbatim,
+        "warn-verbatim" => SignedMode::WarnVerbatim,
+        "strip" => SignedMode::Strip,
+        "warn-strip" => SignedMode::WarnStrip,
+        "abort" => SignedMode::Abort,
+        "strip-if-invalid" | "abort-if-invalid" | "sign-if-invalid" => {
+            SignedMode::NeedsVerification
+        }
+        _ if starts(value, "sign-if-invalid=") => SignedMode::NeedsVerification,
+        _ => {
+            return Err(UsageError(format!("usage: unknown {flag} mode '{value}'\n")).into());
+        }
+    })
 }
 
 /// Everything the command line and the stream's `feature`/`option` commands can set.
@@ -71,6 +183,34 @@ struct Opts {
     relative_marks: bool,
     allow_unsafe: bool,
     cat_blob_fd: Option<i32>,
+    signed_commits: SignedMode,
+    signed_tags: SignedMode,
+    /// `--export-pack-edges=<file>`, kept only so a run that would actually have
+    /// pack edges to report can refuse instead of leaving the file empty.
+    export_pack_edges: Option<String>,
+    /// True once an `--import-marks` file has been named and not yet read. git's
+    /// `dump_marks` refuses to write while this is outstanding, so a fatal
+    /// before the read leaves the export file untouched.
+    import_marks_pending: bool,
+}
+
+impl Opts {
+    /// git's defaults before argv is read.
+    fn new() -> Self {
+        Opts {
+            force: false,
+            date_format: DateFormat::Raw,
+            require_done: false,
+            export_marks: None,
+            relative_marks: false,
+            allow_unsafe: false,
+            cat_blob_fd: None,
+            signed_commits: SignedMode::Verbatim,
+            signed_tags: SignedMode::Verbatim,
+            export_pack_edges: None,
+            import_marks_pending: false,
+        }
+    }
 }
 
 /// A ref being built in memory, exactly one per name the stream has named.
@@ -102,10 +242,10 @@ struct Dir {
 
 /// `git fast-import` — import a stream of objects and ref updates from stdin.
 ///
-/// Every failure is reported as git reports it, `fatal: <reason>` on stderr with
-/// exit 128, so a caller that checks the status sees stock git's contract. A run
-/// that imported cleanly but declined a non-fast-forward ref update exits 1,
-/// again as git does.
+/// The three exit contracts are git's. A command line git cannot parse prints
+/// `usage: …` and exits 129; any other failure prints `fatal: <reason>` and
+/// exits 128; a run that imported cleanly but declined a non-fast-forward ref
+/// update exits 1.
 pub fn fast_import(args: &[String]) -> Result<ExitCode> {
     // Dispatch passes the subcommand itself at index 0.
     let args = match args.first() {
@@ -114,81 +254,23 @@ pub fn fast_import(args: &[String]) -> Result<ExitCode> {
     };
     match run(args) {
         Ok(code) => Ok(code),
-        Err(e) => {
-            eprintln!("fatal: {e}");
-            Ok(ExitCode::from(128))
-        }
+        Err(e) => match e.downcast_ref::<UsageError>() {
+            Some(u) => {
+                eprint!("{}", u.0);
+                Ok(ExitCode::from(129))
+            }
+            None => {
+                eprintln!("fatal: {e}");
+                Ok(ExitCode::from(128))
+            }
+        },
     }
 }
 
-/// Parse the command line, then drive the stream to completion.
+/// Open the repository, parse the command line, then drive the stream.
 fn run(args: &[String]) -> Result<ExitCode> {
-    let mut opts = Opts {
-        force: false,
-        date_format: DateFormat::Raw,
-        require_done: false,
-        export_marks: None,
-        relative_marks: false,
-        allow_unsafe: false,
-        cat_blob_fd: None,
-    };
-    let mut import_marks: Vec<(String, bool)> = Vec::new();
-
-    for a in args {
-        let a = a.as_str();
-        match a {
-            "--force" => opts.force = true,
-            // Both only steer the stderr statistics block, which is not printed.
-            "--quiet" | "--stats" => {}
-            "--done" => opts.require_done = true,
-            "--allow-unsafe-features" => opts.allow_unsafe = true,
-            "--relative-marks" => opts.relative_marks = true,
-            "--no-relative-marks" => opts.relative_marks = false,
-            // Pack tuning only: identical objects and refs either way.
-            _ if starts(a, "--depth=")
-                || starts(a, "--active-branches=")
-                || starts(a, "--big-file-threshold=")
-                || starts(a, "--max-pack-size=") => {}
-            _ if starts(a, "--date-format=") => {
-                opts.date_format = date_format(&a["--date-format=".len()..])?;
-            }
-            _ if starts(a, "--export-marks=") => {
-                opts.export_marks = Some(a["--export-marks=".len()..].to_string());
-            }
-            _ if starts(a, "--import-marks=") => {
-                import_marks.push((a["--import-marks=".len()..].to_string(), false));
-            }
-            _ if starts(a, "--import-marks-if-exists=") => {
-                import_marks.push((a["--import-marks-if-exists=".len()..].to_string(), true));
-            }
-            _ if starts(a, "--cat-blob-fd=") => {
-                let v = &a["--cat-blob-fd=".len()..];
-                opts.cat_blob_fd = Some(
-                    v.parse::<i32>()
-                        .map_err(|_| anyhow!("unable to parse --cat-blob-fd={v}"))?,
-                );
-            }
-            _ if starts(a, "--signed-commits=") || starts(a, "--signed-tags=") => {
-                let mode = &a[a.find('=').expect("matched on a `=` prefix") + 1..];
-                if mode != "verbatim" {
-                    bail!("unsupported flag {a:?} (only `verbatim` is ported; signature \
-                           verification and signing need a gpg driver the vendored crates \
-                           do not provide)");
-                }
-            }
-            _ if starts(a, "--rewrite-submodules-from=")
-                || starts(a, "--rewrite-submodules-to=") =>
-            {
-                bail!("unsupported flag {a:?} (submodule object-id rewriting is not ported)")
-            }
-            _ if starts(a, "--export-pack-edges=") => {
-                bail!("unsupported flag {a:?} (objects are written loose, so there are no \
-                       pack edges to report)")
-            }
-            _ => bail!("unknown option {a}"),
-        }
-    }
-
+    // git runs `setup_git_directory()` before it looks at argv, so even a usage
+    // error outside a repository comes out as "not a git repository".
     let repo = gix::discover(".")?;
     // Serialize object and ref writes through the repo coordinator, as the other
     // writing porcelain does, so concurrent zvcs writers queue instead of racing.
@@ -196,30 +278,26 @@ fn run(args: &[String]) -> Result<ExitCode> {
 
     let mut imp = Importer {
         repo,
-        opts,
+        opts: Opts::new(),
         marks: HashMap::new(),
         branches: Vec::new(),
         by_name: HashMap::new(),
         tags: Vec::new(),
         failed: false,
         seen_data_command: false,
+        submodule_rewrites: Vec::new(),
     };
-    for (path, if_exists) in &import_marks {
-        imp.import_marks(path, *if_exists)?;
-    }
 
-    let mut input = Input::new();
-    let saw_done = imp.stream(&mut input)?;
-    if imp.opts.require_done && !saw_done {
-        bail!("stream ends early");
+    match imp.import(args) {
+        Ok(code) => Ok(code),
+        // git's `usage()` exits without running `die_nicely`, so a usage error
+        // leaves the marks file alone; every other failure still dumps it.
+        Err(e) if e.downcast_ref::<UsageError>().is_some() => Err(e),
+        Err(e) => {
+            imp.dump_marks_on_fatal();
+            Err(e)
+        }
     }
-
-    imp.checkpoint()?;
-    Ok(if imp.failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
 }
 
 /// `str::starts_with` under a shorter name, so the option table stays readable.
@@ -227,18 +305,42 @@ fn starts(s: &str, prefix: &str) -> bool {
     s.starts_with(prefix)
 }
 
-/// Map a `--date-format=`/`feature date-format=` value onto a ported format.
+/// Map a `--date-format=`/`feature date-format=` value onto a format.
+///
+/// Every name git knows parses here; the two this port cannot evaluate are
+/// refused at the identity line that would need them, not on the command line,
+/// because that is where git's own failure would be observable.
 fn date_format(name: &str) -> Result<DateFormat> {
     match name {
         "raw" => Ok(DateFormat::Raw),
         "raw-permissive" => Ok(DateFormat::RawPermissive),
-        "rfc2822" | "now" => bail!(
-            "unsupported date format '{name}' (ported: raw, raw-permissive) — porting it \
-             would mean reimplementing git's date parser, and a near-miss would silently \
-             store the wrong timestamp"
-        ),
+        "rfc2822" => Ok(DateFormat::Rfc2822),
+        "now" => Ok(DateFormat::Now),
         _ => bail!("unknown --date-format argument {name}"),
     }
+}
+
+/// git's `parse_non_negative_integer`, used for `--depth`, `--active-branches`
+/// and `--cat-blob-fd`.
+fn non_negative(flag: &str, value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|_| anyhow!("{flag}: argument must be a non-negative integer"))
+}
+
+/// git's `parse_ulong_with_suffix`, used for the two byte-size options. A value
+/// it cannot read is not a distinct error: git falls through and reports the
+/// whole argument as an unknown option.
+fn byte_size(value: &str) -> Option<u64> {
+    // Every suffix git accepts is one ASCII byte, so trimming one byte off the
+    // end cannot split a character.
+    let (digits, scale) = match value.chars().last() {
+        Some('k' | 'K') => (&value[..value.len() - 1], 1024_u64),
+        Some('m' | 'M') => (&value[..value.len() - 1], 1024 * 1024),
+        Some('g' | 'G') => (&value[..value.len() - 1], 1024 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    digits.parse::<u64>().ok()?.checked_mul(scale)
 }
 
 // ---------------------------------------------------------------------------
@@ -361,22 +463,178 @@ struct Importer {
     /// Whether a command other than `feature`/`option` has been seen, which is
     /// what makes a later `option` command an error.
     seen_data_command: bool,
+    /// Submodule names named by `--rewrite-submodules-from/-to`. Only their
+    /// presence is used: a stream that carries a gitlink is refused, because
+    /// rewriting the object id it names is not ported.
+    submodule_rewrites: Vec<String>,
 }
 
 impl Importer {
+    /// Parse the command line, read the marks it names, then drive the stream.
+    fn import(&mut self, args: &[String]) -> Result<ExitCode> {
+        let import_marks = self.parse_args(args)?;
+        for (path, if_exists) in &import_marks {
+            self.import_marks(path, *if_exists)?;
+        }
+        self.opts.import_marks_pending = false;
+
+        let mut input = Input::new();
+        let saw_done = self.stream(&mut input)?;
+        if self.opts.require_done && !saw_done {
+            bail!("stream ends early");
+        }
+
+        self.checkpoint()?;
+        Ok(if self.failed {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        })
+    }
+
+    /// Apply argv to `self.opts`, returning the `--import-marks` files to read.
+    ///
+    /// Mirrors git's `parse_argv`: options are applied strictly left to right,
+    /// so a failure leaves everything to its left in effect, and the first
+    /// argument that is not an option — or a bare `--` — ends option parsing and,
+    /// because git has no positional arguments here, ends the run with `usage()`.
+    fn parse_args(&mut self, args: &[String]) -> Result<Vec<(String, bool)>> {
+        let mut import_marks: Vec<(String, bool)> = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let a = args[i].as_str();
+            if !a.starts_with('-') || a == "--" {
+                break;
+            }
+            match a {
+                "--force" => self.opts.force = true,
+                // Both only steer the stderr statistics block, which is not printed.
+                "--quiet" | "--stats" => {}
+                "--done" => self.opts.require_done = true,
+                "--allow-unsafe-features" => self.opts.allow_unsafe = true,
+                "--relative-marks" => self.opts.relative_marks = true,
+                "--no-relative-marks" => self.opts.relative_marks = false,
+                // Pack tuning only: identical objects and refs either way, but
+                // the values are still validated so a typo fails as it does in git.
+                _ if starts(a, "--depth=") => {
+                    non_negative("--depth", &a["--depth=".len()..])?;
+                }
+                _ if starts(a, "--active-branches=") => {
+                    non_negative("--active-branches", &a["--active-branches=".len()..])?;
+                }
+                _ if starts(a, "--big-file-threshold=") => {
+                    byte_size(&a["--big-file-threshold=".len()..])
+                        .ok_or_else(|| anyhow!("unknown option {a}"))?;
+                }
+                _ if starts(a, "--max-pack-size=") => {
+                    byte_size(&a["--max-pack-size=".len()..])
+                        .ok_or_else(|| anyhow!("unknown option {a}"))?;
+                }
+                _ if starts(a, "--date-format=") => {
+                    self.opts.date_format = date_format(&a["--date-format=".len()..])?;
+                }
+                _ if starts(a, "--export-marks=") => {
+                    self.opts.export_marks = Some(a["--export-marks=".len()..].to_string());
+                }
+                _ if starts(a, "--import-marks=") => {
+                    import_marks.push((a["--import-marks=".len()..].to_string(), false));
+                    self.opts.import_marks_pending = true;
+                }
+                _ if starts(a, "--import-marks-if-exists=") => {
+                    import_marks.push((a["--import-marks-if-exists=".len()..].to_string(), true));
+                    self.opts.import_marks_pending = true;
+                }
+                _ if starts(a, "--cat-blob-fd=") => {
+                    let v = &a["--cat-blob-fd=".len()..];
+                    let fd = non_negative("--cat-blob-fd", v)?;
+                    self.opts.cat_blob_fd = Some(
+                        i32::try_from(fd)
+                            .map_err(|_| anyhow!("--cat-blob-fd: argument must be a non-negative integer"))?,
+                    );
+                }
+                _ if starts(a, "--signed-commits=") => {
+                    self.opts.signed_commits =
+                        signed_mode("--signed-commits", &a["--signed-commits=".len()..])?;
+                }
+                _ if starts(a, "--signed-tags=") => {
+                    self.opts.signed_tags =
+                        signed_mode("--signed-tags", &a["--signed-tags=".len()..])?;
+                }
+                _ if starts(a, "--rewrite-submodules-from=") => {
+                    self.submodule_rewrite(&a["--rewrite-submodules-from=".len()..])?;
+                }
+                _ if starts(a, "--rewrite-submodules-to=") => {
+                    self.submodule_rewrite(&a["--rewrite-submodules-to=".len()..])?;
+                }
+                _ if starts(a, "--export-pack-edges=") => {
+                    let path = &a["--export-pack-edges=".len()..];
+                    // git opens the file the moment it parses the option, which
+                    // is why it exists even when the run dies further along.
+                    std::fs::File::create(path)
+                        .with_context(|| format!("Cannot open '{path}'"))?;
+                    self.opts.export_pack_edges = Some(path.to_string());
+                }
+                _ => bail!("unknown option {a}"),
+            }
+            i += 1;
+        }
+        if i != args.len() {
+            return Err(usage());
+        }
+        Ok(import_marks)
+    }
+
+    /// `--rewrite-submodules-from/-to=<name>:<marks file>`: validate the spec and
+    /// read the marks file, so both failures land exactly where git's do.
+    fn submodule_rewrite(&mut self, spec: &str) -> Result<()> {
+        let (name, file) = spec
+            .split_once(':')
+            .ok_or_else(|| anyhow!("expected format name:filename for submodule rewrite option"))?;
+        // Parsed for its errors: a missing or corrupt marks file is the only
+        // observable effect of this option until a gitlink actually appears.
+        read_mark_file(std::path::Path::new(file), file, false)?;
+        self.submodule_rewrites.push(name.to_string());
+        Ok(())
+    }
+
+    /// git's `die_nicely` path: a fatal error still writes the `--export-marks`
+    /// file on the way out.
+    fn dump_marks_on_fatal(&self) {
+        let _ = self.export_marks();
+    }
+
+    /// Refuse a stream that writes objects while `--export-pack-edges` is set.
+    ///
+    /// git names one pack boundary per pack it produced; this port writes loose
+    /// objects, so it would leave the file git created empty. An empty edges file
+    /// reads as "the import produced no packs", which is a wrong answer that
+    /// looks like a right one, so the run stops instead.
+    fn check_pack_edges(&self) -> Result<()> {
+        match &self.opts.export_pack_edges {
+            None => Ok(()),
+            Some(path) => bail!(
+                "unsupported flag \"--export-pack-edges={path}\" for a stream that writes \
+                 objects (this port writes loose objects, so there are no pack edges to report)"
+            ),
+        }
+    }
+
     /// Read commands until `done` or EOF. Returns whether `done` ended the stream.
     fn stream(&mut self, input: &mut Input) -> Result<bool> {
         while let Some(line) = input.command()? {
             let cmd = line.as_slice();
             if cmd == b"blob" {
                 self.seen_data_command = true;
+                self.check_pack_edges()?;
                 self.parse_blob(input)?;
             } else if let Some(v) = after(cmd, b"commit ") {
                 self.seen_data_command = true;
+                self.check_pack_edges()?;
                 let name = utf8(v, "ref name")?;
                 self.parse_commit(input, &name)?;
             } else if let Some(v) = after(cmd, b"tag ") {
                 self.seen_data_command = true;
+                self.check_pack_edges()?;
                 let name = utf8(v, "tag name")?;
                 self.parse_tag(input, &name)?;
             } else if let Some(v) = after(cmd, b"reset ") {
@@ -470,12 +728,46 @@ impl Importer {
         let committer = self.ident(&v)?;
         line = input.command()?;
 
-        if field(&line, b"gpgsig ").is_some() {
-            bail!(
-                "signed commits are not supported (the `gpgsig` header layout is documented \
-                 as experimental, and guessing it would change the commit bytes)"
-            );
+        // `gpgsig SP <git hash algo> SP <signature format> LF data`, at most one
+        // per hash algorithm, sitting between `committer` and `encoding`.
+        let mut signatures: Vec<(&'static str, Vec<u8>)> = Vec::new();
+        while let Some(v) = field(&line, b"gpgsig ") {
+            let spec = utf8(&v, "gpgsig")?;
+            let algo = spec.split(' ').next().unwrap_or_default();
+            let header = match algo {
+                "sha1" => "gpgsig",
+                "sha256" => "gpgsig-sha256",
+                _ => bail!("unknown git hash algorithm in gpgsig: '{algo}'"),
+            };
+            line = input.command()?;
+            let Some(spec) = field(&line, b"data ") else {
+                bail!("expected 'data n' command");
+            };
+            signatures.push((header, input.data(&spec)?));
+            line = input.command()?;
         }
+        if !signatures.is_empty() {
+            match self.opts.signed_commits {
+                SignedMode::Verbatim => {}
+                SignedMode::WarnVerbatim => {
+                    eprintln!("warning: importing a commit signature verbatim");
+                }
+                SignedMode::Strip => signatures.clear(),
+                SignedMode::WarnStrip => {
+                    eprintln!("warning: stripping a commit signature");
+                    signatures.clear();
+                }
+                SignedMode::Abort => {
+                    bail!("encountered signed commit; use --signed-commits=<mode> to handle it")
+                }
+                SignedMode::NeedsVerification => bail!(
+                    "unsupported flag \"--signed-commits=<mode>-if-invalid\" (the `-if-invalid` \
+                     modes decide by verifying the signature, which needs a gpg driver the \
+                     vendored crates do not provide)"
+                ),
+            }
+        }
+
         if let Some(v) = field(&line, b"encoding ") {
             encoding = Some(v);
             line = input.command()?;
@@ -545,6 +837,23 @@ impl Importer {
         buf.extend_from_slice(b"\ncommitter ");
         buf.extend_from_slice(&committer);
         buf.push(b'\n');
+        for (header, payload) in &signatures {
+            // git folds a multi-line header value by prefixing every line after
+            // the first with one space, and the payload's trailing LF makes a
+            // final empty — so folded to a bare space — line.
+            buf.extend_from_slice(header.as_bytes());
+            buf.push(b' ');
+            let mut lines = payload.split(|&b| b == b'\n');
+            if let Some(first) = lines.next() {
+                buf.extend_from_slice(first);
+            }
+            buf.push(b'\n');
+            for rest in lines {
+                buf.push(b' ');
+                buf.extend_from_slice(rest);
+                buf.push(b'\n');
+            }
+        }
         if let Some(enc) = &encoding {
             buf.extend_from_slice(b"encoding ");
             buf.extend_from_slice(enc);
@@ -587,7 +896,31 @@ impl Importer {
         let Some(spec) = field(&line, b"data ") else {
             bail!("expected 'data n' command");
         };
-        let message = input.data(&spec)?;
+        let mut message = input.data(&spec)?;
+
+        // A tag's signature lives in its message, so the mode is applied by
+        // truncating at the marker git's `parse_signature` would find.
+        if let Some(at) = signature_offset(&message) {
+            match self.opts.signed_tags {
+                SignedMode::Verbatim => {}
+                SignedMode::WarnVerbatim => {
+                    eprintln!("warning: importing a tag signature verbatim for tag '{name}'");
+                }
+                SignedMode::Strip => message.truncate(at),
+                SignedMode::WarnStrip => {
+                    eprintln!("warning: stripping a tag signature for tag '{name}'");
+                    message.truncate(at);
+                }
+                SignedMode::Abort => {
+                    bail!("encountered signed tag; use --signed-tags=<mode> to handle it")
+                }
+                SignedMode::NeedsVerification => bail!(
+                    "unsupported flag \"--signed-tags=<mode>-if-invalid\" (the `-if-invalid` \
+                     modes decide by verifying the signature, which needs a gpg driver the \
+                     vendored crates do not provide)"
+                ),
+            }
+        }
 
         let kind = self.repo.find_header(object)?.kind();
         let mut buf = Vec::new();
@@ -729,6 +1062,18 @@ impl Importer {
                 .ok_or_else(|| anyhow!("Missing space after SHA1: M {}", String::from_utf8_lossy(rest)))?;
             (self.dataref(dataref)?, unquote(rest)?)
         };
+
+        // A gitlink is the only thing `--rewrite-submodules-from/-to` would touch,
+        // and mapping its object id through the two marks files is not ported, so
+        // the run stops here rather than record the un-rewritten id.
+        if mode == 0o160000 && !self.submodule_rewrites.is_empty() {
+            bail!(
+                "unsupported flag \"--rewrite-submodules-{{from,to}}={}\" for a stream that \
+                 carries a gitlink (mapping its object id through the submodule marks files \
+                 is not ported)",
+                self.submodule_rewrites.join(",")
+            );
+        }
 
         // The object must actually be what the mode claims it is. A gitlink is
         // exempt from the presence check: the commit it names lives in the
@@ -1042,7 +1387,17 @@ impl Importer {
             .get(gt + 1..)
             .and_then(|d| d.strip_prefix(b" "))
             .ok_or_else(|| anyhow!("Missing space after > in ident string: {}", String::from_utf8_lossy(raw)))?;
-        if !valid_raw_date(date, self.opts.date_format == DateFormat::Raw) {
+        let strict = match self.opts.date_format {
+            DateFormat::Raw => true,
+            DateFormat::RawPermissive => false,
+            other => bail!(
+                "unsupported flag \"--date-format={}\" (ported: raw, raw-permissive) — \
+                 porting it would mean reimplementing git's date parser, and a near-miss \
+                 would silently store the wrong timestamp",
+                other.name()
+            ),
+        };
+        if !valid_raw_date(date, strict) {
             bail!(
                 "invalid raw date \"{}\" in ident: {}",
                 String::from_utf8_lossy(date),
@@ -1066,33 +1421,22 @@ impl Importer {
     /// Load `:<idnum> SP <oid>` lines into the mark table; later files win.
     fn import_marks(&mut self, path: &str, if_exists: bool) -> Result<()> {
         let full = self.marks_path(path);
-        let text = match std::fs::read_to_string(&full) {
-            Ok(t) => t,
-            Err(e) if if_exists && e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => bail!("cannot read {}: {e}", full.display()),
-        };
-        for line in text.lines() {
-            if line.is_empty() {
-                continue;
-            }
-            let rest = line
-                .strip_prefix(':')
-                .ok_or_else(|| anyhow!("corrupt mark line: {line}"))?;
-            let (mark, hex) = rest
-                .split_once(' ')
-                .ok_or_else(|| anyhow!("corrupt mark line: {line}"))?;
-            let mark: u64 = mark
-                .parse()
-                .map_err(|_| anyhow!("corrupt mark line: {line}"))?;
-            let id = ObjectId::from_hex(hex.as_bytes())
-                .map_err(|_| anyhow!("corrupt mark line: {line}"))?;
+        let display = full.display().to_string();
+        for (mark, id) in read_mark_file(&full, &display, if_exists)? {
             self.marks.insert(mark, id);
         }
         Ok(())
     }
 
     /// Write out the mark table, ascending by mark number, as git does.
+    ///
+    /// git's `dump_marks` declines while an `--import-marks` file is named but
+    /// unread, so a run that died before loading it does not overwrite the
+    /// export with a half-populated table.
     fn export_marks(&self) -> Result<()> {
+        if self.opts.import_marks_pending {
+            return Ok(());
+        }
         let Some(path) = &self.opts.export_marks else {
             return Ok(());
         };
@@ -1195,6 +1539,69 @@ impl Importer {
         })?;
         Ok(())
     }
+}
+
+/// Where a cryptographic signature starts inside a tag message, or `None` when
+/// the message carries none.
+///
+/// git's `parse_signature` knows four armor headers, one per signature format it
+/// supports, and each has to begin a line. When a message contains more than one
+/// the last wins, so a body that merely quotes an armor header keeps everything
+/// up to the real signature.
+fn signature_offset(message: &[u8]) -> Option<usize> {
+    const MARKERS: [&[u8]; 4] = [
+        b"-----BEGIN PGP SIGNATURE-----",
+        b"-----BEGIN PGP MESSAGE-----",
+        b"-----BEGIN SIGNED MESSAGE-----",
+        b"-----BEGIN SSH SIGNATURE-----",
+    ];
+    let starts_line = |at: usize| at == 0 || message[at - 1] == b'\n';
+    (0..message.len())
+        .rev()
+        .find(|&at| {
+            starts_line(at) && MARKERS.iter().any(|m| message[at..].starts_with(m))
+        })
+}
+
+/// The bare `strerror` text of an I/O error. Rust appends ` (os error <n>)` to
+/// its `Display`; git's `die_errno` does not, so it is trimmed off here.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(i) => text[..i].to_string(),
+        None => text,
+    }
+}
+
+/// Read a `:<idnum> SP <oid>` marks file, as git's `read_mark_file` does.
+///
+/// `display` is the name to put in the error text — git reports the path it was
+/// handed, which is the resolved one for `--import-marks` and the raw one for
+/// `--rewrite-submodules-from/-to`. With `if_exists`, a missing file is not an
+/// error and yields no marks; a corrupt line always is.
+fn read_mark_file(
+    path: &std::path::Path,
+    display: &str,
+    if_exists: bool,
+) -> Result<Vec<(u64, ObjectId)>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if if_exists && e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => bail!("cannot read '{display}': {}", strerror(&e)),
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let corrupt = || anyhow!("corrupt mark line: {line}");
+        let rest = line.strip_prefix(':').ok_or_else(|| corrupt())?;
+        let (mark, hex) = rest.split_once(' ').ok_or_else(|| corrupt())?;
+        let mark: u64 = mark.parse().map_err(|_| corrupt())?;
+        let id = ObjectId::from_hex(hex.as_bytes()).map_err(|_| corrupt())?;
+        out.push((mark, id));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

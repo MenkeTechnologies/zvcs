@@ -19,7 +19,15 @@
 //!   * `--prefix=<prefix>/`, including the leading directory entry git writes
 //!     for a prefix that ends in `/`.
 //!   * `-o <file>` / `--output=<file>`.
-//!   * `-l` / `--list`, `-v` / `--verbose`.
+//!   * `-l` / `--list` (including git's refusal to take any positional
+//!     alongside it), `-v` / `--verbose`.
+//!   * `--mtime=<time>`, which overrides the entry *and* `pax_global_header`
+//!     timestamps. git runs the value through `approxidate()`, which falls back
+//!     to the current time for anything it cannot parse; see [`approxidate`] for
+//!     what this port does and does not parse.
+//!   * `-<digits>` compression levels, to the extent git itself honours them:
+//!     `tar` rejects one with `Argument not supported for format 'tar': -<n>`,
+//!     and the last `-<digits>` on the command line is the one reported.
 //!   * Trailing `[--] <path>...` filters, with git's "pathspec did not match"
 //!     failure, and git's lazy directory-entry emission (a directory record is
 //!     written only once a file below it is written).
@@ -30,12 +38,15 @@
 //! Not covered — every one of these fails loudly rather than emitting an
 //! archive that would silently differ from git's:
 //!   * `--format=zip`, `tgz`, `tar.gz`: the vendored `gix-archive` is built
-//!     without its `tar`/`tar_gz`/`zip` features, so there is no deflate or
-//!     zip-container substrate in the build, and git's `tgz` output depends on
-//!     its internal gzip settings.
+//!     without its `tar`/`tar_gz`/`zip` features, and no zlib/deflate writer is
+//!     reachable from this crate's dependency set (`gix` + `anyhow`). git's
+//!     `tgz` is an in-process `gzdopen()` stream, so shelling out to the system
+//!     `gzip` would only coincidentally agree with it; the flag is accepted for
+//!     the purposes of git's own argument ordering and then fails loudly.
 //!   * `--remote` / `--exec` (needs the `git-upload-archive` protocol),
-//!     `--add-file`, `--add-virtual-file`, `--worktree-attributes`, `--mtime`,
-//!     and the `-<digit>` compression levels.
+//!     `--add-file`, `--add-virtual-file` and `--worktree-attributes`: parsed,
+//!     so that git's usage/format/tree-ish diagnostics still come out in the
+//!     right order, and then rejected before a single byte is written.
 //!   * Repositories whose archived tree carries content-affecting attributes
 //!     (`export-ignore`, `export-subst`, `text`, `eol`, `filter`, `ident`,
 //!     `working-tree-encoding`), or a `core.autocrlf` / `core.eol` /
@@ -72,6 +83,41 @@ const ZEROS: [u8; RECORD] = [0; RECORD];
 /// a precise message the moment one is actually requested.
 const FORMATS: &[&str] = &["tar", "tgz", "tar.gz", "zip"];
 
+/// The formats carrying git's `ARCHIVER_WANT_COMPRESSION_LEVELS`. A `-<digits>`
+/// given for any other format is fatal, which is the only way a compression
+/// level is observable from here since none of these three can be produced yet.
+const LEVEL_FORMATS: &[&str] = &["tgz", "tar.gz", "zip"];
+
+/// git's `archive_usage` followed by the option list `parse_options()` renders,
+/// byte for byte, as printed on stderr for a usage error.
+const USAGE: &str = "\
+usage: git archive [<options>] <tree-ish> [<path>...]
+   or: git archive --list
+   or: git archive --remote <repo> [--exec <cmd>] [<options>] <tree-ish> [<path>...]
+   or: git archive --remote <repo> [--exec <cmd>] --list
+
+    --[no-]format <fmt>   archive format
+    --[no-]prefix <prefix>
+                          prepend prefix to each pathname in the archive
+    --[no-]add-file <file>
+                          add untracked file to archive
+    --[no-]add-virtual-file <path:content>
+                          add untracked file to archive
+    -o, --[no-]output <file>
+                          write the archive to this file
+    --[no-]worktree-attributes
+                          read .gitattributes in working directory
+    -v, --[no-]verbose    report archived files on stderr
+    --mtime <time>        set modification time of archive entries
+    -NUM                  set compression level
+
+    -l, --[no-]list       list supported archive formats
+
+    --[no-]remote <repo>  retrieve the archive from remote repository <repo>
+    --[no-]exec <command> path to the remote git-upload-archive command
+
+";
+
 /// Parsed command line for one `archive` invocation.
 #[derive(Default)]
 struct Opts {
@@ -79,6 +125,14 @@ struct Opts {
     prefix: Option<String>,
     output: Option<String>,
     verbose: bool,
+    /// Raw `--mtime` text, still unparsed: git resolves it only after the usage,
+    /// format and compression-level diagnostics have had their chance.
+    mtime: Option<String>,
+    /// The last `-<digits>` seen; git keeps a single `int`, so later ones win.
+    level: Option<u32>,
+    worktree_attributes: bool,
+    /// `--add-file` / `--add-virtual-file` values, in command-line order.
+    added: Vec<String>,
     treeish: Option<String>,
     paths: Vec<String>,
 }
@@ -117,14 +171,26 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             "--" => literal = true,
             "-l" | "--list" => list = true,
             "-v" | "--verbose" => opts.verbose = true,
+            "--worktree-attributes" => opts.worktree_attributes = true,
             "--format" => opts.format = Some(value_of(args, &mut i, "--format")?),
             "--prefix" => opts.prefix = Some(value_of(args, &mut i, "--prefix")?),
             "-o" | "--output" => opts.output = Some(value_of(args, &mut i, "--output")?),
+            "--mtime" => opts.mtime = Some(value_of(args, &mut i, "--mtime")?),
+            "--add-file" | "--add-virtual-file" => {
+                let value = value_of(args, &mut i, a)?;
+                opts.added.push(value);
+            }
             _ if a.starts_with("--format=") => opts.format = Some(a[9..].to_string()),
             _ if a.starts_with("--prefix=") => opts.prefix = Some(a[9..].to_string()),
             _ if a.starts_with("--output=") => opts.output = Some(a[9..].to_string()),
+            _ if a.starts_with("--mtime=") => opts.mtime = Some(a[8..].to_string()),
+            _ if a.starts_with("--add-file=") => opts.added.push(a[11..].to_string()),
+            _ if a.starts_with("--add-virtual-file=") => opts.added.push(a[19..].to_string()),
+            _ if compression_level(a).is_some() => opts.level = compression_level(a),
             _ if a.len() > 1 && a.starts_with('-') => bail!(
-                "unsupported flag {a:?} (ported: --format, --prefix, -o/--output, -l/--list, -v/--verbose, --)"
+                "unsupported flag {a:?} (ported: --format, --prefix, -o/--output, --mtime, \
+                 -<digits>, --add-file, --add-virtual-file, --worktree-attributes, \
+                 -l/--list, -v/--verbose, --)"
             ),
             _ if opts.treeish.is_none() => opts.treeish = Some(a.to_string()),
             _ => opts.paths.push(a.to_string()),
@@ -132,8 +198,13 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    // `--list` short-circuits everything else, exactly as git's parse-options does.
+    // `--list` short-circuits everything else, but git rejects any leftover
+    // positional first — it never lists formats *and* takes a tree-ish.
     if list {
+        if let Some(extra) = opts.treeish.as_deref().or(opts.paths.first().map(String::as_str)) {
+            eprintln!("fatal: extra command line parameter '{extra}'");
+            return Ok(ExitCode::from(128));
+        }
         let mut out = String::new();
         for f in FORMATS {
             out.push_str(f);
@@ -143,9 +214,10 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // git checks `argc` before it looks at the format or the compression level,
+    // so a missing tree-ish outranks both `-<digits>` and an unknown format.
     let Some(spec) = opts.treeish.clone() else {
-        eprintln!("usage: git archive [<options>] <tree-ish> [<path>...]");
-        eprintln!("   or: git archive --list");
+        eprint!("{USAGE}");
         return Ok(ExitCode::from(129));
     };
 
@@ -160,14 +232,17 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             .unwrap_or("tar")
             .to_string(),
     };
-    match format.as_str() {
-        "tar" => {}
-        "tgz" | "tar.gz" | "zip" => bail!(
-            "archive format {format:?} is not supported (ported: tar) \
-             — the vendored gix-archive is built without its tar/tar_gz/zip features"
-        ),
-        _ => {
-            eprintln!("fatal: Unknown archive format '{format}'");
+    if !FORMATS.contains(&format.as_str()) {
+        eprintln!("fatal: Unknown archive format '{format}'");
+        return Ok(ExitCode::from(128));
+    }
+
+    // git's `parse_archive_args()`: a compression level is fatal for a format
+    // that does not declare `ARCHIVER_WANT_COMPRESSION_LEVELS`, and the level it
+    // names is the last one parsed, not the first one given.
+    if let Some(level) = opts.level {
+        if !LEVEL_FORMATS.contains(&format.as_str()) {
+            eprintln!("fatal: Argument not supported for format '{format}': -{level}");
             return Ok(ExitCode::from(128));
         }
     }
@@ -193,20 +268,36 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
     // A commit (or a tag peeling to one) contributes the pax global header and
     // the entry mtime; anything else that peels to a tree uses the current time.
     let commit = id.object()?.peel_to_commit().ok().map(|c| (c.id, c.time()));
-    let (commit_id, mtime) = match commit {
+    let (commit_id, default_mtime) = match commit {
         Some((cid, time)) => (Some(cid), time?.seconds),
-        None => (
-            None,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or_default(),
-        ),
+        None => (None, now()),
+    };
+    // `--mtime` replaces that for every entry and for the global header alike.
+    let mtime = match opts.mtime.as_deref() {
+        Some(text) => approxidate(text),
+        None => default_mtime,
     };
     let Ok(mut tree) = id.object()?.peel_to_tree() else {
         eprintln!("fatal: not a tree object: {}", id.detach());
         return Ok(ExitCode::from(128));
     };
+
+    // Everything git diagnoses with an exit code of its own has now had its
+    // turn, so this is the first point at which bailing cannot mask a real git
+    // error message. Each of these would otherwise silently produce an archive
+    // that differs from git's.
+    if format != "tar" {
+        bail!(
+            "archive format {format:?} is not supported (ported: tar) — no deflate or \
+             zip-container writer is reachable from this crate"
+        );
+    }
+    if let Some(given) = opts.added.first() {
+        bail!("--add-file/--add-virtual-file is not supported (given {given:?})");
+    }
+    if opts.worktree_attributes {
+        bail!("--worktree-attributes is not supported");
+    }
 
     // Run from a subdirectory, git narrows the tree to that subdirectory and
     // makes every archived path relative to it.
@@ -292,6 +383,40 @@ fn value_of(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
     args.get(*i)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("option `{flag}` requires a value"))
+}
+
+/// The level in a `-<digits>` argument, or `None` if `arg` is not one.
+fn compression_level(arg: &str) -> Option<u32> {
+    let digits = arg.strip_prefix('-')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Seconds since the epoch, right now.
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// git's `approxidate()`, as `--mtime` uses it: whatever the value parses to,
+/// and the current time for anything that does not parse at all (`--mtime=@0`
+/// and `--mtime=bogus-time` both land here, as stock git does).
+///
+/// The parse itself is `gix::date::parse`, covering ISO-8601 (with or without a
+/// zone, dotted or compact), RFC-2822, git's `<seconds> <±hhmm>` raw form, a
+/// bare epoch count and relative spellings like `2 days ago`. Two known
+/// deviations from git: a zone-less date is read as UTC where git reads it in
+/// the local zone, and a date git's approxidate accepts but `gix-date` does not
+/// falls back to the current time instead of that date.
+fn approxidate(spec: &str) -> i64 {
+    match gix::date::parse(spec, Some(std::time::SystemTime::now())) {
+        Ok(time) => time.seconds,
+        Err(_) => now(),
+    }
 }
 
 /// git's `filename_to_archive_format()`: the format whose name the output file's

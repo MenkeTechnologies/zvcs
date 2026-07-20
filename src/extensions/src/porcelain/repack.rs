@@ -10,11 +10,19 @@
 //!     and `-g<n>` / `-g <n>`
 //!   * the five distinct parse-options diagnostics, each byte-for-byte:
 //!     `unknown option`, `unknown switch`, `ambiguous option`, `takes no value`,
-//!     `requires a value`, plus the integer/magnitude value-type messages
+//!     `requires a value`, plus the integer/magnitude value-type messages and
+//!     the `not in range [-2147483648,2147483647]` message for an integer that
+//!     overflows a C `int` once its `k`/`m`/`g` suffix is applied
+//!   * `--filter` spec validation, which is a parse-options callback and so
+//!     dies (exit 128) at its own position in argv: `invalid filter-spec`,
+//!     `expected 'tree:<depth>'`, `expected something after combine:`,
+//!     `sparse:path filters support has been dropped`, and the
+//!     `object:type=<type>` message
 //!   * the pre-flight option-conflict `fatal:`s that stock git emits before it
 //!     does any work at all (exit 128): the `-A`/`-k`/`--cruft` triad, geometric
-//!     vs. `-a`/`-A`, incremental-with-bitmaps, and `--filter-to` without
-//!     `--filter`
+//!     vs. `-a`/`-A`, incremental-with-bitmaps, `--filter-to` without
+//!     `--filter`, and — last of the five — `invalid --name-hash-version
+//!     option: <n>` for any version above 2
 //! (all checked against git 2.55.0.)
 //!
 //! Everything else — i.e. `repack` actually repacking — bails, naming the
@@ -52,11 +60,21 @@
 //!   6. **`update-server-info`.** Absent `-n`, `repack` refreshes
 //!      `objects/info/packs`; nothing in the vendored crates writes that file.
 //!
-//! Two smaller, deliberate gaps in the covered part, so this doc claims no more
-//! than the code does: the `warning: minimum pack size limit is 1 MiB` that git
-//! prints for `--max-pack-size` below 1 MiB is not emitted, and the
-//! `repack.writeBitmaps` / `pack.writeBitmaps` config keys are not read, so the
-//! incremental-with-bitmaps `fatal:` fires only when `-b` is given explicitly.
+//! Smaller, deliberate gaps in the covered part, so this doc claims no more
+//! than the code does:
+//!   * the `warning: minimum pack size limit is 1 MiB` that git prints for
+//!     `--max-pack-size` below 1 MiB is not emitted;
+//!   * the `repack.writeBitmaps` / `pack.writeBitmaps` config keys are not read,
+//!     so the incremental-with-bitmaps `fatal:` fires only when `-b` is given
+//!     explicitly;
+//!   * `--filter=sparse:oid=<rev>` is accepted on syntax alone — git's rejection
+//!     of it depends on resolving and parsing the named blob;
+//!   * `combine:` sub-specs are not percent-decoded;
+//!   * with an invalid *integer* value earlier in argv than an invalid filter
+//!     spec, git reports the filter (`--window=x --filter=bogus:spec` → exit
+//!     128) while this reports the integer (exit 129). The mechanism behind
+//!     that inversion was not identified, and the ordering is otherwise
+//!     positional, so the positional behaviour is what is implemented.
 
 use anyhow::{bail, Result};
 use std::process::ExitCode;
@@ -188,6 +206,9 @@ struct State {
     geometric: bool,
     filter: bool,
     filter_to: bool,
+    /// The scaled value of the last `--name-hash-version`; 0 when unset or
+    /// cleared by `--no-name-hash-version`, which is the default git accepts.
+    name_hash_version: i64,
 }
 
 /// The outcome of parsing: either a fully-formed request, or a diagnostic that
@@ -309,7 +330,7 @@ fn long_opt(body: &str, args: &[String], i: &mut usize, st: &mut State) -> Optio
     }
 
     if negated {
-        set_long(idx, true, st);
+        set_long(idx, true, None, st);
         *i += 1;
         return None;
     }
@@ -337,26 +358,107 @@ fn long_opt(body: &str, args: &[String], i: &mut usize, st: &mut State) -> Optio
         if let Some(code) = check_value(def, &shown, v) {
             return Some(code);
         }
+        // `--filter` is an `OPT_PARSE_LIST_OBJECTS_FILTER` callback, so a bad
+        // spec dies where it sits in argv rather than at the end of parsing:
+        // `--filter=bogus:spec --zzz` reports the filter, `--zzz
+        // --filter=bogus:spec` reports the unknown option (git 2.55.0).
+        if def.long == "filter" {
+            if let Some(msg) = filter_error(v) {
+                return Some(fatal(&msg));
+            }
+        }
     }
 
-    set_long(idx, false, st);
+    set_long(idx, false, value, st);
     *i += 1;
     None
+}
+
+/// git's `OPT_INTEGER` value, scaled by an optional single `k`/`m`/`g` factor of
+/// 1024, or `None` when the text is not a number at all. Computed in `i128` so
+/// that a value far outside `long` still yields a magnitude the range check can
+/// reject, matching `strtol`'s `ERANGE` path.
+fn scaled(v: &str) -> Option<i128> {
+    let (negative, rest) = match v.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, v),
+    };
+    let (digits, factor) = match rest.chars().last() {
+        Some('k' | 'K') => (&rest[..rest.len() - 1], 1024i128),
+        Some('m' | 'M') => (&rest[..rest.len() - 1], 1024 * 1024),
+        Some('g' | 'G') => (&rest[..rest.len() - 1], 1024 * 1024 * 1024),
+        _ => (rest, 1),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // A literal too long for `i128` is out of range by any measure; saturating
+    // keeps it on the range-error path instead of the type-error one.
+    let n = digits.parse::<i128>().unwrap_or(i128::MAX / factor);
+    let n = n.saturating_mul(factor);
+    Some(if negative { -n } else { n })
+}
+
+/// Validate a `--filter` spec the way `gently_parse_list_objects_filter` does,
+/// returning the text git puts after `fatal: ` for the first rejection.
+///
+/// `sparse:oid=<rev>` is accepted on syntax alone: git's own rejection of it
+/// depends on resolving the object, and this command bails before reaching the
+/// object database either way.
+///
+/// Not covered: the percent-decoding git applies to each `combine:` sub-spec.
+fn filter_error(spec: &str) -> Option<String> {
+    let invalid = || Some(format!("invalid filter-spec '{spec}'"));
+
+    if let Some(rest) = spec.strip_prefix("combine:") {
+        if rest.is_empty() {
+            return Some("expected something after combine:".to_string());
+        }
+        // Empty sub-specs are skipped, so `combine:+` is accepted.
+        return rest.split('+').filter(|s| !s.is_empty()).find_map(filter_error);
+    }
+
+    match spec {
+        "blob:none" => None,
+        _ if spec.starts_with("blob:limit=") => {
+            // `git_parse_ulong`: digits with an optional k/m/g, never signed.
+            match scaled(&spec["blob:limit=".len()..]) {
+                Some(n) if n >= 0 => None,
+                _ => invalid(),
+            }
+        }
+        _ if spec.starts_with("tree:") => match scaled(&spec["tree:".len()..]) {
+            Some(n) if n >= 0 => None,
+            _ => Some("expected 'tree:<depth>'".to_string()),
+        },
+        _ if spec.starts_with("sparse:path=") => {
+            Some("sparse:path filters support has been dropped".to_string())
+        }
+        _ if spec.starts_with("sparse:oid=") => None,
+        _ if spec.starts_with("object:type=") => {
+            let ty = &spec["object:type=".len()..];
+            if matches!(ty, "blob" | "tree" | "commit" | "tag") {
+                None
+            } else {
+                Some(format!("'{ty}' for 'object:type=<type>' is not a valid object type"))
+            }
+        }
+        _ => invalid(),
+    }
 }
 
 /// Validate a value against the option's parse-options type, emitting git's
 /// exact type diagnostic on failure.
 fn check_value(def: &OptDef, shown: &str, v: &str) -> Option<ExitCode> {
+    // parse-options names a long option as ``option `x'`` and a short one as
+    // ``switch `x'``; only `-g` reaches the value checks by its short form.
+    let label = format!("option `{shown}'");
     match def.kind {
-        Kind::Int if !is_number(v, true) => {
-            eprintln!(
-                "error: option `{shown}' expects an integer value with an optional k/m/g suffix"
-            );
-            Some(ExitCode::from(129))
-        }
+        Kind::Int => int_value(&label, v).err(),
+        Kind::Magnitude if v.is_empty() => Some(numerical_value(&label)),
         Kind::Magnitude if !is_number(v, false) => {
             eprintln!(
-                "error: option `{shown}' expects a non-negative integer value with an optional k/m/g suffix"
+                "error: {label} expects a non-negative integer value with an optional k/m/g suffix"
             );
             Some(ExitCode::from(129))
         }
@@ -368,8 +470,43 @@ fn check_value(def: &OptDef, shown: &str, v: &str) -> Option<ExitCode> {
     }
 }
 
+/// git's diagnostic for an empty value, which every numeric option shares.
+fn numerical_value(label: &str) -> ExitCode {
+    eprintln!("error: {label} expects a numerical value");
+    ExitCode::from(129)
+}
+
+/// Parse an `OPT_INTEGER` value for the already-formatted `label` (e.g.
+/// ``option `geometric'`` or ``switch `g'``), emitting git's type diagnostic for
+/// non-numbers and its range diagnostic for anything a C `int` cannot hold
+/// (`--name-hash-version=3g` scales to 3 GiB and hits the latter). Every one of
+/// these prints a single line and exits 129, with no usage block.
+fn int_value(label: &str, v: &str) -> Result<i64, ExitCode> {
+    if v.is_empty() {
+        return Err(numerical_value(label));
+    }
+    let n = match scaled(v) {
+        Some(n) => n,
+        None => {
+            eprintln!("error: {label} expects an integer value with an optional k/m/g suffix");
+            return Err(ExitCode::from(129));
+        }
+    };
+    if n < i32::MIN as i128 || n > i32::MAX as i128 {
+        eprintln!(
+            "error: value {v} for {label} not in range [{},{}]",
+            i32::MIN,
+            i32::MAX
+        );
+        return Err(ExitCode::from(129));
+    }
+    Ok(n as i64)
+}
+
 /// Record the effect of long option `OPTS[idx]`; `negated` is true for the
-/// `--no-<long>` form, which clears the flag instead of setting it.
+/// `--no-<long>` form, which clears the flag instead of setting it. `value` is
+/// the option's argument, already validated, for the one option whose value the
+/// pre-flight checks read.
 ///
 /// Only the flags the pre-flight checks consult are tracked; the rest are
 /// accepted and dropped, since the command bails before they could matter.
@@ -377,9 +514,16 @@ fn check_value(def: &OptDef, shown: &str, v: &str) -> Option<ExitCode> {
 /// `--no-cruft` clears `cruft` but leaves `all_into_one` alone: git's `-a`/`-A`
 /// and `--cruft` all set the same `ALL_INTO_ONE` bit, and the `--no-` form of a
 /// bit option only clears its own bit once it has been set by that option.
-fn set_long(idx: usize, negated: bool, st: &mut State) {
+fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
     let on = !negated;
     match OPTS[idx].long {
+        // `--no-name-hash-version` restores the default, which git accepts.
+        "name-hash-version" => {
+            st.name_hash_version = match value {
+                Some(v) if on => scaled(v).unwrap_or(0) as i64,
+                _ => 0,
+            }
+        }
         "cruft" => {
             st.cruft = on;
             st.all_into_one |= on;
@@ -482,11 +626,8 @@ fn short_opts(cluster: &str, args: &[String], i: &mut usize, st: &mut State) -> 
                 } else {
                     rest
                 };
-                if !is_number(&value, true) {
-                    eprintln!(
-                        "error: option `geometric' expects an integer value with an optional k/m/g suffix"
-                    );
-                    return Some(ExitCode::from(129));
+                if let Err(code) = int_value("switch `g'", &value) {
+                    return Some(code);
                 }
                 st.geometric = true;
                 *i += 1;
@@ -556,6 +697,16 @@ fn preflight(st: &State) -> Option<ExitCode> {
         return Some(fatal(
             "option '--filter-to' can only be used along with '--filter'",
         ));
+    }
+
+    // git only knows name hash versions 1 and 2; it leaves everything at or
+    // below 0 alone, since 0 is the "unset" default and a negative value never
+    // reaches the hashing code.
+    if st.name_hash_version > 2 {
+        return Some(fatal(&format!(
+            "invalid --name-hash-version option: {}",
+            st.name_hash_version
+        )));
     }
 
     None

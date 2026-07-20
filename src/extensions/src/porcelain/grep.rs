@@ -1,20 +1,29 @@
 //! `git grep` — search the contents of tracked files for a pattern.
 //!
-//! Covered: the tracked-worktree default and `--cached`, pathspec limiting (via
-//! gitoxide's pathspec platform, so magic and globs work and a subdirectory
-//! invocation searches only that subtree), and the line/name/count/quiet output
-//! modes with byte-identical formatting, including git's binary-file handling
-//! and `core.quotePath` path quoting.
+//! Covered: the tracked-worktree default, `--cached` and `--untracked`, pathspec
+//! limiting (via gitoxide's pathspec platform, so magic and globs work and a
+//! subdirectory invocation searches only that subtree), `--max-depth`,
+//! `--max-count`, and the line/name/count/quiet output modes with byte-identical
+//! formatting, including git's binary-file handling and `core.quotePath` path
+//! quoting.
 //!
 //! Not covered, and rejected loudly rather than approximated: patterns that need
 //! a regex engine (the vendored gitoxide crates ship none — `gix`'s optional
-//! `regex` dependency is behind the unused `revparse-regex` feature and is not
-//! re-exported), searching `<tree>` revisions, `--untracked`/`--no-index`,
-//! context lines (`-A`/`-B`/`-C`), `--heading`/`--break`, `-p`/`-W`, `-f`,
-//! `--and`/`--or`/`--not`, `-m`, `--color`, and `-O`.
+//! `regex` dependency is behind the `revparse-regex` feature but is not
+//! re-exported, so it cannot be reached from here), searching `<tree>`
+//! revisions, `--no-index`, `--recurse-submodules`, `--textconv`, context lines
+//! (`-A`/`-B`/`-C`/`-W`/`-p`), `--heading`/`--break`, `-f`, `--and`/`--or`/
+//! `--not`, `-O`, and coloured output.
+//!
+//! Flags in that last group that only shape the *rendering* of a match — context
+//! lines, `--heading`, `--break`, `-p`, `-W` — are accepted during parsing (git
+//! itself diagnoses a missing pattern before it looks at them) and refused at
+//! the point they would change what is printed. When nothing matched there is
+//! nothing for them to shape, so the empty output and exit code 1 are git's
+//! answer exactly, and the run is allowed to finish.
 
 use anyhow::{bail, Result};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -30,42 +39,63 @@ enum Dialect {
     Basic,
     Extended,
     Fixed,
+    Perl,
 }
 
 /// Parsed command-line options for a single `grep` invocation.
 struct Opts {
-    invert: bool,       // -v
-    ignore_case: bool,  // -i
-    word: bool,         // -w
-    text: bool,         // -a: treat binary files as text
-    no_binary: bool,    // -I: never match in binary files
-    line_number: bool,  // -n
-    column: bool,       // --column
-    files_with: bool,   // -l/--files-with-matches/--name-only
-    files_without: bool, // -L/--files-without-match
-    count: bool,        // -c
-    quiet: bool,        // -q
-    nul: bool,          // -z
-    only_matching: bool, // -o
-    show_names: bool,   // -h clears, -H sets (default: on)
-    full_name: bool,    // --full-name
-    cached: bool,       // --cached
+    invert: bool,         // -v
+    ignore_case: bool,    // -i
+    word: bool,           // -w
+    text: bool,           // -a: treat binary files as text
+    no_binary: bool,      // -I: never match in binary files
+    line_number: bool,    // -n
+    column: bool,         // --column
+    files_with: bool,     // -l/--files-with-matches/--name-only
+    files_without: bool,  // -L/--files-without-match
+    count: bool,          // -c
+    quiet: bool,          // -q
+    nul: bool,            // -z
+    only_matching: bool,  // -o
+    show_names: bool,     // -h clears, -H sets (default: on)
+    full_name: bool,      // --full-name
+    cached: bool,         // --cached
+    untracked: bool,      // --untracked
+    exclude_standard: bool, // --[no-]exclude-standard (default: on)
+    max_count: i64,       // -m/--max-count, -1 = unlimited
+    max_depth: i64,       // --max-depth, -1 = unlimited
+}
+
+/// Flags that git accepts but this port cannot render, kept aside so the
+/// "no pattern given" diagnosis still happens first, exactly as in git.
+#[derive(Default)]
+struct Deferred {
+    /// The flag as the user spelled it, for the refusal message.
+    context: Option<String>,
+    /// Changes which files are searched, so it can never be shrugged off.
+    set_changing: Option<String>,
+    all_match: bool,
 }
 
 /// `git grep` — print lines matching a pattern.
 ///
 /// Supported flags (output byte-for-byte identical to stock git for these):
-///   * source: default (tracked files in the worktree), `--cached`
-///   * matching: `-i`, `-v`, `-w`, `-F`/`--fixed-strings`, `-E`, `-G`,
-///     `-e <pattern>` (repeatable; patterns are OR'd)
+///   * source: default (tracked files in the worktree), `--cached`,
+///     `--untracked`, `--[no-]exclude-standard`
+///   * matching: `-i`, `-v`, `-w`, `-F`/`--fixed-strings`, `-E`, `-G`, `-P`,
+///     `-e <pattern>` (repeatable; patterns are OR'd), `-m`/`--max-count`
 ///   * binary: `-a`/`--text`, `-I`
+///   * scope: `--max-depth`, `-r`/`--recursive`, `--no-recursive`
 ///   * output: `-n`, `--column`, `-l`/`--files-with-matches`/`--name-only`,
 ///     `-L`/`--files-without-match`, `-c`/`--count`, `-q`/`--quiet`, `-o`,
-///     `-z`/`--null`, `-h`, `-H`, `--full-name`
+///     `-z`/`--null`, `-h`, `-H`, `--full-name`, `--color=never|auto`
+///   * accepted no-ops: `--no-textconv`, `--[no-]ext-grep`, `--threads`,
+///     `--no-heading`, `--no-break`, `--no-recurse-submodules`, `--index`
 ///   * `[--] <pathspec>...`
 ///
-/// Exit status matches git: `0` when at least one line matched, `1` when none
-/// did, and a non-zero error exit (via the caller's error path) otherwise.
+/// Exit status matches git: `0` when at least one file produced output (for
+/// `-L`, when at least one file was listed), `1` when none did, `128` for a
+/// fatal such as a missing pattern, and `129` for a malformed option value.
 pub fn grep(args: &[String]) -> Result<ExitCode> {
     let mut opts = Opts {
         invert: false,
@@ -84,14 +114,18 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         show_names: true,
         full_name: false,
         cached: false,
+        untracked: false,
+        exclude_standard: true,
+        max_count: -1,
+        max_depth: -1,
     };
+    let mut deferred = Deferred::default();
     let mut dialect = Dialect::Basic;
     let mut patterns: Vec<String> = Vec::new();
     let mut positionals: Vec<String> = Vec::new();
     let mut no_more_opts = false;
 
-    // Skip args[0], which is the subcommand name itself.
-    let mut i = 1;
+    let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if no_more_opts || a == "-" || !a.starts_with('-') {
@@ -105,36 +139,158 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             continue;
         }
         if let Some(long) = a.strip_prefix("--") {
-            match long {
+            // `--name=value` and `--name value` are both accepted by git for
+            // every long option that takes one.
+            let (name, inline) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (long, None),
+            };
+            // Reads the value of an option that requires one, consuming the
+            // next argument when it was not spelled inline.
+            macro_rules! value {
+                () => {
+                    match inline.clone() {
+                        Some(v) => v,
+                        None => {
+                            i += 1;
+                            match args.get(i) {
+                                Some(v) => v.clone(),
+                                None => {
+                                    eprintln!("error: option `{name}' requires a value");
+                                    return Ok(ExitCode::from(129));
+                                }
+                            }
+                        }
+                    }
+                };
+            }
+            match name {
                 "invert-match" => opts.invert = true,
+                "no-invert-match" => opts.invert = false,
                 "ignore-case" => opts.ignore_case = true,
+                "no-ignore-case" => opts.ignore_case = false,
                 "word-regexp" => opts.word = true,
+                "no-word-regexp" => opts.word = false,
                 "text" => opts.text = true,
+                "no-text" => opts.text = false,
                 "line-number" => opts.line_number = true,
+                "no-line-number" => opts.line_number = false,
                 "column" => opts.column = true,
+                "no-column" => opts.column = false,
                 "files-with-matches" | "name-only" => opts.files_with = true,
+                "no-files-with-matches" | "no-name-only" => opts.files_with = false,
                 "files-without-match" => opts.files_without = true,
+                "no-files-without-match" => opts.files_without = false,
                 "count" => opts.count = true,
+                "no-count" => opts.count = false,
                 "quiet" => opts.quiet = true,
+                "no-quiet" => opts.quiet = false,
                 "null" => opts.nul = true,
+                "no-null" => opts.nul = false,
                 "only-matching" => opts.only_matching = true,
+                "no-only-matching" => opts.only_matching = false,
                 "full-name" => opts.full_name = true,
+                "no-full-name" => opts.full_name = false,
                 "cached" => opts.cached = true,
-                "recursive" => {} // the default
+                "no-cached" => opts.cached = false,
+                "untracked" => opts.untracked = true,
+                "no-untracked" => opts.untracked = false,
+                "exclude-standard" => opts.exclude_standard = true,
+                "no-exclude-standard" => opts.exclude_standard = false,
                 "extended-regexp" => dialect = Dialect::Extended,
                 "basic-regexp" => dialect = Dialect::Basic,
                 "fixed-strings" => dialect = Dialect::Fixed,
+                "perl-regexp" => dialect = Dialect::Perl,
+                "no-extended-regexp" | "no-basic-regexp" | "no-fixed-strings"
+                | "no-perl-regexp" => dialect = Dialect::Basic,
+                // `--recursive` and `--no-recursive` are git's spellings of
+                // `--max-depth=-1` and `--max-depth=0`.
+                "recursive" => opts.max_depth = -1,
+                "no-recursive" => opts.max_depth = 0,
+                "max-depth" => match parse_int(name, &value!()) {
+                    Ok(n) => opts.max_depth = n,
+                    Err(code) => return Ok(code),
+                },
+                "max-count" => match parse_int(name, &value!()) {
+                    Ok(n) => opts.max_count = n,
+                    Err(code) => return Ok(code),
+                },
+                // Worker-thread count cannot change the output of a
+                // single-threaded search: git orders results by path either way.
+                "threads" => match parse_int(name, &value!()) {
+                    Ok(_) => {}
+                    Err(code) => return Ok(code),
+                },
+                // `--no-textconv` is git's default for grep, and `--ext-grep` is
+                // documented as ignored by modern builds.
+                "no-textconv" | "ext-grep" | "no-ext-grep" | "index" => {}
+                "no-heading" | "no-break" | "no-show-function" | "no-function-context"
+                | "no-recurse-submodules" | "no-all-match" => {}
+                "color" => match color_wanted(inline.as_deref()) {
+                    Ok(true) => bail!("{}", unsupported("--color=always")),
+                    Ok(false) => {}
+                    Err(v) => {
+                        eprintln!("error: option `color' expects \"always\", \"auto\", or \"never\", not \"{v}\"");
+                        return Ok(ExitCode::from(129));
+                    }
+                },
+                "no-color" => {}
+                "heading" | "break" | "show-function" | "function-context" => {
+                    deferred.context.get_or_insert_with(|| a.to_string());
+                }
+                "context" | "after-context" | "before-context" => {
+                    match parse_int(name, &value!()) {
+                        Ok(0) => {}
+                        Ok(_) => {
+                            deferred.context.get_or_insert_with(|| format!("--{name}"));
+                        }
+                        Err(code) => return Ok(code),
+                    }
+                }
+                "no-context" | "no-after-context" | "no-before-context" => {}
+                "all-match" => deferred.all_match = true,
+                "recurse-submodules" | "textconv" | "no-index" => {
+                    deferred.set_changing.get_or_insert_with(|| a.to_string());
+                }
                 _ => bail!("{}", unsupported(a)),
             }
             i += 1;
             continue;
         }
 
-        // Short flags, possibly grouped (`-in`). `-e` consumes the rest of the
-        // group as its value, or the next argument when the group ends with it.
+        // `-NUM` is git's shortcut for `-C NUM`.
+        if a.len() > 1 && a[1..].bytes().all(|b| b.is_ascii_digit()) {
+            if a[1..].parse::<u64>().unwrap_or(0) != 0 {
+                deferred.context.get_or_insert_with(|| a.to_string());
+            }
+            i += 1;
+            continue;
+        }
+
+        // Short flags, possibly grouped (`-in`). A flag that takes a value
+        // consumes the rest of the group as that value, or the next argument
+        // when the group ends with it.
         let group: Vec<char> = a[1..].chars().collect();
         let mut c = 0;
         while c < group.len() {
+            // The value of the flag at `group[c]`, per the rule above.
+            macro_rules! short_value {
+                ($flag:expr) => {{
+                    let rest: String = group[c + 1..].iter().collect();
+                    if rest.is_empty() {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => v.clone(),
+                            None => {
+                                eprintln!("error: switch `{}' requires a value", $flag);
+                                return Ok(ExitCode::from(129));
+                            }
+                        }
+                    } else {
+                        rest
+                    }
+                }};
+            }
             match group[c] {
                 'i' => opts.ignore_case = true,
                 'v' => opts.invert = true,
@@ -150,23 +306,49 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 'o' => opts.only_matching = true,
                 'h' => opts.show_names = false,
                 'H' => opts.show_names = true,
-                'r' => {} // the default
+                'r' => opts.max_depth = -1,
                 'E' => dialect = Dialect::Extended,
                 'G' => dialect = Dialect::Basic,
                 'F' => dialect = Dialect::Fixed,
-                'e' => {
-                    let rest: String = group[c + 1..].iter().collect();
-                    if rest.is_empty() {
-                        i += 1;
-                        let Some(p) = args.get(i) else {
-                            bail!("switch `e' requires a value");
-                        };
-                        patterns.push(p.clone());
-                    } else {
-                        patterns.push(rest);
+                'P' => dialect = Dialect::Perl,
+                'p' | 'W' => {
+                    deferred.context.get_or_insert_with(|| format!("-{}", group[c]));
+                }
+                'A' | 'B' | 'C' => {
+                    let flag = group[c];
+                    let long = match flag {
+                        'A' => "after-context",
+                        'B' => "before-context",
+                        _ => "context",
+                    };
+                    let v = short_value!(flag);
+                    match parse_int(long, &v) {
+                        Ok(0) => {}
+                        Ok(_) => {
+                            deferred.context.get_or_insert_with(|| format!("-{flag}"));
+                        }
+                        Err(code) => return Ok(code),
                     }
                     c = group.len();
                     continue;
+                }
+                'm' => {
+                    let v = short_value!('m');
+                    match parse_int("max-count", &v) {
+                        Ok(n) => opts.max_count = n,
+                        Err(code) => return Ok(code),
+                    }
+                    c = group.len();
+                    continue;
+                }
+                'e' => {
+                    patterns.push(short_value!('e'));
+                    c = group.len();
+                    continue;
+                }
+                'f' => {
+                    let _ = short_value!('f');
+                    bail!("{}", unsupported("-f"));
                 }
                 other => bail!("{}", unsupported(&format!("-{other}"))),
             }
@@ -175,26 +357,31 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
+    // git diagnoses a missing pattern before anything else it was handed.
+    if patterns.is_empty() && positionals.is_empty() {
+        eprintln!("fatal: no pattern given");
+        return Ok(ExitCode::from(128));
+    }
     // Without `-e`, the first positional is the pattern.
     if patterns.is_empty() {
-        if positionals.is_empty() {
-            bail!("no pattern given");
-        }
         patterns.push(positionals.remove(0));
     }
 
-    // Combinations whose exact output this port does not reproduce.
-    if opts.only_matching && patterns.len() > 1 {
-        bail!("-o with more than one pattern is not supported");
+    // `--max-count=0` is documented to "exit immediately with a non-zero
+    // status", ahead of even the source-conflict check.
+    if opts.max_count == 0 {
+        return Ok(ExitCode::from(1));
     }
-    if opts.only_matching && opts.invert {
-        bail!("-o combined with -v is not supported");
+    if opts.untracked && opts.cached {
+        eprintln!("fatal: options '--untracked' and '--cached' cannot be used together");
+        return Ok(ExitCode::from(128));
     }
-    if opts.column && opts.invert {
-        bail!("--column combined with -v is not supported");
+
+    if let Some(flag) = &deferred.set_changing {
+        bail!("{}", unsupported(flag));
     }
-    if opts.quiet && opts.files_without {
-        bail!("-q combined with -L is not supported");
+    if deferred.all_match && patterns.len() > 1 {
+        bail!("{}", unsupported("--all-match"));
     }
 
     let needles: Vec<Vec<u8>> = patterns
@@ -215,19 +402,22 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         specs.push(BString::from(p.as_str()));
     }
 
-    // The repo-root-relative prefix of the current directory; git strips it from
-    // printed paths unless `--full-name` was given.
-    let prefix: Option<Vec<u8>> = if opts.full_name {
+    // The repo-root-relative prefix of the current directory. It scopes a bare
+    // invocation to the current subtree, is the base `--max-depth` counts from
+    // when no pathspec narrows it, and is stripped from printed paths unless
+    // `--full-name` was given.
+    let cwd_prefix: Vec<u8> = match repo.prefix()? {
+        Some(p) if !p.as_os_str().is_empty() => {
+            let mut b = gix::path::into_bstr(p).into_owned().to_vec();
+            b.push(b'/');
+            b
+        }
+        _ => Vec::new(),
+    };
+    let prefix: Option<&[u8]> = if opts.full_name || cwd_prefix.is_empty() {
         None
     } else {
-        match repo.prefix()? {
-            Some(p) if !p.as_os_str().is_empty() => {
-                let mut b = gix::path::into_bstr(p).into_owned().to_vec();
-                b.push(b'/');
-                Some(b)
-            }
-            _ => None,
-        }
+        Some(cwd_prefix.as_slice())
     };
 
     // `empty_patterns_match_prefix = true` reproduces git's behaviour of
@@ -239,7 +429,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         &index,
         gix::worktree::stack::state::attributes::Source::IdMapping,
     )?;
-    let mut files: Vec<(BString, gix::hash::ObjectId)> = Vec::new();
+    let mut files: Vec<(BString, Option<gix::hash::ObjectId>)> = Vec::new();
     if let Some(iter) = ps.index_entries_with_paths(&index) {
         for (path, entry) in iter {
             // git's `grep_cache()` only visits regular files: symlinks and
@@ -252,8 +442,50 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             if files.last().is_some_and(|(last, _)| last.as_bstr() == path) {
                 continue;
             }
-            files.push((path.to_owned(), entry.id));
+            files.push((path.to_owned(), Some(entry.id)));
         }
+    }
+
+    if opts.untracked {
+        collect_untracked(&repo, &index, &specs, &opts, &mut files)?;
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files.dedup_by(|a, b| a.0 == b.0);
+    }
+
+    apply_max_depth(&mut files, &specs, &cwd_prefix, opts.max_depth);
+
+    // Reading a candidate's bytes, from the index with `--cached` and from the
+    // worktree otherwise. `None` means the file is gone, which git ignores.
+    let content_of = |path: &BString, id: &Option<gix::hash::ObjectId>| -> Result<Option<Vec<u8>>> {
+        if opts.cached {
+            let Some(id) = id else { return Ok(None) };
+            return Ok(Some(repo.find_object(*id)?.data.clone()));
+        }
+        let Some(abs) = repo.workdir_path(path.as_bstr()) else {
+            return Ok(None);
+        };
+        match std::fs::read(&abs) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    };
+
+    // Context, headings and function names only reshape printed match lines, so
+    // they are irrelevant to the name/count/quiet modes — and to any run that
+    // found nothing, where git's output is empty and its exit code is 1 too.
+    let renders_lines = !(opts.quiet || opts.files_with || opts.files_without || opts.count);
+    if let Some(flag) = deferred.context.filter(|_| renders_lines) {
+        for (path, id) in &files {
+            let Some(content) = content_of(path, id)? else { continue };
+            if !opts.text && is_binary(&content) && opts.no_binary {
+                continue;
+            }
+            if lines(&content).any(|l| next_match(l, &needles, 0, &opts).is_some() != opts.invert) {
+                bail!("{}", unsupported(&flag));
+            }
+        }
+        return Ok(ExitCode::from(1));
     }
 
     let stdout = std::io::stdout();
@@ -261,27 +493,14 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     let mut any_hit = false;
 
     for (path, id) in &files {
-        let content = if opts.cached {
-            let object = repo.find_object(*id)?;
-            object.data.clone()
-        } else {
-            let Some(abs) = repo.workdir_path(path.as_bstr()) else {
-                continue;
-            };
-            match std::fs::read(&abs) {
-                Ok(bytes) => bytes,
-                // git silently ignores index entries whose file is gone.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            }
-        };
+        let Some(content) = content_of(path, id)? else { continue };
 
         let binary = !opts.text && is_binary(&content);
         if binary && opts.no_binary {
             continue;
         }
 
-        let name = display_name(path.as_bstr(), prefix.as_deref(), &opts);
+        let name = display_name(path.as_bstr(), prefix, &opts);
         if search_file(&mut out, &content, &name, binary, &needles, &opts)? {
             any_hit = true;
             if opts.quiet {
@@ -298,8 +517,124 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     })
 }
 
+/// Add the untracked files under `specs` to `files`, as `--untracked` asks.
+///
+/// `--exclude-standard` is on by default, matching git, so ignored files stay
+/// out unless `--no-exclude-standard` was given. Only regular files are added:
+/// directories, symlinks and nested repositories are not searchable content,
+/// exactly as on the index path.
+fn collect_untracked(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    specs: &[BString],
+    opts: &Opts,
+    files: &mut Vec<(BString, Option<gix::hash::ObjectId>)>,
+) -> Result<()> {
+    let options = repo
+        .dirwalk_options()?
+        .empty_patterns_match_prefix(true)
+        .emit_untracked(gix::dir::walk::EmissionMode::Matching)
+        .emit_ignored(
+            (!opts.exclude_standard).then_some(gix::dir::walk::EmissionMode::Matching),
+        );
+    let mut collect = gix::dir::walk::delegate::Collect::default();
+    let should_interrupt = std::sync::atomic::AtomicBool::default();
+    repo.dirwalk(index, specs, &should_interrupt, options, &mut collect)?;
+
+    for (entry, _) in collect.unorded_entries {
+        if entry.disk_kind != Some(gix::dir::entry::Kind::File) {
+            continue;
+        }
+        match entry.status {
+            gix::dir::entry::Status::Untracked => {}
+            gix::dir::entry::Status::Ignored(_) if !opts.exclude_standard => {}
+            _ => continue,
+        }
+        files.push((entry.rela_path, None));
+    }
+    Ok(())
+}
+
+/// Drop candidates that lie deeper than `--max-depth` allows.
+///
+/// git counts depth from the end of the pathspec that selected the file — with
+/// no pathspec, from the repo-relative current directory — so `--max-depth=0`
+/// with `-- a` keeps `a/z.txt` but not `a/b/z.txt`. Per `git help grep`, the
+/// option "is ignored if <pathspec> contains active wildcards".
+fn apply_max_depth(
+    files: &mut Vec<(BString, Option<gix::hash::ObjectId>)>,
+    specs: &[BString],
+    cwd_prefix: &[u8],
+    max_depth: i64,
+) {
+    let Ok(max_depth) = usize::try_from(max_depth) else {
+        return;
+    };
+    let has_wildcard = specs.iter().any(|s| {
+        let bytes: &[u8] = s;
+        bytes.iter().any(|&b| matches!(b, b'*' | b'?' | b'[' | b':'))
+    });
+    if has_wildcard {
+        return;
+    }
+
+    // The directory each pathspec descends from; a spec naming a file exactly
+    // sits at depth zero, which the `== spec` test below covers.
+    let bases: Vec<Vec<u8>> = if specs.is_empty() {
+        vec![cwd_prefix.to_vec()]
+    } else {
+        specs
+            .iter()
+            .map(|s| {
+                let bytes: &[u8] = s;
+                let mut b = bytes.to_vec();
+                if !b.is_empty() && b.last() != Some(&b'/') {
+                    b.push(b'/');
+                }
+                b
+            })
+            .collect()
+    };
+
+    files.retain(|(path, _)| {
+        let path: &[u8] = path;
+        if specs.iter().any(|s| {
+            let spec: &[u8] = s;
+            spec == path
+        }) {
+            return true;
+        }
+        bases.iter().any(|base| {
+            path.len() >= base.len()
+                && &path[..base.len()] == base.as_slice()
+                && path[base.len()..].iter().filter(|&&b| b == b'/').count() <= max_depth
+        })
+    });
+}
+
+/// Whether colourised output was asked for. `Err` carries an unrecognised
+/// `--color=<when>` value so the caller can report it the way git does.
+fn color_wanted(when: Option<&str>) -> Result<bool, String> {
+    match when {
+        None | Some("always") | Some("true") => Ok(true),
+        Some("never") | Some("false") => Ok(false),
+        Some("auto") => Ok(std::io::stdout().is_terminal()),
+        Some(other) => Err(other.to_string()),
+    }
+}
+
+/// Parse an option value that git declares as an integer, reporting git's own
+/// usage error (exit 129) when it is not one.
+fn parse_int(name: &str, value: &str) -> Result<i64, ExitCode> {
+    value.parse::<i64>().map_err(|_| {
+        eprintln!("error: option `{name}' expects an integer value with an optional k/m/g suffix");
+        ExitCode::from(129)
+    })
+}
+
 /// Search one file's `content`, emitting whatever the active output mode calls
-/// for. Returns whether the file contained at least one (post-`-v`) match.
+/// for. Returns whether this file contributes a hit to the exit status: for
+/// `-L` that is having been *listed* (no match), otherwise having matched.
 fn search_file(
     out: &mut impl Write,
     content: &[u8],
@@ -308,6 +643,11 @@ fn search_file(
     needles: &[Vec<u8>],
     opts: &Opts,
 ) -> Result<bool> {
+    let limit = if opts.max_count < 0 {
+        usize::MAX
+    } else {
+        opts.max_count as usize
+    };
     let mut count = 0usize;
     let mut hit = false;
     // Once a binary file is known to match, git prints a single notice in place
@@ -315,7 +655,10 @@ fn search_file(
     let mut binary_notice_pending = binary;
 
     for (lno, line) in lines(content).enumerate() {
-        let first = first_match(line, needles, opts);
+        if count >= limit {
+            break;
+        }
+        let first = next_match(line, needles, 0, opts);
         let matched = first.is_some() != opts.invert;
         if !matched {
             continue;
@@ -337,10 +680,11 @@ fn search_file(
             break;
         }
 
-        if opts.only_matching {
-            let needle = &needles[0];
+        // `-o` has nothing to narrow under `-v`, where the whole line is the
+        // result; git prints the full line in that case.
+        if opts.only_matching && !opts.invert {
             let mut at = 0usize;
-            while let Some((start, len)) = find_from(line, needle, at, opts) {
+            while let Some((start, len)) = next_match(line, needles, at, opts) {
                 if len == 0 {
                     break; // an empty pattern has no non-empty part to show
                 }
@@ -350,22 +694,22 @@ fn search_file(
                 at = start + len;
             }
         } else {
-            write_prefix(out, name, lno + 1, first.unwrap_or(0) + 1, opts)?;
+            write_prefix(out, name, lno + 1, first.map_or(0, |(s, _)| s) + 1, opts)?;
             out.write_all(line)?;
             out.write_all(b"\n")?;
         }
     }
 
     // git's precedence: -q suppresses all output, then -L, then -l, then -c.
-    if opts.quiet {
-        return Ok(hit);
-    }
     let term: &[u8] = if opts.nul { b"\0" } else { b"\n" };
     if opts.files_without {
-        if !hit {
+        if !hit && !opts.quiet {
             out.write_all(name)?;
             out.write_all(term)?;
         }
+        return Ok(!hit);
+    }
+    if opts.quiet {
         return Ok(hit);
     }
     if opts.files_with {
@@ -420,12 +764,19 @@ fn lines(content: &[u8]) -> impl Iterator<Item = &[u8]> {
         .take(if empty { 0 } else { usize::MAX })
 }
 
-/// The 0-based offset of the earliest match of any pattern in `line`.
-fn first_match(line: &[u8], needles: &[Vec<u8>], opts: &Opts) -> Option<usize> {
+/// The next match of any pattern in `line` at or after `at`, as `(start, len)`.
+/// Ties on `start` go to the longest match, which is what git prints under `-o`
+/// when two `-e` patterns begin at the same offset.
+fn next_match(
+    line: &[u8],
+    needles: &[Vec<u8>],
+    at: usize,
+    opts: &Opts,
+) -> Option<(usize, usize)> {
     needles
         .iter()
-        .filter_map(|n| find_from(line, n, 0, opts).map(|(start, _)| start))
-        .min()
+        .filter_map(|n| find_from(line, n, at, opts))
+        .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
 }
 
 /// Find `needle` in `hay` at or after `from`, honouring `-i` and `-w`.
@@ -480,7 +831,7 @@ fn literal_of(pattern: &str, dialect: Dialect) -> Result<Vec<u8>> {
     let meta: &[char] = match dialect {
         Dialect::Fixed => &[],
         Dialect::Basic => &['.', '*', '[', ']', '^', '$', '\\'],
-        Dialect::Extended => &[
+        Dialect::Extended | Dialect::Perl => &[
             '.', '*', '[', ']', '^', '$', '\\', '+', '?', '{', '}', '(', ')', '|',
         ],
     };
@@ -545,6 +896,8 @@ fn unsupported(flag: &str) -> String {
     format!(
         "unsupported flag {flag:?} (ported: -e, -i, -v, -w, -a, -I, -n, --column, \
          -l/--files-with-matches/--name-only, -L/--files-without-match, -c, -q, -z, -o, \
-         -h, -H, -E, -G, -F, --full-name, --cached, and pathspecs)"
+         -h, -H, -E, -G, -F, -P, -m/--max-count, --max-depth, -r/--[no-]recursive, \
+         --full-name, --cached, --untracked, --[no-]exclude-standard, \
+         --color=never|auto, and pathspecs)"
     )
 }

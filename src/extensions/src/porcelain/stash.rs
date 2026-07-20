@@ -218,9 +218,16 @@ fn push(repo: &gix::Repository, message: Option<String>, quiet: bool) -> Result<
     let w_tree_id = w_editor.write()?.detach();
 
     // `I` commit (parent: HEAD), then `W` merge commit (parents: HEAD, I).
+    //
+    // The newline asymmetry is git's, not a typo: `do_create_stash` terminates
+    // the index commit's message but commits the stash message verbatim, so a
+    // `W` commit body ends on the last byte of the message with no trailing LF.
+    // Appending one here changes the commit id and diverges `refs/stash` plus
+    // every object-listing probe from stock git. Verified byte-for-byte against
+    // git 2.55.0 for the `push`, `push -m`, and `save` message forms.
     let index_commit = repo.new_commit(format!("{index_msg}\n"), i_tree_id, [head_id])?.id().detach();
     let w_commit = repo
-        .new_commit(format!("{stash_msg}\n"), w_tree_id, [head_id, index_commit])?
+        .new_commit(&stash_msg, w_tree_id, [head_id, index_commit])?
         .id()
         .detach();
 
@@ -370,7 +377,7 @@ fn sync_worktree(
     opts.destination_is_initially_empty = false;
     opts.overwrite_existing = true;
     let odb = repo.objects.clone().into_arc()?;
-    gix::worktree::state::checkout(
+    crate::worktree::checkout_subset(
         &mut subset,
         workdir.as_path(),
         odb,

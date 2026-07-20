@@ -1,77 +1,77 @@
 //! `git rebase` — reapply commits on top of another base tip.
 //!
+//! ### Shape of the port
+//!
+//! `builtin/rebase.c` is a long funnel: `parse_options()`, then ~130 lines of
+//! backend inference and option-compatibility checks, then `<upstream>` and
+//! `<onto>` resolution, then `require_clean_work_tree()`, then
+//! `can_fast_forward()`, and only at the very end the actual replay. Almost
+//! every invocation git rejects, it rejects *inside the funnel*, long before a
+//! commit would be picked. This module reproduces the funnel in git's order and
+//! bails only at the point where a commit would actually have to be replayed.
+//!
+//! That ordering is load-bearing, not cosmetic: `git rebase --strategy-option=ours v0.2.0`
+//! against a repo without that tag fails with `fatal: invalid upstream 'v0.2.0'`,
+//! not with anything about strategies. Refusing an unimplemented flag at parse
+//! time produces the wrong diagnostic for every such combination.
+//!
 //! ### What is ported
 //!
-//! Only the two branches of `cmd_rebase()` that do **not** replay any commit are
-//! served natively, plus the argument handling and the pre-flight checks that
-//! guard them. For these, stdout, stderr, the exit code, the refs, the reflogs,
-//! `ORIG_HEAD`, the index and the worktree all match stock git:
-//!
-//! * **up to date** — when `can_fast_forward()` holds (see [`is_up_to_date`]),
-//!   git prints `Current branch <name> is up to date.` (or `HEAD is up to date.`
-//!   on a detached `HEAD`) on **stdout**, exits 0 and touches nothing at all —
-//!   not even `ORIG_HEAD`.
-//! * **empty todo list** — when `<upstream>..<head>` contains no commit, the
-//!   sequencer has nothing to pick and simply moves the branch to `<onto>`.
-//!   `ORIG_HEAD` is written, `HEAD` is detached at `<onto>` with a
-//!   `rebase (start): checkout <onto-spec>` reflog entry, the branch is updated
-//!   with `rebase (finish): <ref> onto <onto-oid>`, `HEAD` is re-attached with
-//!   `rebase (finish): returning to <ref>`, and
-//!   `Successfully rebased and updated <ref>.` goes to **stderr**. On a detached
-//!   `HEAD` only the `rebase (start)` entry is written and the message names
-//!   `detached HEAD`, exactly as git does.
-//! * the `require_clean_work_tree()` refusal, byte for byte including the
-//!   `additionally, your index contains uncommitted changes.` second line.
-//! * `fatal: invalid upstream '<spec>'`, `fatal: Does not point to a valid
-//!   commit '<spec>'` and `fatal: no rebase in progress` (all exit 128), the
-//!   missing-tracking-information block (exit 1, on stdout), and `-h` / unknown
-//!   option usage (exit 129).
+//! * The whole option grammar, including the backend inference (`imply_merge()`,
+//!   `parse_opt_am()`/`parse_opt_merge()`/`parse_opt_interactive()`), and every
+//!   `die()` it can raise — `apply options and merge options cannot be used
+//!   together`, `<opt> requires the merge backend`, `--reschedule-failed-exec
+//!   requires --exec or --interactive`, `switch \`C' expects a numerical value`,
+//!   `Invalid whitespace option`, the `--keep-base`/`--onto`/`--root`/
+//!   `--fork-point` pairwise conflicts, and the `usage` (129) paths.
+//! * `<upstream>` / `<onto>` resolution, including `a...b` merge-base onto specs
+//!   and `--keep-base`, plus `fatal: invalid upstream '<spec>'`,
+//!   `fatal: Does not point to a valid commit '<spec>'` and `'<spec>': need
+//!   exactly one merge base[ with branch]`.
+//! * `error_on_missing_default_upstream()` on **stdout**, exit 1, in both its
+//!   forms (on a branch, and `You are not currently on a branch.`).
+//! * `require_clean_work_tree()`, byte for byte, including the `<path>: needs
+//!   merge` lines `refresh_index()` prints on **stdout** for a conflicted index
+//!   and the `additionally, your index contains uncommitted changes.` line.
+//! * `can_fast_forward()` — merge-base checks plus `is_linear_history()` — and
+//!   both of its outcomes: the silent up-to-date exit, and the
+//!   `Current branch <b> is up to date, rebase forced.` variant that falls
+//!   through when `REBASE_FORCE` is set.
+//! * The two finishes that replay nothing:
+//!   - **merge backend, empty todo** — the sequencer's `noop` item. `ORIG_HEAD`,
+//!     `rebase (start): checkout <onto>`, the branch update
+//!     `rebase (finish): <ref> onto <oid>`, `rebase (finish): returning to <ref>`,
+//!     the `Rebasing (1/1)` progress line `pick_commits()` emits for the `noop`
+//!     when `--no-ff`/`-f` turned off `allow_ff`, and
+//!     `Successfully rebased and updated <ref>.` on stderr.
+//!   - **apply backend, `merge-base(onto, head) == head`** — `First, rewinding
+//!     head to replay your work on top of it...` then `Fast-forwarded <b> to
+//!     <onto>.`, both on stdout, with the same ref/reflog dance and no
+//!     `Successfully rebased` line.
 //!
 //! ### What is NOT ported, and why
 //!
-//! Any invocation that would have to replay a commit bails. Two *independent*
-//! blockers stand in the way, and neither can be worked around from a single
-//! file:
+//! Anything that replays a commit. Two independent blockers stand in the way:
 //!
-//! 1. **No three-way tree merge.** A pick is a merge of the picked commit's tree
-//!    against `HEAD`'s over the commit's first parent. `gix::merge`,
-//!    `Repository::merge_trees()` and `Repository::merge_commits()` all sit
-//!    behind the `gix` crate's `merge` feature (`gix/Cargo.toml`: `merge =
-//!    ["tree-editor", "blob-diff", "dep:gix-merge", "attributes"]`), which is
-//!    listed under `need-more-recent-msrv` and so is *not* in `default`;
-//!    `src/extensions/Cargo.toml` enables only
-//!    `blocking-http-transport-reqwest-rust-tls` and `tree-editor`. The vendored
-//!    `gix-rebase` crate is an empty placeholder (`#![forbid(unsafe_code)]` and
-//!    nothing else).
-//! 2. **No patch-id equivalence.** Default `git rebase` (i.e. without
-//!    `--reapply-cherry-picks`) *drops* every to-be-rebased commit whose patch
-//!    is already present in `<upstream>`, printing `warning: skipped previously
-//!    applied commit <abbrev>` plus two `hint:` lines. Deciding that needs a
-//!    patch-id per commit on both sides of the symmetric difference. Nothing in
-//!    the vendored crates computes one — `porcelain::patch_id` is a stdin filter
-//!    over pre-rendered diff text and exposes no reusable entry point. Getting
-//!    this wrong does not merely lose output fidelity: it silently *keeps*
-//!    commits git would have dropped, duplicating history while appearing to
-//!    succeed.
+//! 1. **No three-way tree merge wired up here.** A pick is a merge of the picked
+//!    commit's tree against `HEAD`'s over the commit's first parent.
+//! 2. **No patch-id equivalence.** Default `git rebase` *drops* every
+//!    to-be-rebased commit whose patch is already in `<upstream>`, printing
+//!    `warning: skipped previously applied commit <abbrev>`. Deciding that needs
+//!    a patch-id per commit on both sides of the symmetric difference; nothing
+//!    vendored computes one (`porcelain::patch_id` is a stdin filter over
+//!    pre-rendered diff text). Getting this wrong silently *keeps* commits git
+//!    would have dropped — duplicated history that looks like success.
 //!
-//! Blocker 2 stands even where blocker 1 could be side-stepped with the
-//! file-granularity resolution `porcelain::cherry_pick` uses, because a real
-//! `git rebase <upstream>` almost always has upstream-only commits to compare
-//! against. So the replay path is refused outright rather than approximated.
-//!
-//! The same applies transitively to everything built on replay: `--continue`,
-//! `--skip`, `--abort`, `--quit`, `--edit-todo`, `--show-current-patch` (which
-//! additionally need the `.git/rebase-merge` state directory this port never
-//! creates), `-i`, `--exec`, `--autosquash`, `--rebase-merges`, `--root`,
-//! `--keep-base`, `--fork-point`, `--autostash`, `--signoff`, `-s`/`-X`,
-//! `--empty`, `--update-refs` and the patch-id de-duplication that default
-//! `git rebase` performs (`warning: skipped previously applied commit …`).
-//! Every one of them is rejected with a precise message; none is silently
-//! ignored.
-//!
-//! Ranges containing a merge commit are refused as well: git flattens them by
-//! dropping the merges and replaying the rest in `--topo-order`, and neither the
-//! replay nor that ordering is reproduced here.
+//! So the replay is refused rather than approximated, and so are the few
+//! non-replay features that still need substrate this module does not have:
+//! `--continue`/`--skip`/`--abort`/`--quit`/`--edit-todo`/`--show-current-patch`
+//! (the `.git/rebase-merge` state directory), `--root` (it mints a root commit),
+//! `--fork-point` (`get_fork_point()` walks the upstream reflog), `--autostash`
+//! against a dirty tree (it writes a stash commit), `--signoff` (it rewrites
+//! messages even when the range is empty), `-v`/`--stat` past the up-to-date
+//! exit (the upstream diffstat), and an executable `pre-rebase` hook.
+//! Each is rejected with a message naming the reason; none is silently ignored.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -150,6 +150,22 @@ usage: git rebase [-i] [options] [--exec <cmd>] [--onto <newbase> | --keep-base]
                           apply all changes, even those already present upstream
 ";
 
+/// `options.flags`, mirroring the `REBASE_*` bits in `builtin/rebase.c`.
+const NO_QUIET: u32 = 1 << 0;
+const VERBOSE: u32 = 1 << 1;
+const DIFFSTAT: u32 = 1 << 2;
+const FORCE: u32 = 1 << 3;
+const INTERACTIVE_EXPLICIT: u32 = 1 << 4;
+
+/// `enum rebase_type`. The backend is *inferred* from the options, and which
+/// one is in force decides several of git's `die()`s, so it is tracked exactly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Unspecified,
+    Apply,
+    Merge,
+}
+
 /// The mode options of `git rebase`, which replace the normal invocation.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ModeOption {
@@ -174,131 +190,692 @@ impl ModeOption {
     }
 }
 
+/// git's `imply_merge()`: a merge-only option either selects the merge backend
+/// or, if the apply backend was already selected, is fatal.
+fn imply_merge(ty: &mut Backend, option: &str) -> Result<(), String> {
+    match *ty {
+        Backend::Apply => Err(format!("{option} requires the merge backend")),
+        Backend::Merge => Ok(()),
+        Backend::Unspecified => {
+            *ty = Backend::Merge;
+            Ok(())
+        }
+    }
+}
+
 pub fn rebase(args: &[String]) -> Result<ExitCode> {
-    // --- argument parsing -------------------------------------------------
-    // `args` excludes the subcommand: `lib.rs` splits `argv` into `sub` and
-    // `rest = &argv[2..]`, and `dispatch::run` hands `rest` straight to the
-    // porcelain fn (see `"commit" => porcelain::commit(args)` in dispatch.rs).
-    let mut quiet = false;
-    let mut onto_spec: Option<String> = None;
-    let mut mode: Option<ModeOption> = None;
+    // `die()`: one line on stderr prefixed `fatal: `, exit 128.
+    macro_rules! die {
+        ($($t:tt)*) => {{
+            eprintln!("fatal: {}", format_args!($($t)*));
+            return Ok(ExitCode::from(128));
+        }};
+    }
+    // `usage_with_options()`: the whole usage block on stderr, exit 129.
+    macro_rules! usage {
+        () => {{
+            eprint!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }};
+    }
+    // `parse_options` errors: one line, then the usage block, exit 129.
+    macro_rules! opterr {
+        ($($t:tt)*) => {{
+            eprint!("error: {}\n{USAGE}", format_args!($($t)*));
+            return Ok(ExitCode::from(129));
+        }};
+    }
+    macro_rules! try_imply {
+        ($ty:expr, $opt:expr) => {
+            if let Err(m) = imply_merge(&mut $ty, $opt) {
+                die!("{m}");
+            }
+        };
+    }
+
+    // `total_argc` is git's pre-parse argc, i.e. "rebase" plus everything after
+    // it. The `--continue`-family check below compares against it directly.
+    let total_argc = args.len() + 1;
+
+    // --- state ------------------------------------------------------------
+    let mut flags: u32 = NO_QUIET;
+    let mut ty = Backend::Unspecified;
+    let mut action: Option<ModeOption> = None;
     let mut positional: Vec<String> = Vec::new();
 
+    let mut onto_name: Option<String> = None;
+    let mut keep_base = false;
+    let mut ok_to_skip_pre_rebase = false;
+    let mut trailers: Vec<String> = Vec::new();
+    let mut signoff = false;
+    let mut committer_date_is_author_date = false;
+    let mut ignore_date = false;
+    let mut git_am_opts: Vec<String> = Vec::new();
+    let mut ignore_whitespace = false;
+    let mut preserve_merges = false;
+    let mut empty_set = false;
+    let mut autosquash: i32 = -1;
+    let mut update_refs: i32 = -1;
+    let mut autostash = false;
+    let mut exec: Vec<String> = Vec::new();
+    let mut rebase_merges: i32 = -1;
+    let mut fork_point: i32 = -1;
+    let mut strategy: Option<String> = None;
+    let mut strategy_opts: Vec<String> = Vec::new();
+    let mut root = false;
+    let mut reschedule_failed_exec: i32 = -1;
+    let mut reapply_cherry_picks: i32 = -1;
+
+    // git reads the repository (and the in-progress state dirs, which seed the
+    // backend) before `parse_options` runs.
+    let repo = gix::discover(".")?;
+    let state_dir = repo.common_dir();
+    let apply_in_progress = state_dir.join("rebase-apply").is_dir();
+    let merge_in_progress = state_dir.join("rebase-merge").is_dir();
+    if apply_in_progress {
+        ty = Backend::Apply;
+    } else if merge_in_progress {
+        ty = Backend::Merge;
+    }
+    let in_progress = apply_in_progress || merge_in_progress;
+
+    // --- parse_options ----------------------------------------------------
     let mut i = 0;
+    let mut no_more_options = false;
     while i < args.len() {
         let a = args[i].as_str();
-        match a {
-            "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+
+        if no_more_options || a == "-" || !a.starts_with('-') || a.len() == 1 {
+            positional.push(a.to_string());
+            i += 1;
+            continue;
+        }
+        if a == "--" {
+            no_more_options = true;
+            i += 1;
+            continue;
+        }
+
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, inline) = match long.find('=') {
+                Some(p) => (&long[..p], Some(long[p + 1..].to_string())),
+                None => (long, None),
+            };
+            // parse-options accepts `--no-<name>` for every option that is not
+            // itself spelled with a leading `no-`; the two `no-*`-named options
+            // here (`--no-verify`, `--no-stat`, `--no-ff`) fall out of the same
+            // rule with their sense flipped, which is exactly how git's usage
+            // block renders them.
+            let (name, unset) = match name.strip_prefix("no-") {
+                Some(rest) if !rest.is_empty() => (rest, true),
+                _ => (name, false),
+            };
+
+            // Pull the value of a value-taking option: inline `=v`, else the
+            // next argv entry.
+            macro_rules! value {
+                () => {{
+                    match inline.clone() {
+                        Some(v) => v,
+                        None => {
+                            i += 1;
+                            match args.get(i) {
+                                Some(v) => v.clone(),
+                                None => {
+                                    // git names the option without its dashes
+                                    // and prints no usage block here.
+                                    eprintln!("error: option `{name}' requires a value");
+                                    return Ok(ExitCode::from(129));
+                                }
+                            }
+                        }
+                    }
+                }};
             }
-            "-q" | "--quiet" => quiet = true,
-            "--no-quiet" => quiet = false,
-            "--onto" => {
-                i += 1;
-                let Some(v) = args.get(i) else {
-                    // git's `parse_options` names the option without its dashes.
-                    eprint!("error: option `onto' requires a value\n{USAGE}");
-                    return Ok(ExitCode::from(129));
+            macro_rules! noarg {
+                () => {
+                    if inline.is_some() {
+                        opterr!("option `{name}' takes no value");
+                    }
                 };
-                onto_spec = Some(v.clone());
             }
-            "--continue" => mode = Some(ModeOption::Continue),
-            "--skip" => mode = Some(ModeOption::Skip),
-            "--abort" => mode = Some(ModeOption::Abort),
-            "--quit" => mode = Some(ModeOption::Quit),
-            "--edit-todo" => mode = Some(ModeOption::EditTodo),
-            "--show-current-patch" => mode = Some(ModeOption::ShowCurrentPatch),
 
-            // Recognized by stock git, but each one changes what history the
-            // rebase produces, and none of them can be honoured without the
-            // cherry-pick substrate (see the module note). Refuse explicitly.
-            "-i" | "--interactive" => bail!("unsupported flag {a:?} (interactive rebase needs a todo list and commit replay; ported: --onto, -q/--quiet, <upstream>, <branch>)"),
-            "-r" | "--rebase-merges" | "--no-rebase-merges" => bail!("unsupported flag {a:?} (merge replay is not ported)"),
-            "--root" | "--no-root" => bail!("unsupported flag {a:?} (root rebase requires commit replay)"),
-            "--keep-base" | "--no-keep-base" => bail!("unsupported flag {a:?} (keep-base requires commit replay)"),
-            "--fork-point" | "--no-fork-point" => bail!("unsupported flag {a:?} (fork-point upstream refinement is not ported)"),
-            "--autostash" | "--no-autostash" => bail!("unsupported flag {a:?} (autostash is not ported)"),
-            "--autosquash" | "--no-autosquash" => bail!("unsupported flag {a:?} (autosquash requires an interactive todo list)"),
-            "--update-refs" | "--no-update-refs" => bail!("unsupported flag {a:?} (update-refs requires commit replay)"),
-            "--reapply-cherry-picks" | "--no-reapply-cherry-picks" => bail!("unsupported flag {a:?} (patch-id de-duplication is not ported)"),
-            "--signoff" | "--no-signoff" => bail!("unsupported flag {a:?} (rewriting commit messages requires commit replay)"),
-            "--committer-date-is-author-date" | "--no-committer-date-is-author-date" | "--reset-author-date" | "--no-reset-author-date" => {
-                bail!("unsupported flag {a:?} (rewriting commit dates requires commit replay)")
-            }
-            "-f" | "--force-rebase" | "--no-ff" => bail!("unsupported flag {a:?} (forced replay of unchanged commits is not ported)"),
-            "--ff" => bail!("unsupported flag {a:?} (only the no-replay fast-forward path is ported; drop the flag)"),
-            "-m" | "--merge" | "--apply" => bail!("unsupported flag {a:?} (rebase backends are not ported)"),
-            "-x" | "--exec" | "--no-exec" => bail!("unsupported flag {a:?} (exec lines require an interactive todo list)"),
-            "-s" | "--strategy" | "-X" | "--strategy-option" => bail!("unsupported flag {a:?} (merge strategies are not ported)"),
-            "-S" | "--gpg-sign" | "--no-gpg-sign" => bail!("unsupported flag {a:?} (signing requires commit replay)"),
-            "--empty" => bail!("unsupported flag {a:?} (empty-commit handling requires commit replay)"),
-            "-v" | "--verbose" | "--stat" | "--no-stat" | "-n" => bail!("unsupported flag {a:?} (the upstream diffstat is not ported)"),
-            "--rerere-autoupdate" | "--no-rerere-autoupdate" => bail!("unsupported flag {a:?} (rerere is not ported)"),
-            "--reschedule-failed-exec" | "--no-reschedule-failed-exec" => bail!("unsupported flag {a:?} (exec lines are not ported)"),
-            "--verify" | "--no-verify" => bail!("unsupported flag {a:?} (the pre-rebase hook is not run)"),
-            "--ignore-whitespace" | "--no-ignore-whitespace" | "--whitespace" | "-C" => {
-                bail!("unsupported flag {a:?} (apply-backend options are not ported)")
-            }
-            "--trailer" | "--no-trailer" => bail!("unsupported flag {a:?} (trailers require commit replay)"),
-
-            "--" => {
-                if i + 1 < args.len() {
-                    bail!("pathspec arguments are not accepted by rebase");
+            match name {
+                "onto" => {
+                    if unset {
+                        onto_name = None;
+                    } else {
+                        onto_name = Some(value!());
+                    }
                 }
+                "keep-base" => {
+                    noarg!();
+                    keep_base = !unset;
+                }
+                "verify" => {
+                    noarg!();
+                    // `--no-verify` *enables* skipping the hook.
+                    ok_to_skip_pre_rebase = unset;
+                }
+                "quiet" => {
+                    noarg!();
+                    // OPT_NEGBIT: plain `-q`/`--quiet` clears the bits.
+                    if unset {
+                        flags |= NO_QUIET | VERBOSE | DIFFSTAT;
+                    } else {
+                        flags &= !(NO_QUIET | VERBOSE | DIFFSTAT);
+                    }
+                }
+                "verbose" => {
+                    noarg!();
+                    if unset {
+                        flags &= !(NO_QUIET | VERBOSE | DIFFSTAT);
+                    } else {
+                        flags |= NO_QUIET | VERBOSE | DIFFSTAT;
+                    }
+                }
+                // `--no-stat` clears the diffstat bit; `--stat` is its negation.
+                "stat" => {
+                    noarg!();
+                    if unset {
+                        flags &= !DIFFSTAT;
+                    } else {
+                        flags |= DIFFSTAT;
+                    }
+                }
+                "trailer" => {
+                    if unset {
+                        trailers.clear();
+                    } else {
+                        trailers.push(value!());
+                    }
+                }
+                "signoff" => {
+                    noarg!();
+                    signoff = !unset;
+                }
+                "committer-date-is-author-date" => {
+                    noarg!();
+                    committer_date_is_author_date = !unset;
+                }
+                "reset-author-date" | "ignore-date" => {
+                    noarg!();
+                    ignore_date = !unset;
+                }
+                "ignore-whitespace" => {
+                    noarg!();
+                    ignore_whitespace = !unset;
+                }
+                "whitespace" => {
+                    if unset {
+                        git_am_opts.retain(|o| !o.starts_with("--whitespace="));
+                    } else {
+                        let v = value!();
+                        git_am_opts.push(format!("--whitespace={v}"));
+                    }
+                }
+                "force-rebase" => {
+                    noarg!();
+                    if unset {
+                        flags &= !FORCE;
+                    } else {
+                        flags |= FORCE;
+                    }
+                }
+                // `--no-ff` sets REBASE_FORCE; `--ff` is its negation.
+                "ff" => {
+                    noarg!();
+                    if unset {
+                        flags |= FORCE;
+                    } else {
+                        flags &= !FORCE;
+                    }
+                }
+                "continue" => {
+                    noarg!();
+                    action = Some(ModeOption::Continue);
+                }
+                "skip" => {
+                    noarg!();
+                    action = Some(ModeOption::Skip);
+                }
+                "abort" => {
+                    noarg!();
+                    action = Some(ModeOption::Abort);
+                }
+                "quit" => {
+                    noarg!();
+                    action = Some(ModeOption::Quit);
+                }
+                "edit-todo" => {
+                    noarg!();
+                    action = Some(ModeOption::EditTodo);
+                }
+                "show-current-patch" => {
+                    noarg!();
+                    action = Some(ModeOption::ShowCurrentPatch);
+                }
+                "apply" => {
+                    noarg!();
+                    if ty == Backend::Merge {
+                        die!("apply options and merge options cannot be used together");
+                    }
+                    ty = Backend::Apply;
+                }
+                "merge" => {
+                    noarg!();
+                    if ty == Backend::Apply {
+                        die!("apply options and merge options cannot be used together");
+                    }
+                    ty = Backend::Merge;
+                }
+                "interactive" => {
+                    noarg!();
+                    if ty == Backend::Apply {
+                        die!("apply options and merge options cannot be used together");
+                    }
+                    ty = Backend::Merge;
+                    flags |= INTERACTIVE_EXPLICIT;
+                }
+                "preserve-merges" => {
+                    noarg!();
+                    preserve_merges = true;
+                }
+                "rerere-autoupdate" => {
+                    noarg!();
+                    // Only consulted while resolving a conflict during replay,
+                    // which never happens on the paths this module completes.
+                }
+                "empty" => {
+                    let v = value!();
+                    match v.to_ascii_lowercase().as_str() {
+                        "drop" | "keep" | "stop" => {}
+                        "ask" => eprintln!(
+                            "warning: --empty=ask is deprecated; use '--empty=stop' instead."
+                        ),
+                        _ => die!(
+                            "unrecognized empty type '{v}'; valid values are \"drop\", \"keep\", and \"stop\"."
+                        ),
+                    }
+                    empty_set = true;
+                }
+                // `--keep-empty` only changes which commits the sequencer picks,
+                // so beyond selecting the merge backend it has no effect on a
+                // range that picks nothing.
+                "keep-empty" => {
+                    noarg!();
+                    try_imply!(ty, if unset { "--no-keep-empty" } else { "--keep-empty" });
+                }
+                "autosquash" => {
+                    noarg!();
+                    autosquash = i32::from(!unset);
+                }
+                "update-refs" => {
+                    noarg!();
+                    update_refs = i32::from(!unset);
+                }
+                // Accepted, and genuinely a no-op on the paths this module
+                // completes: a range that picks nothing produces no commit to
+                // sign.
+                "gpg-sign" => {}
+                "autostash" => {
+                    noarg!();
+                    autostash = !unset;
+                }
+                "exec" => {
+                    if unset {
+                        exec.clear();
+                    } else {
+                        exec.push(value!());
+                    }
+                }
+                "allow-empty-message" => noarg!(),
+                "rebase-merges" => {
+                    if unset {
+                        rebase_merges = 0;
+                    } else {
+                        rebase_merges = 1;
+                        match inline.as_deref() {
+                            None => {}
+                            Some("") => eprintln!(
+                                "warning: --rebase-merges with an empty string argument is deprecated and will stop working in a future version of Git. Use --rebase-merges without an argument instead, which does the same thing."
+                            ),
+                            Some("no-rebase-cousins" | "rebase-cousins") => {}
+                            Some(other) => die!("Unknown rebase-merges mode: {other}"),
+                        }
+                    }
+                }
+                "fork-point" => {
+                    noarg!();
+                    fork_point = i32::from(!unset);
+                }
+                "strategy" => {
+                    if unset {
+                        strategy = None;
+                    } else {
+                        strategy = Some(value!());
+                    }
+                }
+                "strategy-option" => {
+                    if unset {
+                        strategy_opts.clear();
+                    } else {
+                        strategy_opts.push(value!());
+                    }
+                }
+                "root" => {
+                    noarg!();
+                    root = !unset;
+                }
+                "reschedule-failed-exec" => {
+                    noarg!();
+                    reschedule_failed_exec = i32::from(!unset);
+                }
+                "reapply-cherry-picks" => {
+                    noarg!();
+                    reapply_cherry_picks = i32::from(!unset);
+                }
+                _ => opterr!("unknown option `{}'", &a[2..]),
             }
-            s if s.starts_with("--onto=") => onto_spec = Some(s["--onto=".len()..].to_string()),
-            s if s.starts_with("--empty=") => {
-                bail!("unsupported flag {s:?} (empty-commit handling requires commit replay)")
+            i += 1;
+            continue;
+        }
+
+        // --- short options, including clusters and attached values ---------
+        let chars: Vec<char> = a.chars().collect();
+        let mut k = 1;
+        while k < chars.len() {
+            let c = chars[k];
+            let rest: String = chars[k + 1..].iter().collect();
+            // Value for an option that requires one: the rest of the cluster,
+            // else the next argv entry.
+            macro_rules! sval {
+                () => {{
+                    if rest.is_empty() {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => v.clone(),
+                            None => {
+                                eprintln!("error: switch `{c}' requires a value");
+                                return Ok(ExitCode::from(129));
+                            }
+                        }
+                    } else {
+                        rest.clone()
+                    }
+                }};
             }
-            s if s.starts_with("--strategy=") || s.starts_with("--strategy-option=") => {
-                bail!("unsupported flag {s:?} (merge strategies are not ported)")
+            match c {
+                'h' => {
+                    print!("{USAGE}");
+                    return Ok(ExitCode::from(129));
+                }
+                'q' => flags &= !(NO_QUIET | VERBOSE | DIFFSTAT),
+                'v' => flags |= NO_QUIET | VERBOSE | DIFFSTAT,
+                'n' => flags &= !DIFFSTAT,
+                'f' => flags |= FORCE,
+                'm' => {
+                    if ty == Backend::Apply {
+                        die!("apply options and merge options cannot be used together");
+                    }
+                    ty = Backend::Merge;
+                }
+                'i' => {
+                    if ty == Backend::Apply {
+                        die!("apply options and merge options cannot be used together");
+                    }
+                    ty = Backend::Merge;
+                    flags |= INTERACTIVE_EXPLICIT;
+                }
+                'p' => preserve_merges = true,
+                // Same as the long `--keep-empty` above: it only selects the
+                // merge backend, and carries no state of its own.
+                'k' => try_imply!(ty, "--keep-empty"),
+                'C' => {
+                    let v = sval!();
+                    git_am_opts.push(format!("-C{v}"));
+                    break;
+                }
+                'x' => {
+                    exec.push(sval!());
+                    break;
+                }
+                's' => {
+                    strategy = Some(sval!());
+                    break;
+                }
+                'X' => {
+                    strategy_opts.push(sval!());
+                    break;
+                }
+                // Optional-argument shorts consume only an attached value.
+                'S' => break,
+                'r' => {
+                    rebase_merges = 1;
+                    if !rest.is_empty() {
+                        match rest.as_str() {
+                            "no-rebase-cousins" | "rebase-cousins" => {}
+                            other => die!("Unknown rebase-merges mode: {other}"),
+                        }
+                    }
+                    break;
+                }
+                _ => opterr!("unknown switch `{c}'"),
             }
-            s if s.starts_with("--exec=") => {
-                bail!("unsupported flag {s:?} (exec lines require an interactive todo list)")
-            }
-            // git's `parse_options` reports the long form without its dashes and
-            // the short form as a "switch"; both then dump the usage block.
-            s if s.starts_with("--") => {
-                eprint!("error: unknown option `{}'\n{USAGE}", &s[2..]);
-                return Ok(ExitCode::from(129));
-            }
-            s if s.starts_with('-') && s.len() > 1 => {
-                eprint!(
-                    "error: unknown switch `{}'\n{USAGE}",
-                    s.chars().nth(1).unwrap_or('?')
-                );
-                return Ok(ExitCode::from(129));
-            }
-            s => positional.push(s.to_string()),
+            k += 1;
         }
         i += 1;
     }
 
-    if positional.len() > 2 {
-        eprint!("{USAGE}");
-        return Ok(ExitCode::from(129));
+    // --- post-parse checks, in builtin/rebase.c order ----------------------
+    if !trailers.is_empty() {
+        flags |= FORCE;
     }
 
-    let repo = gix::discover(".")?;
-
-    // --- mode options -----------------------------------------------------
-    // Without a rebase in progress git dies the same way for every mode option,
-    // and that is reproducible here exactly. With one in progress the state
-    // directory would have to be understood and the picks resumed, which this
-    // port cannot do.
-    if let Some(m) = mode {
-        if in_progress(&repo) {
-            bail!(
-                "unsupported flag {:?} (resuming a rebase requires replaying commits)",
-                m.flag()
-            );
-        }
-        eprintln!("fatal: no rebase in progress");
+    if preserve_merges {
+        eprintln!(
+            "fatal: --preserve-merges was replaced by --rebase-merges\n\
+             Note: Your `pull.rebase` configuration may also be set to 'preserve',\n\
+             which is no longer supported; use 'merges' instead"
+        );
         return Ok(ExitCode::from(128));
     }
 
-    // --- HEAD -------------------------------------------------------------
+    // A mode option must be the *only* argument.
+    if action.is_some() && total_argc != 2 {
+        usage!();
+    }
+    if positional.len() > 2 {
+        usage!();
+    }
+
+    if keep_base {
+        if onto_name.is_some() {
+            die!("options '--keep-base' and '--onto' cannot be used together");
+        }
+        if root {
+            die!("options '--keep-base' and '--root' cannot be used together");
+        }
+        if fork_point < 0 {
+            fork_point = 0;
+        }
+    }
+    if root && fork_point > 0 {
+        die!("options '--root' and '--fork-point' cannot be used together");
+    }
+
+    if let Some(m) = action {
+        if !in_progress {
+            die!("no rebase in progress");
+        }
+        if m == ModeOption::EditTodo && ty != Backend::Merge {
+            die!("The --edit-todo action can only be used during interactive rebase.");
+        }
+        // Every mode option resumes or unwinds a sequencer run recorded in the
+        // state directory this port never writes.
+        bail!(
+            "unsupported flag {:?} (resuming a rebase requires the .git/rebase-merge state directory and commit replay)",
+            m.flag()
+        );
+    }
+    if in_progress {
+        let base = if apply_in_progress {
+            "rebase-apply"
+        } else {
+            "rebase-merge"
+        };
+        let dir = if apply_in_progress {
+            state_dir.join("rebase-apply")
+        } else {
+            state_dir.join("rebase-merge")
+        };
+        eprintln!(
+            "fatal: It seems that there is already a {base} directory, and\n\
+             I wonder if you are in the middle of another rebase.  If that is the\n\
+             case, please try\n\tgit rebase (--continue | --abort | --skip)\n\
+             If that is not the case, please\n\trm -fr \"{}\"\n\
+             and run me again.  I am stopping in case you still have something\n\
+             valuable there.",
+            dir.display()
+        );
+        return Ok(ExitCode::from(128));
+    }
+
+    let mut allow_preemptive_ff = true;
+    if flags & INTERACTIVE_EXPLICIT != 0 || !exec.is_empty() || autosquash == 1 {
+        allow_preemptive_ff = false;
+    }
+    if committer_date_is_author_date || ignore_date {
+        flags |= FORCE;
+    }
+
+    // git's chain is `if fix/strip … else if -C … else if --whitespace= …`, so
+    // `fix` and `strip` are consumed by the first arm and never reach the
+    // stricter value check below. Reordering these would reject them.
+    for opt in &git_am_opts {
+        if opt == "--whitespace=fix" || opt == "--whitespace=strip" {
+            allow_preemptive_ff = false;
+        } else if let Some(p) = opt.strip_prefix("-C") {
+            if !p.chars().all(|c| c.is_ascii_digit()) {
+                die!("switch `C' expects a numerical value");
+            }
+        } else if let Some(p) = opt.strip_prefix("--whitespace=") {
+            if !p.is_empty() && !matches!(p, "warn" | "nowarn" | "error" | "error-all") {
+                die!("Invalid whitespace option: '{p}'");
+            }
+        }
+    }
+
+    for cmd in &exec {
+        if cmd.contains('\n') {
+            eprintln!("error: exec commands cannot contain newlines");
+            return Ok(ExitCode::from(1));
+        }
+        if cmd.trim_matches([' ', '\t', '\r', '\x0c', '\x0b']).is_empty() {
+            eprintln!("error: empty exec command");
+            return Ok(ExitCode::from(1));
+        }
+    }
+
+    if flags & NO_QUIET == 0 {
+        git_am_opts.push("-q".to_string());
+    }
+
+    if empty_set {
+        try_imply!(ty, "--empty");
+    }
+
+    if reapply_cherry_picks < 0 {
+        reapply_cherry_picks = i32::from(keep_base);
+    } else if !keep_base {
+        try_imply!(
+            ty,
+            if reapply_cherry_picks == 1 {
+                "--reapply-cherry-picks"
+            } else {
+                "--no-reapply-cherry-picks"
+            }
+        );
+    }
+
+    if !exec.is_empty() {
+        try_imply!(ty, "--exec");
+    }
+
+    if ty == Backend::Apply {
+        if ignore_whitespace {
+            git_am_opts.push("--ignore-whitespace".to_string());
+        }
+        if committer_date_is_author_date {
+            git_am_opts.push("--committer-date-is-author-date".to_string());
+        }
+        if ignore_date {
+            git_am_opts.push("--ignore-date".to_string());
+        }
+    } else if ignore_whitespace {
+        strategy_opts.push("ignore-space-change".to_string());
+    }
+
+    if strategy.is_none() && !strategy_opts.is_empty() {
+        strategy = Some("ort".to_string());
+    }
+    if strategy.is_some() {
+        try_imply!(ty, "--strategy");
+    }
+
+    if root && onto_name.is_none() {
+        try_imply!(ty, "--root without --onto");
+    }
+    if !trailers.is_empty() {
+        try_imply!(ty, "--trailer");
+    }
+
+    // "all am options except -q are compatible only with --apply"
+    if !git_am_opts.is_empty() || ty == Backend::Apply {
+        let has_real_am_opt = git_am_opts.iter().any(|o| o != "-q");
+        if has_real_am_opt || ty == Backend::Apply {
+            if ty == Backend::Merge {
+                die!("apply options and merge options cannot be used together");
+            }
+            ty = Backend::Apply;
+        }
+    }
+
+    if update_refs == 1 {
+        try_imply!(ty, "--update-refs");
+    }
+    if rebase_merges == 1 {
+        try_imply!(ty, "--rebase-merges");
+    }
+    if autosquash == 1 {
+        try_imply!(ty, "--autosquash");
+    }
+
+    if ty == Backend::Unspecified {
+        // `options.default_backend` starts as "merge" and is overridden by
+        // `rebase.backend`.
+        let configured = repo
+            .config_snapshot()
+            .string("rebase.backend")
+            .map(|v| v.to_string());
+        match configured.as_deref() {
+            None | Some("merge") => ty = Backend::Merge,
+            Some("apply") => ty = Backend::Apply,
+            Some(other) => die!("Unknown rebase backend: {other}"),
+        }
+    }
+
+    if reschedule_failed_exec > 0 && ty != Backend::Merge {
+        die!("--reschedule-failed-exec requires --exec or --interactive");
+    }
+
+    if signoff {
+        // `--signoff` appends a trailer to every replayed commit; git also sets
+        // REBASE_FORCE, so it never takes the up-to-date exit either.
+        bail!("unsupported flag \"--signoff\" (rewriting commit messages requires commit replay)");
+    }
+
+    // --- HEAD --------------------------------------------------------------
     let head = repo.head()?;
     if head.is_unborn() {
         bail!("cannot rebase an unborn branch");
@@ -307,66 +884,143 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         .id()
         .ok_or_else(|| anyhow!("HEAD does not point to a commit"))?
         .detach();
-    // Owned branch name when attached, `None` when detached.
     let branch: Option<FullName> = head.referent_name().map(std::borrow::ToOwned::to_owned);
     drop(head);
 
-    // git switches to `<branch>` before rebasing; that is a checkout, which is
-    // out of scope here, so only the already-current branch is accepted.
-    if let Some(requested) = positional.get(1) {
-        let current = branch.as_ref().map(|b| b.shorten().to_string());
-        if current.as_deref() != Some(requested.as_str()) {
-            bail!(
-                "rebasing a branch other than the checked-out one requires a checkout; run `git switch {requested}` first"
-            );
-        }
+    // --- <upstream> --------------------------------------------------------
+    if root {
+        // With no `--onto`, git mints a fresh root commit (`commit_tree("")`),
+        // which changes the object database before anything else happens.
+        bail!("unsupported flag \"--root\" (rebasing onto a synthesized root commit requires commit replay)");
     }
-
-    // --- <upstream> -------------------------------------------------------
     let upstream_spec = match positional.first() {
+        Some(s) if s == "-" => "@{-1}".to_string(),
         Some(s) => s.clone(),
         None => {
-            // git falls back to `branch.<name>.merge` / `branch.<name>.remote`.
             let tracking = branch.as_ref().and_then(|b| {
                 repo.branch_remote_tracking_ref_name(b.as_ref(), gix::remote::Direction::Fetch)
             });
             match tracking {
-                Some(Ok(name)) => name.shorten().to_string(),
+                Some(Ok(name)) => {
+                    if fork_point < 0 {
+                        fork_point = 1;
+                    }
+                    name.shorten().to_string()
+                }
                 Some(Err(e)) => bail!("{e}"),
                 None => {
-                    let Some(b) = branch.as_ref() else {
-                        bail!("HEAD is detached and no <upstream> was given");
-                    };
                     // `error_on_missing_default_upstream()`: stdout, exit 1.
-                    print!(
-                        "There is no tracking information for the current branch.\n\
-                         Please specify which branch you want to rebase against.\n\
-                         See git-rebase(1) for details.\n\
-                         \n    git rebase '<branch>'\n\n\
-                         If you wish to set tracking information for this branch you can do so with:\n\
-                         \n    git branch --set-upstream-to=<remote>/<branch> {}\n\n",
-                        b.shorten().to_string()
-                    );
+                    match branch.as_ref() {
+                        Some(b) => print!(
+                            "There is no tracking information for the current branch.\n\
+                             Please specify which branch you want to rebase against.\n\
+                             See git-rebase(1) for details.\n\
+                             \n    git rebase '<branch>'\n\n\
+                             If you wish to set tracking information for this branch you can do so with:\n\
+                             \n    git branch --set-upstream-to=<remote>/<branch> {}\n\n",
+                            b.shorten()
+                        ),
+                        None => print!(
+                            "You are not currently on a branch.\n\
+                             Please specify which branch you want to rebase against.\n\
+                             See git-rebase(1) for details.\n\
+                             \n    git rebase '<branch>'\n\n"
+                        ),
+                    }
                     return Ok(ExitCode::from(1));
                 }
             }
         }
     };
     let Some(upstream_oid) = peel_to_commit(&repo, &upstream_spec) else {
-        eprintln!("fatal: invalid upstream '{upstream_spec}'");
-        return Ok(ExitCode::from(128));
+        die!("invalid upstream '{upstream_spec}'");
     };
 
-    // --- <onto> -----------------------------------------------------------
-    let onto_spec = onto_spec.unwrap_or_else(|| upstream_spec.clone());
-    let Some(onto_oid) = peel_to_commit(&repo, &onto_spec) else {
-        eprintln!("fatal: Does not point to a valid commit '{onto_spec}'");
-        return Ok(ExitCode::from(128));
+    // --- <branch> ----------------------------------------------------------
+    // git checks out `<branch>` before rebasing. That checkout is out of scope
+    // here, so only the already-current branch is accepted — but the argument is
+    // still validated the way git validates it, in git's order.
+    let branch_name = match positional.get(1) {
+        Some(requested) => {
+            let is_branch = repo
+                .try_find_reference(&format!("refs/heads/{requested}"))
+                .ok()
+                .flatten()
+                .is_some();
+            if !is_branch && peel_to_commit(&repo, requested).is_none() {
+                die!("no such branch/commit '{requested}'");
+            }
+            let current = branch.as_ref().map(|b| b.shorten().to_string());
+            if current.as_deref() != Some(requested.as_str()) {
+                bail!(
+                    "rebasing a branch other than the checked-out one requires a checkout; run `git switch {requested}` first"
+                );
+            }
+            requested.clone()
+        }
+        None => match branch.as_ref() {
+            Some(b) => b.shorten().to_string(),
+            None => "HEAD".to_string(),
+        },
     };
 
-    // --- require_clean_work_tree() ---------------------------------------
-    // Checked before anything is decided, and before `ORIG_HEAD` is written.
-    let (unstaged, staged) = dirty_state(&repo)?;
+    // --- <onto> ------------------------------------------------------------
+    let onto_spec = if keep_base {
+        format!("{upstream_spec}...{branch_name}")
+    } else {
+        onto_name.clone().unwrap_or_else(|| upstream_spec.clone())
+    };
+    let onto_is_merge_base = onto_spec.contains("...");
+    let onto_oid = if let Some(p) = onto_spec.find("...") {
+        let left = if p == 0 { "HEAD" } else { &onto_spec[..p] };
+        let right_raw = &onto_spec[p + 3..];
+        let right = if right_raw.is_empty() {
+            "HEAD"
+        } else {
+            right_raw
+        };
+        let base = match (peel_to_commit(&repo, left), peel_to_commit(&repo, right)) {
+            (Some(l), Some(r)) => merge_base_unique(&repo, l, r)?,
+            _ => None,
+        };
+        match base {
+            Some(oid) => oid,
+            None if keep_base => {
+                die!("'{upstream_spec}': need exactly one merge base with branch")
+            }
+            None => die!("'{onto_spec}': need exactly one merge base"),
+        }
+    } else {
+        match peel_to_commit(&repo, &onto_spec) {
+            Some(oid) => oid,
+            None => die!("Does not point to a valid commit '{onto_spec}'"),
+        }
+    };
+
+    // `--keep-base` defaults `--reapply-cherry-picks` on, which git models by
+    // moving the upstream to the onto so nothing looks already-applied.
+    let upstream_oid = if keep_base && reapply_cherry_picks == 1 {
+        onto_oid
+    } else {
+        upstream_oid
+    };
+
+    if fork_point > 0 {
+        // `get_fork_point()` needs the upstream's reflog to find where the
+        // branch diverged; nothing here walks reflogs.
+        bail!("unsupported flag \"--fork-point\" (refining the upstream needs `merge-base --fork-point`, which walks the upstream reflog)");
+    }
+
+    // --- require_clean_work_tree() -----------------------------------------
+    // `refresh_index()` runs first and reports unmerged paths on stdout, even
+    // under --quiet, before either error line.
+    let (unstaged, staged, conflicts) = dirty_state(&repo)?;
+    if autostash && (unstaged || staged) {
+        bail!("unsupported flag \"--autostash\" (stashing a dirty worktree requires writing a stash commit)");
+    }
+    for path in &conflicts {
+        println!("{path}: needs merge");
+    }
     if unstaged || staged {
         if unstaged {
             eprintln!("error: cannot rebase: You have unstaged changes.");
@@ -380,40 +1034,73 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
 
-    // --- can_fast_forward(): nothing to do at all ------------------------
-    if is_up_to_date(&repo, onto_oid, upstream_oid, head_oid)? {
-        if !quiet {
-            match branch.as_ref() {
-                Some(b) => println!("Current branch {} is up to date.", b.shorten().to_string()),
-                None => println!("HEAD is up to date."),
+    // --- can_fast_forward() ------------------------------------------------
+    let branch_base = merge_base_unique(&repo, onto_oid, head_oid)?;
+    if allow_preemptive_ff && can_fast_forward(&repo, branch_base, onto_oid, upstream_oid, head_oid)?
+    {
+        if flags & FORCE == 0 {
+            if flags & NO_QUIET != 0 {
+                if branch_name == "HEAD" {
+                    println!("HEAD is up to date.");
+                } else {
+                    println!("Current branch {branch_name} is up to date.");
+                }
+            }
+            return Ok(ExitCode::SUCCESS);
+        } else if flags & NO_QUIET != 0 {
+            if branch_name == "HEAD" {
+                println!("HEAD is up to date, rebase forced.");
+            } else {
+                println!("Current branch {branch_name} is up to date, rebase forced.");
             }
         }
-        return Ok(ExitCode::SUCCESS);
     }
 
-    // --- the todo list ----------------------------------------------------
-    // `<upstream>..<head>`, which is what the sequencer would pick.
+    if !ok_to_skip_pre_rebase && hook_is_runnable(&repo, "pre-rebase") {
+        bail!("a pre-rebase hook is installed; running hooks is not ported");
+    }
+
+    if flags & DIFFSTAT != 0 {
+        bail!("unsupported flag \"-v\"/\"--stat\" (the upstream diffstat is not ported)");
+    }
+
+    // --- decide whether anything would be replayed -------------------------
+    // The merge backend picks the right side of `<upstream>...<head>`; the apply
+    // backend picks `<upstream>..<head>`. Both are empty exactly when
+    // `<upstream>..<head>` is, which is what is measured here.
     let mut todo: Vec<ObjectId> = Vec::new();
     for info in repo.rev_walk([head_oid]).with_hidden([upstream_oid]).all()? {
         todo.push(info?.id);
     }
 
-    for id in &todo {
-        if repo.find_commit(*id)?.parent_ids().count() > 1 {
-            bail!("the range {upstream_spec}..HEAD contains merge commits; flattening them requires commit replay");
+    let apply_backend = ty == Backend::Apply;
+    if apply_backend {
+        // The apply backend detaches first and only then notices it merely
+        // fast-forwarded. Deciding here keeps a refused rebase from mutating
+        // anything.
+        if branch_base != Some(head_oid) {
+            bail!(
+                "replaying {} commit(s) with the apply backend needs `git am`-style patch \
+                 application, which is not ported",
+                todo.len()
+            );
         }
-    }
-
-    if !todo.is_empty() {
+    } else if !todo.is_empty() {
         bail!(
-            "replaying {} commit(s) needs a three-way tree merge (this build of `gix` has the \
-             `merge` feature off) and patch-id equivalence to drop already-upstream commits \
-             (unavailable); only the up-to-date and no-replay fast-forward paths are ported",
+            "replaying {} commit(s) needs a three-way tree merge plus patch-id equivalence to drop \
+             already-upstream commits; neither is wired up here, so only the up-to-date and \
+             no-replay fast-forward paths are ported",
             todo.len()
         );
     }
 
-    // --- no-replay path: move the branch to <onto> ------------------------
+    if !exec.is_empty() {
+        // Reachable only with an empty todo list, where git appends no exec
+        // lines at all — but saying so is cheaper than proving it per case.
+        bail!("unsupported flag \"--exec\" (exec lines run inside the sequencer)");
+    }
+
+    // --- the no-replay finish ---------------------------------------------
     // Serialize the whole read-modify-write through the repo coordinator (a
     // no-op when no daemon is running), matching the merge/zsync write path.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
@@ -423,6 +1110,10 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // first because `index_or_load_from_head` would otherwise fall back to the
     // *new* HEAD if a repository happened to have no index file on disk.
     let old_index = repo.index_or_load_from_head()?.into_owned();
+
+    if apply_backend && flags & NO_QUIET != 0 {
+        println!("First, rewinding head to replay your work on top of it...");
+    }
 
     // git writes ORIG_HEAD only once it commits to actually rebasing. It is a
     // pseudo-ref, so no reflog is created for it (gix applies git's own
@@ -452,6 +1143,18 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     let should_interrupt = AtomicBool::new(false);
     update_clean_worktree(&repo, &old_index, onto_oid, &should_interrupt)?;
 
+    if apply_backend {
+        println!("Fast-forwarded {branch_name} to {onto_spec}.");
+    } else if flags & FORCE != 0 && flags & NO_QUIET != 0 {
+        // `complete_action()` appends a `noop` item to an empty todo list, and
+        // with `allow_ff` off `skip_unnecessary_picks()` cannot drop it, so
+        // `pick_commits()` reports exactly one step.
+        eprint!(
+            "Rebasing (1/1){}",
+            if flags & VERBOSE != 0 { "\n" } else { "\r" }
+        );
+    }
+
     // ... then re-points the branch and re-attaches HEAD to it. On a detached
     // HEAD there is no branch, and git writes no `rebase (finish)` entry.
     let label = match &branch {
@@ -480,29 +1183,62 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         None => "detached HEAD".to_string(),
     };
 
-    if !quiet {
+    // The apply backend's fast-forward finishes silently; only the sequencer
+    // announces itself.
+    if !apply_backend && flags & NO_QUIET != 0 {
         eprintln!("Successfully rebased and updated {label}.");
     }
     Ok(ExitCode::SUCCESS)
 }
 
-/// git's `can_fast_forward()`: true when `<head>` already sits on top of
-/// `<onto>` and nothing between `<upstream>` and `<head>` would be replayed —
-/// i.e. `merge-base(onto, head) == onto` and `merge-base(upstream, head) ==
-/// onto`. Multiple merge-bases on either side make git give up on the shortcut,
-/// so they do here too.
-fn is_up_to_date(
+/// git's `can_fast_forward()`: `<head>` already sits on top of `<onto>` and
+/// nothing between `<upstream>` and `<head>` would be replayed. Multiple
+/// merge-bases on either side make git give up on the shortcut, so they do here
+/// too, and the history from `<onto>` up to `<head>` must be linear.
+fn can_fast_forward(
     repo: &gix::Repository,
+    branch_base: Option<ObjectId>,
     onto: ObjectId,
     upstream: ObjectId,
     head: ObjectId,
 ) -> Result<bool> {
-    let bases = repo.merge_bases_many(onto, &[head])?;
-    if bases.len() != 1 || bases[0].detach() != onto {
+    if branch_base != Some(onto) {
         return Ok(false);
     }
-    let bases = repo.merge_bases_many(upstream, &[head])?;
-    Ok(bases.len() == 1 && bases[0].detach() == onto)
+    if merge_base_unique(repo, upstream, head)? != Some(onto) {
+        return Ok(false);
+    }
+    is_linear_history(repo, onto, head)
+}
+
+/// git's `is_linear_history()`: walk first-and-only parents from `to` down to
+/// `from`; any merge on the way means the range is not a plain fast-forward.
+fn is_linear_history(repo: &gix::Repository, from: ObjectId, to: ObjectId) -> Result<bool> {
+    let mut cur = to;
+    while cur != from {
+        let parents: Vec<ObjectId> = repo.find_commit(cur)?.parent_ids().map(|p| p.detach()).collect();
+        match parents.len() {
+            0 => return Ok(true),
+            1 => cur = parents[0],
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// The single merge base of `a` and `b`, or `None` when there is none or more
+/// than one — the case git models with a null `branch_base`.
+fn merge_base_unique(
+    repo: &gix::Repository,
+    a: ObjectId,
+    b: ObjectId,
+) -> Result<Option<ObjectId>> {
+    let bases = repo.merge_bases_many(a, &[b])?;
+    Ok(if bases.len() == 1 {
+        Some(bases[0].detach())
+    } else {
+        None
+    })
 }
 
 /// Resolve `spec` and peel it to a commit id, or `None` when either step fails —
@@ -512,9 +1248,49 @@ fn peel_to_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     Some(id.object().ok()?.peel_to_commit().ok()?.id)
 }
 
-/// `(worktree differs from index, index differs from HEAD)`, the two predicates
-/// behind `has_unstaged_changes()` and `has_uncommitted_changes()`.
-fn dirty_state(repo: &gix::Repository) -> Result<(bool, bool)> {
+/// True when `name` names a hook git would actually run.
+fn hook_is_runnable(repo: &gix::Repository, name: &str) -> bool {
+    let path = repo.common_dir().join("hooks").join(name);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// `(worktree differs from index, index differs from HEAD, unmerged paths)` —
+/// the two predicates behind `has_unstaged_changes()` and
+/// `has_uncommitted_changes()`, plus the paths `refresh_index()` announces.
+///
+/// An unmerged entry makes both `diff-files` and `diff-index --cached` report a
+/// change, so a conflicted index is both unstaged *and* uncommitted regardless
+/// of what the worktree looks like.
+fn dirty_state(repo: &gix::Repository) -> Result<(bool, bool, Vec<String>)> {
+    let mut conflicts: Vec<String> = Vec::new();
+    {
+        let index = repo.index_or_load_from_head()?.into_owned();
+        let backing = index.path_backing();
+        let mut last: Option<String> = None;
+        for e in index.entries() {
+            if e.stage_raw() == 0 {
+                continue;
+            }
+            let path = e.path_in(backing).to_string();
+            // git prints one line per conflicted path, not per stage.
+            if last.as_deref() != Some(path.as_str()) {
+                conflicts.push(path.clone());
+                last = Some(path);
+            }
+        }
+    }
+    if !conflicts.is_empty() {
+        return Ok((true, true, conflicts));
+    }
+
     let mut unstaged = false;
     let mut staged = false;
     let patterns: Vec<BString> = Vec::new();
@@ -536,14 +1312,7 @@ fn dirty_state(repo: &gix::Repository) -> Result<(bool, bool)> {
             }
         }
     }
-    Ok((unstaged, staged))
-}
-
-/// True when a rebase state directory is present, i.e. `git rebase --continue`
-/// and friends would have something to act on.
-fn in_progress(repo: &gix::Repository) -> bool {
-    let dir = repo.common_dir();
-    dir.join("rebase-merge").is_dir() || dir.join("rebase-apply").is_dir()
+    Ok((unstaged, staged, conflicts))
 }
 
 fn full_name(name: &str) -> Result<FullName> {
@@ -618,7 +1387,7 @@ fn update_clean_worktree(
     opts.destination_is_initially_empty = false;
     opts.overwrite_existing = true;
     let odb = repo.objects.clone().into_arc()?;
-    gix::worktree::state::checkout(
+    crate::worktree::checkout_subset(
         &mut subset,
         workdir.as_path(),
         odb,

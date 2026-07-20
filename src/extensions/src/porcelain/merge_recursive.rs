@@ -405,7 +405,7 @@ fn apply_to_worktree(
         opts.destination_is_initially_empty = false;
         opts.overwrite_existing = true;
         let odb = repo.objects.clone().into_arc()?;
-        gix::worktree::state::checkout(
+        crate::worktree::checkout_subset(
             &mut subset,
             workdir.as_path(),
             odb,

@@ -1,42 +1,91 @@
 //! `git cherry-pick <commit>...` — replay the change each commit introduces on
 //! top of `HEAD`, recording a new commit for each.
 //!
+//! ## Order of operations
+//!
+//! git's `builtin/revert.c` runs a fixed pipeline, and the exit code a given
+//! command line produces depends entirely on which stage it dies in. This port
+//! reproduces that pipeline stage for stage, because a great many command lines
+//! never reach the pick itself:
+//!
+//! 1. **Option parsing**, left to right. A bad `--cleanup` mode dies with
+//!    `fatal: Invalid cleanup mode <v>` and status 128 *here*, before anything
+//!    else — including before the sequencer verbs, so `--cleanup=bogus --quit`
+//!    is a failure even though `--quit` alone succeeds. A missing or malformed
+//!    option value prints only its `error:` line and exits 129 without the usage
+//!    block. Options git does not know are *kept*, not rejected
+//!    (`PARSE_OPT_KEEP_UNKNOWN_OPT`), and only turn into an error in stage 5.
+//! 2. **Sequencer verbs** (`--quit`, `--continue`, `--abort`, `--skip`). Options
+//!    that would have no meaning alongside a verb are rejected with
+//!    `fatal: cherry-pick: <opt> cannot be used with <verb>` and status 128.
+//!    `--quit` with nothing in progress is a silent success; the other three
+//!    report `no cherry-pick[ or revert] in progress` and exit 128.
+//! 3. **No revisions given** → the usage block on stderr, status 129.
+//! 4. **Revision resolution**, in argument order. The first spec that does not
+//!    resolve dies with `fatal: bad revision '<spec>'` and status 128. This is
+//!    why `--strategy=nonexistent-strategy README.md` reports the *revision*, not
+//!    the strategy: nothing validates a strategy name before this point.
+//! 5. **Leftover unknown options** → usage, status 129. A bad revision in stage 4
+//!    outranks this, matching `setup_revisions`, which dies on the revision as it
+//!    walks the argument list and only reports leftovers once it finishes.
+//! 6. **Dirty worktree** → `fatal: cherry-pick failed`, status 128.
+//! 7. The picks themselves.
+//!
 //! ## What is served
 //!
-//! Each pick is a three-way tree merge with *base* = the picked commit's first
-//! parent, *ours* = the current `HEAD` tree and *theirs* = the picked commit's
-//! tree. This port resolves the merge at **file granularity only**: a path is
-//! taken from *theirs* when *ours* still matches *base*, kept from *ours* when
-//! *theirs* matches *base*, and kept when both sides made the identical change.
+//! Each pick is a three-way tree merge with *base* = the picked commit's
+//! mainline parent (`-m`, default the first), *ours* = the current `HEAD` tree
+//! and *theirs* = the picked commit's tree. This port resolves the merge at
+//! **file granularity only**: a path is taken from *theirs* when *ours* still
+//! matches *base*, kept from *ours* when *theirs* matches *base*, and kept when
+//! both sides made the identical change.
 //!
-//! When a path was changed differently on both sides, a *content* (hunk-level)
-//! merge would be required. The vendored `gix-merge` blob/tree merge is not
-//! compiled into this binary (the `merge` feature of the vendored `gix` crate is
-//! off), so that case `bail!`s with the path named rather than producing a wrong
-//! tree. The same applies to conflicted picks: no `CHERRY_PICK_HEAD`,
-//! `.git/sequencer` state or conflict markers are ever written, so
-//! `--continue` / `--skip` / `--abort` / `--quit` are refused as well.
+//! When a path was changed differently on both sides a *content* (hunk-level)
+//! merge is required, which would have to write conflict markers, stage 1/2/3
+//! index entries, `MERGE_MSG` and `AUTO_MERGE`. None of that is implemented, so
+//! that case `bail!`s with the path named rather than producing a wrong tree.
+//! `--continue`, `--skip` and `--abort` are refused for the same reason: this
+//! port can enter the stopped state but not resume from it.
 //!
-//! Stdout for a successful pick is byte-identical to stock git: the
-//! `[<branch> <abbrev>] <subject>` summary, the optional ` Author:` line (only
-//! when the picked author differs from the configured committer, matching
-//! `print_commit_summary`), the always-present ` Date:` line carrying the
-//! preserved author date, and git's short-stat plus create/delete/mode-change
-//! block. `--ff` prints nothing, exactly like git.
+//! ## Empty results
 //!
-//! Repository state matches too: the author signature (name, email and time) is
-//! preserved from the picked commit, the committer comes from configuration, and
-//! the reflog entry is `cherry-pick: <subject>` (or `cherry-pick: fast-forward`).
-//! Mailmap is not applied to the printed identities, so a repository that
-//! rewrites the picked author via `.mailmap` would see a different ` Author:`.
+//! A pick whose merged tree equals the `HEAD` tree is *empty*, and git splits
+//! that into two cases governed by different flags:
+//!
+//! - **Initially empty** (the picked commit and its parent have the same tree):
+//!   committed when `--allow-empty` or `--empty=keep` is given, otherwise the
+//!   pick stops. `--empty=drop` does *not* drop these.
+//! - **Became empty** (the change is already upstream): committed under
+//!   `--empty=keep` / `--keep-redundant-commits`, skipped with a
+//!   `dropping <oid> <subject> -- patch contents already upstream` line on
+//!   stderr under `--empty=drop`, and stops under the default `--empty=stop`.
+//!
+//! Stopping writes `CHERRY_PICK_HEAD` and `MERGE_MSG`, prints git's
+//! cherry-pick-in-progress status block on stdout and its advice on stderr, and
+//! exits 1 — matching stock git, whose worktree is necessarily clean at that
+//! point, so the `nothing to commit, working tree clean` tail is unconditional.
+//! `AUTO_MERGE` is not written; it names a tree git only needs for `--continue`.
 //!
 //! ## Supported flags
 //!
-//! `-x`, `--ff`, `--allow-empty`, `--allow-empty-message`, `--no-edit`, `-r`
-//! (a documented no-op in git), `--no-gpg-sign` (no-op here as we never sign).
-//! Everything else — `-e`, `-n`, `-s`, `-m`, `-S`, `--strategy`, `-X`,
-//! `--cleanup`, `--empty`, `--keep-redundant-commits`, the sequencer verbs and
-//! commit *ranges* — is refused with a precise message.
+//! `-x`, `-m`/`--mainline`, `--ff`/`--no-ff`, `--allow-empty`,
+//! `--allow-empty-message`, `--empty=stop|drop|keep`,
+//! `--keep-redundant-commits`, `-s`/`--signoff`, `--cleanup=<mode>`,
+//! `--no-edit`, `--commit`, the `--no-` forms of the above, `--quit`, and the
+//! no-ops `-r`, `--no-gpg-sign` (we never sign) and `--rerere-autoupdate`
+//! (rerere only participates in conflicts, which are refused anyway).
+//!
+//! Refused with a precise message: `-e`/`--edit`, `-n`/`--no-commit`,
+//! `--strategy`, `-X`, `-S`, commit *ranges*, and `--continue`/`--skip`/
+//! `--abort` against a pick that is genuinely in progress.
+//!
+//! Repository state for a successful pick matches git: the author signature
+//! (name, email and time) is preserved from the picked commit, the committer
+//! comes from configuration, and the reflog entry is `cherry-pick: <subject>`
+//! (or `cherry-pick: fast-forward`). Mailmap is not applied to the printed
+//! identities, so a repository that rewrites the picked author via `.mailmap`
+//! would see a different ` Author:`. The detached-HEAD status header names the
+//! current commit rather than the reflog-recorded detach point.
 //!
 //! The worktree-update helper below is a verbatim port of the one in
 //! `porcelain::merge`; it cannot be shared because that module is private and
@@ -55,70 +104,372 @@ use gix::prelude::ObjectIdExt;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
-pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
-    // --- argument parsing ------------------------------------------------
-    let mut specs: Vec<&str> = Vec::new();
-    let mut record_origin = false;
-    let mut allow_ff = false;
-    let mut allow_empty = false;
-    let mut allow_empty_message = false;
+/// git's own `cherry-pick` usage block, verbatim, including the trailing blank
+/// line. Printed on stderr for every 129 exit that is not a value error.
+const USAGE: &str = "\
+usage: git cherry-pick [--edit] [-n] [-m <parent-number>] [-s] [-x] [--ff]
+                       [-S[<keyid>]] <commit>...
+   or: git cherry-pick (--continue | --skip | --abort | --quit)
 
+    --quit                end revert or cherry-pick sequence
+    --continue            resume revert or cherry-pick sequence
+    --abort               cancel revert or cherry-pick sequence
+    --skip                skip current commit and continue
+    --[no-]cleanup <mode> how to strip spaces and #comments from message
+    -n, --no-commit       don't automatically commit
+    --commit              opposite of --no-commit
+    -e, --[no-]edit       edit the commit message
+    -s, --[no-]signoff    add a Signed-off-by trailer
+    -m, --[no-]mainline <parent-number>
+                          select mainline parent
+    --[no-]rerere-autoupdate
+                          update the index with reused conflict resolution if possible
+    --[no-]strategy <strategy>
+                          merge strategy
+    -X, --[no-]strategy-option <option>
+                          option for merge strategy
+    -S, --[no-]gpg-sign[=<key-id>]
+                          GPG sign commit
+    -x                    append commit name
+    --[no-]ff             allow fast-forward
+    --[no-]allow-empty    preserve initially empty commits
+    --[no-]allow-empty-message
+                          allow commits with empty messages
+    --[no-]keep-redundant-commits
+                          deprecated: use --empty=keep instead
+    --empty (stop|drop|keep)
+                          how to handle commits that become empty
+
+";
+
+/// The usage block on stderr, status 129 — git's `usage_with_options`.
+fn usage() -> ExitCode {
+    eprint!("{USAGE}");
+    ExitCode::from(129)
+}
+
+/// A single `error:` line on stderr, status 129 — git's `error()` returns from
+/// an option callback, and `parse_options` exits without reprinting usage.
+fn opt_error(message: &str) -> ExitCode {
+    eprintln!("error: {message}");
+    ExitCode::from(129)
+}
+
+/// `fatal: <message>`, status 128 — git's `die()`.
+fn fatal(message: &str) -> ExitCode {
+    eprintln!("fatal: {message}");
+    ExitCode::from(128)
+}
+
+/// git's sequencer failure shape: the specific `error:` line, then the generic
+/// `fatal: cherry-pick failed`, status 128.
+fn sequencer_failed(message: &str) -> ExitCode {
+    eprintln!("error: {message}");
+    eprintln!("fatal: cherry-pick failed");
+    ExitCode::from(128)
+}
+
+/// What to do with a pick whose result is empty (`--empty`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Empty {
+    Stop,
+    Drop,
+    Keep,
+}
+
+/// `--cleanup` modes. `Default` resolves to `Whitespace` here because it only
+/// differs from it when an editor runs, and `--edit` is refused.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cleanup {
+    Verbatim,
+    Whitespace,
+    Strip,
+    Scissors,
+    Default,
+}
+
+/// The four sequencer verbs, carrying the spelling git uses in diagnostics.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    Quit,
+    Continue,
+    Abort,
+    Skip,
+}
+
+impl Verb {
+    fn name(self) -> &'static str {
+        match self {
+            Verb::Quit => "--quit",
+            Verb::Continue => "--continue",
+            Verb::Abort => "--abort",
+            Verb::Skip => "--skip",
+        }
+    }
+}
+
+/// Everything the command line established, in the shape the pipeline consumes.
+#[derive(Default)]
+struct Opts<'a> {
+    specs: Vec<&'a str>,
+    /// An option git's table does not contain. Kept rather than rejected, and
+    /// only fatal once every revision has resolved (stage 5).
+    leftover_unknown: bool,
+    verb: Option<Verb>,
+    record_origin: bool,
+    allow_ff: bool,
+    allow_empty: bool,
+    allow_empty_message: bool,
+    no_commit: bool,
+    edit: bool,
+    signoff: bool,
+    mainline: Option<u32>,
+    empty: Option<Empty>,
+    cleanup: Option<Cleanup>,
+    strategy: bool,
+    xopts: bool,
+    gpg_sign: bool,
+}
+
+impl Opts<'_> {
+    fn empty_action(&self) -> Empty {
+        self.empty.unwrap_or(Empty::Stop)
+    }
+}
+
+/// Parse `--cleanup`'s value the way git's `get_cleanup_mode` does: an unknown
+/// mode is fatal (128) on the spot, not a usage error.
+fn parse_cleanup(value: &str) -> Result<Cleanup, ExitCode> {
+    match value {
+        "verbatim" => Ok(Cleanup::Verbatim),
+        "whitespace" => Ok(Cleanup::Whitespace),
+        "strip" => Ok(Cleanup::Strip),
+        "scissors" => Ok(Cleanup::Scissors),
+        "default" => Ok(Cleanup::Default),
+        other => Err(fatal(&format!("Invalid cleanup mode {other}"))),
+    }
+}
+
+fn parse_empty(value: &str) -> Result<Empty, ExitCode> {
+    match value {
+        "stop" => Ok(Empty::Stop),
+        "drop" => Ok(Empty::Drop),
+        "keep" => Ok(Empty::Keep),
+        other => Err(opt_error(&format!("invalid value for '--empty': '{other}'"))),
+    }
+}
+
+/// `-m`'s value must be a positive integer; git rejects everything else with one
+/// message regardless of whether it was unparsable or zero.
+fn parse_mainline(value: &str) -> Result<u32, ExitCode> {
+    match value.parse::<u32>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(opt_error("option `mainline' expects a number greater than zero")),
+    }
+}
+
+/// An option's value: either attached (`--opt=v`, `-Xv`) or the next argument.
+/// Advances `i` when it consumes that next argument, like `parse_options` does.
+fn take_value<'a>(
+    attached: Option<&'a str>,
+    args: &'a [String],
+    i: &mut usize,
+    name: &str,
+) -> Result<&'a str, ExitCode> {
+    match attached {
+        Some(v) => Ok(v),
+        None => {
+            *i += 1;
+            match args.get(*i) {
+                Some(v) => Ok(v.as_str()),
+                None => Err(opt_error(&format!("option `{name}' requires a value"))),
+            }
+        }
+    }
+}
+
+/// Walk the command line once, left to right, exactly like `parse_options`.
+///
+/// Returns `Err(code)` for the errors that abort parsing immediately; unknown
+/// options are recorded in `leftover_unknown` instead, so that a later bad
+/// revision can outrank them.
+fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
+    let mut o = Opts::default();
+    let mut only_specs = false;
     let mut i = 0;
+
     while i < args.len() {
-        let a = args[i].as_str();
-        match a {
-            "-x" => record_origin = true,
-            "--ff" => allow_ff = true,
-            "--allow-empty" => allow_empty = true,
-            "--allow-empty-message" => allow_empty_message = true,
-            // git documents `-r` as a no-op retained for compatibility, and we
-            // never sign, so `--no-gpg-sign` is satisfied by construction.
-            "-r" | "--no-gpg-sign" | "--no-edit" => {}
-            "-e" | "--edit" => anyhow::bail!("`-e`/`--edit` (editor mode) is not supported"),
-            "-n" | "--no-commit" => {
-                anyhow::bail!("`-n`/`--no-commit` is not supported; each pick is committed")
+        let arg = args[i].as_str();
+        if only_specs {
+            o.specs.push(arg);
+            i += 1;
+            continue;
+        }
+
+        // Split `--name=value` once so both spellings share a match arm.
+        let (name, inline) = match arg.split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n, Some(v)),
+            _ => (arg, None),
+        };
+
+        match name {
+            "--" => only_specs = true,
+
+            "--quit" => o.verb = o.verb.or(Some(Verb::Quit)),
+            "--continue" => o.verb = o.verb.or(Some(Verb::Continue)),
+            "--abort" => o.verb = o.verb.or(Some(Verb::Abort)),
+            "--skip" => o.verb = o.verb.or(Some(Verb::Skip)),
+
+            "--cleanup" => {
+                o.cleanup = Some(parse_cleanup(take_value(inline, args, &mut i, "cleanup")?)?);
             }
-            "-s" | "--signoff" => {
-                anyhow::bail!("`-s`/`--signoff` is not supported (trailer placement is unported)")
+            "--no-cleanup" => o.cleanup = None,
+            "--empty" => {
+                o.empty = Some(parse_empty(take_value(inline, args, &mut i, "empty")?)?);
             }
-            "-m" | "--mainline" => {
-                anyhow::bail!("`-m`/`--mainline` (picking a merge commit) is not supported")
+            "--mainline" => {
+                o.mainline = Some(parse_mainline(take_value(inline, args, &mut i, "mainline")?)?);
             }
-            "--continue" | "--skip" | "--abort" | "--quit" => {
-                anyhow::bail!("sequencer state (.git/sequencer, CHERRY_PICK_HEAD) is not implemented, so `{a}` is unavailable")
+            "--no-mainline" => o.mainline = None,
+            "--strategy" => {
+                take_value(inline, args, &mut i, "strategy")?;
+                o.strategy = true;
             }
-            "--" => {}
-            s if s.starts_with("--mainline=") => {
-                anyhow::bail!("`--mainline` (picking a merge commit) is not supported")
+            "--no-strategy" => o.strategy = false,
+            "--strategy-option" => {
+                take_value(inline, args, &mut i, "strategy-option")?;
+                o.xopts = true;
             }
-            s if s.starts_with("--strategy") || s.starts_with("-X") => {
-                anyhow::bail!("merge strategies are not supported; only trivially-resolvable picks are served")
+            "--no-strategy-option" => o.xopts = false,
+            "--gpg-sign" => o.gpg_sign = true,
+            "--no-gpg-sign" => o.gpg_sign = false,
+
+            "--commit" => o.no_commit = false,
+            "--no-commit" => o.no_commit = true,
+            "--edit" => o.edit = true,
+            "--no-edit" => o.edit = false,
+            "--signoff" => o.signoff = true,
+            "--no-signoff" => o.signoff = false,
+            "--ff" => o.allow_ff = true,
+            "--no-ff" => o.allow_ff = false,
+            "--allow-empty" => o.allow_empty = true,
+            "--no-allow-empty" => o.allow_empty = false,
+            "--allow-empty-message" => o.allow_empty_message = true,
+            "--no-allow-empty-message" => o.allow_empty_message = false,
+            "--keep-redundant-commits" => o.empty = Some(Empty::Keep),
+            "--no-keep-redundant-commits" => o.empty = Some(Empty::Stop),
+            // rerere only ever participates in conflict resolution, and every
+            // conflicted pick is refused below, so both spellings are no-ops.
+            "--rerere-autoupdate" | "--no-rerere-autoupdate" => {}
+
+            _ if name.starts_with("--") => o.leftover_unknown = true,
+
+            // Short options, including clusters like `-xn` and attached values
+            // like `-Xtheirs` / `-m1` / `-S<keyid>`. A non-ASCII argument cannot
+            // be a cluster of git's short options, so it goes straight to the
+            // unknown pile rather than being sliced at a non-char boundary.
+            _ if name.len() > 1 && name.starts_with('-') && name.is_ascii() => {
+                let bytes = name.as_bytes();
+                let mut c = 1;
+                while c < bytes.len() {
+                    let rest = &name[c + 1..];
+                    let attached = (!rest.is_empty()).then_some(rest);
+                    match bytes[c] {
+                        b'x' => o.record_origin = true,
+                        b'n' => o.no_commit = true,
+                        b'e' => o.edit = true,
+                        b's' => o.signoff = true,
+                        b'm' => {
+                            let v = take_value(attached, args, &mut i, "mainline")?;
+                            o.mainline = Some(parse_mainline(v)?);
+                            break;
+                        }
+                        b'X' => {
+                            take_value(attached, args, &mut i, "strategy-option")?;
+                            o.xopts = true;
+                            break;
+                        }
+                        // `-S` takes an *optional* key id, so a bare `-S` never
+                        // reaches into the next argument.
+                        b'S' => {
+                            o.gpg_sign = true;
+                            break;
+                        }
+                        _ => {
+                            o.leftover_unknown = true;
+                            break;
+                        }
+                    }
+                    c += 1;
+                }
             }
-            s if s.starts_with("--cleanup") => anyhow::bail!("`--cleanup` is not supported"),
-            s if s.starts_with("--empty") || s == "--keep-redundant-commits" => {
-                anyhow::bail!("`--empty`/`--keep-redundant-commits` is not supported")
-            }
-            s if s.starts_with("-S") || s.starts_with("--gpg-sign") => {
-                anyhow::bail!("commit signing is not supported")
-            }
-            s if s.starts_with('-') => anyhow::bail!("unsupported option `{s}`"),
-            s if s.contains("..") => {
-                anyhow::bail!("commit ranges are not supported; name each commit individually")
-            }
-            s => specs.push(s),
+
+            // Any other dashed argument: unknown, so kept for stage 5.
+            _ if name.len() > 1 && name.starts_with('-') => o.leftover_unknown = true,
+
+            _ => o.specs.push(arg),
         }
         i += 1;
     }
 
-    if specs.is_empty() {
-        anyhow::bail!("no commit specified");
+    Ok(o)
+}
+
+pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
+    let opts = match parse(args) {
+        Ok(o) => o,
+        Err(code) => return Ok(code),
+    };
+
+    // --- stage 2: sequencer verbs ----------------------------------------
+    if let Some(verb) = opts.verb {
+        return handle_verb(verb, &opts);
     }
 
-    // --- repository + serialized read-modify-write -----------------------
+    // --- stage 3: nothing to pick ----------------------------------------
+    if opts.specs.is_empty() {
+        return Ok(usage());
+    }
+
     let repo = gix::discover(".")?;
     // The whole sequence (tree build, commit, HEAD move, worktree update) is one
     // logical write; hold the coordinator lock across all of it, like `merge`.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+
+    // --- stage 4: resolve every revision, in order ------------------------
+    let mut picks: Vec<ObjectId> = Vec::with_capacity(opts.specs.len());
+    for spec in &opts.specs {
+        let parsed = match repo.rev_parse(*spec) {
+            Ok(parsed) => parsed,
+            Err(_) => return Ok(fatal(&format!("bad revision '{spec}'"))),
+        };
+        match parsed.single() {
+            Some(id) => picks.push(id.detach()),
+            // Both endpoints resolved, so this is a genuine range. Enumerating it
+            // is unported, and silently picking one end would be wrong.
+            None => anyhow::bail!(
+                "commit ranges are not supported; name each commit individually (`{spec}`)"
+            ),
+        }
+    }
+
+    // --- stage 5: options git kept but never consumed ----------------------
+    if opts.leftover_unknown {
+        return Ok(usage());
+    }
+
+    if opts.edit {
+        anyhow::bail!("`-e`/`--edit` (editor mode) is not supported");
+    }
+    if opts.no_commit {
+        anyhow::bail!("`-n`/`--no-commit` is not supported; each pick is committed");
+    }
+    if opts.strategy || opts.xopts {
+        anyhow::bail!("merge strategies are not supported; only trivially-resolvable picks are served");
+    }
+    if opts.gpg_sign {
+        anyhow::bail!("commit signing is not supported");
+    }
 
     let hash = repo.object_hash();
 
@@ -132,9 +483,11 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         .detach();
     drop(head);
 
-    // git requires a clean worktree; refuse rather than clobber uncommitted work.
+    // --- stage 6: git's `require_clean_work_tree` --------------------------
     if repo.is_dirty()? {
-        anyhow::bail!("your local changes would be overwritten by cherry-pick");
+        eprintln!("error: your local changes would be overwritten by cherry-pick.");
+        eprintln!("hint: commit your changes or stash them to proceed.");
+        return Ok(sequencer_failed_tail());
     }
 
     // Committer identity, shared by every pick in the sequence.
@@ -148,17 +501,32 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
     // so filesystem stats are reused and a later `status` stays cheap.
     let mut index = repo.index_or_load_from_head()?.into_owned();
 
-    for spec in specs {
-        let pick = repo.rev_parse_single(spec)?.object()?.peel_to_commit()?;
-        let pick_id = pick.id;
+    for (spec, pick_id) in opts.specs.iter().zip(picks) {
+        let pick = repo.find_commit(pick_id)?;
 
+        // --- pick the base (mainline) parent ------------------------------
         let parents: Vec<ObjectId> = pick.parent_ids().map(|id| id.detach()).collect();
-        match parents.len() {
-            0 => anyhow::bail!("cannot cherry-pick the root commit {spec}"),
-            1 => {}
-            _ => anyhow::bail!("commit {spec} is a merge but no -m option was given"),
-        }
-        let base_id = parents[0];
+        let base_id = match opts.mainline {
+            // `-m N` is legal on a non-merge as long as parent N exists, so a
+            // plain commit accepts `-m 1` and behaves exactly as without it.
+            Some(n) => match parents.get(n as usize - 1) {
+                Some(id) => *id,
+                None => {
+                    return Ok(sequencer_failed(&format!(
+                        "commit {pick_id} does not have parent {n}"
+                    )));
+                }
+            },
+            None => match parents.len() {
+                0 => anyhow::bail!("cannot cherry-pick the root commit {spec}"),
+                1 => parents[0],
+                _ => {
+                    return Ok(sequencer_failed(&format!(
+                        "commit {pick_id} is a merge but no -m option was given."
+                    )));
+                }
+            },
+        };
 
         let pick_tree = pick.tree_id()?.detach();
         let base_tree = repo.find_commit(base_id)?.tree_id()?.detach();
@@ -166,7 +534,7 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
 
         // `--ff`: HEAD is exactly the picked commit's parent, so replaying the
         // change is a fast-forward. git prints nothing in this case.
-        if allow_ff && head_id == base_id {
+        if opts.allow_ff && head_id == base_id {
             advance_head(&repo, head_id, pick_id, "cherry-pick: fast-forward".into())?;
             index = update_clean_worktree(&repo, &index, pick_id, &should_interrupt)?;
             head_id = pick_id;
@@ -196,7 +564,7 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
                 o
             } else {
                 anyhow::bail!(
-                    "cherry-picking {} needs a three-way content merge for {path}; the vendored gix-merge blob merge is not compiled in (the `merge` feature is off), so only trivially-resolvable picks are served",
+                    "cherry-picking {} needs a three-way content merge for {path}; writing conflict markers, staged index entries and MERGE_MSG is unported, so only trivially-resolvable picks are served",
                     pick_id.to_hex_with_len(7)
                 );
             };
@@ -213,35 +581,20 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         }
         let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
 
-        // --- empty-result guards -----------------------------------------
-        // git distinguishes a commit that was empty to begin with (allowed with
-        // --allow-empty) from one that *became* empty (needs --empty=keep, which
-        // requires sequencer state we do not implement).
-        if tree_id == head_tree {
-            if pick_tree == base_tree {
-                if !allow_empty {
-                    anyhow::bail!(
-                        "commit {} is empty; use --allow-empty to keep it",
-                        pick_id.to_hex_with_len(7)
-                    );
-                }
-            } else {
-                anyhow::bail!(
-                    "cherry-picking {} produces an empty commit; sequencer state (CHERRY_PICK_HEAD, .git/sequencer) is not implemented",
-                    pick_id.to_hex_with_len(7)
-                );
-            }
-        }
-
         // --- message -----------------------------------------------------
         let mut message: BString = pick.message_raw()?.to_owned();
-        if message.trim().is_empty() && !allow_empty_message {
+        // Only an explicit `--cleanup` rewrites the picked message; without one
+        // git carries it across untouched.
+        if let Some(mode) = opts.cleanup {
+            message = cleanup_message(&message, mode);
+        }
+        if message.trim().is_empty() && !opts.allow_empty_message {
             anyhow::bail!("the commit message of {spec} is empty (use --allow-empty-message)");
         }
         if message.last() != Some(&b'\n') {
             message.push(b'\n');
         }
-        if record_origin {
+        if opts.record_origin {
             if !has_conforming_footer(&message) {
                 message.push(b'\n');
             }
@@ -249,10 +602,37 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
             message.extend_from_slice(pick_id.to_string().as_bytes());
             message.extend_from_slice(b")\n");
         }
+        if opts.signoff {
+            let trailer = format!("Signed-off-by: {committer_ident}\n");
+            if !message.ends_with(trailer.as_bytes()) {
+                if !has_conforming_footer(&message) {
+                    message.push(b'\n');
+                }
+                message.extend_from_slice(trailer.as_bytes());
+            }
+        }
         let subject = gix::objs::commit::MessageRef::from_bytes(message.as_bstr())
             .summary()
             .to_str_lossy()
             .into_owned();
+
+        // --- empty-result guards -----------------------------------------
+        if tree_id == head_tree {
+            let initially_empty = pick_tree == base_tree;
+            let action = opts.empty_action();
+            let keep = action == Empty::Keep || (initially_empty && opts.allow_empty);
+            if !keep {
+                // `--empty` governs commits that *became* empty; an initially
+                // empty one is only ever kept via `--allow-empty`/`--empty=keep`.
+                if !initially_empty && action == Empty::Drop {
+                    eprintln!(
+                        "dropping {pick_id} {subject} -- patch contents already upstream"
+                    );
+                    continue;
+                }
+                return stop_empty(&repo, pick_id, head_id, &message);
+            }
+        }
 
         // --- write the commit, preserving the original author -------------
         let author = pick.author()?;
@@ -293,6 +673,143 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// The bare `fatal: cherry-pick failed` tail, for call sites that already
+/// printed their own `error:` line(s).
+fn sequencer_failed_tail() -> ExitCode {
+    eprintln!("fatal: cherry-pick failed");
+    ExitCode::from(128)
+}
+
+/// Stage 2 of git's pipeline: a sequencer verb was given.
+fn handle_verb(verb: Verb, opts: &Opts<'_>) -> Result<ExitCode> {
+    // git's `verify_opt_compatible`, in its declaration order.
+    for (name, given) in [
+        ("--no-commit", opts.no_commit),
+        ("--signoff", opts.signoff),
+        ("--mainline", opts.mainline.is_some()),
+        ("--strategy", opts.strategy),
+        ("--strategy-option", opts.xopts),
+        ("-x", opts.record_origin),
+        ("--ff", opts.allow_ff),
+    ] {
+        if given {
+            return Ok(fatal(&format!(
+                "cherry-pick: {name} cannot be used with {}",
+                verb.name()
+            )));
+        }
+    }
+
+    let repo = gix::discover(".")?;
+    let git_dir = repo.git_dir().to_owned();
+    let in_progress =
+        git_dir.join("CHERRY_PICK_HEAD").exists() || git_dir.join("sequencer").exists();
+
+    Ok(match verb {
+        // `--quit` forgets the operation without touching index or worktree, and
+        // succeeds even when nothing was in progress.
+        Verb::Quit => {
+            let _ = std::fs::remove_file(git_dir.join("CHERRY_PICK_HEAD"));
+            let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
+            let _ = std::fs::remove_file(git_dir.join("AUTO_MERGE"));
+            let _ = std::fs::remove_dir_all(git_dir.join("sequencer"));
+            ExitCode::SUCCESS
+        }
+        Verb::Skip if !in_progress => {
+            sequencer_failed("no cherry-pick in progress")
+        }
+        Verb::Continue | Verb::Abort if !in_progress => {
+            sequencer_failed("no cherry-pick or revert in progress")
+        }
+        // A pick really is stopped, but resuming needs the staged-conflict and
+        // `.git/sequencer` machinery this port does not write.
+        other => anyhow::bail!(
+            "a cherry-pick is in progress, but resuming it (`{}`) is not implemented",
+            other.name()
+        ),
+    })
+}
+
+/// git's stopped-on-empty state: record `CHERRY_PICK_HEAD` and `MERGE_MSG`, print
+/// the in-progress status block on stdout and the advice on stderr, exit 1.
+///
+/// The worktree is necessarily clean here — the merged tree equalled `HEAD`'s —
+/// so the status block's body is fixed rather than derived from a diff.
+fn stop_empty(
+    repo: &gix::Repository,
+    pick_id: ObjectId,
+    head_id: ObjectId,
+    message: &BString,
+) -> Result<ExitCode> {
+    let git_dir = repo.git_dir();
+    std::fs::write(git_dir.join("CHERRY_PICK_HEAD"), format!("{pick_id}\n"))?;
+    std::fs::write(git_dir.join("MERGE_MSG"), &message[..])?;
+
+    match repo.head_name()? {
+        Some(name) => println!("On branch {}", name.shorten()),
+        None => println!("HEAD detached at {}", head_id.attach(repo).shorten_or_id()),
+    }
+    println!(
+        "You are currently cherry-picking commit {}.",
+        pick_id.attach(repo).shorten_or_id()
+    );
+    println!("  (all conflicts fixed: run \"git cherry-pick --continue\")");
+    println!("  (use \"git cherry-pick --skip\" to skip this patch)");
+    println!("  (use \"git cherry-pick --abort\" to cancel the cherry-pick operation)");
+    println!();
+    println!("nothing to commit, working tree clean");
+
+    eprintln!("The previous cherry-pick is now empty, possibly due to conflict resolution.");
+    eprintln!("If you wish to commit it anyway, use:");
+    eprintln!();
+    eprintln!("    git commit --allow-empty");
+    eprintln!();
+    eprintln!("Otherwise, please use 'git cherry-pick --skip'");
+
+    Ok(ExitCode::from(1))
+}
+
+/// git's `strbuf_stripspace` plus the per-mode extras: trailing whitespace goes,
+/// runs of blank lines collapse to one, and leading/trailing blank lines are
+/// dropped. `strip` additionally removes comment lines, `scissors` truncates at
+/// the scissors marker, and `verbatim` returns the message untouched.
+fn cleanup_message(message: &BString, mode: Cleanup) -> BString {
+    if mode == Cleanup::Verbatim {
+        return message.clone();
+    }
+    let strip_comments = mode == Cleanup::Strip;
+
+    let mut out: Vec<u8> = Vec::with_capacity(message.len());
+    let mut pending_blank = false;
+    let mut seen_content = false;
+    for line in message.split(|&b| b == b'\n') {
+        // `# ------------------------ >8 ------------------------` and
+        // everything after it is the scissors cut.
+        if mode == Cleanup::Scissors && line.starts_with(b"# ") && line.contains_str(">8") {
+            break;
+        }
+        if strip_comments && line.first() == Some(&b'#') {
+            continue;
+        }
+        let trimmed = match line.iter().rposition(|b| !b.is_ascii_whitespace()) {
+            Some(last) => &line[..=last],
+            None => &[][..],
+        };
+        if trimmed.is_empty() {
+            pending_blank = seen_content;
+            continue;
+        }
+        if pending_blank {
+            out.push(b'\n');
+            pending_blank = false;
+        }
+        out.extend_from_slice(trimmed);
+        out.push(b'\n');
+        seen_content = true;
+    }
+    BString::from(out)
 }
 
 /// Flatten a tree into `path -> (mode, blob id)`, recursively, dropping entries
@@ -502,7 +1019,7 @@ fn update_clean_worktree(
     let odb = repo.objects.clone().into_arc()?;
     let discard_files = gix::progress::Discard;
     let discard_bytes = gix::progress::Discard;
-    gix::worktree::state::checkout(
+    crate::worktree::checkout_subset(
         &mut subset,
         workdir.as_path(),
         odb,

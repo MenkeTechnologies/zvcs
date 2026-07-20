@@ -442,7 +442,7 @@ fn checkout_subset(
     let should_interrupt = AtomicBool::new(false);
     let discard_files = gix::progress::Discard;
     let discard_bytes = gix::progress::Discard;
-    gix::worktree::state::checkout(
+    crate::worktree::checkout_subset(
         &mut subset,
         workdir.as_path(),
         odb,

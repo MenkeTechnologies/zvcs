@@ -16,26 +16,50 @@
 //!
 //! Covered:
 //!   * revision selection — `<since>` (implicit `<since>..HEAD`), `<a>..<b>`,
-//!     `^<rev>`, `-<n>`, `--root`; merges are excluded as git does.
+//!     `<a>...<b>`, `^<rev>`, `-<n>`, `--root`; merges are excluded as git does.
+//!   * revision errors — git's own `fatal: ambiguous argument …` / `bad object`
+//!     / `bad revision` / `Invalid revision range` text on stderr with exit 128,
+//!     and a positional that names an existing path is a pathspec, not an error.
 //!   * output — file-per-patch (default, names printed to stdout) or `--stdout`.
-//!   * flags — `--stdout`, `-o`/`--output-directory`, `-<n>`, `-n`/`--numbered`,
-//!     `-N`/`--no-numbered`, `--start-number`, `--numbered-files`, `--suffix`,
-//!     `--subject-prefix`, `-v`/`--reroll-count`, `--signature`/`--no-signature`,
-//!     `--zero-commit`, `-p`/`--no-stat`, `--root`, `-q`/`--quiet`,
-//!     `--filename-max-length`.
+//!   * flags — `--stdout`, `-o`/`--output-directory`, `-<n>`/`--max-count`,
+//!     `--skip`, `--reverse`, `--min-parents`/`--max-parents`/`--no-merges`,
+//!     `-n`/`--numbered`, `-N`/`--no-numbered`, `--start-number`,
+//!     `--numbered-files`, `--suffix`, `--subject-prefix`, `--rfc`,
+//!     `-v`/`--reroll-count`, `--signature`/`--no-signature`, `--zero-commit`,
+//!     `-p`/`--no-stat`, `--root`, `-q`/`--quiet`, `--filename-max-length`,
+//!     `--cover-letter`, `-U`/`--unified`, `-a`/`--text`, `--minimal`,
+//!     `--histogram`, `--diff-algorithm=myers|minimal|histogram`.
+//!
+//! Flags git accepts that are *not* ported are recorded during parsing and
+//! rejected only once it is clear a patch would actually be emitted. That
+//! ordering is deliberate: git validates option values first (exit 129), then
+//! resolves revisions (exit 128), and only then renders. Rejecting early would
+//! report a porting gap for an invocation git itself refuses, so the two
+//! implementations would disagree about *why* they failed. Nothing is silently
+//! ignored: if the commit list is non-empty the unported flag is still fatal.
 //!
 //! Not covered — these `bail!` rather than emit output that would diverge:
-//!   * binary files. git format-patch implies `--binary`, i.e. a base85
-//!     `GIT binary patch` payload; that encoder is not ported.
-//!   * cover letters, threading, MIME attach/inline, signoff, `--keep-subject`,
-//!     extra headers (`--to`/`--cc`/`--in-reply-to`), notes, interdiff and
-//!     range-diff, `--ignore-if-in-upstream`, and every non-default diff flag.
+//!   * binary files, unless `-a`/`--text` is given. format-patch implies
+//!     `--binary`, i.e. a base85 `GIT binary patch` payload; that encoder is not
+//!     ported.
+//!   * pathspec-limited output. A pathspec is parsed and honoured to the extent
+//!     that it never becomes a bogus revision error, but limiting the walk and
+//!     the patch to it is not ported, so a pathspec that reaches a non-empty
+//!     commit list is fatal.
+//!   * threading, MIME attach/inline, signoff, `--keep-subject`, extra headers
+//!     (`--to`/`--cc`/`--in-reply-to`), notes, interdiff and range-diff,
+//!     `--ignore-if-in-upstream`, the alternate diffstat formats (`--numstat`,
+//!     `--shortstat`, `--dirstat`, `--compact-summary`, `--stat=<width>`),
+//!     whitespace-insensitive diffing, `-I<regex>` (no regex engine is vendored),
+//!     patience diff (imara-diff has Myers, MyersMinimal and Histogram only),
+//!     and rename/copy detection.
 //!
 //! Known deviation, stated rather than hidden: rename/copy detection is
 //! disabled (as elsewhere in this crate), so a commit that renames a file
 //! renders as a delete plus an add instead of git's `rename from`/`rename to`
 //! and `old => new` stat line. Column widths are computed in Unicode scalar
-//! values, so East-Asian wide characters in a path measure 1 rather than 2.
+//! values, so East-Asian wide characters in a path measure 1 rather than 2. The
+//! cover letter's shortlog does not wrap long subjects at 76 columns.
 
 use anyhow::{anyhow, bail, Result};
 use std::io::Write;
@@ -68,7 +92,12 @@ const HEADER_MAX_LENGTH: i64 = 78;
 /// The charset name used for RFC2047 encoding and the 8-bit MIME header.
 const ENCODING: &str = "UTF-8";
 
+/// git's placeholder subject and body in a generated cover letter.
+const COVER_SUBJECT: &str = "*** SUBJECT HERE ***";
+const COVER_BLURB: &str = "*** BLURB HERE ***";
+
 struct Opts {
+    // Output shape.
     to_stdout: bool,
     outdir: Option<String>,
     numbered: Option<bool>,
@@ -80,15 +109,256 @@ struct Opts {
     signature: String,
     zero_commit: bool,
     no_stat: bool,
-    root: bool,
     quiet: bool,
     name_max: usize,
+    cover_letter: bool,
+
+    // Revision selection.
+    root: bool,
+    max_count: Option<usize>,
+    skip: usize,
+    reverse: bool,
+    min_parents: usize,
+    max_parents: Option<usize>,
+    revs: Vec<String>,
+    paths: Vec<String>,
+
+    // Diff rendering.
+    context: u32,
+    algorithm: Algorithm,
+    text: bool,
+
+    /// Flags git accepts that this module has not ported, in the spelling the
+    /// caller used. Reported only when a patch would actually be emitted.
+    deferred: Vec<String>,
 }
 
 pub fn format_patch(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
-    let mut opts = Opts {
+    let mut opts = match parse(&repo, args)? {
+        Parsed::Ready(opts) => *opts,
+        Parsed::Exit(code) => return Ok(code),
+    };
+
+    // git: "Make sure 0000-$sub.patch gives non-negative length for $sub".
+    let floor = "0000-".len() + opts.suffix.len();
+    if opts.name_max <= floor {
+        opts.name_max = floor;
+    }
+    if let Some(r) = &opts.reroll {
+        opts.subject_prefix.push_str(&format!(" v{r}"));
+    }
+
+    let (commits, paths) = match select_commits(&repo, &opts)? {
+        Selected::Commits { commits, paths } => (commits, paths),
+        Selected::Exit(code) => return Ok(code),
+    };
+    if commits.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Everything below emits bytes, so an unported flag can no longer be
+    // deferred: it would change what those bytes are.
+    if let Some(flag) = opts.deferred.first() {
+        bail!("unsupported flag {flag:?}");
+    }
+    if let Some(path) = paths.first() {
+        bail!("pathspec-limited format-patch is not supported (got {path:?})");
+    }
+
+    // Auto-numbering kicks in for a series; -n/-N override it. A cover letter
+    // always numbers, since it is itself patch 0 of the series.
+    let total = commits.len();
+    let numbered = opts.numbered.unwrap_or(total > 1 || opts.cover_letter);
+    let printed_total = if numbered {
+        total + opts.start_number - 1
+    } else {
+        0
+    };
+
+    let mut stdout = std::io::stdout().lock();
+    let mut buffered: Vec<u8> = Vec::new();
+
+    if opts.cover_letter {
+        let mut msg: Vec<u8> = Vec::new();
+        render_cover_letter(&repo, &commits, printed_total, &opts, &mut msg)?;
+        emit_message(&mut buffered, &msg, cover_filename(&opts), &opts)?;
+    }
+
+    for (idx, id) in commits.iter().enumerate() {
+        let commit = repo.find_object(*id)?.try_into_commit()?;
+        let nr = idx + opts.start_number;
+
+        let mut msg: Vec<u8> = Vec::new();
+        render_message(&repo, &commit, nr, printed_total, &opts, &mut msg)?;
+
+        // git puts one extra blank line between patches in the mbox stream; the
+        // cover letter is not separated that way.
+        if opts.to_stdout && idx > 0 {
+            buffered.push(b'\n');
+        }
+        emit_message(&mut buffered, &msg, patch_filename(&commit, nr, &opts)?, &opts)?;
+    }
+
+    match stdout.write_all(&buffered).and_then(|()| stdout.flush()) {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        // A downstream `| head` closing the pipe is not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Append one rendered message to the mbox stream, or write it to its file and
+/// note the name for stdout.
+fn emit_message(buffered: &mut Vec<u8>, msg: &[u8], name: String, opts: &Opts) -> Result<()> {
+    if opts.to_stdout {
+        buffered.extend_from_slice(msg);
+        return Ok(());
+    }
+    let path = match &opts.outdir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir)?;
+            format!("{dir}/{name}")
+        }
+        None => name.clone(),
+    };
+    if !opts.quiet {
+        let shown = match &opts.outdir {
+            Some(_) => path.clone(),
+            None => name,
+        };
+        writeln!(buffered, "{shown}")?;
+    }
+    std::fs::write(&path, msg)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+
+enum Parsed {
+    Ready(Box<Opts>),
+    /// git refused the command line itself; the message is already on stderr.
+    Exit(ExitCode),
+}
+
+/// Flags whose effect is already this module's behavior, so accepting them
+/// changes nothing: the slider heuristic is what the blob diff runs, rename
+/// detection is off, color and progress are never rendered, `a/`+`b/` are the
+/// prefixes emitted, the stat+summary block is the default, and format-patch
+/// implies `--binary` (binary content is rejected either way).
+const NO_OP: &[&str] = &[
+    "--indent-heuristic",
+    "--no-renames",
+    "--rename-empty",
+    "--no-rename-empty",
+    "--no-color",
+    "--no-textconv",
+    "--no-ext-diff",
+    "--progress",
+    "--no-progress",
+    "--no-signoff",
+    "--no-attach",
+    "--no-thread",
+    "--no-notes",
+    "--no-base",
+    "--no-encode-email-headers",
+    "--no-force-in-body-from",
+    "--no-relative",
+    "--default-prefix",
+    "--ita-invisible-in-index",
+    "--binary",
+    "--stat",
+    "--summary",
+];
+
+/// Flags git accepts that this module has not ported. Matched as `--flag` or
+/// `--flag=<value>`; see the module header for what each of them would change.
+const DEFERRED: &[&str] = &[
+    "-k",
+    "--keep-subject",
+    "-s",
+    "--signoff",
+    "--attach",
+    "--inline",
+    "--thread",
+    "--in-reply-to",
+    "--to",
+    "--cc",
+    "--add-header",
+    "--from",
+    "--force-in-body-from",
+    "--encode-email-headers",
+    "--notes",
+    "--base",
+    "--interdiff",
+    "--range-diff",
+    "--creation-factor",
+    "--signature-file",
+    "--description-file",
+    "--cover-from-description",
+    "--commit-list-format",
+    "--always",
+    "--ignore-if-in-upstream",
+    "--numstat",
+    "--shortstat",
+    "--compact-summary",
+    "--dirstat",
+    "--dirstat-by-file",
+    "--cumulative",
+    "--stat-width",
+    "--stat-name-width",
+    "--stat-count",
+    "--patience",
+    "--no-indent-heuristic",
+    "--full-index",
+    "--no-binary",
+    "--abbrev",
+    "--break-rewrites",
+    "--find-renames",
+    "--find-copies",
+    "--find-copies-harder",
+    "--irreversible-delete",
+    "--skip-to",
+    "--rotate-to",
+    "--ignore-cr-at-eol",
+    "--ignore-space-at-eol",
+    "--ignore-space-change",
+    "--ignore-all-space",
+    "--ignore-blank-lines",
+    "--ignore-matching-lines",
+    "--inter-hunk-context",
+    "--function-context",
+    "--textconv",
+    "--no-prefix",
+    "--line-prefix",
+    "--output-indicator-new",
+    "--output-indicator-old",
+    "--output-indicator-context",
+    "--anchored",
+    "--no-walk",
+    "--first-parent",
+    "--topo-order",
+    "--date-order",
+    "--author-date-order",
+    "-b",
+    "-w",
+    "-D",
+    "-W",
+];
+
+/// Short options that carry an attached value, e.g. `-I^$` or `-M50%`.
+const DEFERRED_SHORT: &[&str] = &["-I", "-l", "-M", "-C", "-B", "-O", "-S", "-G", "-X"];
+
+/// True when `arg` is exactly `name` or the `name=<value>` form.
+fn is_flag(arg: &str, name: &str) -> bool {
+    arg == name || arg.strip_prefix(name).is_some_and(|r| r.starts_with('='))
+}
+
+fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
+    let mut o = Opts {
         to_stdout: false,
         outdir: None,
         numbered: None,
@@ -105,176 +375,210 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
             .unwrap_or_else(|| SIGNATURE_VERSION.to_owned()),
         zero_commit: false,
         no_stat: false,
-        root: false,
         quiet: false,
         name_max: NAME_MAX_DEFAULT,
+        cover_letter: false,
+        root: false,
+        max_count: None,
+        skip: 0,
+        reverse: false,
+        min_parents: 0,
+        // format-patch sets `rev.max_parents = 1`: merges never get a patch.
+        max_parents: Some(1),
+        revs: Vec::new(),
+        paths: Vec::new(),
+        context: 3,
+        algorithm: Algorithm::Myers,
+        text: false,
+        deferred: Vec::new(),
     };
 
-    let mut max_count: Option<usize> = None;
-    let mut revs: Vec<String> = Vec::new();
-
-    let mut i = 1;
+    let mut i = 0;
+    let mut pathspec_mode = false;
     while i < args.len() {
         let a = args[i].as_str();
+        if pathspec_mode {
+            o.paths.push(a.to_owned());
+            i += 1;
+            continue;
+        }
         match a {
-            "--stdout" => opts.to_stdout = true,
-            "-o" => {
+            "--" => pathspec_mode = true,
+            "--stdout" => o.to_stdout = true,
+            "-o" | "--output-directory" => {
                 i += 1;
-                opts.outdir = Some(value_at(args, i, "-o")?);
+                o.outdir = Some(value_at(args, i, a)?);
             }
-            "--output-directory" => {
-                i += 1;
-                opts.outdir = Some(value_at(args, i, "--output-directory")?);
-            }
-            "-n" | "--numbered" => opts.numbered = Some(true),
-            "-N" | "--no-numbered" => opts.numbered = Some(false),
+            "-n" | "--numbered" => o.numbered = Some(true),
+            "-N" | "--no-numbered" => o.numbered = Some(false),
             "--start-number" => {
                 i += 1;
-                opts.start_number = parse_num(&value_at(args, i, "--start-number")?)?;
+                o.start_number = parse_num(&value_at(args, i, a)?)?;
             }
-            "--numbered-files" => opts.numbered_files = true,
+            "--numbered-files" => o.numbered_files = true,
             "--subject-prefix" => {
                 i += 1;
-                opts.subject_prefix = value_at(args, i, "--subject-prefix")?;
+                o.subject_prefix = value_at(args, i, a)?;
             }
             "--suffix" => {
                 i += 1;
-                opts.suffix = value_at(args, i, "--suffix")?;
+                o.suffix = value_at(args, i, a)?;
             }
             "-v" | "--reroll-count" => {
                 i += 1;
-                opts.reroll = Some(value_at(args, i, "-v")?);
+                o.reroll = Some(value_at(args, i, a)?);
             }
             "--signature" => {
                 i += 1;
-                opts.signature = value_at(args, i, "--signature")?;
+                o.signature = value_at(args, i, a)?;
             }
-            "--no-signature" => opts.signature.clear(),
-            "--zero-commit" => opts.zero_commit = true,
-            "--no-zero-commit" => opts.zero_commit = false,
-            "-p" | "--no-stat" => opts.no_stat = true,
-            "--root" => opts.root = true,
-            "-q" | "--quiet" => opts.quiet = true,
+            "--no-signature" => o.signature.clear(),
+            "--zero-commit" => o.zero_commit = true,
+            "--no-zero-commit" => o.zero_commit = false,
+            "-p" | "--no-stat" => o.no_stat = true,
+            "--root" => o.root = true,
+            "-q" | "--quiet" => o.quiet = true,
             "--filename-max-length" => {
                 i += 1;
-                opts.name_max = parse_num(&value_at(args, i, "--filename-max-length")?)?;
+                o.name_max = parse_num(&value_at(args, i, a)?)?;
             }
-            // We never colorize; accept the flags that ask for no color.
-            "--no-color" | "--color=never" | "--color=auto" => {}
-            "--" => {
-                if i + 1 < args.len() {
-                    bail!("pathspec-limited format-patch is not supported");
+            "--cover-letter" => o.cover_letter = true,
+            "--no-cover-letter" => o.cover_letter = false,
+            "--rfc" => o.subject_prefix = "RFC PATCH".to_owned(),
+            "--reverse" => o.reverse = true,
+            "--no-merges" => o.max_parents = Some(1),
+            "--minimal" => o.algorithm = Algorithm::MyersMinimal,
+            "--histogram" => o.algorithm = Algorithm::Histogram,
+            "-a" | "--text" => o.text = true,
+            // At the top of the worktree `--relative` neither strips a prefix
+            // nor filters by directory, so there it is genuinely a no-op.
+            "--relative" => {
+                if !at_worktree_top(repo) {
+                    o.deferred.push(a.to_owned());
                 }
             }
             s if s.starts_with("--output-directory=") => {
-                opts.outdir = Some(s["--output-directory=".len()..].to_owned())
+                o.outdir = Some(s["--output-directory=".len()..].to_owned());
             }
             s if s.starts_with("--start-number=") => {
-                opts.start_number = parse_num(&s["--start-number=".len()..])?
+                o.start_number = parse_num(&s["--start-number=".len()..])?;
             }
             s if s.starts_with("--subject-prefix=") => {
-                opts.subject_prefix = s["--subject-prefix=".len()..].to_owned()
+                o.subject_prefix = s["--subject-prefix=".len()..].to_owned();
             }
-            s if s.starts_with("--suffix=") => opts.suffix = s["--suffix=".len()..].to_owned(),
+            s if s.starts_with("--suffix=") => o.suffix = s["--suffix=".len()..].to_owned(),
             s if s.starts_with("--reroll-count=") => {
-                opts.reroll = Some(s["--reroll-count=".len()..].to_owned())
+                o.reroll = Some(s["--reroll-count=".len()..].to_owned());
             }
             s if s.starts_with("--signature=") => {
-                opts.signature = s["--signature=".len()..].to_owned()
+                o.signature = s["--signature=".len()..].to_owned();
             }
             s if s.starts_with("--filename-max-length=") => {
-                opts.name_max = parse_num(&s["--filename-max-length=".len()..])?
+                o.name_max = parse_num(&s["--filename-max-length=".len()..])?;
             }
-            s if s.len() > 2 && s.starts_with("-o") => opts.outdir = Some(s[2..].to_owned()),
+            s if s.starts_with("--rfc=") => {
+                o.subject_prefix = format!("{} PATCH", &s["--rfc=".len()..]);
+            }
+            s if s.starts_with("--max-count=") => {
+                o.max_count = Some(parse_num(&s["--max-count=".len()..])?);
+            }
+            s if s.starts_with("--skip=") => o.skip = parse_num(&s["--skip=".len()..])?,
+            s if s.starts_with("--min-parents=") => {
+                o.min_parents = parse_num(&s["--min-parents=".len()..])?;
+            }
+            s if s.starts_with("--max-parents=") => {
+                o.max_parents = Some(parse_num(&s["--max-parents=".len()..])?);
+            }
+            s if s.starts_with("--unified=") => {
+                o.context = parse_num(&s["--unified=".len()..])? as u32;
+            }
+            s if s.len() > 2 && s.starts_with("-U") && s[2..].bytes().all(|c| c.is_ascii_digit()) => {
+                o.context = parse_num(&s[2..])? as u32;
+            }
+            s if s.starts_with("--diff-algorithm=") => {
+                match &s["--diff-algorithm=".len()..] {
+                    "myers" => o.algorithm = Algorithm::Myers,
+                    "minimal" => o.algorithm = Algorithm::MyersMinimal,
+                    "histogram" => o.algorithm = Algorithm::Histogram,
+                    // imara-diff has no patience implementation.
+                    "patience" => o.deferred.push(a.to_owned()),
+                    _ => {
+                        eprintln!(
+                            "error: option diff-algorithm accepts \"myers\", \"minimal\", \
+                             \"patience\" and \"histogram\""
+                        );
+                        return Ok(Parsed::Exit(ExitCode::from(129)));
+                    }
+                }
+            }
+            s if s.starts_with("--thread=") => match &s["--thread=".len()..] {
+                "shallow" | "deep" => o.deferred.push(a.to_owned()),
+                // git rejects the value with a bare usage exit and no message.
+                _ => return Ok(Parsed::Exit(ExitCode::from(129))),
+            },
+            s if s.starts_with("--cover-from-description=") => {
+                let v = &s["--cover-from-description=".len()..];
+                match v {
+                    "message" | "subject" | "auto" | "none" => o.deferred.push(a.to_owned()),
+                    _ => {
+                        return Ok(Parsed::Exit(fatal(&format!(
+                            "{v}: invalid cover from description mode"
+                        ))))
+                    }
+                }
+            }
+            // "none" is what this module does: submodule changes are shown.
+            s if s.starts_with("--ignore-submodules=") => {
+                if &s["--ignore-submodules=".len()..] != "none" {
+                    o.deferred.push(a.to_owned());
+                }
+            }
+            s if s.starts_with("--src-prefix=") => {
+                if &s["--src-prefix=".len()..] != "a/" {
+                    o.deferred.push(a.to_owned());
+                }
+            }
+            s if s.starts_with("--dst-prefix=") => {
+                if &s["--dst-prefix=".len()..] != "b/" {
+                    o.deferred.push(a.to_owned());
+                }
+            }
+            // Colour is never emitted, so the flags that ask for none agree.
+            s if s.starts_with("--color=") => {
+                if !matches!(&s["--color=".len()..], "never" | "auto") {
+                    o.deferred.push(a.to_owned());
+                }
+            }
+            s if s.starts_with("--stat=") || s.starts_with("--relative=") => {
+                o.deferred.push(a.to_owned());
+            }
+            s if s.len() > 2 && s.starts_with("-o") => o.outdir = Some(s[2..].to_owned()),
             s if s.len() > 2
                 && s.starts_with("-v")
                 && s[2..].bytes().all(|c| c.is_ascii_digit()) =>
             {
-                opts.reroll = Some(s[2..].to_owned())
+                o.reroll = Some(s[2..].to_owned());
             }
             // `-<n>` is a commit count, unlike `-n` which means --numbered.
             s if s.len() > 1
                 && s.starts_with('-')
                 && s[1..].bytes().all(|c| c.is_ascii_digit()) =>
             {
-                max_count = Some(parse_num(&s[1..])?)
+                o.max_count = Some(parse_num(&s[1..])?);
             }
-            s if s.starts_with('-') => bail!(
-                "unsupported flag {s:?} (ported: --stdout, -o/--output-directory, -<n>, \
-                 -n/--numbered, -N/--no-numbered, --start-number, --numbered-files, --suffix, \
-                 --subject-prefix, -v/--reroll-count, --signature/--no-signature, --zero-commit, \
-                 -p/--no-stat, --root, -q/--quiet, --filename-max-length)"
-            ),
-            s => revs.push(s.to_owned()),
+            s if NO_OP.contains(&s) => {}
+            s if DEFERRED.iter().any(|f| is_flag(s, f))
+                || DEFERRED_SHORT.iter().any(|f| s.starts_with(f)) =>
+            {
+                o.deferred.push(s.to_owned());
+            }
+            s if s.starts_with('-') => bail!("unsupported flag {s:?}"),
+            s => o.revs.push(s.to_owned()),
         }
         i += 1;
     }
 
-    // git: "Make sure 0000-$sub.patch gives non-negative length for $sub".
-    let floor = "0000-".len() + opts.suffix.len();
-    if opts.name_max <= floor {
-        opts.name_max = floor;
-    }
-    if let Some(r) = &opts.reroll {
-        opts.subject_prefix.push_str(&format!(" v{r}"));
-    }
-
-    let commits = select_commits(&repo, &revs, max_count, opts.root)?;
-    if commits.is_empty() {
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // Auto-numbering kicks in for a series; -n/-N override it.
-    let total = commits.len();
-    let numbered = opts.numbered.unwrap_or(total > 1);
-    let printed_total = if numbered {
-        total + opts.start_number - 1
-    } else {
-        0
-    };
-
-    let mut stdout = std::io::stdout().lock();
-    let mut buffered: Vec<u8> = Vec::new();
-
-    for (idx, id) in commits.iter().enumerate() {
-        let commit = repo.find_object(*id)?.try_into_commit()?;
-        let nr = idx + opts.start_number;
-
-        let mut msg: Vec<u8> = Vec::new();
-        render_message(&repo, &commit, nr, printed_total, &opts, &mut msg)?;
-
-        if opts.to_stdout {
-            // git puts one extra blank line between messages in the mbox stream.
-            if idx > 0 {
-                buffered.push(b'\n');
-            }
-            buffered.extend_from_slice(&msg);
-        } else {
-            let name = patch_filename(&commit, nr, &opts)?;
-            let path = match &opts.outdir {
-                Some(dir) => {
-                    std::fs::create_dir_all(dir)?;
-                    format!("{dir}/{name}")
-                }
-                None => name.clone(),
-            };
-            if !opts.quiet {
-                let shown = match &opts.outdir {
-                    Some(_) => path.clone(),
-                    None => name,
-                };
-                writeln!(buffered, "{shown}")?;
-            }
-            std::fs::write(&path, &msg)?;
-        }
-    }
-
-    match stdout.write_all(&buffered).and_then(|()| stdout.flush()) {
-        Ok(()) => Ok(ExitCode::SUCCESS),
-        // A downstream `| head` closing the pipe is not an error.
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
-        Err(e) => Err(e.into()),
-    }
+    Ok(Parsed::Ready(Box::new(o)))
 }
 
 fn parse_num(s: &str) -> Result<usize> {
@@ -289,62 +593,164 @@ fn value_at(args: &[String], i: usize, name: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("option `{name}` requires a value"))
 }
 
+/// Whether the process runs at the root of the worktree, where a relative
+/// pathspec prefix is empty.
+fn at_worktree_top(repo: &gix::Repository) -> bool {
+    let (Some(workdir), Ok(cwd)) = (repo.workdir(), std::env::current_dir()) else {
+        return false;
+    };
+    match (workdir.canonicalize(), cwd.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Revision selection
+// ---------------------------------------------------------------------------
+
+/// git exits 128 on a fatal error; `anyhow::bail!` would collapse that to 1, so
+/// the message goes to stderr here and the code is returned explicitly.
+fn fatal(msg: &str) -> ExitCode {
+    eprintln!("fatal: {msg}");
+    ExitCode::from(128)
+}
+
+/// git's `die_verify_filename()` wording for an argument that is neither a
+/// revision nor an existing path.
+fn ambiguous(spec: &str) -> ExitCode {
+    fatal(&format!(
+        "ambiguous argument '{spec}': unknown revision or path not in the working tree.\n\
+         Use '--' to separate paths from revisions, like this:\n\
+         'git <command> [<revision>...] -- [<file>...]'"
+    ))
+}
+
+/// A full-length object name is reported as a missing object rather than as an
+/// ambiguous argument — git can tell it was meant to be an object id.
+fn is_full_oid(spec: &str, hexsz: usize) -> bool {
+    spec.len() == hexsz && spec.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+enum Selected {
+    Commits {
+        commits: Vec<ObjectId>,
+        /// Pathspecs, including positionals that turned out to name a path.
+        paths: Vec<String>,
+    },
+    Exit(ExitCode),
+}
+
 /// Resolve the revision arguments into the commits to format, oldest first and
 /// with merges dropped (git sets `rev.max_parents = 1`).
 ///
 /// A lone revision with neither `-<n>` nor `--root` is git's traditional
 /// `format-patch <since>` shorthand for `<since>..HEAD`; anything else is an
-/// ordinary walk over the given tips and exclusions.
-fn select_commits(
-    repo: &gix::Repository,
-    revs: &[String],
-    max_count: Option<usize>,
-    root: bool,
-) -> Result<Vec<ObjectId>> {
-    let resolve = |spec: &str| -> Result<ObjectId> {
-        Ok(repo
-            .rev_parse_single(BStr::new(spec))?
-            .object()?
-            .peel_to_commit()
-            .map_err(|e| anyhow!("{spec}: not a commit: {e}"))?
-            .id)
+/// ordinary walk over the given tips and exclusions. With no tips at all git
+/// formats nothing unless `-<n>` or `--root` asked for HEAD implicitly.
+fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
+    let hexsz = repo.object_hash().len_in_hex();
+    let resolve = |spec: &str| -> Option<ObjectId> {
+        repo.rev_parse_single(BStr::new(spec))
+            .ok()
+            .and_then(|id| id.object().ok())
+            .and_then(|obj| obj.peel_to_commit().ok())
+            .map(|c| c.id)
     };
+    // An empty side of a range means HEAD, as in `..main` or `main..`.
+    // A named fn, not a closure: closure inference unifies the input and output
+    // lifetimes into one variable that cannot outlive the call.
+    fn or_head(s: &str) -> &str {
+        if s.is_empty() {
+            "HEAD"
+        } else {
+            s
+        }
+    }
 
     let mut tips: Vec<ObjectId> = Vec::new();
     let mut hidden: Vec<ObjectId> = Vec::new();
-    let mut saw_plain_rev = false;
+    let mut paths: Vec<String> = o.paths.clone();
+    let mut plain_tips = 0usize;
 
-    let specs: Vec<&str> = if revs.is_empty() {
-        vec!["HEAD"]
-    } else {
-        revs.iter().map(String::as_str).collect()
-    };
-    for s in &specs {
-        if s.contains("...") {
-            bail!("symmetric-difference range `{s}` is not supported");
-        }
-        if let Some(rest) = s.strip_prefix('^') {
-            hidden.push(resolve(rest)?);
-        } else if let Some((left, right)) = s.split_once("..") {
-            let left = if left.is_empty() { "HEAD" } else { left };
-            let right = if right.is_empty() { "HEAD" } else { right };
-            hidden.push(resolve(left)?);
-            tips.push(resolve(right)?);
+    for spec in &o.revs {
+        // A missing side of a range is reported against the whole range: as a
+        // missing object when it was spelled as one, else as an ambiguous
+        // argument, exactly as git's `setup_revisions()` does.
+        let range_error = |side: &str| -> ExitCode {
+            if is_full_oid(side, hexsz) {
+                fatal(&format!("Invalid revision range {spec}"))
+            } else {
+                ambiguous(spec)
+            }
+        };
+
+        if let Some((left, right)) = spec.split_once("...") {
+            let (left, right) = (or_head(left), or_head(right));
+            let Some(a) = resolve(left) else {
+                return Ok(Selected::Exit(range_error(left)));
+            };
+            let Some(b) = resolve(right) else {
+                return Ok(Selected::Exit(range_error(right)));
+            };
+            // `a...b` is everything reachable from either tip but not both.
+            for base in repo.merge_bases_many(a, &[b])? {
+                hidden.push(base.detach());
+            }
+            tips.push(a);
+            tips.push(b);
+        } else if let Some((left, right)) = spec.split_once("..") {
+            let (left, right) = (or_head(left), or_head(right));
+            let Some(a) = resolve(left) else {
+                return Ok(Selected::Exit(range_error(left)));
+            };
+            let Some(b) = resolve(right) else {
+                return Ok(Selected::Exit(range_error(right)));
+            };
+            hidden.push(a);
+            tips.push(b);
+        } else if let Some(rest) = spec.strip_prefix('^') {
+            match resolve(rest) {
+                Some(id) => hidden.push(id),
+                None if is_full_oid(rest, hexsz) => {
+                    return Ok(Selected::Exit(fatal(&format!("bad object {rest}"))))
+                }
+                // An exclusion is never retried as a filename.
+                None => return Ok(Selected::Exit(fatal(&format!("bad revision '{spec}'")))),
+            }
         } else {
-            saw_plain_rev = true;
-            tips.push(resolve(s)?);
+            match resolve(spec) {
+                Some(id) => {
+                    tips.push(id);
+                    plain_tips += 1;
+                }
+                // git falls back to treating the argument as a pathspec when it
+                // names something that exists in the worktree.
+                None if std::path::Path::new(spec).exists() => paths.push(spec.clone()),
+                None if is_full_oid(spec, hexsz) => {
+                    return Ok(Selected::Exit(fatal(&format!("bad object {spec}"))))
+                }
+                None => return Ok(Selected::Exit(ambiguous(spec))),
+            }
         }
     }
 
     // `format-patch <since>` prepares what the other side does not have yet.
-    if specs.len() == 1 && saw_plain_rev && max_count.is_none() && !root {
-        let since = tips.pop().expect("single spec produced one tip");
+    if plain_tips == 1 && tips.len() == 1 && o.max_count.is_none() && !o.root {
+        let since = tips.pop().expect("a single tip was just counted");
         hidden.push(since);
+        tips.push(repo.head_id()?.detach());
+    } else if tips.is_empty() && (o.max_count.is_some() || o.root) {
+        // `format-patch -3` and `format-patch --root` walk from HEAD; with no
+        // revision argument at all git formats nothing.
         tips.push(repo.head_id()?.detach());
     }
 
     if tips.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Selected::Commits {
+            commits: Vec::new(),
+            paths,
+        });
     }
 
     let mut platform = repo
@@ -355,28 +761,42 @@ fn select_commits(
     }
 
     let mut out: Vec<ObjectId> = Vec::new();
+    let mut skipped = 0usize;
     for info in platform.all()? {
         let info = info?;
-        // Merges never get a patch.
-        if repo
+        let parents = repo
             .find_object(info.id)?
             .try_into_commit()?
             .parent_ids()
-            .count()
-            > 1
-        {
+            .count();
+        if parents < o.min_parents {
             continue;
         }
-        if let Some(max) = max_count {
-            if out.len() >= max {
-                break;
-            }
+        if o.max_parents.is_some_and(|max| parents > max) {
+            continue;
+        }
+        if skipped < o.skip {
+            skipped += 1;
+            continue;
+        }
+        if o.max_count.is_some_and(|max| out.len() >= max) {
+            break;
         }
         out.push(info.id);
     }
-    out.reverse();
-    Ok(out)
+    // The walk is newest-first; git emits oldest-first unless asked to reverse.
+    if !o.reverse {
+        out.reverse();
+    }
+    Ok(Selected::Commits {
+        commits: out,
+        paths,
+    })
 }
+
+// ---------------------------------------------------------------------------
+// Message rendering
+// ---------------------------------------------------------------------------
 
 /// `[v<n>-]NNNN-<sanitized subject><suffix>`, or the bare number under
 /// `--numbered-files`. Port of `fmt_output_subject()` (log-tree.c).
@@ -384,17 +804,29 @@ fn patch_filename(commit: &gix::Commit<'_>, nr: usize, opts: &Opts) -> Result<St
     if opts.numbered_files {
         return Ok(nr.to_string());
     }
-
     let msg = skip_blank_lines(commit.message_raw()?);
     // git's `%f` sanitizes only the first line of the subject.
     let first_line = &msg[..one_line(msg)];
+    Ok(numbered_filename(nr, trim_end_ws(first_line), opts))
+}
+
+/// The cover letter is always patch zero, whatever `--start-number` moved the
+/// rest of the series to.
+fn cover_filename(opts: &Opts) -> String {
+    if opts.numbered_files {
+        return "0".to_owned();
+    }
+    numbered_filename(0, b"cover letter", opts)
+}
+
+fn numbered_filename(nr: usize, subject: &[u8], opts: &Opts) -> String {
     let mut name = String::new();
     if let Some(r) = &opts.reroll {
         sanitize_subject(&mut name, format!("v{r}").as_bytes());
         name.push('-');
     }
     name.push_str(&format!("{nr:04}-"));
-    sanitize_subject(&mut name, trim_end_ws(first_line));
+    sanitize_subject(&mut name, subject);
 
     let max = opts.name_max - (opts.suffix.len() + 1);
     if name.len() > max {
@@ -402,7 +834,7 @@ fn patch_filename(commit: &gix::Commit<'_>, nr: usize, opts: &Opts) -> Result<St
         name.truncate(max);
     }
     name.push_str(&opts.suffix);
-    Ok(name)
+    name
 }
 
 /// Port of `format_sanitized_subject()` (pretty.c): collapse everything that is
@@ -446,12 +878,7 @@ fn render_message(
     opts: &Opts,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let name = if opts.zero_commit {
-        ObjectId::null(commit.id.kind()).to_hex().to_string()
-    } else {
-        commit.id.to_hex().to_string()
-    };
-    writeln!(out, "From {name} Mon Sep 17 00:00:00 2001")?;
+    write_from_line(out, commit.id, opts)?;
 
     // Headers and body are built in one buffer because git's wrapping and the
     // final `strbuf_rtrim` both depend on what is already in it.
@@ -466,59 +893,19 @@ fn render_message(
     let author_mail = author.email.to_str().map_err(|_| {
         anyhow!("author email is not valid UTF-8; RFC2047 encoding needs a known charset")
     })?;
-
-    // From: — RFC2047 when non-ASCII, RFC822 quoting for specials, else wrapped.
-    sb.push_str("From: ");
-    let mut max_length = HEADER_MAX_LENGTH;
-    if needs_rfc2047_encoding(author_name) {
-        add_rfc2047(&mut sb, author_name, true);
-        max_length = 76;
-    } else if author_name.bytes().any(is_rfc822_special) {
-        let quoted = rfc822_quoted(author_name);
-        wrap_text(&mut sb, &quoted, -6, 1, max_length);
-    } else {
-        wrap_text(&mut sb, author_name, -6, 1, max_length);
-    }
-    if max_length < last_line_length(&sb) + 2 + author_mail.len() as i64 + 1 {
-        sb.push('\n');
-    }
-    sb.push_str(&format!(" <{author_mail}>\n"));
-
     let date = author
         .time()?
         .format(gix::date::time::format::GIT_RFC2822)?;
-    sb.push_str(&format!("Date: {date}\n"));
+    write_identity_headers(&mut sb, author_name, author_mail, &date);
 
     // Subject: — the first paragraph, folded onto one logical line.
     let msg = skip_blank_lines(raw);
     let (title, rest) = format_subject(msg);
-    if total > 0 {
-        let width = decimal_width(total as u64);
-        let sep = if opts.subject_prefix.is_empty() {
-            ""
-        } else {
-            " "
-        };
-        sb.push_str(&format!(
-            "Subject: [{}{sep}{:0width$}/{total}] ",
-            opts.subject_prefix, nr
-        ));
-    } else if !opts.subject_prefix.is_empty() {
-        sb.push_str(&format!("Subject: [{}] ", opts.subject_prefix));
-    } else {
-        sb.push_str("Subject: ");
-    }
     let title = title
         .to_str()
         .map_err(|_| anyhow!("commit subject is not valid UTF-8"))?
         .to_owned();
-    if needs_rfc2047_encoding(&title) {
-        add_rfc2047(&mut sb, &title, false);
-    } else {
-        let consumed = -last_line_length(&sb);
-        wrap_text(&mut sb, &title, consumed, 1, HEADER_MAX_LENGTH);
-    }
-    sb.push('\n');
+    write_subject(&mut sb, &title, nr, total, opts);
 
     if need_8bit {
         sb.push_str("MIME-Version: 1.0\n");
@@ -552,20 +939,13 @@ fn render_message(
         None => None,
     };
     let abbrev = new_tree.id().shorten()?.hex_len();
-
-    let mut changes = repo.diff_tree_to_tree(
-        old_tree.as_ref(),
-        Some(&new_tree),
-        gix::diff::Options::default(),
-    )?;
-    changes.sort_by(|a, b| change_path(a).cmp(change_path(b)));
+    let changes = tree_changes(repo, old_tree.as_ref(), Some(&new_tree))?;
 
     if !changes.is_empty() {
         let mut patch: Vec<u8> = Vec::new();
         let mut stats: Vec<StatEntry> = Vec::new();
         for change in &changes {
-            let entry = emit_change(repo, &mut patch, change, abbrev)?;
-            stats.push(entry);
+            stats.push(emit_change(repo, &mut patch, change, abbrev, opts)?);
         }
 
         if opts.no_stat {
@@ -579,15 +959,215 @@ fn render_message(
         out.extend_from_slice(&patch);
     }
 
-    if !opts.signature.is_empty() {
-        out.extend_from_slice(b"-- \n");
-        out.extend_from_slice(opts.signature.as_bytes());
-        if !opts.signature.ends_with('\n') {
+    write_signature(out, opts);
+    Ok(())
+}
+
+/// Port of `make_cover_letter()` (log-tree.c): the placeholder subject and
+/// blurb, a shortlog of the series, and the diffstat of the whole range.
+///
+/// The magic `From` line names the newest commit of the series, and the
+/// identity is the committer's — the cover letter is written now, by whoever
+/// runs the command, not by the author of any one patch.
+fn render_cover_letter(
+    repo: &gix::Repository,
+    commits: &[ObjectId],
+    total: usize,
+    opts: &Opts,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    // The series is oldest-first unless `--reverse` flipped it; either way the
+    // newest commit is the one without a descendant inside the series.
+    let newest = if opts.reverse {
+        *commits.first().expect("a non-empty series")
+    } else {
+        *commits.last().expect("a non-empty series")
+    };
+    write_from_line(out, newest, opts)?;
+
+    let mut sb = String::new();
+    let (name, mail, date) = match repo.committer().transpose()? {
+        Some(sig) => (
+            sig.name.to_str()?.to_owned(),
+            sig.email.to_str()?.to_owned(),
+            sig.time()?.format(gix::date::time::format::GIT_RFC2822)?,
+        ),
+        // No committer identity configured: fall back to the series' author so
+        // the cover letter is still a well-formed message.
+        None => {
+            let commit = repo.find_object(newest)?.try_into_commit()?;
+            let author = commit.author()?;
+            (
+                author.name.to_str()?.to_owned(),
+                author.email.to_str()?.to_owned(),
+                author.time()?.format(gix::date::time::format::GIT_RFC2822)?,
+            )
+        }
+    };
+    write_identity_headers(&mut sb, &name, &mail, &date);
+    write_subject(&mut sb, COVER_SUBJECT, 0, total, opts);
+    sb.push('\n');
+    sb.push_str(COVER_BLURB);
+    sb.push_str("\n\n");
+    out.extend_from_slice(sb.as_bytes());
+
+    emit_shortlog(repo, commits, out)?;
+    out.push(b'\n');
+
+    // The range's combined diffstat needs a base to diff against, which a root
+    // commit does not have; git omits the block in that case.
+    let first = repo
+        .find_object(*commits.first().expect("a non-empty series"))?
+        .try_into_commit()?;
+    let base = match first.parent_ids().next() {
+        Some(pid) => Some(pid.object()?.try_into_commit()?.tree()?),
+        None => None,
+    };
+    if let (Some(base), false) = (base, opts.no_stat) {
+        let newest_tree = repo.find_object(newest)?.try_into_commit()?.tree()?;
+        let abbrev = newest_tree.id().shorten()?.hex_len();
+        let changes = tree_changes(repo, Some(&base), Some(&newest_tree))?;
+        if !changes.is_empty() {
+            let mut discard: Vec<u8> = Vec::new();
+            let mut stats: Vec<StatEntry> = Vec::new();
+            for change in &changes {
+                stats.push(emit_change(repo, &mut discard, change, abbrev, opts)?);
+            }
+            emit_stats(out, &stats)?;
+            emit_summary(out, &changes)?;
             out.push(b'\n');
         }
-        out.push(b'\n');
+    }
+
+    write_signature(out, opts);
+    Ok(())
+}
+
+/// git's shortlog as the cover letter embeds it: one `Name (count):` group per
+/// author, most commits first, each subject indented by two spaces.
+fn emit_shortlog(repo: &gix::Repository, commits: &[ObjectId], out: &mut Vec<u8>) -> Result<()> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for id in commits {
+        let commit = repo.find_object(*id)?.try_into_commit()?;
+        let author = commit.author()?.name.to_str()?.to_owned();
+        let msg = skip_blank_lines(commit.message_raw()?);
+        let (title, _) = format_subject(msg);
+        let title = title.to_str()?.to_owned();
+        match groups.iter_mut().find(|(name, _)| *name == author) {
+            Some((_, subjects)) => subjects.push(title),
+            None => groups.push((author, vec![title])),
+        }
+    }
+    // Ties keep author order stable by name, as git's string list does.
+    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+
+    for (i, (name, subjects)) in groups.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\n');
+        }
+        writeln!(out, "{name} ({}):", subjects.len())?;
+        for s in subjects {
+            writeln!(out, "  {s}")?;
+        }
     }
     Ok(())
+}
+
+/// The mbox magic line. `--zero-commit` replaces the commit name with zeroes.
+fn write_from_line(out: &mut Vec<u8>, id: ObjectId, opts: &Opts) -> Result<()> {
+    let name = if opts.zero_commit {
+        ObjectId::null(id.kind()).to_hex().to_string()
+    } else {
+        id.to_hex().to_string()
+    };
+    writeln!(out, "From {name} Mon Sep 17 00:00:00 2001")?;
+    Ok(())
+}
+
+/// `From:` — RFC2047 when non-ASCII, RFC822 quoting for specials, else wrapped —
+/// followed by `Date:`.
+fn write_identity_headers(sb: &mut String, name: &str, mail: &str, date: &str) {
+    sb.push_str("From: ");
+    let mut max_length = HEADER_MAX_LENGTH;
+    if needs_rfc2047_encoding(name) {
+        add_rfc2047(sb, name, true);
+        max_length = 76;
+    } else if name.bytes().any(is_rfc822_special) {
+        let quoted = rfc822_quoted(name);
+        wrap_text(sb, &quoted, -6, 1, max_length);
+    } else {
+        wrap_text(sb, name, -6, 1, max_length);
+    }
+    if max_length < last_line_length(sb) + 2 + mail.len() as i64 + 1 {
+        sb.push('\n');
+    }
+    sb.push_str(&format!(" <{mail}>\n"));
+    sb.push_str(&format!("Date: {date}\n"));
+}
+
+/// `Subject: [<prefix> n/total] <title>`, with the numbering git uses.
+fn write_subject(sb: &mut String, title: &str, nr: usize, total: usize, opts: &Opts) {
+    if total > 0 {
+        let width = decimal_width(total as u64);
+        let sep = if opts.subject_prefix.is_empty() {
+            ""
+        } else {
+            " "
+        };
+        sb.push_str(&format!(
+            "Subject: [{}{sep}{:0width$}/{total}] ",
+            opts.subject_prefix, nr
+        ));
+    } else if !opts.subject_prefix.is_empty() {
+        sb.push_str(&format!("Subject: [{}] ", opts.subject_prefix));
+    } else {
+        sb.push_str("Subject: ");
+    }
+    if needs_rfc2047_encoding(title) {
+        add_rfc2047(sb, title, false);
+    } else {
+        let consumed = -last_line_length(sb);
+        wrap_text(sb, title, consumed, 1, HEADER_MAX_LENGTH);
+    }
+    sb.push('\n');
+}
+
+fn write_signature(out: &mut Vec<u8>, opts: &Opts) {
+    if opts.signature.is_empty() {
+        return;
+    }
+    out.extend_from_slice(b"-- \n");
+    out.extend_from_slice(opts.signature.as_bytes());
+    if !opts.signature.ends_with('\n') {
+        out.push(b'\n');
+    }
+    out.push(b'\n');
+}
+
+/// The file-level changes between two trees, in path order.
+///
+/// `tree_with_rewrites` reports the directory entry *and* its recursed contents;
+/// git's patch format only names blobs and submodules, so tree entries are
+/// dropped — keeping one would render a raw tree object as a binary file.
+fn tree_changes(
+    repo: &gix::Repository,
+    old_tree: Option<&gix::Tree<'_>>,
+    new_tree: Option<&gix::Tree<'_>>,
+) -> Result<Vec<ChangeDetached>> {
+    let mut changes =
+        repo.diff_tree_to_tree(old_tree, new_tree, gix::diff::Options::default())?;
+    changes.retain(|c| !is_tree_entry(c));
+    changes.sort_by(|a, b| change_path(a).cmp(change_path(b)));
+    Ok(changes)
+}
+
+fn is_tree_entry(change: &ChangeDetached) -> bool {
+    match change {
+        ChangeDetached::Addition { entry_mode, .. }
+        | ChangeDetached::Deletion { entry_mode, .. }
+        | ChangeDetached::Modification { entry_mode, .. }
+        | ChangeDetached::Rewrite { entry_mode, .. } => entry_mode.is_tree(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,6 +1647,7 @@ fn emit_change(
     out: &mut Vec<u8>,
     change: &ChangeDetached,
     abbrev: usize,
+    opts: &Opts,
 ) -> Result<StatEntry> {
     let mut counts = (0u64, 0u64);
     match change {
@@ -1081,10 +1662,10 @@ fn emit_change(
             writeln!(out, "new file mode {:o}", entry_mode.value())?;
             let is_sub = entry_mode.is_commit();
             let content = content_of(repo, *id, is_sub)?;
-            reject_binary(is_sub, &content, path)?;
+            reject_binary(is_sub, &content, path, opts)?;
             let short = short_oid(repo, *id, abbrev, is_sub)?;
             writeln!(out, "index {}..{}", "0".repeat(short.len()), short)?;
-            counts = emit_body(out, None, Some(path), &[], &content)?;
+            counts = emit_body(out, None, Some(path), &[], &content, opts)?;
         }
         ChangeDetached::Deletion {
             location,
@@ -1097,10 +1678,10 @@ fn emit_change(
             writeln!(out, "deleted file mode {:o}", entry_mode.value())?;
             let is_sub = entry_mode.is_commit();
             let content = content_of(repo, *id, is_sub)?;
-            reject_binary(is_sub, &content, path)?;
+            reject_binary(is_sub, &content, path, opts)?;
             let short = short_oid(repo, *id, abbrev, is_sub)?;
             writeln!(out, "index {}..{}", short, "0".repeat(short.len()))?;
-            counts = emit_body(out, Some(path), None, &content, &[])?;
+            counts = emit_body(out, Some(path), None, &content, &[], opts)?;
         }
         ChangeDetached::Modification {
             location,
@@ -1124,8 +1705,8 @@ fn emit_change(
                 let new_is_sub = entry_mode.is_commit();
                 let old_content = content_of(repo, *previous_id, old_is_sub)?;
                 let new_content = content_of(repo, *id, new_is_sub)?;
-                reject_binary(old_is_sub, &old_content, path)?;
-                reject_binary(new_is_sub, &new_content, path)?;
+                reject_binary(old_is_sub, &old_content, path, opts)?;
+                reject_binary(new_is_sub, &new_content, path, opts)?;
                 let old_short = short_oid(repo, *previous_id, abbrev, old_is_sub)?;
                 let new_short = short_oid(repo, *id, abbrev, new_is_sub)?;
                 // The mode suffix is dropped when `old mode`/`new mode` said it.
@@ -1134,7 +1715,14 @@ fn emit_change(
                 } else {
                     writeln!(out, "index {old_short}..{new_short} {new_mode}")?;
                 }
-                counts = emit_body(out, Some(path), Some(path), &old_content, &new_content)?;
+                counts = emit_body(
+                    out,
+                    Some(path),
+                    Some(path),
+                    &old_content,
+                    &new_content,
+                    opts,
+                )?;
             }
         }
         // Never produced: rewrite tracking is off via Options::default().
@@ -1148,9 +1736,10 @@ fn emit_change(
 }
 
 /// format-patch implies `--binary`, whose base85 `GIT binary patch` payload is
-/// not ported; refuse rather than emit a textual approximation.
-fn reject_binary(is_submodule: bool, content: &[u8], path: &[u8]) -> Result<()> {
-    if !is_submodule && content.iter().take(8000).any(|&b| b == 0) {
+/// not ported; refuse rather than emit a textual approximation. `-a`/`--text`
+/// asks for exactly that textual rendering, so it is honoured.
+fn reject_binary(is_submodule: bool, content: &[u8], path: &[u8], opts: &Opts) -> Result<()> {
+    if !opts.text && !is_submodule && content.iter().take(8000).any(|&b| b == 0) {
         bail!(
             "binary file {:?}: the GIT binary patch encoding is not ported",
             path.as_bstr()
@@ -1159,12 +1748,12 @@ fn reject_binary(is_submodule: bool, content: &[u8], path: &[u8]) -> Result<()> 
     Ok(())
 }
 
-/// `diff --git a/<path> b/<path>` line, preserving raw path bytes.
+/// `diff --git a/<path> b/<path>` line, with git's `quote_two()` C-quoting.
 fn emit_git_header(out: &mut Vec<u8>, path: &[u8]) {
-    out.extend_from_slice(b"diff --git a/");
-    out.extend_from_slice(path);
-    out.extend_from_slice(b" b/");
-    out.extend_from_slice(path);
+    out.extend_from_slice(b"diff --git ");
+    out.extend_from_slice(&quote_two("a/", path));
+    out.push(b' ');
+    out.extend_from_slice(&quote_two("b/", path));
     out.push(b'\n');
 }
 
@@ -1176,42 +1765,45 @@ fn emit_body(
     new: Option<&[u8]>,
     old_content: &[u8],
     new_content: &[u8],
+    opts: &Opts,
 ) -> Result<(u64, u64)> {
     let mut hunks: Vec<u8> = Vec::new();
-    let counts = emit_text_hunks(&mut hunks, old_content, new_content)?;
+    let counts = emit_text_hunks(&mut hunks, old_content, new_content, opts)?;
     if hunks.is_empty() {
         return Ok(counts);
     }
 
-    out.extend_from_slice(b"--- ");
-    match old {
-        Some(p) => {
-            out.extend_from_slice(b"a/");
-            out.extend_from_slice(p);
-        }
-        None => out.extend_from_slice(b"/dev/null"),
-    }
-    out.push(b'\n');
-
-    out.extend_from_slice(b"+++ ");
-    match new {
-        Some(p) => {
-            out.extend_from_slice(b"b/");
-            out.extend_from_slice(p);
-        }
-        None => out.extend_from_slice(b"/dev/null"),
-    }
-    out.push(b'\n');
-
+    emit_file_header(out, b"--- ", old, "a/");
+    emit_file_header(out, b"+++ ", new, "b/");
     out.extend_from_slice(&hunks);
     Ok(counts)
 }
 
-/// Compute the unified diff of two blobs with git's default settings, returning
-/// the added/deleted line counts the diffstat needs.
-fn emit_text_hunks(out: &mut Vec<u8>, old: &[u8], new: &[u8]) -> Result<(u64, u64)> {
+/// One `---`/`+++` line. git appends a tab when the rendered name contains a
+/// space, so that a reader can tell where the name ends.
+fn emit_file_header(out: &mut Vec<u8>, marker: &[u8], path: Option<&[u8]>, prefix: &str) {
+    out.extend_from_slice(marker);
+    let name = match path {
+        Some(p) => quote_two(prefix, p),
+        None => b"/dev/null".to_vec(),
+    };
+    out.extend_from_slice(&name);
+    if name.contains(&b' ') {
+        out.push(b'\t');
+    }
+    out.push(b'\n');
+}
+
+/// Compute the unified diff of two blobs, returning the added/deleted line
+/// counts the diffstat needs.
+fn emit_text_hunks(
+    out: &mut Vec<u8>,
+    old: &[u8],
+    new: &[u8],
+    opts: &Opts,
+) -> Result<(u64, u64)> {
     let input = InternedInput::new(old, new);
-    let diff = diff_with_slider_heuristics(Algorithm::Myers, &input);
+    let diff = diff_with_slider_heuristics(opts.algorithm, &input);
     let before_lines: Vec<&[u8]> = input.before.iter().map(|&t| input.interner[t]).collect();
     let writer = HunkWriter {
         out,
@@ -1219,7 +1811,13 @@ fn emit_text_hunks(out: &mut Vec<u8>, old: &[u8], new: &[u8]) -> Result<(u64, u6
         added: 0,
         deleted: 0,
     };
-    let counts = UnifiedDiff::new(&diff, &input, writer, ContextSize::symmetrical(3)).consume()?;
+    let counts = UnifiedDiff::new(
+        &diff,
+        &input,
+        writer,
+        ContextSize::symmetrical(opts.context),
+    )
+    .consume()?;
     Ok(counts)
 }
 
@@ -1251,7 +1849,7 @@ impl<'a> HunkWriter<'a> {
     }
 }
 
-impl<'a> ConsumeHunk for HunkWriter<'a> {
+impl ConsumeHunk for HunkWriter<'_> {
     type Out = (u64, u64);
 
     fn consume_hunk(
@@ -1297,8 +1895,11 @@ impl<'a> ConsumeHunk for HunkWriter<'a> {
     }
 }
 
-/// git omits the `,len` field when the hunk spans exactly one line.
+/// Port of `xdl_emit_hunk_hdr()` (xdiff): the `,len` field is omitted when the
+/// hunk spans exactly one line, and an empty side is anchored to the line
+/// *before* the change — which is line 0 for a file that is being created.
 fn write_range(out: &mut Vec<u8>, start: u32, len: u32) {
+    let start = if len == 0 { start.saturating_sub(1) } else { start };
     if len == 1 {
         let _ = write!(out, "{start}");
     } else {
@@ -1341,17 +1942,14 @@ fn change_path(change: &ChangeDetached) -> &[u8] {
     }
 }
 
-/// C-style path quoting matching git's default `core.quotePath=true`, used for
-/// the stat and summary columns (`quote_c_style`).
-fn quote_path(path: impl AsRef<[u8]>) -> String {
-    let bytes = path.as_ref();
-    let needs = bytes
+/// True when `quote_c_style()` would escape any byte of `bytes`.
+fn needs_c_quote(bytes: &[u8]) -> bool {
+    bytes
         .iter()
-        .any(|&b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || b >= 0x80);
-    if !needs {
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let mut out = String::from("\"");
+        .any(|&b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || b >= 0x80)
+}
+
+fn c_escape_into(out: &mut String, bytes: &[u8]) {
     for &b in bytes {
         match b {
             b'"' => out.push_str("\\\""),
@@ -1367,6 +1965,32 @@ fn quote_path(path: impl AsRef<[u8]>) -> String {
             b => out.push(b as char),
         }
     }
+}
+
+/// C-style path quoting matching git's default `core.quotePath=true`, used for
+/// the stat and summary columns (`quote_c_style`).
+fn quote_path(path: impl AsRef<[u8]>) -> String {
+    let bytes = path.as_ref();
+    if !needs_c_quote(bytes) {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut out = String::from("\"");
+    c_escape_into(&mut out, bytes);
     out.push('"');
     out
+}
+
+/// git's `quote_two()`: `<prefix><path>` is quoted as a whole when either half
+/// needs escaping, so `a/` stays inside the quotes.
+fn quote_two(prefix: &str, path: &[u8]) -> Vec<u8> {
+    if !needs_c_quote(prefix.as_bytes()) && !needs_c_quote(path) {
+        let mut out = prefix.as_bytes().to_vec();
+        out.extend_from_slice(path);
+        return out;
+    }
+    let mut out = String::from("\"");
+    c_escape_into(&mut out, prefix.as_bytes());
+    c_escape_into(&mut out, path);
+    out.push('"');
+    out.into_bytes()
 }

@@ -19,25 +19,54 @@
 //! * `--raw` (the default), `--name-only`, `--name-status`, `-s`/`--no-patch`
 //! * `-z`, `--abbrev=<n>` (clamped to 4..=hash length, like git)
 //! * `--no-commit-id`, `--always`
+//! * `--diff-filter=<letters>`, `--exit-code`, `--quiet`
 //! * literal `<path>` filters (exact entry, directory prefix, or a tree that a filter
 //!   points below), before or after `--`
-//! * `-h` — git's usage text on stdout, exit 129; no arguments — the same text on
+//! * git's argument classification: a positional is a `<tree-ish>` when it resolves as
+//!   a revision, otherwise the first one and every argument after it must name a path
+//!   that exists in the working tree. The three fatal paths git takes here — `bad
+//!   object`, `ambiguous argument`, `no such path` — are reproduced verbatim on
+//!   stderr with exit 128, and `option '<x>' must come before non-option arguments`
+//!   likewise.
+//! * `-h` — git's usage text on stdout, exit 129; no `<tree-ish>` — the same text on
 //!   stderr, exit 129
 //!
-//! ### Honest limitations (bailed on with a precise message, never silently ignored)
+//! ### Options accepted but deliberately without effect
+//!
+//! [`is_ignorable`] lists options that only steer *patch* and *stat* rendering. Since
+//! this module bails rather than emit those formats, the options provably cannot
+//! change the bytes it does emit; each entry there was checked against stock git in
+//! the raw, `-t`, `--name-status` and commit-id-line forms before being listed.
+//!
+//! ### Honest limitations
+//!
+//! Every other option stock git accepts is recognised by [`is_known_unsupported`] and
+//! recorded, not applied. Recognition is load-bearing: git validates and resolves its
+//! arguments *before* it renders anything, so `diff-tree --numstat <bad-rev>` has to
+//! fail on the revision exactly as git does. The recorded option is turned into a
+//! terse bail at the point output would be produced, so an invocation that would print
+//! the wrong bytes fails loudly instead. When git itself produces no output for the
+//! invocation (an unborn root commit without `--root`, a `<tree-ish>` that is not a
+//! commit, a merge without `-m`), there are no bytes to get wrong and the exit status
+//! is git's.
+//!
+//! Not implemented, and bailed on whenever they would matter:
 //!
 //! * `-p`/`-u`/`--patch` and the `--stat`/`--numstat`/`--dirstat`/`--summary` family.
 //!   Patch output abbreviates the `index` line to git's *auto* abbreviation length,
 //!   which is derived from the repository's approximate object count (`core.abbrev`
-//!   when set). The vendored crates expose no equivalent, so a patch here would
-//!   differ from git in the `index` line rather than being byte-identical.
-//! * bare `--abbrev` (no `=<n>`) and `--abbrev-commit`, for the same reason.
+//!   when set). The vendored crates expose no equivalent.
+//! * bare `--abbrev` (no `=<n>`), for the same reason.
 //! * `-c`/`--cc`/`--combined-all-paths` — combined merge diffs have no substrate in
 //!   the vendored `gix-diff`.
 //! * `--stdin`, `-v`, `--pretty`/`--format` — these need commit-message formatting,
 //!   which belongs to the `log`/`show` machinery, not the tree diff.
+//! * whitespace-insensitive comparison (`-w`, `-b`, `--ignore-*`). These are not
+//!   patch-only: git re-compares blob *content* and drops a pair whose only
+//!   difference is whitespace, so the raw output changes too.
 //! * `--merge-base`, rename/copy detection (`-M`/`-C`/`-B`), pickaxe (`-S`/`-G`),
-//!   `-R`, `-O`, `--find-copies-harder`.
+//!   `-R`, `-O`, `--find-copies-harder`, `--line-prefix`, `--relative`,
+//!   `--submodule`/`--ignore-submodules`.
 //! * magic (`:(...)`) and glob pathspecs.
 
 use anyhow::{bail, Result};
@@ -92,6 +121,18 @@ common diff options:
 
 "#;
 
+/// git's `die_verify_filename()` text when the argument was the first non-revision
+/// one, i.e. the one that could plausibly have been a misspelt revision.
+const AMBIGUOUS_TAIL: &str = "unknown revision or path not in the working tree.\n\
+                             Use '--' to separate paths from revisions, like this:\n\
+                             'git <command> [<revision>...] -- [<file>...]'";
+
+/// git's `die_verify_filename()` text for the remaining arguments, which are already
+/// known to be paths.
+const NO_SUCH_PATH_TAIL: &str = "no such path in the working tree.\n\
+                                 Use 'git <command> -- <path>...' to specify paths \
+                                 that do not exist locally.";
+
 /// The `S_IFMT` mask git uses to decide whether a pair is a *type* change (`T`) or a
 /// plain modification (`M`); `100644` and `100755` share a type, `120000` and
 /// `160000` do not.
@@ -99,6 +140,12 @@ const IFMT: u16 = 0o170000;
 
 /// git's `MINIMUM_ABBREV`: `--abbrev=<n>` below this is raised to it.
 const MINIMUM_ABBREV: usize = 4;
+
+/// Exit code git uses for a fatal error.
+const FATAL: u8 = 128;
+
+/// Exit code git uses for a usage error.
+const USAGE_ERROR: u8 = 129;
 
 /// How the change list should be rendered.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -120,7 +167,9 @@ struct Opts {
     merges: bool,        // -m: diff a merge against every parent
     no_commit_id: bool,  // --no-commit-id
     always: bool,        // --always: print the commit id even with no changes
+    exit_code: bool,     // --exit-code/--quiet: exit 1 when anything differs
     abbrev: usize,       // object-id width in the raw output
+    filter: u32,         // --diff-filter mask, see `filter_bit`
     format: Format,
     paths: Vec<BString>, // literal path filters (empty = whole tree)
 }
@@ -148,6 +197,19 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
+    // `-h` must work outside a repository, so it is answered before discovery.
+    if args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a == "-h")
+    {
+        print!("{USAGE}");
+        return Ok(ExitCode::from(USAGE_ERROR));
+    }
+
+    let repo = gix::discover(".")?;
+    let hash = repo.object_hash();
+
     let mut opts = Opts {
         recurse: false,
         show_trees: false,
@@ -156,78 +218,112 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         merges: false,
         no_commit_id: false,
         always: false,
-        abbrev: 0, // filled in from the repository's hash length below
+        exit_code: false,
+        abbrev: hash.len_in_hex(),
+        filter: ALL_STATUSES,
         format: Format::Raw,
         paths: Vec::new(),
     };
 
-    // `-h` must work outside a repository, so it is answered before discovery.
-    if args
-        .iter()
-        .take_while(|a| a.as_str() != "--")
-        .any(|a| a == "-h")
-    {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
-    }
-
-    let mut abbrev_request: Option<usize> = None;
+    // The first option git accepts but this port cannot honour. Kept until we know
+    // whether the invocation produces output at all; see the module documentation.
+    let mut unsupported: Option<String> = None;
     let mut revs: Vec<String> = Vec::new();
     let mut raw_paths: Vec<String> = Vec::new();
-    let mut after_dashdash = false;
 
-    let repo = gix::discover(".")?;
-    let hash = repo.object_hash();
+    // git scans the whole argument list for a literal `--` up front; when one is
+    // present every argument before it must be a revision.
+    let seen_dashdash = args.iter().any(|a| a == "--");
 
-    for a in args {
-        if after_dashdash {
-            raw_paths.push(a.clone());
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            raw_paths.extend(args[i + 1..].iter().cloned());
+            break;
+        }
+        if a.starts_with('-') && a != "-" {
+            match a {
+                "-r" => opts.recurse = true,
+                "-t" => {
+                    opts.recurse = true; // -t implies -r
+                    opts.show_trees = true;
+                }
+                "-z" => opts.nul = true,
+                "--root" => opts.root = true,
+                "-m" => opts.merges = true,
+                "--no-commit-id" => opts.no_commit_id = true,
+                "--always" => opts.always = true,
+                "--raw" => opts.format = Format::Raw,
+                "--name-only" => opts.format = Format::NameOnly,
+                "--name-status" => opts.format = Format::NameStatus,
+                "-s" | "--no-patch" => opts.format = Format::NoOutput,
+                "--exit-code" => opts.exit_code = true,
+                // `--quiet` is `-s` plus `--exit-code`: git still prints the
+                // commit-id line, only the diff body is suppressed.
+                "--quiet" => {
+                    opts.format = Format::NoOutput;
+                    opts.exit_code = true;
+                }
+                // Normally answered before discovery; kept so `-h` never falls
+                // through to the unknown-option arm.
+                "-h" => {
+                    print!("{USAGE}");
+                    return Ok(ExitCode::from(USAGE_ERROR));
+                }
+                _ if a.starts_with("--abbrev=") => {
+                    let v = &a["--abbrev=".len()..];
+                    let n: usize = v
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("invalid --abbrev value {v:?}"))?;
+                    opts.abbrev = n.clamp(MINIMUM_ABBREV, hash.len_in_hex());
+                }
+                _ if a.starts_with("--diff-filter=") => {
+                    match parse_diff_filter(&a["--diff-filter=".len()..]) {
+                        Some(mask) => opts.filter = mask,
+                        None => return Ok(ExitCode::from(USAGE_ERROR)),
+                    }
+                }
+                _ if is_ignorable(a) => {}
+                _ if is_known_unsupported(a) => {
+                    unsupported.get_or_insert_with(|| a.to_string());
+                }
+                // Not one of git's diff-tree options as far as this port knows; git
+                // would answer with its usage text and 129, but guessing that here
+                // would hide a genuinely missing option, so fail loudly instead.
+                _ => bail!("unrecognized option {a:?}"),
+            }
+            i += 1;
             continue;
         }
-        match a.as_str() {
-            "--" => after_dashdash = true,
-            // Normally answered before discovery; kept so `-h` never reaches the
-            // unsupported-flag arm.
-            "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
-            }
-            "-r" => opts.recurse = true,
-            "-t" => {
-                opts.recurse = true; // -t implies -r
-                opts.show_trees = true;
-            }
-            "-z" => opts.nul = true,
-            "--root" => opts.root = true,
-            "-m" => opts.merges = true,
-            "--no-commit-id" => opts.no_commit_id = true,
-            "--always" => opts.always = true,
-            "--raw" => opts.format = Format::Raw,
-            "--name-only" => opts.format = Format::NameOnly,
-            "--name-status" => opts.format = Format::NameStatus,
-            "-s" | "--no-patch" => opts.format = Format::NoOutput,
-            s if s.starts_with("--abbrev=") => {
-                let v = &s["--abbrev=".len()..];
-                let n: usize = v
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("invalid --abbrev value {v:?}"))?;
-                abbrev_request = Some(n.clamp(MINIMUM_ABBREV, hash.len_in_hex()));
-            }
-            s if s.starts_with('-') => bail!(
-                "unsupported flag {s:?} (ported: -r, -t, -z, -m, -s/--no-patch, --root, \
-                 --raw, --name-only, --name-status, --no-commit-id, --always, --abbrev=<n>, -h)"
-            ),
-            // The first positional is always the <tree-ish>; a second one is a
-            // <tree-ish> only when it resolves as a revision, as git decides it.
-            s if revs.is_empty() && raw_paths.is_empty() => revs.push(s.to_string()),
-            s if revs.len() == 1 && raw_paths.is_empty() && repo.rev_parse_single(s).is_ok() => {
-                revs.push(s.to_string());
-            }
-            s => raw_paths.push(s.to_string()),
-        }
-    }
 
-    opts.abbrev = abbrev_request.unwrap_or_else(|| hash.len_in_hex());
+        // A positional. It is a `<tree-ish>` exactly when it resolves as a revision.
+        if repo.rev_parse_single(a).is_ok() {
+            revs.push(a.to_string());
+            i += 1;
+            continue;
+        }
+        // A full-length object name always parses as one, so git gets as far as
+        // looking the object up and reports its absence rather than guessing that a
+        // path was meant.
+        if a.len() == hash.len_in_hex() && a.bytes().all(|b| b.is_ascii_hexdigit()) {
+            eprintln!("fatal: bad object {a}");
+            return Ok(ExitCode::from(FATAL));
+        }
+        if seen_dashdash {
+            eprintln!("fatal: bad revision '{a}'");
+            return Ok(ExitCode::from(FATAL));
+        }
+        // git stops parsing options here and requires this argument and every one
+        // after it to name an existing path.
+        for (n, rest) in args[i..].iter().enumerate() {
+            if let Some(code) = verify_filename(rest, n == 0) {
+                return Ok(ExitCode::from(code));
+            }
+            raw_paths.push(rest.clone());
+        }
+        break;
+    }
 
     for p in &raw_paths {
         if p.starts_with(':') || p.bytes().any(|b| matches!(b, b'*' | b'?' | b'[')) {
@@ -238,48 +334,357 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
 
     if revs.is_empty() {
         eprint!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(ExitCode::from(USAGE_ERROR));
     }
 
     let mut out: Vec<u8> = Vec::new();
-    let code = if revs.len() == 2 {
-        // Two tree-ishes: a plain tree-vs-tree diff with no commit-id line.
-        let Some(old) = resolve_tree(&repo, &revs[0])? else {
-            return Ok(ExitCode::from(128));
-        };
-        let Some(new) = resolve_tree(&repo, &revs[1])? else {
-            return Ok(ExitCode::from(128));
-        };
-        let changes = collect(&repo, Some(old), Some(new), &opts)?;
-        render_all(&mut out, &changes, &opts);
-        ExitCode::SUCCESS
+    let mut differed = false;
+    let code = if revs.len() > 2 {
+        // git accepts more than two tree-ishes and then prints nothing at all.
+        0
+    } else if revs.len() == 2 {
+        // Two tree-ishes: a plain tree-vs-tree diff with no commit-id line. git dies
+        // on the first argument it cannot use, so the second is only looked at once
+        // the first resolved.
+        match resolve_tree(&repo, &revs[0])? {
+            None => FATAL,
+            Some(old) => match resolve_tree(&repo, &revs[1])? {
+                None => FATAL,
+                Some(new) => {
+                    let changes = collect(&repo, Some(old), Some(new), &opts)?;
+                    differed = !changes.is_empty();
+                    render_all(&mut out, &changes, &opts);
+                    0
+                }
+            },
+        }
     } else {
-        single_commit(&repo, &revs[0], &opts, &mut out)?
+        single_commit(&repo, &revs[0], &opts, &mut out, &mut differed)?
     };
+
+    // A recognised-but-unimplemented option can only produce wrong bytes when there
+    // are bytes to produce. `differed` is checked alongside the buffer because an
+    // option such as `--numstat` renders from the change list even in the forms that
+    // leave the raw buffer empty (`-s --no-commit-id`).
+    if code == 0 && (differed || !out.is_empty()) {
+        if let Some(flag) = &unsupported {
+            bail!("unsupported flag {flag:?}");
+        }
+    }
 
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(&out)?;
     stdout.flush()?;
-    Ok(code)
+
+    if code == 0 && opts.exit_code && differed {
+        return Ok(ExitCode::from(1));
+    }
+    Ok(ExitCode::from(code))
+}
+
+/// git's `verify_filename()`: `Some(code)` when the argument cannot be a path, after
+/// printing the message git prints for it.
+///
+/// `first` selects between the two texts git uses — the leading non-revision argument
+/// is diagnosed as a possibly-misspelt revision, later ones simply as missing paths.
+fn verify_filename(arg: &str, first: bool) -> Option<u8> {
+    if arg.starts_with('-') {
+        eprintln!("fatal: option '{arg}' must come before non-option arguments");
+        return Some(FATAL);
+    }
+    if looks_like_pathspec(arg) || std::path::Path::new(arg).symlink_metadata().is_ok() {
+        return None;
+    }
+    if first {
+        eprintln!("fatal: ambiguous argument '{arg}': {AMBIGUOUS_TAIL}");
+    } else {
+        eprintln!("fatal: {arg}: {NO_SUCH_PATH_TAIL}");
+    }
+    Some(FATAL)
+}
+
+/// git's `looks_like_pathspec()`: a leading `:` marks magic, and an unescaped glob
+/// metacharacter means the argument was never meant to name a file directly.
+fn looks_like_pathspec(arg: &str) -> bool {
+    if arg.starts_with(':') {
+        return true;
+    }
+    let mut escaped = false;
+    for b in arg.bytes() {
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if matches!(b, b'*' | b'?' | b'[') {
+            return true;
+        }
+    }
+    false
+}
+
+/// `--diff-filter` status bits. Bit 0 is git's "all or none" marker (`*`).
+const AON: u32 = 1;
+/// Every real status bit, i.e. the mask that filters nothing out.
+const ALL_STATUSES: u32 = !AON;
+
+/// The bit git assigns to a `--diff-filter` change class, or `None` if the letter is
+/// not one.
+fn filter_bit(letter: u8) -> Option<u32> {
+    let shift = match letter {
+        b'*' => 0,
+        b'A' => 1,
+        b'B' => 2,
+        b'C' => 3,
+        b'D' => 4,
+        b'M' => 5,
+        b'R' => 6,
+        b'T' => 7,
+        b'U' => 8,
+        b'X' => 9,
+        _ => return None,
+    };
+    Some(1 << shift)
+}
+
+/// Parse `--diff-filter=<letters>` into a status mask.
+///
+/// Uppercase letters (and `*`) select, lowercase letters deselect. A string made only
+/// of deselections starts from "everything" so that `--diff-filter=d` means "all but
+/// deletions"; any selection present starts from nothing instead, which is why
+/// `--diff-filter=Md` is just `M`. `None` means git rejected the string, after
+/// printing its error; the caller exits 129.
+fn parse_diff_filter(spec: &str) -> Option<u32> {
+    let selects = spec.bytes().any(|b| b == b'*' || b.is_ascii_uppercase());
+    let mut mask = if selects { 0 } else { ALL_STATUSES };
+    for b in spec.bytes() {
+        let negate = b.is_ascii_lowercase();
+        let Some(bit) = filter_bit(b.to_ascii_uppercase()) else {
+            eprintln!(
+                "error: unknown change class '{}' in --diff-filter={spec}",
+                b as char
+            );
+            return None;
+        };
+        if negate {
+            mask &= !bit;
+        } else {
+            mask |= bit;
+        }
+    }
+    Some(mask)
+}
+
+/// Apply a `--diff-filter` mask to a collected change list.
+fn apply_filter(changes: &mut Vec<Change>, mask: u32) {
+    if mask == ALL_STATUSES {
+        return;
+    }
+    let wanted = mask & !AON;
+    let matches = |c: &Change| filter_bit(status(c)).is_some_and(|b| b & wanted != 0);
+    if mask & AON != 0 {
+        // "all or none": one hit shows the whole list, no hit shows nothing.
+        if !changes.iter().any(matches) {
+            changes.clear();
+        }
+    } else {
+        changes.retain(matches);
+    }
+}
+
+/// Options stock git's `diff-tree` accepts that only steer patch or stat rendering.
+///
+/// This module never emits either format — it bails first — so these provably cannot
+/// change the bytes it does emit. Each entry was compared against stock git in the
+/// raw, `-t`, `--name-status` and commit-id-line forms before being listed here.
+/// Options that re-compare blob content (`-w`, `-b`, the `--ignore-*` family) are
+/// deliberately absent: they drop pairs from the raw output too.
+fn is_ignorable(a: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "--no-prefix",
+        "--default-prefix",
+        "--color",
+        "--no-color",
+        "--color-words",
+        "--abbrev-commit",
+        "--no-abbrev-commit",
+        "--text",
+        "-a",
+        "--minimal",
+        "--patience",
+        "--histogram",
+        "--indent-heuristic",
+        "--no-indent-heuristic",
+        "--expand-tabs",
+        "--no-expand-tabs",
+        "--function-context",
+        "-W",
+        "--full-index",
+        "--textconv",
+        "--no-textconv",
+        "--ext-diff",
+        "--no-ext-diff",
+        "--ita-invisible-in-index",
+        "--ita-visible-in-index",
+    ];
+    const PREFIX: &[&str] = &[
+        "--src-prefix=",
+        "--dst-prefix=",
+        "--color=",
+        "--diff-algorithm=",
+        "--inter-hunk-context=",
+        "--output-indicator-new=",
+        "--output-indicator-old=",
+        "--output-indicator-context=",
+        "--ws-error-highlight=",
+        "--word-diff=",
+        "--word-diff-regex=",
+    ];
+    EXACT.contains(&a) || PREFIX.iter().any(|p| a.starts_with(p))
+}
+
+/// Options stock git's `diff-tree` accepts that this port cannot reproduce.
+///
+/// Recognising them is what lets argument validation and revision resolution run in
+/// git's order; the caller turns a recognised option into a bail as soon as output
+/// would actually be produced.
+fn is_known_unsupported(a: &str) -> bool {
+    const EXACT: &[&str] = &[
+        // patch and stat output
+        "-p",
+        "-u",
+        "--patch",
+        "--patch-with-raw",
+        "--patch-with-stat",
+        "--binary",
+        "--stat",
+        "--numstat",
+        "--shortstat",
+        "--dirstat",
+        "--dirstat-by-file",
+        "--cumulative",
+        "--summary",
+        "--compact-summary",
+        "--check",
+        "--unified",
+        // object-name width we cannot derive
+        "--abbrev",
+        // rename, copy and rewrite detection
+        "-B",
+        "-C",
+        "-D",
+        "-M",
+        "--break-rewrites",
+        "--find-renames",
+        "--find-copies",
+        "--find-copies-harder",
+        "--irreversible-delete",
+        "--no-renames",
+        "--rename-empty",
+        "--no-rename-empty",
+        // pickaxe and ordering
+        "--pickaxe-all",
+        "--pickaxe-regex",
+        "-R",
+        // path rewriting
+        "--relative",
+        "--no-relative",
+        "--line-prefix",
+        "--skip-to",
+        "--rotate-to",
+        "--output",
+        // submodule handling changes which gitlink pairs are reported
+        "--submodule",
+        "--ignore-submodules",
+        // content comparison: these drop pairs from the raw output as well
+        "-b",
+        "-w",
+        "--ignore-cr-at-eol",
+        "--ignore-space-at-eol",
+        "--ignore-space-change",
+        "--ignore-all-space",
+        "--ignore-blank-lines",
+        // commit formatting, combined diffs and revision walking
+        "--stdin",
+        "-v",
+        "--pretty",
+        "--format",
+        "--merge-base",
+        "-c",
+        "--cc",
+        "--combined-all-paths",
+        "--diff-merges",
+        "--no-diff-merges",
+        "--remerge-diff",
+        "--first-parent",
+        "--full-diff",
+        "--max-depth",
+        "--max-count",
+        // colour and word diff variants that need a rendered body
+        "--word-diff",
+        "--color-moved",
+        "--no-color-moved",
+        "--anchored",
+    ];
+    const PREFIX: &[&str] = &[
+        "--stat=",
+        "--stat-width=",
+        "--stat-name-width=",
+        "--stat-count=",
+        "--stat-graph-width=",
+        "--dirstat=",
+        "--dirstat-by-file=",
+        "--submodule=",
+        "--ignore-submodules=",
+        "--ignore-matching-lines=",
+        "--color-moved=",
+        "--color-moved-ws=",
+        "--line-prefix=",
+        "--anchored=",
+        "--pretty=",
+        "--format=",
+        "--diff-merges=",
+        "--encoding=",
+        "--max-depth=",
+        "--max-count=",
+        "--skip-to=",
+        "--rotate-to=",
+        "--relative=",
+        "--output=",
+        "--find-renames=",
+        "--find-copies=",
+        "--break-rewrites=",
+        "--unified=",
+        // short options that carry an attached value
+        "-U",
+        "-S",
+        "-G",
+        "-O",
+        "-l",
+        "-B",
+        "-C",
+        "-M",
+    ];
+    EXACT.contains(&a) || PREFIX.iter().any(|p| a.starts_with(p))
 }
 
 /// Resolve a `<tree-ish>` to the id of the tree it names.
 ///
-/// `Ok(None)` means the spec could not be resolved; git reports that as a fatal
-/// error and exits 128, so the caller propagates that code.
+/// `Ok(None)` means git would have died here; the message is already on stderr and
+/// the caller exits 128.
 fn resolve_tree(repo: &gix::Repository, spec: &str) -> Result<Option<ObjectId>> {
     let Ok(id) = repo.rev_parse_single(spec) else {
-        eprintln!("fatal: ambiguous argument '{spec}': unknown revision");
+        eprintln!("fatal: ambiguous argument '{spec}': {AMBIGUOUS_TAIL}");
         return Ok(None);
     };
     let Ok(object) = id.object() else {
-        eprintln!("fatal: bad object '{spec}'");
+        eprintln!("fatal: bad object {spec}");
         return Ok(None);
     };
+    let oid = object.id;
     match object.peel_to_tree() {
         Ok(tree) => Ok(Some(tree.id)),
         Err(_) => {
-            eprintln!("fatal: not a tree object: '{spec}'");
+            eprintln!("fatal: unable to read tree ({oid})");
             Ok(None)
         }
     }
@@ -287,22 +692,29 @@ fn resolve_tree(repo: &gix::Repository, spec: &str) -> Result<Option<ObjectId>> 
 
 /// The single-`<commit>` form: diff the commit against its parent(s), each diff
 /// prefixed by the commit id unless suppressed.
+///
+/// Returns the exit code and sets `differed` when any change survived filtering, which
+/// is what `--exit-code` reports on.
 fn single_commit(
     repo: &gix::Repository,
     spec: &str,
     opts: &Opts,
     out: &mut Vec<u8>,
-) -> Result<ExitCode> {
+    differed: &mut bool,
+) -> Result<u8> {
     let Ok(id) = repo.rev_parse_single(spec) else {
-        eprintln!("fatal: ambiguous argument '{spec}': unknown revision");
-        return Ok(ExitCode::from(128));
+        eprintln!("fatal: ambiguous argument '{spec}': {AMBIGUOUS_TAIL}");
+        return Ok(FATAL);
     };
-    let object = id.object()?;
+    let Ok(object) = id.object() else {
+        eprintln!("fatal: bad object {spec}");
+        return Ok(FATAL);
+    };
     let (found_id, found_kind) = (object.id, object.kind);
     let Ok(commit) = object.peel_to_commit() else {
         // git treats this as non-fatal: it complains and exits 0.
         eprintln!("error: object {found_id} is a {found_kind}, not a commit");
-        return Ok(ExitCode::SUCCESS);
+        return Ok(0);
     };
 
     let commit_id = commit.id;
@@ -314,11 +726,11 @@ fn single_commit(
         if opts.root {
             vec![None]
         } else {
-            return Ok(ExitCode::SUCCESS);
+            return Ok(0);
         }
     } else if parents.len() > 1 && !opts.merges {
         // A merge is silently skipped unless -m asks for per-parent diffs.
-        return Ok(ExitCode::SUCCESS);
+        return Ok(0);
     } else if opts.merges {
         let mut trees = Vec::with_capacity(parents.len());
         for p in &parents {
@@ -332,13 +744,14 @@ fn single_commit(
     let term = if opts.nul { b'\0' } else { b'\n' };
     for before in befores {
         let changes = collect(repo, before, Some(new_tree), opts)?;
+        *differed |= !changes.is_empty();
         if opts.always || (!opts.no_commit_id && !changes.is_empty()) {
             out.extend_from_slice(commit_id.to_hex().to_string().as_bytes());
             out.push(term);
         }
         render_all(out, &changes, opts);
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(0)
 }
 
 /// The tree a commit points at.
@@ -371,7 +784,8 @@ fn read_entries(repo: &gix::Repository, id: Option<ObjectId>) -> Result<Vec<Entr
         .collect())
 }
 
-/// Collect every change turning `old` into `new`, in git's emission order.
+/// Collect every change turning `old` into `new`, in git's emission order, with
+/// `--diff-filter` applied.
 fn collect(
     repo: &gix::Repository,
     old: Option<ObjectId>,
@@ -380,6 +794,7 @@ fn collect(
 ) -> Result<Vec<Change>> {
     let mut out = Vec::new();
     walk(repo, old, new, BStr::new(""), opts, &mut out)?;
+    apply_filter(&mut out, opts.filter);
     Ok(out)
 }
 

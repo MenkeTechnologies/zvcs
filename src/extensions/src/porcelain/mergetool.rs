@@ -18,14 +18,16 @@
 //!   * `require_work_tree`;
 //!   * the full "is there anything to do" decision, i.e. the `MERGE_RR` /
 //!     `git rerere remaining` branch and the `diff --diff-filter=U` pathspec
-//!     filter, ending in `print_noop_and_exit`'s `No files need merging` / exit 0.
+//!     filter, ending in `print_noop_and_exit`'s `No files need merging` / exit 0;
+//!   * `show_tool_help`, i.e. all of `--tool-help[=<mode>]` — see [`show_tool_help`]
+//!     and [`TOOLS`] for how the backend catalogue it lists is represented here.
 //!
 //! When that decision yields at least one conflicted path — the point where the
 //! script would print `Merging:` and start invoking a backend — this bails instead
-//! of emitting partial output. `--tool-help` bails likewise: its listing is a probe
-//! of the installed `mergetools/` scripts against `$PATH`, which does not exist here.
+//! of emitting partial output.
 
 use anyhow::{bail, Result};
+use std::path::Path;
 use std::process::ExitCode;
 
 use gix::bstr::{BString, ByteSlice};
@@ -58,12 +60,15 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
     let mut i = 0usize;
     while i < rest.len() {
         let a = rest[i].as_str();
-        if a.starts_with("--tool-help") {
-            // `--tool-help` and `--tool-help=<mode>` both list backends and exit.
-            bail!(
-                "--tool-help lists the mergetools/ shell backends git ships and probes each \
-                 against $PATH; that catalogue is not part of the vendored gitoxide crates"
-            );
+        if let Some(mode) = a.strip_prefix("--tool-help=") {
+            // `TOOL_MODE=${1#--tool-help=}; show_tool_help` — the arm runs before
+            // `git_dir_init`/`require_work_tree` and ends in `exit 0`.
+            show_tool_help(mode);
+            return Ok(ExitCode::SUCCESS);
+        } else if a == "--tool-help" {
+            // `$TOOL_MODE` is still its `git-mergetool` default of `merge`.
+            show_tool_help("merge");
+            return Ok(ExitCode::SUCCESS);
         } else if a == "-t" || a.starts_with("--tool") {
             // `case "$#,$1" in *,*=*) stuck ;; 1,*) usage ;; *) take $2 ;; esac`
             if !a.contains('=') {
@@ -139,6 +144,276 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
 fn usage_error() -> ExitCode {
     eprintln!("{USAGE}");
     ExitCode::from(1)
+}
+
+/// One mode's view of a backend: what `is_available` probes and what the listing prints.
+struct Backend {
+    /// `translate_merge_tool_path <tool>` — the name looked up on `$PATH`. It is
+    /// often not the tool name (`vscode` probes `code`, `araxis` probes `compare`).
+    path: &'static str,
+    /// `merge_cmd_help <tool>` / `diff_cmd_help <tool>`.
+    help: &'static str,
+}
+
+/// A single entry of the variant list `show_tool_names` iterates.
+struct Tool {
+    name: &'static str,
+    /// The `mergetools/` scripts whose `list_tool_variants` emits this name, for
+    /// names that are not themselves script names. Empty marks a script name.
+    ///
+    /// `setup_user_tool` replaces `list_tool_variants` with one that echoes only
+    /// the script's own name, so a configured `mergetool.<script>.cmd` stops that
+    /// script from contributing its extra variants. A variant survives while any
+    /// one of its producers is unconfigured — which is why `vimdiff1` still shows
+    /// up when only `mergetool.vimdiff.cmd` is set, `gvimdiff`/`nvimdiff` (both of
+    /// which source `mergetools/vimdiff`) still emitting the full list.
+    producers: &'static [&'static str],
+    /// `None` where `can_merge` is false, or where the merge-mode
+    /// `list_tool_variants` never emits this name.
+    merge: Option<Backend>,
+    /// `None` where `can_diff` is false, or where the diff-mode
+    /// `list_tool_variants` never emits this name — diff mode has no numbered
+    /// `vimdiff` variants.
+    diff: Option<Backend>,
+}
+
+const fn backend(path: &'static str, help: &'static str) -> Option<Backend> {
+    Some(Backend { path, help })
+}
+
+/// The three scripts that all source `mergetools/vimdiff` and so all emit the
+/// whole `[g|n]vimdiff[1-3]` family.
+const VIM_FAMILY: &[&str] = &["gvimdiff", "nvimdiff", "vimdiff"];
+
+/// The `mergetools/` catalogue, in the `sort -u` order `show_tool_names` iterates.
+///
+/// git derives this by sourcing every script in `$(git --exec-path)/mergetools`
+/// and calling `list_tool_variants`, `can_merge`/`can_diff`, `merge_cmd_help`/
+/// `diff_cmd_help` and `translate_merge_tool_path` on each. Those are arbitrary
+/// shell, so the *values* they yield are transcribed here as data — read out of
+/// git 2.55.0's scripts — while the enumeration, `$PATH` probe, config merge,
+/// sort and formatting around them are implemented below. A git whose catalogue
+/// differs from 2.55.0's will therefore list a different set than this does.
+const TOOLS: &[Tool] = &[
+    Tool { name: "araxis", producers: &[], merge: backend("compare", "Use Araxis Merge (requires a graphical session)"), diff: backend("compare", "Use Araxis Merge (requires a graphical session)") },
+    Tool { name: "bc", producers: &[], merge: backend("bcompare", "Use Beyond Compare (requires a graphical session)"), diff: backend("bcompare", "Use Beyond Compare (requires a graphical session)") },
+    Tool { name: "bc3", producers: &["bc"], merge: backend("bcompare", "Use Beyond Compare (requires a graphical session)"), diff: backend("bcompare", "Use Beyond Compare (requires a graphical session)") },
+    Tool { name: "bc4", producers: &["bc"], merge: backend("bcompare", "Use Beyond Compare (requires a graphical session)"), diff: backend("bcompare", "Use Beyond Compare (requires a graphical session)") },
+    // `translate_merge_tool_path` is the one that branches on the mode.
+    Tool { name: "codecompare", producers: &[], merge: backend("CodeMerge", "Use Code Compare (requires a graphical session)"), diff: backend("CodeCompare", "Use Code Compare (requires a graphical session)") },
+    Tool { name: "deltawalker", producers: &[], merge: backend("DeltaWalker", "Use DeltaWalker (requires a graphical session)"), diff: backend("DeltaWalker", "Use DeltaWalker (requires a graphical session)") },
+    Tool { name: "diffmerge", producers: &[], merge: backend("diffmerge", "Use DiffMerge (requires a graphical session)"), diff: backend("diffmerge", "Use DiffMerge (requires a graphical session)") },
+    Tool { name: "diffuse", producers: &[], merge: backend("diffuse", "Use Diffuse (requires a graphical session)"), diff: backend("diffuse", "Use Diffuse (requires a graphical session)") },
+    Tool { name: "ecmerge", producers: &[], merge: backend("ecmerge", "Use ECMerge (requires a graphical session)"), diff: backend("ecmerge", "Use ECMerge (requires a graphical session)") },
+    Tool { name: "emerge", producers: &[], merge: backend("emacs", "Use Emacs' Emerge"), diff: backend("emacs", "Use Emacs' Emerge") },
+    Tool { name: "examdiff", producers: &[], merge: backend("ExamDiff.com", "Use ExamDiff Pro (requires a graphical session)"), diff: backend("ExamDiff.com", "Use ExamDiff Pro (requires a graphical session)") },
+    Tool { name: "guiffy", producers: &[], merge: backend("guiffy", "Use Guiffy's Diff Tool (requires a graphical session)"), diff: backend("guiffy", "Use Guiffy's Diff Tool (requires a graphical session)") },
+    Tool { name: "gvimdiff", producers: &[], merge: backend("gvim", "Use gVim (requires a graphical session) with a custom layout (see `git help mergetool`'s `BACKEND SPECIFIC HINTS` section)"), diff: backend("gvim", "Use gVim (requires a graphical session)") },
+    Tool { name: "gvimdiff1", producers: VIM_FAMILY, merge: backend("gvim", "Use gVim (requires a graphical session) with a 2 panes layout (LOCAL and REMOTE)"), diff: None },
+    Tool { name: "gvimdiff2", producers: VIM_FAMILY, merge: backend("gvim", "Use gVim (requires a graphical session) with a 3 panes layout (LOCAL, MERGED and REMOTE)"), diff: None },
+    Tool { name: "gvimdiff3", producers: VIM_FAMILY, merge: backend("gvim", "Use gVim (requires a graphical session) where only the MERGED file is shown"), diff: None },
+    Tool { name: "kdiff3", producers: &[], merge: backend("kdiff3.exe", "Use KDiff3 (requires a graphical session)"), diff: backend("kdiff3.exe", "Use KDiff3 (requires a graphical session)") },
+    // `can_merge` returns 1: kompare is diff-only.
+    Tool { name: "kompare", producers: &[], merge: None, diff: backend("kompare", "Use Kompare (requires a graphical session)") },
+    Tool { name: "meld", producers: &[], merge: backend("meld", "Use Meld (requires a graphical session) with optional `auto merge` (see `git help mergetool`'s `CONFIGURATION` section)"), diff: backend("meld", "Use Meld (requires a graphical session)") },
+    Tool { name: "nvimdiff", producers: &[], merge: backend("nvim", "Use Neovim with a custom layout (see `git help mergetool`'s `BACKEND SPECIFIC HINTS` section)"), diff: backend("nvim", "Use Neovim") },
+    Tool { name: "nvimdiff1", producers: VIM_FAMILY, merge: backend("nvim", "Use Neovim with a 2 panes layout (LOCAL and REMOTE)"), diff: None },
+    Tool { name: "nvimdiff2", producers: VIM_FAMILY, merge: backend("nvim", "Use Neovim with a 3 panes layout (LOCAL, MERGED and REMOTE)"), diff: None },
+    Tool { name: "nvimdiff3", producers: VIM_FAMILY, merge: backend("nvim", "Use Neovim where only the MERGED file is shown"), diff: None },
+    Tool { name: "opendiff", producers: &[], merge: backend("opendiff", "Use FileMerge (requires a graphical session)"), diff: backend("opendiff", "Use FileMerge (requires a graphical session)") },
+    Tool { name: "p4merge", producers: &[], merge: backend("p4merge", "Use HelixCore P4Merge (requires a graphical session)"), diff: backend("p4merge", "Use HelixCore P4Merge (requires a graphical session)") },
+    Tool { name: "smerge", producers: &[], merge: backend("smerge", "Use Sublime Merge (requires a graphical session)"), diff: backend("smerge", "Use Sublime Merge (requires a graphical session)") },
+    Tool { name: "tkdiff", producers: &[], merge: backend("tkdiff", "Use TkDiff (requires a graphical session)"), diff: backend("tkdiff", "Use TkDiff (requires a graphical session)") },
+    // `can_diff` returns 1: tortoisemerge is merge-only.
+    Tool { name: "tortoisemerge", producers: &[], merge: backend("tortoisemerge", "Use TortoiseMerge (requires a graphical session)"), diff: None },
+    Tool { name: "vimdiff", producers: &[], merge: backend("vim", "Use Vim with a custom layout (see `git help mergetool`'s `BACKEND SPECIFIC HINTS` section)"), diff: backend("vim", "Use Vim") },
+    Tool { name: "vimdiff1", producers: VIM_FAMILY, merge: backend("vim", "Use Vim with a 2 panes layout (LOCAL and REMOTE)"), diff: None },
+    Tool { name: "vimdiff2", producers: VIM_FAMILY, merge: backend("vim", "Use Vim with a 3 panes layout (LOCAL, MERGED and REMOTE)"), diff: None },
+    Tool { name: "vimdiff3", producers: VIM_FAMILY, merge: backend("vim", "Use Vim where only the MERGED file is shown"), diff: None },
+    Tool { name: "vscode", producers: &[], merge: backend("code", "Use Visual Studio Code (requires a graphical session)"), diff: backend("code", "Use Visual Studio Code (requires a graphical session)") },
+    Tool { name: "winmerge", producers: &[], merge: backend("WinMergeU.exe", "Use WinMerge (requires a graphical session)"), diff: backend("WinMergeU.exe", "Use WinMerge (requires a graphical session)") },
+    Tool { name: "xxdiff", producers: &[], merge: backend("xxdiff", "Use xxdiff (requires a graphical session)"), diff: backend("xxdiff", "Use xxdiff (requires a graphical session)") },
+];
+
+/// `show_tool_help` from `git-mergetool--lib`: the available backends, the
+/// `user-defined:` block from `<mode>tool.*.cmd`, the unavailable backends, and
+/// the closing windowed-environment note — all on stdout, then `exit 0`.
+///
+/// `mode` is `$TOOL_MODE`, which `--tool-help=<mode>` sets to an arbitrary string.
+/// Anything other than `merge` or `diff` makes `mode_ok` false for every backend,
+/// so only the config-derived block survives.
+fn show_tool_help(mode: &str) {
+    let tool_opt = format!("'git {mode}tool --tool=<tool>'");
+
+    // `git config --get-regexp` reads global and system config too, and this arm
+    // runs before any repository setup — so fall back to the globals outside one.
+    let config = match gix::discover(".") {
+        Ok(repo) => Some(repo.config_snapshot().plumbing().clone()),
+        Err(_) => gix::config::File::from_globals().ok(),
+    };
+
+    let mut config_tools = Vec::new();
+    // `get_merge_tool_cmd`: the names whose `.cmd` is set to something non-empty.
+    let mut configured = Vec::new();
+    if let Some(config) = &config {
+        if mode == "diff" {
+            list_config_tools(config, "difftool", &mut config_tools, &mut configured);
+        }
+        list_config_tools(config, "mergetool", &mut config_tools, &mut configured);
+    }
+    // `{ ... } | sort`. The `\t\t` prefix is on every line, so this orders by
+    // tool name; git's `sort` is locale-sensitive where this is byte-wise.
+    config_tools.sort();
+    let extra_content = if config_tools.is_empty() {
+        String::new()
+    } else {
+        format!("\tuser-defined:\n{}", config_tools.join("\n"))
+    };
+
+    // A configured `.cmd` makes that script emit only its own name, so a variant
+    // survives only while at least one of its producers is unconfigured.
+    let listed: Vec<(&str, &Backend)> = TOOLS
+        .iter()
+        .filter(|t| {
+            t.producers.is_empty()
+                || t.producers
+                    .iter()
+                    .any(|s| !configured.iter().any(|c| c.as_str() == *s))
+        })
+        .filter_map(|t| {
+            let b = match mode {
+                "diff" => t.diff.as_ref(),
+                "merge" => t.merge.as_ref(),
+                _ => None,
+            };
+            b.map(|b| (t.name, b))
+        })
+        .collect();
+
+    let (available, unavailable): (Vec<_>, Vec<_>) =
+        listed.into_iter().partition(|(_, b)| is_available(b.path));
+
+    let mut any_shown = show_tool_names(
+        &available,
+        Some(&format!("{tool_opt} may be set to one of the following:")),
+        &format!("No suitable tool for 'git {mode}tool --tool=<tool>' found."),
+        &extra_content,
+    );
+    any_shown |= show_tool_names(
+        &unavailable,
+        Some("\nThe following tools are valid, but not currently available:"),
+        "",
+        "",
+    );
+
+    if any_shown {
+        println!();
+        println!("Some of the tools listed above only work in a windowed");
+        println!("environment. If run in a terminal-only session, they will fail.");
+    }
+}
+
+/// `show_tool_names`: print `preamble` lazily before the first line it has to
+/// emit, then one padded line per tool, then `extra_content`, or `not_found_msg`
+/// if it turned out there was nothing at all. Returns `shown_any`.
+fn show_tool_names(
+    tools: &[(&str, &Backend)],
+    preamble: Option<&str>,
+    not_found_msg: &str,
+    extra_content: &str,
+) -> bool {
+    let mut preamble = preamble.filter(|p| !p.is_empty());
+    let mut shown_any = false;
+
+    for (name, b) in tools {
+        if let Some(p) = preamble.take() {
+            println!("{p}");
+        }
+        shown_any = true;
+        // `printf "%s%-15s  %s\n"`. The help text is one word because
+        // `git-mergetool--lib` sets `IFS` to a lone linefeed.
+        println!("\t\t{name:<15}  {}", b.help);
+    }
+
+    if !extra_content.is_empty() {
+        // No newline after the preamble here: git avoids a blank line when the
+        // config block is the first thing shown.
+        if let Some(p) = preamble.take() {
+            print!("{p}");
+        }
+        shown_any = true;
+        print!("\n{extra_content}\n");
+    }
+
+    if preamble.is_some() && !not_found_msg.is_empty() {
+        println!("{not_found_msg}");
+    }
+    shown_any
+}
+
+/// `list_config_tools`: one `\t\t`-prefixed line per `<section>.<tool>.cmd`.
+///
+/// git reads these from `git config --get-regexp <section>'\..*\.cmd'`, which
+/// prints `<key> <value>`, and then splits with `read -r key value` under the
+/// `IFS=<LF>` set at the top of `git-mergetool--lib`. Nothing splits on the
+/// space, so the whole line lands in `key`, and stripping `<section>.` off the
+/// front and `.cmd` off the *end* leaves the value dangling in the output. That
+/// is what git prints, so it is what this reproduces.
+///
+/// `configured` collects the subsection names carrying a non-empty `cmd`, which is
+/// what `get_merge_tool_cmd` tests before `setup_user_tool` narrows the variants.
+fn list_config_tools(
+    config: &gix::config::File,
+    section: &str,
+    out: &mut Vec<String>,
+    configured: &mut Vec<String>,
+) {
+    let Some(sections) = config.sections_by_name(section) else {
+        return;
+    };
+    for s in sections {
+        let Some(sub) = s.header().subsection_name() else {
+            continue;
+        };
+        let sub = sub.to_str_lossy();
+        for value in s.values("cmd") {
+            let line = format!("{sub}.cmd {}", value.to_str_lossy());
+            out.push(format!("\t\t{}", line.strip_suffix(".cmd").unwrap_or(&line)));
+            if !value.is_empty() && !configured.iter().any(|c| c.as_str() == &*sub) {
+                configured.push(sub.to_string());
+            }
+        }
+    }
+}
+
+/// `is_available`: `type "$merge_tool_path"`, i.e. an executable of that name on
+/// `$PATH`. None of the catalogue's names are shell builtins, so the builtin and
+/// function lookups `type` also does cannot match.
+fn is_available(path: &str) -> bool {
+    if path.contains('/') {
+        return is_executable(Path::new(path));
+    }
+    let Some(var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&var).any(|dir| {
+        // POSIX: an empty `$PATH` element means the current directory.
+        let dir = if dir.as_os_str().is_empty() { ".".into() } else { dir };
+        is_executable(&dir.join(path))
+    })
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 /// The unmerged paths of the index, deduplicated, in index (path-sorted) order —

@@ -41,19 +41,46 @@
 //!   (three committishes first, then two ranges, then one symmetric range).
 //! * Ranges spelled `<a>..<b>` or `<a>...<b>`, either side defaulting to `HEAD`
 //!   when empty.
-//! * `--creation-factor=<n>`, `--left-only`, `--right-only`, `--no-dual-color`
-//!   and `--no-color`. Dual and simple coloring are byte-identical once color is
-//!   off, which is the only mode this port emits.
-//! * `--left-only` together with `--right-only`: upstream's `error()` on stderr
-//!   and its exit status.
+//! * `--creation-factor=<n>` (and its `--creation-factor <n>` /
+//!   `--no-creation-factor` spellings), `--left-only`, `--right-only`,
+//!   `--no-dual-color`, `--no-color`, `--color=never`, `--color=auto`, `-p` /
+//!   `-u` / `--patch`, and `--no-notes`. Dual and simple coloring are
+//!   byte-identical once color is off, which is the only mode this port emits.
+//! * The failure paths, with upstream's exit status: a bad argument shape exits
+//!   129, `--left-only` together with `--right-only` exits 255, and a range
+//!   naming an unknown revision exits 255.
 //!
-//! ### Not covered — these `bail!` rather than emit output that would diverge
+//! ### Option handling — nothing is silently ignored
 //!
-//! * Color in any form: `--color`, `--color=<when>`, and `--dual-color` (which
+//! Upstream forwards most of the `git diff` option set to the inner patch
+//! rendering. This port implements only the options listed above; every other
+//! option is *deferred*, meaning it is recorded and never applied:
+//!
+//! * If the run reaches the point where output would be produced, it stops with
+//!   a terse `unsupported flag` message on stderr rather than emitting a patch
+//!   that ignored the option.
+//! * If the run instead ends earlier — a usage error, or a range that names an
+//!   unknown revision — the deferred option never becomes observable, because
+//!   upstream's behaviour on those two paths does not depend on it. That was
+//!   checked against git 2.55 by running every flag this subcommand's parity
+//!   grammar can emit with no range argument: all 84 produce the same
+//!   `fatal: need two commit ranges` and the same exit status 129.
+//!
+//! An option this port does not recognise at all is deferred too, rather than
+//! rejected: upstream accepts the whole `git diff` option list here, and
+//! guessing at that list would turn an accepted option into a bogus usage
+//! error. The one place the spelling still matters is arity — the long and
+//! short options that take their value as a separate argv element are listed in
+//! [`LONG_TAKES_VALUE`] and [`SHORT_TAKES_VALUE`] so the value is consumed and
+//! not mistaken for a revision.
+//!
+//! ### Not covered — these stop rather than emit output that would diverge
+//!
+//! * Color in any form: `--color`, `--color=always`, and `--dual-color` (which
 //!   upstream uses to *force* color on). The dual-color markup is not ported.
-//! * `--notes[=<ref>]` / `--no-notes`, and repositories carrying a `refs/notes/
-//!   commits` ref — upstream asks `git log` to show notes by default, so a note
-//!   would silently change the compared text.
+//! * `--notes[=<ref>]`, and repositories carrying a `refs/notes/commits` ref
+//!   unless `--no-notes` was given — upstream asks `git log` to show notes by
+//!   default, so a note would silently change the compared text.
 //! * `--diff-merges=<format>` / `--remerge-diff` (merges are ignored here, which
 //!   is the default upstream behaviour), pathspec limiting (`[--] <path>...`),
 //!   and every other `git diff` option upstream forwards to the inner patches.
@@ -73,9 +100,12 @@
 //!   first), which is identical for the linear patch series range-diff exists to
 //!   compare, but may break commit-date ties differently on merge-heavy ranges,
 //!   because upstream's tie-break is its binary heap's internal order.
-//! * A usage error prints `fatal: <reason>` on stderr and exits 129 like
-//!   upstream, but without the option list upstream prints after it. Stdout is
-//!   empty either way.
+//! * A usage error prints `fatal: <reason>` and the three-line synopsis on
+//!   stderr and exits 129 like upstream, but without the ~90-line option list
+//!   upstream prints after the synopsis. Stdout is empty either way.
+//! * An unrecognised option reaches the usage error as "need two commit ranges"
+//!   rather than upstream's "unknown option", because unrecognised options are
+//!   deferred (see above). The exit status, 129, is the same.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BinaryHeap, HashMap};
@@ -130,11 +160,72 @@ impl Patch {
     }
 }
 
+/// The three-line synopsis `builtin_range_diff_usage` opens with. Upstream then
+/// prints its whole option table; that part is not reproduced (see the module
+/// docs), and stderr prose is not part of the compatibility contract anyway.
+const USAGE: &str = "\
+usage: git range-diff [<options>] <old-base>..<old-tip> <new-base>..<new-tip>
+   or: git range-diff [<options>] <old-tip>...<new-tip>
+   or: git range-diff [<options>] <base> <old-tip> <new-tip>
+";
+
+/// Long options of `git range-diff -h` whose value is a separate argv element
+/// when the option is spelled without `=`. Consuming it keeps a value like the
+/// `myers` of `--diff-algorithm myers` from being classified as a revision.
+const LONG_TAKES_VALUE: &[&str] = &[
+    "--anchored",
+    "--color-moved-ws",
+    "--creation-factor",
+    "--diff-algorithm",
+    "--diff-merges",
+    "--dst-prefix",
+    "--find-object",
+    "--ignore-matching-lines",
+    "--inter-hunk-context",
+    "--line-prefix",
+    "--max-depth",
+    "--max-memory",
+    "--output",
+    "--output-indicator-context",
+    "--output-indicator-new",
+    "--output-indicator-old",
+    "--rotate-to",
+    "--skip-to",
+    "--src-prefix",
+    "--stat-count",
+    "--stat-graph-width",
+    "--stat-name-width",
+    "--stat-width",
+    "--word-diff-regex",
+    "--ws-error-highlight",
+];
+
+/// Short options whose value is a separate argv element. The remaining short
+/// options either take no value (`-p`, `-R`, `-w`, …) or attach it (`-U1`,
+/// `-M50`, …), so neither consumes the next element.
+const SHORT_TAKES_VALUE: &[&str] = &["-G", "-I", "-O", "-S", "-l"];
+
 /// Parsed command line.
 struct Opts {
     creation_factor: i64,
     left_only: bool,
     right_only: bool,
+    /// Whether upstream would ask `git log` to render notes. On by default;
+    /// `--no-notes` turns it off, which is the only setting this port renders.
+    notes: bool,
+    /// The first option this port recognises as real but does not implement,
+    /// held until the run is about to produce output. See the module docs.
+    deferred: Option<String>,
+}
+
+impl Opts {
+    /// Record an unimplemented option. Upstream reports the *first* offending
+    /// option, so a later one never overwrites an earlier one.
+    fn defer(&mut self, reason: String) {
+        if self.deferred.is_none() {
+            self.deferred = Some(reason);
+        }
+    }
 }
 
 pub fn range_diff(args: &[String]) -> Result<ExitCode> {
@@ -142,36 +233,108 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         creation_factor: CREATION_FACTOR_DEFAULT,
         left_only: false,
         right_only: false,
+        notes: true,
+        deferred: None,
     };
-    let mut rest: Vec<String> = Vec::new();
+    // `args` excludes the `range-diff` verb: `dispatch::run` takes the
+    // subcommand separately, so option parsing starts at index 0.
+    let mut revs: Vec<String> = Vec::new();
+    let mut pathspec: Vec<String> = Vec::new();
+    let mut after_dash_dash = false;
 
-    let mut i = 1;
+    let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
-        match a {
+        if after_dash_dash {
+            pathspec.push(a.to_string());
+            i += 1;
+            continue;
+        }
+        if a == "--" {
+            after_dash_dash = true;
+            i += 1;
+            continue;
+        }
+        // A bare `-` is a revision-ish operand, not an option.
+        if a.len() < 2 || !a.starts_with('-') {
+            revs.push(a.to_string());
+            i += 1;
+            continue;
+        }
+
+        // `--name=value` splits; a short option's value is always attached, so
+        // an `=` inside one belongs to the value.
+        let (name, inline) = match a.find('=') {
+            Some(p) if a.starts_with("--") => (&a[..p], Some(&a[p + 1..])),
+            _ => (a, None),
+        };
+
+        match name {
             "--left-only" => opts.left_only = true,
+            "--no-left-only" => opts.left_only = false,
             "--right-only" => opts.right_only = true,
-            // Without color, the dual and simple renderings are the same bytes.
+            "--no-right-only" => opts.right_only = false,
+            // Without color the dual and simple renderings are the same bytes,
+            // and `auto` resolves to off because output is not a terminal.
             "--no-dual-color" | "--no-color" => {}
+            "--color" if matches!(inline, Some("never") | Some("auto")) => {}
+            // Patch output is what this port emits; `-p`/`-u` ask for it.
+            "-p" | "-u" | "--patch" => {}
+            "--no-notes" => opts.notes = false,
+            "--no-creation-factor" => opts.creation_factor = CREATION_FACTOR_DEFAULT,
             "--creation-factor" => {
-                i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or_else(|| anyhow!("option `--creation-factor` requires a value"))?;
-                opts.creation_factor = parse_factor(v)?;
+                let value = match inline {
+                    Some(v) => v.to_string(),
+                    None => {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => v.clone(),
+                            None => {
+                                return Ok(usage_error(
+                                    "option `creation-factor' requires a value",
+                                ))
+                            }
+                        }
+                    }
+                };
+                match value.parse::<i64>() {
+                    Ok(n) => opts.creation_factor = n,
+                    // Upstream's `OPT_INTEGER` failure is a usage error, 129.
+                    Err(_) => {
+                        return Ok(usage_error(
+                            "option `creation-factor' expects an integer value with an \
+                             optional k/m/g suffix",
+                        ))
+                    }
+                }
             }
-            _ if a.starts_with("--creation-factor=") => {
-                opts.creation_factor = parse_factor(&a["--creation-factor=".len()..])?;
+            _ => {
+                opts.defer(format!(
+                    "unsupported flag {a:?} (ported: --creation-factor, --left-only, \
+                     --right-only, --no-dual-color, --no-color, --color=never, \
+                     --color=auto, --patch, --no-notes)"
+                ));
+                if inline.is_none()
+                    && (LONG_TAKES_VALUE.contains(&name) || SHORT_TAKES_VALUE.contains(&name))
+                {
+                    i += 1;
+                }
             }
-            "--" => bail!("pathspec limiting is not supported"),
-            _ if a.starts_with('-') => bail!(
-                "unsupported flag {a:?} (ported: --creation-factor, --left-only, \
-                 --right-only, --no-dual-color, --no-color)"
-            ),
-            _ => rest.push(a.to_string()),
         }
         i += 1;
     }
+
+    if !pathspec.is_empty() {
+        opts.defer("pathspec limiting is not supported".to_string());
+    }
+
+    let repo = gix::discover(".")?;
+
+    // Upstream's order: the argument shape is checked first, so a bad shape is
+    // 129 even when `--left-only --right-only` were also given.
+    let Some((range1, range2)) = classify(&repo, &revs, &mut opts)? else {
+        return Ok(usage_error("need two commit ranges"));
+    };
 
     if opts.left_only && opts.right_only {
         // Upstream's `error()`, whose -1 return becomes git's exit status 255.
@@ -179,13 +342,25 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(255));
     }
 
-    let repo = gix::discover(".")?;
-    let Some((range1, range2)) = classify(&repo, &rest)? else {
-        eprintln!("fatal: need two commit ranges\n");
-        return Ok(ExitCode::from(129));
+    // Upstream resolves each range by running `git log` over it, oldest range
+    // first; a range naming an unknown revision is fatal before any patch is
+    // read, and `git log`'s -1 return becomes exit status 255.
+    let ends1 = match endpoints(&repo, &range1) {
+        Ok(e) => e,
+        Err(_) => return Ok(could_not_parse_log(&range1)),
+    };
+    let ends2 = match endpoints(&repo, &range2) {
+        Ok(e) => e,
+        Err(_) => return Ok(could_not_parse_log(&range2)),
     };
 
-    if repo.try_find_reference("refs/notes/commits")?.is_some() {
+    // Every remaining difference from upstream would show up in the output, so
+    // stop here rather than emit a patch that ignored an option.
+    if let Some(reason) = &opts.deferred {
+        bail!("{reason}");
+    }
+
+    if opts.notes && repo.try_find_reference("refs/notes/commits")?.is_some() {
         bail!(
             "this repository has a refs/notes/commits ref; `git range-diff` shows notes \
              by default and note rendering is not ported"
@@ -193,8 +368,8 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     }
 
     let mailmap = repo.open_mailmap();
-    let mut a = read_patches(&repo, &range1, &mailmap)?;
-    let mut b = read_patches(&repo, &range2, &mailmap)?;
+    let mut a = read_patches(&repo, ends1, &mailmap)?;
+    let mut b = read_patches(&repo, ends2, &mailmap)?;
 
     find_exact_matches(&mut a, &mut b);
     get_correspondences(&mut a, &mut b, opts.creation_factor);
@@ -209,10 +384,24 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `OPT_INTEGER` for `--creation-factor`.
-fn parse_factor(s: &str) -> Result<i64> {
-    s.parse::<i64>()
-        .map_err(|_| anyhow!("invalid value {s:?} for `--creation-factor`"))
+/// Upstream's `usage_msg_opt()`: the reason, a blank line, the synopsis, 129.
+fn usage_error(reason: &str) -> ExitCode {
+    eprintln!("fatal: {reason}\n");
+    eprint!("{USAGE}");
+    ExitCode::from(129)
+}
+
+/// What `git log <range>` prints when an endpoint names nothing, followed by
+/// `builtin/range-diff.c`'s own `error()`. `git log`'s failure is upstream's
+/// exit status 255.
+fn could_not_parse_log(range: &str) -> ExitCode {
+    eprintln!(
+        "fatal: ambiguous argument '{range}': unknown revision or path not in the working tree."
+    );
+    eprintln!("Use '--' to separate paths from revisions, like this:");
+    eprintln!("'git <command> [<revision>...] -- [<file>...]'");
+    eprintln!("error: could not parse log for '{range}'");
+    ExitCode::from(255)
 }
 
 // ---------------------------------------------------------------------------
@@ -222,14 +411,21 @@ fn parse_factor(s: &str) -> Result<i64> {
 /// Upstream's argument classification, in its exact precedence order: three
 /// committishes, then two commit ranges, then one symmetric range. `Ok(None)`
 /// means "need two commit ranges", the usage error.
-fn classify(repo: &gix::Repository, args: &[String]) -> Result<Option<(String, String)>> {
+///
+/// Operands past the ones a form consumes are a pathspec — upstream accepts
+/// them without a `--` separator — so they are deferred, not refused outright.
+fn classify(
+    repo: &gix::Repository,
+    args: &[String],
+    opts: &mut Opts,
+) -> Result<Option<(String, String)>> {
     if args.len() > 2
         && committish(repo, &args[0])
         && committish(repo, &args[1])
         && committish(repo, &args[2])
     {
         if args.len() > 3 {
-            bail!("pathspec limiting is not supported");
+            opts.defer("pathspec limiting is not supported".to_string());
         }
         return Ok(Some((
             format!("{}..{}", args[0], args[1]),
@@ -238,7 +434,7 @@ fn classify(repo: &gix::Repository, args: &[String]) -> Result<Option<(String, S
     }
     if args.len() > 1 && is_range(repo, &args[0]) && is_range(repo, &args[1]) {
         if args.len() > 2 {
-            bail!("pathspec limiting is not supported");
+            opts.defer("pathspec limiting is not supported".to_string());
         }
         return Ok(Some((args[0].clone(), args[1].clone())));
     }
@@ -306,13 +502,16 @@ fn endpoints(repo: &gix::Repository, spec: &str) -> Result<(Vec<ObjectId>, Vec<O
 // read_patches()
 // ---------------------------------------------------------------------------
 
-/// Render every non-merge commit of `range` into its canonical patch text.
+/// Render every non-merge commit of a range into its canonical patch text.
+///
+/// The range is taken already split into its endpoints, because upstream
+/// resolves both ranges up front and reports an unresolvable one as a `git log`
+/// failure rather than as a patch-rendering failure.
 fn read_patches(
     repo: &gix::Repository,
-    range: &str,
+    (tips, hidden): (Vec<ObjectId>, Vec<ObjectId>),
     mailmap: &gix::mailmap::Snapshot,
 ) -> Result<Vec<Patch>> {
-    let (tips, hidden) = endpoints(repo, range)?;
     let ids = ordered_commits(repo, tips, hidden)?;
     let mut out = Vec::with_capacity(ids.len());
     for (index, id) in ids.into_iter().enumerate() {

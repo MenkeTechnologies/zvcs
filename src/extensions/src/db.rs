@@ -572,3 +572,50 @@ pub fn mark_notified(conn: &Connection, ids: &[i64]) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod snapshot_atomic_tests {
+    use super::{load_snapshot, save_snapshot, SCHEMA};
+    use rusqlite::Connection;
+
+    #[test]
+    fn save_snapshot_rolls_back_on_mid_write_failure() {
+        // Prove the DELETE + N INSERTs are one transaction: if an INSERT fails
+        // part-way, the prior good snapshot must survive intact (the pre-fix code
+        // autocommitted the DELETE first, destroying it).
+        let dir = std::env::temp_dir().join(format!("zvcs-snapatom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("t.sqlite")).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+
+        let good = vec![
+            ("g1".into(), "w1".into(), "s1".into()),
+            ("g2".into(), "w2".into(), "s2".into()),
+            ("g3".into(), "w3".into(), "s3".into()),
+        ];
+        save_snapshot(&conn, "snap", &good).unwrap();
+        assert_eq!(load_snapshot(&conn, "snap").unwrap().len(), 3);
+
+        // Make the 2nd INSERT of a re-save abort mid-transaction.
+        conn.execute_batch(
+            "CREATE TRIGGER boom BEFORE INSERT ON snapshots \
+             WHEN NEW.sha = 'BOOM' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+        )
+        .unwrap();
+
+        let doomed: Vec<(String, String, String)> = vec![
+            ("n1".into(), "w".into(), "ok".into()),
+            ("n2".into(), "w".into(), "BOOM".into()),
+        ];
+        assert!(save_snapshot(&conn, "snap", &doomed).is_err(), "the poisoned INSERT must fail the save");
+
+        // Rolled back: the ORIGINAL 3-entry snapshot is intact, not replaced by the
+        // partial (1-entry) doomed one.
+        let after = load_snapshot(&conn, "snap").unwrap();
+        assert_eq!(after.len(), 3, "failed save must not destroy the prior snapshot (got {})", after.len());
+        assert!(after.iter().any(|(g, _, _)| g == "g1"), "original entries must survive");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -1,0 +1,45 @@
+{
+  "command": "fsck",
+  "mutating": false,
+  "flags": [
+    "--unreachable",
+    "--dangling",
+    "--no-dangling",
+    "--root",
+    "--tags",
+    "--cache",
+    "--no-reflogs",
+    "--full",
+    "--no-full",
+    "--connectivity-only",
+    "--strict",
+    "--verbose",
+    "--name-objects",
+    "--no-name-objects",
+    "--progress",
+    "--no-progress",
+    "--references",
+    "--no-references"
+  ],
+  "positionals": [
+    "",
+    "HEAD",
+    "main",
+    "feature",
+    "v0.1.0",
+    "v0.2.0",
+    "HEAD^{tree}",
+    "HEAD:README.md",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

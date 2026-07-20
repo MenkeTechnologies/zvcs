@@ -1,0 +1,45 @@
+{
+  "command": "backfill",
+  "mutating": false,
+  "flags": [
+    "--min-batch-size=1",
+    "--min-batch-size=50000",
+    "--min-batch-size=1k",
+    "--min-batch-size=abc",
+    "--min-batch-size=-1",
+    "--sparse",
+    "--no-sparse",
+    "--include-edges",
+    "--no-include-edges",
+    "--first-parent",
+    "--since=2020-01-01",
+    "--max-count=1",
+    "--all",
+    "--reverse",
+    "--not",
+    "--bogus-flag"
+  ],
+  "positionals": [
+    "",
+    "HEAD",
+    "main",
+    "feature",
+    "v0.1.0",
+    "v0.2.0",
+    "HEAD~1",
+    "main..feature",
+    "main...feature",
+    "README.md",
+    "src/lib.rs",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

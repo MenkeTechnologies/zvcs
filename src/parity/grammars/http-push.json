@@ -1,0 +1,7 @@
+{
+  "command": "http-push",
+  "mutating": true,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

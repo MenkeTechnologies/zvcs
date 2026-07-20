@@ -1,0 +1,31 @@
+{
+  "command": "unpack-objects",
+  "mutating": true,
+  "flags": [
+    "-n",
+    "-q",
+    "-r",
+    "-n -q",
+    "-q -r",
+    "-n -r",
+    "--strict",
+    "-q --strict",
+    "-n --strict",
+    "--max-input-size=0",
+    "--max-input-size=1",
+    "--max-input-size=1024",
+    "--max-input-size=1048576",
+    "-q --max-input-size=1048576",
+    "-n -q -r --strict"
+  ],
+  "positionals": [
+    "",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "detached"
+  ]
+}

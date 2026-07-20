@@ -1,0 +1,7 @@
+{
+  "command": "remote-ftps",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

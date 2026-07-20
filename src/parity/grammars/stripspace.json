@@ -1,0 +1,7 @@
+{
+  "command": "stripspace",
+  "mutating": false,
+  "flags": ["-s", "--strip-comments", "-c", "--comment-lines"],
+  "positionals": ["", "does-not-exist"],
+  "shapes": ["linear", "branched", "merged", "dirty", "detached"]
+}

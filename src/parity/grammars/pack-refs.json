@@ -1,0 +1,33 @@
+{
+  "command": "pack-refs",
+  "mutating": true,
+  "flags": [
+    "--all",
+    "--no-all",
+    "--prune",
+    "--no-prune",
+    "--auto",
+    "--no-auto",
+    "--include=refs/heads/*",
+    "--include=refs/tags/*",
+    "--include=refs/heads/feature",
+    "--include=refs/does-not-exist/*",
+    "--no-include",
+    "--exclude=refs/heads/*",
+    "--exclude=refs/tags/*",
+    "--exclude=refs/heads/main",
+    "--exclude=refs/does-not-exist/*",
+    "--no-exclude"
+  ],
+  "positionals": [
+    "",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "detached",
+    "submodule"
+  ]
+}

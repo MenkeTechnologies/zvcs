@@ -1,0 +1,7 @@
+{
+  "command": "patch-id",
+  "mutating": false,
+  "flags": ["--stable", "--unstable", "--verbatim"],
+  "positionals": ["", "does-not-exist"],
+  "shapes": ["linear", "branched", "merged", "detached", "awkward-paths"]
+}

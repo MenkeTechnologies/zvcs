@@ -1,0 +1,7 @@
+{
+  "command": "interpret-trailers",
+  "mutating": false,
+  "flags": ["--parse", "--only-trailers", "--no-only-trailers", "--only-input", "--no-only-input", "--unfold", "--no-unfold", "--trim-empty", "--no-trim-empty", "--divider", "--no-divider", "--no-in-place", "--no-trailer", "--no-where", "--no-if-exists", "--no-if-missing", "--trailer=Acked-by: Test User <test@example.com>", "--trailer=Signed-off-by: Test User <test@example.com>", "--trailer=Reviewed-by=Test User <test@example.com>", "--trailer=Empty-value: ", "--where=after", "--where=before", "--where=end", "--where=start", "--where=bogus", "--if-exists=add", "--if-exists=replace", "--if-exists=doNothing", "--if-exists=addIfDifferent", "--if-exists=addIfDifferentNeighbor", "--if-exists=bogus", "--if-missing=add", "--if-missing=doNothing", "--if-missing=bogus"],
+  "positionals": ["", "README.md", "src/lib.rs", "does-not-exist"],
+  "shapes": ["linear", "dirty", "awkward-paths"]
+}

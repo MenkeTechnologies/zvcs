@@ -1,0 +1,19 @@
+{
+  "command": "count-objects",
+  "mutating": false,
+  "flags": [
+    "-v",
+    "--verbose",
+    "-H",
+    "--human-readable",
+    "--no-verbose",
+    "--no-human-readable",
+    "-v -H",
+    "--verbose --human-readable",
+    "-H -v",
+    "--verbose --no-human-readable",
+    "--human-readable --no-verbose"
+  ],
+  "positionals": ["", "does-not-exist", "HEAD"],
+  "shapes": ["linear", "branched", "merged", "dirty", "conflicted", "detached", "awkward-paths", "submodule"]
+}

@@ -1,0 +1,7 @@
+{
+  "command": "update-server-info",
+  "mutating": true,
+  "flags": ["-f", "--force", "--no-force"],
+  "positionals": ["", "does-not-exist"],
+  "shapes": ["linear", "branched", "merged", "dirty", "conflicted", "detached", "awkward-paths", "submodule"]
+}

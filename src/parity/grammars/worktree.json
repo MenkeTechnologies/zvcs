@@ -1,0 +1,33 @@
+{
+  "command": "worktree",
+  "mutating": false,
+  "flags": [
+    "--porcelain",
+    "--no-porcelain",
+    "-z",
+    "-v",
+    "--verbose",
+    "--no-verbose",
+    "--expire=now",
+    "--expire=1.day.ago",
+    "--expire=never",
+    "-n",
+    "--dry-run"
+  ],
+  "positionals": [
+    "list",
+    "",
+    "does-not-exist",
+    "--bogus-option"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

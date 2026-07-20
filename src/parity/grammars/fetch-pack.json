@@ -1,0 +1,7 @@
+{
+  "command": "fetch-pack",
+  "mutating": true,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

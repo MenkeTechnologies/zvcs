@@ -1,0 +1,51 @@
+{
+  "command": "check-attr",
+  "mutating": false,
+  "flags": [
+    "-a",
+    "--all",
+    "--no-all",
+    "--cached",
+    "--no-cached",
+    "-z",
+    "--source=HEAD",
+    "--source=main",
+    "--source=feature",
+    "--source=v0.1.0",
+    "--source=v0.2.0",
+    "--source=HEAD~1",
+    "--source=does-not-exist",
+    "--"
+  ],
+  "positionals": [
+    "",
+    "text",
+    "diff",
+    "eol",
+    "binary",
+    "merge",
+    "filter",
+    "export-ignore",
+    "no-such-attr",
+    "README.md",
+    "src/lib.rs",
+    "src/",
+    ".gitattributes",
+    "does-not-exist",
+    "a b/c.txt",
+    "-leading-dash.txt",
+    "./README.md",
+    "/absolute/path",
+    "*.rs"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

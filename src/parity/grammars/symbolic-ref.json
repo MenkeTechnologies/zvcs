@@ -1,0 +1,41 @@
+{
+  "command": "symbolic-ref",
+  "mutating": false,
+  "flags": [
+    "",
+    "-q",
+    "--quiet",
+    "--short",
+    "--recurse",
+    "--no-recurse",
+    "-q --short",
+    "--quiet --short",
+    "--short --no-recurse",
+    "-q --no-recurse",
+    "--short --recurse",
+    "--quiet --short --no-recurse"
+  ],
+  "positionals": [
+    "HEAD",
+    "refs/heads/main",
+    "refs/heads/feature",
+    "refs/tags/v0.1.0",
+    "refs/tags/v0.2.0",
+    "refs/remotes/origin/HEAD",
+    "MERGE_HEAD",
+    "ORIG_HEAD",
+    "does-not-exist",
+    "refs/heads/does-not-exist",
+    "bad..name",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "submodule"
+  ]
+}

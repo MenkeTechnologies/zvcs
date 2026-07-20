@@ -1,0 +1,7 @@
+{
+  "command": "upload-archive",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

@@ -1,0 +1,7 @@
+{
+  "command": "upload-pack",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

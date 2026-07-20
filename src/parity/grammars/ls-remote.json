@@ -1,0 +1,51 @@
+{
+  "command": "ls-remote",
+  "mutating": false,
+  "flags": [
+    "--branches",
+    "-b",
+    "--heads",
+    "--tags",
+    "-t",
+    "--refs",
+    "--symref",
+    "--exit-code",
+    "--get-url",
+    "-q",
+    "--quiet",
+    "--sort=refname",
+    "--sort=-refname",
+    "--sort=version:refname",
+    "--sort=-v:refname",
+    "--sort=objectname",
+    "--sort=creatordate",
+    "--server-option=foo",
+    "-o",
+    "--"
+  ],
+  "positionals": [
+    "",
+    ".",
+    "./",
+    "origin",
+    "HEAD",
+    "main",
+    "feature",
+    "v0.1.0",
+    "v0.2.0",
+    "refs/heads/main",
+    "refs/heads/*",
+    "refs/tags/*",
+    "v*",
+    "does-not-exist",
+    "refs/heads/does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

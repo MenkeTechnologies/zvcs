@@ -1,0 +1,7 @@
+{
+  "command": "http-backend",
+  "mutating": true,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

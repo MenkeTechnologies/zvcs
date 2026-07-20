@@ -1,0 +1,7 @@
+{
+  "command": "remote-ext",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

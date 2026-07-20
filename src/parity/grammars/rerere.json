@@ -1,0 +1,33 @@
+{
+  "command": "rerere",
+  "mutating": true,
+  "flags": [
+    "--rerere-autoupdate",
+    "--no-rerere-autoupdate",
+    "-h",
+    "--bogus-flag"
+  ],
+  "positionals": [
+    "",
+    "clear",
+    "diff",
+    "status",
+    "remaining",
+    "gc",
+    "forget",
+    "README.md",
+    "src/lib.rs",
+    "does-not-exist",
+    "bogus-subcommand"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

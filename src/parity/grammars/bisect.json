@@ -1,0 +1,49 @@
+{
+  "command": "bisect",
+  "mutating": true,
+  "flags": [
+    "--no-checkout",
+    "--first-parent",
+    "--term-new=slow",
+    "--term-old=fast",
+    "--term-bad=broken",
+    "--term-good=works",
+    "--term-new=reset",
+    "--term-good",
+    "--term-old",
+    "--term-bad",
+    "--term-new",
+    "--bogus-flag"
+  ],
+  "positionals": [
+    "",
+    "start",
+    "log",
+    "terms",
+    "next",
+    "skip",
+    "reset",
+    "good",
+    "bad",
+    "old",
+    "new",
+    "help",
+    "HEAD",
+    "main",
+    "feature",
+    "v0.1.0",
+    "v0.2.0",
+    "does-not-exist",
+    "bogus-subcommand"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

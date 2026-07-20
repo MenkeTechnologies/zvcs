@@ -1,0 +1,36 @@
+{
+  "command": "repo",
+  "mutating": false,
+  "flags": [
+    "--keys",
+    "--all",
+    "-z",
+    "--format=lines",
+    "--format=nul",
+    "--format=table"
+  ],
+  "positionals": [
+    "info",
+    "structure",
+    "info layout.bare",
+    "info layout.shallow",
+    "info object.format",
+    "info references.format",
+    "info layout.bare layout.shallow",
+    "info references.format object.format layout.bare layout.shallow",
+    "info does-not-exist",
+    "structure extra-arg",
+    "does-not-exist",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "command": "var",
+  "mutating": false,
+  "flags": ["-l"],
+  "positionals": [
+    "",
+    "GIT_AUTHOR_IDENT",
+    "GIT_COMMITTER_IDENT",
+    "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_PAGER",
+    "GIT_DEFAULT_BRANCH",
+    "GIT_SHELL_PATH",
+    "GIT_ATTR_SYSTEM",
+    "GIT_ATTR_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_GLOBAL",
+    "does-not-exist",
+    "GIT_AUTHOR_NAME",
+    "git_editor",
+    "-l"
+  ],
+  "shapes": ["linear", "detached", "submodule"]
+}

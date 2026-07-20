@@ -1,0 +1,26 @@
+{
+  "command": "show-index",
+  "mutating": false,
+  "flags": [
+    "--object-format=sha1",
+    "--object-format=sha256",
+    "--object-format=bogus",
+    "--no-object-format",
+    "-h"
+  ],
+  "positionals": [
+    "",
+    "does-not-exist",
+    "README.md",
+    "HEAD"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "command": "request-pull",
+  "mutating": false,
+  "flags": ["-p"],
+  "positionals": [
+    "v0.1.0 .",
+    "v0.1.0 . HEAD",
+    "v0.1.0 . main",
+    "v0.2.0 . feature",
+    "v0.1.0 . main:for-upstream",
+    "HEAD~1 . HEAD",
+    "main .",
+    "v0.1.0 ./ HEAD",
+    "v0.1.0 /nonexistent/repo.git HEAD",
+    "does-not-exist . HEAD",
+    "v0.1.0 . does-not-exist",
+    "v0.1.0",
+    ""
+  ],
+  "shapes": ["linear", "branched", "merged", "dirty", "detached"]
+}

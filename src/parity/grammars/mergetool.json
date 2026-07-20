@@ -1,0 +1,7 @@
+{
+  "command": "mergetool",
+  "mutating": true,
+  "flags": ["--tool-help"],
+  "positionals": ["", "README.md", "src/lib.rs", "src", "does-not-exist"],
+  "shapes": ["conflicted", "linear", "merged"]
+}

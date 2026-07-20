@@ -1,0 +1,43 @@
+{
+  "command": "merge-file",
+  "mutating": true,
+  "flags": [
+    "-p",
+    "--stdout",
+    "-q",
+    "--quiet",
+    "--diff3",
+    "--no-diff3",
+    "--zdiff3",
+    "--ours",
+    "--theirs",
+    "--union",
+    "--marker-size=7",
+    "--marker-size=32",
+    "--marker-size=0",
+    "--diff-algorithm=myers",
+    "--diff-algorithm=minimal",
+    "--diff-algorithm=patience",
+    "--diff-algorithm=histogram",
+    "--diff-algorithm=bogus",
+    "--object-id",
+    "--no-object-id",
+    "-L mine",
+    "-L base",
+    "-L theirs"
+  ],
+  "positionals": [
+    "README.md",
+    "src/lib.rs",
+    "does-not-exist",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "awkward-paths"
+  ]
+}

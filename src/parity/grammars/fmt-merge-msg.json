@@ -1,0 +1,35 @@
+{
+  "command": "fmt-merge-msg",
+  "mutating": false,
+  "flags": [
+    "--log",
+    "--log=1",
+    "--log=20",
+    "--log=0",
+    "--no-log",
+    "--summary",
+    "--no-summary",
+    "--message=Merge feature into main",
+    "--no-message",
+    "--into-name=main",
+    "--into-name=feature",
+    "--no-into-name",
+    "--file=README.md",
+    "--file=src/lib.rs",
+    "--file=does-not-exist",
+    "--no-file",
+    "--log=not-a-number",
+    "--bogus-flag"
+  ],
+  "positionals": [
+    "",
+    "HEAD",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "detached"
+  ]
+}

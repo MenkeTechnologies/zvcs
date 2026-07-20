@@ -1,0 +1,34 @@
+{
+  "command": "maintenance",
+  "mutating": true,
+  "flags": [
+    "--auto",
+    "--quiet",
+    "--schedule=hourly",
+    "--schedule=daily",
+    "--schedule=weekly",
+    "--task=commit-graph",
+    "--task=gc",
+    "--task=loose-objects",
+    "--task=incremental-repack",
+    "--task=pack-refs",
+    "--task=reflog-expire",
+    "--task=rerere-gc",
+    "--task=worktree-prune",
+    "--task=bogus-task"
+  ],
+  "positionals": [
+    "run",
+    "is-needed",
+    "",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "submodule"
+  ]
+}

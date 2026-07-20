@@ -1,0 +1,7 @@
+{
+  "command": "difftool",
+  "mutating": true,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

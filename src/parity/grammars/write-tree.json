@@ -1,0 +1,26 @@
+{
+  "command": "write-tree",
+  "mutating": true,
+  "flags": [
+    "--missing-ok",
+    "--prefix=src/",
+    "--prefix=does-not-exist/",
+    "--prefix=README.md/",
+    "--missing-ok --prefix=src/"
+  ],
+  "positionals": [
+    "",
+    "does-not-exist",
+    "HEAD"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

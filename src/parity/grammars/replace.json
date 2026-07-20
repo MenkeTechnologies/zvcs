@@ -1,0 +1,35 @@
+{
+  "command": "replace",
+  "mutating": true,
+  "flags": [
+    "-f",
+    "--force",
+    "-d",
+    "--delete",
+    "-l",
+    "--list",
+    "--format=short",
+    "--format=medium",
+    "--format=long",
+    "--graft",
+    "--convert-graft-file"
+  ],
+  "positionals": [
+    "",
+    "HEAD",
+    "HEAD~1",
+    "HEAD^{tree}",
+    "main",
+    "feature",
+    "v0.1.0",
+    "v0.2.0",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "detached",
+    "dirty"
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "command": "multi-pack-index",
+  "mutating": true,
+  "flags": [
+    "--object-dir=.git/objects",
+    "--progress",
+    "--no-progress",
+    "--bitmap",
+    "--no-bitmap",
+    "--incremental",
+    "--no-incremental",
+    "--write-chain-file",
+    "--no-write-chain-file",
+    "--base=none",
+    "--base=deadbeef",
+    "--preferred-pack=does-not-exist.idx",
+    "--refs-snapshot=/dev/null",
+    "--batch-size=0",
+    "--batch-size=1048576",
+    "--object-dir=does-not-exist"
+  ],
+  "positionals": [
+    "write",
+    "verify",
+    "expire",
+    "repack",
+    "compact",
+    "",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "detached",
+    "submodule"
+  ]
+}

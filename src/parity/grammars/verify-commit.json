@@ -1,0 +1,7 @@
+{
+  "command": "verify-commit",
+  "mutating": false,
+  "flags": ["-v", "--verbose", "--no-verbose", "--raw", "--no-raw"],
+  "positionals": ["HEAD", "HEAD~1", "HEAD^{commit}", "main", "feature", "v0.1.0", "v0.2.0", "@", "", "does-not-exist", "README.md"],
+  "shapes": ["linear", "branched", "merged", "dirty", "detached", "submodule"]
+}

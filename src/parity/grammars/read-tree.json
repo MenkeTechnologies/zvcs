@@ -1,0 +1,50 @@
+{
+  "command": "read-tree",
+  "mutating": true,
+  "flags": [
+    "-m",
+    "--reset",
+    "-u",
+    "-i",
+    "-n",
+    "--dry-run",
+    "-v",
+    "--verbose",
+    "-q",
+    "--quiet",
+    "--trivial",
+    "--aggressive",
+    "--empty",
+    "--no-empty",
+    "--sparse-checkout",
+    "--no-sparse-checkout",
+    "--recurse-submodules",
+    "--no-recurse-submodules",
+    "--prefix=sub/",
+    "--index-output=.git/parity-index",
+    "--exclude-per-directory=.gitignore"
+  ],
+  "positionals": [
+    "HEAD",
+    "",
+    "main",
+    "feature",
+    "v0.1.0",
+    "v0.2.0",
+    "HEAD^{tree}",
+    "HEAD~1",
+    "main feature",
+    "HEAD main feature",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

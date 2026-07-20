@@ -1,0 +1,7 @@
+{
+  "command": "remote-http",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

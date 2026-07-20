@@ -1,0 +1,7 @@
+{
+  "command": "fsmonitor--daemon",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

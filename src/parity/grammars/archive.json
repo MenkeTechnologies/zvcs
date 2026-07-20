@@ -1,0 +1,52 @@
+{
+  "command": "archive",
+  "mutating": false,
+  "flags": [
+    "--format=tar",
+    "--format=zip",
+    "--format=tar.gz",
+    "--format=tgz",
+    "--format=does-not-exist",
+    "--list",
+    "-l",
+    "--verbose",
+    "-v",
+    "--prefix=pfx/",
+    "--prefix=a/b/",
+    "--prefix=nested",
+    "--worktree-attributes",
+    "--mtime=2005-04-07T22:13:13",
+    "--mtime=@0",
+    "--mtime=bogus-time",
+    "--add-virtual-file=extra.txt:hello",
+    "--add-virtual-file=dir/nested.txt:line1",
+    "-0",
+    "-9",
+    "-1"
+  ],
+  "positionals": [
+    "HEAD",
+    "main",
+    "feature",
+    "v0.1.0",
+    "v0.2.0",
+    "HEAD^{tree}",
+    "HEAD:src",
+    "HEAD~1",
+    "README.md",
+    "src/lib.rs",
+    "src",
+    "does-not-exist",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

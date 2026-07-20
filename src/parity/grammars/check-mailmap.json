@@ -1,0 +1,31 @@
+{
+  "command": "check-mailmap",
+  "mutating": false,
+  "flags": [
+    "--mailmap-file=.mailmap",
+    "--mailmap-file=does-not-exist",
+    "--no-mailmap-file",
+    "--mailmap-blob=HEAD:.mailmap",
+    "--mailmap-blob=HEAD:README.md",
+    "--mailmap-blob=does-not-exist",
+    "--no-mailmap-blob"
+  ],
+  "positionals": [
+    "A U Thor <author@example.com>",
+    "<author@example.com>",
+    "author@example.com",
+    "Committer Name <committer@example.com>",
+    "Bad <unclosed",
+    "does-not-exist",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "command": "check-ignore",
+  "mutating": false,
+  "flags": [
+    "-q",
+    "--quiet",
+    "--no-quiet",
+    "-v",
+    "--verbose",
+    "--no-verbose",
+    "-n",
+    "--non-matching",
+    "--no-non-matching",
+    "-z",
+    "--no-index",
+    "--no-no-index",
+    "--index",
+    "--"
+  ],
+  "positionals": [
+    "",
+    "README.md",
+    "src/lib.rs",
+    "src/",
+    "src",
+    ".gitignore",
+    "target/debug/app",
+    "build.log",
+    "a.log",
+    "node_modules/pkg/index.js",
+    ".git/config",
+    "does-not-exist",
+    "does-not-exist.log",
+    "a b/c.txt",
+    "-leading-dash.txt",
+    "./README.md",
+    "../outside.txt",
+    "/absolute/path",
+    "*.log",
+    "sub/../README.md"
+  ],
+  "shapes": [
+    "linear",
+    "dirty",
+    "awkward-paths",
+    "submodule"
+  ]
+}

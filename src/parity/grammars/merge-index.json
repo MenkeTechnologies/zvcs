@@ -1,0 +1,7 @@
+{
+  "command": "merge-index",
+  "mutating": false,
+  "flags": ["-o", "-q", "-a", "--"],
+  "positionals": ["cat", "true", "false", "echo", "README.md", "src/lib.rs", "does-not-exist", ""],
+  "shapes": ["conflicted", "merged", "linear", "dirty", "awkward-paths"]
+}

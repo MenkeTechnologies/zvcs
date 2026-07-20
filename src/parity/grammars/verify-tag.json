@@ -1,0 +1,36 @@
+{
+  "command": "verify-tag",
+  "mutating": false,
+  "flags": [
+    "-v",
+    "--verbose",
+    "--no-verbose",
+    "--raw",
+    "--no-raw",
+    "--format=%(tag)",
+    "--format=%(objectname)",
+    "--format=%(objecttype)",
+    "--format=%(tag) %(objectname)",
+    "--format=%(taggername) %(taggeremail)",
+    "--format=%(contents:subject)",
+    "--format="
+  ],
+  "positionals": [
+    "v0.2.0",
+    "v0.1.0",
+    "refs/tags/v0.2.0",
+    "v0.2.0^{}",
+    "main",
+    "HEAD",
+    "does-not-exist",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "submodule"
+  ]
+}

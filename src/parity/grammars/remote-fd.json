@@ -1,0 +1,7 @@
+{
+  "command": "remote-fd",
+  "mutating": false,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

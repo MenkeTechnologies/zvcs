@@ -1,0 +1,41 @@
+{
+  "command": "cherry",
+  "mutating": false,
+  "flags": [
+    "-v",
+    "--verbose",
+    "--no-verbose",
+    "--abbrev",
+    "--abbrev=4",
+    "--abbrev=7",
+    "--abbrev=12",
+    "--abbrev=40",
+    "--no-abbrev"
+  ],
+  "positionals": [
+    "",
+    "main",
+    "feature",
+    "HEAD",
+    "v0.1.0",
+    "v0.2.0",
+    "main feature",
+    "feature main",
+    "main HEAD",
+    "main feature v0.1.0",
+    "v0.2.0 feature",
+    "HEAD HEAD",
+    "main^",
+    "main~1 feature",
+    "does-not-exist",
+    "main does-not-exist",
+    "README.md"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "detached",
+    "dirty"
+  ]
+}

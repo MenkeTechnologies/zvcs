@@ -1,0 +1,32 @@
+{
+  "command": "verify-pack",
+  "mutating": false,
+  "flags": [
+    "-v",
+    "--verbose",
+    "--no-verbose",
+    "-s",
+    "--stat-only",
+    "--no-stat-only",
+    "--object-format=sha1",
+    "--object-format=sha256",
+    "--object-format=bogus",
+    "--"
+  ],
+  "positionals": [
+    "",
+    ".git/objects/pack/pack.idx",
+    "README.md",
+    "src/lib.rs",
+    ".git/objects/pack",
+    "does-not-exist.idx",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "detached",
+    "submodule"
+  ]
+}

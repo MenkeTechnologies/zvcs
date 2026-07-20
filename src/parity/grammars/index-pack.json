@@ -1,0 +1,38 @@
+{
+  "command": "index-pack",
+  "mutating": true,
+  "flags": [
+    "-v",
+    "--verify",
+    "--rev-index",
+    "--no-rev-index",
+    "--keep",
+    "--keep=parity-harness",
+    "--strict",
+    "--strict=missingEmail=ignore,badTagName=error",
+    "--fsck-objects",
+    "--fsck-objects=missingEmail=ignore",
+    "--check-self-contained-and-connected",
+    "--promisor",
+    "--promisor=parity",
+    "--threads=1",
+    "--threads=0",
+    "--index-version=2",
+    "--max-input-size=1",
+    "--max-input-size=1073741824",
+    "--object-format=sha1"
+  ],
+  "positionals": [
+    "",
+    ".git/objects/pack/pack-does-not-exist.pack",
+    "README.md",
+    "does-not-exist.pack",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "detached"
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "command": "show-ref",
+  "mutating": false,
+  "flags": [
+    "--head",
+    "--branches",
+    "--heads",
+    "--tags",
+    "-d",
+    "--dereference",
+    "-s",
+    "--hash",
+    "--hash=6",
+    "--hash=40",
+    "--abbrev",
+    "--abbrev=4",
+    "--abbrev=8",
+    "--abbrev=40",
+    "-q",
+    "--quiet",
+    "--verify",
+    "--exists",
+    "--"
+  ],
+  "positionals": [
+    "",
+    "main",
+    "feature",
+    "HEAD",
+    "v0.1.0",
+    "v0.2.0",
+    "refs/heads/main",
+    "refs/heads/feature",
+    "refs/tags/v0.1.0",
+    "refs/tags/v0.2.0",
+    "heads/main",
+    "tags/v0.2.0",
+    "refs/heads",
+    "mymain",
+    "does-not-exist",
+    "refs/heads/does-not-exist",
+    "refs/tags/does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

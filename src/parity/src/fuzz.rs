@@ -194,11 +194,19 @@ pub fn grammars() -> Vec<Grammar> {
     ]
 }
 
+/// Every grammar the fuzzer draws from: the hand-written ones above, plus the
+/// per-command grammars generated from git's own documentation.
+fn all_grammars() -> Vec<Grammar> {
+    let mut all = grammars();
+    all.extend(crate::grammars_generated::generated());
+    all
+}
+
 /// Generate `per_cmd` cases for each grammar from `seed`.
 pub fn generate(seed: u64, per_cmd: usize) -> Vec<Case> {
     let mut rng = Rng::new(seed);
     let mut out = Vec::new();
-    for g in grammars() {
+    for g in all_grammars() {
         for _ in 0..per_cmd {
             out.push(sample(&mut rng, &g));
         }

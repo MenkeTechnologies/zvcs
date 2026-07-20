@@ -1,0 +1,49 @@
+{
+  "command": "sparse-checkout",
+  "mutating": true,
+  "flags": [
+    "--cone",
+    "--no-cone",
+    "--sparse-index",
+    "--no-sparse-index",
+    "--skip-checks",
+    "-z",
+    "--dry-run",
+    "-n",
+    "--force",
+    "-f",
+    "--verbose",
+    "-v"
+  ],
+  "positionals": [
+    "",
+    "list",
+    "init",
+    "init --cone",
+    "set",
+    "set src",
+    "set src --no-cone",
+    "set /src/",
+    "set README.md",
+    "add",
+    "add src",
+    "add does-not-exist",
+    "reapply",
+    "check-rules",
+    "clean",
+    "disable",
+    "does-not-exist",
+    "src",
+    "README.md"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

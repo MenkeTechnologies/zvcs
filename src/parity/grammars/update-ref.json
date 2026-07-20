@@ -1,0 +1,42 @@
+{
+  "command": "update-ref",
+  "mutating": true,
+  "flags": [
+    "-d",
+    "-m",
+    "-z",
+    "--deref",
+    "--no-deref",
+    "--create-reflog",
+    "--no-create-reflog",
+    "--no-stdin",
+    "--batch-updates",
+    "--no-batch-updates",
+    "-0"
+  ],
+  "positionals": [
+    "",
+    "HEAD",
+    "main",
+    "feature",
+    "refs/heads/main",
+    "refs/heads/feature",
+    "refs/heads/fuzz-tmp",
+    "refs/tags/v0.1.0",
+    "refs/tags/v0.2.0",
+    "v0.1.0",
+    "v0.2.0",
+    "HEAD^{commit}",
+    "0000000000000000000000000000000000000000",
+    "refs/heads/does-not-exist",
+    "refs/heads/bad..name",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached"
+  ]
+}

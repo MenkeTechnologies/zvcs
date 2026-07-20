@@ -1,0 +1,46 @@
+{
+  "command": "name-rev",
+  "mutating": false,
+  "flags": [
+    "--tags",
+    "--name-only",
+    "--no-undefined",
+    "--always",
+    "--all",
+    "--refs=main",
+    "--refs=feature",
+    "--refs=v0.*",
+    "--refs=refs/tags/*",
+    "--refs=nomatch*",
+    "--no-refs",
+    "--exclude=main",
+    "--exclude=v0.1.0",
+    "--exclude=refs/heads/*",
+    "--no-exclude"
+  ],
+  "positionals": [
+    "",
+    "HEAD",
+    "HEAD^",
+    "HEAD~1",
+    "main",
+    "feature",
+    "v0.1.0",
+    "v0.2.0",
+    "v0.2.0^{commit}",
+    "refs/heads/main",
+    "HEAD@{0}",
+    "main feature",
+    "HEAD main v0.1.0",
+    "does-not-exist",
+    "0000000000000000000000000000000000000000"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "detached",
+    "submodule"
+  ]
+}

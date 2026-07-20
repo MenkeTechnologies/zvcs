@@ -1,0 +1,37 @@
+{
+  "command": "merge-base",
+  "mutating": false,
+  "flags": [
+    "-a",
+    "--all",
+    "--octopus",
+    "--independent",
+    "--is-ancestor",
+    "--fork-point"
+  ],
+  "positionals": [
+    "HEAD",
+    "main",
+    "feature",
+    "main feature",
+    "HEAD feature",
+    "main feature HEAD",
+    "v0.1.0",
+    "v0.2.0",
+    "v0.1.0 v0.2.0",
+    "HEAD~1",
+    "HEAD HEAD",
+    "main main",
+    "HEAD~1 HEAD",
+    "does-not-exist",
+    "main does-not-exist",
+    "README.md",
+    ""
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "detached"
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "command": "commit-graph",
+  "mutating": true,
+  "flags": [
+    "--reachable",
+    "--append",
+    "--changed-paths",
+    "--no-changed-paths",
+    "--split",
+    "--split=no-merge",
+    "--split=replace",
+    "--max-commits=1",
+    "--max-commits=1000",
+    "--size-multiple=2",
+    "--max-new-filters=0",
+    "--max-new-filters=-1",
+    "--no-max-new-filters",
+    "--expire-time=1970-01-01",
+    "--progress",
+    "--no-progress",
+    "--shallow",
+    "--object-dir=.git/objects",
+    "--object-dir=does-not-exist"
+  ],
+  "positionals": [
+    "write",
+    "verify",
+    "",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "detached",
+    "dirty",
+    "awkward-paths",
+    "submodule"
+  ]
+}

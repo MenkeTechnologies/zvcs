@@ -1,0 +1,23 @@
+{
+  "command": "unpack-file",
+  "mutating": true,
+  "flags": ["-h"],
+  "positionals": [
+    "",
+    "HEAD:README.md",
+    "HEAD:src/lib.rs",
+    "main:README.md",
+    "feature:README.md",
+    "feature:src/lib.rs",
+    "v0.1.0:README.md",
+    "v0.2.0:src/lib.rs",
+    ":README.md",
+    ":0:src/lib.rs",
+    "HEAD^{tree}",
+    "HEAD",
+    "HEAD:does-not-exist",
+    "does-not-exist",
+    "0000000000000000000000000000000000000000"
+  ],
+  "shapes": ["linear", "branched", "merged", "dirty", "conflicted", "detached", "awkward-paths", "submodule"]
+}

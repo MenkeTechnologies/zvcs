@@ -1,0 +1,32 @@
+{
+  "command": "gc",
+  "mutating": true,
+  "flags": [
+    "--aggressive",
+    "--auto",
+    "--no-detach",
+    "--cruft",
+    "--no-cruft",
+    "--max-cruft-size=1024",
+    "--prune=now",
+    "--prune=2.weeks.ago",
+    "--no-prune",
+    "--quiet",
+    "--force",
+    "--keep-largest-pack"
+  ],
+  "positionals": [
+    "",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

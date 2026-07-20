@@ -1,0 +1,7 @@
+{
+  "command": "receive-pack",
+  "mutating": true,
+  "flags": [],
+  "positionals": [],
+  "shapes": []
+}

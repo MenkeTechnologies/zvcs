@@ -1,0 +1,37 @@
+{
+  "command": "prune",
+  "mutating": true,
+  "flags": [
+    "-n",
+    "--dry-run",
+    "-v",
+    "--verbose",
+    "--progress",
+    "--expire=now",
+    "--expire=never",
+    "--expire=2.weeks.ago",
+    "--expire=1979-02-26",
+    "--"
+  ],
+  "positionals": [
+    "",
+    "HEAD",
+    "main",
+    "feature",
+    "v0.1.0",
+    "v0.2.0",
+    "HEAD^",
+    "refs/heads/main",
+    "does-not-exist"
+  ],
+  "shapes": [
+    "linear",
+    "branched",
+    "merged",
+    "dirty",
+    "conflicted",
+    "detached",
+    "awkward-paths",
+    "submodule"
+  ]
+}

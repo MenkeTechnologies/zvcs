@@ -58,6 +58,14 @@ CREATE TABLE IF NOT EXISTS repo_status (
     head       TEXT,
     updated_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS snapshots (
+    name       TEXT NOT NULL,
+    git_dir    TEXT NOT NULL,
+    workdir    TEXT,
+    sha        TEXT NOT NULL,
+    created_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS snapshots_name ON snapshots(name);
 ";
 
 /// `~/.zvcs/db.sqlite` (honors `ZVCS_HOME`).
@@ -352,6 +360,38 @@ pub fn list_status(conn: &Connection) -> Result<Vec<StatusRow>> {
                 head: r.get(4)?,
             })
         })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Save a tree-wide snapshot: replace any existing rows for `name` with the given
+/// `(git_dir, workdir, sha)` entries.
+pub fn save_snapshot(conn: &Connection, name: &str, entries: &[(String, String, String)]) -> Result<()> {
+    conn.execute("DELETE FROM snapshots WHERE name = ?1", [name])?;
+    let ts = now();
+    for (git_dir, workdir, sha) in entries {
+        conn.execute(
+            "INSERT INTO snapshots (name, git_dir, workdir, sha, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![name, git_dir, workdir, sha, ts],
+        )?;
+    }
+    Ok(())
+}
+
+/// Load a snapshot's entries as `(git_dir, workdir, sha)`.
+pub fn load_snapshot(conn: &Connection, name: &str) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare("SELECT git_dir, workdir, sha FROM snapshots WHERE name = ?1 ORDER BY git_dir")?;
+    let rows = stmt
+        .query_map([name], |r| Ok((r.get(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// List snapshot names with their repo count.
+pub fn list_snapshots(conn: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare("SELECT name, COUNT(*) FROM snapshots GROUP BY name ORDER BY name")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }

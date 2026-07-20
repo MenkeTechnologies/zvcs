@@ -12,7 +12,8 @@ use std::process::ExitCode;
 /// zvcs-native extension verbs — the superset that stock git does not have.
 pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
-    "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo",
+    "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
+    "zsnapshots",
 ];
 
 pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
@@ -34,6 +35,9 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zstatus" => superset::zstatus(args),
         "zlog" => superset::zlog(args),
         "zundo" => superset::zundo(args),
+        "zsnapshot" => superset::zsnapshot(args),
+        "zrestore" => superset::zrestore(args),
+        "zsnapshots" => superset::zsnapshots(args),
 
         // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----
         "add" => porcelain::add(args),

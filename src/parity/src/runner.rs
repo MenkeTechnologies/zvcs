@@ -62,6 +62,16 @@ pub enum Verdict {
     /// zvcs did not exit within the case timeout while stock git did. Tracked
     /// apart from Crash: a hang is usually a wait on input git does not want.
     Hang,
+    /// Stock git does not agree with *itself* on this invocation, so byte
+    /// comparison cannot measure anything. Established by re-running the stock
+    /// side in a second pristine repo and diffing the two stock outputs — never
+    /// asserted from a pattern.
+    ///
+    /// Only reachable when stock disagrees with stock, so it can never mask a
+    /// real zvcs difference. Reported in its own bucket and excluded from the
+    /// parity denominator: counting an unmeasurable case as a failure is as
+    /// wrong as counting it as a pass.
+    Nondeterministic,
 }
 
 impl Verdict {
@@ -78,6 +88,7 @@ impl Verdict {
             Verdict::StateDiff => "STATE-DIFF",
             Verdict::Crash => "CRASH",
             Verdict::Hang => "HANG",
+            Verdict::Nondeterministic => "NONDETERMINISTIC",
         }
     }
 }
@@ -326,6 +337,16 @@ pub fn run_case(
         Verdict::Match
     };
 
+    // A failing case might be one stock git cannot reproduce itself. Re-run the
+    // stock side in a fresh copy and compare stock against stock; only a
+    // disagreement there reclassifies. Done lazily, on failure only, so the
+    // common path still costs one stock run.
+    let verdict = if verdict != Verdict::Match && stock_disagrees_with_itself(case, templates, workdir, &stock_stdout)? {
+        Verdict::Nondeterministic
+    } else {
+        verdict
+    };
+
     Ok(Outcome {
         case: case.clone(),
         verdict,
@@ -338,6 +359,33 @@ pub fn run_case(
         stock_state: stock_state_n,
         zvcs_state: zvcs_state_n,
     })
+}
+
+/// Re-run the stock side in a second pristine repo and report whether its
+/// output differs from the first stock run.
+///
+/// This is the only evidence accepted for calling a case unmeasurable. Two
+/// things in git's output are non-deterministic by construction — `unpack-file`
+/// prints a randomly named temp file, and `blame` stamps uncommitted lines with
+/// the current wall clock — and no implementation can match a value that is
+/// re-rolled every run.
+///
+/// The alternative would be hand-written masks for each pattern, which have to
+/// be maintained and quietly widen over time. Asking the oracle to reproduce
+/// itself needs no pattern and cannot be aimed at a real difference: if stock
+/// agrees with stock, this returns false and the original verdict stands.
+fn stock_disagrees_with_itself(
+    case: &Case,
+    templates: &Templates,
+    workdir: &Path,
+    first_stdout: &str,
+) -> Result<bool> {
+    let repo = workdir.join("stock-repeat");
+    let _ = std::fs::remove_dir_all(&repo);
+    templates.instantiate(case.shape, &repo)?;
+    let home = &templates.home;
+    let again = run_side(Path::new("git"), &repo, home, &case.args)?;
+    Ok(normalize(&again.stdout, &repo, home) != *first_stdout)
 }
 
 /// Locate the zvcs `git` binary. Explicit override wins; otherwise the usual

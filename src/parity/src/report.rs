@@ -67,11 +67,24 @@ pub struct Tally {
     pub exit_diff: usize,
     pub state_diff: usize,
     pub crash: usize,
+    pub nondeterministic: usize,
     pub hang: usize,
 }
 
 impl Tally {
+    /// Every case run, including ones nothing could score.
     pub fn total(&self) -> usize {
+        self.scored() + self.nondeterministic
+    }
+
+    /// Cases a byte comparison can actually judge — the parity denominator.
+    ///
+    /// Non-deterministic cases are excluded rather than counted as failures:
+    /// stock git does not reproduce them itself, so no implementation could
+    /// match, and scoring them against zvcs would understate parity as surely
+    /// as passing them would overstate it. The count is always printed beside
+    /// the percentage so the exclusion is visible, never inferred.
+    pub fn scored(&self) -> usize {
         self.matched
             + self.unsupported
             + self.stdout_diff
@@ -90,14 +103,15 @@ impl Tally {
             Verdict::StateDiff => self.state_diff += 1,
             Verdict::Crash => self.crash += 1,
             Verdict::Hang => self.hang += 1,
+            Verdict::Nondeterministic => self.nondeterministic += 1,
         }
     }
 
     pub fn pct(&self) -> f64 {
-        if self.total() == 0 {
+        if self.scored() == 0 {
             0.0
         } else {
-            100.0 * self.matched as f64 / self.total() as f64
+            100.0 * self.matched as f64 / self.scored() as f64
         }
     }
 }
@@ -122,6 +136,26 @@ pub fn tally(outcomes: Vec<Outcome>) -> Report {
     Report { by_cmd, overall, failures }
 }
 
+/// Render a percentage that never rounds up to a milestone it has not reached.
+///
+/// 4119/4121 is 99.951%, which `{:.1}%` prints as "100.0%" — a number a reader
+/// will take to mean "no failures". Anything short of every case matching is
+/// capped just below, so only a genuine sweep can display 100%.
+fn pct_str(matched: usize, scored: usize) -> String {
+    if scored == 0 {
+        return "n/a".to_string();
+    }
+    if matched == scored {
+        return "100%".to_string();
+    }
+    let pct = 100.0 * matched as f64 / scored as f64;
+    if pct > 99.9 {
+        format!("{:.3}%", pct)
+    } else {
+        format!("{:.1}%", pct)
+    }
+}
+
 /// Truncate long diffs so one pathological case cannot bury the rest.
 fn clip(s: &str, lines: usize) -> String {
     let mut out: Vec<&str> = s.lines().take(lines).collect();
@@ -140,10 +174,10 @@ impl Report {
             if total == 0 { 0.0 } else { 100.0 * have as f64 / total as f64 }
         );
         println!(
-            "parity   : {}/{} cases matched ({:.1}%)",
+            "parity   : {}/{} cases matched ({})",
             self.overall.matched,
-            self.overall.total(),
-            self.overall.pct()
+            self.overall.scored(),
+            pct_str(self.overall.matched, self.overall.scored())
         );
         println!(
             "           unsupported={} stdout-diff={} exit-diff={} state-diff={} crash={} hang={}",
@@ -154,13 +188,19 @@ impl Report {
             self.overall.crash,
             self.overall.hang
         );
+        if self.overall.nondeterministic > 0 {
+            println!(
+                "           excluded={} (stock git does not reproduce these itself)",
+                self.overall.nondeterministic
+            );
+        }
 
         println!("\n--- per subcommand ---");
         println!("{:<14} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>7}", "cmd", "total", "match", "unsupp", "out", "exit", "state", "parity");
         for (cmd, t) in &self.by_cmd {
             println!(
                 "{:<14} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6} {:>6.1}%",
-                cmd, t.total(), t.matched, t.unsupported, t.stdout_diff, t.exit_diff, t.state_diff, t.pct()
+                cmd, t.scored(), t.matched, t.unsupported, t.stdout_diff, t.exit_diff, t.state_diff, t.pct()
             );
         }
 

@@ -7,6 +7,7 @@
 //! outlives the invoking command and never holds the terminal.
 
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Ensure a coordinator is running for the current repo, if `[zvcs]` autonomy is
@@ -19,21 +20,30 @@ pub fn ensure_if_configured() {
         return;
     }
 
-    let git_dir = repo.git_dir();
     let sock = crate::superset::zdaemon::socket_path();
     // Already listening? A successful connect means the singleton daemon is up.
     if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
         return;
     }
 
+    let workdir = repo
+        .workdir()
+        .unwrap_or_else(|| repo.git_dir())
+        .to_path_buf();
+    spawn_detached(&workdir);
+}
+
+/// Spawn `git zdaemon start` detached (own process group, stdio → the singleton
+/// log), rooted at `workdir` so it discovers the right repo to watch. Fire and
+/// forget — a race with another spawner is harmless (the loser's `start` bails
+/// "daemon already running"). Used by autostart and by `zdaemon restart`.
+pub fn spawn_detached(workdir: &Path) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let workdir = repo.workdir().unwrap_or(git_dir).to_path_buf();
-
     let mut cmd = Command::new(exe);
     cmd.args(["zdaemon", "start"])
-        .current_dir(&workdir)
+        .current_dir(workdir)
         .stdin(Stdio::null());
 
     // Route daemon output to the singleton log; never the terminal (no chatter).
@@ -55,11 +65,6 @@ pub fn ensure_if_configured() {
         }
     }
 
-    // Detach into its own process group so a terminal signal to the invoking
-    // command does not also kill the daemon.
     cmd.process_group(0);
-
-    // Fire and forget: a race with another instance spawning simultaneously is
-    // harmless — the loser's `start` bails "daemon already running".
     let _ = cmd.spawn();
 }

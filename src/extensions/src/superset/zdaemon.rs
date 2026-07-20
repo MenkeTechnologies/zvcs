@@ -94,15 +94,26 @@ fn reply(mut stream: &UnixStream, msg: &str) {
     let _ = stream.flush();
 }
 
+const USAGE: &str = "usage: git zdaemon <start|stop|restart|reload|status|info|ping|log>";
+
 pub fn zdaemon(args: &[String]) -> Result<ExitCode> {
     let action = args.first().map(String::as_str).unwrap_or("");
     match action {
         "start" => start(),
-        "status" => status(),
         "stop" => stop(),
-        "" => anyhow::bail!("usage: git zdaemon <start|stop|status>"),
-        other => anyhow::bail!("unknown action {other:?} (want start|stop|status)"),
+        "restart" | "reload" => restart(),
+        "status" => status(),
+        "info" => info(),
+        "ping" => ping_cmd(),
+        "log" => log_cmd(&args[1..]),
+        "" => anyhow::bail!("{USAGE}"),
+        other => anyhow::bail!("unknown action {other:?} — {USAGE}"),
     }
+}
+
+/// The daemon's pidfile, written on start and removed on stop.
+fn pid_path() -> PathBuf {
+    zvcs_home().join("zvcs.pid")
 }
 
 /// Probe whether a live daemon owns the socket.
@@ -132,6 +143,9 @@ fn start() -> Result<ExitCode> {
 
     let listener = UnixListener::bind(&path)
         .map_err(|e| anyhow::anyhow!("cannot bind {}: {e}", path.display()))?;
+
+    // Record our pid for `zdaemon info`.
+    let _ = std::fs::write(pid_path(), std::process::id().to_string());
 
     let (tx, rx): (Sender<Cmd>, Receiver<Cmd>) = mpsc::channel();
 
@@ -210,6 +224,7 @@ fn worker_loop(rx: Receiver<Cmd>, sock_path: PathBuf) {
             Cmd::Stop { stream } => {
                 reply(&stream, "STOPPING");
                 let _ = std::fs::remove_file(&sock_path);
+                let _ = std::fs::remove_file(pid_path());
                 std::process::exit(0);
             }
         }
@@ -410,18 +425,139 @@ fn status() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `git zdaemon stop` — ask the daemon to exit, then reap the socket.
+/// `git zdaemon stop` — ask the daemon to exit, then reap the socket + pidfile.
 fn stop() -> Result<ExitCode> {
     let path = socket_path();
     match query(&path, "STOP") {
-        Some(resp) => {
-            println!("{resp}");
-            let _ = std::fs::remove_file(&path);
+        Some(resp) => println!("{resp}"),
+        None => println!("not running"),
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(pid_path());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git zdaemon restart` (alias `reload`) — stop any running daemon, then respawn
+/// it detached (re-reading `[zvcs]` config and rebuilding the watch set).
+fn restart() -> Result<ExitCode> {
+    let path = socket_path();
+    if ping(&path) {
+        let _ = query(&path, "STOP");
+    }
+    // Wait for the old daemon to release the socket.
+    for _ in 0..50 {
+        if !path.exists() {
+            break;
         }
-        None => {
-            println!("not running");
-            let _ = std::fs::remove_file(&path);
+        thread::sleep(Duration::from_millis(40));
+    }
+    let _ = std::fs::remove_file(&path);
+
+    let workdir = gix::discover(".")
+        .ok()
+        .and_then(|r| r.workdir().map(|w| w.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    crate::autostart::spawn_detached(&workdir);
+
+    for _ in 0..75 {
+        if ping(&path) {
+            println!("restarted");
+            return Ok(ExitCode::SUCCESS);
         }
+        thread::sleep(Duration::from_millis(40));
+    }
+    println!("restart: daemon did not come up (see {})", zvcs_home().join("zvcs.log").display());
+    Ok(ExitCode::FAILURE)
+}
+
+/// `git zdaemon ping` — exit 0 if a daemon is live, 1 otherwise (scriptable).
+fn ping_cmd() -> Result<ExitCode> {
+    if ping(&socket_path()) {
+        println!("running");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        println!("not running");
+        Ok(ExitCode::FAILURE)
+    }
+}
+
+/// `git zdaemon log [-n N] [-f]` — show (and optionally follow) the daemon log.
+fn log_cmd(args: &[String]) -> Result<ExitCode> {
+    let mut n: usize = 40;
+    let mut follow = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-n" => {
+                i += 1;
+                n = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(n);
+            }
+            "-f" | "--follow" => follow = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    let log = zvcs_home().join("zvcs.log");
+    let content = std::fs::read_to_string(&log).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    for l in &lines[start..] {
+        println!("{l}");
+    }
+    if follow {
+        // Simple tail -f: print bytes appended after our current position.
+        let mut pos = content.len() as u64;
+        loop {
+            thread::sleep(Duration::from_millis(400));
+            let Ok(meta) = std::fs::metadata(&log) else { continue };
+            let len = meta.len();
+            if len > pos {
+                if let Ok(mut f) = std::fs::File::open(&log) {
+                    use std::io::{Read, Seek, SeekFrom};
+                    if f.seek(SeekFrom::Start(pos)).is_ok() {
+                        let mut buf = String::new();
+                        if f.read_to_string(&mut buf).is_ok() {
+                            print!("{buf}");
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
+                    }
+                }
+                pos = len;
+            } else if len < pos {
+                pos = len; // log rotated/truncated
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git zdaemon info` — running state, paths, pid, live lane snapshot, config.
+fn info() -> Result<ExitCode> {
+    let sock = socket_path();
+    let running = ping(&sock);
+    println!("running: {running}");
+    if let Ok(pid) = std::fs::read_to_string(pid_path()) {
+        println!("pid:     {}", pid.trim());
+    }
+    println!("socket:  {}", sock.display());
+    println!("home:    {}", zvcs_home().display());
+    println!("log:     {}", zvcs_home().join("zvcs.log").display());
+    println!("db:      {}", crate::db::db_path().display());
+    if let Some(state) = query(&sock, "STATUS") {
+        println!("state:   {state}");
+    }
+    if let Ok(repo) = gix::discover(".") {
+        let cfg = crate::config::ZvcsConfig::load(&repo);
+        println!(
+            "config:  autoreconcile={} autobump={} autocrawl={} autostatus={} hook={} interval={}s",
+            cfg.autoreconcile,
+            cfg.autobump,
+            cfg.autocrawl,
+            cfg.autostatus,
+            cfg.hook.is_some(),
+            cfg.interval.as_secs()
+        );
     }
     Ok(ExitCode::SUCCESS)
 }

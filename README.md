@@ -134,6 +134,10 @@ attached; a dirty worktree is skipped. `git zbump [<path>...]` advances the
 parent's gitlink to each submodule's HEAD **only** on a fast-forward, then
 **commits** the coalesced bumps (clearing the `(new commits)` marker). `git
 zdaemon <start|stop|status>` controls the singleton coordinator (below). `git
+zdaemon <start|stop|restart|reload|status|info|ping|log>` is the full daemon
+control surface — `restart`/`reload` respawn it (re-reading config), `ping` is a
+scriptable liveness check, `info` prints pid/socket/paths/config, and `log [-n
+N] [-f]` shows/tails `~/.zvcs/zvcs.log`. `git
 zup` brings the whole tree — the top-level repo **and** every nested submodule —
 to latest `origin/main` (fetch + fast-forward, attached; dirty/diverged skipped).
 

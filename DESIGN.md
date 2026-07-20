@@ -103,6 +103,14 @@ Wire protocol (line-framed) extends the current
 (`ACQUIRE <git-dir> <client-id>`), plus `SUBMIT`/`JOB`, `JOBSTOP`,
 `JOBRESTART`, `REINDEX`, and a `REPL` upgrade.
 
+**Control surface:** `git zdaemon <start|stop|restart|reload|status|info|ping|log>`.
+`restart`/`reload` STOP the running daemon and respawn it detached (re-reading
+`[zvcs]` config, rebuilding the watch set); `ping` is a scriptable liveness check
+(exit 0/1); `info` reports pid (from `~/.zvcs/zvcs.pid`, written on start),
+socket/home/db paths, the live lane snapshot, and the resolved config; `log [-n
+N] [-f]` shows/tails `~/.zvcs/zvcs.log`. These are client-side wrappers over the
+existing `STATUS`/`STOP` protocol + the pidfile — no new wire verbs.
+
 ## 4. Concurrency model & submodule topology
 
 Each submodule is its own repository with its own index at

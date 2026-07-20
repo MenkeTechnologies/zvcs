@@ -133,9 +133,13 @@ cargo build
 ./target/debug/git rev-parse HEAD
 ./target/debug/git rev-parse --abbrev-ref HEAD
 
-# superset: the singleton fair-lock coordinator
+# superset: the singleton fair-lock coordinator (full control surface)
 ./target/debug/git zdaemon start
-./target/debug/git zdaemon status
+./target/debug/git zdaemon status       # holder / lane snapshot
+./target/debug/git zdaemon info         # pid, socket, paths, config
+./target/debug/git zdaemon ping         # exit 0 if live (scriptable)
+./target/debug/git zdaemon restart      # respawn, re-reading config
+./target/debug/git zdaemon log -f       # tail ~/.zvcs/zvcs.log
 ./target/debug/git zdaemon stop
 
 # coordination: reconcile submodules to mainline (attached, ff-only) + bump pointers

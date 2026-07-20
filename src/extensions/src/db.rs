@@ -44,6 +44,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at   INTEGER
 );
 CREATE INDEX IF NOT EXISTS jobs_repo_state ON jobs(repo_id, state);
+CREATE TABLE IF NOT EXISTS claims (
+    repo_id    INTEGER PRIMARY KEY REFERENCES repos(id),
+    session    TEXT NOT NULL,
+    workdir    TEXT,
+    claimed_at INTEGER
+);
 ";
 
 /// `~/.zvcs/db.sqlite` (honors `ZVCS_HOME`).
@@ -291,6 +297,60 @@ pub fn restart_job(conn: &Connection, id: i64) -> Result<Option<(i64, String)>> 
         rusqlite::params![repo_id, kind, spec, session, id, now()],
     )?;
     Ok(Some((conn.last_insert_rowid(), spec)))
+}
+
+/// Outcome of a claim attempt.
+pub enum ClaimResult {
+    /// The claim was newly acquired by this session.
+    Acquired,
+    /// This session already held the claim.
+    AlreadyMine,
+    /// Another session holds it (carries that session).
+    HeldBy(String),
+}
+
+/// Claim `repo_id` for `session` (one claim per repo, race-safe via the PK).
+pub fn claim(conn: &Connection, repo_id: i64, session: &str, workdir: Option<&str>) -> Result<ClaimResult> {
+    let held: Option<String> = conn
+        .query_row("SELECT session FROM claims WHERE repo_id=?1", [repo_id], |r| r.get(0))
+        .optional()?;
+    if let Some(s) = held {
+        return Ok(if s == session { ClaimResult::AlreadyMine } else { ClaimResult::HeldBy(s) });
+    }
+    match conn.execute(
+        "INSERT INTO claims (repo_id, session, workdir, claimed_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![repo_id, session, workdir, now()],
+    ) {
+        Ok(_) => Ok(ClaimResult::Acquired),
+        Err(_) => {
+            // Lost a race — report the winner.
+            let s: String = conn.query_row("SELECT session FROM claims WHERE repo_id=?1", [repo_id], |r| r.get(0))?;
+            Ok(if s == session { ClaimResult::AlreadyMine } else { ClaimResult::HeldBy(s) })
+        }
+    }
+}
+
+/// Release `repo_id`'s claim if held by `session`. Returns true if a claim was removed.
+pub fn unclaim(conn: &Connection, repo_id: i64, session: &str) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM claims WHERE repo_id=?1 AND session=?2",
+        rusqlite::params![repo_id, session],
+    )?;
+    Ok(n > 0)
+}
+
+/// All active claims as `(path, session, claimed_at)` — `path` is the workdir,
+/// falling back to the git dir.
+pub fn list_claims(conn: &Connection) -> Result<Vec<(String, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(c.workdir, r.git_dir), c.session, c.claimed_at
+         FROM claims c JOIN repos r ON r.id = c.repo_id
+         ORDER BY c.claimed_at",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 pub fn mark_notified(conn: &Connection, ids: &[i64]) -> Result<()> {

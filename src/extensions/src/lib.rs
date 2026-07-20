@@ -52,6 +52,14 @@ pub fn run() -> ExitCode {
     }
 }
 
+/// The current session key for attributing operations to an agent: `ZVCS_SESSION`
+/// if set (export `ZVCS_SESSION=$$` per shell), else the parent process id. Used
+/// by claims, job submission, and the op ledger.
+pub fn session_key() -> String {
+    std::env::var("ZVCS_SESSION")
+        .unwrap_or_else(|_| format!("pid-{}", std::os::unix::process::parent_id()))
+}
+
 /// Print (once) any unnotified failed autonomous jobs for the current repo, then
 /// mark them notified. Cheap no-op when there is no ledger or no failures; never
 /// creates the ledger (only reads/updates one the daemon already made).

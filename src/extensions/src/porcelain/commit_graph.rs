@@ -46,7 +46,7 @@ usage: git commit-graph verify [--object-dir <dir>] [--shallow] [--[no-]progress
 pub fn commit_graph(args: &[String]) -> Result<ExitCode> {
     // `-h` is handled before anything else, exactly as parse-options does:
     // usage to stdout, exit 129.
-    if args[1..].iter().any(|a| a == "-h") {
+    if args.iter().any(|a| a == "-h") {
         print!("{USAGE}");
         return Ok(ExitCode::from(129));
     }

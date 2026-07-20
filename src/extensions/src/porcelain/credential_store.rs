@@ -43,8 +43,7 @@ use std::process::ExitCode;
 /// timeout is upstream's 1000 ms default, since reading it would mean opening a
 /// repository this command otherwise never needs.
 pub fn credential_store(args: &[String]) -> Result<ExitCode> {
-    // args[0] is the subcommand name itself.
-    let parsed = match parse_args(&args[1..]) {
+    let parsed = match parse_args(args) {
         Ok(p) => p,
         Err(UsageError::Help) => {
             print!("{USAGE}");

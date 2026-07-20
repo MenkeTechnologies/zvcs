@@ -16,8 +16,10 @@
 //! another algorithm would change the merge result.
 //!
 //! The three-way line merge itself is a port of the built-in text driver from
-//! the vendored `gix-merge` crate (`blob/builtin_driver/text`), inlined here
-//! because the `gix/merge` feature is not enabled for this build. It carries
+//! the vendored `gix-merge` crate (`blob/builtin_driver/text`), inlined here.
+//! (The `gix/merge` feature is enabled now, so this could call the crate
+//! directly instead; the inlined copy is kept until that swap is verified
+//! against the parity harness rather than assumed equivalent.) It carries
 //! that crate's known deviations from git's `xdl_merge` around conflict-region
 //! line-ending detection, so pathological inputs (mixed CRLF, missing trailing
 //! newline inside a conflict) may differ from stock git by a line terminator.
@@ -82,8 +84,7 @@ struct Labels<'a> {
 
 /// `git merge-file` — see the module docs for the covered surface.
 pub fn merge_file(args: &[String]) -> Result<ExitCode> {
-    // args[0] is the subcommand name itself.
-    let argv = &args[1..];
+    let argv = args;
 
     let mut to_stdout = false;
     let mut quiet = false;

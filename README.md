@@ -101,9 +101,23 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | `zdaemon` | superset | Implemented — `start` / `stop` / `status`. |
 | `zsync` | superset | Implemented — reconcile submodules to mainline, kept attached. |
 | `zbump` | superset | Implemented — forward-only gitlink bumps. |
-| `rev-parse` | git-compat | Partial — resolves `HEAD` and `--abbrev-ref HEAD`. |
+| every stock subcommand | git-compat | Dispatched — depth varies; see the parity report. |
 
-Anything else errors `not yet ported`; there is no fallthrough to stock git.
+Every subcommand stock git ships has a dispatch arm, so nothing reaches the
+`not yet ported` path; there is no fallthrough to stock git. Dispatching is not
+the same as agreeing with git, and the two are measured separately — an
+unimplemented flag errors terse rather than guessing, and the parity harness
+scores that as a failure.
+
+Run the harness to see current depth per subcommand:
+
+```sh
+cargo run -p zvcs-parity                 # curated corpus
+cargo run -p zvcs-parity -- --fuzz 12    # plus generated flag combinations
+```
+
+It builds fixture repositories with stock git, runs each invocation against both
+binaries, and compares stdout, exit code, and the resulting repository state.
 
 ## [0x04] THE SUPERSET VERBS
 
@@ -177,13 +191,32 @@ always skipped — autonomy never regresses or clobbers in-flight work.
 
 ## [0x07] STATUS & ROADMAP
 
-Early and in active development. Implemented today: the `git` shadow binary and
-dispatch, `rev-parse` (`HEAD` / `--abbrev-ref`), all three superset verbs
-(`zdaemon`, `zsync`, `zbump`) with the `RepoLock` daemon client, and the
-autonomous `[zvcs]` mode (config-gated auto-spawn + background reconcile/bump).
-FCFS lock serialization and the fetch→ff→attach→worktree reconcile are covered
-by tests. Git-compat porcelain is ported one subcommand at a time on top of the
-vendored gitoxide.
+Early and in active development.
+
+The coordination layer is implemented: the `git` shadow binary and dispatch, all
+three superset verbs (`zdaemon`, `zsync`, `zbump`) with the `RepoLock` daemon
+client, and the autonomous `[zvcs]` mode (config-gated auto-spawn + background
+reconcile/bump). FCFS lock serialization and the fetch→ff→attach→worktree
+reconcile are covered by tests.
+
+Git compatibility is tracked as two independent numbers, because a subcommand
+that dispatches is not thereby correct:
+
+- **Coverage** — every subcommand stock git ships is dispatched natively.
+- **Parity** — the share of harness cases whose stdout, exit code, and resulting
+  repository state match stock git exactly.
+
+Parity is the number that matters and it is the work that remains. Depth varies
+widely per subcommand; some are byte-faithful across their documented flag set,
+others implement the common flags and bail terse on the rest. A few subcommands
+are honest skeletons that name the missing substrate instead of pretending:
+the foreign-SCM bridges (`p4`, `cvsimport`, `cvsserver`, `cvsexportcommit`,
+`archimport`) and the shell/Perl tools (`imap-send`, `instaweb`, `subtree`,
+`filter-branch`) have no gitoxide backing to port onto.
+
+Mutating subcommands are currently excluded from generated fuzz cases, so their
+parity rests on curated cases only. Treat their scores as less well covered than
+the read-only ones rather than as evidence of correctness.
 
 ## [0x08] DOCUMENTATION
 

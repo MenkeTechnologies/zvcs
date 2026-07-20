@@ -69,7 +69,8 @@ pub fn check_mailmap(args: &[String]) -> Result<ExitCode> {
         contacts: Vec::new(),
     };
 
-    let rest = &args[1..];
+    // Dispatch already strips the verb, so every element is a real argument.
+    let rest = args;
     let mut no_more_opts = false;
     let mut i = 0;
     while i < rest.len() {

@@ -51,7 +51,7 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
     let mut revs: Vec<&str> = Vec::new();
     let mut no_more_opts = false;
 
-    for a in args.iter().skip(1) {
+    for a in args.iter() {
         let a = a.as_str();
         if no_more_opts || !a.starts_with('-') || a == "-" {
             revs.push(a);

@@ -73,7 +73,8 @@ struct RrEntry {
 /// rewriting `MERGE_RR`. With an actual conflict in flight both need
 /// `ll_merge()`, so they `bail!` rather than record a wrong conflict id.
 pub fn rerere(args: &[String]) -> Result<ExitCode> {
-    let rest = &args[1..];
+    // Dispatch strips the verb; every element here is a real argument.
+    let rest = args;
 
     // git.c short-circuits a bare `-h` before repository setup, so it works
     // outside a repository; every other form runs RUN_SETUP first.

@@ -104,7 +104,7 @@ pub fn cherry(args: &[String]) -> Result<ExitCode> {
     let mut positional: Vec<&str> = Vec::new();
     let mut end_of_options = false;
 
-    for a in args.iter().skip(1) {
+    for a in args.iter() {
         let a = a.as_str();
         if end_of_options {
             positional.push(a);

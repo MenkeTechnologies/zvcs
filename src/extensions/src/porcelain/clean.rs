@@ -48,7 +48,7 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
     let mut pathspecs: Vec<BString> = Vec::new();
     let mut no_more_opts = false;
 
-    for a in args.iter().skip(1) {
+    for a in args.iter() {
         if !no_more_opts && a == "--" {
             no_more_opts = true;
             continue;

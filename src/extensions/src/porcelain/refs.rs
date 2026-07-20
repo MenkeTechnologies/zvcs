@@ -111,8 +111,8 @@ const PER_WORKTREE: [&str; 3] = ["refs/worktree/", "refs/bisect/", "refs/rewritt
 
 /// `git refs` — see the module docs for the covered surface.
 pub fn refs(args: &[String]) -> Result<ExitCode> {
-    // `args[0]` is the subcommand name `refs` itself, as dispatch passes it.
-    let Some(sub) = args.get(1) else {
+    // Dispatch strips the verb, so `args[0]` is this command's own subcommand.
+    let Some(sub) = args.first() else {
         eprint!("error: need a subcommand\n{USAGE}");
         return Ok(ExitCode::from(129));
     };
@@ -122,9 +122,10 @@ pub fn refs(args: &[String]) -> Result<ExitCode> {
             print!("{USAGE}");
             Ok(ExitCode::from(129))
         }
-        "exists" => exists(&args[2..]),
-        "list" => list(&args[2..]),
-        "optimize" => optimize(&args[1..]),
+        "exists" => exists(&args[1..]),
+        "list" => list(&args[1..]),
+        // `optimize` keeps its own leading token: the pack-refs port skips it.
+        "optimize" => optimize(args),
         "migrate" => bail!(
             "unsupported subcommand \"migrate\": the vendored gix-ref has no reftable backend \
              (only the loose+packed files store), so there is no format to migrate to"

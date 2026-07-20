@@ -72,7 +72,8 @@ enum Op {
 /// `args[0]` is the subcommand name itself; exactly one further argument — the
 /// action — is accepted, matching git's own arity check.
 pub fn credential(args: &[String]) -> Result<ExitCode> {
-    let rest = &args[1..];
+    // Dispatch strips the verb; every element here is a real argument.
+    let rest = args;
     if rest.len() != 1 {
         eprintln!("{USAGE}");
         return Ok(ExitCode::from(129));

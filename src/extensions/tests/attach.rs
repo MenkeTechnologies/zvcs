@@ -107,3 +107,23 @@ fn reattaches_dirty_detached_head_without_clobbering() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn refuses_to_attach_when_branch_is_ahead() {
+    // main is ahead of a detached HEAD → attaching would need a worktree move (or
+    // move main backward), so ensure_attached refuses rather than clobber.
+    let tmp = init_repo("ahead");
+    let c0 = head_sha(&tmp);
+    git(&tmp, &["commit", "--allow-empty", "-q", "-m", "c1"]); // main -> c1
+    git(&tmp, &["checkout", "-q", "--detach", &c0]); // HEAD detached at c0, main=c1
+
+    let repo = gix::discover(&tmp).expect("discover");
+    let outcome = ensure_attached(&repo).expect("ensure_attached");
+    assert!(matches!(outcome, Attached::Refused(_)), "must refuse when main is ahead of HEAD");
+
+    // HEAD must remain detached (nothing was attached/clobbered).
+    let repo = gix::discover(&tmp).expect("re-discover");
+    assert!(repo.head_name().unwrap().is_none(), "HEAD must stay detached after refusal");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

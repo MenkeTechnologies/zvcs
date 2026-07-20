@@ -22,7 +22,31 @@ use std::process::ExitCode;
 /// Parse `argv`, dispatch the subcommand, and return the process exit code.
 /// Errors are reported terse on stderr as `zvcs: <command>: <reason>`.
 pub fn run() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+
+    // Consume the leading git-global options we support, so `git -C <dir> <verb>`
+    // (extremely common in scripts and tooling) reaches the verb instead of
+    // treating `-C` as the subcommand. `-C <dir>` chdirs (before autostart /
+    // failure-surfacing, which key off the cwd); the pager flags are accepted and
+    // ignored (zvcs never pages). Unrecognized globals (`-c`, `--git-dir`, …) are
+    // left in place and surface as an error rather than being silently mishandled.
+    let mut idx = 0;
+    while idx < raw.len() {
+        match raw[idx].as_str() {
+            "-C" => {
+                let Some(dir) = raw.get(idx + 1) else { break };
+                if std::env::set_current_dir(dir).is_err() {
+                    eprintln!("zvcs: -C: cannot chdir to {dir}");
+                    return ExitCode::FAILURE;
+                }
+                idx += 2;
+            }
+            "-p" | "-P" | "--paginate" | "--no-pager" => idx += 1,
+            _ => break,
+        }
+    }
+    let args = &raw[idx..];
+
     let Some(sub) = args.first() else {
         eprintln!("zvcs: no subcommand given");
         return ExitCode::FAILURE;
@@ -74,7 +98,12 @@ fn surface_pending_failures() {
         Ok(p) => p,
         Err(_) => return,
     };
-    let Ok(conn) = db::open_rw() else {
+    // Read with the cheap RO handle: this runs on EVERY git invocation across all
+    // concurrent instances, and the common case is zero pending failures. Opening
+    // RW here would replay the whole schema DDL and take a write lock every time,
+    // purely to run a SELECT. Only take the RW handle when there is something to
+    // clear.
+    let Ok(conn) = db::open_ro() else {
         return;
     };
     let Ok(pending) = db::pending_failures(&conn, &git_dir) else {
@@ -91,5 +120,7 @@ fn surface_pending_failures() {
             eprintln!("zvcs: {kind} failed: {reason}");
         }
     }
-    let _ = db::mark_notified(&conn, &ids);
+    if let Ok(wconn) = db::open_rw() {
+        let _ = db::mark_notified(&wconn, &ids);
+    }
 }

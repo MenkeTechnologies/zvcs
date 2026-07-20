@@ -43,3 +43,33 @@ fn zforeach_runs_across_all_and_subset() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn double_dash_shields_command_args_from_selector_parsing() {
+    // The command after `--` may itself contain selector-looking flags. They must
+    // reach the command, NOT be consumed as selectors (which would both mangle the
+    // command and narrow the repo set — running the wrong command on the wrong set).
+    let root = std::env::temp_dir().join(format!("zvcs-fedd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+
+    for name in ["alpha", "beta"] {
+        let r = root.join(name);
+        std::fs::create_dir_all(&r).unwrap();
+        git(&r, &["init", "-q", "-b", "main"]);
+        git(&r, &["commit", "--allow-empty", "-q", "-m", "c0"]);
+    }
+    assert!(Command::new(BIN).args(["zreindex", root.to_str().unwrap()]).current_dir(&root).env("ZVCS_HOME", &home).status().unwrap().success());
+
+    // `--session prod` here is part of the COMMAND (echo's args), not a selector.
+    // No repo is claimed by "prod", so the buggy path narrows to zero → "no repos
+    // matched" and drops the command's args.
+    let out = zvcs(&home, &root, &["zforeach", "--", "echo", "hi", "--session", "prod"]);
+    assert!(!out.contains("no repos matched"), "command's --session was wrongly parsed as a selector:\n{out}");
+    assert!(out.contains("alpha") && out.contains("beta"), "must run across ALL repos:\n{out}");
+    assert!(out.contains("--session prod"), "the command must receive its own --session arg:\n{out}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

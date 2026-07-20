@@ -111,8 +111,8 @@ pub fn open_ro() -> Result<Connection> {
 }
 
 /// Remove repos whose git-dir no longer exists on disk (deleted since indexing).
-/// Returns the number pruned. Old jobs keep their `repo_id` (the join tolerates a
-/// missing repo), so history is preserved.
+/// Returns the number pruned. Job history is preserved but *detached* (repo_id
+/// nulled), so it can't rejoin a newly-indexed repo that reuses the rowid.
 pub fn prune_missing(conn: &Connection) -> Result<usize> {
     let mut stmt = conn.prepare("SELECT id, git_dir FROM repos")?;
     let rows: Vec<(i64, String)> = stmt
@@ -122,9 +122,13 @@ pub fn prune_missing(conn: &Connection) -> Result<usize> {
     let mut removed = 0;
     for (id, git_dir) in rows {
         if !std::path::Path::new(&git_dir).exists() {
-            // Delete rows keyed by repo_id first: SQLite reuses rowids and FKs are
-            // off, so an orphaned claim/status could otherwise silently reattach
-            // to a newly-indexed repo that reuses this id.
+            // Clear everything keyed by this repo_id first: SQLite reuses rowids and
+            // FKs are off, so an orphaned row could otherwise silently reattach to a
+            // newly-indexed repo that reuses this id. Jobs are DETACHED (repo_id →
+            // NULL) rather than deleted — history survives, but `pending_failures`
+            // (INNER JOIN) and `list_jobs` (LEFT JOIN, NULL git_dir) can't
+            // mis-attribute a pruned repo's failure to the id's next occupant.
+            conn.execute("UPDATE jobs SET repo_id=NULL WHERE repo_id=?1", [id])?;
             conn.execute("DELETE FROM claims WHERE repo_id=?1", [id])?;
             conn.execute("DELETE FROM repo_status WHERE repo_id=?1", [id])?;
             conn.execute("DELETE FROM repos WHERE id=?1", [id])?;
@@ -395,14 +399,20 @@ pub fn list_status(conn: &Connection) -> Result<Vec<StatusRow>> {
 /// Save a tree-wide snapshot: replace any existing rows for `name` with the given
 /// `(git_dir, workdir, sha)` entries.
 pub fn save_snapshot(conn: &Connection, name: &str, entries: &[(String, String, String)]) -> Result<()> {
-    conn.execute("DELETE FROM snapshots WHERE name = ?1", [name])?;
+    // One transaction: the DELETE of the prior snapshot and the N INSERTs must be
+    // all-or-nothing. Otherwise a crash mid-write would drop the previous good
+    // snapshot AND leave a partial one, so `zrestore` would half-restore the tree
+    // while reporting success (and a concurrent reader could observe the gap).
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM snapshots WHERE name = ?1", [name])?;
     let ts = now();
     for (git_dir, workdir, sha) in entries {
-        conn.execute(
+        tx.execute(
             "INSERT INTO snapshots (name, git_dir, workdir, sha, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![name, git_dir, workdir, sha, ts],
         )?;
     }
+    tx.commit()?;
     Ok(())
 }
 

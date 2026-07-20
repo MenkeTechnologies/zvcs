@@ -65,3 +65,34 @@ fn prune_drops_claim_so_reused_rowid_starts_fresh() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn prune_detaches_jobs_so_reused_rowid_gets_no_stale_failure() {
+    // A pruned repo's failed job must not surface on a NEW repo that reuses its
+    // rowid (notify-on-next-command joins jobs->repos on repo_id).
+    let root = std::env::temp_dir().join(format!("zvcs-prunejob-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+    let rs = root.to_str().unwrap();
+
+    // A: index (id 1), then record a FAILED job for it (a foreach that fails in A).
+    let a = mkrepo(&root, "a");
+    zvcs(&home, None, &root, &["zreindex", rs]);
+    zvcs(&home, None, &root, &["zforeach", "--repo", "a", "--", "git", "rev-parse", "--verify", "--quiet", "no-such-ref"]);
+
+    // Delete A and reindex → prune removes A's repos row and DETACHES its job
+    // (repo_id → NULL). The table is empty so the next rowid (1) is reused.
+    std::fs::remove_dir_all(&a).unwrap();
+    zvcs(&home, None, &root, &["zreindex", rs]);
+
+    // B reuses rowid 1. A plain command in B must NOT surface A's foreach failure.
+    let b = mkrepo(&root, "b");
+    zvcs(&home, None, &root, &["zreindex", rs]);
+    let out = Command::new(BIN).args(["zstatus"]).current_dir(&b).env("ZVCS_HOME", &home).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("foreach failed"), "pruned repo's failure resurfaced on rowid-reused repo:\n{stderr}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

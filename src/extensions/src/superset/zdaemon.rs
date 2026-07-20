@@ -134,18 +134,45 @@ fn ping(path: &Path) -> bool {
     }
 }
 
+/// Best-effort exclusive lock across the start sequence. Two concurrent starters
+/// (the 16-instance workload autostarts freely) must not both unlink a *stale*
+/// socket and bind their own — that leaves two live daemons (duplicated autonomy
+/// + a leaked process). Held only across check-remove-bind; the bound socket
+/// itself serializes everyone after (a non-stale second bind gets EADDRINUSE).
+/// Returns None if the lock can't be taken (then we proceed anyway — no worse than
+/// an unlocked start); a lock left by a hard-killed starter is stolen so it can't
+/// wedge startup permanently.
+fn hold_start_lock(at: &Path) -> Option<gix::lock::Marker> {
+    use gix::lock::{acquire::Fail, Marker};
+    if let Ok(m) = Marker::acquire_to_hold_resource(at, Fail::Immediately, None) {
+        return Some(m);
+    }
+    // Contended: wait briefly for the other starter to finish (bind is ms-fast),
+    // then retry. Still locked → treat as stale (crashed mid-start) and steal it.
+    thread::sleep(Duration::from_millis(250));
+    if let Ok(m) = Marker::acquire_to_hold_resource(at, Fail::Immediately, None) {
+        return Some(m);
+    }
+    let mut stale = at.as_os_str().to_owned();
+    stale.push(".lock");
+    let _ = std::fs::remove_file(PathBuf::from(stale));
+    Marker::acquire_to_hold_resource(at, Fail::Immediately, None).ok()
+}
+
 fn start() -> Result<ExitCode> {
     let path = socket_path();
 
-    if path.exists() {
-        if ping(&path) {
-            anyhow::bail!("daemon already running");
+    let listener = {
+        let _marker = hold_start_lock(&zvcs_home().join("daemon-start"));
+        if path.exists() {
+            if ping(&path) {
+                anyhow::bail!("daemon already running");
+            }
+            let _ = std::fs::remove_file(&path);
         }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    let listener = UnixListener::bind(&path)
-        .map_err(|e| anyhow::anyhow!("cannot bind {}: {e}", path.display()))?;
+        UnixListener::bind(&path)
+            .map_err(|e| anyhow::anyhow!("cannot bind {}: {e}", path.display()))?
+    };
 
     // Record our pid for `zdaemon info`.
     let _ = std::fs::write(pid_path(), std::process::id().to_string());

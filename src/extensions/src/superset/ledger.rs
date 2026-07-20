@@ -62,6 +62,9 @@ pub fn zjobs(args: &[String]) -> Result<ExitCode> {
             limit = args
                 .get(i)
                 .and_then(|s| s.parse().ok())
+                // Clamp to >=1: SQLite reads a negative LIMIT as "unlimited", so a
+                // stray `-n -1`/`-n 0` would dump the entire ledger.
+                .map(|n: i64| n.max(1))
                 .unwrap_or(limit);
         }
         i += 1;

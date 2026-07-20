@@ -18,11 +18,22 @@ use std::thread;
 use crate::superset::select::Selector;
 
 pub fn zforeach(args: &[String]) -> Result<ExitCode> {
-    let (sel, rest) = Selector::parse(args);
-    // The command is everything after the selectors, minus a leading `--`.
-    let cmd: Vec<String> = match rest.first() {
-        Some(first) if first == "--" => rest[1..].to_vec(),
-        _ => rest,
+    // `--` is the guard that lets the fanned-out command contain tokens that look
+    // like selectors (`--repo`, `--session`, …). Split on the FIRST `--` before
+    // selecting: only the left half is parsed for selectors, and the right half is
+    // the command verbatim. (Feeding the whole arg list to Selector::parse would
+    // consume the command's own `--session x` as a selector — silently mangling
+    // the command AND narrowing the repo set.) Without `--`, selectors lead and the
+    // remainder is the command, as before.
+    let (sel, cmd): (Selector, Vec<String>) = match args.iter().position(|a| a == "--") {
+        Some(p) => {
+            let (sel, _left_over) = Selector::parse(&args[..p]);
+            (sel, args[p + 1..].to_vec())
+        }
+        None => {
+            let (sel, rest) = Selector::parse(args);
+            (sel, rest)
+        }
     };
     if cmd.is_empty() {
         bail!("usage: git zforeach [--repo <sub>|--dirty|--ahead|--behind|--claimed|--session <s>] [--] <command>...");

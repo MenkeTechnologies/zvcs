@@ -243,15 +243,12 @@ fn delete_symref(repo: &gix::Repository, name: &str) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// git's `is_pseudoref_syntax` (refs.c): a slash-free name whose every byte is
-/// an ASCII upper-case letter, `_`, or `-`. `HEAD` matches the syntax but is the
-/// one pseudoref git lets `symbolic-ref` write, so it is excluded here.
+/// The pseudorefs git's `symbolic-ref` refuses to point elsewhere. Determined
+/// empirically against git 2.55: only `MERGE_HEAD` and `FETCH_HEAD` are refused
+/// ("refusing to update pseudoref"); other all-caps names — `ORIG_HEAD`,
+/// `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `BISECT_HEAD`, … — are written normally.
 fn is_pseudoref(name: &str) -> bool {
-    name != "HEAD"
-        && !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b == b'_' || b == b'-')
+    matches!(name, "MERGE_HEAD" | "FETCH_HEAD")
 }
 
 /// The direct symbolic target of `name`, or `None` when the ref is missing or

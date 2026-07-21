@@ -81,31 +81,25 @@ const NOT_COMMITTED_MAIL: &[u8] = b"not.committed.yet";
 /// `--ignore-rev`, regex/function `-L` forms, …) are rejected with a terse
 /// message rather than emitting wrong output.
 pub fn blame(args: &[String]) -> Result<ExitCode> {
-    let opts = match Options::parse(args)? {
-        Parsed::Usage => {
-            let mut err = std::io::stderr().lock();
-            err.write_all(USAGE.as_bytes())?;
-            err.flush()?;
-            return Ok(ExitCode::from(129));
-        }
-        Parsed::Options(opts) => opts,
-    };
+    let mut opts = Options::parse(args)?;
 
     let repo = gix::discover(".")?;
 
-    // Resolve the suspect commit (default HEAD), peeling tags to a commit.
-    // `head_id` is only required for the working-tree overlay, so an unborn HEAD
-    // stays tolerable as long as an explicit revision was given.
-    let (suspect, head_id) = match &opts.rev {
-        Some(rev) => {
-            let id = repo
-                .rev_parse_single(rev.as_str())?
-                .object()?
-                .peel_to_commit()?
-                .id()
-                .detach();
-            (id, repo.head_id().ok().map(|h| h.detach()))
-        }
+    // Split the positional arguments into a revision and a single path following
+    // git blame's DWIM grammar, then resolve the revision. This may short-circuit
+    // with git's usage text (129) or a `bad revision` / `More than one commit`
+    // fatal (128); those cases print to stderr and return the code here.
+    match resolve_targets(&repo, &mut opts)? {
+        Targets::Usage => return print_usage(),
+        Targets::Fatal(code) => return Ok(code),
+        Targets::Resolved => {}
+    }
+
+    // Resolve the suspect commit (default HEAD). `head_id` is only required for
+    // the working-tree overlay, so an unborn HEAD stays tolerable as long as an
+    // explicit revision was given.
+    let (suspect, head_id) = match opts.suspect_id {
+        Some(id) => (id, repo.head_id().ok().map(|h| h.detach())),
         None => {
             let id = repo.head_id()?.detach();
             (id, Some(id))
@@ -686,15 +680,131 @@ fn format_tz(offset_seconds: i32) -> String {
     format!("{sign}{:02}{:02}", abs / 3600, (abs % 3600) / 60)
 }
 
-/// Parsed command line, or a request to print git's usage.
-enum Parsed {
-    Options(Options),
+/// Print git blame's usage text on stderr and yield its exit status (129).
+fn print_usage() -> Result<ExitCode> {
+    let mut err = std::io::stderr().lock();
+    err.write_all(USAGE.as_bytes())?;
+    err.flush()?;
+    Ok(ExitCode::from(129))
+}
+
+/// Outcome of splitting the positionals into `[<rev>...] <file>` and resolving
+/// the revision, mirroring `cmd_blame`'s argument grammar in git.
+enum Targets {
+    /// The positional shape is not a valid blame invocation: print usage (129).
     Usage,
+    /// A fatal error (`bad revision` / `More than one commit`) was already
+    /// written to stderr; return this exit code (128).
+    Fatal(ExitCode),
+    /// `opts.file`, `opts.rev` and `opts.suspect_id` are now populated.
+    Resolved,
+}
+
+/// git's `is_a_rev`: the name resolves to some object in the repository.
+fn is_a_rev(repo: &gix::Repository, name: &str) -> bool {
+    repo.rev_parse_single(name).is_ok()
+}
+
+/// Resolve a revision to the commit it names (peeling tags), or `None` if it is
+/// not a valid revision — git's `get_oid` followed by a peel to commit.
+fn resolve_commit(repo: &gix::Repository, rev: &str) -> Option<ObjectId> {
+    repo.rev_parse_single(rev)
+        .ok()?
+        .object()
+        .ok()?
+        .peel_to_commit()
+        .ok()
+        .map(|c| c.id().detach())
+}
+
+/// Split the collected positionals into `[<rev>...] <file>` following git
+/// blame's DWIM rules, then resolve the revision. Reproduces `cmd_blame`'s
+/// argument handling for the presence/absence of the `--` separator.
+fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets> {
+    // Determine the revision arguments (in order) and the single path.
+    let (revs, file): (Vec<String>, String) = match opts.post.take() {
+        // `--` was present: everything after it is a pathspec. blame accepts
+        // exactly one path; a trailing second token is DWIM'd as a revision.
+        Some(post) => {
+            let pre = std::mem::take(&mut opts.pre);
+            match post.len() {
+                0 => return Ok(Targets::Usage),
+                1 => (pre, post.into_iter().next().unwrap()),
+                // `blame -- <file> <rev>`: only legal with no revs before `--`.
+                2 if pre.is_empty() => {
+                    let mut it = post.into_iter();
+                    let file = it.next().unwrap();
+                    let rev = it.next().unwrap();
+                    (vec![rev], file)
+                }
+                _ => return Ok(Targets::Usage),
+            }
+        }
+        // No `--`: the last positional is the path, the rest are revisions.
+        None => {
+            let mut pos = std::mem::take(&mut opts.pre);
+            match pos.len() {
+                0 => return Ok(Targets::Usage),
+                1 => (vec![], pos.pop().unwrap()),
+                // Two positionals: `blame <path> <rev>` if the last is a rev,
+                // otherwise `blame <rev> <path>`.
+                2 => {
+                    if is_a_rev(repo, &pos[1]) {
+                        let rev = pos.pop().unwrap();
+                        let file = pos.pop().unwrap();
+                        (vec![rev], file)
+                    } else {
+                        let file = pos.pop().unwrap();
+                        let rev = pos.pop().unwrap();
+                        (vec![rev], file)
+                    }
+                }
+                _ => {
+                    let file = pos.pop().unwrap();
+                    (pos, file)
+                }
+            }
+        }
+    };
+
+    // Resolve the revisions in order, matching git: the first that fails to
+    // resolve is a `bad revision`; a second one that succeeds is `More than one
+    // commit to dig from`.
+    let mut suspect: Option<(String, ObjectId)> = None;
+    for r in &revs {
+        match resolve_commit(repo, r) {
+            Some(id) => {
+                if let Some((first, _)) = &suspect {
+                    let mut err = std::io::stderr().lock();
+                    writeln!(err, "fatal: More than one commit to dig from {first} and {r}?")?;
+                    err.flush()?;
+                    return Ok(Targets::Fatal(ExitCode::from(128)));
+                }
+                suspect = Some((r.clone(), id));
+            }
+            None => {
+                let mut err = std::io::stderr().lock();
+                writeln!(err, "fatal: bad revision '{r}'")?;
+                err.flush()?;
+                return Ok(Targets::Fatal(ExitCode::from(128)));
+            }
+        }
+    }
+
+    opts.rev = suspect.as_ref().map(|(n, _)| n.clone());
+    opts.suspect_id = suspect.map(|(_, id)| id);
+    opts.file = file;
+    Ok(Targets::Resolved)
 }
 
 struct Options {
     rev: Option<String>,
     file: String,
+    suspect_id: Option<ObjectId>,
+    /// Positionals before the `--` separator (or all of them if absent).
+    pre: Vec<String>,
+    /// Positionals after `--`; `None` when no `--` was given.
+    post: Option<Vec<String>>,
     ranges: Vec<RangeInclusive<u32>>,
     long: bool,
     suppress: bool,
@@ -707,7 +817,7 @@ struct Options {
 }
 
 impl Options {
-    fn parse(args: &[String]) -> Result<Parsed> {
+    fn parse(args: &[String]) -> Result<Options> {
         let mut ranges: Vec<RangeInclusive<u32>> = Vec::new();
         let mut long = false;
         let mut suppress = false;
@@ -717,19 +827,23 @@ impl Options {
         let mut abbrev: Option<usize> = None;
         let mut porcelain = false;
         let mut line_porcelain = false;
-        let mut positionals: Vec<String> = Vec::new();
-        let mut only_paths = false;
+        // Positionals before the first `--`; `post` collects those after it.
+        // `post.is_some()` means a `--` separator was seen.
+        let mut pre: Vec<String> = Vec::new();
+        let mut post: Option<Vec<String>> = None;
 
         let mut i = 0;
         while i < args.len() {
             let a = args[i].as_str();
-            if only_paths {
-                positionals.push(a.to_string());
+            if let Some(paths) = post.as_mut() {
+                paths.push(a.to_string());
                 i += 1;
                 continue;
             }
             match a {
-                "--" => only_paths = true,
+                // The first `--` ends option parsing; everything after it is a
+                // pathspec, including a further `--`.
+                "--" => post = Some(Vec::new()),
                 "-l" | "--long" => long = true,
                 "-s" => suppress = true,
                 "-e" | "--show-email" => show_email = true,
@@ -764,26 +878,19 @@ impl Options {
                 _ if a.starts_with('-') && a.len() > 1 => {
                     bail!("unsupported option: {a}")
                 }
-                _ => positionals.push(a.to_string()),
+                _ => pre.push(a.to_string()),
             }
             i += 1;
         }
 
-        // `[<rev>] [--] <file>`: the last positional is the path; a single
-        // positional before it (if any) is the revision.
-        let (rev, file) = match positionals.len() {
-            0 => return Ok(Parsed::Usage),
-            1 => (None, positionals.pop().unwrap()),
-            2 => {
-                let file = positionals.pop().unwrap();
-                (Some(positionals.pop().unwrap()), file)
-            }
-            _ => bail!("too many paths given; only a single file is supported"),
-        };
-
-        Ok(Parsed::Options(Options {
-            rev,
-            file,
+        // The revision/path split and its validation happen against the repo in
+        // `resolve_targets`, since git's DWIM (`is_a_rev`) needs the object db.
+        Ok(Options {
+            rev: None,
+            file: String::new(),
+            suspect_id: None,
+            pre,
+            post,
             ranges,
             long,
             suppress,
@@ -793,7 +900,7 @@ impl Options {
             abbrev,
             porcelain,
             line_porcelain,
-        }))
+        })
     }
 }
 

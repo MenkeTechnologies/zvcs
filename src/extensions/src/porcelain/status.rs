@@ -77,9 +77,11 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         let s = a.as_str();
         match s {
             "-s" | "--short" => short = true,
-            "--porcelain" | "--porcelain=v1" => short = true,
+            "--porcelain" | "--porcelain=v1" | "--porcelain=1" => short = true,
             "--long" => short = false,
-            "--porcelain=v2" => anyhow::bail!("porcelain v2 format is not supported"),
+            "--porcelain=v2" | "--porcelain=2" => {
+                anyhow::bail!("porcelain v2 format is not supported")
+            }
             "-z" | "--null" => anyhow::bail!("NUL-terminated output (-z) is not supported"),
             "-b" | "--branch" => branch_header = true,
             "--no-branch" => branch_header = false,
@@ -101,10 +103,23 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             "--renames" | "-M" | "--find-renames" => {
                 renames = Some(Some(gix::diff::Rewrites::default()));
             }
+            // git validates the `--porcelain=<version>` value as it parses, dying
+            // immediately (exit 128) on anything but v1/v2 — a later valid
+            // `--porcelain=v1` does not rescue an earlier bad version.
+            _ if s.starts_with("--porcelain=") => {
+                let version = &s["--porcelain=".len()..];
+                eprintln!("fatal: unsupported porcelain version '{version}'");
+                return Ok(ExitCode::from(128));
+            }
             _ if s.starts_with("--untracked-files=") => {
                 let mode = &s["--untracked-files=".len()..];
-                eprintln!("fatal: Invalid untracked files mode '{mode}'");
-                return Ok(ExitCode::from(128));
+                match parse_untracked_mode(mode) {
+                    Some(m) => untracked_flag = Some(m),
+                    None => {
+                        eprintln!("fatal: Invalid untracked files mode '{mode}'");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
             }
             _ if s.starts_with("--ignored=") => {
                 let mode = &s["--ignored=".len()..];
@@ -141,13 +156,17 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                         'v' => {}
                         'z' => anyhow::bail!("NUL-terminated output (-z) is not supported"),
                         'u' => {
-                            untracked_flag = Some(match rest {
-                                "" | "all" => Untracked::All,
-                                "no" => Untracked::No,
-                                "normal" => Untracked::Normal,
-                                mode => {
-                                    eprintln!("fatal: Invalid untracked files mode '{mode}'");
-                                    return Ok(ExitCode::from(128));
+                            // A bare `-u` (no attached value) is git's `all` default;
+                            // an attached value parses exactly as `--untracked-files=`.
+                            untracked_flag = Some(if rest.is_empty() {
+                                Untracked::All
+                            } else {
+                                match parse_untracked_mode(rest) {
+                                    Some(m) => m,
+                                    None => {
+                                        eprintln!("fatal: Invalid untracked files mode '{rest}'");
+                                        return Ok(ExitCode::from(128));
+                                    }
                                 }
                             });
                             break;
@@ -378,6 +397,104 @@ fn configured_untracked(repo: &gix::Repository) -> Untracked {
         b"all" => Untracked::All,
         _ => Untracked::Normal,
     }
+}
+
+/// Resolve a `--untracked-files=<mode>` / `-u<mode>` value the way git does.
+/// The three named modes match verbatim; any other value is run through git's
+/// `git_parse_maybe_bool`, where a truthy value means `normal` and a falsy value
+/// means `no`. `None` is git's "Invalid untracked files mode" (fatal, exit 128).
+fn parse_untracked_mode(value: &str) -> Option<Untracked> {
+    match value {
+        "no" => Some(Untracked::No),
+        "normal" => Some(Untracked::Normal),
+        "all" => Some(Untracked::All),
+        _ => match parse_maybe_bool(value) {
+            Some(true) => Some(Untracked::Normal),
+            Some(false) => Some(Untracked::No),
+            None => None,
+        },
+    }
+}
+
+/// Port of git's `git_parse_maybe_bool`: recognise the textual booleans, then
+/// fall back to an integer parse where any non-zero value is `true`. `None` is
+/// git's parse failure.
+fn parse_maybe_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "" | "false" | "no" | "off" => return Some(false),
+        "true" | "yes" | "on" => return Some(true),
+        _ => {}
+    }
+    parse_git_int(value).map(|n| n != 0)
+}
+
+/// Port of git's `git_parse_int` (`git_parse_signed` with an `INT_MAX` ceiling):
+/// C `strtoimax(value, &end, 0)` — base auto-detected from the `0x`/`0` prefix —
+/// followed by `get_unit_factor` (an optional single `k`/`m`/`g` suffix, 1024-
+/// based) and the range check. `None` is git's EINVAL / ERANGE.
+fn parse_git_int(value: &str) -> Option<i64> {
+    let b = value.as_bytes();
+    let mut i = 0;
+    // strtoimax skips leading C whitespace.
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        i += 1;
+    }
+    let mut negative = false;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        negative = b[i] == b'-';
+        i += 1;
+    }
+    // base-0 prefix detection: `0x`/`0X` (with a hex digit) is hex, a lone
+    // leading `0` is octal, everything else decimal.
+    let base: u64 = if i < b.len() && b[i] == b'0' {
+        if i + 2 < b.len()
+            && (b[i + 1] == b'x' || b[i + 1] == b'X')
+            && (b[i + 2] as char).is_ascii_hexdigit()
+        {
+            i += 2;
+            16
+        } else {
+            8 // the leading `0` is itself the first octal digit
+        }
+    } else {
+        10
+    };
+    let digits_start = i;
+    let mut val: i64 = 0;
+    while i < b.len() {
+        let digit = match b[i] {
+            b'0'..=b'9' => (b[i] - b'0') as u64,
+            b'a'..=b'f' => (b[i] - b'a' + 10) as u64,
+            b'A'..=b'F' => (b[i] - b'A' + 10) as u64,
+            _ => break,
+        };
+        if digit >= base {
+            break;
+        }
+        // Overflow here is git's ERANGE from strtoimax.
+        val = val.checked_mul(base as i64)?.checked_add(digit as i64)?;
+        i += 1;
+    }
+    if i == digits_start {
+        return None; // no digits converted -> EINVAL
+    }
+    if negative {
+        val = -val;
+    }
+    // get_unit_factor: the remainder must be exactly empty or one of k/m/g.
+    let factor: i64 = match value[i..].to_ascii_lowercase().as_str() {
+        "" => 1,
+        "k" => 1024,
+        "m" => 1024 * 1024,
+        "g" => 1024 * 1024 * 1024,
+        _ => return None, // EINVAL
+    };
+    // git_parse_int caps at INT_MAX before applying the factor.
+    const MAX: i64 = i32::MAX as i64;
+    if (val < 0 && -MAX / factor > val) || (val > 0 && MAX / factor < val) {
+        return None; // ERANGE
+    }
+    Some(val * factor)
 }
 
 /// Parse the `<n>` of `-M<n>` / `--find-renames=<n>` into a similarity fraction.

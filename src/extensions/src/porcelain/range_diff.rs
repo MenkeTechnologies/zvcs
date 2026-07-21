@@ -38,17 +38,29 @@
 //!
 //! * `range-diff <range1> <range2>`, `range-diff <rev1>...<rev2>` and
 //!   `range-diff <base> <rev1> <rev2>`, dispatched with upstream's precedence
-//!   (three committishes first, then two ranges, then one symmetric range).
+//!   (three committishes first, then two ranges, then one symmetric range). A
+//!   `--` at argv index 1, 2 or 3 *forces* the matching form, reporting the same
+//!   `not a symmetric range` / `not a commit range` / `not a revision` usage
+//!   errors when its operands do not fit.
 //! * Ranges spelled `<a>..<b>` or `<a>...<b>`, either side defaulting to `HEAD`
-//!   when empty.
+//!   when empty, plus every other spelling gitoxide's rev-parse resolves —
+//!   `<rev>^!`, `<rev>^@`, `^<rev>` — recognised both as a range operand and for
+//!   the walk.
+//! * A trailing `-- <path>...` pathspec of plain paths and directory prefixes,
+//!   which limits the range to commits touching a matched path and each rendered
+//!   patch to the matched file sections, exactly as `git log -- <path>` does. A
+//!   magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec stops rather than
+//!   match with different semantics.
 //! * `--creation-factor=<n>` (and its `--creation-factor <n>` /
 //!   `--no-creation-factor` spellings), `--left-only`, `--right-only`,
 //!   `--no-dual-color`, `--no-color`, `--color=never`, `--color=auto`, `-p` /
-//!   `-u` / `--patch`, and `--no-notes`. Dual and simple coloring are
-//!   byte-identical once color is off, which is the only mode this port emits.
+//!   `-u` / `--patch`, `--no-notes`, and `--ws-error-highlight=<kind>` (a no-op
+//!   with color off, which is the only mode this port emits). Dual and simple
+//!   coloring are byte-identical once color is off.
 //! * The failure paths, with upstream's exit status: a bad argument shape exits
-//!   129, `--left-only` together with `--right-only` exits 255, and a range
-//!   naming an unknown revision exits 255.
+//!   129, a two-range operand that names nothing exits 128 (`bad revision`, the
+//!   fatal `is_range_diff_range()` raises), `--left-only` together with
+//!   `--right-only` exits 255, and a range naming an unknown revision exits 255.
 //!
 //! ### Option handling — nothing is silently ignored
 //!
@@ -82,8 +94,8 @@
 //!   unless `--no-notes` was given — upstream asks `git log` to show notes by
 //!   default, so a note would silently change the compared text.
 //! * `--diff-merges=<format>` / `--remerge-diff` (merges are ignored here, which
-//!   is the default upstream behaviour), pathspec limiting (`[--] <path>...`),
-//!   and every other `git diff` option upstream forwards to the inner patches.
+//!   is the default upstream behaviour), a magic or wildcard pathspec, and every
+//!   other `git diff` option upstream forwards to the inner patches.
 //! * Commits containing a rename that git's `diffcore-rename` would detect.
 //!   These are found by re-running the tree diff with gitoxide's rename tracker
 //!   at git's default 50% threshold, and refused: upstream's `old => new`
@@ -237,27 +249,30 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         deferred: None,
     };
     // `args` excludes the `range-diff` verb: `dispatch::run` takes the
-    // subcommand separately, so option parsing starts at index 0.
-    let mut revs: Vec<String> = Vec::new();
-    let mut pathspec: Vec<String> = Vec::new();
+    // subcommand separately, so option parsing starts at index 0. Positionals
+    // are collected in order into `pos`, and the `--` end-of-options marker is
+    // *kept* in that list the way upstream's `PARSE_OPT_KEEP_DASHDASH` keeps it,
+    // because the classifier below reads its position (see [`classify`]).
+    let mut pos: Vec<String> = Vec::new();
     let mut after_dash_dash = false;
 
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if after_dash_dash {
-            pathspec.push(a.to_string());
+            pos.push(a.to_string());
             i += 1;
             continue;
         }
         if a == "--" {
+            pos.push("--".to_string());
             after_dash_dash = true;
             i += 1;
             continue;
         }
         // A bare `-` is a revision-ish operand, not an option.
         if a.len() < 2 || !a.starts_with('-') {
-            revs.push(a.to_string());
+            pos.push(a.to_string());
             i += 1;
             continue;
         }
@@ -281,6 +296,15 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // Patch output is what this port emits; `-p`/`-u` ask for it.
             "-p" | "-u" | "--patch" => {}
             "--no-notes" => opts.notes = false,
+            // `--ws-error-highlight=<kind>` only tints whitespace errors when
+            // color is on. This port always emits with color off, so it is a
+            // byte-for-byte no-op; accept it and consume a detached value so the
+            // value is not mistaken for a revision.
+            "--ws-error-highlight" => {
+                if inline.is_none() {
+                    i += 1;
+                }
+            }
             "--no-creation-factor" => opts.creation_factor = CREATION_FACTOR_DEFAULT,
             "--creation-factor" => {
                 let value = match inline {
@@ -324,16 +348,20 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    if !pathspec.is_empty() {
-        opts.defer("pathspec limiting is not supported".to_string());
-    }
-
     let repo = gix::discover(".")?;
 
-    // Upstream's order: the argument shape is checked first, so a bad shape is
-    // 129 even when `--left-only --right-only` were also given.
-    let Some((range1, range2)) = classify(&repo, &revs, &mut opts)? else {
-        return Ok(usage_error("need two commit ranges"));
+    // Upstream's order: the argument shape is checked first (a bad shape is 129
+    // even when `--left-only --right-only` were also given), and the two-range
+    // form resolves each operand through `is_range_diff_range()`, which exits
+    // 128 the moment `setup_revisions()` meets a token it cannot resolve.
+    let dash_dash = pos.iter().position(|s| s.as_str() == "--");
+    let Classified {
+        range1,
+        range2,
+        extra,
+    } = match classify(&repo, &pos, dash_dash) {
+        Ok(c) => c,
+        Err(code) => return Ok(code),
     };
 
     if opts.left_only && opts.right_only {
@@ -341,6 +369,16 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         eprintln!("error: options '--left-only' and '--right-only' cannot be used together");
         return Ok(ExitCode::from(255));
     }
+
+    // Everything from the form's consumed count onward — including the `--`
+    // itself when present — is forwarded to the inner `git log` (upstream's
+    // `strvec_pushv(&log_arg, argv + …)`). A leading `--` makes the remainder a
+    // pathspec; anything else is a stray operand the inner log rejects.
+    let (pathspec, stray): (Vec<String>, Option<String>) = match extra.first() {
+        Some(first) if first.as_str() == "--" => (extra[1..].to_vec(), None),
+        Some(first) => (Vec::new(), Some(first.clone())),
+        None => (Vec::new(), None),
+    };
 
     // Upstream resolves each range by running `git log` over it, oldest range
     // first; a range naming an unknown revision is fatal before any patch is
@@ -354,11 +392,26 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         Err(_) => return Ok(could_not_parse_log(&range2)),
     };
 
+    // A stray operand given without a `--` separator is handed verbatim to the
+    // inner `git log`, which rejects it exactly as it would on its own command
+    // line (see [`stray_operand`]).
+    if let Some(token) = stray {
+        return Ok(stray_operand(&repo, &range1, &token));
+    }
+
     // Every remaining difference from upstream would show up in the output, so
     // stop here rather than emit a patch that ignored an option.
     if let Some(reason) = &opts.deferred {
         bail!("{reason}");
     }
+
+    // A pathspec limits both which commits appear and which file sections each
+    // rendered patch carries. Plain paths are matched here; a magic pathspec
+    // this port does not implement stops rather than filter differently.
+    let matcher = match build_matcher(&pathspec) {
+        Ok(m) => m,
+        Err(reason) => bail!("{reason}"),
+    };
 
     if opts.notes && repo.try_find_reference("refs/notes/commits")?.is_some() {
         bail!(
@@ -368,8 +421,8 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     }
 
     let mailmap = repo.open_mailmap();
-    let mut a = read_patches(&repo, ends1, &mailmap)?;
-    let mut b = read_patches(&repo, ends2, &mailmap)?;
+    let mut a = read_patches(&repo, ends1, &mailmap, matcher.as_ref())?;
+    let mut b = read_patches(&repo, ends2, &mailmap, matcher.as_ref())?;
 
     find_exact_matches(&mut a, &mut b);
     get_correspondences(&mut a, &mut b, opts.creation_factor);
@@ -408,61 +461,235 @@ fn could_not_parse_log(range: &str) -> ExitCode {
 // Argument dispatch (builtin/range-diff.c)
 // ---------------------------------------------------------------------------
 
-/// Upstream's argument classification, in its exact precedence order: three
-/// committishes, then two commit ranges, then one symmetric range. `Ok(None)`
-/// means "need two commit ranges", the usage error.
+/// A resolved argument shape: the two ranges to compare and the trailing
+/// operands (from the form's consumed count on, including any `--`) that
+/// upstream forwards to the inner `git log`.
+struct Classified {
+    range1: String,
+    range2: String,
+    extra: Vec<String>,
+}
+
+/// The three answers `is_range_diff_range()` can give, distinguishing "resolves
+/// but is not a range" from "does not resolve at all", because upstream turns
+/// the latter into a fatal `bad revision` (exit 128) rather than a fall-through.
+enum RangeKind {
+    /// Both a positive and a negative endpoint: a range.
+    Range,
+    /// Resolves, but not to a range (a plain committish such as `main`).
+    NotRange,
+    /// `setup_revisions()` could not resolve a token — upstream dies here.
+    Bad,
+}
+
+/// Upstream's argument classification (`cmd_range_diff`), transcribed with its
+/// exact precedence: three committishes, then two commit ranges, then one
+/// symmetric range, then the `need two commit ranges` usage error. `Err(code)`
+/// carries an already-reported exit status — a usage error (129) or, when a
+/// two-range operand fails to resolve, `is_range_diff_range()`'s fatal 128.
 ///
-/// Operands past the ones a form consumes are a pathspec — upstream accepts
-/// them without a `--` separator — so they are deferred, not refused outright.
+/// `dash_dash` is the index of the first `--` in `pos` (or `None`). When it is
+/// present it *forces* one of the three forms by position exactly as upstream
+/// does, validating the operands and reporting the matching message.
 fn classify(
     repo: &gix::Repository,
-    args: &[String],
-    opts: &mut Opts,
-) -> Result<Option<(String, String)>> {
-    if args.len() > 2
-        && committish(repo, &args[0])
-        && committish(repo, &args[1])
-        && committish(repo, &args[2])
+    pos: &[String],
+    dash_dash: Option<usize>,
+) -> Result<Classified, ExitCode> {
+    let argc = pos.len();
+
+    // Three committishes: `<base> <old-tip> <new-tip>`.
+    if dash_dash == Some(3)
+        || (dash_dash.is_none()
+            && argc > 2
+            && committish(repo, &pos[0])
+            && committish(repo, &pos[1])
+            && committish(repo, &pos[2]))
     {
-        if args.len() > 3 {
-            opts.defer("pathspec limiting is not supported".to_string());
+        if dash_dash.is_some() {
+            for token in &pos[..3] {
+                if !committish(repo, token) {
+                    return Err(usage_error(&format!("not a revision: '{token}'")));
+                }
+            }
         }
-        return Ok(Some((
-            format!("{}..{}", args[0], args[1]),
-            format!("{}..{}", args[0], args[2]),
-        )));
+        let offset = dash_dash.unwrap_or(3);
+        return Ok(Classified {
+            range1: format!("{}..{}", pos[0], pos[1]),
+            range2: format!("{}..{}", pos[0], pos[2]),
+            extra: pos[offset..].to_vec(),
+        });
     }
-    if args.len() > 1 && is_range(repo, &args[0]) && is_range(repo, &args[1]) {
-        if args.len() > 2 {
-            opts.defer("pathspec limiting is not supported".to_string());
+
+    // Two commit ranges. Auto-detection resolves each operand up front; a token
+    // `setup_revisions()` cannot parse is fatal (`bad revision`, 128) rather
+    // than a fall-through, and the second operand is only consulted when the
+    // first is a range (upstream's `&&` short-circuit).
+    let two_ranges = if dash_dash == Some(2) {
+        true
+    } else if dash_dash.is_none() && argc > 1 {
+        match is_range_diff_range(repo, &pos[0]) {
+            RangeKind::Bad => return Err(bad_revision(&pos[0])),
+            RangeKind::NotRange => false,
+            RangeKind::Range => match is_range_diff_range(repo, &pos[1]) {
+                RangeKind::Bad => return Err(bad_revision(&pos[1])),
+                RangeKind::NotRange => false,
+                RangeKind::Range => true,
+            },
         }
-        return Ok(Some((args[0].clone(), args[1].clone())));
-    }
-    if args.len() == 1 {
-        if let Some(dots) = args[0].find("...") {
-            let a = if dots == 0 { "HEAD" } else { &args[0][..dots] };
-            let b = if args[0].len() > dots + 3 {
-                &args[0][dots + 3..]
-            } else {
-                "HEAD"
-            };
-            return Ok(Some((format!("{b}..{a}"), format!("{a}..{b}"))));
+    } else {
+        false
+    };
+    if two_ranges {
+        if dash_dash.is_some() {
+            for token in &pos[..2] {
+                match is_range_diff_range(repo, token) {
+                    RangeKind::Bad => return Err(bad_revision(token)),
+                    RangeKind::NotRange => {
+                        return Err(usage_error(&format!("not a commit range: '{token}'")))
+                    }
+                    RangeKind::Range => {}
+                }
+            }
         }
+        let offset = dash_dash.unwrap_or(2);
+        return Ok(Classified {
+            range1: pos[0].clone(),
+            range2: pos[1].clone(),
+            extra: pos[offset..].to_vec(),
+        });
     }
-    Ok(None)
+
+    // One symmetric range: `<old-tip>...<new-tip>`, either side defaulting to
+    // `HEAD`. Upstream detects this with a raw `strstr(argv[0], "...")`, so the
+    // endpoints are validated later by the range resolution, not here.
+    if dash_dash == Some(1) || (dash_dash.is_none() && argc > 0 && pos[0].contains("...")) {
+        if dash_dash.is_some() && !pos[0].contains("...") {
+            return Err(usage_error(&format!("not a symmetric range: '{}'", pos[0])));
+        }
+        let spec = &pos[0];
+        let dots = spec.find("...").expect("symmetric form has ...");
+        let a = if dots == 0 { "HEAD" } else { &spec[..dots] };
+        let b = if spec.len() > dots + 3 {
+            &spec[dots + 3..]
+        } else {
+            "HEAD"
+        };
+        let offset = dash_dash.unwrap_or(1);
+        return Ok(Classified {
+            range1: format!("{b}..{a}"),
+            range2: format!("{a}..{b}"),
+            extra: pos[offset..].to_vec(),
+        });
+    }
+
+    Err(usage_error("need two commit ranges"))
 }
 
 /// `get_oid_committish()`: does `spec` name something that peels to a commit?
+/// Never fatal — a miss is reported as `false`, matching upstream's use of the
+/// return value as a mere predicate in the three-committish test.
 fn committish(repo: &gix::Repository, spec: &str) -> bool {
     resolve_commit(repo, spec).is_ok()
 }
 
-/// `is_range_diff_range()`: does `spec` name a range with both a positive and a
-/// negative endpoint? Only the `<a>..<b>` and `<a>...<b>` spellings are
-/// recognised here; `<rev>^!` and `<rev>^-<n>` are not, and fall through to the
-/// usage error rather than being mis-parsed.
-fn is_range(repo: &gix::Repository, spec: &str) -> bool {
-    endpoints(repo, spec).is_ok()
+/// `is_range_diff_range()`: run `spec` through the same resolution `git log`
+/// uses and classify the result. An unresolvable token is [`RangeKind::Bad`],
+/// which the caller turns into upstream's fatal `bad revision` (exit 128); a
+/// resolved spec is a [`RangeKind::Range`] when it carries both a positive tip
+/// and a hidden negative endpoint, and [`RangeKind::NotRange`] otherwise. This
+/// recognises every spelling gitoxide's rev-parse does, so `<rev>^!` and
+/// `<rev>^@` are handled alongside `<a>..<b>` and `<a>...<b>`.
+fn is_range_diff_range(repo: &gix::Repository, spec: &str) -> RangeKind {
+    match endpoints(repo, spec) {
+        Ok((tips, hidden)) => {
+            if !tips.is_empty() && !hidden.is_empty() {
+                RangeKind::Range
+            } else {
+                RangeKind::NotRange
+            }
+        }
+        Err(_) => RangeKind::Bad,
+    }
+}
+
+/// Upstream's fatal `bad revision '<spec>'`, exit 128: what `setup_revisions()`
+/// prints (via `is_range_diff_range()`, or the inner `git log`) when a token
+/// resolves to neither a revision nor an unambiguous path.
+fn bad_revision(spec: &str) -> ExitCode {
+    eprintln!("fatal: bad revision '{spec}'");
+    ExitCode::from(128)
+}
+
+/// A stray operand (a range consumed the form, but an extra token followed
+/// without a `--`) is appended to the inner `git log` argument list. Reproduce
+/// how that `git log` rejects it: a token naming a working-tree path is
+/// *ambiguous* (255, wrapped in `range-diff`'s own `could not parse log`), a
+/// token naming nothing is a fatal `bad revision` (128), and a token that does
+/// resolve would silently extend the walk — a shape this port does not render.
+fn stray_operand(repo: &gix::Repository, range: &str, token: &str) -> ExitCode {
+    if repo.rev_parse_single(token).is_ok() {
+        eprintln!("fatal: range-diff: a stray revision operand is not supported: '{token}'");
+        return ExitCode::from(128);
+    }
+    let on_disk = repo
+        .workdir()
+        .map(|w| w.join(token).exists())
+        .unwrap_or(false);
+    if on_disk {
+        eprintln!(
+            "fatal: ambiguous argument '{token}': unknown revision or path not in the working tree."
+        );
+        eprintln!("Use '--' to separate paths from revisions, like this:");
+        eprintln!("'git <command> [<revision>...] -- [<file>...]'");
+        eprintln!("error: could not parse log for '{range}'");
+        ExitCode::from(255)
+    } else {
+        bad_revision(token)
+    }
+}
+
+/// A plain-path pathspec limiter. `git`'s pathspec grammar is far larger, but
+/// the corpus only ever produces plain paths and directory prefixes here; any
+/// magic (`:(glob)`, `:!exclude`, …) or wildcard is refused up front by
+/// [`build_matcher`] rather than matched with subtly different semantics.
+struct PathMatcher {
+    paths: Vec<Vec<u8>>,
+}
+
+impl PathMatcher {
+    /// A change path matches when it equals a pathspec exactly or lies under it
+    /// as a directory prefix, which is git's plain-path containment rule.
+    fn matches(&self, path: &[u8]) -> bool {
+        self.paths.iter().any(|p| {
+            path == p.as_slice()
+                || (path.len() > p.len() && path[p.len()] == b'/' && path.starts_with(p))
+        })
+    }
+}
+
+/// Build the pathspec limiter, or `None` when there is nothing to limit. A
+/// pathspec this port does not implement is refused with a terse reason so the
+/// run stops rather than filter with different semantics.
+fn build_matcher(pathspec: &[String]) -> Result<Option<PathMatcher>, String> {
+    let mut paths: Vec<Vec<u8>> = Vec::new();
+    for spec in pathspec {
+        if spec.is_empty() {
+            // An empty pathspec matches everything, i.e. no limiting.
+            return Ok(None);
+        }
+        if spec.starts_with(':') {
+            return Err(format!("magic pathspec is not supported: {spec:?}"));
+        }
+        if spec.bytes().any(|b| matches!(b, b'*' | b'?' | b'[' | b'\\')) {
+            return Err(format!("wildcard pathspec is not supported: {spec:?}"));
+        }
+        // A trailing slash on a directory pathspec is not part of the stored
+        // path prefix; git treats `src/` and `src` alike.
+        let trimmed = spec.strip_suffix('/').unwrap_or(spec.as_str());
+        paths.push(trimmed.as_bytes().to_vec());
+    }
+    Ok((!paths.is_empty()).then_some(PathMatcher { paths }))
 }
 
 fn resolve_commit(repo: &gix::Repository, spec: &str) -> Result<ObjectId> {
@@ -477,7 +704,12 @@ fn resolve_commit(repo: &gix::Repository, spec: &str) -> Result<ObjectId> {
 /// Split a range into the tips it includes and the commits it hides.
 ///
 /// `<a>..<b>` hides `a` and includes `b`; `<a>...<b>` includes both and hides
-/// their merge bases, matching how `git log` resolves the same spelling.
+/// their merge bases, matching how `git log` resolves the same spelling. Any
+/// other spelling gitoxide's rev-parse understands — `<rev>^!` (the commit with
+/// its parents hidden), `<rev>^@` (only the parents), a bare committish, or
+/// `^<rev>` — is mapped to the same tip/hidden split so the classifier can see
+/// it as a range and the walk can traverse it. An unresolvable spec is an
+/// error, which upstream reports as a `git log` failure.
 fn endpoints(repo: &gix::Repository, spec: &str) -> Result<(Vec<ObjectId>, Vec<ObjectId>)> {
     let or_head = |s: &str| if s.is_empty() { "HEAD" } else { s }.to_string();
     if let Some(dots) = spec.find("...") {
@@ -495,7 +727,31 @@ fn endpoints(repo: &gix::Repository, spec: &str) -> Result<(Vec<ObjectId>, Vec<O
         let right = resolve_commit(repo, &or_head(&spec[dots + 2..]))?;
         return Ok((vec![right], vec![left]));
     }
-    bail!("{spec:?} is not a commit range of the form <a>..<b> or <a>...<b>")
+
+    // No literal `..`/`...`: defer to rev-parse, which recognises `^!`, `^@`,
+    // `^<rev>` and plain committishes. The parents of a `^!`/`^@` spec are read
+    // straight off the named commit.
+    use gix::revision::plumbing::Spec;
+    let parents_of = |id: ObjectId| -> Result<Vec<ObjectId>> {
+        let commit = repo.find_object(id)?.try_into_commit()?;
+        Ok(commit.parent_ids().map(|p| p.detach()).collect())
+    };
+    let parsed = repo.rev_parse(spec).map_err(|e| anyhow!("{spec}: {e}"))?;
+    match parsed.detach() {
+        Spec::Include(id) => Ok((vec![id], vec![])),
+        Spec::Exclude(id) => Ok((vec![], vec![id])),
+        Spec::Range { from, to } => Ok((vec![to], vec![from])),
+        Spec::Merge { theirs, ours } => {
+            let bases: Vec<ObjectId> = repo
+                .merge_bases_many(theirs, &[ours])?
+                .into_iter()
+                .map(|id| id.detach())
+                .collect();
+            Ok((vec![theirs, ours], bases))
+        }
+        Spec::ExcludeParents(id) => Ok((vec![id], parents_of(id)?)),
+        Spec::IncludeOnlyParents(id) => Ok((parents_of(id)?, vec![])),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -511,11 +767,20 @@ fn read_patches(
     repo: &gix::Repository,
     (tips, hidden): (Vec<ObjectId>, Vec<ObjectId>),
     mailmap: &gix::mailmap::Snapshot,
+    matcher: Option<&PathMatcher>,
 ) -> Result<Vec<Patch>> {
     let ids = ordered_commits(repo, tips, hidden)?;
     let mut out = Vec::with_capacity(ids.len());
-    for (index, id) in ids.into_iter().enumerate() {
-        out.push(build_patch(repo, id, index, mailmap)?);
+    // With a pathspec, a commit that touches no matching path is dropped
+    // entirely (`git log -- <path>` never lists it), so the position numbers
+    // upstream prints — `util->i` — count only surviving commits. Assign the
+    // index as patches are kept, not from the pre-filter walk position.
+    let mut index = 0usize;
+    for id in ids {
+        if let Some(patch) = build_patch(repo, id, index, mailmap, matcher)? {
+            out.push(patch);
+            index += 1;
+        }
     }
     Ok(out)
 }
@@ -587,13 +852,16 @@ fn ordered_commits(
         .collect())
 }
 
-/// Build the canonical patch text of one commit.
+/// Build the canonical patch text of one commit, or `None` when a pathspec is
+/// in force and the commit touches no matching path — the case `git log -- …`
+/// omits from the range entirely.
 fn build_patch(
     repo: &gix::Repository,
     id: ObjectId,
     index: usize,
     mailmap: &gix::mailmap::Snapshot,
-) -> Result<Patch> {
+    matcher: Option<&PathMatcher>,
+) -> Result<Option<Patch>> {
     let commit = repo.find_object(id)?.try_into_commit()?;
 
     // ` ## Metadata ##` — only the `Author:` line of `--pretty=medium` survives
@@ -637,6 +905,16 @@ fn build_patch(
         gix::diff::Options::default(),
     )?;
     changes.sort_by(|x, y| change_path(x).cmp(change_path(y)));
+
+    // A pathspec keeps only the sections it matches, and a commit left with no
+    // section is not part of the limited history at all.
+    if let Some(matcher) = matcher {
+        changes.retain(|c| matcher.matches(change_path(c)));
+        if changes.is_empty() {
+            return Ok(None);
+        }
+    }
+
     reject_renames(repo, old_tree.as_ref(), &new_tree, &changes, id)?;
 
     let mut diff_offset = 0usize;
@@ -649,7 +927,7 @@ fn build_patch(
         emit_section(repo, &mut text, change, &mut diffsize)?;
     }
 
-    Ok(Patch {
+    Ok(Some(Patch {
         index,
         abbrev: id.attach(repo).shorten()?.to_string(),
         subject: subject_of(raw),
@@ -658,7 +936,7 @@ fn build_patch(
         diffsize,
         matching: -1,
         shown: false,
-    })
+    }))
 }
 
 /// `diff.renames` is on for `git log`, so a detected rename changes both the

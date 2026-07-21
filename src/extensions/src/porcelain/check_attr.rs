@@ -234,15 +234,11 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
         _ => BString::default(),
     };
 
-    // Where `.gitattributes` blobs come from. git's default direction is
-    // `GIT_ATTR_CHECKIN` (worktree first, index as fallback); `--cached` reads
-    // the index only; `--source` reads the named tree only.
-    let (index, attr_source) = if cached {
-        (
-            AttrIndex::Worktree(repo.index_or_empty()?),
-            Source::IdMapping,
-        )
-    } else if let Some(spec) = &source {
+    // git resolves `--source` to a tree-ish whenever it is given and dies if it
+    // does not name one — *before* reading any attribute and regardless of
+    // `--cached`, which merely overrides the read direction. So validate here
+    // unconditionally, then let `--cached` win when both are set.
+    let source_tree = if let Some(spec) = &source {
         let tree = repo
             .rev_parse_single(spec.as_str())
             .ok()
@@ -253,6 +249,21 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
             eprintln!("fatal: {spec}: not a valid tree-ish source");
             return Ok(ExitCode::from(128));
         };
+        Some(tree)
+    } else {
+        None
+    };
+
+    // Where `.gitattributes` blobs come from. git's default direction is
+    // `GIT_ATTR_CHECKIN` (worktree first, index as fallback); `--cached` reads
+    // the index only — and takes precedence over `--source`; `--source` alone
+    // reads the named tree only.
+    let (index, attr_source) = if cached {
+        (
+            AttrIndex::Worktree(repo.index_or_empty()?),
+            Source::IdMapping,
+        )
+    } else if let Some(tree) = source_tree {
         (
             AttrIndex::FromTree(repo.index_from_tree(&tree)?),
             Source::IdMapping,

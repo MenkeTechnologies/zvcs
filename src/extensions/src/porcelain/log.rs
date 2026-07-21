@@ -16,15 +16,20 @@ const STAT_TERM_WIDTH: usize = 80;
 /// `git log` — commit history reachable from a starting revision (default `HEAD`).
 ///
 /// Ported invocation forms:
-///   * `git log [<rev>]`                        → history from `HEAD` or a resolved revision
+///   * `git log [<rev>...]`                      → history from `HEAD`, a revision, or the
+///     union of several revisions
+///   * `-- <pathspec>...`                        → path-limited traversal: show only commits
+///     that touched a matching plain pathspec (magic pathspecs surfaced terse)
 ///   * `-n N` / `--max-count=N` / `-N` / `-nN`   → limit the number of commits shown
 ///   * `--all`                                   → start from every ref plus `HEAD`
 ///   * `--merges` / `--no-merges`                → keep only (or drop) multi-parent commits
 ///   * `--reverse`                               → emit the selected commits oldest-first
 ///   * `--date-order` / `--topo-order`           → git's two topological sort orders
 ///   * `--oneline`, `--pretty=`/`--format=` with
-///     `oneline`, `short`, `medium`, and `format:`/`tformat:` strings
+///     `oneline`, `short`, `medium`, and `format:`/`tformat:` strings (last flag wins;
+///     an invalid value is rejected exactly as git's `get_commit_format` does)
 ///   * `--name-only`, `--name-status`, `--stat`  → per-commit diff against the first parent
+///     (`--name-only`/`--name-status` are mutually exclusive and suppress `--stat`)
 ///   * `--graph`                                 → git's ASCII commit graph (see below)
 ///
 /// Output separation follows git's `format:` (separator) versus `tformat:`
@@ -36,8 +41,10 @@ const STAT_TERM_WIDTH: usize = 80;
 ///     rejected instead of being drawn wrong.
 ///   * Rename detection is off, so a rename shows as a delete plus an add.
 ///   * `--stat` assumes an 80-column terminal and measures paths in `char`s.
-///   * Pathspec limiting, `-p`, date/author filters, and every flag not listed
-///     above are rejected explicitly.
+///   * Pathspec limiting compares each commit to its first parent only, so merge
+///     simplification (TREESAME across multiple parents) is not modelled.
+///   * `-p`, date/author filters, and every flag not listed above are rejected
+///     explicitly.
 pub fn log(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
@@ -54,34 +61,66 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut only_merges = false;
     let mut no_merges = false;
     let mut order = Order::Default;
-    let mut rev: Option<String> = None;
+    let mut revs: Vec<String> = Vec::new();
+    let mut pathspecs: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
         if a == "--" {
-            bail!("pathspec filtering is not ported");
+            // Everything after `--` is a pathspec, even tokens that look like
+            // flags — git stops option parsing at the separator.
+            pathspecs.extend(args[i + 1..].iter().cloned());
+            break;
         } else if a == "-n" || a == "--max-count" {
             i += 1;
             let v = args
                 .get(i)
                 .ok_or_else(|| anyhow!("option `{a}` requires a value"))?;
-            max_count = Some(parse_count(a, v)?);
+            match parse_max_count(v) {
+                Ok(mc) => max_count = mc,
+                Err(()) => {
+                    eprintln!("fatal: '{v}': not an integer");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         } else if let Some(v) = a.strip_prefix("--max-count=") {
-            max_count = Some(parse_count("--max-count", v)?);
+            match parse_max_count(v) {
+                Ok(mc) => max_count = mc,
+                Err(()) => {
+                    eprintln!("fatal: '{v}': not an integer");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         } else if a == "--oneline" {
             pretty = Pretty::Oneline;
             terminator = true;
             abbrev_commit = true;
         } else if let Some(v) = a.strip_prefix("--pretty=") {
-            let (p, t) = parse_pretty(v)?;
-            pretty = p;
-            terminator = t;
+            match get_commit_format(v)? {
+                Some((p, t)) => {
+                    pretty = p;
+                    terminator = t;
+                }
+                None => {
+                    eprintln!("fatal: invalid --pretty format: {v}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         } else if let Some(v) = a.strip_prefix("--format=") {
-            // `--format=<s>` is git's shorthand for `--pretty=tformat:<s>`.
-            check_format(v)?;
-            pretty = Pretty::User(v.to_string());
-            terminator = true;
+            // `--format=<s>` is git's alias for `--pretty=<s>` (same parser, not a
+            // blind `tformat:` wrapper — `--format=abc` is rejected just like
+            // `--pretty=abc`).
+            match get_commit_format(v)? {
+                Some((p, t)) => {
+                    pretty = p;
+                    terminator = t;
+                }
+                None => {
+                    eprintln!("fatal: invalid --pretty format: {v}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         } else if a == "--name-only" {
             name_only = true;
         } else if a == "--name-status" {
@@ -106,17 +145,29 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             let body = &a[1..];
             if let Some(num) = body.strip_prefix('n') {
                 // `-nN` shorthand (e.g. `-n5`).
-                max_count = Some(parse_count("-n", num)?);
+                match parse_max_count(num) {
+                    Ok(mc) => max_count = mc,
+                    Err(()) => {
+                        eprintln!("fatal: '{num}': not an integer");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
             } else if !body.is_empty() && body.bytes().all(|c| c.is_ascii_digit()) {
-                // `-N` shorthand (e.g. `-5`).
-                max_count = Some(parse_count(a, body)?);
+                // `-N` shorthand (e.g. `-5`): show N commits, so N is positive.
+                match parse_max_count(body) {
+                    Ok(mc) => max_count = mc,
+                    Err(()) => {
+                        eprintln!("fatal: '{body}': not an integer");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
             } else {
                 bail!("unsupported flag {a:?}");
             }
-        } else if rev.is_some() {
-            bail!("multiple revisions are not ported");
         } else {
-            rev = Some(a.clone());
+            // A non-flag token before `--` is a revision; git accepts several and
+            // walks the union of their histories.
+            revs.push(a.clone());
         }
         i += 1;
     }
@@ -127,10 +178,19 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
+    // `--name-only` and `--name-status` are mutually exclusive diff formats;
+    // git rejects the pair in `diff_setup_done` before any traversal.
+    if name_only && name_status {
+        eprintln!(
+            "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
+        );
+        return Ok(ExitCode::from(128));
+    }
+
     // Collect the starting tips in git's order: the named revision (or HEAD),
     // then every ref sorted by full name, then HEAD again for `--all`.
     let mut tips: Vec<ObjectId> = Vec::new();
-    if let Some(spec) = &rev {
+    for spec in &revs {
         match repo.rev_parse_single(spec.as_str()) {
             Ok(id) => tips.push(id.detach()),
             Err(_) => {
@@ -168,7 +228,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
-    if rev.is_none() || all {
+    if revs.is_empty() || all {
         let head = repo.head()?;
         if head.is_unborn() && !all {
             let branch = head
@@ -195,6 +255,18 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         nodes = topo_sort(nodes, effective_order == Order::Date);
     }
 
+    // Path-limited traversal: keep only commits that touched a matching pathspec,
+    // measured against the first parent (the empty tree for a root commit).
+    if !pathspecs.is_empty() {
+        let mut kept = Vec::with_capacity(nodes.len());
+        for node in nodes.into_iter() {
+            if commit_touches(&repo, &node, &pathspecs)? {
+                kept.push(node);
+            }
+        }
+        nodes = kept;
+    }
+
     if only_merges {
         nodes.retain(|n| n.parents.len() >= 2);
     }
@@ -218,12 +290,18 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         let commit = repo.find_object(node.id)?.try_into_commit()?;
         let mut block: Vec<u8> = Vec::new();
         render_entry(&mut block, &commit, &pretty, abbrev_commit)?;
-        if terminator {
+        // A `tformat:` record is terminated by a newline, but an empty record
+        // (an empty user format) emits nothing at all — no stray terminator.
+        if terminator && !block.is_empty() {
             block.push(b'\n');
         }
 
         if want_diff && node.parents.len() < 2 {
-            let files = collect_changes(&repo, &commit, node.parents.first().copied(), stat)?;
+            // `--name-only`/`--name-status` are the reported format when present;
+            // git suppresses `--stat` in that case, so the blob reads it needs
+            // are skipped too.
+            let show_stat = stat && !name_only && !name_status;
+            let files = collect_changes(&repo, &commit, node.parents.first().copied(), show_stat)?;
             let mut diff: Vec<u8> = Vec::new();
             if name_status {
                 for f in &files {
@@ -237,14 +315,14 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                     diff.extend_from_slice(&f.path);
                     diff.push(b'\n');
                 }
-            }
-            if stat {
+            } else if show_stat {
                 emit_stat(&mut diff, &files)?;
             }
             if !diff.is_empty() {
                 // git puts a blank line between the log message and the diff for
-                // every format but `oneline`.
-                if !matches!(pretty, Pretty::Oneline) {
+                // every format but `oneline` — and only when the message block
+                // rendered something to separate from.
+                if !matches!(pretty, Pretty::Oneline) && !block.is_empty() {
                     block.push(b'\n');
                 }
                 block.extend_from_slice(&diff);
@@ -278,11 +356,30 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     }
 }
 
-/// Parse a positive commit count for `-n`/`--max-count`, with a git-shaped error.
-fn parse_count(flag: &str, value: &str) -> Result<usize> {
-    value
-        .parse::<usize>()
-        .map_err(|_| anyhow!("invalid number {value:?} for {flag}"))
+/// Parse a `-n`/`--max-count` value the way git does: a base-10 signed integer
+/// with no trailing garbage. A negative value means "unlimited" (git's `-1`
+/// sentinel), reported as `Ok(None)`; a non-negative value caps the walk.
+/// `Err(())` marks a value git rejects with `fatal: '<value>': not an integer`.
+fn parse_max_count(value: &str) -> Result<Option<usize>, ()> {
+    match parse_int(value) {
+        Some(n) if n < 0 => Ok(None),
+        Some(n) => Ok(Some(n as usize)),
+        None => Err(()),
+    }
+}
+
+/// A base-10 signed integer git would accept: optional `+`/`-`, then digits only,
+/// no trailing characters, no overflow. Returns `None` for anything else.
+fn parse_int(value: &str) -> Option<i64> {
+    let (neg, digits) = match value.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, value.strip_prefix('+').unwrap_or(value)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: i64 = digits.parse().ok()?;
+    Some(if neg { -n } else { n })
 }
 
 /// git distinguishes a well-formed but absent object id from an unresolvable name:
@@ -453,25 +550,44 @@ enum Pretty {
     User(String),
 }
 
-/// Returns the format and whether it terminates (rather than separates) records.
-fn parse_pretty(spec: &str) -> Result<(Pretty, bool)> {
+/// git's `get_commit_format`, the shared parser behind `--pretty=` and
+/// `--format=`. Returns the format and whether it terminates (rather than
+/// separates) records:
+///   * `Ok(Some(..))` — a valid, supported format.
+///   * `Ok(None)`     — a value git itself rejects (`fatal: invalid --pretty
+///     format: <arg>`, exit 128): non-empty, no `%`, not a `format:`/`tformat:`
+///     prefix, and not a known format name.
+///   * `Err(..)`      — a value git accepts but this port does not yet render
+///     (an unsupported `%` placeholder), surfaced terse rather than faked.
+///
+/// An empty value is git's empty user format: it renders nothing per commit and,
+/// as a terminator format, drops even the trailing newline.
+fn get_commit_format(spec: &str) -> Result<Option<(Pretty, bool)>> {
+    if spec.is_empty() {
+        return Ok(Some((Pretty::User(String::new()), true)));
+    }
     if let Some(fmt) = spec.strip_prefix("format:") {
         check_format(fmt)?;
-        return Ok((Pretty::User(fmt.to_string()), false));
+        return Ok(Some((Pretty::User(fmt.to_string()), false)));
     }
     if let Some(fmt) = spec.strip_prefix("tformat:") {
         check_format(fmt)?;
-        return Ok((Pretty::User(fmt.to_string()), true));
+        return Ok(Some((Pretty::User(fmt.to_string()), true)));
+    }
+    if spec.contains('%') {
+        check_format(spec)?;
+        return Ok(Some((Pretty::User(spec.to_string()), true)));
     }
     match spec {
-        "oneline" => Ok((Pretty::Oneline, true)),
-        "medium" => Ok((Pretty::Medium, false)),
-        "short" => Ok((Pretty::Short, false)),
-        _ if spec.contains('%') => {
-            check_format(spec)?;
-            Ok((Pretty::User(spec.to_string()), true))
+        "oneline" => Ok(Some((Pretty::Oneline, true))),
+        "medium" => Ok(Some((Pretty::Medium, false))),
+        "short" => Ok(Some((Pretty::Short, false))),
+        // Valid git format names this port does not render yet: surfaced terse,
+        // not as git's "invalid" — they are legal, just unported.
+        "full" | "fuller" | "reference" | "email" | "raw" | "mboxrd" => {
+            bail!("pretty format {spec:?} is not ported")
         }
-        _ => bail!("unsupported pretty format {spec}"),
+        _ => Ok(None),
     }
 }
 
@@ -673,6 +789,81 @@ fn collect_changes(
         }
     }
     Ok(out)
+}
+
+/// Whether `node`'s commit touched any path matching `pathspecs`, diffed against
+/// its first parent (the empty tree for a root commit). This is the predicate
+/// git's path-limited traversal shows a commit on.
+fn commit_touches(repo: &gix::Repository, node: &Node, pathspecs: &[String]) -> Result<bool> {
+    let commit = repo.find_object(node.id)?.try_into_commit()?;
+    let files = collect_changes(repo, &commit, node.parents.first().copied(), false)?;
+    for f in &files {
+        for spec in pathspecs {
+            if pathspec_matches(spec, &f.path)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Does a plain git pathspec match a repo-relative path? Matches git's default
+/// (non-magic) rules: an exact path, a leading directory (`src` matches
+/// `src/lib.rs`), or a wildcard where `*`/`?` span the whole path. Magic
+/// pathspecs (`:(glob)`, `:!exclude`, …) and bracket classes are surfaced terse
+/// rather than matched wrong.
+fn pathspec_matches(spec: &str, path: &[u8]) -> Result<bool> {
+    if spec.starts_with(':') {
+        bail!("magic pathspecs are not ported");
+    }
+    let spec = spec.strip_prefix("./").unwrap_or(spec);
+    let spec = spec.trim_end_matches('/');
+    if spec.is_empty() || spec == "." {
+        return Ok(true);
+    }
+    let sb = spec.as_bytes();
+    if path == sb {
+        return Ok(true);
+    }
+    // Leading-directory match: the path lives under the pathspec directory.
+    if path.len() > sb.len() && path.starts_with(sb) && path[sb.len()] == b'/' {
+        return Ok(true);
+    }
+    if spec.bytes().any(|b| b == b'[') {
+        bail!("bracket-class pathspecs are not ported");
+    }
+    if spec.bytes().any(|b| b == b'*' || b == b'?') {
+        return Ok(wildmatch(sb, path));
+    }
+    Ok(false)
+}
+
+/// Glob match for a plain pathspec: `*` matches any run (slashes included, as
+/// git's default fnmatch does), `?` matches one byte. Linear-time with the usual
+/// single backtrack point for `*`.
+fn wildmatch(pat: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0usize, 0usize);
+    let (mut star_p, mut star_t): (Option<usize>, usize) = (None, 0);
+    while t < text.len() {
+        if p < pat.len() && (pat[p] == b'?' || pat[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star_p = Some(p);
+            star_t = t;
+            p += 1;
+        } else if let Some(sp) = star_p {
+            p = sp + 1;
+            star_t += 1;
+            t = star_t;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
 }
 
 /// Turn one gix change into a [`FileChange`], or `None` for the directory entries

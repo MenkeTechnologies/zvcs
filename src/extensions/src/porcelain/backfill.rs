@@ -29,6 +29,12 @@
 //!     names an existing path is a pathspec, not an error, as in git.
 //!   * an unrecognized argument gives `fatal: unrecognized argument: <arg>`,
 //!     exit 128 — git's `setup_revisions` wording, not parse-options'.
+//!   * the integer-valued rev options (`--max-count`, `--skip`, `--min-parents`,
+//!     `--max-parents` and the `-<n>` shorthand) are validated with git's
+//!     `strtol_i`, so a malformed value (`--max-count=0x10`, `-5abc`, an overflow)
+//!     gives `fatal: '<value>': not an integer`, exit 128. `--max-count`/`--skip`
+//!     also take the value from the next argument and report `Option '<opt>'
+//!     requires a value` when it is missing or is the `--` terminator.
 //!
 //! What is **not** covered: the download itself, i.e. `backfill`'s entire reason
 //! for existing in a partial clone. The vendored gitoxide has no partial-clone
@@ -216,11 +222,63 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
         }
 
         if a.len() > 1 && a.starts_with('-') {
-            // `-<n>` is rev-list's max-count shorthand.
-            if a[1..].bytes().all(|b| b.is_ascii_digit()) {
-                continue;
+            // `-<n>` is rev-list's max-count shorthand: git takes any `-<digit>…`
+            // as the numeric form and validates the tail with `strtol_i`, dying
+            // `'<n>': not an integer` on anything it will not fully consume.
+            if a.as_bytes()[1].is_ascii_digit() {
+                let n = &a[1..];
+                if strtol_i(n) {
+                    continue;
+                }
+                eprintln!("fatal: '{n}': not an integer");
+                return Ok(ExitCode::from(128));
             }
-            let name = a.split_once('=').map_or(a, |(name, _)| name);
+
+            let (name, value) = match a.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (a, None),
+            };
+
+            // Integer-valued rev options validate with git's `strtol_i` (base 10,
+            // signed `int`, whole-string). `--max-count`/`--skip` take the value
+            // from `=` or the next argument — but never the `--` terminator, which
+            // git reports as a missing value. `--min-parents`/`--max-parents` take
+            // it only from `=`; their bare spelling is unrecognized here.
+            match name {
+                "--max-count" | "--skip" => {
+                    let value = match value {
+                        Some(value) => value,
+                        None => match rest.get(j) {
+                            Some(&next) if next != "--" => {
+                                j += 1;
+                                next
+                            }
+                            _ => {
+                                eprintln!("fatal: Option '{name}' requires a value");
+                                return Ok(ExitCode::from(128));
+                            }
+                        },
+                    };
+                    if !strtol_i(value) {
+                        eprintln!("fatal: '{value}': not an integer");
+                        return Ok(ExitCode::from(128));
+                    }
+                    continue;
+                }
+                "--min-parents" | "--max-parents" => {
+                    let Some(value) = value else {
+                        eprintln!("fatal: unrecognized argument: {a}");
+                        return Ok(ExitCode::from(128));
+                    };
+                    if !strtol_i(value) {
+                        eprintln!("fatal: '{value}': not an integer");
+                        return Ok(ExitCode::from(128));
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
             if REV_OPTS.contains(&a) || REV_OPTS_WITH_VALUE.contains(&name) {
                 match name {
                     "--not" => negating = !negating,
@@ -303,6 +361,20 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
     // No promisor remote: there is nothing to request and nothing to write.
     // Stock git prints nothing, touches nothing and exits 0.
     Ok(ExitCode::SUCCESS)
+}
+
+/// git's `strtol_i`: is `s` a base-10 signed `int` the way `strtol(s, &end, 10)`
+/// reads it — leading ASCII whitespace skipped, an optional `+`/`-`, decimal
+/// digits, and then `*end == '\0'` (no trailing bytes) with the result in `int`
+/// range. So ` 5`, `+5`, `-5`, `07` and `-2147483648` are integers, while `0x10`,
+/// `5k`, `5 `, `2147483648` and `` are not. Used for `--max-count`, `--skip`,
+/// `--min-parents`, `--max-parents` and the `-<n>` shorthand.
+fn strtol_i(s: &str) -> bool {
+    // strtol skips only C-locale whitespace; Rust's `i32` parser then enforces
+    // the sign/digit grammar and the whole-string, in-range requirements.
+    s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r'])
+        .parse::<i32>()
+        .is_ok()
 }
 
 /// Peel `spec` to a commit id, or `None` when it names no commit.

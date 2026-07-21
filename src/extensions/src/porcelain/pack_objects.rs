@@ -50,7 +50,11 @@
 //!   and the integer/magnitude value-type messages
 //! * the value-callback `fatal:`s git raises *during* parsing, in argv order:
 //!   `--index-version` (git's `strtoul` grammar, including the `,<offset>` tail
-//!   and the `off32_limit` sign check), `--missing`, `--stdin-packs=<mode>`
+//!   and the `off32_limit` sign check), `--missing`, `--stdin-packs=<mode>`, and
+//!   `--filter` (git's full `gently_parse_list_objects_filter` grammar:
+//!   `blob:none`, `blob:limit=<n>`, `tree:<depth>`, `sparse:oid=`, the dropped
+//!   `sparse:path=`, `object:type=<t>`, and recursive `combine:` with its
+//!   percent-decode and reserved-character checks)
 //! * the usage-on-no-output rule (`pack_to_stdout != !base_name`, plus a second
 //!   positional) and every post-parse `fatal:` git emits before it touches the
 //!   object database, in git's own order: bad compression level, `--thin`
@@ -1236,7 +1240,7 @@ fn long_opt(body: &str, args: &[String], i: &mut usize, st: &mut State) -> Optio
     None
 }
 
-/// Validate a value against the option's parse-options type and, for the three
+/// Validate a value against the option's parse-options type and, for the four
 /// options git validates in a callback, against that callback's own grammar.
 ///
 /// The type diagnostics exit 129; the callback ones are `die()`s and exit 128.
@@ -1267,8 +1271,236 @@ fn check_value(def: &OptDef, shown: &str, v: &str) -> Option<ExitCode> {
         "stdin-packs" if !STDIN_PACKS_MODES.contains(&v) => {
             Some(fatal(&format!("invalid value for 'stdin-packs': '{v}'")))
         }
+        "filter" => check_filter_spec(v),
         _ => None,
     }
+}
+
+/// git's `--filter` callback (`OPT_PARSE_LIST_OBJECTS_FILTER` →
+/// `gently_parse_list_objects_filter`), which validates the spec while parsing
+/// and `die()`s (exit 128) on the first rejection, in argv order — before the
+/// no-output usage check ever runs. `None` when git accepts the spec.
+///
+/// Ported from git 2.55.0 `list-objects-filter-options.c`, with pack-objects'
+/// `allow_auto_filter = false`. Only validation is ported here; how an accepted
+/// spec then shapes the object set is [`apply_filter`]'s job.
+fn check_filter_spec(spec: &str) -> Option<ExitCode> {
+    gently_parse_filter(spec.as_bytes()).err().map(|m| fatal(&m))
+}
+
+/// `gently_parse_list_objects_filter`: match the spec against git's fixed set of
+/// filter forms, in git's declaration order (which decides which diagnostic a
+/// near-miss like `blob:` or `object:` gets). `Err(msg)` carries the exact text
+/// git puts after `fatal: `.
+fn gently_parse_filter(arg: &[u8]) -> Result<(), String> {
+    // pack-objects does not set `allow_auto_filter`, so `auto` is always refused.
+    if arg == b"auto" {
+        return Err("'auto' filter not supported by this command".to_string());
+    }
+    if arg == b"blob:none" {
+        return Ok(());
+    }
+    if let Some(v0) = arg.strip_prefix(b"blob:limit=".as_slice()) {
+        // A bad magnitude is not its own diagnostic: git falls out of the
+        // if/else chain to the generic `invalid filter-spec` at the bottom.
+        if git_parse_ulong(v0).is_some() {
+            return Ok(());
+        }
+    } else if let Some(v0) = arg.strip_prefix(b"tree:".as_slice()) {
+        if git_parse_ulong(v0).is_none() {
+            return Err("expected 'tree:<depth>'".to_string());
+        }
+        return Ok(());
+    } else if arg.strip_prefix(b"sparse:oid=".as_slice()).is_some() {
+        // Any oid name is accepted at parse time; resolution happens later.
+        return Ok(());
+    } else if arg.strip_prefix(b"sparse:path=".as_slice()).is_some() {
+        return Err("sparse:path filters support has been dropped".to_string());
+    } else if let Some(v0) = arg.strip_prefix(b"object:type=".as_slice()) {
+        if !is_object_type(v0) {
+            return Err(format!(
+                "'{}' for 'object:type=<type>' is not a valid object type",
+                String::from_utf8_lossy(v0)
+            ));
+        }
+        return Ok(());
+    } else if let Some(v0) = arg.strip_prefix(b"combine:".as_slice()) {
+        return parse_combine_filter(v0);
+    }
+
+    Err(format!(
+        "invalid filter-spec '{}'",
+        String::from_utf8_lossy(arg)
+    ))
+}
+
+/// `parse_combine_filter`: split on `+` into sub-filters (each of which is
+/// parsed recursively), tolerating empty segments so a leading or trailing `+`
+/// is accepted. An empty body is the one combine-specific error.
+fn parse_combine_filter(arg: &[u8]) -> Result<(), String> {
+    if arg.is_empty() {
+        return Err("expected something after combine:".to_string());
+    }
+    let mut p = arg;
+    loop {
+        let end = p.iter().position(|&c| c == b'+').unwrap_or(p.len());
+        let sub = &p[..end];
+        if !sub.is_empty() {
+            parse_combine_subfilter(sub)?;
+        }
+        if end == p.len() {
+            break;
+        }
+        p = &p[end + 1..];
+        if p.is_empty() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// `parse_combine_subfilter`: percent-decode the segment, reject any reserved
+/// character in the *raw* segment, then parse the decoded bytes recursively. The
+/// `LOFC_AUTO` combine check git runs afterwards is unreachable here, since a
+/// bare `auto` sub-filter is already refused by [`gently_parse_filter`].
+fn parse_combine_subfilter(subspec: &[u8]) -> Result<(), String> {
+    let decoded = url_percent_decode(subspec);
+    if let Some(c) = has_reserved_character(subspec) {
+        return Err(format!("must escape char in sub-filter-spec: '{c}'"));
+    }
+    gently_parse_filter(&decoded)
+}
+
+/// git's `RESERVED_NON_WS` set plus every byte at or below a space: the first
+/// such byte in `sub` is the one git names in its escape diagnostic.
+fn has_reserved_character(sub: &[u8]) -> Option<char> {
+    const RESERVED_NON_WS: &[u8] = br#"~`!@#$^&*()[]{}\;'",<>?"#;
+    sub.iter()
+        .copied()
+        .find(|&c| c <= b' ' || RESERVED_NON_WS.contains(&c))
+        .map(|c| c as char)
+}
+
+/// `type_from_string_gently`, case-sensitively: the four named object types git
+/// accepts after `object:type=`.
+fn is_object_type(v: &[u8]) -> bool {
+    matches!(v, b"commit" | b"tree" | b"blob" | b"tag")
+}
+
+/// `url_percent_decode` (`decode_plus = 0`): decode `%XX` where both digits are
+/// hex and the byte is non-zero, and copy every other byte through unchanged —
+/// which is exactly how git leaves a truncated or malformed `%` in place.
+fn url_percent_decode(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == b'%' && i + 3 <= s.len() {
+            if let (Some(h), Some(l)) = (hexval(s[i + 1]), hexval(s[i + 2])) {
+                let byte = (h << 4) | l;
+                if byte > 0 {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(s[i]);
+        i += 1;
+    }
+    out
+}
+
+/// One hex digit's value, or `None` — the `hex2chr` half git's decoder uses.
+fn hexval(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// git's `git_parse_ulong` (via `git_parse_unsigned`), as `blob:limit=` and
+/// `tree:` consume their value: the string must be non-empty and hold no `-`
+/// anywhere, a base-0 `strtoumax` must convert at least one digit without
+/// overflowing an `unsigned long`, and any trailing unit must be one of
+/// `k`/`m`/`g` (either case). `None` is git's "0 return" (rejected value).
+///
+/// The `unsigned long` ceiling is 64-bit on every target this builds for, so
+/// only the multiply can overflow `max`; `checked_mul` stands in for git's
+/// `unsigned_mult_overflows` / `> max` pair.
+fn git_parse_ulong(value: &[u8]) -> Option<u64> {
+    if value.is_empty() || value.contains(&b'-') {
+        return None;
+    }
+    let (val, end) = strtoumax_base0(value)?;
+    let factor = unit_factor(end)?;
+    val.checked_mul(factor)
+}
+
+/// `get_unit_factor`: an empty tail is a factor of one, `k`/`m`/`g` scale by
+/// 2^10/2^20/2^30, and anything else is git's `0` (an invalid value).
+fn unit_factor(end: &[u8]) -> Option<u64> {
+    match end {
+        b"" => Some(1),
+        b"k" | b"K" => Some(1024),
+        b"m" | b"M" => Some(1024 * 1024),
+        b"g" | b"G" => Some(1024 * 1024 * 1024),
+        _ => None,
+    }
+}
+
+/// C's `strtoumax(value, &end, 0)` over the prefix git's numeric parser reads:
+/// skip leading ASCII whitespace and an optional sign, auto-detect the base
+/// (`0x` hex, a leading `0` octal, else decimal), and consume digits. Returns
+/// the converted value and the unconsumed tail, or `None` when no digit was
+/// converted or the magnitude overflows `u64` (git's `ERANGE`).
+///
+/// git rejects any `-` before this runs, so the negative branch is defensive
+/// only; it wraps the way C would rather than inventing a value.
+fn strtoumax_base0(value: &[u8]) -> Option<(u64, &[u8])> {
+    let mut i = 0;
+    while i < value.len() && value[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut negative = false;
+    if i < value.len() && (value[i] == b'+' || value[i] == b'-') {
+        negative = value[i] == b'-';
+        i += 1;
+    }
+
+    let (base, start) = if value.len() > i + 2
+        && value[i] == b'0'
+        && (value[i + 1] | 0x20) == b'x'
+        && value[i + 2].is_ascii_hexdigit()
+    {
+        (16u64, i + 2)
+    } else if i < value.len() && value[i] == b'0' {
+        (8u64, i)
+    } else {
+        (10u64, i)
+    };
+
+    let mut j = start;
+    let mut val: u64 = 0;
+    let mut overflow = false;
+    while j < value.len() {
+        let Some(d) = hexval(value[j]).map(u64::from).filter(|&d| d < base) else {
+            break;
+        };
+        match val.checked_mul(base).and_then(|v| v.checked_add(d)) {
+            Some(v) => val = v,
+            None => overflow = true,
+        }
+        j += 1;
+    }
+    if j == start || overflow {
+        return None;
+    }
+    if negative {
+        val = 0u64.wrapping_sub(val);
+    }
+    Some((val, &value[j..]))
 }
 
 /// git's `parse_index_version()` callback, which is `strtoul`-shaped rather than

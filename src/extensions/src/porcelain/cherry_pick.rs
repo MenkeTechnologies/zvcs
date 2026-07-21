@@ -8,13 +8,19 @@
 //! reproduces that pipeline stage for stage, because a great many command lines
 //! never reach the pick itself:
 //!
-//! 1. **Option parsing**, left to right. A bad `--cleanup` mode dies with
-//!    `fatal: Invalid cleanup mode <v>` and status 128 *here*, before anything
-//!    else — including before the sequencer verbs, so `--cleanup=bogus --quit`
-//!    is a failure even though `--quit` alone succeeds. A missing or malformed
-//!    option value prints only its `error:` line and exits 129 without the usage
-//!    block. Options git does not know are *kept*, not rejected
-//!    (`PARSE_OPT_KEEP_UNKNOWN_OPT`), and only turn into an error in stage 5.
+//! 1. **Option parsing**, left to right. `--cleanup` is stored raw and only its
+//!    *final* value is validated once parsing finishes (last-wins;
+//!    `--no-cleanup` clears it), so `--cleanup=bogus --cleanup=default` is fine
+//!    and `--cleanup=default --cleanup=bogus` dies. A bad final `--cleanup` mode
+//!    dies with `fatal: Invalid cleanup mode <v>` and status 128 *here*, before
+//!    anything else — including before the sequencer verbs, so
+//!    `--cleanup=bogus --quit` is a failure even though `--quit` alone succeeds.
+//!    `--empty` and `-m`, by contrast, validate *eagerly* per value as git's
+//!    parse-options callbacks do, so a bad one of those (status 129) outranks a
+//!    later bad `--cleanup`. A missing or malformed option value prints only its
+//!    `error:` line and exits 129 without the usage block. Options git does not
+//!    know are *kept*, not rejected (`PARSE_OPT_KEEP_UNKNOWN_OPT`), and only turn
+//!    into an error in stage 5.
 //! 2. **Sequencer verbs** (`--quit`, `--continue`, `--abort`, `--skip`). Options
 //!    that would have no meaning alongside a verb are rejected with
 //!    `fatal: cherry-pick: <opt> cannot be used with <verb>` and status 128.
@@ -230,7 +236,11 @@ struct Opts<'a> {
     signoff: bool,
     mainline: Option<u32>,
     empty: Option<Empty>,
-    cleanup: Option<Cleanup>,
+    /// The raw, unvalidated `--cleanup` value (last-wins; `None` after
+    /// `--no-cleanup`). git stores the string and validates only this final
+    /// value once parsing is over, so a bad mode overwritten by a later good one
+    /// never errors.
+    cleanup: Option<&'a str>,
     strategy: bool,
     xopts: bool,
     gpg_sign: bool,
@@ -332,8 +342,9 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
             "--abort" => o.verb = o.verb.or(Some(Verb::Abort)),
             "--skip" => o.verb = o.verb.or(Some(Verb::Skip)),
 
+            // Stored raw; the final value is validated post-parse, not here.
             "--cleanup" => {
-                o.cleanup = Some(parse_cleanup(take_value(inline, args, &mut i, "cleanup")?)?);
+                o.cleanup = Some(take_value(inline, args, &mut i, "cleanup")?);
             }
             "--no-cleanup" => o.cleanup = None,
             "--empty" => {
@@ -433,6 +444,19 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         Err(code) => return Ok(code),
     };
 
+    // --- stage 1 (tail): validate the final `--cleanup` value -------------
+    // git's `parse_args` stores `--cleanup` raw and runs `get_cleanup_mode` on
+    // the final value right after option parsing — before the sequencer verbs,
+    // before revision resolution, before the no-revision usage error. A bad mode
+    // dies `fatal: Invalid cleanup mode <v>` (128) here and nowhere later.
+    let cleanup: Option<Cleanup> = match opts.cleanup {
+        Some(raw) => match parse_cleanup(raw) {
+            Ok(mode) => Some(mode),
+            Err(code) => return Ok(code),
+        },
+        None => None,
+    };
+
     // --- stage 2: sequencer verbs ----------------------------------------
     if let Some(verb) = opts.verb {
         return handle_verb(verb, &opts);
@@ -449,7 +473,15 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     // --- stage 4: resolve every revision, in order ------------------------
+    //
+    // git's `setup_revisions` walks the whole argument list and dies on the
+    // *first* spec that fails to resolve, regardless of what comes after it. So a
+    // bad revision outranks the unsupported-range bail below: `main..feature
+    // does-not-exist` must report `bad revision 'does-not-exist'` (128), not the
+    // range. Validate every spec first; only after the list is clean does the
+    // range become the failure.
     let mut picks: Vec<ObjectId> = Vec::with_capacity(opts.specs.len());
+    let mut range_spec: Option<&str> = None;
     for spec in &opts.specs {
         let parsed = match repo.rev_parse(*spec) {
             Ok(parsed) => parsed,
@@ -460,11 +492,16 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
             // commit-ish it is handed before replaying it.
             Some(id) => picks.push(id.object()?.peel_to_commit()?.id),
             // Both endpoints resolved, so this is a genuine range. Enumerating it
-            // is unported, and silently picking one end would be wrong.
-            None => anyhow::bail!(
-                "commit ranges are not supported; name each commit individually (`{spec}`)"
-            ),
+            // is unported, and silently picking one end would be wrong — but the
+            // bail waits until every remaining spec has been validated, so a
+            // later bad revision still wins.
+            None => range_spec = range_spec.or(Some(*spec)),
         }
+    }
+    if let Some(spec) = range_spec {
+        anyhow::bail!(
+            "commit ranges are not supported; name each commit individually (`{spec}`)"
+        );
     }
 
     // --- stage 5: options git kept but never consumed ----------------------
@@ -632,7 +669,7 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         let mut message: BString = pick.message_raw()?.to_owned();
         // Only an explicit `--cleanup` rewrites the picked message; without one
         // git carries it across untouched.
-        if let Some(mode) = opts.cleanup {
+        if let Some(mode) = cleanup {
             message = cleanup_message(&message, mode);
         }
         if message.trim().is_empty() && !opts.allow_empty_message {

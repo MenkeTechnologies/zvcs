@@ -86,11 +86,15 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
                 "abbrev" => opts.abbrev = Abbrev::Auto,
                 _ if long.starts_with("hash=") => {
                     opts.hash_only = true;
-                    opts.abbrev = parse_abbrev(&long["hash=".len()..])?;
+                    match parse_abbrev(&long["hash=".len()..]) {
+                        Some(a) => opts.abbrev = a,
+                        None => return numeric_error("hash"),
+                    }
                 }
-                _ if long.starts_with("abbrev=") => {
-                    opts.abbrev = parse_abbrev(&long["abbrev=".len()..])?;
-                }
+                _ if long.starts_with("abbrev=") => match parse_abbrev(&long["abbrev=".len()..]) {
+                    Some(a) => opts.abbrev = a,
+                    None => return numeric_error("abbrev"),
+                },
                 "exclude-existing" => bail!("unsupported flag \"--exclude-existing\" ({PORTED})"),
                 _ if long.starts_with("exclude-existing=") => {
                     bail!("unsupported flag \"--exclude-existing=\" ({PORTED})")
@@ -111,7 +115,10 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
                     opts.hash_only = true;
                     let rest: String = short[i + 1..].iter().collect();
                     if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
-                        opts.abbrev = parse_abbrev(&rest)?;
+                        match parse_abbrev(&rest) {
+                            Some(a) => opts.abbrev = a,
+                            None => return numeric_error("hash"),
+                        }
                         i = short.len();
                         continue;
                     }
@@ -142,13 +149,64 @@ const PORTED: &str = "ported: --head, -d/--dereference, -s/--hash[=<n>], \
                       --abbrev[=<n>], --branches/--heads, --tags, --verify, \
                       --exists, -q/--quiet";
 
-/// Parse an `--abbrev=<n>` / `--hash=<n>` value the way git does: `0` disables
-/// abbreviation entirely, anything else is raised to git's 4-digit minimum.
-fn parse_abbrev(s: &str) -> Result<Abbrev> {
-    let n: usize = s
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid abbreviation length {s:?}"))?;
-    Ok(if n == 0 { Abbrev::Full } else { Abbrev::Len(n.max(4)) })
+/// git's `parse_opt_abbrev_cb` numeric-value rejection: prints
+/// `error: option `<name>' expects a numerical value` and exits 129 (the
+/// parse-options usage-error code), where `<name>` is `abbrev` or `hash`.
+fn numeric_error(name: &str) -> Result<ExitCode> {
+    eprintln!("error: option `{name}' expects a numerical value");
+    Ok(ExitCode::from(129))
+}
+
+/// Parse an `--abbrev=<n>` / `--hash=<n>` value exactly as git's
+/// `parse_opt_abbrev_cb` does. The value is read with C `strtol` base-10
+/// semantics (leading whitespace and an optional sign, then digits); any
+/// remaining character — including trailing whitespace — is rejected (`None`,
+/// git's exit-129 path). The parsed `long` is truncated to a C `int`, then `0`
+/// keeps the full id, a nonzero value below git's 4-digit minimum is raised to
+/// 4, and larger values are clamped to the hash width at render time.
+fn parse_abbrev(s: &str) -> Option<Abbrev> {
+    let v = strtol_i32(s)?;
+    Some(if v == 0 {
+        Abbrev::Full
+    } else if v < 4 {
+        Abbrev::Len(4)
+    } else {
+        Abbrev::Len(v as usize)
+    })
+}
+
+/// C `strtol(s, &end, 10)` followed by assignment to a 32-bit `int`, as git
+/// stores its abbrev value: skip leading whitespace, take an optional `+`/`-`
+/// and base-10 digits, and require the whole string to be consumed. On integer
+/// overflow the accumulator saturates to `i64::MIN`/`MAX` — whose low 32 bits
+/// (`0` / `-1`) match a C `long`-to-`int` truncation of `LONG_MIN`/`LONG_MAX`.
+fn strtol_i32(s: &str) -> Option<i32> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    // strtol's isspace: space, \t, \n, \v, \f, \r.
+    while i < b.len() && (b[i] == 0x0B || b[i].is_ascii_whitespace()) {
+        i += 1;
+    }
+    let neg = matches!(b.get(i), Some(b'-'));
+    if matches!(b.get(i), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let start = i;
+    let mut acc: i64 = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        let d = i64::from(b[i] - b'0');
+        acc = if neg {
+            acc.saturating_mul(10).saturating_sub(d)
+        } else {
+            acc.saturating_mul(10).saturating_add(d)
+        };
+        i += 1;
+    }
+    // No digits, or trailing junk after the number -> not a numerical value.
+    if i == start || i != b.len() {
+        return None;
+    }
+    Some(acc as i32)
 }
 
 /// Default form: walk every ref under `refs/` (optionally restricted to

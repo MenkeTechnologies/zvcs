@@ -64,6 +64,11 @@
 //!     lands in that refused set too.
 //!   * resuming a sequence: `--continue`, and `--abort`/`--skip` when a revert
 //!     really is in progress, all need `git reset --merge`, which is not ported.
+//!     A multi-pick (sequencer) revert whose pick empties out prints git's
+//!     `Revert currently in progress` status block byte-for-byte, but the
+//!     `.git/sequencer` todo/opts backing that block is not written, since
+//!     nothing here can resume it — the object set, index, refs and worktree
+//!     an empty pick leaves are already identical to git's.
 //!   * `-S`/`--gpg-sign` — bails, since nothing here can produce a signature.
 //!   * **spawning an editor.** `-e`/`--edit` is accepted and only changes which
 //!     `--cleanup=default` mode applies; the generated message is then taken as
@@ -355,8 +360,8 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
         return Ok(usage_error());
     }
 
-    let commits = match resolve_specs(&repo, &specs)? {
-        Selection::List(list) => list,
+    let (commits, sequencer) = match resolve_specs(&repo, &specs)? {
+        Selection::List { commits, sequencer } => (commits, sequencer),
         Selection::Failed(code) => return Ok(code),
     };
     if commits.is_empty() {
@@ -368,7 +373,7 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
     // With `-n` nothing is committed between steps; each further revert stacks
     // because it re-reads the index the previous one left behind.
     for id in commits {
-        match revert_one(&repo, id, &o, cleanup)? {
+        match revert_one(&repo, id, &o, cleanup, sequencer)? {
             Step::Failed(code) => return Ok(code),
             Step::Done => {}
         }
@@ -442,7 +447,15 @@ fn run_mode(repo: &gix::Repository, mode: Cmd) -> Result<ExitCode> {
 /// `Failed` carries the exit code of a refusal whose text git has already
 /// printed; `List` is the commit sequence to work through.
 enum Selection {
-    List(Vec<ObjectId>),
+    /// The commits to work through, plus whether git's sequencer is in play.
+    /// A lone plain `<commit>` takes git's `no_walk` single-pick fast path,
+    /// which never persists a sequencer or reports a revert "in progress"; any
+    /// range/`^`-exclusion, or more than one operand, switches to the walking
+    /// sequencer, which does. That flag is observable: when such a pick reverts
+    /// to an empty result it stops with the `Revert currently in progress` block
+    /// (`git revert HEAD..x` yields it even for a single walked commit, while
+    /// `git revert x` alone does not).
+    List { commits: Vec<ObjectId>, sequencer: bool },
     Failed(ExitCode),
 }
 
@@ -485,13 +498,16 @@ fn resolve_specs(repo: &gix::Repository, specs: &[String]) -> Result<Selection> 
     }
 
     if include.is_empty() || !walked {
-        return Ok(Selection::List(include));
+        // No walk: git's single-pick fast path only when exactly one operand.
+        let sequencer = include.len() > 1;
+        return Ok(Selection::List { commits: include, sequencer });
     }
     let mut out = Vec::new();
     for info in repo.rev_walk(include).with_hidden(exclude).all()? {
         out.push(info?.id);
     }
-    Ok(Selection::List(out))
+    // A walked selection always runs through git's sequencer, even at length 1.
+    Ok(Selection::List { commits: out, sequencer: true })
 }
 
 /// Resolve one revision to the commit it names, or `None` if either step fails
@@ -521,6 +537,7 @@ fn revert_one(
     target_id: ObjectId,
     o: &Options,
     cleanup: Option<Cleanup>,
+    sequencer: bool,
 ) -> Result<Step> {
     let target = repo.find_commit(target_id)?;
     let parents: Vec<ObjectId> = target.parent_ids().map(|id| id.detach()).collect();
@@ -700,6 +717,17 @@ fn revert_one(
         match repo.head_name()? {
             Some(name) => println!("On branch {}", name.shorten()),
             None => println!("HEAD detached at {}", head_id.to_hex_with_len(7)),
+        }
+        // A sequencer pick that reverts to nothing stops mid-sequence rather
+        // than ending, so `git commit`'s status carries the in-progress advice
+        // git's `wt_status_get_state` prints from the live sequencer todo. The
+        // single-pick fast path has no sequencer, so it omits this block.
+        if sequencer {
+            println!("Revert currently in progress.");
+            println!("  (run \"git revert --continue\" to continue)");
+            println!("  (use \"git revert --skip\" to skip this patch)");
+            println!("  (use \"git revert --abort\" to cancel the revert operation)");
+            println!();
         }
         println!("nothing to commit, working tree clean");
         return Ok(Step::Failed(ExitCode::from(1)));

@@ -6,17 +6,18 @@
 //! (including git's "0 means unlimited"), `--sort` (repeatable, `-` for
 //! descending, last key primary), `--points-at`, `--merged`/`--no-merged`,
 //! `--contains`/`--no-contains`, `--start-after`, `--color`, `--omit-empty`,
-//! `--ignore-case`, `--shell` quoting, and the format language's `%%` / `%xx`
-//! escapes plus the `%(...)` atoms listed on [`parse_atom`].
+//! `--ignore-case`, `--include-root-refs`, the `--shell`/`--perl`/`--python`/
+//! `--tcl` quoting styles (mutually exclusive, `--no-<style>` clears one), and
+//! the format language's `%%` / `%xx` escapes plus the `%(...)` atoms listed on
+//! [`parse_atom`].
 //!
 //! Exit codes follow git: 128 for the `die()` paths (a bad `--merged` operand, a
 //! format that fails verification, the `--start-after` conflicts) and 129 for the
 //! `parse-options` paths (a missing option value, a bad `--contains` or
 //! `--points-at` operand, an unknown option).
 //!
-//! Not covered — each rejected rather than silently producing divergent output:
-//! `--stdin`, `--include-root-refs`, the `--perl`/`--python`/`--tcl` quoting
-//! modes, and the atoms that need substrate this module does not build
+//! Not covered — rejected rather than silently producing divergent output:
+//! `--stdin`, and the atoms that need substrate this module does not build
 //! (`%(upstream)`, `%(push)`, `%(align)`, `%(if)`, `%(describe)`,
 //! `%(worktreepath)`, `%(trailers)`, `%(signature)`, `%(raw)`, `%(deltabase)`,
 //! `%(ahead-behind)`, `%(is-base)`, `%(objectsize:disk)`, `version:`/`v:` sort
@@ -230,6 +231,25 @@ enum ColorWhen {
     Auto,
 }
 
+/// How `--shell`/`--perl`/`--python`/`--tcl` quote each rendered atom.
+///
+/// git tracks the four styles as independent bits (see the `Q_*` masks) so that
+/// repeating one style is harmless but requesting two distinct ones is
+/// "more than one quoting style?". `--no-<style>` clears its bit.
+#[derive(Clone, Copy, PartialEq)]
+enum QuoteStyle {
+    None,
+    Shell,
+    Perl,
+    Python,
+    Tcl,
+}
+
+const Q_SHELL: u8 = 1;
+const Q_PERL: u8 = 2;
+const Q_PYTHON: u8 = 4;
+const Q_TCL: u8 = 8;
+
 /// The reachability filters, each a list of commits combined with "any".
 #[derive(Default)]
 struct Filters {
@@ -280,7 +300,9 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     let mut filters = Filters::default();
     let mut omit_empty = false;
     let mut ignore_case = false;
-    let mut shell_quote = false;
+    let mut include_root_refs = false;
+    // Each quoting style is an independent bit, mirroring git's `OPT_BIT`.
+    let mut quote_bits: u8 = 0;
 
     let mut i = 0;
     let mut only_patterns = false;
@@ -404,15 +426,22 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             "--no-omit-empty" => omit_empty = false,
             "--ignore-case" => ignore_case = true,
             "--no-ignore-case" => ignore_case = false,
-            "--shell" | "-s" => shell_quote = true,
-            "--perl" | "--python" | "--tcl" | "-p" => {
-                bail!("unsupported flag {name:?} (ported quoting mode: --shell)")
-            }
-            "--stdin" | "--include-root-refs" => {
+            "--include-root-refs" => include_root_refs = true,
+            "--no-include-root-refs" => include_root_refs = false,
+            "--shell" | "-s" => quote_bits |= Q_SHELL,
+            "--no-shell" => quote_bits &= !Q_SHELL,
+            "--perl" | "-p" => quote_bits |= Q_PERL,
+            "--no-perl" => quote_bits &= !Q_PERL,
+            "--python" => quote_bits |= Q_PYTHON,
+            "--no-python" => quote_bits &= !Q_PYTHON,
+            "--tcl" => quote_bits |= Q_TCL,
+            "--no-tcl" => quote_bits &= !Q_TCL,
+            "--stdin" => {
                 bail!(
                     "unsupported flag {name:?} (ported: --format, --count, --sort, --exclude, \
                      --points-at, --start-after, --color, --merged, --no-merged, --contains, \
-                     --no-contains, --omit-empty, --ignore-case, --shell)"
+                     --no-contains, --omit-empty, --ignore-case, --include-root-refs, --shell, \
+                     --perl, --python, --tcl)"
                 )
             }
             s if s.starts_with('-') && s.len() > 1 => {
@@ -434,6 +463,20 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
         Some(count as usize)
     } else {
         None
+    };
+
+    // git rejects two *distinct* styles right after option parsing; repeating
+    // one (or clearing it with `--no-<style>`) leaves a single bit or none.
+    if quote_bits.count_ones() > 1 {
+        return Ok(usage_error("more than one quoting style?"));
+    }
+    let quote_style = match quote_bits {
+        0 => QuoteStyle::None,
+        Q_SHELL => QuoteStyle::Shell,
+        Q_PERL => QuoteStyle::Perl,
+        Q_PYTHON => QuoteStyle::Python,
+        Q_TCL => QuoteStyle::Tcl,
+        _ => unreachable!("count_ones() <= 1 leaves a single style bit"),
     };
 
     let color_on = match color_when {
@@ -497,6 +540,23 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     for r in repo.references()?.all()? {
         let r = r.map_err(|e| anyhow!("{e}"))?;
         names.push(r.name().as_bstr().to_vec());
+    }
+    // `--include-root-refs` also lists HEAD and the pseudorefs in the git dir
+    // that git's `is_root_ref` accepts. They live directly under `$GIT_DIR`, so
+    // the loose scan there finds them; `sort_refs` re-orders everything by name.
+    if include_root_refs {
+        for entry in std::fs::read_dir(repo.git_dir())? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            if let Some(name) = file_name.to_str() {
+                if is_root_ref(name.as_bytes()) {
+                    names.push(name.as_bytes().to_vec());
+                }
+            }
+        }
     }
     // The `:short` disambiguation rules test candidate names against every ref.
     let all_names: HashSet<Vec<u8>> = names.iter().cloned().collect();
@@ -594,10 +654,16 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
                 Item::Atom(atom) => {
                     let value = render(&repo, atom, info)?;
                     // Colour escapes are emitted verbatim; git does not quote them.
-                    if shell_quote && !matches!(atom.field, Field::Color(_)) {
-                        line.extend_from_slice(&sq_quote(&value));
-                    } else {
+                    if matches!(atom.field, Field::Color(_)) {
                         line.extend_from_slice(&value);
+                    } else {
+                        match quote_style {
+                            QuoteStyle::None => line.extend_from_slice(&value),
+                            QuoteStyle::Shell => line.extend_from_slice(&sq_quote(&value)),
+                            QuoteStyle::Perl => line.extend_from_slice(&perl_quote(&value)),
+                            QuoteStyle::Python => line.extend_from_slice(&python_quote(&value)),
+                            QuoteStyle::Tcl => line.extend_from_slice(&tcl_quote(&value)),
+                        }
                     }
                 }
             }
@@ -1495,6 +1561,34 @@ fn fold_subject(subject: &[u8]) -> Vec<u8> {
     out
 }
 
+/// git's `is_root_ref`: which files directly under `$GIT_DIR` count as root
+/// refs for `--include-root-refs`.
+///
+/// The name must be `is_root_ref_syntax` (uppercase letters, `-`, `_`), must not
+/// be one of the special multi-valued refs the ref backend never iterates
+/// (`FETCH_HEAD`, `MERGE_HEAD`), and must then be `HEAD`, end with `_HEAD`, or
+/// be one of the irregular pseudorefs git lists explicitly.
+fn is_root_ref(name: &[u8]) -> bool {
+    const IRREGULAR: [&[u8]; 5] = [
+        b"AUTO_MERGE",
+        b"BISECT_EXPECTED_REV",
+        b"NOTES_MERGE_PARTIAL",
+        b"NOTES_MERGE_REF",
+        b"MERGE_AUTOSTASH",
+    ];
+    if name.is_empty()
+        || !name
+            .iter()
+            .all(|&b| b.is_ascii_uppercase() || b == b'-' || b == b'_')
+    {
+        return false;
+    }
+    if name == b"FETCH_HEAD" || name == b"MERGE_HEAD" {
+        return false;
+    }
+    name == b"HEAD" || name.ends_with(b"_HEAD") || IRREGULAR.contains(&name)
+}
+
 /// git's `sq_quote_buf`: always single-quoted, with `'` and `!` escaped so the
 /// result is safe to `eval` in a shell.
 fn sq_quote(value: &[u8]) -> Vec<u8> {
@@ -1507,5 +1601,57 @@ fn sq_quote(value: &[u8]) -> Vec<u8> {
         }
     }
     out.push(b'\'');
+    out
+}
+
+/// git's `perl_quote_buf`: single-quoted, backslash-escaping `'` and `\`.
+fn perl_quote(value: &[u8]) -> Vec<u8> {
+    let mut out = vec![b'\''];
+    for &b in value {
+        if b == b'\'' || b == b'\\' {
+            out.push(b'\\');
+        }
+        out.push(b);
+    }
+    out.push(b'\'');
+    out
+}
+
+/// git's `python_quote_buf`: like perl, but also rendering newlines as `\n`.
+fn python_quote(value: &[u8]) -> Vec<u8> {
+    let mut out = vec![b'\''];
+    for &b in value {
+        match b {
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\'' | b'\\' => {
+                out.push(b'\\');
+                out.push(b);
+            }
+            _ => out.push(b),
+        }
+    }
+    out.push(b'\'');
+    out
+}
+
+/// git's `tcl_quote_buf`: double-quoted, backslash-escaping the Tcl metacharacters
+/// and rendering the control bytes `\f \r \n \t \v` as two-character escapes.
+fn tcl_quote(value: &[u8]) -> Vec<u8> {
+    let mut out = vec![b'"'];
+    for &b in value {
+        match b {
+            b'[' | b']' | b'{' | b'}' | b'$' | b'\\' | b'"' => {
+                out.push(b'\\');
+                out.push(b);
+            }
+            b'\x0c' => out.extend_from_slice(b"\\f"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\x0b' => out.extend_from_slice(b"\\v"),
+            _ => out.push(b),
+        }
+    }
+    out.push(b'"');
     out
 }

@@ -64,6 +64,30 @@ fn fatal(message: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
+/// Reject a malformed integer flag value exactly as git does: `fatal: '<v>': not
+/// an integer`, exit 128 — not the 129 usage path.
+fn not_an_integer(value: &str) -> ExitCode {
+    fatal(&format!("'{value}': not an integer"))
+}
+
+/// Parse a flag value the way git's `git_parse_signed` does: optional surrounding
+/// ASCII whitespace, an optional sign, then base-10 digits with nothing trailing.
+/// `0x10`, `3abc`, an empty string, and out-of-range values all fail — matching
+/// git, which then dies "not an integer".
+fn parse_git_int(value: &str) -> Option<i64> {
+    value.trim_matches(|c: char| c.is_ascii_whitespace()).parse::<i64>().ok()
+}
+
+/// Map a signed `--max-count`/`-n` to the internal limit: git treats any negative
+/// value as "no limit" (its stored max_count stays -1), so those become `None`.
+fn clamp_count(n: i64) -> Option<usize> {
+    if n < 0 {
+        None
+    } else {
+        Some(n as usize)
+    }
+}
+
 /// How commits are ordered before filtering and limiting.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Order {
@@ -93,9 +117,11 @@ enum Order {
 ///   * `--parents`                    — append each commit's parents to its line
 ///   * `--objects`                    — also list the trees and blobs reachable
 ///                                       from the listed commits
+///   * `-- <path>...`                 — path-limited: keep only commits whose diff
+///                                       against a parent touched a matching path
 ///
 /// Genuinely unsupported forms are rejected: symmetric-difference ranges
-/// (`<a>...<b>`) and pathspec filtering (`-- <path>`).
+/// (`<a>...<b>`) and magic pathspecs (`:(glob)`, `:!exclude`, …).
 pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let repo = match gix::discover(".") {
         Ok(repo) => repo,
@@ -112,9 +138,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut objects = false;
     let mut show_parents = false;
     let mut order = Order::Date;
-    let mut min_parents: usize = 0;
+    // git parses these as signed C ints. Negative min-parents lets every commit
+    // through; negative max-count / max-parents mean "no limit" (git stores -1).
+    let mut min_parents: i64 = 0;
     let mut max_parents: Option<usize> = None;
     let mut max_count: Option<usize> = None;
+    let mut pathspecs: Vec<Vec<u8>> = Vec::new();
     let mut tips: Vec<ObjectId> = Vec::new();
     let mut hidden: Vec<ObjectId> = Vec::new();
     // Annotated tag objects encountered while peeling seeds. `--objects` lists
@@ -162,41 +191,46 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             "-n" => {
                 i += 1;
                 let Some(n) = args.get(i) else {
-                    return Ok(usage_error());
+                    eprintln!("error: -n requires an argument");
+                    return Ok(ExitCode::from(128));
                 };
-                let Ok(n) = n.parse::<usize>() else {
-                    return Ok(usage_error());
-                };
-                max_count = Some(n);
-            }
-            "--" => {
-                if i + 1 < args.len() {
-                    return Ok(fatal("pathspec filtering is not supported"));
+                match parse_git_int(n) {
+                    Some(v) => max_count = clamp_count(v),
+                    None => return Ok(not_an_integer(n)),
                 }
             }
+            "--" => {
+                // Everything after `--` is a pathspec, never a rev or flag.
+                pathspecs.extend(args[i + 1..].iter().map(|s| s.as_bytes().to_vec()));
+                break;
+            }
             s if s.starts_with("--max-count=") => {
-                let Ok(n) = s["--max-count=".len()..].parse::<usize>() else {
-                    return Ok(usage_error());
-                };
-                max_count = Some(n);
+                let v = &s["--max-count=".len()..];
+                match parse_git_int(v) {
+                    Some(n) => max_count = clamp_count(n),
+                    None => return Ok(not_an_integer(v)),
+                }
             }
             s if s.starts_with("--min-parents=") => {
-                let Ok(n) = s["--min-parents=".len()..].parse::<usize>() else {
-                    return Ok(usage_error());
-                };
-                min_parents = n;
+                let v = &s["--min-parents=".len()..];
+                match parse_git_int(v) {
+                    Some(n) => min_parents = n,
+                    None => return Ok(not_an_integer(v)),
+                }
             }
             s if s.starts_with("--max-parents=") => {
-                let Ok(n) = s["--max-parents=".len()..].parse::<usize>() else {
-                    return Ok(usage_error());
-                };
-                max_parents = Some(n);
+                let v = &s["--max-parents=".len()..];
+                match parse_git_int(v) {
+                    // git stores a negative max-parents as -1: "no upper limit".
+                    Some(n) => max_parents = if n < 0 { None } else { Some(n as usize) },
+                    None => return Ok(not_an_integer(v)),
+                }
             }
             s if s.len() > 2 && s.starts_with("-n") && s[2..].bytes().all(|b| b.is_ascii_digit()) => {
-                let Ok(n) = s[2..].parse::<usize>() else {
-                    return Ok(usage_error());
-                };
-                max_count = Some(n);
+                match parse_git_int(&s[2..]) {
+                    Some(n) => max_count = clamp_count(n),
+                    None => return Ok(not_an_integer(&s[2..])),
+                }
             }
             // Every remaining flag is one git knows and this does not; a
             // revision never starts with `-`, so anything left is a usage error.
@@ -257,8 +291,26 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     }
     commits.retain(|id| {
         let n = parents_of.get(id).map_or(0, Vec::len);
-        n >= min_parents && max_parents.is_none_or(|max| n <= max)
+        n as i64 >= min_parents && max_parents.is_none_or(|max| n <= max)
     });
+
+    // Path-limit last among the output-time filters: a commit survives iff its
+    // diff against a parent touched a matching path (git's TREESAME test). This
+    // must run before `--max-count`, which counts only commits actually shown.
+    if !pathspecs.is_empty() {
+        if pathspecs.iter().any(|p| p.first() == Some(&b':')) {
+            return Ok(fatal("magic pathspecs are not supported"));
+        }
+        let mut kept = Vec::with_capacity(commits.len());
+        for id in &commits {
+            let parents = parents_of.get(id).map(Vec::as_slice).unwrap_or(&[]);
+            if commit_touches_path(&repo, *id, parents, first_parent, &pathspecs)? {
+                kept.push(*id);
+            }
+        }
+        commits = kept;
+    }
+
     if let Some(max) = max_count {
         commits.truncate(max);
     }
@@ -495,6 +547,86 @@ fn commit_tree(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
         return None;
     }
     Some(object.into_commit().tree_id().ok()?.detach())
+}
+
+/// Whether `commit` should appear under a path limit — git's TREESAME test.
+///
+/// A single-parent commit is shown iff it differs from its parent for the paths.
+/// A merge is shown iff it differs from *every* parent (git's default merge
+/// simplification for which commits are listed). A root commit is shown iff its
+/// tree already contains a matching path. `--first-parent` limits a merge to its
+/// first parent. This lists the shown set; it does not reproduce git's traversal
+/// pruning, which only diverges for merges limited to a path that names a real
+/// tracked file.
+fn commit_touches_path(
+    repo: &gix::Repository,
+    commit: ObjectId,
+    parents: &[ObjectId],
+    first_parent: bool,
+    pathspecs: &[Vec<u8>],
+) -> Result<bool> {
+    let Some(tree) = commit_tree(repo, commit) else {
+        return Ok(false);
+    };
+    if parents.is_empty() {
+        return diff_touches_path(repo, None, tree, pathspecs);
+    }
+    let considered = if first_parent { &parents[..1] } else { parents };
+    for parent in considered {
+        let parent_tree = commit_tree(repo, *parent);
+        if !diff_touches_path(repo, parent_tree, tree, pathspecs)? {
+            // TREESAME to this parent → not shown under default simplification.
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether the diff turning `old_tree` (empty when `None`) into `new_tree` touches
+/// any of `pathspecs`. Rename tracking is off so a rename shows as a deletion and
+/// an addition, letting either endpoint's path match.
+fn diff_touches_path(
+    repo: &gix::Repository,
+    old_tree: Option<ObjectId>,
+    new_tree: ObjectId,
+    pathspecs: &[Vec<u8>],
+) -> Result<bool> {
+    let Some(new) = tree_object(repo, new_tree) else {
+        return Ok(false);
+    };
+    let old = old_tree
+        .and_then(|id| tree_object(repo, id))
+        .unwrap_or_else(|| repo.empty_tree());
+
+    let mut platform = old.changes().map_err(|e| anyhow!("{e}"))?;
+    platform.options(|o| {
+        o.track_path();
+        o.track_rewrites(None);
+    });
+    let mut matched = false;
+    platform
+        .for_each_to_obtain_tree(&new, |change| {
+            if path_matches(&change.location()[..], pathspecs) {
+                matched = true;
+                Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
+            } else {
+                Ok(std::ops::ControlFlow::Continue(()))
+            }
+        })
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(matched)
+}
+
+/// git's plain (non-magic) pathspec match: a pathspec matches a path when it is
+/// equal to it or is a leading directory prefix ending at a component boundary,
+/// so `dir` matches `dir/file` but `fil` does not match `file`.
+fn path_matches(path: &[u8], pathspecs: &[Vec<u8>]) -> bool {
+    pathspecs.iter().any(|spec| {
+        let spec = spec.strip_suffix(b"/").unwrap_or(spec);
+        spec.is_empty()
+            || path == spec
+            || (path.len() > spec.len() && path.starts_with(spec) && path[spec.len()] == b'/')
+    })
 }
 
 /// The entries of a tree object, or `None` if it is missing or not a tree.

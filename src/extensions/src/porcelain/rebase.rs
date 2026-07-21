@@ -893,6 +893,20 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         die!("--reschedule-failed-exec requires --exec or --interactive");
     }
 
+    // git resolves `<upstream>` here. With `--root` no upstream token is
+    // consumed, so `builtin/rebase.c`'s `--root` arm ends with `if (argc > 1)
+    // usage_with_options(...)`: at most a single `[<branch>]` positional is
+    // allowed, and a second one is a usage error (129). Without `--root` the
+    // first positional is the upstream and the `> 2` case was already rejected
+    // above, so this only bites the `--root` path. It sits after every
+    // `imply_merge()`/backend `die()` — `git rebase --root --apply a b` reports
+    // `--root without --onto requires the merge backend` (128), not this — and
+    // before the signoff refusal, matching `git rebase --root --signoff a b`,
+    // which git answers with the usage block rather than touching `--signoff`.
+    if root && positional.len() > 1 {
+        usage!();
+    }
+
     if signoff {
         // `--signoff` appends a trailer to every replayed commit; git also sets
         // REBASE_FORCE, so it never takes the up-to-date exit either.

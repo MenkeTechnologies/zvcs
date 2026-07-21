@@ -1,8 +1,9 @@
 use anyhow::{anyhow, bail, Result};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::bstr::ByteSlice;
 use gix::date::time::Format as TimeFormat;
@@ -65,6 +66,17 @@ use gix::prelude::ObjectIdExt;
 /// named by `$TZ` (or `/etc/localtime`), read straight out of the TZif database.
 ///
 /// Filtering: `--merges`, `--no-merges` (by parent count of the entry's commit).
+/// `--since=`/`--after=` and `--until=`/`--before=` keep entries by their own
+/// reflog timestamp — the instant the ref was updated, which is what git's `-g`
+/// walk limits on via the fake reflog parent — parsed through git's approxidate
+/// (`1 year ago`, `now`, …), inclusive at both ends. Pathspecs after `--` keep an
+/// entry only when its commit's diff against its first parent touches one of them.
+///
+/// Decoration: `--decorate[=short|full]` annotates each entry's commit with the
+/// refs (`refs/heads`, `refs/remotes`, `refs/tags`, `HEAD`) that resolve to it,
+/// in git's order — descending full-ref-name, `HEAD` first as `HEAD -> <branch>`
+/// or bare `HEAD`. `--decorate=auto`/`--no-decorate`/`--decorate=no` are off, as
+/// the default is when stdout is not a tty.
 ///
 /// Output: `--parents`, and `--format=`/`--pretty=` for the placeholders
 /// `%H %h %T %P %p %s %an %ae %ad %cn %ce %cd %gd %gD %gn %ge %gs %n %% %x<hh>`
@@ -95,16 +107,14 @@ use gix::prelude::ObjectIdExt;
 ///   * Diff output that needs the rest of git's diff driver — `-p`, `--patch`,
 ///     `--stat` (column-width scaling against the terminal width), `--raw`,
 ///     `--dirstat`.
-///   * Message filtering — `--grep=<pat>` and the commit-date limiters `--since=`,
-///     `--after=`, `--before=`, `--until=`. `--grep` needs git's regex dialect
-///     selection; the limiters need approxidate over the *reflog entry* timestamp.
-///   * Decoration — `--decorate`, `--decorate=short`, `--decorate=full`, `%d`, `%D`,
-///     `%C(...)`, `--color=always`.
+///   * Message filtering — `--grep=<pat>`, which needs git's regex dialect selection.
+///   * The `%d`/`%D` decoration placeholders, `%C(...)` color, and `--color=always`.
 ///   * The multi-line `--pretty` built-ins (`short`, `medium`, `full`, `fuller`,
-///     `raw`, `reference`, `email`) and bare `--pretty`.
+///     `raw`, `reference`, `email`) and bare `--pretty`. These are deferred: when a
+///     filter (a date limiter or a pathspec) drops every entry the format is never
+///     exercised and the command succeeds with empty output, exactly as git does.
 ///   * `--date=relative`, `--date=human`, `--date=format:...` — these need the
 ///     current time or strftime-style user formats, which `gix-date` does not expose.
-///   * Pathspecs (`--` and anything after it).
 ///
 /// # Known divergences
 ///
@@ -122,6 +132,10 @@ use gix::prelude::ObjectIdExt;
 ///   * A rename below 100% similarity reports `gix-diff`'s byte-ratio score, while
 ///     git reports its own `estimate_similarity()` score over hashed chunks. The two
 ///     agree at 100% (identical blob ids) and can differ by a percent otherwise.
+///   * Pathspec filtering matches an entry against the diff of its commit versus
+///     its first parent, so a merge entry (which this module does not diff) is
+///     dropped by any pathspec. git simplifies merge history against a pathspec
+///     differently; the two agree on the non-merge entries that dominate a reflog.
 pub fn reflog(args: &[String]) -> Result<ExitCode> {
     // Tolerate the subcommand being present at index 0 regardless of how the
     // dispatcher slices argv.
@@ -170,6 +184,10 @@ struct Section {
     full: String,
     /// Index of the first entry to print (a `@{<n>}` or `@{<date>}` start point).
     start: usize,
+    /// Whether this argument used a `@{<date>}` selector, which switches only this
+    /// section's selector column to date form (git decides this per argument, not
+    /// once for the whole command).
+    date_selector: bool,
     entries: Vec<Entry>,
 }
 
@@ -260,8 +278,6 @@ struct Opts {
     abbrev: Abbrev,
     /// Set by `--date=<fmt>`.
     date: Option<DateFormat>,
-    /// Set by a `<ref>@{<date>}` argument, which switches selectors to date form.
-    date_from_selector: bool,
     /// `--format=`/`--pretty=` string; `None` is git's default oneline layout.
     format: Option<String>,
     parents: bool,
@@ -270,6 +286,24 @@ struct Opts {
     diff: DiffFormats,
     /// `core.quotePath`, which decides whether bytes >= 0x80 are octal-escaped.
     quote_high: bool,
+    /// `--decorate[=short|full|auto|no]` — how to annotate each entry's commit
+    /// with the refs that point at it. `None` is git's piped default (off).
+    decorate: Option<Decorate>,
+    /// `--since=`/`--after=`: keep entries whose own timestamp is `>=` this instant.
+    since: Option<i64>,
+    /// `--until=`/`--before=`: keep entries whose own timestamp is `<=` this instant.
+    until: Option<i64>,
+    /// Pathspecs after `--`: keep an entry only when its commit's diff against its
+    /// first parent touches at least one of them.
+    pathspecs: Vec<Vec<u8>>,
+}
+
+/// `--decorate` rendering mode. `Short` strips the ref namespace prefix, `Full`
+/// keeps the whole ref name; both prefix tags with `tag: `.
+#[derive(Clone, Copy)]
+enum Decorate {
+    Short,
+    Full,
 }
 
 impl Default for Opts {
@@ -279,12 +313,15 @@ impl Default for Opts {
             skip: 0,
             abbrev: Abbrev::Auto,
             date: None,
-            date_from_selector: false,
             format: None,
             parents: false,
             merges: None,
             diff: DiffFormats::default(),
             quote_high: true,
+            decorate: None,
+            since: None,
+            until: None,
+            pathspecs: Vec::new(),
         }
     }
 }
@@ -294,6 +331,133 @@ impl Default for Opts {
 fn note_first(slot: &mut Option<String>, what: String) {
     if slot.is_none() {
         *slot = Some(what);
+    }
+}
+
+/// Resolve a `--since`/`--until` value to a unix instant the way git's approxidate
+/// does: parse it against the current time, and fall back to that same current
+/// time for anything unparseable — git never errors on a date limiter.
+fn parse_limit_date(value: &str) -> i64 {
+    let now = SystemTime::now();
+    let now_secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    gix::date::parse(value, Some(now)).map_or(now_secs, |t| t.seconds)
+}
+
+/// git pathspec match: an entry survives when at least one of its changed paths (a
+/// destination, or a rename/copy source) equals a pathspec or lies under it.
+fn pathspec_matches(changes: &[FileChange], specs: &[Vec<u8>]) -> bool {
+    changes.iter().any(|change| {
+        specs.iter().any(|spec| {
+            spec_covers(spec, &change.path)
+                || change.source.as_deref().is_some_and(|s| spec_covers(spec, s))
+        })
+    })
+}
+
+/// One pathspec against one path: an empty spec matches everything, otherwise the
+/// path must equal the spec or sit in the subtree the spec names.
+fn spec_covers(spec: &[u8], path: &[u8]) -> bool {
+    let spec = spec.strip_suffix(b"/").unwrap_or(spec);
+    if spec.is_empty() {
+        return true;
+    }
+    path == spec
+        || (path.len() > spec.len() && path.starts_with(spec) && path[spec.len()] == b'/')
+}
+
+/// The refs that decorate each commit, resolved once for a `--decorate` run.
+struct Decorations {
+    /// Peeled commit id -> the full names of every ref that resolves to it.
+    by_oid: HashMap<ObjectId, Vec<String>>,
+    /// The commit `HEAD` resolves to, when there is one.
+    head_oid: Option<ObjectId>,
+    /// The branch `HEAD` symrefs to when attached, as a full ref name.
+    head_branch: Option<String>,
+    mode: Decorate,
+}
+
+impl Decorations {
+    fn build(repo: &gix::Repository, mode: Decorate) -> Self {
+        let mut by_oid: HashMap<ObjectId, Vec<String>> = HashMap::new();
+        if let Ok(platform) = repo.references() {
+            if let Ok(iter) = platform.all() {
+                for reference in iter.flatten() {
+                    let name = reference.name().as_bstr().to_str_lossy().into_owned();
+                    if !(name.starts_with("refs/heads/")
+                        || name.starts_with("refs/remotes/")
+                        || name.starts_with("refs/tags/"))
+                    {
+                        continue;
+                    }
+                    if let Ok(id) = reference.into_fully_peeled_id() {
+                        by_oid.entry(id.detach()).or_default().push(name);
+                    }
+                }
+            }
+        }
+        let head = repo.head().ok();
+        let head_branch = head.as_ref().and_then(|h| {
+            (!h.is_detached())
+                .then(|| h.referent_name().map(|n| n.as_bstr().to_str_lossy().into_owned()))
+                .flatten()
+        });
+        let head_oid = repo.head_id().ok().map(|id| id.detach());
+        Decorations {
+            by_oid,
+            head_oid,
+            head_branch,
+            mode,
+        }
+    }
+
+    /// The parenthesised decoration for a commit, or `None` when nothing points at
+    /// it. git prepends each ref as it walks the sorted ref list, so the refs come
+    /// out in descending full-name order; `HEAD` is placed first, as `HEAD ->
+    /// <branch>` when it symrefs to a branch at this commit, else a bare `HEAD`.
+    fn for_commit(&self, oid: ObjectId) -> Option<String> {
+        let mut names: Vec<String> = self.by_oid.get(&oid).cloned().unwrap_or_default();
+        names.sort();
+        names.reverse();
+
+        let mut items: Vec<String> = Vec::with_capacity(names.len() + 1);
+        if self.head_oid == Some(oid) {
+            match &self.head_branch {
+                Some(branch) => {
+                    names.retain(|n| n != branch);
+                    items.push(format!("HEAD -> {}", self.render_ref(branch)));
+                }
+                None => items.push("HEAD".to_owned()),
+            }
+        }
+        for name in &names {
+            items.push(self.decorate_ref(name));
+        }
+        if items.is_empty() {
+            return None;
+        }
+        Some(format!("({})", items.join(", ")))
+    }
+
+    /// A ref name shortened per the decorate mode, without the `tag:` prefix.
+    fn render_ref(&self, name: &str) -> String {
+        match self.mode {
+            Decorate::Full => name.to_owned(),
+            Decorate::Short => name
+                .strip_prefix("refs/heads/")
+                .or_else(|| name.strip_prefix("refs/remotes/"))
+                .or_else(|| name.strip_prefix("refs/tags/"))
+                .unwrap_or(name)
+                .to_owned(),
+        }
+    }
+
+    /// A ref as it appears in the decoration list: tags carry a `tag: ` prefix.
+    fn decorate_ref(&self, name: &str) -> String {
+        if name.starts_with("refs/tags/") {
+            format!("tag: {}", self.render_ref(name))
+        } else {
+            self.render_ref(name)
+        }
     }
 }
 
@@ -320,6 +484,14 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
     while i < rest.len() {
         let a = rest[i].as_str();
         match a {
+            // ---- end of options --------------------------------------------
+            // Everything after the first `--` is a pathspec, including a further
+            // literal `--`. git resolves none of these as revisions.
+            "--" => {
+                opts.pathspecs = rest[i + 1..].iter().map(|s| s.as_bytes().to_vec()).collect();
+                break;
+            }
+
             // ---- counting -------------------------------------------------
             "-n" | "--max-count" | "--skip" => {
                 i += 1;
@@ -379,6 +551,26 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
                 }
             },
             "--relative-date" => note_first(&mut unimplemented, a.to_owned()),
+
+            // ---- reflog-entry date limiters -------------------------------
+            // git filters `-g` on the reflog entry's own timestamp (set from the
+            // fake reflog parent), not the commit date. `--since`/`--after` keep
+            // entries at or after the instant, `--until`/`--before` at or before.
+            s if s.starts_with("--since=") || s.starts_with("--after=") => {
+                let v = s.split_once('=').expect("checked for `=` above").1;
+                opts.since = Some(parse_limit_date(v));
+            }
+            s if s.starts_with("--until=") || s.starts_with("--before=") => {
+                let v = s.split_once('=').expect("checked for `=` above").1;
+                opts.until = Some(parse_limit_date(v));
+            }
+
+            // ---- decoration -----------------------------------------------
+            "--decorate" | "--decorate=short" => opts.decorate = Some(Decorate::Short),
+            "--decorate=full" => opts.decorate = Some(Decorate::Full),
+            // `auto` decorates only on a tty; the parity harness pipes, so it is off,
+            // as are the explicit off spellings.
+            "--decorate=no" | "--no-decorate" | "--decorate=auto" => opts.decorate = None,
 
             // ---- output format --------------------------------------------
             "--oneline" => opts.format = None,
@@ -447,22 +639,17 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
             // ---- recognized, no effect on reflog output ---------------------
             // Each of these was verified byte-identical to plain `git reflog`.
             "--walk-reflogs" | "-g" | "--single-worktree" | "--first-parent" | "--boundary"
-            | "--source" | "--decorate=no" | "--no-decorate" | "--color=never"
+            | "--source" | "--color=never"
             | "--color=auto" | "--no-color" | "--invert-grep" | "--all-match"
             | "--regexp-ignore-case" | "-i" | "--fixed-strings" | "-F" | "--basic-regexp"
             | "--extended-regexp" | "-E" | "--perl-regexp" | "-P" => {}
 
             // ---- recognized, deliberately unimplemented ---------------------
             "-p" | "--patch" | "-u" | "--stat" | "--raw" | "--dirstat"
-            | "--patch-with-stat" | "--decorate" | "--decorate=full" | "--decorate=short"
-            | "--color" | "--color=always" | "--" => {
+            | "--patch-with-stat" | "--color" | "--color=always" => {
                 note_first(&mut unimplemented, a.to_owned());
             }
             s if s.starts_with("--grep=")
-                || s.starts_with("--since=")
-                || s.starts_with("--after=")
-                || s.starts_with("--before=")
-                || s.starts_with("--until=")
                 || s.starts_with("--stat=")
                 || s.starts_with("--dirstat=") =>
             {
@@ -479,7 +666,7 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
             // ---- revision ---------------------------------------------------
             s => {
                 saw_ref_source = true;
-                match resolve_spec(repo, s, &mut opts)? {
+                match resolve_spec(repo, s)? {
                     Resolved::Section(section) => sections.push(section),
                     // Resolves to an object but owns no reflog: git prints nothing.
                     Resolved::Empty => {}
@@ -513,9 +700,6 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: unrecognized argument: {arg}");
         return Ok(ExitCode::from(128));
     }
-    if let Some(what) = unimplemented {
-        bail!("`reflog show {what}` is not ported");
-    }
 
     // Bare `git reflog` on an unborn HEAD has its own fatal message in git,
     // distinct from the "ambiguous argument" one an explicit `HEAD` produces.
@@ -530,28 +714,32 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(128));
             }
         }
-        match resolve_spec(repo, "HEAD", &mut opts)? {
+        match resolve_spec(repo, "HEAD")? {
             Resolved::Section(section) => sections.push(section),
             Resolved::Empty => {}
             Resolved::Fatal(code) => return Ok(code),
         }
     }
 
-    render(repo, &sections, &opts, full_hex)
+    render(repo, &sections, &opts, full_hex, &unimplemented)
 }
 
 /// Walk the collected sections and write git's output for them.
+///
+/// `unimplemented` names the first option that this module recognizes but cannot
+/// render. It is deferred to here rather than failing during the argument scan
+/// because a filter (a date limiter or a pathspec) may drop every entry, in which
+/// case git prints nothing and the unsupported option never comes into play — so
+/// the failure is raised only when an entry actually survives every filter and
+/// therefore would be printed.
 fn render(
     repo: &gix::Repository,
     sections: &[Section],
     opts: &Opts,
     full_hex: usize,
+    unimplemented: &Option<String>,
 ) -> Result<ExitCode> {
     let fallback_len = abbrev_len(repo, full_hex);
-    // No `--date` and no date selector means the classic `@{<n>}` numbering.
-    let selector_fmt: Option<DateFormat> = opts
-        .date
-        .or_else(|| opts.date_from_selector.then(|| DateFormat::plain(tfmt::DEFAULT)));
     let field_fmt: DateFormat = opts.date.unwrap_or_else(|| DateFormat::plain(tfmt::DEFAULT));
 
     let mut skipped = 0usize;
@@ -559,18 +747,44 @@ fn render(
     let budget = opts.max_count.unwrap_or(usize::MAX);
     let mut out: Vec<u8> = Vec::new();
     // Built once and reused: it caches decoded blobs across every entry's diff.
-    let mut diff_cache = opts
-        .diff
-        .any()
+    // Needed for the diff formats and for pathspec filtering, both of which walk
+    // each entry's tree diff.
+    let mut diff_cache = (opts.diff.any() || !opts.pathspecs.is_empty())
         .then(|| repo.diff_resource_cache_for_tree_diff().ok())
         .flatten();
+    // The ref-set that decorates each entry's commit, resolved once.
+    let decorations = opts.decorate.map(|mode| Decorations::build(repo, mode));
 
     'outer: for section in sections {
+        // `--date` forces every section to date form; otherwise only a section
+        // whose argument used a `@{<date>}` selector shows dates, the rest count.
+        let selector_fmt: Option<DateFormat> = opts
+            .date
+            .or_else(|| section.date_selector.then(|| DateFormat::plain(tfmt::DEFAULT)));
         for (n, entry) in section.entries.iter().enumerate().skip(section.start) {
             if let Some(want_merge) = opts.merges {
                 if is_merge(repo, entry.oid) != want_merge {
                     continue;
                 }
+            }
+            // git's `-g` date limiting compares against the reflog entry's own
+            // timestamp, not the commit date.
+            if opts.since.is_some_and(|s| entry.time.seconds < s) {
+                continue;
+            }
+            if opts.until.is_some_and(|u| entry.time.seconds > u) {
+                continue;
+            }
+            // git diffs each entry's commit against its first parent, whatever the
+            // reflog message says the entry was. Computed before the skip/count
+            // budget because pathspec filtering must run first.
+            let changes = match diff_cache.as_mut() {
+                Some(cache) => collect_changes(repo, entry.oid, cache),
+                None => Vec::new(),
+            };
+            // Pathspecs keep only entries whose diff touches one of them.
+            if !opts.pathspecs.is_empty() && !pathspec_matches(&changes, &opts.pathspecs) {
+                continue;
             }
             if skipped < opts.skip {
                 skipped += 1;
@@ -579,15 +793,15 @@ fn render(
             if printed >= budget {
                 break 'outer;
             }
+            // This entry survived every filter, so git would print it. If some
+            // option was recognized but this module cannot render it, faithful
+            // output is impossible now — fail rather than print a wrong answer.
+            if let Some(what) = unimplemented {
+                bail!("`reflog show {what}` is not ported");
+            }
             let selector = match selector_fmt {
                 Some(f) => f.render(entry.time),
                 None => n.to_string(),
-            };
-            // git diffs each entry's commit against its first parent, whatever the
-            // reflog message says the entry was.
-            let changes = match diff_cache.as_mut() {
-                Some(cache) => collect_changes(repo, entry.oid, cache),
-                None => Vec::new(),
             };
             match &opts.format {
                 Some(fmt) => {
@@ -626,6 +840,13 @@ fn render(
                             );
                         }
                     }
+                    // git's `--decorate` annotates the commit right after its id.
+                    if let Some(deco) = &decorations {
+                        if let Some(text) = deco.for_commit(entry.oid) {
+                            out.push(b' ');
+                            out.extend_from_slice(text.as_bytes());
+                        }
+                    }
                     out.push(b' ');
                     out.extend_from_slice(section.display.as_bytes());
                     out.extend_from_slice(format!("@{{{selector}}}: ").as_bytes());
@@ -651,7 +872,7 @@ enum Resolved {
 
 /// Resolve a `<ref>`, `<ref>@{<n>}` or `<ref>@{<date>}` argument the way git's
 /// revision parser does, reporting git's own fatal text at the failure points.
-fn resolve_spec(repo: &gix::Repository, spec: &str, opts: &mut Opts) -> Result<Resolved> {
+fn resolve_spec(repo: &gix::Repository, spec: &str) -> Result<Resolved> {
     let (base, selector) = split_selector(spec);
 
     let entries = read_entries(repo, base)?;
@@ -670,6 +891,7 @@ fn resolve_spec(repo: &gix::Repository, spec: &str, opts: &mut Opts) -> Result<R
                 display: base.to_owned(),
                 full: full_name(repo, base),
                 start: 0,
+                date_selector: false,
                 entries,
             }))
         }
@@ -688,6 +910,7 @@ fn resolve_spec(repo: &gix::Repository, spec: &str, opts: &mut Opts) -> Result<R
                 display: base.to_owned(),
                 full: full_name(repo, base),
                 start: n,
+                date_selector: false,
                 entries,
             }))
         }
@@ -700,8 +923,6 @@ fn resolve_spec(repo: &gix::Repository, spec: &str, opts: &mut Opts) -> Result<R
             let Ok(target) = gix::date::parse(&normalized, Some(SystemTime::now())) else {
                 return Ok(Resolved::Fatal(fatal_ambiguous(spec)));
             };
-            // Any date selector switches the printed selector to date form.
-            opts.date_from_selector = true;
 
             // Entries are newest-first; the answer is the newest one that was
             // already current at `target`.
@@ -721,6 +942,8 @@ fn resolve_spec(repo: &gix::Repository, spec: &str, opts: &mut Opts) -> Result<R
                 display: base.to_owned(),
                 full: full_name(repo, base),
                 start,
+                // A date selector switches only this section's column to date form.
+                date_selector: true,
                 entries,
             }))
         }
@@ -788,6 +1011,7 @@ fn expand_all(repo: &gix::Repository, excludes: &[String]) -> Result<Vec<Section
                 display: name.clone(),
                 full: name,
                 start: 0,
+                date_selector: false,
                 entries,
             });
         }
@@ -797,6 +1021,7 @@ fn expand_all(repo: &gix::Repository, excludes: &[String]) -> Result<Vec<Section
             display: "HEAD".to_owned(),
             full: "HEAD".to_owned(),
             start: 0,
+            date_selector: false,
             entries,
         });
     }
@@ -829,6 +1054,7 @@ fn expand_prefixed(
                 display: short,
                 full: name,
                 start: 0,
+                date_selector: false,
                 entries,
             });
         }
@@ -856,6 +1082,7 @@ fn expand_glob(
                 display: name.clone(),
                 full: name,
                 start: 0,
+                date_selector: false,
                 entries,
             });
         }

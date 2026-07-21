@@ -441,6 +441,13 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
 
     let mut i = 0;
     let mut pathspec_mode = false;
+    // git stores `--cover-from-description`'s value as a plain string during
+    // option parsing and only validates it *after* the whole command line is
+    // parsed. So an inline value error earlier or later on the line (e.g. a
+    // malformed `--start-number`, which parse-options rejects in place with
+    // exit 129) must win over this option's own exit-128 rejection. Capture the
+    // last value here (last-wins) and validate it once the loop is done.
+    let mut cover_from_desc: Option<String> = None;
     while i < args.len() {
         let a = args[i].as_str();
         if pathspec_mode {
@@ -459,7 +466,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "-N" | "--no-numbered" => o.numbered = Some(false),
             "--start-number" => {
                 i += 1;
-                o.start_number = parse_num(&value_at(args, i, a)?)?;
+                match parse_start_number(&value_at(args, i, a)?) {
+                    Ok(n) => o.start_number = n,
+                    Err(code) => return Ok(Parsed::Exit(code)),
+                }
             }
             "--numbered-files" => o.numbered_files = true,
             "--subject-prefix" => {
@@ -526,7 +536,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 o.outdir = Some(s["--output-directory=".len()..].to_owned());
             }
             s if s.starts_with("--start-number=") => {
-                o.start_number = parse_num(&s["--start-number=".len()..])?;
+                match parse_start_number(&s["--start-number=".len()..]) {
+                    Ok(n) => o.start_number = n,
+                    Err(code) => return Ok(Parsed::Exit(code)),
+                }
             }
             s if s.starts_with("--subject-prefix=") => {
                 o.subject_prefix = s["--subject-prefix=".len()..].to_owned();
@@ -582,15 +595,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 _ => return Ok(Parsed::Exit(ExitCode::from(129))),
             },
             s if s.starts_with("--cover-from-description=") => {
-                let v = &s["--cover-from-description=".len()..];
-                match v {
-                    "message" | "subject" | "auto" | "none" => o.deferred.push(a.to_owned()),
-                    _ => {
-                        return Ok(Parsed::Exit(fatal(&format!(
-                            "{v}: invalid cover from description mode"
-                        ))))
-                    }
-                }
+                cover_from_desc = Some(s["--cover-from-description=".len()..].to_owned());
             }
             // "none" is what this module does: submodule changes are shown.
             s if s.starts_with("--ignore-submodules=") => {
@@ -614,7 +619,20 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                     o.deferred.push(a.to_owned());
                 }
             }
-            s if s.starts_with("--stat=") || s.starts_with("--relative=") => {
+            // `--stat=<width>[,<name-width>[,<count>]]`: git's `diff_opt_stat()`
+            // parses each field with `strtoul(_, _, 10)` and rejects any leftover
+            // (`error(_("invalid --stat value: %s"))`, exit 129) before it would
+            // ever walk revisions. The width-tuned stat itself is not ported, so
+            // a value git accepts is still deferred.
+            s if s.starts_with("--stat=") => {
+                let val = &s["--stat=".len()..];
+                if !stat_value_ok(val.as_bytes()) {
+                    eprintln!("error: invalid --stat value: {val}");
+                    return Ok(Parsed::Exit(ExitCode::from(129)));
+                }
+                o.deferred.push(a.to_owned());
+            }
+            s if s.starts_with("--relative=") => {
                 o.deferred.push(a.to_owned());
             }
             // `--dirstat`, `-X` and `--dirstat-by-file` all take an *optional*
@@ -683,6 +701,24 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             s => o.revs.push(s.to_owned()),
         }
         i += 1;
+    }
+
+    // `--cover-from-description=<mode>` is validated only now, after the whole
+    // command line has been parsed (git keeps it as a raw string and calls
+    // `parse_cover_from_description()` once). An unrecognised mode is `die()`
+    // (exit 128); the recognised modes only reshape the cover letter, which is
+    // not ported, so they are deferred and become fatal iff a patch is emitted.
+    if let Some(v) = cover_from_desc {
+        match v.as_str() {
+            "default" | "message" | "subject" | "auto" | "none" => {
+                o.deferred.push(format!("--cover-from-description={v}"));
+            }
+            _ => {
+                return Ok(Parsed::Exit(fatal(&format!(
+                    "{v}: invalid cover from description mode"
+                ))))
+            }
+        }
     }
 
     // builtin/log.c: the stat+summary block is format-patch's default, but only
@@ -773,6 +809,160 @@ fn push_ignore_regex(o: &mut Opts, pattern: &str) -> std::result::Result<(), Exi
 fn parse_num(s: &str) -> Result<usize> {
     s.parse::<usize>()
         .map_err(|_| anyhow!("invalid number `{s}`"))
+}
+
+/// Emulate C `strtoul(nptr, &end, 10)`, returning the byte offset of `end` — the
+/// first character the conversion did not consume. Leading ASCII whitespace and a
+/// single optional sign are skipped; when no digit is consumed there is "no
+/// conversion", so `end` is the original pointer (offset 0), matching libc.
+fn strtoul10_end(s: &[u8]) -> usize {
+    let mut i = 0;
+    while i < s.len() && matches!(s[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        i += 1;
+    }
+    if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
+        i += 1;
+    }
+    let digit_start = i;
+    while i < s.len() && s[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == digit_start {
+        return 0;
+    }
+    i
+}
+
+/// Port of the value check in `diff_opt_stat()` (diff.c) for the `--stat=<v>`
+/// form: `width = strtoul(v); if (*end==',') name_width = strtoul(...); if
+/// (*end==',') count = strtoul(...);` and then the value is valid iff nothing is
+/// left over (`if (*end) return error(...)`).
+fn stat_value_ok(val: &[u8]) -> bool {
+    let mut rest = &val[strtoul10_end(val)..];
+    if rest.first() == Some(&b',') {
+        rest = &rest[1..];
+        rest = &rest[strtoul10_end(rest)..];
+    }
+    if rest.first() == Some(&b',') {
+        rest = &rest[1..];
+        rest = &rest[strtoul10_end(rest)..];
+    }
+    rest.is_empty()
+}
+
+/// The three outcomes of parsing an integer-with-suffix option value.
+enum IntParse {
+    /// A number in the signed 32-bit range git accepts for `--start-number`.
+    Ok(i64),
+    /// Not a number, or trailing junk / an unrecognised unit suffix.
+    Bad,
+    /// A well-formed number, but outside `[i32::MIN, i32::MAX]` after the unit.
+    Range,
+}
+
+/// Port of C `strtoimax(s, &end, 0)`: optional leading ASCII whitespace, an
+/// optional sign, then a base-0 numeral (`0x…` hex, `0…` octal, else decimal).
+/// Returns the value and the number of bytes consumed, or `None` when no digit is
+/// consumed. Accumulates in `i128` so an over-long numeral saturates rather than
+/// wrapping; the caller's range check turns that into git's ERANGE.
+fn strtoimax0(s: &[u8]) -> Option<(i128, usize)> {
+    let mut i = 0;
+    while i < s.len() && matches!(s[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        i += 1;
+    }
+    let neg = match s.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let (base, start) = if s.get(i) == Some(&b'0') && matches!(s.get(i + 1), Some(b'x') | Some(b'X'))
+    {
+        (16i128, i + 2)
+    } else if s.get(i) == Some(&b'0') {
+        (8i128, i)
+    } else {
+        (10i128, i)
+    };
+    let mut j = start;
+    let mut val: i128 = 0;
+    // Saturate well past the i32 range the caller checks against, so an
+    // arbitrarily long numeral becomes an out-of-range error rather than
+    // wrapping, while every in-range value is left exact.
+    let saturate = 1i128 << 40;
+    while j < s.len() {
+        let d = match s[j] {
+            b'0'..=b'9' => (s[j] - b'0') as i128,
+            b'a'..=b'f' => (s[j] - b'a' + 10) as i128,
+            b'A'..=b'F' => (s[j] - b'A' + 10) as i128,
+            _ => break,
+        };
+        if d >= base {
+            break;
+        }
+        val = (val * base + d).min(saturate);
+        j += 1;
+    }
+    if j == start {
+        return None;
+    }
+    Some((if neg { -val } else { val }, j))
+}
+
+/// git parses `--start-number` as a signed integer with an optional `k`/`m`/`g`
+/// unit (base-0, so hex and octal too) into a 4-byte int. This mirrors
+/// parse-options.c's per-value handling: no digits after the sign is the "integer
+/// value with an optional k/m/g suffix" error, an over-range magnitude is the
+/// "not in range" error, and both are `error()` → exit 129.
+fn parse_int_with_suffix(value: &str) -> IntParse {
+    let b = value.as_bytes();
+    let Some((mag, consumed)) = strtoimax0(b) else {
+        return IntParse::Bad;
+    };
+    let factor: i128 = match &b[consumed..] {
+        [] => 1,
+        [c] if c.eq_ignore_ascii_case(&b'k') => 1024,
+        [c] if c.eq_ignore_ascii_case(&b'm') => 1024 * 1024,
+        [c] if c.eq_ignore_ascii_case(&b'g') => 1024 * 1024 * 1024,
+        _ => return IntParse::Bad,
+    };
+    let total = mag * factor;
+    if total < i32::MIN as i128 || total > i32::MAX as i128 {
+        return IntParse::Range;
+    }
+    IntParse::Ok(total as i64)
+}
+
+/// Validate a `--start-number` value the way git's parse-options does, returning
+/// the number to use or the exit code git would print for. builtin/log.c clamps a
+/// negative start number to 1 after parsing, so that is folded in here.
+fn parse_start_number(value: &str) -> std::result::Result<usize, ExitCode> {
+    if value.is_empty() {
+        eprintln!("error: option `start-number' expects a numerical value");
+        return Err(ExitCode::from(129));
+    }
+    match parse_int_with_suffix(value) {
+        IntParse::Ok(v) => Ok(if v < 0 { 1 } else { v as usize }),
+        IntParse::Bad => {
+            eprintln!(
+                "error: option `start-number' expects an integer value with an \
+                 optional k/m/g suffix"
+            );
+            Err(ExitCode::from(129))
+        }
+        IntParse::Range => {
+            eprintln!(
+                "error: value {value} for option `start-number' not in range \
+                 [-2147483648,2147483647]"
+            );
+            Err(ExitCode::from(129))
+        }
+    }
 }
 
 /// The value slot of a two-token option, e.g. the `<dir>` in `-o <dir>`.

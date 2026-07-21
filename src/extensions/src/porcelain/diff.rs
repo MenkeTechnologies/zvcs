@@ -162,8 +162,28 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--stat=") || s.starts_with("--stat-") => fmt |= F_DIFFSTAT,
             s if s.starts_with("--find-renames=") || s.starts_with("--find-copies=") => {}
             s if s.starts_with("-M") || s.starts_with("-C") => {}
-            s if s.starts_with("-U") => ctx = parse_context(&s[2..])?,
-            s if s.starts_with("--unified=") => ctx = parse_context(&s["--unified=".len()..])?,
+            // `-U` / `--unified[=<n>]`: git's `diff_opt_unified()` enables patch
+            // output unconditionally, so any of these implies `-p` even alongside
+            // `--raw`/`--stat`/`--numstat`. A bare `-U` / `--unified` keeps the
+            // default context; an attached value is parsed with strtol semantics.
+            "-U" | "--unified" => fmt |= F_PATCH,
+            s if s.starts_with("-U") || s.starts_with("--unified=") => {
+                let val = s.strip_prefix("--unified=").unwrap_or(&s[2..]);
+                match parse_unified(val) {
+                    UnifiedValue::Context(n) => {
+                        ctx = n;
+                        fmt |= F_PATCH;
+                    }
+                    UnifiedValue::NotNumeric => {
+                        eprintln!("error: --unified expects a numerical value");
+                        return Ok(ExitCode::from(129));
+                    }
+                    UnifiedValue::Negative => {
+                        eprintln!("error: --unified expects a non-negative integer");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
             s if s.starts_with('-') => bail!("unsupported option {s:?}"),
             s => raw_positional.push(s.to_string()),
         }
@@ -673,8 +693,48 @@ fn looks_like_range(tok: &str) -> bool {
     !tok.starts_with('.') && !tok.contains('/')
 }
 
-fn parse_context(s: &str) -> Result<u32> {
-    s.parse::<u32>().map_err(|_| anyhow::anyhow!("invalid context line count {s:?}"))
+/// The three outcomes of parsing a `-U`/`--unified` value, mirroring the two
+/// distinct `error()` paths in git's `diff_opt_unified()`.
+enum UnifiedValue {
+    Context(u32),
+    /// Trailing non-digit bytes (`*s != '\0'`) — "expects a numerical value".
+    NotNumeric,
+    /// A negative integer — "expects a non-negative integer".
+    Negative,
+}
+
+/// Parse a `-U`/`--unified` value with git's `strtol(arg, &s, 10)` semantics:
+/// leading whitespace and an optional sign are skipped, decimal digits are read,
+/// and any trailing byte that is not part of the number (`*s != '\0'`) makes the
+/// value non-numerical. An empty string yields context 0 (`strtol("")` performs no
+/// conversion and leaves `*s` at the terminating NUL, which git accepts). Overflow
+/// saturates rather than wrapping to a negative like git's `int` truncation would.
+fn parse_unified(arg: &str) -> UnifiedValue {
+    let b = arg.as_bytes();
+    let mut i = 0;
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        i += 1;
+    }
+    let neg = matches!(b.get(i), Some(b'-'));
+    if matches!(b.get(i), Some(b'+') | Some(b'-')) {
+        i += 1;
+    }
+    let digits_start = i;
+    let mut val: i64 = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        val = val.saturating_mul(10).saturating_add((b[i] - b'0') as i64);
+        i += 1;
+    }
+    // No digits consumed: strtol performs no conversion and leaves `s` at the
+    // original pointer (offset 0), so anything but a wholly empty string is junk.
+    let end = if i == digits_start { 0 } else { i };
+    if end < b.len() {
+        return UnifiedValue::NotNumeric;
+    }
+    if neg && val != 0 {
+        return UnifiedValue::Negative;
+    }
+    UnifiedValue::Context(val.min(u32::MAX as i64) as u32)
 }
 
 /// Convert an index-entry mode into an [`EntryKind`], or `None` for tree entries.

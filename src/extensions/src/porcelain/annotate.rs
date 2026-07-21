@@ -92,6 +92,37 @@ pub fn annotate(args: &[String]) -> Result<ExitCode> {
     let blank_boundary = opts.blank_boundary.unwrap_or(false);
     let show_root = opts.show_root.unwrap_or(false);
 
+    // blame's argument DWIM (`builtin/blame.c`): split the positionals into the
+    // revision arguments and the single `<file>`. This is resolution-dependent
+    // (the 2-positional case asks whether the trailing arg *is a rev*), which is
+    // why it runs here rather than in the pure parser.
+    let rev_args = match dwim_positionals(&repo, &opts.pre, opts.post.as_deref()) {
+        DwimResult::Usage => {
+            eprintln!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+        DwimResult::Plan { rev_args, file } => {
+            opts.file = file;
+            rev_args
+        }
+    };
+
+    // `setup_revisions()` resolves each rev argument; the first that names no
+    // object is git's "bad revision" (128). git does this *before* it opens
+    // `--ignore-revs-file` (verified: `-C40 --ignore-revs-file=missing HEAD
+    // does-not-exist <file>` reports the bad revision, not the missing file),
+    // so it precedes precedence 3.
+    let mut suspects: Vec<ObjectId> = Vec::with_capacity(rev_args.len());
+    for rev in &rev_args {
+        match resolve_commit(&repo, rev) {
+            Some(id) => suspects.push(id),
+            None => {
+                eprintln!("fatal: bad revision '{rev}'");
+                return Ok(ExitCode::from(128));
+            }
+        }
+    }
+
     // Precedence 3: the revs-file is read before anything else touches the odb.
     let mut ignore_revs: Vec<String> = Vec::new();
     for path in &opts.ignore_revs_files {
@@ -127,20 +158,31 @@ pub fn annotate(args: &[String]) -> Result<ExitCode> {
     // Precedence 5: `--reverse` needs a rev *range* to dig forward through. A
     // bare `git annotate --reverse <file>` has none, and git says so before it
     // ever looks at the path.
-    if opts.reverse && opts.rev.is_none() {
+    if opts.reverse && rev_args.is_empty() {
         eprintln!("fatal: No commit to dig up from?");
         return Ok(ExitCode::from(128));
     }
 
-    // Resolve the suspect commit (default HEAD), peeling tags to a commit.
-    let suspect = match &opts.rev {
-        Some(rev) => match resolve_commit(&repo, rev) {
-            Some(id) => id,
-            None => {
-                eprintln!("fatal: bad revision '{rev}'");
-                return Ok(ExitCode::from(128));
-            }
-        },
+    // Blame digs from exactly one commit. Two positive revs is git's "More than
+    // one commit to dig from", reported *after* the ignore files are read
+    // (verified: `--ignore-revs-file=missing A B <file>` opens the file first),
+    // so it lands here rather than beside the bad-revision check above.
+    if suspects.len() > 1 {
+        eprintln!(
+            "fatal: More than one commit to dig from {} and {}?",
+            rev_args[1], rev_args[0]
+        );
+        return Ok(ExitCode::from(128));
+    }
+
+    // The suspect commit (default HEAD, peeled to a commit above). Record the
+    // explicit rev string so the "no such path" messages quote HEAD vs a named
+    // revision exactly as git does.
+    let suspect = match suspects.first() {
+        Some(id) => {
+            opts.rev = Some(rev_args[0].clone());
+            *id
+        }
         None => repo.head_id()?.detach(),
     };
 
@@ -367,8 +409,17 @@ enum Parsed {
 /// lists, plus the `--reverse` rev-list option blame forwards to
 /// `setup_revisions()`.
 struct Options {
+    /// Resolved in `annotate()` from the DWIM below; `None` when the suspect is
+    /// the implicit `HEAD` (governs whether "no such path" messages quote HEAD).
     rev: Option<String>,
+    /// Resolved in `annotate()` from the DWIM below.
     file: String,
+    /// Positional args before a standalone `--`.
+    pre: Vec<String>,
+    /// Positional args after a standalone `--`; `None` when no `--` was seen.
+    /// blame's DWIM (`builtin/blame.c`) branches on the presence and count of
+    /// these, so the pre/post split has to survive parsing intact.
+    post: Option<Vec<String>>,
     /// Raw `-L` specs, in order. Resolution needs the file, so it happens late.
     line_specs: Vec<String>,
     long: bool,
@@ -444,6 +495,8 @@ impl Options {
         let mut o = Options {
             rev: None,
             file: String::new(),
+            pre: Vec::new(),
+            post: None,
             line_specs: Vec::new(),
             long: false,
             raw_timestamp: false,
@@ -465,8 +518,11 @@ impl Options {
             contents: None,
             revs_file: None,
         };
-        let mut positionals: Vec<String> = Vec::new();
-        let mut only_paths = false;
+        // `pre` = positionals before a standalone `--`; `post` = everything
+        // after it (only the *first* standalone `--` separates — a later `--`
+        // is an ordinary pathspec, exactly like git's argv scan).
+        let mut pre: Vec<String> = Vec::new();
+        let mut post: Option<Vec<String>> = None;
 
         // Fetch the value of an option written as a separate argument; a
         // missing value is `parse_options()`'s "requires a value" usage error.
@@ -485,13 +541,13 @@ impl Options {
         let mut i = 0;
         while i < args.len() {
             let a = args[i].as_str();
-            if only_paths {
-                positionals.push(a.to_string());
+            if let Some(p) = post.as_mut() {
+                p.push(a.to_string());
                 i += 1;
                 continue;
             }
             match a {
-                "--" => only_paths = true,
+                "--" => post = Some(Vec::new()),
 
                 // Output-shape flags the compat renderer honours.
                 "-l" => o.long = true,
@@ -598,22 +654,16 @@ impl Options {
                 // argv entry, `--` and a path glued together) a usage error.
                 _ if a.starts_with('-') && a.len() > 1 => return Parsed::Usage(None),
 
-                _ => positionals.push(a.to_string()),
+                _ => pre.push(a.to_string()),
             }
             i += 1;
         }
 
-        // `[<rev>] [--] <file>`: the last positional is the path; a single
-        // positional before it (if any) is the revision.
-        match positionals.len() {
-            0 => return Parsed::Usage(None),
-            1 => o.file = positionals.pop().unwrap(),
-            2 => {
-                o.file = positionals.pop().unwrap();
-                o.rev = positionals.pop();
-            }
-            _ => return Parsed::Usage(None),
-        }
+        // The rev/path split (blame's DWIM) is resolution-dependent — it turns
+        // on whether a positional resolves to an object — so it happens in
+        // `annotate()` after the repo is open, not here.
+        o.pre = pre;
+        o.post = post;
 
         Parsed::Options(Box::new(o))
     }
@@ -840,6 +890,85 @@ fn split_lines(blob: &[u8]) -> Vec<&[u8]> {
 
 fn count_lines(blob: &[u8]) -> u32 {
     split_lines(blob).len() as u32
+}
+
+/// Outcome of blame's positional DWIM: either a structural usage error (129),
+/// or a plan splitting the argv into revision arguments and the single `<file>`.
+enum DwimResult {
+    Usage,
+    Plan { rev_args: Vec<String>, file: String },
+}
+
+/// Reproduce `builtin/blame.c`'s DWIM that separates `<rev>`s from `<file>`.
+///
+/// git strips the path out of the argv *itself* (appending a synthetic `--`)
+/// before handing the rest to `setup_revisions()`, so the rule is positional,
+/// not "the last non-rev is the file". Reconstructed from git 2.55.0 behaviour:
+///
+/// * With a standalone `--` (`post` is `Some`):
+///   - 1 arg after `--`  → that arg is the file, everything before is revs.
+///   - 2 args after `--` → only the `-- <file> <rev>` legacy form, which git
+///     accepts *only* as the whole command line (`argc == 4`): nothing may
+///     precede the `--`. The file is the first, the rev the second. Anything
+///     before `--` makes it a usage error.
+///   - 0 or ≥3 args after `--` → usage error.
+/// * Without a `--` (`post` is `None`), over the `pre` positionals:
+///   - 0 → usage error (no `<file>`).
+///   - 1 → the sole positional is the file; the suspect defaults to HEAD.
+///   - 2 → if the *trailing* one names an object it is the rev and the leading
+///     one is the file (`git annotate <file> <rev>`); otherwise the leading one
+///     is the rev and the trailing one is the file (`git annotate <rev> <file>`).
+///   - ≥3 → the last is the file; every earlier positional is a rev argument
+///     (each resolved by `setup_revisions()`, so a non-object among them is a
+///     "bad revision").
+fn dwim_positionals(
+    repo: &gix::Repository,
+    pre: &[String],
+    post: Option<&[String]>,
+) -> DwimResult {
+    match post {
+        Some(post) => match post.len() {
+            1 => DwimResult::Plan {
+                rev_args: pre.to_vec(),
+                file: post[0].clone(),
+            },
+            2 if pre.is_empty() => DwimResult::Plan {
+                rev_args: vec![post[1].clone()],
+                file: post[0].clone(),
+            },
+            _ => DwimResult::Usage,
+        },
+        None => match pre.len() {
+            0 => DwimResult::Usage,
+            1 => DwimResult::Plan {
+                rev_args: Vec::new(),
+                file: pre[0].clone(),
+            },
+            2 => {
+                if is_a_rev(repo, &pre[1]) {
+                    DwimResult::Plan {
+                        rev_args: vec![pre[1].clone()],
+                        file: pre[0].clone(),
+                    }
+                } else {
+                    DwimResult::Plan {
+                        rev_args: vec![pre[0].clone()],
+                        file: pre[1].clone(),
+                    }
+                }
+            }
+            n => DwimResult::Plan {
+                rev_args: pre[..n - 1].to_vec(),
+                file: pre[n - 1].clone(),
+            },
+        },
+    }
+}
+
+/// git's `is_a_rev()`: whether `name` resolves to an existing object. Used only
+/// for the 2-positional DWIM tie-break.
+fn is_a_rev(repo: &gix::Repository, name: &str) -> bool {
+    repo.rev_parse_single(name).is_ok()
 }
 
 /// Resolve a revision to a commit id, peeling tags.

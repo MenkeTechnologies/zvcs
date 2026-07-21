@@ -27,8 +27,14 @@
 //! Not backed here, and refused with a terse message rather than faked:
 //! signing (`-s`, `-u`), verification (`-v`), an editor-supplied message (`-a`
 //! with neither `-m` nor `-F`), `--cleanup`, `--column`, the listing filters
-//! (`--contains`, `--points-at`, `--merged`, …), sort keys other than `refname`,
-//! and `--format` atoms outside the small set listed in [`render_atom`].
+//! (`--contains`, `--points-at`, `--merged`, …), and `--format` atoms outside the
+//! small set listed in [`render_atom`].
+//!
+//! `--sort` accepts only the `refname` field (ascending or descending). A key
+//! naming a field git does not know is rejected exactly as git does — `fatal:
+//! unknown field name: <atom>` / `malformed field name:` at exit 128 (see
+//! [`resolve_sort`]) — while a field git does recognize but this port cannot sort
+//! by (`taggerdate`, `objectname`, …) is refused rather than faked.
 
 use anyhow::{anyhow, bail, Result};
 use std::io::{Read, Write};
@@ -58,7 +64,9 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     let mut force = false;
     let mut annotate = false;
     let mut lines: Option<usize> = None;
-    let mut sort: Option<String> = None;
+    // Every `--sort` occurrence, in the order given. git accumulates them into a
+    // multi-level sort and validates each field name at parse time.
+    let mut sorts: Vec<String> = Vec::new();
     let mut format: Option<String> = None;
     // `-m` chunks in the order given, and the `-F` file if one was named.
     let mut messages: Vec<Vec<u8>> = Vec::new();
@@ -88,9 +96,9 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             "-n" => lines = Some(1),
             _ => {
                 if let Some(rest) = a.strip_prefix("--sort=") {
-                    sort = Some(rest.to_string());
+                    sorts.push(rest.to_string());
                 } else if a == "--sort" {
-                    sort = Some(take_value(args, &mut i, "sort")?.to_string());
+                    sorts.push(take_value(args, &mut i, "sort")?.to_string());
                 } else if let Some(rest) = a.strip_prefix("--format=") {
                     format = Some(rest.to_string());
                 } else if a == "--format" {
@@ -122,6 +130,18 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // git validates every `--sort` field name while parsing options — before it
+    // touches the repository or decides between listing and creating — dying on
+    // the first syntactically invalid key with exit 128. Reproduce that here so
+    // a bad sort key fails the same way regardless of mode.
+    let reverse = match resolve_sort(&sorts) {
+        SortOutcome::Fatal(msg) => return fatal(&msg),
+        SortOutcome::Unsupported(spec) => {
+            bail!("--sort={spec} is not supported (only refname and -refname)")
+        }
+        SortOutcome::Refname { reverse } => reverse,
+    };
+
     let repo = gix::discover(".")?;
 
     if delete {
@@ -132,13 +152,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     // listing-only option (`-l`, `-n`) was given. `--sort`/`--format` alone do
     // *not* switch modes: `git tag --format=… v0.*` still tries to create.
     if list || lines.is_some() || positionals.is_empty() {
-        return list_tags(
-            &repo,
-            &positionals,
-            lines,
-            format.as_deref(),
-            sort.as_deref(),
-        );
+        return list_tags(&repo, &positionals, lines, format.as_deref(), reverse);
     }
 
     let annotate = annotate || !messages.is_empty() || message_file.is_some();
@@ -161,28 +175,140 @@ fn take_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a s
     Ok(v.as_str())
 }
 
+/// git's `ref-filter.c` `valid_atom[]` field names, as of the git this parity
+/// suite runs against. A `--sort` key whose field name is outside this set is
+/// what git calls an "unknown field name"; membership here is only used to tell
+/// git-rejects-it apart from git-accepts-it, never to claim this port can sort
+/// by the field.
+const VALID_SORT_ATOMS: &[&str] = &[
+    "refname",
+    "objecttype",
+    "objectsize",
+    "objectname",
+    "deltabase",
+    "tree",
+    "parent",
+    "numparent",
+    "object",
+    "type",
+    "tag",
+    "author",
+    "authorname",
+    "authoremail",
+    "authordate",
+    "committer",
+    "committername",
+    "committeremail",
+    "committerdate",
+    "tagger",
+    "taggername",
+    "taggeremail",
+    "taggerdate",
+    "creator",
+    "creatordate",
+    "subject",
+    "body",
+    "trailers",
+    "contents",
+    "signature",
+    "raw",
+    "upstream",
+    "push",
+    "symref",
+    "flag",
+    "HEAD",
+    "color",
+    "worktreepath",
+    "align",
+    "end",
+    "if",
+    "then",
+    "else",
+    "rest",
+    "ahead-behind",
+    "is-base",
+    "describe",
+];
+
+/// Outcome of validating and interpreting every `--sort` key.
+enum SortOutcome {
+    /// All keys parse and reduce to a refname sort with this reverse flag.
+    Refname { reverse: bool },
+    /// A field name git itself rejects: emit `fatal: {0}` and exit 128.
+    Fatal(String),
+    /// A field git accepts but this port cannot sort by (e.g. `taggerdate`).
+    Unsupported(String),
+}
+
+/// Split a `--sort` key into its `-` (descending) and `version:`/`v:` prefixes
+/// and the remaining field atom, exactly as git's `parse_ref_sorting` does.
+fn parse_sort_key(key: &str) -> (bool, bool, &str) {
+    let mut s = key;
+    let mut reverse = false;
+    if let Some(rest) = s.strip_prefix('-') {
+        reverse = true;
+        s = rest;
+    }
+    let mut version = false;
+    if let Some(rest) = s.strip_prefix("version:").or_else(|| s.strip_prefix("v:")) {
+        version = true;
+        s = rest;
+    }
+    (reverse, version, s)
+}
+
+/// git's `parse_ref_filter_atom`: an empty atom is a `malformed field name`, and
+/// a field name (the part before the first `:`) outside `valid_atom[]` is an
+/// `unknown field name`. Returns the message git would `die` with, sans `fatal:`.
+fn git_sort_error(key: &str) -> Option<String> {
+    let (_, _, atom) = parse_sort_key(key);
+    if atom.is_empty() {
+        return Some(format!("malformed field name: {atom}"));
+    }
+    let name = atom.split(':').next().unwrap_or(atom);
+    if !VALID_SORT_ATOMS.contains(&name) {
+        return Some(format!("unknown field name: {atom}"));
+    }
+    None
+}
+
+/// Validate and interpret every `--sort` key. git dies on the first
+/// syntactically invalid key in the order given, so that is checked across all
+/// keys first; only then is this port's narrower support (refname only, most
+/// significant key last) considered.
+fn resolve_sort(sorts: &[String]) -> SortOutcome {
+    for key in sorts {
+        if let Some(msg) = git_sort_error(key) {
+            return SortOutcome::Fatal(msg);
+        }
+    }
+    let mut reverse = false;
+    let mut unsupported: Option<String> = None;
+    for key in sorts {
+        let (rev, version, atom) = parse_sort_key(key);
+        if !version && atom == "refname" {
+            reverse = rev;
+        } else {
+            unsupported = Some(key.clone());
+        }
+    }
+    match unsupported {
+        Some(spec) => SortOutcome::Unsupported(spec),
+        None => SortOutcome::Refname { reverse },
+    }
+}
+
 /// List tags, honoring pattern operands, `--sort`, and `--format`/`-n` rendering.
+///
+/// `reverse` is the already-resolved sort direction (see [`resolve_sort`]); this
+/// port sorts by refname only, so descending is just the ascending order flipped.
 fn list_tags(
     repo: &gix::Repository,
     patterns: &[&str],
     lines: Option<usize>,
     format: Option<&str>,
-    sort: Option<&str>,
+    reverse: bool,
 ) -> Result<ExitCode> {
-    let mut reverse = false;
-    if let Some(spec) = sort {
-        let key = match spec.strip_prefix('-') {
-            Some(rest) => {
-                reverse = true;
-                rest
-            }
-            None => spec,
-        };
-        if key != "refname" {
-            bail!("--sort={spec} is not supported (only refname and -refname)");
-        }
-    }
-
     let mut entries: Vec<Entry> = Vec::new();
     for r in repo.references()?.tags()? {
         let r = r.map_err(|e| anyhow!("failed to read a tag reference: {e}"))?;

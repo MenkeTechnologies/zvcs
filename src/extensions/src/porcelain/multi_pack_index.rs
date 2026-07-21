@@ -34,6 +34,21 @@
 //! treatment of a flat MIDX as a one-layer chain. Only the compaction itself is
 //! unported — see below.
 //!
+//! Every sub-command honours `--` as its operand terminator exactly as git's
+//! parse-options does: the first `--` ends option parsing and every following
+//! token — including another `--` or a `--flag`-shaped word — is a literal
+//! operand (an endpoint for `compact`, a rejected extra for the others). A
+//! top-level `--` before any sub-command leaves git's `OPT_SUBCOMMAND` parser
+//! with nothing to dispatch, so it reports `need a subcommand`.
+//!
+//! `repack`'s argument handling is ported even though its batched-repack
+//! execution is not (see below): `-h`, the two common options, the
+//! `--batch-size=<n>` `OPT_MAGNITUDE` grammar with git's three distinct value
+//! diagnostics, the `--` terminator and the leftover-operand usage block all
+//! match git byte-for-byte, because git rejects a malformed `repack` invocation
+//! during option parsing before it writes a single pack. Only a well-formed
+//! `repack` reaches the missing writer and bails.
+//!
 //! Not covered — these `bail!` rather than producing a diverging artifact:
 //!
 //!   * `write --bitmap` / `--preferred-pack=` / `--refs-snapshot=` — the
@@ -53,8 +68,10 @@
 //!   * `write --stdin-packs` — the writer takes a path list, so this could be
 //!     fed, but git's cruft-pack handling for the stdin set is not modelled and
 //!     a wrong pack set is a silently wrong index.
-//!   * `repack` — it creates new pack files from batched old ones and then
-//!     rewrites the MIDX; `gix-pack` has no pack-repacking driver.
+//!   * `repack`'s execution — a well-formed `repack` creates new pack files from
+//!     batched old ones and then rewrites the MIDX; `gix-pack` has no
+//!     pack-repacking driver. Its argument parsing is fully reproduced (above);
+//!     only this final step bails.
 //!
 //! `verify` uses `verify_integrity_fast`, which is the exact scope of git's
 //! `verify_midx_file`: trailing checksum, fan-out monotonicity, OID ordering,
@@ -180,8 +197,9 @@ usage: git multi-pack-index [<options>] repack [--batch-size=<size>]
 ///     own progress goes to stderr and never to stdout)
 ///   * `-h` at the top level and on every sub-command
 ///
-/// The `repack` sub-command and the `write` flags that need a bitmap or chain
-/// writer `bail!` — see the module docs for the specific missing substrate.
+/// The `write` flags that need a bitmap or chain writer, and a well-formed
+/// `repack` (whose argument parsing is otherwise reproduced), `bail!` — see the
+/// module docs for the specific missing substrate.
 pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
     // Dispatch includes the verb at index 0.
     let args = match args.first().map(String::as_str) {
@@ -213,6 +231,13 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
             print!("{USAGE}");
             return Ok(ExitCode::from(129));
         }
+        // A bare `--` terminates option parsing. Any subcommand would have been
+        // matched above (`subcommand.is_some()` takes the earlier branch), so at
+        // the top level `--` leaves git's `OPT_SUBCOMMAND` parser with no
+        // subcommand and it falls through to `need a subcommand`.
+        if a == "--" {
+            break;
+        }
         // git's `unknown option` names everything after the `--`, including any
         // `=<value>`: `--base=deadbeef` reports ``unknown option `base=deadbeef'``.
         if let Some(name) = a.strip_prefix("--") {
@@ -231,15 +256,7 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
         Some("verify") => verify(&rest, object_dir),
         Some("expire") => expire(&rest, object_dir),
         Some("compact") => compact(&rest, object_dir),
-        // `repack` parses cleanly but has no implementation behind it; a usage
-        // block would misrepresent that, so only `-h` is honoured.
-        Some("repack") => {
-            if rest.iter().any(|a| *a == "-h") {
-                print!("{REPACK_USAGE}");
-                return Ok(ExitCode::from(129));
-            }
-            bail!("unsupported subcommand \"repack\" (ported: write, verify, expire, compact) — batched repacking needs a pack writer that gix-pack does not provide")
-        }
+        Some("repack") => repack(&rest, object_dir),
         Some(other) => Ok(usage_error(
             Some(&format!("unknown subcommand: `{other}'")),
             USAGE,
@@ -249,8 +266,18 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
 
 /// `write`: index every pack in the object directory into a fresh MIDX.
 fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
+    let mut after_dd = false;
     let mut it = rest.iter().copied();
     while let Some(a) = it.next() {
+        if after_dd {
+            // Everything past `--` is an operand and `write` takes none, so git
+            // prints the bare usage block with no `error:` line.
+            return Ok(usage_error(None, WRITE_USAGE));
+        }
+        if a == "--" {
+            after_dd = true;
+            continue;
+        }
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
@@ -362,8 +389,18 @@ fn write_midx(pack_dir: &Path, object_hash: gix::hash::Kind) -> Result<bool> {
 
 /// `verify`: check the MIDX against the pack indices it references.
 fn verify(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
+    let mut after_dd = false;
     let mut it = rest.iter().copied();
     while let Some(a) = it.next() {
+        if after_dd {
+            // Operands after `--`; `verify` takes none, so git prints the bare
+            // usage block (this is also what `verify extra` produces).
+            return Ok(usage_error(None, VERIFY_USAGE));
+        }
+        if a == "--" {
+            after_dd = true;
+            continue;
+        }
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
@@ -417,8 +454,17 @@ fn verify(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
 /// is rewritten only if at least one pack was actually dropped — an expire that
 /// finds nothing to do leaves the existing MIDX byte-for-byte untouched.
 fn expire(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
+    let mut after_dd = false;
     let mut it = rest.iter().copied();
     while let Some(a) = it.next() {
+        if after_dd {
+            // Operands after `--`; `expire` takes none.
+            return Ok(usage_error(None, EXPIRE_USAGE));
+        }
+        if a == "--" {
+            after_dd = true;
+            continue;
+        }
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
@@ -513,8 +559,19 @@ fn expire(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
 /// itself is not — see the module docs for the missing `gix-pack` substrate.
 fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     let mut positional: Vec<&str> = Vec::new();
+    let mut after_dd = false;
     let mut it = rest.iter().copied();
     while let Some(a) = it.next() {
+        if after_dd {
+            // Past `--` every token is a literal endpoint, even another `--` or a
+            // `--flag`-looking word (`compact -- --base=z a` looks up `--base=z`).
+            positional.push(a);
+            continue;
+        }
+        if a == "--" {
+            after_dd = true;
+            continue;
+        }
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
@@ -583,6 +640,192 @@ fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     }
 
     bail!("compacting MIDX chain layers {from}..{to} is unported — gix-pack reads and writes v1 MIDX with zero base files only (multi_index/init.rs discards the base-file count), so a chain layer cannot be read back, let alone merged")
+}
+
+/// `repack`: batch small packs into new ones and rewrite the MIDX.
+///
+/// The batched-repack execution itself is unported — `gix-pack` has no
+/// pack-repacking driver — but git rejects a malformed invocation during option
+/// parsing, long before any pack is written, so every argument-error path is
+/// reproduced here byte-for-byte: `-h`, the `--object-dir` / `--progress`
+/// commons, the `--batch-size=<n>` `OPT_MAGNITUDE` value grammar (base-0 numeric
+/// parse plus optional k/m/g suffix, with git's three distinct diagnostics for
+/// an empty, malformed or out-of-range value), the `--` operand terminator and
+/// git's leftover-operand usage block. A well-formed invocation reaches the part
+/// that needs the missing writer and `bail!`s.
+fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
+    let mut after_dd = false;
+    // `repack` collects non-option words without stopping, then rejects them all
+    // once parsing succeeds; a bad option encountered first still wins, so this
+    // only fires after the loop.
+    let mut has_operand = false;
+    let mut it = rest.iter().copied();
+    while let Some(a) = it.next() {
+        if after_dd {
+            has_operand = true;
+            continue;
+        }
+        if a == "--" {
+            after_dd = true;
+            continue;
+        }
+        match take_common(a, &mut it, &mut object_dir)? {
+            Common::Consumed => continue,
+            Common::MissingValue(name) => {
+                return Ok(usage_error(
+                    Some(&format!("option `{name}' requires a value")),
+                    REPACK_USAGE,
+                ))
+            }
+            Common::NotCommon => {}
+        }
+        match a {
+            "-h" => {
+                print!("{REPACK_USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            "--batch-size" => match it.next() {
+                Some(v) => {
+                    if let Some(msg) = batch_size_error(v) {
+                        return Ok(usage_error(Some(&msg), REPACK_USAGE));
+                    }
+                }
+                None => {
+                    return Ok(usage_error(
+                        Some("option `batch-size' requires a value"),
+                        REPACK_USAGE,
+                    ))
+                }
+            },
+            _ if a.starts_with("--batch-size=") => {
+                let v = &a["--batch-size=".len()..];
+                if let Some(msg) = batch_size_error(v) {
+                    return Ok(usage_error(Some(&msg), REPACK_USAGE));
+                }
+            }
+            _ if a.starts_with("--") => {
+                return Ok(usage_error(
+                    Some(&format!("unknown option `{}'", &a[2..])),
+                    REPACK_USAGE,
+                ));
+            }
+            _ if a.len() > 1 && a.starts_with('-') => {
+                let c = a.chars().nth(1).expect("checked length");
+                return Ok(usage_error(Some(&format!("unknown switch `{c}'")), REPACK_USAGE));
+            }
+            // A bare word is an operand; `repack` takes none.
+            _ => has_operand = true,
+        }
+    }
+
+    if has_operand {
+        return Ok(usage_error(None, REPACK_USAGE));
+    }
+
+    bail!("unsupported subcommand \"repack\" (ported: write, verify, expire, compact) — batched repacking needs a pack writer that gix-pack does not provide")
+}
+
+/// Classify a `--batch-size` value the way git's `OPT_MAGNITUDE` does and return
+/// the exact `error:` text git prints, or `None` when the value is accepted.
+///
+/// git parses it through `git_parse_ulong`: reject any `-` outright, run
+/// `strtoumax(value, &end, 0)` (base 0 — `0x` hex, leading `0` octal, else
+/// decimal, skipping leading whitespace and a single `+`), then require the
+/// remainder to be an empty or a `k`/`m`/`g` suffix (case-insensitive). An empty
+/// value, a malformed one and an out-of-`unsigned long`-range one each get a
+/// distinct message; the range bound prints literally as `[0,-1]` in git 2.55.
+fn batch_size_error(v: &str) -> Option<String> {
+    match classify_magnitude(v) {
+        MagValue::Ok => None,
+        MagValue::Empty => Some("option `batch-size' expects a numerical value".to_string()),
+        MagValue::Invalid => Some(
+            "option `batch-size' expects a non-negative integer value with an optional k/m/g suffix"
+                .to_string(),
+        ),
+        MagValue::Range => Some(format!("value {v} for option `batch-size' not in range [0,-1]")),
+    }
+}
+
+/// The three outcomes of a magnitude parse that map to git's three diagnostics.
+enum MagValue {
+    Ok,
+    /// The value was the empty string.
+    Empty,
+    /// Non-numeric, negative, or a bad unit suffix.
+    Invalid,
+    /// Numerically valid but larger than an `unsigned long` can hold.
+    Range,
+}
+
+/// A faithful port of `git_parse_ulong` (base-0 numeric parse + k/m/g suffix),
+/// classified into [`MagValue`]. The upper bound is `u64::MAX`, matching
+/// `unsigned long` on git's 64-bit targets.
+fn classify_magnitude(arg: &str) -> MagValue {
+    if arg.is_empty() {
+        return MagValue::Empty;
+    }
+    // `git_parse_unsigned` rejects a `-` anywhere before touching `strtoumax`,
+    // which would otherwise accept negatives by wrapping.
+    if arg.contains('-') {
+        return MagValue::Invalid;
+    }
+    let b = arg.as_bytes();
+    let mut i = 0;
+    // strtoumax skips leading C-locale whitespace, then a single optional `+`.
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        i += 1;
+    }
+    if i < b.len() && b[i] == b'+' {
+        i += 1;
+    }
+    // base 0: `0x`/`0X` -> hex, leading `0` -> octal, else decimal.
+    let (radix, start): (u128, usize) =
+        if i + 1 < b.len() && b[i] == b'0' && (b[i + 1] == b'x' || b[i + 1] == b'X') {
+            (16, i + 2)
+        } else if i < b.len() && b[i] == b'0' {
+            (8, i)
+        } else {
+            (10, i)
+        };
+    let mut val: u128 = 0;
+    let mut any = false;
+    let mut too_big = false;
+    let mut j = start;
+    while j < b.len() {
+        let digit = match b[j] {
+            c @ b'0'..=b'9' => (c - b'0') as u128,
+            c @ b'a'..=b'f' => (c - b'a' + 10) as u128,
+            c @ b'A'..=b'F' => (c - b'A' + 10) as u128,
+            _ => break,
+        };
+        if digit >= radix {
+            break;
+        }
+        any = true;
+        match val.checked_mul(radix).and_then(|v| v.checked_add(digit)) {
+            Some(v) => val = v,
+            None => too_big = true,
+        }
+        j += 1;
+    }
+    // git checks `strtoumax`'s ERANGE before it looks at the suffix.
+    if too_big {
+        return MagValue::Range;
+    }
+    if !any {
+        return MagValue::Invalid;
+    }
+    let factor: u128 = match &arg[j..] {
+        "" => 1,
+        "k" | "K" => 1024,
+        "m" | "M" => 1024 * 1024,
+        "g" | "G" => 1024 * 1024 * 1024,
+        _ => return MagValue::Invalid,
+    };
+    match val.checked_mul(factor) {
+        Some(uval) if uval <= u64::MAX as u128 => MagValue::Ok,
+        _ => MagValue::Range,
+    }
 }
 
 /// Checksums of the MIDX layers `compact` can name, newest last.
@@ -772,6 +1015,42 @@ mod tests {
             );
         }
         assert!(COMPACT_USAGE.contains("<from> <to>"), "compact takes two endpoints");
+    }
+
+    /// `--batch-size` is git's `OPT_MAGNITUDE`; every arm here is the verbatim
+    /// classification stock git 2.55 gives (`git multi-pack-index repack
+    /// --batch-size=<v>`), so a regression in the base-0 parse, the suffix set or
+    /// the `unsigned long` bound would surface as a message/exit-code diff.
+    #[test]
+    fn batch_size_matches_opt_magnitude() {
+        let ok = [
+            "0", "1", "010", "0x10", "0X1F", "+1", " 1", "  10", "1k", "1K", "9g", "9G",
+            "18446744073709551615",
+        ];
+        for v in ok {
+            assert!(matches!(classify_magnitude(v), MagValue::Ok), "expected Ok for {v:?}");
+            assert_eq!(batch_size_error(v), None, "{v:?} should be accepted");
+        }
+        assert!(matches!(classify_magnitude(""), MagValue::Empty));
+        assert_eq!(
+            batch_size_error("").as_deref(),
+            Some("option `batch-size' expects a numerical value")
+        );
+        for v in ["abc", "-1", "-0", "1.5", ".5", "1kb", "1g1", "7 ", "0o17", "0b101"] {
+            assert!(matches!(classify_magnitude(v), MagValue::Invalid), "expected Invalid for {v:?}");
+            assert_eq!(
+                batch_size_error(v).as_deref(),
+                Some("option `batch-size' expects a non-negative integer value with an optional k/m/g suffix"),
+                "{v:?}"
+            );
+        }
+        for v in ["18446744073709551616", "20000000000000000000", "0xffffffffffffffffff"] {
+            assert!(matches!(classify_magnitude(v), MagValue::Range), "expected Range for {v:?}");
+            assert_eq!(
+                batch_size_error(v),
+                Some(format!("value {v} for option `batch-size' not in range [0,-1]"))
+            );
+        }
     }
 
     /// A flat MIDX is a one-layer chain for `compact`'s purposes, so an object

@@ -38,10 +38,13 @@
 //!     `--dirstat` on its own replaces the raw listing, while `--raw --dirstat`
 //!     prints both, and `--name-only`, `--name-status` and `-s` suppress it entirely.
 //!   * `[--] <path>...`                 — pathspec limiting, resolved relative to the cwd
-//!     while output paths stay repository-root relative, as git does. Without a `--`
-//!     separator a pathspec has to exist on disk (git's `verify_filename`), so a
-//!     mistyped revision exits 128 with the `ambiguous argument` text rather than
-//!     silently matching nothing.
+//!     while output paths stay repository-root relative, as git does. Positionals are
+//!     resolved the way `setup_revisions` does: the first that names an object is the
+//!     tree-ish, a second object is an extra revision (diff-index takes exactly one, so
+//!     two or more exit 129 with the usage text), and once a positional is accepted as a
+//!     path every later one must exist on disk. Without a `--` separator a mistyped
+//!     revision that is neither object nor path exits 128 with the `ambiguous argument`
+//!     text rather than silently matching nothing.
 //!
 //! Status letters produced: `A`, `D`, `T` (the `S_IFMT` bits of the two modes differ,
 //! e.g. file ↔ symlink), `M`, and `U` for unmerged paths under `--cached`.
@@ -49,7 +52,8 @@
 //! Options that only steer patch, stat or colour rendering (`--color[=<when>]`, `-D`,
 //! `--ws-error-highlight=`, `--src-prefix=`/`--dst-prefix=`/`--no-prefix`,
 //! `--diff-algorithm=`, `--anchored=`, `--color-moved[=]`, `--word-diff[=]`,
-//! `--submodule[=]`, `--ignore-submodules[=]`, `--skip-to=`, `--rotate-to=`,
+//! `--submodule` (bare or `=short|log|diff`; any other value is rejected 129 as git
+//! does), `--ignore-submodules[=]`, `--skip-to=`, `--rotate-to=`,
 //! `--ignore-blank-lines`, `-B`, `-l<n>`, `-a`/`--text`, `-W`, …) are accepted and
 //! ignored: stock git's raw, `--name-only` and `--name-status` bytes are identical with
 //! and without them. The full list is `render_only_option`.
@@ -346,6 +350,58 @@ fn unsupported_format(a: &str) -> bool {
         || (a.len() > 2 && a.starts_with("-U"))
 }
 
+/// Which output-format family an unsupported-format flag belongs to, as
+/// `(is_stat, is_patch)`. git's `diff_flush()` writes one separator line between the
+/// diffstat and the patch when both families are active, so both bits are tracked to
+/// reproduce that byte in the otherwise-empty case. `--check` and `--summary` set
+/// neither (they are separate formats that emit no such separator), and
+/// `--patch-with-raw` is deliberately excluded — it also renders the raw listing,
+/// which this path cannot combine, so it is left to the ordinary refusal.
+fn format_family(a: &str) -> (bool, bool) {
+    let stat = matches!(
+        a,
+        "--stat" | "--numstat" | "--shortstat" | "--compact-summary" | "--patch-with-stat"
+    ) || a.starts_with("--stat=")
+        || a.starts_with("--stat-width=")
+        || a.starts_with("--stat-name-width=")
+        || a.starts_with("--stat-count=");
+    let patch = matches!(a, "-p" | "-u" | "--patch" | "--binary" | "--patch-with-stat")
+        || a.starts_with("--unified=")
+        || (a.len() > 2 && a.starts_with("-U"));
+    (stat, patch)
+}
+
+/// git parses `--abbrev=<n>` with `strtoul(arg, NULL, 10)`, which never fails: it skips
+/// leading whitespace and an optional sign, reads the leading decimal digits, yields `0`
+/// when there are none, and wraps a negative value to a huge number. `abbrev_len` then
+/// clamps the result into git's `[4, hash-length]` range, so garbage abbreviates to 4 and
+/// a negative one prints the full id, exactly as stock git does.
+fn git_abbrev(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        i += 1;
+    }
+    let mut negative = false;
+    if i < b.len() && (b[i] == b'-' || b[i] == b'+') {
+        negative = b[i] == b'-';
+        i += 1;
+    }
+    let start = i;
+    let mut val: usize = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        val = val.saturating_mul(10).saturating_add(usize::from(b[i] - b'0'));
+        i += 1;
+    }
+    if i == start {
+        0
+    } else if negative {
+        usize::MAX
+    } else {
+        val
+    }
+}
+
 /// Short options whose value may be written as a separate argument (`-S fn` as well as
 /// `-Sfn`).
 fn short_option_takes_value(a: &str) -> bool {
@@ -401,13 +457,17 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let mut pickaxe_arg: Option<(u8, Vec<u8>)> = None;
     let mut ignore_arg: Option<Vec<u8>> = None;
     let mut pickaxe_regex = false;
-    let mut treeish: Option<&str> = None;
+    // Positionals given before a `--` separator, in order. git's `setup_revisions`
+    // resolves each against the object database; the first that resolves is the
+    // tree-ish and the rest are extra revisions or pathspecs (see the scan below).
+    let mut positionals: Vec<String> = Vec::new();
     let mut paths: Vec<BString> = Vec::new();
-    // Positionals given without a `--` separator. git's `verify_filename` insists that
-    // each one names something that exists in the working tree, so that a mistyped
-    // revision is reported instead of silently becoming a pathspec that matches nothing.
-    let mut unseparated: Vec<&str> = Vec::new();
     let mut after_dashdash = false;
+    // Whether a stat-family and/or a patch-family output format was requested. git's
+    // `diff_flush()` writes one separator line between the two blocks when both are
+    // active, which is the only byte an otherwise-unrenderable format still produces.
+    let mut want_stat = false;
+    let mut want_patch = false;
     // The first option git understands but this module does not. Held back rather than
     // raised immediately: git parses the whole command line before it looks at the
     // tree-ish, so a missing or unresolvable revision still has to win, exactly as it
@@ -513,10 +573,18 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 }
             }
             s if s.starts_with("--abbrev=") => {
-                let n: usize = s["--abbrev=".len()..]
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("invalid --abbrev value in {s:?}"))?;
-                opts.abbrev = Some(Some(n));
+                // git parses this with `strtoul`, which never fails; `abbrev_len`
+                // clamps the result into `[4, hash-length]` afterwards.
+                opts.abbrev = Some(Some(git_abbrev(&s["--abbrev=".len()..])));
+            }
+            s if s.starts_with("--submodule=") => {
+                // `parse_submodule_params()`: only these three spellings are valid,
+                // and git rejects anything else with an immediate usage error.
+                let val = &s["--submodule=".len()..];
+                if !matches!(val, "short" | "log" | "diff") {
+                    eprintln!("error: failed to parse --submodule option parameter: '{val}'");
+                    return Ok(ExitCode::from(129));
+                }
             }
             s if s.len() > 2 && s.starts_with("-I") => {
                 ignore_arg = Some(s[2..].as_bytes().to_vec());
@@ -529,6 +597,9 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             }
             s => {
                 if unsupported_format(s) {
+                    let (st, pt) = format_family(s);
+                    want_stat |= st;
+                    want_patch |= pt;
                     bad_format.get_or_insert_with(|| s.to_owned());
                 } else if render_only_option(s) {
                     // Accepted and ignored.
@@ -537,11 +608,8 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                         i += 1;
                     }
                     unsupported.get_or_insert_with(|| s.to_owned());
-                } else if treeish.is_none() {
-                    treeish = Some(s);
                 } else {
-                    unseparated.push(s);
-                    paths.push(s.into());
+                    positionals.push(s.to_owned());
                 }
             }
         }
@@ -583,21 +651,50 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let Some(spec) = treeish else {
-        eprint!("{}", USAGE);
-        return Ok(ExitCode::from(129));
-    };
-
     let repo = gix::discover(".")?;
 
-    let Some(resolved) = repo.rev_parse_single(spec).ok().map(|id| id.detach()) else {
-        eprintln!(
-            "fatal: ambiguous argument '{spec}': unknown revision or path not in the working tree.\n\
-             Use '--' to separate paths from revisions, like this:\n\
-             'git <command> [<revision>...] -- [<file>...]'"
-        );
-        return Ok(ExitCode::from(128));
-    };
+    // git's `setup_revisions`: each positional before `--` is tried as a revision.
+    // The first that resolves is the tree-ish; a further one that also resolves is
+    // an extra revision. Once a positional fails to resolve and is accepted as a
+    // path, `pathspec_mode` latches on and every later positional must be a path on
+    // disk (`no such path`), while a non-revision that is not a path is the classic
+    // `ambiguous argument`. diff-index then insists on exactly one revision — zero
+    // or two or more print its usage — mirroring `builtin/diff-index.c`.
+    let mut spec: Option<String> = None;
+    let mut resolved: Option<ObjectId> = None;
+    let mut pending = 0usize;
+    let mut pathspec_mode = false;
+    for arg in &positionals {
+        if pathspec_mode {
+            if std::fs::symlink_metadata(arg).is_err() {
+                eprintln!("fatal: {arg}: no such path in the working tree.");
+                return Ok(ExitCode::from(128));
+            }
+            paths.push(arg.as_str().into());
+        } else if let Ok(id) = repo.rev_parse_single(arg.as_str()) {
+            pending += 1;
+            if spec.is_none() {
+                spec = Some(arg.clone());
+                resolved = Some(id.detach());
+            }
+        } else if std::fs::symlink_metadata(arg).is_err() {
+            eprintln!(
+                "fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree.\n\
+                 Use '--' to separate paths from revisions, like this:\n\
+                 'git <command> [<revision>...] -- [<file>...]'"
+            );
+            return Ok(ExitCode::from(128));
+        } else {
+            pathspec_mode = true;
+            paths.push(arg.as_str().into());
+        }
+    }
+    if pending != 1 {
+        eprint!("{}", USAGE);
+        return Ok(ExitCode::from(129));
+    }
+    let spec = spec.expect("pending == 1 guarantees a resolved tree-ish");
+    let resolved = resolved.expect("pending == 1 guarantees a resolved tree-ish");
 
     let base = if merge_base {
         let head = match repo.head_id() {
@@ -636,19 +733,6 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
-
-    // git's `verify_filename`: a positional that follows the tree-ish without a `--`
-    // has to exist on disk, or it was meant to be a revision and is reported as one.
-    for arg in &unseparated {
-        if std::fs::symlink_metadata(arg).is_err() {
-            eprintln!(
-                "fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree.\n\
-                 Use '--' to separate paths from revisions, like this:\n\
-                 'git <command> [<revision>...] -- [<file>...]'"
-            );
-            return Ok(ExitCode::from(128));
-        }
-    }
 
     if let Some(flag) = unsupported {
         bail!("unsupported flag {flag:?} (ported: {PORTED})");
@@ -690,6 +774,11 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     // git emits index order, which is a plain byte-wise sort of the paths.
     deltas.sort_by(|a, b| a.path.cmp(&b.path));
 
+    // The number of file pairs git would have queued (after pathspec limiting, before
+    // content comparison drops the stat-dirty-but-identical ones). git's `diff_flush()`
+    // separator between the diffstat and the patch is printed only when this is > 0.
+    let raw_delta_count = deltas.len();
+
     // git's `diffcore_std`: content comparison first (which also fills in the object id
     // it had to compute), then the pickaxe, then `--diff-filter`.
     let content_driven = opts.ws.any()
@@ -723,6 +812,16 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     if let Some(flag) = &bad_format {
         if !deltas.is_empty() {
             bail!("unsupported output format {flag:?} (ported: {PORTED})");
+        }
+        // `diff_flush()` writes a single separator line between the (empty) diffstat
+        // and the (empty) patch whenever both a stat-family and a patch-family format
+        // are active and at least one file pair was queued — i.e. every pair was
+        // content-identical (stat-dirty), so both blocks render nothing but the
+        // separator survives. `-z` makes it a NUL; `--line-prefix` precedes it.
+        if want_stat && want_patch && opts.format == Format::Raw && raw_delta_count > 0 {
+            let mut sep = opts.line_prefix.clone();
+            sep.push(if opts.nul { 0 } else { b'\n' });
+            std::io::stdout().lock().write_all(&sep)?;
         }
     } else {
         // git's `diff_flush()` order: the pair listing first, then the dirstat block.

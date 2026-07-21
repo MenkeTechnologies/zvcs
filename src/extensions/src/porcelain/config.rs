@@ -79,8 +79,24 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     let mut mode = Mode::Auto;
     let mut name_only = false;
     let mut positional: Vec<&str> = Vec::new();
+    // git's parse-options terminator: the first bare `--` ends option parsing.
+    // It is consumed (never a positional itself), and every following token —
+    // including ones that start with `-` — is an operand, not a flag. So
+    // `git config --get -- --list` reads the key literally named `--list`, and
+    // `git config --get-all -- a b c d` is a 4-operand `--get-all`, which git
+    // rejects as "wrong number of arguments" rather than parsing the tail.
+    let mut end_of_options = false;
 
     for a in args {
+        if end_of_options {
+            positional.push(a.as_str());
+            continue;
+        }
+        if a.as_str() == "--" {
+            end_of_options = true;
+            continue;
+        }
+
         let action = match a.as_str() {
             "-l" | "--list" => Some(Mode::List),
             "--get" => Some(Mode::Get),

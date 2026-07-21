@@ -54,8 +54,13 @@
 //!     now exist in [`gzip`]; the container does not.
 //!   * `--remote` / `--exec` (needs the `git-upload-archive` protocol),
 //!     `--add-file` and `--add-virtual-file`: parsed, so that git's
-//!     usage/format/tree-ish diagnostics still come out in the right order, and
-//!     then rejected before a single byte is written.
+//!     diagnostics still come out in the right order, and then rejected before a
+//!     single byte is written. `--add-virtual-file` is validated the way git's
+//!     `add_file_cb` is (a missing colon or an empty path before it is fatal at
+//!     parse time), and the "unsupported" rejection is deferred until after
+//!     every diagnostic git emits first — usage, format, compression level,
+//!     invalid tree-ish, attribute conversion, an unmatched pathspec — since git
+//!     writes the added records last, after the tree walk.
 //!   * Repositories whose archived tree carries content-affecting attributes
 //!     (`export-ignore`, `export-subst`, `text`, `eol`, `filter`, `ident`,
 //!     `working-tree-encoding`), or a `core.autocrlf` / `core.eol` /
@@ -185,8 +190,13 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             "--prefix" => opts.prefix = Some(value_of(args, &mut i, "--prefix")?),
             "-o" | "--output" => opts.output = Some(value_of(args, &mut i, "--output")?),
             "--mtime" => opts.mtime = Some(value_of(args, &mut i, "--mtime")?),
-            "--add-file" | "--add-virtual-file" => {
+            "--add-file" => opts.added.push(value_of(args, &mut i, a)?),
+            "--add-virtual-file" => {
                 let value = value_of(args, &mut i, a)?;
+                if let Some(msg) = virtual_file_error(&value) {
+                    eprintln!("fatal: {msg}");
+                    return Ok(ExitCode::from(128));
+                }
                 opts.added.push(value);
             }
             _ if a.starts_with("--format=") => opts.format = Some(a[9..].to_string()),
@@ -194,7 +204,14 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--output=") => opts.output = Some(a[9..].to_string()),
             _ if a.starts_with("--mtime=") => opts.mtime = Some(a[8..].to_string()),
             _ if a.starts_with("--add-file=") => opts.added.push(a[11..].to_string()),
-            _ if a.starts_with("--add-virtual-file=") => opts.added.push(a[19..].to_string()),
+            _ if a.starts_with("--add-virtual-file=") => {
+                let value = &a[19..];
+                if let Some(msg) = virtual_file_error(value) {
+                    eprintln!("fatal: {msg}");
+                    return Ok(ExitCode::from(128));
+                }
+                opts.added.push(value.to_string());
+            }
             _ if compression_level(a).is_some() => opts.level = compression_level(a),
             _ if a.len() > 1 && a.starts_with('-') => bail!(
                 "unsupported flag {a:?} (ported: --format, --prefix, -o/--output, --mtime, \
@@ -326,10 +343,6 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: deflateInit2: stream consistency error (no message)");
         return Ok(ExitCode::from(128));
     }
-    if let Some(given) = opts.added.first() {
-        bail!("--add-file/--add-virtual-file is not supported (given {given:?})");
-    }
-
     // Run from a subdirectory, git narrows the tree to that subdirectory and
     // makes every archived path relative to it.
     if let Some(prefix) = repo.prefix()?.map(std::path::Path::to_path_buf) {
@@ -368,6 +381,15 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             opts.paths[idx]
         );
         return Ok(ExitCode::from(128));
+    }
+
+    // git supports `--add-file`/`--add-virtual-file`; this port cannot write the
+    // extra records, so it bails here — but only after every diagnostic git
+    // itself would emit first (usage, format, compression level, invalid
+    // tree-ish, attribute conversion, an unmatched pathspec) has had its turn.
+    // git writes the added records last of all, so nothing has reached stdout.
+    if let Some(given) = opts.added.first() {
+        bail!("--add-file/--add-virtual-file is not supported (given {given:?})");
     }
 
     let base = opts.prefix.clone().unwrap_or_default();
@@ -458,6 +480,20 @@ fn value_of(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
     args.get(*i)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("option `{flag}` requires a value"))
+}
+
+/// git's `add_file_cb` validation for `--add-virtual-file <path:content>`,
+/// which runs inside `parse_options()` — so it fires before the format,
+/// compression-level and tree-ish diagnostics, exactly like stock git. The
+/// value must carry a colon, and the path before it must be non-empty. Returns
+/// the `fatal:` text git would `die()` with (exit 128), or `None` when valid.
+/// `--add-file` has no such check, so it is not routed through here.
+fn virtual_file_error(value: &str) -> Option<String> {
+    match value.find(':') {
+        None => Some(format!("missing colon: '{value}'")),
+        Some(0) => Some(format!("empty file name: '{value}'")),
+        Some(_) => None,
+    }
 }
 
 /// The level in a `-<digits>` argument, or `None` if `arg` is not one.

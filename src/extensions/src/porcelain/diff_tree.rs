@@ -17,7 +17,8 @@
 //!   prints nothing unless `-m` is given
 //! * `-r`, `-t` (implies `-r`), `--root`, `-m`
 //! * `--raw` (the default), `--name-only`, `--name-status`, `-s`/`--no-patch`
-//! * `-z`, `--abbrev=<n>` (clamped to 4..=hash length, like git)
+//! * `-z`, `--abbrev=<n>` (parsed with git's `strtoul`: leading base-10 digits
+//!   only, no error on garbage, clamped to 4..=hash length)
 //! * `--no-commit-id`, `--always`
 //! * `--diff-filter=<letters>`, `--exit-code`, `--quiet`
 //! * literal `<path>` filters (exact entry, directory prefix, or a tree that a filter
@@ -28,6 +29,12 @@
 //!   object`, `ambiguous argument`, `no such path` — are reproduced verbatim on
 //!   stderr with exit 128, and `option '<x>' must come before non-option arguments`
 //!   likewise.
+//! * git's parse-time value validation, which runs before revision resolution: an
+//!   invalid `--color=<x>` value (anything but always/auto/never, case-blind) is a
+//!   usage error (`error: option `color' expects …`, exit 129), and an invalid
+//!   `--pretty`/`--format` name is fatal (`fatal: invalid --pretty format: <x>`,
+//!   exit 128). A valid `--pretty`/`--format` is still a format this port cannot
+//!   render and is recorded like any other unsupported option.
 //! * `-h` — git's usage text on stdout, exit 129; no `<tree-ish>` — the same text on
 //!   stderr, exit 129
 //!
@@ -272,17 +279,51 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(USAGE_ERROR));
                 }
                 _ if a.starts_with("--abbrev=") => {
-                    let v = &a["--abbrev=".len()..];
-                    let n: usize = v
-                        .parse()
-                        .map_err(|_| anyhow::anyhow!("invalid --abbrev value {v:?}"))?;
-                    opts.abbrev = n.clamp(MINIMUM_ABBREV, hash.len_in_hex());
+                    // git parses the value with strtoul(arg, NULL, 10): leading
+                    // base-10 digits only, no error on garbage (yields 0), then
+                    // clamps to [MINIMUM_ABBREV, hash length]. A value above the hash
+                    // length — including one that wrapped from a leading `-` — clamps
+                    // down to it, so `--abbrev=true`, `--abbrev=0x10`, `--abbrev=` and
+                    // `--abbrev=-5` are all accepted exactly as git accepts them.
+                    let n = git_strtoul(&a["--abbrev=".len()..]);
+                    opts.abbrev =
+                        n.clamp(MINIMUM_ABBREV as u64, hash.len_in_hex() as u64) as usize;
                 }
                 _ if a.starts_with("--diff-filter=") => {
                     match parse_diff_filter(&a["--diff-filter=".len()..]) {
                         Some(mask) => opts.filter = mask,
                         None => return Ok(ExitCode::from(USAGE_ERROR)),
                     }
+                }
+                // git validates `--color`'s value while parsing options (before it
+                // resolves revisions), accepting only always/auto/never
+                // case-insensitively and rejecting everything else — including
+                // `true`/`false`/`0`/`1`/empty — with a usage error.
+                _ if a.starts_with("--color=") => {
+                    let v = &a["--color=".len()..];
+                    if !matches!(
+                        v.to_ascii_lowercase().as_str(),
+                        "always" | "never" | "auto"
+                    ) {
+                        eprintln!(
+                            "error: option `color' expects \"always\", \"auto\", or \"never\""
+                        );
+                        return Ok(ExitCode::from(USAGE_ERROR));
+                    }
+                    // Accepted; has no effect on the raw output this port emits.
+                }
+                // git validates the `--pretty`/`--format` argument through
+                // `get_commit_format` at parse time and dies fatally on a format name
+                // it does not recognise, before it ever checks for a missing
+                // <tree-ish>. A valid format is still one this port cannot render, so
+                // it is recorded like any other unsupported option.
+                _ if a.starts_with("--format=") || a.starts_with("--pretty=") => {
+                    let v = a.split_once('=').map(|(_, r)| r).unwrap_or("");
+                    if !valid_pretty_format(v) {
+                        eprintln!("fatal: invalid --pretty format: {v}");
+                        return Ok(ExitCode::from(FATAL));
+                    }
+                    unsupported.get_or_insert_with(|| a.to_string());
                 }
                 _ if is_ignorable(a) => {}
                 _ if is_known_unsupported(a) => {
@@ -491,6 +532,71 @@ fn apply_filter(changes: &mut Vec<Change>, mask: u32) {
     }
 }
 
+/// git's `strtoul(s, NULL, 10)`, used for `--abbrev=<n>`: skip leading ASCII
+/// whitespace and an optional sign, read base-10 digits until the first non-digit,
+/// and never report an error — no digits yields 0. A leading `-` negates with the
+/// same unsigned wraparound C's `strtoul` performs, which the caller then clamps to
+/// the hash length.
+fn git_strtoul(s: &str) -> u64 {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let neg = match b.get(i) {
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        _ => false,
+    };
+    let mut val: u64 = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        val = val.wrapping_mul(10).wrapping_add((b[i] - b'0') as u64);
+        i += 1;
+    }
+    if neg {
+        val.wrapping_neg()
+    } else {
+        val
+    }
+}
+
+/// git's `get_commit_format` accept/reject decision for a `--pretty`/`--format`
+/// value. Accepted: the empty string (the default format), any custom format (a
+/// `format:`/`tformat:` prefix or a string containing `%`), and any case-insensitive
+/// prefix of a built-in format name. Everything else is what git rejects with
+/// `die("invalid --pretty format: <arg>")`; the caller reproduces that fatal.
+///
+/// The built-in names and the prefix matching were both confirmed against stock git
+/// 2.55: `--format=med` resolves (`medium`), `--format=Full` resolves case-blind,
+/// while `auto`, `default`, `onelineX` and a leading-space value are rejected.
+fn valid_pretty_format(v: &str) -> bool {
+    const PRESETS: &[&str] = &[
+        "oneline",
+        "short",
+        "medium",
+        "full",
+        "fuller",
+        "reference",
+        "email",
+        "raw",
+        "mboxrd",
+    ];
+    if v.is_empty() || v.contains('%') {
+        return true;
+    }
+    if v.starts_with("format:") || v.starts_with("tformat:") {
+        return true;
+    }
+    let lower = v.to_ascii_lowercase();
+    PRESETS.iter().any(|p| p.starts_with(&lower))
+}
+
 /// Options stock git's `diff-tree` accepts that only steer patch or stat rendering.
 ///
 /// This module never emits either format — it bails first — so these provably cannot
@@ -529,7 +635,6 @@ fn is_ignorable(a: &str) -> bool {
     const PREFIX: &[&str] = &[
         "--src-prefix=",
         "--dst-prefix=",
-        "--color=",
         "--diff-algorithm=",
         "--inter-hunk-context=",
         "--output-indicator-new=",
@@ -608,6 +713,10 @@ fn is_known_unsupported(a: &str) -> bool {
         "-v",
         "--pretty",
         "--format",
+        // `--oneline` is `--pretty=oneline --abbrev-commit`; it renders a
+        // commit-message line this port cannot produce.
+        "--oneline",
+        "--no-oneline",
         "--merge-base",
         "-c",
         "--cc",

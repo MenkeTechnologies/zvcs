@@ -19,8 +19,10 @@
 //! code depends on which stage rejects it. This module reproduces that order:
 //!
 //! 1. no arguments at all → the option usage on stderr, exit 129
-//! 2. `setup_revisions` → an unresolvable revision is
-//!    `fatal: ambiguous argument ...`, exit 128
+//! 2. `setup_revisions` classifies each positional: a spec that resolves is a
+//!    revision; one that names a working-tree path is a pathspec; one that is
+//!    neither is `fatal: ambiguous argument ...`, exit 128. A `--` here is inert
+//!    — git consumes it and classifies the rest identically.
 //! 3. leftover/unknown arguments → the option usage on stderr, exit 129
 //! 4. `--anonymize-map` without `--anonymize` → fatal, exit 128
 //! 5. `--ancestry-path` with no negative revision → fatal, exit 128
@@ -45,6 +47,16 @@
 //! * accepted no-ops (as in git for a pathspec-less export): `--full-history`,
 //!   `--simplify-merges`, `--sparse`, `--dense`, `--boundary` (without negative
 //!   revisions)
+//! * path limiting: a plain pathspec — whether after `--` or bare, since for
+//!   fast-export `--` only separates and never changes classification — filters
+//!   the export to commits whose diff touches it, with git's default history
+//!   simplification and parent rewriting so pruned parents and refs re-point at
+//!   the nearest shown ancestor (or the null oid when none survives)
+//! * integer flag values matched to git's own parsers: `--progress` accepts a
+//!   base-0, k/m/g-suffixed, signed value and rejects the rest with a usage
+//!   error; `--max-count`/`--skip` take a strict signed decimal (negative =
+//!   "no limit" / "no skip") and die `not an integer` on garbage; `--reencode`
+//!   accepts a `git_parse_maybe_bool` value or `abort`
 //!
 //! ### Honest limitations (bailed on with a precise message, never silently ignored)
 //!
@@ -66,7 +78,8 @@
 //! * `--import-marks=<file>`, `--import-marks-if-exists=<file>`,
 //!   `--reference-excluded-parents`, `--refspec=<refspec>` (with refs to export),
 //!   `--ancestry-path` (with negative revisions), `--boundary` (with negative
-//!   revisions), and pathspec filtering (`-- <path>...`).
+//!   revisions), and magic/glob pathspecs (`:(glob)`, `:!exclude`, `*.rs`), whose
+//!   matcher this port does not reproduce.
 
 use anyhow::{anyhow, bail, Result};
 use std::cmp::Ordering;
@@ -208,7 +221,7 @@ struct Opts {
     show_original_ids: bool, // --show-original-ids: `original-oid <sha>` directives
     mark_tags: bool,         // --mark-tags: give annotated tags a mark too
     fake_missing_tagger: bool, // --fake-missing-tagger
-    progress: Option<u64>,   // --progress=<n>: a `progress` line every <n> objects
+    progress: Option<i64>,   // --progress=<n>: a `progress` line every <n> objects
     export_marks: Option<String>, // --export-marks=<file>
     signed_tags: SignedMode, // --signed-tags=<mode>
     signed_commits: SignedMode, // --signed-commits=<mode>
@@ -279,16 +292,17 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     let mut refspecs: Vec<String> = Vec::new();
     let mut reference_excluded_parents = false;
     let mut pathspecs: Vec<String> = Vec::new();
-    let mut in_pathspecs = false;
 
     for a in args {
         let s = a.as_str();
-        if in_pathspecs {
-            pathspecs.push(s.to_string());
-            continue;
-        }
         match s {
-            "--" => in_pathspecs = true,
+            // git keeps `--` in argv but, once its own `parse_options` has run,
+            // `setup_revisions` classifies each following token exactly as it
+            // classifies one before `--`: a rev, an existing path, or a fatal.
+            // For fast-export the separator therefore has no observable effect,
+            // so it is consumed and the tokens after it flow through the same
+            // rev/pathspec resolution as the ones before (see the resolve stage).
+            "--" => {}
 
             // ---- fast-export's own options ----
             "--no-data" => opts.no_data = true,
@@ -328,22 +342,33 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
             "-M" | "-C" => opts.rename_detection = true,
 
             _ if s.starts_with("--progress=") => {
+                // git's `--progress` is a parse-options `OPTION_INTEGER`: base-0
+                // magnitude, an optional k/m/g suffix, a signed C-int range, and
+                // a *usage* (129) error on anything else.
                 let v = &s["--progress=".len()..];
-                match v.parse::<u64>() {
-                    Ok(n) => opts.progress = Some(n),
-                    Err(_) => return Ok(usage_exit()),
+                match parse_progress_int(v) {
+                    Some(n) => opts.progress = Some(n),
+                    None => return Ok(usage_exit()),
                 }
             }
             _ if s.starts_with("--max-count=") => {
-                match s["--max-count=".len()..].parse::<usize>() {
-                    Ok(n) => max_count = Some(n),
-                    Err(_) => return Ok(usage_exit()),
+                // rev-list's `--max-count` is a strict signed decimal (`atoi`
+                // family): garbage dies `fatal: '<v>': not an integer` (128, not
+                // the 129 usage path), and a negative value means "no limit".
+                let v = &s["--max-count=".len()..];
+                match parse_signed_int(v) {
+                    Some(n) => max_count = if n < 0 { None } else { Some(n as usize) },
+                    None => return Ok(fatal(&format!("'{v}': not an integer"))),
                 }
             }
-            _ if s.starts_with("--skip=") => match s["--skip=".len()..].parse::<usize>() {
-                Ok(n) => skip = n,
-                Err(_) => return Ok(usage_exit()),
-            },
+            _ if s.starts_with("--skip=") => {
+                // Same parser as `--max-count`; git clamps a negative skip to 0.
+                let v = &s["--skip=".len()..];
+                match parse_signed_int(v) {
+                    Some(n) => skip = if n < 0 { 0 } else { n as usize },
+                    None => return Ok(fatal(&format!("'{v}': not an integer"))),
+                }
+            }
             _ if s.starts_with("--export-marks=") => {
                 opts.export_marks = Some(s["--export-marks=".len()..].to_string());
             }
@@ -380,12 +405,14 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
                 };
             }
             _ if s.starts_with("--reencode=") => {
-                opts.reencode = match &s["--reencode=".len()..] {
-                    "yes" => ReencodeMode::Yes,
-                    "no" => ReencodeMode::No,
-                    "abort" => ReencodeMode::Abort,
-                    _ => return Ok(usage_exit()),
-                };
+                // git's `parse_opt_reencode_mode`: `abort`, or a
+                // `git_parse_maybe_bool` value (so `yes`/`true`/`on`/`1`/any
+                // non-zero int → yes, `no`/`false`/`off`/`0`/empty → no).
+                // Unrecognised values are a usage error (129).
+                match parse_reencode(&s["--reencode=".len()..]) {
+                    Some(m) => opts.reencode = m,
+                    None => return Ok(usage_exit()),
+                }
             }
 
             // Anything else beginning with `-` survives both option parsers and
@@ -399,9 +426,24 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
     // ---- Stage 2: `setup_revisions` resolves revisions and dies on the first bad one. ----
+    // A token that resolves is a revision; one that does not is, as in git's
+    // `handle_revision_arg`, a pathspec when it names a working-tree path and a
+    // `fatal: ambiguous argument` otherwise. Magic/glob pathspecs are matched by
+    // git's own parser, which this port does not reproduce, so they bail terse.
     let mut sel = Selection::default();
     for (tok, negated) in &rev_tokens {
-        if add_rev_token(&repo, tok, *negated, &mut sel).is_err() {
+        if add_rev_token(&repo, tok, *negated, &mut sel).is_ok() {
+            continue;
+        }
+        if *negated {
+            return Ok(fatal_ambiguous(tok));
+        }
+        if is_magic_or_glob(tok) {
+            bail!("magic pathspecs are not supported");
+        }
+        if is_worktree_path(&repo, tok) {
+            pathspecs.push(tok.clone());
+        } else {
             return Ok(fatal_ambiguous(tok));
         }
     }
@@ -425,9 +467,6 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     }
     if reference_excluded_parents {
         bail!("--reference-excluded-parents is not supported");
-    }
-    if !pathspecs.is_empty() {
-        bail!("pathspec filtering is not supported");
     }
     if ancestry_path {
         bail!("--ancestry-path is not supported");
@@ -595,13 +634,74 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // ---- Path limiting: git's default history simplification with parent
+    // rewriting (`revs.prune_data` + `revs.rewrite_parents`). ----
+    // A commit is shown iff its pathspec-restricted diff against the parent it
+    // follows is non-empty (git's `try_to_simplify_commit`). Each shown commit's
+    // parents, and every ref that pointed at a pruned commit, are then rewritten
+    // to the nearest shown ancestor by following first parents through the pruned
+    // (TREESAME) run — exactly `rewrite_one`.
+    let specs: Vec<Vec<u8>> = pathspecs.iter().map(|s| s.as_bytes().to_vec()).collect();
+    let filtering = !specs.is_empty();
+    let mut simpl: HashMap<ObjectId, Simpl> = HashMap::new();
+    let mut emit_parents: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    if filtering {
+        for info in &order_list {
+            let real: Vec<ObjectId> = info.parent_ids.iter().copied().collect();
+            let tree = commit_tree_id(&repo, info.id)?;
+            let (treesame, followed) = if real.is_empty() {
+                // A root is TREESAME (pruned) when it carries no matching path.
+                (!diff_matches(&repo, None, tree, &specs)?, Vec::new())
+            } else {
+                let considered = if first_parent { &real[..1] } else { &real[..] };
+                let mut ts = false;
+                let mut followed = real.clone();
+                for p in considered {
+                    let pt = commit_tree_id(&repo, *p)?;
+                    if !diff_matches(&repo, Some(pt), tree, &specs)? {
+                        ts = true;
+                        followed = vec![*p];
+                        break;
+                    }
+                }
+                (ts, followed)
+            };
+            simpl.insert(info.id, Simpl { treesame, followed });
+        }
+        // Keep only shown (non-TREESAME) commits.
+        order_list.retain(|i| simpl.get(&i.id).is_none_or(|s| !s.treesame));
+        // A shown commit keeps all its real parents (only the first under
+        // `--first-parent`); rewrite each to the nearest shown ancestor and drop
+        // duplicates (git's `remove_duplicate_parents`).
+        for info in &order_list {
+            let take = if first_parent { 1 } else { info.parent_ids.len() };
+            let mut ep: Vec<ObjectId> = Vec::new();
+            for p in info.parent_ids.iter().take(take) {
+                if let Some(rp) = rewrite_one(*p, &simpl) {
+                    if !ep.contains(&rp) {
+                        ep.push(rp);
+                    }
+                }
+            }
+            emit_parents.insert(info.id, ep);
+        }
+    }
+    let pcount = |i: &gix::traverse::commit::Info| -> usize {
+        if filtering {
+            emit_parents.get(&i.id).map_or(0, Vec::len)
+        } else {
+            i.parent_ids.len()
+        }
+    };
+
     // git applies `commit_ignore` (`--no-merges`/`--merges`), then `--skip`, then
-    // `--max-count`, all in rev-list order — before fast-export reverses.
+    // `--max-count`, all in rev-list order — before fast-export reverses. Under a
+    // pathspec the parent count is the rewritten one, matching git's post-prune view.
     if no_merges {
-        order_list.retain(|i| i.parent_ids.len() <= 1);
+        order_list.retain(|i| pcount(i) <= 1);
     }
     if only_merges {
-        order_list.retain(|i| i.parent_ids.len() > 1);
+        order_list.retain(|i| pcount(i) > 1);
     }
     if skip > 0 {
         order_list.drain(..skip.min(order_list.len()));
@@ -626,7 +726,9 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     }
 
     for info in &order_list {
-        if let Some(f) = emit_commit(&repo, info, &opts, &sources, &mut st)? {
+        let override_parents = emit_parents.get(&info.id).map(Vec::as_slice);
+        if let Some(f) = emit_commit(&repo, info, &opts, &sources, &mut st, &specs, override_parents)?
+        {
             return Ok(die_midstream(&st.out, &f));
         }
     }
@@ -644,7 +746,15 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     trailing.dedup();
     for (name, commit_id) in trailing.iter().rev() {
         let printed = st.anon_refname(&opts, name.as_bstr());
-        let mark = st.marks.get(commit_id).copied();
+        // Under a pathspec the ref's own commit may have been pruned; git points
+        // the ref at the nearest shown ancestor (the same `rewrite_one` used for
+        // parents), and only at the null oid when no ancestor survives.
+        let target = if filtering {
+            rewrite_one(*commit_id, &simpl)
+        } else {
+            Some(*commit_id)
+        };
+        let mark = target.and_then(|id| st.marks.get(&id).copied());
         st.out.extend_from_slice(b"reset ");
         st.out.extend_from_slice(&printed);
         match mark {
@@ -763,6 +873,168 @@ fn dedup_first_wins(ids: &mut Vec<ObjectId>) {
 /// An omitted range endpoint means `HEAD`, as in `..main` or `main..`.
 fn default_head(s: &str) -> &str {
     if s.is_empty() { "HEAD" } else { s }
+}
+
+// ---------------------------------------------------------------------------
+// Flag-value parsers (matched byte-for-byte in behaviour to git's)
+// ---------------------------------------------------------------------------
+
+/// git's parse-options `OPTION_INTEGER` value parser, used by `--progress`:
+/// an optional sign, a base-0 magnitude (`0x…` hex, leading-`0` octal, else
+/// decimal), an optional single `k`/`m`/`g` (1024) suffix, and a result that
+/// fits a signed C `int`. Returns `None` for anything git rejects with a usage
+/// error (empty, non-numeric, bad suffix, trailing junk, out of range).
+fn parse_progress_int(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let (neg, mut i) = match b.first() {
+        Some(b'+') => (false, 1),
+        Some(b'-') => (true, 1),
+        _ => (false, 0),
+    };
+    let radix: u32 = if b[i..].starts_with(b"0x") || b[i..].starts_with(b"0X") {
+        i += 2;
+        16
+    } else if b.get(i) == Some(&b'0') {
+        8
+    } else {
+        10
+    };
+    let start = i;
+    // Checked throughout so an absurdly long value overflows to `None` (a usage
+    // error, as git's own range check would give) rather than panicking.
+    let mut val: i128 = 0;
+    while let Some(d) = b.get(i).and_then(|c| (*c as char).to_digit(radix)) {
+        val = val.checked_mul(radix as i128)?.checked_add(d as i128)?;
+        i += 1;
+    }
+    if i == start {
+        return None; // no digits consumed
+    }
+    if let Some(&c) = b.get(i) {
+        let mult: i128 = match c {
+            b'k' | b'K' => 1024,
+            b'm' | b'M' => 1024 * 1024,
+            b'g' | b'G' => 1024 * 1024 * 1024,
+            _ => return None,
+        };
+        val = val.checked_mul(mult)?;
+        i += 1;
+    }
+    if i != b.len() {
+        return None; // junk after the suffix
+    }
+    let result = if neg { -val } else { val };
+    if result < i32::MIN as i128 || result > i32::MAX as i128 {
+        return None;
+    }
+    Some(result as i64)
+}
+
+/// git's `git_parse_signed` as used by rev-list's `--max-count`/`--skip`: an
+/// optional sign and base-10 digits, whitespace-trimmed, with nothing else. No
+/// hex, no suffix — `0x10` and `3abc` both fail, and git then dies "not an
+/// integer".
+fn parse_signed_int(s: &str) -> Option<i64> {
+    s.trim_matches(|c: char| c.is_ascii_whitespace())
+        .parse::<i64>()
+        .ok()
+}
+
+/// git's `parse_opt_reencode_mode`: `abort`, else a `git_parse_maybe_bool` value
+/// (`yes`/`true`/`on`/any non-zero int → yes; `no`/`false`/`off`/`0`/empty → no).
+fn parse_reencode(s: &str) -> Option<ReencodeMode> {
+    if s.eq_ignore_ascii_case("abort") {
+        return Some(ReencodeMode::Abort);
+    }
+    match s.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" => Some(ReencodeMode::Yes),
+        "false" | "no" | "off" | "" => Some(ReencodeMode::No),
+        // The integer fallback uses base-0 like git_parse_int; only the truth of
+        // the value matters, and no fixture commit carries an encoding header, so
+        // the resulting mode never changes the emitted stream.
+        _ => match parse_progress_int(s) {
+            Some(0) => Some(ReencodeMode::No),
+            Some(_) => Some(ReencodeMode::Yes),
+            None => None,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pathspec classification and path-limited history simplification
+// ---------------------------------------------------------------------------
+
+/// A commit's place in git's default history simplification: `treesame` is set
+/// when it introduces no change under the pathspec (so it is pruned from the
+/// output), and `followed` is the single parent it is TREESAME to, empty for a
+/// pruned root.
+struct Simpl {
+    treesame: bool,
+    followed: Vec<ObjectId>,
+}
+
+/// git's `looks_like_pathspec` territory this port does not implement: a magic
+/// pathspec (`:(glob)`, `:!exclude`, `:/`) or one carrying glob metacharacters.
+fn is_magic_or_glob(tok: &str) -> bool {
+    tok.starts_with(':') || tok.bytes().any(|b| matches!(b, b'*' | b'?' | b'['))
+}
+
+/// git's `file_exists`: whether a plain pathspec names something in the working
+/// tree. `lstat`-style so a directory or a broken symlink still counts.
+fn is_worktree_path(repo: &gix::Repository, tok: &str) -> bool {
+    repo.workdir()
+        .map(|wd| wd.join(tok).symlink_metadata().is_ok())
+        .unwrap_or(false)
+}
+
+/// git's plain (non-magic) pathspec match: a pathspec matches a path when equal
+/// to it or a leading directory prefix ending at a component boundary, so `dir`
+/// matches `dir/file` but `fil` does not match `file`.
+fn path_matches(path: &[u8], specs: &[Vec<u8>]) -> bool {
+    specs.iter().any(|spec| {
+        let spec = spec.strip_suffix(b"/").unwrap_or(spec);
+        spec.is_empty()
+            || path == spec
+            || (path.len() > spec.len() && path.starts_with(spec) && path[spec.len()] == b'/')
+    })
+}
+
+/// The id of a commit's tree, for the pathspec-restricted TREESAME comparisons.
+fn commit_tree_id(repo: &gix::Repository, id: ObjectId) -> Result<ObjectId> {
+    Ok(repo.find_object(id)?.peel_to_tree()?.id)
+}
+
+/// Whether the diff turning `old` (empty when `None`) into `new` touches any
+/// pathspec — the negation of git's TREESAME. Uses the same recursive walk as
+/// the emission diff so the two never disagree.
+fn diff_matches(
+    repo: &gix::Repository,
+    old: Option<ObjectId>,
+    new: ObjectId,
+    specs: &[Vec<u8>],
+) -> Result<bool> {
+    let changes = collect(repo, old, Some(new))?;
+    Ok(changes.iter().any(|c| path_matches(c.path.as_bstr(), specs)))
+}
+
+/// git's `rewrite_one`: replace a parent (or a ref target) with the nearest
+/// shown ancestor by following first parents through the pruned (TREESAME) run.
+/// `None` means the run reached a pruned root, so the link is dropped entirely.
+fn rewrite_one(mut id: ObjectId, simpl: &HashMap<ObjectId, Simpl>) -> Option<ObjectId> {
+    // The parent chain strictly shrinks, so `simpl.len() + 1` steps always
+    // terminate; the bound is belt-and-braces against a malformed graph.
+    for _ in 0..=simpl.len() {
+        match simpl.get(&id) {
+            // Outside the walked set (e.g. a boundary): treat as shown.
+            None => return Some(id),
+            Some(s) if !s.treesame => return Some(id),
+            Some(s) => match s.followed.first() {
+                Some(p) => id = *p,
+                None => return None,
+            },
+        }
+    }
+    Some(id)
 }
 
 /// Record a positive tip, plus a cmdline ref entry when the spec dwims to a ref.
@@ -968,10 +1240,15 @@ impl State {
     }
 
     /// git's `show_progress`, called after each exported blob and commit.
+    ///
+    /// git guards on `progress` being non-zero, then tests `counter % progress`.
+    /// The value is a C `int`, so a negative `--progress` is legal and, because
+    /// `counter % -1 == 0` for every counter, prints a line after every object —
+    /// reproduced here with a signed remainder.
     fn tick(&mut self, opts: &Opts) {
         self.counter += 1;
         if let Some(n) = opts.progress {
-            if n != 0 && self.counter % n == 0 {
+            if n != 0 && (self.counter as i64) % n == 0 {
                 self.out
                     .extend_from_slice(format!("progress {} objects\n", self.counter).as_bytes());
             }
@@ -1007,12 +1284,19 @@ impl State {
 }
 
 /// Emit one commit: its new blobs first, then the `commit` stanza.
+///
+/// `specs` is empty unless a pathspec is in force; when set, only changes
+/// matching it are exported. `override_parents`, present under path limiting,
+/// supplies the rewritten parent list (nearest shown ancestors) that git diffs
+/// and links against in place of the commit's literal parents.
 fn emit_commit(
     repo: &gix::Repository,
     info: &gix::traverse::commit::Info,
     opts: &Opts,
     sources: &HashMap<ObjectId, BString>,
     st: &mut State,
+    specs: &[Vec<u8>],
+    override_parents: Option<&[ObjectId]>,
 ) -> Result<Option<Fatal>> {
     let id = info.id;
     let data = repo.find_object(id)?.data.clone();
@@ -1024,7 +1308,10 @@ fn emit_commit(
         .ok_or_else(|| anyhow!("commit {id} has no author header"))?;
     let committer = header_line(headers, b"committer")
         .ok_or_else(|| anyhow!("commit {id} has no committer header"))?;
-    let parents: Vec<ObjectId> = info.parent_ids.iter().copied().collect();
+    let parents: Vec<ObjectId> = match override_parents {
+        Some(ps) => ps.to_vec(),
+        None => info.parent_ids.iter().copied().collect(),
+    };
 
     // `--reencode` only has anything to decide when the commit declares its own
     // encoding. `no` keeps the header as-is, which is what this port does; the
@@ -1075,7 +1362,12 @@ fn emit_commit(
     if base.is_some() && opts.rename_detection {
         bail!("-M/-C rename detection is not supported");
     }
-    let changes = collect(repo, base, Some(tree))?;
+    let mut changes = collect(repo, base, Some(tree))?;
+    // Under a pathspec, `show_filemodify` only emits — and only exports blobs for
+    // — changes matching it, exactly as git's diff is pathspec-limited.
+    if !specs.is_empty() {
+        changes.retain(|c| path_matches(c.path.as_bstr(), specs));
+    }
 
     // git exports every referenced blob before the commit that first names it,
     // walking the diff queue in order.

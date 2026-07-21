@@ -12,6 +12,15 @@
 //! and the single surviving revision is printed *after* the scan using the final
 //! option state. That is why `--verify HEAD --symbolic` prints `HEAD`.
 //!
+//! `--` is the end-of-options separator: every following token is a pathspec,
+//! echoed verbatim under `DO_NONFLAGS` with no worktree existence check and never
+//! interpreted as a flag or counted as a revision (git sets `as_is = 2`). The
+//! `--` token itself is echoed when `DO_FLAGS`/`DO_REVS` are still in effect.
+//!
+//! Range revspecs are expanded at their position: `a..b` prints `b` then `^a`;
+//! `a...b` prints `b`, `a`, then `^<merge-base>` for each merge base — matching
+//! stock git's left-to-right emission.
+//!
 //! Implemented: `--verify`, `-q`/`--quiet`, `--short[=n]`, `--abbrev-ref`,
 //! `--symbolic`, `--symbolic-full-name`, `--git-dir`, `--show-toplevel`,
 //! `--is-inside-work-tree`, `--is-bare-repository`, `--all`, `--branches`,
@@ -47,6 +56,15 @@ enum RefSet {
     Tags,
 }
 
+/// A resolved range revspec, ready to emit at its position in the scan.
+#[derive(Clone, Copy)]
+enum RangeSpec {
+    /// `from..to`: prints `to`, then `^from`.
+    Range { from: ObjectId, to: ObjectId },
+    /// `theirs...ours`: prints `ours`, `theirs`, then `^<merge-base>` per base.
+    Merge { theirs: ObjectId, ours: ObjectId },
+}
+
 struct Opts {
     verify: bool,
     quiet: bool,
@@ -78,7 +96,6 @@ impl Default for Opts {
 /// the way unknown options are echoed would silently produce a wrong answer, so
 /// they are rejected instead.
 const UNIMPLEMENTED_EXACT: &[&str] = &[
-    "--",
     "-h",
     "--help",
     "--parseopt",
@@ -151,8 +168,31 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
     let mut revs = 0usize;
     // Once a path argument is seen, every later argument is a path too.
     let mut as_is = false;
+    // Set by an explicit `--`: git's `as_is = 2`. Every later token is a pathspec
+    // echoed verbatim with no existence check and no flag interpretation.
+    let mut dashdash = false;
 
     for arg in args {
+        // After an explicit `--`, everything is a pathspec: echo it (when paths
+        // are being echoed) and move on. No existence check, no flag parsing.
+        if dashdash {
+            if o.echo_paths {
+                emit(&mut out, arg.as_bytes())?;
+            }
+            continue;
+        }
+
+        // `--` terminates options. git echoes the separator itself while flags or
+        // revs are still being echoed (`DO_FLAGS`/`DO_REVS`), i.e. not under
+        // `--verify`/`--short`.
+        if !as_is && arg == "--" {
+            if o.echo_flags {
+                emit(&mut out, arg.as_bytes())?;
+            }
+            dashdash = true;
+            continue;
+        }
+
         if !as_is && arg.len() > 1 && arg.starts_with('-') {
             match option(&mut o, arg)? {
                 Opt::Consumed => {}
@@ -209,6 +249,33 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 }
             }
             None => {
+                // A range revspec (`a..b`, `a...b`) is not a single object, so it
+                // fails `rev_parse_single` and lands here. Expand it at this
+                // position before falling through to path handling.
+                let range = if arg.is_empty() {
+                    None
+                } else {
+                    repo.rev_parse(arg.as_str()).ok().and_then(|s| match s.detach() {
+                        gix::revision::plumbing::Spec::Range { from, to } => {
+                            Some(RangeSpec::Range { from, to })
+                        }
+                        gix::revision::plumbing::Spec::Merge { theirs, ours } => {
+                            Some(RangeSpec::Merge { theirs, ours })
+                        }
+                        _ => None,
+                    })
+                };
+                if let Some(range) = range {
+                    emit_range(&mut out, &repo, &o, range)?;
+                    // A range is never a single revision. Under `--verify`/`--short`
+                    // the endpoints still print, but the scan then fails afterward
+                    // with "Needed a single revision" (git prints them, then dies).
+                    if o.verify {
+                        revs += 2;
+                    }
+                    continue;
+                }
+
                 if o.verify {
                     out.flush()?;
                     return Ok(die_single(o.quiet));
@@ -434,18 +501,59 @@ fn show_rev(
         }
     }
 
-    match o.abbrev {
-        None => emit(out, id.to_string().as_bytes())?,
-        Some(0) => {
-            let short = id.attach(repo).shorten()?;
-            emit(out, short.to_string().as_bytes())?;
-        }
+    emit(out, render_id(repo, o, id)?)?;
+    Ok(())
+}
+
+/// Render an object id to the hex bytes that current option state calls for:
+/// full hex, `core.abbrev`/auto-length (`Some(0)`), or an `n`-char disambiguated
+/// prefix. Shared by positional revisions and range endpoints.
+fn render_id(repo: &gix::Repository, o: &Opts, id: &ObjectId) -> Result<Vec<u8>> {
+    Ok(match o.abbrev {
+        None => id.to_string().into_bytes(),
+        Some(0) => id.attach(repo).shorten()?.to_string().into_bytes(),
         Some(n) => {
             let n = n.clamp(4, id.kind().len_in_hex());
             let candidate = gix::odb::store::prefix::disambiguate::Candidate::new(*id, n)?;
             match repo.objects.disambiguate_prefix(candidate)? {
-                Some(prefix) => emit(out, prefix.to_string().as_bytes())?,
-                None => emit(out, id.to_string().as_bytes())?,
+                Some(prefix) => prefix.to_string().into_bytes(),
+                None => id.to_string().into_bytes(),
+            }
+        }
+    })
+}
+
+/// Emit `^<id>` for the excluded side of a range.
+fn emit_exclude(out: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
+    out.write_all(b"^")?;
+    out.write_all(bytes)?;
+    out.write_all(b"\n")
+}
+
+/// Expand a range revspec at its position, matching stock git's line order.
+///
+/// `a..b` prints `b` then `^a`; `a...b` prints `b`, `a`, then `^<merge-base>` for
+/// each merge base between the two sides (none is printed when the histories are
+/// unrelated). Endpoints honor the current abbreviation state.
+fn emit_range(
+    out: &mut impl Write,
+    repo: &gix::Repository,
+    o: &Opts,
+    range: RangeSpec,
+) -> Result<()> {
+    match range {
+        RangeSpec::Range { from, to } => {
+            emit(out, render_id(repo, o, &to)?)?;
+            emit_exclude(out, &render_id(repo, o, &from)?)?;
+        }
+        RangeSpec::Merge { theirs, ours } => {
+            emit(out, render_id(repo, o, &ours)?)?;
+            emit(out, render_id(repo, o, &theirs)?)?;
+            let bases = repo
+                .merge_bases_many(theirs, &[ours])
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            for base in bases {
+                emit_exclude(out, &render_id(repo, o, &base.detach())?)?;
             }
         }
     }

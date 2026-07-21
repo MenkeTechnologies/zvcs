@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::collections::HashSet;
 use std::io::Write;
+use std::path::Path;
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -88,6 +89,50 @@ fn usage_error(msg: &str) -> ExitCode {
     eprintln!("error: {msg}");
     eprint!("{USAGE}");
     ExitCode::from(129)
+}
+
+/// Reproduce git's rejection of any pathspec that resolves outside the
+/// repository. git normalizes each pathspec against the current prefix and, on
+/// the first one that escapes the worktree root (a leading `..`) or names an
+/// absolute path outside it, dies with
+/// `fatal: <arg>: '<arg>' is outside repository at '<worktree-root>'` (exit 128).
+///
+/// gix performs the same normalization inside `Search::from_specs`, so we run it
+/// per pattern here to map the failure back to the specific command-line argument
+/// (git reports the original spelling, `raw`) and emit git's exact message before
+/// `repo.pathspec()` can turn the condition into a generic exit-1 anyhow error.
+///
+/// Magic pathspecs (`:(…)`, `:/…`) carry their own semantics and are left for gix.
+fn check_pathspecs_inside_repo(
+    repo: &gix::Repository,
+    patterns: &[BString],
+    raw_patterns: &[String],
+) -> Result<Option<ExitCode>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let defaults = repo.pathspec_defaults_inherit_ignore_case(false)?;
+    // The CWD relative to the worktree root; git's `prefix`. Empty at the top level.
+    let prefix = repo.prefix()?.map(Path::to_path_buf).unwrap_or_default();
+    // The absolute, symlink-resolved worktree root; git's `absolute_path(get_git_work_tree())`.
+    let root = gix::path::realpath(repo.workdir().unwrap_or_else(|| repo.git_dir()))?;
+
+    for (pattern, raw) in patterns.iter().zip(raw_patterns.iter()) {
+        if pattern.first() == Some(&b':') {
+            continue;
+        }
+        let Ok(mut parsed) = gix::pathspec::parse(pattern.as_slice(), defaults) else {
+            continue;
+        };
+        if parsed.normalize(&prefix, &root).is_err() {
+            eprintln!(
+                "fatal: {raw}: '{raw}' is outside repository at '{}'",
+                root.display()
+            );
+            return Ok(Some(ExitCode::from(128)));
+        }
+    }
+    Ok(None)
 }
 
 /// `git ls-files` — list index entries, and optionally worktree-derived sets.
@@ -217,6 +262,15 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             _ => None,
         }
     };
+
+    // A pathspec that resolves outside the repository is a fatal error in git:
+    //   `fatal: <arg>: '<arg>' is outside repository at '<worktree-root>'` (exit 128).
+    // gix surfaces the same condition as a normalize error inside `repo.pathspec()`,
+    // which would otherwise collapse to exit 1 via `?`. Detect it up front, reporting
+    // the first offending pathspec in argument order exactly as git does.
+    if let Some(code) = check_pathspecs_inside_repo(&repo, &patterns, &raw_patterns)? {
+        return Ok(code);
+    }
 
     let mut ps = repo.pathspec(
         true,

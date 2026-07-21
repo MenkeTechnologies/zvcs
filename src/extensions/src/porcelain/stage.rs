@@ -330,6 +330,46 @@ fn is_literal_spec(spec: &str) -> bool {
     !spec.is_empty() && !spec.starts_with(':') && !spec.contains(['*', '?', '['])
 }
 
+/// Mark every positive pathspec that matches at least one of `paths` as seen.
+///
+/// git marks a pathspec seen the moment it matches any examined path on its own —
+/// before exclude pathspecs are applied, and regardless of whether another
+/// pathspec also matched that path. gix's combined matcher instead attributes each
+/// path to a single pathspec and never yields a path an exclude pathspec shadowed,
+/// so it under-reports overlapping specs (`src/ src/lib.rs` both matching
+/// `src/lib.rs`) and exclude-shadowed specs (`*.md` whose only match is dropped by
+/// `:(exclude)README.md`). Recover the rest by testing each still-unseen positive
+/// pathspec against `paths` with its own single-pattern matcher, which carries no
+/// exclude and so matches exactly what git counts. `paths` is the universe of
+/// tracked and to-be-staged paths — never a gitignored-and-skipped one, so a
+/// wildcard whose only match is gitignored still (correctly) stays unseen.
+fn mark_seen_per_spec(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    patterns: &[BString],
+    o: &Opts,
+    paths: &[BString],
+    seen: &mut HashSet<usize>,
+) -> Result<()> {
+    // `patterns` is 1:1 with `o.pathspecs`, so the index doubles as the seen key.
+    for (i, spec) in o.pathspecs.iter().enumerate() {
+        if seen.contains(&i) || is_exclude_spec(spec) || spec.is_empty() {
+            continue;
+        }
+        let mut ps = repo.pathspec(
+            true,
+            std::slice::from_ref(&patterns[i]),
+            false,
+            index,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+        )?;
+        if paths.iter().any(|p| ps.is_included(p.as_bstr(), Some(false))) {
+            seen.insert(i);
+        }
+    }
+    Ok(())
+}
+
 /// Report the first pathspec that matched nothing, using the message git uses for
 /// the mode we are in. Returns `None` when every pathspec was accounted for.
 ///
@@ -409,6 +449,10 @@ fn refresh(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // path -> refreshed stat, applied after the immutable scan.
     let mut restat: HashMap<BString, Stat> = HashMap::new();
     let mut unstaged: BTreeMap<BString, char> = BTreeMap::new();
+    // Every refreshable index path, for the same per-spec seen accounting `add`
+    // does — an entry a pathspec matches counts even if the combined matcher
+    // attributed it to a different, overlapping pathspec.
+    let mut universe: Vec<BString> = Vec::new();
 
     {
         let backing = index.path_backing();
@@ -417,6 +461,7 @@ fn refresh(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                 continue; // conflicted stages and gitlinks are not refreshable here
             }
             let path = e.path_in(backing);
+            universe.push(path.to_owned());
             let Some(m) = ps.pattern_matching_relative_path(path, Some(false)) else {
                 continue;
             };
@@ -456,6 +501,7 @@ fn refresh(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         }
     }
 
+    mark_seen_per_spec(repo, &index, &patterns, o, &universe, &mut seen)?;
     if let Some(code) = unmatched_pathspec_exit(repo, o, &seen, false) {
         return Ok(code);
     }
@@ -590,6 +636,11 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let mut staged: Vec<Staged> = Vec::new();
     let mut printed: BTreeMap<BString, &'static str> = BTreeMap::new();
     let mut had_error = false;
+    // The paths git counts toward "did the pathspec match anything": everything
+    // that cleared the ignore/update filters below, plus the tracked set added
+    // after the loop. Fed to `mark_seen_per_spec` so overlapping and
+    // exclude-shadowed pathspecs are attributed the way git attributes them.
+    let mut universe: Vec<BString> = Vec::new();
 
     for (path, is_ignored) in candidates {
         let current = tracked.get(&path);
@@ -605,6 +656,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         if o.update && !already_tracked {
             continue;
         }
+        universe.push(path.clone());
 
         if let Some(m) = ps.pattern_matching_relative_path(path.as_bstr(), Some(false)) {
             if !m.is_excluded() && m.sequence_number < patterns.len() {
@@ -696,7 +748,11 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
     // --- validate that every pathspec matched something ---------------------
     // Runs before any object or index write, matching git: a bad pathspec leaves
-    // the repository, and the object database, completely untouched.
+    // the repository, and the object database, completely untouched. The tracked
+    // set joins the walked candidates so a pathspec that matched only a tracked
+    // (possibly exclude-shadowed) path is still recorded as seen.
+    universe.extend(tracked.keys().cloned());
+    mark_seen_per_spec(repo, &index, &patterns, o, &universe, &mut seen)?;
     if let Some(code) = unmatched_pathspec_exit(repo, o, &seen, o.update) {
         return Ok(code);
     }

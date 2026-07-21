@@ -201,7 +201,13 @@ fn status(args: &[String], mut quiet: bool, mut cached: bool) -> Result<ExitCode
             "--cached" => cached = true,
             "--recursive" => recursive = true,
             _ if a.starts_with('-') => return usage_exit(),
-            _ => patterns.push(BString::from(a.as_str())),
+            // git parses `status` with `PARSE_OPT_STOP_AT_NON_OPTION`: the first
+            // non-option operand ends option parsing, so a later `--recursive`
+            // (or any dash-prefixed token) is a pathspec, not a flag.
+            _ => {
+                patterns.push(BString::from(a.as_str()));
+                no_more_opts = true;
+            }
         }
     }
 
@@ -359,7 +365,12 @@ fn init(args: &[String], mut quiet: bool) -> Result<ExitCode> {
             "--" => no_more_opts = true,
             "-q" | "--quiet" => quiet = true,
             _ if a.starts_with('-') => return usage_exit(),
-            _ => patterns.push(BString::from(a.as_str())),
+            // `PARSE_OPT_STOP_AT_NON_OPTION`: the first operand ends option
+            // parsing, so trailing dash-prefixed tokens are pathspecs.
+            _ => {
+                patterns.push(BString::from(a.as_str()));
+                no_more_opts = true;
+            }
         }
     }
 
@@ -534,7 +545,14 @@ fn summary(args: &[String], mut cached: bool) -> Result<ExitCode> {
                 }
             }
             s if s.starts_with('-') && s.len() > 1 => return usage_exit(),
-            _ => rest.push(a.clone()),
+            // `PARSE_OPT_STOP_AT_NON_OPTION`: the first operand (the `[commit]`
+            // slot, then pathspecs) ends option parsing, so a trailing
+            // `--recursive`/`--files`/etc. is an operand rather than a flag.
+            // This is why `summary foreach --recursive` exits 0 in git.
+            _ => {
+                rest.push(a.clone());
+                no_more_opts = true;
+            }
         }
     }
 

@@ -25,8 +25,9 @@
 //! Not covered, and refused rather than approximated:
 //!   * `--stdin` (multi-merge batch protocol) and actually *running* the
 //!     deprecated `--trivial-merge` mode (its option-compatibility rules are
-//!     enforced; the legacy three-tree walk with its embedded unified diff is
-//!     not ported)
+//!     enforced and its operands are peeled to trees so git's `unknown rev` /
+//!     `unable to read tree` diagnostics are reproduced; only the legacy
+//!     three-tree walk with its embedded unified diff is not ported)
 //!   * the strategy options `subtree[=<path>]`, `renormalize`, `patience`,
 //!     `diff-algorithm=patience`, `ignore-space-change`, `ignore-all-space`,
 //!     `ignore-space-at-eol` and `ignore-cr-at-eol` — `gix-merge`'s text driver
@@ -133,7 +134,6 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     let mut merge_base: Option<String> = None;
     let mut xopts: Vec<String> = Vec::new();
     let mut revs: Vec<String> = Vec::new();
-    let mut no_more_opts = false;
 
     // git remembers how many arguments it started with so that `--trivial-merge`
     // can insist that nothing else was passed alongside it.
@@ -142,18 +142,21 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     let mut i = 1; // args[0] is the subcommand name
     while i < args.len() {
         let a = args[i].as_str();
-        if no_more_opts || !a.starts_with('-') || a == "-" {
-            revs.push(a.to_string());
-            i += 1;
-            continue;
+        // git's merge-tree parses with PARSE_OPT_STOP_AT_NON_OPTION. A bare `--`
+        // ends option parsing and is itself consumed; any other non-option token
+        // (including `-`) ends it and is kept. From that point on every remaining
+        // argv slot is a positional rev, even one that looks like a flag — e.g.
+        // `merge-tree feature -- x` treats both `--` and `x` as revs.
+        if a == "--" {
+            revs.extend(args[i + 1..].iter().cloned());
+            break;
+        }
+        if !a.starts_with('-') || a == "-" {
+            revs.extend(args[i..].iter().cloned());
+            break;
         }
 
         if let Some(long) = a.strip_prefix("--") {
-            if long.is_empty() {
-                no_more_opts = true;
-                i += 1;
-                continue;
-            }
             let (name, inline) = match long.split_once('=') {
                 Some((n, v)) => (n, Some(v.to_string())),
                 None => (long, None),
@@ -273,13 +276,32 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     if use_stdin {
         bail!("unsupported flag \"--stdin\" (the multi-merge batch protocol is not ported)");
     }
+
+    let repo = gix::discover(".")?;
+
     if mode == Mode::Trivial {
+        // git's trivial merge peels each of the three operands to a tree before
+        // it walks them: an operand that names no object is a fatal `unknown rev`,
+        // and one that names a non-tree is `unable to read tree`. Both fire
+        // (exit 128) before the walk, so they are reproduced here even though the
+        // legacy three-tree walk with its embedded unified diff is not ported.
+        for spec in &revs {
+            match resolve_tree(&repo, spec) {
+                TreeResolution::Ok => {}
+                TreeResolution::UnknownRev => {
+                    eprintln!("fatal: unknown rev {spec}");
+                    return Ok(ExitCode::from(128));
+                }
+                TreeResolution::NotATree(oid) => {
+                    eprintln!("fatal: unable to read tree ({oid})");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
         bail!("unsupported mode \"--trivial-merge\" (git's deprecated three-tree walk is not ported; use --write-tree)");
     }
 
     let (spec1, spec2) = (revs[0].as_str(), revs[1].as_str());
-
-    let repo = gix::discover(".")?;
     let labels = Labels {
         ancestor: None,
         current: Some(BStr::new(spec1)),
@@ -609,6 +631,36 @@ fn peel_tree(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 fn peel_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     let object = repo.rev_parse_single(spec).ok()?.object().ok()?;
     Some(object.peel_to_commit().ok()?.id)
+}
+
+/// Outcome of resolving a trivial-merge operand, mirroring the two distinct
+/// failure modes of git's `get_tree_descriptor()`.
+enum TreeResolution {
+    /// The spec peels to a tree.
+    Ok,
+    /// The spec names no object at all — git's `unknown rev`.
+    UnknownRev,
+    /// The spec resolves but does not peel to a tree — git's `unable to read
+    /// tree`, which names the resolved object id.
+    NotATree(ObjectId),
+}
+
+/// Resolve `spec` the way git's trivial merge does: to a tree, or one of the two
+/// fatal conditions it distinguishes before it begins the three-tree walk.
+fn resolve_tree(repo: &gix::Repository, spec: &str) -> TreeResolution {
+    let id = match repo.rev_parse_single(spec) {
+        Ok(id) => id,
+        Err(_) => return TreeResolution::UnknownRev,
+    };
+    let object = match id.object() {
+        Ok(object) => object,
+        Err(_) => return TreeResolution::UnknownRev,
+    };
+    let oid = object.id;
+    match object.peel_to_tree() {
+        Ok(_) => TreeResolution::Ok,
+        Err(_) => TreeResolution::NotATree(oid),
+    }
 }
 
 /// Turn the structured conflict records into git's informational messages.

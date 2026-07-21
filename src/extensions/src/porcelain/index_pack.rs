@@ -61,14 +61,20 @@
 //! refuses ref-deltas outright. Packs written by `git pack-objects` use
 //! OFS_DELTA unless `--no-delta-base-offset` was passed.
 //!
-//! Three narrower gaps are documented rather than papered over: `-v` and
+//! The fsck message-type list in `--strict=<id>=<severity>...` and
+//! `--fsck-objects=<id>=<severity>...` IS validated at parse time by
+//! `validate_fsck_msg_types`, mirroring git's `fsck_set_msg_types()`: a
+//! malformed value dies (exit 128) with git's exact wording — `Missing '=':
+//! '<tok>'`, `Unhandled message id: <id>`, `Unknown fsck message type:
+//! '<sev>'`, or `Cannot demote <id> to <sev>` — before any positional check.
+//! Only a *well-formed* value reaches the later `--strict`/`--fsck-objects`
+//! unported rejection (no fsck pass is run here).
+//!
+//! Two narrower gaps are documented rather than papered over: `-v` and
 //! `--progress-title` are accepted but no progress is drawn on stderr (stdout
-//! is unaffected, so the compared bytes still match); the fsck message ids in
-//! `--strict=<id>=<severity>` and `--fsck-objects=<id>=<severity>` are not
-//! validated, so git's parse-time `fatal: Unhandled message id: <id>` and
-//! `fatal: Missing '=': <x>` are not reproduced — those spellings reach the
-//! `--strict`/`--fsck-objects` rejection instead; and a `--verify` that finds
-//! real corruption reports the `gix` error rather than git's diagnostic text.
+//! is unaffected, so the compared bytes still match); and a `--verify` that
+//! finds real corruption reports the `gix` error rather than git's diagnostic
+//! text.
 
 use anyhow::{bail, Result};
 use std::fs;
@@ -198,8 +204,22 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
                 opts.keep = Some(Some(a["--keep=".len()..].to_string()));
             }
             _ if a.starts_with("--promisor=") => opts.promisor = true,
-            _ if a.starts_with("--strict=") => opts.strict = true,
-            _ if a.starts_with("--fsck-objects=") => opts.fsck_objects = true,
+            _ if a.starts_with("--strict=") => {
+                // git parses the fsck message-type list here, in the argument
+                // loop, and dies before any positional check when it is
+                // malformed. Reproduce that so a bad `--strict=<v>` reports
+                // git's exact fatal rather than the deferred usage block.
+                if let Err(code) = validate_fsck_msg_types(&a["--strict=".len()..]) {
+                    return Ok(code);
+                }
+                opts.strict = true;
+            }
+            _ if a.starts_with("--fsck-objects=") => {
+                if let Err(code) = validate_fsck_msg_types(&a["--fsck-objects=".len()..]) {
+                    return Ok(code);
+                }
+                opts.fsck_objects = true;
+            }
             _ if a.starts_with("--threads=") => {
                 // git validates the number here and answers with usage, not a
                 // fatal, when it does not parse.
@@ -603,6 +623,72 @@ fn parse_index_version(rest: &str) -> Option<(u64, Option<u64>)> {
         }
         None => tail.is_empty().then_some((version, None)),
     }
+}
+
+/// Every fsck message id git recognises, each the enum name from
+/// `FOREACH_FSCK_MSG_ID` (fsck.h) lowercased with underscores removed — the
+/// exact string `parse_msg_id()` compares a lowercased user token against.
+const FSCK_MSG_IDS: &[&str] = &[
+    "nulinheader", "unterminatedheader", "badheadercontinuation", "baddate",
+    "baddateoverflow", "bademail", "badgpgsig", "badheadtarget", "badname",
+    "badobjectsha1", "badpackedrefentry", "badpackedrefheader", "badparentsha1",
+    "badreferentname", "badrefcontent", "badreffiletype", "badrefname",
+    "badrefoid", "badtimezone", "badtree", "badtreesha1", "badtype",
+    "duplicateentries", "gitattributesblob", "gitattributeslarge",
+    "gitattributeslinelength", "gitattributesmissing", "gitmodulesblob",
+    "gitmoduleslarge", "gitmodulesmissing", "gitmodulesname", "gitmodulespath",
+    "gitmodulessymlink", "gitmodulesupdate", "gitmodulesurl", "missingauthor",
+    "missingcommitter", "missingemail", "missingnamebeforeemail", "missingobject",
+    "missingspacebeforedate", "missingspacebeforeemail", "missingtag",
+    "missingtagentry", "missingtree", "missingtype", "missingtypeentry",
+    "multipleauthors", "packedrefentrynotterminated", "packedrefunsorted",
+    "treenotsorted", "unknowntype", "zeropaddeddate", "badreftabletablename",
+    "emptyname", "fullpathname", "hasdot", "hasdotdot", "hasdotgit",
+    "largepathname", "nullsha1", "nulincommit", "zeropaddedfilemode",
+    "badfilemode", "badtagname", "emptypackedrefsfile", "gitattributessymlink",
+    "gitignoresymlink", "gitmodulesparse", "mailmapsymlink", "missingtaggerentry",
+    "refmissingnewline", "symlinkref", "symreftargetisnotaref",
+    "trailingrefcontent", "extraheaderentry",
+];
+
+/// The fsck message ids whose default severity is `FSCK_FATAL`; git refuses to
+/// demote these to anything other than `error`.
+const FSCK_FATAL_IDS: &[&str] = &["nulinheader", "unterminatedheader"];
+
+/// Validate a `--strict=<v>` / `--fsck-objects=<v>` message-type list exactly as
+/// git's `fsck_set_msg_types()` → `fsck_set_msg_type()` do, dying (fatal, exit
+/// 128) with git's message on the first malformed token.
+///
+/// git splits the value on space, comma or pipe, skips empty tokens, lowercases
+/// the id (the part before the first `=`), and for each token in order:
+///   * no `=`                       → `Missing '=': '<id>'`
+///   * unknown id                   → `Unhandled message id: <id>`
+///   * severity not error/warn/ignore (case-sensitive) → `Unknown fsck message
+///     type: '<severity>'`
+///   * a `FSCK_FATAL` id set below `error` → `Cannot demote <id> to <severity>`
+/// A fully valid list returns `Ok`; the flag is still rejected later as
+/// unported, but only after every check git performs first has passed.
+fn validate_fsck_msg_types(values: &str) -> std::result::Result<(), ExitCode> {
+    for token in values.split([' ', ',', '|']) {
+        if token.is_empty() {
+            continue;
+        }
+        let Some(eq) = token.find('=') else {
+            return Err(fatal(format!("Missing '=': '{}'", token.to_ascii_lowercase())));
+        };
+        let id = token[..eq].to_ascii_lowercase();
+        let severity = &token[eq + 1..];
+        if !FSCK_MSG_IDS.contains(&id.as_str()) {
+            return Err(fatal(format!("Unhandled message id: {id}")));
+        }
+        if !matches!(severity, "error" | "warn" | "ignore") {
+            return Err(fatal(format!("Unknown fsck message type: '{severity}'")));
+        }
+        if severity != "error" && FSCK_FATAL_IDS.contains(&id.as_str()) {
+            return Err(fatal(format!("Cannot demote {id} to {severity}")));
+        }
+    }
+    Ok(())
 }
 
 /// C's `strtoul` reduced to what `--index-version` needs: returns the parsed

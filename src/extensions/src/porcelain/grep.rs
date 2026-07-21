@@ -140,21 +140,17 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     let mut deferred = Deferred::default();
     let mut dialect = Dialect::Basic;
     let mut patterns: Vec<String> = Vec::new();
-    let mut positionals: Vec<String> = Vec::new();
-    let mut no_more_opts = false;
 
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
-        if no_more_opts || a == "-" || !a.starts_with('-') {
-            positionals.push(a.to_string());
-            i += 1;
-            continue;
-        }
-        if a == "--" {
-            no_more_opts = true;
-            i += 1;
-            continue;
+        // git scans options with `PARSE_OPT_STOP_AT_NON_OPTION | KEEP_DASHDASH`:
+        // scanning halts at the first non-option token, at a bare `-`, and at `--`
+        // (which is left in place). Everything from that point is resolved below by
+        // the same rules as git's `cmd_grep`, so an option that trails a pathspec is
+        // rejected as misplaced rather than quietly accepted.
+        if a == "--" || a == "-" || !a.starts_with('-') {
+            break;
         }
         if let Some(long) = a.strip_prefix("--") {
             // `--name=value` and `--name value` are both accepted by git for
@@ -386,14 +382,25 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    // git diagnoses a missing pattern before anything else it was handed.
-    if patterns.is_empty() && positionals.is_empty() {
+    // Everything option-scanning stopped at: a possible leading `--`, the pattern,
+    // any revisions, a separating `--`, and the pathspecs. git's `cmd_grep` walks
+    // these in a fixed order; the steps below reproduce it (see builtin/grep.c).
+    let mut rest: Vec<String> = args[i..].to_vec();
+
+    // A leading `--` with no `-e`/`-f` pattern yet cannot be separating revisions
+    // from paths, so git drops it before taking the pattern.
+    if patterns.is_empty() && rest.first().is_some_and(|a| a.as_str() == "--") {
+        rest.remove(0);
+    }
+    // Without an explicit `-e`, the first unrecognised non-option token is the
+    // pattern (it may itself start with `-` when it followed the dropped `--`).
+    if patterns.is_empty() && !rest.is_empty() {
+        patterns.push(rest.remove(0));
+    }
+    // git diagnoses a missing pattern here, before it looks at anything else.
+    if patterns.is_empty() {
         eprintln!("fatal: no pattern given");
         return Ok(ExitCode::from(128));
-    }
-    // Without `-e`, the first positional is the pattern.
-    if patterns.is_empty() {
-        patterns.push(positionals.remove(0));
     }
 
     // git resolves an unset `--exclude-standard` to whether an index is being
@@ -405,19 +412,70 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         opts.exclude_standard = !opts.no_index;
     }
 
-    // Under `--no-index` there are no revisions for a positional to name, so
-    // each one must already exist as a path. git verifies that during setup,
-    // ahead of both `--max-count` and the source-conflict rules.
-    if opts.no_index {
-        for p in &positionals {
-            if let Some(code) = verify_worktree_path(p) {
+    let repo = gix::discover(".")?;
+
+    // Split the remaining tokens into revisions and pathspecs the way git does.
+    // With a `--` present every token before it must resolve as a revision; with
+    // none, revision resolution stops at the first token that is not a rev and the
+    // rest are paths. Revisions are only entertained while an index is consulted
+    // and `--untracked` is off.
+    let allow_revs = !opts.no_index && !opts.untracked;
+    let seen_dashdash = rest.iter().any(|a| a.as_str() == "--");
+    let mut revs: Vec<String> = Vec::new();
+    let mut path_start = rest.len();
+    let mut r = 0;
+    while r < rest.len() {
+        let arg = rest[r].clone();
+        if arg.as_str() == "--" {
+            r += 1;
+            path_start = r;
+            break;
+        }
+        if !allow_revs {
+            if seen_dashdash {
+                eprintln!("fatal: --no-index or --untracked cannot be used with revs");
+                return Ok(ExitCode::from(128));
+            }
+            path_start = r;
+            break;
+        }
+        if repo.rev_parse_single(arg.as_str()).is_ok() {
+            // git's `verify_non_filename`: a token that is both a revision and an
+            // existing path is ambiguous unless a `--` disambiguates it.
+            if !seen_dashdash && check_filename(&arg) {
+                eprintln!("fatal: ambiguous argument '{arg}': both revision and filename");
+                eprintln!("Use '--' to separate paths from revisions, like this:");
+                eprintln!("'git <command> [<revision>...] -- [<file>...]'");
+                return Ok(ExitCode::from(128));
+            }
+            revs.push(arg);
+            r += 1;
+            path_start = r;
+            continue;
+        }
+        if seen_dashdash {
+            eprintln!("fatal: unable to resolve revision: {arg}");
+            return Ok(ExitCode::from(128));
+        }
+        path_start = r;
+        break;
+    }
+
+    // Anything past the revisions is a path. Without a `--`, git verifies each and
+    // rejects an option that trailed the pattern with the "must come before"
+    // message; the first path is diagnosed as a possibly-misspelt revision when
+    // revisions were allowed at that position.
+    if !seen_dashdash {
+        for j in path_start..rest.len() {
+            if let Some(code) = verify_filename(&rest[j], j == path_start && allow_revs) {
                 return Ok(code);
             }
         }
     }
+    let positionals: Vec<String> = rest[path_start..].to_vec();
 
     // `--max-count=0` is documented to "exit immediately with a non-zero
-    // status", ahead of even the source-conflict check.
+    // status", ahead of the source-conflict check.
     if opts.max_count == 0 {
         return Ok(ExitCode::from(1));
     }
@@ -434,12 +492,18 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         bail!("{}", unsupported("--all-match"));
     }
 
+    // A resolved revision means a `<tree>` search, which git would run here and
+    // this port cannot; it is refused only now, after every diagnostic git emits
+    // ahead of it has had its chance.
+    if let Some(rev) = revs.first() {
+        bail!("searching a tree/revision ({rev:?}) is not supported");
+    }
+
     let needles: Vec<Vec<u8>> = patterns
         .iter()
         .map(|p| literal_of(p, dialect))
         .collect::<Result<_>>()?;
 
-    let repo = gix::discover(".")?;
     let index = repo.open_index()?;
 
     // `--textconv` can only change what is searched when there is a converter to
@@ -453,17 +517,10 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         );
     }
 
-    // A positional left over after the pattern is a `<tree>` in git's grammar
-    // when it resolves as a revision; otherwise it is a pathspec. `--no-index`
-    // removes the revision half of that grammar, and its positionals were
-    // already verified to name real paths above.
-    let mut specs: Vec<BString> = Vec::new();
-    for p in &positionals {
-        if !opts.no_index && repo.rev_parse_single(p.as_str()).is_ok() {
-            bail!("searching a tree/revision ({p:?}) is not supported");
-        }
-        specs.push(BString::from(p.as_str()));
-    }
+    let specs: Vec<BString> = positionals
+        .iter()
+        .map(|p| BString::from(p.as_str()))
+        .collect();
 
     // The repo-root-relative prefix of the current directory. It scopes a bare
     // invocation to the current subtree, is the base `--max-depth` counts from
@@ -604,9 +661,15 @@ fn source_conflict(opts: &Opts) -> Option<ExitCode> {
     Some(ExitCode::from(128))
 }
 
-/// git's `verify_filename()` as `--no-index` reaches it. With no revisions to
-/// disambiguate against, a positional that is not self-evidently a pattern has
-/// to name something that exists, or git dies before searching anything.
+/// git's `verify_filename()`. A leftover token sitting in path position that
+/// starts with `-` is a misplaced option — git dies with the "must come before
+/// non-option arguments" message rather than treating it as a path. Otherwise it
+/// has to look like a pathspec or name an existing path, or git dies before
+/// searching anything. `diagnose_misspelt_rev` picks git's wording: the
+/// "ambiguous argument" form when a revision was still admissible at this
+/// position (the first path, with revs allowed), the plainer "no such path" form
+/// otherwise (subsequent paths, or when revisions were never in play — including
+/// every `--no-index`/`--untracked` path).
 ///
 /// Returns the exit code to stop with, having already reported it, or `None`
 /// when the argument is acceptable.
@@ -615,36 +678,50 @@ fn source_conflict(opts: &Opts) -> Option<ExitCode> {
 /// them from too for every form but `:/<path>`: that one is root-relative, and
 /// git can say so because it has already changed directory to the root by this
 /// point. The two agree whenever grep is run from the root.
-fn verify_worktree_path(arg: &str) -> Option<ExitCode> {
-    if looks_like_pathspec(arg) {
+fn verify_filename(arg: &str, diagnose_misspelt_rev: bool) -> Option<ExitCode> {
+    if arg.starts_with('-') {
+        eprintln!("fatal: option '{arg}' must come before non-option arguments");
+        return Some(ExitCode::from(128));
+    }
+    if looks_like_pathspec(arg) || check_filename(arg) {
         return None;
     }
-    // `check_filename()` strips the leading magic that still leaves a path
-    // behind, then stats what remains. Magic with nothing after it is accepted
-    // without a stat — `:/` names the root, and excluding everything with a bare
-    // `:!`/`:^` is pointless but legal. A bare empty argument gets no such
-    // exemption: it reaches the stat and fails it, which is why `git grep
-    // --no-index <pattern> ""` is a fatal rather than a match-nothing.
+    if diagnose_misspelt_rev {
+        eprintln!(
+            "fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree."
+        );
+        eprintln!("Use '--' to separate paths from revisions, like this:");
+        eprintln!("'git <command> [<revision>...] -- [<file>...]'");
+    } else {
+        eprintln!("fatal: {arg}: no such path in the working tree.");
+        eprintln!("Use 'git <command> -- <path>...' to specify paths that do not exist locally.");
+    }
+    Some(ExitCode::from(128))
+}
+
+/// git's `check_filename()`: whether `arg` names something that exists in the
+/// worktree. It strips the leading pathspec magic that still leaves a path behind
+/// and stats what remains. Magic with nothing after it counts as existing without
+/// a stat — `:/` names the root, and excluding everything with a bare `:!`/`:^`
+/// is pointless but legal. A bare empty argument gets no such exemption: it
+/// reaches the stat and fails it, which is why `git grep --no-index <pattern> ""`
+/// is a fatal rather than a match-nothing.
+fn check_filename(arg: &str) -> bool {
     let path = match [":/", ":!", ":^"]
         .into_iter()
         .find_map(|magic| arg.strip_prefix(magic))
     {
-        Some("") => return None,
+        Some("") => return true,
         Some(rest) => rest,
         None => arg,
     };
-    if std::fs::symlink_metadata(path).is_ok() {
-        return None;
-    }
-    eprintln!("fatal: {arg}: no such path in the working tree.");
-    eprintln!("Use 'git <command> -- <path>...' to specify paths that do not exist locally.");
-    Some(ExitCode::from(128))
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 /// git's `looks_like_pathspec()`: raw pathspec magic, or an unescaped glob
 /// metacharacter, means the argument is a pattern rather than a name to stat.
 fn looks_like_pathspec(arg: &str) -> bool {
-    if arg.starts_with(":(") {
+    if arg.starts_with(":(") && arg.contains(')') {
         return true;
     }
     let mut escaped = false;

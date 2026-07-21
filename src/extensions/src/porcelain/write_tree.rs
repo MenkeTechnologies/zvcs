@@ -66,6 +66,9 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
             "--missing-ok" => missing_ok = true,
             "--no-missing-ok" => missing_ok = false,
             "--no-prefix" => prefix = None,
+            // End-of-options: everything after `--` is a pathspec/positional,
+            // which write-tree ignores. Options seen before `--` still apply.
+            "--" => break,
             "--prefix" => {
                 i += 1;
                 let Some(v) = args.get(i) else {

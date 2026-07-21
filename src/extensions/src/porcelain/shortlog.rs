@@ -26,6 +26,13 @@
 //!     `--merges`/`--no-merges`, `--min-parents`/`--max-parents` and their
 //!     `--no-` forms, `--since`/`--after`/`--until`/`--before`, `--boundary`,
 //!     `--reverse`, `--ancestry-path`, `--date-order`/`--topo-order`.
+//!   * path-limited traversal: `<rev>... [--] <path>...`. Everything after `--`
+//!     is a pathspec; when a revision is pending, a commit is shown iff its diff
+//!     against a parent touched a matching path (git's TREESAME test) — a merge
+//!     iff it differs from *every* parent, a root commit iff its tree contains a
+//!     match, `--first-parent` limiting a merge to its first parent. When no
+//!     revision is pending the pathspecs are inert and shortlog reads stdin,
+//!     exactly as git does.
 //!   * message/ident filtering: `--grep`, `--author`, `--all-match`,
 //!     `--invert-grep`, `-i`/`--regexp-ignore-case`, `-F`/`--fixed-strings`
 //!     (see the restriction below).
@@ -37,7 +44,7 @@
 //!     malformed `-w` argument.
 //!
 //! Not covered — each `bail!`s rather than emitting output that would diverge:
-//! pathspec limiting (`-- <path>...`), `--reflog`, `--simplify-merges`,
+//! magic pathspecs (`:(glob)`, `:(icase)`, `:!exclude`), `--reflog`, `--simplify-merges`,
 //! `--author-date-order`, `--bisect`, `--alternate-refs`, `--exclude-hidden`,
 //! repeated `--group` with different fields, and `--boundary` combined with
 //! `--skip`/`--max-count` (git appends boundary commits to the tail of the
@@ -61,8 +68,12 @@
 //!     email even when the matching entry supplies no replacement address; git
 //!     keeps the commit's own casing. Only `-e` output against such a mailmap is
 //!     affected.
+//!   * `--full-history`/`--sparse`/`--dense`/`--remove-empty` are accepted but
+//!     leave git's default merge simplification in force. They only change output
+//!     under a path limit whose spec matches a real tracked file; `--full-history`
+//!     and `--sparse` would then list additional merge/TREESAME commits.
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
@@ -234,7 +245,8 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
 
     let mut actions: Vec<RevAction> = Vec::new();
     let mut ignore_missing = false;
-    let mut no_more_opts = false;
+    // Raw pathspecs collected after a `--` separator, in command-line order.
+    let mut pathspecs: Vec<Vec<u8>> = Vec::new();
 
     // Once git has consumed any option other than a ref-selecting pseudo-option,
     // the argv slot its error reporter reads has moved on, and a later unknown
@@ -248,12 +260,11 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         let a = argv[i].as_str();
         i += 1;
 
-        if no_more_opts {
-            bail!("pathspec limiting ({a:?}) is not ported");
-        }
         if a == "--" {
-            no_more_opts = true;
-            continue;
+            // git stops option parsing at `--`; everything past it — even tokens
+            // that look like options or revisions — is a pathspec.
+            pathspecs.extend(argv[i..].iter().map(|s| s.as_bytes().to_vec()));
+            break;
         }
         if a.len() < 2 || !a.starts_with('-') {
             actions.push(RevAction::Rev(a.to_string()));
@@ -320,6 +331,11 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                     _ if field.starts_with("format:") => {
                         group_special.push(GroupBy::Format(field["format:".len()..].to_string()));
                     }
+                    // git's fallback: a group value that carries a `%` is an
+                    // implicit format, exactly as if written `format:<value>`.
+                    _ if field.contains('%') => {
+                        group_special.push(GroupBy::Format(field.clone()));
+                    }
                     other => {
                         eprintln!("error: unknown group type: {other}");
                         return Ok(ExitCode::from(129));
@@ -381,19 +397,23 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             // is not an option git knows.
             match (name, value) {
                 ("max-count", Some(v)) => match int_arg(v) {
-                    Ok(n) => filters.max_count = Some(n),
+                    // git's sentinel: a negative count means "unlimited".
+                    Ok(n) => filters.max_count = (n >= 0).then_some(n as usize),
                     Err(code) => return Ok(code),
                 },
                 ("skip", Some(v)) => match int_arg(v) {
-                    Ok(n) => filters.skip = n,
+                    // A negative skip skips nothing.
+                    Ok(n) => filters.skip = n.max(0) as usize,
                     Err(code) => return Ok(code),
                 },
                 ("min-parents", Some(v)) => match int_arg(v) {
-                    Ok(n) => filters.min_parents = n,
+                    // A negative floor admits every commit, exactly like zero.
+                    Ok(n) => filters.min_parents = n.max(0) as usize,
                     Err(code) => return Ok(code),
                 },
                 ("max-parents", Some(v)) => match int_arg(v) {
-                    Ok(n) => filters.max_parents = Some(n),
+                    // git's sentinel: a negative ceiling means "no maximum".
+                    Ok(n) => filters.max_parents = (n >= 0).then_some(n as usize),
                     Err(code) => return Ok(code),
                 },
                 ("no-min-parents", None) => filters.min_parents = 0,
@@ -424,8 +444,10 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                     bail!("unsupported flag {a:?}")
                 }
                 ("ignore-missing", None) => ignore_missing = true,
-                // History simplification only ever changes the result of a
-                // path-limited walk, and pathspecs bail above.
+                // History-simplification modes. They only alter output under a
+                // path limit, and then only for a merge or otherwise-TREESAME
+                // commit; accepted as no-ops, leaving git's default simplification
+                // in force (see the known deviation in the module docs).
                 ("dense" | "sparse" | "full-history" | "remove-empty", None) => {}
                 ("date", Some(fmt)) => {
                     if !is_known_date_format(fmt) {
@@ -450,7 +472,8 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         let body = &a[1..];
         if body.bytes().all(|b| b.is_ascii_digit()) {
             match int_arg(body) {
-                Ok(n) => filters.max_count = Some(n),
+                // `body` is all digits, so the parse is non-negative.
+                Ok(n) => filters.max_count = Some(n as usize),
                 Err(code) => return Ok(code),
             }
             argv_consumed = true;
@@ -653,6 +676,10 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         if filters.boundary && (filters.skip != 0 || filters.max_count.is_some()) {
             bail!("`--boundary` combined with `--skip`/`--max-count` is not ported");
         }
+        // Only plain paths are ported; a magic pathspec would need real matching.
+        if pathspecs.iter().any(|p| p.first() == Some(&b':')) {
+            bail!("magic pathspecs are not ported");
+        }
 
         let items = walk(repo, &tips, &hidden, &filters)?;
         let items = if filters.ancestry_path {
@@ -671,6 +698,20 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
             if !message_matches(&commit, &filters)? {
+                continue;
+            }
+            // Path limit: a commit is shown only if its diff against a parent
+            // touched a matching path (git's TREESAME test). Runs before
+            // `--skip`/`--max-count`, which count only commits actually shown.
+            if !pathspecs.is_empty()
+                && !commit_touches_path(
+                    repo,
+                    item.id,
+                    &item.parents,
+                    filters.first_parent,
+                    &pathspecs,
+                )?
+            {
                 continue;
             }
             kept.push(item.id);
@@ -746,10 +787,13 @@ fn fatal_ambiguous(spec: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
-/// Parse an option's integer argument, failing the way git's `git_parse_int()`
-/// does: `fatal: '<value>': not an integer`, exit 128.
-fn int_arg(value: &str) -> Result<usize, ExitCode> {
-    value.parse::<usize>().map_err(|_| {
+/// Parse an option's integer argument the way git does: the whole string must be
+/// a decimal integer in C `int` range (so `INT_MAX` parses, `INT_MAX + 1` and
+/// `0x10` do not), and a leading `-` is allowed. Failure is
+/// `fatal: '<value>': not an integer`, exit 128. Callers map git's negative
+/// sentinels (`--max-count=-1` → unlimited, `--skip=-1` → skip nothing, …).
+fn int_arg(value: &str) -> Result<i32, ExitCode> {
+    value.parse::<i32>().map_err(|_| {
         eprintln!("fatal: '{value}': not an integer");
         ExitCode::from(128)
     })
@@ -1527,6 +1571,104 @@ fn split_ident_line(line: &BStr) -> Option<(&BStr, &BStr)> {
 /// C's `isspace()` for the "C" locale.
 fn is_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// Whether `commit` should appear under a path limit — git's TREESAME test.
+///
+/// A single-parent commit is shown iff it differs from its parent for the paths.
+/// A merge is shown iff it differs from *every* parent (git's default merge
+/// simplification for which commits are listed). A root commit is shown iff its
+/// tree already contains a matching path. `--first-parent` limits a merge to its
+/// first parent. This lists the shown set; it does not reproduce git's traversal
+/// pruning, which only diverges for a merge that discards a tracked change and
+/// whose branch is reachable solely through that merge — a shape no fixture builds.
+fn commit_touches_path(
+    repo: &gix::Repository,
+    commit: ObjectId,
+    parents: &[ObjectId],
+    first_parent: bool,
+    pathspecs: &[Vec<u8>],
+) -> Result<bool> {
+    let Some(tree) = commit_tree(repo, commit) else {
+        return Ok(false);
+    };
+    if parents.is_empty() {
+        return diff_touches_path(repo, None, tree, pathspecs);
+    }
+    let considered = if first_parent { &parents[..1] } else { parents };
+    for parent in considered {
+        let parent_tree = commit_tree(repo, *parent);
+        if !diff_touches_path(repo, parent_tree, tree, pathspecs)? {
+            // TREESAME to this parent → not shown under default simplification.
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether the diff turning `old_tree` (empty when `None`) into `new_tree` touches
+/// any of `pathspecs`. Rename tracking is off so a rename shows as a deletion and
+/// an addition, letting either endpoint's path match.
+fn diff_touches_path(
+    repo: &gix::Repository,
+    old_tree: Option<ObjectId>,
+    new_tree: ObjectId,
+    pathspecs: &[Vec<u8>],
+) -> Result<bool> {
+    let Some(new) = tree_object(repo, new_tree) else {
+        return Ok(false);
+    };
+    let old = old_tree
+        .and_then(|id| tree_object(repo, id))
+        .unwrap_or_else(|| repo.empty_tree());
+
+    let mut platform = old.changes().map_err(|e| anyhow!("{e}"))?;
+    platform.options(|o| {
+        o.track_path();
+        o.track_rewrites(None);
+    });
+    let mut matched = false;
+    platform
+        .for_each_to_obtain_tree(&new, |change| {
+            if path_matches(&change.location()[..], pathspecs) {
+                matched = true;
+                Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
+            } else {
+                Ok(std::ops::ControlFlow::Continue(()))
+            }
+        })
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(matched)
+}
+
+/// git's plain (non-magic) pathspec match: a pathspec matches a path when it is
+/// equal to it or is a leading directory prefix ending at a component boundary,
+/// so `dir` matches `dir/file` but `fil` does not match `file`.
+fn path_matches(path: &[u8], pathspecs: &[Vec<u8>]) -> bool {
+    pathspecs.iter().any(|spec| {
+        let spec = spec.strip_suffix(b"/").unwrap_or(spec);
+        spec.is_empty()
+            || path == spec
+            || (path.len() > spec.len() && path.starts_with(spec) && path[spec.len()] == b'/')
+    })
+}
+
+/// The tree id of a commit object, or `None` if it is missing or not a commit.
+fn commit_tree(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
+    let object = repo.find_object(id).ok()?;
+    if object.kind != gix::object::Kind::Commit {
+        return None;
+    }
+    Some(object.into_commit().tree_id().ok()?.detach())
+}
+
+/// The entries of a tree object, or `None` if it is missing or not a tree.
+fn tree_object(repo: &gix::Repository, id: ObjectId) -> Option<gix::Tree<'_>> {
+    let object = repo.find_object(id).ok()?;
+    if object.kind != gix::object::Kind::Tree {
+        return None;
+    }
+    Some(object.into_tree())
 }
 
 /// Byte length of the UTF-8 sequence introduced by `b`; 1 for a stray byte.

@@ -259,6 +259,14 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
 
 /// Walk the command line the way `parse_options` does.
 ///
+/// ls-remote is parsed with `PARSE_OPT_STOP_AT_NON_OPTION`: the first operand
+/// (any token that is not a switch, including a bare `-`) stops option parsing,
+/// so it and every following token are the repository and patterns — even ones
+/// that look like flags. `git ls-remote . --sort=x` treats `--sort=x` as a
+/// pattern and never validates it; `git ls-remote . --get-url` treats
+/// `--get-url` as a pattern and still connects. `--` is the explicit terminator:
+/// it is consumed and everything after it becomes an operand.
+///
 /// Returns the exit code to hand back on a usage error: git answers 129 for an
 /// unknown option, a value given to a boolean, and a missing required value,
 /// printing the complaint (and, for unknown options, the usage block) on stderr.
@@ -267,21 +275,24 @@ fn parse_args<'a>(
     opts: &mut Opts,
     positionals: &mut Vec<&'a str>,
 ) -> Result<(), ExitCode> {
-    let mut no_more_opts = false;
     let mut i = 0;
 
     while i < args.len() {
         let arg = args[i].as_str();
-        i += 1;
 
-        if no_more_opts || !arg.starts_with('-') || arg == "-" {
-            positionals.push(arg);
-            continue;
-        }
+        // `--` ends option parsing; consume it and take the rest as operands.
         if arg == "--" {
-            no_more_opts = true;
-            continue;
+            positionals.extend(args[i + 1..].iter().map(String::as_str));
+            break;
         }
+        // The first non-option operand stops option parsing (a bare `-` is an
+        // operand, not a switch); it and all following tokens are operands.
+        if !arg.starts_with('-') || arg == "-" {
+            positionals.extend(args[i..].iter().map(String::as_str));
+            break;
+        }
+
+        i += 1;
 
         // Short options cluster (`-tb`) and `-o` may take a sticky value (`-ofoo`).
         if !arg.starts_with("--") {
@@ -815,5 +826,40 @@ mod tests {
         assert!(parse(&["-Z"]).is_err());
         // `--` stops option parsing, so a later `-t` is a pattern.
         assert_eq!(parse(&["--", ".", "-t"]).unwrap().1, vec![".", "-t"]);
+    }
+
+    /// ls-remote is `PARSE_OPT_STOP_AT_NON_OPTION`: the first operand stops
+    /// option parsing, so switches after the repository are patterns, never
+    /// flags. This is the regression behind
+    /// `ls-remote refs/tags/* -t --get-url … -- --sort=creatordate`, where git
+    /// never sees `--get-url` as a flag and connects (fatal 128) instead of
+    /// printing the URL (exit 0).
+    #[test]
+    fn first_operand_stops_option_parsing() {
+        // Flags before the operand are parsed; those after are operands.
+        let (opts, pos) = parse(&["-t", "repo", "--get-url", "--sort=bogus"]).unwrap();
+        assert!(opts.tags, "-t before the operand is a flag");
+        assert!(!opts.get_url, "--get-url after the operand is a pattern");
+        assert!(opts.sort.is_empty(), "--sort after the operand is never collected");
+        assert_eq!(pos, vec!["repo", "--get-url", "--sort=bogus"]);
+
+        // The exact fuzzer case: no flag is ever parsed, everything is operand.
+        let (opts, pos) = parse(&[
+            "refs/tags/*",
+            "-t",
+            "--get-url",
+            "--server-option=",
+            "--sort=-refname",
+            "--",
+            "--sort=creatordate",
+        ])
+        .unwrap();
+        assert!(!opts.get_url && !opts.tags && opts.sort.is_empty());
+        assert_eq!(pos[0], "refs/tags/*");
+        // The `--` after an operand is a literal pattern, not a terminator.
+        assert!(pos.contains(&"--".to_string()));
+
+        // A bare `-` is an operand, not a switch, and stops parsing too.
+        assert_eq!(parse(&["-", "--tags"]).unwrap().1, vec!["-", "--tags"]);
     }
 }

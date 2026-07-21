@@ -415,6 +415,10 @@ enum Fatal {
     EmptyPathspec,
     /// `fatal: No such path '<p>' in the diff` from `--rotate-to`/`--skip-to`, exit 128.
     NoSuchPath(String),
+    /// `error: option 'color' expects "always", "auto", or "never"`, exit 129.
+    /// This is the parse-options `OPT_COLOR_FLAG` validation error, distinct from
+    /// the subcommand usage text, so it carries git's own exit code of 129.
+    ColorValue,
 }
 
 impl Fatal {
@@ -453,6 +457,13 @@ impl Fatal {
             }
             Fatal::NoSuchPath(p) => {
                 let _ = writeln!(err, "fatal: No such path '{p}' in the diff");
+            }
+            Fatal::ColorValue => {
+                let _ = writeln!(
+                    err,
+                    "error: option `color' expects \"always\", \"auto\", or \"never\""
+                );
+                return ExitCode::from(129);
             }
         }
         ExitCode::from(128)
@@ -859,11 +870,20 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
             return Ok(Flag::Handled);
         }
     }
-    // `--color=never|auto` is what this always produces anyway: NO_COLOR is
-    // honored and stdout is a pipe, so only an explicit `always` differs.
+    // parse-options `OPT_COLOR_FLAG` accepts only a case-insensitive `always`,
+    // `auto` or `never`; any other value (including empty) is a usage error with
+    // git's own message and exit 129. `--color=never|auto` is what this always
+    // produces anyway — NO_COLOR is honored and stdout is a pipe — so only an
+    // explicit `always` alters content.
     if let Some(v) = s.strip_prefix("--color=") {
-        if v == "always" && opts.content_altering.is_none() {
-            opts.content_altering = Some(s.to_owned());
+        match v.to_ascii_lowercase().as_str() {
+            "always" => {
+                if opts.content_altering.is_none() {
+                    opts.content_altering = Some(s.to_owned());
+                }
+            }
+            "auto" | "never" => {}
+            _ => return Err(Fatal::ColorValue),
         }
         return Ok(Flag::Handled);
     }

@@ -75,17 +75,32 @@
 //! * Object ids are abbreviated the way git's `diff_aligned_abbrev` does: `core.abbrev`
 //!   when set, otherwise an auto width floored at 7, extended per id until unambiguous;
 //!   an absent side renders as that many `0`s.
+//! * **Path-limited traversal.** Everything after `--` — and any pre-`--` argument that
+//!   resolved as a filename rather than a revision — is a pathspec. A commit is shown
+//!   iff its `--raw` change list, filtered down to the paths the pathspec matches, is
+//!   non-empty; the shown lines are the surviving ones. Matching is delegated to gix's
+//!   `Pathspec`, git's own algorithm: literal paths and directory prefixes, shell globs
+//!   (`*.rs`), and `:(glob)` / `:!exclude` / exclude-only magic. Slot accounting matches
+//!   git — a path-filtered-empty commit consumes no `--max-count`.
+//! * **Malformed option values are rejected at parse time, matching git's exit code.**
+//!   An invalid `--pretty=`/`--format=` value is `fatal: invalid --pretty format` (128);
+//!   `--min-parents=`/`--max-parents=` reject a non-integer (128); `--unified=`,
+//!   `--stat-width=`/`--stat-count=`/`--stat-name-width=`, `--color=`, and `--word-diff=`
+//!   reject a bad value as a `parse-options` `error:` (129). The value itself is still
+//!   unimplemented, but a bad one now exits exactly as git does instead of reaching the
+//!   generic recognised-but-unported path.
 //!
 //! ### Honest limitations (bailed on with a precise message, never silently ignored)
 //!
 //! * **Every other recognised option.** They are recognised for the purpose of argument
 //!   classification — that is what git does, and it is what decides the exit-128 output
 //!   above — but under `--i-still-use-this` a recognised option this module does not
-//!   implement bails rather than being ignored. `-p`/`--patch`, `--stat` and friends,
-//!   `--pretty`/`--format`, `--graph`, date/author/grep filters, `-M`/`-C`, and
+//!   implement bails rather than being ignored. `-p`/`--patch`, `--stat` and friends, a
+//!   *valid* `--pretty`/`--format`, `--graph`, date/author/grep filters, `-M`/`-C`, and
 //!   `--decorate` all land here.
-//! * **Pathspec filtering** and **multiple or non-single revisions** (`a..b`, `^a`,
-//!   `a...b`) bail under `--i-still-use-this`.
+//! * **`:(attr:…)` attribute pathspecs** (which need the worktree attribute stack) and
+//!   **multiple or non-single revisions** (`a..b`, `^a`, `a...b`) bail under
+//!   `--i-still-use-this`.
 //! * **Rename detection.** git's `diff.renames` defaults to on, so a commit that both
 //!   adds and deletes files gets `R<score>` lines in a queue order produced by
 //!   `diffcore_rename`. The vendored `gix-diff` rewrite tracker computes similarity
@@ -1010,6 +1025,63 @@ fn consume_option(
         }
         return Ok(1);
     }
+    // `--pretty=`/`--format=` both funnel to git's `get_commit_format`, which validates
+    // the format string the moment it is parsed (a `die()`, exit 128) — ahead of the
+    // deprecation notice and of any deferred unrecognised option.
+    if let Some(v) = a.strip_prefix("--pretty=") {
+        validate_pretty_format(v)?;
+        note_recognized(a, p);
+        return Ok(1);
+    }
+    if let Some(v) = a.strip_prefix("--format=") {
+        validate_pretty_format(v)?;
+        note_recognized(a, p);
+        return Ok(1);
+    }
+    // Numeric and enum options git rejects at parse time. The value is not implemented
+    // here regardless, but git's *exit code* on a malformed value (128 for the
+    // `die()`-backed integer parses, 129 for the `parse-options` ones) is reproduced so
+    // a fuzzed bad value matches rather than reaching the generic recognised path.
+    if let Some(v) = a.strip_prefix("--min-parents=") {
+        let _ = parse_count(v)?;
+        note_recognized(a, p);
+        return Ok(1);
+    }
+    if let Some(v) = a.strip_prefix("--max-parents=") {
+        let _ = parse_count(v)?;
+        note_recognized(a, p);
+        return Ok(1);
+    }
+    if let Some(v) = a.strip_prefix("--unified=") {
+        validate_unified(v)?;
+        note_recognized(a, p);
+        return Ok(1);
+    }
+    if let Some(v) = a.strip_prefix("--stat-width=") {
+        validate_stat_num(v, "stat-width")?;
+        note_recognized(a, p);
+        return Ok(1);
+    }
+    if let Some(v) = a.strip_prefix("--stat-count=") {
+        validate_stat_num(v, "stat-count")?;
+        note_recognized(a, p);
+        return Ok(1);
+    }
+    if let Some(v) = a.strip_prefix("--stat-name-width=") {
+        validate_stat_num(v, "stat-name-width")?;
+        note_recognized(a, p);
+        return Ok(1);
+    }
+    if let Some(v) = a.strip_prefix("--color=") {
+        validate_color(v)?;
+        note_recognized(a, p);
+        return Ok(1);
+    }
+    if let Some(v) = a.strip_prefix("--word-diff=") {
+        validate_word_diff(v)?;
+        note_recognized(a, p);
+        return Ok(1);
+    }
     if PREFIX_OPTS.iter().any(|pre| a.starts_with(pre)) {
         note_recognized(a, p);
         return Ok(1);
@@ -1210,6 +1282,79 @@ fn validate_diff_merges(v: &str) -> Result<(), Fatal> {
     }
 }
 
+/// git's `get_commit_format`: a `--pretty`/`--format` value is valid when it is empty,
+/// carries a `format:`/`tformat:` prefix, contains a `%` placeholder, or is a
+/// case-insensitive prefix of one of the built-in format names. Anything else is
+/// `fatal: invalid --pretty format: <v>` (exit 128), reported the instant the option is
+/// parsed. The set of names is git's `builtin_formats` table in `pretty.c`.
+fn validate_pretty_format(v: &str) -> Result<(), Fatal> {
+    const NAMES: &[&str] = &[
+        "raw",
+        "medium",
+        "short",
+        "email",
+        "mboxrd",
+        "fuller",
+        "full",
+        "oneline",
+        "reference",
+    ];
+    if v.is_empty()
+        || v.starts_with("format:")
+        || v.starts_with("tformat:")
+        || v.contains('%')
+    {
+        return Ok(());
+    }
+    let sought = v.to_ascii_lowercase();
+    if NAMES.iter().any(|n| n.starts_with(sought.as_str())) {
+        return Ok(());
+    }
+    Err(Fatal::die(format!("invalid --pretty format: {v}")))
+}
+
+/// git's `--unified`/`-U` value parse: an empty value keeps the default; otherwise the
+/// value must be a non-negative decimal integer (git tolerates overflow but rejects a
+/// sign or any trailing non-digit). A bad value is a `parse-options` `error:`, exit 129.
+fn validate_unified(v: &str) -> Result<(), Fatal> {
+    if v.is_empty() || v.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(());
+    }
+    Err(Fatal::usage("--unified expects a numerical value"))
+}
+
+/// git's `--stat-width`/`--stat-count`/`--stat-name-width` parse via `parse_stat_value`:
+/// an empty value keeps the default, a leading `-` is tolerated, and the rest must be
+/// digits. A non-numeric value is a `parse-options` `error:`, exit 129.
+fn validate_stat_num(v: &str, name: &str) -> Result<(), Fatal> {
+    let digits = v.strip_prefix('-').unwrap_or(v);
+    if v.is_empty() || (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())) {
+        return Ok(());
+    }
+    Err(Fatal::usage(format!("{name} expects a numerical value")))
+}
+
+/// git's `--color` value parse: `always`, `auto`, or `never` (case-insensitive). Bare
+/// `--color` is handled as a flag; only the `--color=<v>` form reaches here. A bad value
+/// is a `parse-options` `error:`, exit 129.
+fn validate_color(v: &str) -> Result<(), Fatal> {
+    if matches!(v.to_ascii_lowercase().as_str(), "always" | "auto" | "never") {
+        return Ok(());
+    }
+    Err(Fatal::usage(
+        "option `color' expects \"always\", \"auto\", or \"never\"",
+    ))
+}
+
+/// git's `--word-diff` value parse: `plain`, `porcelain`, `color`, or `none`. A bad
+/// value is a `parse-options` `error:`, exit 129.
+fn validate_word_diff(v: &str) -> Result<(), Fatal> {
+    if matches!(v, "plain" | "porcelain" | "color" | "none") {
+        return Ok(());
+    }
+    Err(Fatal::usage(format!("bad --word-diff argument: {v}")))
+}
+
 /// Walk and render, once `--i-still-use-this` has cleared the deprecation gate.
 fn run(repo: &gix::Repository, parsed: Parsed) -> Result<ExitCode> {
     if let Some(flag) = &parsed.unimplemented {
@@ -1218,12 +1363,32 @@ fn run(repo: &gix::Repository, parsed: Parsed) -> Result<ExitCode> {
              --no-merges, --no-renames, -n/--max-count/-nN/-N)"
         );
     }
-    if !parsed.pathspecs.is_empty() {
-        bail!("pathspec filtering is not ported");
-    }
     if parsed.revs.len() > 1 {
         bail!("multiple revisions are not ported");
     }
+
+    // Path-limited traversal: everything after `--` (and any pre-`--` argument that
+    // resolved as a filename) is a pathspec. A commit is shown iff, after filtering its
+    // raw change list down to the paths matching the pathspec, at least one change
+    // remains — exactly git's default history simplification over this `--no-merges`
+    // walk. gix's `Pathspec` reproduces git's matcher (literal prefixes, shell globs,
+    // `:(glob)`/`:!exclude` magic and exclude-only sets); attribute pathspecs
+    // (`:(attr:…)`) are the one form it would need the worktree for, and those bail.
+    let mut matcher = if parsed.pathspecs.is_empty() {
+        None
+    } else {
+        Some(gix::Pathspec::new(
+            repo,
+            false,
+            parsed.pathspecs.iter().map(String::as_str),
+            false,
+            || {
+                Err::<gix::worktree::Stack, Box<dyn std::error::Error + Send + Sync>>(
+                    "attribute pathspecs are not ported".into(),
+                )
+            },
+        )?)
+    };
 
     // Resolve the starting tip. A bare `HEAD` may be unborn, which git reports as a
     // fatal error rather than as empty output.
@@ -1277,6 +1442,13 @@ fn run(repo: &gix::Repository, parsed: Parsed) -> Result<ExitCode> {
 
         let mut changes: Vec<Change> = Vec::new();
         walk_trees(repo, old_tree, Some(new_tree), BStr::new(""), &mut changes)?;
+
+        // Path limiting: keep only the changes whose path matches the pathspec. A
+        // commit with no surviving change is `TREESAME` and is dropped without
+        // consuming a `--max-count` slot, just like an empty diff below.
+        if let Some(m) = matcher.as_mut() {
+            changes.retain(|c| m.is_included(c.path.as_bstr(), Some(false)));
+        }
 
         // `cmd_whatchanged` leaves `always_show_header` off, so a commit that produced
         // no diff prints nothing at all and git restores the `--max-count` it spent.

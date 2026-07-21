@@ -10,6 +10,7 @@ use gix::object::tree::diff::ChangeDetached;
 use gix::objs::tree::EntryKind;
 use gix::objs::{Kind, TreeRefIter};
 use gix::prelude::ObjectIdExt;
+use gix::revision::plumbing::Spec as RevSpec;
 
 /// git's floor for an abbreviated object id, used for the all-zero side of an
 /// `index`/raw line where there is no real object to disambiguate against.
@@ -49,18 +50,27 @@ const STAT_TERM_WIDTH: usize = 80;
 ///     and `--stat` measures a path in `char`s rather than display columns.
 ///   * `--stat` assumes an 80-column terminal; `COLUMNS` and `diff.statGraphWidth`
 ///     are not consulted.
-///   * Pathspec limiting and every flag not listed above are rejected explicitly.
+///
+/// Revision arguments accept the full walk grammar: plain names are shown directly
+/// (deduplicated per commit, in argument order), while ranges (`a..b`), symmetric
+/// differences (`a...b`), and exclusions (`^a`) drive a revision walk. Pathspecs
+/// after `--` limit each commit's diff by plain path prefix (pathspec magic is not
+/// interpreted). Every flag not listed above is rejected explicitly.
 pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut specs: Vec<&str> = Vec::new();
+    let mut pathspecs: Vec<Vec<u8>> = Vec::new();
     let mut formats = Formats::default();
     let mut pretty = Pretty::Medium;
     let mut after_dashdash = false;
 
     for a in args {
-        if after_dashdash {
-            bail!("pathspec limiting is not supported");
-        }
         let s = a.as_str();
+        // Everything after `--` is a pathspec, even tokens that look like flags:
+        // `git show -- --stat` limits by the path `--stat`, it does not enable stat.
+        if after_dashdash {
+            pathspecs.push(a.as_bytes().to_vec());
+            continue;
+        }
         match s {
             "--" => after_dashdash = true,
             "-p" | "-u" | "--patch" => formats.patch = true,
@@ -78,7 +88,13 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     .strip_prefix("--format=")
                     .or_else(|| s.strip_prefix("--pretty="))
                 {
-                    pretty = parse_pretty(spec)?;
+                    // git validates each `--pretty`/`--format` occurrence eagerly,
+                    // before resolving any revision, and rejects an invalid one
+                    // wherever it appears with exit 128.
+                    match parse_pretty(spec) {
+                        Some(p) => pretty = p,
+                        None => return Ok(fatal(&format!("invalid --pretty format: {spec}\n"))),
+                    }
                 } else if s.starts_with('-') {
                     bail!("unsupported option {s}");
                 } else {
@@ -96,16 +112,51 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     }
 
     let repo = gix::discover(".")?;
+    let hex_len = repo.object_hash().len_in_hex();
 
     // git resolves every revision before rendering anything, so a bad revision
-    // produces no stdout at all even when an earlier one was fine.
-    let mut resolved: Vec<(&str, ObjectId)> = Vec::with_capacity(specs.len());
+    // produces no stdout at all even when an earlier one was fine. Ranges (`a..b`),
+    // symmetric differences (`a...b`), and exclusions (`^a`) turn the request into
+    // a revision walk; plain object names are shown directly.
+    let mut walk_tips: Vec<ObjectId> = Vec::new();
+    let mut walk_hidden: Vec<ObjectId> = Vec::new();
+    let mut plain: Vec<(&str, ObjectId)> = Vec::new();
+    let mut needs_walk = false;
     for spec in &specs {
-        match repo.rev_parse_single(BStr::new(*spec)) {
-            Ok(id) => resolved.push((*spec, id.detach())),
-            Err(_) => {
-                let hex_len = repo.object_hash().len_in_hex();
-                return Ok(fatal(&bad_revision_message(spec, hex_len)));
+        let parsed = match repo.rev_parse(BStr::new(*spec)) {
+            Ok(p) => p.detach(),
+            Err(_) => return Ok(fatal(&bad_revision_message(spec, hex_len))),
+        };
+        match parsed {
+            RevSpec::Include(id) | RevSpec::ExcludeParents(id) => {
+                plain.push((*spec, id));
+                walk_tips.push(id);
+            }
+            RevSpec::Exclude(id) => {
+                needs_walk = true;
+                walk_hidden.push(id);
+            }
+            RevSpec::Range { from, to } => {
+                needs_walk = true;
+                walk_tips.push(to);
+                walk_hidden.push(from);
+            }
+            RevSpec::Merge { theirs, ours } => {
+                // `theirs...ours` = reachable from either but not both, which git
+                // computes as `theirs ours --not $(merge-base theirs ours)`.
+                needs_walk = true;
+                walk_tips.push(theirs);
+                walk_tips.push(ours);
+                for mb in repo.merge_bases_many(theirs, &[ours])? {
+                    walk_hidden.push(mb.detach());
+                }
+            }
+            RevSpec::IncludeOnlyParents(id) => {
+                needs_walk = true;
+                let commit = repo.find_object(id)?.try_into_commit()?;
+                for p in commit.parent_ids() {
+                    walk_tips.push(p.detach());
+                }
             }
         }
     }
@@ -120,8 +171,19 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     };
 
     let mut out: Vec<u8> = Vec::new();
-    for (spec, id) in &resolved {
-        show_one(&repo, &mut out, spec, *id, &pretty, selection)?;
+    // git marks each commit it prints as SHOWN, so a commit named twice (or reached
+    // twice by a walk) is printed once. Blobs, trees, and tags are not deduplicated.
+    let mut shown: Vec<ObjectId> = Vec::new();
+    if needs_walk {
+        let walk = repo.rev_walk(walk_tips).with_hidden(walk_hidden).all()?;
+        for info in walk {
+            let id = info?.id;
+            show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &pathspecs, &mut shown)?;
+        }
+    } else {
+        for (spec, id) in &plain {
+            show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &mut shown)?;
+        }
     }
 
     let mut stdout = std::io::stdout().lock();
@@ -166,15 +228,21 @@ enum Pretty {
     User(String),
 }
 
-fn parse_pretty(spec: &str) -> Result<Pretty> {
+/// Parse a `--pretty`/`--format` value, or `None` when git would reject it with
+/// `fatal: invalid --pretty format: <spec>`. git's rule: a `format:`/`tformat:`
+/// prefix or any `%` placeholder is a user format; the empty string is an empty
+/// user format (prints nothing); a known format name is that format; anything
+/// else is invalid.
+fn parse_pretty(spec: &str) -> Option<Pretty> {
     if let Some(fmt) = spec.strip_prefix("format:").or_else(|| spec.strip_prefix("tformat:")) {
-        return Ok(Pretty::User(fmt.to_string()));
+        return Some(Pretty::User(fmt.to_string()));
     }
     match spec {
-        "oneline" => Ok(Pretty::Oneline),
-        "medium" => Ok(Pretty::Medium),
-        _ if spec.contains('%') => Ok(Pretty::User(spec.to_string())),
-        _ => bail!("unsupported pretty format {spec}"),
+        "" => Some(Pretty::User(String::new())),
+        "oneline" => Some(Pretty::Oneline),
+        "medium" => Some(Pretty::Medium),
+        _ if spec.contains('%') => Some(Pretty::User(spec.to_string())),
+        _ => None,
     }
 }
 
@@ -344,6 +412,8 @@ fn show_one(
     id: ObjectId,
     pretty: &Pretty,
     selection: Selection,
+    pathspecs: &[Vec<u8>],
+    shown: &mut Vec<ObjectId>,
 ) -> Result<()> {
     let mut obj = repo.find_object(id)?;
     loop {
@@ -357,8 +427,13 @@ fn show_one(
                 break;
             }
             Kind::Commit => {
+                // git prints a given commit at most once (the SHOWN flag).
+                if shown.contains(&obj.id) {
+                    break;
+                }
+                shown.push(obj.id);
                 let commit = obj.try_into_commit()?;
-                show_commit(repo, out, &commit, pretty, selection)?;
+                show_commit(repo, out, &commit, pretty, selection, pathspecs)?;
                 break;
             }
             Kind::Tag => {
@@ -425,9 +500,13 @@ fn show_commit(
     commit: &gix::Commit<'_>,
     pretty: &Pretty,
     selection: Selection,
+    pathspecs: &[Vec<u8>],
 ) -> Result<()> {
     let parents: Vec<_> = commit.parent_ids().collect();
     let is_merge = parents.len() > 1;
+    // An empty user format (`--format=`) prints no header at all, and git then
+    // omits the blank line that would separate the header from the diff.
+    let header_empty = matches!(pretty, Pretty::User(f) if f.is_empty());
 
     match pretty {
         Pretty::Oneline => {
@@ -438,7 +517,11 @@ fn show_commit(
         }
         Pretty::User(fmt) => {
             expand_format(out, commit, fmt)?;
-            out.push(b'\n');
+            // A `tformat` (the default for `--format=`) terminates each non-empty
+            // entry with a newline; the empty format terminates nothing.
+            if !fmt.is_empty() {
+                out.push(b'\n');
+            }
         }
         Pretty::Medium => {
             writeln!(out, "commit {}", commit.id())?;
@@ -476,12 +559,36 @@ fn show_commit(
         return Ok(());
     }
 
-    // Separator between the message and the diff output. For a merge git always
-    // uses a blank line; otherwise `--oneline` gets none, and a combined
-    // stat-plus-patch gets `---`.
+    // Resolve the file-level changes up front: whether any survive the pathspec
+    // filter decides whether a separator is printed at all.
+    let mut files = collect_changes(repo, commit, parents.first().map(|p| p.detach()))?;
+    if !pathspecs.is_empty() {
+        files.retain(|f| matches_pathspec(&f.path, pathspecs));
+    }
+
     if is_merge {
-        out.push(b'\n');
-    } else {
+        // git shows a blank line after a merge's message regardless of format, then
+        // (by default) only `--stat`, measured against the first parent. The empty
+        // user format prints neither the blank line nor a header.
+        if !header_empty {
+            out.push(b'\n');
+        }
+        if let Selection::Blocks { stat: true, .. } = selection {
+            emit_stat(out, &files)?;
+        }
+        return Ok(());
+    }
+
+    // A pathspec that matched nothing leaves the message with no diff and, like git,
+    // no trailing separator.
+    if files.is_empty() {
+        return Ok(());
+    }
+
+    // Separator between the message and the diff output. `--oneline` and the empty
+    // user format get none; a combined stat-plus-patch gets `---`; otherwise a
+    // blank line.
+    if !header_empty {
         match (pretty, selection) {
             (Pretty::Oneline, _) => {}
             (
@@ -496,14 +603,6 @@ fn show_commit(
         }
     }
 
-    // git's default omits everything but `--stat` for a merge commit; what it does
-    // show is measured against the first parent.
-    if is_merge && !matches!(selection, Selection::Blocks { stat: true, .. }) {
-        return Ok(());
-    }
-
-    let files = collect_changes(repo, commit, parents.first().map(|p| p.detach()))?;
-
     match selection {
         Selection::Disabled => {}
         Selection::Names => {
@@ -514,7 +613,7 @@ fn show_commit(
         }
         Selection::Blocks { raw, stat, patch } => {
             let mut wrote_block = false;
-            if raw && !is_merge {
+            if raw {
                 emit_raw(repo, out, &files)?;
                 wrote_block = true;
             }
@@ -522,7 +621,7 @@ fn show_commit(
                 emit_stat(out, &files)?;
                 wrote_block = true;
             }
-            if patch && !is_merge {
+            if patch {
                 if wrote_block {
                     out.push(b'\n');
                 }
@@ -534,6 +633,20 @@ fn show_commit(
     }
 
     Ok(())
+}
+
+/// git limits a commit's diff to paths matching the pathspecs after `--`. Without
+/// pathspec magic (`:(glob)`, `:!`, …), a pathspec matches a path when they are
+/// equal or the path lies under the pathspec directory. `.` matches everything.
+fn matches_pathspec(path: &[u8], pathspecs: &[Vec<u8>]) -> bool {
+    pathspecs.iter().any(|spec| {
+        let spec: &[u8] = spec.strip_suffix(b"/").unwrap_or(spec.as_slice());
+        if spec.is_empty() || spec == b"." {
+            return true;
+        }
+        path == spec
+            || (path.len() > spec.len() && path.starts_with(spec) && path[spec.len()] == b'/')
+    })
 }
 
 // ---------------------------------------------------------------------------

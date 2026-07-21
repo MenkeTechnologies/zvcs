@@ -21,10 +21,13 @@
 //! and the index walk already skips the gitlink entries git would recurse into —
 //! except that `--untracked` alongside it is the fatal git makes of it.
 //!
-//! Not covered, and rejected loudly rather than approximated: patterns that need
-//! a regex engine (the vendored gitoxide crates ship none — `gix`'s optional
-//! `regex` dependency is behind the `revparse-regex` feature but is not
-//! re-exported, so it cannot be reached from here), searching `<tree>`
+//! Full regex is supported via the `regex` crate (byte-oriented): `-F` literals,
+//! `-E`/ERE and `-P`/Perl pass through, and `-G`/BRE is translated by swapping
+//! which of `( ) { } + ? |` are escaped. A `{`/`}` that forms no valid interval
+//! is literalised, matching git's POSIX leniency; a genuinely malformed pattern
+//! is the `fatal` (exit 128) git makes of it.
+//!
+//! Not covered, and rejected loudly rather than approximated: searching `<tree>`
 //! revisions, the function-context renderers (`-W`/`-p`/`--function-context`/
 //! `--show-function`), `--heading`/`--break`, `-f`, `--and`/`--or`/`--not`,
 //! `-O`, and coloured output.
@@ -552,10 +555,16 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         bail!("searching a tree/revision ({rev:?}) is not supported");
     }
 
-    let needles: Vec<Vec<u8>> = patterns
-        .iter()
-        .map(|p| literal_of(p, dialect))
-        .collect::<Result<_>>()?;
+    // git's regcomp failure is a fatal (exit 128); the regex crate's message
+    // differs from git's regcomp wording, but that goes to stderr, which is not
+    // a compatibility surface — the exit code is.
+    let matcher = match Matcher::build(&patterns, dialect, opts.ignore_case, opts.word) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            return Ok(ExitCode::from(128));
+        }
+    };
 
     let index = repo.open_index()?;
 
@@ -662,7 +671,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             if !opts.text && is_binary(&content) && opts.no_binary {
                 continue;
             }
-            if lines(&content).any(|l| next_match(l, &needles, 0, &opts).is_some() != opts.invert) {
+            if lines(&content).any(|l| next_match(l, &matcher, 0).is_some() != opts.invert) {
                 bail!("{}", unsupported(&flag));
             }
         }
@@ -692,7 +701,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 // git reports a binary hit through the exit status but prints no
                 // context lines and no "Binary file matches" notice for it.
                 if lines(&content)
-                    .any(|l| next_match(l, &needles, 0, &opts).is_some() != opts.invert)
+                    .any(|l| next_match(l, &matcher, 0).is_some() != opts.invert)
                 {
                     any_hit = true;
                 }
@@ -702,7 +711,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 &mut out,
                 &content,
                 &name,
-                &needles,
+                &matcher,
                 &opts,
                 pre_context,
                 post_context,
@@ -728,7 +737,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         }
 
         let name = display_name(path.as_bstr(), prefix, &opts);
-        if search_file(&mut out, &content, &name, binary, &needles, &opts)? {
+        if search_file(&mut out, &content, &name, binary, &matcher, &opts)? {
             any_hit = true;
             if opts.quiet {
                 break;
@@ -1061,7 +1070,7 @@ fn render_context(
     out: &mut impl Write,
     content: &[u8],
     name: &[u8],
-    needles: &[Vec<u8>],
+    matcher: &Matcher,
     opts: &Opts,
     pre: usize,
     post: usize,
@@ -1083,7 +1092,7 @@ fn render_context(
         if matches >= limit {
             break;
         }
-        if next_match(line, needles, 0, opts).is_some() != opts.invert {
+        if next_match(line, matcher, 0).is_some() != opts.invert {
             is_match[idx] = true;
             hit = true;
             matches += 1;
@@ -1127,7 +1136,7 @@ fn render_context(
         if is_match[idx] {
             if opts.only_matching && !opts.invert {
                 let mut at = 0usize;
-                while let Some((start, len)) = next_match(line, needles, at, opts) {
+                while let Some((start, len)) = next_match(line, matcher, at) {
                     if len == 0 {
                         break;
                     }
@@ -1137,7 +1146,7 @@ fn render_context(
                     at = start + len;
                 }
             } else {
-                let col = next_match(line, needles, 0, opts).map_or(0, |(s, _)| s) + 1;
+                let col = next_match(line, matcher, 0).map_or(0, |(s, _)| s) + 1;
                 write_prefix(out, name, idx + 1, col, opts)?;
                 out.write_all(line)?;
                 out.write_all(b"\n")?;
@@ -1177,7 +1186,7 @@ fn search_file(
     content: &[u8],
     name: &[u8],
     binary: bool,
-    needles: &[Vec<u8>],
+    matcher: &Matcher,
     opts: &Opts,
 ) -> Result<bool> {
     let limit = if opts.max_count < 0 {
@@ -1195,7 +1204,7 @@ fn search_file(
         if count >= limit {
             break;
         }
-        let first = next_match(line, needles, 0, opts);
+        let first = next_match(line, matcher, 0);
         let matched = first.is_some() != opts.invert;
         if !matched {
             continue;
@@ -1221,7 +1230,7 @@ fn search_file(
         // result; git prints the full line in that case.
         if opts.only_matching && !opts.invert {
             let mut at = 0usize;
-            while let Some((start, len)) = next_match(line, needles, at, opts) {
+            while let Some((start, len)) = next_match(line, matcher, at) {
                 if len == 0 {
                     break; // an empty pattern has no non-empty part to show
                 }
@@ -1301,19 +1310,141 @@ fn lines(content: &[u8]) -> impl Iterator<Item = &[u8]> {
         .take(if empty { 0 } else { usize::MAX })
 }
 
-/// The next match of any pattern in `line` at or after `at`, as `(start, len)`.
-/// Ties on `start` go to the longest match, which is what git prints under `-o`
-/// when two `-e` patterns begin at the same offset.
-fn next_match(
-    line: &[u8],
-    needles: &[Vec<u8>],
-    at: usize,
-    opts: &Opts,
-) -> Option<(usize, usize)> {
-    needles
-        .iter()
-        .filter_map(|n| find_from(line, n, at, opts))
-        .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+/// A compiled search: the `-e` patterns (OR'd) as one byte regex, plus git's
+/// `-w` word-boundary constraint and the empty-pattern "matches every line" rule.
+struct Matcher {
+    /// `None` when every pattern is empty (then `match_all` carries the result).
+    re: Option<regex::bytes::Regex>,
+    word: bool,
+    /// An empty `-e` pattern matches all lines (git's documented behaviour).
+    match_all: bool,
+}
+
+impl Matcher {
+    fn build(patterns: &[String], dialect: Dialect, ignore_case: bool, word: bool) -> Result<Self> {
+        let match_all = patterns.iter().any(|p| p.is_empty());
+        let nonempty: Vec<&String> = patterns.iter().filter(|p| !p.is_empty()).collect();
+        let re = if nonempty.is_empty() {
+            None
+        } else {
+            let combined = nonempty
+                .iter()
+                .map(|p| Ok(format!("(?:{})", translate_pattern(p, dialect)?)))
+                .collect::<Result<Vec<_>>>()?
+                .join("|");
+            let compile = |pat: &str| {
+                regex::bytes::RegexBuilder::new(pat)
+                    .case_insensitive(ignore_case)
+                    .unicode(false) // git greps bytes, not scalar values
+                    .build()
+            };
+            match compile(&combined) {
+                Ok(re) => Some(re),
+                // git's POSIX engine treats a `{`/`}` that does not form a valid
+                // interval as a literal; the regex crate rejects it. Recover that
+                // leniency by literalising braces and retrying — a genuine error
+                // (an unmatched `(` or `[`) still fails and surfaces as fatal.
+                Err(_) => {
+                    let lenient = combined.replace('{', "\\{").replace('}', "\\}");
+                    Some(
+                        compile(&lenient)
+                            .map_err(|e| anyhow::anyhow!("invalid regex: {e}"))?,
+                    )
+                }
+            }
+        };
+        Ok(Self { re, word, match_all })
+    }
+
+    /// The next match in `line` at or after `at`, as `(start, len)`. Ties go to
+    /// the leftmost match; `-w` skips matches not sitting on word boundaries.
+    fn find_at(&self, line: &[u8], at: usize) -> Option<(usize, usize)> {
+        if at > line.len() {
+            return None;
+        }
+        if self.match_all {
+            return Some((at, 0));
+        }
+        let re = self.re.as_ref()?;
+        let mut from = at;
+        loop {
+            let m = re.find_at(line, from)?;
+            let (s, e) = (m.start(), m.end());
+            if !self.word || word_bounded(line, s, e) {
+                return Some((s, e - s));
+            }
+            // This match straddles a word char; look past its start for another.
+            from = s + 1;
+            if from > line.len() {
+                return None;
+            }
+        }
+    }
+}
+
+/// Translate a pattern in `dialect` into the byte-regex syntax the `regex` crate
+/// accepts: `-F` escapes to a literal, ERE/PCRE pass through, and BRE is mapped
+/// by swapping which of `( ) { } + ? |` are escaped.
+fn translate_pattern(pattern: &str, dialect: Dialect) -> Result<String> {
+    Ok(match dialect {
+        Dialect::Fixed => regex::escape(pattern),
+        Dialect::Extended | Dialect::Perl => pattern.to_string(),
+        Dialect::Basic => bre_to_regex(pattern),
+    })
+}
+
+/// GNU BRE → `regex`-crate syntax. In BRE the grouping/quantifier operators are
+/// the *escaped* forms (`\(` `\)` `\{` `\}` `\+` `\?` `\|`) while the bare
+/// characters are literals; ERE (and this crate) are the reverse. Bytes inside a
+/// `[...]` bracket expression are copied verbatim.
+fn bre_to_regex(p: &str) -> String {
+    let b = p.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut in_class = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_class {
+            out.push(c as char);
+            if c == b']' {
+                in_class = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'[' => {
+                in_class = true;
+                out.push('[');
+            }
+            b'\\' if i + 1 < b.len() => {
+                let n = b[i + 1];
+                match n {
+                    // BRE's escaped operators become bare operators.
+                    b'(' | b')' | b'{' | b'}' | b'+' | b'?' | b'|' => out.push(n as char),
+                    // Everything else keeps its backslash (`\.`, `\\`, `\b`, …).
+                    _ => {
+                        out.push('\\');
+                        out.push(n as char);
+                    }
+                }
+                i += 1;
+            }
+            // Bare operators are literals in BRE, so escape them for the crate.
+            b'(' | b')' | b'{' | b'}' | b'+' | b'?' | b'|' => {
+                out.push('\\');
+                out.push(c as char);
+            }
+            _ => out.push(c as char),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The next match of the compiled `matcher` in `line` at or after `at`.
+fn next_match(line: &[u8], matcher: &Matcher, at: usize) -> Option<(usize, usize)> {
+    matcher.find_at(line, at)
 }
 
 /// Find `needle` in `hay` at or after `from`, honouring `-i` and `-w`.

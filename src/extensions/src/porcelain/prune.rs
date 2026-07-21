@@ -48,8 +48,19 @@
 //! `TIME_MAX` (prune every unreachable object, no grace). Anything else is a
 //! date, parsed by `gix::date::parse` after git's approxidate tokenisation is
 //! approximated by splitting digit/letter runs and treating `.` as a separator,
-//! so `2.weeks.ago`, `2weeks ago` and `2 weeks` all reach the same span. A value
-//! that no form parses is `fatal: malformed expiration date '<value>'`, exit 128.
+//! so `2.weeks.ago`, `2weeks ago` and `2 weeks` all reach the same span.
+//!
+//! When no `gix` form parses, git's own `approxidate` is far more permissive
+//! than a strict date parser: `approxidate_str()` only reports a malformed date
+//! when its `touched` flag stays clear, i.e. the string held *no* recognisable
+//! token at all. A run of digits always sets `touched` (so `0x10`, `12abc`,
+//! `-5`, `1e5` are all accepted), as does a standalone date word — a `>= 3` char
+//! prefix of a month name, a number word `one`..`ten`, `last`, or one of
+//! `am`/`pm`/`noon`/`midnight`/`tea`/`yesterday`/`today`. Only a string with
+//! neither (a bare `abc`, `week`, `monday`, `tomorrow`, or whitespace) is
+//! `fatal: malformed expiration date '<value>'`, exit 128. A bare integer
+//! `>= 100000000` is `match_digit()`'s raw-epoch case; every other accepted
+//! value approxidate resolves relative to now.
 //!
 //! Deviation: a bare `YYYY-MM-DD` resolves to UTC midnight, where git's
 //! approxidate uses *local* midnight — up to ~14h apart. The vendored crates
@@ -427,7 +438,112 @@ fn parse_expiry_date(value: &str) -> Option<i64> {
             return Some(time.seconds);
         }
     }
+
+    // No `gix` form parsed, but git's `approxidate` accepts far more: it only
+    // fails when nothing in the string looked like a date token. Match that
+    // decision so `--expire` rejects exactly what stock git rejects (128) and
+    // accepts everything else (exit 0), rather than turning approxidate-valid
+    // garbage into a fatal error.
+    if approxidate_touched(value) {
+        // `match_digit()`'s raw-epoch case: a bare integer >= 100_000_000 is the
+        // timestamp itself. Everything else approxidate resolves relative to the
+        // current time (a lone `10` tweaks day-of-month, etc.); those field
+        // tweaks are not reproduced here — only the accept/reject decision is
+        // observable, since this path is only reached for values git treats as
+        // "roughly now".
+        if let Ok(n) = value.trim().parse::<i64>() {
+            if n >= 100_000_000 {
+                return Some(n);
+            }
+        }
+        return now
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs() as i64);
+    }
     None
+}
+
+/// git's `approxidate_str()` reports a malformed date only when its `touched`
+/// flag stays clear: the string held no recognisable date token. A digit run
+/// always sets it; an alpha run sets it only when the whole run is a recognised
+/// word (see `is_date_word`). Reproducing that predicate is what keeps
+/// `--expire`'s exit code (128 vs 0) in step with stock git on edge input.
+fn approxidate_touched(value: &str) -> bool {
+    if value.bytes().any(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    // git calls `approxidate_alpha` at the start of each alpha run and consumes
+    // the whole run; a keyword only counts when it *is* that run. Walk maximal
+    // ASCII-alphabetic runs and test each in isolation.
+    let mut rest = value;
+    while let Some(start) = rest.find(|c: char| c.is_ascii_alphabetic()) {
+        let tail = &rest[start..];
+        let end = tail
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(tail.len());
+        if is_date_word(&tail[..end]) {
+            return true;
+        }
+        rest = &tail[end..];
+    }
+    false
+}
+
+/// A single alpha token stock git's approxidate recognises on its own, and so
+/// sets `touched` for: the number words `one`..`ten` and `last`, the time
+/// keywords `am`/`pm`/`noon`/`midnight`/`tea`/`yesterday`/`today`/`now`/`never`,
+/// or a `>= 3` character prefix of a full month name (`now` and `never` are also
+/// approxidate keywords, distinct from the whole-string literals handled
+/// earlier; `all` and `false` are only literals). Weekday names (`monday`) and bare
+/// unit words (`week`, `day`, `hour`, ...) are deliberately absent: git leaves
+/// `touched` clear for them, so standing alone they are malformed dates.
+fn is_date_word(token: &str) -> bool {
+    let t = token.to_ascii_lowercase();
+    if matches!(
+        t.as_str(),
+        "one" | "two"
+            | "three"
+            | "four"
+            | "five"
+            | "six"
+            | "seven"
+            | "eight"
+            | "nine"
+            | "ten"
+            | "last"
+            | "am"
+            | "pm"
+            | "noon"
+            | "midnight"
+            | "tea"
+            | "yesterday"
+            | "today"
+            // `now` and `never` are also approxidate keywords in their own
+            // right, recognised anywhere in the string. The whole-string forms
+            // are special-cased before this runs, but as a sub-token (e.g.
+            // `now.ago`, `x never`) they still have to set `touched`. `all` and
+            // `false` are *not* approxidate keywords — only the two literals.
+            | "now"
+            | "never"
+    ) {
+        return true;
+    }
+    const MONTHS: [&str; 12] = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    t.len() >= 3 && MONTHS.iter().any(|m| m.starts_with(t.as_str()))
 }
 
 /// The spellings to try for a date, in order. git's approxidate tokenises on

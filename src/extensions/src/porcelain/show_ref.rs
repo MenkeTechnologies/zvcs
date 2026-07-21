@@ -99,7 +99,7 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
                 _ if long.starts_with("exclude-existing=") => {
                     bail!("unsupported flag \"--exclude-existing=\" ({PORTED})")
                 }
-                _ => bail!("unsupported flag {a:?} ({PORTED})"),
+                _ => return unknown_option("option", long),
             }
             continue;
         }
@@ -123,14 +123,17 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
                         continue;
                     }
                 }
-                c => bail!("unsupported flag \"-{c}\" ({PORTED})"),
+                c => return unknown_option("switch", &c.to_string()),
             }
             i += 1;
         }
     }
 
+    // git validates the parsed options (unknown flag / numeric value above, exit
+    // 129) *before* this post-parse compatibility check, which is a plain `die()`
+    // — a single `fatal:` line and exit 128, with no usage block.
     if exists && verify {
-        bail!("--exists and --verify are mutually exclusive");
+        return die_incompatible("--verify", "--exists");
     }
 
     let repo = gix::discover(".")?;
@@ -155,6 +158,53 @@ const PORTED: &str = "ported: --head, -d/--dereference, -s/--hash[=<n>], \
 fn numeric_error(name: &str) -> Result<ExitCode> {
     eprintln!("error: option `{name}' expects a numerical value");
     Ok(ExitCode::from(129))
+}
+
+/// git's parse-options usage block for `show-ref`, printed on stderr after the
+/// `error:` line on any usage error (exit 129). Byte-for-byte from stock git
+/// 2.55.0's `usage_with_options()`; ends with the trailing blank line git emits.
+const USAGE: &str = r#"usage: git show-ref [--head] [-d | --dereference]
+                    [-s | --hash[=<n>]] [--abbrev[=<n>]] [--branches] [--tags]
+                    [--] [<pattern>...]
+   or: git show-ref --verify [-q | --quiet] [-d | --dereference]
+                    [-s | --hash[=<n>]] [--abbrev[=<n>]]
+                    [--] [<ref>...]
+   or: git show-ref --exclude-existing[=<pattern>]
+   or: git show-ref --exists <ref>
+
+    --[no-]tags           only show tags (can be combined with --branches)
+    --[no-]branches       only show branches (can be combined with --tags)
+    --[no-]exists         check for reference existence without resolving
+    --[no-]verify         stricter reference checking, requires exact ref path
+    --[no-]head           show the HEAD reference, even if it would be filtered out
+    -d, --[no-]dereference
+                          dereference tags into object IDs
+    -s, --[no-]hash[=<n>] only show SHA1 hash using <n> digits
+    --[no-]abbrev[=<n>]   use <n> digits to display object names
+    -q, --[no-]quiet      do not print results to stdout (useful with --verify)
+    --exclude-existing[=<pattern>]
+                          show refs from stdin that aren't in local repository
+
+"#;
+
+/// git's parse-options rejection of an unrecognized flag, printed as
+/// `error: unknown <kind> <name>` in git's quoting. `kind` is "option" for a
+/// `--long` flag and "switch" for a short one; short groups report the single
+/// offending character. Prints the usage block and exits 129 — the usage-error
+/// code, not `bail!`'s collapsed 1.
+fn unknown_option(kind: &str, name: &str) -> Result<ExitCode> {
+    eprintln!("error: unknown {kind} `{name}'");
+    eprint!("{USAGE}");
+    Ok(ExitCode::from(129))
+}
+
+/// git's `die_for_incompatible_opt`: two flags that cannot be combined. Unlike
+/// the parse-options 129 path this is a plain `die()` — one `fatal:` line, no
+/// usage block, exit 128. The message names the options in git's fixed order
+/// regardless of the order they appeared on the command line.
+fn die_incompatible(a: &str, b: &str) -> Result<ExitCode> {
+    eprintln!("fatal: options '{a}' and '{b}' cannot be used together");
+    Ok(ExitCode::from(128))
 }
 
 /// Parse an `--abbrev=<n>` / `--hash=<n>` value exactly as git's

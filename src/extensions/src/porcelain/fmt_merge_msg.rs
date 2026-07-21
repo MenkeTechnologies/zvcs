@@ -29,7 +29,8 @@
 //!   * annotated (unsigned) tag bodies spliced in ahead of the shortlog, and the
 //!     commented origin headers git inserts once a second tag shows up.
 //!   * `merge.branchdesc` (`branch.<name>.description`, rendered as `  : ` lines).
-//!   * `-F`/`--file <path>` (`-` means stdin), lines marked `not-for-merge`, and
+//!   * `-F`/`--file <path>` (`-` and an empty value both mean stdin), lines
+//!     marked `not-for-merge`, and
 //!     tips already reachable from `HEAD`, which `reduce_heads` drops.
 //!   * the negated spellings `parse_options` derives from the option table:
 //!     `--no-message` and `--no-into-name` clear their value, `--no-log` /
@@ -249,7 +250,11 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
 
     let mut input = Vec::new();
     match inpath.as_deref() {
-        Some(path) if path != "-" => {
+        // An empty `--file=` / `-F ''` value is not a filename: git's
+        // `fix_filename()` leaves it unprefixed and the builtin never opens it,
+        // so the input comes from stdin (checked against git 2.55, at the repo
+        // root and from a subdirectory). `-` is likewise stdin.
+        Some(path) if path != "-" && !path.is_empty() => {
             // `xfopen()` dies; `die()` is exit 128, not anyhow's 1.
             let mut file = match std::fs::File::open(path) {
                 Ok(file) => file,

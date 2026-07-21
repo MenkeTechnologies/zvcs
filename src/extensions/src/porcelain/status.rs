@@ -66,10 +66,14 @@ enum Untracked {
 pub fn status(args: &[String]) -> Result<ExitCode> {
     let mut short = false;
     let mut branch_header = false;
-    // `None` until a flag names a mode, so `status.showUntrackedFiles` still wins
-    // when the caller stays silent, exactly as git resolves it.
-    let mut untracked_flag: Option<Untracked> = None;
-    let mut show_ignored = false;
+    // `--untracked-files` and `--ignored` are git OPT_STRING options: the raw
+    // argument is *stored* during parsing (last occurrence wins; the `--no-`
+    // form resets it to unspecified) and validated exactly once *after* the whole
+    // command line is parsed. So an intermediate invalid value that a later flag
+    // overrides must never error. `None` means unspecified — for untracked that
+    // lets `status.showUntrackedFiles` win, for ignored it means "do not show".
+    let mut untracked_arg: Option<String> = None;
+    let mut ignored_arg: Option<String> = None;
     // `None` keeps git's configured default (`status.renames`/`diff.renames`).
     let mut renames: Option<Option<gix::diff::Rewrites>> = None;
 
@@ -85,17 +89,13 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             "-z" | "--null" => anyhow::bail!("NUL-terminated output (-z) is not supported"),
             "-b" | "--branch" => branch_header = true,
             "--no-branch" => branch_header = false,
-            "--ignored" | "--ignored=traditional" | "--ignored=matching" => show_ignored = true,
-            "--ignored=no" | "--no-ignored" => show_ignored = false,
-            "-u" | "--untracked-files" | "-uall" | "--untracked-files=all" => {
-                untracked_flag = Some(Untracked::All);
-            }
-            "-uno" | "--untracked-files=no" | "--no-untracked-files" => {
-                untracked_flag = Some(Untracked::No);
-            }
-            "-unormal" | "--untracked-files=normal" => {
-                untracked_flag = Some(Untracked::Normal);
-            }
+            // Bare forms take git's default optarg ("all" / "traditional"); the
+            // `--no-` forms reset to unspecified. Attached values (`--...=<v>`,
+            // `-u<v>`) are captured raw below and validated after the loop.
+            "--untracked-files" => untracked_arg = Some("all".to_string()),
+            "--no-untracked-files" => untracked_arg = None,
+            "--ignored" => ignored_arg = Some("traditional".to_string()),
+            "--no-ignored" => ignored_arg = None,
             // Everything after `--` is a pathspec; the pathspec arm below rejects
             // any that follow, and a trailing `--` on its own is a no-op.
             "--" => {}
@@ -112,19 +112,10 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(128));
             }
             _ if s.starts_with("--untracked-files=") => {
-                let mode = &s["--untracked-files=".len()..];
-                match parse_untracked_mode(mode) {
-                    Some(m) => untracked_flag = Some(m),
-                    None => {
-                        eprintln!("fatal: Invalid untracked files mode '{mode}'");
-                        return Ok(ExitCode::from(128));
-                    }
-                }
+                untracked_arg = Some(s["--untracked-files=".len()..].to_string());
             }
             _ if s.starts_with("--ignored=") => {
-                let mode = &s["--ignored=".len()..];
-                eprintln!("fatal: Invalid ignored mode '{mode}'");
-                return Ok(ExitCode::from(128));
+                ignored_arg = Some(s["--ignored=".len()..].to_string());
             }
             _ if s.starts_with("--find-renames=") || s.starts_with("-M") => {
                 let raw = s
@@ -157,17 +148,12 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                         'z' => anyhow::bail!("NUL-terminated output (-z) is not supported"),
                         'u' => {
                             // A bare `-u` (no attached value) is git's `all` default;
-                            // an attached value parses exactly as `--untracked-files=`.
-                            untracked_flag = Some(if rest.is_empty() {
-                                Untracked::All
+                            // an attached value is captured raw and validated after
+                            // the loop, exactly as `--untracked-files=`.
+                            untracked_arg = Some(if rest.is_empty() {
+                                "all".to_string()
                             } else {
-                                match parse_untracked_mode(rest) {
-                                    Some(m) => m,
-                                    None => {
-                                        eprintln!("fatal: Invalid untracked files mode '{rest}'");
-                                        return Ok(ExitCode::from(128));
-                                    }
-                                }
+                                rest.to_string()
                             });
                             break;
                         }
@@ -193,6 +179,33 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             _ => anyhow::bail!("pathspec-limited status ({a:?}) is not supported"),
         }
     }
+
+    // Validate the deferred OPT_STRING modes now that the whole command line is
+    // parsed, in git's own order: `--untracked-files` first, then `--ignored`.
+    // Only the final stored value is checked; a bad value dies with exit 128.
+    let untracked_flag: Option<Untracked> = match &untracked_arg {
+        Some(v) => match parse_untracked_mode(v) {
+            Some(m) => Some(m),
+            None => {
+                eprintln!("fatal: Invalid untracked files mode '{v}'");
+                return Ok(ExitCode::from(128));
+            }
+        },
+        None => None,
+    };
+    let show_ignored = match &ignored_arg {
+        // git accepts exactly these three ignored modes (no boolean coercion);
+        // `no` is valid but suppresses the listing, anything else is fatal.
+        Some(v) => match v.as_str() {
+            "traditional" | "matching" => true,
+            "no" => false,
+            _ => {
+                eprintln!("fatal: Invalid ignored mode '{v}'");
+                return Ok(ExitCode::from(128));
+            }
+        },
+        None => false,
+    };
 
     let repo = gix::discover(".")?;
 

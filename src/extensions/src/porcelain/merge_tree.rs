@@ -15,8 +15,10 @@
 //!     `--write-tree` (the default mode), `--`
 //!   * the whole option grammar, including every `-X`/`--strategy-option`
 //!     spelling git accepts, `--no-strategy-option`, `--trivial-merge`'s
-//!     "incompatible with all other options" rule, and git's usage/`error:`
-//!     diagnostics with their 128/129 exit codes
+//!     "incompatible with all other options" rule, the `--quiet` +
+//!     `--messages` mutual-exclusion `die()` (exit 128, checked before operand
+//!     count), and git's usage/`error:` diagnostics with their 128/129 exit
+//!     codes
 //!   * the strategy options `ours`, `theirs`, `no-renames`, `find-renames`,
 //!     `find-renames=<n>`, `rename-threshold=<n>`, `histogram`,
 //!     `diff-algorithm=myers|default|minimal|histogram`, and the no-op
@@ -228,6 +230,18 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
             }
         }
         i += 1;
+    }
+
+    // git's first post-parse check: `--quiet` and an explicit `--messages`
+    // (the final value after `--messages`/`--no-messages` resolution) are
+    // mutually exclusive. It `die()`s — exit 128 — before it validates the
+    // strategy options, the trivial-merge exclusivity rule or the operand
+    // count, so it outranks all of those. Parse-time diagnostics (unknown
+    // option, `--write-tree`/`--trivial-merge` clash) still win because they
+    // fire during parsing, before this point is reached.
+    if quiet && show_messages == Some(true) {
+        eprintln!("fatal: options '--quiet' and '--messages' cannot be used together");
+        return Ok(ExitCode::from(128));
     }
 
     // How many argv slots parse-options consumed as options. `--trivial-merge`

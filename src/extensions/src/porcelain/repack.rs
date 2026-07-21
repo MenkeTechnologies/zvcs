@@ -186,7 +186,8 @@ const USAGE: &str = r#"usage: git repack [-a] [-A] [-d] [-f] [-F] [-l] [-n] [-q]
 enum Kind {
     /// `OPT_BOOL`/`OPT_BIT`: no value; `--opt=x` is an error.
     Bool,
-    /// `OPT_INTEGER`: signed, optional single `k`/`m`/`g` suffix.
+    /// `OPT_INTEGER`: signed base-0 integer (`0x` hex, leading-`0` octal, decimal),
+    /// with an optional single `k`/`m`/`g` suffix.
     Int,
     /// `OPT_MAGNITUDE`: as `Int` but non-negative.
     Magnitude,
@@ -688,29 +689,91 @@ fn long_opt(body: &str, args: &[String], i: &mut usize, st: &mut State) -> Optio
     None
 }
 
-/// git's `OPT_INTEGER` value, scaled by an optional single `k`/`m`/`g` factor of
-/// 1024, or `None` when the text is not a number at all. Computed in `i128` so
-/// that a value far outside `long` still yields a magnitude the range check can
-/// reject, matching `strtol`'s `ERANGE` path.
-fn scaled(v: &str) -> Option<i128> {
-    let (negative, rest) = match v.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, v),
+/// Mirror C `strtol`/`strtoumax` with **base 0**, which is how git parses every
+/// numeric option value (`OPT_INTEGER`, `OPT_MAGNITUDE`) and the numbers inside a
+/// `--filter` spec: skip leading ASCII whitespace, an optional `+`/`-` sign, then
+/// a base-0 integer — `0x`/`0X` hexadecimal, a leading `0` octal, otherwise
+/// decimal. Returns `(negative, magnitude, unparsed-remainder)`, or `None` when no
+/// digit is consumed at all (git's `end == value`, an `EINVAL`). The magnitude is
+/// accumulated in `u128` and saturates, so a literal too large for any integer
+/// type still reaches the caller's range check instead of wrapping.
+fn c_strtol(s: &str) -> Option<(bool, u128, &str)> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let neg = match b.get(i) {
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        _ => false,
     };
-    let (digits, factor) = match rest.chars().last() {
-        Some('k' | 'K') => (&rest[..rest.len() - 1], 1024i128),
-        Some('m' | 'M') => (&rest[..rest.len() - 1], 1024 * 1024),
-        Some('g' | 'G') => (&rest[..rest.len() - 1], 1024 * 1024 * 1024),
-        _ => (rest, 1),
+
+    // base-0 prefix detection: `0x`/`0X` before a hex digit is hexadecimal, a bare
+    // leading `0` is octal, everything else decimal. A `0x` with no hex digit
+    // after it parses as just the `0` (`strtol` stops at the `x`).
+    let (base, start): (u32, usize) = if b.get(i) == Some(&b'0')
+        && matches!(b.get(i + 1), Some(b'x' | b'X'))
+    {
+        match b.get(i + 2) {
+            Some(c) if (*c as char).is_ascii_hexdigit() => (16, i + 2),
+            _ => return Some((neg, 0, &s[i + 1..])),
+        }
+    } else if b.get(i) == Some(&b'0') {
+        (8, i)
+    } else {
+        (10, i)
     };
-    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+
+    let mut val: u128 = 0;
+    let mut j = start;
+    while j < b.len() {
+        match (b[j] as char).to_digit(base) {
+            Some(d) => {
+                val = val.saturating_mul(base as u128).saturating_add(d as u128);
+                j += 1;
+            }
+            None => break,
+        }
+    }
+    if j == start {
         return None;
     }
-    // A literal too long for `i128` is out of range by any measure; saturating
-    // keeps it on the range-error path instead of the type-error one.
-    let n = digits.parse::<i128>().unwrap_or(i128::MAX / factor);
-    let n = n.saturating_mul(factor);
-    Some(if negative { -n } else { n })
+    Some((neg, val, &s[j..]))
+}
+
+/// git's `get_unit_factor`: the text after the digits must be empty or exactly one
+/// of `k`/`m`/`g` (either case). A multi-character remainder (`10kg`, `10x`) is
+/// not a valid suffix and makes the whole value invalid.
+fn unit_factor(rest: &str) -> Option<u128> {
+    if rest.is_empty() {
+        Some(1)
+    } else if rest.eq_ignore_ascii_case("k") {
+        Some(1024)
+    } else if rest.eq_ignore_ascii_case("m") {
+        Some(1024 * 1024)
+    } else if rest.eq_ignore_ascii_case("g") {
+        Some(1024 * 1024 * 1024)
+    } else {
+        None
+    }
+}
+
+/// The scaled signed value of a git number — a base-0 integer times its optional
+/// `k`/`m`/`g` factor — or `None` when the text is not a valid number. Used where
+/// only the value matters and the caller applies its own sign/range rule
+/// (`blob:limit=<n>`, `tree:<depth>`, `--name-hash-version`).
+fn scaled(v: &str) -> Option<i128> {
+    let (neg, val, rest) = c_strtol(v)?;
+    let factor = unit_factor(rest)?;
+    let n = val.saturating_mul(factor).min(i128::MAX as u128) as i128;
+    Some(if neg { -n } else { n })
 }
 
 /// Validate a `--filter` spec the way `gently_parse_list_objects_filter` does,
@@ -769,13 +832,7 @@ fn check_value(def: &OptDef, shown: &str, v: &str) -> Option<ExitCode> {
     let label = format!("option `{shown}'");
     match def.kind {
         Kind::Int => int_value(&label, v).err(),
-        Kind::Magnitude if v.is_empty() => Some(numerical_value(&label)),
-        Kind::Magnitude if !is_number(v, false) => {
-            eprintln!(
-                "error: {label} expects a non-negative integer value with an optional k/m/g suffix"
-            );
-            Some(ExitCode::from(129))
-        }
+        Kind::Magnitude => magnitude_value(&label, v),
         Kind::OptStr if def.long == "write-midx" && !WRITE_MIDX_MODES.contains(&v) => {
             eprintln!("error: unknown value for write-midx: {v}");
             Some(ExitCode::from(129))
@@ -793,20 +850,27 @@ fn numerical_value(label: &str) -> ExitCode {
 /// Parse an `OPT_INTEGER` value for the already-formatted `label` (e.g.
 /// ``option `geometric'`` or ``switch `g'``), emitting git's type diagnostic for
 /// non-numbers and its range diagnostic for anything a C `int` cannot hold
-/// (`--name-hash-version=3g` scales to 3 GiB and hits the latter). Every one of
-/// these prints a single line and exits 129, with no usage block.
+/// (`--name-hash-version=3g` scales to 3 GiB and hits the latter). The accepted
+/// range is `[-2147483648, 2147483647]`: git's `git_parse_signed` allows the
+/// magnitude to reach `INT_MAX + 1` when the value is negative, so `INT_MIN` is in
+/// range. Every one of these prints a single line and exits 129, with no usage
+/// block.
 fn int_value(label: &str, v: &str) -> Result<i64, ExitCode> {
     if v.is_empty() {
         return Err(numerical_value(label));
     }
-    let n = match scaled(v) {
-        Some(n) => n,
+    // A non-number (`end == value`) and an unrecognised suffix (`10x`, `10kg`) are
+    // both `EINVAL` in git and share this one diagnostic.
+    let (neg, val, factor) = match c_strtol(v).and_then(|(n, val, rest)| unit_factor(rest).map(|f| (n, val, f))) {
+        Some(parsed) => parsed,
         None => {
             eprintln!("error: {label} expects an integer value with an optional k/m/g suffix");
             return Err(ExitCode::from(129));
         }
     };
-    if n < i32::MIN as i128 || n > i32::MAX as i128 {
+    let product = val.saturating_mul(factor);
+    let max = i32::MAX as u128 + if neg { 1 } else { 0 };
+    if product > max {
         eprintln!(
             "error: value {v} for {label} not in range [{},{}]",
             i32::MIN,
@@ -814,7 +878,47 @@ fn int_value(label: &str, v: &str) -> Result<i64, ExitCode> {
         );
         return Err(ExitCode::from(129));
     }
-    Ok(n as i64)
+    let n = product as i64;
+    Ok(if neg { -n } else { n })
+}
+
+/// Parse an `OPT_MAGNITUDE` value: as [`int_value`] but non-negative, with git's
+/// `unsigned long` ceiling (`u64::MAX`, printed by git as `-1`). git's
+/// `git_parse_unsigned` rejects a literal leading `-` outright, before parsing,
+/// with the type diagnostic rather than a range one.
+fn magnitude_value(label: &str, v: &str) -> Option<ExitCode> {
+    if v.is_empty() {
+        return Some(numerical_value(label));
+    }
+    let type_err = || {
+        eprintln!(
+            "error: {label} expects a non-negative integer value with an optional k/m/g suffix"
+        );
+        Some(ExitCode::from(129))
+    };
+    if v.starts_with('-') {
+        return type_err();
+    }
+    let (neg, val, rest) = match c_strtol(v) {
+        Some(parsed) => parsed,
+        None => return type_err(),
+    };
+    // A sign can only remain after leading whitespace here; git would let
+    // `strtoumax` wrap it, but that path is unreachable in practice, so reject it.
+    if neg {
+        return type_err();
+    }
+    let factor = match unit_factor(rest) {
+        Some(f) => f,
+        None => return type_err(),
+    };
+    match val.checked_mul(factor) {
+        Some(p) if p <= u64::MAX as u128 => None,
+        _ => {
+            eprintln!("error: value {v} for {label} not in range [0,-1]");
+            Some(ExitCode::from(129))
+        }
+    }
 }
 
 /// Record the effect of long option `OPTS[idx]`; `negated` is true for the
@@ -976,22 +1080,6 @@ fn short_opts(cluster: &str, args: &[String], i: &mut usize, st: &mut State) -> 
     }
     *i += 1;
     None
-}
-
-/// git's number grammar for `OPT_INTEGER` / `OPT_MAGNITUDE`: digits with an
-/// optional single `k`/`m`/`g` suffix (either case), and a sign only when
-/// `signed` (i.e. never for a magnitude).
-fn is_number(v: &str, signed: bool) -> bool {
-    let digits = match v.strip_prefix('-') {
-        Some(rest) if signed => rest,
-        Some(_) => return false,
-        None => v,
-    };
-    let digits = match digits.chars().last() {
-        Some('k' | 'K' | 'm' | 'M' | 'g' | 'G') => &digits[..digits.len() - 1],
-        _ => digits,
-    };
-    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
 /// The option conflicts stock git rejects before it does any work, in git's own

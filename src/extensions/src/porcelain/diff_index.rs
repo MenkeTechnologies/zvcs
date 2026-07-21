@@ -49,14 +49,29 @@
 //! Status letters produced: `A`, `D`, `T` (the `S_IFMT` bits of the two modes differ,
 //! e.g. file ↔ symlink), `M`, and `U` for unmerged paths under `--cached`.
 //!
-//! Options that only steer patch, stat or colour rendering (`--color[=<when>]`, `-D`,
+//! Options that only steer patch, stat or colour rendering (`--color` bare, `-D`,
 //! `--ws-error-highlight=`, `--src-prefix=`/`--dst-prefix=`/`--no-prefix`,
-//! `--diff-algorithm=`, `--anchored=`, `--color-moved[=]`, `--word-diff[=]`,
-//! `--submodule` (bare or `=short|log|diff`; any other value is rejected 129 as git
-//! does), `--ignore-submodules[=]`, `--skip-to=`, `--rotate-to=`,
-//! `--ignore-blank-lines`, `-B`, `-l<n>`, `-a`/`--text`, `-W`, …) are accepted and
-//! ignored: stock git's raw, `--name-only` and `--name-status` bytes are identical with
-//! and without them. The full list is `render_only_option`.
+//! `--diff-algorithm=`, `--anchored=`, `--color-moved[=]`, `--word-diff` bare,
+//! `--ignore-submodules` bare, `--ignore-blank-lines`, `-B`, `-l<n>`, `-a`/`--text`,
+//! `-W`, …) are accepted and ignored: stock git's raw, `--name-only` and `--name-status`
+//! bytes are identical with and without them. The full list is `render_only_option`.
+//!
+//! A handful of options carry a value git validates during its single left-to-right
+//! parse, so this module validates it too and reproduces git's exact code and message at
+//! the option's argv position (a bad revision earlier in argv still wins first):
+//!
+//!   * `--submodule=<v>` — only `short|log|diff`; else exit 129
+//!     `error: failed to parse --submodule option parameter: '<v>'`.
+//!   * `--color=<when>` — only `always|auto|never` (case-insensitive); else exit 129
+//!     ``error: option `color' expects "always", "auto", or "never"``.
+//!   * `--word-diff=<mode>` — only `plain|color|porcelain|none`; else exit 129
+//!     `error: bad --word-diff argument: <mode>`.
+//!   * `--ignore-submodules=<v>` — only `none|untracked|dirty|all`; else exit 128
+//!     `fatal: bad --ignore-submodules argument: <v>`.
+//!   * `--skip-to=<path>` / `--rotate-to=<path>` — git reorders the queued pairs so
+//!     output starts at `<path>` (skip drops the earlier pairs, rotate wraps them to the
+//!     end); a `<path>` naming no queued pair is exit 128
+//!     `fatal: No such path '<path>' in the diff`, but only for a non-empty diff.
 //!
 //! ### Honest limitations (bailed on with a precise message, never faked)
 //!
@@ -159,6 +174,12 @@ struct Opts {
     /// `DIFF_FORMAT_RAW` only when nothing else was asked for, so a bare `--dirstat`
     /// prints directories alone while `--raw --dirstat` prints both.
     emit_pairs: bool,
+    /// `--skip-to=<path>` / `--rotate-to=<path>`: `(is_skip, path)`, last one wins.
+    /// git reorders the queued pairs at flush time so output starts at `<path>`; skip
+    /// drops everything before it, rotate wraps the earlier pairs to the end. A `<path>`
+    /// that names no queued pair is fatal (`No such path '<path>' in the diff`, exit 128),
+    /// but only when the queue is non-empty — an all-clean diff never validates it.
+    skip_or_rotate: Option<(bool, BString)>,
 }
 
 /// One file-level change, already reduced to the columns git's raw format prints.
@@ -294,25 +315,22 @@ fn render_only_option(a: &str) -> bool {
         "--textconv",
         "--word-diff",
     ];
+    // NB: the value-validated options `--color=`, `--word-diff=`, `--ignore-submodules=`,
+    // `--submodule=`, `--skip-to=` and `--rotate-to=` are handled by dedicated arms in the
+    // parse loop (they can fail), so they deliberately do *not* appear here.
     const WITH_VALUE: &[&str] = &[
         "--anchored=",
         "--break-rewrites=",
-        "--color=",
         "--color-moved=",
         "--color-moved-ws=",
         "--diff-algorithm=",
         "--diff-merges=",
         "--dst-prefix=",
-        "--ignore-submodules=",
         "--inter-hunk-context=",
         "--output-indicator-context=",
         "--output-indicator-new=",
         "--output-indicator-old=",
-        "--rotate-to=",
-        "--skip-to=",
         "--src-prefix=",
-        "--submodule=",
-        "--word-diff=",
         "--word-diff-regex=",
         "--ws-error-highlight=",
     ];
@@ -447,6 +465,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         detect_rename: false,
         dirstat: None,
         emit_pairs: true,
+        skip_or_rotate: None,
     };
     let mut quiet = false;
     let mut merge_base = false;
@@ -479,14 +498,16 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let mut unsupported: Option<String> = None;
     // The first patch/stat rendering asked for, which this module cannot produce.
     let mut bad_format: Option<String> = None;
-    // The first `--submodule=<bad>` and its argv index. git rejects an unparseable
-    // submodule format with `error: failed to parse --submodule option parameter` and
-    // exit 129, but it does so at the option's position in its single left-to-right
-    // parse — so a bad revision that appears *earlier* in argv dies first with exit 128.
-    // Deferring the error (rather than returning the moment the flag is seen) is what
-    // lets `does-not-exist --submodule=-1 HEAD` reproduce git's 128 while
-    // `HEAD --submodule=-1 does-not-exist` still reproduces its 129.
-    let mut bad_submodule: Option<(usize, String)> = None;
+    // The first option whose *value* git rejects during its single left-to-right parse,
+    // as `(argv index, exit code, exact stderr bytes)`. git validates such values inline
+    // with `handle_revision_arg`, so a bad revision appearing *earlier* in argv dies first
+    // (exit 128, `ambiguous argument`) while the same bad option appearing earlier wins.
+    // Held with its argv index — rather than returned the moment the flag is seen — so the
+    // positional scan can fire whichever error git's single pass would hit first. Covers
+    // `--submodule=` (129), `--color=` (129), `--word-diff=` (129) and
+    // `--ignore-submodules=` (128); `get_or_insert` keeps the earliest since the scan runs
+    // left to right.
+    let mut deferred: Option<(usize, u8, Vec<u8>)> = None;
 
     // git `die()`s on a bad dirstat parameter the moment it parses it, before it looks
     // at anything else on the command line, so each call site returns straight away.
@@ -596,8 +617,59 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 // still wins with git's 128, matching git's single left-to-right parse.
                 let val = &s["--submodule=".len()..];
                 if !matches!(val, "short" | "log" | "diff") {
-                    bad_submodule.get_or_insert((cur, val.to_owned()));
+                    deferred.get_or_insert((
+                        cur,
+                        129,
+                        format!("error: failed to parse --submodule option parameter: '{val}'\n").into_bytes(),
+                    ));
                 }
+            }
+            s if s.starts_with("--color=") => {
+                // `OPT_COLOR_FLAG` → `git_config_colorbool`: `--color=<when>` accepts only
+                // `always`, `auto` or `never` (case-insensitively); anything else, empty
+                // included, is exit 129. Bare `--color` (below, `render_only_option`) means
+                // `always` and is always accepted.
+                let val = &s["--color=".len()..];
+                if !matches!(val.to_ascii_lowercase().as_str(), "always" | "auto" | "never") {
+                    deferred.get_or_insert((
+                        cur,
+                        129,
+                        b"error: option `color' expects \"always\", \"auto\", or \"never\"\n".to_vec(),
+                    ));
+                }
+            }
+            s if s.starts_with("--word-diff=") => {
+                // `diff_opt_word_diff`: `--word-diff=<mode>` accepts only `plain`, `color`,
+                // `porcelain` or `none` (case-sensitively); anything else, empty included,
+                // is exit 129. Bare `--word-diff` means `plain` and is accepted above.
+                let val = &s["--word-diff=".len()..];
+                if !matches!(val, "plain" | "color" | "porcelain" | "none") {
+                    deferred.get_or_insert((
+                        cur,
+                        129,
+                        format!("error: bad --word-diff argument: {val}\n").into_bytes(),
+                    ));
+                }
+            }
+            s if s.starts_with("--ignore-submodules=") => {
+                // `parse_ignore_submodules_arg`: `--ignore-submodules=<value>` accepts only
+                // `none`, `untracked`, `dirty` or `all` (case-sensitively); anything else,
+                // empty included, is `fatal: bad --ignore-submodules argument: <value>`
+                // (exit 128). Bare `--ignore-submodules` is accepted above.
+                let val = &s["--ignore-submodules=".len()..];
+                if !matches!(val, "none" | "untracked" | "dirty" | "all") {
+                    deferred.get_or_insert((
+                        cur,
+                        128,
+                        format!("fatal: bad --ignore-submodules argument: {val}\n").into_bytes(),
+                    ));
+                }
+            }
+            s if s.starts_with("--skip-to=") => {
+                opts.skip_or_rotate = Some((true, s["--skip-to=".len()..].into()));
+            }
+            s if s.starts_with("--rotate-to=") => {
+                opts.skip_or_rotate = Some((false, s["--rotate-to=".len()..].into()));
             }
             s if s.len() > 2 && s.starts_with("-I") => {
                 ignore_arg = Some(s[2..].as_bytes().to_vec());
@@ -678,13 +750,13 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let mut pending = 0usize;
     let mut pathspec_mode = false;
     for (idx, arg) in &positionals {
-        // git parses left to right: a `--submodule=<bad>` sitting *before* this
-        // positional would already have died with exit 129, so fire that deferred error
-        // now rather than resolving a positional git never reached.
-        if let Some((sub_idx, val)) = &bad_submodule {
-            if sub_idx < idx {
-                eprintln!("error: failed to parse --submodule option parameter: '{val}'");
-                return Ok(ExitCode::from(129));
+        // git parses left to right: an option-value error sitting *before* this positional
+        // would already have died at its argv position, so fire that deferred error now
+        // rather than resolving a positional git never reached.
+        if let Some((err_idx, code, msg)) = &deferred {
+            if err_idx < idx {
+                std::io::stderr().lock().write_all(msg)?;
+                return Ok(ExitCode::from(*code));
             }
         }
         if pathspec_mode {
@@ -711,11 +783,11 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             paths.push(arg.as_str().into());
         }
     }
-    // A `--submodule=<bad>` after every positional (or with no positional that failed
+    // An option-value error after every positional (or with no positional that failed
     // first) is git's next parse error, ahead of the "exactly one revision" usage check.
-    if let Some((_, val)) = &bad_submodule {
-        eprintln!("error: failed to parse --submodule option parameter: '{val}'");
-        return Ok(ExitCode::from(129));
+    if let Some((_, code, msg)) = &deferred {
+        std::io::stderr().lock().write_all(msg)?;
+        return Ok(ExitCode::from(*code));
     }
     if pending != 1 {
         eprint!("{}", USAGE);
@@ -835,6 +907,33 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     }
     if !opts.filter_include.is_empty() || !opts.filter_exclude.is_empty() {
         deltas.retain(|d| passes_filter(d.status(), &opts));
+    }
+
+    // git's `diff_flush()` reorders the queued pairs for `--skip-to`/`--rotate-to` before
+    // any output format runs: it scans the queue for the first pair whose path matches and
+    // `die()`s with exit 128 when none does — but only for a non-empty queue, so an
+    // all-clean diff accepts any target. The comparison is against the repository-root
+    // path, exactly as it is against `p->two->path`, so the target is used verbatim (never
+    // cwd-prefixed). skip drops the pairs before the match; rotate wraps them to the end.
+    if let Some((is_skip, target)) = &opts.skip_or_rotate {
+        if !deltas.is_empty() {
+            match deltas.iter().position(|d| d.path == *target) {
+                Some(k) => {
+                    if *is_skip {
+                        deltas.drain(..k);
+                    } else {
+                        deltas.rotate_left(k);
+                    }
+                }
+                None => {
+                    let mut msg = b"fatal: No such path '".to_vec();
+                    msg.extend_from_slice(target.as_slice());
+                    msg.extend_from_slice(b"' in the diff\n");
+                    std::io::stderr().lock().write_all(&msg)?;
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
     }
 
     if let Some(flag) = &bad_format {

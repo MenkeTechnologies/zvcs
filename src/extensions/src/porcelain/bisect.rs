@@ -7,7 +7,13 @@
 //! directly, since git keeps no reflog for them).
 //!
 //! Supported subcommands, with stdout/stderr and exit codes matching stock git:
-//!   * `git bisect start [<bad> [<good>...]]`
+//!   * `git bisect start [--term-(bad|new)=<t> --term-(good|old)=<t>]
+//!     [--no-checkout] [--first-parent] [<bad> [<good>...]] [--] [<pathspec>...]`
+//!     — the full argument grammar of git's `bisect_start`, including custom
+//!     terms (validated by `check_term_format`), the `--term-*` value taken in
+//!     either `=value` or following-token form, and git's revision-vs-pathspec
+//!     split (an unresolvable token starts the pathspec unless `--` is present,
+//!     in which case it is a fatal bad revision, exit 128).
 //!   * `git bisect bad|new [<rev>]`
 //!   * `git bisect good|old [<rev>...]`
 //!   * `git bisect terms [--term-good|--term-old|--term-bad|--term-new]`
@@ -27,8 +33,11 @@
 //!     pick a different midpoint; that is refused instead.
 //!   * A good revision that is not an ancestor of the bad one (git's
 //!     `Bisecting: a merge base must be tested` path).
-//!   * `skip`, `run`, `replay`, `visualize`/`view`, `next`, `help`, custom
-//!     `--term-*`, `--no-checkout`, `--first-parent`, and pathspec limiting.
+//!   * `skip`, `run`, `replay`, `visualize`/`view`, `next`, and `help`.
+//!   * Pathspec limiting is parsed and recorded in `BISECT_NAMES`, but it does
+//!     not constrain candidate selection, so a `--`-limited bisection with
+//!     revisions would pick a different midpoint; only the empty-pathspec case
+//!     (recording state, then reporting status) is faithful.
 //!   * The worktree update goes through this crate's `checkout`, which refuses to
 //!     switch across a dirty tracked worktree; stock git refuses with a different
 //!     message in the same situation.
@@ -262,6 +271,37 @@ fn terms_for_first_marking(word: &str) -> Option<Terms> {
     }
 }
 
+/// git's `check_term_format`: reject a custom term that is malformed, shadows a
+/// builtin subcommand, or would swap the fixed meaning of the `bad`/`new` and
+/// `good`/`old` families. `orig_term` is the side being set (`"bad"` or
+/// `"good"`). On failure the `Err` string is the exact `error: …` line git
+/// writes to stderr; on success `Ok(())`.
+fn check_term_format(term: &str, orig_term: &str) -> std::result::Result<(), String> {
+    // git validates `refs/bisect/<term>` through `check_refname_format`; the
+    // vendored validator answers the same question for a name with slashes.
+    let refname = format!("refs/bisect/{term}");
+    if gix::validate::reference::name(refname.as_bytes().as_bstr()).is_err() {
+        return Err(format!("error: '{term}' is not a valid term"));
+    }
+    if matches!(
+        term,
+        "help" | "start" | "skip" | "next" | "reset" | "visualize" | "view" | "replay" | "log"
+            | "run" | "terms"
+    ) {
+        return Err(format!(
+            "error: can't use the builtin command '{term}' as a term"
+        ));
+    }
+    if (orig_term != "bad" && matches!(term, "bad" | "new"))
+        || (orig_term != "good" && matches!(term, "good" | "old"))
+    {
+        return Err(format!(
+            "error: can't change the meaning of the term '{term}'"
+        ));
+    }
+    Ok(())
+}
+
 // --- subcommand: unknown -----------------------------------------------------
 
 /// git prints the "you're currently in a X/Y bisect" hint only when terms exist,
@@ -410,35 +450,104 @@ fn describe(repo: &gix::Repository, id: ObjectId) -> Result<String> {
 // --- subcommand: start -------------------------------------------------------
 
 fn start(args: &[String]) -> Result<ExitCode> {
-    for a in args {
-        match a.as_str() {
-            "--" => bail!("pathspec-limited bisection (`--`) is not supported"),
-            "--no-checkout" => {
-                bail!("unsupported flag \"--no-checkout\" (ported: <bad> [<good>...])")
-            }
-            "--first-parent" => {
-                bail!("unsupported flag \"--first-parent\" (ported: <bad> [<good>...])")
-            }
-            s if s.starts_with("--term-") => {
-                bail!("unsupported flag {s:?}: custom terms are not supported (ported: bad/good and new/old)")
-            }
-            s if s.starts_with('-') => bail!("unsupported flag {s:?} (ported: <bad> [<good>...])"),
-            _ => {}
-        }
-    }
-
     let ctx = Ctx::open()?;
 
-    // Resolve every revision before touching state, so a typo leaves the
-    // repository exactly as it was.
-    let mut resolved: Vec<ObjectId> = Vec::with_capacity(args.len());
-    for spec in args {
-        match resolve(&ctx.repo, spec) {
-            Ok(id) => resolved.push(id),
-            Err(_) => {
-                eprintln!("error: Bad rev input: {spec}");
+    let mut terms = Terms {
+        bad: "bad".into(),
+        good: "good".into(),
+    };
+    let mut no_checkout = false;
+    let mut first_parent = false;
+    let mut must_write_terms = false;
+    let mut resolved: Vec<ObjectId> = Vec::new();
+    let mut pathspecs: Vec<String> = Vec::new();
+
+    // git scans once for a `--`: its presence turns an unresolvable revision
+    // into a hard error rather than the start of the pathspec list.
+    let has_double_dash = args.iter().any(|a| a == "--");
+
+    // The argument grammar of `bisect_start`, ported faithfully: options and
+    // revisions may interleave, the `--term-*` flags take their value in either
+    // `=value` or a following-token form, and everything after `--` (or after
+    // the first token that is neither an option nor a resolvable revision) is a
+    // pathspec.
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            pathspecs = args[i + 1..].to_vec();
+            break;
+        } else if arg == "--no-checkout" {
+            no_checkout = true;
+        } else if arg == "--first-parent" {
+            first_parent = true;
+        } else if arg == "--term-good" || arg == "--term-old" {
+            i += 1;
+            let Some(v) = args.get(i) else {
+                eprintln!("error: '' is not a valid term");
                 return Ok(ExitCode::from(1));
+            };
+            must_write_terms = true;
+            terms.good = v.clone();
+        } else if let Some(v) = arg
+            .strip_prefix("--term-good=")
+            .or_else(|| arg.strip_prefix("--term-old="))
+        {
+            must_write_terms = true;
+            terms.good = v.to_owned();
+        } else if arg == "--term-bad" || arg == "--term-new" {
+            i += 1;
+            let Some(v) = args.get(i) else {
+                eprintln!("error: '' is not a valid term");
+                return Ok(ExitCode::from(1));
+            };
+            must_write_terms = true;
+            terms.bad = v.clone();
+        } else if let Some(v) = arg
+            .strip_prefix("--term-bad=")
+            .or_else(|| arg.strip_prefix("--term-new="))
+        {
+            must_write_terms = true;
+            terms.bad = v.to_owned();
+        } else if arg.starts_with("--") {
+            eprintln!("error: unrecognized option: '{arg}'");
+            return Ok(ExitCode::from(1));
+        } else {
+            match resolve(&ctx.repo, arg) {
+                Ok(id) => resolved.push(id),
+                Err(_) if has_double_dash => {
+                    eprintln!("fatal: '{arg}' does not appear to be a valid revision");
+                    return Ok(ExitCode::from(128));
+                }
+                // An unresolvable token with no `--` present starts the pathspec.
+                Err(_) => {
+                    pathspecs = args[i..].to_vec();
+                    break;
+                }
             }
+        }
+        i += 1;
+    }
+
+    // Naming any revision commits the session to the default terms.
+    if !resolved.is_empty() {
+        must_write_terms = true;
+    }
+
+    // git's `write_terms` gate, in its order: equality first, then the format
+    // of each side (bad before good). Each is a plain `error:` line, exit 1.
+    if must_write_terms {
+        if terms.bad == terms.good {
+            eprintln!("error: please use two different terms");
+            return Ok(ExitCode::from(1));
+        }
+        if let Err(msg) = check_term_format(&terms.bad, "bad") {
+            eprintln!("{msg}");
+            return Ok(ExitCode::from(1));
+        }
+        if let Err(msg) = check_term_format(&terms.good, "good") {
+            eprintln!("{msg}");
+            return Ok(ExitCode::from(1));
         }
     }
 
@@ -454,21 +563,32 @@ fn start(args: &[String]) -> Result<ExitCode> {
     let start_head = head_label(&ctx.repo)?;
     std::fs::create_dir_all(ctx.refs_dir())?;
     std::fs::write(ctx.file("BISECT_START"), format!("{start_head}\n"))?;
-    // The pathspec list, always empty here (pathspec limiting bails above).
-    std::fs::write(ctx.file("BISECT_NAMES"), "\n")?;
-    std::fs::write(ctx.file("BISECT_LOG"), "")?;
-
-    let terms = Terms {
-        bad: "bad".into(),
-        good: "good".into(),
+    let bisect_names = if pathspecs.is_empty() {
+        String::new()
+    } else {
+        pathspecs
+            .iter()
+            .map(|p| sq_quote(p))
+            .collect::<Vec<_>>()
+            .join(" ")
     };
-    if !resolved.is_empty() {
+    std::fs::write(ctx.file("BISECT_NAMES"), format!("{bisect_names}\n"))?;
+    std::fs::write(ctx.file("BISECT_LOG"), "")?;
+    if first_parent {
+        std::fs::write(ctx.file("BISECT_FIRST_PARENT"), "\n")?;
+    }
+    if no_checkout {
+        let head_oid = ctx.repo.head_id()?.detach();
+        write_ref(&ctx.file("BISECT_HEAD"), head_oid)?;
+    }
+
+    if must_write_terms {
         write_terms(&ctx, &terms)?;
     }
 
     // The first revision is the bad one; the rest are good.
-    for (i, id) in resolved.iter().enumerate() {
-        let (term, path) = if i == 0 {
+    for (idx, id) in resolved.iter().enumerate() {
+        let (term, path) = if idx == 0 {
             (&terms.bad, ctx.refs_dir().join("bad"))
         } else {
             (
@@ -491,7 +611,7 @@ fn start(args: &[String]) -> Result<ExitCode> {
         ctx.append_log(&format!("git bisect start {}\n", quoted.join(" ")))?;
     }
 
-    auto_next(&ctx, &terms)
+    auto_next(&ctx, &terms, no_checkout)
 }
 
 /// The label `BISECT_START` records: the branch name, or the full oid when HEAD
@@ -616,7 +736,9 @@ fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
         ctx.append_log(&format!("git bisect {term} {}\n", id.to_hex()))?;
     }
 
-    auto_next(&ctx, &terms)
+    // A session opened with `--no-checkout` records its position in BISECT_HEAD.
+    let no_checkout = ctx.file("BISECT_HEAD").exists();
+    auto_next(&ctx, &terms, no_checkout)
 }
 
 fn resolve(repo: &gix::Repository, spec: &str) -> Result<ObjectId> {
@@ -649,7 +771,11 @@ fn subject(repo: &gix::Repository, id: ObjectId) -> Result<String> {
 // --- the bisection step ------------------------------------------------------
 
 /// git's `bisect_auto_next`: report what is still missing, or take a step.
-fn auto_next(ctx: &Ctx, terms: &Terms) -> Result<ExitCode> {
+///
+/// With `no_checkout` the chosen commit is recorded in the per-worktree
+/// `BISECT_HEAD` ref instead of being checked out, matching `git bisect start
+/// --no-checkout`.
+fn auto_next(ctx: &Ctx, terms: &Terms, no_checkout: bool) -> Result<ExitCode> {
     let bad = ctx.bad()?;
     let goods = ctx.goods()?;
 
@@ -700,7 +826,11 @@ fn auto_next(ctx: &Ctx, terms: &Terms) -> Result<ExitCode> {
 
     write_ref(&ctx.file("BISECT_EXPECTED_REV"), best)?;
     let hex = best.to_hex().to_string();
-    super::checkout::checkout(&["-q".to_string(), hex.clone()])?;
+    if no_checkout {
+        write_ref(&ctx.file("BISECT_HEAD"), best)?;
+    } else {
+        super::checkout::checkout(&["-q".to_string(), hex.clone()])?;
+    }
     println!("[{hex}] {}", subject(&ctx.repo, best)?);
     Ok(ExitCode::SUCCESS)
 }

@@ -39,12 +39,26 @@
 //!     xdiff's `xdl_get_hunk()` hunk selection.
 //!
 //! Flags git accepts that are *not* ported are recorded during parsing and
-//! rejected only once it is clear a patch would actually be emitted. That
-//! ordering is deliberate: git validates option values first (exit 129), then
-//! resolves revisions (exit 128), and only then renders. Rejecting early would
-//! report a porting gap for an invocation git itself refuses, so the two
-//! implementations would disagree about *why* they failed. Nothing is silently
-//! ignored: if the commit list is non-empty the unported flag is still fatal.
+//! rejected only once it is clear a patch would actually be emitted. Rejecting
+//! early would report a porting gap for an invocation git itself refuses, so the
+//! two implementations would disagree about *why* they failed. Nothing is
+//! silently ignored: if the commit list is non-empty the unported flag is still
+//! fatal.
+//!
+//! Error precedence mirrors git's two passes. Format-patch's own options
+//! (`--start-number`, `--thread`, `--cover-from-description`, …) are validated in
+//! `parse_options` and so preempt everything, whatever their position. The diff
+//! options and the revisions then share `setup_revisions`, a single
+//! left-to-right pass, so a bad diff-option *value* (`--color=`, `--diff-algorithm=`,
+//! `--stat=`, `--ignore-submodules=`, the `--max-parents=`/`--max-count=`/… integer
+//! counts) and a bad revision race by command-line position: whichever comes
+//! first wins. These value errors are therefore not emitted in place — they are
+//! recorded in `Opts::opt_error` with their argument index and resolved against
+//! the revisions in `select_commits`, so `format-patch --color=bad HEAD~9` is the
+//! colour error (129) while `format-patch HEAD~9 --color=bad` is the revision
+//! error (128). git's own exit taxonomy is preserved: 129 for an option value
+//! parse-options rejects, 128 for a `die()` (bad revision, bad `--ignore-submodules`
+//! word, a count that is `'not an integer'`).
 //!
 //! Not covered — these `bail!` rather than emit output that would diverge:
 //!   * binary files, unless `-a`/`--text` is given. format-patch implies
@@ -177,6 +191,21 @@ struct Opts {
     /// Flags git accepts that this module has not ported, in the spelling the
     /// caller used. Reported only when a patch would actually be emitted.
     deferred: Vec<String>,
+
+    /// `--range-diff=<range>`: git validates the range after the walk (128 on a
+    /// bad revision); the range-diff render itself is not ported.
+    range_diff: Option<String>,
+
+    /// Arg index of each entry in `revs`, so a revision error can be ordered
+    /// against a diff-option value error the way git's `setup_revisions()` does.
+    rev_pos: Vec<usize>,
+
+    /// The earliest diff-option value error, as `(arg index, exit code, stderr
+    /// line)`. git reports these from inside `setup_revisions()`, so a revision
+    /// error at an earlier position on the command line preempts it. It is
+    /// recorded here during parsing and resolved against the revisions in
+    /// `select_commits`, rather than emitted in place.
+    opt_error: Option<(usize, u8, String)>,
 }
 
 pub fn format_patch(args: &[String]) -> Result<ExitCode> {
@@ -202,6 +231,18 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
     };
     if commits.is_empty() {
         return Ok(ExitCode::SUCCESS);
+    }
+
+    // git validates the `--range-diff` range after the walk
+    // (`infer_range_diff_ranges`); an unresolvable side dies 128 there, before
+    // any supported-but-unported diff option would matter. A range git accepts
+    // still can't be rendered here, so it falls through to the unsupported-flag
+    // report below.
+    if let Some(rd) = opts.range_diff.clone() {
+        if let Err(code) = validate_range_diff(&repo, &rd) {
+            return Ok(code);
+        }
+        opts.deferred.push(format!("--range-diff={rd}"));
     }
 
     // Everything below emits bytes, so an unported flag can no longer be
@@ -338,7 +379,6 @@ const DEFERRED: &[&str] = &[
     "--notes",
     "--base",
     "--interdiff",
-    "--range-diff",
     "--creation-factor",
     "--signature-file",
     "--description-file",
@@ -437,6 +477,9 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         text: false,
         ignore_regex: Vec::new(),
         deferred: Vec::new(),
+        range_diff: None,
+        rev_pos: Vec::new(),
+        opt_error: None,
     };
 
     let mut i = 0;
@@ -557,15 +600,39 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             s if s.starts_with("--rfc=") => {
                 o.subject_prefix = format!("{} PATCH", &s["--rfc=".len()..]);
             }
+            // The revision-walk counts share git's strict signed-int parser
+            // (`strtol_i`, base 10): trailing junk or a non-numeral is
+            // `die("'%s': not an integer")` (exit 128) from inside
+            // setup_revisions, so it is recorded positionally rather than
+            // emitted in place. A negative value disables the corresponding
+            // bound the way revision.c's `>= 0` guards do.
             s if s.starts_with("--max-count=") => {
-                o.max_count = Some(parse_num(&s["--max-count=".len()..])?);
+                let val = &s["--max-count=".len()..];
+                match strtol_i(val) {
+                    Some(v) => o.max_count = (v >= 0).then_some(v as usize),
+                    None => not_an_integer(&mut o.opt_error, i, val),
+                }
             }
-            s if s.starts_with("--skip=") => o.skip = parse_num(&s["--skip=".len()..])?,
+            s if s.starts_with("--skip=") => {
+                let val = &s["--skip=".len()..];
+                match strtol_i(val) {
+                    Some(v) => o.skip = v.max(0) as usize,
+                    None => not_an_integer(&mut o.opt_error, i, val),
+                }
+            }
             s if s.starts_with("--min-parents=") => {
-                o.min_parents = parse_num(&s["--min-parents=".len()..])?;
+                let val = &s["--min-parents=".len()..];
+                match strtol_i(val) {
+                    Some(v) => o.min_parents = v.max(0) as usize,
+                    None => not_an_integer(&mut o.opt_error, i, val),
+                }
             }
             s if s.starts_with("--max-parents=") => {
-                o.max_parents = Some(parse_num(&s["--max-parents=".len()..])?);
+                let val = &s["--max-parents=".len()..];
+                match strtol_i(val) {
+                    Some(v) => o.max_parents = (v >= 0).then_some(v as usize),
+                    None => not_an_integer(&mut o.opt_error, i, val),
+                }
             }
             s if s.starts_with("--unified=") => {
                 o.context = parse_num(&s["--unified=".len()..])? as u32;
@@ -580,13 +647,17 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                     "histogram" => o.algorithm = Algorithm::Histogram,
                     // imara-diff has no patience implementation.
                     "patience" => o.deferred.push(a.to_owned()),
-                    _ => {
-                        eprintln!(
-                            "error: option diff-algorithm accepts \"myers\", \"minimal\", \
-                             \"patience\" and \"histogram\""
-                        );
-                        return Ok(Parsed::Exit(ExitCode::from(129)));
-                    }
+                    // git's `parse_algorithm_value()` rejects this in
+                    // setup_revisions (exit 129); recorded positionally so an
+                    // earlier bad revision preempts it.
+                    _ => record_opt_error(
+                        &mut o.opt_error,
+                        i,
+                        129,
+                        "error: option diff-algorithm accepts \"myers\", \"minimal\", \
+                         \"patience\" and \"histogram\""
+                            .to_owned(),
+                    ),
                 }
             }
             s if s.starts_with("--thread=") => match &s["--thread=".len()..] {
@@ -597,11 +668,32 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             s if s.starts_with("--cover-from-description=") => {
                 cover_from_desc = Some(s["--cover-from-description=".len()..].to_owned());
             }
-            // "none" is what this module does: submodule changes are shown.
+            // git's `parse_ignore_submodules_arg()` accepts only these four
+            // words; anything else is `die("bad --ignore-submodules argument")`
+            // (exit 128) from setup_revisions. "none" is already this module's
+            // behavior (submodule changes are shown); the other three only affect
+            // an unported render, so they are deferred.
             s if s.starts_with("--ignore-submodules=") => {
-                if &s["--ignore-submodules=".len()..] != "none" {
-                    o.deferred.push(a.to_owned());
+                match &s["--ignore-submodules=".len()..] {
+                    "none" => {}
+                    "all" | "untracked" | "dirty" => o.deferred.push(a.to_owned()),
+                    v => record_opt_error(
+                        &mut o.opt_error,
+                        i,
+                        128,
+                        format!("fatal: bad --ignore-submodules argument: {v}"),
+                    ),
                 }
+            }
+            // `--range-diff=<range>` / `--range-diff <range>`: the range is
+            // validated after the walk (see `validate_range_diff`); the render is
+            // not ported, so a range git accepts is still fatal there.
+            "--range-diff" => {
+                i += 1;
+                o.range_diff = Some(value_at(args, i, a)?);
+            }
+            s if s.starts_with("--range-diff=") => {
+                o.range_diff = Some(s["--range-diff=".len()..].to_owned());
             }
             s if s.starts_with("--src-prefix=") => {
                 if &s["--src-prefix=".len()..] != "a/" {
@@ -613,10 +705,22 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                     o.deferred.push(a.to_owned());
                 }
             }
-            // Colour is never emitted, so the flags that ask for none agree.
+            // git's `--color=<when>` runs `git_config_colorbool(NULL, arg)`,
+            // which accepts only never/always/auto (case-insensitively) and
+            // otherwise `error()`s (exit 129) from setup_revisions. Colour is
+            // never emitted here, so never/auto agree; "always" would colourize
+            // and is not ported, so it is deferred.
             s if s.starts_with("--color=") => {
-                if !matches!(&s["--color=".len()..], "never" | "auto") {
-                    o.deferred.push(a.to_owned());
+                match s["--color=".len()..].to_ascii_lowercase().as_str() {
+                    "never" | "auto" => {}
+                    "always" => o.deferred.push(a.to_owned()),
+                    _ => record_opt_error(
+                        &mut o.opt_error,
+                        i,
+                        129,
+                        "error: option `color' expects \"always\", \"auto\", or \"never\""
+                            .to_owned(),
+                    ),
                 }
             }
             // `--stat=<width>[,<name-width>[,<count>]]`: git's `diff_opt_stat()`
@@ -626,11 +730,16 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             // a value git accepts is still deferred.
             s if s.starts_with("--stat=") => {
                 let val = &s["--stat=".len()..];
-                if !stat_value_ok(val.as_bytes()) {
-                    eprintln!("error: invalid --stat value: {val}");
-                    return Ok(Parsed::Exit(ExitCode::from(129)));
+                if stat_value_ok(val.as_bytes()) {
+                    o.deferred.push(a.to_owned());
+                } else {
+                    record_opt_error(
+                        &mut o.opt_error,
+                        i,
+                        129,
+                        format!("error: invalid --stat value: {val}"),
+                    );
                 }
-                o.deferred.push(a.to_owned());
             }
             s if s.starts_with("--relative=") => {
                 o.deferred.push(a.to_owned());
@@ -698,7 +807,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 o.deferred.push(s.to_owned());
             }
             s if s.starts_with('-') => bail!("unsupported flag {s:?}"),
-            s => o.revs.push(s.to_owned()),
+            s => {
+                o.revs.push(s.to_owned());
+                o.rev_pos.push(i);
+            }
         }
         i += 1;
     }
@@ -809,6 +921,97 @@ fn push_ignore_regex(o: &mut Opts, pattern: &str) -> std::result::Result<(), Exi
 fn parse_num(s: &str) -> Result<usize> {
     s.parse::<usize>()
         .map_err(|_| anyhow!("invalid number `{s}`"))
+}
+
+/// Record a diff-option value error the way git would report it from inside
+/// `setup_revisions()`: it is not fatal in place, because a revision error at an
+/// earlier command-line position preempts it. Only the earliest such error is
+/// kept — parsing is left-to-right, so the first one recorded is the earliest.
+fn record_opt_error(slot: &mut Option<(usize, u8, String)>, idx: usize, code: u8, msg: String) {
+    if slot.is_none() {
+        *slot = Some((idx, code, msg));
+    }
+}
+
+/// git's `die(_("'%s': not an integer"))` for the revision-walk counts, recorded
+/// positionally (exit 128).
+fn not_an_integer(slot: &mut Option<(usize, u8, String)>, idx: usize, val: &str) {
+    record_opt_error(slot, idx, 128, format!("fatal: '{val}': not an integer"));
+}
+
+/// Port of git's `strtol_i(s, 10, &result)`: skip leading ASCII whitespace, an
+/// optional sign, then base-10 digits, and succeed only if the whole string is
+/// consumed and at least one digit was seen (`p == s` and a trailing `*p` are
+/// both failures). Overflow past `i64` is a failure too, matching git's
+/// `(int)ul != ul` guard closely enough for the values git accepts.
+fn strtol_i(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        i += 1;
+    }
+    let neg = b.get(i) == Some(&b'-');
+    if matches!(b.get(i), Some(b'+') | Some(b'-')) {
+        i += 1;
+    }
+    let digit_start = i;
+    let mut val: i64 = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        val = val.checked_mul(10)?.checked_add((b[i] - b'0') as i64)?;
+        i += 1;
+    }
+    if i == digit_start || i != b.len() {
+        return None;
+    }
+    Some(if neg { -val } else { val })
+}
+
+/// When a recorded diff-option value error is at an earlier command-line
+/// position than a failing revision, git reports the option error instead.
+/// Prints the stored message and returns its exit code, else `None`.
+fn opt_preempts(o: &Opts, rev_pos: usize) -> Option<ExitCode> {
+    match &o.opt_error {
+        Some((p, code, msg)) if *p < rev_pos => {
+            eprintln!("{msg}");
+            Some(ExitCode::from(*code))
+        }
+        _ => None,
+    }
+}
+
+/// git reaches a diff-option value error during `setup_revisions()` whenever no
+/// earlier revision failed, so once every revision has resolved the recorded
+/// error still fires. Prints the stored message and returns its exit code.
+fn emit_opt_error(o: &Opts) -> Option<ExitCode> {
+    o.opt_error.as_ref().map(|(_, code, msg)| {
+        eprintln!("{msg}");
+        ExitCode::from(*code)
+    })
+}
+
+/// Port of the revision resolution `is_range_diff_range()` performs on
+/// `--range-diff=<arg>`: each side of an `a..b`/`a...b` range (an empty side is
+/// HEAD), or the bare argument, must resolve, else git `die()`s
+/// `bad revision '<arg>'` (exit 128) after the walk. The range-diff render is not
+/// ported, so a range git accepts is handled as an unsupported flag by the
+/// caller; only the resolution failure is reproduced here.
+fn validate_range_diff(repo: &gix::Repository, arg: &str) -> std::result::Result<(), ExitCode> {
+    let ok_side = |side: &str| -> bool {
+        let s = if side.is_empty() { "HEAD" } else { side };
+        repo.rev_parse_single(BStr::new(s)).is_ok()
+    };
+    let ok = if let Some((l, r)) = arg.split_once("...") {
+        ok_side(l) && ok_side(r)
+    } else if let Some((l, r)) = arg.split_once("..") {
+        ok_side(l) && ok_side(r)
+    } else {
+        ok_side(arg)
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(fatal(&format!("bad revision '{arg}'")))
+    }
 }
 
 /// Emulate C `strtoul(nptr, &end, 10)`, returning the byte offset of `end` — the
@@ -1052,7 +1255,18 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
     let mut paths: Vec<String> = o.paths.clone();
     let mut plain_tips = 0usize;
 
-    for spec in &o.revs {
+    for (k, spec) in o.revs.iter().enumerate() {
+        // git resolves revisions and diff options in one left-to-right pass, so
+        // a recorded diff-option value error preempts this revision iff it sits
+        // earlier on the command line. `rev_err` defers computing the revision
+        // error (which prints its own message) until that check has passed.
+        let rpos = o.rev_pos[k];
+        let rev_err = |compute: &dyn Fn() -> ExitCode| -> ExitCode {
+            match opt_preempts(o, rpos) {
+                Some(e) => e,
+                None => compute(),
+            }
+        };
         // A missing side of a range is reported against the whole range: as a
         // missing object when it was spelled as one, else as an ambiguous
         // argument, exactly as git's `setup_revisions()` does.
@@ -1067,10 +1281,10 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
         if let Some((left, right)) = spec.split_once("...") {
             let (left, right) = (or_head(left), or_head(right));
             let Some(a) = resolve(left) else {
-                return Ok(Selected::Exit(range_error(left)));
+                return Ok(Selected::Exit(rev_err(&|| range_error(left))));
             };
             let Some(b) = resolve(right) else {
-                return Ok(Selected::Exit(range_error(right)));
+                return Ok(Selected::Exit(rev_err(&|| range_error(right))));
             };
             // `a...b` is everything reachable from either tip but not both.
             for base in repo.merge_bases_many(a, &[b])? {
@@ -1081,10 +1295,10 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
         } else if let Some((left, right)) = spec.split_once("..") {
             let (left, right) = (or_head(left), or_head(right));
             let Some(a) = resolve(left) else {
-                return Ok(Selected::Exit(range_error(left)));
+                return Ok(Selected::Exit(rev_err(&|| range_error(left))));
             };
             let Some(b) = resolve(right) else {
-                return Ok(Selected::Exit(range_error(right)));
+                return Ok(Selected::Exit(rev_err(&|| range_error(right))));
             };
             hidden.push(a);
             tips.push(b);
@@ -1092,10 +1306,16 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
             match resolve(rest) {
                 Some(id) => hidden.push(id),
                 None if is_full_oid(rest, hexsz) => {
-                    return Ok(Selected::Exit(fatal(&format!("bad object {rest}"))))
+                    return Ok(Selected::Exit(rev_err(&|| {
+                        fatal(&format!("bad object {rest}"))
+                    })))
                 }
                 // An exclusion is never retried as a filename.
-                None => return Ok(Selected::Exit(fatal(&format!("bad revision '{spec}'")))),
+                None => {
+                    return Ok(Selected::Exit(rev_err(&|| {
+                        fatal(&format!("bad revision '{spec}'"))
+                    })))
+                }
             }
         } else {
             match resolve(spec) {
@@ -1107,11 +1327,19 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
                 // names something that exists in the worktree.
                 None if std::path::Path::new(spec).exists() => paths.push(spec.clone()),
                 None if is_full_oid(spec, hexsz) => {
-                    return Ok(Selected::Exit(fatal(&format!("bad object {spec}"))))
+                    return Ok(Selected::Exit(rev_err(&|| {
+                        fatal(&format!("bad object {spec}"))
+                    })))
                 }
-                None => return Ok(Selected::Exit(ambiguous(spec))),
+                None => return Ok(Selected::Exit(rev_err(&|| ambiguous(spec)))),
             }
         }
+    }
+
+    // Every revision resolved (or became a pathspec). git still reaches any
+    // recorded diff-option value error during the same pass, so it fires now.
+    if let Some(e) = emit_opt_error(o) {
+        return Ok(Selected::Exit(e));
     }
 
     // `format-patch <since>` prepares what the other side does not have yet.

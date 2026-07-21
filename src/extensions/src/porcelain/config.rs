@@ -81,12 +81,19 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     let mut mode = Mode::Auto;
     let mut name_only = false;
     let mut positional: Vec<&str> = Vec::new();
-    // git's parse-options terminator: the first bare `--` ends option parsing.
-    // It is consumed (never a positional itself), and every following token —
-    // including ones that start with `-` — is an operand, not a flag. So
-    // `git config --get -- --list` reads the key literally named `--list`, and
-    // `git config --get-all -- a b c d` is a 4-operand `--get-all`, which git
-    // rejects as "wrong number of arguments" rather than parsing the tail.
+    // git config parses options with `PARSE_OPT_STOP_AT_NON_OPTION`: option
+    // scanning ends at the FIRST argument that is not an option, and that token
+    // plus every one after it are operands — even the ones that look like
+    // `--flags`. Two independent terminators reach this state:
+    //   * a bare `--`, which is consumed (never a positional itself), or
+    //   * the first non-option token (anything not starting with `-`, plus a
+    //     lone `-`), which is itself the first operand.
+    // Consequences that must match stock git:
+    //   * `git config user.name value --get` is a 3-operand value-pattern set —
+    //     the trailing `--get` is the pattern, not an action flag.
+    //   * `git config key --local a b` is 4 operands (`--local` is data here),
+    //     so it is rejected as "no action specified", not a scoped write.
+    //   * `git config --get -- --list` still reads the key literally `--list`.
     let mut end_of_options = false;
 
     for a in args {
@@ -96,6 +103,14 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         }
         if a.as_str() == "--" {
             end_of_options = true;
+            continue;
+        }
+        // First non-option token: it ends option parsing AND is the first
+        // operand. A lone `-` is a non-option (git treats it as data), so it
+        // stops here too.
+        if a.as_str() == "-" || !a.starts_with('-') {
+            end_of_options = true;
+            positional.push(a.as_str());
             continue;
         }
 

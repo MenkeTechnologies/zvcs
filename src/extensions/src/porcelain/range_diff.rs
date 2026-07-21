@@ -57,10 +57,20 @@
 //!   `-u` / `--patch`, `--no-notes`, and `--ws-error-highlight=<kind>` (a no-op
 //!   with color off, which is the only mode this port emits). Dual and simple
 //!   coloring are byte-identical once color is off.
+//! * The diff options that upstream forwards but that touch only patch bytes
+//!   this port already discards, so accepting them changes nothing:
+//!   `--full-index` (the abbreviated/full `index` line is dropped), `--binary`
+//!   (text files gain no binary hunk; the `Binary files … differ` label is
+//!   unchanged), and every `--diff-merges` variant (`--no-diff-merges`,
+//!   `--remerge-diff`, `--diff-merges=<fmt>`) because range-diff excludes
+//!   merges. They are accepted silently, not deferred.
 //! * The failure paths, with upstream's exit status: a bad argument shape exits
 //!   129, a two-range operand that names nothing exits 128 (`bad revision`, the
 //!   fatal `is_range_diff_range()` raises), `--left-only` together with
-//!   `--right-only` exits 255, and a range naming an unknown revision exits 255.
+//!   `--right-only` exits 255, a range naming an unknown revision exits 255, and
+//!   combining two or more of `--name-only` / `--name-status` / `--check` / `-s`
+//!   exits 128 — upstream's `diff_setup_done()` fatal, raised before any
+//!   revision is resolved (so it precedes the shape and range checks above).
 //!
 //! ### Option handling — nothing is silently ignored
 //!
@@ -68,9 +78,17 @@
 //! rendering. This port implements only the options listed above; every other
 //! option is *deferred*, meaning it is recorded and never applied:
 //!
-//! * If the run reaches the point where output would be produced, it stops with
-//!   a terse `unsupported flag` message on stderr rather than emitting a patch
-//!   that ignored the option.
+//! * A deferred option is forwarded to the inner patch rendering, so it can only
+//!   change the diff-of-diffs body of a matched pair or the matching itself —
+//!   never a subject or the `<`/`>` header of an unmatched commit. When one of
+//!   the two ranges is empty no commit can match, every commit renders as a bare
+//!   header with no body, and the option provably cannot reach the output, so
+//!   the page is emitted (exit 0) exactly as upstream emits it — this is the
+//!   common `<old>...<new>` ancestor case. Otherwise, if a body would be
+//!   produced, the run stops with a terse `unsupported flag` message on stderr
+//!   rather than emitting a patch that ignored the option. `--abbrev` /
+//!   `--no-abbrev` are the exception: they rewrite the abbreviated id in every
+//!   header, so they stop even when the page would be header-only.
 //! * If the run instead ends earlier — a usage error, or a range that names an
 //!   unknown revision — the deferred option never becomes observable, because
 //!   upstream's behaviour on those two paths does not depend on it. That was
@@ -148,6 +166,27 @@ const FUNC_BUF_SIZE: usize = 80;
 const FIRST_FEW_BYTES: usize = 8000;
 /// The four-space `output_prefix` upstream installs for the diff-of-diffs.
 const INDENT: &[u8] = b"    ";
+
+/// The four `diff.h` output-format bits `diff_setup_done()` forbids combining:
+/// `--name-only`, `--name-status`, `--check` and `-s`. Two or more set is the
+/// fatal `cannot be used together` (exit 128) upstream raises before it resolves
+/// any revision. `-s`/`--no-patch` *assigns* `DIFF_FORMAT_NO_OUTPUT`, clearing
+/// the earlier bits, so `--name-only -s` is one bit but `-s --name-only` is two.
+const FMT_NAME: u32 = 1 << 0;
+const FMT_NAME_STATUS: u32 = 1 << 1;
+const FMT_CHECKDIFF: u32 = 1 << 2;
+const FMT_NO_OUTPUT: u32 = 1 << 3;
+
+/// The terse `unsupported flag` message naming what this port *does* render, so
+/// a deferred option reports a consistent list wherever it is caught.
+fn unsupported_flag(flag: &str) -> String {
+    format!(
+        "unsupported flag {flag:?} (ported: --creation-factor, --left-only, \
+         --right-only, --no-dual-color, --no-color, --color=never, --color=auto, \
+         --patch, --no-notes, --full-index, --binary, --diff-merges, \
+         --no-diff-merges, --remerge-diff)"
+    )
+}
 
 /// One commit rendered into its canonical patch text: upstream's
 /// `struct patch_util` fused with the `string_list` item holding the text.
@@ -263,6 +302,13 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     let mut pos: Vec<String> = Vec::new();
     let mut after_dash_dash = false;
 
+    // The accumulated `diff_setup_done()` output-format bits (see [`FMT_NAME`]),
+    // and whether a deferred option rewrites the abbreviated id printed in every
+    // pair header (`--abbrev`/`--no-abbrev`), which the emit gate below must not
+    // suppress even when it would otherwise produce header-only output.
+    let mut fmt_mask: u32 = 0;
+    let mut deferred_header = false;
+
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -303,6 +349,41 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // Patch output is what this port emits; `-p`/`-u` ask for it.
             "-p" | "-u" | "--patch" => {}
             "--no-notes" => opts.notes = false,
+            // Forwarded to the inner `git log`, but touch only patch bytes this
+            // port already discards: `--full-index` only lengthens the `index`
+            // line (dropped with the rest of the diff header), `--binary` adds a
+            // binary hunk to text files that have none and leaves the `Binary
+            // files … differ` label untouched, and every `--diff-merges` variant
+            // acts on merges that range-diff excludes (`--no-merges`). So they
+            // are genuine no-ops here, not deferrals — accept them silently.
+            "--full-index" | "--binary" | "--no-binary" | "--no-diff-merges"
+            | "--remerge-diff" => {}
+            "--diff-merges" => {
+                if inline.is_none() {
+                    i += 1;
+                }
+            }
+            // The four mutually-exclusive `diff_setup_done()` output formats.
+            // Each still changes the diff-of-diffs body this port cannot render,
+            // so they stay deferred; but their bits are tracked here so the
+            // `cannot be used together` fatal can fire before any revision is
+            // resolved. `-s`/`--no-patch` assigns `NO_OUTPUT`, clearing the rest.
+            "--name-only" => {
+                fmt_mask |= FMT_NAME;
+                opts.defer(unsupported_flag(a));
+            }
+            "--name-status" => {
+                fmt_mask |= FMT_NAME_STATUS;
+                opts.defer(unsupported_flag(a));
+            }
+            "--check" => {
+                fmt_mask |= FMT_CHECKDIFF;
+                opts.defer(unsupported_flag(a));
+            }
+            "-s" | "--no-patch" => {
+                fmt_mask = FMT_NO_OUTPUT;
+                opts.defer(unsupported_flag(a));
+            }
             // `--ws-error-highlight=<kind>` only tints whitespace errors when
             // color is on. This port always emits with color off, so it is a
             // byte-for-byte no-op; accept it and consume a detached value so the
@@ -343,11 +424,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                 // `UINTMAX_MAX >> (64 - 32)` = `u32::MAX`.
                 match git_parse_unsigned(&arg, u32::MAX as u64) {
                     // Accepted by upstream but not rendered by this port.
-                    Ok(_) => opts.defer(format!(
-                        "unsupported flag {a:?} (ported: --creation-factor, --left-only, \
-                         --right-only, --no-dual-color, --no-color, --color=never, \
-                         --color=auto, --patch, --no-notes)"
-                    )),
+                    Ok(_) => opts.defer(unsupported_flag(a)),
                     Err(MagnitudeError::Range) => {
                         return Ok(option_error(&format!(
                             "value {arg} for option `inter-hunk-context' not in range \
@@ -390,11 +467,13 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                 }
             }
             _ => {
-                opts.defer(format!(
-                    "unsupported flag {a:?} (ported: --creation-factor, --left-only, \
-                     --right-only, --no-dual-color, --no-color, --color=never, \
-                     --color=auto, --patch, --no-notes)"
-                ));
+                // `--abbrev`/`--no-abbrev`/`--abbrev=<n>` rewrite the abbreviated
+                // id in every pair header, so the emit gate must never suppress
+                // this deferral into header-only output.
+                if name == "--abbrev" || name == "--no-abbrev" {
+                    deferred_header = true;
+                }
+                opts.defer(unsupported_flag(a));
                 if inline.is_none()
                     && (LONG_TAKES_VALUE.contains(&name) || SHORT_TAKES_VALUE.contains(&name))
                 {
@@ -403,6 +482,20 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             }
         }
         i += 1;
+    }
+
+    // `diff_setup_done()` runs before any revision is resolved: two or more of
+    // `--name-only`/`--name-status`/`--check`/`-s` is a fatal (128) here, ahead
+    // of the argument-shape (129), `--left-only`/`--right-only` (255) and range
+    // (128/255) checks below. Value errors (`--creation-factor`,
+    // `--inter-hunk-context`) already returned 129 inside the loop, matching
+    // upstream's parse-options-first ordering.
+    if fmt_mask.count_ones() >= 2 {
+        eprintln!(
+            "fatal: options '--name-only', '--name-status', '--check', and '-s' \
+             cannot be used together"
+        );
+        return Ok(ExitCode::from(128));
     }
 
     let repo = gix::discover(".")?;
@@ -456,12 +549,6 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         return Ok(stray_operand(&repo, &range1, &token));
     }
 
-    // Every remaining difference from upstream would show up in the output, so
-    // stop here rather than emit a patch that ignored an option.
-    if let Some(reason) = &opts.deferred {
-        bail!("{reason}");
-    }
-
     // A pathspec limits both which commits appear and which file sections each
     // rendered patch carries. Plain paths are matched here; a magic pathspec
     // this port does not implement stops rather than filter differently.
@@ -483,6 +570,22 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
 
     find_exact_matches(&mut a, &mut b);
     get_correspondences(&mut a, &mut b, opts.creation_factor);
+
+    // A deferred (unimplemented) diff option is forwarded to the inner patch
+    // rendering, so it can only alter the diff-of-diffs body of a matched pair
+    // or the matching itself — never a subject or the `<`/`>` header of an
+    // unmatched commit. When one range is empty no commit can match, every
+    // commit renders as a bare header with no body, and the option provably
+    // cannot reach the output — so it is emitted, matching upstream, which
+    // accepts these options and prints the same header-only page (this is the
+    // common `<old>...<new>` ancestor case). `--abbrev`/`--no-abbrev` are the
+    // exception, since they rewrite the id in every header. Otherwise stop
+    // rather than emit a patch that ignored the option.
+    if let Some(reason) = &opts.deferred {
+        if deferred_header || !(a.is_empty() || b.is_empty()) {
+            bail!("{reason}");
+        }
+    }
 
     let mut rendered: Vec<u8> = Vec::new();
     output(&mut rendered, &mut a, &b, &opts)?;

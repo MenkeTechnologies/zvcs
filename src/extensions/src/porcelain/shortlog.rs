@@ -49,14 +49,23 @@
 //! repeated `--group` with different fields, and `--boundary` combined with
 //! `--skip`/`--max-count` (git appends boundary commits to the tail of the
 //! revision stream, where a limit can truncate them; that interaction is not
-//! modelled here). `--exclude-first-parent-only` is accepted only when it is
+//! modelled here). git accepts every one of the unported *option* flags in that
+//! list at parse time and only acts on it after parsing every option and
+//! resolving every revision, so their bail is *deferred*: an earlier or later
+//! `fatal:`/usage error on the same line (e.g. `--reflog --date=v1` → `fatal:
+//! unknown date format v1`, exit 128) is reproduced with git's exact exit code,
+//! and the unported-flag bail fires only when git itself would have succeeded.
+//! `--exclude-first-parent-only` is accepted only when it is
 //! provably a no-op — that is, when nothing reachable from the excluded tips is
 //! a merge — and bails otherwise.
 //!
 //! `--grep`/`--author` patterns are matched as fixed strings. git's default is
 //! POSIX basic regex; no regex engine is vendored here, so a pattern containing
-//! a metacharacter bails instead of being mis-matched. `-P`/`--perl-regexp`
-//! bails for the same reason. (`--committer=<pattern>` needs no handling:
+//! a metacharacter bails instead of being mis-matched. The dialect selectors
+//! `-E`/`--extended-regexp` and `-P`/`--perl-regexp` are accepted as no-ops just
+//! like `--basic-regexp`: the metacharacter guard, not the dialect flag, is
+//! what decides whether a pattern can be answered, so `-P -s` (no pattern)
+//! succeeds exactly as in git. (`--committer=<pattern>` needs no handling:
 //! `committer` is one of shortlog's own boolean options, so git rejects the
 //! `=<value>` spelling outright.)
 //!
@@ -248,6 +257,16 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     // Raw pathspecs collected after a `--` separator, in command-line order.
     let mut pathspecs: Vec<Vec<u8>> = Vec::new();
 
+    // git accepts these options but this port cannot reproduce their behavior
+    // (reflog/bisect/alternate-refs/exclude-hidden change the pending set;
+    // author-date-order/simplify-merges change the walk). git accepts each at
+    // parse time and only acts on it after it has parsed every option and
+    // resolved every revision — so a `fatal:`/usage error elsewhere on the line
+    // is reported first. The bail is therefore deferred: recorded here, acted on
+    // only after the parse loop and the revision-resolution loop have had their
+    // chance to emit git's exact exit code. Holds the first such flag as written.
+    let mut unsupported: Option<String> = None;
+
     // Once git has consumed any option other than a ref-selecting pseudo-option,
     // the argv slot its error reporter reads has moved on, and a later unknown
     // option is reported as the literal text `(null)`. Reproduced from git 2.55;
@@ -389,7 +408,13 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 name,
                 "reflog" | "bisect" | "alternate-refs" | "exclude-hidden"
             ) {
-                bail!("unsupported flag {a:?}");
+                // git accepts these; defer the bail so a later parse-time fatal
+                // (e.g. `--date=v1`) or a bad revision still reports git's code.
+                if unsupported.is_none() {
+                    unsupported = Some(a.to_string());
+                }
+                argv_consumed = true;
+                continue;
             }
 
             // Everything else is a revision-walk option. Options that take a
@@ -433,15 +458,21 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 // Both name a regex dialect this port cannot evaluate; the
                 // pattern guard after the loop is what decides whether we can
                 // answer at all, so the dialect itself needs no state.
-                ("basic-regexp" | "extended-regexp", None) => {}
-                ("perl-regexp", None) => bail!("unsupported flag {a:?}"),
+                // Regex-dialect selectors. git accepts each; the post-loop
+                // pattern guard is the sole arbiter of whether a pattern this
+                // port cannot evaluate was actually supplied, so the dialect
+                // itself needs no state and `-P` is not special among them.
+                ("basic-regexp" | "extended-regexp" | "perl-regexp", None) => {}
                 ("boundary", None) => filters.boundary = true,
                 ("ancestry-path", None) => filters.ancestry_path = true,
                 ("reverse", None) => opts.reverse = true,
                 ("date-order", None) => filters.order = Order::Date,
                 ("topo-order", None) => filters.order = Order::Topo,
                 ("author-date-order" | "simplify-merges", None) => {
-                    bail!("unsupported flag {a:?}")
+                    // git accepts these; defer as above so a genuine fatal wins.
+                    if unsupported.is_none() {
+                        unsupported = Some(a.to_string());
+                    }
                 }
                 ("ignore-missing", None) => ignore_missing = true,
                 // History-simplification modes. They only alter output under a
@@ -492,11 +523,12 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 argv_consumed = true;
                 continue;
             }
-            "E" => {
+            // `-E`/`-P`: extended/perl regex dialect selectors, no-ops here (see
+            // the long-option arm; the post-loop pattern guard is the arbiter).
+            "E" | "P" => {
                 argv_consumed = true;
                 continue;
             }
-            "P" => bail!("unsupported flag {a:?}"),
             _ => {}
         }
 
@@ -633,6 +665,14 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
+    }
+
+    // Both option parsing and revision resolution above have now had their
+    // chance to emit git's exact `fatal:`/usage exit code in argv order. Only if
+    // none did do we surface a git-valid-but-unported flag as our own failure —
+    // never producing wrong output for a feature we cannot execute.
+    if let Some(flag) = unsupported {
+        bail!("unsupported flag {flag:?}");
     }
 
     // git: "assume HEAD if from a tty" — only when nothing else is pending.

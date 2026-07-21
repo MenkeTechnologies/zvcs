@@ -10,6 +10,7 @@ use gix::date::time::Format as TimeFormat;
 use gix::date::time::{CustomFormat, format as tfmt};
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
+use regex::bytes::{Regex, RegexBuilder};
 
 /// `git reflog` — read the reference logs recorded under `$GIT_DIR/logs`.
 ///
@@ -81,23 +82,33 @@ use gix::prelude::ObjectIdExt;
 /// Output: `--parents`, and `--format=`/`--pretty=` for the placeholders
 /// `%H %h %T %P %p %s %an %ae %ad %cn %ce %cd %gd %gD %gn %ge %gs %n %% %x<hh>`
 /// plus the `oneline` built-in. Empty formats print nothing at all, and a format
-/// string is newline-terminated per entry, both matching git.
+/// string is newline-terminated per entry, both matching git. The multi-line
+/// built-ins `medium` (also bare `--pretty`), `short`, `full`, `fuller`, `raw` and
+/// `reference` render with git's `Reflog:`/`Reflog message:` header lines; only
+/// the `email`/`mboxrd` patch formats remain deferred.
+///
+/// Filtering: `--grep=<pat>` keeps entries whose commit message matches, with
+/// git's default POSIX-basic dialect (translated to the `regex` engine), plus
+/// `-E`/`-P` (extended), `-F` (fixed), `-i` (ignore case), `--all-match` and
+/// `--invert-grep`. A pattern git's regex compiler would reject is fatal (128).
 ///
 /// # Diff output
 ///
-/// `--numstat`, `--summary`, `--shortstat`, `--name-only` and `--name-status` render
-/// the diff of each entry's commit against its first parent (the empty tree for a
-/// root commit). Merge commits produce no diff, matching `git log`'s default of not
-/// diffing a merge at all. Paths go through git's `quote_c_style()`, honouring
-/// `core.quotePath`, and renames through its `pprint_rename()` brace compaction.
+/// `--raw`, `--numstat`, `--summary`, `--shortstat`, `--name-only` and
+/// `--name-status` render the diff of each entry's commit against its first parent
+/// (the empty tree for a root commit). Merge commits produce no diff, matching
+/// `git log`'s default of not diffing a merge at all. Paths go through git's
+/// `quote_c_style()`, honouring `core.quotePath`, and renames through its
+/// `pprint_rename()` brace compaction. `--raw` object ids are abbreviated with the
+/// diff `--abbrev`, a missing side printed as an abbreviated null id.
 ///
 /// git's output-format bits behave in a specific, order-sensitive way that is
-/// reproduced here (verified against git 2.55.0): `--name-only`, `--name-status`,
-/// `--numstat`, `--summary` and `--shortstat` each *add* a bit, while `-s`/
-/// `--no-patch` *assigns* "no output", clearing every bit set before it. After the
-/// scan, more than one of `--name-only`/`--name-status`/`-s` is fatal, and either
-/// name format suppresses the stat family. So `--numstat -s` prints nothing while
-/// `-s --numstat` prints the numstat.
+/// reproduced here (verified against git 2.55.0): `--raw`, `--name-only`,
+/// `--name-status`, `--numstat`, `--summary` and `--shortstat` each *add* a bit,
+/// while `-s`/`--no-patch` *assigns* "no output", clearing every bit set before it.
+/// After the scan, more than one of `--name-only`/`--name-status`/`-s` is fatal,
+/// and either name format suppresses both the stat family and `--raw`. So
+/// `--numstat -s` prints nothing while `-s --numstat` prints the numstat.
 ///
 /// # Options recognized but deliberately not implemented
 ///
@@ -105,14 +116,12 @@ use gix::prelude::ObjectIdExt;
 /// would print a wrong answer that looks like success:
 ///
 ///   * Diff output that needs the rest of git's diff driver — `-p`, `--patch`,
-///     `--stat` (column-width scaling against the terminal width), `--raw`,
-///     `--dirstat`.
-///   * Message filtering — `--grep=<pat>`, which needs git's regex dialect selection.
+///     `--stat` (column-width scaling against the terminal width), `--dirstat`.
 ///   * The `%d`/`%D` decoration placeholders, `%C(...)` color, and `--color=always`.
-///   * The multi-line `--pretty` built-ins (`short`, `medium`, `full`, `fuller`,
-///     `raw`, `reference`, `email`) and bare `--pretty`. These are deferred: when a
-///     filter (a date limiter or a pathspec) drops every entry the format is never
-///     exercised and the command succeeds with empty output, exactly as git does.
+///   * The `email`/`mboxrd` patch `--pretty` formats, which need git's mbox driver.
+///     These are deferred: when a filter (a date limiter or a pathspec) drops every
+///     entry the format is never exercised and the command succeeds with empty
+///     output, exactly as git does.
 ///   * `--date=relative`, `--date=human`, `--date=format:...` — these need the
 ///     current time or strftime-style user formats, which `gix-date` does not expose.
 ///
@@ -206,6 +215,10 @@ enum Abbrev {
 struct DateFormat {
     fmt: TimeFormat,
     local: bool,
+    /// git's `iso-strict` mode, which prints `Z` (not `+00:00`) at a zero UTC
+    /// offset. gitoxide's `ISO8601_STRICT` always spells the offset out, so this
+    /// flag drives a post-format fixup of the zero-offset case.
+    iso_strict: bool,
 }
 
 impl DateFormat {
@@ -213,6 +226,7 @@ impl DateFormat {
         DateFormat {
             fmt: fmt.into(),
             local: false,
+            iso_strict: false,
         }
     }
 
@@ -223,7 +237,15 @@ impl DateFormat {
         } else {
             time
         };
-        time.format_or_unix(self.fmt)
+        let out = time.format_or_unix(self.fmt);
+        // `git`'s ISO-8601-strict layout uses a literal `Z` for UTC, where
+        // gitoxide's `%:z` renders `+00:00`.
+        if self.iso_strict {
+            if let Some(prefix) = out.strip_suffix("+00:00") {
+                return format!("{prefix}Z");
+            }
+        }
+        out
     }
 }
 
@@ -239,6 +261,10 @@ struct DiffFormats {
     numstat: bool,
     shortstat: bool,
     summary: bool,
+    /// git's `DIFF_FORMAT_RAW`, set by `--raw`: `:<mode> <mode> <sha> <sha>
+    /// <status>\t<path>`. Not one of the mutually-exclusive bits, but a name
+    /// format still supersedes it.
+    raw: bool,
     /// git's `DIFF_FORMAT_NO_OUTPUT`, set by `-s`/`--no-patch`. It renders nothing
     /// itself but still counts towards the "cannot be used together" check.
     no_output: bool,
@@ -246,7 +272,12 @@ struct DiffFormats {
 
 impl DiffFormats {
     fn any(self) -> bool {
-        self.name_only || self.name_status || self.numstat || self.shortstat || self.summary
+        self.name_only
+            || self.name_status
+            || self.numstat
+            || self.shortstat
+            || self.summary
+            || self.raw
     }
 
     /// `-s` / `--no-patch` assigns "no output", dropping every bit set before it.
@@ -262,12 +293,14 @@ impl DiffFormats {
         usize::from(self.name_only) + usize::from(self.name_status) + usize::from(self.no_output)
     }
 
-    /// git's `diff_setup_done()`: either name format outranks the stat family.
+    /// git's `diff_setup_done()`: either name format outranks the stat family
+    /// and the raw format.
     fn resolve(&mut self) {
         if self.name_only || self.name_status {
             self.numstat = false;
             self.shortstat = false;
             self.summary = false;
+            self.raw = false;
         }
     }
 }
@@ -278,8 +311,12 @@ struct Opts {
     abbrev: Abbrev,
     /// Set by `--date=<fmt>`.
     date: Option<DateFormat>,
-    /// `--format=`/`--pretty=` string; `None` is git's default oneline layout.
-    format: Option<String>,
+    /// The output layout: `--oneline` (git's default for reflog), a `--format=`/
+    /// `--pretty=<placeholders>` string, or a built-in multi-line format.
+    out: OutFmt,
+    /// `--grep=<pat>` message filters (matched against each entry's commit
+    /// message); `None` when no `--grep` was given.
+    grep: Option<GrepFilter>,
     parents: bool,
     /// `Some(true)` for `--merges`, `Some(false)` for `--no-merges`.
     merges: Option<bool>,
@@ -306,6 +343,123 @@ enum Decorate {
     Full,
 }
 
+/// The reflog output layout.
+enum OutFmt {
+    /// `git reflog`'s default (`--pretty=oneline` with `--abbrev-commit`).
+    Oneline,
+    /// A `--format=`/`--pretty=<placeholders>` user string.
+    Custom(String),
+    /// A named multi-line format that carries git's reflog decorations.
+    Builtin(Builtin),
+}
+
+/// A `git log` built-in `--pretty` format, minus `oneline` (its own variant) and
+/// the `email`/`mboxrd` patch formats (still deferred as unimplemented).
+#[derive(Clone, Copy)]
+enum Builtin {
+    Medium,
+    Short,
+    Full,
+    Fuller,
+    Raw,
+    Reference,
+}
+
+impl Builtin {
+    /// Whether git prints a blank line between consecutive entries. The header
+    /// formats do; `reference` is one-line-like and does not.
+    fn separates(self) -> bool {
+        !matches!(self, Builtin::Reference)
+    }
+}
+
+/// `--grep=` message filtering, matched against each entry's commit message the
+/// way git's `--walk-reflogs` grep does (with `--all-match` / `--invert-grep`).
+struct GrepFilter {
+    patterns: Vec<Regex>,
+    /// `--all-match`: every pattern must match instead of any.
+    all_match: bool,
+    /// `--invert-grep`: keep entries that do *not* match.
+    invert: bool,
+}
+
+impl GrepFilter {
+    fn keeps(&self, message: &[u8]) -> bool {
+        let hit = if self.all_match {
+            self.patterns.iter().all(|re| re.is_match(message))
+        } else {
+            self.patterns.iter().any(|re| re.is_match(message))
+        };
+        hit != self.invert
+    }
+}
+
+/// git's default `--grep` dialect selection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrepKind {
+    /// POSIX basic regular expressions (git's default).
+    Basic,
+    /// `-E`/`-P`: extended/Perl — passed to the (ERE-superset) `regex` engine.
+    Extended,
+    /// `-F`: a literal string.
+    Fixed,
+}
+
+/// Translate a POSIX **basic** regular expression to the `regex` crate's dialect
+/// (an ERE superset). In BRE `+ ? | ( ) { }` are literal and their backslashed
+/// forms are the operators; `. * [ ] ^ $ \` mean the same in both. This swaps the
+/// two escaping conventions and leaves bracket expressions untouched.
+fn bre_to_ere(pat: &str) -> String {
+    let mut out = String::new();
+    let mut chars = pat.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                // Backslashed operator in BRE -> bare operator in ERE.
+                Some(n @ ('+' | '?' | '|' | '(' | ')' | '{' | '}')) => out.push(n),
+                // Same meaning in both dialects; keep the escape.
+                Some(n @ ('.' | '*' | '[' | ']' | '^' | '$' | '\\')) => {
+                    out.push('\\');
+                    out.push(n);
+                }
+                // Shared character-class shorthands.
+                Some(n @ ('w' | 's' | 'b' | 'd' | 'B' | 'S' | 'W')) => {
+                    out.push('\\');
+                    out.push(n);
+                }
+                // `\<other>` is a literal `<other>` in BRE.
+                Some(n) => out.push_str(&regex::escape(&n.to_string())),
+                None => out.push_str("\\\\"),
+            },
+            // Literal in BRE, operator in ERE: escape to keep it literal.
+            '+' | '?' | '|' | '(' | ')' | '{' | '}' => {
+                out.push('\\');
+                out.push(c);
+            }
+            // Copy a bracket expression verbatim (identical in BRE and ERE).
+            '[' => {
+                out.push('[');
+                if chars.peek() == Some(&'^') {
+                    out.push(chars.next().expect("peeked"));
+                }
+                // A `]` immediately after `[` or `[^` is a literal member.
+                if chars.peek() == Some(&']') {
+                    out.push(chars.next().expect("peeked"));
+                }
+                for d in chars.by_ref() {
+                    out.push(d);
+                    if d == ']' {
+                        break;
+                    }
+                }
+            }
+            // `.` `*` `^` `$` and every ordinary character mean the same thing.
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 impl Default for Opts {
     fn default() -> Self {
         Opts {
@@ -313,7 +467,8 @@ impl Default for Opts {
             skip: 0,
             abbrev: Abbrev::Auto,
             date: None,
-            format: None,
+            out: OutFmt::Oneline,
+            grep: None,
             parents: false,
             merges: None,
             diff: DiffFormats::default(),
@@ -480,6 +635,14 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
     let mut unrecognized: Option<String> = None;
     let mut unimplemented: Option<String> = None;
 
+    // `--grep` state, resolved into a compiled filter after the whole scan (git
+    // sets these fields in any order, then compiles once in `setup_revisions`).
+    let mut grep_patterns: Vec<String> = Vec::new();
+    let mut grep_kind = GrepKind::Basic;
+    let mut grep_ignore_case = false;
+    let mut grep_invert = false;
+    let mut grep_all_match = false;
+
     let mut i = 0;
     while i < rest.len() {
         let a = rest[i].as_str();
@@ -573,17 +736,21 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
             "--decorate=no" | "--no-decorate" | "--decorate=auto" => opts.decorate = None,
 
             // ---- output format --------------------------------------------
-            "--oneline" => opts.format = None,
-            "--pretty" | "--format" => note_first(&mut unimplemented, a.to_owned()),
+            // Bare `--pretty` is git's shorthand for `--pretty=medium`; bare
+            // `--format` (no `=`) is not an option at all — git reports it as an
+            // unrecognized argument, so it falls through to that arm below.
+            "--oneline" => opts.out = OutFmt::Oneline,
+            "--pretty" => opts.out = OutFmt::Builtin(Builtin::Medium),
             s if s.starts_with("--pretty=") || s.starts_with("--format=") => {
                 let v = s.split_once('=').expect("checked for `=` above").1;
                 match classify_pretty(v) {
-                    Pretty::Oneline => opts.format = None,
+                    Pretty::Oneline => opts.out = OutFmt::Oneline,
+                    Pretty::Builtin(b) => opts.out = OutFmt::Builtin(b),
                     Pretty::Custom(f) => match unsupported_placeholder(&f) {
                         Some(p) => {
                             note_first(&mut unimplemented, format!("{s} (placeholder {p})"));
                         }
-                        None => opts.format = Some(f),
+                        None => opts.out = OutFmt::Custom(f),
                     },
                     Pretty::Unimplemented => note_first(&mut unimplemented, s.to_owned()),
                     Pretty::Invalid => {
@@ -632,27 +799,38 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
             "--numstat" => opts.diff.numstat = true,
             "--shortstat" => opts.diff.shortstat = true,
             "--summary" => opts.diff.summary = true,
+            "--raw" => opts.diff.raw = true,
             // git assigns `DIFF_FORMAT_NO_OUTPUT` here rather than or-ing a bit, so
             // this drops every diff format named to its left.
             "--no-patch" | "-s" => opts.diff.set_no_output(),
 
+            // ---- message filtering -----------------------------------------
+            // git applies `--grep` to each entry's commit message. The dialect and
+            // case/invert/all-match modifiers are collected here and compiled once
+            // after the scan, matching git's `setup_revisions` ordering.
+            s if s.starts_with("--grep=") => {
+                grep_patterns.push(s["--grep=".len()..].to_owned());
+            }
+            "--invert-grep" => grep_invert = true,
+            "--all-match" => grep_all_match = true,
+            "--regexp-ignore-case" | "-i" => grep_ignore_case = true,
+            "--fixed-strings" | "-F" => grep_kind = GrepKind::Fixed,
+            "--basic-regexp" => grep_kind = GrepKind::Basic,
+            "--extended-regexp" | "-E" | "--perl-regexp" | "-P" => {
+                grep_kind = GrepKind::Extended;
+            }
+
             // ---- recognized, no effect on reflog output ---------------------
             // Each of these was verified byte-identical to plain `git reflog`.
             "--walk-reflogs" | "-g" | "--single-worktree" | "--first-parent" | "--boundary"
-            | "--source" | "--color=never"
-            | "--color=auto" | "--no-color" | "--invert-grep" | "--all-match"
-            | "--regexp-ignore-case" | "-i" | "--fixed-strings" | "-F" | "--basic-regexp"
-            | "--extended-regexp" | "-E" | "--perl-regexp" | "-P" => {}
+            | "--source" | "--color=never" | "--color=auto" | "--no-color" => {}
 
             // ---- recognized, deliberately unimplemented ---------------------
-            "-p" | "--patch" | "-u" | "--stat" | "--raw" | "--dirstat"
+            "-p" | "--patch" | "-u" | "--stat" | "--dirstat"
             | "--patch-with-stat" | "--color" | "--color=always" => {
                 note_first(&mut unimplemented, a.to_owned());
             }
-            s if s.starts_with("--grep=")
-                || s.starts_with("--stat=")
-                || s.starts_with("--dirstat=") =>
-            {
+            s if s.starts_with("--stat=") || s.starts_with("--dirstat=") => {
                 note_first(&mut unimplemented, s.to_owned());
             }
 
@@ -699,6 +877,35 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
     if let Some(arg) = unrecognized {
         eprintln!("fatal: unrecognized argument: {arg}");
         return Ok(ExitCode::from(128));
+    }
+
+    // git compiles `--grep` patterns once the whole command line is parsed; a bad
+    // pattern is fatal (exit 128), as it is in git's `compile_regexp`.
+    if !grep_patterns.is_empty() {
+        let mut compiled: Vec<Regex> = Vec::with_capacity(grep_patterns.len());
+        for pat in &grep_patterns {
+            let translated = match grep_kind {
+                GrepKind::Fixed => regex::escape(pat),
+                GrepKind::Extended => pat.clone(),
+                GrepKind::Basic => bre_to_ere(pat),
+            };
+            match RegexBuilder::new(&translated)
+                .case_insensitive(grep_ignore_case)
+                .multi_line(true)
+                .build()
+            {
+                Ok(re) => compiled.push(re),
+                Err(_) => {
+                    eprintln!("fatal: command line, '{pat}': invalid regular expression");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
+        opts.grep = Some(GrepFilter {
+            patterns: compiled,
+            all_match: grep_all_match,
+            invert: grep_invert,
+        });
     }
 
     // Bare `git reflog` on an unborn HEAD has its own fatal message in git,
@@ -775,6 +982,18 @@ fn render(
             if opts.until.is_some_and(|u| entry.time.seconds > u) {
                 continue;
             }
+            // git's `--grep` limits the walk to entries whose commit message
+            // matches, before the diff of the entry is ever computed.
+            if let Some(grep) = &opts.grep {
+                let message = repo
+                    .find_commit(entry.oid)
+                    .ok()
+                    .and_then(|c| c.message_raw().ok().map(|m| m.to_vec()))
+                    .unwrap_or_default();
+                if !grep.keeps(&message) {
+                    continue;
+                }
+            }
             // git diffs each entry's commit against its first parent, whatever the
             // reflog message says the entry was. Computed before the skip/count
             // budget because pathspec filtering must run first.
@@ -803,8 +1022,8 @@ fn render(
                 Some(f) => f.render(entry.time),
                 None => n.to_string(),
             };
-            match &opts.format {
-                Some(fmt) => {
+            match &opts.out {
+                OutFmt::Custom(fmt) => {
                     let line = expand_format(
                         repo,
                         fmt,
@@ -828,7 +1047,7 @@ fn render(
                         }
                     }
                 }
-                None => {
+                OutFmt::Oneline => {
                     out.extend_from_slice(
                         abbrev_id(repo, entry.oid, &opts.abbrev, fallback_len).as_bytes(),
                     );
@@ -853,8 +1072,39 @@ fn render(
                     out.extend_from_slice(&entry.message);
                     out.push(b'\n');
                 }
+                OutFmt::Builtin(kind) => {
+                    // The header formats put a blank line between consecutive
+                    // entries; the first printed entry gets none.
+                    if kind.separates() && printed > 0 {
+                        out.push(b'\n');
+                    }
+                    let block = build_builtin_block(
+                        repo,
+                        *kind,
+                        section,
+                        entry,
+                        &selector,
+                        opts,
+                        field_fmt,
+                        fallback_len,
+                        decorations.as_ref(),
+                    );
+                    out.extend_from_slice(&block);
+                    // A diff, when one is selected, is separated by a blank line.
+                    if !changes.is_empty() {
+                        out.push(b'\n');
+                    }
+                }
             }
-            append_diff(&mut out, &changes, opts.diff, opts.quote_high);
+            append_diff(
+                &mut out,
+                repo,
+                &changes,
+                opts.diff,
+                opts.quote_high,
+                &opts.abbrev,
+                fallback_len,
+            );
             printed += 1;
         }
     }
@@ -1224,6 +1474,7 @@ fn parse_date_mode(value: &str) -> DateMode {
     } else {
         (base, local)
     };
+    let mut iso_strict = false;
     let fmt: TimeFormat = match base {
         // The local rendering of the default layout drops the zone offset.
         "" | "default" if local => DEFAULT_LOCAL.into(),
@@ -1232,18 +1483,26 @@ fn parse_date_mode(value: &str) -> DateMode {
         "unix" => tfmt::UNIX,
         "short" => tfmt::SHORT.into(),
         "iso" | "iso8601" => tfmt::ISO8601.into(),
-        "iso-strict" | "iso8601-strict" => tfmt::ISO8601_STRICT.into(),
+        "iso-strict" | "iso8601-strict" => {
+            iso_strict = true;
+            tfmt::ISO8601_STRICT.into()
+        }
         "rfc" | "rfc2822" => tfmt::RFC2822.into(),
         // Recognized by git, but these need the current time, which is not a
         // property of the entry being rendered.
         "relative" | "human" => return DateMode::Unimplemented,
         _ => return DateMode::Unknown,
     };
-    DateMode::Known(DateFormat { fmt, local })
+    DateMode::Known(DateFormat {
+        fmt,
+        local,
+        iso_strict,
+    })
 }
 
 enum Pretty {
     Oneline,
+    Builtin(Builtin),
     Custom(String),
     Unimplemented,
     Invalid,
@@ -1259,9 +1518,14 @@ fn classify_pretty(value: &str) -> Pretty {
     }
     match value {
         "oneline" => Pretty::Oneline,
-        "short" | "medium" | "full" | "fuller" | "raw" | "reference" | "email" | "mboxrd" => {
-            Pretty::Unimplemented
-        }
+        "medium" => Pretty::Builtin(Builtin::Medium),
+        "short" => Pretty::Builtin(Builtin::Short),
+        "full" => Pretty::Builtin(Builtin::Full),
+        "fuller" => Pretty::Builtin(Builtin::Fuller),
+        "raw" => Pretty::Builtin(Builtin::Raw),
+        "reference" => Pretty::Builtin(Builtin::Reference),
+        // The mbox/patch formats need git's whole email driver; still deferred.
+        "email" | "mboxrd" => Pretty::Unimplemented,
         v if v.is_empty() || v.contains('%') => Pretty::Custom(v.to_owned()),
         _ => Pretty::Invalid,
     }
@@ -1469,6 +1733,202 @@ fn is_merge(repo: &gix::Repository, id: ObjectId) -> bool {
     parents_of(repo, id).len() >= 2
 }
 
+/// Render one entry in a built-in multi-line `--pretty` format, including the
+/// `Reflog:`/`Reflog message:` decorations git adds under `--walk-reflogs`. The
+/// returned block is already newline-terminated; the caller handles the blank
+/// line between entries and any following diff.
+#[allow(clippy::too_many_arguments)]
+fn build_builtin_block(
+    repo: &gix::Repository,
+    kind: Builtin,
+    section: &Section,
+    entry: &Entry,
+    selector: &str,
+    opts: &Opts,
+    field_fmt: DateFormat,
+    fallback_len: usize,
+    decorations: Option<&Decorations>,
+) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let commit = repo.find_commit(entry.oid).ok();
+    let subject = || {
+        commit
+            .as_ref()
+            .and_then(|c| c.message().ok().map(|m| m.summary().to_vec()))
+            .unwrap_or_default()
+    };
+
+    // `reference` is a one-line format with no reflog header.
+    if let Builtin::Reference = kind {
+        let id = abbrev_id(repo, entry.oid, &opts.abbrev, fallback_len);
+        let date = commit
+            .as_ref()
+            .and_then(|c| c.author().ok())
+            .map(|a| DateFormat::plain(tfmt::SHORT).render(a.time().ok().unwrap_or_default()))
+            .unwrap_or_default();
+        out.extend_from_slice(id.as_bytes());
+        out.extend_from_slice(b" (");
+        out.extend_from_slice(&subject());
+        out.extend_from_slice(b", ");
+        out.extend_from_slice(date.as_bytes());
+        out.extend_from_slice(b")\n");
+        return out;
+    }
+
+    // `commit <id>`: `raw` prints the full hash, the rest honour `--abbrev-commit`.
+    out.extend_from_slice(b"commit ");
+    let id = match kind {
+        Builtin::Raw => entry.oid.to_string(),
+        _ => abbrev_id(repo, entry.oid, &opts.abbrev, fallback_len),
+    };
+    out.extend_from_slice(id.as_bytes());
+    if let Some(deco) = decorations {
+        if let Some(text) = deco.for_commit(entry.oid) {
+            out.push(b' ');
+            out.extend_from_slice(text.as_bytes());
+        }
+    }
+    out.push(b'\n');
+
+    // The reflog header lines, common to every multi-line format.
+    out.extend_from_slice(b"Reflog: ");
+    out.extend_from_slice(section.display.as_bytes());
+    out.extend_from_slice(format!("@{{{selector}}} (").as_bytes());
+    out.extend_from_slice(&entry.who_name);
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(&entry.who_email);
+    out.extend_from_slice(b">)\n");
+    out.extend_from_slice(b"Reflog message: ");
+    out.extend_from_slice(&entry.message);
+    out.push(b'\n');
+
+    let parents = parents_of(repo, entry.oid);
+    match kind {
+        Builtin::Raw => {
+            if let Some(c) = &commit {
+                if let Ok(tree) = c.tree_id() {
+                    out.extend_from_slice(format!("tree {}\n", tree.detach()).as_bytes());
+                }
+            }
+            for parent in &parents {
+                out.extend_from_slice(format!("parent {parent}\n").as_bytes());
+            }
+            if let Some(c) = &commit {
+                if let Ok(a) = c.author() {
+                    append_raw_ident(&mut out, b"author ", &a);
+                }
+                if let Ok(cm) = c.committer() {
+                    append_raw_ident(&mut out, b"committer ", &cm);
+                }
+            }
+        }
+        _ => {
+            // `Merge: <abbrev parents>` for a merge commit.
+            if parents.len() > 1 {
+                out.extend_from_slice(b"Merge:");
+                for parent in &parents {
+                    out.push(b' ');
+                    out.extend_from_slice(
+                        abbrev_id(repo, *parent, &opts.abbrev, fallback_len).as_bytes(),
+                    );
+                }
+                out.push(b'\n');
+            }
+            let author = commit.as_ref().and_then(|c| c.author().ok());
+            let committer = commit.as_ref().and_then(|c| c.committer().ok());
+            match kind {
+                Builtin::Medium => {
+                    append_ident(&mut out, b"Author: ", author.as_ref());
+                    append_date(&mut out, b"Date:   ", author.as_ref(), field_fmt);
+                }
+                Builtin::Short => append_ident(&mut out, b"Author: ", author.as_ref()),
+                Builtin::Full => {
+                    append_ident(&mut out, b"Author: ", author.as_ref());
+                    append_ident(&mut out, b"Commit: ", committer.as_ref());
+                }
+                Builtin::Fuller => {
+                    append_ident(&mut out, b"Author:     ", author.as_ref());
+                    append_date(&mut out, b"AuthorDate: ", author.as_ref(), field_fmt);
+                    append_ident(&mut out, b"Commit:     ", committer.as_ref());
+                    append_date(&mut out, b"CommitDate: ", committer.as_ref(), field_fmt);
+                }
+                Builtin::Raw | Builtin::Reference => unreachable!("handled above"),
+            }
+        }
+    }
+
+    // A blank line, then the message body — the folded subject only for `short`,
+    // the whole raw message otherwise, indented four spaces per line.
+    out.push(b'\n');
+    if let Builtin::Short = kind {
+        let mut body = subject();
+        body.push(b'\n');
+        indent_body(&mut out, &body);
+    } else {
+        let body = commit
+            .as_ref()
+            .and_then(|c| c.message_raw().ok().map(|m| m.to_vec()))
+            .unwrap_or_default();
+        indent_body(&mut out, &body);
+    }
+    out
+}
+
+/// git's raw `author`/`committer` line: `<label><name> <email> <raw-time>`, where
+/// the time is copied verbatim from the object (`<seconds> <tz>`).
+fn append_raw_ident(out: &mut Vec<u8>, label: &[u8], sig: &gix::actor::SignatureRef<'_>) {
+    out.extend_from_slice(label);
+    out.extend_from_slice(sig.name);
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(sig.email);
+    out.extend_from_slice(b"> ");
+    out.extend_from_slice(sig.time.as_bytes());
+    out.push(b'\n');
+}
+
+/// git's `Author: <name> <email>` identity line.
+fn append_ident(out: &mut Vec<u8>, label: &[u8], sig: Option<&gix::actor::SignatureRef<'_>>) {
+    out.extend_from_slice(label);
+    if let Some(sig) = sig {
+        out.extend_from_slice(sig.name);
+        out.extend_from_slice(b" <");
+        out.extend_from_slice(sig.email);
+        out.push(b'>');
+    }
+    out.push(b'\n');
+}
+
+/// git's `Date:   <formatted>` line, in the selector's `--date` layout.
+fn append_date(
+    out: &mut Vec<u8>,
+    label: &[u8],
+    sig: Option<&gix::actor::SignatureRef<'_>>,
+    fmt: DateFormat,
+) {
+    out.extend_from_slice(label);
+    if let Some(sig) = sig {
+        let time = sig.time().ok().unwrap_or_default();
+        out.extend_from_slice(fmt.render(time).as_bytes());
+    }
+    out.push(b'\n');
+}
+
+/// git's `strbuf_add_lines`: prefix every line (blank ones included) of `msg`
+/// with four spaces, stopping at the message end without a trailing blank line.
+fn indent_body(out: &mut Vec<u8>, msg: &[u8]) {
+    let mut rest = msg;
+    while !rest.is_empty() {
+        let (line, next) = match rest.iter().position(|&b| b == b'\n') {
+            Some(p) => (&rest[..p], &rest[p + 1..]),
+            None => (rest, &rest[rest.len()..]),
+        };
+        out.extend_from_slice(b"    ");
+        out.extend_from_slice(line);
+        out.push(b'\n');
+        rest = next;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // diff output
 // ---------------------------------------------------------------------------
@@ -1503,6 +1963,11 @@ struct FileChange {
     kind: ChangeKind,
     old_mode: Option<u16>,
     new_mode: Option<u16>,
+    /// The pre-image blob id, `None` on the added side (git's raw format prints a
+    /// null id there).
+    old_oid: Option<ObjectId>,
+    /// The post-image blob id, `None` on the deleted side.
+    new_oid: Option<ObjectId>,
     /// `(insertions, deletions)`, or `None` when either side is binary.
     counts: Option<(u32, u32)>,
     /// Rename/copy similarity in percent.
@@ -1574,6 +2039,7 @@ fn to_file_change(
         TreeChange::Addition {
             location,
             entry_mode,
+            id,
             ..
         } => {
             if entry_mode.is_tree() {
@@ -1585,6 +2051,8 @@ fn to_file_change(
                 kind: ChangeKind::Added,
                 old_mode: None,
                 new_mode: Some(entry_mode.value()),
+                old_oid: None,
+                new_oid: Some(id.detach()),
                 counts: if entry_mode.is_commit() {
                     Some((1, 0))
                 } else {
@@ -1596,6 +2064,7 @@ fn to_file_change(
         TreeChange::Deletion {
             location,
             entry_mode,
+            id,
             ..
         } => {
             if entry_mode.is_tree() {
@@ -1607,6 +2076,8 @@ fn to_file_change(
                 kind: ChangeKind::Deleted,
                 old_mode: Some(entry_mode.value()),
                 new_mode: None,
+                old_oid: Some(id.detach()),
+                new_oid: None,
                 counts: if entry_mode.is_commit() {
                     Some((0, 1))
                 } else {
@@ -1619,6 +2090,8 @@ fn to_file_change(
             location,
             previous_entry_mode,
             entry_mode,
+            previous_id,
+            id,
             ..
         } => {
             if entry_mode.is_tree() || previous_entry_mode.is_tree() {
@@ -1630,6 +2103,8 @@ fn to_file_change(
                 kind: ChangeKind::Modified,
                 old_mode: Some(previous_entry_mode.value()),
                 new_mode: Some(entry_mode.value()),
+                old_oid: Some(previous_id.detach()),
+                new_oid: Some(id.detach()),
                 counts: if entry_mode.is_commit() || previous_entry_mode.is_commit() {
                     // A gitlink diffs as the single line `Subproject commit <id>`.
                     Some((1, 1))
@@ -1664,6 +2139,8 @@ fn to_file_change(
                 },
                 old_mode: Some(source_entry_mode.value()),
                 new_mode: Some(entry_mode.value()),
+                old_oid: Some(source_id.detach()),
+                new_oid: Some(id.detach()),
                 counts: if entry_mode.is_commit() || source_entry_mode.is_commit() {
                     Some(if identical { (0, 0) } else { (1, 1) })
                 } else {
@@ -1688,10 +2165,56 @@ fn blob_counts(
 }
 
 /// Write the diff of one reflog entry in every selected format, in git's order:
-/// the name formats first, then numstat, then shortstat, then summary.
-fn append_diff(out: &mut Vec<u8>, changes: &[FileChange], fmts: DiffFormats, quote_high: bool) {
+/// the raw format first, then the name formats, then numstat, shortstat, summary.
+fn append_diff(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    changes: &[FileChange],
+    fmts: DiffFormats,
+    quote_high: bool,
+    abbrev: &Abbrev,
+    fallback_len: usize,
+) {
     if changes.is_empty() {
         return;
+    }
+
+    // `--raw`: `:<old-mode> <new-mode> <old-sha> <new-sha> <status>\t<path>`, with
+    // a missing side rendered as a zero mode and an abbreviated null object id.
+    if fmts.raw {
+        let null = ObjectId::null(repo.object_hash());
+        for change in changes {
+            out.extend_from_slice(
+                format!(
+                    ":{:06o} {:06o} ",
+                    change.old_mode.unwrap_or(0),
+                    change.new_mode.unwrap_or(0)
+                )
+                .as_bytes(),
+            );
+            out.extend_from_slice(
+                abbrev_id(repo, change.old_oid.unwrap_or(null), abbrev, fallback_len).as_bytes(),
+            );
+            out.push(b' ');
+            out.extend_from_slice(
+                abbrev_id(repo, change.new_oid.unwrap_or(null), abbrev, fallback_len).as_bytes(),
+            );
+            out.push(b' ');
+            out.push(change.kind.letter());
+            match &change.source {
+                Some(source) => {
+                    out.extend_from_slice(format!("{:03}\t", change.score).as_bytes());
+                    out.extend_from_slice(&quote_path(source, quote_high));
+                    out.push(b'\t');
+                    out.extend_from_slice(&quote_path(&change.path, quote_high));
+                }
+                None => {
+                    out.push(b'\t');
+                    out.extend_from_slice(&quote_path(&change.path, quote_high));
+                }
+            }
+            out.push(b'\n');
+        }
     }
 
     if fmts.name_only {

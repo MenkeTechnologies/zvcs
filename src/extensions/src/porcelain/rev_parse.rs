@@ -56,6 +56,16 @@ enum RefSet {
     Tags,
 }
 
+/// What the full revspec grammar (`rev_parse`) made of an argument the
+/// single-object parser could not resolve.
+#[derive(Clone, Copy)]
+enum Parsed {
+    /// A range/merge revspec, expanded to both endpoints at this position.
+    Range(RangeSpec),
+    /// A single object: `reversed` marks a `^rev` exclude, which prints `^<id>`.
+    Single { id: ObjectId, reversed: bool },
+}
+
 /// A resolved range revspec, ready to emit at its position in the scan.
 #[derive(Clone, Copy)]
 enum RangeSpec {
@@ -164,7 +174,8 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
 
     let mut o = Opts::default();
     // The single revision `--verify` mode holds back until the scan finishes.
-    let mut held: Option<(ObjectId, BString)> = None;
+    // The `bool` is git's "reversed" flag: a `^rev` exclude prints `^<id>`.
+    let mut held: Option<(ObjectId, BString, bool)> = None;
     let mut revs = 0usize;
     // Once a path argument is seen, every later argument is a path too.
     let mut as_is = false;
@@ -204,7 +215,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 }
                 Opt::Refs(which) => {
                     for (echo, full, id) in collect_refs(&repo, which)? {
-                        show_rev(&mut out, &repo, &o, &id, Some(echo.as_bstr()), Some(full.as_bstr()))?;
+                        show_rev(&mut out, &repo, &o, &id, Some(echo.as_bstr()), Some(full.as_bstr()), false)?;
                     }
                 }
                 Opt::Unknown => {
@@ -243,37 +254,75 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             Some(id) => {
                 if o.verify {
                     revs += 1;
-                    held = Some((id, BString::from(arg.as_bytes())));
+                    held = Some((id, BString::from(arg.as_bytes()), false));
                 } else {
-                    show_rev(&mut out, &repo, &o, &id, Some(arg.as_bytes().as_bstr()), None)?;
+                    show_rev(&mut out, &repo, &o, &id, Some(arg.as_bytes().as_bstr()), None, false)?;
                 }
             }
             None => {
-                // A range revspec (`a..b`, `a...b`) is not a single object, so it
-                // fails `rev_parse_single` and lands here. Expand it at this
+                // A multi-object revspec that `rev_parse_single` cannot resolve
+                // lands here: a range (`a..b`, `a...b`), an exclude (`^rev`), or a
+                // single revision that only the full grammar accepts (`Include`).
+                // The full parser (`rev_parse`) classifies it; expand at this
                 // position before falling through to path handling.
-                let range = if arg.is_empty() {
+                let parsed = if arg.is_empty() {
                     None
                 } else {
                     repo.rev_parse(arg.as_str()).ok().and_then(|s| match s.detach() {
                         gix::revision::plumbing::Spec::Range { from, to } => {
-                            Some(RangeSpec::Range { from, to })
+                            Some(Parsed::Range(RangeSpec::Range { from, to }))
                         }
                         gix::revision::plumbing::Spec::Merge { theirs, ours } => {
-                            Some(RangeSpec::Merge { theirs, ours })
+                            Some(Parsed::Range(RangeSpec::Merge { theirs, ours }))
                         }
+                        // `^rev`: git's "reversed" single revision, prints `^<id>`.
+                        gix::revision::plumbing::Spec::Exclude(id) => {
+                            Some(Parsed::Single { id, reversed: true })
+                        }
+                        // A single revision the single-object parser missed.
+                        gix::revision::plumbing::Spec::Include(id) => {
+                            Some(Parsed::Single { id, reversed: false })
+                        }
+                        // `a^@`/`a^!` expand to a variable number of parents; not
+                        // implemented, so fall through to path handling as before.
                         _ => None,
                     })
                 };
-                if let Some(range) = range {
-                    emit_range(&mut out, &repo, &o, range)?;
-                    // A range is never a single revision. Under `--verify`/`--short`
-                    // the endpoints still print, but the scan then fails afterward
-                    // with "Needed a single revision" (git prints them, then dies).
-                    if o.verify {
-                        revs += 2;
+                match parsed {
+                    Some(Parsed::Range(range)) => {
+                        emit_range(&mut out, &repo, &o, range)?;
+                        // A range is never a single revision. Under
+                        // `--verify`/`--short` the endpoints still print, but the
+                        // scan then fails afterward with "Needed a single revision".
+                        if o.verify {
+                            revs += 2;
+                        }
+                        continue;
                     }
-                    continue;
+                    Some(Parsed::Single { id, reversed }) => {
+                        // The name for `--symbolic` echo is the text after any `^`.
+                        let name = if reversed {
+                            arg.strip_prefix('^').unwrap_or(arg.as_str())
+                        } else {
+                            arg.as_str()
+                        };
+                        if o.verify {
+                            revs += 1;
+                            held = Some((id, BString::from(name.as_bytes()), reversed));
+                        } else {
+                            show_rev(
+                                &mut out,
+                                &repo,
+                                &o,
+                                &id,
+                                Some(name.as_bytes().as_bstr()),
+                                None,
+                                reversed,
+                            )?;
+                        }
+                        continue;
+                    }
+                    None => {}
                 }
 
                 if o.verify {
@@ -299,8 +348,8 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
 
     if o.verify {
         match held {
-            Some((id, name)) if revs == 1 => {
-                show_rev(&mut out, &repo, &o, &id, Some(name.as_bstr()), None)?;
+            Some((id, name, reversed)) if revs == 1 => {
+                show_rev(&mut out, &repo, &o, &id, Some(name.as_bstr()), None, reversed)?;
             }
             _ => {
                 out.flush()?;
@@ -474,34 +523,48 @@ fn show_rev(
     id: &ObjectId,
     name: Option<&BStr>,
     known_full: Option<&BStr>,
+    reversed: bool,
 ) -> Result<()> {
-    if o.abbrev_ref || o.sym == Sym::Full {
+    // Build the rendered text without the newline first. `None` means "print
+    // nothing" — and for a `^rev` exclude the `^` is suppressed along with it,
+    // which is why `rev-parse --abbrev-ref ^HEAD~1` prints an empty result
+    // rather than a bare `^`.
+    let payload: Option<Vec<u8>> = if o.abbrev_ref || o.sym == Sym::Full {
         let full = match known_full {
             Some(f) => Some(f.to_owned()),
             None => name.and_then(|n| dwim_full_name(repo, n)),
         };
         // A revision that names no ref prints nothing at all in these modes.
-        if let Some(full) = full {
+        full.map(|full| {
             if o.abbrev_ref {
-                let short = <&gix::refs::FullNameRef>::try_from(full.as_bstr())
+                <&gix::refs::FullNameRef>::try_from(full.as_bstr())
                     .map(|f| f.shorten().to_owned())
-                    .unwrap_or_else(|_| full.clone());
-                emit(out, &short)?;
+                    .unwrap_or_else(|_| full.clone())
+                    .into()
             } else {
-                emit(out, &full)?;
+                full.into()
             }
-        }
-        return Ok(());
-    }
+        })
+    } else if o.sym == Sym::AsIs {
+        // `--symbolic` echoes the input name; with no name, fall back to the id.
+        Some(match name {
+            Some(n) => n.to_vec(),
+            None => render_id(repo, o, id)?,
+        })
+    } else {
+        Some(render_id(repo, o, id)?)
+    };
 
-    if o.sym == Sym::AsIs {
-        if let Some(n) = name {
-            emit(out, n)?;
-            return Ok(());
+    if let Some(p) = payload {
+        if reversed {
+            let mut buf = Vec::with_capacity(p.len() + 1);
+            buf.push(b'^');
+            buf.extend_from_slice(&p);
+            emit(out, &buf)?;
+        } else {
+            emit(out, &p)?;
         }
     }
-
-    emit(out, render_id(repo, o, id)?)?;
     Ok(())
 }
 

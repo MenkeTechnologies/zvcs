@@ -63,7 +63,12 @@ struct Opts {
     ignore_errors: bool,
     ignore_missing: bool,
     sparse: Option<bool>,
-    /// `Some(true)` for `--chmod=+x`, `Some(false)` for `--chmod=-x`.
+    /// The raw value of the last `--chmod=<v>` seen. git validates this only
+    /// once, on the final occurrence (last-wins), so `--chmod=v1 --chmod=+x`
+    /// succeeds — the good value overwrites the bad. Validated in `stage()`.
+    chmod_arg: Option<String>,
+    /// The validated form of `chmod_arg`: `Some(true)` for `+x`, `Some(false)`
+    /// for `-x`. Filled in after option validation, never during parsing.
     chmod: Option<bool>,
     pathspec_file_nul: bool,
     pathspec_from_file: bool,
@@ -121,13 +126,11 @@ fn parse(args: &[String]) -> Result<Opts> {
             "--pathspec-file-nul" => o.pathspec_file_nul = true,
             "--no-pathspec-file-nul" => o.pathspec_file_nul = false,
 
-            "--chmod=+x" => o.chmod = Some(true),
-            "--chmod=-x" => o.chmod = Some(false),
             other if other.starts_with("--chmod=") => {
-                // git: `fatal: --chmod param '<v>' must be either -x or +x`
-                let value = &other["--chmod=".len()..];
-                eprintln!("fatal: --chmod param '{value}' must be either -x or +x");
-                std::process::exit(i32::from(FATAL));
+                // git records the value and validates only the *last* one, after
+                // option parsing (`chmod_callback` stores; `cmd_add` checks). So
+                // `--chmod=v1 --chmod=+x` is accepted. Just keep the raw string.
+                o.chmod_arg = Some(other["--chmod=".len()..].to_string());
             }
 
             other if other == "--pathspec-from-file" || other.starts_with("--pathspec-from-file=") => {
@@ -168,7 +171,7 @@ fn parse(args: &[String]) -> Result<Opts> {
 // ---------------------------------------------------------------------------
 
 pub fn stage(args: &[String]) -> Result<ExitCode> {
-    let o = parse(args)?;
+    let mut o = parse(args)?;
 
     // --- option validation, in git's own order ------------------------------
     // The order matters when an invocation violates several rules at once, and it
@@ -182,6 +185,20 @@ pub fn stage(args: &[String]) -> Result<ExitCode> {
     if o.ignore_missing && !o.dry_run {
         eprintln!("fatal: the option '--ignore-missing' requires '--dry-run'");
         return Ok(ExitCode::from(FATAL));
+    }
+    // `--chmod` is validated here, once, on its last value — after the `-A`/`-u`
+    // and `--ignore-missing` fatals outrank it, but before the empty-pathspec and
+    // `--pathspec-file-nul` checks. Verified against git 2.55.0; the code is 128,
+    // not the 129 an eager option-value rejection would give.
+    if let Some(arg) = &o.chmod_arg {
+        match arg.as_str() {
+            "+x" => o.chmod = Some(true),
+            "-x" => o.chmod = Some(false),
+            _ => {
+                eprintln!("fatal: --chmod param '{arg}' must be either -x or +x");
+                return Ok(ExitCode::from(FATAL));
+            }
+        }
     }
     if o.pathspecs.iter().any(String::is_empty) {
         eprintln!("fatal: empty string is not a valid pathspec. please use . instead if you meant to match all paths");
@@ -581,6 +598,12 @@ struct Staged {
 fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let index = open_index(repo)?;
 
+    // git applies `--chmod` only when a pathspec is present: cmd_add runs it under
+    // `if (chmod_arg && pathspec.nr)`, and `-A`/`-u` do not synthesize a pathspec.
+    // So `stage -u --chmod=+x` (no pathspec) leaves every mode untouched — matching
+    // git — rather than flipping the bit on every tracked entry.
+    let chmod = if o.pathspecs.is_empty() { None } else { o.chmod };
+
     // Repo-relative stage-0 entries: the tracked set, with what is staged today.
     let tracked: HashMap<BString, (gix::hash::ObjectId, Mode)> = {
         let backing = index.path_backing();
@@ -764,6 +787,16 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         return Ok(ExitCode::from(FATAL));
     }
 
+    // `--intent-to-add` deposits the empty blob into the object store the moment it
+    // reaches the add phase, as a side effect of git's intent machinery — even in
+    // `--dry-run`, and even when no path actually becomes an intent-to-add entry
+    // (e.g. `-N -u`, or `-N` over an all-tracked pathspec). Only a pathspec that
+    // failed validation above skips it, which is why this sits after that check.
+    // The write is atomic and idempotent, so it needs no index lock.
+    if o.intent_to_add {
+        repo.write_blob(b"")?;
+    }
+
     // --- dry run: report only, never touch the index or the odb -------------
     if o.dry_run {
         report(&printed);
@@ -772,7 +805,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
     // Nothing to write: report and leave the index file alone, so its extensions
     // (notably the tree cache dropped below) survive a run that changed nothing.
-    if staged.is_empty() && deletions.is_empty() && o.chmod.is_none() {
+    if staged.is_empty() && deletions.is_empty() && chmod.is_none() {
         if o.verbose {
             report(&printed);
         }
@@ -821,7 +854,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
     // `--chmod` forces the mode of every matched path, whether or not this run
     // restaged it, and never contributes to the verbose report.
-    if let Some(executable) = o.chmod {
+    if let Some(executable) = chmod {
         let want = if executable { Mode::FILE_EXECUTABLE } else { Mode::FILE };
         // Collect first, so the matcher and the index's shared borrow are both
         // released before the entries are mutated below.

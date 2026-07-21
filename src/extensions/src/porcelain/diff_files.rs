@@ -109,6 +109,15 @@ const F_NO_OUTPUT: u32 = 1 << 10;
 /// Formats whose records depend on file content rather than on stat data.
 const F_CONTENT: u32 = F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_DIRSTAT | F_SUMMARY | F_PATCH;
 
+/// Output-format flags whose git option is an `OPT_BITOP` that *clears*
+/// `DIFF_FORMAT_NO_OUTPUT` when it fires. `--name-only`/`--name-status`/`--check`
+/// are plain `OPT_BIT`s and are deliberately excluded — they never clear it, which
+/// is why `-s --name-only` dies while `-s --raw` prints raw.
+const F_POSITIVE: u32 = F_RAW | F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_DIRSTAT | F_SUMMARY | F_PATCH;
+
+/// Every output-format bit `-s`/`--no-patch` clears when it sets `NO_OUTPUT`.
+const F_ALL_FORMATS: u32 = F_POSITIVE | F_NAME | F_NAME_STATUS | F_CHECKDIFF;
+
 /// How lines are compared, mirroring xdiff's `XDF_*` whitespace flags.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Whitespace {
@@ -451,6 +460,27 @@ enum Fatal {
     /// This is the parse-options `OPT_COLOR_FLAG` validation error, distinct from
     /// the subcommand usage text, so it carries git's own exit code of 129.
     ColorValue,
+    /// `fatal: option '<opt>' must come before non-option arguments`, exit 128.
+    /// `setup_revisions()` refuses any dashed option once a pathspec has been seen.
+    OptionAfterArg(String),
+    /// `fatal: bad --ignore-submodules argument: <v>`, exit 128.
+    BadIgnoreSubmodules(String),
+    /// `error: option 'inter-hunk-context' expects a numerical value`, exit 129.
+    /// The `OPT_MAGNITUDE` empty-value branch.
+    Magnitude(&'static str),
+    /// `error: option '<opt>' expects a non-negative integer value with an optional
+    /// k/m/g suffix`, exit 129. The `OPT_MAGNITUDE` bad-value branch.
+    BadMagnitude(&'static str),
+    /// `error: unknown value after ws-error-highlight=<prefix>`, exit 129, where
+    /// `<prefix>` is the accepted portion of the value before the offending token.
+    WsErrorHighlight(String),
+    /// `error: color moved setting must be one of …` + `error: bad --color-moved
+    /// argument: <v>`, exit 129.
+    ColorMoved(String),
+    /// `fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be
+    /// used together`, exit 128. `diff_setup_done()` dies when `-s` (NO_OUTPUT) is
+    /// left set alongside a name/status/check format.
+    NameStatusNoPatch,
 }
 
 impl Fatal {
@@ -496,6 +526,41 @@ impl Fatal {
                     "error: option `color' expects \"always\", \"auto\", or \"never\""
                 );
                 return ExitCode::from(129);
+            }
+            Fatal::OptionAfterArg(opt) => {
+                let _ = writeln!(err, "fatal: option '{opt}' must come before non-option arguments");
+            }
+            Fatal::BadIgnoreSubmodules(v) => {
+                let _ = writeln!(err, "fatal: bad --ignore-submodules argument: {v}");
+            }
+            Fatal::Magnitude(opt) => {
+                let _ = writeln!(err, "error: option `{opt}' expects a numerical value");
+                return ExitCode::from(129);
+            }
+            Fatal::BadMagnitude(opt) => {
+                let _ = writeln!(
+                    err,
+                    "error: option `{opt}' expects a non-negative integer value with an optional k/m/g suffix"
+                );
+                return ExitCode::from(129);
+            }
+            Fatal::WsErrorHighlight(prefix) => {
+                let _ = writeln!(err, "error: unknown value after ws-error-highlight={prefix}");
+                return ExitCode::from(129);
+            }
+            Fatal::ColorMoved(v) => {
+                let _ = writeln!(
+                    err,
+                    "error: color moved setting must be one of 'no', 'default', 'blocks', 'zebra', 'dimmed-zebra', 'plain'"
+                );
+                let _ = writeln!(err, "error: bad --color-moved argument: {v}");
+                return ExitCode::from(129);
+            }
+            Fatal::NameStatusNoPatch => {
+                let _ = writeln!(
+                    err,
+                    "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
+                );
             }
         }
         ExitCode::from(128)
@@ -595,6 +660,9 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
     let mut paths: Vec<BString> = Vec::new();
     let mut unsupported: Option<String> = None;
     let mut after_dashdash = false;
+    // `setup_revisions()` records the first pathspec; from then on any dashed
+    // option is rejected before it is even classified.
+    let mut seen_non_option = false;
 
     for a in args {
         let s = a.as_str();
@@ -610,6 +678,12 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
             continue;
         }
         if s.starts_with('-') && s.len() > 1 {
+            // "option '<opt>' must come before non-option arguments": this beats
+            // both flag-validity (129) and per-value checks, so it is tested first.
+            if seen_non_option {
+                return Err(Fatal::OptionAfterArg(s.to_owned()));
+            }
+            let fmt_before = opts.fmt;
             match classify(s, &mut opts, &mut quiet)? {
                 Flag::Handled => {}
                 Flag::Unsupported => {
@@ -618,6 +692,11 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
                     }
                 }
                 Flag::Unknown => return Err(Fatal::Usage),
+            }
+            // `OPT_BITOP`: a positive output-format flag clears `NO_OUTPUT`, so a
+            // later `--raw`/`-p`/`--stat` re-enables output after an earlier `-s`.
+            if (opts.fmt & !fmt_before) & F_POSITIVE != 0 {
+                opts.fmt &= !F_NO_OUTPUT;
             }
             continue;
         }
@@ -630,6 +709,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
             return Err(Fatal::Ambiguous(s.to_owned()));
         }
         paths.push(s.into());
+        seen_non_option = true;
     }
 
     // `diff_merges_setup_revs()`: `-c`/`--cc` set `merges_need_diff`, which forces
@@ -638,10 +718,16 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         opts.fmt |= F_PATCH;
     }
 
-    // `diff_setup_done()`: --name-only / --name-status / --check / -s clear
-    // every other output format, and an empty format falls back to raw.
-    if opts.fmt & (F_NAME | F_NAME_STATUS | F_CHECKDIFF | F_NO_OUTPUT) != 0 {
-        opts.fmt &= !(F_RAW | F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_DIRSTAT | F_SUMMARY | F_PATCH);
+    // `diff_setup_done()`: --name-only / --name-status / --check clear every other
+    // content/patch format. `-s` (NO_OUTPUT) is *not* in this trigger — its own
+    // `OPT_BITOP` already cleared the other formats in argument order.
+    if opts.fmt & (F_NAME | F_NAME_STATUS | F_CHECKDIFF) != 0 {
+        opts.fmt &= !F_POSITIVE;
+    }
+    // `diff_setup_done()` dies when `-s` survives alongside a name/status/check
+    // format, i.e. `-s` came after them with nothing re-enabling output.
+    if opts.fmt & F_NO_OUTPUT != 0 && opts.fmt & (F_NAME | F_NAME_STATUS | F_CHECKDIFF) != 0 {
+        return Err(Fatal::NameStatusNoPatch);
     }
     if quiet {
         // `--quiet` wins over every other format and turns on the exit status.
@@ -817,7 +903,12 @@ fn classify(s: &str, opts: &mut Opts, quiet: &mut bool) -> Result<Flag, Fatal> {
             opts.fmt |= F_DIRSTAT;
             opts.dirstat.cumulative = true;
         }
-        "-s" | "--no-patch" => opts.fmt |= F_NO_OUTPUT,
+        // `OPT_BITOP('s', "no-patch", …, NO_OUTPUT, all-other-formats)`: sets
+        // NO_OUTPUT and clears every other output-format bit, in argument order.
+        "-s" | "--no-patch" => {
+            opts.fmt &= !F_ALL_FORMATS;
+            opts.fmt |= F_NO_OUTPUT;
+        }
         "-z" => opts.nul = true,
         "--abbrev" => opts.abbrev = Some(None),
         "--no-abbrev" => opts.abbrev = None,
@@ -917,7 +1008,7 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
             "dirty" => Ignore::Dirty,
             "untracked" => Ignore::Untracked,
             "none" => Ignore::None,
-            _ => return Err(Fatal::Usage),
+            _ => return Err(Fatal::BadIgnoreSubmodules(v.to_owned())),
         });
         return Ok(Flag::Handled);
     }
@@ -1084,6 +1175,28 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
             Err(Fatal::NotAnInteger(v.to_owned()))
         };
     }
+    // `--inter-hunk-context=<n>` is an `OPT_MAGNITUDE`: gix has no such knob, so the
+    // value is a no-op, but git still validates it (and rejects a bad one at 129).
+    if let Some(v) = s.strip_prefix("--inter-hunk-context=") {
+        validate_magnitude(v, "inter-hunk-context")?;
+        return Ok(Flag::Handled);
+    }
+    // `--ws-error-highlight=<kinds>`: a comma list drawn from old/new/context/all/
+    // default/none. Highlighting needs color, which is never on here, so the value
+    // is a no-op — but a bad token is git's own 129 usage error.
+    if let Some(v) = s.strip_prefix("--ws-error-highlight=") {
+        validate_ws_error_highlight(v)?;
+        return Ok(Flag::Handled);
+    }
+    // `--color-moved=<mode>`: colored moves need color (never on here), so this is a
+    // no-op, but an unknown mode is git's 129 error.
+    if let Some(v) = s.strip_prefix("--color-moved=") {
+        const MODES: &[&str] = &["no", "default", "plain", "blocks", "zebra", "dimmed-zebra", "dimmed_zebra"];
+        if v.is_empty() || MODES.contains(&v) {
+            return Ok(Flag::Handled);
+        }
+        return Err(Fatal::ColorMoved(v.to_owned()));
+    }
     if ACCEPTED_NOOP.contains(&s) || ACCEPTED_NOOP_VALUED.iter().any(|p| s.starts_with(p)) {
         return Ok(Flag::Handled);
     }
@@ -1191,6 +1304,68 @@ fn parse_filter(v: &str) -> Result<Filter, Fatal> {
     };
     keep.retain(|c| !exclude.contains(c));
     Ok(Filter { keep, all_or_none })
+}
+
+/// `OPT_MAGNITUDE` validation (`parse_options.c` `parse_opt_unsigned`): an optional
+/// leading `+`, one or more decimal digits, then an optional single k/m/g suffix
+/// (case-insensitive). An empty value and a malformed one carry distinct messages.
+fn validate_magnitude(v: &str, opt: &'static str) -> Result<(), Fatal> {
+    if v.is_empty() {
+        return Err(Fatal::Magnitude(opt));
+    }
+    let b = v.as_bytes();
+    let mut i = 0;
+    if b[i] == b'+' {
+        i += 1;
+    }
+    let digits_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == digits_start {
+        return Err(Fatal::BadMagnitude(opt));
+    }
+    if i < b.len() && matches!(b[i], b'k' | b'K' | b'm' | b'M' | b'g' | b'G') {
+        i += 1;
+    }
+    if i != b.len() {
+        return Err(Fatal::BadMagnitude(opt));
+    }
+    Ok(())
+}
+
+/// `parse_ws_error_highlight()`: walk the comma list left to right, matching each
+/// token exactly against the recognized kinds. On the first token that does not
+/// match, git reports the accepted prefix consumed so far (a trailing comma is fine
+/// because the walk simply ends). An empty value is accepted.
+fn validate_ws_error_highlight(v: &str) -> Result<(), Fatal> {
+    const KINDS: &[&str] = &["old", "new", "context", "all", "default", "none"];
+    let b = v.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let mut matched: Option<usize> = None;
+        for k in KINDS {
+            let kb = k.as_bytes();
+            if b[i..].starts_with(kb) {
+                let after = i + kb.len();
+                if after == b.len() || b[after] == b',' {
+                    matched = Some(kb.len());
+                    break;
+                }
+            }
+        }
+        match matched {
+            Some(len) => {
+                i += len;
+                if i < b.len() {
+                    // skip the separating comma
+                    i += 1;
+                }
+            }
+            None => return Err(Fatal::WsErrorHighlight(v[..i].to_owned())),
+        }
+    }
+    Ok(())
 }
 
 /// git's `looks_like_pathspec()`: long-form magic, or an unescaped glob character.

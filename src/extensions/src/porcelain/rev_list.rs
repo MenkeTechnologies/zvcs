@@ -110,7 +110,9 @@ enum Order {
 ///                                       position the flag appears in the argv
 ///   * `--count`                      — print only the number of output lines
 ///   * `-n <n>` / `-n<n>` / `--max-count=<n>` — limit the number listed
-///   * `--reverse`                    — reverse the output (limit applied first)
+///   * `--reverse`                    — toggle reversed output (git XORs the flag,
+///                                       so it applies with an odd count only;
+///                                       limit applied first)
 ///   * `--first-parent`               — follow only the first parent of merges
 ///   * `--topo-order` / `--date-order` — topological orderings
 ///   * `--merges` / `--no-merges` / `--{min,max}-parents=<n>` — parent-count filter
@@ -169,7 +171,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         let a = args[i].as_str();
         match a {
             "--count" => count_only = true,
-            "--reverse" => reverse = true,
+            // git toggles this with `revs->reverse ^= 1`, so an even number of
+            // `--reverse` flags cancels out and leaves the default order.
+            "--reverse" => reverse = !reverse,
             "--first-parent" => first_parent = true,
             "--objects" => objects = true,
             "--parents" => show_parents = true,

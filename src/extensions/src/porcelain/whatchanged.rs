@@ -82,6 +82,24 @@
 //!   `Pathspec`, git's own algorithm: literal paths and directory prefixes, shell globs
 //!   (`*.rs`), and `:(glob)` / `:!exclude` / exclude-only magic. Slot accounting matches
 //!   git — a path-filtered-empty commit consumes no `--max-count`.
+//! * **Ref-set selectors.** `--all`, `--tags`, `--branches` and `--remotes` replace the
+//!   default `HEAD` tip with the union of the matching commit refs (any explicit `<rev>`
+//!   is unioned in too), so history from every selected ref is walked. An empty selection
+//!   (`--tags` in a tagless repo) walks nothing and exits 0, as git does.
+//! * **`--grep` commit-message filter** for the literal-pattern case. git greps the
+//!   message with POSIX *basic* regex by default; a pattern that is a pure literal under
+//!   the active flavour (`-F` forces literal, `-E`/`-P` widen the metacharacter set) is
+//!   matched with an exact substring test — byte-identical to git's result. Multiple
+//!   `--grep` OR (`--all-match` ANDs), `--invert-grep` negates, and `-i` folds ASCII case.
+//!   A pattern carrying regex metacharacters is deferred (see below) rather than matched
+//!   with the wrong flavour.
+//! * **Unported options are applied lazily, matching git's exit code on empty output.**
+//!   git only applies display/filter options to the commits it actually shows, so an
+//!   invocation whose filters leave nothing to show exits 0 with empty output whatever
+//!   those options are. This module mirrors that: a recognised-but-unported option no
+//!   longer bails up front — it bails only when a commit survives every filter and would
+//!   be rendered. `whatchanged --i-still-use-this --unified=1 --grep=X` over a repo where
+//!   no message matches `X` now exits 0 (empty), exactly like git, instead of erroring.
 //! * **Malformed option values are rejected at parse time, matching git's exit code.**
 //!   An invalid `--pretty=`/`--format=` value is `fatal: invalid --pretty format` (128);
 //!   `--min-parents=`/`--max-parents=` reject a non-integer (128); `--unified=`,
@@ -95,9 +113,14 @@
 //! * **Every other recognised option.** They are recognised for the purpose of argument
 //!   classification — that is what git does, and it is what decides the exit-128 output
 //!   above — but under `--i-still-use-this` a recognised option this module does not
-//!   implement bails rather than being ignored. `-p`/`--patch`, `--stat` and friends, a
-//!   *valid* `--pretty`/`--format`, `--graph`, date/author/grep filters, `-M`/`-C`, and
-//!   `--decorate` all land here.
+//!   implement bails *when a commit would be shown* rather than being ignored (see the
+//!   lazy-application note above; when the filters empty the walk, they exit 0 like git).
+//!   `-p`/`--patch`, `--stat` and friends, a *valid* `--pretty`/`--format`, `--graph`,
+//!   date/author filters, a non-literal `--grep`, `-M`/`-C`, and `--decorate` all land here.
+//! * **Tip-set-broadening selectors this module does not resolve** — `--reflog`,
+//!   `--walk-reflogs`/`-g`, `--stdin`, `--bisect`, `--not`, and patterned ref globs
+//!   (`--glob=`, `--exclude=`, `--branches=`/`--tags=`/`--remotes=` with a value) — bail
+//!   *before* the walk, since ignoring one could make real history look empty.
 //! * **`:(attr:…)` attribute pathspecs** (which need the worktree attribute stack) and
 //!   **multiple or non-single revisions** (`a..b`, `^a`, `a...b`) bail under
 //!   `--i-still-use-this`.
@@ -553,6 +576,80 @@ const REFLOG_LIMITING: &[&str] = &[
 /// pathspec it marks does not count towards the one `--follow` requires.
 const FOLLOW_OK_MAGIC: &[&str] = &["top", "exclude"];
 
+/// A `--grep` commit-message filter, reproduced for the literal-pattern case.
+///
+/// git greps the commit message with `regcomp`, defaulting to POSIX *basic* regular
+/// expressions (`-E` selects extended, `-F` fixed strings, `-P` PCRE). Only patterns
+/// that are pure literals under the active flavour are honoured here — for those, git's
+/// regex match degenerates to a substring test, which is reproduced exactly. A pattern
+/// carrying any regex metacharacter is left to the deferred-unimplemented path instead of
+/// being matched with the wrong flavour. Multiple `--grep` are OR-ed (`--all-match`
+/// AND-s them), `--invert-grep` negates the verdict, and `-i` folds ASCII case.
+#[derive(Default)]
+struct GrepFilter {
+    patterns: Vec<String>,
+    ignore_case: bool,
+    all_match: bool,
+    invert: bool,
+    fixed: bool,
+    extended: bool,
+}
+
+impl GrepFilter {
+    fn active(&self) -> bool {
+        !self.patterns.is_empty()
+    }
+
+    /// Whether every collected pattern is a pure literal under the active flavour, so a
+    /// substring test reproduces git's match. `-F` makes any pattern literal; otherwise a
+    /// regex metacharacter (basic, or the wider extended set) disqualifies it.
+    fn is_faithful(&self) -> bool {
+        if self.fixed {
+            return true;
+        }
+        let specials: &[u8] = if self.extended {
+            b".*[]^$\\+?(){}|"
+        } else {
+            b".*[]^$\\"
+        };
+        self.patterns
+            .iter()
+            .all(|p| !p.bytes().any(|b| specials.contains(&b)))
+    }
+
+    /// Whether a commit with this message is kept. Only called once [`is_faithful`] has
+    /// confirmed the substring test is exact.
+    fn keeps(&self, message: &[u8]) -> bool {
+        let hay: Vec<u8> = if self.ignore_case {
+            message.to_ascii_lowercase()
+        } else {
+            message.to_vec()
+        };
+        let test = |pat: &str| {
+            let needle = if self.ignore_case {
+                pat.to_ascii_lowercase()
+            } else {
+                pat.to_string()
+            };
+            contains_subslice(&hay, needle.as_bytes())
+        };
+        let matched = if self.all_match {
+            self.patterns.iter().all(|p| test(p))
+        } else {
+            self.patterns.iter().any(|p| test(p))
+        };
+        matched != self.invert
+    }
+}
+
+/// Whether `haystack` contains `needle` as a contiguous run (`needle` empty ⇒ true).
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// The result of reproducing `setup_revisions` over the argument list.
 #[derive(Default)]
 struct Parsed {
@@ -560,8 +657,24 @@ struct Parsed {
     max_count: Option<usize>,
     revs: Vec<String>,
     pathspecs: Vec<String>,
-    /// The first recognised option this module does not implement, if any.
+    /// The first recognised option this module does not implement, if any. Consulted
+    /// only when a commit actually survives filtering and is about to be rendered — git
+    /// applies these options to *shown* commits, so an invocation whose filters leave
+    /// nothing to show produces empty output and exit 0 no matter what they are.
     unimplemented: Option<String>,
+    /// A collected `--grep` filter. Applied when every pattern is literal-faithful;
+    /// otherwise it feeds `unimplemented` so a shown commit still bails.
+    grep: GrepFilter,
+    /// Ref-set selectors that replace the default `HEAD` tip with a union of refs.
+    select_all: bool,
+    select_tags: bool,
+    select_branches: bool,
+    select_remotes: bool,
+    /// A tip-set-broadening selector this module does not implement (`--reflog`,
+    /// `--walk-reflogs`, `--stdin`, `--bisect`, a patterned `--glob=`/`--exclude=`/
+    /// `--branches=`/… selector). Bailed *before* the walk, because ignoring it could let
+    /// this module report exit-0-empty while git still has history to show.
+    set_broadening: Option<String>,
 }
 
 /// `git whatchanged` — see the module documentation for the covered surface.
@@ -992,6 +1105,84 @@ fn consume_option(
         return Ok(1);
     }
 
+    // `--grep` companion flags. On their own (no `--grep`) they are inert in git — verified
+    // against stock git 2.55.0 — so, unlike the rest of FLAG_OPTS, they must not mark the
+    // command unimplemented; they only tune how a collected `--grep` pattern is matched.
+    match a {
+        "-i" | "--regexp-ignore-case" => {
+            p.grep.ignore_case = true;
+            return Ok(1);
+        }
+        "--all-match" => {
+            p.grep.all_match = true;
+            return Ok(1);
+        }
+        "--invert-grep" => {
+            p.grep.invert = true;
+            return Ok(1);
+        }
+        "-F" | "--fixed-strings" => {
+            p.grep.fixed = true;
+            return Ok(1);
+        }
+        // `-E`/`-P` widen the metacharacter set; treated the same for the literal check
+        // (only a pure-literal pattern is honoured under either).
+        "-E" | "--extended-regexp" | "-P" | "--perl-regexp" => {
+            p.grep.extended = true;
+            return Ok(1);
+        }
+        _ => {}
+    }
+
+    // Ref-set selectors resolved into walk tips (a union of the matching commit refs).
+    match a {
+        "--all" => {
+            p.select_all = true;
+            return Ok(1);
+        }
+        "--tags" => {
+            p.select_tags = true;
+            return Ok(1);
+        }
+        "--branches" => {
+            p.select_branches = true;
+            return Ok(1);
+        }
+        "--remotes" => {
+            p.select_remotes = true;
+            return Ok(1);
+        }
+        _ => {}
+    }
+
+    // Tip-set-broadening selectors that are recognised but not resolved here. They inject
+    // history from outside the default `HEAD` tip (reflogs, stdin, bisect, patterned ref
+    // globs), so ignoring one could make a non-empty history look empty. Remembered and
+    // bailed *before* the walk rather than deferred, to never falsely report exit-0-empty.
+    const SET_BROADENING: &[&str] = &[
+        "--reflog",
+        "--stdin",
+        "--bisect",
+        "--walk-reflogs",
+        "-g",
+        "--not",
+        "--alternate-refs",
+    ];
+    const SET_BROADENING_PREFIX: &[&str] = &[
+        "--glob=",
+        "--exclude=",
+        "--exclude-hidden=",
+        "--branches=",
+        "--tags=",
+        "--remotes=",
+    ];
+    if SET_BROADENING.contains(&a) || SET_BROADENING_PREFIX.iter().any(|pre| a.starts_with(pre)) {
+        if p.set_broadening.is_none() {
+            p.set_broadening = Some(a.to_string());
+        }
+        return Ok(1);
+    }
+
     if FLAG_OPTS.contains(&a) {
         note_recognized(a, p);
         return Ok(1);
@@ -1089,6 +1280,12 @@ fn consume_option(
     for opt in VALUE_OPTS {
         let attached = format!("{opt}=");
         if let Some(v) = a.strip_prefix(attached.as_str()) {
+            // `--grep` is honoured (for literal patterns) rather than deferred, so it does
+            // not mark the command unimplemented on its own.
+            if *opt == "--grep" {
+                p.grep.patterns.push(v.to_string());
+                return Ok(1);
+            }
             match *opt {
                 "--date" => validate_date_format(v)?,
                 "--skip" => {
@@ -1102,6 +1299,10 @@ fn consume_option(
         }
         if a == *opt {
             let v = next.ok_or_else(|| Fatal::die(format!("Option '{opt}' requires a value")))?;
+            if *opt == "--grep" {
+                p.grep.patterns.push(v.to_string());
+                return Ok(2);
+            }
             match *opt {
                 "--date" => validate_date_format(v)?,
                 "--skip" => {
@@ -1356,14 +1557,28 @@ fn validate_word_diff(v: &str) -> Result<(), Fatal> {
 }
 
 /// Walk and render, once `--i-still-use-this` has cleared the deprecation gate.
-fn run(repo: &gix::Repository, parsed: Parsed) -> Result<ExitCode> {
-    if let Some(flag) = &parsed.unimplemented {
-        bail!(
-            "{flag} is recognised but not ported (ported: --i-still-use-this, --raw, \
-             --no-merges, --no-renames, -n/--max-count/-nN/-N)"
-        );
+fn run(repo: &gix::Repository, mut parsed: Parsed) -> Result<ExitCode> {
+    // A tip-set-broadening selector this module does not resolve: bail up front, because
+    // silently ignoring it could make an invocation with real history look empty.
+    if let Some(flag) = &parsed.set_broadening {
+        bail!("{flag} selects history that is not ported");
     }
-    if parsed.revs.len() > 1 {
+
+    // A `--grep` whose patterns are not all literal under the active flavour cannot be
+    // matched faithfully (git defaults to POSIX basic regex); treat it like any other
+    // unported option — deferred to render time — rather than matching with wrong rules.
+    if parsed.grep.active() && !parsed.grep.is_faithful() && parsed.unimplemented.is_none() {
+        parsed.unimplemented = Some("--grep".to_string());
+    }
+    let apply_grep = parsed.grep.active() && parsed.grep.is_faithful();
+
+    // The unported-option bail is deferred: git applies these options only to commits it
+    // actually shows, so an invocation whose filters leave nothing to show exits 0 with no
+    // output regardless of them. The bail therefore fires per-commit, below, the moment a
+    // commit survives filtering and would be rendered — not here.
+    let has_selector =
+        parsed.select_all || parsed.select_tags || parsed.select_branches || parsed.select_remotes;
+    if !has_selector && parsed.revs.len() > 1 {
         bail!("multiple revisions are not ported");
     }
 
@@ -1390,22 +1605,29 @@ fn run(repo: &gix::Repository, parsed: Parsed) -> Result<ExitCode> {
         )?)
     };
 
-    // Resolve the starting tip. A bare `HEAD` may be unborn, which git reports as a
-    // fatal error rather than as empty output.
-    let tip = match parsed.revs.first() {
-        // `parse_args` already resolved this spec, so the error arm is unreachable; it
-        // is spelled out rather than `?`-ed to keep the gix error out of `anyhow`.
-        Some(spec) => match repo.rev_parse(spec.as_str()) {
-            Ok(rev) => match rev.single() {
-                Some(id) => id.detach(),
-                None => bail!("revision ranges are not ported"),
+    // Resolve the walk tips. Ref-set selectors (`--all`/`--tags`/`--branches`/`--remotes`)
+    // replace the default `HEAD` with the union of the matching commit refs; an empty
+    // selector set (e.g. `--tags` in a tagless repo) is not an error — git walks nothing
+    // and exits 0. Otherwise a single `<rev>` is used, defaulting to `HEAD`, which may be
+    // unborn (git reports that as a fatal error rather than as empty output).
+    let tips: Vec<ObjectId> = if has_selector {
+        selector_tips(repo, &parsed)?
+    } else {
+        match parsed.revs.first() {
+            // `parse_args` already resolved this spec, so the error arm is unreachable; it
+            // is spelled out rather than `?`-ed to keep the gix error out of `anyhow`.
+            Some(spec) => match repo.rev_parse(spec.as_str()) {
+                Ok(rev) => match rev.single() {
+                    Some(id) => vec![id.detach()],
+                    None => bail!("revision ranges are not ported"),
+                },
+                Err(e) => bail!("{spec}: {e}"),
             },
-            Err(e) => bail!("{spec}: {e}"),
-        },
-        None => match repo.head()?.try_peel_to_id()? {
-            Some(id) => id.detach(),
-            None => bail!("your current branch does not have any commits yet"),
-        },
+            None => match repo.head()?.try_peel_to_id()? {
+                Some(id) => vec![id.detach()],
+                None => bail!("your current branch does not have any commits yet"),
+            },
+        }
     };
 
     let renames = !parsed.no_renames && renames_enabled(repo);
@@ -1413,7 +1635,7 @@ fn run(repo: &gix::Repository, parsed: Parsed) -> Result<ExitCode> {
 
     // Newest-first by commit date, the default `git log` ordering.
     let walk = repo
-        .rev_walk([tip])
+        .rev_walk(tips.iter().copied())
         .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst))
         .all()?;
 
@@ -1432,6 +1654,16 @@ fn run(repo: &gix::Repository, parsed: Parsed) -> Result<ExitCode> {
         let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
         if parents.len() > 1 {
             continue;
+        }
+
+        // `--grep`: git filters on the commit message during traversal, before the diff,
+        // and an excluded commit is dropped whether or not it changed anything.
+        if apply_grep {
+            let message = commit.message_raw()?;
+            let bytes: &[u8] = &message[..];
+            if !parsed.grep.keeps(bytes) {
+                continue;
+            }
         }
 
         let new_tree = commit.tree_id()?.detach();
@@ -1454,6 +1686,19 @@ fn run(repo: &gix::Repository, parsed: Parsed) -> Result<ExitCode> {
         // no diff prints nothing at all and git restores the `--max-count` it spent.
         if changes.is_empty() {
             continue;
+        }
+
+        // Deferred unported-option bail: this commit survives every filter and would be
+        // rendered, but an option this module cannot honour (a patch/stat display mode, a
+        // non-literal `--grep`, …) is active, so its raw rendering would not match git.
+        // Reaching here means git *does* have output, so an honest bail is the right
+        // answer; an invocation whose filters emptied the walk never gets here and exits 0.
+        if let Some(flag) = &parsed.unimplemented {
+            bail!(
+                "{flag} is recognised but not ported (ported: --i-still-use-this, --raw, \
+                 --no-merges, --no-renames, --grep, --all/--branches/--tags/--remotes, \
+                 -n/--max-count/-nN/-N)"
+            );
         }
 
         // git would run `diffcore_rename` over this pair set; see the module docs for
@@ -1481,6 +1726,66 @@ fn run(repo: &gix::Repository, parsed: Parsed) -> Result<ExitCode> {
     stdout.write_all(&out)?;
     stdout.flush()?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Collect the walk tips for the ref-set selectors (`--all`/`--tags`/`--branches`/
+/// `--remotes`), matching git's rev-list: each selected ref is peeled to its object and
+/// only commit tips are kept (a tag pointing at a tree/blob contributes no history). Any
+/// explicit `<rev>` on the command line is unioned in, as git does. `--all` is the union
+/// of local branches, tags and remote-tracking branches; exotic ref namespaces
+/// (`refs/stash`, notes, …) are not included, matching the common `for-each-ref` set.
+fn selector_tips(repo: &gix::Repository, parsed: &Parsed) -> Result<Vec<ObjectId>> {
+    let mut ids: Vec<ObjectId> = Vec::new();
+    let refs = repo.references()?;
+    if parsed.select_branches || parsed.select_all {
+        add_ref_tips(repo, refs.local_branches()?, &mut ids)?;
+    }
+    if parsed.select_tags || parsed.select_all {
+        add_ref_tips(repo, refs.tags()?, &mut ids)?;
+    }
+    if parsed.select_remotes || parsed.select_all {
+        add_ref_tips(repo, refs.remote_branches()?, &mut ids)?;
+    }
+    // git's `--all` is "all refs in refs/, along with HEAD" — so a detached HEAD (or any
+    // commit reachable only from HEAD) is included even though no ref names it.
+    if parsed.select_all {
+        if let Ok(mut head) = repo.head() {
+            if let Ok(Some(id)) = head.try_peel_to_id() {
+                ids.push(id.detach());
+            }
+        }
+    }
+    for spec in &parsed.revs {
+        if let Ok(rev) = repo.rev_parse(spec.as_str()) {
+            if let Some(id) = rev.single() {
+                ids.push(id.detach());
+            }
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// Peel each reference in `iter` to its target object and push the commit ids onto `ids`.
+fn add_ref_tips<'a>(
+    repo: &gix::Repository,
+    iter: impl Iterator<
+        Item = std::result::Result<gix::Reference<'a>, Box<dyn std::error::Error + Send + Sync + 'static>>,
+    >,
+    ids: &mut Vec<ObjectId>,
+) -> Result<()> {
+    for r in iter {
+        let mut r = r.map_err(|e| anyhow!("reference iteration failed: {e}"))?;
+        let id = r
+            .peel_to_id()
+            .map_err(|e| anyhow!("cannot resolve reference: {e}"))?
+            .detach();
+        if matches!(repo.find_object(id).map(|o| o.kind), Ok(gix::objs::Kind::Commit)) {
+            ids.push(id);
+        }
+    }
+    Ok(())
 }
 
 /// Whether git would run rename detection: `diff.renames` defaults to on, and only an

@@ -82,10 +82,19 @@
 //! `--continue`/`--skip`/`--abort`/`--quit`/`--edit-todo`/`--show-current-patch`
 //! (the `.git/rebase-merge` state directory), `--root` (it mints a root commit),
 //! `--fork-point` (`get_fork_point()` walks the upstream reflog), `--autostash`
-//! against a dirty tree (it writes a stash commit), `--signoff` (it rewrites
-//! messages even when the range is empty), `-v`/`--stat` past the up-to-date
-//! exit (the upstream diffstat), and an executable `pre-rebase` hook.
+//! against a dirty tree (it writes a stash commit), `--signoff`/`--trailer`
+//! **over a range that actually picks commits** (they rewrite each commit's
+//! message, which the exact replay does not reproduce), `-v`/`--stat` past the
+//! up-to-date exit (the upstream diffstat), and an executable `pre-rebase` hook.
 //! Each is rejected with a message naming the reason; none is silently ignored.
+//!
+//! `--signoff`/`--trailer` are *not* refused up front, and *not* refused at all
+//! when the todo is empty: like git they only set `REBASE_FORCE`, so an
+//! up-to-date range takes the noop / fast-forward finish (git rewrites nothing
+//! there — `git rebase --signoff HEAD` leaves the tip untouched), and a missing
+//! upstream (stdout, exit 1) or an invalid upstream/onto (`fatal:`, exit 128)
+//! still reports git's own diagnostic in git's order, since resolution runs
+//! before the message-rewrite refusal.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -696,6 +705,13 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     if !trailers.is_empty() {
         flags |= FORCE;
     }
+    // git sets REBASE_FORCE for `--signoff` alongside trailers, so an already
+    // up-to-date range still replays (the noop finish) instead of taking the
+    // silent up-to-date exit — `git rebase --signoff HEAD` prints
+    // `Current branch <b> is up to date, rebase forced.`, not `... up to date.`.
+    if signoff {
+        flags |= FORCE;
+    }
 
     if preserve_merges {
         eprintln!(
@@ -922,11 +938,12 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         usage!();
     }
 
-    if signoff {
-        // `--signoff` appends a trailer to every replayed commit; git also sets
-        // REBASE_FORCE, so it never takes the up-to-date exit either.
-        bail!("unsupported flag \"--signoff\" (rewriting commit messages requires commit replay)");
-    }
+    // `--signoff`/`--trailer` do not error here. git resolves `<upstream>`,
+    // `<onto>` and the clean-work-tree state first, so a missing upstream
+    // (`error_on_missing_default_upstream`, stdout, exit 1), an invalid upstream
+    // or onto (`fatal:`, exit 128) or a dirty tree all take precedence over any
+    // message-rewrite refusal — the refusal moves down to the exact-replay
+    // decision, where it fires only if commits would actually be rewritten.
 
     // --- HEAD --------------------------------------------------------------
     let head = repo.head()?;
@@ -1160,6 +1177,20 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     let plan = plan.unwrap_or_default();
 
     if exact_replay {
+        // `--signoff`/`--trailer` rewrite the *message* of every picked commit
+        // (a Signed-off-by / custom trailer). The exact replay reproduces commit
+        // metadata — committer, and the author date under `--ignore-date` — but
+        // not message trailers, so a range that actually picks commits is refused
+        // rather than replayed without the trailer. An empty todo (handled by the
+        // noop / fast-forward finishes below) signs nothing, so it needs no guard;
+        // that is why `git rebase --signoff HEAD` is accepted and only a non-empty
+        // range is refused here.
+        if signoff {
+            bail!("unsupported flag \"--signoff\" (rewriting commit messages requires commit replay)");
+        }
+        if !trailers.is_empty() {
+            bail!("unsupported flag \"--trailer\" (rewriting commit messages requires commit replay)");
+        }
         // `git format-patch` emits nothing for a commit that changes no tree, so
         // the apply backend stops at one with `Patch is empty.` and leaves a
         // half-finished `.git/rebase-apply` behind. Reproducing that interrupted

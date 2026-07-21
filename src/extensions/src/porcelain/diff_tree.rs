@@ -34,7 +34,16 @@
 //!   usage error (`error: option `color' expects …`, exit 129), and an invalid
 //!   `--pretty`/`--format` name is fatal (`fatal: invalid --pretty format: <x>`,
 //!   exit 128). A valid `--pretty`/`--format` is still a format this port cannot
-//!   render and is recorded like any other unsupported option.
+//!   render and is recorded like any other unsupported option. An invalid
+//!   `--expand-tabs=<n>` (not a base-10 non-negative integer) and an invalid
+//!   `--ignore-submodules=<v>` (outside none/untracked/dirty/all) are both fatal
+//!   (`fatal: '<n>': not a non-negative integer` / `fatal: bad --ignore-submodules
+//!   argument: <v>`, exit 128); valid values are recorded as unsupported.
+//! * `--merge-base` requires exactly two commits; git enforces this after resolving
+//!   revisions but before the missing-`<tree-ish>` check, so any other count — zero
+//!   included — is `fatal: --merge-base only works with two commits` (exit 128). The
+//!   valid two-commit case needs a merge-base computation this port does not
+//!   implement and is recorded as unsupported.
 //! * `-h` — git's usage text on stdout, exit 129; no `<tree-ish>` — the same text on
 //!   stderr, exit 129
 //!
@@ -235,6 +244,9 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
     // The first option git accepts but this port cannot honour. Kept until we know
     // whether the invocation produces output at all; see the module documentation.
     let mut unsupported: Option<String> = None;
+    // `--merge-base` is validated after revision resolution: git requires exactly two
+    // commits and dies fatally (not a usage error) otherwise, even with zero revs.
+    let mut merge_base = false;
     let mut revs: Vec<String> = Vec::new();
     let mut raw_paths: Vec<String> = Vec::new();
 
@@ -261,6 +273,15 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 "-m" => opts.merges = true,
                 "--no-commit-id" => opts.no_commit_id = true,
                 "--always" => opts.always = true,
+                // git validates the operand count for `--merge-base` after it has
+                // resolved the revisions (exactly two commits), so the flag is only
+                // recorded here; the count check runs once parsing is complete. It is
+                // still unsupported for the valid two-commit case, which needs the
+                // merge-base computation this port does not implement.
+                "--merge-base" => {
+                    merge_base = true;
+                    unsupported.get_or_insert_with(|| a.to_string());
+                }
                 "--raw" => opts.format = Format::Raw,
                 "--name-only" => opts.format = Format::NameOnly,
                 "--name-status" => opts.format = Format::NameStatus,
@@ -325,6 +346,31 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                     }
                     unsupported.get_or_insert_with(|| a.to_string());
                 }
+                // git parses `--expand-tabs=<n>` at option time as a base-10 integer
+                // (leading whitespace and an optional sign allowed, the whole value
+                // consumed, no overflow) and dies fatally on anything that is not a
+                // non-negative integer — before any revision is resolved. A valid
+                // value only affects patch rendering, which this port never emits.
+                _ if a.starts_with("--expand-tabs=") => {
+                    let v = &a["--expand-tabs=".len()..];
+                    if parse_nonneg_int(v).is_none() {
+                        eprintln!("fatal: '{v}': not a non-negative integer");
+                        return Ok(ExitCode::from(FATAL));
+                    }
+                }
+                // git validates `--ignore-submodules=<value>` at option time against a
+                // fixed, case-sensitive set and dies fatally on anything else (the
+                // empty string included), before revision resolution. A valid value is
+                // still unsupported: it changes which gitlink pairs are reported, so it
+                // is recorded like any other unimplemented option.
+                _ if a.starts_with("--ignore-submodules=") => {
+                    let v = &a["--ignore-submodules=".len()..];
+                    if !matches!(v, "none" | "untracked" | "dirty" | "all") {
+                        eprintln!("fatal: bad --ignore-submodules argument: {v}");
+                        return Ok(ExitCode::from(FATAL));
+                    }
+                    unsupported.get_or_insert_with(|| a.to_string());
+                }
                 _ if is_ignorable(a) => {}
                 _ if is_known_unsupported(a) => {
                     unsupported.get_or_insert_with(|| a.to_string());
@@ -371,6 +417,14 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
             bail!("magic/glob pathspecs are not supported, got {p:?}");
         }
         opts.paths.push(BString::from(p.trim_end_matches('/').as_bytes()));
+    }
+
+    // git checks the `--merge-base` operand count after resolving revisions but before
+    // the missing-<tree-ish> usage error, so zero revs here is the fatal merge-base
+    // message, not the usage text.
+    if merge_base && revs.len() != 2 {
+        eprintln!("fatal: --merge-base only works with two commits");
+        return Ok(ExitCode::from(FATAL));
     }
 
     if revs.is_empty() {
@@ -564,6 +618,47 @@ fn git_strtoul(s: &str) -> u64 {
     } else {
         val
     }
+}
+
+/// git's option-time integer parse for `--expand-tabs=<n>`: base-10 `strtol` with the
+/// whole value consumed, then a non-negative check. Leading ASCII whitespace and an
+/// optional `+`/`-` sign are allowed, trailing characters are not, and a value that
+/// overflows is rejected. `None` is what git turns into
+/// `die("'%s': not a non-negative integer")`.
+///
+/// Confirmed against stock git 2.55: `0`, `5`, `+3`, `-0`, `08`, ` 5`, `\t5` accept;
+/// `v1`, `-1`, ``(empty), `3x`, `5 `(trailing space), `0x5`, and an overflowing run of
+/// digits reject.
+fn parse_nonneg_int(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let neg = match b.get(i) {
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        _ => false,
+    };
+    let start = i;
+    let mut val: i64 = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        val = val.checked_mul(10)?.checked_add((b[i] - b'0') as i64)?;
+        i += 1;
+    }
+    // At least one digit, and nothing after it (git's strtol skips leading whitespace
+    // but never trailing).
+    if i == start || i != b.len() {
+        return None;
+    }
+    let val = if neg { -val } else { val };
+    (val >= 0).then_some(val)
 }
 
 /// git's `get_commit_format` accept/reject decision for a `--pretty`/`--format`
@@ -772,6 +867,10 @@ fn is_known_unsupported(a: &str) -> bool {
         "-B",
         "-C",
         "-M",
+        // `-I<regex>` (`--ignore-matching-lines`): git recognises the attached form
+        // and, like the other content-comparison options, it can drop pairs from the
+        // raw output, so it is recorded rather than applied.
+        "-I",
     ];
     EXACT.contains(&a) || PREFIX.iter().any(|p| a.starts_with(p))
 }

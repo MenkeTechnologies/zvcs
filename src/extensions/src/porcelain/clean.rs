@@ -216,9 +216,10 @@ fn parse(args: &[String]) -> std::result::Result<Parsed, u8> {
 ///   * grouped short flags (`-ndx`, `-ffd`, …).
 ///
 /// Diagnostics follow git: an unknown option or a missing option value exits
-/// 129, a pathspec that leaves the worktree and the `clean.requireForce` refusal
-/// exit 128, in the same order git checks them (force refusal first, then
-/// `-x`/`-X`, then pathspec validation).
+/// 129, while a pathspec with invalid magic (`:(bogusmagic)…`), a pathspec that
+/// leaves the worktree, and the `clean.requireForce` refusal exit 128, in the
+/// same order git checks them (force refusal first, then `-x`/`-X`, then per
+/// pathspec left-to-right: magic parse, then worktree-escape).
 ///
 /// Paths are sorted by their repository-relative form (directories carrying a
 /// trailing `/`) and then rendered relative to the current working directory,
@@ -285,7 +286,17 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
         .map(gix::path::realpath)
         .transpose()?
         .unwrap_or_default();
+    // git validates every pathspec left-to-right: for each element it first
+    // parses the magic prefix (`:(…)`), then checks it does not escape the
+    // worktree. A magic-parse failure is `fatal:` / exit 128 — not the exit 1
+    // that `anyhow` would collapse a walk-time parse error to. Parse here with
+    // the same defaults the walk uses so acceptance never diverges from it.
+    let pathspec_defaults = repo.pathspec_defaults_inherit_ignore_case(true)?;
     for spec in &pathspecs {
+        if let Err(err) = gix::pathspec::parse(spec.as_bytes(), pathspec_defaults) {
+            eprintln!("fatal: {}", git_pathspec_error(spec, &err));
+            return Ok(ExitCode::from(128));
+        }
         if pathspec_leaves_worktree(spec, prefix_parts.len(), &workdir_real) {
             eprintln!(
                 "fatal: {spec}: '{spec}' is outside repository at '{}'",
@@ -560,6 +571,37 @@ impl gix::dir::walk::Delegate for Collect {
     ) -> gix::dir::walk::Action {
         self.0.push(entry.to_owned());
         std::ops::ControlFlow::Continue(())
+    }
+}
+
+/// Translate a gitoxide pathspec parse error into git's exact `fatal:` message
+/// text (the `fatal: ` prefix is added by the caller). Every one of these is an
+/// exit-128 fatal in git; gitoxide's own wording differs, so map each variant to
+/// the string git's `pathspec.c` / `attr.c` print for the same input.
+fn git_pathspec_error(spec: &str, err: &gix::pathspec::parse::Error) -> String {
+    use gix::pathspec::parse::Error;
+    match err {
+        Error::EmptyString => {
+            "empty string is not a valid pathspec. please use . instead if you meant to match all paths"
+                .to_string()
+        }
+        Error::InvalidKeyword { keyword } => {
+            format!("Invalid pathspec magic '{keyword}' in '{spec}'")
+        }
+        Error::Unimplemented { short_keyword } => {
+            format!("Unimplemented pathspec magic '{short_keyword}' in '{spec}'")
+        }
+        Error::MissingClosingParenthesis => {
+            format!("Missing ')' at the end of pathspec magic in '{spec}'")
+        }
+        Error::InvalidAttribute { attribute } => format!("invalid attribute name {attribute}"),
+        Error::InvalidAttributeValue { character } => {
+            format!("cannot use '{character}' for value matching")
+        }
+        Error::TrailingEscapeCharacter => "cannot use '\\' for value matching".to_string(),
+        Error::EmptyAttribute => "attr spec must not be empty".to_string(),
+        Error::MultipleAttributeSpecifications => "Only one 'attr:' specification is allowed.".to_string(),
+        Error::IncompatibleSearchModes => format!("{spec}: 'literal' and 'glob' are incompatible"),
     }
 }
 

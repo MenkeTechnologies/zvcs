@@ -91,19 +91,27 @@ fn usage_error(msg: &str) -> ExitCode {
     ExitCode::from(129)
 }
 
-/// Reproduce git's rejection of any pathspec that resolves outside the
-/// repository. git normalizes each pathspec against the current prefix and, on
-/// the first one that escapes the worktree root (a leading `..`) or names an
-/// absolute path outside it, dies with
-/// `fatal: <arg>: '<arg>' is outside repository at '<worktree-root>'` (exit 128).
+/// Reproduce git's exit-128 pathspec taxonomy. git parses every pathspec up
+/// front (its `parse_pathspec` / `init_pathspec_item`) and dies with `fatal:`
+/// (exit 128) on the first spec that either
+///   (a) carries **invalid magic** — `:(bogusmagic)…`, an unimplemented short
+///       magic like `:"…`, a missing `)`, incompatible `literal`/`glob`, or an
+///       empty `attr:` — reported before any path handling, or
+///   (b) **escapes the worktree** — a leading `..` or an absolute path outside
+///       the root — reported as
+///       `fatal: <raw>: '<path>' is outside repository at '<worktree-root>'`,
+///       where the quoted portion is the path with its magic prefix stripped
+///       (`:!../x` → `'../x'`), and `<raw>` is the original spelling.
 ///
-/// gix performs the same normalization inside `Search::from_specs`, so we run it
-/// per pattern here to map the failure back to the specific command-line argument
-/// (git reports the original spelling, `raw`) and emit git's exact message before
-/// `repo.pathspec()` can turn the condition into a generic exit-1 anyhow error.
+/// gitoxide surfaces both conditions later inside `repo.pathspec()`, where the
+/// `?` operator would collapse them into a generic exit-1 anyhow error. We walk
+/// the specs in argument order and, per spec, parse-then-normalize exactly as
+/// git does, emitting git's message and returning 128 on the first failure.
 ///
-/// Magic pathspecs (`:(…)`, `:/…`) carry their own semantics and are left for gix.
-fn check_pathspecs_inside_repo(
+/// Parse failures git does *not* treat as fatal magic (attribute-value corner
+/// cases where gitoxide is stricter than git) are left for `repo.pathspec()`,
+/// so a spec git accepts is never forced to 128 here.
+fn check_pathspecs(
     repo: &gix::Repository,
     patterns: &[BString],
     raw_patterns: &[String],
@@ -118,21 +126,52 @@ fn check_pathspecs_inside_repo(
     let root = gix::path::realpath(repo.workdir().unwrap_or_else(|| repo.git_dir()))?;
 
     for (pattern, raw) in patterns.iter().zip(raw_patterns.iter()) {
-        if pattern.first() == Some(&b':') {
-            continue;
-        }
-        let Ok(mut parsed) = gix::pathspec::parse(pattern.as_slice(), defaults) else {
-            continue;
+        // (a) Magic parsing — git rejects bad magic before touching the path.
+        let mut parsed = match gix::pathspec::parse(pattern.as_slice(), defaults) {
+            Ok(p) => p,
+            Err(err) => match pathspec_parse_fatal(&err, raw) {
+                Some(msg) => {
+                    eprintln!("fatal: {msg}");
+                    return Ok(Some(ExitCode::from(128)));
+                }
+                None => continue,
+            },
         };
+        // (b) Path normalization — a spec escaping the worktree is fatal. git
+        // quotes the path portion (magic stripped), captured before normalize
+        // consumes it, and prefixes the whole line with the raw spelling.
+        let path = parsed.path().to_str_lossy().into_owned();
         if parsed.normalize(&prefix, &root).is_err() {
             eprintln!(
-                "fatal: {raw}: '{raw}' is outside repository at '{}'",
+                "fatal: {raw}: '{path}' is outside repository at '{}'",
                 root.display()
             );
             return Ok(Some(ExitCode::from(128)));
         }
     }
     Ok(None)
+}
+
+/// Map a gitoxide pathspec parse error to git's exact `fatal:` message body
+/// (everything after `fatal: `), or `None` for the attribute corner cases where
+/// gitoxide is stricter than git and forcing a 128 would reject a spec git
+/// accepts (e.g. `:(attr:-unset)`), which must instead flow through to gix.
+fn pathspec_parse_fatal(err: &gix::pathspec::parse::Error, raw: &str) -> Option<String> {
+    use gix::pathspec::parse::Error as E;
+    Some(match err {
+        E::InvalidKeyword { keyword } => {
+            format!("Invalid pathspec magic '{}' in '{raw}'", keyword.to_str_lossy())
+        }
+        E::Unimplemented { short_keyword } => {
+            format!("Unimplemented pathspec magic '{short_keyword}' in '{raw}'")
+        }
+        E::MissingClosingParenthesis => {
+            format!("Missing ')' at the end of pathspec magic in '{raw}'")
+        }
+        E::IncompatibleSearchModes => format!("{raw}: 'literal' and 'glob' are incompatible"),
+        E::EmptyAttribute => "attr spec must not be empty".to_string(),
+        _ => return None,
+    })
 }
 
 /// `git ls-files` — list index entries, and optionally worktree-derived sets.
@@ -263,12 +302,13 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         }
     };
 
-    // A pathspec that resolves outside the repository is a fatal error in git:
-    //   `fatal: <arg>: '<arg>' is outside repository at '<worktree-root>'` (exit 128).
-    // gix surfaces the same condition as a normalize error inside `repo.pathspec()`,
-    // which would otherwise collapse to exit 1 via `?`. Detect it up front, reporting
-    // the first offending pathspec in argument order exactly as git does.
-    if let Some(code) = check_pathspecs_inside_repo(&repo, &patterns, &raw_patterns)? {
+    // git validates every pathspec up front and dies with exit 128 on the first
+    // one that carries invalid magic (`:(bogusmagic)…`) or escapes the worktree
+    // (a leading `..`, an absolute path outside the root). gix surfaces both as
+    // errors inside `repo.pathspec()`, which would otherwise collapse to exit 1
+    // via `?`. Detect them here, reporting the first offender in argument order
+    // with git's exact message and code.
+    if let Some(code) = check_pathspecs(&repo, &patterns, &raw_patterns)? {
         return Ok(code);
     }
 

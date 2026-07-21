@@ -31,8 +31,11 @@
 //!     to the current time for anything it cannot parse; see [`approxidate`] for
 //!     what this port does and does not parse.
 //!   * `-<digits>` compression levels, to the extent git itself honours them:
-//!     `tar` rejects one with `Argument not supported for format 'tar': -<n>`,
-//!     and the last `-<digits>` on the command line is the one reported.
+//!     `tar` rejects any with `Argument not supported for format 'tar': -<n>`,
+//!     `zip` rejects one outside `0..=9` with the same message, `tgz`/`tar.gz`
+//!     accept any at parse time and only fail (at `deflateInit2`, after the tree
+//!     walk) on one above `9`; the last `-<digits>` on the command line is the
+//!     one reported.
 //!   * Trailing `[--] <path>...` filters, with git's "pathspec did not match"
 //!     failure, and git's lazy directory-entry emission (a directory record is
 //!     written only once a file below it is written).
@@ -51,7 +54,12 @@
 //!   * `--format=zip`: git's `archive-zip.c` is a separate container format
 //!     (local file headers, a central directory, DOS timestamps and the zip64
 //!     escapes) that is not ported here. The deflate coder it would need does
-//!     now exist in [`gzip`]; the container does not.
+//!     now exist in [`gzip`]; the container does not. The rejection is deferred
+//!     to archive-writing time, exactly where git would begin emitting the
+//!     container, so every diagnostic git produces first for an invalid `zip`
+//!     invocation (unknown option, out-of-range level, bad tree-ish, unmatched
+//!     pathspec, content-affecting attribute) still comes out with git's exact
+//!     exit code; only a `zip` request git would have completed fails here.
 //!   * `--remote` / `--exec` (needs the `git-upload-archive` protocol),
 //!     `--add-file` and `--add-virtual-file`: parsed, so that git's
 //!     diagnostics still come out in the right order, and then rejected before a
@@ -263,11 +271,16 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    // git's `parse_archive_args()`: a compression level is fatal for a format
-    // that does not declare `ARCHIVER_WANT_COMPRESSION_LEVELS`, and the level it
-    // names is the last one parsed, not the first one given.
+    // git's `parse_archive_args()`: a compression level is fatal at parse time
+    // for a format that does not declare `ARCHIVER_WANT_COMPRESSION_LEVELS`
+    // (`tar`), and for `zip`, whose archiver additionally rejects a level outside
+    // zlib's `0..=9` range with the very same message and exit code. `tgz` /
+    // `tar.gz` accept any level here; an out-of-range one is not diagnosed until
+    // `deflateInit2()` fails, which is after the tree walk (see below). The level
+    // reported is the last `-<digits>` parsed, not the first one given.
     if let Some(level) = opts.level {
-        if !LEVEL_FORMATS.contains(&format.as_str()) {
+        let reject = !LEVEL_FORMATS.contains(&format.as_str()) || (format == "zip" && level > 9);
+        if reject {
             eprintln!("fatal: Argument not supported for format '{format}': -{level}");
             return Ok(ExitCode::from(128));
         }
@@ -325,24 +338,14 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     };
 
-    // Everything git diagnoses with an exit code of its own has now had its
-    // turn, so this is the first point at which bailing cannot mask a real git
-    // error message. Each of these would otherwise silently produce an archive
-    // that differs from git's.
+    // git does not diagnose an unsupported container, nor an out-of-range gzip
+    // level, until *archive-writing* time — after the subdirectory narrowing,
+    // the attribute scan and the whole path-filter walk have each had their turn
+    // to fail with git's own exit code. Both checks are therefore deferred to
+    // just before the first byte is written (see below); here we only compute the
+    // format flags the writer needs.
     let gzipped = matches!(format.as_str(), "tgz" | "tar.gz");
-    if !gzipped && format != "tar" {
-        bail!(
-            "archive format {format:?} is not supported (ported: tar, tgz, tar.gz) — the zip \
-             container is not ported"
-        );
-    }
-    // git only learns that zlib rejects the level when `deflateInit2()` fails,
-    // which happens after every other diagnostic above has had its turn.
     let level = opts.level.unwrap_or(6);
-    if gzipped && level > 9 {
-        eprintln!("fatal: deflateInit2: stream consistency error (no message)");
-        return Ok(ExitCode::from(128));
-    }
     // Run from a subdirectory, git narrows the tree to that subdirectory and
     // makes every archived path relative to it.
     if let Some(prefix) = repo.prefix()?.map(std::path::Path::to_path_buf) {
@@ -381,6 +384,29 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
             opts.paths[idx]
         );
         return Ok(ExitCode::from(128));
+    }
+
+    // Now that every git diagnostic with an exit code of its own has fired, the
+    // two archive-writing-time failures can be emitted in git's own order. git
+    // only learns that zlib rejects a `tgz` / `tar.gz` level when
+    // `deflateInit2()` fails, which it does here, after the walk — so
+    // `git archive --format=tgz -10 <tree> <unmatched>` reports the pathspec
+    // miss, not the deflate error.
+    if gzipped && level > 9 {
+        eprintln!("fatal: deflateInit2: stream consistency error (no message)");
+        return Ok(ExitCode::from(128));
+    }
+    // The `zip` container (git's `archive-zip.c`) is not ported. git would write
+    // it and exit 0; this port can only bail. Deferring the bail to here means a
+    // `zip` invocation that git itself would have rejected first (unknown option,
+    // an out-of-range level, a bad tree-ish, an unmatched pathspec, a
+    // content-affecting attribute) still exits with git's exact code and message
+    // — only a `zip` request git would actually have succeeded on fails here.
+    if !gzipped && format != "tar" {
+        bail!(
+            "archive format {format:?} is not supported (ported: tar, tgz, tar.gz) — the zip \
+             container is not ported"
+        );
     }
 
     // git supports `--add-file`/`--add-virtual-file`; this port cannot write the

@@ -14,20 +14,27 @@
 //! converter would have to be executed as an external process, which is refused
 //! rather than guessed at.
 //!
+//! Context lines are covered: `-A`/`-B`/`-C` (and `--after-context`/
+//! `--before-context`/`--context`/`-<num>`) render the surrounding lines with
+//! git's `-` context prefix and `--` hunk separators. `--recurse-submodules` is
+//! accepted as a no-op — a repo without populated submodules greps identically,
+//! and the index walk already skips the gitlink entries git would recurse into —
+//! except that `--untracked` alongside it is the fatal git makes of it.
+//!
 //! Not covered, and rejected loudly rather than approximated: patterns that need
 //! a regex engine (the vendored gitoxide crates ship none — `gix`'s optional
 //! `regex` dependency is behind the `revparse-regex` feature but is not
 //! re-exported, so it cannot be reached from here), searching `<tree>`
-//! revisions, `--recurse-submodules`, context lines (`-A`/`-B`/`-C`/`-W`/`-p`),
-//! `--heading`/`--break`, `-f`, `--and`/`--or`/`--not`, `-O`, and coloured
-//! output.
+//! revisions, the function-context renderers (`-W`/`-p`/`--function-context`/
+//! `--show-function`), `--heading`/`--break`, `-f`, `--and`/`--or`/`--not`,
+//! `-O`, and coloured output.
 //!
-//! Flags in that last group that only shape the *rendering* of a match — context
-//! lines, `--heading`, `--break`, `-p`, `-W` — are accepted during parsing (git
-//! itself diagnoses a missing pattern before it looks at them) and refused at
-//! the point they would change what is printed. When nothing matched there is
-//! nothing for them to shape, so the empty output and exit code 1 are git's
-//! answer exactly, and the run is allowed to finish.
+//! Flags in that last group that only shape the *rendering* of a match —
+//! `--heading`, `--break`, `-p`, `-W` — are accepted during parsing (git itself
+//! diagnoses a missing pattern before it looks at them) and refused at the point
+//! they would change what is printed. When nothing matched there is nothing for
+//! them to shape, so the empty output and exit code 1 are git's answer exactly,
+//! and the run is allowed to finish.
 
 use anyhow::{bail, Result};
 use std::io::{IsTerminal, Write};
@@ -83,8 +90,8 @@ struct Opts {
 struct Deferred {
     /// The flag as the user spelled it, for the refusal message.
     context: Option<String>,
-    /// Changes which files are searched, so it can never be shrugged off —
-    /// except under `--no-index`, which documents it as having no effect.
+    /// Records that `--recurse-submodules` was requested, for the `--untracked`
+    /// incompatibility check; the flag is otherwise a no-op here.
     set_changing: Option<String>,
     all_match: bool,
 }
@@ -101,9 +108,11 @@ struct Deferred {
 ///   * output: `-n`, `--column`, `-l`/`--files-with-matches`/`--name-only`,
 ///     `-L`/`--files-without-match`, `-c`/`--count`, `-q`/`--quiet`, `-o`,
 ///     `-z`/`--null`, `-h`, `-H`, `--full-name`, `--color=never|auto`
+///   * context: `-A`/`--after-context`, `-B`/`--before-context`,
+///     `-C`/`--context`, `-<num>`
 ///   * accepted no-ops: `--[no-]textconv` with no converter configured,
 ///     `--[no-]ext-grep`, `--threads`, `--no-heading`, `--no-break`,
-///     `--no-recurse-submodules`
+///     `--recurse-submodules`/`--no-recurse-submodules`
 ///   * `[--] <pathspec>...`
 ///
 /// Exit status matches git: `0` when at least one file produced output (for
@@ -140,6 +149,12 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     let mut deferred = Deferred::default();
     let mut dialect = Dialect::Basic;
     let mut patterns: Vec<String> = Vec::new();
+    // `-A`/`-B`/`-C`/`--after-context`/`--before-context`/`--context`/`-NUM`:
+    // the number of trailing and leading lines to show around each match. git
+    // sets each component independently (last assignment wins; `-C`/`-NUM` set
+    // both), so they are tracked as plain counters here.
+    let mut pre_context: usize = 0;
+    let mut post_context: usize = 0;
 
     let mut i = 0;
     while i < args.len() {
@@ -263,15 +278,25 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 "heading" | "break" | "show-function" | "function-context" => {
                     deferred.context.get_or_insert_with(|| a.to_string());
                 }
-                "context" | "after-context" | "before-context" => {
-                    match parse_int(name, &value!()) {
-                        Ok(0) => {}
-                        Ok(_) => {
-                            deferred.context.get_or_insert_with(|| format!("--{name}"));
-                        }
+                "after-context" => {
+                    match parse_context_nonneg("option `after-context'", &value!()) {
+                        Ok(n) => post_context = n,
                         Err(code) => return Ok(code),
                     }
                 }
+                "before-context" => {
+                    match parse_context_nonneg("option `before-context'", &value!()) {
+                        Ok(n) => pre_context = n,
+                        Err(code) => return Ok(code),
+                    }
+                }
+                "context" => match parse_context_signed(&value!()) {
+                    Ok(n) => {
+                        pre_context = n;
+                        post_context = n;
+                    }
+                    Err(code) => return Ok(code),
+                },
                 "no-context" | "no-after-context" | "no-before-context" => {}
                 "all-match" => deferred.all_match = true,
                 "recurse-submodules" => {
@@ -283,11 +308,11 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
-        // `-NUM` is git's shortcut for `-C NUM`.
+        // `-NUM` is git's shortcut for `-C NUM`: it sets both context sides.
         if a.len() > 1 && a[1..].bytes().all(|b| b.is_ascii_digit()) {
-            if a[1..].parse::<u64>().unwrap_or(0) != 0 {
-                deferred.context.get_or_insert_with(|| a.to_string());
-            }
+            let n = a[1..].parse::<usize>().unwrap_or(usize::MAX);
+            pre_context = n;
+            post_context = n;
             i += 1;
             continue;
         }
@@ -339,18 +364,30 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 'p' | 'W' => {
                     deferred.context.get_or_insert_with(|| format!("-{}", group[c]));
                 }
-                'A' | 'B' | 'C' => {
-                    let flag = group[c];
-                    let long = match flag {
-                        'A' => "after-context",
-                        'B' => "before-context",
-                        _ => "context",
-                    };
-                    let v = short_value!(flag);
-                    match parse_int(long, &v) {
-                        Ok(0) => {}
-                        Ok(_) => {
-                            deferred.context.get_or_insert_with(|| format!("-{flag}"));
+                'A' => {
+                    let v = short_value!('A');
+                    match parse_context_nonneg("switch `A'", &v) {
+                        Ok(n) => post_context = n,
+                        Err(code) => return Ok(code),
+                    }
+                    c = group.len();
+                    continue;
+                }
+                'B' => {
+                    let v = short_value!('B');
+                    match parse_context_nonneg("switch `B'", &v) {
+                        Ok(n) => pre_context = n,
+                        Err(code) => return Ok(code),
+                    }
+                    c = group.len();
+                    continue;
+                }
+                'C' => {
+                    let v = short_value!('C');
+                    match parse_context_signed(&v) {
+                        Ok(n) => {
+                            pre_context = n;
+                            post_context = n;
                         }
                         Err(code) => return Ok(code),
                     }
@@ -474,6 +511,17 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     }
     let positionals: Vec<String> = rest[path_start..].to_vec();
 
+    // git zeroes `--recurse-submodules` under `--no-index` (there is no index to
+    // find gitlinks in), then rejects the surviving flag alongside `--untracked`.
+    // This port does not descend into populated submodules, but a repo without
+    // them greps identically either way, so the flag is otherwise accepted as a
+    // no-op — the index walk already skips the gitlink entries git would recurse.
+    let recurse_submodules = deferred.set_changing.is_some() && !opts.no_index;
+    if recurse_submodules && opts.untracked {
+        eprintln!("fatal: --untracked not supported with --recurse-submodules");
+        return Ok(ExitCode::from(128));
+    }
+
     // `--max-count=0` is documented to "exit immediately with a non-zero
     // status", ahead of the source-conflict check.
     if opts.max_count == 0 {
@@ -483,11 +531,16 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    // `--recurse-submodules` "has no effect if --no-index is specified": that
-    // walk enters a checked-out submodule as an ordinary directory regardless.
-    if let Some(flag) = deferred.set_changing.filter(|_| !opts.no_index) {
-        bail!("{}", unsupported(&flag));
+    // git resolves `--[no-]exclude-standard` against whether an index is being
+    // consulted; pinning it explicitly is only meaningful with `--no-index` or
+    // `--untracked`, so git dies here for tracked contents (the default or
+    // `--cached`). This sits after the source-conflict check, matching the order
+    // of the else-if chain in git's `cmd_grep`.
+    if exclude_standard_explicit && !opts.no_index && !opts.untracked {
+        eprintln!("fatal: --[no-]exclude-standard cannot be used for tracked contents");
+        return Ok(ExitCode::from(128));
     }
+
     if deferred.all_match && patterns.len() > 1 {
         bail!("{}", unsupported("--all-match"));
     }
@@ -619,6 +672,52 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     let mut any_hit = false;
+
+    // With `-A`/`-B`/`-C` the printed match lines gain surrounding context and a
+    // `--` hunk separator, so those runs take a dedicated renderer; every other
+    // mode (including `-A0`/`-C0`, which git treats as no context) stays on the
+    // plain per-line path.
+    if renders_lines && (pre_context > 0 || post_context > 0) {
+        // `printed_any` spans all files: git's `--` separator precedes every hunk
+        // except the first one printed across the whole run, files included.
+        let mut printed_any = false;
+        for (path, id) in &files {
+            let Some(content) = content_of(path, id)? else { continue };
+            let binary = !opts.text && is_binary(&content);
+            if binary && opts.no_binary {
+                continue;
+            }
+            let name = display_name(path.as_bstr(), prefix, &opts);
+            if binary {
+                // git reports a binary hit through the exit status but prints no
+                // context lines and no "Binary file matches" notice for it.
+                if lines(&content)
+                    .any(|l| next_match(l, &needles, 0, &opts).is_some() != opts.invert)
+                {
+                    any_hit = true;
+                }
+                continue;
+            }
+            if render_context(
+                &mut out,
+                &content,
+                &name,
+                &needles,
+                &opts,
+                pre_context,
+                post_context,
+                &mut printed_any,
+            )? {
+                any_hit = true;
+            }
+        }
+        out.flush()?;
+        return Ok(if any_hit {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        });
+    }
 
     for (path, id) in &files {
         let Some(content) = content_of(path, id)? else { continue };
@@ -921,6 +1020,155 @@ fn parse_int(name: &str, value: &str) -> Result<i64, ExitCode> {
     })
 }
 
+/// Parse a `-A`/`-B` (`--after-context`/`--before-context`) value, which git
+/// requires to be a non-negative integer. `spelled` is how git names the flag in
+/// its usage error — `switch `A'` for the short form, `option `after-context'`
+/// for the long — reported at exit 129 exactly as git does.
+fn parse_context_nonneg(spelled: &str, value: &str) -> Result<usize, ExitCode> {
+    match value.parse::<i64>() {
+        Ok(n) if n >= 0 => Ok(n as usize),
+        _ => {
+            eprintln!(
+                "error: {spelled} expects a non-negative integer value with an optional k/m/g suffix"
+            );
+            Err(ExitCode::from(129))
+        }
+    }
+}
+
+/// Parse a `-C`/`--context` value. git parses this one as a plain signed number
+/// (always naming it `switch `C'`), so a negative value is accepted and means
+/// unlimited context rather than being rejected the way `-A`/`-B` are.
+fn parse_context_signed(value: &str) -> Result<usize, ExitCode> {
+    match value.parse::<i64>() {
+        Ok(n) if n < 0 => Ok(usize::MAX),
+        Ok(n) => Ok(n as usize),
+        Err(_) => {
+            eprintln!("error: switch `C' expects a numerical value");
+            Err(ExitCode::from(129))
+        }
+    }
+}
+
+/// Render one file's matches with `-A`/`-B`/`-C` context, byte-identical to git:
+/// a match line keeps the `:`-separated header (with a column under `--column`),
+/// a context line uses `-` separators and never a column, and a `--` line
+/// precedes every hunk except the first one printed across the whole run.
+/// `printed_any` carries that "first hunk" state between files. Returns whether
+/// this file produced a match, for the exit status.
+#[allow(clippy::too_many_arguments)]
+fn render_context(
+    out: &mut impl Write,
+    content: &[u8],
+    name: &[u8],
+    needles: &[Vec<u8>],
+    opts: &Opts,
+    pre: usize,
+    post: usize,
+    printed_any: &mut bool,
+) -> Result<bool> {
+    let lines: Vec<&[u8]> = lines(content).collect();
+    let n = lines.len();
+    let limit = if opts.max_count < 0 {
+        usize::MAX
+    } else {
+        opts.max_count as usize
+    };
+
+    // The matching lines, capped at `--max-count` matches per file as git does.
+    let mut is_match = vec![false; n];
+    let mut hit = false;
+    let mut matches = 0usize;
+    for (idx, line) in lines.iter().enumerate() {
+        if matches >= limit {
+            break;
+        }
+        if next_match(line, needles, 0, opts).is_some() != opts.invert {
+            is_match[idx] = true;
+            hit = true;
+            matches += 1;
+        }
+    }
+    if !hit {
+        return Ok(false);
+    }
+
+    // Every match drags its pre/post neighbours into the shown set; overlapping
+    // windows merge, which is what makes adjacent matches share one hunk.
+    let mut show = vec![false; n];
+    for idx in 0..n {
+        if !is_match[idx] {
+            continue;
+        }
+        let lo = idx.saturating_sub(pre);
+        let hi = idx.saturating_add(post).min(n - 1);
+        for s in show.iter_mut().take(hi + 1).skip(lo) {
+            *s = true;
+        }
+    }
+
+    // Walk the shown lines in order; a gap starts a new hunk, and each hunk after
+    // the first printed anywhere is introduced by `--`.
+    let mut prev_shown: Option<usize> = None;
+    for idx in 0..n {
+        if !show[idx] {
+            continue;
+        }
+        let new_hunk = prev_shown.is_none_or(|p| idx > p + 1);
+        if new_hunk {
+            if *printed_any {
+                out.write_all(b"--\n")?;
+            }
+            *printed_any = true;
+        }
+        prev_shown = Some(idx);
+
+        let line = lines[idx];
+        if is_match[idx] {
+            if opts.only_matching && !opts.invert {
+                let mut at = 0usize;
+                while let Some((start, len)) = next_match(line, needles, at, opts) {
+                    if len == 0 {
+                        break;
+                    }
+                    write_prefix(out, name, idx + 1, start + 1, opts)?;
+                    out.write_all(&line[start..start + len])?;
+                    out.write_all(b"\n")?;
+                    at = start + len;
+                }
+            } else {
+                let col = next_match(line, needles, 0, opts).map_or(0, |(s, _)| s) + 1;
+                write_prefix(out, name, idx + 1, col, opts)?;
+                out.write_all(line)?;
+                out.write_all(b"\n")?;
+            }
+        } else if !(opts.only_matching && !opts.invert) {
+            write_context_prefix(out, name, idx + 1, opts)?;
+            out.write_all(line)?;
+            out.write_all(b"\n")?;
+        }
+        // Under `-o` a context line has no matched substring to show, so it emits
+        // nothing (its hunk still contributes the leading `--`); this matches
+        // git's `-o -A` exactly. git's `-o -B`/`-o -C` additionally double some
+        // separators — a documented quirk this port does not reproduce.
+    }
+    Ok(true)
+}
+
+/// The `<name>-<lineno>-` header git puts on a context line: like
+/// [`write_prefix`] but with `-` separators and no column field.
+fn write_context_prefix(out: &mut impl Write, name: &[u8], lno: usize, opts: &Opts) -> Result<()> {
+    if opts.show_names {
+        out.write_all(name)?;
+        out.write_all(b"-")?;
+    }
+    if opts.line_number {
+        write!(out, "{lno}")?;
+        out.write_all(b"-")?;
+    }
+    Ok(())
+}
+
 /// Search one file's `content`, emitting whatever the active output mode calls
 /// for. Returns whether this file contributes a hit to the exit status: for
 /// `-L` that is having been *listed* (no match), otherwise having matched.
@@ -1186,7 +1434,7 @@ fn unsupported(flag: &str) -> String {
         "unsupported flag {flag:?} (ported: -e, -i, -v, -w, -a, -I, -n, --column, \
          -l/--files-with-matches/--name-only, -L/--files-without-match, -c, -q, -z, -o, \
          -h, -H, -E, -G, -F, -P, -m/--max-count, --max-depth, -r/--[no-]recursive, \
-         --full-name, --cached, --untracked, --no-index/--index, \
-         --[no-]exclude-standard, --color=never|auto, and pathspecs)"
+         -A/-B/-C context, --full-name, --cached, --untracked, --no-index/--index, \
+         --[no-]exclude-standard, --recurse-submodules, --color=never|auto, and pathspecs)"
     )
 }

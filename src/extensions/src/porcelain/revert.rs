@@ -354,11 +354,13 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
     if specs.is_empty() {
         return Ok(usage_error());
     }
-    // Options git did not recognize reach the revision parser, which rejects
-    // them with the usage text rather than a "bad revision" complaint.
-    if specs.iter().any(|s| s.starts_with('-') && s != "-") {
-        return Ok(usage_error());
-    }
+    // Options git did not recognize reach the revision parser. It scans the
+    // operand list left to right: a bad *revision* is diagnosed the moment it is
+    // reached (`fatal: bad revision …`, exit 128), while an unrecognized dash
+    // operand is only deferred and reported as the usage text (exit 129) after
+    // the whole list is walked. So a bad revision outranks any dash token that
+    // follows it — the diagnosis order is handled inside `resolve_specs`, not by
+    // a blanket pre-scan here.
 
     let (commits, sequencer) = match resolve_specs(&repo, &specs)? {
         Selection::List { commits, sequencer } => (commits, sequencer),
@@ -463,8 +465,17 @@ fn resolve_specs(repo: &gix::Repository, specs: &[String]) -> Result<Selection> 
     let mut include: Vec<ObjectId> = Vec::new();
     let mut exclude: Vec<ObjectId> = Vec::new();
     let mut walked = false;
+    let mut unknown_option = false;
 
     for spec in specs {
+        // A dash-prefixed operand is not a revision: git's `setup_revisions`
+        // keeps it as an unrecognized option and, unless a bad revision is hit
+        // first, reports the usage error (129) only after the whole list is
+        // scanned. A lone `-` is the exception — git rewrites it to `@{-1}`.
+        if spec.starts_with('-') && spec != "-" {
+            unknown_option = true;
+            continue;
+        }
         // git rewrites a lone `-` into the previously checked-out branch.
         let spec = if spec == "-" { "@{-1}" } else { spec.as_str() };
 
@@ -495,6 +506,13 @@ fn resolve_specs(repo: &gix::Repository, specs: &[String]) -> Result<Selection> 
         } else {
             include.push(id);
         }
+    }
+
+    // No bad revision was hit anywhere in the list; a deferred unrecognized dash
+    // operand now surfaces as the usage error, exactly as git's post-scan option
+    // check does — whether or not any valid commit was resolved.
+    if unknown_option {
+        return Ok(Selection::Failed(usage_error()));
     }
 
     if include.is_empty() || !walked {

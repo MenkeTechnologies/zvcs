@@ -46,8 +46,11 @@
 //! `--batch-size=<n>` `OPT_MAGNITUDE` grammar with git's three distinct value
 //! diagnostics, the `--` terminator and the leftover-operand usage block all
 //! match git byte-for-byte, because git rejects a malformed `repack` invocation
-//! during option parsing before it writes a single pack. Only a well-formed
-//! `repack` reaches the missing writer and bails.
+//! during option parsing before it writes a single pack. A well-formed `repack`
+//! reproduces git's no-op cases exactly: `midx_repack()` exits 0 with no output
+//! and no state change when the object store has no MIDX, and when the MIDX names
+//! fewer than two packs — a batch needs two packs to collapse one into another.
+//! Only a MIDX naming two or more packs reaches the missing writer and bails.
 //!
 //! Not covered — these `bail!` rather than producing a diverging artifact:
 //!
@@ -68,10 +71,11 @@
 //!   * `write --stdin-packs` — the writer takes a path list, so this could be
 //!     fed, but git's cruft-pack handling for the stdin set is not modelled and
 //!     a wrong pack set is a silently wrong index.
-//!   * `repack`'s execution — a well-formed `repack` creates new pack files from
-//!     batched old ones and then rewrites the MIDX; `gix-pack` has no
-//!     pack-repacking driver. Its argument parsing is fully reproduced (above);
-//!     only this final step bails.
+//!   * `repack`'s execution when a MIDX names two or more packs — this creates
+//!     new pack files from batched old ones and then rewrites the MIDX;
+//!     `gix-pack` has no pack-repacking driver. Its argument parsing and every
+//!     no-op state (no MIDX, or a MIDX with fewer than two packs) are fully
+//!     reproduced (above); only this final batching step bails.
 //!
 //! `verify` uses `verify_integrity_fast`, which is the exact scope of git's
 //! `verify_midx_file`: trailing checksum, fan-out monotonicity, OID ordering,
@@ -197,9 +201,10 @@ usage: git multi-pack-index [<options>] repack [--batch-size=<size>]
 ///     own progress goes to stderr and never to stdout)
 ///   * `-h` at the top level and on every sub-command
 ///
-/// The `write` flags that need a bitmap or chain writer, and a well-formed
-/// `repack` (whose argument parsing is otherwise reproduced), `bail!` — see the
-/// module docs for the specific missing substrate.
+/// The `write` flags that need a bitmap or chain writer, and a `repack` whose
+/// MIDX names two or more packs (its no-op states and argument parsing are
+/// otherwise reproduced), `bail!` — see the module docs for the specific missing
+/// substrate.
 pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
     // Dispatch includes the verb at index 0.
     let args = match args.first().map(String::as_str) {
@@ -651,8 +656,10 @@ fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
 /// commons, the `--batch-size=<n>` `OPT_MAGNITUDE` value grammar (base-0 numeric
 /// parse plus optional k/m/g suffix, with git's three distinct diagnostics for
 /// an empty, malformed or out-of-range value), the `--` operand terminator and
-/// git's leftover-operand usage block. A well-formed invocation reaches the part
-/// that needs the missing writer and `bail!`s.
+/// git's leftover-operand usage block. A well-formed invocation reproduces git's
+/// no-op cases (no MIDX, or a MIDX naming fewer than two packs) as a silent exit
+/// 0; only a MIDX naming two or more packs reaches the missing writer and
+/// `bail!`s.
 fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     let mut after_dd = false;
     // `repack` collects non-option words without stopping, then rejects them all
@@ -722,7 +729,33 @@ fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         return Ok(usage_error(None, REPACK_USAGE));
     }
 
-    bail!("unsupported subcommand \"repack\" (ported: write, verify, expire, compact) — batched repacking needs a pack writer that gix-pack does not provide")
+    // `midx_repack()` (midx.c) is a silent no-op — exit 0, no output, no state
+    // change — whenever there is nothing for it to batch. It loads the MIDX with
+    // `load_multi_pack_index()` and returns 0 straight away when the object store
+    // has none, which is the state of every repository that has never run
+    // `multi-pack-index write`. It likewise does nothing when the MIDX names
+    // fewer than two packs, because a batch needs at least two packs to collapse
+    // one into another. git prints nothing and exits 0 in all of these cases,
+    // regardless of `--batch-size`, so this reproduces them exactly.
+    let (_repo, pack_dir) = object_store(object_dir)?;
+    let midx = pack_dir.join("multi-pack-index");
+    if !midx.exists() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let file = multi_index::File::at(&midx, None)?;
+    if file.num_indices() < 2 {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // A MIDX naming two or more packs is the only state in which `midx_repack()`
+    // actually spawns `pack-objects` to rewrite a batch and then rewrites the
+    // MIDX. That step needs a pack-repacking driver gix-pack does not provide —
+    // its only output mode is `Mode::PackCopyAndBaseObjects` with no delta
+    // compression — so collapsing packs is not yet ported.
+    bail!(
+        "multi-pack-index repack of a MIDX naming {} packs is not yet ported — batched repacking needs a pack writer that gix-pack does not provide",
+        file.num_indices()
+    )
 }
 
 /// Classify a `--batch-size` value the way git's `OPT_MAGNITUDE` does and return

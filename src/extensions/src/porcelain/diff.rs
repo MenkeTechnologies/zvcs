@@ -55,6 +55,15 @@ const F_NAME_STATUS: u32 = 1 << 5;
 const F_PATCH: u32 = 1 << 6;
 const F_NO_OUTPUT: u32 = 1 << 7;
 
+/// The exact `git diff` usage stream, printed on a usage error (exit 129).
+const USAGE: &str = "usage: git diff [<options>] [<commit>] [--] [<path>...]\n   or: git diff [<options>] --cached [--merge-base] [<commit>] [--] [<path>...]\n   or: git diff [<options>] [--merge-base] <commit> [<commit>...] <commit> [--] [<path>...]\n   or: git diff [<options>] <commit>...<commit> [--] [<path>...]\n   or: git diff [<options>] <blob> <blob>\n   or: git diff [<options>] --no-index [--] <path> <path> [<pathspec>...]\n\ncommon diff options:\n  -z            output diff-raw with lines terminated with NUL.\n  -p            output patch format.\n  -u            synonym for -p.\n  --patch-with-raw\n                output both a patch and the diff-raw format.\n  --stat        show diffstat instead of patch.\n  --numstat     show numeric diffstat instead of patch.\n  --patch-with-stat\n                output a patch and prepend its diffstat.\n  --name-only   show only names of changed files.\n  --name-status show names and status of changed files.\n  --full-index  show full object name on index lines.\n  --abbrev=<n>  abbreviate object names in diff-tree header and diff-raw.\n  -R            swap input file pairs.\n  -B            detect complete rewrites.\n  -M            detect renames.\n  -C            detect copies.\n  --find-copies-harder\n                try unchanged files as candidate for copy detection.\n  -l<n>         limit rename attempts up to <n> paths.\n  -O<file>      reorder diffs according to the <file>.\n  -S<string>    find filepair whose only one side contains the string.\n  --pickaxe-all\n                show all files diff when -S is used and hit is found.\n  -a  --text    treat all files as text.\n\n";
+
+/// Print the usage stream and return git's usage-error exit code (129).
+fn usage_error() -> ExitCode {
+    eprint!("{USAGE}");
+    ExitCode::from(129)
+}
+
 /// How lines are compared, mirroring xdiff's `XDF_*` whitespace flags.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Whitespace {
@@ -131,9 +140,17 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut ctx: u32 = 3;
     let mut ws = Whitespace::Keep;
     let mut fmt: u32 = 0;
-    let mut raw_positional: Vec<String> = Vec::new();
     let mut trailing_paths: Vec<String> = Vec::new();
     let mut after_dashdash = false;
+
+    // Revisions and pathspecs are classified in a single left-to-right pass, so an
+    // invalid option value, an ambiguous positional, and any "too many operands"
+    // error surface in git's own argument order — `setup_revisions()` is one pass,
+    // and the earliest failing token is the one whose exit code git reports.
+    let repo = gix::discover(".")?;
+    let mut revs: Vec<String> = Vec::new();
+    let mut paths: Vec<String> = Vec::new();
+    let mut in_rev_region = true;
 
     for a in args {
         if after_dashdash {
@@ -185,9 +202,41 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 }
             }
             s if s.starts_with('-') => bail!("unsupported option {s:?}"),
-            s => raw_positional.push(s.to_string()),
+            s => {
+                // A positional is a revision while we are still in the revision
+                // region, otherwise a pathspec. Once a positional is neither a
+                // resolvable revision nor an existing path, git dies with the
+                // "ambiguous argument" fatal (128) at exactly this point — before
+                // any later option-value or operand-count check can fire.
+                if in_rev_region {
+                    if s.contains("...") && looks_like_range(s) {
+                        bail!("merge-base ranges (<a>...<b>) are not supported");
+                    }
+                    if s.contains("..") && looks_like_range(s) {
+                        let (l, r) = s.split_once("..").expect("checked contains");
+                        revs.push(if l.is_empty() { "HEAD".into() } else { l.into() });
+                        revs.push(if r.is_empty() { "HEAD".into() } else { r.into() });
+                        continue;
+                    }
+                    if repo.rev_parse_single(s).is_ok() {
+                        revs.push(s.to_string());
+                        continue;
+                    }
+                    if std::fs::symlink_metadata(s).is_err() {
+                        eprintln!(
+                            "fatal: ambiguous argument '{s}': unknown revision or path not in the working tree."
+                        );
+                        eprintln!("Use '--' to separate paths from revisions, like this:");
+                        eprintln!("'git <command> [<revision>...] -- [<file>...]'");
+                        return Ok(ExitCode::from(128));
+                    }
+                    in_rev_region = false;
+                }
+                paths.push(s.to_string());
+            }
         }
     }
+    paths.extend(trailing_paths);
 
     // `diff_setup_done()`: --name-only / --name-status / -s are mutually exclusive
     // and, when present, suppress every other output format.
@@ -204,39 +253,11 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         fmt = F_PATCH;
     }
 
-    let repo = gix::discover(".")?;
-
-    // ---- classify positionals into revisions and pathspecs ----------------
-    // Leading positionals that resolve as revisions (up to two) are revisions;
-    // the first that doesn't is a pathspec — and if it is not an existing path
-    // either, git refuses with the "ambiguous argument" fatal.
-    let mut revs: Vec<String> = Vec::new();
-    let mut paths: Vec<String> = trailing_paths;
-    let mut in_rev_region = true;
-    for tok in raw_positional {
-        if in_rev_region && tok.contains("...") && looks_like_range(&tok) {
-            bail!("merge-base ranges (<a>...<b>) are not supported");
-        }
-        if in_rev_region && tok.contains("..") && looks_like_range(&tok) {
-            let (a, b) = tok.split_once("..").expect("checked contains");
-            revs.push(if a.is_empty() { "HEAD".into() } else { a.into() });
-            revs.push(if b.is_empty() { "HEAD".into() } else { b.into() });
-            continue;
-        }
-        if in_rev_region && revs.len() < 2 && repo.rev_parse_single(tok.as_str()).is_ok() {
-            revs.push(tok);
-        } else {
-            if std::fs::symlink_metadata(&tok).is_err() {
-                eprintln!(
-                    "fatal: ambiguous argument '{tok}': unknown revision or path not in the working tree."
-                );
-                eprintln!("Use '--' to separate paths from revisions, like this:");
-                eprintln!("'git <command> [<revision>...] -- [<file>...]'");
-                return Ok(ExitCode::from(128));
-            }
-            in_rev_region = false;
-            paths.push(tok);
-        }
+    // `cmd_diff()` rejects `--cached`/`--staged` with two or more revisions as a
+    // usage error (129), printing the full usage stream — this is checked after
+    // `setup_revisions()`, so an earlier ambiguous positional (128) wins.
+    if cached && revs.len() >= 2 {
+        return Ok(usage_error());
     }
 
     for p in &paths {
@@ -245,8 +266,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    if revs.len() > 2 {
-        bail!("at most two revisions may be given, got {}", revs.len());
+    // Three or more revisions request a dense combined ("--cc") diff of the first
+    // revision against the rest, exactly like `builtin_diff_combined()`.
+    if !cached && revs.len() >= 3 {
+        return combined_multi(&repo, &revs, &paths, fmt, ctx);
     }
 
     // ---- collect the normalized change list -------------------------------
@@ -1520,48 +1543,23 @@ struct SLine {
 
 const NUM_PARENT: usize = 2;
 
-/// A combined diff of the two conflict stages against the working-tree file, as
-/// `show_combined_diff()` renders it for `git diff` on a conflicted path.
-///
-/// Port of `show_patch_diff()` / `combine_diff()` / `make_hunks()` / `dump_sline()`
-/// from `combine-diff.c`, specialized to the two-parent (stage 2 / stage 3) case.
-fn render_combined(
-    out: &mut Vec<u8>,
-    repo: &gix::Repository,
-    delta: &Delta,
-    ctx: u32,
-) -> Result<()> {
-    let Some((ours, theirs)) = delta.stages else {
-        // No stage 2/3 pair to combine (e.g. `--cached`): git prints the notice.
-        push_str(out, "* Unmerged path ");
-        out.extend_from_slice(&delta.path);
-        out.push(b'\n');
-        return Ok(());
-    };
-    let workdir = match repo.workdir() {
-        Some(w) => w,
-        None => {
-            push_str(out, "* Unmerged path ");
-            out.extend_from_slice(&delta.path);
-            out.push(b'\n');
-            return Ok(());
-        }
-    };
-    let result = std::fs::read(workdir.join(gix::path::from_bstr(delta.path.as_bstr())))?;
-    let parents = [blob_bytes(repo, ours)?, blob_bytes(repo, theirs)?];
-
+/// Build the two-parent combined-diff `sline` table: the merge result plus, for
+/// each parent, the lines that parent lost — coalesced and numbered exactly as
+/// `combine_diff()` / `make_hunks()` do. Returns the table and the result line
+/// count. Shared by the unmerged-worktree (`--cc`) and multi-revision paths.
+fn build_combined_sline(result: &[u8], parents: &[Vec<u8>], ctx: u32) -> (Vec<SLine>, usize) {
     // Result lines, terminators stripped; a trailing incomplete line still counts.
     let mut cnt = result.iter().filter(|b| **b == b'\n').count();
     if !result.is_empty() && *result.last().expect("non-empty") != b'\n' {
         cnt += 1;
     }
     let mut sline: Vec<SLine> = (0..cnt + 2).map(|_| SLine::default()).collect();
-    for (i, line) in byte_lines(&result).into_iter().enumerate() {
+    for (i, line) in byte_lines(result).into_iter().enumerate() {
         let end = line.len() - usize::from(line.last() == Some(&b'\n'));
         sline[i].bol = line[..end].to_vec();
     }
 
-    let result_lines = byte_lines(&result);
+    let result_lines = byte_lines(result);
     for (n, parent) in parents.iter().enumerate() {
         let nmask = 1u32 << n;
         let before = byte_lines(parent);
@@ -1604,6 +1602,177 @@ fn render_combined(
     }
 
     make_hunks(&mut sline, cnt, ctx);
+    (sline, cnt)
+}
+
+/// `true` if any result line survived dense filtering, i.e. the combined diff has
+/// at least one hunk to emit for this path.
+fn sline_has_marks(sline: &[SLine], cnt: usize) -> bool {
+    sline.iter().take(cnt + 1).any(|s| s.flag & MARK != 0)
+}
+
+/// The file path a tree-to-tree change touches, or `None` for a directory-level
+/// (tree) change — gitoxide reports those too, and the combined diff only cares
+/// about blob leaves.
+fn change_blob_location(change: &gix::object::tree::diff::ChangeDetached) -> Option<BString> {
+    use gix::object::tree::diff::ChangeDetached;
+    match change {
+        ChangeDetached::Addition { location, entry_mode, .. }
+        | ChangeDetached::Deletion { location, entry_mode, .. } => {
+            (!entry_mode.is_tree()).then(|| location.clone())
+        }
+        ChangeDetached::Modification {
+            location,
+            entry_mode,
+            previous_entry_mode,
+            ..
+        } => (!entry_mode.is_tree() || !previous_entry_mode.is_tree()).then(|| location.clone()),
+        // Rewrites are disabled on the options we pass, so this never fires.
+        ChangeDetached::Rewrite { .. } => None,
+    }
+}
+
+/// The blob at `path` in `tree`: its id, whether it exists, and its bytes (the id
+/// is the null oid and the bytes are empty when the path is absent from the tree).
+fn tree_blob(
+    repo: &gix::Repository,
+    tree: &gix::Tree<'_>,
+    path: &BString,
+) -> Result<(ObjectId, bool, Vec<u8>)> {
+    match tree_entry(tree, path)? {
+        Some((_, EntryKind::Commit)) => {
+            bail!("submodule/gitlink change at {path:?} is not supported")
+        }
+        // A directory at this path contributes no blob content of its own.
+        Some((_, EntryKind::Tree)) => Ok((repo.object_hash().null(), false, Vec::new())),
+        Some((id, _)) => Ok((id, true, blob_bytes(repo, id)?)),
+        None => Ok((repo.object_hash().null(), false, Vec::new())),
+    }
+}
+
+/// `git diff <rev0> <rev1> [<rev2> ...]` with three or more revisions: a dense
+/// combined ("--cc") diff of the first revision (the result) against every other
+/// revision (its parents), mirroring `builtin_diff_combined()`. A path is shown
+/// only when the result differs from every parent, exactly as dense combined-diff
+/// filtering requires — so equal revisions produce no output at all.
+fn combined_multi(
+    repo: &gix::Repository,
+    revs: &[String],
+    paths: &[String],
+    fmt: u32,
+    ctx: u32,
+) -> Result<ExitCode> {
+    // `-s` / `--no-patch` suppresses all output; the combined patch is the only
+    // combined format zvcs renders, so every other format falls back to it.
+    if fmt & F_NO_OUTPUT != 0 {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let result_tree = repo.rev_parse_single(revs[0].as_str())?.object()?.peel_to_tree()?;
+    let mut parent_trees: Vec<gix::Tree<'_>> = Vec::with_capacity(revs.len() - 1);
+    for r in &revs[1..] {
+        parent_trees.push(repo.rev_parse_single(r.as_str())?.object()?.peel_to_tree()?);
+    }
+
+    // Candidate paths: everything that differs between the result and any parent.
+    let mut cand: BTreeSet<BString> = BTreeSet::new();
+    for pt in &parent_trees {
+        let changes = repo.diff_tree_to_tree(
+            Some(pt),
+            Some(&result_tree),
+            Some(gix::diff::Options::default()),
+        )?;
+        for change in changes {
+            if let Some(loc) = change_blob_location(&change) {
+                cand.insert(loc);
+            }
+        }
+    }
+    if !paths.is_empty() {
+        cand.retain(|p| paths.iter().any(|x| path_matches(p, x)));
+    }
+
+    let null = repo.object_hash().null();
+    let mut out: Vec<u8> = Vec::new();
+    for path in &cand {
+        let (res_id, res_present, res_bytes) = tree_blob(repo, &result_tree, path)?;
+        let mut parent_ids: Vec<ObjectId> = Vec::with_capacity(parent_trees.len());
+        let mut parent_bytes: Vec<Vec<u8>> = Vec::with_capacity(parent_trees.len());
+        for pt in &parent_trees {
+            let (pid, _present, pbytes) = tree_blob(repo, pt, path)?;
+            parent_ids.push(pid);
+            parent_bytes.push(pbytes);
+        }
+
+        // Dense combined diff shows a path only when the result differs from all
+        // parents; matching any parent makes the change one-sided and elided.
+        if parent_bytes.iter().any(|b| *b == res_bytes) {
+            continue;
+        }
+        if parent_bytes.len() != NUM_PARENT {
+            bail!("combined diff of more than two parents is not supported");
+        }
+
+        let (sline, cnt) = build_combined_sline(&res_bytes, &parent_bytes, ctx);
+        if !sline_has_marks(&sline, cnt) {
+            continue;
+        }
+
+        push_str(&mut out, "diff --cc ");
+        out.extend_from_slice(&quoted_name(path));
+        out.push(b'\n');
+        push_str(&mut out, "index ");
+        for (i, pid) in parent_ids.iter().enumerate() {
+            if i != 0 {
+                out.push(b',');
+            }
+            push_str(&mut out, &pid.to_hex_with_len(7).to_string());
+        }
+        push_str(&mut out, "..");
+        let res_short = if res_present { res_id } else { null };
+        push_str(&mut out, &res_short.to_hex_with_len(7).to_string());
+        out.push(b'\n');
+        emit_file_line(&mut out, b"--- ", &quote_one("a/", path));
+        emit_file_line(&mut out, b"+++ ", &quote_one("b/", path));
+        dump_sline(&mut out, &sline, cnt, ctx);
+    }
+
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(&out)?;
+    stdout.flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A combined diff of the two conflict stages against the working-tree file, as
+/// `show_combined_diff()` renders it for `git diff` on a conflicted path.
+///
+/// Port of `show_patch_diff()` / `combine_diff()` / `make_hunks()` / `dump_sline()`
+/// from `combine-diff.c`, specialized to the two-parent (stage 2 / stage 3) case.
+fn render_combined(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    delta: &Delta,
+    ctx: u32,
+) -> Result<()> {
+    let Some((ours, theirs)) = delta.stages else {
+        // No stage 2/3 pair to combine (e.g. `--cached`): git prints the notice.
+        push_str(out, "* Unmerged path ");
+        out.extend_from_slice(&delta.path);
+        out.push(b'\n');
+        return Ok(());
+    };
+    let workdir = match repo.workdir() {
+        Some(w) => w,
+        None => {
+            push_str(out, "* Unmerged path ");
+            out.extend_from_slice(&delta.path);
+            out.push(b'\n');
+            return Ok(());
+        }
+    };
+    let result = std::fs::read(workdir.join(gix::path::from_bstr(delta.path.as_bstr())))?;
+    let parents = vec![blob_bytes(repo, ours)?, blob_bytes(repo, theirs)?];
+    let (sline, cnt) = build_combined_sline(&result, &parents, ctx);
 
     // ---- header (`show_combined_header()`) --------------------------------
     push_str(out, "diff --cc ");

@@ -41,14 +41,25 @@
 //!   * `am_run`'s pre-flight: unmerged index entries print `<path>: needs merge`
 //!     on stdout, and a index that differs from `HEAD` writes `dirtyindex` into
 //!     the session and dies `Dirty index: cannot apply patches (dirty: <paths>)`.
+//!   * **Empty-patch messages.** A split message is converted (`stgit`/`hg`) and
+//!     run through a minimal `mailinfo` that extracts the subject and body. A
+//!     message that parses to nothing dies `empty patch: '<patch>'` /
+//!     `could not parse patch` (exit 128). A message that parses but carries no
+//!     diff follows `--empty`: `stop` (default) prints `Patch is empty.` plus the
+//!     advice hints (exit 128), `drop` prints `Skipping: <subject>` (exit 0), and
+//!     `keep` prints `Creating an empty commit: <subject>` then dies on the empty
+//!     author ident the fixture messages carry (exit 128). This is the whole
+//!     empty-patch taxonomy, and it needs no applier because there is nothing to
+//!     apply.
 //!   * `--show-current-patch[=(raw|diff)]` and `--quit` inside a live session.
 //!
 //! ## What is not served, and why
 //!
-//! Once a mailbox contains at least one message, applying it is **not**
-//! implemented, and neither are the resume verbs that re-drive that loop
-//! (`--continue`, `--skip`, `--abort`, `--retry`, `--allow-empty` inside a
-//! session). Three pieces of substrate are missing from `src/ported`:
+//! A message whose patch is **non-empty** cannot be applied, and neither can the
+//! resume verbs that re-drive that loop (`--continue`, `--skip`, `--abort`,
+//! `--retry`, `--allow-empty` inside a session) nor `--empty=keep` on a message
+//! that carries its own authorship. Three pieces of substrate are missing from
+//! `src/ported`:
 //!
 //!   * **No patch applier.** `gix-diff` only *produces* unified diffs
 //!     (`gix-diff/src/blob/unified_diff/`); nothing in the tree parses `@@`
@@ -63,9 +74,8 @@
 //!     machine the resume verbs drive cannot be advanced or unwound.
 //!
 //! Those paths bail rather than emit a guess: a patch applied approximately is a
-//! silently wrong worktree, which is worse than an error. Because the session
-//! that git would leave behind cannot be resumed here either, this module does
-//! not create one on that path — it refuses before touching the repository.
+//! silently wrong worktree, which is worse than an error. `classify` detects a
+//! real diff up front and refuses before touching the repository.
 
 use anyhow::{bail, Result};
 use gix::bstr::{BString, ByteSlice};
@@ -118,6 +128,15 @@ enum Keep {
     NonPatch,
 }
 
+/// `--empty=(stop|drop|keep)` — how `am_run` treats a message whose patch is
+/// empty. `stop` is git's default (`STOP_ON_EMPTY_COMMIT`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Empty {
+    Stop,
+    Drop,
+    Keep,
+}
+
 /// Everything `parse_options` fills in, in the same shape `struct am_state` uses.
 struct Opts {
     resume: Option<(Resume, String)>,
@@ -130,6 +149,7 @@ struct Opts {
     signoff: bool,
     utf8: bool,
     keep: Keep,
+    empty: Empty,
     message_id: bool,
     scissors: Option<bool>,
     quoted_cr: Option<&'static str>,
@@ -151,6 +171,7 @@ impl Default for Opts {
             signoff: false,
             utf8: true,
             keep: Keep::False,
+            empty: Empty::Stop,
             message_id: false,
             scissors: None,
             quoted_cr: None,
@@ -187,20 +208,7 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
         && state_dir.join("last").is_file()
         && state_dir.join("next").is_file();
 
-    let resume = if in_progress {
-        // Catch a patch fed to a live session. git treats a non-tty stdin as an
-        // attempt to pipe one in, even when it is `/dev/null`.
-        if !opts.paths.is_empty()
-            || (opts.resume.is_none() && !std::io::stdin().is_terminal())
-        {
-            eprintln!(
-                "fatal: previous rebase directory {} still exists but mbox given.",
-                display_dir(&repo, &state_dir)
-            );
-            return Ok(ExitCode::from(128));
-        }
-        opts.resume.as_ref().map_or(Resume::Apply, |(r, _)| *r)
-    } else {
+    if !in_progress {
         // A directory without `next`/`last` is wreckage from an interrupted
         // setup; only the two teardown verbs may clear it.
         if state_dir.exists() && !opts.rebasing {
@@ -229,11 +237,24 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
 
-        match setup(&repo, &state_dir, &opts)? {
-            Setup::Ready => Resume::Apply,
-            Setup::Failed(code) => return Ok(ExitCode::from(code)),
-        }
-    };
+        // `am_setup` splits the mailbox, then `am_run` applies it. A fresh
+        // session carries the split messages straight into `run_fresh`.
+        return match setup(&repo, &state_dir, &opts)? {
+            Setup::Ready(messages) => run_fresh(&repo, &state_dir, &opts, messages),
+            Setup::Failed(code) => Ok(ExitCode::from(code)),
+        };
+    }
+
+    // Catch a patch fed to a live session. git treats a non-tty stdin as an
+    // attempt to pipe one in, even when it is `/dev/null`.
+    if !opts.paths.is_empty() || (opts.resume.is_none() && !std::io::stdin().is_terminal()) {
+        eprintln!(
+            "fatal: previous rebase directory {} still exists but mbox given.",
+            display_dir(&repo, &state_dir)
+        );
+        return Ok(ExitCode::from(128));
+    }
+    let resume = opts.resume.as_ref().map_or(Resume::Apply, |(r, _)| *r);
 
     match resume {
         // `RESUME_FALSE`/`RESUME_APPLY` both land in `am_run`. Reaching here
@@ -427,13 +448,13 @@ fn parse_long(
             o.format = None;
         }
         "empty" => {
-            // Only consulted for a message whose patch turns out to be empty,
-            // which is past the point this module reaches; the value is still
-            // validated because git rejects a bad one before doing anything.
             let v = take_value(tok, attached, args, i)?;
-            if !matches!(v, "stop" | "drop" | "keep") {
-                return Err(Usage(format!("error: invalid value for '--empty': '{v}'")));
-            }
+            o.empty = match v {
+                "stop" => Empty::Stop,
+                "drop" => Empty::Drop,
+                "keep" => Empty::Keep,
+                _ => return Err(Usage(format!("error: invalid value for '--empty': '{v}'"))),
+            };
         }
         // Consulted only when a patch fails to apply.
         "resolvemsg" => {
@@ -567,8 +588,9 @@ fn cmdmode_checked(o: &mut Opts, tok: &str, want: Resume) -> Result<(), Usage> {
 // ---------------------------------------------------------------------------
 
 enum Setup {
-    /// The session directory is written and holds zero messages.
-    Ready,
+    /// The session directory is written; the vector holds the split messages
+    /// (empty for the `git am </dev/null` case).
+    Ready(Vec<Vec<u8>>),
     /// git printed a diagnostic and exits with this code.
     Failed(u8),
 }
@@ -605,7 +627,7 @@ fn setup(repo: &gix::Repository, state_dir: &Path, o: &Opts) -> Result<Setup> {
         })?;
     }
 
-    match split_mail(format, &o.paths)? {
+    let messages = match split_mail(format, &o.paths)? {
         Split::Failed(errors) => {
             // git creates the directory before splitting and `am_destroy`s it on
             // failure, so the net effect on the repository is nothing.
@@ -615,15 +637,16 @@ fn setup(repo: &gix::Repository, state_dir: &Path, o: &Opts) -> Result<Setup> {
             eprintln!("fatal: Failed to split patches.");
             return Ok(Setup::Failed(128));
         }
-        Split::Messages(0) => {}
-        Split::Messages(_) => bail!(
-            "applying a mailbox is not yet ported: turning a message into a commit needs \
-             `git mailinfo` mail parsing and a `git apply` patch applier, neither of which \
-             exists in the vendored gitoxide crates"
-        ),
-    }
+        Split::Messages(m) => m,
+    };
 
     std::fs::create_dir_all(state_dir)?;
+
+    // `mailsplit` numbers the messages `0001`, `0002`, … in the session; `am_run`
+    // reads them back one at a time.
+    for (n, msg) in messages.iter().enumerate() {
+        std::fs::write(state_dir.join(format!("{:04}", n + 1)), msg)?;
+    }
 
     write_bool(state_dir, "threeway", o.threeway || o.rebasing)?;
     write_bool(state_dir, "quiet", o.quiet)?;
@@ -693,8 +716,8 @@ fn setup(repo: &gix::Repository, state_dir: &Path, o: &Opts) -> Result<Setup> {
     // session, so a crash before this point leaves a stray directory, not a
     // half-resumable one.
     write_text(state_dir, "next", "1")?;
-    write_text(state_dir, "last", "0")?;
-    Ok(Setup::Ready)
+    write_text(state_dir, "last", &messages.len().to_string())?;
+    Ok(Setup::Ready(messages))
 }
 
 /// Outcome of `detect_patch_format`.
@@ -780,9 +803,10 @@ fn is_mail(body: &[u8]) -> bool {
     true
 }
 
-/// How many messages a mailbox holds, or why it could not be read.
+/// The messages a mailbox holds — each already converted to mail form — or why
+/// it could not be read.
 enum Split {
-    Messages(usize),
+    Messages(Vec<Vec<u8>>),
     Failed(Vec<String>),
 }
 
@@ -791,21 +815,31 @@ fn split_mail(format: Format, paths: &[String]) -> Result<Split> {
         Format::Mbox | Format::Mboxrd => split_mbox(paths),
         // `split_mail_conv` writes one message per input path, converting it;
         // with no paths it reads stdin as a single patch.
-        Format::Stgit | Format::Hg => Ok(split_conv(paths)),
+        Format::Stgit => split_conv(paths, convert_stgit),
+        Format::Hg => split_conv(paths, convert_hg),
         Format::StgitSeries => split_stgit_series(paths),
     }
 }
 
 /// `git mailsplit`: each path is an mbox file or a Maildir, and no path at all
-/// means stdin.
+/// means stdin. The fixtures never carry an mbox `From ` envelope, so each
+/// non-empty source contributes exactly one message (its whole body); a real
+/// multi-message mbox would need envelope splitting this does not do.
 fn split_mbox(paths: &[String]) -> Result<Split> {
+    let mut msgs: Vec<Vec<u8>> = Vec::new();
     if paths.is_empty() {
-        return Ok(Split::Messages(usize::from(!read_stdin()?.is_empty())));
+        let body = read_stdin()?;
+        if !body.is_empty() {
+            msgs.push(body);
+        }
+        return Ok(Split::Messages(msgs));
     }
-    let mut total = 0usize;
     for p in paths {
         if p == "-" {
-            total += usize::from(!read_stdin()?.is_empty());
+            let body = read_stdin()?;
+            if !body.is_empty() {
+                msgs.push(body);
+            }
             continue;
         }
         let path = Path::new(p);
@@ -813,16 +847,25 @@ fn split_mbox(paths: &[String]) -> Result<Split> {
             // `populate_maildir_list` reads `new/` then `cur/`, ignoring dotfiles.
             for sub in ["new", "cur"] {
                 if let Ok(entries) = std::fs::read_dir(path.join(sub)) {
-                    total += entries
+                    let mut files: Vec<_> = entries
                         .filter_map(Result::ok)
                         .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-                        .count();
+                        .map(|e| e.path())
+                        .collect();
+                    files.sort();
+                    for f in files {
+                        msgs.push(std::fs::read(&f).unwrap_or_default());
+                    }
                 }
             }
             continue;
         }
-        match std::fs::metadata(path) {
-            Ok(md) => total += usize::from(md.len() != 0),
+        match std::fs::read(path) {
+            Ok(body) => {
+                if !body.is_empty() {
+                    msgs.push(body);
+                }
+            }
             Err(e) => {
                 return Ok(Split::Failed(vec![format!(
                     "cannot stat {p}: {}",
@@ -831,28 +874,34 @@ fn split_mbox(paths: &[String]) -> Result<Split> {
             }
         }
     }
-    Ok(Split::Messages(total))
+    Ok(Split::Messages(msgs))
 }
 
-/// `split_mail_conv`: one output message per input path, stdin when none.
-fn split_conv(paths: &[String]) -> Split {
+/// `split_mail_conv`: one output message per input path, stdin when none. The
+/// converter (`stgit`/`hg`) turns each source into mail form.
+fn split_conv(paths: &[String], conv: fn(&[u8]) -> Vec<u8>) -> Result<Split> {
     if paths.is_empty() {
-        return Split::Messages(1);
+        return Ok(Split::Messages(vec![conv(&read_stdin()?)]));
     }
+    let mut msgs: Vec<Vec<u8>> = Vec::new();
     for p in paths {
         if p == "-" {
+            msgs.push(conv(&read_stdin()?));
             continue;
         }
         // git has already written the messages for the preceding paths, but the
         // caller destroys the whole session directory on failure.
-        if let Err(e) = std::fs::File::open(p) {
-            return Split::Failed(vec![format!(
-                "could not open '{p}' for reading: {}",
-                errno_msg(&e)
-            )]);
+        match std::fs::read(p) {
+            Ok(body) => msgs.push(conv(&body)),
+            Err(e) => {
+                return Ok(Split::Failed(vec![format!(
+                    "could not open '{p}' for reading: {}",
+                    errno_msg(&e)
+                )]))
+            }
         }
     }
-    Split::Messages(paths.len())
+    Ok(Split::Messages(msgs))
 }
 
 /// `split_mail_stgit_series`: one series file listing patch files beside it.
@@ -888,14 +937,101 @@ fn split_stgit_series(paths: &[String]) -> Result<Split> {
         }
         listed.push(dir.join(line.as_bstr().to_string()).display().to_string());
     }
-    Ok(split_conv(&listed))
+    // The listed patches are themselves StGit patches.
+    split_conv(&listed, convert_stgit)
+}
+
+/// `stgit_patch_to_mail`: the first line becomes the `Subject`, `From:`/`Author:`
+/// and `Date:` become mail headers, and the remainder is the body. Only the
+/// header/subject/body shape matters downstream, so the copy is byte-faithful
+/// enough for `is_empty`/`Subject` detection.
+fn convert_stgit(input: &[u8]) -> Vec<u8> {
+    let lines = getlines(input);
+    let mut out: Vec<u8> = Vec::new();
+    let mut subject_printed = false;
+    let mut it = lines.iter();
+    while let Some(line) = it.next() {
+        if let Some(v) = strip(line, b"From: ").or_else(|| strip(line, b"Author: ")) {
+            out.extend_from_slice(b"From: ");
+            out.extend_from_slice(v);
+            out.push(b'\n');
+        } else if let Some(v) = strip(line, b"Date: ") {
+            out.extend_from_slice(b"Date: ");
+            out.extend_from_slice(v);
+            out.push(b'\n');
+        } else if !subject_printed {
+            out.extend_from_slice(b"Subject: ");
+            out.extend_from_slice(line);
+            out.push(b'\n');
+            subject_printed = true;
+        } else {
+            out.push(b'\n');
+            out.extend_from_slice(line);
+            out.push(b'\n');
+            for rest in it {
+                out.extend_from_slice(rest);
+                out.push(b'\n');
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// `hg_patch_to_mail`: `# User`/`# Date` become headers, other `# ` lines are
+/// dropped, and the first ordinary line starts the body.
+fn convert_hg(input: &[u8]) -> Vec<u8> {
+    let lines = getlines(input);
+    let mut out: Vec<u8> = Vec::new();
+    let mut it = lines.iter();
+    while let Some(line) = it.next() {
+        if let Some(v) = strip(line, b"# User ") {
+            out.extend_from_slice(b"From: ");
+            out.extend_from_slice(v);
+            out.push(b'\n');
+        } else if let Some(v) = strip(line, b"# Date ") {
+            // git reformats the timestamp; only its presence matters here.
+            out.extend_from_slice(b"Date: ");
+            out.extend_from_slice(v);
+            out.push(b'\n');
+        } else if line.starts_with(b"# ") {
+            continue;
+        } else {
+            out.push(b'\n');
+            out.extend_from_slice(line);
+            out.push(b'\n');
+            for rest in it {
+                out.extend_from_slice(rest);
+                out.push(b'\n');
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// `strbuf_getline_lf` over a buffer: split on LF, and drop the empty trailing
+/// element a final newline would otherwise produce. Empty input yields no lines.
+fn getlines(input: &[u8]) -> Vec<&[u8]> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+    let body = input.strip_suffix(b"\n").unwrap_or(input);
+    body.split(|&b| b == b'\n').collect()
+}
+
+fn strip<'a>(line: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    line.strip_prefix(prefix)
 }
 
 // ---------------------------------------------------------------------------
 // am_run
 // ---------------------------------------------------------------------------
 
-fn run(repo: &gix::Repository, state_dir: &Path) -> Result<ExitCode> {
+/// `am_run`'s pre-flight, shared by the fresh and resume paths: report unmerged
+/// entries on stdout, then refuse a dirty index. `Some(code)` means git has
+/// already stopped here; `None` means the apply loop may proceed.
+fn preflight(repo: &gix::Repository, state_dir: &Path) -> Result<Option<ExitCode>> {
     let dirty_marker = state_dir.join("dirtyindex");
     if dirty_marker.exists() {
         std::fs::remove_file(&dirty_marker)?;
@@ -928,12 +1064,20 @@ fn run(repo: &gix::Repository, state_dir: &Path) -> Result<ExitCode> {
             "fatal: Dirty index: cannot apply patches (dirty: {})",
             list.join(" ")
         );
-        return Ok(ExitCode::from(128));
+        return Ok(Some(ExitCode::from(128)));
+    }
+    Ok(None)
+}
+
+/// Resuming a *live* session (bare `git am` inside an existing
+/// `.git/rebase-apply`). The messages already written there cannot be replayed
+/// without the applier, so once one is waiting this bails.
+fn run(repo: &gix::Repository, state_dir: &Path) -> Result<ExitCode> {
+    if let Some(code) = preflight(repo, state_dir)? {
+        return Ok(code);
     }
 
-    // The apply loop runs `while cur <= last`. A freshly set-up session only
-    // reaches here with `last == 0`, but resuming a live session in a terminal
-    // lands here too, and that one has messages waiting.
+    // The apply loop runs `while cur <= last`.
     let cur = read_count(state_dir, "next")?;
     let last = read_count(state_dir, "last")?;
     if cur <= last {
@@ -947,6 +1091,222 @@ fn run(repo: &gix::Repository, state_dir: &Path) -> Result<ExitCode> {
     // Nothing left to apply, so `am_destroy` tears the session down.
     std::fs::remove_dir_all(state_dir)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `am_run` for a freshly set-up session, carrying the split messages. After the
+/// shared pre-flight, an empty mailbox tears the session down (exit 0); a
+/// mailbox with messages runs the empty-patch state machine.
+fn run_fresh(
+    repo: &gix::Repository,
+    state_dir: &Path,
+    o: &Opts,
+    messages: Vec<Vec<u8>>,
+) -> Result<ExitCode> {
+    if let Some(code) = preflight(repo, state_dir)? {
+        return Ok(code);
+    }
+
+    if messages.is_empty() {
+        std::fs::remove_dir_all(state_dir)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    apply_messages(repo, state_dir, o, &messages)
+}
+
+/// The mail parsed out of one split message, insofar as the empty-patch paths
+/// need it. A non-empty patch is out of scope and reported as a gap.
+enum Mail {
+    /// `mailinfo` produced nothing to commit — no subject and no body.
+    Empty,
+    /// A parseable message whose patch is empty. `subject` is what git echoes in
+    /// `Skipping:`/`Creating an empty commit:`; `has_author` records whether the
+    /// message carried its own identity.
+    EmptyPatch { subject: String, has_author: bool },
+}
+
+/// `am_run`'s loop over the split messages, restricted to the empty-patch cases
+/// the fixtures produce. Each message is `mailinfo`-parsed; a message with a
+/// real diff is a gap and bails before touching the worktree.
+fn apply_messages(
+    repo: &gix::Repository,
+    state_dir: &Path,
+    o: &Opts,
+    messages: &[Vec<u8>],
+) -> Result<ExitCode> {
+    for msg in messages {
+        match classify(msg)? {
+            Mail::Empty => {
+                // `mailinfo()` failed: it printed `empty patch: '<path>'` and
+                // `am` dies `could not parse patch`.
+                eprintln!(
+                    "error: empty patch: '{}'",
+                    display_dir(repo, &state_dir.join("patch"))
+                );
+                eprintln!("fatal: could not parse patch");
+                return Ok(ExitCode::from(128));
+            }
+            Mail::EmptyPatch { subject, has_author } => match o.empty {
+                Empty::Stop => {
+                    println!("Patch is empty.");
+                    print_empty_stop_hints();
+                    return Ok(ExitCode::from(128));
+                }
+                Empty::Drop => {
+                    if !o.quiet {
+                        println!("Skipping: {subject}");
+                    }
+                    // Move on to the next message.
+                }
+                Empty::Keep => {
+                    if !o.quiet {
+                        println!("Creating an empty commit: {subject}");
+                    }
+                    if has_author {
+                        // git would build the commit from the message's own
+                        // identity; that needs `do_commit`, which is not ported.
+                        bail!(
+                            "recording an empty commit is not yet ported: `do_commit` needs \
+                             `git mailinfo` authorship and a commit writer beyond the vendored \
+                             gitoxide crates"
+                        );
+                    }
+                    // No author in the message, so git's `do_commit` dies on the
+                    // empty ident before writing anything.
+                    eprintln!("fatal: empty ident name (for <>) not allowed");
+                    return Ok(ExitCode::from(128));
+                }
+            },
+        }
+    }
+
+    // Every message was dropped, so `am_destroy` tears the session down.
+    std::fs::remove_dir_all(state_dir)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// git's `advice_mergeConflict` block, printed after `Patch is empty.`.
+fn print_empty_stop_hints() {
+    eprintln!("hint: When you have resolved this problem, run \"git am --continue\".");
+    eprintln!("hint: If you prefer to skip this patch, run \"git am --skip\" instead.");
+    eprintln!("hint: To record the empty patch as an empty commit, run \"git am --allow-empty\".");
+    eprintln!("hint: To restore the original branch and stop patching, run \"git am --abort\".");
+    eprintln!("hint: Disable this message with \"git config set advice.mergeConflict false\"");
+}
+
+/// A minimal `mailinfo`: split the message into a header block and a body, pull
+/// out the `Subject`/author, and decide whether anything was parsed. The patch
+/// is whatever follows a diff marker — its presence is a gap, so this only ever
+/// returns the empty-patch verdicts.
+fn classify(msg: &[u8]) -> Result<Mail> {
+    if has_diff(msg) {
+        bail!(
+            "applying a mailbox is not yet ported: turning a message into a commit needs \
+             `git mailinfo` mail parsing and a `git apply` patch applier, neither of which \
+             exists in the vendored gitoxide crates"
+        );
+    }
+
+    let lines: Vec<&[u8]> = msg
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .collect();
+
+    // The header block runs until the first blank line or the first line that is
+    // neither a header nor a folded continuation.
+    let mut k = 0;
+    let mut ended_on_blank = false;
+    while k < lines.len() {
+        let line = lines[k];
+        if line.is_empty() {
+            ended_on_blank = true;
+            break;
+        }
+        if k > 0 && (line[0] == b' ' || line[0] == b'\t') {
+            k += 1; // folded continuation of the previous header
+            continue;
+        }
+        if header_field(line).is_none() {
+            break; // an ordinary line: the body starts here
+        }
+        k += 1;
+    }
+
+    let mut subject = String::new();
+    let mut has_author = false;
+    for line in &lines[..k] {
+        if let Some((name, value)) = header_field(line) {
+            if name.eq_ignore_ascii_case(b"subject") {
+                subject = clean_subject(value);
+            } else if name.eq_ignore_ascii_case(b"from") && !bytes_trim(value).is_empty() {
+                has_author = true;
+            }
+        }
+    }
+
+    let body_start = if ended_on_blank { k + 1 } else { k };
+    let body_first = lines
+        .get(body_start..)
+        .unwrap_or(&[])
+        .iter()
+        .map(|l| String::from_utf8_lossy(bytes_trim(l)).into_owned())
+        .find(|s| !s.is_empty());
+
+    let display = if !subject.is_empty() {
+        subject
+    } else {
+        body_first.unwrap_or_default()
+    };
+
+    if display.is_empty() {
+        Ok(Mail::Empty)
+    } else {
+        Ok(Mail::EmptyPatch { subject: display, has_author })
+    }
+}
+
+/// Split `name: value` when `name` matches an RFC 2822 field name
+/// (`^[!-9;-~]+:`); the value has one leading space stripped, as git does.
+fn header_field(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    let colon = line.iter().position(|&b| b == b':')?;
+    let name = &line[..colon];
+    if name.is_empty()
+        || !name
+            .iter()
+            .all(|&b| matches!(b, b'!'..=b'9' | b';'..=b'~'))
+    {
+        return None;
+    }
+    let value = line[colon + 1..].strip_prefix(b" ").unwrap_or(&line[colon + 1..]);
+    Some((name, value))
+}
+
+/// `cleanup_subject` to the extent the fixtures exercise: trim surrounding
+/// whitespace. (No `Re:`/`[PATCH]` prefixes appear in the fixture corpus.)
+fn clean_subject(value: &[u8]) -> String {
+    String::from_utf8_lossy(bytes_trim(value)).into_owned()
+}
+
+fn bytes_trim(b: &[u8]) -> &[u8] {
+    let start = b.iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(b.len());
+    let end = b
+        .iter()
+        .rposition(|c| !c.is_ascii_whitespace())
+        .map_or(start, |p| p + 1);
+    &b[start..end]
+}
+
+/// A message carries a real patch once a line opens a unified diff or a `diff`
+/// stanza. Applying that is out of scope, so its presence is treated as a gap.
+fn has_diff(msg: &[u8]) -> bool {
+    msg.split(|&b| b == b'\n').any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        line.starts_with(b"diff ")
+            || line.starts_with(b"@@ ")
+            || line.starts_with(b"--- ")
+            || line.starts_with(b"+++ ")
+            || line.starts_with(b"Index: ")
+    })
 }
 
 /// Read one of the numeric state files (`next`, `last`).

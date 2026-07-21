@@ -173,6 +173,13 @@ fn set_symref(
     if name == "HEAD" && !target.starts_with("refs/") {
         return fatal("Refusing to point HEAD outside of refs/");
     }
+    // git refuses to make a *pseudoref* (MERGE_HEAD, FETCH_HEAD, ORIG_HEAD, …)
+    // symbolic; HEAD is the one all-caps name it permits. `is_pseudoref_syntax`
+    // in refs.c: a slash-free name whose every byte is upper-case / `_` / `-`.
+    if is_pseudoref(name) {
+        eprintln!("error: refusing to update pseudoref '{name}'");
+        return Ok(ExitCode::from(1));
+    }
     if gix::validate::reference::name_partial(BStr::new(target)).is_err() {
         return fatal(&format!("Refusing to set '{name}' to invalid ref '{target}'"));
     }
@@ -181,9 +188,11 @@ fn set_symref(
     let target_full = full_name(target)?;
 
     // Capture the pre-edit resolution so the reflog line carries the same
-    // `<old> <new>` pair git writes.
+    // `<old> <new>` pair git writes. A target that resolves to no object is
+    // fine — git happily creates a dangling symref (`ref: does-not-exist`),
+    // exit 0, and simply writes no reflog entry for it.
     let previous = leaf_object_id(repo, BStr::new(name))?;
-    let new = leaf_object_id(repo, BStr::new(target))?;
+    let new = leaf_object_id(repo, BStr::new(target)).unwrap_or(None);
 
     repo.edit_reference(RefEdit {
         change: Change::Update {
@@ -232,6 +241,17 @@ fn delete_symref(repo: &gix::Repository, name: &str) -> Result<ExitCode> {
         deref: false,
     })?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// git's `is_pseudoref_syntax` (refs.c): a slash-free name whose every byte is
+/// an ASCII upper-case letter, `_`, or `-`. `HEAD` matches the syntax but is the
+/// one pseudoref git lets `symbolic-ref` write, so it is excluded here.
+fn is_pseudoref(name: &str) -> bool {
+    name != "HEAD"
+        && !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b == b'_' || b == b'-')
 }
 
 /// The direct symbolic target of `name`, or `None` when the ref is missing or

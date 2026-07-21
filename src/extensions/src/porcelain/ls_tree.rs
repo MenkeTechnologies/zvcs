@@ -276,7 +276,14 @@ fn set_cmdmode(
 /// non-numeric is an error, `0` disables abbreviation, and any other value below
 /// `MINIMUM_ABBREV` (including negatives) is raised to it.
 fn parse_abbrev(v: &str) -> Option<Abbrev> {
-    let n: i64 = v.parse().ok()?;
+    let n: i64 = match v.parse() {
+        Ok(n) => n,
+        // git parses with strtol and clamps: an all-digit value too large for
+        // the integer is not an error, it saturates to the hash width (the
+        // render step caps `Len` at the hash length anyway).
+        Err(_) if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => i64::MAX,
+        Err(_) => return None,
+    };
     Some(match n {
         0 => Abbrev::Full,
         n if n < MINIMUM_ABBREV as i64 => Abbrev::Len(MINIMUM_ABBREV),

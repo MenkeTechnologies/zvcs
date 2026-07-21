@@ -180,8 +180,12 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     if pathspecs.is_empty() && !(all || update_only) {
         // git: message + advice on stderr, exit 0. stdout stays empty.
         eprintln!("Nothing specified, nothing added.");
-        eprintln!("hint: Maybe you wanted to say 'git add .'?");
-        eprintln!("hint: Disable this message with \"git config set advice.addEmptyPathspec false\"");
+        if crate::advice::enabled("addEmptyPathspec") {
+            eprintln!("hint: Maybe you wanted to say 'git add .'?");
+            eprintln!(
+                "hint: Disable this message with \"git config set advice.addEmptyPathspec false\""
+            );
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -395,7 +399,12 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             // git: message on stderr, exit 1.
             eprintln!("The following paths are ignored by one of your .gitignore files:");
             eprintln!("{p}");
-            eprintln!("hint: Use -f if you really want to add them.");
+            if crate::advice::enabled("addIgnoredFile") {
+                eprintln!("hint: Use -f if you really want to add them.");
+                eprintln!(
+                    "hint: Disable this message with \"git config set advice.addIgnoredFile false\""
+                );
+            }
             return Ok(ExitCode::from(1));
         }
         if !on_disk && !ignore_missing {

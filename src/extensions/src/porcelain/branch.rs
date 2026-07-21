@@ -473,7 +473,9 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
     if gix::validate::reference::branch_name(BStr::new(full.as_bytes())).is_err() {
         let code = fatal(format!("'{name}' is not a valid branch name"))?;
-        ref_syntax_hints();
+        if crate::advice::enabled("refSyntax") {
+            ref_syntax_hints();
+        }
         return Ok(code);
     }
 
@@ -533,7 +535,9 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
     if gix::validate::reference::branch_name(BStr::new(new_full.as_bytes())).is_err() {
         let code = fatal(format!("'{new}' is not a valid branch name"))?;
-        ref_syntax_hints();
+        if crate::advice::enabled("refSyntax") {
+            ref_syntax_hints();
+        }
         return Ok(code);
     }
 
@@ -665,10 +669,12 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             };
             if !merged {
                 let code = error_exit(format!("the branch '{name}' is not fully merged"))?;
-                eprintln!("hint: If you are sure you want to delete it, run 'git branch -D {name}'");
-                eprintln!(
-                    "hint: Disable this message with \"git config set advice.forceDeleteBranch false\""
-                );
+                if crate::advice::enabled("forceDeleteBranch") {
+                    eprintln!("hint: If you are sure you want to delete it, run 'git branch -D {name}'");
+                    eprintln!(
+                        "hint: Disable this message with \"git config set advice.forceDeleteBranch false\""
+                    );
+                }
                 return Ok(code);
             }
         }

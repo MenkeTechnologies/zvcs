@@ -405,8 +405,12 @@ pub fn stage(args: &[String]) -> Result<ExitCode> {
     // Only `-A` and `-u` imply a pathspec; every other flag alone is a no-op.
     if o.pathspecs.is_empty() && !(o.addremove == Some(true) || o.update) {
         eprintln!("Nothing specified, nothing added.");
-        eprintln!("hint: Maybe you wanted to say 'git add .'?");
-        eprintln!("hint: Disable this message with \"git config set advice.addEmptyPathspec false\"");
+        if crate::advice::enabled("addEmptyPathspec") {
+            eprintln!("hint: Maybe you wanted to say 'git add .'?");
+            eprintln!(
+                "hint: Disable this message with \"git config set advice.addEmptyPathspec false\""
+            );
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -619,8 +623,12 @@ fn unmatched_pathspec_exit(
         for p in &ignored {
             eprintln!("{p}");
         }
-        eprintln!("hint: Use -f if you really want to add them.");
-        eprintln!("hint: Disable this message with \"git config set advice.addIgnoredFile false\"");
+        if crate::advice::enabled("addIgnoredFile") {
+            eprintln!("hint: Use -f if you really want to add them.");
+            eprintln!(
+                "hint: Disable this message with \"git config set advice.addIgnoredFile false\""
+            );
+        }
         return Some(ExitCode::FAILURE);
     }
     None

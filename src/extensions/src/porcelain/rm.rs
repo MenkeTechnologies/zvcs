@@ -470,12 +470,17 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
             ));
         }
         if !blocks.is_empty() {
-            let hint = if opts.cached {
-                "(use -f to force removal)"
+            let joined = blocks.join("\nerror: ");
+            if crate::advice::enabled("rmHints") {
+                let hint = if opts.cached {
+                    "(use -f to force removal)"
+                } else {
+                    "(use --cached to keep the file, or -f to force removal)"
+                };
+                eprintln!("error: {joined}\n{hint}");
             } else {
-                "(use --cached to keep the file, or -f to force removal)"
-            };
-            eprintln!("error: {}\n{hint}", blocks.join("\nerror: "));
+                eprintln!("error: {joined}");
+            }
             return Ok(ExitCode::from(1));
         }
     }

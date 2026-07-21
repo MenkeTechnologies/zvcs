@@ -4,6 +4,7 @@
 //! the engine as a library lets integration tests drive the coordination layer
 //! (e.g. [`lock::RepoLock`] against a live `zdaemon`) directly.
 
+pub mod advice;
 pub mod alias;
 pub mod autocorrect;
 pub mod autostart;

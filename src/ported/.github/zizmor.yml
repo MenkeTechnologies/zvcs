@@ -1,5 +1,0 @@
-rules:
-  anonymous-definition:
-    disable: true
-  concurrency-limits:
-    disable: true

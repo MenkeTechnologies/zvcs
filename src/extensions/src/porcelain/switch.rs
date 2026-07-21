@@ -407,7 +407,9 @@ fn switch_existing(
                     return switch_create(repo, branch, false, &sp, quiet, force, None);
                 }
                 Dwim::Many { count, hint_remote } => {
-                    print_ambiguous_remote_hint(&hint_remote);
+                    if crate::advice::enabled("checkoutAmbiguousRemoteBranchName") {
+                        print_ambiguous_remote_hint(&hint_remote);
+                    }
                     return fatal(format!(
                         "'{branch}' matched multiple ({count}) remote tracking branches"
                     ));
@@ -728,6 +730,9 @@ fn print_ambiguous_remote_hint(remote: &str) {
     eprintln!("hint: If you'd like to always have checkouts of an ambiguous <name> prefer");
     eprintln!("hint: one remote, e.g. the '{remote}' remote, consider setting");
     eprintln!("hint: checkout.defaultRemote={remote} in your config.");
+    eprintln!(
+        "hint: Disable this message with \"git config set advice.checkoutAmbiguousRemoteBranchName false\""
+    );
 }
 
 /// The upstream a newly created branch should track: `(remote, merge_ref,

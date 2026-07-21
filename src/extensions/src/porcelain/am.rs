@@ -1149,7 +1149,9 @@ fn apply_messages(
             Mail::EmptyPatch { subject, has_author } => match o.empty {
                 Empty::Stop => {
                     println!("Patch is empty.");
-                    print_empty_stop_hints();
+                    if crate::advice::enabled("mergeConflict") {
+                        print_empty_stop_hints();
+                    }
                     return Ok(ExitCode::from(128));
                 }
                 Empty::Drop => {

@@ -146,7 +146,7 @@ jobs:
           linux_blocks=$( { emit on_intel x86_64-unknown-linux-gnu "$SHA_X86_LINUX"; emit on_arm aarch64-unknown-linux-gnu "$SHA_ARM_LINUX"; } )
           {
             printf 'class Zvcs < Formula\n'
-            printf '  desc "git-shadowing superset VCS: lock-free many-writer git over submodules via a zdaemon FIFO coordinator"\n'
+            printf '  desc "Git-shadowing superset VCS with lock-free many-writer commits over submodules"\n'
             printf '  homepage "https://github.com/MenkeTechnologies/zvcs"\n'
             printf '  license "MIT"\n'
             printf '  version "%s"\n\n' "$V"

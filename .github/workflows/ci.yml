@@ -22,6 +22,14 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Tests spawn the real `git` binary to build fixtures (a `git commit`
+      # requires a committer identity) and the zdaemon autobumps commits; a
+      # fresh runner has no global git identity, so configure one. Tests that
+      # set their own `-c user.*` still override this.
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@zvcs.test"
+          git config --global user.name "zvcs ci"
       # The workspace member is the `zvcs` package (the `git` shadow binary +
       # coordination layer); src/ported gitoxide is a separate excluded
       # workspace. Build the binary, then run the coordination test that proves

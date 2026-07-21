@@ -27,6 +27,9 @@ gix = { path = "../ported/gix", features = [
     "merge",
 ] }
 anyhow = "1"
+# POSIX-ERE value-pattern matching for `git config <name> <value> <value-pattern>`.
+# Foundational, vendorable crate; byte-oriented `regex::bytes` mirrors git's regexec.
+regex = "1"
 # File-watch autonomy: the daemon reacts to local ref changes (a `git pull`/commit
 # updates `logs/HEAD` / remote-tracking refs) and never polls a remote.
 notify = "6"

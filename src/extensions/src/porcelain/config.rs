@@ -66,6 +66,8 @@ fn is_synthetic(source: Source) -> bool {
 ///   * `git config --get-all <name>`          → every value, one per line
 ///   * `git config -l` / `--list`             → all `key=value`, merged scopes
 ///   * `git config <name> <value>`            → set (overwrite last), local
+///   * `git config <name> <value> <pattern>`  → rewrite values matching the ERE,
+///                                              or append when none match, local
 ///   * `git config --add <name> <value>`      → append a multivar entry, local
 ///   * `git config --unset <name>`            → drop the value, exit 5 if absent
 ///   * `git config --unset-all <name>`        → drop every value of the key
@@ -161,8 +163,9 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
 
     match mode {
         Mode::List => list(&repo, name_only),
-        // `<name> <value-pattern>` filters values by an ERE; no regex engine is
-        // vendored, so the two-argument form is refused rather than faked.
+        // `--get <name> <value-pattern>` filters returned values by an ERE — a
+        // read-side feature distinct from the value-pattern *set* form below and
+        // not yet implemented; the two-argument read is refused rather than faked.
         Mode::Get | Mode::GetAll if positional.len() == 2 => {
             bail!("value-pattern filtering is not supported")
         }
@@ -171,8 +174,9 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         // No action flag: one positional reads, two set the value.
         Mode::Auto if positional.len() == 1 => get(&repo, positional[0], false),
         Mode::Auto if positional.len() == 2 => write_local(&repo, positional[0], positional[1], WriteOp::Set),
-        // `<name> <value> <value-pattern>` replaces only matching values.
-        Mode::Auto => bail!("value-pattern filtering is not supported"),
+        // `<name> <value> <value-pattern>` rewrites the values whose text matches
+        // the POSIX ERE, or adds a new value when none match.
+        Mode::Auto => set_with_value_pattern(&repo, positional[0], positional[1], positional[2]),
         Mode::Add => {
             let (name, value) = name_and_value(&positional)?;
             write_local(&repo, name, value, WriteOp::Add)
@@ -343,6 +347,90 @@ fn write_local(repo: &gix::Repository, name: &str, value: &str, op: WriteOp) -> 
             } else {
                 section.remove(key.value_name);
             }
+        }
+    }
+
+    persist(&path, &file)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git config <name> <value> <value-pattern>` — the value-pattern set form.
+///
+/// Among the existing values of `<name>` in the repository-local file, the
+/// POSIX ERE `<value-pattern>` selects which are rewritten to `<value>`
+/// (a leading `!` inverts the match, matching against the value text as bytes,
+/// unanchored — git's `regexec`). The outcomes mirror stock git exactly:
+///
+///   * no value matches   → append `<value>` as a new line (exit 0)
+///   * exactly one matches → rewrite that value in place (exit 0)
+///   * more than one       → without `--replace-all` git refuses: it prints
+///                           `warning: <key> has multiple values` on stderr,
+///                           leaves the file untouched, and exits 5
+///   * invalid ERE         → `error: invalid pattern: <pattern>`, exit 6
+fn set_with_value_pattern(
+    repo: &gix::Repository,
+    name: &str,
+    value: &str,
+    value_pattern: &str,
+) -> Result<ExitCode> {
+    let key = parse_key(name)?;
+    let section_lc = key.section_name.to_lowercase();
+    let value_lc = key.value_name.to_lowercase();
+
+    // A leading `!` inverts the match; the remainder is the ERE. Compile it the
+    // way git does before touching the file, so a bad pattern is exit 6 whether
+    // or not any value would have matched.
+    let (invert, pat) = match value_pattern.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, value_pattern),
+    };
+    let re = match regex::bytes::Regex::new(pat) {
+        Ok(re) => re,
+        Err(_) => {
+            eprintln!("error: invalid pattern: {pat}");
+            return Ok(ExitCode::from(6));
+        }
+    };
+
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+
+    let path = repo.common_dir().join("config");
+    let mut file = ConfigFile::from_path_no_includes(path.clone(), Source::Local)?;
+
+    // Existing values of the key in this file, in order of occurrence. An absent
+    // key yields an empty list, which routes to the append branch below.
+    let existing = file
+        .raw_values_by(&section_lc, key.subsection_name, &value_lc)
+        .unwrap_or_default();
+
+    let mut matching: Vec<usize> = Vec::new();
+    for (i, v) in existing.iter().enumerate() {
+        if re.is_match(v.as_ref()) != invert {
+            matching.push(i);
+        }
+    }
+
+    match matching.as_slice() {
+        // No value matches: append a new one (git's add-on-no-match).
+        [] => {
+            file.section_mut_or_create_new(&section_lc, key.subsection_name)?
+                .push(&value_lc, value)?;
+        }
+        // Exactly one match: rewrite that value in place. The index is shared
+        // with `raw_values_by` above — both walk values in occurrence order.
+        [idx] => {
+            file.raw_values_mut_by(&section_lc, key.subsection_name, &value_lc)?
+                .set_string_at(*idx, value)?;
+        }
+        // Multiple matches without `--replace-all`: git warns and exits 5,
+        // leaving the file untouched.
+        _ => {
+            let key_disp = match key.subsection_name {
+                Some(sub) => format!("{section_lc}.{sub}.{value_lc}"),
+                None => format!("{section_lc}.{value_lc}"),
+            };
+            eprintln!("warning: {key_disp} has multiple values");
+            return Ok(ExitCode::from(5));
         }
     }
 

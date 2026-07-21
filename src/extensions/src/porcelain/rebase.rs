@@ -894,6 +894,20 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         die!("--reschedule-failed-exec requires --exec or --interactive");
     }
 
+    // git resolves `<onto>` here. With `--root` and no `--onto`, `builtin/rebase.c`
+    // mints a synthesized root commit — an empty-tree commit with no parents and
+    // the configured author/committer — to stand in as `<onto>`, and writes it to
+    // the object database at *this* point, before the `argc > 1` operand check
+    // below. So an invalid `git rebase --root -- a b` still leaves that one loose
+    // object behind (exit 129), byte-for-byte what stock git leaves. It happens
+    // after the backend `die()`s — `git rebase --root --apply a b` reports
+    // `--root without --onto requires the merge backend` (128) and mints nothing —
+    // and is skipped entirely when `--onto` supplies the base (`git rebase --root
+    // --onto HEAD -- a b` usage-errors with no object written).
+    if root && onto_name.is_none() {
+        write_synth_root(&repo)?;
+    }
+
     // git resolves `<upstream>` here. With `--root` no upstream token is
     // consumed, so `builtin/rebase.c`'s `--root` arm ends with `if (argc > 1)
     // usage_with_options(...)`: at most a single `[<branch>]` positional is
@@ -1340,6 +1354,34 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         eprintln!("Successfully rebased and updated {label}.");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Mint the synthesized root commit git's `--root` (without `--onto`) creates as
+/// its stand-in `<onto>`: an empty-tree commit with no parents carrying the
+/// configured author and committer. `builtin/rebase.c` writes this to the object
+/// database while resolving `<onto>`, before it validates the operand count, so
+/// reproducing git's ordering means writing it here — even on the invocations git
+/// goes on to reject with the usage block. Only the loose object is written; no
+/// ref, reflog, `ORIG_HEAD`, or index entry is touched, matching git.
+fn write_synth_root(repo: &gix::Repository) -> Result<()> {
+    let author = repo
+        .author()
+        .ok_or_else(|| anyhow!("author identity is not configured"))??
+        .to_owned()?;
+    let committer = repo
+        .committer()
+        .ok_or_else(|| anyhow!("committer identity is not configured"))??
+        .to_owned()?;
+    repo.write_object(&gix::objs::Commit {
+        message: BString::default(),
+        tree: ObjectId::empty_tree(repo.object_hash()),
+        author,
+        committer,
+        encoding: None,
+        parents: Default::default(),
+        extra_headers: Default::default(),
+    })?;
+    Ok(())
 }
 
 /// Resolve `onto..head` into replay steps by walking first parents from `head`

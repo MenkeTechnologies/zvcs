@@ -8,25 +8,48 @@
 //! orchestration around third-party binaries. None of that substrate is in the
 //! vendored gitoxide crates, and faking it would silently corrupt conflicted files.
 //!
-//! Ported here, byte-faithfully, is everything the script does *before* it touches
-//! a tool:
+//! Ported here, byte-faithfully, is everything the script does *before* it hands a
+//! file to a tool:
 //!   * the option loop of `main()`, including its quirks (`--tool*` prefix match,
 //!     the stuck `=` form, `-t` with a missing value falling through to `usage`);
 //!   * `git-sh-setup`'s leading-`-h` handling — usage to stdout, exit 0, and it
 //!     works outside a repository;
 //!   * `usage` — the same one-line usage to stderr, exit 1;
 //!   * `require_work_tree`;
+//!   * `get_merge_tool` / `guess_merge_tool`: honouring a configured
+//!     `merge.tool`/`merge.guitool`, and otherwise building git's candidate list
+//!     and emitting the `'merge.tool' is not configured` guidance on stderr — see
+//!     [`select_merge_tool`];
 //!   * the full "is there anything to do" decision, i.e. the `MERGE_RR` /
 //!     `git rerere remaining` branch and the `diff --diff-filter=U` pathspec
 //!     filter, ending in `print_noop_and_exit`'s `No files need merging` / exit 0;
+//!   * the `Merging:` banner and, per conflicted path, `merge_file`'s conflict
+//!     description block (`Normal`/`Deleted`/`Symbolic link`/`Submodule merge
+//!     conflict for …` with its `{local}`/`{remote}` `describe_file` lines) and
+//!     the `Hit return to start merge resolution tool (<tool>):` prompt — see
+//!     [`merge_file_message`];
 //!   * `show_tool_help`, i.e. all of `--tool-help[=<mode>]` — see [`show_tool_help`]
 //!     and [`TOOLS`] for how the backend catalogue it lists is represented here.
 //!
-//! When that decision yields at least one conflicted path — the point where the
-//! script would print `Merging:` and start invoking a backend — this bails instead
-//! of emitting partial output.
+//! What is *not* ported is the substrate that begins once the prompt is answered:
+//! materialising index stages 1/2/3 into `BASE`/`LOCAL`/`REMOTE` temp files, the
+//! `mergetools/` shell backend that exec's the (usually graphical) program, and
+//! the resolve loops for the exotic conflict shapes. With stdin at EOF — the
+//! non-interactive path the parity harness drives — `read` fails, `merge_file`
+//! returns 1, and a single conflicted path makes `main` `exit 1`, all before that
+//! substrate is reached; that byte-exact path is reproduced here. If the prompt is
+//! actually answered (a tty), or the conflict is one of the resolve-loop shapes,
+//! this bails rather than fake the tool run.
+//!
+//! One post-state caveat: the unported temp-file staging is *also* the only reason
+//! stock leaves `<name>_{BASE,LOCAL,REMOTE,BACKUP}_$$.<ext>` files in the worktree
+//! on this path, and the `$$` in those names is the git-mergetool shell's PID —
+//! non-deterministic run to run. `git status` therefore differs between two stock
+//! runs, so no implementation can byte-match that state; the observable
+//! stdout/stderr/exit reproduced here are deterministic.
 
 use anyhow::{bail, Result};
+use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -59,6 +82,13 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
     }
 
     // Port of main()'s `while test $# != 0` option loop, case arms in order.
+    // `-t`/`--tool=` set `merge_tool` (skipping the guess); `-g`/`--gui` pick the
+    // `merge.guitool` config key; `-y`/`--prompt`/`--no-prompt` override the
+    // `mergetool.prompt` default. All three only matter once a conflicted path is
+    // reached, so they are captured rather than acted on here.
+    let mut explicit_tool: Option<String> = None;
+    let mut gui = false;
+    let mut prompt_flag: Option<bool> = None;
     let mut i = 0usize;
     while i < rest.len() {
         let a = rest[i].as_str();
@@ -73,14 +103,23 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         } else if a == "-t" || a.starts_with("--tool") {
             // `case "$#,$1" in *,*=*) stuck ;; 1,*) usage ;; *) take $2 ;; esac`
-            if !a.contains('=') {
+            if let Some(v) = a.strip_prefix("--tool=") {
+                explicit_tool = Some(v.to_string());
+            } else if !a.contains('=') {
                 if i + 1 >= rest.len() {
                     return Ok(usage_error());
                 }
+                explicit_tool = Some(rest[i + 1].clone());
                 i += 1;
             }
         } else if matches!(a, "--no-gui" | "-g" | "--gui" | "-y" | "--no-prompt" | "--prompt") {
-            // Only steer the unported backend-invocation loop.
+            match a {
+                "-g" | "--gui" => gui = true,
+                "--no-gui" => gui = false,
+                "-y" | "--no-prompt" => prompt_flag = Some(false),
+                "--prompt" => prompt_flag = Some(true),
+                _ => {}
+            }
         } else if a.starts_with("-O") {
             // Orders the unported backend-invocation loop; never observable here.
         } else if a == "--" {
@@ -101,6 +140,22 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
     // which cannot be reproduced, so this states the condition instead.
     if repo.workdir().is_none() {
         bail!("this operation must be run in a work tree");
+    }
+
+    // `get_merge_tool` (main line `merge_tool=$(get_merge_tool)`), which runs
+    // *before* the "anything to do?" decision — so its `guess_merge_tool` stderr
+    // guidance is emitted even when the answer turns out to be `No files need
+    // merging`, exactly as stock does.
+    let snapshot = repo.config_snapshot();
+    let selection = match &explicit_tool {
+        Some(t) => Selection { tool: Some(t.clone()), guessed: false, guidance: Vec::new() },
+        None => select_merge_tool(&snapshot, gui),
+    };
+    let show_prompt_default = prompt_enabled(&snapshot, prompt_flag);
+    if !selection.guidance.is_empty() {
+        let mut e = std::io::stderr().lock();
+        e.write_all(&selection.guidance)?;
+        e.flush()?;
     }
 
     // `git diff --name-only --diff-filter=U` — the unmerged index paths.
@@ -132,13 +187,310 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    bail!(
-        "resolving {} conflicted path(s) needs git's mergetools/ shell backends, the \
-         BASE/LOCAL/REMOTE temp-file staging around them, and the interactive prompt loop; \
-         that substrate is not in the vendored gitoxide crates (ported: option parsing, -h, \
-         and the 'No files need merging' no-op path)",
-        files.len()
-    );
+    // `printf "Merging:\n"; printf "%s\n" "$files"`, then the per-file loop.
+    let index = repo.open_index()?;
+    let mut out = std::io::stdout().lock();
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"Merging:\n");
+    for f in &files {
+        buf.extend_from_slice(f.as_slice());
+        buf.push(b'\n');
+    }
+
+    let tool = selection.tool.as_deref().unwrap_or("");
+    let n = files.len();
+    for (idx, f) in files.iter().enumerate() {
+        // `printf "\n"` at the top of each iteration.
+        buf.push(b'\n');
+        let msg = merge_file_message(&repo, &index, f.as_bstr())?;
+        buf.extend_from_slice(&msg.text);
+
+        match msg.after {
+            AfterMessage::Resolve => {
+                // `resolve_{deleted,symlink,submodule}_merge` drive their own
+                // prompt/read loops or a tool; unported. The description block is
+                // faithful; stop before the resolve loop.
+                out.write_all(&buf)?;
+                out.flush()?;
+                bail!(SUBSTRATE);
+            }
+            AfterMessage::Normal => {
+                // `if guessed_merge_tool = true || prompt = true` — the prompt.
+                let show_prompt = selection.guessed || show_prompt_default;
+                if show_prompt {
+                    buf.extend_from_slice(b"Hit return to start merge resolution tool (");
+                    buf.extend_from_slice(tool.as_bytes());
+                    buf.extend_from_slice(b"): ");
+                }
+                out.write_all(&buf)?;
+                out.flush()?;
+                buf.clear();
+
+                if !show_prompt {
+                    // No prompt: stock goes straight to `run_merge_tool` — unported.
+                    bail!(SUBSTRATE);
+                }
+                // `read ans || return 1`. With stdin at EOF the read fails and
+                // `merge_file` returns 1.
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line)? == 0 {
+                    // `test $# -ne 1 && prompt_after_failed_merge || exit 1`.
+                    if n - idx == 1 {
+                        return Ok(ExitCode::from(1));
+                    }
+                    out.write_all(b"Continue merging other unresolved paths [y/n]? ")?;
+                    out.flush()?;
+                    let mut ans = String::new();
+                    if std::io::stdin().read_line(&mut ans)? == 0 {
+                        // First `read` in the loop fails -> return 1 -> exit 1.
+                        return Ok(ExitCode::from(1));
+                    }
+                    // An answer other than EOF would let git keep going, but that
+                    // needs the unported tool run for the paths already prompted.
+                    bail!(SUBSTRATE);
+                }
+                // The prompt was answered: stock now `run_merge_tool`s — unported.
+                bail!(SUBSTRATE);
+            }
+        }
+    }
+
+    // The loop returns or bails for every conflicted path; reaching here would
+    // mean `files` was empty, which is handled above.
+    out.write_all(&buf)?;
+    out.flush()?;
+    Ok(ExitCode::from(1))
+}
+
+/// Message shared by the substrate-not-ported bails once the ported prefix ends.
+const SUBSTRATE: &str = "starting a merge resolution tool needs git's mergetools/ \
+     shell backends and the BASE/LOCAL/REMOTE temp-file staging around them, which is \
+     not in the vendored gitoxide crates (ported up to and including the prompt)";
+
+/// Outcome of the selected merge tool, mirroring `get_merge_tool`'s three signals:
+/// the tool name (empty when the guess found nothing), whether it was *guessed*
+/// (which forces the prompt), and the stderr bytes `guess_merge_tool` emits.
+struct Selection {
+    tool: Option<String>,
+    guessed: bool,
+    guidance: Vec<u8>,
+}
+
+/// `get_merge_tool`: use a configured `merge.tool` (or `merge.guitool` under `-g`)
+/// when it is set and valid, otherwise `guess_merge_tool`.
+///
+/// The guess reproduces `list_merge_tool_candidates` + the guidance heredoc, then
+/// returns the first candidate whose *name* is on `$PATH`. Selection uses the raw
+/// name because, at guess time, `translate_merge_tool_path` is still `git-mergetool
+/// --lib`'s identity default — no `setup_tool` has overridden it — so `is_available`
+/// probes e.g. `vimdiff`/`emerge` directly, not the `vim`/`emacs` a configured tool
+/// would resolve to.
+fn select_merge_tool(snapshot: &gix::config::Snapshot<'_>, gui: bool) -> Selection {
+    // `get_configured_merge_tool`'s key order for merge mode.
+    let keys: &[&str] = if gui { &["merge.guitool", "merge.tool"] } else { &["merge.tool"] };
+    let configured = keys.iter().find_map(|k| {
+        snapshot
+            .string(*k)
+            .map(|v| v.to_str_lossy().into_owned())
+            .filter(|v| !v.is_empty())
+    });
+
+    let mut guidance = Vec::new();
+    if let Some(t) = configured {
+        if valid_tool(&t, snapshot) {
+            return Selection { tool: Some(t), guessed: false, guidance };
+        }
+        // `git config option $TOOL_MODE.${gui_prefix}tool set to unknown tool: …`.
+        let key = if gui { "merge.guitool" } else { "merge.tool" };
+        guidance.extend_from_slice(
+            format!("git config option {key} set to unknown tool: {t}\nResetting to default...\n")
+                .as_bytes(),
+        );
+    }
+
+    // `guess_merge_tool`: the candidate list, then the `cat >&2 <<-EOF` guidance.
+    let candidates = merge_tool_candidates();
+    guidance.extend_from_slice(b"\nThis message is displayed because 'merge.tool' is not configured.\n");
+    guidance.extend_from_slice(b"See 'git mergetool --tool-help' or 'git help config' for more details.\n");
+    guidance.extend_from_slice(b"'git mergetool' will now attempt to use one of the following tools:\n");
+    guidance.extend_from_slice(candidates.join(" ").as_bytes());
+    guidance.push(b'\n');
+
+    for c in &candidates {
+        if is_available(c) {
+            return Selection { tool: Some(c.clone()), guessed: true, guidance };
+        }
+    }
+    // `echo >&2 "No known merge tool is available."; return 1` — get_merge_tool's
+    // `|| exit` then leaves merge_tool empty with guessed_merge_tool=true.
+    guidance.extend_from_slice(b"No known merge tool is available.\n");
+    Selection { tool: None, guessed: true, guidance }
+}
+
+/// `valid_tool`: a catalogue backend, or a name with a configured
+/// `mergetool.<tool>.cmd` (`setup_user_tool`).
+fn valid_tool(tool: &str, snapshot: &gix::config::Snapshot<'_>) -> bool {
+    let cmd_key = format!("mergetool.{tool}.cmd");
+    TOOLS.iter().any(|t| t.name == tool)
+        || snapshot.string(&cmd_key).is_some_and(|v| !v.is_empty())
+}
+
+/// `list_merge_tool_candidates` for merge mode: the base `tortoisemerge`, the
+/// graphical block only when `$DISPLAY` is set, and the editor-derived tail keyed
+/// on `${VISUAL:-$EDITOR}`.
+fn merge_tool_candidates() -> Vec<String> {
+    let nonempty = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+
+    let mut tools: Vec<String> = Vec::new();
+    if nonempty("DISPLAY") {
+        let graphical: &[&str] = if nonempty("GNOME_DESKTOP_SESSION_ID") {
+            &["meld", "opendiff", "kdiff3", "tkdiff", "xxdiff"]
+        } else {
+            &["opendiff", "kdiff3", "tkdiff", "xxdiff", "meld"]
+        };
+        tools.extend(graphical.iter().map(|s| s.to_string()));
+        tools.push("tortoisemerge".to_string());
+        tools.extend(
+            ["gvimdiff", "diffuse", "diffmerge", "ecmerge", "p4merge", "araxis", "bc", "codecompare", "smerge"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+    } else {
+        tools.push("tortoisemerge".to_string());
+    }
+
+    // `${VISUAL:-$EDITOR}`: VISUAL wins unless unset or empty.
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var("EDITOR").ok())
+        .unwrap_or_default();
+    let tail: &[&str] = if editor.contains("nvim") {
+        &["nvimdiff", "vimdiff", "emerge"]
+    } else if editor.contains("vim") {
+        &["vimdiff", "nvimdiff", "emerge"]
+    } else {
+        &["emerge", "vimdiff", "nvimdiff"]
+    };
+    tools.extend(tail.iter().map(|s| s.to_string()));
+    tools
+}
+
+/// `test "$prompt" = true`: the `-y`/`--prompt`/`--no-prompt` override, else the
+/// `mergetool.prompt` config default (unset counts as not-true).
+fn prompt_enabled(snapshot: &gix::config::Snapshot<'_>, flag: Option<bool>) -> bool {
+    match flag {
+        Some(b) => b,
+        None => snapshot.boolean("mergetool.prompt") == Some(true),
+    }
+}
+
+/// What `merge_file` does after emitting a path's description block.
+enum AfterMessage {
+    /// The `Normal merge conflict` shape, which reaches the `Hit return` prompt.
+    Normal,
+    /// A `Deleted`/`Symbolic link`/`Submodule` conflict, which drives a resolve
+    /// loop instead of the prompt — unported past the description.
+    Resolve,
+}
+
+/// The bytes `merge_file` prints for one conflicted path, and what it does next.
+struct MergeFileMessage {
+    text: Vec<u8>,
+    after: AfterMessage,
+}
+
+/// Port of `merge_file`'s description block: pick the conflict shape from the
+/// index stages and render its header plus the two `describe_file` lines.
+fn merge_file_message(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    path: &gix::bstr::BStr,
+) -> Result<MergeFileMessage> {
+    // `git ls-files -u -- "$MERGED"` reduced to the stage → (mode, id) it needs.
+    let mut base: Option<gix::index::entry::Mode> = None;
+    let mut local: Option<(gix::index::entry::Mode, gix::ObjectId)> = None;
+    let mut remote: Option<(gix::index::entry::Mode, gix::ObjectId)> = None;
+    for entry in index.entries() {
+        if entry.path(index) != path {
+            continue;
+        }
+        match entry.stage_raw() {
+            1 => base = Some(entry.mode),
+            2 => local = Some((entry.mode, entry.id)),
+            3 => remote = Some((entry.mode, entry.id)),
+            _ => {}
+        }
+    }
+
+    let base_present = base.is_some();
+    let local_mode = local.map(|(m, _)| m);
+    let remote_mode = remote.map(|(m, _)| m);
+    let is_submodule = |m: Option<gix::index::entry::Mode>| m.is_some_and(|m| m.bits() == 0o160000);
+    let is_symlink = |m: Option<gix::index::entry::Mode>| m.is_some_and(|m| m.bits() == 0o120000);
+
+    let mut text: Vec<u8> = Vec::new();
+    let header = |text: &mut Vec<u8>, label: &str| {
+        text.extend_from_slice(label.as_bytes());
+        text.extend_from_slice(b" for '");
+        text.extend_from_slice(path.as_bytes());
+        text.extend_from_slice(b"':\n");
+    };
+
+    let after = if is_submodule(local_mode) || is_submodule(remote_mode) {
+        header(&mut text, "Submodule merge conflict");
+        describe_file(repo, &mut text, "local", local, base_present)?;
+        describe_file(repo, &mut text, "remote", remote, base_present)?;
+        AfterMessage::Resolve
+    } else if local_mode.is_none() || remote_mode.is_none() {
+        header(&mut text, "Deleted merge conflict");
+        describe_file(repo, &mut text, "local", local, base_present)?;
+        describe_file(repo, &mut text, "remote", remote, base_present)?;
+        AfterMessage::Resolve
+    } else if is_symlink(local_mode) || is_symlink(remote_mode) {
+        header(&mut text, "Symbolic link merge conflict");
+        describe_file(repo, &mut text, "local", local, base_present)?;
+        describe_file(repo, &mut text, "remote", remote, base_present)?;
+        AfterMessage::Resolve
+    } else {
+        header(&mut text, "Normal merge conflict");
+        describe_file(repo, &mut text, "local", local, base_present)?;
+        describe_file(repo, &mut text, "remote", remote, base_present)?;
+        AfterMessage::Normal
+    };
+
+    Ok(MergeFileMessage { text, after })
+}
+
+/// `describe_file`: the `  {<branch>}: <what>` line for one side of the conflict.
+///
+/// The stage's `mode`/`id` stand in for the temp file the script would `cat`
+/// (symlink target) or the sha it echoes (submodule commit); a missing stage is
+/// `deleted`, and any other regular file is `modified`/`created` per `base_present`.
+fn describe_file(
+    repo: &gix::Repository,
+    text: &mut Vec<u8>,
+    branch: &str,
+    stage: Option<(gix::index::entry::Mode, gix::ObjectId)>,
+    base_present: bool,
+) -> Result<()> {
+    text.extend_from_slice(format!("  {{{branch}}}: ").as_bytes());
+    match stage {
+        None => text.extend_from_slice(b"deleted\n"),
+        Some((mode, id)) if mode.bits() == 0o120000 => {
+            // `a symbolic link -> '$(cat "$file")'` — the target is the blob body.
+            let target = repo.find_object(id)?.data.clone();
+            text.extend_from_slice(b"a symbolic link -> '");
+            text.extend_from_slice(&target);
+            text.extend_from_slice(b"'\n");
+        }
+        Some((mode, id)) if mode.bits() == 0o160000 => {
+            text.extend_from_slice(format!("submodule commit {}\n", id.to_hex()).as_bytes());
+        }
+        Some(_) if base_present => text.extend_from_slice(b"modified file\n"),
+        Some(_) => text.extend_from_slice(b"created file\n"),
+    }
+    Ok(())
 }
 
 /// `usage` from `git-sh-setup` with an empty `OPTIONS_SPEC`: `die` the one-line

@@ -128,10 +128,28 @@ struct Atom {
     field: Field,
 }
 
-/// A parsed format string is a sequence of literal runs and atoms.
+/// A parsed format string is a sequence of literal runs, atoms, and the
+/// `%(align:…)` / `%(end)` container markers that pad the content between them.
 enum Item {
     Lit(Vec<u8>),
     Atom(Atom),
+    AlignStart(AlignSpec),
+    End,
+}
+
+/// `%(align:<width>,<position>)` — pad the enclosed content to `width` display
+/// columns; content already at or over `width` is left untouched (never cut).
+#[derive(Clone)]
+struct AlignSpec {
+    width: usize,
+    position: AlignPos,
+}
+
+#[derive(Clone, Copy)]
+enum AlignPos {
+    Left,
+    Right,
+    Middle,
 }
 
 /// A sort key: an atom plus its direction.
@@ -523,7 +541,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             .iter()
             .filter_map(|it| match it {
                 Item::Atom(a) => Some(a),
-                Item::Lit(_) => None,
+                Item::Lit(_) | Item::AlignStart(_) | Item::End => None,
             })
             .chain(sorts.iter().map(|s| &s.atom))
     };
@@ -648,23 +666,48 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     let mut out: Vec<u8> = Vec::new();
     for info in &refs {
         let mut line: Vec<u8> = Vec::new();
+        // `%(align:…)…%(end)` buffers its content so it can be padded on close;
+        // nested aligns stack, and the innermost buffer is the current target.
+        let mut align_stack: Vec<(AlignSpec, Vec<u8>)> = Vec::new();
         for item in &items {
             match item {
-                Item::Lit(bytes) => line.extend_from_slice(bytes),
+                Item::AlignStart(spec) => align_stack.push((spec.clone(), Vec::new())),
+                Item::End => {
+                    // Balance is guaranteed by parse_format, so a pop always succeeds.
+                    let (spec, buf) = align_stack.pop().expect("balanced by parse");
+                    let padded = pad_align(&buf, &spec);
+                    let target = align_stack
+                        .last_mut()
+                        .map(|(_, b)| b)
+                        .unwrap_or(&mut line);
+                    target.extend_from_slice(&padded);
+                }
+                Item::Lit(bytes) => {
+                    let target = align_stack
+                        .last_mut()
+                        .map(|(_, b)| b)
+                        .unwrap_or(&mut line);
+                    target.extend_from_slice(bytes);
+                }
                 Item::Atom(atom) => {
                     let value = render(&repo, atom, info)?;
                     // Colour escapes are emitted verbatim; git does not quote them.
-                    if matches!(atom.field, Field::Color(_)) {
-                        line.extend_from_slice(&value);
+                    let rendered = if matches!(atom.field, Field::Color(_)) {
+                        value
                     } else {
                         match quote_style {
-                            QuoteStyle::None => line.extend_from_slice(&value),
-                            QuoteStyle::Shell => line.extend_from_slice(&sq_quote(&value)),
-                            QuoteStyle::Perl => line.extend_from_slice(&perl_quote(&value)),
-                            QuoteStyle::Python => line.extend_from_slice(&python_quote(&value)),
-                            QuoteStyle::Tcl => line.extend_from_slice(&tcl_quote(&value)),
+                            QuoteStyle::None => value,
+                            QuoteStyle::Shell => sq_quote(&value),
+                            QuoteStyle::Perl => perl_quote(&value),
+                            QuoteStyle::Python => python_quote(&value),
+                            QuoteStyle::Tcl => tcl_quote(&value),
                         }
-                    }
+                    };
+                    let target = align_stack
+                        .last_mut()
+                        .map(|(_, b)| b)
+                        .unwrap_or(&mut line);
+                    target.extend_from_slice(&rendered);
                 }
             }
         }
@@ -765,6 +808,7 @@ fn parse_format(fmt: &[u8], color_on: bool) -> std::result::Result<Vec<Item>, At
     let mut items = Vec::new();
     let mut lit: Vec<u8> = Vec::new();
     let mut i = 0;
+    let mut align_depth = 0usize;
 
     while i < fmt.len() {
         if fmt[i] != b'%' {
@@ -791,7 +835,23 @@ fn parse_format(fmt: &[u8], color_on: bool) -> std::result::Result<Vec<Item>, At
                 if !lit.is_empty() {
                     items.push(Item::Lit(std::mem::take(&mut lit)));
                 }
-                items.push(Item::Atom(parse_atom(spec, color_on)?));
+                // `%(align:…)` / `%(end)` are containers handled here rather than
+                // as value atoms; everything else is a normal atom.
+                if spec == "end" {
+                    if align_depth == 0 {
+                        return Err(fatal_atom(
+                            "format: %(end) atom used without corresponding atom",
+                        ));
+                    }
+                    align_depth -= 1;
+                    items.push(Item::End);
+                } else if spec == "align" || spec.starts_with("align:") {
+                    let opts = spec.strip_prefix("align:");
+                    items.push(Item::AlignStart(parse_align(opts)?));
+                    align_depth += 1;
+                } else {
+                    items.push(Item::Atom(parse_atom(spec, color_on)?));
+                }
                 i = end + 1;
             }
             _ => {
@@ -816,7 +876,61 @@ fn parse_format(fmt: &[u8], color_on: bool) -> std::result::Result<Vec<Item>, At
     if !lit.is_empty() {
         items.push(Item::Lit(lit));
     }
+    if align_depth != 0 {
+        return Err(fatal_atom("format: %(end) atom missing"));
+    }
     Ok(items)
+}
+
+/// Parse `%(align:<opts>)` options: a width and an optional position, given
+/// positionally (`25,left`) or by key (`width=25,position=left`), in any order.
+fn parse_align(opts: Option<&str>) -> std::result::Result<AlignSpec, AtomError> {
+    let missing = || fatal_atom("expected format: %(align:<width>,<position>)");
+    let opts = opts.ok_or_else(missing)?;
+    let mut width: Option<usize> = None;
+    let mut position = AlignPos::Left;
+    for tok in opts.split(',') {
+        if let Some(w) = tok.strip_prefix("width=") {
+            width = Some(w.parse().map_err(|_| missing())?);
+        } else if let Some(p) = tok.strip_prefix("position=") {
+            position = parse_align_pos(p)?;
+        } else if let Ok(w) = tok.parse::<usize>() {
+            width = Some(w);
+        } else {
+            position = parse_align_pos(tok)?;
+        }
+    }
+    let width = width.ok_or_else(missing)?;
+    Ok(AlignSpec { width, position })
+}
+
+fn parse_align_pos(p: &str) -> std::result::Result<AlignPos, AtomError> {
+    match p {
+        "left" => Ok(AlignPos::Left),
+        "right" => Ok(AlignPos::Right),
+        "middle" => Ok(AlignPos::Middle),
+        other => Err(fatal_atom(format!("unrecognized %(align) argument: {other}"))),
+    }
+}
+
+/// Pad `content` to `spec.width` display columns per the position; content at or
+/// over the width is returned unchanged (git never truncates). Display width is
+/// the char count — exact for the ASCII refnames this pads in practice.
+fn pad_align(content: &[u8], spec: &AlignSpec) -> Vec<u8> {
+    let cols = String::from_utf8_lossy(content).chars().count();
+    if cols >= spec.width {
+        return content.to_vec();
+    }
+    let pad = spec.width - cols;
+    let (left, right) = match spec.position {
+        AlignPos::Left => (0, pad),
+        AlignPos::Right => (pad, 0),
+        AlignPos::Middle => (pad / 2, pad - pad / 2),
+    };
+    let mut out = vec![b' '; left];
+    out.extend_from_slice(content);
+    out.extend(std::iter::repeat(b' ').take(right));
+    out
 }
 
 /// Every atom name stock git accepts, so an unrecognised one can be told apart

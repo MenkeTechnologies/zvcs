@@ -127,13 +127,67 @@ fn real_main() -> Result<ExitCode> {
     let workdir = root.join("run");
     std::fs::create_dir_all(&workdir)?;
 
-    let mut outcomes = Vec::with_capacity(cases.len());
-    for (n, case) in cases.iter().enumerate() {
-        if n % 50 == 0 && n > 0 {
-            eprintln!("  … {n}/{}", cases.len());
+    // Cases are independent, so they run across a worker pool. Each worker owns
+    // its own workdir subtree (run/w<k>), so the fixed `stock`/`zvcs`/
+    // `stock-repeat` child dirs `run_case` uses never collide between threads.
+    // Results are written back by original index, so the report is identical to
+    // a sequential run regardless of scheduling — determinism is preserved.
+    let n_workers = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).max(1))
+        .unwrap_or(1)
+        .min(cases.len().max(1));
+    eprintln!("workers  : {n_workers}");
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let total = cases.len();
+    // One owning slot per case, filled by index so the result order is
+    // independent of which worker ran which case.
+    let slots: Vec<std::sync::Mutex<Option<runner::Outcome>>> =
+        (0..total).map(|_| std::sync::Mutex::new(None)).collect();
+
+    let first_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+
+    std::thread::scope(|scope| {
+        for w in 0..n_workers {
+            let (next, done, slots, cases, templates, zvcs_bin, workdir, first_err) = (
+                &next, &done, &slots, &cases, &templates, &zvcs_bin, &workdir, &first_err,
+            );
+            let wdir = workdir.join(format!("w{w}"));
+            scope.spawn(move || {
+                let _ = std::fs::create_dir_all(&wdir);
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= total || first_err.lock().unwrap().is_some() {
+                        break;
+                    }
+                    match run_case(&cases[i], zvcs_bin, templates, &wdir) {
+                        Ok(o) => *slots[i].lock().unwrap() = Some(o),
+                        Err(e) => {
+                            *first_err.lock().unwrap() = Some(e);
+                            break;
+                        }
+                    }
+                    let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if d % 200 == 0 {
+                        eprintln!("  … {d}/{total}");
+                    }
+                }
+            });
         }
-        outcomes.push(run_case(case, &zvcs_bin, &templates, &workdir)?);
+    });
+
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
     }
+    let outcomes: Vec<runner::Outcome> = slots
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .unwrap()
+                .expect("every case slot filled unless an error aborted the run")
+        })
+        .collect();
 
     // Coverage is probed in a throwaway repo so a stray mutating probe cannot
     // touch anything that matters.

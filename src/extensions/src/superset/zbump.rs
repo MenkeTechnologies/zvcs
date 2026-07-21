@@ -120,7 +120,10 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
             Ok(id) => id.detach(),
             Err(err) => {
                 println!("{path_str}: refused (cannot compute merge-base: {err})");
-                refusals.push((path_str.clone(), format!("cannot compute merge-base: {err}")));
+                refusals.push((
+                    path_str.clone(),
+                    format!("cannot compute merge-base: {err}"),
+                ));
                 continue;
             }
         };
@@ -203,14 +206,19 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
                         ci.entries_mut()[i].id = *oid;
                     }
                 }
-                crate::index_commit::commit_index(&repo, &ci, &message)?
+                crate::index_commit::commit_index_autonomous(&repo, &ci, &message)?
             }
             // Unborn parent HEAD can't have a recorded gitlink to bump (head_id
             // would have refused), so this arm is unreachable in practice; commit
             // the index as a safe fallback.
-            None => crate::index_commit::commit_index(&repo, &index, &message)?,
+            None => crate::index_commit::commit_index_autonomous(&repo, &index, &message)?,
         };
-        println!("committed {} ({} pointer{})", commit_id.to_hex_with_len(12), bumped, plural);
+        println!(
+            "committed {} ({} pointer{})",
+            commit_id.to_hex_with_len(12),
+            bumped,
+            plural
+        );
     }
 
     Ok(BumpOutcome { bumped, refusals })

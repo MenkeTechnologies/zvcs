@@ -20,7 +20,69 @@ use gix::ObjectId;
 /// git does. The caller is responsible for holding the repo lock across the
 /// read-modify-write and for having persisted `index` if on-disk consistency is
 /// required; this function only reads `index`'s entries to build the tree.
-pub fn commit_index(repo: &gix::Repository, index: &gix::index::File, message: &str) -> Result<ObjectId> {
+pub fn commit_index(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    message: &str,
+) -> Result<ObjectId> {
+    let (tree_id, parents, msg) = prepare_commit(repo, index, message)?;
+
+    // `Repository::commit` writes the commit and advances `HEAD` (write-through
+    // to its branch, or the detached ref) with the canonical reflog message,
+    // requiring the first parent to be the current tip — git's ref-safety check.
+    // It reads author/committer from configuration and, exactly like git, errors
+    // when no `user.name`/`user.email` is set — the porcelain `git commit` path.
+    let commit_id = repo.commit("HEAD", &msg, tree_id, parents)?;
+    Ok(commit_id.detach())
+}
+
+/// Like [`commit_index`], but for the daemon's autonomous autobump.
+///
+/// git refuses to commit without a configured `user.name`/`user.email`; the
+/// autobump inherits that via [`commit_index`]'s `repo.commit`, so on a machine
+/// or CI runner with no git identity the daemon would stage the coalesced
+/// pointer bump but fail to *commit* it — leaving the parent's `modified: <sub>`
+/// marker in place and autonomy silently stalled. The daemon must not depend on
+/// ambient identity: prefer the configured committer/author when present (so the
+/// commit is attributed to the developer, unchanged), and fall back to a fixed
+/// `zvcs` identity only when none is configured.
+pub fn commit_index_autonomous(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    message: &str,
+) -> Result<ObjectId> {
+    let (tree_id, parents, msg) = prepare_commit(repo, index, message)?;
+
+    // Raw git wire time ("<seconds> <±hhmm>"), built the same way gix builds a
+    // signature's time for a config-less identity (see gix identity::Personas).
+    let now = gix::date::Time::now_local_or_utc().format_or_unix(gix::date::time::Format::Raw);
+    let fallback = gix::actor::SignatureRef {
+        name: b"zvcs".as_bstr(),
+        email: b"zvcs@localhost".as_bstr(),
+        time: &now,
+    };
+    // `committer()`/`author()` are `None` when unconfigured; `Some(Err(_))` on a
+    // malformed configured date.
+    let committer = match repo.committer() {
+        Some(sig) => sig?,
+        None => fallback,
+    };
+    let author = match repo.author() {
+        Some(sig) => sig?,
+        None => fallback,
+    };
+
+    let commit_id = repo.commit_as(committer, author, "HEAD", &msg, tree_id, parents)?;
+    Ok(commit_id.detach())
+}
+
+/// Build the canonical tree from `index`'s entries and resolve the parent(s),
+/// shared by [`commit_index`] and [`commit_index_autonomous`].
+fn prepare_commit(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    message: &str,
+) -> Result<(ObjectId, Vec<ObjectId>, String)> {
     let hash = repo.object_hash();
     let backing = index.path_backing();
 
@@ -61,9 +123,5 @@ pub fn commit_index(repo: &gix::Repository, index: &gix::index::File, message: &
         msg.push('\n');
     }
 
-    // `Repository::commit` writes the commit and advances `HEAD` (write-through
-    // to its branch, or the detached ref) with the canonical reflog message,
-    // requiring the first parent to be the current tip — git's ref-safety check.
-    let commit_id = repo.commit("HEAD", &msg, tree_id, parents)?;
-    Ok(commit_id.detach())
+    Ok((tree_id, parents, msg))
 }

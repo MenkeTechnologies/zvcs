@@ -65,6 +65,7 @@ enum Untracked {
 /// pathspec-limited status.
 pub fn status(args: &[String]) -> Result<ExitCode> {
     let mut short = false;
+    let mut porcelain_v2 = false;
     let mut branch_header = false;
     // `--untracked-files` and `--ignored` are git OPT_STRING options: the raw
     // argument is *stored* during parsing (last occurrence wins; the `--no-`
@@ -83,9 +84,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             "-s" | "--short" => short = true,
             "--porcelain" | "--porcelain=v1" | "--porcelain=1" => short = true,
             "--long" => short = false,
-            "--porcelain=v2" | "--porcelain=2" => {
-                anyhow::bail!("porcelain v2 format is not supported")
-            }
+            "--porcelain=v2" | "--porcelain=2" => porcelain_v2 = true,
             "-z" | "--null" => anyhow::bail!("NUL-terminated output (-z) is not supported"),
             "-b" | "--branch" => branch_header = true,
             "--no-branch" => branch_header = false,
@@ -231,6 +230,13 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     let merging = repo.git_dir().join("MERGE_HEAD").exists();
 
     let untracked = untracked_flag.unwrap_or_else(|| configured_untracked(&repo));
+
+    // The porcelain-v2 machine format is a separate renderer with its own,
+    // richer per-path fields (HEAD/index/worktree modes + oids); it shares none
+    // of the v1/long collection below, so the two cannot regress each other.
+    if porcelain_v2 {
+        return porcelain_v2_output(&repo, untracked, show_ignored, renames, branch_header);
+    }
 
     // Collect the four change classes from the unified status iterator.
     let mut staged: Vec<(StageKind, BString, Option<BString>)> = Vec::new();
@@ -593,6 +599,368 @@ fn referent_short(name: Option<&gix::refs::FullNameRef>, fallback: &str) -> Stri
 /// Map an index-entry mode to a coarse type class, ignoring the executable bit
 /// (git treats a permission-only change as `modified`, not `typechange`).
 /// 0 = regular blob, 1 = symlink, 2 = gitlink/commit, 3 = tree.
+/// One path's porcelain-v2 record, merged across the tree↔index (staged) and
+/// index↔worktree (unstaged) passes. Modes are the git octal values.
+struct V2Rec {
+    x: u8,
+    y: u8,
+    m_h: u32,
+    m_i: u32,
+    m_w: u32,
+    h_h: gix::hash::ObjectId,
+    h_i: gix::hash::ObjectId,
+    /// Whether a tree↔index change set the HEAD/index fields (else fill from index).
+    staged: bool,
+    /// `(R|C, similarity, source-path)` for a rename/copy — renders a `2` line.
+    rename: Option<(u8, u32, BString)>,
+}
+
+/// The worktree file's git mode: symlink, executable blob, or plain blob. A
+/// missing file yields the plain-blob default (the caller uses 0 for deletions).
+fn worktree_mode(repo: &gix::Repository, path: &gix::bstr::BStr) -> u32 {
+    let Some(wd) = repo.workdir() else {
+        return 0o100644;
+    };
+    let full = wd.join(gix::path::from_bstr(path));
+    match std::fs::symlink_metadata(&full) {
+        Ok(m) if m.file_type().is_symlink() => 0o120000,
+        Ok(_m) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if _m.permissions().mode() & 0o111 != 0 {
+                    0o100755
+                } else {
+                    0o100644
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                0o100644
+            }
+        }
+        Err(_) => 0o100644,
+    }
+}
+
+/// `git status --porcelain=v2` — the stable machine format (git-status(1),
+/// "Porcelain Format Version 2"). Ordinary changes render as
+/// `1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>`, renames/copies as `2 …`,
+/// unmerged paths as `u …`, and untracked / ignored as `? <path>` / `! <path>`;
+/// with `--branch` the `# branch.*` header precedes them. A separate renderer
+/// from v1/long — it shares no collection, so neither can regress the other.
+fn porcelain_v2_output(
+    repo: &gix::Repository,
+    untracked: Untracked,
+    show_ignored: bool,
+    renames: Option<Option<gix::diff::Rewrites>>,
+    branch_header: bool,
+) -> Result<ExitCode> {
+    use gix::bstr::ByteSlice;
+    use std::collections::BTreeMap;
+
+    let zero = gix::hash::ObjectId::null(gix::hash::Kind::Sha1);
+    let mut out = String::new();
+
+    // ---------------------------------------------------------------- header
+    if branch_header {
+        match repo.head_id() {
+            Ok(id) => out.push_str(&format!("# branch.oid {}\n", id.detach())),
+            Err(_) => out.push_str("# branch.oid (initial)\n"),
+        }
+        let head = repo.head()?;
+        let head_name = if head.is_detached() {
+            "(detached)".to_string()
+        } else {
+            head.referent_name()
+                .map(|n| n.shorten().to_str_lossy().into_owned())
+                .unwrap_or_else(|| "(detached)".to_string())
+        };
+        drop(head);
+        out.push_str(&format!("# branch.head {head_name}\n"));
+        if let Some(t) = tracking_info(repo)? {
+            out.push_str(&format!("# branch.upstream {}\n", t.upstream));
+            if !t.gone {
+                out.push_str(&format!("# branch.ab +{} -{}\n", t.ahead, t.behind));
+            }
+        }
+    }
+
+    // --------------------------------------------------------------- collect
+    let mut recs: BTreeMap<BString, V2Rec> = BTreeMap::new();
+    let mut unmerged: Vec<(u8, BString)> = Vec::new();
+    let mut untracked_paths: Vec<BString> = Vec::new();
+    let mut ignored_paths: Vec<BString> = Vec::new();
+
+    let new_rec = || V2Rec {
+        x: b'.',
+        y: b'.',
+        m_h: 0,
+        m_i: 0,
+        m_w: 0,
+        h_h: zero,
+        h_i: zero,
+        staged: false,
+        rename: None,
+    };
+
+    let mut platform = repo
+        .status(gix::progress::Discard)?
+        .untracked_files(match untracked {
+            Untracked::No => gix::status::UntrackedFiles::None,
+            Untracked::Normal => gix::status::UntrackedFiles::Collapsed,
+            Untracked::All => gix::status::UntrackedFiles::Files,
+        });
+    if show_ignored {
+        let mode = if untracked == Untracked::All {
+            gix::dir::walk::EmissionMode::Matching
+        } else {
+            gix::dir::walk::EmissionMode::CollapseDirectory
+        };
+        platform = platform.dirwalk_options(|opts| opts.emit_ignored(Some(mode)));
+    }
+    if let Some(rewrites) = renames {
+        platform = platform.tree_index_track_renames(match rewrites {
+            Some(r) => gix::status::tree_index::TrackRenames::Given(r),
+            None => gix::status::tree_index::TrackRenames::Disabled,
+        });
+    }
+
+    let patterns: Vec<BString> = Vec::new();
+    for item in platform.into_iter(patterns)? {
+        match item? {
+            gix::status::Item::TreeIndex(change) => {
+                use gix::diff::index::ChangeRef;
+                match change {
+                    ChangeRef::Addition {
+                        location,
+                        entry_mode,
+                        id,
+                        ..
+                    } => {
+                        let r = recs.entry(location.into_owned()).or_insert_with(new_rec);
+                        r.x = b'A';
+                        r.m_i = entry_mode.bits();
+                        r.h_i = id.into_owned();
+                        r.staged = true;
+                    }
+                    ChangeRef::Deletion {
+                        location,
+                        entry_mode,
+                        id,
+                        ..
+                    } => {
+                        let r = recs.entry(location.into_owned()).or_insert_with(new_rec);
+                        r.x = b'D';
+                        r.m_h = entry_mode.bits();
+                        r.h_h = id.into_owned();
+                        r.staged = true;
+                    }
+                    ChangeRef::Modification {
+                        location,
+                        previous_entry_mode,
+                        previous_id,
+                        entry_mode,
+                        id,
+                        ..
+                    } => {
+                        let r = recs.entry(location.into_owned()).or_insert_with(new_rec);
+                        r.x = if type_class(previous_entry_mode) != type_class(entry_mode) {
+                            b'T'
+                        } else {
+                            b'M'
+                        };
+                        r.m_h = previous_entry_mode.bits();
+                        r.h_h = previous_id.into_owned();
+                        r.m_i = entry_mode.bits();
+                        r.h_i = id.into_owned();
+                        r.staged = true;
+                    }
+                    ChangeRef::Rewrite {
+                        source_location,
+                        source_entry_mode,
+                        source_id,
+                        location,
+                        entry_mode,
+                        id,
+                        copy,
+                        ..
+                    } => {
+                        let kind = if copy { b'C' } else { b'R' };
+                        let orig = source_location.into_owned();
+                        let r = recs.entry(location.into_owned()).or_insert_with(new_rec);
+                        r.x = kind;
+                        r.m_h = source_entry_mode.bits();
+                        r.h_h = source_id.into_owned();
+                        r.m_i = entry_mode.bits();
+                        r.h_i = id.into_owned();
+                        r.staged = true;
+                        // Rename detection here is exact-match (100% similarity).
+                        r.rename = Some((kind, 100, orig));
+                    }
+                }
+            }
+            gix::status::Item::IndexWorktree(iw) => {
+                use gix::status::index_worktree::Item;
+                use gix::status::plumbing::index_as_worktree::{Change, Conflict, EntryStatus};
+                match iw {
+                    Item::Modification {
+                        rela_path, status, ..
+                    } => match status {
+                        EntryStatus::Conflict { summary, .. } => {
+                            let mask = match summary {
+                                Conflict::BothDeleted => 1,
+                                Conflict::AddedByUs => 2,
+                                Conflict::DeletedByThem => 3,
+                                Conflict::AddedByThem => 4,
+                                Conflict::DeletedByUs => 5,
+                                Conflict::BothAdded => 6,
+                                Conflict::BothModified => 7,
+                            };
+                            unmerged.push((mask, rela_path));
+                        }
+                        EntryStatus::IntentToAdd => {
+                            anyhow::bail!("intent-to-add entries (git add -N) are not supported")
+                        }
+                        EntryStatus::NeedsUpdate(_) => {}
+                        EntryStatus::Change(change) => {
+                            let r = recs.entry(rela_path).or_insert_with(new_rec);
+                            match change {
+                                Change::Removed => r.y = b'D',
+                                Change::Type { .. } => r.y = b'T',
+                                Change::Modification { .. }
+                                | Change::SubmoduleModification(_) => r.y = b'M',
+                            }
+                        }
+                    },
+                    Item::DirectoryContents { entry, .. } => match entry.status {
+                        gix::dir::entry::Status::Untracked => untracked_paths.push(walk_path(&entry)),
+                        gix::dir::entry::Status::Ignored(_) => ignored_paths.push(walk_path(&entry)),
+                        _ => {}
+                    },
+                    Item::Rewrite { .. } => {}
+                }
+            }
+        }
+    }
+
+    // --------------------------------------- fill from index & worktree stat
+    let index = repo.index_or_empty()?;
+    for (path, r) in recs.iter_mut() {
+        if !r.staged {
+            // No staged change: HEAD == index for this path, so pull both from
+            // the stage-0 index entry.
+            if let Ok(idx) = index.entry_index_by_path(path.as_bstr()) {
+                let e = &index.entries()[idx];
+                r.m_i = e.mode.bits();
+                r.h_i = e.id;
+            }
+            r.m_h = r.m_i;
+            r.h_h = r.h_i;
+        }
+        r.m_w = match r.y {
+            b'D' => 0,
+            b'.' => r.m_i, // worktree matches the index
+            _ => worktree_mode(repo, path.as_bstr()),
+        };
+    }
+
+    // ------------------------------------------------------------- render
+    // git emits 1/2/u lines together, sorted by path, then '?' then '!'.
+    let mut lines: Vec<(BString, String)> = Vec::new();
+    for (path, r) in &recs {
+        let xy = format!("{}{}", r.x as char, r.y as char);
+        let line = if let Some((kind, score, ref orig)) = r.rename {
+            format!(
+                "2 {xy} N... {:06o} {:06o} {:06o} {} {} {}{} {}\t{}",
+                r.m_h,
+                r.m_i,
+                r.m_w,
+                r.h_h,
+                r.h_i,
+                kind as char,
+                score,
+                quote_path(path),
+                quote_path(orig),
+            )
+        } else {
+            format!(
+                "1 {xy} N... {:06o} {:06o} {:06o} {} {} {}",
+                r.m_h,
+                r.m_i,
+                r.m_w,
+                r.h_h,
+                r.h_i,
+                quote_path(path),
+            )
+        };
+        lines.push((path.clone(), line));
+    }
+    for (mask, path) in &unmerged {
+        let xy = match mask {
+            1 => "DD",
+            2 => "AU",
+            3 => "UD",
+            4 => "UA",
+            5 => "DU",
+            6 => "AA",
+            _ => "UU",
+        };
+        // Per-stage (1=base, 2=ours, 3=theirs) modes and oids from the index.
+        let mut sm = [0u32; 3];
+        let mut sh = [zero; 3];
+        for e in index.entries() {
+            if e.path(&index) == path.as_bstr() {
+                match e.stage_raw() {
+                    1 => {
+                        sm[0] = e.mode.bits();
+                        sh[0] = e.id;
+                    }
+                    2 => {
+                        sm[1] = e.mode.bits();
+                        sh[1] = e.id;
+                    }
+                    3 => {
+                        sm[2] = e.mode.bits();
+                        sh[2] = e.id;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let m_w = worktree_mode(repo, path.as_bstr());
+        let line = format!(
+            "u {xy} N... {:06o} {:06o} {:06o} {:06o} {} {} {} {}",
+            sm[0],
+            sm[1],
+            sm[2],
+            m_w,
+            sh[0],
+            sh[1],
+            sh[2],
+            quote_path(path),
+        );
+        lines.push((path.clone(), line));
+    }
+    lines.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, line) in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+
+    untracked_paths.sort();
+    ignored_paths.sort();
+    for p in &untracked_paths {
+        out.push_str(&format!("? {}\n", quote_path(p)));
+    }
+    for p in &ignored_paths {
+        out.push_str(&format!("! {}\n", quote_path(p)));
+    }
+
+    print!("{out}");
+    Ok(ExitCode::SUCCESS)
+}
+
 fn type_class(mode: gix::index::entry::Mode) -> u8 {
     match mode.to_tree_entry_mode() {
         Some(m) if m.is_link() => 1,

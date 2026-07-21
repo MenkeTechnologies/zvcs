@@ -341,7 +341,9 @@ pub fn run_case(
     // stock side in a fresh copy and compare stock against stock; only a
     // disagreement there reclassifies. Done lazily, on failure only, so the
     // common path still costs one stock run.
-    let verdict = if verdict != Verdict::Match && stock_disagrees_with_itself(case, templates, workdir, &stock_stdout)? {
+    let verdict = if verdict != Verdict::Match
+        && stock_disagrees_with_itself(case, templates, workdir, &stock_stdout, &stock_state_n)?
+    {
         Verdict::Nondeterministic
     } else {
         verdict
@@ -361,31 +363,42 @@ pub fn run_case(
     })
 }
 
-/// Re-run the stock side in a second pristine repo and report whether its
-/// output differs from the first stock run.
+/// Re-run the stock side in a second pristine repo and report whether stock
+/// disagrees with itself — on **either** stdout or resulting repository state.
 ///
-/// This is the only evidence accepted for calling a case unmeasurable. Two
-/// things in git's output are non-deterministic by construction — `unpack-file`
-/// prints a randomly named temp file, and `blame` stamps uncommitted lines with
-/// the current wall clock — and no implementation can match a value that is
-/// re-rolled every run.
+/// This is the only evidence accepted for calling a case unmeasurable. Git's
+/// output and state carry values that are re-rolled every run, and no
+/// implementation can match a value stock does not reproduce:
+///   * `unpack-file` prints a randomly named temp file (stdout);
+///   * `blame` stamps uncommitted lines with the current wall clock (stdout);
+///   * `mergetool`, on the no-tool/EOF path, leaves `*_{BASE,LOCAL,REMOTE,
+///     BACKUP}_<pid>.txt` temp files whose names embed the process id (state).
 ///
-/// The alternative would be hand-written masks for each pattern, which have to
-/// be maintained and quietly widen over time. Asking the oracle to reproduce
-/// itself needs no pattern and cannot be aimed at a real difference: if stock
-/// agrees with stock, this returns false and the original verdict stands.
+/// State non-determinism is checked as well as stdout precisely because of that
+/// last class: an earlier version compared stdout only and mis-scored the
+/// mergetool case as a failure though stock could not reproduce its own state.
+///
+/// The alternative would be hand-written masks per pattern, which have to be
+/// maintained and quietly widen. Asking the oracle to reproduce itself needs no
+/// pattern and cannot be aimed at a real difference: if stock agrees with stock
+/// on both surfaces, this returns false and the original verdict stands.
 fn stock_disagrees_with_itself(
     case: &Case,
     templates: &Templates,
     workdir: &Path,
     first_stdout: &str,
+    first_state: &str,
 ) -> Result<bool> {
     let repo = workdir.join("stock-repeat");
     let _ = std::fs::remove_dir_all(&repo);
     templates.instantiate(case.shape, &repo)?;
     let home = &templates.home;
     let again = run_side(Path::new("git"), &repo, home, &case.args)?;
-    Ok(normalize(&again.stdout, &repo, home) != *first_stdout)
+    if normalize(&again.stdout, &repo, home) != *first_stdout {
+        return Ok(true);
+    }
+    let again_state = normalize(probe_state(&repo, home).as_bytes(), &repo, home);
+    Ok(again_state != *first_state)
 }
 
 /// Locate the zvcs `git` binary. Explicit override wins; otherwise the usual

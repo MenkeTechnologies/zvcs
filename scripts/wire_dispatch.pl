@@ -74,6 +74,16 @@ close($dfh);
 
 my $arms = join('', map { sprintf(qq{        "%s" => porcelain::%s(args),\n}, $sub_of->($_), $_) } @mods);
 
+# The verb-name list backing dispatch::is_verb — same source (the module set),
+# so alias expansion's builtin-precedence check can never disagree with the
+# arms about which verbs actually dispatch.
+my $verbs = join('', map { sprintf(qq{    "%s",\n}, $sub_of->($_)) } @mods);
+my $vbegin = '    // ---- BEGIN generated porcelain verbs (scripts/wire_dispatch.pl) ----';
+my $vend   = '    // ---- END generated porcelain verbs ----';
+$disp =~ /\Q$vbegin\E.*?\Q$vend\E/s
+    or die "dispatch.rs: could not locate the generated porcelain verbs region\n";
+$disp =~ s/\Q$vbegin\E.*?\Q$vend\E/$vbegin\n$verbs$vend/s;
+
 my $begin = '        // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----';
 my $end   = '        // ---- END generated porcelain arms ----';
 

@@ -26,6 +26,18 @@ gix = { path = "../ported/gix", features = [
     "tree-editor",
     "merge",
 ] }
+# Clone progress rendering. gitoxide already depends on prodash 31.0.0 (registry)
+# and drives fetch/checkout through its progress traits; enabling the line
+# renderer here (features unify with gix's copy) lets `git clone` show the remote
+# sideband progress + local receive/resolve/checkout status to stderr, like git.
+prodash = { version = "31.0.0", features = [
+    "render-line",
+    "render-line-crossterm",
+    "render-line-autoconfigure",
+    "progress-tree",
+    "unit-bytes",
+    "unit-human",
+] }
 anyhow = "1"
 # POSIX-ERE value-pattern matching for `git config <name> <value> <value-pattern>`.
 # Foundational, vendorable crate; byte-oriented `regex::bytes` mirrors git's regexec.
@@ -40,3 +52,5 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 ignore = "0.4"
 # Job spec encoding over the daemon socket (async z-verbs).
 serde_json = "1"
+# Terminal paging: dup2/isatty/close to splice the pager onto fd 1/2, as git does.
+libc = "0.2"

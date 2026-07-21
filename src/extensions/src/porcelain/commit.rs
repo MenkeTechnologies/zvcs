@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use gix::bstr::{BString, ByteSlice};
@@ -26,10 +27,16 @@ use gix::ObjectId;
 /// (a rename is reported as a delete plus a create), and binary blobs contribute
 /// `0` insertions/deletions to the short-stat, just as `git` does.
 ///
+/// With no `-m`, the message is captured from an editor exactly as git does:
+/// a template (`commit.template` plus a commented status header) is opened with
+/// the `GIT_EDITOR` → `core.editor` → `$VISUAL` → `$EDITOR` editor, then cleaned
+/// up per `commit.cleanup` (default: strip comment/blank lines) with the comment
+/// character taken from `core.commentChar`.
+///
 /// Options that change staging or history semantics (`--amend`, `-F`, `-C`,
-/// `--author`, `-p`, `-S`, pathspec-limited commits, editor mode, …) are not
-/// backed by this port and fail with a precise message rather than silently
-/// doing the wrong thing.
+/// `--author`, `-p`, `-S`, pathspec-limited commits, …) are not backed by this
+/// port and fail with a precise message rather than silently doing the wrong
+/// thing.
 pub fn commit(args: &[String]) -> Result<ExitCode> {
     // --- argument parsing ------------------------------------------------
     let mut messages: Vec<String> = Vec::new();
@@ -93,18 +100,20 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    if messages.is_empty() {
-        anyhow::bail!("no commit message provided (editor mode is unsupported; use -m)");
-    }
+    // A `-m`/`--message` value is validated now; without one, the message is
+    // captured from the editor below, but only once we know there is something
+    // to commit (git opens the editor only then).
+    let from_flags = !messages.is_empty();
     let mut message = messages.join("\n\n");
-    if message.trim().is_empty() && !allow_empty_message {
-        anyhow::bail!("empty commit message (use --allow-empty-message to override)");
+    if from_flags {
+        if message.trim().is_empty() && !allow_empty_message {
+            anyhow::bail!("empty commit message (use --allow-empty-message to override)");
+        }
+        // Match git's on-disk message, which is newline-terminated.
+        if !message.ends_with('\n') {
+            message.push('\n');
+        }
     }
-    // Match git's on-disk message, which is newline-terminated.
-    if !message.ends_with('\n') {
-        message.push('\n');
-    }
-    let subject = message.lines().next().unwrap_or("").to_string();
 
     // --- repository + serialized read-modify-write -----------------------
     let repo = gix::discover(".")?;
@@ -175,6 +184,20 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if unchanged && !allow_empty {
         anyhow::bail!("nothing to commit (no changes staged)");
     }
+
+    // --- editor mode (no `-m`) -------------------------------------------
+    // There is something to commit: open the editor on the template and read
+    // the message back, git's behavior when no message was given on the CLI.
+    if !from_flags {
+        message = obtain_message_via_editor(&repo, is_root)?;
+        if message.trim().is_empty() && !allow_empty_message {
+            anyhow::bail!("Aborting commit due to empty commit message.");
+        }
+        if !message.ends_with('\n') {
+            message.push('\n');
+        }
+    }
+    let subject = message.lines().next().unwrap_or("").to_string();
 
     // --- write the commit and advance HEAD -------------------------------
     // `Repository::commit` writes the commit object, then updates `HEAD`
@@ -401,4 +424,177 @@ fn plural(n: u64) -> &'static str {
     } else {
         "s"
     }
+}
+
+/// git's editor path for `git commit` without `-m`: build a template from
+/// `commit.template` and a commented status header, open it in the configured
+/// editor, and return the cleaned-up message per `commit.cleanup`.
+fn obtain_message_via_editor(repo: &gix::Repository, is_root: bool) -> Result<String> {
+    let snap = repo.config_snapshot();
+    let comment = comment_char(&snap);
+
+    let mut buf = String::new();
+
+    // `commit.template`, if configured, seeds the buffer (git reads it verbatim).
+    if let Some(path) = snap.string("commit.template") {
+        let path = expand_tilde(&path.to_string());
+        match std::fs::read_to_string(&path) {
+            Ok(text) => buf.push_str(&text),
+            Err(e) => anyhow::bail!("could not read commit.template '{}': {e}", path.display()),
+        }
+        if !buf.is_empty() && !buf.ends_with('\n') {
+            buf.push('\n');
+        }
+    }
+
+    // Commented help + a minimal status header, mirroring git's wt-status block.
+    let branch = repo.head_name()?.map(|n| n.shorten().to_string());
+    buf.push('\n');
+    buf.push_str(&format!(
+        "{comment} Please enter the commit message for your changes. Lines starting\n"
+    ));
+    buf.push_str(&format!(
+        "{comment} with '{comment}' will be ignored, and an empty message aborts the commit.\n"
+    ));
+    buf.push_str(&format!("{comment}\n"));
+    match &branch {
+        Some(b) => buf.push_str(&format!("{comment} On branch {b}\n")),
+        None => buf.push_str(&format!("{comment} HEAD detached\n")),
+    }
+    if is_root {
+        buf.push_str(&format!("{comment}\n{comment} Initial commit\n"));
+    }
+    buf.push_str(&format!("{comment}\n"));
+
+    // Write the template to COMMIT_EDITMSG, edit in place, read it back.
+    let path = repo.git_dir().join("COMMIT_EDITMSG");
+    std::fs::write(&path, &buf)?;
+    launch_editor(&snap, &path)?;
+    let edited = std::fs::read_to_string(&path)?;
+
+    Ok(cleanup_message(&edited, comment, cleanup_mode(&snap)))
+}
+
+/// The comment character for message templates: `core.commentChar` (first char),
+/// defaulting to `#`. `auto` is treated as the default here.
+fn comment_char(snap: &gix::config::Snapshot<'_>) -> char {
+    match snap.string("core.commentChar") {
+        None => '#',
+        Some(v) => {
+            let s = v.to_string();
+            if s.is_empty() || s == "auto" {
+                '#'
+            } else {
+                s.chars().next().unwrap_or('#')
+            }
+        }
+    }
+}
+
+/// Resolve the editor command git would use: `GIT_EDITOR` → `core.editor` →
+/// `$VISUAL` → `$EDITOR`, else `vi`. On a dumb/non-interactive terminal with no
+/// editor configured, git refuses rather than launching a broken editor.
+fn resolve_editor(snap: &gix::config::Snapshot<'_>) -> Result<String> {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    if let Some(e) = env("GIT_EDITOR") {
+        return Ok(e);
+    }
+    if let Some(e) = snap.string("core.editor") {
+        return Ok(e.to_string());
+    }
+    if let Some(e) = env("VISUAL") {
+        return Ok(e);
+    }
+    if let Some(e) = env("EDITOR") {
+        return Ok(e);
+    }
+    let dumb = std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true);
+    if dumb || !std::io::stdin().is_terminal() {
+        anyhow::bail!("Terminal is dumb, but EDITOR unset. Please supply the message using -m.");
+    }
+    Ok("vi".to_string())
+}
+
+/// Open `path` in the configured editor and wait, git-style: the editor string
+/// runs through the shell so `core.editor = "code -w"` and other argument-bearing
+/// commands work, and stdio is inherited so the interactive editor owns the tty.
+fn launch_editor(snap: &gix::config::Snapshot<'_>, path: &std::path::Path) -> Result<()> {
+    let editor = resolve_editor(snap)?;
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$@\""))
+        .arg(&editor) // $0
+        .arg(path) // $1
+        .status()
+        .map_err(|e| anyhow::anyhow!("cannot run editor '{editor}': {e}"))?;
+    if !status.success() {
+        anyhow::bail!("there was a problem with the editor '{editor}'");
+    }
+    Ok(())
+}
+
+/// The `commit.cleanup` modes this port implements; `scissors` degrades to
+/// `strip` (safe — it only removes more), and unknown values likewise.
+enum Cleanup {
+    Strip,
+    Whitespace,
+    Verbatim,
+}
+
+/// `commit.cleanup`, defaulting to `strip` (git's default when a message is read
+/// from an editor).
+fn cleanup_mode(snap: &gix::config::Snapshot<'_>) -> Cleanup {
+    match snap.string("commit.cleanup").map(|v| v.to_string()).as_deref() {
+        Some("verbatim") => Cleanup::Verbatim,
+        Some("whitespace") => Cleanup::Whitespace,
+        _ => Cleanup::Strip,
+    }
+}
+
+/// Apply git's message cleanup: `verbatim` leaves the text untouched; otherwise
+/// trailing whitespace is trimmed, runs of blank lines are collapsed, and
+/// leading/trailing blank lines are dropped. `strip` additionally removes lines
+/// beginning with the comment character.
+fn cleanup_message(raw: &str, comment: char, mode: Cleanup) -> String {
+    if let Cleanup::Verbatim = mode {
+        return raw.to_string();
+    }
+    let strip_comments = matches!(mode, Cleanup::Strip);
+
+    let mut out: Vec<&str> = Vec::new();
+    let mut prev_blank = true; // drop leading blank lines
+    for line in raw.lines() {
+        if strip_comments && line.starts_with(comment) {
+            continue;
+        }
+        let line = line.trim_end();
+        let blank = line.is_empty();
+        if blank && prev_blank {
+            continue;
+        }
+        out.push(line);
+        prev_blank = blank;
+    }
+    while out.last() == Some(&"") {
+        out.pop();
+    }
+    let mut s = out.join("\n");
+    if !s.is_empty() {
+        s.push('\n');
+    }
+    s
+}
+
+/// Expand a leading `~`/`~/` to `$HOME`, as git does for path-valued config.
+fn expand_tilde(tok: &str) -> std::path::PathBuf {
+    if tok == "~" {
+        if let Some(h) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(h);
+        }
+    } else if let Some(rest) = tok.strip_prefix("~/") {
+        if let Some(h) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(h).join(rest);
+        }
+    }
+    std::path::PathBuf::from(tok)
 }

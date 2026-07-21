@@ -5,6 +5,8 @@ use std::process::ExitCode;
 use gix::bstr::BString;
 use gix::hash::ObjectId;
 
+use super::color::{Slot, StatusColors};
+
 /// The exact usage block stock `git status` prints on a usage error (exit 129).
 const USAGE: &str = "usage: git status [<options>] [--] [<pathspec>...]
 
@@ -66,6 +68,10 @@ enum Untracked {
 pub fn status(args: &[String]) -> Result<ExitCode> {
     let mut short = false;
     let mut porcelain_v2 = false;
+    // `--porcelain` selects the short *machine* format, which git never colors;
+    // `-s`/`--short` is the colored short display. Both set `short`, so this tracks
+    // which one, last-format-flag winning.
+    let mut porcelain = false;
     let mut branch_header = false;
     // `--untracked-files` and `--ignored` are git OPT_STRING options: the raw
     // argument is *stored* during parsing (last occurrence wins; the `--no-`
@@ -81,9 +87,18 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     for a in args {
         let s = a.as_str();
         match s {
-            "-s" | "--short" => short = true,
-            "--porcelain" | "--porcelain=v1" | "--porcelain=1" => short = true,
-            "--long" => short = false,
+            "-s" | "--short" => {
+                short = true;
+                porcelain = false;
+            }
+            "--porcelain" | "--porcelain=v1" | "--porcelain=1" => {
+                short = true;
+                porcelain = true;
+            }
+            "--long" => {
+                short = false;
+                porcelain = false;
+            }
             "--porcelain=v2" | "--porcelain=2" => porcelain_v2 = true,
             "-z" | "--null" => anyhow::bail!("NUL-terminated output (-z) is not supported"),
             "-b" | "--branch" => branch_header = true,
@@ -141,7 +156,10 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 while let Some(c) = chars.next() {
                     let rest = chars.as_str();
                     match c {
-                        's' => short = true,
+                        's' => {
+                            short = true;
+                            porcelain = false;
+                        }
                         'b' => branch_header = true,
                         'v' => {}
                         'z' => anyhow::bail!("NUL-terminated output (-z) is not supported"),
@@ -370,10 +388,15 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         tracking_info(&repo)?
     };
 
+    // git colors the human formats (long and short display) when `color.status`
+    // (or `color.ui`) is on and stdout is a terminal; the porcelain machine format
+    // is never colored.
+    let colors = super::color::StatusColors::resolve(&repo, porcelain);
+
     if short {
         let mut out = String::new();
         if branch_header {
-            out.push_str(&short_branch_header(&head_state, tracking.as_ref()));
+            out.push_str(&short_branch_header(&head_state, tracking.as_ref(), &colors));
         }
         out.push_str(&render_short(
             staged,
@@ -381,6 +404,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             unmerged,
             &untracked_paths,
             &ignored_paths,
+            &colors,
         ));
         print!("{out}");
     } else {
@@ -398,6 +422,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 &unmerged,
                 &untracked_paths,
                 &ignored_paths,
+                &colors,
             )
         );
     }
@@ -1077,35 +1102,54 @@ fn tracking_lines(tracking: Option<&Tracking>) -> String {
 }
 
 /// The `## …` line of `git status -sb`, per git's `wt_shortstatus_print_tracking`.
-fn short_branch_header(head_state: &HeadState, tracking: Option<&Tracking>) -> String {
-    let mut out = String::from("## ");
+fn short_branch_header(
+    head_state: &HeadState,
+    tracking: Option<&Tracking>,
+    colors: &StatusColors,
+) -> String {
+    // git wraps the fixed scaffolding (`## `, `...`, the `[ahead …]` labels) in the
+    // header slot, the current branch/ahead count in the local-branch slot, and the
+    // upstream/behind count in the remote-branch slot.
+    let h = |s: &str| colors.paint(Slot::Header, s);
+    let mut out = h("## ");
     match head_state {
         HeadState::Detached(_) => {
-            out.push_str("HEAD (no branch)\n");
+            out.push_str(&colors.paint(Slot::Nobranch, "HEAD (no branch)"));
+            out.push('\n');
             return out;
         }
         HeadState::Unborn(name) => {
             // An unborn branch has no commits to compare, so git stops at the name.
-            out.push_str(&format!("No commits yet on {name}\n"));
+            out.push_str(&h("No commits yet on "));
+            out.push_str(&colors.paint(Slot::LocalBranch, name));
+            out.push('\n');
             return out;
         }
-        HeadState::Branch(name) => out.push_str(name),
+        HeadState::Branch(name) => out.push_str(&colors.paint(Slot::LocalBranch, name)),
     }
 
     let Some(t) = tracking else {
         out.push('\n');
         return out;
     };
-    out.push_str("...");
-    out.push_str(&t.upstream);
+    out.push_str(&h("..."));
+    out.push_str(&colors.paint(Slot::RemoteBranch, &t.upstream));
     if t.gone {
-        out.push_str(" [gone]");
+        out.push_str(&h(" [gone]"));
     } else if t.ahead > 0 && t.behind > 0 {
-        out.push_str(&format!(" [ahead {}, behind {}]", t.ahead, t.behind));
+        out.push_str(&h(" [ahead "));
+        out.push_str(&colors.paint(Slot::LocalBranch, &t.ahead.to_string()));
+        out.push_str(&h(", behind "));
+        out.push_str(&colors.paint(Slot::RemoteBranch, &t.behind.to_string()));
+        out.push_str(&h("]"));
     } else if t.ahead > 0 {
-        out.push_str(&format!(" [ahead {}]", t.ahead));
+        out.push_str(&h(" [ahead "));
+        out.push_str(&colors.paint(Slot::LocalBranch, &t.ahead.to_string()));
+        out.push_str(&h("]"));
     } else if t.behind > 0 {
-        out.push_str(&format!(" [behind {}]", t.behind));
+        out.push_str(&h(" [behind "));
+        out.push_str(&colors.paint(Slot::RemoteBranch, &t.behind.to_string()));
+        out.push_str(&h("]"));
     }
     out.push('\n');
     out
@@ -1134,6 +1178,7 @@ fn render_long(
     unmerged: &[(u8, BString)],
     untracked: &[BString],
     ignored: &[BString],
+    colors: &StatusColors,
 ) -> String {
     let mut out = String::new();
 
@@ -1180,14 +1225,11 @@ fn render_long(
         }
         for (kind, path, orig) in staged {
             let label = stage_label(*kind);
-            match orig {
-                Some(o) => out.push_str(&format!(
-                    "\t{label:<12}{} -> {}\n",
-                    quote_path(o),
-                    quote_path(path)
-                )),
-                None => out.push_str(&format!("\t{label:<12}{}\n", quote_path(path))),
-            }
+            let body = match orig {
+                Some(o) => format!("{label:<12}{} -> {}", quote_path(o), quote_path(path)),
+                None => format!("{label:<12}{}", quote_path(path)),
+            };
+            out.push_str(&format!("\t{}\n", colors.paint(Slot::Added, &body)));
         }
         out.push('\n');
     }
@@ -1197,7 +1239,8 @@ fn render_long(
         out.push_str(unmerged_hint(unmerged));
         for (mask, path) in unmerged {
             let label = unmerged_label(*mask);
-            out.push_str(&format!("\t{label:<17}{}\n", quote_path(path)));
+            let body = format!("{label:<17}{}", quote_path(path));
+            out.push_str(&format!("\t{}\n", colors.paint(Slot::Unmerged, &body)));
         }
         out.push('\n');
     }
@@ -1212,7 +1255,8 @@ fn render_long(
         out.push_str("  (use \"git restore <file>...\" to discard changes in working directory)\n");
         for (kind, path) in unstaged {
             let label = work_label(*kind);
-            out.push_str(&format!("\t{label:<12}{}\n", quote_path(path)));
+            let body = format!("{label:<12}{}", quote_path(path));
+            out.push_str(&format!("\t{}\n", colors.paint(Slot::Changed, &body)));
         }
         out.push('\n');
     }
@@ -1230,15 +1274,17 @@ fn render_long(
             out.push_str("Untracked files:\n");
             out.push_str("  (use \"git add <file>...\" to include in what will be committed)\n");
             for path in untracked {
-                out.push_str(&format!("\t{}\n", quote_path(path)));
+                out.push_str(&format!("\t{}\n", colors.paint(Slot::Untracked, &quote_path(path))));
             }
             out.push('\n');
         }
         if show_ignored && !ignored.is_empty() {
             out.push_str("Ignored files:\n");
             out.push_str("  (use \"git add -f <file>...\" to include in what will be committed)\n");
+            // git colors ignored paths with the untracked slot — there is no
+            // separate `color.status.ignored`.
             for path in ignored {
-                out.push_str(&format!("\t{}\n", quote_path(path)));
+                out.push_str(&format!("\t{}\n", colors.paint(Slot::Untracked, &quote_path(path))));
             }
             out.push('\n');
         }
@@ -1272,11 +1318,15 @@ fn render_short(
     unmerged: Vec<(u8, BString)>,
     untracked: &[BString],
     ignored: &[BString],
+    colors: &StatusColors,
 ) -> String {
     struct Short {
         x: u8,
         y: u8,
         orig: Option<BString>,
+        /// A conflicted path: git colors both status columns together with the
+        /// unmerged slot, rather than the index/worktree slots separately.
+        unmerged: bool,
     }
 
     // Merge the change streams per path: X is the staged (index) column, Y the
@@ -1289,6 +1339,7 @@ fn render_short(
             x: b' ',
             y: b' ',
             orig: None,
+            unmerged: false,
         });
         e.x = stage_char(kind);
         if orig.is_some() {
@@ -1300,31 +1351,59 @@ fn render_short(
             x: b' ',
             y: b' ',
             orig: None,
+            unmerged: false,
         });
         e.y = work_char(kind);
     }
     for (mask, path) in unmerged {
         let (x, y) = unmerged_chars(mask);
-        map.insert(path, Short { x, y, orig: None });
+        map.insert(
+            path,
+            Short {
+                x,
+                y,
+                orig: None,
+                unmerged: true,
+            },
+        );
     }
 
     let mut out = String::new();
     for (path, e) in &map {
-        let (x, y) = (e.x as char, e.y as char);
+        // git colors a conflicted path's two columns together with the unmerged
+        // slot; otherwise the index column takes the added slot and the worktree
+        // column the changed slot, and a blank column stays an uncolored space.
+        let cols = if e.unmerged {
+            colors.paint(Slot::Unmerged, &format!("{}{}", e.x as char, e.y as char))
+        } else {
+            let x = short_col(colors, Slot::Added, e.x);
+            let y = short_col(colors, Slot::Changed, e.y);
+            format!("{x}{y}")
+        };
         match &e.orig {
             Some(o) => {
-                out.push_str(&format!("{x}{y} {} -> {}\n", quote_path(o), quote_path(path)))
+                out.push_str(&format!("{cols} {} -> {}\n", quote_path(o), quote_path(path)))
             }
-            None => out.push_str(&format!("{x}{y} {}\n", quote_path(path))),
+            None => out.push_str(&format!("{cols} {}\n", quote_path(path))),
         }
     }
     for path in untracked {
-        out.push_str(&format!("?? {}\n", quote_path(path)));
+        out.push_str(&format!("{} {}\n", colors.paint(Slot::Untracked, "??"), quote_path(path)));
     }
     for path in ignored {
-        out.push_str(&format!("!! {}\n", quote_path(path)));
+        out.push_str(&format!("{} {}\n", colors.paint(Slot::Untracked, "!!"), quote_path(path)));
     }
     out
+}
+
+/// One short-format status column: a blank column is an uncolored space; a set
+/// column is the letter painted in `slot`.
+fn short_col(colors: &StatusColors, slot: Slot, ch: u8) -> String {
+    if ch == b' ' {
+        " ".to_string()
+    } else {
+        colors.paint(slot, &(ch as char).to_string())
+    }
 }
 
 /// git picks the resolution hint from which conflict flavours are present:

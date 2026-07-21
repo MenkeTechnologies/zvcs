@@ -4,6 +4,8 @@
 //! the engine as a library lets integration tests drive the coordination layer
 //! (e.g. [`lock::RepoLock`] against a live `zdaemon`) directly.
 
+pub mod alias;
+pub mod autocorrect;
 pub mod autostart;
 pub mod config;
 pub mod crawler;
@@ -13,6 +15,7 @@ pub mod index_commit;
 pub mod jobpool;
 pub mod jobrun;
 pub mod lock;
+pub mod pager;
 pub mod porcelain;
 pub mod superset;
 pub mod worktree;
@@ -27,10 +30,12 @@ pub fn run() -> ExitCode {
     // Consume the leading git-global options we support, so `git -C <dir> <verb>`
     // (extremely common in scripts and tooling) reaches the verb instead of
     // treating `-C` as the subcommand. `-C <dir>` chdirs (before autostart /
-    // failure-surfacing, which key off the cwd); the pager flags are accepted and
-    // ignored (zvcs never pages). Unrecognized globals (`-c`, `--git-dir`, …) are
-    // left in place and surface as an error rather than being silently mishandled.
+    // failure-surfacing, which key off the cwd); the pager flags force paging on
+    // (`-p`/`--paginate`) or off (`-P`/`--no-pager`). Unrecognized globals (`-c`,
+    // `--git-dir`, …) are left in place and surface as an error rather than being
+    // silently mishandled.
     let mut idx = 0;
+    let mut pager_forced: Option<bool> = None;
     while idx < raw.len() {
         match raw[idx].as_str() {
             "-C" => {
@@ -41,7 +46,14 @@ pub fn run() -> ExitCode {
                 }
                 idx += 2;
             }
-            "-p" | "-P" | "--paginate" | "--no-pager" => idx += 1,
+            "-p" | "--paginate" => {
+                pager_forced = Some(true);
+                idx += 1;
+            }
+            "-P" | "--no-pager" => {
+                pager_forced = Some(false);
+                idx += 1;
+            }
             _ => break,
         }
     }
@@ -50,6 +62,17 @@ pub fn run() -> ExitCode {
     let Some(sub) = args.first() else {
         eprintln!("zvcs: no subcommand given");
         return ExitCode::FAILURE;
+    };
+
+    // Faithful port of `cmd_main()` in git.c: `handle_options()` breaks out early
+    // on `-v`/`--version`/`-h`/`--help`, then `cmd_main` rewrites the command token
+    // (`argv[0] = "version"` / `argv[0] = "help"`) before dispatch. Without this,
+    // `git --version` reaches the dispatch table as an unknown verb and errors
+    // "not yet ported" instead of printing the version.
+    let sub = match sub.as_str() {
+        "--version" | "-v" => "version",
+        "--help" | "-h" => "help",
+        other => other,
     };
     let rest = &args[1..];
 
@@ -67,13 +90,55 @@ pub fn run() -> ExitCode {
         autostart::ensure_if_configured();
     }
 
-    match dispatch::run(sub, rest) {
+    // Resolve gitconfig `alias.<cmd>` before paging and dispatch, mirroring git's
+    // run_argv: a real verb wins over a same-named alias, otherwise the alias is
+    // expanded (recursively) and a `!shell` alias is run directly. Done before
+    // the pager so paging keys off the resolved command, not the alias name.
+    let (sub, rest): (String, Vec<String>) = match alias::resolve(sub, rest, &mut pager_forced) {
+        alias::Outcome::Shell(code) => return code,
+        alias::Outcome::Fatal(msg) => {
+            eprintln!("zvcs: {msg}");
+            return ExitCode::FAILURE;
+        }
+        alias::Outcome::Command(head, args) => (head, args),
+    };
+
+    // An unknown verb (not a builtin, not an alias) goes through git's
+    // `help_unknown_cmd`: `help.autocorrect` may auto-run the nearest command,
+    // otherwise git's "not a git command" message + suggestions is printed. A
+    // correction may itself be an alias, so it is re-resolved before dispatch.
+    let (sub, rest): (String, Vec<String>) = if dispatch::is_verb(&sub) {
+        (sub, rest)
+    } else {
+        match autocorrect::correct(&sub) {
+            autocorrect::Correction::None => return ExitCode::FAILURE,
+            autocorrect::Correction::Use(corrected) => {
+                match alias::resolve(&corrected, &rest, &mut pager_forced) {
+                    alias::Outcome::Shell(code) => return code,
+                    alias::Outcome::Fatal(msg) => {
+                        eprintln!("zvcs: {msg}");
+                        return ExitCode::FAILURE;
+                    }
+                    alias::Outcome::Command(head, args) => (head, args),
+                }
+            }
+        }
+    };
+
+    // Install the pager (over stdout, and stderr when it is a tty) before the
+    // command runs, so its output — and any error below — flows through it. Torn
+    // down after the command and after error reporting, so the error lands in the
+    // pager and control returns to the shell only once the user quits it.
+    pager::maybe_setup(&sub, pager_forced);
+    let code = match dispatch::run(&sub, &rest) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("zvcs: {sub}: {e:#}");
             ExitCode::FAILURE
         }
-    }
+    };
+    pager::finish();
+    code
 }
 
 /// The current session key for attributing operations to an agent: `ZVCS_SESSION`

@@ -41,6 +41,11 @@ const STAT_TERM_WIDTH: usize = 80;
 ///     `--numstat`, `--shortstat`                → per-commit diff against the first parent
 ///     (`--name-only`/`--name-status` are mutually exclusive and suppress the count
 ///     formats); `-s`/`--no-patch` accepted as no-ops
+///   * `-p`/`--patch`/`-u`                        → per-commit `diff --git` patch against the
+///     first parent (the empty tree for a root commit), three lines of context; suppressed by
+///     `--name-only`/`--name-status`, emitted after the count formats otherwise, and skipped
+///     for merge commits (git shows no diff there without `-m`/`-c`/`--cc`). Rendered by the
+///     same pipeline as `git diff`, so the two produce byte-identical patches.
 ///   * `--graph`                                 → git's ASCII commit graph (see below)
 ///
 /// Output separation follows git's `format:` (separator) versus `tformat:`
@@ -54,9 +59,8 @@ const STAT_TERM_WIDTH: usize = 80;
 ///   * `--stat` assumes an 80-column terminal and measures paths in `char`s.
 ///   * Pathspec limiting compares each commit to its first parent only, so merge
 ///     simplification (TREESAME across multiple parents) is not modelled.
-///   * `-p`/`--patch`, `--grep`/`--author` filters, `--since`/`--until` date
-///     filters, revision ranges (`A..B`), and every flag not listed above are
-///     rejected explicitly.
+///   * `--grep`/`--author` filters, `--since`/`--until` date filters, revision
+///     ranges (`A..B`), and every flag not listed above are rejected explicitly.
 pub fn log(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
@@ -70,6 +74,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut stat = false;
     let mut numstat = false;
     let mut shortstat = false;
+    let mut patch = false;
     let mut graph = false;
     let mut all = false;
     let mut reverse = false;
@@ -205,16 +210,18 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             abbrev_commit = true;
         } else if a == "--no-abbrev-commit" {
             abbrev_commit = false;
+        } else if a == "-p" || a == "--patch" || a == "-u" {
+            // `-u` is git's documented synonym for `-p`.
+            patch = true;
         } else if a == "-s" || a == "--no-patch" {
-            // Suppress diff output. This port emits no per-commit patch by
-            // default, so the only effect is to clear any diff format requested
-            // earlier — git treats `-s` as order-sensitive, so a later `--stat`
-            // re-enables it.
+            // Suppress diff output — git treats `-s` as order-sensitive, so a
+            // later `--stat`/`-p` re-enables whichever format follows it.
             stat = false;
             numstat = false;
             shortstat = false;
             name_only = false;
             name_status = false;
+            patch = false;
         } else if a == "--name-only" {
             name_only = true;
         } else if a == "--name-status" {
@@ -397,8 +404,16 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         bail!("--graph is not ported for octopus merges");
     }
 
-    let want_diff = name_only || name_status || stat || numstat || shortstat;
-    let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(nodes.len());
+    // `--name-only`/`--name-status` are git's reported format; they suppress both
+    // the count formats and the `-p` patch. The patch is emitted after the count
+    // formats otherwise.
+    let emit_patch = patch && !name_only && !name_status;
+    let want_names = name_only || name_status || stat || numstat || shortstat;
+    // `--graph` needs every commit's block up front to lay out the columns, so it
+    // buffers; every other format streams commit-by-commit (see the write below).
+    let mut blocks: Vec<Vec<u8>> = Vec::new();
+    let mut stdout = std::io::stdout().lock();
+    let mut first = true;
     for node in &nodes {
         let commit = repo.find_object(node.id)?.try_into_commit()?;
         // `--parents` decorates the header with the commit's own parent ids.
@@ -430,73 +445,127 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             block.push(b'\n');
         }
 
-        if want_diff && node.parents.len() < 2 {
-            // `--name-only`/`--name-status` are the reported format when present;
-            // git suppresses the count formats in that case, so the blob reads
-            // they need are skipped too.
-            let count_formats = (stat || numstat || shortstat) && !name_only && !name_status;
-            let files = collect_changes(&repo, &commit, node.parents.first().copied(), count_formats)?;
+        if (want_names || emit_patch) && node.parents.len() < 2 {
             let mut diff: Vec<u8> = Vec::new();
-            if name_status {
-                for f in &files {
-                    diff.push(f.status);
-                    diff.push(b'\t');
-                    diff.extend_from_slice(&f.path);
-                    diff.push(b'\n');
+            if want_names {
+                // `--name-only`/`--name-status` are the reported format when
+                // present; git suppresses the count formats in that case, so the
+                // blob reads they need are skipped too.
+                let count_formats = (stat || numstat || shortstat) && !name_only && !name_status;
+                let files =
+                    collect_changes(&repo, &commit, node.parents.first().copied(), count_formats)?;
+                if name_status {
+                    for f in &files {
+                        diff.push(f.status);
+                        diff.push(b'\t');
+                        diff.extend_from_slice(&f.path);
+                        diff.push(b'\n');
+                    }
+                } else if name_only {
+                    for f in &files {
+                        diff.extend_from_slice(&f.path);
+                        diff.push(b'\n');
+                    }
+                } else {
+                    // git stacks the count formats in a fixed order: numstat, then
+                    // the full stat block, then a bare shortstat summary if stat did
+                    // not already print one.
+                    if numstat {
+                        emit_numstat(&mut diff, &files);
+                    }
+                    if stat {
+                        emit_stat(&mut diff, &files)?;
+                    } else if shortstat {
+                        emit_shortstat(&mut diff, &files)?;
+                    }
                 }
-            } else if name_only {
-                for f in &files {
-                    diff.extend_from_slice(&f.path);
-                    diff.push(b'\n');
-                }
-            } else {
-                // git stacks the count formats in a fixed order: numstat, then
-                // the full stat block, then a bare shortstat summary if stat did
-                // not already print one.
-                if numstat {
-                    emit_numstat(&mut diff, &files);
-                }
-                if stat {
-                    emit_stat(&mut diff, &files)?;
-                } else if shortstat {
-                    emit_shortstat(&mut diff, &files)?;
+            }
+            if emit_patch {
+                // The full patch, rendered by the same pipeline as `git diff` so
+                // the two agree byte-for-byte. git separates a preceding count
+                // format from the patch with a blank line.
+                let p = super::diff::commit_patch(
+                    &repo,
+                    &commit,
+                    node.parents.first().copied(),
+                    3,
+                )?;
+                if !p.is_empty() {
+                    if !diff.is_empty() {
+                        diff.push(b'\n');
+                    }
+                    diff.extend_from_slice(&p);
                 }
             }
             if !diff.is_empty() {
-                // git puts a blank line between the log message and the diff for
+                // git puts a separator between the log message and the diff for
                 // every format but `oneline` — and only when the message block
-                // rendered something to separate from.
+                // rendered something to separate from. A `--stat` block shown
+                // together with `-p` is fenced off with a `---` line; every other
+                // diff format uses a plain blank line.
                 if !matches!(pretty, Pretty::Oneline) && !block.is_empty() {
-                    block.push(b'\n');
+                    if stat && emit_patch {
+                        block.extend_from_slice(b"---\n");
+                    } else {
+                        block.push(b'\n');
+                    }
                 }
                 block.extend_from_slice(&diff);
             }
         }
-        blocks.push(block);
-    }
+        if graph {
+            // Buffer for the column layout, which spans all commits at once.
+            blocks.push(block);
+            continue;
+        }
 
-    // `format:` separates records with a newline; `tformat:` already terminated
-    // each one above.
-    if !terminator {
-        let last = blocks.len().saturating_sub(1);
-        for (idx, block) in blocks.iter_mut().enumerate() {
-            if idx != last {
-                block.push(b'\n');
+        // Stream this commit's block immediately, so `git log -p | head` stops
+        // after a commit or two instead of computing every patch first. A
+        // `format:`/built-in (separator) format precedes every record but the
+        // first with a blank line; a `tformat:` record was already terminated
+        // above, so no separator is inserted.
+        let mut piece: Vec<u8> = Vec::new();
+        if !terminator && !first {
+            piece.push(b'\n');
+        }
+        piece.extend_from_slice(&block);
+        first = false;
+        // Each block ends in a newline, so the line-buffered stdout flushes it here;
+        // a closed downstream pipe (`| head`) surfaces as a BrokenPipe on this write,
+        // which is a normal stop rather than an error. No per-commit flush is needed.
+        if let Err(e) = stdout.write_all(&piece) {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(ExitCode::SUCCESS);
             }
+            return Err(e.into());
         }
     }
 
-    let out = if graph {
-        render_graph(&nodes, &blocks)?
+    if graph {
+        // `format:` separates records with a newline; `tformat:` already
+        // terminated each block above.
+        if !terminator {
+            let last = blocks.len().saturating_sub(1);
+            for (idx, block) in blocks.iter_mut().enumerate() {
+                if idx != last {
+                    block.push(b'\n');
+                }
+            }
+        }
+        let out = render_graph(&nodes, &blocks)?;
+        match stdout.write_all(&out) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
+            Err(e) => Err(e.into()),
+        }
     } else {
-        blocks.concat()
-    };
-
-    match std::io::stdout().write_all(&out) {
-        Ok(()) => Ok(ExitCode::SUCCESS),
-        // A downstream `| head` closing the pipe is not an error.
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
-        Err(e) => Err(e.into()),
+        // Flush the tail: a block that did not end in a newline (an empty user
+        // format) may still be buffered.
+        match stdout.flush() {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 

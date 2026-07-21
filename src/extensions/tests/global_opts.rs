@@ -48,3 +48,34 @@ fn dash_c_runs_verb_in_the_named_directory() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Faithful port of `cmd_main()` in git.c: the top-level `-v`/`--version` flags
+/// are rewritten to the `version` subcommand before dispatch, so `git --version`
+/// prints the version instead of erroring "not yet ported". Regression guard for
+/// the missing rewrite that made `git --version` fail.
+#[test]
+fn top_level_version_flag_prints_version() {
+    for flag in ["--version", "-v"] {
+        let out = Command::new(BIN).arg(flag).output().unwrap();
+        assert!(out.status.success(), "git {flag} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.starts_with("git version "), "git {flag} should print the version:\n{stdout}");
+    }
+
+    // The rewrite happens after global-option consumption, so a leading global
+    // still reaches it: `git -C <dir> --version` prints the version too.
+    let out = Command::new(BIN).args(["-C", ".", "--version"]).output().unwrap();
+    assert!(out.status.success(), "git -C . --version failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("git version "));
+}
+
+/// `-h`/`--help` are likewise rewritten to the `help` subcommand (git.c), which
+/// prints the top-level usage banner rather than erroring.
+#[test]
+fn top_level_help_flag_prints_usage() {
+    for flag in ["--help", "-h"] {
+        let out = Command::new(BIN).arg(flag).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("usage: git"), "git {flag} should print usage:\n{stdout}");
+    }
+}

@@ -1059,6 +1059,69 @@ fn collect_tree_change(
     Ok(())
 }
 
+/// The `-p`/`--patch` body for one commit: its tree diffed against `parent`'s
+/// tree (the empty tree for a root commit), rendered as git's `diff --git` patch
+/// with `ctx` lines of context. This runs the exact delta pipeline `git diff`'s
+/// tree-vs-tree path uses — `collect_tree_change` → `analyze` → `render_patch` —
+/// so `git log -p` and `git diff` produce byte-identical patches (same index-line
+/// abbreviation, `a/`/`b/` prefixes, and hunk formatting). Merge commits are the
+/// caller's concern: git shows no diff for them without `-m`/`-c`/`--cc`, so `log`
+/// only invokes this for commits with a single parent (or none).
+pub(crate) fn commit_patch(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    parent: Option<ObjectId>,
+    ctx: u32,
+) -> Result<Vec<u8>> {
+    let new_tree = commit.tree()?;
+    let old_tree = match parent {
+        Some(pid) => Some(repo.find_object(pid)?.try_into_commit()?.tree()?),
+        None => None,
+    };
+
+    let changes = repo.diff_tree_to_tree(
+        old_tree.as_ref(),
+        Some(&new_tree),
+        Some(gix::diff::Options::default()),
+    )?;
+    let mut deltas: Vec<Delta> = Vec::new();
+    for change in changes {
+        collect_tree_change(change, &mut deltas)?;
+    }
+    // `diff_flush()` order: paths ascending. Tree diffs never produce unmerged
+    // deltas, so the secondary key is inert here but kept for parity with `diff()`.
+    deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
+
+    let hash_kind = repo.object_hash();
+    let mut cache = repo.diff_resource_cache_for_tree_diff()?;
+    let r = Render {
+        abbrev: 7,
+        full_index: false,
+        z: false,
+        src_prefix: b"a/".to_vec(),
+        dst_prefix: b"b/".to_vec(),
+        hash_kind,
+    };
+
+    let mut out: Vec<u8> = Vec::new();
+    for delta in &deltas {
+        // A worktree side never arises for a tree diff, so `workdir` is `None`.
+        let an = analyze(
+            &mut cache,
+            &repo.objects,
+            delta,
+            ctx,
+            Whitespace::Keep,
+            hash_kind,
+            None,
+            true,
+            None,
+        )?;
+        render_patch(&mut out, repo, delta, &an, ctx, &r)?;
+    }
+    Ok(out)
+}
+
 fn toggle_exec(k: EntryKind) -> EntryKind {
     match k {
         EntryKind::Blob => EntryKind::BlobExecutable,

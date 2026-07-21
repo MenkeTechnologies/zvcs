@@ -77,6 +77,13 @@
 //!   checked against git 2.55 by running every flag this subcommand's parity
 //!   grammar can emit with no range argument: all 84 produce the same
 //!   `fatal: need two commit ranges` and the same exit status 129.
+//! * The exception is an option upstream *validates while parsing*, before any
+//!   revision is resolved: `--creation-factor` (`OPTION_INTEGER`) and
+//!   `--inter-hunk-context` (`OPTION_UNSIGNED`, a k/m/g magnitude via
+//!   [`git_parse_unsigned`]). A malformed value for either is the 129 `error:`
+//!   upstream reports at parse time, not a deferred `unsupported flag`. A
+//!   `--inter-hunk-context` value upstream accepts is deferred like the rest,
+//!   because rendering it would change the inner patch text.
 //!
 //! An option this port does not recognise at all is deferred too, rather than
 //! rejected: upstream accepts the whole `git diff` option list here, and
@@ -305,6 +312,56 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                     i += 1;
                 }
             }
+            // Upstream parses `--inter-hunk-context` as `OPTION_UNSIGNED` at
+            // parse time, before any revision is resolved, so a bad value is
+            // reported here (exit 129) rather than deferred to output. A value
+            // upstream accepts is recorded and deferred like any other diff
+            // option this port does not render.
+            "--inter-hunk-context" => {
+                let arg = match inline {
+                    Some(v) => v.to_string(),
+                    None => {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => v.clone(),
+                            None => {
+                                return Ok(option_error(
+                                    "option `inter-hunk-context' requires a value",
+                                ))
+                            }
+                        }
+                    }
+                };
+                // `else if (!*arg)` in the `OPTION_UNSIGNED` case: an empty
+                // value has its own message, distinct from a malformed one.
+                if arg.is_empty() {
+                    return Ok(option_error(
+                        "option `inter-hunk-context' expects a numerical value",
+                    ));
+                }
+                // `interhunkcontext` has 4-byte precision, so the bound is
+                // `UINTMAX_MAX >> (64 - 32)` = `u32::MAX`.
+                match git_parse_unsigned(&arg, u32::MAX as u64) {
+                    // Accepted by upstream but not rendered by this port.
+                    Ok(_) => opts.defer(format!(
+                        "unsupported flag {a:?} (ported: --creation-factor, --left-only, \
+                         --right-only, --no-dual-color, --no-color, --color=never, \
+                         --color=auto, --patch, --no-notes)"
+                    )),
+                    Err(MagnitudeError::Range) => {
+                        return Ok(option_error(&format!(
+                            "value {arg} for option `inter-hunk-context' not in range \
+                             [0,4294967295]"
+                        )))
+                    }
+                    Err(MagnitudeError::Invalid) => {
+                        return Ok(option_error(
+                            "option `inter-hunk-context' expects a non-negative integer \
+                             value with an optional k/m/g suffix",
+                        ))
+                    }
+                }
+            }
             "--no-creation-factor" => opts.creation_factor = CREATION_FACTOR_DEFAULT,
             "--creation-factor" => {
                 let value = match inline {
@@ -455,6 +512,112 @@ fn could_not_parse_log(range: &str) -> ExitCode {
     eprintln!("'git <command> [<revision>...] -- [<file>...]'");
     eprintln!("error: could not parse log for '{range}'");
     ExitCode::from(255)
+}
+
+/// A parse-options value error: `error: <reason>` on stderr, exit 129, and —
+/// unlike [`usage_error`] — no synopsis, because parse-options reports these
+/// value failures with a bare `error()` and no `usage_with_options()` call.
+fn option_error(reason: &str) -> ExitCode {
+    eprintln!("error: {reason}");
+    ExitCode::from(129)
+}
+
+/// The errno `git_parse_unsigned()` sets, which parse-options turns into two
+/// different messages: `EINVAL` (malformed) and `ERANGE` (out of bounds).
+enum MagnitudeError {
+    /// `EINVAL`: not a non-negative integer with an optional k/m/g suffix.
+    Invalid,
+    /// `ERANGE`: parsed, but overflowed `uintmax_t` or exceeded the bound.
+    Range,
+}
+
+/// Port of `get_unit_factor()` (`parse.c`): the k/m/g suffix multiplier, `1` for
+/// no suffix, `None` for anything else. `strcasecmp` compares the whole
+/// remainder, so only an exact `k`/`m`/`g` (any case) is a unit.
+fn get_unit_factor(end: &[u8]) -> Option<u64> {
+    if end.is_empty() {
+        Some(1)
+    } else if end.eq_ignore_ascii_case(b"k") {
+        Some(1024)
+    } else if end.eq_ignore_ascii_case(b"m") {
+        Some(1024 * 1024)
+    } else if end.eq_ignore_ascii_case(b"g") {
+        Some(1024 * 1024 * 1024)
+    } else {
+        None
+    }
+}
+
+/// Port of `git_parse_unsigned()` (`parse.c`) with `OPTION_UNSIGNED`'s bound
+/// applied: `value` is a non-negative integer with an optional k/m/g suffix,
+/// capped at `max`. The C reads `strtoumax(value, &end, 0)` — base auto-detect,
+/// so `0x…` is hex and a leading `0` is octal — after rejecting any string
+/// containing `-` (which `strtoumax` would otherwise accept), then multiplies by
+/// the unit factor and range-checks. `errno` maps to [`MagnitudeError`].
+fn git_parse_unsigned(value: &str, max: u64) -> Result<u64, MagnitudeError> {
+    let bytes = value.as_bytes();
+    // `if (strchr(value, '-'))` — a minus sign anywhere is rejected up front.
+    if bytes.contains(&b'-') {
+        return Err(MagnitudeError::Invalid);
+    }
+
+    // `strtoumax(value, &end, 0)`: skip leading isspace, an optional `+`, then
+    // pick the base from a `0x`/`0` prefix.
+    let mut i = 0;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'+' {
+        i += 1;
+    }
+    let (base, digits_start): (u64, usize) = if i < bytes.len() && bytes[i] == b'0' {
+        if bytes.get(i + 1).is_some_and(|&b| b == b'x' || b == b'X')
+            && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
+        {
+            (16, i + 2)
+        } else {
+            // A leading `0` is octal; the `0` itself is a valid octal digit, so
+            // a bare `0` parses as zero.
+            (8, i)
+        }
+    } else {
+        (10, i)
+    };
+
+    let mut end = digits_start;
+    let mut val: u128 = 0;
+    let mut overflow = false;
+    while end < bytes.len() {
+        let digit = match bytes[end] {
+            b'0'..=b'9' => u64::from(bytes[end] - b'0'),
+            b'a'..=b'f' => u64::from(bytes[end] - b'a') + 10,
+            b'A'..=b'F' => u64::from(bytes[end] - b'A') + 10,
+            _ => break,
+        };
+        if digit >= base {
+            break;
+        }
+        val = val * u128::from(base) + u128::from(digit);
+        if val > u128::from(u64::MAX) {
+            overflow = true;
+        }
+        end += 1;
+    }
+    // `if (end == value)` — no digits at all is malformed.
+    if end == digits_start {
+        return Err(MagnitudeError::Invalid);
+    }
+    // `strtoumax` sets `ERANGE` when the value overflows `uintmax_t`.
+    if overflow {
+        return Err(MagnitudeError::Range);
+    }
+
+    let factor = get_unit_factor(&bytes[end..]).ok_or(MagnitudeError::Invalid)?;
+    // `unsigned_mult_overflows(factor, val) || factor * val > max`.
+    match (val as u64).checked_mul(factor) {
+        Some(product) if product <= max => Ok(product),
+        _ => Err(MagnitudeError::Range),
+    }
 }
 
 // ---------------------------------------------------------------------------

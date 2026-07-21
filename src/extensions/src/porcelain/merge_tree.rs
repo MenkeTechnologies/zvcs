@@ -136,10 +136,12 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     let mut revs: Vec<String> = Vec::new();
 
     // git remembers how many arguments it started with so that `--trivial-merge`
-    // can insist that nothing else was passed alongside it.
-    let original_argc = args.len().saturating_sub(1);
+    // can insist that nothing else was passed alongside it. `dispatch::run` hands
+    // us only the post-subcommand argument vector (the `merge-tree` verb is
+    // already stripped), so every slot in `args` is a real operand.
+    let original_argc = args.len();
 
-    let mut i = 1; // args[0] is the subcommand name
+    let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         // git's merge-tree parses with PARSE_OPT_STOP_AT_NON_OPTION. A bare `--`

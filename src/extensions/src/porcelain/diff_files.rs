@@ -53,6 +53,11 @@
 //!   * `--summary`, `--check`.
 //!   * `-w`, `-b`, `--ignore-space-at-eol`, `--ignore-cr-at-eol`.
 //!   * `-R`, `--diff-filter=<letters>`, `-S<string>`, `-G<pattern>`, `--pickaxe-all`.
+//!   * `-c`/`--cc` and the free combined diff `git diff-files -p` produces for a
+//!     conflict: `run_diff_files()` routes an unmerged path that kept both stage #2
+//!     and stage #3 through `show_combined_diff()`, so the patch is a `diff --cc`
+//!     (or `diff --combined` under a bare `-c`) and, when a raw/name format is also
+//!     on, the record is the `::`-prefixed combined form.
 //!   * `-0`/`-1`/`-2`/`-3`, `--base`/`--ours`/`--theirs` (unmerged stage selection).
 //!   * `--exit-code`, `--quiet`, `-s`/`--no-patch`.
 //!   * `--line-prefix=<s>`, `--rotate-to=<p>`, `--skip-to=<p>`, `--relative[=<p>]`/`--no-relative`.
@@ -64,9 +69,6 @@
 //!
 //! ### Not implemented (bailed on with a precise message, never faked)
 //!
-//!   * `-c`/`--cc`: the combined diff needs a second output pipeline (`::`-prefixed
-//!     raw records, `diff --cc` patches, and conflicted paths emitted ahead of the
-//!     ordinary queue because `show_combined_diff()` prints during the index scan).
 //!   * `-I<regex>`/`--ignore-matching-lines=<regex>` beyond an optionally anchored
 //!     literal, and `-G`/`-S --pickaxe-regex` likewise: no regex engine is vendored.
 //!   * `--binary` for content that is actually binary (the `GIT binary patch`
@@ -83,7 +85,7 @@ use gix::bstr::{BString, ByteSlice};
 use gix::diff::blob::pipeline::{Mode, WorktreeRoots};
 use gix::diff::blob::platform::prepare_diff::Operation;
 use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
-use gix::diff::blob::{diff_with_slider_heuristics, InternedInput, ResourceKind, UnifiedDiff};
+use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, InternedInput, ResourceKind, UnifiedDiff};
 use gix::hash::ObjectId;
 use gix::objs::tree::EntryKind;
 use gix::prelude::ObjectIdExt;
@@ -327,6 +329,24 @@ struct Opts {
     /// `-C`/`--find-copies[-harder]`: rename detection registers every "added"
     /// pair as a copy destination, which hashes its worktree side on the way.
     find_copies: bool,
+    /// `run_diff_files()` shows a combined diff (`show_combined_diff()`) for an
+    /// unmerged path that still has both stage #2 and stage #3, instead of the
+    /// `* Unmerged path` marker plus a two-way diff against one stage. This is on
+    /// whenever git's `revs->combine_merges` is: set by `-c`/`--cc`, or set for
+    /// free by `diff_merges_set_dense_combined_if_unset()` when no explicit stage
+    /// was requested and a patch is being produced.
+    combine_merges: bool,
+    /// `revs->dense_combined_merges`: `--cc` (and the free default) densify the
+    /// header to `diff --cc`; a bare `-c` leaves it `diff --combined`.
+    dense_combined: bool,
+    /// True once any of `-0`/`-1`/`-2`/`-3`/`--base`/`--ours`/`--theirs` is seen,
+    /// i.e. git's `revs->max_count != -1`, which suppresses the free combined diff.
+    explicit_stage: bool,
+    /// `-c`/`--cc` set `revs->merges_need_diff`, which forces the patch format when
+    /// no other output format was requested.
+    merges_need_diff: bool,
+    /// `--full-index`: the combined header prints full object ids.
+    full_index: bool,
 }
 
 impl Opts {
@@ -360,6 +380,18 @@ impl Delta {
     fn new_valid(&self) -> bool {
         self.dst_mode != 0
     }
+}
+
+/// One unmerged path that `run_diff_files()` routes through `show_combined_diff()`
+/// because it kept both stage #2 (ours) and stage #3 (theirs). git records these
+/// two stages as `dpath->parent[0]` and `dpath->parent[1]`, with the worktree file
+/// as the single result side.
+struct CombinedPath {
+    path: BString,
+    /// `parent[0]` = stage #2, `parent[1]` = stage #3: their staged blob and mode.
+    parents: [(ObjectId, u32); 2],
+    /// The result mode, i.e. the worktree file's mode (`0` when it is gone).
+    wt_mode: u32,
 }
 
 /// Per-delta blob analysis: the destination object id plus line counts and the
@@ -553,6 +585,11 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         dirstat: DirStat::default(),
         unmerged_stage: 2,
         find_copies: false,
+        combine_merges: false,
+        dense_combined: false,
+        explicit_stage: false,
+        merges_need_diff: false,
+        full_index: false,
     };
     let mut quiet = false;
     let mut paths: Vec<BString> = Vec::new();
@@ -595,6 +632,12 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         paths.push(s.into());
     }
 
+    // `diff_merges_setup_revs()`: `-c`/`--cc` set `merges_need_diff`, which forces
+    // the patch format when nothing else was asked for.
+    if opts.merges_need_diff && opts.fmt == 0 {
+        opts.fmt |= F_PATCH;
+    }
+
     // `diff_setup_done()`: --name-only / --name-status / --check / -s clear
     // every other output format, and an empty format falls back to raw.
     if opts.fmt & (F_NAME | F_NAME_STATUS | F_CHECKDIFF | F_NO_OUTPUT) != 0 {
@@ -615,6 +658,16 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
     } else {
         Format::Raw
     };
+
+    // `cmd_diff_files()`: "diff-files --base -p should not combine merges because
+    // it was not asked to". With no explicit stage and a patch on the way,
+    // `diff_merges_set_dense_combined_if_unset()` turns on a dense combined diff
+    // for free; `-c`/`--cc` have already set `combine_merges` by this point, so the
+    // "if unset" guard leaves their (possibly non-dense) choice alone.
+    if !opts.explicit_stage && opts.fmt & F_PATCH != 0 && !opts.combine_merges {
+        opts.combine_merges = true;
+        opts.dense_combined = true;
+    }
 
     // `--pickaxe-all` / `--pickaxe-regex` may appear on either side of the `-S`
     // they modify, so they are folded in once the whole line has been read.
@@ -710,8 +763,6 @@ const ACCEPTED_NOOP: &[&str] = &[
     "--break-rewrites",
     "-M",
     "--find-renames",
-    // Raw output already carries full object ids.
-    "--full-index",
     // diff-files' "stay quiet about removed files"; zvcs never warns about them.
     "-q",
 ];
@@ -733,7 +784,7 @@ const ACCEPTED_NOOP_VALUED: &[&str] = &[
 ];
 
 /// Real git flags whose effect on the output we do not produce.
-const KNOWN_UNSUPPORTED: &[&str] = &["-c", "--cc", "--find-object"];
+const KNOWN_UNSUPPORTED: &[&str] = &["--find-object"];
 
 /// Prefixes of real git flags in the same category as [`KNOWN_UNSUPPORTED`].
 const KNOWN_UNSUPPORTED_VALUED: &[&str] = &["--find-object=", "-O", "--output="];
@@ -797,10 +848,35 @@ fn classify(s: &str, opts: &mut Opts, quiet: &mut bool) -> Result<Flag, Fatal> {
         "--ignore-space-at-eol" => opts.ws = Whitespace::IgnoreAtEol,
         "--ignore-cr-at-eol" => opts.ws = Whitespace::IgnoreCrAtEol,
         "-C" | "--find-copies" | "--find-copies-harder" => opts.find_copies = true,
-        "-0" => opts.unmerged_stage = 0,
-        "-1" | "--base" => opts.unmerged_stage = 1,
-        "-2" | "--ours" => opts.unmerged_stage = 2,
-        "-3" | "--theirs" => opts.unmerged_stage = 3,
+        // `-c`/`--cc`: request a combined diff and, per `common_setup()`, imply the
+        // patch format when nothing else is asked for. `--cc` also densifies.
+        "-c" => {
+            opts.combine_merges = true;
+            opts.dense_combined = false;
+            opts.merges_need_diff = true;
+        }
+        "--cc" => {
+            opts.combine_merges = true;
+            opts.dense_combined = true;
+            opts.merges_need_diff = true;
+        }
+        "--full-index" => opts.full_index = true,
+        "-0" => {
+            opts.unmerged_stage = 0;
+            opts.explicit_stage = true;
+        }
+        "-1" | "--base" => {
+            opts.unmerged_stage = 1;
+            opts.explicit_stage = true;
+        }
+        "-2" | "--ours" => {
+            opts.unmerged_stage = 2;
+            opts.explicit_stage = true;
+        }
+        "-3" | "--theirs" => {
+            opts.unmerged_stage = 3;
+            opts.explicit_stage = true;
+        }
         "--relative" => opts.relative = Relative::Cwd,
         "--no-relative" => opts.relative = Relative::No,
         "--ignore-submodules" => {
@@ -1156,11 +1232,12 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
         .ok_or_else(|| anyhow::anyhow!("this operation must be run in a work tree"))?
         .to_owned();
     let hash_kind = repo.object_hash();
-    let mut deltas = collect(repo, paths, &opts)?;
+    let (mut deltas, mut combined) = collect(repo, paths, &opts)?;
 
     // git emits index order, which for these records is a byte-wise path sort
     // with a conflict's `U` line kept ahead of its stage-2 comparison.
     deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
+    combined.sort_by(|a, b| a.path.cmp(&b.path));
 
     if opts.reverse {
         for d in &mut deltas {
@@ -1186,6 +1263,7 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     }
 
     apply_relative(repo, &mut deltas, &opts.relative)?;
+    apply_relative_combined(repo, &mut combined, &opts.relative)?;
 
     // Content is needed by every non-raw format, by the whitespace family's
     // pruning, and by the pickaxe.
@@ -1271,6 +1349,25 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     let mut separator = false;
     let mut check_failed = false;
 
+    // `show_combined_diff()` runs inline during the index scan, so a combined
+    // path's output leads the section the queue then fills. It emits at most one
+    // form per path: a `::`-prefixed raw/name record when a raw-ish format is on,
+    // otherwise a `diff --cc` patch.
+    let combine_raw = opts.fmt & (F_RAW | F_NAME | F_NAME_STATUS) != 0;
+    let mut combined_patch: Vec<u8> = Vec::new();
+    if !combined.is_empty() {
+        if combine_raw {
+            for c in &combined {
+                render_combined_raw(&mut out, repo, c, &opts);
+            }
+            separator = true;
+        } else if opts.fmt & F_PATCH != 0 {
+            for c in &combined {
+                render_combined_patch(&mut combined_patch, repo, c, &opts, &workdir)?;
+            }
+        }
+    }
+
     if !deltas.is_empty() {
         if opts.fmt & (F_RAW | F_NAME | F_NAME_STATUS) != 0 {
             out.extend_from_slice(&render_raw(repo, &deltas, &opts));
@@ -1316,14 +1413,15 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             }
             separator = true;
         }
+    }
 
-        if opts.fmt & F_PATCH != 0 {
-            if separator {
-                rest.push(b'\n');
-            }
-            for (d, an) in deltas.iter().zip(&analyses) {
-                render_patch(&mut rest, d, an, &opts);
-            }
+    if opts.fmt & F_PATCH != 0 && (!combined_patch.is_empty() || !deltas.is_empty()) {
+        if separator {
+            rest.push(b'\n');
+        }
+        rest.extend_from_slice(&combined_patch);
+        for (d, an) in deltas.iter().zip(&analyses) {
+            render_patch(&mut rest, d, an, &opts);
         }
     }
 
@@ -1338,11 +1436,12 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
 
     // `diff_result_code()`: bit 0 is `--exit-code`, bit 1 is `--check`.
     let mut code = 0u8;
-    let has_changes = if opts.diff_from_contents() {
-        analyses.iter().any(|a| a.changed)
-    } else {
-        !deltas.is_empty()
-    };
+    let has_changes = !combined.is_empty()
+        || if opts.diff_from_contents() {
+            analyses.iter().any(|a| a.changed)
+        } else {
+            !deltas.is_empty()
+        };
     if opts.exit_code && has_changes {
         code |= 1;
     }
@@ -1392,6 +1491,37 @@ fn apply_relative(
         |d| match d.path.strip_prefix(needle.as_slice()).map(|r| r.to_vec()) {
             Some(rest) => {
                 d.path = rest.into();
+                true
+            }
+            None => false,
+        },
+    );
+    Ok(())
+}
+
+/// `--relative[=<p>]` for the combined-diff paths, mirroring [`apply_relative`].
+fn apply_relative_combined(
+    repo: &gix::Repository,
+    combined: &mut Vec<CombinedPath>,
+    relative: &Relative,
+) -> Result<()> {
+    let prefix: BString = match relative {
+        Relative::No => return Ok(()),
+        Relative::Path(p) => p.clone(),
+        Relative::Cwd => match repo.prefix()? {
+            Some(p) => gix::path::into_bstr(p).into_owned(),
+            None => return Ok(()),
+        },
+    };
+    if prefix.is_empty() {
+        return Ok(());
+    }
+    let mut needle: Vec<u8> = prefix.into();
+    needle.push(b'/');
+    combined.retain_mut(
+        |c| match c.path.strip_prefix(needle.as_slice()).map(|r| r.to_vec()) {
+            Some(rest) => {
+                c.path = rest.into();
                 true
             }
             None => false,
@@ -1554,7 +1684,12 @@ struct Collector<'a> {
     null: ObjectId,
     /// `-0`/`-1`/`-2`/`-3`: which conflict stage the second record compares.
     unmerged_stage: u8,
+    /// `revs->combine_merges`: an unmerged path with both stage #2 and stage #3 is
+    /// diverted to [`Collector::combined`] instead of producing a `U` marker plus a
+    /// two-way record.
+    combine: bool,
     deltas: Vec<Delta>,
+    combined: Vec<CombinedPath>,
 }
 
 impl Collector<'_> {
@@ -1622,6 +1757,21 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
                 // against whichever stage `diff_unmerged_stage` selects (2 by
                 // default). When that stage is absent, only the marker is shown.
                 let wt_mode = self.worktree_mode(rela_path);
+
+                // `run_diff_files()`: when `combine_merges` is on and both stage #2
+                // and stage #3 survive (`num_compare_stages == 2`), the whole path
+                // is shown as one combined diff and never enters the ordinary queue.
+                if self.combine {
+                    if let (Some(s2), Some(s3)) = (entries[1].as_ref(), entries[2].as_ref()) {
+                        self.combined.push(CombinedPath {
+                            path,
+                            parents: [(s2.id, s2.mode.bits()), (s3.id, s3.mode.bits())],
+                            wt_mode,
+                        });
+                        return;
+                    }
+                }
+
                 self.deltas.push(Delta {
                     src_mode: 0,
                     dst_mode: wt_mode,
@@ -1720,8 +1870,13 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
     }
 }
 
-/// Run the index↔worktree stat comparison and reduce every entry to [`Delta`]s.
-fn collect(repo: &gix::Repository, patterns: Vec<BString>, opts: &Opts) -> Result<Vec<Delta>> {
+/// Run the index↔worktree stat comparison and reduce every entry to [`Delta`]s,
+/// diverting combined unmerged paths into a separate list.
+fn collect(
+    repo: &gix::Repository,
+    patterns: Vec<BString>,
+    opts: &Opts,
+) -> Result<(Vec<Delta>, Vec<CombinedPath>)> {
     let index = repo.index_or_empty()?;
     let workdir = repo
         .workdir()
@@ -1746,7 +1901,9 @@ fn collect(repo: &gix::Repository, patterns: Vec<BString>, opts: &Opts) -> Resul
         executable_bit: caps.executable_bit,
         null: ObjectId::null(repo.object_hash()),
         unmerged_stage: opts.unmerged_stage,
+        combine: opts.combine_merges,
         deltas: Vec::new(),
+        combined: Vec::new(),
     };
     let mut progress = gix::progress::Discard;
     let should_interrupt = AtomicBool::new(false);
@@ -1771,7 +1928,7 @@ fn collect(repo: &gix::Repository, patterns: Vec<BString>, opts: &Opts) -> Resul
         },
     )?;
 
-    Ok(collector.deltas)
+    Ok((collector.deltas, collector.combined))
 }
 
 /// Flip the executable bit of a regular-file mode, leaving anything else alone.
@@ -2960,6 +3117,778 @@ fn emit_file_line(out: &mut Vec<u8>, lead: &[u8], label: &[u8]) {
         out.push(b'\t');
     }
     out.push(b'\n');
+}
+
+// ---------------------------------------------------------------------------
+// combined diff (combine-diff.c)
+//
+// A faithful port of `combine_diff()`, `make_hunks()`/`give_context()`,
+// `dump_sline()` and `show_combined_header()`/`show_raw_diff()`. It is driven only
+// for an unmerged path that kept both stage #2 and stage #3, which is the sole way
+// `git diff-files` reaches `show_combined_diff()`.
+// ---------------------------------------------------------------------------
+
+/// `struct lline`: a line lost from one or more parents relative to the result.
+#[derive(Clone, Default)]
+struct Lline {
+    line: Vec<u8>,
+    /// Bit `p` on = parent `p` had this line.
+    parent_map: u64,
+}
+
+/// `struct sline`: one line surviving in the merge result, plus the lines lost
+/// from the parents that hang in front of it.
+#[derive(Default)]
+struct Sline {
+    /// Accumulated, coalesced lost lines (across parents processed so far).
+    lost: Vec<Lline>,
+    /// Lost lines from the parent currently being diffed, before coalescing.
+    plost: Vec<Lline>,
+    /// Offset and length of this line's bytes inside the result buffer; `len`
+    /// excludes the trailing newline, exactly like `sline[lno].len` in git.
+    bol: usize,
+    len: usize,
+    /// Bit `p` on = parent `p` differs here (a `+` for that column). Bit
+    /// `num_parent` is the "interesting" mark; bit `num_parent+1` is `no_pre_delete`.
+    flag: u64,
+    /// First line number in each parent, per `combine_diff()`'s accounting.
+    p_lno: Vec<u64>,
+}
+
+/// `append_lost()`: strip a trailing newline and record the line as lost from the
+/// parent named by `mask`.
+fn append_lost(sline: &mut Sline, line: &[u8], mask: u64) {
+    let line = if line.last() == Some(&b'\n') {
+        &line[..line.len() - 1]
+    } else {
+        line
+    };
+    sline.plost.push(Lline {
+        line: line.to_vec(),
+        parent_map: mask,
+    });
+}
+
+/// Read one parent's blob for the combined diff, mirroring `grab_blob()`: a
+/// gitlink becomes a `Subproject commit` stub and a null id an empty buffer.
+fn read_parent_blob(repo: &gix::Repository, id: &ObjectId, mode: u32) -> Result<Vec<u8>> {
+    if mode == 0o160000 {
+        return Ok(format!("Subproject commit {}\n", id.to_hex()).into_bytes());
+    }
+    if id.is_null() {
+        return Ok(Vec::new());
+    }
+    Ok(repo.find_object(*id)?.data.clone())
+}
+
+/// `buffer_is_binary()`: a NUL byte within the first 8000 bytes.
+fn buffer_is_binary(buf: &[u8]) -> bool {
+    let n = buf.len().min(8000);
+    buf[..n].contains(&0)
+}
+
+/// `combine_diff()` for one parent: diff its blob against the result with zero
+/// context, recording `+` marks on result lines and `-` (lost) lines, then assign
+/// the per-parent line numbers.
+fn combine_diff_parent(
+    parent: &[u8],
+    result: &[u8],
+    sline: &mut [Sline],
+    cnt: usize,
+    n: usize,
+    ws: Whitespace,
+) {
+    let before = byte_lines(parent);
+    let after = byte_lines(result);
+    let mut input: InternedInput<Vec<u8>> = InternedInput::default();
+    input.update_before(before.iter().map(|l| normalize(l, ws)));
+    input.update_after(after.iter().map(|l| normalize(l, ws)));
+    // git's combined diff runs xdiff with `xpp.flags = opt->xdl_opts`; Myers is
+    // git's default algorithm.
+    let diff = diff_with_slider_heuristics(Algorithm::Myers, &input);
+    let nmask = 1u64 << n;
+
+    // With zero context every hunk is one raw change group. git hangs all of a
+    // hunk's `-` lines on `sline[nb]` where `nb` is the result line the additions
+    // begin at (`after.start`), and marks each `+` line's result position.
+    for hunk in diff.hunks() {
+        let bucket = hunk.after.start as usize;
+        for bi in hunk.before.clone() {
+            append_lost(&mut sline[bucket], before[bi as usize], nmask);
+        }
+        for aj in hunk.after.clone() {
+            sline[aj as usize].flag |= nmask;
+        }
+    }
+
+    // Assign this parent's line numbers, coalescing its lost lines into the
+    // accumulated set as it goes.
+    let mut p_lno = 1u64;
+    for lno in 0..=cnt {
+        sline[lno].p_lno[n] = p_lno;
+        if !sline[lno].plost.is_empty() {
+            let plost = std::mem::take(&mut sline[lno].plost);
+            let base = std::mem::take(&mut sline[lno].lost);
+            sline[lno].lost = coalesce_lines(base, plost, n, ws);
+        }
+        for ll in &sline[lno].lost {
+            if ll.parent_map & nmask != 0 {
+                p_lno += 1;
+            }
+        }
+        if lno < cnt && sline[lno].flag & nmask == 0 {
+            p_lno += 1;
+        }
+    }
+    sline[cnt + 1].p_lno[n] = p_lno;
+}
+
+/// `reuse_combine_diff()`: parent `i` equals parent `j`, so copy `j`'s marks.
+fn reuse_combine_diff(sline: &mut [Sline], cnt: usize, i: usize, j: usize) {
+    let imask = 1u64 << i;
+    let jmask = 1u64 << j;
+    for lno in 0..=cnt {
+        sline[lno].p_lno[i] = sline[lno].p_lno[j];
+        for ll in &mut sline[lno].lost {
+            if ll.parent_map & jmask != 0 {
+                ll.parent_map |= imask;
+            }
+        }
+        if sline[lno].flag & jmask != 0 {
+            sline[lno].flag |= imask;
+        }
+    }
+    sline[cnt + 1].p_lno[i] = sline[cnt + 1].p_lno[j];
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Coalesce {
+    Match,
+    Base,
+    New,
+}
+
+/// `coalesce_lines()`: merge a parent's lost lines into the accumulated set by
+/// LCS, so a line lost from several parents is shown once with all their columns.
+fn coalesce_lines(base: Vec<Lline>, newlines: Vec<Lline>, parent: usize, ws: Whitespace) -> Vec<Lline> {
+    if newlines.is_empty() {
+        return base;
+    }
+    if base.is_empty() {
+        return newlines;
+    }
+    let m = base.len();
+    let k = newlines.len();
+    let mut lcs = vec![vec![0i32; k + 1]; m + 1];
+    let mut dir = vec![vec![Coalesce::Base; k + 1]; m + 1];
+    for j in 1..=k {
+        dir[0][j] = Coalesce::New;
+    }
+    for i in 1..=m {
+        for j in 1..=k {
+            if lines_equal(&base[i - 1].line, &newlines[j - 1].line, ws) {
+                lcs[i][j] = lcs[i - 1][j - 1] + 1;
+                dir[i][j] = Coalesce::Match;
+            } else if lcs[i][j - 1] >= lcs[i - 1][j] {
+                lcs[i][j] = lcs[i][j - 1];
+                dir[i][j] = Coalesce::New;
+            } else {
+                lcs[i][j] = lcs[i - 1][j];
+                dir[i][j] = Coalesce::Base;
+            }
+        }
+    }
+    let mut out: Vec<Lline> = Vec::with_capacity(m + k);
+    let (mut i, mut j) = (m, k);
+    while i != 0 || j != 0 {
+        match dir[i][j] {
+            Coalesce::Match => {
+                let mut l = base[i - 1].clone();
+                l.parent_map |= 1u64 << parent;
+                out.push(l);
+                i -= 1;
+                j -= 1;
+            }
+            Coalesce::New => {
+                out.push(newlines[j - 1].clone());
+                j -= 1;
+            }
+            Coalesce::Base => {
+                out.push(base[i - 1].clone());
+                i -= 1;
+            }
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// `match_string_spaces()` reduced to what the whitespace flags require here.
+fn lines_equal(a: &[u8], b: &[u8], ws: Whitespace) -> bool {
+    normalize(a, ws) == normalize(b, ws)
+}
+
+/// `interesting()`.
+fn sline_interesting(sl: &Sline, all_mask: u64) -> bool {
+    sl.flag & all_mask != 0 || !sl.lost.is_empty()
+}
+
+/// `adjust_hunk_tail()`.
+fn adjust_hunk_tail(sline: &[Sline], all_mask: u64, hunk_begin: usize, i: usize) -> usize {
+    if hunk_begin + 1 <= i && sline[i - 1].flag & all_mask == 0 {
+        i - 1
+    } else {
+        i
+    }
+}
+
+/// `find_next()`.
+fn find_next(sline: &[Sline], mark: u64, mut i: usize, cnt: usize, look_for_uninteresting: bool) -> usize {
+    while i <= cnt {
+        let marked = sline[i].flag & mark != 0;
+        if look_for_uninteresting == !marked {
+            return i;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// `give_context()`.
+fn give_context(sline: &mut [Sline], cnt: usize, num_parent: usize, context: usize) -> bool {
+    let all_mask = (1u64 << num_parent) - 1;
+    let mark = 1u64 << num_parent;
+    let no_pre_delete = 2u64 << num_parent;
+
+    let mut i = find_next(sline, mark, 0, cnt, false);
+    if cnt < i {
+        return false;
+    }
+
+    while i <= cnt {
+        let mut j = i.saturating_sub(context);
+        while j < i {
+            if sline[j].flag & mark == 0 {
+                sline[j].flag |= no_pre_delete;
+            }
+            sline[j].flag |= mark;
+            j += 1;
+        }
+
+        loop {
+            // Where does the next uninteresting line start?
+            let mut j = find_next(sline, mark, i, cnt, true);
+            if cnt < j {
+                return true;
+            }
+            let k = find_next(sline, mark, j, cnt, false);
+            j = adjust_hunk_tail(sline, all_mask, i, j);
+
+            if k < j + context {
+                while j < k {
+                    sline[j].flag |= mark;
+                    j += 1;
+                }
+                i = k;
+                continue;
+            }
+
+            i = k;
+            let kk = if j + context < cnt + 1 { j + context } else { cnt + 1 };
+            while j < kk {
+                sline[j].flag |= mark;
+                j += 1;
+            }
+            break;
+        }
+    }
+    true
+}
+
+/// `make_hunks()`: mark interesting lines, thin single-parent hunks under `dense`,
+/// and expand context.
+fn make_hunks(sline: &mut [Sline], cnt: usize, num_parent: usize, dense: bool, context: usize) -> bool {
+    let all_mask = (1u64 << num_parent) - 1;
+    let mark = 1u64 << num_parent;
+
+    for i in 0..=cnt {
+        if sline_interesting(&sline[i], all_mask) {
+            sline[i].flag |= mark;
+        } else {
+            sline[i].flag &= !mark;
+        }
+    }
+    if !dense {
+        return give_context(sline, cnt, num_parent, context);
+    }
+
+    let mut i = 0usize;
+    while i <= cnt {
+        while i <= cnt && sline[i].flag & mark == 0 {
+            i += 1;
+        }
+        if cnt < i {
+            break;
+        }
+        let hunk_begin = i;
+        let mut j = i + 1;
+        while j <= cnt {
+            if sline[j].flag & mark == 0 {
+                let mut la = adjust_hunk_tail(sline, all_mask, hunk_begin, j);
+                la = if la + context < cnt + 1 { la + context } else { cnt + 1 };
+                let mut contin = false;
+                while la > 0 && j <= la - 1 {
+                    la -= 1;
+                    if sline[la].flag & mark != 0 {
+                        contin = true;
+                        break;
+                    }
+                }
+                if !contin {
+                    break;
+                }
+                j = la;
+            }
+            j += 1;
+        }
+        let hunk_end = j;
+
+        // Is the hunk really interesting? Only when the set of parents the result
+        // differs from is not the same on every line.
+        let mut same_diff = 0u64;
+        let mut has_interesting = false;
+        let mut jj = i;
+        while jj < hunk_end && !has_interesting {
+            let this_diff = sline[jj].flag & all_mask;
+            if this_diff != 0 {
+                if same_diff == 0 {
+                    same_diff = this_diff;
+                } else if same_diff != this_diff {
+                    has_interesting = true;
+                    break;
+                }
+            }
+            for ll in &sline[jj].lost {
+                if has_interesting {
+                    break;
+                }
+                let this_diff = ll.parent_map;
+                if same_diff == 0 {
+                    same_diff = this_diff;
+                } else if same_diff != this_diff {
+                    has_interesting = true;
+                }
+            }
+            jj += 1;
+        }
+
+        if !has_interesting && same_diff != all_mask {
+            for j in hunk_begin..hunk_end {
+                sline[j].flag &= !mark;
+            }
+        }
+        i = hunk_end;
+    }
+
+    give_context(sline, cnt, num_parent, context)
+}
+
+/// `show_parent_lno()`: the ` -<l0>,<len>` field for one parent in the hunk header.
+fn show_parent_lno(out: &mut Vec<u8>, sline: &[Sline], l0: usize, l1: usize, n: usize, null_context: u64) {
+    let a = sline[l0].p_lno[n];
+    let b = sline[l1].p_lno[n];
+    out.extend_from_slice(format!(" -{},{}", a, b - a - null_context).as_bytes());
+}
+
+/// `hunk_comment_line()`.
+fn hunk_comment_line(sl: &Sline, result: &[u8]) -> bool {
+    if sl.len == 0 {
+        return false;
+    }
+    let ch = result[sl.bol];
+    ch.is_ascii_alphabetic() || ch == b'_' || ch == b'$'
+}
+
+/// `dump_sline()`: render every combined hunk. `ind_*` carry the
+/// `--output-indicator-*` overrides that the two-way writer also honors.
+fn dump_sline(
+    out: &mut Vec<u8>,
+    sline: &[Sline],
+    cnt: usize,
+    num_parent: usize,
+    result: &[u8],
+    result_deleted: bool,
+    context: usize,
+    line_prefix: &[u8],
+) {
+    let mark = 1u64 << num_parent;
+    let no_pre_delete = 2u64 << num_parent;
+    if result_deleted {
+        return;
+    }
+
+    let mut lno = 0usize;
+    loop {
+        let mut hunk_comment: Option<usize> = None;
+        while lno <= cnt && sline[lno].flag & mark == 0 {
+            if hunk_comment_line(&sline[lno], result) {
+                hunk_comment = Some(lno);
+            }
+            lno += 1;
+        }
+        if cnt < lno {
+            break;
+        }
+        let mut hunk_end = lno + 1;
+        while hunk_end <= cnt {
+            if sline[hunk_end].flag & mark == 0 {
+                break;
+            }
+            hunk_end += 1;
+        }
+        let mut rlines = (hunk_end - lno) as u64;
+        if cnt < hunk_end {
+            rlines -= 1; // pointing at the last delete hunk
+        }
+
+        let mut null_context = 0u64;
+        if context == 0 {
+            for j in lno..hunk_end {
+                if sline[j].flag & (mark - 1) == 0 {
+                    null_context += 1;
+                }
+            }
+            rlines -= null_context;
+        }
+
+        out.extend_from_slice(line_prefix);
+        for _ in 0..=num_parent {
+            out.push(b'@');
+        }
+        for i in 0..num_parent {
+            show_parent_lno(out, sline, lno, hunk_end, i, null_context);
+        }
+        out.extend_from_slice(format!(" +{},{} ", lno + 1, rlines).as_bytes());
+        for _ in 0..=num_parent {
+            out.push(b'@');
+        }
+
+        if let Some(hc) = hunk_comment {
+            let bol = sline[hc].bol;
+            let hcbytes = &result[bol..];
+            let mut comment_end = 0usize;
+            for i in 0..40 {
+                let Some(&ch) = hcbytes.get(i) else { break };
+                if ch == b'\n' {
+                    break;
+                }
+                if !ch.is_ascii_whitespace() {
+                    comment_end = i;
+                }
+            }
+            if comment_end != 0 {
+                out.extend_from_slice(b" ");
+                out.extend_from_slice(&hcbytes[..comment_end]);
+            }
+        }
+        out.push(b'\n');
+
+        while lno < hunk_end {
+            let sl = &sline[lno];
+            lno += 1;
+            let lost: &[Lline] = if sl.flag & no_pre_delete != 0 {
+                &[]
+            } else {
+                &sl.lost
+            };
+            for ll in lost {
+                out.extend_from_slice(line_prefix);
+                for j in 0..num_parent {
+                    out.push(if ll.parent_map & (1u64 << j) != 0 { b'-' } else { b' ' });
+                }
+                out.extend_from_slice(&ll.line);
+                out.push(b'\n');
+            }
+            if cnt < lno {
+                break;
+            }
+            out.extend_from_slice(line_prefix);
+            if sl.flag & (mark - 1) == 0 {
+                // Present in every parent: a context line only there to hang the
+                // lost lines. Under --unified=0 it must not be printed at all.
+                if context == 0 {
+                    continue;
+                }
+            }
+            let mut p_mask = 1u64;
+            for _ in 0..num_parent {
+                out.push(if p_mask & sl.flag != 0 { b'+' } else { b' ' });
+                p_mask <<= 1;
+            }
+            out.extend_from_slice(&result[sl.bol..sl.bol + sl.len]);
+            out.push(b'\n');
+        }
+    }
+}
+
+/// `repo_find_unique_abbrev()` for a combined header id: the shortest unique
+/// prefix, but at least `min` characters, and exactly `min` zeros for the null id.
+fn header_hex(repo: &gix::Repository, id: &ObjectId, min: Option<usize>) -> String {
+    let Some(min) = min else {
+        return id.to_hex().to_string(); // --full-index
+    };
+    if id.is_null() {
+        return "0".repeat(min);
+    }
+    let uniq = id.attach(repo).shorten_or_id().hex_len();
+    id.to_hex_with_len(uniq.max(min)).to_string()
+}
+
+/// The combined header's abbreviation floor: `--full-index` → full, otherwise
+/// `core.abbrev` (git's `DEFAULT_ABBREV`), defaulting to 7 when unset.
+fn header_abbrev(repo: &gix::Repository, opts: &Opts) -> Option<usize> {
+    if opts.full_index {
+        return None;
+    }
+    let n = repo
+        .config_snapshot()
+        .integer("core.abbrev")
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(7);
+    Some(n.clamp(4, repo.object_hash().len_in_hex()))
+}
+
+/// `show_combined_header()` for a working-tree combined diff (`show_file_header`
+/// is always set for diff-files). `line_prefix` is empty here because the caller
+/// funnels this output through `prefix_lines()`, which stamps `--line-prefix` once.
+fn show_combined_header(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    c: &CombinedPath,
+    opts: &Opts,
+    line_prefix: &[u8],
+    show_file_header: bool,
+) {
+    let dense = opts.dense_combined;
+    let a_prefix = opts.src_prefix.as_str();
+    let b_prefix = opts.dst_prefix.as_str();
+    let abbrev = header_abbrev(repo, opts);
+
+    out.extend_from_slice(line_prefix);
+    out.extend_from_slice(if dense { b"diff --cc " } else { b"diff --combined " });
+    out.extend_from_slice(&quoted_name(&c.path));
+    out.push(b'\n');
+
+    out.extend_from_slice(line_prefix);
+    out.extend_from_slice(b"index ");
+    for (i, (id, _)) in c.parents.iter().enumerate() {
+        if i != 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(header_hex(repo, id, abbrev).as_bytes());
+    }
+    out.extend_from_slice(b"..");
+    out.extend_from_slice(header_hex(repo, &repo.object_hash().null(), abbrev).as_bytes());
+    out.push(b'\n');
+
+    let mode_differs = c.parents.iter().any(|(_, m)| *m != c.wt_mode);
+    let deleted = c.wt_mode == 0;
+    // diff-files always records DIFF_STATUS_MODIFIED for both parents, so the
+    // "added if nobody had it" branch never fires here.
+    if mode_differs {
+        out.extend_from_slice(line_prefix);
+        if deleted {
+            out.extend_from_slice(b"deleted file ");
+        }
+        out.extend_from_slice(b"mode ");
+        for (i, (_, m)) in c.parents.iter().enumerate() {
+            if i != 0 {
+                out.push(b',');
+            }
+            out.extend_from_slice(format!("{m:06o}").as_bytes());
+        }
+        if c.wt_mode != 0 {
+            out.extend_from_slice(format!("..{:06o}", c.wt_mode).as_bytes());
+        }
+        out.push(b'\n');
+    }
+
+    if !show_file_header {
+        return;
+    }
+
+    // `dump_quoted_path()`: the `--- `/`+++ ` head sits outside the quoted unit,
+    // and `quote_two_c_style(prefix, path)` quotes prefix+path together. diff-files
+    // never records an added parent, so the `---` side always names a/<path>.
+    out.extend_from_slice(line_prefix);
+    out.extend_from_slice(b"--- ");
+    out.extend_from_slice(&quote_one(a_prefix, &c.path));
+    out.push(b'\n');
+
+    out.extend_from_slice(line_prefix);
+    if deleted {
+        out.extend_from_slice(b"+++ /dev/null");
+    } else {
+        out.extend_from_slice(b"+++ ");
+        out.extend_from_slice(&quote_one(b_prefix, &c.path));
+    }
+    out.push(b'\n');
+}
+
+/// The full `diff --cc` section for one combined path.
+fn render_combined_patch(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    c: &CombinedPath,
+    opts: &Opts,
+    workdir: &Path,
+) -> Result<()> {
+    const NUM_PARENT: usize = 2;
+
+    let full = workdir.join(gix::path::from_bstr(c.path.as_bstr()));
+    let (result, result_deleted) = match std::fs::read(&full) {
+        Ok(b) => (b, false),
+        Err(_) => (Vec::new(), true),
+    };
+
+    let parents: Vec<Vec<u8>> = c
+        .parents
+        .iter()
+        .map(|(id, m)| read_parent_blob(repo, id, *m))
+        .collect::<Result<_>>()?;
+
+    let is_binary = buffer_is_binary(&result) || parents.iter().any(|p| buffer_is_binary(p));
+    if is_binary {
+        show_combined_header(out, repo, c, opts, b"", false);
+        out.extend_from_slice(b"Binary files differ\n");
+        return Ok(());
+    }
+
+    // Split the result into lines; `len` excludes the newline, and a final line
+    // without one is still a line, mirroring show_patch_diff()'s sline setup.
+    let mut cnt = result.iter().filter(|&&b| b == b'\n').count();
+    if !result.is_empty() && *result.last().unwrap() != b'\n' {
+        cnt += 1;
+    }
+    let mut sline: Vec<Sline> = (0..cnt + 2)
+        .map(|_| Sline {
+            p_lno: vec![0; NUM_PARENT],
+            ..Sline::default()
+        })
+        .collect();
+    if cnt > 0 {
+        let mut lno = 0usize;
+        for (i, &b) in result.iter().enumerate() {
+            if b == b'\n' {
+                sline[lno].len = i - sline[lno].bol;
+                lno += 1;
+                if lno < cnt {
+                    sline[lno].bol = i + 1;
+                }
+            }
+        }
+        if *result.last().unwrap() != b'\n' {
+            sline[cnt - 1].len = result.len() - sline[cnt - 1].bol;
+        }
+    }
+
+    for n in 0..NUM_PARENT {
+        let mut reused = false;
+        for j in 0..n {
+            if c.parents[n].0 == c.parents[j].0 {
+                reuse_combine_diff(&mut sline, cnt, n, j);
+                reused = true;
+                break;
+            }
+        }
+        if !reused {
+            combine_diff_parent(&parents[n], &result, &mut sline, cnt, n, opts.ws);
+        }
+    }
+
+    // working_tree_file is always true for diff-files, so the header and body are
+    // shown regardless of make_hunks()'s verdict.
+    let _ = make_hunks(&mut sline, cnt, NUM_PARENT, opts.dense_combined, opts.ctx as usize);
+    show_combined_header(out, repo, c, opts, b"", true);
+    dump_sline(
+        out,
+        &sline,
+        cnt,
+        NUM_PARENT,
+        &result,
+        result_deleted,
+        opts.ctx as usize,
+        b"",
+    );
+    Ok(())
+}
+
+/// `show_raw_diff()`: the `::`-prefixed combined raw record, or the combined
+/// name / name-status line.
+fn render_combined_raw(out: &mut Vec<u8>, repo: &gix::Repository, c: &CombinedPath, opts: &Opts) {
+    let (sep, term): (u8, u8) = if opts.nul { (0, 0) } else { (b'\t', b'\n') };
+    let null = repo.object_hash().null();
+
+    out.extend_from_slice(&opts.line_prefix);
+    if opts.fmt & F_RAW != 0 {
+        for _ in &c.parents {
+            out.push(b':');
+        }
+        for (_, m) in &c.parents {
+            out.extend_from_slice(format!("{m:06o} ").as_bytes());
+        }
+        out.extend_from_slice(format!("{:06o}", c.wt_mode).as_bytes());
+        for (id, _) in &c.parents {
+            out.push(b' ');
+            out.extend_from_slice(combined_raw_hex(repo, id, opts).as_bytes());
+        }
+        out.push(b' ');
+        out.extend_from_slice(combined_raw_hex(repo, &null, opts).as_bytes());
+        out.push(b' ');
+    }
+    if opts.fmt & (F_RAW | F_NAME_STATUS) != 0 {
+        // Both parents are DIFF_STATUS_MODIFIED for diff-files.
+        for _ in &c.parents {
+            out.push(b'M');
+        }
+        out.push(sep);
+    }
+    if opts.nul {
+        out.extend_from_slice(c.path.as_ref());
+    } else {
+        out.extend_from_slice(&quoted_name(&c.path));
+    }
+    out.push(term);
+}
+
+/// `diff_aligned_abbrev()` for a combined raw id: `diff-files` sets `rev.abbrev`
+/// to 0, so the default is the full id; `--abbrev=<n>` shortens it.
+fn combined_raw_hex(repo: &gix::Repository, id: &ObjectId, opts: &Opts) -> String {
+    let hexsz = repo.object_hash().len_in_hex();
+    match opts.abbrev {
+        None => id.to_hex().to_string(),
+        Some(Some(n)) => id.to_hex_with_len(n.clamp(4, hexsz)).to_string(),
+        Some(None) => {
+            // Bare `--abbrev` follows core.abbrev / the unique prefix.
+            if id.is_null() {
+                let n = repo
+                    .config_snapshot()
+                    .integer("core.abbrev")
+                    .and_then(|v| usize::try_from(v).ok())
+                    .unwrap_or(7)
+                    .clamp(4, hexsz);
+                "0".repeat(n)
+            } else {
+                let uniq = id.attach(repo).shorten_or_id().hex_len();
+                let floor = repo
+                    .config_snapshot()
+                    .integer("core.abbrev")
+                    .and_then(|v| usize::try_from(v).ok())
+                    .unwrap_or(7);
+                id.to_hex_with_len(uniq.max(floor).clamp(4, hexsz)).to_string()
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

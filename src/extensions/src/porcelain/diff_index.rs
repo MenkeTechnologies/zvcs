@@ -457,10 +457,13 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let mut pickaxe_arg: Option<(u8, Vec<u8>)> = None;
     let mut ignore_arg: Option<Vec<u8>> = None;
     let mut pickaxe_regex = false;
-    // Positionals given before a `--` separator, in order. git's `setup_revisions`
-    // resolves each against the object database; the first that resolves is the
-    // tree-ish and the rest are extra revisions or pathspecs (see the scan below).
-    let mut positionals: Vec<String> = Vec::new();
+    // Positionals given before a `--` separator, paired with their argv index. git's
+    // `setup_revisions` resolves each against the object database; the first that
+    // resolves is the tree-ish and the rest are extra revisions or pathspecs (see the
+    // scan below). The index is kept so a deferred `--submodule=` parse error can fire
+    // at exactly its argv position relative to these, as git's single left-to-right
+    // pass does.
+    let mut positionals: Vec<(usize, String)> = Vec::new();
     let mut paths: Vec<BString> = Vec::new();
     let mut after_dashdash = false;
     // Whether a stat-family and/or a patch-family output format was requested. git's
@@ -476,6 +479,14 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let mut unsupported: Option<String> = None;
     // The first patch/stat rendering asked for, which this module cannot produce.
     let mut bad_format: Option<String> = None;
+    // The first `--submodule=<bad>` and its argv index. git rejects an unparseable
+    // submodule format with `error: failed to parse --submodule option parameter` and
+    // exit 129, but it does so at the option's position in its single left-to-right
+    // parse — so a bad revision that appears *earlier* in argv dies first with exit 128.
+    // Deferring the error (rather than returning the moment the flag is seen) is what
+    // lets `does-not-exist --submodule=-1 HEAD` reproduce git's 128 while
+    // `HEAD --submodule=-1 does-not-exist` still reproduces its 129.
+    let mut bad_submodule: Option<(usize, String)> = None;
 
     // git `die()`s on a bad dirstat parameter the moment it parses it, before it looks
     // at anything else on the command line, so each call site returns straight away.
@@ -489,6 +500,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
 
     let mut i = 0;
     while i < args.len() {
+        let cur = i;
         let a = args[i].as_str();
         i += 1;
         if after_dashdash {
@@ -578,12 +590,13 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 opts.abbrev = Some(Some(git_abbrev(&s["--abbrev=".len()..])));
             }
             s if s.starts_with("--submodule=") => {
-                // `parse_submodule_params()`: only these three spellings are valid,
-                // and git rejects anything else with an immediate usage error.
+                // `parse_submodule_params()`: only these three spellings are valid, and
+                // git rejects anything else (exit 129). The error is deferred with its
+                // argv index rather than raised now, so a bad revision earlier in argv
+                // still wins with git's 128, matching git's single left-to-right parse.
                 let val = &s["--submodule=".len()..];
                 if !matches!(val, "short" | "log" | "diff") {
-                    eprintln!("error: failed to parse --submodule option parameter: '{val}'");
-                    return Ok(ExitCode::from(129));
+                    bad_submodule.get_or_insert((cur, val.to_owned()));
                 }
             }
             s if s.len() > 2 && s.starts_with("-I") => {
@@ -609,7 +622,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                     }
                     unsupported.get_or_insert_with(|| s.to_owned());
                 } else {
-                    positionals.push(s.to_owned());
+                    positionals.push((cur, s.to_owned()));
                 }
             }
         }
@@ -664,7 +677,16 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let mut resolved: Option<ObjectId> = None;
     let mut pending = 0usize;
     let mut pathspec_mode = false;
-    for arg in &positionals {
+    for (idx, arg) in &positionals {
+        // git parses left to right: a `--submodule=<bad>` sitting *before* this
+        // positional would already have died with exit 129, so fire that deferred error
+        // now rather than resolving a positional git never reached.
+        if let Some((sub_idx, val)) = &bad_submodule {
+            if sub_idx < idx {
+                eprintln!("error: failed to parse --submodule option parameter: '{val}'");
+                return Ok(ExitCode::from(129));
+            }
+        }
         if pathspec_mode {
             if std::fs::symlink_metadata(arg).is_err() {
                 eprintln!("fatal: {arg}: no such path in the working tree.");
@@ -688,6 +710,12 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             pathspec_mode = true;
             paths.push(arg.as_str().into());
         }
+    }
+    // A `--submodule=<bad>` after every positional (or with no positional that failed
+    // first) is git's next parse error, ahead of the "exactly one revision" usage check.
+    if let Some((_, val)) = &bad_submodule {
+        eprintln!("error: failed to parse --submodule option parameter: '{val}'");
+        return Ok(ExitCode::from(129));
     }
     if pending != 1 {
         eprint!("{}", USAGE);

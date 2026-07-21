@@ -162,6 +162,7 @@ usage: git rebase [-i] [options] [--exec <cmd>] [--onto <newbase> | --keep-base]
                           automatically re-schedule any `exec` that fails
     --[no-]reapply-cherry-picks
                           apply all changes, even those already present upstream
+
 ";
 
 /// `options.flags`, mirroring the `REBASE_*` bits in `builtin/rebase.c`.

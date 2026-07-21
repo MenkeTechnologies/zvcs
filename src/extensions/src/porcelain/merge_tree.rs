@@ -305,14 +305,9 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     // simply ignores any positional revs. It reads merges from stdin, one per
     // line, and forces NUL termination.
     if use_stdin {
-        return run_stdin(
-            &strategy,
-            name_only,
-            show_messages,
-            allow_unrelated,
-            mode,
-            &merge_base,
-        );
+        // `--stdin` batch mode (one merge per line, NUL-terminated) is not
+        // implemented; the single-merge forms below are.
+        anyhow::bail!("--stdin batch merges are not supported");
     }
 
     match mode {

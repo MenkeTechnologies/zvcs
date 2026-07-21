@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use gix::bstr::ByteSlice;
 use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
 use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, InternedInput, UnifiedDiff};
-use gix::ext::ObjectIdExt;
+use gix::prelude::ObjectIdExt;
 use gix::hash::ObjectId;
 use gix::object::tree::diff::ChangeDetached;
 use gix::objs::tree::EntryKind;

@@ -43,6 +43,7 @@ use std::sync::atomic::AtomicBool;
 use gix::bstr::{BStr, BString};
 use gix::hash::ObjectId;
 use gix::index::entry::{Flags, Mode, Stat};
+use gix::bstr::ByteSlice;
 use gix::prelude::ObjectIdExt;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
@@ -639,8 +640,8 @@ fn write_tracking_config(repo: &gix::Repository, name: &str, info: &TrackInfo) -
     let path = repo.common_dir().join("config");
     let mut file =
         gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)?;
-    file.set_raw_value_by("branch", Some(name), "remote", info.remote.as_str())?;
-    file.set_raw_value_by("branch", Some(name), "merge", info.merge.as_str())?;
+    file.set_raw_value_by("branch", Some(gix::bstr::BStr::new(name)), "remote", info.remote.as_str())?;
+    file.set_raw_value_by("branch", Some(gix::bstr::BStr::new(name)), "merge", info.merge.as_str())?;
     let bytes = file.to_bstring();
     let tmp = path.with_extension("zvcs-tmp");
     std::fs::write(&tmp, &bytes)?;

@@ -1279,7 +1279,7 @@ fn render_all(
 /// The raw blob bytes on one side of a change; an absent side is the empty content.
 fn side_bytes(repo: &gix::Repository, side: Option<Side>) -> Result<Vec<u8>> {
     match side {
-        Some(s) => Ok(repo.find_object(s.id)?.data),
+        Some(s) => Ok(repo.find_object(s.id)?.detach().data),
         None => Ok(Vec::new()),
     }
 }

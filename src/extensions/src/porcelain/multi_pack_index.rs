@@ -52,25 +52,54 @@
 //! fewer than two packs — a batch needs two packs to collapse one into another.
 //! Only a MIDX naming two or more packs reaches the missing writer and bails.
 //!
+//! `write --stdin-packs` reads a set of `.idx` basenames from stdin (git's
+//! `read_packs_from_stdin` + `write_midx_file_only`) and indexes only the packs
+//! it names whose `.pack` sibling exists, ignoring any existing MIDX. The `.idx`
+//! list is fed straight to `write_from_index_paths`, so the artifact is
+//! byte-identical to a full `write` restricted to that pack set (and an empty
+//! resulting set reproduces `error: no pack files to index.` / exit 255).
+//!
+//! `write --refs-snapshot=<path>` (and its separate-argument form) is accepted
+//! and discarded: git only consults the snapshot when generating a multi-pack
+//! bitmap, so without `--bitmap` it never influences a single output byte — git
+//! does not even open the file.
+//!
+//! `write --preferred-pack=<name>` is honoured wherever it is observable without
+//! a bitmap, which is duplicate-object resolution. When the named pack is not
+//! among those being indexed, git warns `unknown preferred pack: '<name>'` and
+//! falls back to its default resolution (newest `.idx` mtime, then lowest pack
+//! index) — exactly what `write_from_index_paths` already does — so that path is
+//! reproduced warning-for-warning and byte-for-byte. A *known* preferred pack
+//! only changes the winner when an object id is shared across the indexed packs;
+//! that single case bails (see below).
+//!
+//! git's two `write` cross-flag validations run before any artifact is produced
+//! and are reproduced as usage errors (exit 129): `--no-write-chain-file`
+//! without `--incremental` (`cannot use --no-write-chain-file without
+//! --incremental`, checked first) and `--base` without `--no-write-chain-file`
+//! (`cannot use --base without --no-write-chain-file`). `--write-chain-file`
+//! without `--incremental` is a no-op that still writes a flat MIDX, and is
+//! accepted as such.
+//!
 //! Not covered — these `bail!` rather than producing a diverging artifact:
 //!
-//!   * `write --bitmap` / `--preferred-pack=` / `--refs-snapshot=` — the
-//!     vendored `gix-pack` has no multi-pack bitmap writer at all
-//!     (`src/ported/gix-pack/src/multi_index/` has `write.rs` and `verify.rs`
-//!     but no bitmap module), and `--preferred-pack` only has an observable
-//!     effect through bitmap generation and duplicate tie-breaking that the
-//!     writer does not expose.
-//!   * `write --incremental` / `--base=` / `--write-chain-file`, and the actual
-//!     collapsing step of `compact` once both endpoints resolve — these read and
-//!     write MIDX chain layers under `<objdir>/pack/multi-pack-index.d/`.
-//!     `gix_pack::multi_index::Version` has only `V1`, the writer always emits
-//!     zero base files, and the reader discards the base-file count outright
-//!     (`multi_index/init.rs:100`: `let (_num_base_files, data) = data.split_at(1);
-//!     // TODO: handle base files once it's clear what this does`), so a layer
-//!     cannot even be read back correctly, let alone merged.
-//!   * `write --stdin-packs` — the writer takes a path list, so this could be
-//!     fed, but git's cruft-pack handling for the stdin set is not modelled and
-//!     a wrong pack set is a silently wrong index.
+//!   * `write --bitmap` — the vendored `gix-pack` has no multi-pack bitmap
+//!     writer at all (`src/ported/gix-pack/src/multi_index/` has `write.rs` and
+//!     `verify.rs` but no bitmap module), so the emitted `.bitmap`/`.rev` could
+//!     not match git's.
+//!   * `write --preferred-pack=<name>` when the named pack is present *and* the
+//!     indexed packs share an object id — the only case the value changes the
+//!     MIDX bytes. `write_from_index_paths` takes only a path list and resolves
+//!     duplicates by mtime/index, with no hook for the preferred-pack tie-break.
+//!   * `write --incremental` (with or without `--base=` /
+//!     `--no-write-chain-file`), and the actual collapsing step of `compact`
+//!     once both endpoints resolve — these read and write MIDX chain layers
+//!     under `<objdir>/pack/multi-pack-index.d/`. `gix_pack::multi_index::Version`
+//!     has only `V1`, the writer always emits zero base files, and the reader
+//!     discards the base-file count outright (`multi_index/init.rs:100`:
+//!     `let (_num_base_files, data) = data.split_at(1); // TODO: handle base
+//!     files once it's clear what this does`), so a layer cannot even be read
+//!     back correctly, let alone merged.
 //!   * `repack`'s execution when a MIDX names two or more packs — this creates
 //!     new pack files from batched old ones and then rewrites the MIDX;
 //!     `gix-pack` has no pack-repacking driver. Its argument parsing and every
@@ -201,9 +230,11 @@ usage: git multi-pack-index [<options>] repack [--batch-size=<size>]
 ///     own progress goes to stderr and never to stdout)
 ///   * `-h` at the top level and on every sub-command
 ///
-/// The `write` flags that need a bitmap or chain writer, and a `repack` whose
-/// MIDX names two or more packs (its no-op states and argument parsing are
-/// otherwise reproduced), `bail!` — see the module docs for the specific missing
+/// `write` also honours `--stdin-packs`, `--preferred-pack=` and
+/// `--refs-snapshot=` (see the module docs), and reproduces git's two cross-flag
+/// usage errors. `write --bitmap` / `--incremental`, a `--preferred-pack` that
+/// would break a cross-pack duplicate tie, and a `repack` whose MIDX names two
+/// or more packs `bail!` — see the module docs for the specific missing
 /// substrate.
 pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
     // Dispatch includes the verb at index 0.
@@ -272,6 +303,15 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
 /// `write`: index every pack in the object directory into a fresh MIDX.
 fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     let mut after_dd = false;
+    // git's write option array is all last-wins booleans plus three string
+    // options; only the flags that reach the flat-write path or a validation
+    // `error()` need to be remembered.
+    let mut bitmap = false;
+    let mut incremental = false;
+    let mut no_chain = false;
+    let mut base = false;
+    let mut stdin_packs = false;
+    let mut preferred: Option<String> = None;
     let mut it = rest.iter().copied();
     while let Some(a) = it.next() {
         if after_dd {
@@ -298,27 +338,52 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
                 print!("{WRITE_USAGE}");
                 return Ok(ExitCode::from(129));
             }
-            // Already the defaults; accepting them changes nothing.
-            "--no-bitmap" | "--no-incremental" | "--no-stdin-packs" | "--no-write-chain-file"
-            | "--no-preferred-pack" | "--no-refs-snapshot" | "--no-base" => {}
-            "--bitmap" => bail!(
-                "unsupported flag \"--bitmap\" (ported: --object-dir, --progress) — gix-pack has no multi-pack bitmap writer"
-            ),
-            "--incremental" | "--write-chain-file" => bail!(
-                "unsupported flag {a:?} (ported: --object-dir, --progress) — gix-pack writes v1 MIDX only, with no chain support"
-            ),
-            "--stdin-packs" => bail!(
-                "unsupported flag \"--stdin-packs\" (ported: --object-dir, --progress) — git's cruft-pack rules for the stdin set are not modelled"
-            ),
-            _ if a.starts_with("--preferred-pack") => bail!(
-                "unsupported flag {a:?} (ported: --object-dir, --progress) — preferred-pack tie-breaking is not exposed by gix_pack::multi_index::write_from_index_paths"
-            ),
-            _ if a.starts_with("--refs-snapshot") => bail!(
-                "unsupported flag {a:?} (ported: --object-dir, --progress) — only meaningful with --bitmap, which is unported"
-            ),
-            _ if a.starts_with("--base") => bail!(
-                "unsupported flag {a:?} (ported: --object-dir, --progress) — requires incremental MIDX layers, which gix-pack cannot write"
-            ),
+            "--bitmap" => bitmap = true,
+            "--no-bitmap" => bitmap = false,
+            "--incremental" => incremental = true,
+            "--no-incremental" => incremental = false,
+            "--write-chain-file" => no_chain = false,
+            "--no-write-chain-file" => no_chain = true,
+            "--stdin-packs" => stdin_packs = true,
+            "--no-stdin-packs" => stdin_packs = false,
+            "--no-refs-snapshot" => {}
+            "--no-base" => base = false,
+            "--no-preferred-pack" => preferred = None,
+            // `--base`/`--refs-snapshot`/`--preferred-pack` are git `OPT_STRING`s:
+            // a `=<value>` inline form and a separate-argument form, the latter
+            // erroring `option `<name>' requires a value` (exit 129) when nothing
+            // follows.
+            "--base" => match it.next() {
+                Some(_) => base = true,
+                None => {
+                    return Ok(usage_error(
+                        Some("option `base' requires a value"),
+                        WRITE_USAGE,
+                    ))
+                }
+            },
+            _ if a.starts_with("--base=") => base = true,
+            "--refs-snapshot" => {
+                if it.next().is_none() {
+                    return Ok(usage_error(
+                        Some("option `refs-snapshot' requires a value"),
+                        WRITE_USAGE,
+                    ));
+                }
+            }
+            _ if a.starts_with("--refs-snapshot=") => {}
+            "--preferred-pack" => match it.next() {
+                Some(v) => preferred = Some(v.to_string()),
+                None => {
+                    return Ok(usage_error(
+                        Some("option `preferred-pack' requires a value"),
+                        WRITE_USAGE,
+                    ))
+                }
+            },
+            _ if a.starts_with("--preferred-pack=") => {
+                preferred = Some(a["--preferred-pack=".len()..].to_string())
+            }
             _ if a.starts_with("--") => {
                 return Ok(usage_error(
                     Some(&format!("unknown option `{}'", &a[2..])),
@@ -329,10 +394,73 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         }
     }
 
+    // `cmd_multi_pack_index_write` runs two `usage_with_options()` validations
+    // (exit 129) before it writes anything, in this order.
+    if no_chain && !incremental {
+        return Ok(usage_error(
+            Some("cannot use --no-write-chain-file without --incremental"),
+            WRITE_USAGE,
+        ));
+    }
+    if base && !no_chain {
+        return Ok(usage_error(
+            Some("cannot use --base without --no-write-chain-file"),
+            WRITE_USAGE,
+        ));
+    }
+
+    // `--bitmap` needs a multi-pack bitmap writer and `--incremental` needs a
+    // MIDX chain writer; gix-pack has neither, so these still bail honestly. A
+    // valid `--base` only ever reaches here alongside `--incremental` (it errors
+    // out above otherwise), so the incremental bail covers it.
+    if bitmap {
+        bail!(
+            "multi-pack-index write --bitmap is not portable here — gix-pack has no multi-pack bitmap writer, so the emitted .bitmap/.rev would not match git's"
+        );
+    }
+    if incremental {
+        bail!(
+            "multi-pack-index write --incremental is not portable here — gix-pack writes a single flat v1 MIDX with zero base files (multi_index/init.rs discards the base-file count), so a chain layer under multi-pack-index.d/ cannot be written"
+        );
+    }
+
     let (repo, pack_dir) = object_store(object_dir)?;
     reject_chain(&pack_dir)?;
 
-    if !write_midx(&pack_dir, repo.object_hash())? {
+    // The pack set: every pack in the object store, or — with `--stdin-packs` —
+    // only those whose `.idx` basename git read from stdin (existing MIDX
+    // ignored, matching `write_midx_file_only`).
+    let mut index_paths = pack_indices(&pack_dir);
+    if stdin_packs {
+        let wanted = read_stdin_pack_names();
+        index_paths.retain(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| wanted.contains(n))
+        });
+    }
+
+    // `--preferred-pack` only steers duplicate-object resolution and bitmap
+    // reuse. git warns and falls back to its default resolution when the named
+    // pack is not among those being indexed; that default is exactly the
+    // `write_from_index_paths` tie-break (newest `.idx` mtime, then lowest pack
+    // index), so an unknown preferred pack stays byte-identical. A *known*
+    // preferred pack changes the winner only when the same object id appears in
+    // more than one of the indexed packs — the one case gix-pack's writer cannot
+    // reproduce, so it bails there and nowhere else.
+    if let Some(name) = &preferred {
+        if preferred_pack_present(name, &index_paths) {
+            if has_cross_pack_duplicates(&index_paths, repo.object_hash())? {
+                bail!(
+                    "multi-pack-index write --preferred-pack={name} cannot be reproduced here — the indexed packs share at least one object id and gix_pack::multi_index::write_from_index_paths does not expose the preferred-pack tie-break git uses to resolve the duplicate"
+                );
+            }
+        } else {
+            eprintln!("warning: unknown preferred pack: '{name}'");
+        }
+    }
+
+    if !write_midx_from(&pack_dir, repo.object_hash(), index_paths)? {
         // `midx-write.c`: `error(_("no pack files to index."))`, and cmd_* hands
         // the -1 straight back to git, which exits 255.
         eprintln!("error: no pack files to index.");
@@ -341,13 +469,78 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Read the `--stdin-packs` name set from stdin: one `.idx` basename per line,
+/// with git's `strbuf_getline` newline handling (a trailing `\r` is stripped and
+/// a final line without a newline still counts). Names are matched verbatim
+/// against pack-directory basenames — no trimming, no path components.
+fn read_stdin_pack_names() -> std::collections::HashSet<String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf).ok();
+    let mut names = std::collections::HashSet::new();
+    let mut rest = buf.as_str();
+    while !rest.is_empty() {
+        let (line, tail) = match rest.split_once('\n') {
+            Some((l, t)) => (l, t),
+            None => (rest, ""),
+        };
+        names.insert(line.strip_suffix('\r').unwrap_or(line).to_string());
+        rest = tail;
+    }
+    names
+}
+
+/// Whether `name` (a `--preferred-pack` value) identifies one of the packs about
+/// to be indexed. git's `cmp_idx_or_pack_name` matches the stored `<base>.idx`
+/// name against the value's `.idx` *or* `.pack` form; a value with no such
+/// extension never matches.
+fn preferred_pack_present(name: &str, index_paths: &[PathBuf]) -> bool {
+    let base = match name
+        .strip_suffix(".idx")
+        .or_else(|| name.strip_suffix(".pack"))
+    {
+        Some(b) => b,
+        None => return false,
+    };
+    let idx = format!("{base}.idx");
+    index_paths
+        .iter()
+        .any(|p| p.file_name().and_then(|n| n.to_str()) == Some(idx.as_str()))
+}
+
+/// Whether any object id appears in more than one of `index_paths`. Every pack
+/// index lists unique ids, so a repeat across the set is a cross-pack duplicate —
+/// the only situation in which `--preferred-pack` changes the MIDX bytes.
+fn has_cross_pack_duplicates(index_paths: &[PathBuf], object_hash: gix::hash::Kind) -> Result<bool> {
+    let mut seen: std::collections::HashSet<gix::ObjectId> = std::collections::HashSet::new();
+    for path in index_paths {
+        let idx = gix::odb::pack::index::File::at(path, object_hash)?;
+        for entry in idx.iter() {
+            if !seen.insert(entry.oid) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Rewrite `<pack_dir>/multi-pack-index` from every pack currently present in
 /// `pack_dir`, returning `false` when there is nothing to index.
 ///
 /// git writes through `multi-pack-index.lock` and renames on success, so a
 /// failed write never replaces a good index; this does the same.
 fn write_midx(pack_dir: &Path, object_hash: gix::hash::Kind) -> Result<bool> {
-    let index_paths = pack_indices(pack_dir);
+    write_midx_from(pack_dir, object_hash, pack_indices(pack_dir))
+}
+
+/// Write `<pack_dir>/multi-pack-index` from an explicit index-path set (used by
+/// `--stdin-packs`, which indexes only the packs named on stdin); otherwise
+/// identical to [`write_midx`].
+fn write_midx_from(
+    pack_dir: &Path,
+    object_hash: gix::hash::Kind,
+    index_paths: Vec<PathBuf>,
+) -> Result<bool> {
     if index_paths.is_empty() {
         return Ok(false);
     }

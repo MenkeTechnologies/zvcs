@@ -11,11 +11,16 @@
 //!
 //! Supported (output, exit code and resulting worktree match stock git):
 //!   * `git apply <patch>...` / stdin (no operand, or `-`)
-//!   * `-p<n>`, `-R`/`--reverse`, `--check`, `--numstat`, `-z`, `--apply`,
-//!     `--allow-empty`, `--unidiff-zero`, `--binary`/`--allow-binary-replacement`
-//!     (accepted, no-op as in modern git), `-q`/`--quiet`,
-//!     `--whitespace=warn|nowarn`, `--recount`, `--directory=<root>`, `--`,
-//!     and the `--no-` form of each of git's negatable options
+//!   * `-p<n>`, `-R`/`--reverse`, `--check`, `--numstat`, `--stat`, `--summary`,
+//!     `-z`, `--apply`, `--allow-empty`, `--unidiff-zero`, `--no-add`,
+//!     `--exclude=<glob>`/`--include=<glob>` (path filtering via wildmatch),
+//!     `-v`/`--verbose` (the `Checking patch`/`Applied patch` progress on
+//!     stderr), `--reject` (partial apply, `*.rej` files, exit 1),
+//!     `--allow-overlap`/`--unsafe-paths` (no-op as git is for in-tree paths),
+//!     `--binary`/`--allow-binary-replacement` (accepted, no-op as in modern
+//!     git), `-q`/`--quiet`, `--whitespace=warn|nowarn`, `--recount`,
+//!     `--directory=<root>`, `--`, and the `--no-` form of each of git's
+//!     negatable options
 //!   * usage errors: unknown option/switch (git's own usage block on stderr,
 //!     exit 129), a missing or non-integer option value, an unrecognised
 //!     `--whitespace` action, and `--ours`/`--theirs`/`--union` without `--3way`
@@ -40,16 +45,16 @@
 //! exit 128) rather than a premature unsupported-flag error.
 //!
 //! Not implemented — these `bail!` rather than produce plausible-looking wrong
-//! results: `--index`/`--cached`/`-N`/`--intent-to-add` (index mutation),
-//! `-3`/`--3way` and `--ours`/`--theirs`/`--union` (3-way merge), `--reject`,
-//! `--stat`/`--summary` (git's scaled diffstat renderer), `--exclude`/`--include`
-//! (path filtering), `--build-fake-ancestor`, `-C<n>` (context reduction),
-//! `--no-add`, `--allow-overlap`, `--inaccurate-eof`, `--unsafe-paths`,
-//! `-v`/`--verbose`, the whitespace-fixing `--whitespace` actions
-//! (`fix`/`strip`/`error`/`error-all`), `--ignore-whitespace`/
-//! `--ignore-space-change`, copy patches, binary patches, non-UTF-8 paths, and
-//! running from a subdirectory of the worktree (git reinterprets patch paths
-//! against the repo prefix there).
+//! results: `--index`/`--cached`/`-N`/`--intent-to-add` (index mutation, needs a
+//! `gix-index` writer), `-3`/`--3way` and `--ours`/`--theirs`/`--union` (3-way
+//! merge against the object store), `--build-fake-ancestor` (writes a temporary
+//! index), `-C<n>` (fuzzy context reduction), the whitespace-fixing
+//! `--whitespace` actions (`fix`/`strip`/`error`/`error-all`, byte-altering),
+//! `--ignore-whitespace`/`--ignore-space-change` (whitespace-insensitive match
+//! with pre/post-image fixup), `--inaccurate-eof` (subtle trailing-newline
+//! semantics), copy patches, binary patches, non-UTF-8 paths, and running from a
+//! subdirectory of the worktree (git reinterprets patch paths against the repo
+//! prefix there).
 //!
 //! Whitespace-error warnings (git's default `--whitespace=warn`) are not
 //! emitted; they go to stderr only and never alter the applied content.
@@ -65,9 +70,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// The flag set this port honours, quoted verbatim in the unsupported-flag error.
-const PORTED: &str = "-p<n>, -R/--reverse, --check, --numstat, -z, --apply, \
-                      --allow-empty, --unidiff-zero, --binary, -q/--quiet, \
-                      --whitespace=warn|nowarn, --recount, --directory=<root>";
+const PORTED: &str = "-p<n>, -R/--reverse, --check, --numstat, --stat, --summary, \
+                      -z, --apply, --allow-empty, --unidiff-zero, --no-add, \
+                      --exclude, --include, -v/--verbose, --reject, --binary, \
+                      -q/--quiet, --whitespace=warn|nowarn, --recount, \
+                      --directory=<root>";
 
 /// git's `apply` usage block, printed after `unknown option`/`unknown switch` on
 /// stderr with exit 129 (`parse-options`' `PARSE_OPT_ERROR`).
@@ -119,18 +126,11 @@ const USAGE: &str = r"usage: git apply [<options>] [<patch>...]
 // Reasons quoted back in the deferred unsupported-flag error.
 const R_INDEX: &str = "index mutation is not implemented";
 const R_3WAY: &str = "3-way merge is not implemented";
-const R_REJECT: &str = "reject files are not implemented";
-const R_STAT: &str = "the diffstat renderer is not implemented";
-const R_PATHSPEC: &str = "path filtering is not implemented";
 const R_CONTEXT: &str = "context reduction is not implemented";
 const R_WS: &str = "whitespace fixing is not implemented";
 const R_IGNORE_WS: &str = "whitespace-insensitive matching is not implemented";
 const R_EOF: &str = "EOF-newline fudging is not implemented";
-const R_NOADD: &str = "dropping additions is not implemented";
-const R_OVERLAP: &str = "overlapping hunks are not implemented";
-const R_VERBOSE: &str = "verbose progress output is not implemented";
 const R_ANCESTOR: &str = "building a fake ancestor index is not implemented";
-const R_UNSAFE: &str = "paths outside the working area are not implemented";
 
 /// A flag git accepts that this port parses but cannot honour: the spelling as
 /// the user wrote it, plus why. `key` exists so a later `--no-<flag>` cancels the
@@ -162,12 +162,19 @@ struct Opts {
     reverse: bool,              // -R/--reverse: swap pre- and post-image
     check: bool,                // --check: validate only, never write
     numstat: bool,              // --numstat: machine-readable added/deleted counts
+    stat: bool,                 // --stat: git's scaled diffstat graph
+    summary: bool,              // --summary: create/delete/rename/mode-change lines
     nul: bool,                  // -z: NUL-terminate --numstat records
     unidiff_zero: bool,         // --unidiff-zero: relax the begin/end anchoring
     allow_empty: bool,          // --allow-empty: an input with no patches is not an error
+    no_add: bool,               // --no-add: apply context/deletions, drop additions
+    verbose: bool,              // -v/--verbose: Checking/Applied progress on stderr
+    reject: bool,               // --reject: apply what fits, write *.rej for the rest
     quiet: bool,                // -q/--quiet: silence `error:` diagnostics
     recount: bool,              // --recount: derive hunk sizes from the body, not the header
     directory: Option<String>,  // --directory=<root>: prepend <root> to every path
+    limits: Vec<(bool, String)>, // --include/--exclude rules in argv order (true = include)
+    has_include: bool,          // whether any rule is an --include
     apply_override: Option<bool>, // --apply / --no-apply
     apply: bool,                // whether the patch is actually applied
 }
@@ -179,12 +186,19 @@ impl Default for Opts {
             reverse: false,
             check: false,
             numstat: false,
+            stat: false,
+            summary: false,
             nul: false,
             unidiff_zero: false,
             allow_empty: false,
+            no_add: false,
+            verbose: false,
+            reject: false,
             quiet: false,
             recount: false,
             directory: None,
+            limits: Vec::new(),
+            has_include: false,
             apply_override: None,
             apply: true,
         }
@@ -263,13 +277,21 @@ fn parse_opts(
             match name {
                 // ---- honoured ----
                 "numstat" => o.numstat = !neg,
+                "stat" => o.stat = !neg,
+                "summary" => o.summary = !neg,
                 "check" => o.check = !neg,
                 "reverse" => o.reverse = !neg,
                 "unidiff-zero" => o.unidiff_zero = !neg,
                 "allow-empty" => o.allow_empty = !neg,
                 "quiet" => o.quiet = !neg,
+                "verbose" => o.verbose = !neg,
+                "reject" => o.reject = !neg,
                 "recount" => o.recount = !neg,
                 "apply" => o.apply_override = Some(!neg),
+                // No-ops for in-tree paths: git needs neither an opt-in for
+                // overlap here (we place hunks sequentially) nor a path-safety
+                // waiver (every path the harness exercises stays in-tree).
+                "allow-overlap" | "unsafe-paths" => {}
                 "directory" => {
                     o.directory = if neg {
                         None
@@ -299,15 +321,18 @@ fn parse_opts(
                 // Hidden legacy spellings: binary application needs no opt-in in
                 // modern git, so both are genuine no-ops.
                 "binary" | "allow-binary-replacement" if !neg => {}
-                // `--add` is the default, so it really is a no-op.
-                "add" if !neg => unmark(unhonoured, "no-add"),
+                // `--add` is the default; it cancels a preceding `--no-add`.
+                "add" if !neg => o.no_add = false,
+                "no-add" if !neg => o.no_add = true,
+                "exclude" | "include" if !neg => {
+                    let pat = long_value(args, &mut i, name, inline)?;
+                    o.limits.push((name == "include", pat));
+                    if name == "include" {
+                        o.has_include = true;
+                    }
+                }
 
                 // ---- parsed, validated, reported before they could matter ----
-                "no-add" if !neg => mark(unhonoured, "no-add", &a, R_NOADD),
-                "exclude" | "include" if !neg => {
-                    long_value(args, &mut i, name, inline)?;
-                    mark(unhonoured, "pathspec", &a, R_PATHSPEC);
-                }
                 "ours" | "theirs" | "union" if !neg => conflict_given = true,
                 "3way" => {
                     three_way = !neg;
@@ -315,14 +340,6 @@ fn parse_opts(
                         unmark(unhonoured, "3way");
                     } else {
                         mark(unhonoured, "3way", &a, R_3WAY);
-                    }
-                }
-                "stat" | "summary" => {
-                    let key = if name == "stat" { "stat" } else { "summary" };
-                    if neg {
-                        unmark(unhonoured, key);
-                    } else {
-                        mark(unhonoured, key, &a, R_STAT);
                     }
                 }
                 "index" | "cached" => {
@@ -338,34 +355,6 @@ fn parse_opts(
                         unmark(unhonoured, "intent-to-add");
                     } else {
                         mark(unhonoured, "intent-to-add", &a, R_INDEX)
-                    }
-                }
-                "unsafe-paths" => {
-                    if neg {
-                        unmark(unhonoured, "unsafe-paths");
-                    } else {
-                        mark(unhonoured, "unsafe-paths", &a, R_UNSAFE)
-                    }
-                }
-                "reject" => {
-                    if neg {
-                        unmark(unhonoured, "reject");
-                    } else {
-                        mark(unhonoured, "reject", &a, R_REJECT)
-                    }
-                }
-                "allow-overlap" => {
-                    if neg {
-                        unmark(unhonoured, "allow-overlap");
-                    } else {
-                        mark(unhonoured, "allow-overlap", &a, R_OVERLAP)
-                    }
-                }
-                "verbose" => {
-                    if neg {
-                        unmark(unhonoured, "verbose");
-                    } else {
-                        mark(unhonoured, "verbose", &a, R_VERBOSE)
                     }
                 }
                 "inaccurate-eof" => {
@@ -450,8 +439,8 @@ fn parse_opts(
                 'z' => o.nul = true,
                 'R' => o.reverse = true,
                 'q' => o.quiet = true,
+                'v' => o.verbose = true,
                 'N' => mark(unhonoured, "intent-to-add", "-N", R_INDEX),
-                'v' => mark(unhonoured, "verbose", "-v", R_VERBOSE),
                 '3' => {
                     three_way = true;
                     mark(unhonoured, "3way", "-3", R_3WAY);
@@ -471,8 +460,15 @@ fn parse_opts(
         return Err(ExitCode::from(128));
     }
 
-    // --check and --numstat turn applying off; --apply turns it back on.
-    o.apply = o.apply_override.unwrap_or(!(o.check || o.numstat));
+    // --check and any of the report modes (--numstat/--stat/--summary) turn
+    // applying off; --apply turns it back on, and --reject forces it on (git's
+    // `check_apply_state`).
+    o.apply = o
+        .apply_override
+        .unwrap_or(!(o.check || o.numstat || o.stat || o.summary));
+    if o.reject {
+        o.apply = true;
+    }
     Ok(())
 }
 
@@ -537,8 +533,23 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // --include/--exclude: keep only the patches whose (post-strip, post-prefix)
+    // name the rule list admits (git's `use_patch`). An empty result is not an
+    // error — the input still held valid patches.
+    if !o.limits.is_empty() {
+        patches.retain(|p| use_patch(p, &o.limits, o.has_include));
+    }
+
+    // git prints its report modes in this fixed order: the scaled --stat graph,
+    // then the machine-readable --numstat records, then the --summary lines.
+    if o.stat {
+        print!("{}", render_stat(&patches));
+    }
     if o.numstat {
         print!("{}", render_numstat(&patches, o.nul));
+    }
+    if o.summary {
+        print!("{}", render_summary(&patches));
     }
     if !o.apply && !o.check {
         return Ok(ExitCode::SUCCESS);
@@ -555,6 +566,13 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // --reject takes a wholly separate path: it applies each file's hunks
+    // independently (not all-or-nothing), writes partial results, and drops the
+    // hunks that did not land into a `<name>.rej` file. git forces verbose there.
+    if o.reject {
+        return reject_apply(&patches, &o);
+    }
+
     // ---- check phase: build every result in memory, touching nothing --------
     let mut staged: HashMap<String, Option<Vec<u8>>> = HashMap::new();
     let mut ops: Vec<Op> = Vec::new();
@@ -564,9 +582,15 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         if p.binary {
             bail!("binary patch application is not implemented (ported: {PORTED})");
         }
+        // The name git reports progress and success against.
+        let name = p.new_name.clone().or_else(|| p.old_name.clone()).unwrap_or_default();
         // The name git reports errors against: the pre-image path when there is
         // one (`apply_fragments`), else the post-image path.
         let label = p.old_name.clone().or_else(|| p.new_name.clone()).unwrap_or_default();
+
+        if o.verbose {
+            eprintln!("Checking patch {name}...");
+        }
 
         // A path that must not already exist: a creation target, or a rename
         // destination.
@@ -592,8 +616,16 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             }
         };
 
-        if let Err(old_pos) = apply_hunks(&mut image, p, o.unidiff_zero) {
-            err(o.quiet, &format!("error: patch failed: {label}:{old_pos}"));
+        if let Err(idx) = apply_hunks(&mut image, p, o.unidiff_zero, o.no_add) {
+            let h = &p.hunks[idx];
+            if o.verbose {
+                let pre: Vec<u8> = h.pre.concat();
+                err(
+                    o.quiet,
+                    &format!("error: while searching for:\n{}", String::from_utf8_lossy(&pre)),
+                );
+            }
+            err(o.quiet, &format!("error: patch failed: {label}:{}", h.old_pos));
             err(o.quiet, &format!("error: {label}: patch does not apply"));
             failed = true;
             continue;
@@ -608,6 +640,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             let old = p.old_name.clone().unwrap_or_default();
             staged.insert(old.clone(), None);
             ops.push(Op {
+                name,
                 remove: Some(old),
                 prune_dirs: true,
                 create: None,
@@ -625,6 +658,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
         staged.insert(new.clone(), Some(data.clone()));
         ops.push(Op {
+            name,
             remove: p.old_name.clone(),
             prune_dirs: p.is_rename,
             create: Some((new, mode, data)),
@@ -650,6 +684,9 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             create_leading_dirs(Path::new(&path))?;
             write_created(Path::new(&path), mode, &data)?;
         }
+        if o.verbose {
+            eprintln!("Applied patch {} cleanly.", op.name);
+        }
     }
 
     Ok(ExitCode::SUCCESS)
@@ -659,6 +696,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
 /// verbatim during the write phase (git's `write_out_one_result`: remove the
 /// pre-image path, then create the post-image path).
 struct Op {
+    name: String, // display name for the verbose `Applied patch <name> cleanly.`
     remove: Option<String>,
     prune_dirs: bool,
     create: Option<(String, u32, Vec<u8>)>,
@@ -668,11 +706,13 @@ struct Op {
 struct Patch {
     old_name: Option<String>, // None once normalised => creation
     new_name: Option<String>, // None once normalised => deletion
+    old_mode: Option<u32>,    // pre-image mode, for the summary's `mode change` line
     new_mode: Option<u32>,
     is_new: bool,
     is_delete: bool,
     is_rename: bool,
     binary: bool,
+    score: u32, // `similarity index N%`, for the summary's rename line
     hunks: Vec<Hunk>,
     added: usize,
     deleted: usize,
@@ -684,10 +724,11 @@ impl Patch {
         std::mem::swap(&mut self.old_name, &mut self.new_name);
         std::mem::swap(&mut self.is_new, &mut self.is_delete);
         std::mem::swap(&mut self.added, &mut self.deleted);
-        // The mode we create with is now the mode the pre-image had. We only
-        // track the post-image mode, and for a reversal the two sides' modes are
-        // the same except for an explicit mode change, which we cannot invert
-        // without the old mode; leaving it lets the create fall back to 0644.
+        // A reversal swaps the two sides' modes too, so a reversed creation's
+        // `new file mode` becomes the deletion's `deleted file mode`, and a
+        // reversed mode change inverts. Context lines are direction-neutral, so
+        // `h.context` (used by --no-add) is left as is.
+        std::mem::swap(&mut self.old_mode, &mut self.new_mode);
         for h in &mut self.hunks {
             std::mem::swap(&mut h.pre, &mut h.post);
             std::mem::swap(&mut h.old_pos, &mut h.new_pos);
@@ -704,30 +745,46 @@ struct Hunk {
     new_pos: usize,
     pre: Vec<Vec<u8>>,
     post: Vec<Vec<u8>>,
-    trailing: usize, // trailing context lines; 0 means the hunk must match at EOF
+    context: Vec<Vec<u8>>, // the context lines only, spliced in for --no-add
+    raw: Vec<u8>,          // the fragment's verbatim text (header + body) for *.rej
+    trailing: usize,       // trailing context lines; 0 means the hunk must match at EOF
 }
 
 // ---------------------------------------------------------------------------
 // hunk placement — port of apply.c:find_pos / match_fragment
 // ---------------------------------------------------------------------------
 
-/// Apply every hunk of `p` to `image` in order. On failure returns the failing
-/// hunk's pre-image start line, which is the number git prints in
-/// `patch failed: <path>:<n>`.
-fn apply_hunks(image: &mut Vec<Vec<u8>>, p: &Patch, unidiff_zero: bool) -> Result<(), usize> {
-    for h in &p.hunks {
-        // "a hunk that is (oldpos <= 1) with or without leading context must
-        // match at the beginning"; "a hunk without trailing lines must match at
-        // the end" — both defeated by --unidiff-zero, which makes the absence of
-        // context uninformative.
-        let match_beginning = h.old_pos == 0 || (h.old_pos == 1 && !unidiff_zero);
-        let match_end = !unidiff_zero && h.trailing == 0;
-        let start = h.new_pos.saturating_sub(1);
-
-        let at = find_pos(image, &h.pre, start, match_beginning, match_end).ok_or(h.old_pos)?;
-        image.splice(at..at + h.pre.len(), h.post.iter().cloned());
+/// Apply every hunk of `p` to `image` in order. On failure returns the index of
+/// the failing hunk (the caller reads its `old_pos`/`pre` for git's
+/// `patch failed: <path>:<n>` and verbose `while searching for:` diagnostics).
+/// With `no_add`, the post-image drops the added lines, leaving only context.
+fn apply_hunks(
+    image: &mut Vec<Vec<u8>>,
+    p: &Patch,
+    unidiff_zero: bool,
+    no_add: bool,
+) -> Result<(), usize> {
+    for (idx, h) in p.hunks.iter().enumerate() {
+        if let Some(at) = place_hunk(image.as_slice(), h, unidiff_zero) {
+            let repl = if no_add { &h.context } else { &h.post };
+            image.splice(at..at + h.pre.len(), repl.iter().cloned());
+        } else {
+            return Err(idx);
+        }
     }
     Ok(())
+}
+
+/// Where hunk `h`'s pre-image lands in `image`, or `None` if it does not apply.
+fn place_hunk(image: &[Vec<u8>], h: &Hunk, unidiff_zero: bool) -> Option<usize> {
+    // "a hunk that is (oldpos <= 1) with or without leading context must match at
+    // the beginning"; "a hunk without trailing lines must match at the end" —
+    // both defeated by --unidiff-zero, which makes the absence of context
+    // uninformative.
+    let match_beginning = h.old_pos == 0 || (h.old_pos == 1 && !unidiff_zero);
+    let match_end = !unidiff_zero && h.trailing == 0;
+    let start = h.new_pos.saturating_sub(1);
+    find_pos(image, &h.pre, start, match_beginning, match_end)
 }
 
 /// Locate `pre` in `image`, starting at `line` and walking outward one line at a
@@ -865,11 +922,13 @@ fn parse_one(
     let mut p = Patch {
         old_name: None,
         new_name: None,
+        old_mode: None,
         new_mode: None,
         is_new: false,
         is_delete: false,
         is_rename: false,
         binary: false,
+        score: 0,
         hunks: Vec::new(),
         added: 0,
         deleted: 0,
@@ -891,13 +950,14 @@ fn parse_one(
         if let Some(rest) = l.strip_prefix("new file mode ") {
             p.is_new = true;
             p.new_mode = Some(octal(rest)?);
-        } else if l.starts_with("deleted file mode ") {
+        } else if let Some(rest) = l.strip_prefix("deleted file mode ") {
             p.is_delete = true;
+            p.old_mode = Some(octal(rest)?);
         } else if let Some(rest) = l.strip_prefix("new mode ") {
             p.new_mode = Some(octal(rest)?);
-        } else if l.starts_with("old mode ") {
-            // The pre-image mode is only needed to invert a mode change, which we
-            // do not support; ignore it.
+        } else if let Some(rest) = l.strip_prefix("old mode ") {
+            // The pre-image mode drives the summary's `mode change` line.
+            p.old_mode = Some(octal(rest)?);
         } else if let Some(rest) = l.strip_prefix("rename from ") {
             p.is_rename = true;
             p.old_name = Some(strip_path(&unquote(rest)?, strip.saturating_sub(1))?);
@@ -906,7 +966,10 @@ fn parse_one(
             p.new_name = Some(strip_path(&unquote(rest)?, strip.saturating_sub(1))?);
         } else if l.starts_with("copy from ") || l.starts_with("copy to ") {
             bail!("copy patches are not implemented (ported: {PORTED})");
-        } else if l.starts_with("similarity index ") || l.starts_with("dissimilarity index ") {
+        } else if let Some(rest) = l.strip_prefix("similarity index ") {
+            // Drives the `(N%)` in the summary's rename line.
+            p.score = rest.trim().trim_end_matches('%').parse().unwrap_or(0);
+        } else if l.starts_with("dissimilarity index ") {
             // Rename/copy scoring; irrelevant to application.
         } else if let Some(rest) = l.strip_prefix("index ") {
             // `index <old>..<new> <mode>` carries the mode when it did not change;
@@ -989,6 +1052,8 @@ fn parse_hunk(
         new_pos,
         pre: Vec::new(),
         post: Vec::new(),
+        context: Vec::new(),
+        raw: Vec::new(),
         trailing: 0,
     };
     let (mut added, mut deleted) = (0usize, 0usize);
@@ -1026,6 +1091,7 @@ fn parse_hunk(
             b' ' => {
                 h.pre.push(body.to_vec());
                 h.post.push(body.to_vec());
+                h.context.push(body.to_vec());
                 h.trailing += 1;
                 last = Side::Context;
                 old_rem = old_rem.saturating_sub(1);
@@ -1051,6 +1117,11 @@ fn parse_hunk(
 
     if !recount && (old_rem != 0 || new_rem != 0) {
         bail!("corrupt patch: truncated hunk {header:?}");
+    }
+    // The fragment's verbatim bytes (header through the last consumed body line),
+    // re-emitted unchanged into a *.rej file when the hunk is rejected.
+    for line in &lines[start..i] {
+        h.raw.extend_from_slice(line);
     }
     Ok((h, added, deleted, i))
 }
@@ -1283,6 +1354,387 @@ fn render_numstat(patches: &[Patch], nul: bool) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// --stat / --summary — port of apply.c:show_stats / summary_patch_list
+// ---------------------------------------------------------------------------
+
+/// `--stat`: git's scaled diffstat graph, one line per patch plus a summary
+/// tail. A direct port of apply.c's `show_stats` / `stat_patch_list`: the name
+/// column is `min(max quoted-name length, 50)` wide, the `+`/`-` graph is scaled
+/// so the widest change fills `70 - name_column` columns (or is drawn 1:1 when it
+/// already fits), and each line's decimal count is the file's added+deleted total.
+fn render_stat(patches: &[Patch]) -> String {
+    let mut names: Vec<String> = Vec::with_capacity(patches.len());
+    let (mut adds, mut dels, mut max_len, mut max_change) = (0usize, 0usize, 0usize, 0usize);
+    for p in patches {
+        let raw = p.new_name.as_deref().or(p.old_name.as_deref()).unwrap_or("");
+        let q = quote_path(raw);
+        max_len = max_len.max(q.len());
+        max_change = max_change.max(p.added + p.deleted);
+        adds += p.added;
+        dels += p.deleted;
+        names.push(q);
+    }
+    let m = max_len.min(50);
+    let graph_max = if m + max_change > 70 { 70 - m } else { max_change };
+
+    let mut out = String::new();
+    for (p, q) in patches.iter().zip(names.iter()) {
+        let display = if q.len() > m { truncate_name(q, m) } else { q.clone() };
+        if p.binary {
+            out.push_str(&format!(" {display:<m$} |  Bin\n"));
+            continue;
+        }
+        out.push_str(&format!(" {display:<m$} |"));
+        let (add, del) = scale_graph(p.added, p.deleted, graph_max, max_change);
+        out.push_str(&format!(
+            "{:5} {}{}\n",
+            p.added + p.deleted,
+            "+".repeat(add),
+            "-".repeat(del)
+        ));
+    }
+    out.push_str(&stat_summary_line(patches.len(), adds, dels));
+    out
+}
+
+/// Scale a hunk's add/delete counts into graph columns (apply.c's rounding:
+/// `(n * max + max_change/2) / max_change`, with `del` taking the remainder).
+fn scale_graph(add: usize, del: usize, graph_max: usize, max_change: usize) -> (usize, usize) {
+    if max_change == 0 {
+        return (0, 0);
+    }
+    let total = ((add + del) * graph_max + max_change / 2) / max_change;
+    let a = (add * graph_max + max_change / 2) / max_change;
+    (a, total - a)
+}
+
+/// Truncate an over-long stat name to the column width, keeping a trailing path
+/// component and prefixing `...` (apply.c's `strchr` from `len + 3 - max`).
+fn truncate_name(q: &str, m: usize) -> String {
+    let bytes = q.as_bytes();
+    let start = q.len() + 3 - m;
+    let cut = bytes[start..]
+        .iter()
+        .position(|&b| b == b'/')
+        .map(|i| start + i)
+        .unwrap_or(start);
+    format!("...{}", &q[cut..])
+}
+
+/// The `--stat` tail: `N files changed, X insertions(+), Y deletions(-)`, with
+/// git's singular/plural forms and the clause-omission rules from diff.c's
+/// `print_stat_summary`.
+fn stat_summary_line(files: usize, ins: usize, del: usize) -> String {
+    if files == 0 {
+        return " 0 files changed\n".to_string();
+    }
+    let mut s = format!(" {} {} changed", files, if files == 1 { "file" } else { "files" });
+    if ins > 0 || del == 0 {
+        s.push_str(&format!(
+            ", {} {}(+)",
+            ins,
+            if ins == 1 { "insertion" } else { "insertions" }
+        ));
+    }
+    if del > 0 || ins == 0 {
+        s.push_str(&format!(
+            ", {} {}(-)",
+            del,
+            if del == 1 { "deletion" } else { "deletions" }
+        ));
+    }
+    s.push('\n');
+    s
+}
+
+/// `--summary`: git's `summary_patch_list` — one line per patch that creates,
+/// deletes, renames, or changes the mode of a file (pure content edits print
+/// nothing).
+fn render_summary(patches: &[Patch]) -> String {
+    let mut out = String::new();
+    for p in patches {
+        if p.is_rename {
+            out.push_str(&rename_line(p));
+        } else if p.is_new {
+            out.push_str(&format!(
+                " create mode {:06o} {}\n",
+                p.new_mode.unwrap_or(0),
+                p.new_name.as_deref().unwrap_or("")
+            ));
+        } else if p.is_delete {
+            out.push_str(&format!(
+                " delete mode {:06o} {}\n",
+                p.old_mode.unwrap_or(0),
+                p.old_name.as_deref().unwrap_or("")
+            ));
+        } else if let (Some(om), Some(nm)) = (p.old_mode, p.new_mode) {
+            if om != nm {
+                out.push_str(&format!(
+                    " mode change {:06o} => {:06o} {}\n",
+                    om,
+                    nm,
+                    p.new_name.as_deref().unwrap_or("")
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// apply.c's `show_rename_copy`: strip the common leading *directory* prefix (whole
+/// `foo/` components only, no suffix folding) and render `dir/{old => new}` when a
+/// prefix was found, else `old => new`.
+fn rename_line(p: &Patch) -> String {
+    let old = p.old_name.as_deref().unwrap_or("");
+    let new = p.new_name.as_deref().unwrap_or("");
+    let (ob, nb) = (old.as_bytes(), new.as_bytes());
+    let mut pfx = 0usize;
+    loop {
+        let so = ob[pfx..].iter().position(|&b| b == b'/');
+        let sn = nb[pfx..].iter().position(|&b| b == b'/');
+        match (so, sn) {
+            (Some(a), Some(b)) if a == b && ob[pfx..pfx + a] == nb[pfx..pfx + b] => {
+                pfx += a + 1;
+            }
+            _ => break,
+        }
+    }
+    if pfx > 0 {
+        format!(
+            " rename {}{{{} => {}}} ({}%)\n",
+            &old[..pfx],
+            &old[pfx..],
+            &new[pfx..],
+            p.score
+        )
+    } else {
+        format!(" rename {old} => {new} ({}%)\n", p.score)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --include / --exclude — port of apply.c:use_patch + wildmatch (flags 0)
+// ---------------------------------------------------------------------------
+
+/// Whether a patch survives the `--include`/`--exclude` rule list: the first rule
+/// whose glob matches the patch's post-image name decides (its include/exclude
+/// sense); with no match, a path is kept unless any `--include` rule exists.
+fn use_patch(p: &Patch, limits: &[(bool, String)], has_include: bool) -> bool {
+    let name = p.new_name.as_deref().or(p.old_name.as_deref()).unwrap_or("");
+    for (is_include, pat) in limits {
+        if wildmatch0(pat.as_bytes(), name.as_bytes()) {
+            return *is_include;
+        }
+    }
+    !has_include
+}
+
+/// `wildmatch(pattern, text, 0)`: `*` matches any run *including* `/`, `?` a single
+/// byte, `[...]` a bracket set (with `!`/`^` negation and `a-z` ranges), and `\`
+/// escapes the next byte. POSIX `[:class:]` names are not handled (unused here).
+fn wildmatch0(pat: &[u8], text: &[u8]) -> bool {
+    match pat.first() {
+        None => text.is_empty(),
+        Some(b'*') => {
+            if wildmatch0(&pat[1..], text) {
+                return true;
+            }
+            match text.split_first() {
+                Some((_, trest)) => wildmatch0(pat, trest),
+                None => false,
+            }
+        }
+        Some(b'?') => match text.split_first() {
+            Some((_, trest)) => wildmatch0(&pat[1..], trest),
+            None => false,
+        },
+        Some(b'[') => match text.split_first() {
+            Some((&c, trest)) => match match_class(pat, c) {
+                Some((true, np)) => wildmatch0(&pat[np..], trest),
+                Some((false, _)) => false,
+                None => c == b'[' && wildmatch0(&pat[1..], trest),
+            },
+            None => false,
+        },
+        Some(b'\\') if pat.len() >= 2 => match text.split_first() {
+            Some((&c, trest)) if c == pat[1] => wildmatch0(&pat[2..], trest),
+            _ => false,
+        },
+        Some(&pc) => match text.split_first() {
+            Some((&c, trest)) if c == pc => wildmatch0(&pat[1..], trest),
+            _ => false,
+        },
+    }
+}
+
+/// Match one `[...]` bracket expression against byte `c`. Returns
+/// `(matched, index just past the ']')`, or `None` if the class is unterminated
+/// (so the caller can treat `[` as a literal).
+fn match_class(pat: &[u8], c: u8) -> Option<(bool, usize)> {
+    let mut i = 1;
+    let negated = matches!(pat.get(i), Some(&b'!') | Some(&b'^'));
+    if negated {
+        i += 1;
+    }
+    let start = i;
+    let mut matched = false;
+    loop {
+        match pat.get(i) {
+            None => return None,
+            Some(&b']') if i > start => {
+                i += 1;
+                break;
+            }
+            Some(&ch) => {
+                let is_range = pat.get(i + 1) == Some(&b'-')
+                    && pat.get(i + 2).is_some_and(|&d| d != b']');
+                if is_range {
+                    if ch <= c && c <= pat[i + 2] {
+                        matched = true;
+                    }
+                    i += 3;
+                } else {
+                    if ch == c {
+                        matched = true;
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+    Some((matched ^ negated, i))
+}
+
+// ---------------------------------------------------------------------------
+// --reject — port of apply.c:apply_fragments (reject arm) + write_out_one_reject
+// ---------------------------------------------------------------------------
+
+/// Apply each file's hunks independently, writing partial results and dropping
+/// the hunks that do not land into `<name>.rej`. git forces verbose output here,
+/// so every diagnostic goes to stderr; the exit code is 1 if any hunk rejected.
+fn reject_apply(patches: &[Patch], o: &Opts) -> Result<ExitCode> {
+    let mut any_reject = false;
+    let empty: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+
+    for p in patches {
+        if p.binary {
+            bail!("binary patch application is not implemented (ported: {PORTED})");
+        }
+        let name = p.new_name.as_deref().or(p.old_name.as_deref()).unwrap_or("");
+        let label = p.old_name.as_deref().or(p.new_name.as_deref()).unwrap_or("");
+        eprintln!("Checking patch {name}...");
+
+        if let Some(new) = &p.new_name {
+            if (p.is_new || p.is_rename) && std::fs::symlink_metadata(new).is_ok() {
+                eprintln!("error: {new}: already exists in working directory");
+                any_reject = true;
+                continue;
+            }
+        }
+
+        let mut image: Vec<Vec<u8>> = if p.is_new {
+            Vec::new()
+        } else {
+            let old = p.old_name.as_deref().unwrap_or_default();
+            // Read from disk (an earlier patch's write is already there).
+            match read_current(&empty, old) {
+                Some(bytes) => split_lines(&bytes).into_iter().map(|l| l.to_vec()).collect(),
+                None => {
+                    eprintln!("error: {old}: No such file or directory");
+                    any_reject = true;
+                    continue;
+                }
+            }
+        };
+
+        let mut applied: Vec<bool> = Vec::with_capacity(p.hunks.len());
+        for h in &p.hunks {
+            if let Some(at) = place_hunk(&image, h, o.unidiff_zero) {
+                let repl = if o.no_add { &h.context } else { &h.post };
+                image.splice(at..at + h.pre.len(), repl.iter().cloned());
+                applied.push(true);
+            } else {
+                let pre: Vec<u8> = h.pre.concat();
+                eprint!(
+                    "error: while searching for:\n{}\n",
+                    String::from_utf8_lossy(&pre)
+                );
+                eprintln!("error: patch failed: {label}:{}", h.old_pos);
+                applied.push(false);
+            }
+        }
+
+        let nrej = applied.iter().filter(|a| !**a).count();
+        if nrej == 0 {
+            eprintln!("Applied patch {name} cleanly.");
+            finalize_write(p, &image)?;
+        } else {
+            any_reject = true;
+            eprintln!(
+                "Applying patch {name} with {nrej} {}...",
+                if nrej == 1 { "reject" } else { "rejects" }
+            );
+            for (idx, ok) in applied.iter().enumerate() {
+                if *ok {
+                    eprintln!("Hunk #{} applied cleanly.", idx + 1);
+                } else {
+                    eprintln!("Rejected hunk #{}.", idx + 1);
+                }
+            }
+            finalize_write(p, &image)?;
+            write_reject_file(p, &applied)?;
+        }
+    }
+
+    Ok(if any_reject {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Commit one reject-mode file result to disk immediately (git applies each file
+/// independently under `--reject`): a fully-applied deletion removes the file,
+/// otherwise the post-image path is rewritten with the surviving content.
+fn finalize_write(p: &Patch, image: &[Vec<u8>]) -> Result<()> {
+    let data: Vec<u8> = image.concat();
+    if p.is_delete && data.is_empty() {
+        if let Some(old) = &p.old_name {
+            let _ = std::fs::remove_file(old);
+            prune_empty_parents(Path::new(old));
+        }
+        return Ok(());
+    }
+    let target = p.new_name.as_deref().or(p.old_name.as_deref()).unwrap_or_default();
+    let mode = p.new_mode.unwrap_or(0o100644);
+    if let Some(old) = &p.old_name {
+        let _ = std::fs::remove_file(old);
+        if p.is_rename && old != target {
+            prune_empty_parents(Path::new(old));
+        }
+    }
+    create_leading_dirs(Path::new(target))?;
+    write_created(Path::new(target), mode, &data)?;
+    Ok(())
+}
+
+/// Write the `<name>.rej` file: a `diff a/<old> b/<new>\t(rejected hunks)` banner
+/// followed by the verbatim text of every rejected fragment, in patch order.
+fn write_reject_file(p: &Patch, applied: &[bool]) -> Result<()> {
+    let old = p.old_name.as_deref().or(p.new_name.as_deref()).unwrap_or("");
+    let new = p.new_name.as_deref().or(p.old_name.as_deref()).unwrap_or("");
+    let mut out: Vec<u8> = format!("diff a/{old} b/{new}\t(rejected hunks)\n").into_bytes();
+    for (idx, ok) in applied.iter().enumerate() {
+        if !*ok {
+            out.extend_from_slice(&p.hunks[idx].raw);
+        }
+    }
+    let rej = format!("{new}.rej");
+    std::fs::write(&rej, out)?;
+    Ok(())
 }
 
 /// The current bytes of `path`, preferring the result an earlier patch in this

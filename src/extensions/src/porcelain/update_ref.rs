@@ -4,21 +4,30 @@
 //! `-d <ref> [<old-oid>]`) with `-m`, `--no-deref`/`--deref` and
 //! `--create-reflog`, plus `--stdin` (and `--stdin -z`) with the `update`,
 //! `create`, `delete`, `verify`, `symref-update`, `symref-create`,
-//! `symref-delete`, `symref-verify`, `option no-deref`, `start`, `commit` and
-//! `abort` commands. A batch without `--batch-updates` is applied through a
-//! single gitoxide ref transaction, so it is all-or-nothing exactly like stock
-//! git. Stock git prints nothing on success; so does this, and exit codes match
-//! (0 on success, 128 on a fatal failure, 129 on a usage error, 1 for a failed
-//! `-d`).
+//! `symref-delete`, `symref-verify`, `option no-deref`, and the transaction
+//! controls `start`, `prepare`, `commit` and `abort`. A batch without
+//! `--batch-updates` is applied through a single gitoxide ref transaction, so it
+//! is all-or-nothing exactly like stock git. Ref edits print nothing on success;
+//! the explicit transaction controls each print `<command>: ok` to stdout, as
+//! stock git does. Exit codes match (0 on success, 128 on a fatal failure, 129
+//! on a usage error, 1 for a failed `-d`).
+//!
+//! The `--stdin` transaction state machine mirrors git's: an implicit
+//! transaction auto-commits at end of input, while an explicit `start` (or a
+//! `prepare` left uncommitted) auto-aborts. A `prepare`d transaction accepts
+//! only `commit`/`abort` ("prepared transactions can only be closed"), a closed
+//! one accepts only `start` ("transaction is closed"), and `start` cannot
+//! restart an already-started transaction ("cannot restart ongoing
+//! transaction"). `prepare` validates the staged edits by acquiring the same
+//! locks git would and rolling them back, so a doomed batch fails at `prepare`
+//! just as it does under git.
 //!
 //! `--batch-updates` is accepted: outside `--stdin` it is the fatal error git
 //! reports, and with `--stdin` each staged edit is applied on its own so one
 //! rejection no longer aborts the rest.
 //!
-//! Not covered, and rejected with an error rather than approximated: the
-//! `--stdin` `prepare` command (needs ref locks held across commands).
-//! One-level lowercase ref names such as `foo` are rejected by `gix-validate`,
-//! where stock git would write `.git/foo`.
+//! Not covered: one-level lowercase ref names such as `foo` are rejected by
+//! `gix-validate`, where stock git would write `.git/foo`.
 
 use anyhow::{anyhow, bail, Result};
 use std::io::Read;
@@ -411,6 +420,72 @@ impl Batch {
     }
 }
 
+/// The `--stdin` transaction state, mirroring git's `enum update_refs_state`.
+#[derive(Clone, Copy, PartialEq)]
+enum TxnState {
+    /// The implicit transaction that exists before any explicit `start`.
+    /// Auto-commits at end of input.
+    Open,
+    /// An explicit `start` opened a transaction. Auto-aborts at end of input.
+    Started,
+    /// `prepare` succeeded; only `commit`/`abort` may follow. Auto-aborts at EOF.
+    Prepared,
+    /// `commit`/`abort` closed the transaction; only `start` may follow.
+    Closed,
+}
+
+/// git recognises the command name first (so an unknown command outranks the
+/// state guard), then classifies it to drive the state machine.
+#[derive(Clone, Copy, PartialEq)]
+enum Cat {
+    /// A ref edit or `option`: allowed only while the transaction is open.
+    Edit,
+    Start,
+    Prepare,
+    Commit,
+    Abort,
+}
+
+/// Classify one `--stdin` command, or `None` if git would `die("unknown command")`.
+fn categorize(cmd: &str) -> Option<Cat> {
+    Some(match cmd {
+        "update" | "create" | "delete" | "verify" | "symref-update" | "symref-create"
+        | "symref-delete" | "symref-verify" | "option" => Cat::Edit,
+        "start" => Cat::Start,
+        "prepare" => Cat::Prepare,
+        "commit" => Cat::Commit,
+        "abort" => Cat::Abort,
+        _ => return None,
+    })
+}
+
+/// git's `prepare`: acquire the locks the staged batch needs and validate its
+/// preconditions, then roll everything back. gitoxide's prepared transaction is
+/// perfectly rolled back when dropped, so this catches a doomed batch at
+/// `prepare` time exactly like stock git, without writing anything.
+fn validate_prepare(repo: &gix::Repository, batch: &Batch) -> Result<()> {
+    for name in &batch.absent {
+        refname(name)?;
+        if repo.try_find_reference(name.as_str())?.is_some() {
+            bail!("cannot lock ref '{name}': reference already exists");
+        }
+    }
+    if batch.edits.is_empty() {
+        return Ok(());
+    }
+    let prepared = repo
+        .refs
+        .transaction()
+        .prepare(
+            batch.edits.clone(),
+            gix::lock::acquire::Fail::Immediately,
+            gix::lock::acquire::Fail::Immediately,
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+    drop(prepared); // rolls the acquired locks back, writing nothing.
+    Ok(())
+}
+
 /// Read `--stdin` instructions, then apply them as one atomic transaction.
 fn run_stdin(
     repo: &gix::Repository,
@@ -428,8 +503,8 @@ fn run_stdin(
     let mut batch = Batch::default();
     // `option no-deref` applies to the next command naming a ref, and only that one.
     let mut next_no_deref = false;
-    // Whether an explicit `start` opened a transaction that has not been committed.
-    let mut open_txn = false;
+    // The transaction state machine; starts in the implicit open transaction.
+    let mut state = TxnState::Open;
 
     let records = if nul {
         split_nul_records(&input)?
@@ -442,30 +517,64 @@ fn run_stdin(
             continue;
         };
         let args = &fields[1..];
+
+        // git recognises the command before consulting the state machine, so an
+        // unknown command is reported even from a closed/prepared transaction.
+        let Some(cat) = categorize(cmd) else {
+            return fatal(anyhow!("unknown command: {}", fields.join(" ")));
+        };
+        // The transaction controls take no arguments; git treats `commit foo` as
+        // an unknown command rather than silently committing.
+        if cat != Cat::Edit && !args.is_empty() {
+            return fatal(anyhow!("unknown command: {}", fields.join(" ")));
+        }
+
+        // State guard, matching git's per-state restrictions. Each violation is a
+        // fatal error exiting 128.
+        match state {
+            TxnState::Started if cat == Cat::Start => {
+                eprintln!("fatal: cannot restart ongoing transaction");
+                return Ok(ExitCode::from(128));
+            }
+            TxnState::Prepared if !matches!(cat, Cat::Commit | Cat::Abort) => {
+                eprintln!("fatal: prepared transactions can only be closed");
+                return Ok(ExitCode::from(128));
+            }
+            TxnState::Closed if cat != Cat::Start => {
+                eprintln!("fatal: transaction is closed");
+                return Ok(ExitCode::from(128));
+            }
+            _ => {}
+        }
+
         let edit_deref = deref && !next_no_deref;
         let mut consumed_option = false;
 
         match cmd {
             "start" => {
-                if open_txn {
-                    return fatal(anyhow!("transaction already started"));
+                println!("start: ok");
+                state = TxnState::Started;
+            }
+            "prepare" => {
+                if let Err(e) = validate_prepare(repo, &batch) {
+                    eprintln!("fatal: prepare: {e:#}");
+                    return Ok(ExitCode::from(128));
                 }
-                open_txn = true;
+                println!("prepare: ok");
+                state = TxnState::Prepared;
             }
             "commit" => {
                 if let Err(e) = apply(repo, std::mem::take(&mut batch), batch_updates) {
-                    return fatal(e);
+                    eprintln!("fatal: commit: {e:#}");
+                    return Ok(ExitCode::from(128));
                 }
-                open_txn = false;
+                println!("commit: ok");
+                state = TxnState::Closed;
             }
             "abort" => {
                 batch = Batch::default();
-                open_txn = false;
-            }
-            "prepare" => {
-                return fatal(anyhow!(
-                    "stdin command \"prepare\" is not supported (gix-ref cannot hold locks across commands)"
-                ))
+                println!("abort: ok");
+                state = TxnState::Closed;
             }
             "option" => {
                 let [opt] = args else {
@@ -489,7 +598,7 @@ fn run_stdin(
                     Err(e) => return fatal(e),
                 }
             }
-            _ => return fatal(anyhow!("unknown command: {}", fields.join(" "))),
+            _ => unreachable!("categorize accepts exactly this command set"),
         }
 
         if !consumed_option {
@@ -497,12 +606,12 @@ fn run_stdin(
         }
     }
 
-    // A transaction opened with `start` and never committed is discarded, as git does.
-    if open_txn {
-        return Ok(ExitCode::SUCCESS);
-    }
-    if let Err(e) = apply(repo, batch, batch_updates) {
-        return fatal(e);
+    // End of input: the implicit transaction auto-commits; an explicit `start`
+    // (or a `prepare` left uncommitted) auto-aborts; a closed one is already done.
+    if state == TxnState::Open {
+        if let Err(e) = apply(repo, batch, batch_updates) {
+            return fatal(e);
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -616,6 +725,11 @@ fn stage_oid_command(
                 bail!("delete: wrong number of arguments");
             }
             let old = parse_val(repo, slot(1), nul)?;
+            // Unlike the command-line `-d`, the stdin `delete` command rejects an
+            // explicit all-zero `<old-oid>` outright rather than deleting.
+            if matches!(old, Val::Zero) {
+                bail!("delete {name}: zero <old-oid>");
+            }
             batch.edits.push(RefEdit {
                 change: Change::Delete {
                     expected: expected_for_delete(&old),

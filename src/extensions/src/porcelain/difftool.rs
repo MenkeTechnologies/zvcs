@@ -20,10 +20,20 @@
 //!   * `--tool=` / `--extcmd=` with an empty value → `fatal: no <tool> given for
 //!     --tool=<tool>` / `fatal: no <cmd> given for --extcmd=<cmd>`, exit 128.
 //!     These fire *after* the worktree check, matching the C.
-//!   * `git difftool [-y|--no-prompt] [-d|--dir-diff]` with no revision and no
-//!     pathspec, in a worktree whose unstaged diff is empty → no output, exit 0.
-//!     git launches no tool in that case, so this is the one launching-shaped
-//!     invocation with a fully determined result.
+//!   * An invocation whose *whole* diff is empty → no output, exit 0. git
+//!     launches no tool when there is nothing to show, and the shapes whose
+//!     entire diff can be computed here are reproduced: plain (index vs
+//!     worktree), `--cached [<rev>]` (a tree vs the index), one revision (a
+//!     tree vs the worktree), and two revisions (tree vs tree). `--tool`,
+//!     `--extcmd`, `-d`, `-g` and `-y` do not change whether the diff is empty
+//!     and so do not disable this. A pathspec-narrowed diff, an unresolvable
+//!     revision, or three or more revisions cannot be computed exactly and fall
+//!     through to the bail rather than answering from the wrong diff.
+//!   * `git difftool --no-index <a> <b>`: the two paths are compared directly
+//!     (no repository). A path that cannot be `lstat`ed → `error: Could not
+//!     access '<path>'`, exit 1; two paths identical in type, mode and bytes →
+//!     no output, exit 0. A differing pair, a directory pair, or any count
+//!     other than two falls through to the bail.
 //!
 //! Everything else bails. The missing substrate, concretely:
 //!
@@ -95,6 +105,13 @@ struct Opts {
     extcmd: Option<String>,
     /// `--no-index` was given (`difftool` then diffs two paths outside any repo).
     no_index: bool,
+    /// `--cached`/`--staged`: diff the named tree (or HEAD) against the index,
+    /// never the worktree.
+    cached: bool,
+    /// A `--` separator was seen, so `others` after it are pathspecs. The
+    /// empty-diff fast path only fires when it can compute the *whole* diff, so
+    /// it declines whenever a pathspec could narrow the comparison.
+    saw_separator: bool,
     /// Any argument that is not one of the options `difftool` itself defines:
     /// revisions, pathspecs, and the `git diff` options it forwards. Tracked so
     /// the empty-diff fast path can refuse to fire when the diff it would have
@@ -133,6 +150,7 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
         match a {
             "--" => {
                 end_of_opts = true;
+                opts.saw_separator = true;
                 // A bare trailing `--` is not itself a pathspec; anything after
                 // it is, and lands in `others` on the next iterations.
             }
@@ -149,6 +167,7 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
             "--trust-exit-code" | "--no-trust-exit-code" => {}
             "--no-index" => opts.no_index = true,
             "--index" => opts.no_index = false,
+            "--cached" | "--staged" => opts.cached = true,
             "--no-tool" => opts.tool = None,
             "--no-extcmd" => opts.extcmd = None,
 
@@ -235,16 +254,17 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
         );
     }
 
+    // `--no-index` compares two filesystem paths directly and needs no
+    // repository, so it is answered before repository setup — matching git,
+    // which accepts `git difftool --no-index a b` both inside and outside a repo.
+    if opts.no_index {
+        return no_index(&opts.others);
+    }
+
     // Phase 2 — repository setup. Both diagnostics are git's own, exit 128.
     let repo = match gix::discover(".") {
         Ok(repo) => repo,
         Err(_) => {
-            if opts.no_index {
-                bail!(
-                    "--no-index is not ported: it still materialises both sides into a temporary \
-                     directory and launches an external tool"
-                );
-            }
             eprintln!("fatal: difftool requires worktree or --no-index");
             return Ok(ExitCode::from(128));
         }
@@ -263,35 +283,169 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: no <cmd> given for --extcmd=<cmd>");
         return Ok(ExitCode::from(128));
     }
-    if opts.no_index {
-        bail!(
-            "--no-index is not ported: it still materialises both sides into a temporary \
-             directory and launches an external tool"
-        );
-    }
 
-    // Phase 4 — the one launching-shaped invocation with a determined result:
-    // plain `git difftool` (optionally `-y`/`-d`) with no revision and no
-    // pathspec, over a worktree that has nothing unstaged. git computes the
-    // diff, finds it empty, launches no tool, prints nothing and exits 0.
+    // Phase 4 — when the diff `difftool` would show is empty, git launches no
+    // tool, prints nothing and exits 0. `--tool`/`--extcmd`/`-d`/`-g`/`-y` do
+    // not change *whether* the diff is empty, so they do not gate this. The one
+    // thing that determines the answer is the revision/pathspec shape; the
+    // shapes below are the ones whose whole diff can be computed exactly here.
     //
-    // Any other argument shape would need a different diff than the plain
-    // index-vs-worktree one (a revision range, `--cached`, a pathspec), so it
-    // falls through to the bail rather than answering from the wrong diff.
-    let plain = opts.others.is_empty() && opts.tool.is_none() && opts.extcmd.is_none();
-    if plain && !has_unstaged(&repo)? {
+    // `is_empty == Some(true)` is only returned when the *entire* diff has been
+    // proven empty, so a false positive (a spurious exit 0 that skips a real
+    // review) is impossible. Shapes that cannot be computed exactly — a
+    // pathspec-narrowed diff, an unresolvable revision, three or more
+    // revisions — yield `None` and fall through to the honest bail rather than
+    // guessing from the wrong diff.
+    let is_empty: Option<bool> = if opts.saw_separator {
+        // A `--` means the trailing `others` are pathspecs that would narrow the
+        // comparison; the narrowed diff is not computed here.
+        None
+    } else if opts.cached {
+        // `--cached [<rev>]`: the <rev> tree (default HEAD) against the index.
+        match opts.others.as_slice() {
+            [] => Some(index_matches_tree(&repo, repo.head_tree_id_or_empty()?.detach())?),
+            [rev] => match resolve_tree(&repo, rev) {
+                Some(t) => Some(index_matches_tree(&repo, t)?),
+                None => None,
+            },
+            _ => None,
+        }
+    } else {
+        match opts.others.as_slice() {
+            // Plain `git difftool`: the index against the worktree.
+            [] => Some(!has_unstaged(&repo)?),
+            // One revision: <rev> against the worktree. Empty iff the worktree
+            // equals <rev>'s tree, which holds exactly when <rev> equals the
+            // index *and* the index equals the worktree. (A token that does not
+            // resolve as a revision may be a pathspec, so decline it.)
+            [rev] => match resolve_tree(&repo, rev) {
+                Some(t) => Some(index_matches_tree(&repo, t)? && !has_unstaged(&repo)?),
+                None => None,
+            },
+            // Two revisions: their two trees. Because trees are content
+            // addressed, the diff is empty exactly when the tree ids are equal.
+            [a, b] => match (resolve_tree(&repo, a), resolve_tree(&repo, b)) {
+                (Some(ta), Some(tb)) => Some(ta == tb),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    if is_empty == Some(true) {
         return Ok(ExitCode::SUCCESS);
     }
 
     bail!(
-        "difftool is not ported: selecting and running a diff tool is implemented as POSIX shell \
-         (git-difftool--helper sourcing git-mergetool--lib and one script per tool from \
-         $(git --exec-path)/mergetools/), the pre-/post-images are staged into a mktemp directory \
-         whose randomised path appears in the tool's own output, and without -y git prompts on the \
-         terminal — none of which the vendored crates provide \
+        "difftool would launch a diff tool here: with a non-empty diff it stages the pre-/post-images \
+         into a mktemp directory whose randomised path appears in the tool's own output, selects the \
+         tool through POSIX shell (git-difftool--helper sourcing git-mergetool--lib and one script per \
+         tool from $(git --exec-path)/mergetools/), and without -y prompts on the terminal — none of \
+         which the vendored crates provide \
          (ported: -h, usage errors, the worktree/bare diagnostics, --tool=/--extcmd= empty-value \
-         diagnostics, and the empty-diff exit-0 case)"
+         diagnostics, --no-index for two paths, and the empty-diff exit-0 case for the plain, \
+         --cached, one-revision and two-revision shapes)"
     )
+}
+
+/// `--no-index`: compare two filesystem paths directly, the way
+/// `git diff --no-index` does, with no repository involved.
+///
+/// The determinable results are reproduced exactly:
+///   * a path that cannot be `lstat`ed → `error: Could not access '<path>'` on
+///     stderr, exit 1 (git checks the two paths in argv order);
+///   * two paths with identical content, mode and type → exit 0, no output, the
+///     same as any empty diff.
+///
+/// A pair that differs would materialise both sides and launch a tool (the
+/// randomised-tempdir / interactive case), and any path count other than two
+/// prints `git diff --no-index`'s own parse-options usage block — `git diff`'s
+/// option surface, not `difftool`'s. Both fall through to the bail.
+fn no_index(paths: &[String]) -> Result<ExitCode> {
+    if let [a, b] = paths {
+        // Accessibility, in argv order, using `lstat` so a broken symlink counts
+        // as present (matching git, which does not follow the link here).
+        for p in [a, b] {
+            if std::fs::symlink_metadata(p).is_err() {
+                eprintln!("error: Could not access '{p}'");
+                return Ok(ExitCode::from(1));
+            }
+        }
+        if paths_identical(a, b)? {
+            return Ok(ExitCode::SUCCESS);
+        }
+        bail!(
+            "--no-index: {a:?} and {b:?} differ (or are directories), so difftool would stage both \
+             sides into a mktemp directory and launch a tool — a randomised path in the tool's own \
+             output, with an interactive prompt without -y"
+        );
+    }
+    bail!(
+        "--no-index with {} path argument(s) prints `git diff --no-index`'s parse-options usage \
+         block on stderr (exit 129); that block is `git diff`'s option surface, produced by its \
+         parser rather than difftool's",
+        paths.len()
+    )
+}
+
+/// Whether two filesystem paths are diff-identical to `git diff --no-index`:
+/// same type, same mode and same bytes. Directories and any type/mode mismatch
+/// return `false` so the caller declines rather than claiming a spurious exit 0.
+fn paths_identical(a: &str, b: &str) -> Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let (ma, mb) = (std::fs::symlink_metadata(a)?, std::fs::symlink_metadata(b)?);
+    if ma.file_type().is_symlink() && mb.file_type().is_symlink() {
+        return Ok(std::fs::read_link(a)? == std::fs::read_link(b)?);
+    }
+    if ma.is_file() && mb.is_file() {
+        let exec_a = ma.permissions().mode() & 0o111 != 0;
+        let exec_b = mb.permissions().mode() & 0o111 != 0;
+        return Ok(exec_a == exec_b && std::fs::read(a)? == std::fs::read(b)?);
+    }
+    Ok(false)
+}
+
+/// The tree id a revision resolves to, or `None` if the argument is not a
+/// revision (it may be a pathspec, which the caller then declines to guess at).
+fn resolve_tree(repo: &gix::Repository, spec: &str) -> Option<gix::ObjectId> {
+    repo.rev_parse_single(spec)
+        .ok()?
+        .object()
+        .ok()?
+        .peel_to_tree()
+        .ok()
+        .map(|t| t.id)
+}
+
+/// Whether the index is byte-for-byte the given tree — i.e. whether
+/// `git diff --cached <tree>` would be empty. Compares every stage-0 entry by
+/// path, mode and blob id in both directions; a conflicted or intent-to-add
+/// entry, or any path present on only one side, counts as a difference.
+fn index_matches_tree(repo: &gix::Repository, tree: gix::ObjectId) -> Result<bool> {
+    use gix::bstr::BString;
+    use gix::ObjectId;
+    use std::collections::BTreeMap;
+
+    let base = repo.index_from_tree(&tree)?;
+    let backing = base.path_backing();
+    let mut want: BTreeMap<BString, (u32, ObjectId)> = base
+        .entries()
+        .iter()
+        .map(|e| (e.path_in(backing).to_owned(), (e.mode.bits(), e.id)))
+        .collect();
+
+    let index = repo.index_or_empty()?;
+    let state: &gix::index::State = &index;
+    for e in state.entries() {
+        if e.stage_raw() != 0 {
+            return Ok(false);
+        }
+        let path = e.path(state).to_owned();
+        match want.remove(&path) {
+            Some((mode, id)) if mode == e.mode.bits() && id == e.id => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(want.is_empty())
 }
 
 /// The short letter a value-taking long option is spelled with (`tool` → `t`),

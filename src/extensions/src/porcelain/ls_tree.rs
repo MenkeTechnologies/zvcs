@@ -64,6 +64,7 @@ struct Opts {
     abbrev: Abbrev,   // --abbrev[=N] / --no-abbrev
     format: Option<String>, // --format=<fmt>: custom per-entry template
     paths: Vec<String>, // path filters (empty = whole tree)
+    match_all: bool,  // an empty pathspec (e.g. `:` or `:(top)`) was given: selects everything
 }
 
 /// Fatal usage error: `git` prints the message, a blank line, then the usage
@@ -113,6 +114,7 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         abbrev: Abbrev::Full,
         format: None,
         paths: Vec::new(),
+        match_all: false,
     };
 
     // The active `OPT_CMDMODE` value plus the spelling the user typed, which is
@@ -225,12 +227,25 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     };
 
-    // Path filters: reject pathspec magic we don't honour, strip one trailing '/'.
+    // Path filters. A `:`-prefixed operand carries pathspec magic: git's
+    // ls-tree accepts only `top` (`:/`) and `literal`, rejecting every other
+    // magic with a fatal (128) diagnostic. Parse it the way git does, then
+    // treat the magic-stripped remainder as an ordinary filter. One trailing
+    // '/' is stripped; an empty remainder (`:`, `:(top)`) matches everything.
     for p in &positionals {
-        if p.starts_with(':') {
-            return Ok(fatal(&format!("pathspec magic is not supported: {p}")));
+        let cleaned = if p.starts_with(':') {
+            match parse_pathspec_magic(p) {
+                Ok(path) => path,
+                Err(code) => return Ok(code),
+            }
+        } else {
+            (*p).to_string()
+        };
+        if cleaned.is_empty() {
+            opts.match_all = true;
+        } else {
+            opts.paths.push(cleaned.trim_end_matches('/').to_string());
         }
-        opts.paths.push(p.trim_end_matches('/').to_string());
     }
 
     let repo = gix::discover(".")?;
@@ -291,6 +306,127 @@ fn parse_abbrev(v: &str) -> Option<Abbrev> {
     })
 }
 
+// Pathspec magic bits, one per entry in `MAGIC_TABLE`.
+const M_TOP: u32 = 1 << 0;
+const M_LITERAL: u32 = 1 << 1;
+const M_GLOB: u32 = 1 << 2;
+const M_ICASE: u32 = 1 << 3;
+const M_EXCLUDE: u32 = 1 << 4;
+const M_ATTR: u32 = 1 << 5;
+
+/// git's `pathspec_magic[]` table: (long name, short mnemonic or `'\0'`, bit).
+/// The order matters — git lists rejected magic back to the user in this order.
+const MAGIC_TABLE: &[(&str, char, u32)] = &[
+    ("top", '/', M_TOP),
+    ("literal", '\0', M_LITERAL),
+    ("glob", '\0', M_GLOB),
+    ("icase", '\0', M_ICASE),
+    ("exclude", '!', M_EXCLUDE),
+    ("attr", '\0', M_ATTR),
+];
+
+/// The magic `git ls-tree` accepts. git parses it with
+/// `PATHSPEC_ALL_MAGIC & ~(PATHSPEC_FROMTOP | PATHSPEC_LITERAL)` as the mask of
+/// *unsupported* magic, so only `top` and `literal` survive; both are no-ops
+/// here (output is already root-relative and matching is already literal).
+const MAGIC_SUPPORTED: u32 = M_TOP | M_LITERAL;
+
+/// Parse the pathspec magic on a `:`-prefixed operand exactly as stock
+/// `git ls-tree` does, returning the magic-stripped path on success or a fatal
+/// (128) `ExitCode` carrying git's verbatim diagnostic on rejected magic.
+///
+/// Handles both spellings: long form `:(name,name,...)path` and the short
+/// mnemonic form `:/`, `:!`, `:^`, `::`. Rejections match git byte-for-byte:
+///   * unknown long name  -> `Invalid pathspec magic '<n>' in '<elt>'`
+///   * missing `)`        -> `Missing ')' at the end of pathspec magic in '<elt>'`
+///   * `literal`+`glob`   -> `<elt>: 'literal' and 'glob' are incompatible`
+///   * any other magic    -> `<elt>: pathspec magic not supported by this command: <list>`
+fn parse_pathspec_magic(elt: &str) -> std::result::Result<String, ExitCode> {
+    let after = &elt[1..]; // strip the leading ':'
+    let mut magic: u32 = 0;
+    let path: String;
+
+    if let Some(body) = after.strip_prefix('(') {
+        // Long form: comma-separated magic names inside parentheses.
+        let Some(close) = body.find(')') else {
+            return Err(fatal(&format!(
+                "Missing ')' at the end of pathspec magic in '{elt}'"
+            )));
+        };
+        for field in body[..close].split(',') {
+            if field.is_empty() {
+                continue; // git skips empty elements (e.g. `,,`)
+            }
+            // `attr:<value>` is the attr magic with an argument.
+            let matched = MAGIC_TABLE.iter().find(|(name, _, _)| {
+                *name == field || (*name == "attr" && field.starts_with("attr:"))
+            });
+            match matched {
+                Some((_, _, bit)) => magic |= bit,
+                None => {
+                    return Err(fatal(&format!(
+                        "Invalid pathspec magic '{field}' in '{elt}'"
+                    )))
+                }
+            }
+        }
+        // git rejects this specific pair while parsing, before the support check.
+        if magic & M_LITERAL != 0 && magic & M_GLOB != 0 {
+            return Err(fatal(&format!(
+                "{elt}: 'literal' and 'glob' are incompatible"
+            )));
+        }
+        path = body[close + 1..].to_string();
+    } else {
+        // Short form: consume mnemonic bytes until a non-mnemonic or a `:`.
+        let bytes = after.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && bytes[i] != b':' {
+            let ch = bytes[i] as char;
+            // `^` is an accepted short alias for exclude alongside `!`.
+            let bit = if ch == '^' {
+                Some(M_EXCLUDE)
+            } else {
+                MAGIC_TABLE
+                    .iter()
+                    .find(|(_, m, _)| *m != '\0' && *m == ch)
+                    .map(|(_, _, b)| *b)
+            };
+            match bit {
+                Some(b) => {
+                    magic |= b;
+                    i += 1;
+                }
+                None => break,
+            }
+        }
+        if i < bytes.len() && bytes[i] == b':' {
+            i += 1; // a terminating `:` is consumed (so `::path` -> `path`)
+        }
+        path = after[i..].to_string();
+    }
+
+    let unsupported = magic & !MAGIC_SUPPORTED;
+    if unsupported != 0 {
+        let mut parts: Vec<String> = Vec::new();
+        for (name, mnem, bit) in MAGIC_TABLE {
+            if unsupported & bit != 0 {
+                if *mnem != '\0' {
+                    parts.push(format!("'{name}' (mnemonic: '{mnem}')"));
+                } else {
+                    parts.push(format!("'{name}'"));
+                }
+            }
+        }
+        return Err(fatal(&format!(
+            "{elt}: pathspec magic not supported by this command: {}",
+            parts.join(", ")
+        )));
+    }
+
+    Ok(path)
+}
+
 /// Recursively render `tree` (rooted at `prefix`, e.g. `"dir/"`) into `out`.
 fn walk(
     repo: &gix::Repository,
@@ -334,7 +470,8 @@ fn walk(
 /// A filter `p` selects `name` when it names the entry exactly (`name == p`) or
 /// when the entry lives inside the directory `p` (`name` starts with `p/`).
 fn path_selects(name: &str, opts: &Opts) -> bool {
-    opts.paths.is_empty()
+    opts.match_all
+        || opts.paths.is_empty()
         || opts
             .paths
             .iter()

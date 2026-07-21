@@ -22,6 +22,8 @@
 //!   * `--index-version <n>` / `--show-index-version` (one shared variable in
 //!     git, so a trailing `--show-index-version` cancels a bad `--index-version`)
 //!   * `--split-index`, `--untracked-cache` and friends, `--fsmonitor`
+//!   * `--index-info` (its three stdin line grammars, including the `-z` and
+//!     C-quoted path forms and mode-0 removal)
 //!   * `--verbose`, `--`, and `<file>...`
 //!
 //! Faithfully reproduced behaviours: git's `prefix_path` normalisation and its
@@ -37,12 +39,9 @@
 //! `<path>: needs merge` for conflicted paths. `--test-untracked-cache` runs the
 //! real filesystem probe and, like git, returns before the index is written.
 //!
-//! Deliberately NOT ported:
-//!   * `--index-info` (a whole second input grammar), which bails with a precise
-//!     reason rather than producing an index that merely looks right.
-//!   * `core.ignoreStat=true`, which would silently flip the assume-unchanged
-//!     bit on every entry git writes.
-//!   * C-quoted paths on `--stdin` (git's `unquote_c_style` input form).
+//! `core.ignoreStat=true` is honoured: like stock git it sets the
+//! assume-unchanged (`CE_VALID`) bit on every entry this command writes, so the
+//! `h` marker shows up in `git ls-files -v`.
 //!
 //! Accepted but not represented on disk, because the vendored `gix_index` writes
 //! neither the extension nor a pinned header version. Each is invisible to
@@ -53,10 +52,13 @@
 //!     emit V4 or be pinned.
 //!   * `--split-index`, `--untracked-cache`, `--fsmonitor`: the `link`, `UNTR`
 //!     and `FSMN` extensions are not writable through the vendored crates.
-//!   * `--unresolve` restores nothing when the index actually carries a `REUC`
-//!     extension: `gix_index` decodes it but exposes no accessors on
-//!     `resolve_undo::ResolvePath`, so the recorded stages cannot be read back.
-//!     That case bails rather than silently doing nothing.
+//!   * `--unresolve` restores the conflict stages recorded in the index's `REUC`
+//!     extension exactly as git does (dropping the stage-0 entry and re-adding
+//!     stages 1/2/3), but the resolve-undo extension itself is not re-emitted:
+//!     `gix_index` decodes `REUC` yet its writer only serialises the tree-cache
+//!     and sparse extensions. This matches every other index-mutating command in
+//!     this port, which likewise cannot persist `REUC`; the restored index
+//!     entries — all that `git status` / `git ls-files` observe — are identical.
 //!
 //! Also note that content filters (`.gitattributes` clean/smudge, `autocrlf`)
 //! are not applied when hashing worktree files, matching this port's `git add`.
@@ -123,6 +125,8 @@ struct Ctx {
 
     /// `core.fileMode`; when false the executable bit of worktree files is ignored.
     trust_executable_bit: bool,
+    /// `core.ignoreStat`; when true every written entry gets the `CE_VALID` bit.
+    ignore_stat: bool,
     stat_opts: gix::index::entry::stat::Options,
 }
 
@@ -135,11 +139,9 @@ type Step = std::result::Result<(), Die>;
 pub fn update_index(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
-    if repo.config_snapshot().boolean("core.ignoreStat") == Some(true) {
-        bail!(
-            "core.ignoreStat=true is not supported (it would set assume-unchanged on every entry)"
-        );
-    }
+    // git's `core.ignorestat` sets the global `assume_unchanged`, which makes
+    // every entry this command writes carry the `CE_VALID` bit.
+    let ignore_stat = repo.config_snapshot().boolean("core.ignoreStat") == Some(true);
 
     let workdir = match repo.workdir() {
         Some(w) => Some(normalize_lexically(
@@ -198,6 +200,7 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         mark_fsmonitor: None,
         set_executable_bit: None,
         trust_executable_bit,
+        ignore_stat,
         stat_opts,
     };
 
@@ -449,8 +452,19 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                     continue;
                 }
 
+                // Like `--stdin`, this consumes stdin and must be the final
+                // argument. It forces `allow_add`/`allow_replace`, exactly as
+                // git's option sets them before reading.
                 "index-info" => {
-                    bail!("--index-info is not supported (its stdin grammar is not ported)")
+                    if i + 1 != args.len() {
+                        eprintln!("error: option 'index-info' must be the last argument");
+                        return Ok(Outcome::Usage);
+                    }
+                    ctx.allow_add = true;
+                    ctx.allow_replace = true;
+                    if let Err(Die) = read_index_info(ctx, nul_term_line)? {
+                        return Ok(Outcome::Die);
+                    }
                 }
 
                 _ => {
@@ -463,7 +477,7 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
         }
 
         // A path argument.
-        if let Err(Die) = handle_path(ctx, a)? {
+        if let Err(Die) = handle_path(ctx, a.as_bytes().as_bstr())? {
             return Ok(Outcome::Die);
         }
         i += 1;
@@ -609,6 +623,9 @@ fn add_cacheinfo(ctx: &mut Ctx, raw_mode: u32, oid: ObjectId, raw_path: &str) ->
 }
 
 /// Read `--stdin` paths (LF- or NUL-separated) and process each like an argv path.
+///
+/// In LF mode a line that begins with `"` is a C-quoted path (git's
+/// `unquote_c_style`); a malformed quoting is `die("line is badly quoted")`.
 fn read_stdin_paths(ctx: &mut Ctx, nul_term_line: bool) -> Result<Step> {
     let mut buf = Vec::new();
     std::io::stdin().read_to_end(&mut buf)?;
@@ -623,22 +640,286 @@ fn read_stdin_paths(ctx: &mut Ctx, nul_term_line: bool) -> Result<Step> {
         } else {
             line
         };
-        let raw = line
-            .to_str()
-            .map_err(|_| anyhow::anyhow!("non-UTF-8 path on --stdin"))?;
-        if !nul_term_line && raw.starts_with('"') {
-            bail!("C-quoted paths on --stdin are not supported");
-        }
-        if let Err(Die) = handle_path(ctx, raw)? {
+        let owned;
+        let raw: &[u8] = if !nul_term_line && line.first() == Some(&b'"') {
+            match unquote_c_style(line) {
+                Some(v) => {
+                    owned = v;
+                    owned.as_slice()
+                }
+                None => {
+                    eprintln!("fatal: line is badly quoted");
+                    return Ok(Err(Die));
+                }
+            }
+        } else {
+            line
+        };
+        if let Err(Die) = handle_path(ctx, raw.as_bstr())? {
             return Ok(Err(Die));
         }
     }
     Ok(Ok(()))
 }
 
+/// git's `read_index_info` (`--index-info`): a second stdin grammar that accepts
+/// any of three line forms and rebuilds index entries at arbitrary stages.
+///
+/// ```text
+/// (1) mode SP sha            TAB path      (git apply --index-info)
+/// (2) mode SP type SP sha    TAB path      (git ls-tree)
+/// (3) mode SP sha SP stage   TAB path      (git ls-files --stage)
+/// ```
+///
+/// The `type` field of form (2) is ignored because the object id is always read
+/// as the fixed-width hex immediately preceding the tab (or the ` stage` suffix).
+/// `mode == 0` removes the path. A malformed line is a fatal `die`, which — like
+/// every other `Die` here — discards all in-memory changes without writing.
+fn read_index_info(ctx: &mut Ctx, nul_term_line: bool) -> Result<Step> {
+    let mut buf = Vec::new();
+    std::io::stdin().read_to_end(&mut buf)?;
+    if buf.is_empty() {
+        return Ok(Ok(()));
+    }
+    let sep = if nul_term_line { b'\0' } else { b'\n' };
+
+    // git's getline stops at EOF, so a single trailing separator does not yield
+    // an empty final record; a *mid-stream* empty line, however, is malformed.
+    let mut records: Vec<&[u8]> = buf.split(|&b| b == sep).collect();
+    if buf.last() == Some(&sep) {
+        records.pop();
+    }
+
+    let hexsz = ctx.repo.object_hash().len_in_hex();
+    for rec in records {
+        match parse_index_info_line(rec, hexsz, nul_term_line) {
+            LineParse::Ok(mode, oid, stage, path) => {
+                let path = path.as_bstr();
+                if !verify_path(path) {
+                    eprintln!("Ignoring path {path}");
+                    continue;
+                }
+                if mode == 0 {
+                    // `remove_file_from_index` never fails, so git never dies here.
+                    remove_path_entries(ctx, path);
+                } else if !index_info_add(ctx, mode, oid, stage, path)? {
+                    eprintln!("fatal: git update-index: unable to update {path}");
+                    return Ok(Err(Die));
+                } else {
+                    report(ctx, format_args!("add '{path}'"));
+                }
+            }
+            LineParse::BadLine => {
+                eprintln!("fatal: malformed index info {}", rec.as_bstr());
+                return Ok(Err(Die));
+            }
+            LineParse::BadQuote => {
+                eprintln!("fatal: git update-index: bad quoting of path name");
+                return Ok(Err(Die));
+            }
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// Outcome of parsing one `--index-info` line.
+enum LineParse {
+    /// `(raw_mode, oid, stage, path_bytes)`.
+    Ok(u32, ObjectId, u32, Vec<u8>),
+    /// git's `bad_line` — `die("malformed index info ...")`.
+    BadLine,
+    /// A C-quoted path that failed to decode — a distinct git `die`.
+    BadQuote,
+}
+
+/// Parse one `--index-info` line, mirroring the byte arithmetic of git's
+/// `read_index_info`.
+fn parse_index_info_line(rec: &[u8], hexsz: usize, nul_term_line: bool) -> LineParse {
+    // Mode: octal digits from the start, terminated by exactly one space. git's
+    // `strtoul(base 8)` must consume at least one digit and stop on a space.
+    let Some(sp) = rec.iter().position(|&b| b == b' ') else {
+        return LineParse::BadLine;
+    };
+    if sp == 0 {
+        return LineParse::BadLine;
+    }
+    let Ok(mode_str) = std::str::from_utf8(&rec[..sp]) else {
+        return LineParse::BadLine;
+    };
+    let Ok(mode) = u32::from_str_radix(mode_str, 8) else {
+        return LineParse::BadLine;
+    };
+
+    // The tab separates the head (mode..sha/stage) from the path.
+    let Some(tab) = rec.iter().position(|&b| b == b'\t') else {
+        return LineParse::BadLine;
+    };
+    // git: `tab - ptr < hexsz + 1`, where ptr is the mode's trailing space.
+    if tab < sp || tab - sp < hexsz + 1 {
+        return LineParse::BadLine;
+    }
+
+    // Optional ` <stage>` suffix just before the tab (form 3).
+    let (sha_end, stage) =
+        if tab >= 2 && rec[tab - 2] == b' ' && (b'0'..=b'3').contains(&rec[tab - 1]) {
+            (tab - 2, u32::from(rec[tab - 1] - b'0'))
+        } else {
+            (tab, 0)
+        };
+    if sha_end < hexsz + 1 {
+        return LineParse::BadLine;
+    }
+    // A space must sit immediately before the fixed-width hex.
+    if rec[sha_end - hexsz - 1] != b' ' {
+        return LineParse::BadLine;
+    }
+    let Ok(oid) = ObjectId::from_hex(&rec[sha_end - hexsz..sha_end]) else {
+        return LineParse::BadLine;
+    };
+
+    let path_bytes = &rec[tab + 1..];
+    let path = if !nul_term_line && path_bytes.first() == Some(&b'"') {
+        match unquote_c_style(path_bytes) {
+            Some(p) => p,
+            None => return LineParse::BadQuote,
+        }
+    } else {
+        path_bytes.to_vec()
+    };
+    LineParse::Ok(mode, oid, stage, path)
+}
+
+/// git's `add_cacheinfo(mode, oid, path, stage)`, honouring the recorded stage.
+/// Stage 0 reuses the general add (which already applies `core.ignorestat`, the
+/// file/directory-conflict handling, and the displacement of any conflicted
+/// stages). Stages 1..=3 replace their own `(path, stage)` slot in place, or
+/// insert a new unmerged entry alongside the others without disturbing them.
+/// Returns `false` where git's `add_index_entry` would have failed.
+fn index_info_add(
+    ctx: &mut Ctx,
+    raw_mode: u32,
+    oid: ObjectId,
+    stage: u32,
+    path: &BStr,
+) -> Result<bool> {
+    let mode = create_ce_mode(raw_mode);
+    let stat = Stat::default();
+
+    if stage == 0 {
+        return add_index_entry(ctx, path, oid, mode, stat);
+    }
+
+    // create_ce_flags(stage), plus CE_VALID under core.ignorestat.
+    let mut want_flags = Flags::from_stage(stage_enum(stage));
+    if ctx.ignore_stat {
+        want_flags |= Flags::ASSUME_VALID;
+    }
+
+    // Replace an existing entry at the same (path, stage) in place.
+    if let Some(idx) = ctx
+        .index
+        .entry_index_by_path_and_stage(path, stage_enum(stage))
+    {
+        let e = &mut ctx.index.entries_mut()[idx];
+        e.id = oid;
+        e.mode = mode;
+        e.stat = stat;
+        e.flags = want_flags;
+        ctx.dirty = true;
+        ctx.tree_stale = true;
+        return Ok(true);
+    }
+
+    // File/directory conflict resolution (index-info implies `--replace`), which
+    // only ever touches entries strictly below `path` or a tracked ancestor file
+    // — never a same-path entry of another stage.
+    let conflicting: Vec<BString> = {
+        let backing = ctx.index.path_backing();
+        let owned = path.to_owned();
+        let mut dir_prefix = owned.to_vec();
+        dir_prefix.push(b'/');
+        ctx.index
+            .entries()
+            .iter()
+            .map(|e| e.path_in(backing))
+            .filter(|p| p.starts_with(&dir_prefix) || is_ancestor_entry(p, owned.as_bstr()))
+            .map(|p| p.to_owned())
+            .collect()
+    };
+    if !conflicting.is_empty() {
+        ctx.index
+            .remove_entries(|_, p, _| conflicting.iter().any(|c| c.as_bstr() == p));
+    }
+
+    ctx.index
+        .dangerously_push_entry(stat, oid, want_flags, mode, path);
+    ctx.index.sort_entries();
+    ctx.dirty = true;
+    ctx.tree_stale = true;
+    Ok(true)
+}
+
+/// Map a raw stage number (0..=3) to gitoxide's `Stage`.
+fn stage_enum(stage: u32) -> Stage {
+    match stage {
+        0 => Stage::Unconflicted,
+        1 => Stage::Base,
+        2 => Stage::Ours,
+        _ => Stage::Theirs,
+    }
+}
+
+/// git's `unquote_c_style` (quote.c): decode a C-quoted string whose first byte
+/// is `"`. Returns the raw decoded bytes, or `None` on malformed quoting. The
+/// closing quote ends the scan; anything after it is ignored, as in git (which
+/// passes `endp == NULL` here).
+fn unquote_c_style(quoted: &[u8]) -> Option<Vec<u8>> {
+    let mut it = quoted.iter().copied();
+    if it.next()? != b'"' {
+        return None;
+    }
+    let mut out = Vec::with_capacity(quoted.len());
+    loop {
+        match it.next()? {
+            b'"' => return Some(out),
+            b'\\' => {
+                let c = it.next()?;
+                let byte = match c {
+                    b'a' => 0x07,
+                    b'b' => 0x08,
+                    b'f' => 0x0c,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'v' => 0x0b,
+                    b'\\' | b'"' => c,
+                    b'0'..=b'7' => {
+                        // Exactly three octal digits, as git always emits.
+                        let mut ac = (c - b'0') << 6;
+                        let d1 = it.next()?;
+                        if !(b'0'..=b'7').contains(&d1) {
+                            return None;
+                        }
+                        ac |= (d1 - b'0') << 3;
+                        let d2 = it.next()?;
+                        if !(b'0'..=b'7').contains(&d2) {
+                            return None;
+                        }
+                        ac |= d2 - b'0';
+                        ac
+                    }
+                    _ => return None,
+                };
+                out.push(byte);
+            }
+            c => out.push(c),
+        }
+    }
+}
+
 /// One path argument: normalise it, run `update_one`, then apply a pending
 /// `--chmod`, exactly in git's order.
-fn handle_path(ctx: &mut Ctx, raw: &str) -> Result<Step> {
+fn handle_path(ctx: &mut Ctx, raw: &BStr) -> Result<Step> {
     let path = match resolve_path(ctx, raw)? {
         Ok(p) => p,
         Err(Die) => return Ok(Err(Die)),
@@ -917,6 +1198,13 @@ fn add_index_entry(
     mode: Mode,
     stat: Stat,
 ) -> Result<bool> {
+    // Under `core.ignorestat`, git stamps every entry it writes with `CE_VALID`.
+    let want_flags = if ctx.ignore_stat {
+        Flags::ASSUME_VALID
+    } else {
+        Flags::empty()
+    };
+
     // Exact stage-0 match: replace in place, no flags required.
     if let Some(idx) = ctx
         .index
@@ -924,11 +1212,11 @@ fn add_index_entry(
     {
         let unchanged = {
             let e = &mut ctx.index.entries_mut()[idx];
-            let same = e.id == id && e.mode == mode && e.stat == stat && e.flags.is_empty();
+            let same = e.id == id && e.mode == mode && e.stat == stat && e.flags == want_flags;
             e.id = id;
             e.mode = mode;
             e.stat = stat;
-            e.flags = Flags::empty();
+            e.flags = want_flags;
             same
         };
         if !unchanged {
@@ -982,7 +1270,7 @@ fn add_index_entry(
     }
 
     ctx.index
-        .dangerously_push_entry(stat, id, Flags::empty(), mode, path);
+        .dangerously_push_entry(stat, id, want_flags, mode, path);
     ctx.index.sort_entries();
     ctx.dirty = true;
     ctx.tree_stale = true;
@@ -1245,21 +1533,82 @@ fn pathspec_matches(specs: &[String], path: &BStr) -> bool {
 }
 
 /// git's `do_unresolve` (`--unresolve`), which also swallows the remaining
-/// arguments as its path list.
-///
-/// The vendored `gix_index` decodes the `REUC` extension but its
-/// `resolve_undo::ResolvePath` records have private fields and no accessors, so
-/// the saved stages cannot be read back. With no `REUC` present there is
-/// nothing to restore and git is a no-op too; otherwise this refuses rather
-/// than reporting a success it did not perform.
-fn do_unresolve(ctx: &Ctx, _specs: &[String]) -> Result<Step> {
-    match ctx.index.resolve_undo() {
-        Some(recorded) if !recorded.is_empty() => bail!(
-            "--unresolve cannot restore stages: gix_index decodes the resolve-undo (REUC) \
-             extension but exposes no accessors on its records"
-        ),
-        _ => Ok(Ok(())),
+/// arguments as its path list. Each argument is `prefix_path`-normalised and
+/// then restored from the index's resolve-undo (`REUC`) records.
+fn do_unresolve(ctx: &mut Ctx, specs: &[String]) -> Result<Step> {
+    for spec in specs {
+        let path = match resolve_path(ctx, spec.as_bytes().as_bstr())? {
+            Ok(p) => p,
+            Err(Die) => return Ok(Err(Die)),
+        };
+        if let Err(Die) = unresolve_one(ctx, path.as_bstr())? {
+            return Ok(Err(Die));
+        }
     }
+    Ok(Ok(()))
+}
+
+/// git's `unresolve_one` + `unmerge_index_entry`: look up the path's resolve-undo
+/// record and, if present, drop its resolved stage-0 entry and re-add the three
+/// recorded conflict stages (1/2/3). A path with no record — or one that is
+/// already unmerged — is left untouched, exactly as git leaves it.
+fn unresolve_one(ctx: &mut Ctx, path: &BStr) -> Result<Step> {
+    // string_list_lookup: find this path's REUC record and copy out its stages
+    // before the mutable passes below (git stage = array index + 1).
+    let stages: [Option<(u32, ObjectId)>; 3] = {
+        let Some(record) = ctx
+            .index
+            .resolve_undo()
+            .and_then(|recs| recs.iter().find(|r| r.name() == path))
+        else {
+            return Ok(Ok(())); // no resolve-undo record for the path
+        };
+        let s = record.stages();
+        [
+            s[0].map(|st| (st.mode(), st.id())),
+            s[1].map(|st| (st.mode(), st.id())),
+            s[2].map(|st| (st.mode(), st.id())),
+        ]
+    };
+
+    // unmerge_index_entry: a resolved (stage-0) entry is removed to make room;
+    // an already-unmerged path is a no-op.
+    if ctx
+        .index
+        .entry_index_by_path_and_stage(path, Stage::Unconflicted)
+        .is_some()
+    {
+        ctx.index
+            .remove_entries(|_, p, e| p == path && e.stage_raw() == 0);
+        ctx.dirty = true;
+        ctx.tree_stale = true;
+    } else {
+        let already_unmerged = {
+            let backing = ctx.index.path_backing();
+            ctx.index.entries().iter().any(|e| e.path_in(backing) == path)
+        };
+        if already_unmerged {
+            return Ok(Ok(()));
+        }
+    }
+
+    let mut added = false;
+    for (k, slot) in stages.iter().enumerate() {
+        if let Some((raw_mode, oid)) = *slot {
+            let stage = (k + 1) as u32;
+            let mode = create_ce_mode(raw_mode);
+            let flags = Flags::from_stage(stage_enum(stage));
+            ctx.index
+                .dangerously_push_entry(Stat::default(), oid, flags, mode, path);
+            added = true;
+        }
+    }
+    if added {
+        ctx.index.sort_entries();
+        ctx.dirty = true;
+        ctx.tree_stale = true;
+    }
+    Ok(Ok(()))
 }
 
 /// git's `test_if_untracked_cache_is_supported`: make a scratch directory in the
@@ -1414,15 +1763,16 @@ fn report(ctx: &Ctx, args: std::fmt::Arguments<'_>) {
 /// git's `prefix_path`: join a command-line path onto the current subdirectory,
 /// normalise `.`, `..` and `//` lexically, and refuse anything that escapes the
 /// worktree. A trailing slash is preserved so `verify_path` can reject it.
-fn resolve_path(ctx: &Ctx, raw: &str) -> Result<std::result::Result<BString, Die>> {
+fn resolve_path(ctx: &Ctx, raw: &BStr) -> Result<std::result::Result<BString, Die>> {
     let Some(workdir) = ctx.workdir.as_ref() else {
         bail!("this operation must be run in a work tree");
     };
 
-    let joined: PathBuf = if raw.starts_with('/') {
-        PathBuf::from(raw)
+    let raw_os = bytes_to_os(raw);
+    let joined: PathBuf = if raw.first() == Some(&b'/') {
+        PathBuf::from(&raw_os)
     } else {
-        workdir.join(&ctx.prefix).join(raw)
+        workdir.join(&ctx.prefix).join(&raw_os)
     };
     let abs = normalize_lexically(&joined);
 
@@ -1435,10 +1785,23 @@ fn resolve_path(ctx: &Ctx, raw: &str) -> Result<std::result::Result<BString, Die
     };
 
     let mut out = rel.to_string_lossy().replace('\\', "/");
-    if raw.ends_with('/') && !out.is_empty() {
+    if raw.last() == Some(&b'/') && !out.is_empty() {
         out.push('/');
     }
     Ok(Ok(BString::from(out.into_bytes())))
+}
+
+/// A worktree path argument is raw bytes; convert to an `OsString` preserving
+/// every byte on Unix (paths there are arbitrary byte strings), falling back to
+/// a lossy conversion on platforms without a byte-oriented `OsStr`.
+#[cfg(unix)]
+fn bytes_to_os(b: &BStr) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::OsStr::from_bytes(b).to_owned()
+}
+#[cfg(not(unix))]
+fn bytes_to_os(b: &BStr) -> std::ffi::OsString {
+    std::ffi::OsString::from(b.to_str_lossy().into_owned())
 }
 
 /// Resolve `.` and `..` textually, without touching the filesystem.

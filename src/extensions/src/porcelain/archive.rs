@@ -41,7 +41,23 @@
 //!     written only once a file below it is written).
 //!   * Being run from a subdirectory, which narrows the tree to that
 //!     subdirectory exactly as git does.
-//!   * `tar.umask` (numeric).
+//!   * `tar.umask` (numeric, and `tar.umask=user`, which git reads from the
+//!     process umask by `umask(0)`-then-restore — reproduced here).
+//!   * `--add-file <path>` and `--add-virtual-file <path:content>`: the extra
+//!     records git writes last of all, after the tree walk, in command-line
+//!     order. `--add-file` takes the disk file's bytes and its executable bit
+//!     (canonicalised and masked exactly like a tree blob), names it
+//!     `<--prefix>` + `basename(path)`, and `stat()`s it at parse time so
+//!     `File not found` / `Not a regular file` fire in git's order; the fake
+//!     object id git assigns each added file (a 1-based counter, big-endian in
+//!     the first eight bytes of an all-zero hash) is reproduced so the
+//!     `<oid>.data` / `<oid>.paxheader` overflow name matches. `--add-virtual-file`
+//!     writes the literal content under the literal path (git does *not* prepend
+//!     `--prefix` to it), validated (missing colon / empty name) at parse time.
+//!   * Unknown options: `--<opt>` → `error: unknown option '<opt>'`, `-<c>` →
+//!     `error: unknown switch '<c>'`, each followed by the usage block on stderr
+//!     with exit 129; `-h` / `--help` print the same usage to stdout, exit 129;
+//!     the `--no-` negations of the boolean and value options.
 //!
 //!   * `--worktree-attributes`, to the extent this port supports attributes at
 //!     all: the working directory's `.gitattributes` files are read and, like
@@ -60,15 +76,12 @@
 //!     invocation (unknown option, out-of-range level, bad tree-ish, unmatched
 //!     pathspec, content-affecting attribute) still comes out with git's exact
 //!     exit code; only a `zip` request git would have completed fails here.
-//!   * `--remote` / `--exec` (needs the `git-upload-archive` protocol),
-//!     `--add-file` and `--add-virtual-file`: parsed, so that git's
-//!     diagnostics still come out in the right order, and then rejected before a
-//!     single byte is written. `--add-virtual-file` is validated the way git's
-//!     `add_file_cb` is (a missing colon or an empty path before it is fatal at
-//!     parse time), and the "unsupported" rejection is deferred until after
-//!     every diagnostic git emits first — usage, format, compression level,
-//!     invalid tree-ish, attribute conversion, an unmatched pathspec — since git
-//!     writes the added records last, after the tree walk.
+//!   * `--remote` / `--exec`: the `git-upload-archive` protocol against another
+//!     repository — a live transport handshake (or a spawned `git-upload-archive`
+//!     subprocess even for a local `--remote=.`), which this port does not drive.
+//!   * A regular blob larger than the 8 GiB `ustar` `size` field, which git spills
+//!     into a pax `size` record; not reproduced here (no fixture can exercise it
+//!     for byte comparison).
 //!   * Repositories whose archived tree carries content-affecting attributes
 //!     (`export-ignore`, `export-subst`, `text`, `eol`, `filter`, `ident`,
 //!     `working-tree-encoding`), or a `core.autocrlf` / `core.eol` /
@@ -153,10 +166,37 @@ struct Opts {
     /// The last `-<digits>` seen; git keeps a single `int`, so later ones win.
     level: Option<u32>,
     worktree_attributes: bool,
-    /// `--add-file` / `--add-virtual-file` values, in command-line order.
-    added: Vec<String>,
+    /// `--add-file` / `--add-virtual-file` records, in command-line order. git
+    /// assigns each one a fake object id from a 1-based counter incremented per
+    /// `add_file_cb` call, which surfaces as the `<oid>.data` / `<oid>.paxheader`
+    /// name when the in-archive path overflows the `ustar` fields.
+    added: Vec<Added>,
     treeish: Option<String>,
     paths: Vec<String>,
+}
+
+/// One `--add-file` / `--add-virtual-file` record, resolved at parse time so its
+/// diagnostics (`File not found`, `Not a regular file`, `missing colon`, `empty
+/// file name`) fire in git's command-line order, before the format, compression
+/// level, tree-ish and pathspec checks that run after `parse_options()`.
+enum Added {
+    /// `--add-file <path>`: the archive name is `<--prefix>` + `basename(path)`
+    /// (git prepends `args->base`), the mode is the disk file's executable bit
+    /// canonicalised the same way tree blobs are, and the bytes are read from
+    /// disk at archive-writing time.
+    File {
+        /// `basename(path)`; the `--prefix` is prepended when the record is written.
+        name: Vec<u8>,
+        /// Whether any execute bit is set on disk (`st_mode & 0111`).
+        exec: bool,
+        /// The path to read the bytes from, resolved against the process cwd.
+        disk: std::path::PathBuf,
+    },
+    /// `--add-virtual-file <path:content>`: the archive name is the literal path
+    /// before the first colon — git does *not* prepend `--prefix` to it — the mode
+    /// is a non-executable blob's, and the content is the literal bytes after the
+    /// first colon.
+    Virtual { name: Vec<u8>, content: Vec<u8> },
 }
 
 /// One record git will write, in the order it writes them. Collected up front so
@@ -191,41 +231,93 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         }
         match a {
             "--" => literal = true,
+            // git's `parse_options()` prints the full usage to *stdout* and exits
+            // 129 on `-h` / `--help`.
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
             "-l" | "--list" => list = true,
+            "--no-list" => list = false,
             "-v" | "--verbose" => opts.verbose = true,
+            "--no-verbose" => opts.verbose = false,
             "--worktree-attributes" => opts.worktree_attributes = true,
+            "--no-worktree-attributes" => opts.worktree_attributes = false,
             "--format" => opts.format = Some(value_of(args, &mut i, "--format")?),
+            "--no-format" => opts.format = None,
             "--prefix" => opts.prefix = Some(value_of(args, &mut i, "--prefix")?),
+            "--no-prefix" => opts.prefix = None,
             "-o" | "--output" => opts.output = Some(value_of(args, &mut i, "--output")?),
+            // git accepts `--no-output` but it is a no-op: `-o FILE --no-output`
+            // (either order) still writes to FILE. Verified against git 2.55.0.
+            "--no-output" => {}
             "--mtime" => opts.mtime = Some(value_of(args, &mut i, "--mtime")?),
-            "--add-file" => opts.added.push(value_of(args, &mut i, a)?),
+            "--add-file" => {
+                let value = value_of(args, &mut i, a)?;
+                match resolve_add_file(&value) {
+                    Ok(item) => opts.added.push(item),
+                    Err(msg) => {
+                        eprintln!("fatal: {msg}");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+            }
             "--add-virtual-file" => {
                 let value = value_of(args, &mut i, a)?;
-                if let Some(msg) = virtual_file_error(&value) {
-                    eprintln!("fatal: {msg}");
-                    return Ok(ExitCode::from(128));
+                match resolve_virtual_file(&value) {
+                    Ok(item) => opts.added.push(item),
+                    Err(msg) => {
+                        eprintln!("fatal: {msg}");
+                        return Ok(ExitCode::from(128));
+                    }
                 }
-                opts.added.push(value);
             }
             _ if a.starts_with("--format=") => opts.format = Some(a[9..].to_string()),
             _ if a.starts_with("--prefix=") => opts.prefix = Some(a[9..].to_string()),
             _ if a.starts_with("--output=") => opts.output = Some(a[9..].to_string()),
             _ if a.starts_with("--mtime=") => opts.mtime = Some(a[8..].to_string()),
-            _ if a.starts_with("--add-file=") => opts.added.push(a[11..].to_string()),
-            _ if a.starts_with("--add-virtual-file=") => {
-                let value = &a[19..];
-                if let Some(msg) = virtual_file_error(value) {
+            _ if a.starts_with("--add-file=") => match resolve_add_file(&a[11..]) {
+                Ok(item) => opts.added.push(item),
+                Err(msg) => {
                     eprintln!("fatal: {msg}");
                     return Ok(ExitCode::from(128));
                 }
-                opts.added.push(value.to_string());
+            },
+            _ if a.starts_with("--add-virtual-file=") => match resolve_virtual_file(&a[19..]) {
+                Ok(item) => opts.added.push(item),
+                Err(msg) => {
+                    eprintln!("fatal: {msg}");
+                    return Ok(ExitCode::from(128));
+                }
+            },
+            // `--remote` / `--exec` are real git options, so this is not an
+            // "unknown option" — but honouring them means driving the
+            // `git-upload-archive` protocol (a transport handshake, or a spawned
+            // `git-upload-archive` even for a local `--remote=.`), which this port
+            // does not do. Consume any separate value so the bail is terse.
+            "--remote" | "--exec" => {
+                let _ = value_of(args, &mut i, a)?;
+                bail!("{a} drives the git-upload-archive protocol, which is not supported here");
+            }
+            _ if a.starts_with("--remote=") || a.starts_with("--exec=") => {
+                bail!("{a} drives the git-upload-archive protocol, which is not supported here");
             }
             _ if compression_level(a).is_some() => opts.level = compression_level(a),
-            _ if a.len() > 1 && a.starts_with('-') => bail!(
-                "unsupported flag {a:?} (ported: --format, --prefix, -o/--output, --mtime, \
-                 -<digits>, --add-file, --add-virtual-file, --worktree-attributes, \
-                 -l/--list, -v/--verbose, --)"
-            ),
+            // git's `parse_options()` rejects any other dashed token with the
+            // usage block on stderr and exit 129 — `unknown option` for a `--long`
+            // form (the leading `--` stripped, the rest kept verbatim) and
+            // `unknown switch` for a single-dash form (just the switch character).
+            _ if a.starts_with("--") => {
+                eprintln!("error: unknown option `{}'", &a[2..]);
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            _ if a.len() > 1 && a.starts_with('-') => {
+                let sw = a.chars().nth(1).unwrap_or('?');
+                eprintln!("error: unknown switch `{sw}'");
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
             _ if opts.treeish.is_none() => opts.treeish = Some(a.to_string()),
             _ => opts.paths.push(a.to_string()),
         }
@@ -409,15 +501,6 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         );
     }
 
-    // git supports `--add-file`/`--add-virtual-file`; this port cannot write the
-    // extra records, so it bails here — but only after every diagnostic git
-    // itself would emit first (usage, format, compression level, invalid
-    // tree-ish, attribute conversion, an unmatched pathspec) has had its turn.
-    // git writes the added records last of all, so nothing has reached stdout.
-    if let Some(given) = opts.added.first() {
-        bail!("--add-file/--add-virtual-file is not supported (given {given:?})");
-    }
-
     let base = opts.prefix.clone().unwrap_or_default();
     let raw: Box<dyn Write> = match &opts.output {
         Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
@@ -459,6 +542,37 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         };
         tar.entry(&path, item.kind, &item.oid, &data)?;
     }
+
+    // git writes the `--add-file` / `--add-virtual-file` records last of all,
+    // after the whole tree walk, in command-line order. Each carries a fake object
+    // id built from a 1-based counter (the Nth added file, big-endian in the first
+    // eight bytes of an otherwise-zero hash), which only becomes visible when the
+    // in-archive path overflows the `ustar` name field and spills into a pax
+    // `<oid>.data` / `<oid>.paxheader` record.
+    let hash_len = repo.object_hash().len_in_bytes();
+    for (idx, added) in opts.added.iter().enumerate() {
+        let mut raw = vec![0u8; hash_len];
+        raw[..8].copy_from_slice(&((idx as u64) + 1).to_be_bytes());
+        let oid = ObjectId::from_bytes_or_panic(&raw);
+        match added {
+            Added::File { name, exec, disk } => {
+                let mut path = base.clone().into_bytes();
+                path.extend_from_slice(name);
+                let data = std::fs::read(disk)?;
+                let kind = if *exec {
+                    EntryKind::BlobExecutable
+                } else {
+                    EntryKind::Blob
+                };
+                tar.entry(&path, kind, &oid, &data)?;
+            }
+            Added::Virtual { name, content } => {
+                // git does not prepend `--prefix` to a virtual file's path.
+                tar.entry(name, EntryKind::Blob, &oid, content)?;
+            }
+        }
+    }
+
     tar.finish()?;
     // The gzip stream's own trailer is only written once the tar is complete.
     tar.out.done()?;
@@ -508,18 +622,53 @@ fn value_of(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("option `{flag}` requires a value"))
 }
 
-/// git's `add_file_cb` validation for `--add-virtual-file <path:content>`,
-/// which runs inside `parse_options()` — so it fires before the format,
-/// compression-level and tree-ish diagnostics, exactly like stock git. The
-/// value must carry a colon, and the path before it must be non-empty. Returns
-/// the `fatal:` text git would `die()` with (exit 128), or `None` when valid.
-/// `--add-file` has no such check, so it is not routed through here.
-fn virtual_file_error(value: &str) -> Option<String> {
+/// git's `add_file_cb` for `--add-virtual-file <path:content>`, which runs
+/// inside `parse_options()` — so its diagnostics fire before the format,
+/// compression-level and tree-ish ones, exactly like stock git. The value must
+/// carry a colon, and the path before it must be non-empty; the first colon
+/// splits the (literal, un-prefixed) archive path from the content. Returns the
+/// `fatal:` text git would `die()` with (exit 128) on the `Err` side.
+fn resolve_virtual_file(value: &str) -> std::result::Result<Added, String> {
     match value.find(':') {
-        None => Some(format!("missing colon: '{value}'")),
-        Some(0) => Some(format!("empty file name: '{value}'")),
-        Some(_) => None,
+        None => Err(format!("missing colon: '{value}'")),
+        Some(0) => Err(format!("empty file name: '{value}'")),
+        Some(idx) => Ok(Added::Virtual {
+            name: value[..idx].as_bytes().to_vec(),
+            content: value[idx + 1..].as_bytes().to_vec(),
+        }),
     }
+}
+
+/// git's `add_file_cb` for `--add-file <path>`: it `stat()`s the file while
+/// still inside `parse_options()`, so `File not found` / `Not a regular file`
+/// (both `die()`, exit 128) fire in command-line order, ahead of the post-parse
+/// diagnostics. The path is resolved against the process cwd exactly as git's
+/// `prefix_filename()` does when run from a subdirectory; the archive name is
+/// the basename, with `--prefix` prepended later at writing time.
+fn resolve_add_file(path: &str) -> std::result::Result<Added, String> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Err(format!("File not found: {path}"));
+    };
+    if !meta.is_file() {
+        return Err(format!("Not a regular file: {path}"));
+    }
+    // git's `canon_mode()` keys the executable bit off the *owner* execute bit
+    // (0100) alone, not any of the group/other bits, before the tar writer mangles
+    // it to 0777/0666 & ~umask. Verified against git 2.55.0 (mode 0641 archives as
+    // non-executable, 0744 as executable).
+    let exec = {
+        use std::os::unix::fs::MetadataExt;
+        meta.mode() & 0o100 != 0
+    };
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.as_encoded_bytes().to_vec())
+        .unwrap_or_else(|| path.as_bytes().to_vec());
+    Ok(Added::File {
+        name,
+        exec,
+        disk: std::path::PathBuf::from(path),
+    })
 }
 
 /// The level in a `-<digits>` argument, or `None` if `arg` is not one.
@@ -572,7 +721,12 @@ fn tar_umask(repo: &gix::Repository) -> Result<u32> {
     };
     let text = raw.to_str()?.trim().to_string();
     if text == "user" {
-        bail!("tar.umask=user is not supported (only a numeric tar.umask is ported)");
+        // git's `git_tar_config`: `tar_umask = umask(0); umask(tar_umask);`.
+        // There is no read-only POSIX umask getter, so git reads it by setting
+        // it to zero and restoring it in one breath; this does the same. The
+        // result is at most 0o777, so masking guards against any garbage the C
+        // ABI leaves in the high bits of the narrower `mode_t` on some targets.
+        return Ok(process_umask() & 0o7777);
     }
     let (digits, radix) = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         Some(rest) => (rest, 16),
@@ -580,6 +734,29 @@ fn tar_umask(repo: &gix::Repository) -> Result<u32> {
         None => (text.as_str(), 10),
     };
     u32::from_str_radix(digits, radix).map_err(|_| anyhow::anyhow!("invalid tar.umask {text:?}"))
+}
+
+/// The process umask, read the way git reads it for `tar.umask=user`: set it to
+/// zero to learn the old value, then restore it. `mode_t` is 32-bit on Linux and
+/// 16-bit on the BSD/macOS targets, so its width is selected per platform to keep
+/// the C ABI correct.
+#[cfg(target_os = "linux")]
+type ModeT = u32;
+#[cfg(not(target_os = "linux"))]
+type ModeT = u16;
+
+extern "C" {
+    fn umask(mask: ModeT) -> ModeT;
+}
+
+fn process_umask() -> u32 {
+    // SAFETY: `umask(2)` has no failure mode and no memory effects; the old value
+    // is restored immediately, matching git's `umask(0); umask(old)` sequence.
+    unsafe {
+        let old = umask(0);
+        umask(old);
+        u32::from(old)
+    }
 }
 
 /// The sub-tree named `name` directly below `tree`, if it is a tree.

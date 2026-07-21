@@ -8,22 +8,31 @@
 //!   * `git restore --staged <pathspec>...`           index    ← HEAD (unstage)
 //!   * `git restore --staged --source=<tree> ...`     index    ← <tree>
 //!   * `git restore --staged --worktree [-s <tree>]`  both     ← HEAD (or <tree>)
+//!   * `git restore --ours/--theirs <pathspec>...`    worktree ← unmerged stage 2/3
+//!   * `git restore --merge [--conflict=<style>] ...` worktree ← recreated conflict
+//!   * `git restore --overlay ...`                    keep target files absent in source
+//!   * `git restore --pathspec-from-file=<f> ...`     read pathspecs from a file/stdin
 //!
 //! The default restore source is the index for `--worktree`, and `HEAD` when
-//! `--staged` is given (either alone or combined). Restore is no-overlay: a path
-//! that exists in the target but not in the source is removed. `--overlay`,
-//! interactive `--patch`, `--pathspec-from-file`, submodule recursion, and merge
-//! conflict resolution (`--ours`/`--theirs`/`--merge`/`--conflict`) are rejected
-//! with a precise error rather than faked.
+//! `--staged` is given (either alone or combined). Restore is no-overlay by
+//! default: a path present in the target but not the source is removed; with
+//! `--overlay` such files are kept. `--ours`/`--theirs` pick the stage-2/stage-3
+//! blob of an unmerged path; `--merge`/`--conflict` recreate the 3-way conflict
+//! (with markers) in the worktree. Interactive `--patch` and submodule recursion
+//! stay unimplemented (no non-interactive semantics / no submodule checkout here).
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU8;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
 use gix::bstr::{BStr, BString};
+use gix::diff::blob::{Algorithm, InternedInput};
 use gix::hash::ObjectId;
 use gix::index::entry::{Flags, Mode, Stat};
+use gix::merge::blob::builtin_driver::text::{Conflict, ConflictStyle, Labels, Options};
 
 /// True if `path` matches any of the (repo-root-relative, slash-separated)
 /// pathspecs. A spec matches its own exact path, or any path under it as a
@@ -38,6 +47,97 @@ fn path_matches(path: &BStr, match_all: bool, specs: &[Vec<u8>]) -> bool {
     })
 }
 
+/// Which unmerged stage a conflict-resolution flag selects.
+#[derive(Copy, Clone, PartialEq)]
+enum Pick {
+    Ours,
+    Theirs,
+}
+
+/// Resolve a (possibly subdirectory-relative) pathspec to a repo-root-relative,
+/// slash-separated path. Returns `Ok(None)` when the spec designates the whole
+/// tree (a `.`/empty at the worktree root), `Ok(Some(path))` for a concrete
+/// path, and `Err(())` when the spec escapes the worktree.
+fn resolve_spec(prefix: &[String], wd: &Path, raw: &str) -> Result<Option<String>, ()> {
+    // Absolute pathspec: resolve lexically against the worktree root.
+    if raw.starts_with('/') {
+        let wds = wd.to_string_lossy();
+        if raw == wds {
+            return Ok(None);
+        }
+        return match raw.strip_prefix(&*wds).and_then(|r| r.strip_prefix('/')) {
+            Some(rest) if rest.is_empty() => Ok(None),
+            Some(rest) => Ok(Some(rest.trim_end_matches('/').to_string())),
+            None => Err(()),
+        };
+    }
+    let mut comps: Vec<&str> = prefix.iter().map(String::as_str).collect();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if comps.pop().is_none() {
+                    return Err(());
+                }
+            }
+            other => comps.push(other),
+        }
+    }
+    if comps.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(comps.join("/")))
+    }
+}
+
+/// Perform a 3-way text merge of the three unmerged stages and return the
+/// merged bytes (with conflict markers, using git's `ours`/`base`/`theirs`
+/// labels). A missing stage is treated as empty content.
+fn three_way_merge(
+    repo: &gix::Repository,
+    base: Option<ObjectId>,
+    ours: Option<ObjectId>,
+    theirs: Option<ObjectId>,
+    style: ConflictStyle,
+) -> Result<Vec<u8>> {
+    let load = |o: Option<ObjectId>| -> Result<Vec<u8>> {
+        Ok(match o {
+            Some(id) => repo.find_object(id)?.detach().data,
+            None => Vec::new(),
+        })
+    };
+    let base_b = load(base)?;
+    let our_b = load(ours)?;
+    let their_b = load(theirs)?;
+
+    let mut input = InternedInput::new(our_b.as_slice(), their_b.as_slice());
+    let mut out = Vec::new();
+    let opts = Options {
+        diff_algorithm: Algorithm::Myers,
+        conflict: Conflict::Keep {
+            style,
+            marker_size: NonZeroU8::new(7).expect("7 != 0"),
+        },
+    };
+    // The free 3-way text merge is re-exported as the value `builtin_driver::text`
+    // (a function that shares its name with the `text` module), so it is invoked
+    // by its full path rather than a `text::merge` alias.
+    gix::merge::blob::builtin_driver::text(
+        &mut out,
+        &mut input,
+        Labels {
+            ancestor: Some(BStr::new("base")),
+            current: Some(BStr::new("ours")),
+            other: Some(BStr::new("theirs")),
+        },
+        our_b.as_slice(),
+        base_b.as_slice(),
+        their_b.as_slice(),
+        opts,
+    );
+    Ok(out)
+}
+
 pub fn restore(args: &[String]) -> Result<ExitCode> {
     // --- Argument parsing ---------------------------------------------------
     let mut staged = false;
@@ -45,6 +145,24 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     let mut source: Option<String> = None;
     let mut pathspecs: Vec<String> = Vec::new();
     let mut after_dashdash = false;
+
+    let mut overlay = false;
+    let mut pick: Option<Pick> = None;
+    let mut merge_flag = false;
+    let mut conflict_style: Option<ConflictStyle> = None;
+    let mut ignore_unmerged = false;
+    let mut pathspec_from_file: Option<String> = None;
+    let mut pathspec_file_nul = false;
+
+    // Parse a `--conflict` style value; git errors with exit 129 on unknown.
+    let parse_conflict = |v: &str| -> Option<ConflictStyle> {
+        match v {
+            "merge" => Some(ConflictStyle::Merge),
+            "diff3" => Some(ConflictStyle::Diff3),
+            "zdiff3" => Some(ConflictStyle::ZealousDiff3),
+            _ => None,
+        }
+    };
 
     let mut i = 0;
     while i < args.len() {
@@ -62,30 +180,129 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 i += 1;
                 match args.get(i) {
                     Some(v) => source = Some(v.clone()),
-                    None => bail!("option `--source` requires a value"),
+                    None => {
+                        // git: short flags are "switch `s'", long are "option `source'".
+                        if a == "-s" {
+                            eprintln!("error: switch `s' requires a value");
+                        } else {
+                            eprintln!("error: option `source' requires a value");
+                        }
+                        return Ok(ExitCode::from(129));
+                    }
                 }
             }
-            // Accepted no-ops: quiet/progress/default no-overlay/default no-recurse.
-            "-q" | "--quiet" | "--progress" | "--no-progress" | "--ignore-unmerged"
-            | "--no-overlay" | "--no-recurse-submodules" => {}
+            "--overlay" => overlay = true,
+            "--no-overlay" => overlay = false,
+            "--ours" | "-2" => pick = Some(Pick::Ours),
+            "--theirs" | "-3" => pick = Some(Pick::Theirs),
+            "-m" | "--merge" => merge_flag = true,
+            "--conflict" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => match parse_conflict(v) {
+                        Some(s) => conflict_style = Some(s),
+                        None => {
+                            eprintln!("error: unknown conflict style '{v}'");
+                            return Ok(ExitCode::from(129));
+                        }
+                    },
+                    None => {
+                        eprintln!("error: option `conflict' requires a value");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            "--ignore-unmerged" => ignore_unmerged = true,
+            "--pathspec-file-nul" => pathspec_file_nul = true,
+            "--pathspec-from-file" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => pathspec_from_file = Some(v.clone()),
+                    None => {
+                        eprintln!("error: option `pathspec-from-file' requires a value");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            // Accepted no-ops: quiet/progress/default no-recurse/diff-context knobs
+            // (context knobs only affect interactive `--patch`, unsupported here).
+            "-q" | "--quiet" | "--progress" | "--no-progress" | "--no-recurse-submodules"
+            | "--ignore-skip-worktree-bits" | "--no-ignore-skip-worktree-bits" => {}
+            "-U" | "--unified" | "--inter-hunk-context" => {
+                i += 1;
+            }
             "-p" | "--patch" => bail!("interactive patch mode (-p/--patch) is not supported"),
-            "--overlay" => bail!("--overlay is not supported (restore is no-overlay only)"),
             "--recurse-submodules" => bail!("--recurse-submodules is not supported"),
-            "--ours" | "--theirs" | "-m" | "--merge" => {
-                bail!("conflict resolution (--ours/--theirs/--merge/--conflict) is not supported")
-            }
-            "--pathspec-from-file" | "--pathspec-file-nul" => {
-                bail!("--pathspec-from-file is not supported")
-            }
             s if s.starts_with("--source=") => source = Some(s["--source=".len()..].to_string()),
-            s if s.starts_with("--conflict") => {
-                bail!("conflict resolution (--ours/--theirs/--merge/--conflict) is not supported")
+            s if s.starts_with("--conflict=") => {
+                let v = &s["--conflict=".len()..];
+                match parse_conflict(v) {
+                    Some(style) => conflict_style = Some(style),
+                    None => {
+                        eprintln!("error: unknown conflict style '{v}'");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
             }
+            s if s.starts_with("--pathspec-from-file=") => {
+                pathspec_from_file = Some(s["--pathspec-from-file=".len()..].to_string());
+            }
+            s if s.starts_with("-U") && s.len() > 2 => {}
             s if s.starts_with("-s") && s.len() > 2 => source = Some(s[2..].to_string()),
-            s if s.starts_with('-') && s != "-" => bail!("unknown option: {s}"),
+            s if s.starts_with('-') && s != "-" => {
+                eprintln!("error: unknown option `{}'", s.trim_start_matches('-'));
+                return Ok(ExitCode::from(129));
+            }
             _ => pathspecs.push(a.clone()),
         }
         i += 1;
+    }
+
+    let merge_active = merge_flag || conflict_style.is_some();
+    let conflict_mode = pick.is_some() || merge_active;
+
+    // --- Pathspec-from-file -------------------------------------------------
+    if pathspec_file_nul && pathspec_from_file.is_none() {
+        eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+        return Ok(ExitCode::from(128));
+    }
+    if let Some(f) = pathspec_from_file.clone() {
+        if !pathspecs.is_empty() {
+            eprintln!("fatal: '--pathspec-from-file' and pathspec arguments cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
+        let data = if f == "-" {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
+            buf
+        } else {
+            std::fs::read(&f)?
+        };
+        let sep = if pathspec_file_nul { b'\0' } else { b'\n' };
+        for part in data.split(|&c| c == sep) {
+            let mut s = part;
+            if !pathspec_file_nul && s.last() == Some(&b'\r') {
+                s = &s[..s.len() - 1];
+            }
+            if s.is_empty() {
+                continue;
+            }
+            pathspecs.push(String::from_utf8_lossy(s).into_owned());
+        }
+    }
+
+    // --- Incompatible-flag combinations (git's fatal/exit-128 diagnostics) --
+    if pick.is_some() && staged {
+        eprintln!("fatal: '--ours' or '--theirs' cannot be used with --staged");
+        return Ok(ExitCode::from(128));
+    }
+    if merge_active && staged {
+        eprintln!("fatal: '--merge' or '--conflict' cannot be used with --staged");
+        return Ok(ExitCode::from(128));
+    }
+    if conflict_mode && source.is_some() {
+        eprintln!("fatal: '--merge', '--ours', or '--theirs' cannot be used when checking out of a tree");
+        return Ok(ExitCode::from(128));
     }
 
     // Default target: worktree when neither is named.
@@ -93,20 +310,8 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         worktree = true;
     }
     if pathspecs.is_empty() {
-        bail!("you must specify path(s) to restore");
-    }
-
-    // Normalize pathspecs: a `.` or empty spec restores everything; others are
-    // matched as repo-root-relative paths (trailing slash trimmed).
-    let mut match_all = false;
-    let mut specs_bytes: Vec<Vec<u8>> = Vec::new();
-    for p in &pathspecs {
-        let t = p.trim_end_matches('/');
-        if t.is_empty() || t == "." {
-            match_all = true;
-        } else {
-            specs_bytes.push(t.as_bytes().to_vec());
-        }
+        eprintln!("fatal: you must specify path(s) to restore");
+        return Ok(ExitCode::from(128));
     }
 
     // --- Repository + lock --------------------------------------------------
@@ -115,13 +320,36 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         .workdir()
         .ok_or_else(|| anyhow!("this operation must be run in a work tree"))?
         .to_owned();
-    // Pathspecs are matched repo-root-relative; a subdirectory prefix is not yet
-    // applied, so refuse to run from anywhere but the worktree root to avoid
-    // silently restoring the wrong files.
     let cwd = std::env::current_dir()?;
-    if cwd.canonicalize().ok() != workdir.canonicalize().ok() {
-        bail!("run from the repository root; subdirectory-relative pathspecs are not yet supported");
+    // Pathspecs given relative to the current directory are resolved against the
+    // worktree root using this prefix, so `git restore` works from any subdir.
+    let wd_c = workdir.canonicalize().unwrap_or_else(|_| workdir.clone());
+    let cwd_c = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+    let prefix_components: Vec<String> = cwd_c
+        .strip_prefix(&wd_c)
+        .ok()
+        .map(|rel| {
+            rel.components()
+                .filter_map(|c| c.as_os_str().to_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Normalize pathspecs: `.`/empty (at root) restores everything; the rest are
+    // resolved to repo-root-relative paths. A spec escaping the worktree is fatal.
+    let mut match_all = false;
+    let mut specs: Vec<(String, Vec<u8>)> = Vec::new();
+    for p in &pathspecs {
+        match resolve_spec(&prefix_components, &wd_c, p) {
+            Ok(None) => match_all = true,
+            Ok(Some(rel)) => specs.push((p.clone(), rel.into_bytes())),
+            Err(()) => {
+                eprintln!("fatal: {p}: '{p}' is outside repository at '{}'", wd_c.display());
+                return Ok(ExitCode::from(128));
+            }
+        }
     }
+    let specs_bytes: Vec<Vec<u8>> = specs.iter().map(|(_, b)| b.clone()).collect();
 
     // Serialize the whole read-modify-write through the repo coordinator so a
     // concurrent zvcs writer can't race `index.lock`. Held for the function.
@@ -160,37 +388,96 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // Current index paths, plus a conflict guard: an unmerged (stage != 0) entry
-    // that a spec targets cannot be restored without conflict-resolution flags.
+    // Current index: stage blobs per path (index 0..=3) plus the path set.
+    let mut stage_blobs: HashMap<BString, [Option<(ObjectId, Mode)>; 4]> = HashMap::new();
     let mut cur_paths: HashSet<BString> = HashSet::new();
     {
         let b = cur.path_backing();
         for e in cur.entries() {
-            let p = e.path_in(b);
-            if e.stage_raw() != 0 && path_matches(p, match_all, &specs_bytes) {
-                bail!(
-                    "path '{}' is unmerged; conflict resolution is not supported",
-                    p
-                );
-            }
-            cur_paths.insert(p.to_owned());
+            let p = e.path_in(b).to_owned();
+            let s = e.stage_raw() as usize;
+            stage_blobs.entry(p.clone()).or_insert([None, None, None, None])[s] = Some((e.id, e.mode));
+            cur_paths.insert(p);
         }
     }
+    let is_unmerged =
+        |arr: &[Option<(ObjectId, Mode)>; 4]| arr[1].is_some() || arr[2].is_some() || arr[3].is_some();
+
+    // Matched unmerged paths (sorted for git-identical diagnostic ordering).
+    let mut unmerged_matched: Vec<BString> = Vec::new();
+    for (p, arr) in &stage_blobs {
+        if is_unmerged(arr) && path_matches(BStr::new(p), match_all, &specs_bytes) {
+            unmerged_matched.push(p.clone());
+        }
+    }
+    unmerged_matched.sort();
 
     // Validate every explicit pathspec matches something git knows about (the
-    // union of source and index paths), mirroring git's fatal pathspec error.
+    // union of source and index paths), mirroring git's pathspec error (exit 1).
     if !match_all {
-        for (spec, raw) in specs_bytes.iter().zip(pathspecs.iter().filter(|p| {
-            let t = p.trim_end_matches('/');
-            !(t.is_empty() || t == ".")
-        })) {
+        for (raw, spec) in &specs {
             let single = [spec.clone()];
             let hit = source_map
                 .keys()
                 .chain(cur_paths.iter())
                 .any(|p| path_matches(BStr::new(p), false, &single));
             if !hit {
-                bail!("pathspec '{raw}' did not match any file(s) known to git");
+                eprintln!("error: pathspec '{raw}' did not match any file(s) known to git");
+                return Ok(ExitCode::from(1));
+            }
+        }
+    }
+
+    // Unmerged handling for the pure worktree-from-index restore: without a
+    // conflict-resolution flag such a path is an error (exit 1), unless
+    // `--ignore-unmerged` downgrades it to a skipped warning.
+    if source_is_index && worktree && !conflict_mode && !unmerged_matched.is_empty() {
+        if ignore_unmerged {
+            for p in &unmerged_matched {
+                eprintln!("warning: path '{p}' is unmerged");
+            }
+        } else {
+            for p in &unmerged_matched {
+                eprintln!("error: path '{p}' is unmerged");
+            }
+            return Ok(ExitCode::from(1));
+        }
+    }
+
+    // Conflict-resolution targets for the worktree: the resolved stage-0 blob
+    // for each matched unmerged path (or removal when the chosen side deleted it).
+    let mut resolved_entries: Vec<(BString, ObjectId, Mode)> = Vec::new();
+    let mut resolved_remove: HashSet<BString> = HashSet::new();
+    if conflict_mode {
+        for p in &unmerged_matched {
+            let arr = &stage_blobs[p];
+            if merge_active {
+                let (ours, theirs) = (arr[2], arr[3]);
+                if ours.is_none() && theirs.is_none() {
+                    resolved_remove.insert(p.clone());
+                    continue;
+                }
+                let mode = ours.or(theirs).map(|(_, m)| m).expect("one side present");
+                let merged = three_way_merge(
+                    &repo,
+                    arr[1].map(|(id, _)| id),
+                    ours.map(|(id, _)| id),
+                    theirs.map(|(id, _)| id),
+                    conflict_style.unwrap_or(ConflictStyle::Merge),
+                )?;
+                let id = repo.write_blob(&merged)?.detach();
+                resolved_entries.push((p.clone(), id, mode));
+            } else {
+                let want = match pick {
+                    Some(Pick::Ours) => arr[2],
+                    _ => arr[3],
+                };
+                match want {
+                    Some((id, mode)) => resolved_entries.push((p.clone(), id, mode)),
+                    None => {
+                        resolved_remove.insert(p.clone());
+                    }
+                }
             }
         }
     }
@@ -226,12 +513,25 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
 
     // --- Apply staged (index) mutations ------------------------------------
     if staged {
+        // Resolve unmerged matched paths: drop all their stage entries so the
+        // source (a tree) can re-add a single stage-0 entry below.
+        if !unmerged_matched.is_empty() {
+            let um: HashSet<BString> = unmerged_matched.iter().cloned().collect();
+            cur.remove_entries(|_, p, e| e.stage_raw() != 0 && um.contains(&p.to_owned()));
+        }
+        let mut need_sort = false;
         for (path, id, mode, stat) in &updates {
-            if let Ok(idx) = cur.entry_index_by_path(BStr::new(path)) {
-                let e = &mut cur.entries_mut()[idx];
-                e.id = *id;
-                e.mode = *mode;
-                e.stat = *stat;
+            match cur.entry_index_by_path(BStr::new(path)) {
+                Ok(idx) => {
+                    let e = &mut cur.entries_mut()[idx];
+                    e.id = *id;
+                    e.mode = *mode;
+                    e.stat = *stat;
+                }
+                Err(_) => {
+                    cur.dangerously_push_entry(*stat, *id, Flags::empty(), *mode, BStr::new(path));
+                    need_sort = true;
+                }
             }
         }
         if !removals.is_empty() {
@@ -240,7 +540,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         for (path, id, mode, flags, stat) in &inserts {
             cur.dangerously_push_entry(*stat, *id, *flags, *mode, BStr::new(path));
         }
-        if !inserts.is_empty() {
+        if !inserts.is_empty() || need_sort {
             cur.sort_entries();
         }
     }
@@ -250,10 +550,16 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     if worktree {
         let should_interrupt = AtomicBool::new(false);
 
-        // Subset of the source restricted to matched entries; checked out over
-        // the existing worktree.
+        // Subset of the source restricted to matched stage-0 entries, plus any
+        // conflict-resolved entries; checked out over the existing worktree.
         let mut subset = source_index.clone();
-        subset.remove_entries(|_, p, _| !path_matches(p, match_all, &specs_bytes));
+        subset.remove_entries(|_, p, e| e.stage_raw() != 0 || !path_matches(p, match_all, &specs_bytes));
+        for (path, id, mode) in &resolved_entries {
+            subset.dangerously_push_entry(Stat::default(), *id, Flags::empty(), *mode, BStr::new(path));
+        }
+        if !resolved_entries.is_empty() {
+            subset.sort_entries();
+        }
 
         let mut opts =
             repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
@@ -281,7 +587,16 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         }
 
         // No-overlay: delete worktree files present before but absent in source.
-        for path in &removals {
+        // `--overlay` suppresses these; conflict-resolution deletes (a side that
+        // removed the file) are applied regardless of overlay.
+        if !overlay {
+            for path in &removals {
+                if let Some(full) = repo.workdir_path(BStr::new(path)) {
+                    let _ = std::fs::remove_file(full);
+                }
+            }
+        }
+        for path in &resolved_remove {
             if let Some(full) = repo.workdir_path(BStr::new(path)) {
                 let _ = std::fs::remove_file(full);
             }
@@ -293,10 +608,17 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // worktree restore refreshed stats so a later status stays clean. A pure
     // `--source` worktree restore leaves the index untouched (content now
     // differs from it, which git reflects as an unstaged modification).
+    // Conflict-resolution (--ours/--theirs/--merge) leaves the unmerged stages
+    // intact: only matched clean stage-0 entries get their stats refreshed.
     let index_write_needed = staged || (worktree && source_is_index);
     if index_write_needed {
         if worktree {
+            // Only refresh stage-0 entries; unmerged stages (1..3) left for a
+            // conflict-resolution restore must keep their recorded stats intact.
             for (e, p) in cur.entries_mut_with_paths() {
+                if e.stage_raw() != 0 {
+                    continue;
+                }
                 if let Some(stat) = fresh_stats.get(&p.to_owned()) {
                     e.stat = *stat;
                 }

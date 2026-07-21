@@ -1,7 +1,8 @@
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gix::hash::ObjectId;
@@ -58,8 +59,21 @@ const ERROR_REACHABLE: u8 = 2;
 ///                                       `verify_pack()`, which this port does not
 ///                                       do either way.
 ///   * `--strict` / `--no-strict`     — accepted; see divergence 1.
+///   * `--lost-found`                  — writes dangling objects into
+///                                       `$GIT_DIR/lost-found/{commit,other}/`,
+///                                       forcing `check_full` on and reflogs off
+///                                       exactly as `cmd_fsck` does. Blobs get
+///                                       their content; every other type gets its
+///                                       id. This is the one flag that mutates the
+///                                       repository.
+///   * `-h` / `--help`                 — prints the usage block to stdout, exit 129.
 ///
-/// `--lost-found` still `bail!`s rather than being ignored.
+/// Unknown, ambiguous, and abbreviated long options are resolved by a faithful
+/// port of `parse-options.c::parse_long_opt` (unambiguous prefixes apply, e.g.
+/// `--unre` == `--unreachable`; an ambiguous prefix or unknown option prints
+/// git's exact diagnostic and exits 129). Linked worktrees contribute their HEAD,
+/// index, and per-worktree reflogs to the head set, matching git's
+/// `get_default_heads()` over every worktree.
 ///
 /// ### Known divergences from stock git — read before trusting a clean result
 ///
@@ -157,17 +171,25 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     };
 
     let mut opt = Options::default();
-    opt.parse(args)?;
+    match opt.parse(args) {
+        ParseControl::Proceed => {}
+        ParseControl::Exit(code) => return Ok(ExitCode::from(code)),
+    }
+
+    // `cmd_fsck`: `--lost-found` forces a full check and turns reflogs off.
+    if opt.write_lost_and_found {
+        opt.check_full = true;
+        opt.include_reflogs = false;
+    }
 
     let repo = gix::discover(".")?;
 
-    // A linked worktree contributes its own HEAD and index to git's head set;
-    // this port only reads the main ones, so refuse rather than mis-report.
+    // Running *from* a linked worktree would make the main worktree's index a
+    // head that this port does not reconstruct (its HEAD is covered by the shared
+    // reflog, but not its index), so refuse rather than mis-report. Running from
+    // the main worktree with linked worktrees present is fully supported below.
     if repo.git_dir() != repo.common_dir() {
         bail!("running from a linked worktree is not supported");
-    }
-    if has_linked_worktrees(&repo) {
-        bail!("repositories with linked worktrees are not supported: their HEAD and index are heads too");
     }
 
     // `cmd_fsck`: the `isatty(2)` default is resolved first, then `--verbose`
@@ -179,11 +201,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             None => std::io::stderr().is_terminal(),
         };
     if show_progress {
-        // Each additional odb source gets its own "Checking object directories"
-        // block, and `--full` adds a "Checking objects" block per pack.
-        if has_alternates(&repo) {
-            bail!("--progress is not ported for a repository with alternates: each odb source emits its own progress block");
-        }
+        // Each odb source gets its own "Checking object directories" block
+        // (handled at the object-directory progress point below), and `--full`
+        // adds a "Checking objects" / commit-graph block per pack that this port
+        // cannot reproduce (no pack verification in the vendored crates).
         if opt.check_full && !opt.connectivity_only && has_packs(&repo) {
             bail!("--progress --full is not ported for a repository with packs: pack verification emits its own progress block");
         }
@@ -315,7 +336,12 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         scan_lines.sort_by_key(|(id, _)| id.as_bytes()[0]);
     }
     if show_progress && !opt.connectivity_only {
-        progress_block("Checking object directories", 256);
+        // `fsck_object_dir()` runs once per odb source (the main object directory
+        // plus every alternate, followed transitively), each emitting its own
+        // 256-subdirectory progress block.
+        for _ in 0..odb_source_count(&repo) {
+            progress_block("Checking object directories", 256);
+        }
     }
 
     // ---- 4. the head set ----------------------------------------------------
@@ -323,7 +349,18 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         default_refs += collect_default_heads(&repo, &mut state, &mut heads)?;
     }
     if opt.include_reflogs {
-        errors |= collect_reflog_heads(&repo, &mut state, &mut heads, opt.verbose)?;
+        let logs_root = repo.common_dir().join("logs");
+        errors |= collect_reflog_heads(&repo, &logs_root, &mut state, &mut heads, opt.verbose)?;
+    }
+    // Every linked worktree contributes its own HEAD, index, and per-worktree
+    // reflogs, exactly as git's `get_default_heads()` iterates all worktrees.
+    // Order is irrelevant: heads only feed the reachability set and `known`,
+    // both of which are membership-based.
+    {
+        let (wt_count, wt_err) =
+            collect_linked_worktree_heads(&repo, &mut state, &mut heads, &opt, explicit_heads)?;
+        default_refs += wt_count;
+        errors |= wt_err;
     }
     if default_refs == 0 {
         eprintln!("notice: No default references");
@@ -383,17 +420,28 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     for (&id, &kind) in &state.missing {
         lines.push((id, format!("missing {kind} {id}")));
     }
-    if opt.show_unreachable || opt.show_dangling {
+    if opt.show_unreachable || opt.show_dangling || opt.write_lost_and_found {
         for &id in &all {
             if state.reachable.contains(&id) {
                 continue;
             }
+            // `check_unreachable_object()`: a shown-unreachable object returns
+            // before the dangling/lost-found block, so `--unreachable` never
+            // writes lost-found.
             if opt.show_unreachable {
                 let kind = repo.find_header(id)?.kind();
                 lines.push((id, format!("unreachable {kind} {id}")));
             } else if !state.used.contains(&id) {
+                // `!USED` — the tip of an unreachable set. `dangling` printing and
+                // lost-found writing are independent: `--no-dangling --lost-found`
+                // still writes the files.
                 let kind = repo.find_header(id)?.kind();
-                lines.push((id, format!("dangling {kind} {id}")));
+                if opt.show_dangling {
+                    lines.push((id, format!("dangling {kind} {id}")));
+                }
+                if opt.write_lost_and_found {
+                    write_lost_found(&repo, id, kind)?;
+                }
             }
         }
     }
@@ -439,6 +487,50 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::from(errors))
 }
 
+/// The full usage block `parse-options.c` prints for `-h` and after a usage
+/// error, reproduced byte-for-byte from `git fsck -h` (git 2.55.0). Ends in two
+/// newlines; print with `print!`/`eprint!` (no extra terminator).
+const FSCK_USAGE: &str = "usage: git fsck [--tags] [--root] [--unreachable] [--cache] [--no-reflogs]\n                [--[no-]full] [--strict] [--verbose] [--lost-found]\n                [--[no-]dangling] [--[no-]progress] [--connectivity-only]\n                [--[no-]name-objects] [--[no-]references] [<object>...]\n\n    -v, --[no-]verbose    be verbose\n    --[no-]unreachable    show unreachable objects\n    --[no-]dangling       show dangling objects\n    --[no-]tags           report tags\n    --[no-]root           report root nodes\n    --[no-]cache          make index objects head nodes\n    --[no-]reflogs        make reflogs head nodes (default)\n    --[no-]full           also consider packs and alternate objects\n    --[no-]connectivity-only\n                          check only connectivity\n    --[no-]strict         enable more strict checking\n    --[no-]lost-found     write dangling objects in .git/lost-found\n    --[no-]progress       show progress\n    --[no-]name-objects   show verbose names for reachable objects\n    --[no-]references     check reference database consistency\n\n";
+
+/// The `fsck_opts[]` long names, in table order — the order matters because
+/// `register_abbrev()` treats the first prefix hit as the candidate and any
+/// later hit as the ambiguity partner. Index maps to a field in `apply()`.
+const FSCK_OPTS: [&str; 14] = [
+    "verbose",
+    "unreachable",
+    "dangling",
+    "tags",
+    "root",
+    "cache",
+    "reflogs",
+    "full",
+    "connectivity-only",
+    "strict",
+    "lost-found",
+    "progress",
+    "name-objects",
+    "references",
+];
+
+/// Whether option parsing wants the command to proceed or to stop with a code.
+enum ParseControl {
+    Proceed,
+    Exit(u8),
+}
+
+/// The outcome of resolving one `--long` token, mirroring `parse_long_opt`'s
+/// return values.
+enum LongOutcome {
+    /// An option (by `FSCK_OPTS` index) with its negation state.
+    Apply { idx: usize, unset: bool },
+    /// A prefix matched more than one option; carries git's exact message.
+    Ambiguous(String),
+    /// A boolean option was given `=value`; carries the canonical name.
+    TakesNoValue(&'static str),
+    /// No option matched.
+    Unknown,
+}
+
 /// The flags `builtin/fsck.c` keeps as file-scope statics, with git's defaults.
 struct Options {
     show_unreachable: bool,
@@ -451,6 +543,7 @@ struct Options {
     check_references: bool,
     keep_cache_objects: bool,
     name_objects: bool,
+    write_lost_and_found: bool,
     verbose: bool,
     progress: Option<bool>,
     objects: Vec<String>,
@@ -469,6 +562,7 @@ impl Default for Options {
             check_references: true,
             keep_cache_objects: false,
             name_objects: false,
+            write_lost_and_found: false,
             verbose: false,
             progress: None,
             objects: Vec::new(),
@@ -477,56 +571,176 @@ impl Default for Options {
 }
 
 impl Options {
-    fn parse(&mut self, args: &[String]) -> Result<()> {
+    fn parse(&mut self, args: &[String]) -> ParseControl {
         let mut only_positionals = false;
         for a in args {
             if only_positionals {
                 self.objects.push(a.clone());
                 continue;
             }
-            match a.as_str() {
-                "--" => only_positionals = true,
-                "--unreachable" => self.show_unreachable = true,
-                "--no-unreachable" => self.show_unreachable = false,
-                "--dangling" => self.show_dangling = true,
-                "--no-dangling" => self.show_dangling = false,
-                "--root" => self.show_root = true,
-                "--no-root" => self.show_root = false,
-                "--tags" => self.show_tags = true,
-                "--no-tags" => self.show_tags = false,
-                "--reflogs" => self.include_reflogs = true,
-                "--no-reflogs" => self.include_reflogs = false,
-                "--cache" => self.keep_cache_objects = true,
-                "--no-cache" => self.keep_cache_objects = false,
-                "--connectivity-only" => self.connectivity_only = true,
-                "--no-connectivity-only" => self.connectivity_only = false,
-                "--name-objects" => self.name_objects = true,
-                "--no-name-objects" => self.name_objects = false,
-                "--progress" => self.progress = Some(true),
-                "--no-progress" => self.progress = Some(false),
-                // `check_full` only gates `verify_pack()`, and `check_references`
-                // only gates `git refs verify`; this port does neither, so both
-                // spellings land on the same behavior. See divergences 1 and 2.
-                "--full" | "--no-full" => self.check_full = a == "--full",
-                "--references" | "--no-references" => self.check_references = a == "--references",
-                "--strict" | "--no-strict" => {}
-                // `OPT__VERBOSE` gives all three spellings.
-                "--verbose" | "-v" => self.verbose = true,
-                "--no-verbose" => self.verbose = false,
-                "--lost-found" => bail!(
-                    "--lost-found is not ported: it writes dangling objects into .git/lost-found/"
-                ),
-                s if s.starts_with('-') && s.len() > 1 => bail!(
-                    "unsupported flag {s:?} (ported: --unreachable, --dangling, --no-dangling, \
-                     --root, --tags, --cache, --reflogs, --no-reflogs, --connectivity-only, --full, \
-                     --no-full, --references, --no-references, --strict, --name-objects, --verbose, \
-                     --no-verbose, --progress, --no-progress)"
-                ),
-                s => self.objects.push(s.to_string()),
+            let s = a.as_str();
+            if s == "--" {
+                only_positionals = true;
+                continue;
+            }
+            // `git.c` intercepts `--help` into a man page and parse-options turns
+            // `-h` into the usage block; neither is reproducible past the usage
+            // text, so both print it to stdout and exit 129 like `-h` does.
+            if s == "-h" || s == "--help" {
+                print!("{FSCK_USAGE}");
+                return ParseControl::Exit(129);
+            }
+            if let Some(long) = s.strip_prefix("--") {
+                match resolve_long(long) {
+                    LongOutcome::Apply { idx, unset } => self.apply(idx, unset),
+                    LongOutcome::Ambiguous(msg) => {
+                        eprintln!("{msg}");
+                        return ParseControl::Exit(129);
+                    }
+                    LongOutcome::TakesNoValue(name) => {
+                        eprintln!("error: option `{name}' takes no value");
+                        return ParseControl::Exit(129);
+                    }
+                    LongOutcome::Unknown => {
+                        eprint!("error: unknown option `{long}'\n{FSCK_USAGE}");
+                        return ParseControl::Exit(129);
+                    }
+                }
+                continue;
+            }
+            if s.starts_with('-') && s.len() > 1 {
+                // The only short option is `-v`; every other switch is unknown.
+                for c in s[1..].chars() {
+                    match c {
+                        'v' => self.verbose = true,
+                        'h' => {
+                            print!("{FSCK_USAGE}");
+                            return ParseControl::Exit(129);
+                        }
+                        _ => {
+                            eprint!("error: unknown switch `{c}'\n{FSCK_USAGE}");
+                            return ParseControl::Exit(129);
+                        }
+                    }
+                }
+                continue;
+            }
+            self.objects.push(a.clone());
+        }
+        ParseControl::Proceed
+    }
+
+    /// Set the field named by `FSCK_OPTS[idx]`; `unset` is the `--no-` form.
+    fn apply(&mut self, idx: usize, unset: bool) {
+        let on = !unset;
+        match idx {
+            0 => self.verbose = on,
+            1 => self.show_unreachable = on,
+            2 => self.show_dangling = on,
+            3 => self.show_tags = on,
+            4 => self.show_root = on,
+            5 => self.keep_cache_objects = on,
+            6 => self.include_reflogs = on,
+            // `check_full` only gates `verify_pack()` and `check_references` only
+            // gates `git refs verify`; this port does neither, but the flags are
+            // still tracked so `--progress` and the packs guard behave. `strict`
+            // selects a message-layer severity this port does not implement.
+            7 => self.check_full = on,
+            8 => self.connectivity_only = on,
+            9 => {} // strict
+            10 => self.write_lost_and_found = on,
+            11 => self.progress = Some(on),
+            12 => self.name_objects = on,
+            13 => self.check_references = on,
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// A faithful port of `parse-options.c::parse_long_opt` restricted to the fsck
+/// option table (no aliases, no argument-taking options, `PARSE_OPT_NONEG`
+/// nowhere). `arg` is the token with its leading `--` already removed.
+fn resolve_long(arg: &str) -> LongOutcome {
+    // `is_alias()` is always false here (fsck registers no alias groups), so a
+    // second abbreviation registration always makes the previous one ambiguous.
+    fn register(
+        abbrev: &mut Option<(usize, bool)>,
+        ambiguous: &mut Option<(usize, bool)>,
+        idx: usize,
+        unset: bool,
+    ) {
+        if let Some(prev) = *abbrev {
+            *ambiguous = Some(prev);
+        }
+        *abbrev = Some((idx, unset));
+    }
+
+    let arg_end = arg.find('=').unwrap_or(arg.len());
+    let mut arg_start = arg;
+    let mut unset = false;
+    let mut arg_starts_with_no_no = false;
+    if let Some(rest) = arg_start.strip_prefix("no-") {
+        arg_start = rest;
+        if let Some(rest2) = arg_start.strip_prefix("no-") {
+            arg_start = rest2;
+            arg_starts_with_no_no = true;
+        } else {
+            unset = true;
+        }
+    }
+    // Length of the name portion of `arg_start` (`arg_end - arg_start` in C).
+    let consumed = arg.len() - arg_start.len();
+    let abbrev_len = arg_end.saturating_sub(consumed);
+
+    let mut abbrev: Option<(usize, bool)> = None;
+    let mut ambiguous: Option<(usize, bool)> = None;
+
+    for (i, &long_name) in FSCK_OPTS.iter().enumerate() {
+        // No fsck long name starts with "no-", so a "no-no-" argument matches
+        // nothing (`else if arg_starts_with_no_no: continue`).
+        if arg_starts_with_no_no {
+            continue;
+        }
+        // Exact / consumed prefix: `skip_prefix(arg_start, long_name, &rest)`.
+        if let Some(rest) = arg_start.strip_prefix(long_name) {
+            if rest.starts_with('=') {
+                return LongOutcome::TakesNoValue(long_name);
+            } else if !rest.is_empty() {
+                continue;
+            } else {
+                return LongOutcome::Apply { idx: i, unset };
             }
         }
-        Ok(())
+        // Abbreviated? `!strncmp(long_name, arg_start, abbrev_len)`.
+        if abbrev_len <= long_name.len()
+            && long_name.as_bytes()[..abbrev_len] == arg_start.as_bytes()[..abbrev_len]
+        {
+            register(&mut abbrev, &mut ambiguous, i, unset);
+        }
+        // Negated and abbreviated very much? `starts_with("no-", arg)` — i.e.
+        // `arg` is a prefix of "no-".
+        if "no-".starts_with(arg) {
+            register(&mut abbrev, &mut ambiguous, i, true);
+        }
     }
+
+    if let Some((ai, au)) = ambiguous {
+        let (bi, bu) = abbrev.expect("ambiguous implies an abbrev too");
+        let an = if au { "no-" } else { "" };
+        let bn = if bu { "no-" } else { "" };
+        return LongOutcome::Ambiguous(format!(
+            "error: ambiguous option: {arg} (could be --{an}{a} or --{bn}{b})",
+            a = FSCK_OPTS[ai],
+            b = FSCK_OPTS[bi],
+        ));
+    }
+    if let Some((bi, bu)) = abbrev {
+        if arg_end < arg.len() {
+            return LongOutcome::TakesNoValue(FSCK_OPTS[bi]);
+        }
+        return LongOutcome::Apply { idx: bi, unset: bu };
+    }
+    LongOutcome::Unknown
 }
 
 /// Everything accumulated across the passes.
@@ -656,14 +870,14 @@ fn collect_default_heads(
 /// calls `lookup_object()`, which does not create — it never enters `obj_hash`.
 fn collect_reflog_heads(
     repo: &gix::Repository,
+    logs_root: &Path,
     state: &mut State,
     heads: &mut Vec<ObjectId>,
     verbose: bool,
 ) -> Result<u8> {
     let mut errors = 0u8;
-    let logs_root = repo.common_dir().join("logs");
     let mut names: Vec<String> = Vec::new();
-    collect_log_names(&logs_root, "", &mut names)?;
+    collect_log_names(logs_root, "", &mut names)?;
     let mut buf = Vec::new();
     for name in names {
         // A log file whose path is not a well-formed ref name is skipped rather
@@ -778,13 +992,6 @@ fn collect_log_names(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<
     Ok(())
 }
 
-/// Whether `$GIT_COMMON_DIR/worktrees` holds at least one linked worktree.
-fn has_linked_worktrees(repo: &gix::Repository) -> bool {
-    std::fs::read_dir(repo.common_dir().join("worktrees"))
-        .map(|mut d| d.next().is_some())
-        .unwrap_or(false)
-}
-
 /// Whether the odb has any pack, which changes git's `--progress` output.
 fn has_packs(repo: &gix::Repository) -> bool {
     std::fs::read_dir(repo.common_dir().join("objects").join("pack"))
@@ -795,14 +1002,104 @@ fn has_packs(repo: &gix::Repository) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the odb has alternates, each of which is another progress-emitting
-/// source for git.
-fn has_alternates(repo: &gix::Repository) -> bool {
-    repo.common_dir()
-        .join("objects")
-        .join("info")
-        .join("alternates")
-        .exists()
+/// The number of odb sources git iterates: the main object directory plus every
+/// alternate, followed transitively (`objects/info/alternates`). git prints one
+/// "Checking object directories" progress block per source. Sources are deduped
+/// by canonical path, matching git's device/inode dedup closely enough for the
+/// count, which is all the identical progress blocks need.
+fn odb_source_count(repo: &gix::Repository) -> usize {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut stack: Vec<PathBuf> = vec![repo.common_dir().join("objects")];
+    let mut count = 0usize;
+    while let Some(objdir) = stack.pop() {
+        let canon = objdir.canonicalize().unwrap_or_else(|_| objdir.clone());
+        if !seen.insert(canon) {
+            continue;
+        }
+        count += 1;
+        let Ok(content) = std::fs::read(objdir.join("info").join("alternates")) else {
+            continue;
+        };
+        for line in content.split(|&b| b == b'\n') {
+            if line.is_empty() || line[0] == b'#' {
+                continue;
+            }
+            let p = Path::new(std::ffi::OsStr::from_bytes(line));
+            let alt = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                objdir.join(p)
+            };
+            stack.push(alt);
+        }
+    }
+    count
+}
+
+/// Every linked worktree's HEAD, index, and per-worktree reflogs as heads,
+/// matching git's `get_default_heads()` iterating all worktrees. The main
+/// worktree's HEAD/index/reflogs are collected by the callers above; this adds
+/// only the linked ones. Returns the number of HEADs (git's `default_refs`
+/// contribution) and any reflog errors, exactly like the main collectors.
+fn collect_linked_worktree_heads(
+    repo: &gix::Repository,
+    state: &mut State,
+    heads: &mut Vec<ObjectId>,
+    opt: &Options,
+    explicit_heads: bool,
+) -> Result<(usize, u8)> {
+    let mut count = 0usize;
+    let mut errors = 0u8;
+    let worktrees = match repo.worktrees() {
+        Ok(w) => w,
+        // No `worktrees/` directory is the common case: nothing to add.
+        Err(_) => return Ok((count, errors)),
+    };
+    for proxy in worktrees {
+        let logs_root = proxy.git_dir().join("logs");
+        // The worktree's working tree may be missing (a prunable worktree); its
+        // HEAD/index/reflogs still live in the git dir and are read regardless.
+        let Ok(wt) = proxy.into_repo_with_possibly_inaccessible_worktree() else {
+            continue;
+        };
+        // An explicit `<object>` argument suppresses the default head set for the
+        // whole command, worktrees included.
+        if !explicit_heads {
+            if let Ok(head) = wt.head() {
+                if let Some(id) = head.id() {
+                    let id = id.detach();
+                    state.note(id);
+                    heads.push(id);
+                    count += 1;
+                }
+            }
+        }
+        if opt.include_reflogs {
+            errors |= collect_reflog_heads(&wt, &logs_root, state, heads, opt.verbose)?;
+        }
+        if !explicit_heads || opt.keep_cache_objects {
+            collect_index_heads(&wt, state, heads, opt.verbose);
+        }
+    }
+    Ok((count, errors))
+}
+
+/// `--lost-found`: write a dangling object into `$GIT_DIR/lost-found/`. Commits
+/// go under `commit/`, everything else under `other/`. A blob's file holds its
+/// content; every other type's file holds its id followed by a newline. Mirrors
+/// `check_unreachable_object()`'s write branch.
+fn write_lost_found(repo: &gix::Repository, id: ObjectId, kind: Kind) -> Result<()> {
+    let subdir = if kind == Kind::Commit { "commit" } else { "other" };
+    let dir = repo.git_dir().join("lost-found").join(subdir);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(id.to_string());
+    if kind == Kind::Blob {
+        let object = repo.find_object(id)?;
+        std::fs::write(&path, &object.data)?;
+    } else {
+        std::fs::write(&path, format!("{id}\n"))?;
+    }
+    Ok(())
 }
 
 /// One completed `struct progress` as git renders it on a non-tty: the final

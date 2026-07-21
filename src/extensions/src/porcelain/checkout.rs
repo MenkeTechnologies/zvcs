@@ -27,8 +27,13 @@
 //!     refused. Untracked files are ignored for the clean check, matching git.
 //!   * Pathspecs match literal files and directory prefixes (and `.`); general
 //!     glob magic is left to the shell.
-//!   * `-m`/`--merge`, `-p`/`--patch`, `--ours`/`--theirs`, `-t`/`--track`,
-//!     `--orphan` are not supported and bail precisely.
+//!   * `--ours`/`--theirs` write a conflicted path's stage-2/stage-3 blob into
+//!     the worktree (index left conflicted), `-t`/`--track` create-and-track,
+//!     `--orphan` starts an unborn branch — all matching stock git.
+//!   * `-m`/`--merge` is accepted: with a clean worktree it is byte-identical to
+//!     a plain switch, and the dirty case is governed by the same conservative
+//!     clean-check as every other switch here.
+//!   * `-p`/`--patch` (interactive hunk selection) still bails — it needs a TTY.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -37,7 +42,7 @@ use std::sync::atomic::AtomicBool;
 
 use gix::bstr::{BStr, BString};
 use gix::hash::ObjectId;
-use gix::index::entry::{Mode, Stat};
+use gix::index::entry::{Flags, Mode, Stat};
 use gix::prelude::ObjectIdExt;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
@@ -50,6 +55,11 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     let mut new_branch: Option<(String, bool)> = None;
     let mut detach = false;
     let mut quiet = false;
+    let mut track = false;
+    let mut orphan: Option<String> = None;
+    // Which conflict stage `--ours`/`--theirs` writes out (2 = ours, 3 = theirs);
+    // the last of the two flags wins, exactly like git's `opts.writeout_stage`.
+    let mut writeout_stage: Option<u8> = None;
     let mut pre: Vec<&str> = Vec::new(); // positionals before `--`
     let mut post: Vec<&str> = Vec::new(); // pathspecs after `--`
     let mut has_dashdash = false;
@@ -71,14 +81,28 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 new_branch = Some((name.clone(), a == "-B"));
                 i += 1;
             }
+            "--orphan" => {
+                let Some(name) = args.get(i + 1) else {
+                    // git: `error: option `orphan' requires a value`, exit 129.
+                    eprintln!("error: option `orphan' requires a value");
+                    return Ok(ExitCode::from(129));
+                };
+                orphan = Some(name.clone());
+                i += 1;
+            }
             "--detach" => detach = true,
             "-q" | "--quiet" => quiet = true,
             "-f" | "--force" => {} // accepted; a clean switch needs no forcing here
-            "-m" | "--merge" => bail!("three-way merge on checkout (-m) is not supported"),
-            "-p" | "--patch" => bail!("interactive patch checkout (-p) is not supported"),
-            "--ours" | "--theirs" => bail!("conflict-side checkout (--ours/--theirs) is not supported"),
-            "-t" | "--track" => bail!("upstream tracking setup (--track) is not supported"),
-            "--orphan" => bail!("orphan branch creation (--orphan) is not supported"),
+            "-t" | "--track" => track = true,
+            "--no-track" => {} // accepted; auto-tracking is off unless -t is given
+            "--ours" | "-2" => writeout_stage = Some(2),
+            "--theirs" | "-3" => writeout_stage = Some(3),
+            // `-m` only changes behavior when local changes must be carried across
+            // the switch; with a clean worktree it is byte-identical to a plain
+            // checkout, so accept it and let the shared clean-check govern the
+            // dirty case exactly as every other switch here does.
+            "-m" | "--merge" => {}
+            "-p" | "--patch" => bail!("interactive patch checkout (-p) needs a TTY"),
             _ if a.starts_with('-') && a.len() > 1 => bail!("unsupported flag {a:?}"),
             _ => pre.push(a),
         }
@@ -86,6 +110,22 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- Dispatch -----------------------------------------------------------
+    // `--orphan <name> [<start>]`: start an unborn branch off `<start>`'s tree.
+    if let Some(name) = orphan {
+        let start = pre.first().copied().unwrap_or("HEAD");
+        return orphan_checkout(&repo, &name, start, quiet);
+    }
+
+    // `--ours`/`--theirs <path>…`: write one conflict side into the worktree.
+    if let Some(stage) = writeout_stage {
+        let paths = if has_dashdash { &post } else { &pre };
+        if paths.is_empty() {
+            eprintln!("fatal: '--ours/--theirs' needs the paths to check out");
+            return Ok(ExitCode::from(128));
+        }
+        return restore_conflict_stage(&repo, paths, stage, !has_dashdash, quiet);
+    }
+
     if let Some((name, reset)) = new_branch {
         if has_dashdash || !post.is_empty() {
             bail!("cannot combine branch creation (-b/-B) with path restore");
@@ -94,7 +134,30 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             bail!("too many start-points given for branch creation");
         }
         let start = pre.first().copied().unwrap_or("HEAD");
-        return create_and_switch(&repo, &name, reset, start, quiet);
+        return create_and_switch(&repo, &name, reset, start, quiet, track);
+    }
+
+    // `-t <remote>/<branch>` with no `-b`: DWIM the local branch name from the
+    // remote-tracking start-point, then create-and-track.
+    if track {
+        if pre.len() != 1 {
+            eprintln!("fatal: missing branch name; try -b");
+            return Ok(ExitCode::from(128));
+        }
+        match resolve_tracking(&repo, pre[0])? {
+            Some(info) => {
+                let Some(name) = info.dwim_name.clone() else {
+                    // A local-branch start-point can't DWIM a new name.
+                    eprintln!("fatal: missing branch name; try -b");
+                    return Ok(ExitCode::from(128));
+                };
+                return create_and_switch(&repo, &name, false, pre[0], quiet, true);
+            }
+            None => {
+                eprintln!("fatal: missing branch name; try -b");
+                return Ok(ExitCode::from(128));
+            }
+        }
     }
 
     if has_dashdash {
@@ -267,11 +330,28 @@ fn create_and_switch(
     reset: bool,
     start: &str,
     quiet: bool,
+    track: bool,
 ) -> Result<ExitCode> {
     let full = format!("refs/heads/{name}");
     if gix::validate::reference::branch_name(BStr::new(full.as_bytes())).is_err() {
         bail!("'{name}' is not a valid branch name");
     }
+
+    // `-t`: resolve the upstream before any mutation, so a bad start-point fails
+    // exactly like git — branch untouched, HEAD unmoved.
+    let track_info = if track {
+        match resolve_tracking(repo, start)? {
+            Some(info) => Some(info),
+            None => {
+                eprintln!(
+                    "fatal: cannot set up tracking information; starting point '{start}' is not a branch"
+                );
+                return Ok(ExitCode::from(128));
+            }
+        }
+    } else {
+        None
+    };
 
     let commit = repo.rev_parse_single(start)?.object()?.peel_to_commit()?;
     let start_id = commit.id;
@@ -324,6 +404,12 @@ fn create_and_switch(
     })?;
     set_head_symbolic(repo, branch_full, &format!("checkout: moving from {old_label} to {name}"))?;
 
+    // `-t`: persist branch.<name>.remote / .merge (lock already held above; the
+    // per-thread RepoLock is reentrant, so config.rs-style locking isn't needed).
+    if let Some(info) = &track_info {
+        write_tracking_config(repo, name, info)?;
+    }
+
     if !quiet {
         // Reset-in-place (-B on the current branch) prints only "Reset branch".
         if existed && already_on {
@@ -341,8 +427,225 @@ fn create_and_switch(
                 eprintln!("Switched to a new branch '{name}'");
             }
         }
+        // git prints the tracking confirmation to stdout, after the stderr
+        // transition line, and only when not quiet.
+        if let Some(info) = &track_info {
+            println!("branch '{name}' set up to track '{}'.", info.display);
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `git checkout --orphan <name> [<start>]`: point `HEAD` at an unborn branch
+/// `<name>` whose worktree/index come from `<start>`'s tree. The ref is not
+/// created (git materializes it only at the first commit) and no reflog entry is
+/// written, matching stock git.
+fn orphan_checkout(
+    repo: &gix::Repository,
+    name: &str,
+    start: &str,
+    quiet: bool,
+) -> Result<ExitCode> {
+    // git resolves the start-point before anything else: a bad one aborts here.
+    let commit = match repo
+        .rev_parse_single(start)
+        .ok()
+        .and_then(|id| id.object().ok())
+        .and_then(|o| o.peel_to_commit().ok())
+    {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "fatal: '{start}' is not a commit and a branch '{name}' cannot be created from it"
+            );
+            return Ok(ExitCode::from(128));
+        }
+    };
+
+    let full = format!("refs/heads/{name}");
+    if gix::validate::reference::branch_name(BStr::new(full.as_bytes())).is_err() {
+        eprintln!("fatal: '{name}' is not a valid branch name");
+        eprintln!("hint: See 'git help check-ref-format'");
+        eprintln!("hint: Disable this message with \"git config set advice.refSyntax false\"");
+        return Ok(ExitCode::from(128));
+    }
+
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+
+    if repo.try_find_reference(full.as_str())?.is_some() {
+        eprintln!("fatal: a branch named '{name}' already exists");
+        return Ok(ExitCode::from(128));
+    }
+
+    let target_tree = commit.tree_id()?.detach();
+    let cur_tree = repo.head_tree_id_or_empty()?.detach();
+    if target_tree != cur_tree {
+        ensure_clean(repo)?;
+        update_worktree_to_tree(repo, target_tree)?;
+    }
+
+    // Write HEAD as a plain symref to the (not-yet-existing) branch. No ref is
+    // created and no reflog line is appended — git's exact orphan behavior.
+    let head_path = repo.git_dir().join("HEAD");
+    std::fs::write(&head_path, format!("ref: {full}\n"))?;
+
+    if !quiet {
+        eprintln!("Switched to a new branch '{name}'");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git checkout --ours|--theirs <path>…`: write one side of a conflict into the
+/// worktree. `stage` is 2 (ours) or 3 (theirs). A non-conflicted path falls back
+/// to its stage-0 blob; a conflicted path missing the requested side errors with
+/// git's `path 'X' does not have our/their version` and exits 1. The index is
+/// left untouched (a conflicted path stays conflicted).
+fn restore_conflict_stage(
+    repo: &gix::Repository,
+    paths: &[&str],
+    stage: u8,
+    bare: bool,
+    quiet: bool,
+) -> Result<ExitCode> {
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+
+    let index = repo.open_index()?;
+    let matched = match_paths(&index, paths)?;
+    let mset: HashSet<BString> = matched.iter().cloned().collect();
+
+    // Which stages each matched path carries (index 0..=3).
+    let mut have: HashMap<BString, [bool; 4]> = HashMap::new();
+    {
+        let backing = index.path_backing();
+        for e in index.entries() {
+            let p = e.path_in(backing).to_owned();
+            if mset.contains(&p) {
+                let s = (e.stage_raw() as usize).min(3);
+                have.entry(p).or_insert([false; 4])[s] = true;
+            }
+        }
+    }
+
+    let side = if stage == 2 { "our" } else { "their" };
+    let mut keep: HashMap<BString, u32> = HashMap::new();
+    let mut had_error = false;
+    for p in &matched {
+        let flags = have.get(p).copied().unwrap_or([false; 4]);
+        let chosen = if flags[0] {
+            Some(0u32) // not conflicted → the single indexed blob
+        } else if flags[stage as usize] {
+            Some(stage as u32)
+        } else {
+            None
+        };
+        match chosen {
+            Some(st) => {
+                keep.insert(p.clone(), st);
+            }
+            None => {
+                let pb: &[u8] = p.as_ref();
+                eprintln!(
+                    "error: path '{}' does not have {side} version",
+                    String::from_utf8_lossy(pb)
+                );
+                had_error = true;
+            }
+        }
+    }
+
+    if !keep.is_empty() {
+        // Build a stage-0 view holding exactly the chosen entries and check it out;
+        // the real index is never rewritten, so conflicts survive.
+        let mut subset = repo.open_index()?;
+        subset.remove_entries(|_, path, e| match keep.get(&path.to_owned()) {
+            Some(&st) => e.stage_raw() != st,
+            None => true,
+        });
+        for e in subset.entries_mut() {
+            e.flags.remove(Flags::STAGE_MASK);
+        }
+        let should_interrupt = AtomicBool::new(false);
+        checkout_subset(repo, &mut subset, &should_interrupt)?;
+    }
+
+    if had_error {
+        return Ok(ExitCode::from(1));
+    }
+    if bare && !quiet {
+        let n = keep.len();
+        eprintln!(
+            "Updated {n} path{} from the index",
+            if n == 1 { "" } else { "s" }
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Upstream a `-t`/`--track` start-point resolves to.
+struct TrackInfo {
+    /// `branch.<name>.remote`: `"."` for a local start-point, else the remote name.
+    remote: String,
+    /// `branch.<name>.merge`, always `refs/heads/<branch>`.
+    merge: String,
+    /// Upstream short name shown in the "set up to track" line.
+    display: String,
+    /// For `-t` without `-b`: the local branch name DWIM'd from the start-point
+    /// (`Some` only for a remote-tracking start; a local one can't DWIM a name).
+    dwim_name: Option<String>,
+}
+
+/// Classify a `-t` start-point as a trackable branch. Returns `None` when it is
+/// neither a local branch nor a remote-tracking branch of a configured remote —
+/// the caller turns that into git's "is not a branch" / "missing branch name".
+fn resolve_tracking(repo: &gix::Repository, start: &str) -> Result<Option<TrackInfo>> {
+    if repo
+        .try_find_reference(format!("refs/heads/{start}").as_str())?
+        .is_some()
+    {
+        return Ok(Some(TrackInfo {
+            remote: ".".into(),
+            merge: format!("refs/heads/{start}"),
+            display: start.into(),
+            dwim_name: None,
+        }));
+    }
+    if repo
+        .try_find_reference(format!("refs/remotes/{start}").as_str())?
+        .is_some()
+    {
+        // Remote names carry no '/', so the first component is the remote.
+        if let Some((remote, rest)) = start.split_once('/') {
+            if !rest.is_empty()
+                && repo
+                    .remote_names()
+                    .iter()
+                    .any(|n| n.to_str_lossy() == remote)
+            {
+                return Ok(Some(TrackInfo {
+                    remote: remote.into(),
+                    merge: format!("refs/heads/{rest}"),
+                    display: start.into(),
+                    dwim_name: Some(rest.into()),
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Persist `branch.<name>.remote` / `branch.<name>.merge` into the repo-local
+/// config. The caller already holds the reentrant `RepoLock`.
+fn write_tracking_config(repo: &gix::Repository, name: &str, info: &TrackInfo) -> Result<()> {
+    let path = repo.common_dir().join("config");
+    let mut file =
+        gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)?;
+    file.set_raw_value_by("branch", Some(name), "remote", info.remote.as_str())?;
+    file.set_raw_value_by("branch", Some(name), "merge", info.merge.as_str())?;
+    let bytes = file.to_bstring();
+    let tmp = path.with_extension("zvcs-tmp");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// Restore `paths` in the worktree from the current index (index left unchanged;

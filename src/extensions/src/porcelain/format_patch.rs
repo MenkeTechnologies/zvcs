@@ -25,9 +25,11 @@
 //!     `--skip`, `--reverse`, `--min-parents`/`--max-parents`/`--no-merges`,
 //!     `-n`/`--numbered`, `-N`/`--no-numbered`, `--start-number`,
 //!     `--numbered-files`, `--suffix`, `--subject-prefix`, `--rfc`,
-//!     `-v`/`--reroll-count`, `--signature`/`--no-signature`, `--zero-commit`,
-//!     `-p`/`--no-stat`, `--root`, `-q`/`--quiet`, `--filename-max-length`,
-//!     `--cover-letter`, `-U`/`--unified`, `-a`/`--text`, `--minimal`,
+//!     `-v`/`--reroll-count`, `--signature`/`--no-signature`,
+//!     `--signature-file`, `--zero-commit`, `-p`/`--no-stat`, `--root`,
+//!     `-q`/`--quiet`, `--filename-max-length`, `--cover-letter`,
+//!     `-k`/`--keep-subject`, `--to`, `--cc`, `--add-header`, `--in-reply-to`,
+//!     `-U`/`--unified`, `-a`/`--text`, `--minimal`,
 //!     `--histogram`, `--diff-algorithm=myers|minimal|histogram`.
 //!   * alternate diffstat formats — `--stat`, `--summary`, `--numstat`,
 //!     `--shortstat`, and the whole dirstat family (`--dirstat[=<params>]`,
@@ -68,8 +70,9 @@
 //!     that it never becomes a bogus revision error, but limiting the walk and
 //!     the patch to it is not ported, so a pathspec that reaches a non-empty
 //!     commit list is fatal.
-//!   * threading, MIME attach/inline, signoff, `--keep-subject`, extra headers
-//!     (`--to`/`--cc`/`--in-reply-to`), notes, interdiff and range-diff,
+//!   * threading (its auto-generated `Message-Id` embeds `time(NULL)`, so it
+//!     cannot be reproduced byte-for-byte), MIME attach/inline, signoff,
+//!     `--from`/`--force-in-body-from`, notes, interdiff and range-diff,
 //!     `--ignore-if-in-upstream`, `--compact-summary`, the width-tuned diffstat
 //!     (`--stat=<width>`, `--stat-width`, `--stat-name-width`, `--stat-count`),
 //!     whitespace-insensitive diffing, patience diff (imara-diff has Myers,
@@ -169,6 +172,18 @@ struct Opts {
     quiet: bool,
     name_max: usize,
     cover_letter: bool,
+    /// `-k`/`--keep-subject`: keep the commit subject verbatim (newlines and
+    /// all), with no `[PATCH]` prefix and no series numbering.
+    keep_subject: bool,
+    /// `--in-reply-to=<id>`: the cleaned inner message id (without `<`/`>`),
+    /// emitted as `In-Reply-To:`/`References:` on every message and the cover.
+    in_reply_to: Option<String>,
+    /// `--to`/`--cc`: recipient lists, one entry per option occurrence, folded
+    /// one entry per continuation line the way git emits them.
+    to: Vec<String>,
+    cc: Vec<String>,
+    /// `--add-header`: extra header lines, emitted verbatim before `To:`/`Cc:`.
+    add_header: Vec<String>,
 
     // Revision selection.
     root: bool,
@@ -362,17 +377,11 @@ const NO_OP: &[&str] = &[
 /// Flags git accepts that this module has not ported. Matched as `--flag` or
 /// `--flag=<value>`; see the module header for what each of them would change.
 const DEFERRED: &[&str] = &[
-    "-k",
-    "--keep-subject",
     "-s",
     "--signoff",
     "--attach",
     "--inline",
     "--thread",
-    "--in-reply-to",
-    "--to",
-    "--cc",
-    "--add-header",
     "--from",
     "--force-in-body-from",
     "--encode-email-headers",
@@ -380,7 +389,6 @@ const DEFERRED: &[&str] = &[
     "--base",
     "--interdiff",
     "--creation-factor",
-    "--signature-file",
     "--description-file",
     "--cover-from-description",
     "--commit-list-format",
@@ -463,6 +471,11 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         quiet: false,
         name_max: NAME_MAX_DEFAULT,
         cover_letter: false,
+        keep_subject: false,
+        in_reply_to: None,
+        to: Vec::new(),
+        cc: Vec::new(),
+        add_header: Vec::new(),
         root: false,
         max_count: None,
         skip: 0,
@@ -491,6 +504,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     // exit 129) must win over this option's own exit-128 rejection. Capture the
     // last value here (last-wins) and validate it once the loop is done.
     let mut cover_from_desc: Option<String> = None;
+    // git increments an internal `subject_prefix` counter whenever
+    // `--subject-prefix`/`--rfc` is given, and later `die()`s if `-k` is also
+    // set. Track only that it was given, not its value.
+    let mut subject_prefix_given = false;
     while i < args.len() {
         let a = args[i].as_str();
         if pathspec_mode {
@@ -518,6 +535,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "--subject-prefix" => {
                 i += 1;
                 o.subject_prefix = value_at(args, i, a)?;
+                subject_prefix_given = true;
             }
             "--suffix" => {
                 i += 1;
@@ -562,7 +580,56 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             }
             "--cover-letter" => o.cover_letter = true,
             "--no-cover-letter" => o.cover_letter = false,
-            "--rfc" => o.subject_prefix = "RFC PATCH".to_owned(),
+            "-k" | "--keep-subject" => o.keep_subject = true,
+            "--to" => {
+                i += 1;
+                o.to.push(value_at(args, i, a)?);
+            }
+            s if s.starts_with("--to=") => o.to.push(s["--to=".len()..].to_owned()),
+            "--cc" => {
+                i += 1;
+                o.cc.push(value_at(args, i, a)?);
+            }
+            s if s.starts_with("--cc=") => o.cc.push(s["--cc=".len()..].to_owned()),
+            "--add-header" => {
+                i += 1;
+                o.add_header.push(value_at(args, i, a)?);
+            }
+            s if s.starts_with("--add-header=") => {
+                o.add_header.push(s["--add-header=".len()..].to_owned());
+            }
+            "--in-reply-to" => {
+                i += 1;
+                let v = value_at(args, i, a)?;
+                match clean_message_id(&v) {
+                    Some(id) => o.in_reply_to = Some(id),
+                    None => return Ok(Parsed::Exit(fatal(&format!("insane in-reply-to: {v}")))),
+                }
+            }
+            s if s.starts_with("--in-reply-to=") => {
+                let v = &s["--in-reply-to=".len()..];
+                match clean_message_id(v) {
+                    Some(id) => o.in_reply_to = Some(id),
+                    None => return Ok(Parsed::Exit(fatal(&format!("insane in-reply-to: {v}")))),
+                }
+            }
+            "--signature-file" => {
+                i += 1;
+                match read_signature_file(&value_at(args, i, a)?) {
+                    Ok(sig) => o.signature = sig,
+                    Err(code) => return Ok(Parsed::Exit(code)),
+                }
+            }
+            s if s.starts_with("--signature-file=") => {
+                match read_signature_file(&s["--signature-file=".len()..]) {
+                    Ok(sig) => o.signature = sig,
+                    Err(code) => return Ok(Parsed::Exit(code)),
+                }
+            }
+            "--rfc" => {
+                o.subject_prefix = "RFC PATCH".to_owned();
+                subject_prefix_given = true;
+            }
             "--reverse" => o.reverse = true,
             "--no-merges" => o.max_parents = Some(1),
             "--minimal" => o.algorithm = Algorithm::MyersMinimal,
@@ -586,6 +653,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             }
             s if s.starts_with("--subject-prefix=") => {
                 o.subject_prefix = s["--subject-prefix=".len()..].to_owned();
+                subject_prefix_given = true;
             }
             s if s.starts_with("--suffix=") => o.suffix = s["--suffix=".len()..].to_owned(),
             s if s.starts_with("--reroll-count=") => {
@@ -599,6 +667,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             }
             s if s.starts_with("--rfc=") => {
                 o.subject_prefix = format!("{} PATCH", &s["--rfc=".len()..]);
+                subject_prefix_given = true;
             }
             // The revision-walk counts share git's strict signed-int parser
             // (`strtol_i`, base 10): trailing junk or a non-numeral is
@@ -830,6 +899,22 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                     "{v}: invalid cover from description mode"
                 ))))
             }
+        }
+    }
+
+    // builtin/log.c `cmd_format_patch()` `die()`s (exit 128) when `-k` is combined
+    // with numbering or a subject prefix, since keep-subject suppresses both. The
+    // numbering check comes first, so it wins when both conflicts are present.
+    if o.keep_subject {
+        if o.numbered == Some(true) {
+            return Ok(Parsed::Exit(fatal(
+                "options '-n' and '-k' cannot be used together",
+            )));
+        }
+        if subject_prefix_given {
+            return Ok(Parsed::Exit(fatal(
+                "options '--subject-prefix/--rfc' and '-k' cannot be used together",
+            )));
         }
     }
 
@@ -1175,6 +1260,51 @@ fn value_at(args: &[String], i: usize, name: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("option `{name}` requires a value"))
 }
 
+/// Port of `clean_message_id()` (builtin/log.c): skip leading whitespace and
+/// `<`, then take through the last byte that is neither whitespace nor `>`. The
+/// caller wraps the result back in `<`/`>`. `None` is git's
+/// `die("insane in-reply-to: …")` (exit 128) when no such byte exists.
+fn clean_message_id(msg_id: &str) -> Option<String> {
+    let b = msg_id.as_bytes();
+    let is_space = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+    let mut a = 0;
+    while a < b.len() && (is_space(b[a]) || b[a] == b'<') {
+        a += 1;
+    }
+    let mut z: Option<usize> = None;
+    let mut m = a;
+    while m < b.len() {
+        if !is_space(b[m]) && b[m] != b'>' {
+            z = Some(m);
+        }
+        m += 1;
+    }
+    z.map(|z| String::from_utf8_lossy(&b[a..=z]).into_owned())
+}
+
+/// Read a `--signature-file`, whose contents become the trailing signature
+/// verbatim. git `die()`s (exit 128) `unable to read signature file '<f>': <err>`
+/// when it cannot be read; the common missing-file / permission errnos are
+/// reproduced from `ErrorKind`.
+fn read_signature_file(path: &str) -> std::result::Result<String, ExitCode> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(e) => {
+            let reason = match e.kind() {
+                std::io::ErrorKind::NotFound => "No such file or directory".to_owned(),
+                std::io::ErrorKind::PermissionDenied => "Permission denied".to_owned(),
+                _ => e
+                    .raw_os_error()
+                    .map(|n| format!("os error {n}"))
+                    .unwrap_or_else(|| e.to_string()),
+            };
+            Err(fatal(&format!(
+                "unable to read signature file '{path}': {reason}"
+            )))
+        }
+    }
+}
+
 /// Whether the process runs at the root of the worktree, where a relative
 /// pathspec prefix is empty.
 fn at_worktree_top(repo: &gix::Repository) -> bool {
@@ -1503,15 +1633,26 @@ fn render_message(
     let date = author
         .time()?
         .format(gix::date::time::format::GIT_RFC2822)?;
+    // `--in-reply-to` puts its headers ahead of everything, so it goes in first.
+    write_in_reply_to(&mut sb, opts);
     write_identity_headers(&mut sb, author_name, author_mail, &date);
 
-    // Subject: — the first paragraph, folded onto one logical line.
+    // Subject: — the first paragraph, folded onto one logical line, unless
+    // `-k`/`--keep-subject` asked for the raw first paragraph (newlines and all).
     let msg = skip_blank_lines(raw);
-    let (title, rest) = format_subject(msg);
-    let title = title
-        .to_str()
-        .map_err(|_| anyhow!("commit subject is not valid UTF-8"))?
-        .to_owned();
+    let (joined, rest) = format_subject(msg);
+    let title = if opts.keep_subject {
+        let consumed = &msg[..msg.len() - rest.len()];
+        trim_end_ws(consumed)
+            .to_str()
+            .map_err(|_| anyhow!("commit subject is not valid UTF-8"))?
+            .to_owned()
+    } else {
+        joined
+            .to_str()
+            .map_err(|_| anyhow!("commit subject is not valid UTF-8"))?
+            .to_owned()
+    };
     write_subject(&mut sb, &title, nr, total, opts);
 
     if need_8bit {
@@ -1519,6 +1660,8 @@ fn render_message(
         sb.push_str(&format!("Content-Type: text/plain; charset={ENCODING}\n"));
         sb.push_str("Content-Transfer-Encoding: 8bit\n");
     }
+    // `--add-header`, then `To:`/`Cc:`, follow the identity/MIME headers.
+    write_extra_headers(&mut sb, opts);
     sb.push('\n');
 
     // Body — the remaining paragraphs, right-trimmed line by line.
@@ -1657,8 +1800,10 @@ fn render_cover_letter(
             )
         }
     };
+    write_in_reply_to(&mut sb, opts);
     write_identity_headers(&mut sb, &name, &mail, &date);
     write_subject(&mut sb, COVER_SUBJECT, 0, total, opts);
+    write_extra_headers(&mut sb, opts);
     sb.push('\n');
     sb.push_str(COVER_BLURB);
     sb.push_str("\n\n");
@@ -1761,9 +1906,13 @@ fn write_identity_headers(sb: &mut String, name: &str, mail: &str, date: &str) {
     sb.push_str(&format!("Date: {date}\n"));
 }
 
-/// `Subject: [<prefix> n/total] <title>`, with the numbering git uses.
+/// `Subject: [<prefix> n/total] <title>`, with the numbering git uses. Under
+/// `-k`/`--keep-subject` the prefix and numbering are dropped entirely, so the
+/// bare `Subject: <title>` carries the commit's own subject.
 fn write_subject(sb: &mut String, title: &str, nr: usize, total: usize, opts: &Opts) {
-    if total > 0 {
+    if opts.keep_subject {
+        sb.push_str("Subject: ");
+    } else if total > 0 {
         let width = decimal_width(total as u64);
         let sep = if opts.subject_prefix.is_empty() {
             ""
@@ -1784,6 +1933,46 @@ fn write_subject(sb: &mut String, title: &str, nr: usize, total: usize, opts: &O
     } else {
         let consumed = -last_line_length(sb);
         wrap_text(sb, title, consumed, 1, HEADER_MAX_LENGTH);
+    }
+    sb.push('\n');
+}
+
+/// `In-Reply-To:`/`References:` for `--in-reply-to`, emitted ahead of `From:` on
+/// every message and the cover. Without `--thread` (unported) git sets both to
+/// the same cleaned id on each message, which is what is reproduced here.
+fn write_in_reply_to(sb: &mut String, opts: &Opts) {
+    if let Some(id) = &opts.in_reply_to {
+        sb.push_str(&format!("In-Reply-To: <{id}>\n"));
+        sb.push_str(&format!("References: <{id}>\n"));
+    }
+}
+
+/// `--add-header` lines (verbatim), then the `To:` and `Cc:` recipient lists,
+/// emitted after the identity/MIME headers and before the blank line that ends
+/// the header block. Each recipient list is folded one entry per continuation
+/// line, aligned under the first address, the way git emits them.
+fn write_extra_headers(sb: &mut String, opts: &Opts) {
+    for h in &opts.add_header {
+        sb.push_str(h);
+        sb.push('\n');
+    }
+    write_recipient_list(sb, "To", &opts.to);
+    write_recipient_list(sb, "Cc", &opts.cc);
+}
+
+fn write_recipient_list(sb: &mut String, name: &str, list: &[String]) {
+    if list.is_empty() {
+        return;
+    }
+    sb.push_str(name);
+    sb.push_str(": ");
+    let indent = " ".repeat(name.len() + 2);
+    for (idx, value) in list.iter().enumerate() {
+        if idx > 0 {
+            sb.push_str(",\n");
+            sb.push_str(&indent);
+        }
+        sb.push_str(value);
     }
     sb.push('\n');
 }

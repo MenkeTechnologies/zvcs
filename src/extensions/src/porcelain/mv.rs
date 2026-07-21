@@ -6,12 +6,15 @@
 //!
 //!   * `git mv <src> <dst>`                 — rename a tracked file or directory
 //!   * `git mv <src>... <existing-dir>`     — move one or more paths into a dir
-//!   * flags `-f`/`--force`, `-k`, `-n`/`--dry-run`, `-v`/`--verbose`, `--`
+//!   * flags `-f`/`--force`, `-k`, `-n`/`--dry-run`, `-v`/`--verbose`,
+//!     `--sparse`, `-h`, `--`
 //!
 //! A directory source remaps every tracked entry beneath it. Overwriting a
-//! tracked/worktree destination requires `-f`. What is intentionally NOT served
-//! is documented where it `bail!`s: sparse-checkout (`--sparse`) semantics and
-//! force-overwriting a directory destination.
+//! tracked/worktree destination requires `-f`. Exit codes match stock git:
+//! usage errors return 129, fatal errors return 128, `-k`-skipped failures
+//! still return 0. `--sparse` is accepted as a no-op — this server enforces no
+//! sparse-checkout cone, so relaxing that cone (all `--sparse` does) is already
+//! the behavior of a plain move.
 
 use anyhow::{anyhow, bail, Result};
 use std::path::{Component, Path, PathBuf};
@@ -20,6 +23,33 @@ use std::process::ExitCode;
 use gix::bstr::{BStr, BString};
 use gix::hash::ObjectId;
 use gix::index::entry::{Flags, Mode, Stage, Stat};
+
+/// `git mv -h` help, printed verbatim to stdout (git exits 129 after it).
+const HELP: &str = "\
+usage: git mv [-v] [-f] [-n] [-k] <source> <destination>
+   or: git mv [-v] [-f] [-n] [-k] <source>... <destination-directory>
+
+    -v, --[no-]verbose    be verbose
+    -n, --[no-]dry-run    dry run
+    -f, --[no-]force      force move/rename even if target exists
+    -k                    skip move/rename errors
+    --[no-]sparse         allow updating entries outside of the sparse-checkout cone
+
+";
+
+/// Print a fatal message to stderr and return git's fatal exit code (128).
+/// stderr prose is not a compatibility surface (git's own is terse and varies);
+/// the exit code is, so it is pinned exactly.
+fn fatal(msg: impl std::fmt::Display) -> Result<ExitCode> {
+    eprintln!("fatal: {msg}");
+    Ok(ExitCode::from(128))
+}
+
+/// Print the usage line to stderr and return git's usage exit code (129).
+fn usage_err() -> Result<ExitCode> {
+    eprintln!("usage: git mv [-v] [-f] [-n] [-k] <source> <destination>");
+    Ok(ExitCode::from(129))
+}
 
 /// A fully validated move: the on-disk rename plus the index path remaps it
 /// implies. For a file the remap list has one pair; for a directory it has one
@@ -48,32 +78,47 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
         }
         match a.as_str() {
             "--" => opts_done = true,
+            "-h" => {
+                // git prints the full help to stdout and exits 129, before any
+                // repository lookup — so `-h` works outside a work tree too.
+                // (`--help` is deliberately NOT handled here: stock git execs the
+                //  man pager for it, a foreign op this server cannot reproduce.)
+                print!("{HELP}");
+                return Ok(ExitCode::from(129));
+            }
             "-f" | "--force" => force = true,
             "-k" => skip = true,
             "-n" | "--dry-run" => dry_run = true,
             "-v" | "--verbose" => verbose = true,
-            "--sparse" => bail!("--sparse (sparse-checkout) is not supported"),
-            s if s.starts_with('-') && s.len() > 1 => bail!("unknown switch `{s}`"),
+            // No sparse-checkout cone is enforced here, so `--sparse` (which only
+            // relaxes that cone) is byte-for-byte a plain move. Accept, no-op.
+            "--sparse" => {}
+            s if s.starts_with('-') && s.len() > 1 => {
+                eprintln!("error: unknown option `{}'", s.trim_start_matches('-'));
+                return usage_err();
+            }
             s => positional.push(s),
         }
     }
 
     if positional.len() < 2 {
-        bail!("usage: git mv [-v] [-f] [-n] [-k] <source> <destination>");
+        return usage_err();
     }
 
     // 2. Repository + worktree context. All paths are resolved relative to the
     //    current directory via the repo prefix, then made repo-relative.
-    let repo = gix::discover(".")?;
-    let workdir = repo
-        .workdir()
-        .ok_or_else(|| anyhow!("this operation must be run in a work tree"))?
-        .to_owned();
-    let prefix = repo
-        .prefix()
-        .map_err(|e| anyhow!("cannot resolve worktree prefix: {e}"))?
-        .map(Path::to_path_buf)
-        .unwrap_or_default();
+    let repo = match gix::discover(".") {
+        Ok(r) => r,
+        Err(_) => return fatal("not a git repository (or any of the parent directories): .git"),
+    };
+    let workdir = match repo.workdir() {
+        Some(w) => w.to_owned(),
+        None => return fatal("this operation must be run in a work tree"),
+    };
+    let prefix = match repo.prefix() {
+        Ok(p) => p.map(Path::to_path_buf).unwrap_or_default(),
+        Err(e) => return fatal(format!("cannot resolve worktree prefix: {e}")),
+    };
 
     // 3. Split operands: everything but the last is a source; the last is the
     //    destination. Decide file-mode vs into-directory-mode the way git does:
@@ -81,18 +126,26 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     let dest_arg = *positional.last().expect("checked len >= 2");
     let sources = &positional[..positional.len() - 1];
 
-    let dest_rel = normalize_rel(&prefix, dest_arg)?;
+    let dest_rel = match normalize_rel(&workdir, &prefix, dest_arg) {
+        Ok(r) => r,
+        Err(e) => return fatal(e),
+    };
     let dest_abs = workdir.join(&dest_rel);
     let trailing_slash = dest_arg.ends_with('/');
     let dest_is_dir = dest_abs.is_dir();
 
     if trailing_slash && !dest_is_dir {
-        let first = normalize_rel(&prefix, sources[0])?;
-        bail!("destination directory does not exist, source={first}, destination={dest_arg}");
+        let first = match normalize_rel(&workdir, &prefix, sources[0]) {
+            Ok(r) => r,
+            Err(e) => return fatal(e),
+        };
+        return fatal(format!(
+            "destination directory does not exist, source={first}, destination={dest_arg}"
+        ));
     }
     let dir_mode = dest_is_dir;
     if sources.len() > 1 && !dir_mode {
-        bail!("destination '{dest_arg}' is not a directory");
+        return fatal(format!("destination '{dest_arg}' is not a directory"));
     }
 
     // 4. Serialize the whole index read-modify-write through the repo
@@ -100,7 +153,10 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     //    lock. The guard is held across validation, the disk renames, and the
     //    single index write below.
     let _lock = (!dry_run).then(|| crate::lock::RepoLock::acquire(repo.git_dir()));
-    let mut index = repo.open_index()?;
+    let mut index = match repo.open_index() {
+        Ok(i) => i,
+        Err(e) => return fatal(format!("index file corrupt: {e}")),
+    };
 
     // 5. Validation phase — build a plan per source against the pristine index.
     //    Without `-k` the first failure aborts before ANY disk/index mutation,
@@ -114,7 +170,7 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
                 if skip {
                     continue;
                 }
-                return Err(e);
+                return fatal(format!("{e:#}"));
             }
         }
     }
@@ -130,8 +186,9 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             println!("Renaming {} to {}", plan.src_rel, plan.dst_rel);
         }
         if !dry_run {
-            std::fs::rename(&plan.src_abs, &plan.dst_abs)
-                .map_err(|e| anyhow!("renaming '{}' failed: {e}", plan.src_rel))?;
+            if let Err(e) = std::fs::rename(&plan.src_abs, &plan.dst_abs) {
+                return fatal(format!("renaming '{}' failed: {e}", plan.src_rel));
+            }
             apply_remaps(&mut index, &plan.remaps);
             modified = true;
         }
@@ -160,7 +217,7 @@ fn plan_source(
     dest_rel: &str,
     force: bool,
 ) -> Result<Plan> {
-    let src_rel = normalize_rel(prefix, src_arg)?;
+    let src_rel = normalize_rel(workdir, prefix, src_arg)?;
     let src_abs = workdir.join(&src_rel);
 
     // When moving into a directory the destination basename is the source's.
@@ -285,23 +342,45 @@ fn apply_remaps(index: &mut gix::index::File, remaps: &[(String, String)]) {
     }
 }
 
-/// Turn a CWD-relative operand into a clean, repo-relative, slash-separated
-/// path by prepending the worktree `prefix` and resolving `.`/`..` lexically.
-/// Rejects absolute paths and any `..` that escapes the worktree.
-fn normalize_rel(prefix: &Path, arg: &str) -> Result<String> {
-    let joined = prefix.join(arg);
+/// Turn an operand into a clean, repo-relative, slash-separated path.
+///
+/// Relative operands are resolved against the worktree `prefix` (the repo-
+/// relative CWD). Absolute operands are resolved against the worktree root
+/// `workdir` and stripped back to repo-relative — stock git accepts an absolute
+/// path that lands inside the worktree (verified: `git mv /abs/inside/a b`
+/// exits 0). `.`/`..` are folded lexically. Any path that escapes the worktree
+/// is a fatal "outside repository", matching git's exit 128.
+fn normalize_rel(workdir: &Path, prefix: &Path, arg: &str) -> Result<String> {
+    let arg_path = Path::new(arg);
+    let joined = if arg_path.is_absolute() {
+        // Resolve symlinks on the longest existing ancestor (macOS /tmp ->
+        // /private/tmp), keep any not-yet-created tail, then strip the worktree
+        // root. Anything not under it is outside the repository.
+        let canon_wd = workdir
+            .canonicalize()
+            .unwrap_or_else(|_| workdir.to_path_buf());
+        let real = canonicalize_lenient(arg_path);
+        match real.strip_prefix(&canon_wd) {
+            Ok(rel) if !rel.as_os_str().is_empty() => rel.to_path_buf(),
+            _ => bail!("'{arg}' is outside repository at '{}'", canon_wd.display()),
+        }
+    } else {
+        prefix.join(arg)
+    };
     let mut parts: Vec<String> = Vec::new();
     for comp in joined.components() {
         match comp {
             Component::CurDir => {}
             Component::ParentDir => {
                 if parts.pop().is_none() {
-                    bail!("path escapes the working tree: {arg}");
+                    bail!("'{arg}' is outside repository at '{}'", workdir.display());
                 }
             }
             Component::Normal(p) => parts.push(p.to_string_lossy().into_owned()),
             Component::RootDir | Component::Prefix(_) => {
-                bail!("absolute paths are not supported: {arg}")
+                // Absolute inputs are stripped to worktree-relative above, so a
+                // residual root component here means the path escaped.
+                bail!("'{arg}' is outside repository at '{}'", workdir.display())
             }
         }
     }
@@ -309,4 +388,29 @@ fn normalize_rel(prefix: &Path, arg: &str) -> Result<String> {
         bail!("invalid path: {arg}");
     }
     Ok(parts.join("/"))
+}
+
+/// Canonicalize the longest existing prefix of `p`, re-appending the trailing
+/// components that don't exist yet (a not-yet-created move destination). Falls
+/// back to the path as given when nothing along it can be canonicalized.
+fn canonicalize_lenient(p: &Path) -> PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p;
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            tail.push(name.to_os_string());
+        }
+        if let Ok(c) = parent.canonicalize() {
+            let mut out = c;
+            for name in tail.iter().rev() {
+                out.push(name);
+            }
+            return out;
+        }
+        cur = parent;
+    }
+    p.to_path_buf()
 }

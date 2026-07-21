@@ -14,13 +14,26 @@
 //! blank line, patch), and `--name-only`/`--name-status`/`-s` suppress every
 //! other format exactly like `diff_setup_done()` does.
 //!
+//! Beyond the format selectors, these options are honored: `-R` (reverse, for
+//! tree/tree and `--cached` pairs), `-z`, `--full-index`, `--abbrev[=<n>]`,
+//! `--no-prefix`/`--default-prefix`/`--src-prefix=`/`--dst-prefix=`, `--summary`,
+//! `--diff-filter=<...>`, `--patch-with-raw`, `--patch-with-stat`, `--exit-code`,
+//! `--quiet`, `--minimal`/`--diff-algorithm=<myers|minimal|histogram>`, and
+//! merge-base ranges `<a>...<b>` (diffed as `merge-base(a,b)` against `b`).
+//! Submodule/gitlink (`160000`) changes render as the short-format
+//! `Subproject commit <oid>` diff for tree/tree and `--cached` pairs.
+//!
 //! ### Honest limitations (bailed on with a precise message, never faked)
 //!
-//! * Merge-base ranges (`<revA>...<revB>`) are not supported.
 //! * Rename/copy detection is not performed. `--find-renames`/`-M`/`-C` are accepted
 //!   (they change nothing on a history without renames) but a real rename still renders
 //!   as a deletion plus an addition.
-//! * Submodule/gitlink (`160000`) changes are not diffable through the blob pipeline and bail.
+//! * `-R` on a worktree diff bails: the worktree "new" side has no object id to move
+//!   onto the old side within this pipeline.
+//! * A submodule change against the worktree (`git diff <rev>`) still bails — it needs
+//!   the submodule's own repository to resolve the working HEAD.
+//! * A type change (regular file ↔ symlink) in the worktree bails.
+//! * The `patience` diff algorithm has no imara-diff equivalent and bails.
 //! * Hunk *section headings* (the text after the second `@@`, i.e. the enclosing function)
 //!   are not emitted — gitoxide's unified-diff writer does not compute them.
 //! * Magic pathspecs (`:(...)`) and glob pathspecs bail; literal path / directory-prefix
@@ -54,6 +67,7 @@ const F_NAME: u32 = 1 << 4;
 const F_NAME_STATUS: u32 = 1 << 5;
 const F_PATCH: u32 = 1 << 6;
 const F_NO_OUTPUT: u32 = 1 << 7;
+const F_SUMMARY: u32 = 1 << 8;
 
 /// The exact `git diff` usage stream, printed on a usage error (exit 129).
 const USAGE: &str = "usage: git diff [<options>] [<commit>] [--] [<path>...]\n   or: git diff [<options>] --cached [--merge-base] [<commit>] [--] [<path>...]\n   or: git diff [<options>] [--merge-base] <commit> [<commit>...] <commit> [--] [<path>...]\n   or: git diff [<options>] <commit>...<commit> [--] [<path>...]\n   or: git diff [<options>] <blob> <blob>\n   or: git diff [<options>] --no-index [--] <path> <path> [<pathspec>...]\n\ncommon diff options:\n  -z            output diff-raw with lines terminated with NUL.\n  -p            output patch format.\n  -u            synonym for -p.\n  --patch-with-raw\n                output both a patch and the diff-raw format.\n  --stat        show diffstat instead of patch.\n  --numstat     show numeric diffstat instead of patch.\n  --patch-with-stat\n                output a patch and prepend its diffstat.\n  --name-only   show only names of changed files.\n  --name-status show names and status of changed files.\n  --full-index  show full object name on index lines.\n  --abbrev=<n>  abbreviate object names in diff-tree header and diff-raw.\n  -R            swap input file pairs.\n  -B            detect complete rewrites.\n  -M            detect renames.\n  -C            detect copies.\n  --find-copies-harder\n                try unchanged files as candidate for copy detection.\n  -l<n>         limit rename attempts up to <n> paths.\n  -O<file>      reorder diffs according to the <file>.\n  -S<string>    find filepair whose only one side contains the string.\n  --pickaxe-all\n                show all files diff when -S is used and hit is found.\n  -a  --text    treat all files as text.\n\n";
@@ -62,6 +76,24 @@ const USAGE: &str = "usage: git diff [<options>] [<commit>] [--] [<path>...]\n  
 fn usage_error() -> ExitCode {
     eprint!("{USAGE}");
     ExitCode::from(129)
+}
+
+/// Rendering options resolved from the command line and shared by every output
+/// format (raw / name / patch). Mirrors the fields of `struct diff_options` that
+/// affect byte-level formatting.
+struct Render {
+    /// Object-name abbreviation length for `--raw` and the patch `index` line.
+    abbrev: usize,
+    /// `--full-index`: emit the full object name on the patch `index` line.
+    full_index: bool,
+    /// `-z`: terminate `--raw`/`--name-only`/`--name-status` records with NUL and
+    /// suppress path C-quoting.
+    z: bool,
+    /// The `a/` (source) path prefix; `b/` under `-R`, empty under `--no-prefix`.
+    src_prefix: Vec<u8>,
+    /// The `b/` (destination) path prefix.
+    dst_prefix: Vec<u8>,
+    hash_kind: gix::hash::Kind,
 }
 
 /// How lines are compared, mirroring xdiff's `XDF_*` whitespace flags.
@@ -143,6 +175,18 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut trailing_paths: Vec<String> = Vec::new();
     let mut after_dashdash = false;
 
+    // Formatting / behavior options resolved below.
+    let mut reverse = false;
+    let mut z = false;
+    let mut full_index = false;
+    let mut want_exit_code = false;
+    let mut quiet = false;
+    let mut src_prefix: Vec<u8> = b"a/".to_vec();
+    let mut dst_prefix: Vec<u8> = b"b/".to_vec();
+    let mut diff_filter: Option<Vec<u8>> = None;
+    let mut algorithm: Option<gix::diff::blob::Algorithm> = None;
+    let mut abbrev: usize = 7;
+
     // Revisions and pathspecs are classified in a single left-to-right pass, so an
     // invalid option value, an ambiguous positional, and any "too many operands"
     // error surface in git's own argument order — `setup_revisions()` is one pass,
@@ -168,14 +212,71 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             "--name-status" => fmt |= F_NAME_STATUS,
             "-p" | "-u" | "--patch" => fmt |= F_PATCH,
             "-s" | "--no-patch" => fmt |= F_NO_OUTPUT,
+            "--summary" => fmt |= F_SUMMARY,
+            // `--patch-with-raw` / `--patch-with-stat` request two formats at once.
+            "--patch-with-raw" => fmt |= F_PATCH | F_RAW,
+            "--patch-with-stat" => fmt |= F_PATCH | F_DIFFSTAT,
             "-w" | "--ignore-all-space" => ws = Whitespace::IgnoreAll,
             "-b" | "--ignore-space-change" => ws = Whitespace::IgnoreChange,
             "--ignore-space-at-eol" => ws = Whitespace::IgnoreAtEol,
+            "-R" => reverse = true,
+            "-z" => z = true,
+            "--exit-code" => want_exit_code = true,
+            "--quiet" => {
+                quiet = true;
+                want_exit_code = true;
+            }
+            "--full-index" => full_index = true,
+            "--abbrev" => abbrev = 7,
+            "--no-prefix" => {
+                src_prefix.clear();
+                dst_prefix.clear();
+            }
+            "--default-prefix" => {
+                src_prefix = b"a/".to_vec();
+                dst_prefix = b"b/".to_vec();
+            }
+            // Diff-algorithm selection. imara-diff has no `patience` variant, so
+            // only the byte-reproducible algorithms are honored.
+            "--minimal" => algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal),
+            "--myers" => algorithm = Some(gix::diff::blob::Algorithm::Myers),
+            "--histogram" => algorithm = Some(gix::diff::blob::Algorithm::Histogram),
             // Accepted no-ops: these describe behavior zvcs already produces, or
             // (for rename detection) make no difference without renames present.
             "--no-renames" | "--no-color" | "--color=never" | "--ignore-blank-lines"
             | "--ignore-cr-at-eol" | "--find-renames" | "--find-copies" | "-M" | "-C"
-            | "--rename-empty" | "--no-rename-empty" | "--text" | "-a" => {}
+            | "--rename-empty" | "--no-rename-empty" | "--text" | "-a"
+            | "--indent-heuristic" | "--no-ext-diff" | "--ext-diff" | "--textconv"
+            | "--no-textconv" | "--ita-invisible-in-index" | "--ita-visible-in-index" => {}
+            s if s == "--ignore-submodules" || s.starts_with("--ignore-submodules=") => {}
+            s if s.starts_with("--diff-filter=") => {
+                diff_filter = Some(s["--diff-filter=".len()..].as_bytes().to_vec());
+            }
+            s if s.starts_with("--abbrev=") => {
+                let raw = &s["--abbrev=".len()..];
+                match raw.parse::<usize>() {
+                    // git clamps `--abbrev` to the range [4, hexsz].
+                    Ok(n) => abbrev = n.clamp(4, repo.object_hash().len_in_hex()),
+                    Err(_) => {
+                        eprintln!("error: option `abbrev' expects a numerical value");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            s if s.starts_with("--src-prefix=") => {
+                src_prefix = s["--src-prefix=".len()..].as_bytes().to_vec();
+            }
+            s if s.starts_with("--dst-prefix=") => {
+                dst_prefix = s["--dst-prefix=".len()..].as_bytes().to_vec();
+            }
+            s if s.starts_with("--diff-algorithm=") => {
+                match &s["--diff-algorithm=".len()..] {
+                    "myers" | "default" => algorithm = Some(gix::diff::blob::Algorithm::Myers),
+                    "minimal" => algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal),
+                    "histogram" => algorithm = Some(gix::diff::blob::Algorithm::Histogram),
+                    other => bail!("diff algorithm {other:?} is not available"),
+                }
+            }
             s if s.starts_with("--stat=") || s.starts_with("--stat-") => fmt |= F_DIFFSTAT,
             s if s.starts_with("--find-renames=") || s.starts_with("--find-copies=") => {}
             s if s.starts_with("-M") || s.starts_with("-C") => {}
@@ -210,7 +311,18 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 // any later option-value or operand-count check can fire.
                 if in_rev_region {
                     if s.contains("...") && looks_like_range(s) {
-                        bail!("merge-base ranges (<a>...<b>) are not supported");
+                        // `A...B` diffs the merge-base of A and B against B, exactly
+                        // like `git diff $(git merge-base A B) B`. Empty sides default
+                        // to `HEAD`, mirroring `setup_revisions()`.
+                        let (l, r) = s.split_once("...").expect("checked contains");
+                        let left = if l.is_empty() { "HEAD" } else { l };
+                        let right = if r.is_empty() { "HEAD" } else { r };
+                        let lid = repo.rev_parse_single(left)?.object()?.peel_to_commit()?.id;
+                        let rid = repo.rev_parse_single(right)?.object()?.peel_to_commit()?.id;
+                        let base = repo.merge_base(lid, rid)?.detach();
+                        revs.push(base.to_hex().to_string());
+                        revs.push(right.to_string());
+                        continue;
                     }
                     if s.contains("..") && looks_like_range(s) {
                         let (l, r) = s.split_once("..").expect("checked contains");
@@ -248,6 +360,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     }
     if fmt & (F_NAME | F_NAME_STATUS | F_NO_OUTPUT) != 0 {
         fmt &= !(F_RAW | F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_PATCH);
+    }
+    // `--name-only`/`--name-status` suppress `--summary`, but `-s` does not.
+    if fmt & (F_NAME | F_NAME_STATUS) != 0 {
+        fmt &= !F_SUMMARY;
     }
     if fmt == 0 {
         fmt = F_PATCH;
@@ -319,38 +435,69 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         deltas.retain(|d| paths.iter().any(|p| path_matches(&d.path, p)));
     }
 
+    // `-R`: swap the two sides of every pair. The worktree "new" side has no object
+    // id to move onto the old side, so a reversed worktree diff genuinely cannot be
+    // expressed through this pipeline.
+    if reverse {
+        if worktree_mode {
+            bail!("-R (reverse) with a worktree diff is not supported");
+        }
+        std::mem::swap(&mut src_prefix, &mut dst_prefix);
+        for d in &mut deltas {
+            reverse_delta(d);
+        }
+    }
+
+    // `--diff-filter`: keep only deltas whose status letter is selected.
+    if let Some(filter) = &diff_filter {
+        deltas.retain(|d| diff_filter_selected(filter, status_char(d)));
+    }
+
     deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
 
     // ---- analyze every delta once -----------------------------------------
+    // `--quiet`/`-s` produce no output, so the patch bodies are never needed.
     let workdir = repo.workdir().map(|p| p.to_owned());
-    let want_patch = fmt & F_PATCH != 0;
+    let want_patch = fmt & F_PATCH != 0 && !quiet;
     let mut analyses: Vec<Analysis> = Vec::with_capacity(deltas.len());
-    for delta in &deltas {
-        analyses.push(analyze(
-            &mut cache,
-            &repo.objects,
-            delta,
-            ctx,
-            ws,
-            hash_kind,
-            workdir.as_deref(),
-            want_patch,
-        )?);
+    if !quiet {
+        for delta in &deltas {
+            analyses.push(analyze(
+                &mut cache,
+                &repo.objects,
+                delta,
+                ctx,
+                ws,
+                hash_kind,
+                workdir.as_deref(),
+                want_patch,
+                algorithm,
+            )?);
+        }
     }
+
+    let r = Render {
+        abbrev,
+        full_index,
+        z,
+        src_prefix,
+        dst_prefix,
+        hash_kind,
+    };
 
     // ---- render, in `diff_flush()` order ----------------------------------
     // `diff_flush()` bails out before printing anything at all when the change
     // queue is empty, so even `--shortstat` stays silent on a clean tree.
     let mut out: Vec<u8> = Vec::new();
     let mut separator = false;
-    if !deltas.is_empty() {
+    if !quiet && !deltas.is_empty() {
         if fmt & (F_RAW | F_NAME | F_NAME_STATUS) != 0 {
             for delta in &deltas {
                 if fmt & (F_RAW | F_NAME_STATUS) != 0 {
-                    render_raw(&mut out, delta, fmt, hash_kind);
+                    render_raw(&mut out, delta, fmt, &r);
                 } else {
-                    out.extend_from_slice(&quoted_name(&delta.path));
-                    out.push(b'\n');
+                    out.extend_from_slice(&name_field(&delta.path, r.z));
+                    out.push(if r.z { 0 } else { b'\n' });
                 }
             }
             separator = true;
@@ -369,6 +516,11 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             separator = true;
         }
 
+        if fmt & F_SUMMARY != 0 {
+            render_summary(&mut out, &deltas);
+            separator = true;
+        }
+
         if fmt & F_PATCH != 0 {
             if separator {
                 out.push(b'\n');
@@ -384,7 +536,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 if !delta.unmerged && unmerged.contains(&delta.path) {
                     continue;
                 }
-                render_patch(&mut out, &repo, delta, an, ctx)?;
+                render_patch(&mut out, &repo, delta, an, ctx, &r)?;
             }
         }
     }
@@ -392,7 +544,46 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(&out)?;
     stdout.flush()?;
+    // `--exit-code`/`--quiet`: exit 1 when any difference was reported.
+    if want_exit_code && !deltas.is_empty() {
+        return Ok(ExitCode::from(1));
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Reverse (`-R`) one object-backed pair: the new side becomes the old side and
+/// vice-versa. Worktree pairs are never reversed (rejected earlier).
+fn reverse_delta(d: &mut Delta) {
+    let new_as_old = match &d.new {
+        NewSide::Blob(id, k) => Some((*id, *k)),
+        NewSide::Absent => None,
+        NewSide::Worktree(_) => return,
+    };
+    let old_as_new = match d.old {
+        Some((id, k)) => NewSide::Blob(id, k),
+        None => NewSide::Absent,
+    };
+    d.old = new_as_old;
+    d.new = old_as_new;
+    if let Some((a, b)) = d.stages {
+        d.stages = Some((b, a));
+    }
+}
+
+/// `--diff-filter`: an uppercase letter selects a status, its lowercase excludes it.
+/// When only exclusions are given every other status is kept; when any inclusion is
+/// present, unlisted statuses are dropped — matching `diff_opt_diff_filter()`.
+fn diff_filter_selected(filter: &[u8], status: u8) -> bool {
+    let up = status.to_ascii_uppercase();
+    if filter.iter().any(|&f| f == up.to_ascii_lowercase()) {
+        return false;
+    }
+    let has_include = filter.iter().any(|f| f.is_ascii_uppercase());
+    if has_include {
+        filter.iter().any(|&f| f == up)
+    } else {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -409,20 +600,16 @@ fn collect_tree_index(
 ) -> Result<()> {
     let tree_id = tree_id_for(repo, spec)?;
     let index = repo.index_or_load_from_head()?;
-    let mut gitlink: Option<BString> = None;
     repo.tree_index_status(
         &tree_id,
         &index,
         None,
         gix::status::tree_index::TrackRenames::Disabled,
         |change, _tree_index, _worktree_index| -> Result<_, std::convert::Infallible> {
-            collect_index_change(change, deltas, &mut gitlink);
+            collect_index_change(change, deltas);
             Ok(gix::diff::index::Action::Continue(()))
         },
     )?;
-    if let Some(p) = gitlink {
-        bail!("submodule/gitlink change at {p:?} is not supported");
-    }
 
     let tree = repo.find_object(tree_id)?.peel_to_tree()?;
     for path in unmerged_paths(&index) {
@@ -765,15 +952,11 @@ fn index_mode_kind(mode: gix::index::entry::Mode) -> Option<EntryKind> {
     mode.to_tree_entry_mode().map(|m| m.kind())
 }
 
-/// Record a change from a tree-vs-index diff, flagging gitlinks for the caller
-/// to reject (the blob pipeline cannot diff `160000` entries).
-fn collect_index_change(
-    change: gix::diff::index::ChangeRef<'_, '_>,
-    deltas: &mut Vec<Delta>,
-    gitlink: &mut Option<BString>,
-) {
+/// Record a change from a tree-vs-index diff. Gitlink (`160000`) entries flow
+/// through as `EntryKind::Commit` deltas, which `analyze()` renders as the
+/// `Subproject commit <oid>` short-format submodule diff.
+fn collect_index_change(change: gix::diff::index::ChangeRef<'_, '_>, deltas: &mut Vec<Delta>) {
     use gix::diff::index::ChangeRef;
-    let is_gitlink = |k: Option<EntryKind>| matches!(k, Some(EntryKind::Commit));
     match change {
         ChangeRef::Addition {
             location,
@@ -781,12 +964,7 @@ fn collect_index_change(
             id,
             ..
         } => {
-            let k = index_mode_kind(entry_mode);
-            if is_gitlink(k) {
-                *gitlink = Some(location.into_owned());
-                return;
-            }
-            if let Some(k) = k {
+            if let Some(k) = index_mode_kind(entry_mode) {
                 deltas.push(Delta::plain(
                     location.into_owned(),
                     None,
@@ -800,12 +978,7 @@ fn collect_index_change(
             id,
             ..
         } => {
-            let k = index_mode_kind(entry_mode);
-            if is_gitlink(k) {
-                *gitlink = Some(location.into_owned());
-                return;
-            }
-            if let Some(k) = k {
+            if let Some(k) = index_mode_kind(entry_mode) {
                 deltas.push(Delta::plain(
                     location.into_owned(),
                     Some((id.into_owned(), k)),
@@ -823,10 +996,6 @@ fn collect_index_change(
         } => {
             let ok = index_mode_kind(previous_entry_mode);
             let nk = index_mode_kind(entry_mode);
-            if is_gitlink(ok) || is_gitlink(nk) {
-                *gitlink = Some(location.into_owned());
-                return;
-            }
             if let (Some(ok), Some(nk)) = (ok, nk) {
                 deltas.push(Delta::plain(
                     location.into_owned(),
@@ -853,10 +1022,10 @@ fn collect_tree_change(
             id,
             ..
         } => {
-            let k = entry_mode.kind();
-            reject_gitlink(k, &location)?;
+            // Gitlinks (`160000`) flow through as `EntryKind::Commit` and are rendered
+            // by `analyze()` as a `Subproject commit` submodule diff.
             if !entry_mode.is_tree() {
-                deltas.push(Delta::plain(location, None, NewSide::Blob(id, k)));
+                deltas.push(Delta::plain(location, None, NewSide::Blob(id, entry_mode.kind())));
             }
         }
         ChangeDetached::Deletion {
@@ -865,10 +1034,8 @@ fn collect_tree_change(
             id,
             ..
         } => {
-            let k = entry_mode.kind();
-            reject_gitlink(k, &location)?;
             if !entry_mode.is_tree() {
-                deltas.push(Delta::plain(location, Some((id, k)), NewSide::Absent));
+                deltas.push(Delta::plain(location, Some((id, entry_mode.kind())), NewSide::Absent));
             }
         }
         ChangeDetached::Modification {
@@ -878,8 +1045,6 @@ fn collect_tree_change(
             entry_mode,
             id,
         } => {
-            reject_gitlink(entry_mode.kind(), &location)?;
-            reject_gitlink(previous_entry_mode.kind(), &location)?;
             if !entry_mode.is_tree() {
                 deltas.push(Delta::plain(
                     location,
@@ -890,13 +1055,6 @@ fn collect_tree_change(
         }
         // Rewrites are disabled, so this never fires; ignore defensively.
         ChangeDetached::Rewrite { .. } => {}
-    }
-    Ok(())
-}
-
-fn reject_gitlink(k: EntryKind, location: &BString) -> Result<()> {
-    if matches!(k, EntryKind::Commit) {
-        bail!("submodule/gitlink change at {location:?} is not supported");
     }
     Ok(())
 }
@@ -930,6 +1088,7 @@ fn analyze(
     hash_kind: gix::hash::Kind,
     workdir: Option<&std::path::Path>,
     want_patch: bool,
+    algo_override: Option<gix::diff::blob::Algorithm>,
 ) -> Result<Analysis> {
     let null = hash_kind.null();
     if delta.unmerged {
@@ -940,6 +1099,21 @@ fn analyze(
             binary: false,
             hunks: None,
         });
+    }
+
+    // Submodule (gitlink) pairs cannot be read through the blob pipeline. git
+    // renders them as a synthetic one-line `Subproject commit <oid>` blob per side,
+    // so a modification counts as one insertion and one deletion.
+    let old_commit = match delta.old {
+        Some((id, EntryKind::Commit)) => Some(id),
+        _ => None,
+    };
+    let new_commit = match &delta.new {
+        NewSide::Blob(id, EntryKind::Commit) => Some(*id),
+        _ => None,
+    };
+    if old_commit.is_some() || new_commit.is_some() {
+        return analyze_gitlink(old_commit, new_commit, null, ctx, want_patch, algo_override);
     }
 
     let path = delta.path.as_bstr();
@@ -993,6 +1167,8 @@ fn analyze(
             bail!("external diff drivers are not supported for {path:?}")
         }
         Operation::InternalDiff { algorithm } => {
+            // `--minimal`/`--histogram`/`--diff-algorithm=` override the default.
+            let algorithm = algo_override.unwrap_or(algorithm);
             let before: Vec<&[u8]> = byte_lines(prep.old.data.as_slice().unwrap_or_default());
             let after: Vec<&[u8]> = byte_lines(prep.new.data.as_slice().unwrap_or_default());
             let mut input: InternedInput<Vec<u8>> = InternedInput::default();
@@ -1024,6 +1200,54 @@ fn analyze(
             })
         }
     }
+}
+
+/// Diff a submodule (gitlink) pair as git's `show_submodule_summary`-free short
+/// format does: one `Subproject commit <full-oid>` line per present side. The new
+/// object id on the `index` line is the new commit id (or null when removed).
+fn analyze_gitlink(
+    old_commit: Option<ObjectId>,
+    new_commit: Option<ObjectId>,
+    null: ObjectId,
+    ctx: u32,
+    want_patch: bool,
+    algo_override: Option<gix::diff::blob::Algorithm>,
+) -> Result<Analysis> {
+    let line = |id: ObjectId| -> Vec<u8> {
+        let mut v = b"Subproject commit ".to_vec();
+        v.extend_from_slice(id.to_hex().to_string().as_bytes());
+        v.push(b'\n');
+        v
+    };
+    let before: Vec<Vec<u8>> = old_commit.map(|id| vec![line(id)]).unwrap_or_default();
+    let after: Vec<Vec<u8>> = new_commit.map(|id| vec![line(id)]).unwrap_or_default();
+    let before_r: Vec<&[u8]> = before.iter().map(|l| l.as_slice()).collect();
+    let after_r: Vec<&[u8]> = after.iter().map(|l| l.as_slice()).collect();
+
+    let mut input: InternedInput<Vec<u8>> = InternedInput::default();
+    input.update_before(before_r.iter().map(|l| l.to_vec()));
+    input.update_after(after_r.iter().map(|l| l.to_vec()));
+    let algorithm = algo_override.unwrap_or(gix::diff::blob::Algorithm::Myers);
+    let diff = diff_with_slider_heuristics(algorithm, &input);
+    let added = diff.count_additions();
+    let deleted = diff.count_removals();
+    let hunks = if want_patch && (added != 0 || deleted != 0) {
+        let sink = PatchSink {
+            buf: Vec::new(),
+            before: &before_r,
+            after: &after_r,
+        };
+        Some(UnifiedDiff::new(&diff, &input, sink, ContextSize::symmetrical(ctx)).consume()?)
+    } else {
+        None
+    };
+    Ok(Analysis {
+        new_id: new_commit.unwrap_or(null),
+        added,
+        deleted,
+        binary: false,
+        hunks,
+    })
 }
 
 /// Split `data` into lines the way `imara_diff::sources::byte_lines` does: the
@@ -1087,17 +1311,17 @@ fn mode_str(k: EntryKind) -> &'static str {
 }
 
 /// `--raw` and `--name-status` (`diff_flush_raw()`).
-fn render_raw(out: &mut Vec<u8>, delta: &Delta, fmt: u32, hash_kind: gix::hash::Kind) {
+fn render_raw(out: &mut Vec<u8>, delta: &Delta, fmt: u32, r: &Render) {
     let status = status_char(delta);
     if fmt & F_NAME_STATUS == 0 {
-        let null = hash_kind.null().to_hex_with_len(7).to_string();
+        let null = r.hash_kind.null().to_hex_with_len(r.abbrev).to_string();
         let old_hash = delta
             .old
-            .map(|(id, _)| id.to_hex_with_len(7).to_string())
+            .map(|(id, _)| id.to_hex_with_len(r.abbrev).to_string())
             .unwrap_or_else(|| null.clone());
         // Worktree content has no object id yet, which git reports as all-zero.
         let new_hash = match (&delta.new, delta.unmerged) {
-            (NewSide::Blob(id, _), false) => id.to_hex_with_len(7).to_string(),
+            (NewSide::Blob(id, _), false) => id.to_hex_with_len(r.abbrev).to_string(),
             _ => null,
         };
         push_str(out, ":");
@@ -1111,9 +1335,55 @@ fn render_raw(out: &mut Vec<u8>, delta: &Delta, fmt: u32, hash_kind: gix::hash::
         push_str(out, " ");
     }
     out.push(status);
-    out.push(b'\t');
-    out.extend_from_slice(&quoted_name(&delta.path));
-    out.push(b'\n');
+    // `-z`: the field / record separators become NUL and paths are not C-quoted.
+    out.push(if r.z { 0 } else { b'\t' });
+    out.extend_from_slice(&name_field(&delta.path, r.z));
+    out.push(if r.z { 0 } else { b'\n' });
+}
+
+/// A path as a `--raw`/`--name-*` field: raw bytes under `-z`, otherwise C-quoted.
+fn name_field(path: &BString, z: bool) -> Vec<u8> {
+    if z {
+        path.as_slice().to_vec()
+    } else {
+        quoted_name(path)
+    }
+}
+
+/// `--summary` (`show_summary()` / `diff_summary_line()`): creation, deletion and
+/// mode-change lines, one per delta in queue order.
+fn render_summary(out: &mut Vec<u8>, deltas: &[Delta]) {
+    for d in deltas {
+        if d.unmerged {
+            continue;
+        }
+        match (d.old, d.new_kind()) {
+            (None, Some(nk)) => {
+                push_str(out, " create mode ");
+                push_str(out, mode_str(nk));
+                out.push(b' ');
+                out.extend_from_slice(&quoted_name(&d.path));
+                out.push(b'\n');
+            }
+            (Some((_, ok)), None) => {
+                push_str(out, " delete mode ");
+                push_str(out, mode_str(ok));
+                out.push(b' ');
+                out.extend_from_slice(&quoted_name(&d.path));
+                out.push(b'\n');
+            }
+            (Some((_, ok)), Some(nk)) if ok != nk => {
+                push_str(out, " mode change ");
+                push_str(out, mode_str(ok));
+                push_str(out, " => ");
+                push_str(out, mode_str(nk));
+                out.push(b' ');
+                out.extend_from_slice(&quoted_name(&d.path));
+                out.push(b'\n');
+            }
+            _ => {}
+        }
+    }
 }
 
 /// `--name-status` letter for a delta.
@@ -1334,25 +1604,29 @@ fn render_patch(
     delta: &Delta,
     an: &Analysis,
     ctx: u32,
+    r: &Render,
 ) -> Result<()> {
     if delta.unmerged {
         return render_combined(out, repo, delta, ctx);
     }
 
+    // The `index` line honors `--abbrev` / `--full-index`.
+    let hlen = if r.full_index { r.hash_kind.len_in_hex() } else { r.abbrev };
+    let null_hash = r.hash_kind.null().to_hex_with_len(hlen).to_string();
     let old_hash = delta
         .old
-        .map(|(id, _)| id.to_hex_with_len(7).to_string())
-        .unwrap_or_else(|| "0000000".to_string());
+        .map(|(id, _)| id.to_hex_with_len(hlen).to_string())
+        .unwrap_or_else(|| null_hash.clone());
     let new_hash = if matches!(delta.new, NewSide::Absent) {
-        "0000000".to_string()
+        null_hash.clone()
     } else {
-        an.new_id.to_hex_with_len(7).to_string()
+        an.new_id.to_hex_with_len(hlen).to_string()
     };
     let content_differs = old_hash != new_hash;
     let new_kind = delta.new_kind();
 
     push_str(out, "diff --git ");
-    out.extend_from_slice(&quote_two("a/", &delta.path, "b/", &delta.path));
+    out.extend_from_slice(&quote_two(&r.src_prefix, &delta.path, &r.dst_prefix, &delta.path));
     out.push(b'\n');
 
     // File-creation / deletion / mode-change lines.
@@ -1394,14 +1668,14 @@ fn render_patch(
     }
 
     let old_label = if delta.old.is_some() {
-        quote_one("a/", &delta.path)
+        quote_one(&r.src_prefix, &delta.path)
     } else {
         b"/dev/null".to_vec()
     };
     let new_label = if matches!(delta.new, NewSide::Absent) {
         b"/dev/null".to_vec()
     } else {
-        quote_one("b/", &delta.path)
+        quote_one(&r.dst_prefix, &delta.path)
     };
 
     if an.binary {
@@ -1492,22 +1766,22 @@ fn quoted_name(path: &BString) -> Vec<u8> {
 }
 
 /// `quote_two_c_style()` for a single prefixed name (the `---`/`+++` lines).
-fn quote_one(prefix: &str, path: &BString) -> Vec<u8> {
+fn quote_one(prefix: &[u8], path: &BString) -> Vec<u8> {
     let s = path.as_slice();
-    if !needs_quote(prefix.as_bytes()) && !needs_quote(s) {
-        let mut out = prefix.as_bytes().to_vec();
+    if !needs_quote(prefix) && !needs_quote(s) {
+        let mut out = prefix.to_vec();
         out.extend_from_slice(s);
         return out;
     }
     let mut out = vec![b'"'];
-    cq_body(prefix.as_bytes(), &mut out);
+    cq_body(prefix, &mut out);
     cq_body(s, &mut out);
     out.push(b'"');
     out
 }
 
 /// The `diff --git <a> <b>` name pair.
-fn quote_two(pa: &str, a: &BString, pb: &str, b: &BString) -> Vec<u8> {
+fn quote_two(pa: &[u8], a: &BString, pb: &[u8], b: &BString) -> Vec<u8> {
     let mut out = quote_one(pa, a);
     out.push(b' ');
     out.extend_from_slice(&quote_one(pb, b));
@@ -1732,8 +2006,8 @@ fn combined_multi(
         let res_short = if res_present { res_id } else { null };
         push_str(&mut out, &res_short.to_hex_with_len(7).to_string());
         out.push(b'\n');
-        emit_file_line(&mut out, b"--- ", &quote_one("a/", path));
-        emit_file_line(&mut out, b"+++ ", &quote_one("b/", path));
+        emit_file_line(&mut out, b"--- ", &quote_one(b"a/", path));
+        emit_file_line(&mut out, b"+++ ", &quote_one(b"b/", path));
         dump_sline(&mut out, &sline, cnt, ctx);
     }
 
@@ -1786,8 +2060,8 @@ fn render_combined(
     // The result lives only in the worktree, so it has no object id.
     push_str(out, &repo.object_hash().null().to_hex_with_len(7).to_string());
     out.push(b'\n');
-    emit_file_line(out, b"--- ", &quote_one("a/", &delta.path));
-    emit_file_line(out, b"+++ ", &quote_one("b/", &delta.path));
+    emit_file_line(out, b"--- ", &quote_one(b"a/", &delta.path));
+    emit_file_line(out, b"+++ ", &quote_one(b"b/", &delta.path));
 
     dump_sline(out, &sline, cnt, ctx);
     Ok(())

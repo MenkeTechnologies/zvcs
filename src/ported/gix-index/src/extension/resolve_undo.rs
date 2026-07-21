@@ -5,10 +5,6 @@ use crate::{extension::Signature, util::split_at_byte_exclusive};
 
 pub type Paths = Vec<ResolvePath>;
 
-#[expect(
-    dead_code,
-    reason = "REUC is decoded but not yet exposed or written; retain its fields for planned round-trip support"
-)]
 #[derive(Clone)]
 pub struct ResolvePath {
     /// relative to the root of the repository, or what would be stored in the index
@@ -18,14 +14,36 @@ pub struct ResolvePath {
     stages: [Option<Stage>; 3],
 }
 
-#[expect(
-    dead_code,
-    reason = "REUC is decoded but not yet exposed or written; retain its fields for planned round-trip support"
-)]
+impl ResolvePath {
+    /// The path this resolve-undo record applies to, relative to the repository root.
+    pub fn name(&self) -> &bstr::BStr {
+        use bstr::ByteSlice;
+        self.name.as_bstr()
+    }
+
+    /// The three recorded stages, in order: `[stage1 (base), stage2 (ours), stage3 (theirs)]`.
+    /// A `None` means that stage was absent (mode `0`) in the recorded conflict.
+    pub fn stages(&self) -> &[Option<Stage>; 3] {
+        &self.stages
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Stage {
     mode: u32,
     id: ObjectId,
+}
+
+impl Stage {
+    /// The raw file mode recorded for this stage (e.g. `0o100644`).
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    /// The blob id recorded for this stage.
+    pub fn id(&self) -> ObjectId {
+        self.id
+    }
 }
 
 pub const SIGNATURE: Signature = *b"REUC";

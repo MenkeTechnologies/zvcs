@@ -19,6 +19,16 @@
 //!   * `git bisect terms [--term-good|--term-old|--term-bad|--term-new]`
 //!   * `git bisect log`
 //!   * `git bisect reset [<commit>]`
+//!   * `git bisect next` — force a step, including git's `warning: bisecting only
+//!     with a <bad> commit` path and the "need at least one bad|good" error.
+//!   * `git bisect replay <logfile>` — re-drive a session from a saved log.
+//!   * `git bisect help` — the usage block on stderr, exit 129.
+//!
+//! A good revision that is not an ancestor of the bad one now goes through git's
+//! merge-base machinery: the merge base is checked out with `Bisecting: a merge
+//! base must be tested`, and the `The merge base <oid> is bad` / `Some '<good>'
+//! revs are not ancestors of the '<bad>' rev` outcomes are reproduced with git's
+//! exit codes (3 and 1 respectively).
 //!
 //! The step selection reproduces git's `find_bisection()` exactly, including the
 //! `halfway()` short-circuit that decides which of two equally-good midpoints is
@@ -31,9 +41,10 @@
 //!   * Merge commits inside the bisect range. git's weight propagation for
 //!     multi-parent commits is not reproduced here, so a non-linear range would
 //!     pick a different midpoint; that is refused instead.
-//!   * A good revision that is not an ancestor of the bad one (git's
-//!     `Bisecting: a merge base must be tested` path).
-//!   * `skip`, `run`, `replay`, `visualize`/`view`, `next`, and `help`.
+//!   * `skip` and `run`: git chooses a skip replacement through its weighted
+//!     `find_bisection`/`skip_away` PRNG, whose exact commit sequence is not
+//!     reproduced; `run` depends on that for exit code 125.
+//!   * `visualize`/`view`: shells out to gitk / `git log`.
 //!   * Pathspec limiting is parsed and recorded in `BISECT_NAMES`, but it does
 //!     not constrain candidate selection, so a `--`-limited bisection with
 //!     revisions would pick a different midpoint; only the empty-pathspec case
@@ -89,17 +100,25 @@ pub fn bisect(args: &[String]) -> Result<ExitCode> {
         "terms" => terms_cmd(rest),
         "log" => log_cmd(),
         "reset" => reset_cmd(rest),
+        "replay" => replay_cmd(rest),
+        "next" => next_cmd(),
+        "help" | "-h" => {
+            // git prints the usage block on stderr and exits 129.
+            eprint!("{USAGE}");
+            Ok(ExitCode::from(129))
+        }
         "skip" => bail!(
-            "`bisect skip` is not supported: git picks a replacement commit at random from the \
-             remaining candidates, which this port does not reproduce"
+            "`bisect skip` is not supported: git picks a replacement commit from the remaining \
+             candidates via its weighted `find_bisection`/`skip_away` PRNG, whose byte-identical \
+             sequence this port does not reproduce"
         ),
-        "run" => bail!("`bisect run` is not supported (it drives an external command per step)"),
-        "replay" => bail!("`bisect replay` is not supported"),
+        "run" => bail!(
+            "`bisect run` is not supported: it drives an external command per step and relies on \
+             `bisect skip` for exit code 125, which is not reproduced here"
+        ),
         "visualize" | "view" => {
             bail!("`bisect visualize` is not supported (it shells out to gitk/git log)")
         }
-        "next" => bail!("`bisect next` is not supported"),
-        "help" => bail!("`bisect help` is not supported"),
         // Anything else is a marking word — `bad`/`good`, `new`/`old`, or a
         // custom term a stock-git session recorded — or a genuine typo.
         other => {
@@ -321,22 +340,30 @@ fn unknown_command(word: &str) -> Result<ExitCode> {
 // --- subcommand: terms -------------------------------------------------------
 
 fn terms_cmd(args: &[String]) -> Result<ExitCode> {
+    // git checks the argument count before it even looks for a session.
+    if args.len() > 1 {
+        eprintln!("error: 'git bisect terms' requires 0 or 1 argument");
+        return Ok(ExitCode::from(1));
+    }
     let ctx = Ctx::open()?;
     let Some(terms) = read_terms(&ctx)? else {
         eprintln!("error: no terms defined");
         return Ok(ExitCode::from(1));
     };
-    match args.len() {
-        0 => {
+    match args.first().map(String::as_str) {
+        None => {
             println!("Your current terms are '{}' for the old state", terms.good);
             println!("and '{}' for the new state.", terms.bad);
         }
-        1 => match args[0].as_str() {
-            "--term-good" | "--term-old" => println!("{}", terms.good),
-            "--term-bad" | "--term-new" => println!("{}", terms.bad),
-            other => bail!("unsupported flag {other:?} (ported: --term-good, --term-old, --term-bad, --term-new)"),
-        },
-        _ => bail!("`bisect terms` takes at most one flag"),
+        Some("--term-good" | "--term-old") => println!("{}", terms.good),
+        Some("--term-bad" | "--term-new") => println!("{}", terms.bad),
+        Some(other) => {
+            eprintln!("error: invalid argument {other} for 'git bisect terms'.");
+            eprintln!(
+                "Supported options are: --term-good|--term-old and --term-bad|--term-new."
+            );
+            return Ok(ExitCode::from(1));
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -356,16 +383,20 @@ fn log_cmd() -> Result<ExitCode> {
 // --- subcommand: reset -------------------------------------------------------
 
 fn reset_cmd(args: &[String]) -> Result<ExitCode> {
-    for a in args {
-        if a.starts_with('-') {
-            bail!("unsupported flag {a:?} (`bisect reset` takes an optional <commit>)");
-        }
-    }
     if args.len() > 1 {
-        bail!("`bisect reset` takes at most one <commit>");
+        eprintln!("error: 'git bisect reset' requires either no argument or a commit");
+        return Ok(ExitCode::from(1));
     }
 
     let ctx = Ctx::open()?;
+    // git rev-parses the argument before touching state; a leading `-` is not a
+    // flag here, just a commit-ish that fails to resolve.
+    if let Some(spec) = args.first() {
+        if resolve(&ctx.repo, spec).is_err() {
+            eprintln!("error: '{spec}' is not a valid commit");
+            return Ok(ExitCode::from(1));
+        }
+    }
     let target = match args.first() {
         Some(spec) => Some(spec.clone()),
         None => match std::fs::read_to_string(ctx.file("BISECT_START")) {
@@ -671,11 +702,8 @@ fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
         return unknown_command(word);
     };
 
-    for a in args {
-        if a.starts_with('-') {
-            bail!("unsupported flag {a:?} (ported: `bisect {word} [<rev>...]`)");
-        }
-    }
+    // git treats every argument as a revision; a leading `-` is not a flag, it is
+    // a commit-ish that fails to resolve into a `Bad rev input` error below.
     if matches!(side, Side::Bad) && args.len() > 1 {
         eprintln!(
             "error: 'git bisect {}' can take only one argument.",
@@ -737,6 +765,139 @@ fn mark(word: &str, args: &[String]) -> Result<ExitCode> {
     }
 
     // A session opened with `--no-checkout` records its position in BISECT_HEAD.
+    let no_checkout = ctx.file("BISECT_HEAD").exists();
+    auto_next(&ctx, &terms, no_checkout)
+}
+
+/// Record one marking (`refs/bisect/<side>` plus the two `BISECT_LOG` lines) the
+/// way `mark` does, but without advancing the bisection — used by `replay`, which
+/// applies every logged mark and only then takes a single step.
+fn write_mark(ctx: &Ctx, term: &str, side: Side, id: ObjectId) -> Result<()> {
+    let path = match side {
+        Side::Bad => ctx.refs_dir().join("bad"),
+        Side::Good => ctx.refs_dir().join(format!("good-{}", id.to_hex())),
+    };
+    write_ref(&path, id)?;
+    ctx.append_log(&format!(
+        "# {term}: [{}] {}\n",
+        id.to_hex(),
+        subject(&ctx.repo, id)?
+    ))?;
+    ctx.append_log(&format!("git bisect {term} {}\n", id.to_hex()))?;
+    Ok(())
+}
+
+// --- subcommand: next --------------------------------------------------------
+
+/// git's `bisect_next`: force a bisection step. Unlike `bisect_auto_next` (which
+/// only reports status until both sides are known), `next` will bisect with just
+/// a bad commit after a warning, and it errors instead of waiting when a side is
+/// missing.
+fn next_cmd() -> Result<ExitCode> {
+    let ctx = Ctx::open()?;
+    if !ctx.in_progress() {
+        eprint!("You need to start by \"git bisect start\"\n\n");
+        return Ok(ExitCode::from(1));
+    }
+    let terms = read_terms(&ctx)?.unwrap_or_else(|| Terms {
+        bad: "bad".into(),
+        good: "good".into(),
+    });
+    let no_checkout = ctx.file("BISECT_HEAD").exists();
+    let bad = ctx.bad()?;
+    let goods = ctx.goods()?;
+
+    match (bad, goods.is_empty()) {
+        (Some(bad), false) => take_step(&ctx, &terms, bad, goods, no_checkout),
+        (Some(bad), true) => {
+            // Have the bad side only: git bisects anyway, less optimally.
+            eprintln!("warning: bisecting only with a {} commit", terms.bad);
+            take_step(&ctx, &terms, bad, goods, no_checkout)
+        }
+        (None, false) => {
+            eprint!(
+                "error: You need to give me at least one bad|new and good|old revision.\n\
+                 You can use \"git bisect bad|new\" and \"git bisect good|old\" for that.\n"
+            );
+            Ok(ExitCode::from(1))
+        }
+        // Neither side known: git fails silently (its `bisect_next_check` returns
+        // an error without a message on this path).
+        (None, true) => Ok(ExitCode::from(1)),
+    }
+}
+
+// --- subcommand: replay ------------------------------------------------------
+
+/// git's `bisect_replay`: re-drive a session from a saved `bisect log`. Each
+/// `git bisect …` line is applied — `start` resets and reseeds, every marking
+/// writes its ref/log without stepping — and a single `bisect_auto_next` runs at
+/// the end, so the terminal output is the start status plus the final step.
+fn replay_cmd(args: &[String]) -> Result<ExitCode> {
+    let Some(file) = args.first() else {
+        eprintln!("error: no logfile given");
+        return Ok(ExitCode::from(1));
+    };
+    let Ok(content) = std::fs::read_to_string(file) else {
+        eprintln!("error: cannot read file '{file}' for replaying");
+        return Ok(ExitCode::from(1));
+    };
+
+    let ctx = Ctx::open()?;
+    for raw in content.lines() {
+        let line = raw.trim_start();
+        let Some(rest) = line
+            .strip_prefix("git bisect ")
+            .or_else(|| line.strip_prefix("git-bisect "))
+        else {
+            continue; // comments and blank lines
+        };
+        let mut toks = rest.split_whitespace();
+        let Some(cmd) = toks.next() else {
+            continue;
+        };
+        let cmd_args: Vec<String> = toks.map(str::to_owned).collect();
+
+        if cmd == "start" {
+            start(&cmd_args)?;
+            continue;
+        }
+        if cmd == "skip" {
+            bail!(
+                "`bisect replay` of a log containing `skip` is not supported: the skip \
+                 replacement PRNG is not reproduced"
+            );
+        }
+
+        // Every other keyword is a marking word. Establish terms the way `mark`
+        // does on the first marking of a fresh session.
+        let terms = match read_terms(&ctx)? {
+            Some(t) => t,
+            None => match terms_for_first_marking(cmd) {
+                Some(t) => {
+                    write_terms(&ctx, &t)?;
+                    t
+                }
+                None => continue, // an unrecognized line; git ignores it
+            },
+        };
+        let Some(side) = side_of(cmd, &terms) else {
+            continue;
+        };
+        let term = match side {
+            Side::Bad => &terms.bad,
+            Side::Good => &terms.good,
+        };
+        for spec in &cmd_args {
+            let id = resolve(&ctx.repo, spec)?;
+            write_mark(&ctx, term, side, id)?;
+        }
+    }
+
+    let terms = read_terms(&ctx)?.unwrap_or_else(|| Terms {
+        bad: "bad".into(),
+        good: "good".into(),
+    });
     let no_checkout = ctx.file("BISECT_HEAD").exists();
     auto_next(&ctx, &terms, no_checkout)
 }
@@ -804,7 +965,24 @@ fn auto_next(ctx: &Ctx, terms: &Terms, no_checkout: bool) -> Result<ExitCode> {
     }
 
     let bad = bad.expect("checked above");
-    check_good_are_ancestors_of_bad(ctx, bad, &goods, terms)?;
+    take_step(ctx, terms, bad, goods, no_checkout)
+}
+
+/// Do the real bisection step: resolve merge bases first (git's
+/// `check_merge_bases`), then pick and check out the midpoint. `git bisect next`
+/// reaches this directly when only the bad side is known, so `goods` may be empty.
+fn take_step(
+    ctx: &Ctx,
+    terms: &Terms,
+    bad: ObjectId,
+    goods: Vec<ObjectId>,
+    no_checkout: bool,
+) -> Result<ExitCode> {
+    if !goods.is_empty() {
+        if let Some(code) = check_merge_bases(ctx, bad, &goods, terms, no_checkout)? {
+            return Ok(code);
+        }
+    }
 
     let chain = candidate_chain(ctx, bad, &goods)?;
     let n = chain.len();
@@ -835,32 +1013,102 @@ fn auto_next(ctx: &Ctx, terms: &Terms, no_checkout: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// git refuses to bisect a range whose good ends are not ancestors of the bad
-/// one without first testing the merge base; that path is not ported.
-fn check_good_are_ancestors_of_bad(
+/// git's `check_merge_bases`: when a good end is not an ancestor of the bad one,
+/// the true merge base(s) must be resolved before the range is linear enough to
+/// bisect. For each merge base of `bad` against the goods:
+///   * if it equals `bad`, the sides are inconsistent — `handle_bad_merge_base`;
+///   * if it is already a good, it needs no test;
+///   * otherwise it is checked out with `Bisecting: a merge base must be tested`.
+///
+/// Returns `Some(code)` when the step is complete (a merge base was checked out,
+/// exit 0) or refused (`handle_bad_merge_base`); `None` means the range is clear
+/// and the caller proceeds to pick the midpoint. Once cleared, `BISECT_ANCESTORS_OK`
+/// short-circuits the check on later steps, exactly as git records it.
+fn check_merge_bases(
     ctx: &Ctx,
     bad: ObjectId,
     goods: &[ObjectId],
     terms: &Terms,
-) -> Result<()> {
+    no_checkout: bool,
+) -> Result<Option<ExitCode>> {
     if ctx.file("BISECT_ANCESTORS_OK").exists() {
-        return Ok(());
+        return Ok(None);
     }
-    for good in goods {
-        let base = ctx.repo.merge_base(bad, *good)?.detach();
-        if base != *good {
-            bail!(
-                "the '{}' revision {} is not an ancestor of the '{}' revision {}; testing a merge \
-                 base first is not supported",
-                terms.good,
-                good.to_hex(),
-                terms.bad,
-                bad.to_hex()
-            );
+    let bases: Vec<ObjectId> = ctx
+        .repo
+        .merge_bases_many(bad, goods)?
+        .into_iter()
+        .map(|id| id.detach())
+        .collect();
+    for mb in bases {
+        if mb == bad {
+            return Ok(Some(handle_bad_merge_base(ctx, bad, goods, terms)?));
         }
+        if goods.contains(&mb) {
+            continue;
+        }
+        // A merge base that is neither the bad rev nor already good has to be
+        // tested; git checks it out and stops the step here.
+        println!("Bisecting: a merge base must be tested");
+        write_ref(&ctx.file("BISECT_EXPECTED_REV"), mb)?;
+        let hex = mb.to_hex().to_string();
+        if no_checkout {
+            write_ref(&ctx.file("BISECT_HEAD"), mb)?;
+        } else {
+            super::checkout::checkout(&["-q".to_string(), hex.clone()])?;
+        }
+        println!("[{hex}] {}", subject(&ctx.repo, mb)?);
+        return Ok(Some(ExitCode::SUCCESS));
     }
     std::fs::write(ctx.file("BISECT_ANCESTORS_OK"), "")?;
-    Ok(())
+    Ok(None)
+}
+
+/// git's `handle_bad_merge_base`: the merge base itself is the bad rev. When it is
+/// the commit we just asked the user to test (`is_expected_rev`), report that the
+/// change lies between it and the goods (exit 3); otherwise the good/bad marks are
+/// simply inconsistent (exit 1).
+fn handle_bad_merge_base(
+    ctx: &Ctx,
+    bad: ObjectId,
+    goods: &[ObjectId],
+    terms: &Terms,
+) -> Result<ExitCode> {
+    let bad_hex = bad.to_hex().to_string();
+    let good_hex = goods
+        .iter()
+        .map(|g| g.to_hex().to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if is_expected_rev(ctx, bad)? {
+        if terms.bad == "bad" && terms.good == "good" {
+            eprintln!("The merge base {bad_hex} is bad.");
+            eprintln!("This means the bug has been fixed between {bad_hex} and [{good_hex}].");
+        } else if terms.bad == "new" && terms.good == "old" {
+            eprintln!("The merge base {bad_hex} is new.");
+            eprintln!("The property has changed between {bad_hex} and [{good_hex}].");
+        } else {
+            eprintln!("The merge base {bad_hex} is '{}'.", terms.bad);
+            eprintln!(
+                "This means the first '{}' commit is between {bad_hex} and [{good_hex}].",
+                terms.good
+            );
+        }
+        return Ok(ExitCode::from(3));
+    }
+    eprintln!(
+        "Some '{}' revs are not ancestors of the '{}' rev.",
+        terms.good, terms.bad
+    );
+    eprintln!("git bisect cannot work properly in this case.");
+    eprintln!("Maybe you mistook '{}' and '{}' revs?", terms.good, terms.bad);
+    Ok(ExitCode::from(1))
+}
+
+/// Whether `id` is the commit the last step asked to be tested, per
+/// `BISECT_EXPECTED_REV` (git's `is_expected_rev`).
+fn is_expected_rev(ctx: &Ctx, id: ObjectId) -> Result<bool> {
+    Ok(read_ref(&ctx.file("BISECT_EXPECTED_REV"))? == Some(id))
 }
 
 /// The commits still under suspicion — reachable from `bad`, not from any good —

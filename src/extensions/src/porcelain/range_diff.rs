@@ -57,6 +57,14 @@
 //!   `-u` / `--patch`, `--no-notes`, and `--ws-error-highlight=<kind>` (a no-op
 //!   with color off, which is the only mode this port emits). Dual and simple
 //!   coloring are byte-identical once color is off.
+//! * `-s` / `--no-patch`: `DIFF_FORMAT_NO_OUTPUT`, which keeps the pair headers
+//!   (`=`/`!`/`<`/`>` and the abbreviated ids) and drops every diff-of-diffs
+//!   body — reproduced by suppressing the inner `patch_diff()` call.
+//! * `--abbrev` / `--no-abbrev` / `--abbrev=<n>`: the abbreviation length of the
+//!   ids in every pair header, ported from `find_unique_abbrev()` and
+//!   `parse_opt_abbrev_cb()` (bare `--abbrev` is 7, `--no-abbrev` / `--abbrev=0`
+//!   the full id, `--abbrev=<n>` clamps `<n>` to `[4, 40]`, and a non-numeric
+//!   `<n>` is the 129 `error: option 'abbrev' expects a numerical value`).
 //! * The diff options that upstream forwards but that touch only patch bytes
 //!   this port already discards, so accepting them changes nothing:
 //!   `--full-index` (the abbreviated/full `index` line is dropped), `--binary`
@@ -86,9 +94,7 @@
 //!   the page is emitted (exit 0) exactly as upstream emits it — this is the
 //!   common `<old>...<new>` ancestor case. Otherwise, if a body would be
 //!   produced, the run stops with a terse `unsupported flag` message on stderr
-//!   rather than emitting a patch that ignored the option. `--abbrev` /
-//!   `--no-abbrev` are the exception: they rewrite the abbreviated id in every
-//!   header, so they stop even when the page would be header-only.
+//!   rather than emitting a patch that ignored the option.
 //! * If the run instead ends earlier — a usage error, or a range that names an
 //!   unknown revision — the deferred option never becomes observable, because
 //!   upstream's behaviour on those two paths does not depend on it. That was
@@ -115,9 +121,11 @@
 //!
 //! * Color in any form: `--color`, `--color=always`, and `--dual-color` (which
 //!   upstream uses to *force* color on). The dual-color markup is not ported.
-//! * `--notes[=<ref>]`, and repositories carrying a `refs/notes/commits` ref
-//!   unless `--no-notes` was given — upstream asks `git log` to show notes by
-//!   default, so a note would silently change the compared text.
+//! * A repository carrying a `refs/notes/commits` ref, unless `--no-notes` was
+//!   given — upstream asks `git log` to show notes by default, so a note would
+//!   silently change the compared text. `--notes` and `--no-notes` themselves
+//!   are honoured; only the *rendering* of an existing note is unported, so a
+//!   repository without notes emits normally under either flag.
 //! * `--diff-merges=<format>` / `--remerge-diff` (merges are ignored here, which
 //!   is the default upstream behaviour), a magic or wildcard pathspec, and every
 //!   other `git diff` option upstream forwards to the inner patches.
@@ -183,8 +191,8 @@ fn unsupported_flag(flag: &str) -> String {
     format!(
         "unsupported flag {flag:?} (ported: --creation-factor, --left-only, \
          --right-only, --no-dual-color, --no-color, --color=never, --color=auto, \
-         --patch, --no-notes, --full-index, --binary, --diff-merges, \
-         --no-diff-merges, --remerge-diff)"
+         --patch, -s, --no-patch, --abbrev, --no-abbrev, --notes, --no-notes, \
+         --full-index, --binary, --diff-merges, --no-diff-merges, --remerge-diff)"
     )
 }
 
@@ -263,6 +271,17 @@ const LONG_TAKES_VALUE: &[&str] = &[
 /// `-M50`, …), so neither consumes the next element.
 const SHORT_TAKES_VALUE: &[&str] = &["-G", "-I", "-O", "-S", "-l"];
 
+/// How the abbreviated commit id in every pair header is computed.
+enum Abbrev {
+    /// No `--abbrev`/`--no-abbrev` was given: use gitoxide's `core.abbrev`
+    /// default, which is `find_unique_abbrev()` with `DEFAULT_ABBREV` (7).
+    Default,
+    /// `find_unique_abbrev()` with this minimum hex length. `Len(40)` is the
+    /// full id (`--no-abbrev` / `--abbrev=0`), since a 40-hex prefix is always
+    /// unambiguous.
+    Len(usize),
+}
+
 /// Parsed command line.
 struct Opts {
     creation_factor: i64,
@@ -271,6 +290,12 @@ struct Opts {
     /// Whether upstream would ask `git log` to render notes. On by default;
     /// `--no-notes` turns it off, which is the only setting this port renders.
     notes: bool,
+    /// `-s` / `--no-patch`: emit only the pair headers, no diff-of-diffs body,
+    /// exactly as `DIFF_FORMAT_NO_OUTPUT` suppresses the inner patch.
+    no_patch: bool,
+    /// Abbreviation length for the ids printed in every pair header, driven by
+    /// `--abbrev` / `--no-abbrev` / `--abbrev=<n>`.
+    abbrev: Abbrev,
     /// The first option this port recognises as real but does not implement,
     /// held until the run is about to produce output. See the module docs.
     deferred: Option<String>,
@@ -292,6 +317,8 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         left_only: false,
         right_only: false,
         notes: true,
+        no_patch: false,
+        abbrev: Abbrev::Default,
         deferred: None,
     };
     // `args` excludes the `range-diff` verb: `dispatch::run` takes the
@@ -302,12 +329,8 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     let mut pos: Vec<String> = Vec::new();
     let mut after_dash_dash = false;
 
-    // The accumulated `diff_setup_done()` output-format bits (see [`FMT_NAME`]),
-    // and whether a deferred option rewrites the abbreviated id printed in every
-    // pair header (`--abbrev`/`--no-abbrev`), which the emit gate below must not
-    // suppress even when it would otherwise produce header-only output.
+    // The accumulated `diff_setup_done()` output-format bits (see [`FMT_NAME`]).
     let mut fmt_mask: u32 = 0;
-    let mut deferred_header = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -349,6 +372,33 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // Patch output is what this port emits; `-p`/`-u` ask for it.
             "-p" | "-u" | "--patch" => {}
             "--no-notes" => opts.notes = false,
+            // `--notes[=<ref>]` turns note rendering on — the default. The value
+            // is an attached OPTARG (a separate argv element is not consumed).
+            // With no notes ref present this is identical to the default output;
+            // the guard below still stops honestly when a `refs/notes/commits`
+            // ref exists, whose rendering is not ported.
+            "--notes" => opts.notes = true,
+            // `--abbrev`/`--no-abbrev`/`--abbrev=<n>` rewrite the abbreviated id
+            // printed in every pair header. Upstream's `parse_opt_abbrev_cb`:
+            // a bare `--abbrev` is `DEFAULT_ABBREV` (7), `--no-abbrev` is 0 (the
+            // full id), and `--abbrev=<n>` parses `<n>` as a C `int` — a value
+            // that is not a whole number (empty, trailing junk, non-digits) is
+            // the 129 `error:` reported at parse time.
+            "--no-abbrev" => opts.abbrev = Abbrev::Len(40),
+            "--abbrev" => {
+                opts.abbrev = match inline {
+                    None => Abbrev::Len(7),
+                    Some(v) => match parse_abbrev_value(v) {
+                        Some(0) => Abbrev::Len(40),
+                        Some(n) => Abbrev::Len(n.clamp(4, 40) as usize),
+                        None => {
+                            return Ok(option_error(
+                                "option `abbrev' expects a numerical value",
+                            ))
+                        }
+                    },
+                };
+            }
             // Forwarded to the inner `git log`, but touch only patch bytes this
             // port already discards: `--full-index` only lengthens the `index`
             // line (dropped with the rest of the diff header), `--binary` adds a
@@ -380,9 +430,13 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                 fmt_mask |= FMT_CHECKDIFF;
                 opts.defer(unsupported_flag(a));
             }
+            // `-s`/`--no-patch` assigns `DIFF_FORMAT_NO_OUTPUT`, clearing the
+            // other format bits, and suppresses the diff-of-diffs body entirely
+            // — leaving the pair headers, which this port renders. So it is
+            // implemented here, not deferred.
             "-s" | "--no-patch" => {
                 fmt_mask = FMT_NO_OUTPUT;
-                opts.defer(unsupported_flag(a));
+                opts.no_patch = true;
             }
             // `--ws-error-highlight=<kind>` only tints whitespace errors when
             // color is on. This port always emits with color off, so it is a
@@ -467,12 +521,6 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                 }
             }
             _ => {
-                // `--abbrev`/`--no-abbrev`/`--abbrev=<n>` rewrite the abbreviated
-                // id in every pair header, so the emit gate must never suppress
-                // this deferral into header-only output.
-                if name == "--abbrev" || name == "--no-abbrev" {
-                    deferred_header = true;
-                }
                 opts.defer(unsupported_flag(a));
                 if inline.is_none()
                     && (LONG_TAKES_VALUE.contains(&name) || SHORT_TAKES_VALUE.contains(&name))
@@ -565,8 +613,8 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     }
 
     let mailmap = repo.open_mailmap();
-    let mut a = read_patches(&repo, ends1, &mailmap, matcher.as_ref())?;
-    let mut b = read_patches(&repo, ends2, &mailmap, matcher.as_ref())?;
+    let mut a = read_patches(&repo, ends1, &mailmap, matcher.as_ref(), &opts.abbrev)?;
+    let mut b = read_patches(&repo, ends2, &mailmap, matcher.as_ref(), &opts.abbrev)?;
 
     find_exact_matches(&mut a, &mut b);
     get_correspondences(&mut a, &mut b, opts.creation_factor);
@@ -578,11 +626,10 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // commit renders as a bare header with no body, and the option provably
     // cannot reach the output — so it is emitted, matching upstream, which
     // accepts these options and prints the same header-only page (this is the
-    // common `<old>...<new>` ancestor case). `--abbrev`/`--no-abbrev` are the
-    // exception, since they rewrite the id in every header. Otherwise stop
-    // rather than emit a patch that ignored the option.
+    // common `<old>...<new>` ancestor case). Otherwise stop rather than emit a
+    // patch that ignored the option.
     if let Some(reason) = &opts.deferred {
-        if deferred_header || !(a.is_empty() || b.is_empty()) {
+        if !(a.is_empty() || b.is_empty()) {
             bail!("{reason}");
         }
     }
@@ -720,6 +767,74 @@ fn git_parse_unsigned(value: &str, max: u64) -> Result<u64, MagnitudeError> {
     match (val as u64).checked_mul(factor) {
         Some(product) if product <= max => Ok(product),
         _ => Err(MagnitudeError::Range),
+    }
+}
+
+/// Port of `parse_opt_abbrev_cb()`'s value handling: `v = (int)strtol(arg, &end,
+/// 10)` requiring `arg` to be a whole number — optional leading ASCII
+/// whitespace, an optional `+`/`-` sign, at least one decimal digit, and no
+/// trailing bytes. `None` is upstream's `expects a numerical value` error. A
+/// value that overflows a C `long` is saturated and then truncated to `int`
+/// exactly as the assignment `int v = strtol(...)` does on a 64-bit host, so the
+/// pathological `--abbrev=<huge>` reproduces git's wrap.
+fn parse_abbrev_value(value: &str) -> Option<i32> {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        i += 1;
+    }
+    let negative = match bytes.get(i) {
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        _ => false,
+    };
+    let digits_start = i;
+    // `strtol` saturates to `LONG_{MAX,MIN}` on overflow; mirror with an i64
+    // accumulator (a C `long` on the 64-bit hosts this port targets).
+    let mut acc: i64 = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        let d = i64::from(bytes[i] - b'0');
+        acc = acc
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(d))
+            .unwrap_or(i64::MAX);
+        i += 1;
+    }
+    // No digits, or trailing bytes after the number: not a whole number.
+    if i == digits_start || i != bytes.len() {
+        return None;
+    }
+    let signed = if negative { acc.wrapping_neg() } else { acc };
+    // `int v = strtol(...)` narrows the `long` to 32 bits.
+    Some(signed as i32)
+}
+
+/// `find_unique_abbrev()`: the abbreviated id printed in a pair header. With no
+/// `--abbrev`/`--no-abbrev`, gitoxide's `shorten()` applies `core.abbrev` (the 7
+/// default). Otherwise probe from the requested minimum length upward for the
+/// shortest hex prefix that resolves unambiguously to this commit — the value
+/// git's `find_unique_abbrev(oid, len)` returns — falling back to the full id.
+fn abbrev_id(repo: &gix::Repository, id: ObjectId, abbrev: &Abbrev) -> Result<String> {
+    match abbrev {
+        Abbrev::Default => Ok(id.attach(repo).shorten()?.to_string()),
+        Abbrev::Len(min) => {
+            let hex = id.to_hex().to_string();
+            let min = (*min).clamp(4, hex.len());
+            for len in min..hex.len() {
+                if let Ok(found) = repo.rev_parse_single(&hex[..len]) {
+                    if found.detach() == id {
+                        return Ok(hex[..len].to_string());
+                    }
+                }
+            }
+            Ok(hex)
+        }
     }
 }
 
@@ -1034,6 +1149,7 @@ fn read_patches(
     (tips, hidden): (Vec<ObjectId>, Vec<ObjectId>),
     mailmap: &gix::mailmap::Snapshot,
     matcher: Option<&PathMatcher>,
+    abbrev: &Abbrev,
 ) -> Result<Vec<Patch>> {
     let ids = ordered_commits(repo, tips, hidden)?;
     let mut out = Vec::with_capacity(ids.len());
@@ -1043,7 +1159,7 @@ fn read_patches(
     // index as patches are kept, not from the pre-filter walk position.
     let mut index = 0usize;
     for id in ids {
-        if let Some(patch) = build_patch(repo, id, index, mailmap, matcher)? {
+        if let Some(patch) = build_patch(repo, id, index, mailmap, matcher, abbrev)? {
             out.push(patch);
             index += 1;
         }
@@ -1127,6 +1243,7 @@ fn build_patch(
     index: usize,
     mailmap: &gix::mailmap::Snapshot,
     matcher: Option<&PathMatcher>,
+    abbrev: &Abbrev,
 ) -> Result<Option<Patch>> {
     let commit = repo.find_object(id)?.try_into_commit()?;
 
@@ -1195,7 +1312,7 @@ fn build_patch(
 
     Ok(Some(Patch {
         index,
-        abbrev: id.attach(repo).shorten()?.to_string(),
+        abbrev: abbrev_id(repo, id, abbrev)?,
         subject: subject_of(raw),
         text,
         diff_offset,
@@ -1922,11 +2039,14 @@ fn output(out: &mut Vec<u8>, a: &mut [Patch], b: &[Patch], opts: &Opts) -> Resul
             j += 1;
         }
 
-        // Show a matching LHS/RHS pair.
+        // Show a matching LHS/RHS pair. `-s`/`--no-patch` keeps the header but
+        // drops the diff-of-diffs body (`DIFF_FORMAT_NO_OUTPUT`).
         if j < b.len() {
             let ai = b[j].matching as usize;
             pair_header(out, patch_no_width, &mut dashes, Some(&a[ai]), Some(&b[j]))?;
-            patch_diff(out, &a[ai].text, &b[j].text)?;
+            if !opts.no_patch {
+                patch_diff(out, &a[ai].text, &b[j].text)?;
+            }
             a[ai].shown = true;
             j += 1;
         }

@@ -17,6 +17,13 @@
 //!   prints nothing unless `-m` is given
 //! * `-r`, `-t` (implies `-r`), `--root`, `-m`
 //! * `--raw` (the default), `--name-only`, `--name-status`, `-s`/`--no-patch`
+//! * `--numstat`, `--shortstat`, `--summary` — the file-granular stat family, forced
+//!   recursive like git; numstat line counts come from the vendored imara-diff (git's
+//!   default Myers algorithm) and binary blobs print `-`; paths are C-quoted (or raw
+//!   under `-z` for numstat) exactly as git's `quote_c_style`
+//! * `--merge-base <a> <b>` — diff the single merge base of the two commits against the
+//!   second commit's tree; zero/multiple bases or a non-commit operand reproduce git's
+//!   fatal messages (exit 128)
 //! * `-z`, `--abbrev=<n>` (parsed with git's `strtoul`: leading base-10 digits
 //!   only, no error on garbage, clamped to 4..=hash length)
 //! * `--no-commit-id`, `--always`
@@ -42,8 +49,8 @@
 //! * `--merge-base` requires exactly two commits; git enforces this after resolving
 //!   revisions but before the missing-`<tree-ish>` check, so any other count — zero
 //!   included — is `fatal: --merge-base only works with two commits` (exit 128). The
-//!   valid two-commit case needs a merge-base computation this port does not
-//!   implement and is recorded as unsupported.
+//!   valid two-commit case is implemented via the vendored merge-base computation
+//!   (`gix::Repository::merge_bases_many`).
 //! * `-h` — git's usage text on stdout, exit 129; no `<tree-ish>` — the same text on
 //!   stderr, exit 129
 //!
@@ -68,10 +75,12 @@
 //!
 //! Not implemented, and bailed on whenever they would matter:
 //!
-//! * `-p`/`-u`/`--patch` and the `--stat`/`--numstat`/`--dirstat`/`--summary` family.
-//!   Patch output abbreviates the `index` line to git's *auto* abbreviation length,
-//!   which is derived from the repository's approximate object count (`core.abbrev`
-//!   when set). The vendored crates expose no equivalent.
+//! * `-p`/`-u`/`--patch` and the `--stat`/`--dirstat` family. Patch output abbreviates
+//!   the `index` line to git's *auto* abbreviation length, which is derived from the
+//!   repository's approximate object count (`core.abbrev` when set); the vendored
+//!   crates expose no equivalent. `--stat`'s graph column depends on terminal-width
+//!   scaling this port does not reproduce. (`--numstat`/`--shortstat`/`--summary` are
+//!   implemented — see above.)
 //! * bare `--abbrev` (no `=<n>`), for the same reason.
 //! * `-c`/`--cc`/`--combined-all-paths` — combined merge diffs have no substrate in
 //!   the vendored `gix-diff`.
@@ -80,8 +89,8 @@
 //! * whitespace-insensitive comparison (`-w`, `-b`, `--ignore-*`). These are not
 //!   patch-only: git re-compares blob *content* and drops a pair whose only
 //!   difference is whitespace, so the raw output changes too.
-//! * `--merge-base`, rename/copy detection (`-M`/`-C`/`-B`), pickaxe (`-S`/`-G`),
-//!   `-R`, `-O`, `--find-copies-harder`, `--line-prefix`, `--relative`,
+//! * rename/copy detection (`-M`/`-C`/`-B`), pickaxe (`-S`/`-G`), `-R`, `-O`,
+//!   `--find-copies-harder`, `--line-prefix`, `--relative`,
 //!   `--submodule`/`--ignore-submodules`.
 //! * magic (`:(...)`) and glob pathspecs.
 
@@ -91,6 +100,7 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
+use gix::diff::blob::{sources, Algorithm, Diff, InternedInput};
 use gix::hash::ObjectId;
 use gix::objs::tree::EntryMode;
 
@@ -170,8 +180,23 @@ enum Format {
     Raw,
     NameOnly,
     NameStatus,
+    /// `--numstat`: `<added>\t<deleted>\t<path>` per changed blob (binary: `-\t-`).
+    NumStat,
+    /// `--shortstat`: the single ` N files changed, …` summary line.
+    ShortStat,
+    /// `--summary`: create/delete/mode-change lines (nothing for plain modifies).
+    Summary,
     /// `-s`/`--no-patch`: the commit-id line only.
     NoOutput,
+}
+
+impl Format {
+    /// The stat family (`--numstat`/`--shortstat`/`--summary`) always operates at file
+    /// granularity: git forces recursion and never lists tree entries themselves,
+    /// regardless of `-r`/`-t`.
+    fn is_stat(self) -> bool {
+        matches!(self, Format::NumStat | Format::ShortStat | Format::Summary)
+    }
 }
 
 /// Parsed command-line options for a single `diff-tree` invocation.
@@ -275,16 +300,16 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 "--always" => opts.always = true,
                 // git validates the operand count for `--merge-base` after it has
                 // resolved the revisions (exactly two commits), so the flag is only
-                // recorded here; the count check runs once parsing is complete. It is
-                // still unsupported for the valid two-commit case, which needs the
-                // merge-base computation this port does not implement.
-                "--merge-base" => {
-                    merge_base = true;
-                    unsupported.get_or_insert_with(|| a.to_string());
-                }
+                // recorded here; the count check runs once parsing is complete. The
+                // valid two-commit case diffs the merge base's tree against the second
+                // commit's tree (see [`merge_base_diff`]).
+                "--merge-base" => merge_base = true,
                 "--raw" => opts.format = Format::Raw,
                 "--name-only" => opts.format = Format::NameOnly,
                 "--name-status" => opts.format = Format::NameStatus,
+                "--numstat" => opts.format = Format::NumStat,
+                "--shortstat" => opts.format = Format::ShortStat,
+                "--summary" => opts.format = Format::Summary,
                 "-s" | "--no-patch" => opts.format = Format::NoOutput,
                 "--exit-code" => opts.exit_code = true,
                 // `--quiet` is `-s` plus `--exit-code`: git still prints the
@@ -419,6 +444,13 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         opts.paths.push(BString::from(p.trim_end_matches('/').as_bytes()));
     }
 
+    // The stat family is always file-granular in git: recursion is forced on and tree
+    // entries are never reported, overriding whatever `-r`/`-t` asked for.
+    if opts.format.is_stat() {
+        opts.recurse = true;
+        opts.show_trees = false;
+    }
+
     // git checks the `--merge-base` operand count after resolving revisions but before
     // the missing-<tree-ish> usage error, so zero revs here is the fatal merge-base
     // message, not the usage text.
@@ -434,7 +466,11 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
 
     let mut out: Vec<u8> = Vec::new();
     let mut differed = false;
-    let code = if revs.len() > 2 {
+    let code = if merge_base {
+        // `--merge-base <a> <b>`: diff the merge base of the two commits against the
+        // second commit's tree. No commit-id line, like the two-tree form.
+        merge_base_diff(&repo, &revs[0], &revs[1], &opts, &mut out, &mut differed)?
+    } else if revs.len() > 2 {
         // git accepts more than two tree-ishes and then prints nothing at all.
         0
     } else if revs.len() == 2 {
@@ -448,7 +484,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 Some(new) => {
                     let changes = collect(&repo, Some(old), Some(new), &opts)?;
                     differed = !changes.is_empty();
-                    render_all(&mut out, &changes, &opts);
+                    render_all(&repo, &mut out, &changes, &opts)?;
                     0
                 }
             },
@@ -757,12 +793,9 @@ fn is_known_unsupported(a: &str) -> bool {
         "--patch-with-stat",
         "--binary",
         "--stat",
-        "--numstat",
-        "--shortstat",
         "--dirstat",
         "--dirstat-by-file",
         "--cumulative",
-        "--summary",
         "--compact-summary",
         "--check",
         "--unified",
@@ -812,7 +845,6 @@ fn is_known_unsupported(a: &str) -> bool {
         // commit-message line this port cannot produce.
         "--oneline",
         "--no-oneline",
-        "--merge-base",
         "-c",
         "--cc",
         "--combined-all-paths",
@@ -957,8 +989,65 @@ fn single_commit(
             out.extend_from_slice(commit_id.to_hex().to_string().as_bytes());
             out.push(term);
         }
-        render_all(out, &changes, opts);
+        render_all(repo, out, &changes, opts)?;
     }
+    Ok(0)
+}
+
+/// `--merge-base <a> <b>`: resolve the two revisions to commits, compute their single
+/// merge base, and diff that base's tree against the second commit's tree. Emits no
+/// commit-id line, matching git's two-argument form.
+///
+/// git validates this in stages: a revision that resolves to a non-commit draws the
+/// same `error: object … is a … , not a commit` git prints, then merge-base search
+/// yields nothing and the run dies `fatal: no merge base found`. Zero or several merge
+/// bases are the fatal `no merge base found` / `multiple merge bases found` git prints
+/// (exit 128).
+fn merge_base_diff(
+    repo: &gix::Repository,
+    spec_a: &str,
+    spec_b: &str,
+    opts: &Opts,
+    out: &mut Vec<u8>,
+    differed: &mut bool,
+) -> Result<u8> {
+    let mut commits: Vec<ObjectId> = Vec::with_capacity(2);
+    let mut all_commits = true;
+    for spec in [spec_a, spec_b] {
+        // Both specs already rev-parsed during argument classification, so this cannot
+        // fail; resolve again to reach the object.
+        let id = repo.rev_parse_single(spec)?;
+        let object = id.object()?;
+        let (oid, kind) = (object.id, object.kind);
+        match object.peel_to_commit() {
+            Ok(commit) => commits.push(commit.id),
+            Err(_) => {
+                eprintln!("error: object {oid} is a {kind}, not a commit");
+                all_commits = false;
+            }
+        }
+    }
+    if !all_commits {
+        eprintln!("fatal: no merge base found");
+        return Ok(FATAL);
+    }
+    let bases = repo.merge_bases_many(commits[0], &commits[1..])?;
+    match bases.len() {
+        0 => {
+            eprintln!("fatal: no merge base found");
+            return Ok(FATAL);
+        }
+        1 => {}
+        _ => {
+            eprintln!("fatal: multiple merge bases found");
+            return Ok(FATAL);
+        }
+    }
+    let base_tree = tree_of(repo, bases[0].detach())?;
+    let new_tree = tree_of(repo, commits[1])?;
+    let changes = collect(repo, Some(base_tree), Some(new_tree), opts)?;
+    *differed = !changes.is_empty();
+    render_all(repo, out, &changes, opts)?;
     Ok(0)
 }
 
@@ -1160,10 +1249,195 @@ fn descend(path: &BString, opts: &Opts) -> bool {
             .any(|p| path == p || under(path, p) || under(p, path))
 }
 
-fn render_all(out: &mut Vec<u8>, changes: &[Change], opts: &Opts) {
-    for c in changes {
-        render(out, c, opts);
+fn render_all(
+    repo: &gix::Repository,
+    out: &mut Vec<u8>,
+    changes: &[Change],
+    opts: &Opts,
+) -> Result<()> {
+    match opts.format {
+        Format::NumStat => {
+            for c in changes {
+                render_numstat(repo, out, c, opts)?;
+            }
+        }
+        Format::ShortStat => render_shortstat(repo, out, changes)?,
+        Format::Summary => {
+            for c in changes {
+                render_summary(out, c);
+            }
+        }
+        _ => {
+            for c in changes {
+                render(out, c, opts);
+            }
+        }
     }
+    Ok(())
+}
+
+/// The raw blob bytes on one side of a change; an absent side is the empty content.
+fn side_bytes(repo: &gix::Repository, side: Option<Side>) -> Result<Vec<u8>> {
+    match side {
+        Some(s) => Ok(repo.find_object(s.id)?.data),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// git's `buffer_is_binary`: a NUL byte within the first `FIRST_FEW_BYTES` (8000)
+/// marks the blob binary, which is what makes numstat print `-` for both counts.
+fn is_binary(data: &[u8]) -> bool {
+    const FIRST_FEW_BYTES: usize = 8000;
+    let n = data.len().min(FIRST_FEW_BYTES);
+    data[..n].contains(&0)
+}
+
+/// Added/removed line counts for one change, or `None` when either side is binary.
+///
+/// Uses git's default diff algorithm (Myers, non-minimal) over whole lines with the
+/// trailing newline kept in each token, so a line that only gains or loses its final
+/// newline counts as one removal plus one addition exactly as git reports.
+fn numstat_counts(repo: &gix::Repository, c: &Change) -> Result<Option<(u32, u32)>> {
+    let old = side_bytes(repo, c.old)?;
+    let new = side_bytes(repo, c.new)?;
+    if is_binary(&old) || is_binary(&new) {
+        return Ok(None);
+    }
+    let input = InternedInput::new(sources::byte_lines(&old), sources::byte_lines(&new));
+    let diff = Diff::compute(Algorithm::Myers, &input);
+    Ok(Some((diff.count_additions(), diff.count_removals())))
+}
+
+/// One `--numstat` line: `<added>\t<deleted>\t<path>` (or `-\t-\t<path>` for a binary
+/// change). Counts are always TAB-separated; `-z` only swaps the line terminator to
+/// NUL and leaves the path unquoted, otherwise the path is C-quoted like git's.
+fn render_numstat(
+    repo: &gix::Repository,
+    out: &mut Vec<u8>,
+    c: &Change,
+    opts: &Opts,
+) -> Result<()> {
+    match numstat_counts(repo, c)? {
+        Some((add, del)) => {
+            out.extend_from_slice(format!("{add}\t{del}\t").as_bytes());
+        }
+        None => out.extend_from_slice(b"-\t-\t"),
+    }
+    write_path(out, &c.path, opts.nul);
+    out.push(if opts.nul { b'\0' } else { b'\n' });
+    Ok(())
+}
+
+/// The single `--shortstat` line, aggregated over every changed blob. Binary blobs
+/// count toward the file total but contribute no line counts.
+fn render_shortstat(repo: &gix::Repository, out: &mut Vec<u8>, changes: &[Change]) -> Result<()> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let mut insertions: u64 = 0;
+    let mut deletions: u64 = 0;
+    for c in changes {
+        if let Some((add, del)) = numstat_counts(repo, c)? {
+            insertions += add as u64;
+            deletions += del as u64;
+        }
+    }
+    print_stat_summary(out, changes.len() as u64, insertions, deletions);
+    Ok(())
+}
+
+/// git's `print_stat_summary`: ` N file[s] changed[, X insertion[s](+)][, Y
+/// deletion[s](-)]`. The insertion clause also shows when there are zero deletions and
+/// vice versa, so a binary-only change still prints both zero clauses.
+fn print_stat_summary(out: &mut Vec<u8>, files: u64, insertions: u64, deletions: u64) {
+    let mut line = format!(" {files} file{} changed", if files != 1 { "s" } else { "" });
+    if insertions > 0 || deletions == 0 {
+        line.push_str(&format!(
+            ", {insertions} insertion{}(+)",
+            if insertions != 1 { "s" } else { "" }
+        ));
+    }
+    if deletions > 0 || insertions == 0 {
+        line.push_str(&format!(
+            ", {deletions} deletion{}(-)",
+            if deletions != 1 { "s" } else { "" }
+        ));
+    }
+    line.push('\n');
+    out.extend_from_slice(line.as_bytes());
+}
+
+/// One `--summary` line, or nothing for a plain modification. git emits ` create mode`
+/// / ` delete mode` for additions and deletions and ` mode change <old> => <new>` when
+/// two present sides carry different modes (an executable-bit flip or a type change).
+/// Summary ignores `-z` entirely: it is always newline-terminated with a C-quoted path.
+fn render_summary(out: &mut Vec<u8>, c: &Change) {
+    match (c.old, c.new) {
+        (None, Some(n)) => {
+            out.extend_from_slice(format!(" create mode {:06o} ", n.mode.value()).as_bytes());
+            write_path(out, &c.path, false);
+            out.push(b'\n');
+        }
+        (Some(o), None) => {
+            out.extend_from_slice(format!(" delete mode {:06o} ", o.mode.value()).as_bytes());
+            write_path(out, &c.path, false);
+            out.push(b'\n');
+        }
+        (Some(o), Some(n)) if o.mode.value() != n.mode.value() => {
+            out.extend_from_slice(
+                format!(" mode change {:06o} => {:06o} ", o.mode.value(), n.mode.value())
+                    .as_bytes(),
+            );
+            write_path(out, &c.path, false);
+            out.push(b'\n');
+        }
+        _ => {}
+    }
+}
+
+/// Write a path the way git's stat formats do: raw when `nul` (git's `-z`, no quoting),
+/// otherwise through [`quote_c_style`].
+fn write_path(out: &mut Vec<u8>, path: &BString, nul: bool) {
+    if nul {
+        out.extend_from_slice(path);
+    } else {
+        out.extend_from_slice(&quote_c_style(path));
+    }
+}
+
+/// git's `quote_c_style` with the default `core.quotePath=true`: if any byte is a
+/// control character, a double quote, a backslash, or has the high bit set, the whole
+/// name is wrapped in double quotes with the standard C escapes (`\a \b \t \n \v \f \r
+/// \" \\`) and every other out-of-range byte written as a three-digit octal `\ooo`.
+/// A name needing none of that is returned unchanged.
+fn quote_c_style(name: &[u8]) -> Vec<u8> {
+    let needs_quote = name
+        .iter()
+        .any(|&b| b < 0x20 || b >= 0x80 || b == b'"' || b == b'\\');
+    if !needs_quote {
+        return name.to_vec();
+    }
+    let mut out = Vec::with_capacity(name.len() + 2);
+    out.push(b'"');
+    for &b in name {
+        match b {
+            0x07 => out.extend_from_slice(b"\\a"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            0x0b => out.extend_from_slice(b"\\v"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b if b < 0x20 || b >= 0x80 => {
+                out.extend_from_slice(format!("\\{b:03o}").as_bytes());
+            }
+            b => out.push(b),
+        }
+    }
+    out.push(b'"');
+    out
 }
 
 /// The status letter git prints for a change.
@@ -1186,6 +1460,11 @@ fn render(out: &mut Vec<u8>, c: &Change, opts: &Opts) {
     let term = if opts.nul { b'\0' } else { b'\n' };
 
     match opts.format {
+        // The stat family is rendered by `render_all` before this per-change path is
+        // reached, so it never arrives here.
+        Format::NumStat | Format::ShortStat | Format::Summary => {
+            unreachable!("stat formats are rendered by render_all")
+        }
         Format::NoOutput => {}
         Format::NameOnly => {
             out.extend_from_slice(&c.path);

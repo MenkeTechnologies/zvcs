@@ -14,10 +14,14 @@
 //!   * `-s`/`--summary`, `-n`/`--numbered`, `-e`/`--email`, `-c`/`--committer`.
 //!   * `-w[<width>[,<indent1>[,<indent2>]]]` — the real wrap algorithm.
 //!   * `--group=author|committer|trailer:<tok>|format:<fmt>`, `--group <field>`,
-//!     `--no-group`, and the `unknown group type` / `with stdin is not
-//!     supported` failures.
+//!     repeated to build git's group bitfield (a commit filed under each field,
+//!     deduped per commit as git does), `--no-group`, and the `unknown group
+//!     type` / `with stdin is not supported` (single and multiple) failures.
 //!   * `--format=<fmt>` — builtin format names are ignored (git only consults
-//!     `--format` when it is a *user* format), user formats are expanded.
+//!     `--format` when it is a *user* format), user formats are expanded. The
+//!     supported placeholders are `%H %h %T %t %P %p %s %n %x## %%`, the author/
+//!     committer name/email pair `%a{n,e,N,E}`/`%c{n,e,N,E}`, and the date forms
+//!     `%a{t,i,I,D,d}`/`%c{t,i,I,D,d}` (`%ad`/`%cd` honour `--date`).
 //!   * `--date=<fmt>` — validated the way `parse_date_format()` validates it.
 //!   * revision selection: `<rev>`, `^<rev>`, `<a>..<b>`, `<a>...<b>`, `--not`,
 //!     `--all`, `--branches[=<glob>]`, `--tags[=<glob>]`, `--remotes[=<glob>]`,
@@ -34,8 +38,9 @@
 //!     revision is pending the pathspecs are inert and shortlog reads stdin,
 //!     exactly as git does.
 //!   * message/ident filtering: `--grep`, `--author`, `--all-match`,
-//!     `--invert-grep`, `-i`/`--regexp-ignore-case`, `-F`/`--fixed-strings`
-//!     (see the restriction below).
+//!     `--invert-grep`, `-i`/`--regexp-ignore-case`, and the dialect selectors
+//!     `-F`/`--fixed-strings`, `-E`/`--extended-regexp`, `-P`/`--perl-regexp`,
+//!     `--basic-regexp` (see the regex note below).
 //!   * the stdin mode git falls into when nothing lands in the pending object
 //!     set and stdin is not a terminal.
 //!   * exit codes and streams: 0 on success, 128 for the `fatal:` paths, 129
@@ -46,7 +51,7 @@
 //! Not covered — each `bail!`s rather than emitting output that would diverge:
 //! magic pathspecs (`:(glob)`, `:(icase)`, `:!exclude`), `--reflog`, `--simplify-merges`,
 //! `--author-date-order`, `--bisect`, `--alternate-refs`, `--exclude-hidden`,
-//! repeated `--group` with different fields, and `--boundary` combined with
+//! and `--boundary` combined with
 //! `--skip`/`--max-count` (git appends boundary commits to the tail of the
 //! revision stream, where a limit can truncate them; that interaction is not
 //! modelled here). git accepts every one of the unported *option* flags in that
@@ -59,15 +64,17 @@
 //! provably a no-op — that is, when nothing reachable from the excluded tips is
 //! a merge — and bails otherwise.
 //!
-//! `--grep`/`--author` patterns are matched as fixed strings. git's default is
-//! POSIX basic regex; no regex engine is vendored here, so a pattern containing
-//! a metacharacter bails instead of being mis-matched. The dialect selectors
-//! `-E`/`--extended-regexp` and `-P`/`--perl-regexp` are accepted as no-ops just
-//! like `--basic-regexp`: the metacharacter guard, not the dialect flag, is
-//! what decides whether a pattern can be answered, so `-P -s` (no pattern)
-//! succeeds exactly as in git. (`--committer=<pattern>` needs no handling:
-//! `committer` is one of shortlog's own boolean options, so git rejects the
-//! `=<value>` spelling outright.)
+//! `--grep`/`--author` patterns are compiled to byte regexes through the
+//! `regex` crate (`regex::bytes`, `unicode(false)` so matching is byte-oriented
+//! like git's `regexec`). git's default dialect is POSIX basic (BRE): its
+//! escaped operators (`\(` `\+` `\{` `\|` …) are translated to the crate's bare
+//! forms and vice versa; `-E`/`--extended-regexp` and `-P`/`--perl-regexp` pass
+//! the pattern through unchanged; `-F`/`--fixed-strings` escapes it to a
+//! literal. The last dialect flag on the line wins, as in git's `grep_config`.
+//! (`--committer=<pattern>` needs no handling: `committer` is one of shortlog's
+//! own boolean options, so git rejects the `=<value>` spelling outright.)
+//! Because the crate's regex engine is not glibc/BSD `regcomp` nor PCRE2, an
+//! exotic pattern can diverge from git; the common BRE/ERE/literal cases match.
 //!
 //! Known deviations, both confined to inputs stock git treats specially:
 //!   * `-w` measures a code point as one display column, where git uses
@@ -125,9 +132,15 @@ struct Opts {
     in1: usize,  // -w indent for the first line of an entry
     in2: usize,  // -w indent for continuation lines
     reverse: bool,
-    group: GroupBy,
+    /// git's `log->groups` bitfield: every group field a commit is filed under.
+    /// Author and committer at most once each; any number of trailer/format
+    /// fields. Empty means "author".
+    groups: Vec<GroupBy>,
     /// `--format=<user format>`; `None` when git would use the subject.
     user_format: Option<String>,
+    /// The raw `--date=<fmt>` value, threaded to `%cd`/`%ad` expansion. `None`
+    /// leaves those placeholders on git's default (ctime-like) format.
+    date_format: Option<String>,
 }
 
 /// git's `log->groups` bitfield, reduced to the single group this port accepts.
@@ -178,6 +191,17 @@ enum Order {
     Topo,
 }
 
+/// Which regex dialect `--grep`/`--author` patterns are written in. git's default
+/// is POSIX basic (BRE); `-E`/`-P` select extended/perl, `-F` a literal. The last
+/// of these on the command line wins, exactly as in git's `grep_config`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    Basic,
+    Extended,
+    Fixed,
+    Perl,
+}
+
 /// The `rev_info` fields shortlog's walk actually reads.
 struct Filters {
     min_parents: usize,
@@ -193,10 +217,15 @@ struct Filters {
     all_match: bool,
     invert_grep: bool,
     ignore_case: bool,
-    fixed_strings: bool,
+    dialect: Dialect,
     boundary: bool,
     ancestry_path: bool,
     order: Order,
+    /// `--grep` patterns compiled to byte regexes, filled in after the parse
+    /// loop once the final dialect and `-i` are known.
+    grep_res: Vec<regex::bytes::Regex>,
+    /// `--author` patterns compiled to byte regexes, same timing as `grep_res`.
+    author_res: Vec<regex::bytes::Regex>,
 }
 
 /// One commit as produced by the walk, before any per-commit filtering.
@@ -221,8 +250,9 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         in1: DEFAULT_INDENT1,
         in2: DEFAULT_INDENT2,
         reverse: false,
-        group: GroupBy::Author,
+        groups: Vec::new(),
         user_format: None,
+        date_format: None,
     };
 
     let mut filters = Filters {
@@ -239,10 +269,12 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         all_match: false,
         invert_grep: false,
         ignore_case: false,
-        fixed_strings: false,
+        dialect: Dialect::Basic,
         boundary: false,
         ancestry_path: false,
         order: Order::Default,
+        grep_res: Vec::new(),
+        author_res: Vec::new(),
     };
 
     // `--group` is a bitfield in git; only a single field is ported, so track
@@ -454,15 +486,13 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 ("all-match", None) => filters.all_match = true,
                 ("invert-grep", None) => filters.invert_grep = true,
                 ("regexp-ignore-case", None) => filters.ignore_case = true,
-                ("fixed-strings", None) => filters.fixed_strings = true,
-                // Both name a regex dialect this port cannot evaluate; the
-                // pattern guard after the loop is what decides whether we can
-                // answer at all, so the dialect itself needs no state.
-                // Regex-dialect selectors. git accepts each; the post-loop
-                // pattern guard is the sole arbiter of whether a pattern this
-                // port cannot evaluate was actually supplied, so the dialect
-                // itself needs no state and `-P` is not special among them.
-                ("basic-regexp" | "extended-regexp" | "perl-regexp", None) => {}
+                ("fixed-strings", None) => filters.dialect = Dialect::Fixed,
+                // Regex-dialect selectors, last-wins like git's `grep_config`.
+                // The pattern is compiled through the `regex` crate after the
+                // loop, so the dialect only decides how the pattern text is read.
+                ("basic-regexp", None) => filters.dialect = Dialect::Basic,
+                ("extended-regexp", None) => filters.dialect = Dialect::Extended,
+                ("perl-regexp", None) => filters.dialect = Dialect::Perl,
                 ("boundary", None) => filters.boundary = true,
                 ("ancestry-path", None) => filters.ancestry_path = true,
                 ("reverse", None) => opts.reverse = true,
@@ -485,6 +515,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                         eprintln!("fatal: unknown date format {fmt}");
                         return Ok(ExitCode::from(128));
                     }
+                    opts.date_format = Some(fmt.to_string());
                 }
                 ("format" | "pretty", Some(arg)) => match parse_pretty(arg) {
                     Some(user) => opts.user_format = user,
@@ -519,13 +550,18 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
             "F" => {
-                filters.fixed_strings = true;
+                filters.dialect = Dialect::Fixed;
                 argv_consumed = true;
                 continue;
             }
-            // `-E`/`-P`: extended/perl regex dialect selectors, no-ops here (see
-            // the long-option arm; the post-loop pattern guard is the arbiter).
-            "E" | "P" => {
+            // `-E`/`-P`: extended/perl regex dialect selectors (last-wins).
+            "E" => {
+                filters.dialect = Dialect::Extended;
+                argv_consumed = true;
+                continue;
+            }
+            "P" => {
+                filters.dialect = Dialect::Perl;
                 argv_consumed = true;
                 continue;
             }
@@ -559,30 +595,43 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         argv_consumed = true;
     }
 
-    // Resolve the requested grouping into the single field this port supports.
-    let group_count =
-        usize::from(group_author) + usize::from(group_committer) + group_special.len();
-    if group_count > 1 {
-        bail!("multiple --group options are not ported");
+    // Collect every requested group field. git's `groups` is a bitfield, so the
+    // author and committer bits are set at most once each regardless of how many
+    // times they were named, while trailer/format fields accumulate. An empty
+    // set means author. Field order is irrelevant to output: the final records
+    // are re-sorted by `render`, and per-commit dedup keys on the string.
+    let mut group_fields: Vec<GroupBy> = Vec::new();
+    if group_author {
+        group_fields.push(GroupBy::Author);
     }
-    opts.group = match group_special.pop() {
-        Some(g) => g,
-        None if group_committer => GroupBy::Committer,
-        None => GroupBy::Author,
-    };
+    if group_committer {
+        group_fields.push(GroupBy::Committer);
+    }
+    group_fields.extend(group_special);
+    if group_fields.is_empty() {
+        group_fields.push(GroupBy::Author);
+    }
+    opts.groups = group_fields;
 
-    // A pattern this port cannot evaluate must never be silently mis-matched.
-    for pattern in filters.grep.iter().chain(&filters.author) {
-        if !filters.fixed_strings && has_regex_metacharacter(pattern) {
-            bail!("regular-expression pattern {pattern:?} is not ported (only fixed strings are)");
-        }
-    }
+    // Compile the message/ident patterns to byte regexes now that the dialect
+    // and `-i` are final. git's default is POSIX basic; `-E`/`-P` extended/perl,
+    // `-F` a literal. A pattern that cannot compile is git's fatal regcomp error.
+    filters.grep_res = compile_patterns(&filters.grep, filters.dialect, filters.ignore_case)?;
+    filters.author_res = compile_patterns(&filters.author, filters.dialect, filters.ignore_case)?;
 
     let repo = gix::discover(".").ok();
     let mailmap = repo
         .as_ref()
         .map(gix::Repository::open_mailmap)
         .unwrap_or_default();
+
+    // git's revision setup runs outside a repository too (shortlog can read
+    // stdin), but rejects any positional argument there — a revision, a `^rev`
+    // or a pathspec — with a usage error, exactly as `setup_revisions` does.
+    if repo.is_none() && (!actions.is_empty() || !pathspecs.is_empty()) {
+        eprint!("error: too many arguments given outside repository\n{USAGE}");
+        return Ok(ExitCode::from(129));
+    }
 
     // Build git's pending object set in command-line order.
     let mut tips: Vec<ObjectId> = Vec::new();
@@ -591,9 +640,9 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     let mut negate = false;
 
     for action in &actions {
-        let Some(repo) = repo.as_ref() else {
-            bail!("not a git repository");
-        };
+        let repo = repo
+            .as_ref()
+            .expect("outside-repository positional args were already rejected");
         match action {
             RevAction::Not => negate = !negate,
             RevAction::Exclude(pattern) => excludes.push(pattern.clone()),
@@ -691,12 +740,18 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     let mut groups: BTreeMap<BString, Group> = BTreeMap::new();
 
     if pending == 0 {
-        match &opts.group {
-            GroupBy::Trailer(_) => {
+        // git checks the multi-group case first, then the single trailer/format
+        // cases; the stdin reader only understands author/committer headers.
+        if opts.groups.len() > 1 {
+            eprintln!("fatal: using multiple --group options with stdin is not supported");
+            return Ok(ExitCode::from(128));
+        }
+        match opts.groups.first() {
+            Some(GroupBy::Trailer(_)) => {
                 eprintln!("fatal: using --group=trailer with stdin is not supported");
                 return Ok(ExitCode::from(128));
             }
-            GroupBy::Format(_) => {
+            Some(GroupBy::Format(_)) => {
                 eprintln!("fatal: using --group=format with stdin is not supported");
                 return Ok(ExitCode::from(128));
             }
@@ -776,7 +831,9 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 BString::default()
             } else {
                 let text = match &opts.user_format {
-                    Some(fmt) => expand_format(repo, &commit, &mailmap, fmt)?,
+                    Some(fmt) => {
+                        expand_format(repo, &commit, &mailmap, fmt, opts.date_format.as_deref())?
+                    }
                     None => {
                         let message = commit.message()?;
                         message.summary().into_owned()
@@ -839,9 +896,9 @@ fn int_arg(value: &str) -> Result<i32, ExitCode> {
     })
 }
 
-/// git's `parse_date_format()`, reduced to the accept/reject decision — the
-/// only thing shortlog needs, since it never formats a date itself except
-/// through `--group=format:%cd`, which is not ported.
+/// git's `parse_date_format()`, reduced to the accept/reject decision. This
+/// only validates the `--date=<fmt>` spelling; the subset of formats that
+/// `%ad`/`%cd` can actually render byte-for-byte is mapped in `git_date_format`.
 fn is_known_date_format(fmt: &str) -> bool {
     let fmt = fmt.strip_prefix("auto:").unwrap_or(fmt);
     if fmt.starts_with("format:") || fmt.starts_with("format-local:") {
@@ -912,38 +969,94 @@ fn approxidate(value: &str) -> i64 {
     }
 }
 
-/// True when the pattern needs a real regex engine to be answered correctly.
-fn has_regex_metacharacter(pattern: &str) -> bool {
-    pattern.bytes().any(|b| {
-        matches!(
-            b,
-            b'.' | b'^'
-                | b'$'
-                | b'*'
-                | b'+'
-                | b'?'
-                | b'('
-                | b')'
-                | b'['
-                | b']'
-                | b'{'
-                | b'}'
-                | b'|'
-                | b'\\'
-        )
-    })
+/// Compile each `--grep`/`--author` pattern into a byte regex, translating from
+/// its dialect the way git's `regcomp` reads it. An empty pattern compiles to a
+/// match-everything regex, matching git ("an empty string ... matches all").
+fn compile_patterns(
+    patterns: &[String],
+    dialect: Dialect,
+    ignore_case: bool,
+) -> Result<Vec<regex::bytes::Regex>> {
+    patterns
+        .iter()
+        .map(|p| build_regex(p, dialect, ignore_case))
+        .collect()
 }
 
-/// Case-sensitive or `-i` substring search, git's fixed-string match.
-fn contains_pattern(haystack: &BStr, pattern: &str, ignore_case: bool) -> bool {
-    if ignore_case {
-        haystack
-            .to_str_lossy()
-            .to_lowercase()
-            .contains(&pattern.to_lowercase())
-    } else {
-        haystack.as_bytes().find(pattern.as_bytes()).is_some()
+/// Build one byte regex from a pattern in `dialect`, mirroring git's engine as
+/// far as the `regex` crate allows: `-F` escapes to a literal, ERE/PCRE pass
+/// through, BRE is translated by swapping which operators are escaped.
+fn build_regex(pattern: &str, dialect: Dialect, ignore_case: bool) -> Result<regex::bytes::Regex> {
+    let translated = match dialect {
+        Dialect::Fixed => regex::escape(pattern),
+        Dialect::Extended | Dialect::Perl => pattern.to_string(),
+        Dialect::Basic => bre_to_regex(pattern),
+    };
+    let compile = |pat: &str| {
+        regex::bytes::RegexBuilder::new(pat)
+            .case_insensitive(ignore_case)
+            .unicode(false) // git greps bytes, not scalar values
+            .build()
+    };
+    match compile(&translated) {
+        Ok(re) => Ok(re),
+        // git's POSIX engine treats a `{`/`}` that forms no valid interval as a
+        // literal; the crate rejects it. Recover that leniency by literalising
+        // the braces and retrying — a genuine error still surfaces.
+        Err(_) => {
+            let lenient = translated.replace('{', "\\{").replace('}', "\\}");
+            compile(&lenient).map_err(|e| anyhow!("invalid regex: {e}"))
+        }
     }
+}
+
+/// GNU BRE → `regex`-crate syntax. In BRE the grouping/quantifier operators are
+/// the *escaped* forms (`\(` `\)` `\{` `\}` `\+` `\?` `\|`) while the bare
+/// characters are literals; ERE (and this crate) are the reverse. Bytes inside a
+/// `[...]` bracket expression are copied verbatim.
+fn bre_to_regex(p: &str) -> String {
+    let b = p.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut in_class = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_class {
+            out.push(c as char);
+            if c == b']' {
+                in_class = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'[' => {
+                in_class = true;
+                out.push('[');
+            }
+            b'\\' if i + 1 < b.len() => {
+                let n = b[i + 1];
+                match n {
+                    // BRE's escaped operators become bare operators.
+                    b'(' | b')' | b'{' | b'}' | b'+' | b'?' | b'|' => out.push(n as char),
+                    // Everything else keeps its backslash (`\.`, `\\`, `\b`, …).
+                    _ => {
+                        out.push('\\');
+                        out.push(n as char);
+                    }
+                }
+                i += 1;
+            }
+            // Bare operators are literals in BRE, so escape them for the crate.
+            b'(' | b')' | b'{' | b'}' | b'+' | b'?' | b'|' => {
+                out.push('\\');
+                out.push(c as char);
+            }
+            _ => out.push(c as char),
+        }
+        i += 1;
+    }
+    out
 }
 
 /// git's `--glob`/`--branches`/`--tags`/`--remotes` ref expansion, including
@@ -1189,39 +1302,34 @@ fn time_matches(commit: &gix::Commit<'_>, filters: &Filters) -> Result<bool> {
     Ok(true)
 }
 
-/// git's grep machinery, reduced to fixed strings: header patterns are ANDed
-/// with the message result, message patterns are ORed unless `--all-match`, and
-/// `--invert-grep` flips the message result only.
+/// git's grep machinery: `--author` header patterns are ANDed with the message
+/// result, `--grep` message patterns are ORed unless `--all-match`, and
+/// `--invert-grep` flips the message result only. Patterns are compiled byte
+/// regexes (`compile_patterns`), so BRE/ERE/PCRE and `-F` literals all work.
 fn message_matches(commit: &gix::Commit<'_>, filters: &Filters) -> Result<bool> {
-    if filters.grep.is_empty() && filters.author.is_empty() {
+    if filters.author_res.is_empty() && filters.grep_res.is_empty() {
         return Ok(true);
     }
 
-    if !filters.author.is_empty() {
+    if !filters.author_res.is_empty() {
         let line = ident_line(commit.author()?);
         if !filters
-            .author
+            .author_res
             .iter()
-            .any(|p| contains_pattern(line.as_bstr(), p, filters.ignore_case))
+            .any(|re| re.is_match(line.as_bytes()))
         {
             return Ok(false);
         }
     }
-    if filters.grep.is_empty() {
+    if filters.grep_res.is_empty() {
         return Ok(true);
     }
 
     let message = commit.message_raw()?;
     let hit = if filters.all_match {
-        filters
-            .grep
-            .iter()
-            .all(|p| contains_pattern(message, p, filters.ignore_case))
+        filters.grep_res.iter().all(|re| re.is_match(message))
     } else {
-        filters
-            .grep
-            .iter()
-            .any(|p| contains_pattern(message, p, filters.ignore_case))
+        filters.grep_res.iter().any(|re| re.is_match(message))
     };
     Ok(hit != filters.invert_grep)
 }
@@ -1238,43 +1346,64 @@ fn ident_line(sig: gix::actor::SignatureRef<'_>) -> BString {
     out
 }
 
-/// The group key(s) a commit files under. Only `--group=trailer` can produce
-/// more than one — or none at all, when the commit carries no such trailer.
+/// The group key(s) a commit files under, across every requested group field.
+/// git iterates its `groups` bitfield and (for `--group=trailer`/`format`) each
+/// configured token, inserting one record per key while a per-commit `strset`
+/// dedups identical strings — so a commit whose author equals its committer is
+/// counted once under both `--group=author --group=committer`. A trailer field
+/// can contribute zero keys (no such trailer) or several (repeated trailers).
 fn group_keys(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     mailmap: &gix::mailmap::Snapshot,
     opts: &Opts,
 ) -> Result<Vec<BString>> {
-    Ok(match &opts.group {
-        GroupBy::Author => vec![format_ident(commit.author()?.trim(), mailmap, opts.email)],
-        GroupBy::Committer => vec![format_ident(
-            commit.committer()?.trim(),
-            mailmap,
-            opts.email,
-        )],
-        GroupBy::Format(fmt) => vec![expand_format(repo, commit, mailmap, fmt)?],
-        GroupBy::Trailer(token) => {
-            let message = commit.message()?;
-            let Some(body) = message.body() else {
-                return Ok(Vec::new());
-            };
-            body.trailers()
-                .filter(|trailer| trailer.token.eq_ignore_ascii_case(token.as_bytes()))
-                .map(|trailer| BString::from(trailer.value.to_vec()))
-                .collect()
+    let mut keys: Vec<BString> = Vec::new();
+    let push = |key: BString, keys: &mut Vec<BString>| {
+        if !keys.contains(&key) {
+            keys.push(key);
         }
-    })
+    };
+    for group in &opts.groups {
+        match group {
+            GroupBy::Author => push(
+                format_ident(commit.author()?.trim(), mailmap, opts.email),
+                &mut keys,
+            ),
+            GroupBy::Committer => push(
+                format_ident(commit.committer()?.trim(), mailmap, opts.email),
+                &mut keys,
+            ),
+            GroupBy::Format(fmt) => push(
+                expand_format(repo, commit, mailmap, fmt, opts.date_format.as_deref())?,
+                &mut keys,
+            ),
+            GroupBy::Trailer(token) => {
+                let message = commit.message()?;
+                if let Some(body) = message.body() {
+                    for trailer in body
+                        .trailers()
+                        .filter(|t| t.token.eq_ignore_ascii_case(token.as_bytes()))
+                    {
+                        push(BString::from(trailer.value.to_vec()), &mut keys);
+                    }
+                }
+            }
+        }
+    }
+    Ok(keys)
 }
 
-/// Port of `format_commit_message()` restricted to the placeholders shortlog
-/// can be asked for here. An unhandled `%<char>` bails rather than silently
-/// rendering something git would render differently.
+/// Port of `format_commit_message()` covering the placeholders shortlog can be
+/// asked for here. An unhandled `%<char>` bails rather than silently rendering
+/// something git would render differently. `date_format` is the `--date=<fmt>`
+/// value that `%ad`/`%cd` honour (`None` = git's default ctime-like format).
 fn expand_format(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     mailmap: &gix::mailmap::Snapshot,
     fmt: &str,
+    date_format: Option<&str>,
 ) -> Result<BString> {
     let mut out = BString::default();
     let bytes = fmt.as_bytes();
@@ -1319,18 +1448,46 @@ fn expand_format(
                 let prefix = commit.id.attach(repo).shorten_or_id();
                 out.extend_from_slice(prefix.to_string().as_bytes());
             }
+            b'T' => out.extend_from_slice(commit.tree_id()?.to_string().as_bytes()),
+            b't' => {
+                out.extend_from_slice(commit.tree_id()?.shorten_or_id().to_string().as_bytes());
+            }
+            b'P' => {
+                for (n, parent) in commit.parent_ids().enumerate() {
+                    if n > 0 {
+                        out.push(b' ');
+                    }
+                    out.extend_from_slice(parent.to_string().as_bytes());
+                }
+            }
+            b'p' => {
+                for (n, parent) in commit.parent_ids().enumerate() {
+                    if n > 0 {
+                        out.push(b' ');
+                    }
+                    out.extend_from_slice(parent.shorten_or_id().to_string().as_bytes());
+                }
+            }
             b's' => {
                 let message = commit.message()?;
                 out.extend_from_slice(message.summary().as_bytes());
             }
-            b'x' => {
-                let hex = fmt.get(i..i + 2).unwrap_or_default();
-                let Ok(byte) = u8::from_str_radix(hex, 16) else {
-                    bail!("`--format` placeholder `%x{hex}` is not ported");
-                };
-                out.push(byte);
-                i += 2;
-            }
+            b'x' => match bytes.get(i..i + 2) {
+                // git's `%x##` needs exactly two hex digits (its `isxdigit`
+                // test, which — unlike `from_str_radix` — rejects a `+`/`-` sign).
+                Some(h) if h[0].is_ascii_hexdigit() && h[1].is_ascii_hexdigit() => {
+                    let hi = (h[0] as char).to_digit(16).unwrap();
+                    let lo = (h[1] as char).to_digit(16).unwrap();
+                    out.push((hi * 16 + lo) as u8);
+                    i += 2;
+                }
+                // Otherwise git prints `%x` verbatim, leaving the trailing bytes
+                // to be read as literals.
+                _ => {
+                    out.push(b'%');
+                    i -= 1;
+                }
+            },
             b'a' | b'c' => {
                 let raw = if next == b'a' {
                     commit.author()?
@@ -1351,6 +1508,14 @@ fn expand_format(
                     b'e' => out.extend_from_slice(sig.email),
                     b'N' => out.extend_from_slice(mapped_name.unwrap_or(sig.name)),
                     b'E' => out.extend_from_slice(mapped_email.unwrap_or(sig.email)),
+                    // Date sub-forms. `%at`/`%ct` epoch, `%ai`/`%ci` ISO,
+                    // `%aI`/`%cI` strict ISO, `%aD`/`%cD` RFC2822, `%ad`/`%cd`
+                    // the `--date`-controlled format. All read the ident's own
+                    // timezone offset, matching git.
+                    b't' | b'i' | b'I' | b'D' | b'd' => {
+                        let time = raw.time().map_err(|e| anyhow!("{e}"))?;
+                        out.extend_from_slice(sig_date(time, which, date_format)?.as_bytes());
+                    }
                     other => bail!(
                         "`--format` placeholder `%{}{}` is not ported",
                         next as char,
@@ -1362,6 +1527,43 @@ fn expand_format(
         }
     }
     Ok(out)
+}
+
+/// Format an ident timestamp for the `%ad`/`%cd` placeholder family. `which` is
+/// the character after `%a`/`%c`, already restricted by the caller to a date
+/// sub-form. The offset carried by `time` is the ident's own, matching git.
+fn sig_date(time: gix::date::Time, which: u8, date_format: Option<&str>) -> Result<String> {
+    use gix::date::time::format as dfmt;
+    let fmt: gix::date::time::Format = match which {
+        b't' => return Ok(time.seconds.to_string()),
+        b'i' => dfmt::ISO8601.into(),
+        b'I' => dfmt::ISO8601_STRICT.into(),
+        b'D' => dfmt::GIT_RFC2822.into(),
+        // `%ad`/`%cd` honour `--date`; only the formats that reproduce git
+        // byte-for-byte are supported, others (relative/human/local) bail.
+        _ => match git_date_format(date_format) {
+            Some(f) => f,
+            None => bail!("`--format` %ad/%cd with --date={date_format:?} is not ported"),
+        },
+    };
+    time.format(fmt).map_err(|e| anyhow!("{e}"))
+}
+
+/// Map git's `--date=<fmt>` selector to the gitoxide date format that renders it
+/// identically. `None` means git's default (ctime-like) format; an unmappable
+/// selector (relative, human, `*-local`, `format:…`, `auto:…`) returns `None`.
+fn git_date_format(spec: Option<&str>) -> Option<gix::date::time::Format> {
+    use gix::date::time::format as dfmt;
+    Some(match spec {
+        None | Some("default") => dfmt::DEFAULT.into(),
+        Some("iso" | "iso8601") => dfmt::ISO8601.into(),
+        Some("iso-strict" | "iso8601-strict") => dfmt::ISO8601_STRICT.into(),
+        Some("short") => dfmt::SHORT.into(),
+        Some("rfc" | "rfc2822") => dfmt::GIT_RFC2822.into(),
+        Some("unix") => dfmt::UNIX,
+        Some("raw") => dfmt::RAW,
+        _ => return None,
+    })
 }
 
 /// Port of `parse_uint()` from `builtin/shortlog.c`: read a decimal run, require
@@ -1520,7 +1722,10 @@ fn read_from_stdin(
     let mut buf = Vec::new();
     std::io::stdin().read_to_end(&mut buf)?;
 
-    let matches: [&[u8]; 2] = if opts.group == GroupBy::Committer {
+    // Only a single author/committer group reaches stdin mode; multiple groups
+    // and trailer/format groups are rejected before this point.
+    let by_committer = matches!(opts.groups.first(), Some(GroupBy::Committer));
+    let matches: [&[u8]; 2] = if by_committer {
         [&b"Commit: "[..], &b"committer "[..]]
     } else {
         [&b"Author: "[..], &b"author "[..]]

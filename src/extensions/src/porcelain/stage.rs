@@ -15,6 +15,8 @@
 //!   * `--chmod=+x|-x`                      — force the index mode of matched paths
 //!   * `--ignore-errors`                    — skip unreadable files, exit 1
 //!   * `--ignore-missing` (with `--dry-run`) — non-matching pathspecs are not fatal
+//!   * `--pathspec-from-file=<file>` / `--pathspec-file-nul` — read pathspecs from
+//!     `<file>` (or stdin for `-`), NUL- or newline-separated, C-quoting honored
 //!   * `-n/--dry-run`, `-v/--verbose`, `-f/--force`, `--sparse/--no-sparse`, `--`
 //!
 //! Deviations (bailed or noted, never faked):
@@ -25,8 +27,8 @@
 //!   * `--sparse`/`--no-sparse` are accepted only while the repo has no
 //!     sparse-checkout; with one configured they are rejected rather than ignored.
 //!   * submodule gitlinks are skipped here (use `git zbump`).
-//!   * interactive/patch/edit and `--pathspec-from-file` are rejected with a
-//!     precise message rather than silently ignored.
+//!   * interactive/patch/edit are rejected with a precise message rather than
+//!     silently ignored (they require a TTY this port does not drive).
 //!   * pathspecs are resolved relative to the repository root, not to the current
 //!     working directory's prefix.
 //!
@@ -43,6 +45,8 @@ use gix::index::entry::{Flags, Mode, Stage, Stat};
 
 /// Exit code git uses for a fatal error.
 const FATAL: u8 = 128;
+/// Exit code git uses for a usage error (bad/missing option value).
+const USAGE: u8 = 129;
 
 // ---------------------------------------------------------------------------
 // options
@@ -72,6 +76,9 @@ struct Opts {
     chmod: Option<bool>,
     pathspec_file_nul: bool,
     pathspec_from_file: bool,
+    /// The `<file>` argument of `--pathspec-from-file=<file>` (or its separate-arg
+    /// form). `-` names stdin. Read in `stage()`, after option validation.
+    pathspec_from_file_value: Option<String>,
     pathspecs: Vec<String>,
 }
 
@@ -85,13 +92,40 @@ impl Opts {
 
 /// Parse the argument vector the way git's `parse_options` does for `cmd_add`:
 /// every toggle honours its `--no-` twin and the last occurrence wins.
-fn parse(args: &[String]) -> Result<Opts> {
+///
+/// The outer `Result` carries hard errors (interactive modes this port cannot
+/// serve); the inner `Result` carries a usage exit code (git's 129) for the
+/// value-bearing options that were handed no value.
+fn parse(args: &[String]) -> Result<std::result::Result<Opts, ExitCode>> {
     let mut o = Opts::default();
     let mut positional_only = false;
 
-    for a in args {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
         if positional_only {
             o.pathspecs.push(a.clone());
+            i += 1;
+            continue;
+        }
+        // `--chmod` and `--pathspec-from-file` take a value. git's parse_options
+        // accepts both the sticky `--opt=val` and the separate `--opt val` forms,
+        // consuming the following argv element for the latter (dying 129 if there
+        // is none). Handle the separate form here; the sticky form falls through
+        // to the `=`-prefixed arms below.
+        if a == "--chmod" || a == "--pathspec-from-file" {
+            let name = &a[2..];
+            let Some(val) = args.get(i + 1) else {
+                eprintln!("error: option `{name}' requires a value");
+                return Ok(Err(ExitCode::from(USAGE)));
+            };
+            if a == "--chmod" {
+                o.chmod_arg = Some(val.clone());
+            } else {
+                o.pathspec_from_file = true;
+                o.pathspec_from_file_value = Some(val.clone());
+            }
+            i += 2;
             continue;
         }
         match a.as_str() {
@@ -133,8 +167,10 @@ fn parse(args: &[String]) -> Result<Opts> {
                 o.chmod_arg = Some(other["--chmod=".len()..].to_string());
             }
 
-            other if other == "--pathspec-from-file" || other.starts_with("--pathspec-from-file=") => {
+            other if other.starts_with("--pathspec-from-file=") => {
                 o.pathspec_from_file = true;
+                o.pathspec_from_file_value =
+                    Some(other["--pathspec-from-file=".len()..].to_string());
             }
 
             // Recognized git flags that this port does not implement: name them.
@@ -162,8 +198,112 @@ fn parse(args: &[String]) -> Result<Opts> {
             other if other.starts_with("--") => bail!("unsupported flag {other}"),
             _ => o.pathspecs.push(a.clone()),
         }
+        i += 1;
     }
-    Ok(o)
+    Ok(Ok(o))
+}
+
+/// Split the bytes of a `--pathspec-from-file` file into pathspecs, matching
+/// git's `parse_pathspec_file` (builtin/add.c → pathspec.c).
+///
+/// In NUL mode the elements are separated by NUL and taken verbatim. Otherwise
+/// each line (LF-terminated, with one trailing CR stripped) is one pathspec, and
+/// a line that begins with `"` is C-style unquoted. A trailing separator does not
+/// yield a final empty element, but an empty line in the middle yields an empty
+/// pathspec (which the caller rejects, exactly as git does).
+///
+/// Returns `Err(line)` — the raw offending line — when a quoted line is malformed,
+/// so the caller can render git's `line is badly quoted: <line>` fatal.
+fn parse_pathspec_file(raw: &[u8], nul: bool) -> std::result::Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    if nul {
+        let mut start = 0;
+        for i in 0..raw.len() {
+            if raw[i] == 0 {
+                out.push(String::from_utf8_lossy(&raw[start..i]).into_owned());
+                start = i + 1;
+            }
+        }
+        if start < raw.len() {
+            out.push(String::from_utf8_lossy(&raw[start..]).into_owned());
+        }
+        return Ok(out);
+    }
+
+    let mut start = 0;
+    let mut i = 0;
+    while i <= raw.len() {
+        let at_end = i == raw.len();
+        if !at_end && raw[i] != b'\n' {
+            i += 1;
+            continue;
+        }
+        // A trailing LF closes the file without a final empty line.
+        if at_end && start == i {
+            break;
+        }
+        let mut line = &raw[start..i];
+        if line.last() == Some(&b'\r') {
+            line = &line[..line.len() - 1];
+        }
+        if line.first() == Some(&b'"') {
+            match unquote_c_style(line) {
+                Some(s) => out.push(s),
+                None => return Err(String::from_utf8_lossy(line).into_owned()),
+            }
+        } else {
+            out.push(String::from_utf8_lossy(line).into_owned());
+        }
+        start = i + 1;
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// Decode a C-style quoted path exactly as git's `unquote_c_style` does: the input
+/// begins with `"`, and decoding stops at the closing `"` (any bytes after it are
+/// ignored, as git ignores its `endp`). Recognizes `\a \b \f \n \r \t \v \\ \"`
+/// and one-to-three-digit octal escapes. Returns `None` on an unterminated string
+/// or an unknown escape, which git treats as "badly quoted".
+fn unquote_c_style(line: &[u8]) -> Option<String> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 1; // skip the opening quote
+    while i < line.len() {
+        match line[i] {
+            b'"' => return Some(String::from_utf8_lossy(&out).into_owned()),
+            b'\\' => {
+                i += 1;
+                let e = *line.get(i)?;
+                match e {
+                    b'a' => out.push(0x07),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0c),
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'v' => out.push(0x0b),
+                    b'\\' => out.push(b'\\'),
+                    b'"' => out.push(b'"'),
+                    b'0'..=b'7' => {
+                        let mut val = u32::from(e - b'0');
+                        let mut digits = 1;
+                        while digits < 3
+                            && matches!(line.get(i + 1), Some(&d) if (b'0'..=b'7').contains(&d))
+                        {
+                            i += 1;
+                            val = val * 8 + u32::from(line[i] - b'0');
+                            digits += 1;
+                        }
+                        out.push(val as u8);
+                    }
+                    _ => return None,
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    None // reached end without a closing quote
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +311,10 @@ fn parse(args: &[String]) -> Result<Opts> {
 // ---------------------------------------------------------------------------
 
 pub fn stage(args: &[String]) -> Result<ExitCode> {
-    let mut o = parse(args)?;
+    let mut o = match parse(args)? {
+        Ok(o) => o,
+        Err(code) => return Ok(code),
+    };
 
     // --- option validation, in git's own order ------------------------------
     // The order matters when an invocation violates several rules at once, and it
@@ -208,13 +351,53 @@ pub fn stage(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
         return Ok(ExitCode::from(FATAL));
     }
+    // `--pathspec-from-file=<file>` replaces the (necessarily empty) command-line
+    // pathspecs with the ones read from `<file>` (or stdin for `-`). git reads and
+    // parses the file here — after the checks above, before the pathspecs are ever
+    // matched — so a malformed file or a clash with argv pathspecs dies with the
+    // repository and object database untouched. Verified against git 2.55.0.
     if o.pathspec_from_file {
-        bail!("--pathspec-from-file is not supported");
+        if !o.pathspecs.is_empty() {
+            eprintln!("fatal: '--pathspec-from-file' and pathspec arguments cannot be used together");
+            return Ok(ExitCode::from(FATAL));
+        }
+        let file = o.pathspec_from_file_value.clone().unwrap_or_default();
+        let raw = if file == "-" {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
+            buf
+        } else {
+            match std::fs::read(&file) {
+                Ok(b) => b,
+                Err(e) => {
+                    // git prints `strerror(errno)` alone; std's Display appends a
+                    // ` (os error N)` tail, so keep only the leading message.
+                    let s = e.to_string();
+                    let reason = s.split(" (os error").next().unwrap_or(&s);
+                    eprintln!("fatal: could not open '{file}' for reading: {reason}");
+                    return Ok(ExitCode::from(FATAL));
+                }
+            }
+        };
+        match parse_pathspec_file(&raw, o.pathspec_file_nul) {
+            Ok(specs) => o.pathspecs = specs,
+            Err(line) => {
+                eprintln!("fatal: line is badly quoted: {line}");
+                return Ok(ExitCode::from(FATAL));
+            }
+        }
+        // The file's own pathspecs get the same empty-string validation git runs
+        // over command-line pathspecs — an empty line is an empty pathspec.
+        if o.pathspecs.iter().any(String::is_empty) {
+            eprintln!("fatal: empty string is not a valid pathspec. please use . instead if you meant to match all paths");
+            return Ok(ExitCode::from(FATAL));
+        }
     }
 
     let repo = gix::discover(".")?;
     if repo.workdir().is_none() {
-        bail!("this operation must be run in a work tree");
+        eprintln!("fatal: this operation must be run in a work tree");
+        return Ok(ExitCode::from(FATAL));
     }
 
     reject_unsupportable_config(&repo, &o)?;

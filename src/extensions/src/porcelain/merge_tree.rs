@@ -24,12 +24,29 @@
 //!     `diff-algorithm=myers|default|minimal|histogram`, and the no-op
 //!     `no-renormalize`
 //!
+//! Also covered:
+//!   * `--stdin` — the multi-merge batch protocol: each input line is one merge
+//!     (`<branch1> <branch2>` or `<base> -- <branch1> <branch2>`), and each
+//!     result is emitted as git's `<clean>\0<tree>\0<-z body>\0` record, with
+//!     the same fatal diagnostics (`malformed input line`, `not something we
+//!     can merge`, `refusing to merge unrelated histories`) and their exit codes
+//!   * the `--quiet` mutual-exclusions with `--name-only`, `--stdin` and `-z`
+//!     (each a `die()`, exit 128), and `--stdin`'s exclusion of `--trivial-merge`
+//!     and `--merge-base`
+//!   * conflict message rendering beyond the plain content family: binary
+//!     content merges (`warning: Cannot merge binary files: <p> (<a> vs. <b>)`),
+//!     symlink content conflicts, `modify/delete`, `rename/delete` and
+//!     `rename/rename` — the side labels are recovered from tree membership so
+//!     they track git's argument labels regardless of `gix-merge`'s canonical
+//!     side ordering
+//!
 //! Not covered, and refused rather than approximated:
-//!   * `--stdin` (multi-merge batch protocol) and actually *running* the
-//!     deprecated `--trivial-merge` mode (its option-compatibility rules are
-//!     enforced and its operands are peeled to trees so git's `unknown rev` /
-//!     `unable to read tree` diagnostics are reproduced; only the legacy
-//!     three-tree walk with its embedded unified diff is not ported)
+//!   * actually *running* the deprecated `--trivial-merge` mode (its
+//!     option-compatibility rules are enforced and its operands are peeled to
+//!     trees so git's `unknown rev` / `unable to read tree` diagnostics are
+//!     reproduced; only the legacy three-tree walk with its embedded unified
+//!     diff is not ported, as reproducing git's xdiff hunk framing byte-for-byte
+//!     through `gix-imara-diff` cannot be guaranteed)
 //!   * the strategy options `subtree[=<path>]`, `renormalize`, `patience`,
 //!     `diff-algorithm=patience`, `ignore-space-change`, `ignore-all-space`,
 //!     `ignore-space-at-eol` and `ignore-cr-at-eol` — `gix-merge`'s text driver
@@ -37,15 +54,15 @@
 //!     and no subtree shift, and `gix-imara-diff` has no patience algorithm.
 //!     They parse and validate exactly as git does; only performing such a
 //!     merge is refused.
-//!   * message rendering for conflict classes outside the content family —
-//!     rename/rename, rename/delete, modify/delete, directory/file, submodule
-//!     and binary conflicts. `gix-merge` reports these as structured
-//!     resolutions, not as git's message strings, so rendering them would mean
-//!     inventing text. Those merges still work under `--no-messages` and
+//!   * message rendering for the remaining exotic conflict classes —
+//!     directory/file, submodule and the rename type-mismatch failures.
+//!     `gix-merge` reports these as structured resolutions whose exact git
+//!     message text (including synthetic `~<label>` rename paths) cannot be
+//!     reconstructed here. Those merges still work under `--no-messages` and
 //!     `--quiet`, where no message text is emitted at all.
 
 use anyhow::{bail, Result};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -53,7 +70,15 @@ use gix::diff::tree_with_rewrites::Change;
 use gix::hash::ObjectId;
 use gix::merge::blob::builtin_driver::text::Labels;
 use gix::merge::tree::apply_index_entries::RemovalMode;
-use gix::merge::tree::{Conflict, FileFavor, Resolution, TreatAsUnresolved};
+use gix::merge::tree::{Conflict, FileFavor, Resolution, ResolutionFailure, TreatAsUnresolved};
+
+/// The outcome of one real (`--write-tree`) merge, ready for framing by the
+/// caller. `Fatal` carries the exit code git would `die()`/`exit()` with; it
+/// aborts the whole process, including a `--stdin` batch mid-stream.
+enum Merged {
+    Fatal(ExitCode),
+    Done { clean: bool, body: Vec<u8> },
+}
 
 /// Verbatim `git merge-tree` usage text, printed to stderr for usage errors
 /// (git exits 129 in those cases).
@@ -232,16 +257,30 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    // git's first post-parse check: `--quiet` and an explicit `--messages`
-    // (the final value after `--messages`/`--no-messages` resolution) are
-    // mutually exclusive. It `die()`s — exit 128 — before it validates the
-    // strategy options, the trivial-merge exclusivity rule or the operand
-    // count, so it outranks all of those. Parse-time diagnostics (unknown
-    // option, `--write-tree`/`--trivial-merge` clash) still win because they
-    // fire during parsing, before this point is reached.
-    if quiet && show_messages == Some(true) {
-        eprintln!("fatal: options '--quiet' and '--messages' cannot be used together");
-        return Ok(ExitCode::from(128));
+    // git's first post-parse checks: `--quiet` is mutually exclusive with
+    // `--messages`, `--name-only`, `--stdin` and `-z`, in that order (git's
+    // four `die_for_incompatible_opt2` calls). Each `die()`s — exit 128 —
+    // before it validates the strategy options, the trivial-merge exclusivity
+    // rule or the operand count, so they outrank all of those. Parse-time
+    // diagnostics (unknown option, `--write-tree`/`--trivial-merge` clash)
+    // still win because they fire during parsing, before this point.
+    if quiet {
+        if show_messages == Some(true) {
+            eprintln!("fatal: options '--quiet' and '--messages' cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
+        if name_only {
+            eprintln!("fatal: options '--quiet' and '--name-only' cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
+        if use_stdin {
+            eprintln!("fatal: options '--quiet' and '--stdin' cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
+        if nul {
+            eprintln!("fatal: options '--quiet' and '-z' cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
     }
 
     // How many argv slots parse-options consumed as options. `--trivial-merge`
@@ -259,6 +298,21 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
             eprintln!("fatal: unknown strategy option: -X{xopt}");
             return Ok(ExitCode::from(128));
         }
+    }
+
+    // git handles `--stdin` right here — after strategy validation and before
+    // the operand-count switch, so it never enforces the two-operand rule and
+    // simply ignores any positional revs. It reads merges from stdin, one per
+    // line, and forces NUL termination.
+    if use_stdin {
+        return run_stdin(
+            &strategy,
+            name_only,
+            show_messages,
+            allow_unrelated,
+            mode,
+            &merge_base,
+        );
     }
 
     match mode {

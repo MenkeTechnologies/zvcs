@@ -36,6 +36,19 @@
 //!   with `from <null-oid>` for refs whose commit was excluded
 //! * `--no-data`, `--data`, `--full-tree`, `--use-done-feature`,
 //!   `--show-original-ids`, `--mark-tags`, `--progress=<n>`, `--export-marks=<file>`
+//! * `--import-marks=<file>` / `--import-marks-if-exists=<file>` — pre-seed the
+//!   mark table from a prior export: already-marked blobs/commits/tags are not
+//!   re-emitted, the id counter continues past the highest imported mark, and
+//!   `from :<mark>` links an incremental commit to its imported parent.
+//!   `--import-marks` dies `could not open '<file>' for reading` (128) on a
+//!   missing file; the `-if-exists` form treats it as empty
+//! * `--reference-excluded-parents` — a parent outside the stream is named by raw
+//!   object id (`from <oid>` / `merge <oid>`) instead of being dropped
+//! * `--refspec=<src>:<dst>` — renames exported ref labels/resets/tags through the
+//!   exact and single-`*` wildcard forms; a ref matching no refspec passes through
+//! * `--anonymize` with `--no-data`, `--show-original-ids`, or a gitlink entry —
+//!   `original-oid` keeps git's real id, and hash-named object refs (`--no-data`
+//!   blobs, gitlinks) use git's `anonymize_oid` sequential fake ids
 //! * `--signed-tags=(verbatim|warn|warn-verbatim|warn-strip|strip|abort)`
 //! * `--tag-of-filtered-object=(abort|drop)`
 //! * `--signed-commits=(strip|warn-strip|abort)`, `--reencode=(no|abort)`; the
@@ -74,20 +87,19 @@
 //!
 //! ### Honest limitations (bailed on with a precise message, never silently ignored)
 //!
-//! * `--anonymize-map=<from>[:<to>]` — git's mapping interacts with its token
-//!   generator in ways not reproducible from here.
-//! * `--anonymize` combined with `--no-data`, `--show-original-ids`, or a
-//!   gitlink entry — those emit object ids, which git replaces with generated
-//!   fake ids this port does not reproduce.
+//! * `--anonymize-map=<from>[:<to>]` — git's seed interacts with a single shared
+//!   token table (refs, paths and idents draw from the same map) whose exact
+//!   structure this port's per-category tables do not reproduce.
 //! * `--signed-commits=(verbatim|warn-verbatim)` on a signed commit — emitting
 //!   `gpgsig` stanzas requires the experimental signed-commit stream extension.
 //! * `--reencode=yes` on a commit carrying an `encoding` header — needs iconv;
 //!   no re-encoding substrate is vendored.
 //! * `--tag-of-filtered-object=rewrite` on a filtered tag — needs rev-list
 //!   parent rewriting.
-//! * `--import-marks=<file>`, `--import-marks-if-exists=<file>`,
-//!   `--reference-excluded-parents`, `--refspec=<refspec>` (with refs to export),
-//!   `--ancestry-path` (with negative revisions), `--boundary` (with negative
+//! * a nested tag (a tag whose object is another tag) — git flattens the chain to
+//!   the innermost tag's content under the outer tag's name, a convoluted shape
+//!   not reproduced here.
+//! * `--ancestry-path` (with negative revisions), `--boundary` (with negative
 //!   revisions), and magic/glob pathspecs (`:(glob)`, `:!exclude`, `*.rs`), whose
 //!   matcher this port does not reproduce.
 
@@ -246,6 +258,8 @@ struct Opts {
     filtered_tag: FilteredTagMode, // --tag-of-filtered-object=<mode>
     reencode: ReencodeMode,  // --reencode=<mode>
     anonymize: bool,         // --anonymize
+    reference_excluded_parents: bool, // --reference-excluded-parents
+    refspecs: Vec<BString>,  // --refspec=<refspec> (applied to exported ref names)
 }
 
 /// The tagger git invents for a tag object that has none, when asked to.
@@ -282,6 +296,8 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         filtered_tag: FilteredTagMode::Abort,
         reencode: ReencodeMode::Abort,
         anonymize: false,
+        reference_excluded_parents: false,
+        refspecs: Vec::new(),
     };
 
     // Revision selection, in command-line order so `--not` scopes correctly.
@@ -304,9 +320,9 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     // been set up, so the order of checks below has to match.
     let mut leftover = false;
     let mut anonymize_map: Vec<String> = Vec::new();
-    let mut import_marks: Option<String> = None;
+    // (path, if_exists): --import-marks dies on a missing file, --import-marks-if-exists is silent.
+    let mut import_marks: Option<(String, bool)> = None;
     let mut refspecs: Vec<String> = Vec::new();
-    let mut reference_excluded_parents = false;
     let mut pathspecs: Vec<String> = Vec::new();
 
     for a in args {
@@ -340,7 +356,7 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
             "--mark-tags" => opts.mark_tags = true,
             "--fake-missing-tagger" => opts.fake_missing_tagger = true,
             "--anonymize" => opts.anonymize = true,
-            "--reference-excluded-parents" => reference_excluded_parents = true,
+            "--reference-excluded-parents" => opts.reference_excluded_parents = true,
 
             // ---- rev-list selection ----
             "--all" => use_all = true,
@@ -397,10 +413,10 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
                 opts.export_marks = Some(s["--export-marks=".len()..].to_string());
             }
             _ if s.starts_with("--import-marks=") => {
-                import_marks = Some(s["--import-marks=".len()..].to_string());
+                import_marks = Some((s["--import-marks=".len()..].to_string(), false));
             }
             _ if s.starts_with("--import-marks-if-exists=") => {
-                import_marks = Some(s["--import-marks-if-exists=".len()..].to_string());
+                import_marks = Some((s["--import-marks-if-exists=".len()..].to_string(), true));
             }
             _ if s.starts_with("--refspec=") => {
                 refspecs.push(s["--refspec=".len()..].to_string());
@@ -485,13 +501,56 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         return Ok(fatal("--ancestry-path given but there are no bottom commits"));
     }
 
+    // ---- `--import-marks[-if-exists]`: seed the mark table from a prior export. ----
+    // git's `read_marks`: each `:<mark> <oid>` line pre-marks that object so it is
+    // never re-emitted, and the id counter continues past the highest imported
+    // mark. `--import-marks` dies on a missing file; `--import-marks-if-exists`
+    // treats a missing file as empty.
+    let mut imported_marks: Vec<(u32, ObjectId)> = Vec::new();
+    let mut imported_max: u32 = 0;
+    if let Some((path, if_exists)) = &import_marks {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                for line in bytes.split(|b| *b == b'\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    // `:<decimal-mark> <hex-oid>`
+                    let Some(rest) = line.strip_prefix(b":") else {
+                        continue;
+                    };
+                    let Some(sp) = rest.iter().position(|b| *b == b' ') else {
+                        continue;
+                    };
+                    let (mark_bytes, oid_bytes) = (&rest[..sp], &rest[sp + 1..]);
+                    let Ok(mark) = std::str::from_utf8(mark_bytes)
+                        .unwrap_or("")
+                        .parse::<u32>()
+                    else {
+                        continue;
+                    };
+                    let Ok(id) = ObjectId::from_hex(oid_bytes) else {
+                        continue;
+                    };
+                    imported_max = imported_max.max(mark);
+                    imported_marks.push((mark, id));
+                }
+            }
+            Err(e) if *if_exists && e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                let reason = if e.kind() == std::io::ErrorKind::NotFound {
+                    "No such file or directory".to_string()
+                } else {
+                    e.to_string()
+                };
+                return Ok(fatal(&format!(
+                    "could not open '{path}' for reading: {reason}"
+                )));
+            }
+        }
+    }
+
     // ---- Options this port does not implement: refuse rather than mis-export. ----
-    if import_marks.is_some() {
-        bail!("--import-marks is not supported");
-    }
-    if reference_excluded_parents {
-        bail!("--reference-excluded-parents is not supported");
-    }
     if ancestry_path {
         bail!("--ancestry-path is not supported");
     }
@@ -501,9 +560,9 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     if !anonymize_map.is_empty() {
         bail!("--anonymize-map is not supported");
     }
-    if opts.anonymize && (opts.no_data || opts.show_original_ids) {
-        bail!("--anonymize with --no-data or --show-original-ids is not supported");
-    }
+
+    // ---- `--refspec`: rename exported refs through push-style refspecs. ----
+    opts.refspecs = refspecs.iter().map(|s| BString::from(s.as_str())).collect();
 
     // ---- Ref selection (`--all` and friends), in git's iteration order. ----
     let mut cmdline: Vec<(BString, ObjectId)> = Vec::new();
@@ -536,10 +595,6 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     }
     for (name, target) in &sel.named {
         cmdline.push((name.clone(), *target));
-    }
-
-    if !refspecs.is_empty() && !cmdline.is_empty() {
-        bail!("--refspec is not supported");
     }
 
     // ---- Ref bookkeeping, mirroring `get_tags_and_duplicates`. ----
@@ -744,6 +799,16 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         labels: std::collections::HashSet::new(),
         anon: Anon::default(),
     };
+
+    // Seed the mark table from `--import-marks`: pre-marked objects are skipped by
+    // the blob/commit/tag emitters, and `last_mark` continues past the highest
+    // imported id so new objects never collide. Imported marks are re-dumped by
+    // `--export-marks`, as git's do.
+    st.last_mark = imported_max;
+    for (mark, id) in &imported_marks {
+        st.marks.insert(*id, *mark);
+        st.commit_marks.push((*mark, *id));
+    }
 
     if opts.use_done {
         st.out.extend_from_slice(b"feature done\n");
@@ -1261,6 +1326,7 @@ struct Anon {
     refs: HashMap<BString, BString>,
     paths: HashMap<BString, BString>,
     idents: HashMap<BString, BString>,
+    oids: HashMap<ObjectId, BString>,
     blob_counter: u32,
     message_counter: u32,
     tag_message_counter: u32,
@@ -1331,6 +1397,19 @@ impl Anon {
             .clone()
     }
 
+    /// git's `anonymize_oid`: each distinct object id is replaced with a decimal
+    /// counter, zero-padded to the hash's hex width, handed out from 1 in
+    /// first-mention order. Used for `--no-data` blob refs and gitlink entries,
+    /// where the stream names an object by hash rather than by mark.
+    fn oid(&mut self, id: ObjectId) -> BString {
+        let width = id.kind().len_in_hex();
+        let next = self.oids.len() + 1;
+        self.oids
+            .entry(id)
+            .or_insert_with(|| BString::from(format!("{next:0width$}")))
+            .clone()
+    }
+
     fn blob(&mut self) -> Vec<u8> {
         let n = self.blob_counter;
         self.blob_counter += 1;
@@ -1392,12 +1471,14 @@ impl State {
         }
     }
 
-    /// The ref name as it should appear in the stream.
+    /// The ref name as it should appear in the stream: `--refspec` renaming first
+    /// (git applies it while collecting refs), then `--anonymize` token mapping.
     fn anon_refname(&mut self, opts: &Opts, name: &BStr) -> BString {
+        let mapped = apply_refspec(&opts.refspecs, name);
         if opts.anonymize {
-            self.anon.refname(name)
+            self.anon.refname(mapped.as_bstr())
         } else {
-            name.to_owned()
+            mapped
         }
     }
 
@@ -1420,6 +1501,49 @@ impl State {
     }
 }
 
+/// git's `apply_refspec`: map a ref name through the first matching `--refspec`,
+/// or return it unchanged when none matches (`query_refspecs` returning non-zero).
+///
+/// Supports the two forms git's refspec grammar produces here: an exact
+/// `<src>:<dst>` and a single-`*` wildcard `<pre>*<suf>:<pre2>*<suf2>`, each with
+/// an optional leading `+` (force flag, inert for output). The captured middle of
+/// a wildcard source is substituted into the destination's `*`.
+fn apply_refspec(specs: &[BString], name: &BStr) -> BString {
+    let nb: &[u8] = name;
+    for spec in specs {
+        let raw: &[u8] = spec;
+        let raw = raw.strip_prefix(b"+").unwrap_or(raw);
+        let Some(colon) = raw.iter().position(|b| *b == b':') else {
+            continue;
+        };
+        let (src, dst) = (&raw[..colon], &raw[colon + 1..]);
+        match (
+            src.iter().position(|b| *b == b'*'),
+            dst.iter().position(|b| *b == b'*'),
+        ) {
+            (Some(si), Some(di)) => {
+                let (spre, ssuf) = (&src[..si], &src[si + 1..]);
+                if nb.len() >= spre.len() + ssuf.len()
+                    && nb.starts_with(spre)
+                    && nb.ends_with(ssuf)
+                {
+                    let mid = &nb[spre.len()..nb.len() - ssuf.len()];
+                    let mut out = BString::from(dst[..di].to_vec());
+                    out.extend_from_slice(mid);
+                    out.extend_from_slice(&dst[di + 1..]);
+                    return out;
+                }
+            }
+            _ => {
+                if src == nb {
+                    return BString::from(dst.to_vec());
+                }
+            }
+        }
+    }
+    name.to_owned()
+}
+
 /// Emit one commit: its new blobs first, then the `commit` stanza.
 ///
 /// `specs` is empty unless a pathspec is in force; when set, only changes
@@ -1436,6 +1560,12 @@ fn emit_commit(
     override_parents: Option<&[ObjectId]>,
 ) -> Result<Option<Fatal>> {
     let id = info.id;
+    // Already exported — typically seeded by `--import-marks`. git's `handle_commit`
+    // returns at `get_object_mark` before emitting anything, so this commit's blobs,
+    // stanza and mark are all skipped and its ref is left to the trailing `reset`.
+    if st.marks.contains_key(&id) {
+        return Ok(None);
+    }
     let data = repo.find_object(id)?.data.clone();
     let (headers, message) = split_object(&data);
     let tree = header_value(headers, b"tree")
@@ -1551,16 +1681,20 @@ fn emit_commit(
         .extend_from_slice(format!("data {}\n", message.len()).as_bytes());
     st.out.extend_from_slice(&message);
 
-    // Parents that were not exported are skipped entirely; the first *printed*
-    // one is `from`, the rest are `merge`.
+    // Parents that were not exported are skipped entirely, unless
+    // `--reference-excluded-parents` asks git to name them by raw object id; the
+    // first *printed* parent is `from`, the rest are `merge`.
     let mut printed = 0usize;
     for p in &parents {
-        let Some(pmark) = st.marks.get(p).copied() else {
-            continue;
+        let reference = match st.marks.get(p).copied() {
+            Some(pmark) => format!(":{pmark}"),
+            None if opts.reference_excluded_parents => p.to_hex().to_string(),
+            None => continue,
         };
         st.out
             .extend_from_slice(if printed == 0 { b"from " } else { b"merge " });
-        st.out.extend_from_slice(format!(":{pmark}\n").as_bytes());
+        st.out.extend_from_slice(reference.as_bytes());
+        st.out.push(b'\n');
         printed += 1;
     }
 
@@ -1608,6 +1742,11 @@ fn emit_tag(
     opts: &Opts,
     st: &mut State,
 ) -> Result<Option<Fatal>> {
+    // A tag already carrying a mark (seeded by `--import-marks` alongside
+    // `--mark-tags`) has been exported before; git skips it.
+    if st.marks.contains_key(&tag_id) {
+        return Ok(None);
+    }
     let data = repo.find_object(tag_id)?.data.clone();
     let (headers, mut message) = split_object(&data);
     let target = header_value(headers, b"object")
@@ -1896,20 +2035,24 @@ fn render_change(c: &Change, opts: &Opts, st: &mut State) -> Result<()> {
         }
         Some(new) => {
             let mode = new.mode.value();
-            let reference = if opts.no_data || new.mode.kind() == EntryKind::Commit {
+            let reference: Vec<u8> = if opts.no_data || new.mode.kind() == EntryKind::Commit {
+                // git names the object by hash here; `--anonymize` substitutes its
+                // generated sequential id (`anonymize_oid`).
                 if opts.anonymize {
-                    bail!("--anonymize with gitlink entries is not supported");
+                    st.anon.oid(new.id).to_vec()
+                } else {
+                    new.id.to_hex().to_string().into_bytes()
                 }
-                new.id.to_hex().to_string()
             } else {
                 let mark = st
                     .marks
                     .get(&new.id)
                     .ok_or_else(|| anyhow!("blob {} was not exported", new.id))?;
-                format!(":{mark}")
+                format!(":{mark}").into_bytes()
             };
-            st.out
-                .extend_from_slice(format!("M {mode:06o} {reference} ").as_bytes());
+            st.out.extend_from_slice(format!("M {mode:06o} ").as_bytes());
+            st.out.extend_from_slice(&reference);
+            st.out.push(b' ');
             print_path(&mut st.out, path.as_bstr());
             st.out.push(b'\n');
         }

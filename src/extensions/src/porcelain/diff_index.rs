@@ -30,7 +30,9 @@
 //!     — content comparison: pairs whose contents match once the requested folding is
 //!     applied are dropped, and the surviving worktree side is hashed so the real object
 //!     id shows up in the raw record instead of the null id, as git does.
-//!   * `-S<s>`, `-G<s>`, `--pickaxe-all`, `--pickaxe-regex` — the pickaxe filters.
+//!   * `-S<s>`, `-G<s>`, `--pickaxe-all`, `--pickaxe-regex` — the pickaxe filters. `-S`
+//!     is a literal kwset search; `-G`, `-I` and `-S --pickaxe-regex` are compiled with
+//!     `regex::bytes` (Unicode off, byte semantics) to mirror git's `regcomp`.
 //!   * `--dirstat[=<params>]` / `-X[<params>]`, `--dirstat-by-file[=<params>]`,
 //!     `--cumulative` — the per-directory damage listing. Damage is scored by git's
 //!     `diffcore_count_changes()` (shared with `diff-files`), by file, or by changed
@@ -85,14 +87,21 @@
 //!   and friends are accepted for their *observable* side effect on this listing — git
 //!   hashes rename candidates, so an added path gains its real object id — but no rename
 //!   is ever reported.
-//! * `-S`/`-G`/`-I` take literal strings here. A pattern containing regular-expression
-//!   metacharacters is refused rather than matched as a literal.
+//! * `-G`/`-I`/`-S --pickaxe-regex` compile with the `regex` crate, not the platform's
+//!   POSIX engine, so a pattern the two engines disagree about (rare metacharacter edge
+//!   cases) can match differently, and an *invalid* pattern's fatal carries a different
+//!   message tail: `-I` reproduces git's `error: invalid regex given to -I: '<pat>'`
+//!   (exit 129) byte for byte, but `-G`/`-S` keep git's `fatal: invalid regex: ` prefix
+//!   and exit 128 while the tail is the `regex` crate's message rather than `regerror`'s.
 //! * A locally modified but committed-clean submodule is reported as unchanged; git also
 //!   inspects the submodule worktree and would report it.
 //! * With a bare `--abbrev` and no `core.abbrev` set, the length comes from gitoxide's
 //!   unique-prefix computation for the first real id (falling back to 7); git derives it
 //!   from the packed object count, so the two can differ on large packed repositories.
-//! * Magic (`:(...)`) and glob pathspecs bail; literal paths and directory prefixes work.
+//! * Magic (`:(...)`) and glob (`* ? [`) pathspecs are matched through gitoxide's pathspec
+//!   engine (git's own algorithm); purely literal paths and directory prefixes stay on the
+//!   simpler in-module matcher. A malformed magic pathspec is the one degraded path: it
+//!   exits with the generic error text rather than git's specific `fatal`.
 //! * An unimplemented option is held until after the tree-ish has been resolved, so a
 //!   missing tree-ish still exits 129 with git's usage text and an unresolvable one still
 //!   exits 128 with git's `ambiguous argument` text, as stock git does.
@@ -103,9 +112,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use gix::bstr::BString;
+use gix::bstr::{BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
+use regex::bytes::Regex;
 
 use super::diff_files::{count_changes_sides, render_dirstat, DirStat};
 
@@ -144,10 +154,49 @@ impl Ws {
     }
 }
 
+/// A search pattern, either a literal substring (git's kwset path for a plain `-S`) or a
+/// compiled regular expression (git's `-G`, `-I`, and `-S --pickaxe-regex`, all of which
+/// call `regcomp` with `REG_EXTENDED | REG_NEWLINE`).
+enum Needle {
+    Literal(Vec<u8>),
+    Regex(Regex),
+}
+
+impl Needle {
+    /// Whether `hay` contains a match — used by `-G` on each changed line and by `-I`.
+    fn is_match(&self, hay: &[u8]) -> bool {
+        match self {
+            Needle::Literal(n) => contains(hay, n),
+            Needle::Regex(re) => re.is_match(hay),
+        }
+    }
+
+    /// Non-overlapping match count — used by `-S` to compare the two sides.
+    fn count(&self, hay: &[u8]) -> usize {
+        match self {
+            Needle::Literal(n) => count_occurrences(hay, n),
+            Needle::Regex(re) => re.find_iter(hay).count(),
+        }
+    }
+}
+
+/// Compile a `-G`/`-I`/`-S --pickaxe-regex` pattern the way git's `regcomp` does: on
+/// bytes, without Unicode mode so `.` and the character classes carry git's C-locale byte
+/// semantics, and with multi-line mode standing in for `REG_NEWLINE` since matching is
+/// done a line at a time. `Err` carries the engine's message for the (best-effort) fatal.
+fn compile_regex(pat: &[u8]) -> std::result::Result<Regex, String> {
+    let s = std::str::from_utf8(pat).map_err(|_| "invalid byte sequence in pattern".to_owned())?;
+    regex::bytes::RegexBuilder::new(s)
+        .unicode(false)
+        .multi_line(true)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 /// The pickaxe: `-S` compares occurrence counts, `-G` greps the changed lines.
 enum Pickaxe {
-    Occurrences(Vec<u8>),
-    Grep(Vec<u8>),
+    Occurrences(Needle),
+    Grep(Needle),
 }
 
 /// Parsed command-line options for a single `diff-index` invocation.
@@ -164,7 +213,7 @@ struct Opts {
     filter_include: Vec<u8>,       // --diff-filter upper-case letters
     filter_exclude: Vec<u8>,       // --diff-filter lower-case letters, upper-cased
     ws: Ws,
-    ignore_lines: Option<Vec<u8>>, // -I<s> / --ignore-matching-lines=<s>
+    ignore_lines: Option<Needle>, // -I<s> / --ignore-matching-lines=<s>
     pickaxe: Option<Pickaxe>,
     pickaxe_all: bool,
     detect_rename: bool, // -M/-C: git hashes rename candidates, so additions gain real ids
@@ -426,16 +475,14 @@ fn short_option_takes_value(a: &str) -> bool {
     matches!(a, "-S" | "-G" | "-I" | "-O" | "-U" | "-l")
 }
 
-/// `true` when a pickaxe/ignore pattern would need a real regular-expression engine.
-/// Anything free of metacharacters is matched literally, which is what git does for a
-/// plain `-S<string>` and what a metacharacter-free `-G`/`-I` regex degenerates to.
-fn is_literal(pat: &[u8]) -> bool {
-    !pat.iter().any(|&c| {
-        matches!(
-            c,
-            b'.' | b'*' | b'+' | b'?' | b'[' | b']' | b'(' | b')' | b'{' | b'}' | b'|' | b'^' | b'$' | b'\\'
-        )
-    })
+/// Set `slot` to `cand` when `cand` sits earlier in argv than whatever is already held,
+/// so a deferred option-value error fires at the position git's single left-to-right
+/// parse would hit it first. Options parsed in the main loop arrive in argv order, but
+/// `-I`'s regex is compiled after the loop and can still be the earliest error.
+fn set_earliest(slot: &mut Option<(usize, u8, Vec<u8>)>, cand: (usize, u8, Vec<u8>)) {
+    if slot.as_ref().is_none_or(|(i, _, _)| cand.0 < *i) {
+        *slot = Some(cand);
+    }
 }
 
 pub fn diff_index(args: &[String]) -> Result<ExitCode> {
@@ -474,7 +521,9 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let mut raw_explicit = false;
     // `-S`/`-G` share one slot (the last one wins, as in git); `-I` composes with them.
     let mut pickaxe_arg: Option<(u8, Vec<u8>)> = None;
-    let mut ignore_arg: Option<Vec<u8>> = None;
+    // `(argv index, pattern)`: the index lets a `-I` that fails to compile fire at exactly
+    // its argv position, as git's inline `regcomp` does.
+    let mut ignore_arg: Option<(usize, Vec<u8>)> = None;
     let mut pickaxe_regex = false;
     // Positionals given before a `--` separator, paired with their argv index. git's
     // `setup_revisions` resolves each against the object database; the first that
@@ -498,6 +547,11 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let mut unsupported: Option<String> = None;
     // The first patch/stat rendering asked for, which this module cannot produce.
     let mut bad_format: Option<String> = None;
+    // A `-G`/`-S --pickaxe-regex` pattern that failed to compile. git compiles these in
+    // `diffcore_pickaxe`, after the tree-ish is resolved, and dies with
+    // `fatal: invalid regex: <msg>` (exit 128); the message tail comes from the platform
+    // regex engine, so only the prefix and exit code are reproduced byte for byte here.
+    let mut bad_regex: Option<Vec<u8>> = None;
     // The first option whose *value* git rejects during its single left-to-right parse,
     // as `(argv index, exit code, exact stderr bytes)`. git validates such values inline
     // with `handle_revision_arg`, so a bad revision appearing *earlier* in argv dies first
@@ -575,7 +629,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 };
                 i += 1;
                 if a == "-I" {
-                    ignore_arg = Some(value.as_bytes().to_vec());
+                    ignore_arg = Some((cur, value.as_bytes().to_vec()));
                 } else {
                     pickaxe_arg = Some((a.as_bytes()[1], value.as_bytes().to_vec()));
                 }
@@ -598,11 +652,23 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 opts.line_prefix = s["--line-prefix=".len()..].as_bytes().to_vec();
             }
             s if s.starts_with("--ignore-matching-lines=") => {
-                ignore_arg = Some(s["--ignore-matching-lines=".len()..].as_bytes().to_vec());
+                ignore_arg = Some((cur, s["--ignore-matching-lines=".len()..].as_bytes().to_vec()));
             }
             s if s.starts_with("--diff-filter=") => {
-                if !parse_filter(&s["--diff-filter=".len()..], &mut opts) {
-                    unsupported.get_or_insert_with(|| s.to_owned());
+                // `diff_opt_diff_filter()` rejects an unknown letter inline during the
+                // single left-to-right parse: `error: unknown change class '<c>' in
+                // <arg>` (exit 129). Deferred with its argv index so a bad revision or
+                // option-value error earlier in argv still wins first, as it does in git.
+                let val = &s["--diff-filter=".len()..];
+                if let Some(bad) = parse_filter(val, &mut opts) {
+                    set_earliest(
+                        &mut deferred,
+                        (
+                            cur,
+                            129,
+                            format!("error: unknown change class '{}' in {s}\n", bad as char).into_bytes(),
+                        ),
+                    );
                 }
             }
             s if s.starts_with("--abbrev=") => {
@@ -672,7 +738,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 opts.skip_or_rotate = Some((false, s["--rotate-to=".len()..].into()));
             }
             s if s.len() > 2 && s.starts_with("-I") => {
-                ignore_arg = Some(s[2..].as_bytes().to_vec());
+                ignore_arg = Some((cur, s[2..].as_bytes().to_vec()));
             }
             s if s.len() > 2 && (s.starts_with("-S") || s.starts_with("-G")) => {
                 pickaxe_arg = Some((s.as_bytes()[1], s[2..].as_bytes().to_vec()));
@@ -717,22 +783,39 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         bad_format = None;
     }
     if let Some((kind, pat)) = pickaxe_arg {
-        // `-S` takes a literal string unless `--pickaxe-regex` turns it into a pattern;
-        // `-G` is always a pattern, so it only works here on a metacharacter-free one.
-        let needs_regex = if kind == b'S' { pickaxe_regex } else { true };
-        if needs_regex && !is_literal(&pat) {
-            unsupported.get_or_insert_with(|| format!("-{}<regex>", kind as char));
-        } else if kind == b'S' {
-            opts.pickaxe = Some(Pickaxe::Occurrences(pat));
+        // `-S` is a literal kwset search unless `--pickaxe-regex` promotes it; `-G` is
+        // always a regex. A regex that fails to compile is git's
+        // `fatal: invalid regex: …` (exit 128), deferred to after the tree-ish just as
+        // git compiles it inside `diffcore_pickaxe`.
+        if kind == b'S' && !pickaxe_regex {
+            opts.pickaxe = Some(Pickaxe::Occurrences(Needle::Literal(pat)));
         } else {
-            opts.pickaxe = Some(Pickaxe::Grep(pat));
+            match compile_regex(&pat) {
+                Ok(re) => {
+                    let needle = Needle::Regex(re);
+                    opts.pickaxe = Some(if kind == b'S' {
+                        Pickaxe::Occurrences(needle)
+                    } else {
+                        Pickaxe::Grep(needle)
+                    });
+                }
+                Err(msg) => {
+                    bad_regex.get_or_insert_with(|| format!("fatal: invalid regex: {msg}\n").into_bytes());
+                }
+            }
         }
     }
-    if let Some(pat) = ignore_arg {
-        if !is_literal(&pat) {
-            unsupported.get_or_insert_with(|| "-I<regex>".to_owned());
-        } else {
-            opts.ignore_lines = Some(pat);
+    if let Some((idx, pat)) = ignore_arg {
+        // `-I` is always a regex (`diff_opt_ignore_regex`), compiled inline; a bad one is
+        // `error: invalid regex given to -I: '<pat>'` (exit 129) at its argv position.
+        match compile_regex(&pat) {
+            Ok(re) => opts.ignore_lines = Some(Needle::Regex(re)),
+            Err(_) => {
+                let mut msg = b"error: invalid regex given to -I: '".to_vec();
+                msg.extend_from_slice(&pat);
+                msg.extend_from_slice(b"'\n");
+                set_earliest(&mut deferred, (idx, 129, msg));
+            }
         }
     }
 
@@ -837,34 +920,52 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     if let Some(flag) = unsupported {
         bail!("unsupported flag {flag:?} (ported: {PORTED})");
     }
-
-    // Match the house line on pathspecs: literal paths and directory prefixes are
-    // honoured, magic and glob prefixes are refused rather than silently matching
-    // differently than git would.
-    for p in &paths {
-        if p.first() == Some(&b':') {
-            bail!("pathspec magic is not supported: {p:?}");
-        }
-        if p.iter().any(|&b| matches!(b, b'*' | b'?' | b'[')) {
-            bail!("glob pathspecs are not supported: {p:?}");
-        }
+    if let Some(msg) = &bad_regex {
+        std::io::stderr().lock().write_all(msg)?;
+        return Ok(ExitCode::from(128));
     }
 
-    // Pathspecs are cwd-relative in git while output paths are root-relative, so lift
-    // every pattern into repository-root space before matching.
-    let prefix = repo_prefix(&repo)?;
-    let paths: Vec<BString> = paths
-        .into_iter()
-        .map(|p| {
-            let mut full = prefix.clone();
-            full.extend_from_slice(&p);
-            full
-        })
-        .collect();
+    // git resolves the tree-ish before it notices there is no worktree, so a bare repo
+    // reaches this `fatal` (exit 128) rather than the earlier usage error.
+    if !opts.cached && repo.workdir().is_none() {
+        eprintln!("fatal: this operation must be run in a work tree");
+        return Ok(ExitCode::from(128));
+    }
+
+    // Magic (`:(…)`) and glob (`* ? [`) pathspecs go through gitoxide's pathspec engine,
+    // git's own algorithm, which applies the cwd prefix, `:(top)`, `:(icase)`, `:(glob)`
+    // and `:(exclude)` exactly as git does. Purely literal paths and directory prefixes
+    // stay on the proven fast path below so their well-exercised behaviour is untouched.
+    let needs_gix = paths
+        .iter()
+        .any(|p| p.first() == Some(&b':') || p.iter().any(|&b| matches!(b, b'*' | b'?' | b'[')));
 
     let mut deltas = collect(&repo, &tree_id, &opts)?;
     if !paths.is_empty() {
-        deltas.retain(|d| paths.iter().any(|p| path_matches(&d.path, p)));
+        if needs_gix {
+            let index = repo.index_or_empty()?;
+            let mut ps = repo.pathspec(
+                false,
+                &paths,
+                false,
+                &index,
+                gix::worktree::stack::state::attributes::Source::IdMapping,
+            )?;
+            deltas.retain(|d| ps.is_included(d.path.as_bstr(), Some(false)));
+        } else {
+            // Pathspecs are cwd-relative in git while output paths are root-relative, so
+            // lift every pattern into repository-root space before matching.
+            let prefix = repo_prefix(&repo)?;
+            let lifted: Vec<BString> = paths
+                .iter()
+                .map(|p| {
+                    let mut full = prefix.clone();
+                    full.extend_from_slice(p);
+                    full
+                })
+                .collect();
+            deltas.retain(|d| lifted.iter().any(|p| path_matches(&d.path, p)));
+        }
     }
     if let Some(rel) = &opts.relative {
         if !rel.is_empty() {
@@ -1124,14 +1225,14 @@ fn line_counts(one: &[u8], two: &[u8], opts: &Opts) -> (u64, u64) {
     (u64::from(diff.count_additions()), u64::from(diff.count_removals()))
 }
 
-/// `--diff-filter=<letters>`: upper-case selects, lower-case excludes. Returns `false`
-/// on a letter git does not know.
-fn parse_filter(spec: &str, opts: &mut Opts) -> bool {
+/// `--diff-filter=<letters>`: upper-case selects, lower-case excludes. Returns the first
+/// letter git does not know (as given, before case folding), or `None` when all are valid.
+fn parse_filter(spec: &str, opts: &mut Opts) -> Option<u8> {
     const KNOWN: &[u8] = b"ACDMRTUXB*";
     for c in spec.bytes() {
         let upper = c.to_ascii_uppercase();
         if !KNOWN.contains(&upper) {
-            return false;
+            return Some(c);
         }
         if c.is_ascii_lowercase() {
             opts.filter_exclude.push(upper);
@@ -1139,7 +1240,7 @@ fn parse_filter(spec: &str, opts: &mut Opts) -> bool {
             opts.filter_include.push(upper);
         }
     }
-    true
+    None
 }
 
 fn passes_filter(status: u8, opts: &Opts) -> bool {
@@ -1478,13 +1579,13 @@ fn apply_pickaxe(repo: &gix::Repository, deltas: &mut Vec<Delta>, opts: &Opts) -
         let two = side_content(repo, workdir.as_deref(), d, false)?;
         let hit = match pickaxe {
             Pickaxe::Occurrences(needle) => {
-                let a = one.as_deref().map(|b| count_occurrences(b, needle)).unwrap_or(0);
-                let b = two.as_deref().map(|b| count_occurrences(b, needle)).unwrap_or(0);
+                let a = one.as_deref().map(|b| needle.count(b)).unwrap_or(0);
+                let b = two.as_deref().map(|b| needle.count(b)).unwrap_or(0);
                 a != b
             }
             Pickaxe::Grep(needle) => match (one.as_deref(), two.as_deref()) {
                 (None, None) => false,
-                (None, Some(t)) | (Some(t), None) => contains(t, needle),
+                (None, Some(t)) | (Some(t), None) => needle.is_match(t),
                 (Some(a), Some(b)) => changed_lines_hit(a, b, needle),
             },
         };
@@ -1590,13 +1691,13 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     count_occurrences(haystack, needle) > 0
 }
 
-/// git's `-G`: does any line the diff adds or removes contain `needle`?
-fn changed_lines_hit(one: &[u8], two: &[u8], needle: &[u8]) -> bool {
+/// git's `-G`: does any line the diff adds or removes match `needle`?
+fn changed_lines_hit(one: &[u8], two: &[u8], needle: &Needle) -> bool {
     let before = split_lines(one);
     let after = split_lines(two);
     let mut hit = false;
     for_each_changed_line(&before, &after, |line| {
-        if contains(line, needle) {
+        if needle.is_match(line) {
             hit = true;
         }
     });
@@ -1623,7 +1724,7 @@ fn contents_match(one: &[u8], two: &[u8], opts: &Opts) -> bool {
     let raw_after = split_lines(two);
     let mut all_match = true;
     for_each_changed_line(&raw_before, &raw_after, |line| {
-        if !contains(line, pattern) {
+        if !pattern.is_match(line) {
             all_match = false;
         }
     });

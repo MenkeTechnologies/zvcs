@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use gix::bstr::ByteSlice;
 use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
 use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, InternedInput, UnifiedDiff};
+use gix::ext::ObjectIdExt;
 use gix::hash::ObjectId;
 use gix::object::tree::diff::ChangeDetached;
 use gix::objs::tree::EntryKind;
@@ -21,15 +22,25 @@ const STAT_TERM_WIDTH: usize = 80;
 ///   * `-- <pathspec>...`                        → path-limited traversal: show only commits
 ///     that touched a matching plain pathspec (magic pathspecs surfaced terse)
 ///   * `-n N` / `--max-count=N` / `-N` / `-nN`   → limit the number of commits shown
+///   * `--skip=N`                                → drop the first N selected commits
 ///   * `--all`                                   → start from every ref plus `HEAD`
 ///   * `--merges` / `--no-merges`                → keep only (or drop) multi-parent commits
+///   * `--min-parents=N` / `--max-parents=N` and
+///     their `--no-` forms                       → parent-count limiting
+///   * `--first-parent`                          → follow only the first parent
 ///   * `--reverse`                               → emit the selected commits oldest-first
 ///   * `--date-order` / `--topo-order`           → git's two topological sort orders
 ///   * `--oneline`, `--pretty=`/`--format=` with
-///     `oneline`, `short`, `medium`, and `format:`/`tformat:` strings (last flag wins;
-///     an invalid value is rejected exactly as git's `get_commit_format` does)
-///   * `--name-only`, `--name-status`, `--stat`  → per-commit diff against the first parent
-///     (`--name-only`/`--name-status` are mutually exclusive and suppress `--stat`)
+///     `oneline`, `short`, `medium`, `full`, `fuller`, `raw`, `reference`, and
+///     `format:`/`tformat:` strings (last flag wins; an invalid value is rejected
+///     exactly as git's `get_commit_format` does)
+///   * `--abbrev-commit` / `--no-abbrev-commit`, `--parents`
+///   * `--date=<mode>`                           → `default`/`short`/`iso`/`iso-strict`/
+///     `rfc`/`unix`/`raw` (clock/zone-relative modes surfaced terse)
+///   * `--name-only`, `--name-status`, `--stat`,
+///     `--numstat`, `--shortstat`                → per-commit diff against the first parent
+///     (`--name-only`/`--name-status` are mutually exclusive and suppress the count
+///     formats); `-s`/`--no-patch` accepted as no-ops
 ///   * `--graph`                                 → git's ASCII commit graph (see below)
 ///
 /// Output separation follows git's `format:` (separator) versus `tformat:`
@@ -43,23 +54,32 @@ const STAT_TERM_WIDTH: usize = 80;
 ///   * `--stat` assumes an 80-column terminal and measures paths in `char`s.
 ///   * Pathspec limiting compares each commit to its first parent only, so merge
 ///     simplification (TREESAME across multiple parents) is not modelled.
-///   * `-p`, date/author filters, and every flag not listed above are rejected
-///     explicitly.
+///   * `-p`/`--patch`, `--grep`/`--author` filters, `--since`/`--until` date
+///     filters, revision ranges (`A..B`), and every flag not listed above are
+///     rejected explicitly.
 pub fn log(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
     let mut max_count: Option<usize> = None;
+    let mut skip: usize = 0;
     let mut pretty = Pretty::Medium;
     let mut terminator = false;
     let mut abbrev_commit = false;
     let mut name_only = false;
     let mut name_status = false;
     let mut stat = false;
+    let mut numstat = false;
+    let mut shortstat = false;
     let mut graph = false;
     let mut all = false;
     let mut reverse = false;
     let mut only_merges = false;
     let mut no_merges = false;
+    let mut first_parent = false;
+    let mut show_parents = false;
+    let mut min_parents: Option<usize> = None;
+    let mut max_parents: Option<usize> = None;
+    let mut date_mode = DateMode::Default;
     let mut order = Order::Default;
     let mut revs: Vec<String> = Vec::new();
     let mut pathspecs: Vec<String> = Vec::new();
@@ -121,12 +141,90 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
             }
+        } else if a == "--pretty" {
+            // Bare `--pretty` is git's `--pretty=medium`.
+            pretty = Pretty::Medium;
+            terminator = false;
+        } else if a == "--format" {
+            // Bare `--format` (no `=value`) is a git usage error, exit 128.
+            eprintln!("fatal: unrecognized argument: --format");
+            return Ok(ExitCode::from(128));
+        } else if a == "--skip" {
+            i += 1;
+            let v = args
+                .get(i)
+                .ok_or_else(|| anyhow!("option `{a}` requires a value"))?;
+            match parse_nonneg(v) {
+                Some(n) => skip = n,
+                None => {
+                    eprintln!("fatal: '{v}': not an integer");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("--skip=") {
+            match parse_nonneg(v) {
+                Some(n) => skip = n,
+                None => {
+                    eprintln!("fatal: '{v}': not an integer");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("--date=") {
+            match parse_date_mode(v) {
+                Some(m) => date_mode = m,
+                None => {
+                    eprintln!("fatal: unknown date format {v}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("--min-parents=") {
+            match parse_nonneg(v) {
+                Some(n) => min_parents = Some(n),
+                None => {
+                    eprintln!("fatal: '{v}': not an integer");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("--max-parents=") {
+            match parse_nonneg(v) {
+                Some(n) => max_parents = Some(n),
+                None => {
+                    eprintln!("fatal: '{v}': not an integer");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        } else if a == "--no-min-parents" {
+            min_parents = Some(0);
+        } else if a == "--no-max-parents" {
+            max_parents = None;
+        } else if a == "--first-parent" {
+            first_parent = true;
+        } else if a == "--parents" {
+            show_parents = true;
+        } else if a == "--abbrev-commit" {
+            abbrev_commit = true;
+        } else if a == "--no-abbrev-commit" {
+            abbrev_commit = false;
+        } else if a == "-s" || a == "--no-patch" {
+            // Suppress diff output. This port emits no per-commit patch by
+            // default, so the only effect is to clear any diff format requested
+            // earlier — git treats `-s` as order-sensitive, so a later `--stat`
+            // re-enables it.
+            stat = false;
+            numstat = false;
+            shortstat = false;
+            name_only = false;
+            name_status = false;
         } else if a == "--name-only" {
             name_only = true;
         } else if a == "--name-status" {
             name_status = true;
         } else if a == "--stat" {
             stat = true;
+        } else if a == "--numstat" {
+            numstat = true;
+        } else if a == "--shortstat" {
+            shortstat = true;
         } else if a == "--graph" {
             graph = true;
         } else if a == "--all" {
@@ -246,7 +344,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // Walk in git's default commit-date order, then re-sort if a topological
     // order was asked for. `--graph` implies `--topo-order` unless `--date-order`
     // was given explicitly.
-    let mut nodes = walk(&repo, &tips)?;
+    let mut nodes = walk(&repo, &tips, first_parent)?;
     let effective_order = match (order, graph) {
         (Order::Default, true) => Order::Topo,
         (o, _) => o,
@@ -267,11 +365,26 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         nodes = kept;
     }
 
+    // `--merges`/`--no-merges` are git's aliases for `--min-parents=2` /
+    // `--max-parents=1`; parent-count limiting happens before commit limiting.
     if only_merges {
         nodes.retain(|n| n.parents.len() >= 2);
     }
     if no_merges {
         nodes.retain(|n| n.parents.len() < 2);
+    }
+    if let Some(min) = min_parents {
+        nodes.retain(|n| n.parents.len() >= min);
+    }
+    if let Some(max) = max_parents {
+        nodes.retain(|n| n.parents.len() <= max);
+    }
+
+    // `--skip` drops the first N of the selected commits, then `--max-count` caps
+    // what remains — git's order in `get_revision`.
+    if skip > 0 {
+        let drop = skip.min(nodes.len());
+        nodes.drain(0..drop);
     }
     if let Some(limit) = max_count {
         nodes.truncate(limit);
@@ -284,12 +397,33 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         bail!("--graph is not ported for octopus merges");
     }
 
-    let want_diff = name_only || name_status || stat;
+    let want_diff = name_only || name_status || stat || numstat || shortstat;
     let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(nodes.len());
     for node in &nodes {
         let commit = repo.find_object(node.id)?.try_into_commit()?;
+        // `--parents` decorates the header with the commit's own parent ids.
+        let extra = if show_parents {
+            let mut e = Vec::new();
+            for p in &node.parents {
+                e.push(b' ');
+                let pid = p.attach(&repo);
+                if abbrev_commit {
+                    e.extend_from_slice(pid.shorten_or_id().to_string().as_bytes());
+                } else {
+                    e.extend_from_slice(pid.to_string().as_bytes());
+                }
+            }
+            e
+        } else {
+            Vec::new()
+        };
+        let ctx = RenderCtx {
+            abbrev_commit,
+            date_mode,
+            extra,
+        };
         let mut block: Vec<u8> = Vec::new();
-        render_entry(&mut block, &commit, &pretty, abbrev_commit)?;
+        render_entry(&mut block, &commit, &pretty, &ctx)?;
         // A `tformat:` record is terminated by a newline, but an empty record
         // (an empty user format) emits nothing at all — no stray terminator.
         if terminator && !block.is_empty() {
@@ -298,10 +432,10 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
 
         if want_diff && node.parents.len() < 2 {
             // `--name-only`/`--name-status` are the reported format when present;
-            // git suppresses `--stat` in that case, so the blob reads it needs
-            // are skipped too.
-            let show_stat = stat && !name_only && !name_status;
-            let files = collect_changes(&repo, &commit, node.parents.first().copied(), show_stat)?;
+            // git suppresses the count formats in that case, so the blob reads
+            // they need are skipped too.
+            let count_formats = (stat || numstat || shortstat) && !name_only && !name_status;
+            let files = collect_changes(&repo, &commit, node.parents.first().copied(), count_formats)?;
             let mut diff: Vec<u8> = Vec::new();
             if name_status {
                 for f in &files {
@@ -315,8 +449,18 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                     diff.extend_from_slice(&f.path);
                     diff.push(b'\n');
                 }
-            } else if show_stat {
-                emit_stat(&mut diff, &files)?;
+            } else {
+                // git stacks the count formats in a fixed order: numstat, then
+                // the full stat block, then a bare shortstat summary if stat did
+                // not already print one.
+                if numstat {
+                    emit_numstat(&mut diff, &files);
+                }
+                if stat {
+                    emit_stat(&mut diff, &files)?;
+                } else if shortstat {
+                    emit_shortstat(&mut diff, &files)?;
+                }
             }
             if !diff.is_empty() {
                 // git puts a blank line between the log message and the diff for
@@ -365,6 +509,15 @@ fn parse_max_count(value: &str) -> Result<Option<usize>, ()> {
         Some(n) if n < 0 => Ok(None),
         Some(n) => Ok(Some(n as usize)),
         None => Err(()),
+    }
+}
+
+/// A non-negative base-10 integer (`--skip`, `--min-parents`, `--max-parents`).
+/// `None` for anything git would reject with `fatal: '<value>': not an integer`.
+fn parse_nonneg(value: &str) -> Option<usize> {
+    match parse_int(value) {
+        Some(n) if n >= 0 => Some(n as usize),
+        _ => None,
     }
 }
 
@@ -437,8 +590,10 @@ fn insert_by_date(list: &mut Vec<Node>, node: Node) {
     list.insert(pos, node);
 }
 
-/// Breadth-first walk over the reachable history, newest commit first.
-fn walk(repo: &gix::Repository, tips: &[ObjectId]) -> Result<Vec<Node>> {
+/// Breadth-first walk over the reachable history, newest commit first. With
+/// `first_parent`, only the first parent of each commit is followed — git's
+/// `--first-parent`.
+fn walk(repo: &gix::Repository, tips: &[ObjectId], first_parent: bool) -> Result<Vec<Node>> {
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut pending: Vec<Node> = Vec::new();
     for tip in tips {
@@ -450,7 +605,12 @@ fn walk(repo: &gix::Repository, tips: &[ObjectId]) -> Result<Vec<Node>> {
     let mut out: Vec<Node> = Vec::new();
     while !pending.is_empty() {
         let node = pending.remove(0);
-        for parent in &node.parents {
+        let parents: &[ObjectId] = if first_parent {
+            &node.parents[..node.parents.len().min(1)]
+        } else {
+            &node.parents
+        };
+        for parent in parents {
             if seen.insert(*parent) {
                 insert_by_date(&mut pending, read_node(repo, *parent)?);
             }
@@ -542,8 +702,16 @@ fn topo_sort(nodes: Vec<Node>, by_date: bool) -> Vec<Node> {
 enum Pretty {
     /// git's default: `commit`/`Merge`/`Author`/`Date` and an indented message.
     Medium,
-    /// `medium` without the `Date` line.
+    /// `medium` without the `Date` line, and only the subject.
     Short,
+    /// `commit`/`Merge`/`Author`/`Commit` and the full indented message.
+    Full,
+    /// `full` plus `AuthorDate`/`CommitDate` lines.
+    Fuller,
+    /// The raw object header: `tree`/`parent`/`author`/`committer`.
+    Raw,
+    /// `<abbrev> (<subject>, <short-date>)` on one line.
+    Reference,
     /// `<hash> <subject>` on one line.
     Oneline,
     /// A `--format=`/`format:` string with `%` placeholders.
@@ -582,9 +750,13 @@ fn get_commit_format(spec: &str) -> Result<Option<(Pretty, bool)>> {
         "oneline" => Ok(Some((Pretty::Oneline, true))),
         "medium" => Ok(Some((Pretty::Medium, false))),
         "short" => Ok(Some((Pretty::Short, false))),
-        // Valid git format names this port does not render yet: surfaced terse,
-        // not as git's "invalid" — they are legal, just unported.
-        "full" | "fuller" | "reference" | "email" | "raw" | "mboxrd" => {
+        "full" => Ok(Some((Pretty::Full, false))),
+        "fuller" => Ok(Some((Pretty::Fuller, false))),
+        "raw" => Ok(Some((Pretty::Raw, false))),
+        "reference" => Ok(Some((Pretty::Reference, true))),
+        // `email`/`mboxrd` need the full mailbox/`From ` framing git's format-patch
+        // machinery produces; surfaced terse rather than faked.
+        "email" | "mboxrd" => {
             bail!("pretty format {spec:?} is not ported")
         }
         _ => Ok(None),
@@ -600,10 +772,15 @@ fn check_format(fmt: &str) -> Result<()> {
             continue;
         }
         match it.next() {
-            Some('H' | 'h' | 'T' | 't' | 'P' | 'p' | 's' | 'n' | '%') => {}
+            Some('H' | 'h' | 'T' | 't' | 'P' | 'p' | 's' | 'b' | 'B' | 'f' | 'n' | '%') => {}
             Some('a') => match it.next() {
-                Some('n' | 'e') => {}
+                Some('n' | 'e' | 'd' | 'i' | 'I' | 't') => {}
                 Some(x) => bail!("unsupported format placeholder %a{x}"),
+                None => bail!("unsupported trailing % in format"),
+            },
+            Some('c') => match it.next() {
+                Some('n' | 'e' | 'd' | 'i' | 'I' | 't') => {}
+                Some(x) => bail!("unsupported format placeholder %c{x}"),
                 None => bail!("unsupported trailing % in format"),
             },
             Some(x) => bail!("unsupported format placeholder %{x}"),
@@ -613,8 +790,14 @@ fn check_format(fmt: &str) -> Result<()> {
     Ok(())
 }
 
-/// Expand the placeholders accepted by [`check_format`] for `commit`.
-fn expand_format(out: &mut Vec<u8>, commit: &gix::Commit<'_>, fmt: &str) -> Result<()> {
+/// Expand the placeholders accepted by [`check_format`] for `commit`. `date_mode`
+/// is the `--date=` setting that `%ad`/`%cd` follow.
+fn expand_format(
+    out: &mut Vec<u8>,
+    commit: &gix::Commit<'_>,
+    fmt: &str,
+    date_mode: DateMode,
+) -> Result<()> {
     let mut it = fmt.chars();
     while let Some(c) = it.next() {
         if c != '%' {
@@ -632,6 +815,9 @@ fn expand_format(out: &mut Vec<u8>, commit: &gix::Commit<'_>, fmt: &str) -> Resu
             Some('P') => write_parents(out, commit, false),
             Some('p') => write_parents(out, commit, true),
             Some('s') => out.extend_from_slice(&subject(commit.message_raw()?)),
+            Some('b') => out.extend_from_slice(&body(commit.message_raw()?)),
+            Some('B') => out.extend_from_slice(commit.message_raw()?),
+            Some('f') => out.extend_from_slice(&sanitized_subject(&subject(commit.message_raw()?))),
             Some('n') => out.push(b'\n'),
             Some('%') => out.push(b'%'),
             Some('a') => {
@@ -639,6 +825,22 @@ fn expand_format(out: &mut Vec<u8>, commit: &gix::Commit<'_>, fmt: &str) -> Resu
                 match it.next() {
                     Some('n') => out.extend_from_slice(author.name),
                     Some('e') => out.extend_from_slice(author.email),
+                    Some('d') => expand_date(out, &author, date_mode)?,
+                    Some('i') => expand_date(out, &author, DateMode::Iso)?,
+                    Some('I') => expand_date(out, &author, DateMode::IsoStrict)?,
+                    Some('t') => write!(out, "{}", author.time()?.seconds)?,
+                    _ => unreachable!("check_format rejected this already"),
+                }
+            }
+            Some('c') => {
+                let committer = commit.committer()?;
+                match it.next() {
+                    Some('n') => out.extend_from_slice(committer.name),
+                    Some('e') => out.extend_from_slice(committer.email),
+                    Some('d') => expand_date(out, &committer, date_mode)?,
+                    Some('i') => expand_date(out, &committer, DateMode::Iso)?,
+                    Some('I') => expand_date(out, &committer, DateMode::IsoStrict)?,
+                    Some('t') => write!(out, "{}", committer.time()?.seconds)?,
                     _ => unreachable!("check_format rejected this already"),
                 }
             }
@@ -646,6 +848,65 @@ fn expand_format(out: &mut Vec<u8>, commit: &gix::Commit<'_>, fmt: &str) -> Resu
         }
     }
     Ok(())
+}
+
+/// Write a signature's timestamp in `mode`, the shared body of `%ad`/`%cd` and
+/// their fixed-format `%ai`/`%aI` cousins.
+fn expand_date(
+    out: &mut Vec<u8>,
+    sig: &gix::actor::SignatureRef<'_>,
+    mode: DateMode,
+) -> Result<()> {
+    let t = sig.time()?;
+    out.extend_from_slice(format_date(t.seconds, t.offset, mode).as_bytes());
+    Ok(())
+}
+
+/// git's `%b`: the message body — everything after the blank line that ends the
+/// subject paragraph. An empty string when the message is a subject only.
+fn body(msg: &[u8]) -> Vec<u8> {
+    // Skip leading blank lines, then the subject paragraph, then the single blank
+    // line separating it from the body.
+    let mut rest = msg;
+    while let Some(stripped) = rest.strip_prefix(b"\n") {
+        rest = stripped;
+    }
+    match rest.windows(2).position(|w| w == b"\n\n") {
+        Some(pos) => rest[pos + 2..].to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// git's `%f`: the subject sanitised into a filename — `istitlechar` bytes
+/// (alphanumeric, `.`, `_`) kept, every other run folded to a single `-`, runs of
+/// `.` collapsed, and trailing `.` trimmed.
+fn sanitized_subject(subj: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    // 2 = at start, 1 = a separator run is pending, 0 = mid-word.
+    let mut space: u8 = 2;
+    let mut i = 0;
+    while i < subj.len() {
+        let c = subj[i];
+        if c.is_ascii_alphanumeric() || c == b'.' || c == b'_' {
+            if space == 1 {
+                out.push(b'-');
+            }
+            space = 0;
+            out.push(c);
+            if c == b'.' {
+                while i + 1 < subj.len() && subj[i + 1] == b'.' {
+                    i += 1;
+                }
+            }
+        } else {
+            space |= 1;
+        }
+        i += 1;
+    }
+    while out.last() == Some(&b'.') {
+        out.pop();
+    }
+    out
 }
 
 /// Space-separated parent ids, abbreviated for `%p` and full for `%P`.
@@ -682,16 +943,27 @@ fn subject(msg: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The per-commit rendering knobs threaded down from [`log`].
+struct RenderCtx {
+    /// `--abbrev-commit`: shorten the commit id on the header/oneline.
+    abbrev_commit: bool,
+    /// `--date=`: the format `%ad`/`%cd` and the `Date`/`*Date` lines follow.
+    date_mode: DateMode,
+    /// `--parents`: the commit's own parent ids, decorating the header/oneline.
+    /// Empty when the flag is off. Full-length ids unless `abbrev_commit`.
+    extra: Vec<u8>,
+}
+
 /// Render one commit's header in the selected format. Built-in formats end with
-/// a newline; user formats and `oneline` do not, because their record ending is
-/// supplied by the separator/terminator rule in [`log`].
+/// a newline; user formats, `oneline`, and `reference` do not, because their
+/// record ending is supplied by the separator/terminator rule in [`log`].
 fn render_entry(
     out: &mut Vec<u8>,
     commit: &gix::Commit<'_>,
     pretty: &Pretty,
-    abbrev_commit: bool,
+    ctx: &RenderCtx,
 ) -> Result<()> {
-    let id = if abbrev_commit {
+    let id = if ctx.abbrev_commit {
         commit.id().shorten_or_id().to_string()
     } else {
         commit.id().to_string()
@@ -700,13 +972,49 @@ fn render_entry(
     match pretty {
         Pretty::Oneline => {
             out.extend_from_slice(id.as_bytes());
+            out.extend_from_slice(&ctx.extra);
             out.push(b' ');
             out.extend_from_slice(&subject(commit.message_raw()?));
         }
-        Pretty::User(fmt) => expand_format(out, commit, fmt)?,
-        Pretty::Medium | Pretty::Short => {
+        Pretty::Reference => {
+            // `%h (%s, %ad)` with `--date=short` unless `--date=` overrode it.
+            let date_mode = match ctx.date_mode {
+                DateMode::Default => DateMode::Short,
+                other => other,
+            };
             let author = commit.author()?;
-            writeln!(out, "commit {id}")?;
+            let t = author.time()?;
+            out.extend_from_slice(commit.id().shorten_or_id().to_string().as_bytes());
+            out.extend_from_slice(b" (");
+            out.extend_from_slice(&subject(commit.message_raw()?));
+            out.extend_from_slice(b", ");
+            out.extend_from_slice(format_date(t.seconds, t.offset, date_mode).as_bytes());
+            out.push(b')');
+        }
+        Pretty::User(fmt) => expand_format(out, commit, fmt, ctx.date_mode)?,
+        Pretty::Raw => {
+            let author = commit.author()?;
+            let committer = commit.committer()?;
+            out.extend_from_slice(b"commit ");
+            // Raw always shows the full commit id; `--parents` still decorates it.
+            out.extend_from_slice(commit.id().to_string().as_bytes());
+            out.extend_from_slice(&ctx.extra);
+            out.push(b'\n');
+            writeln!(out, "tree {}", commit.tree_id()?)?;
+            for pid in commit.parent_ids() {
+                writeln!(out, "parent {pid}")?;
+            }
+            write_raw_ident(out, b"author", &author)?;
+            write_raw_ident(out, b"committer", &committer)?;
+            out.push(b'\n');
+            indent_message(out, commit.message_raw()?);
+        }
+        Pretty::Medium | Pretty::Short | Pretty::Full | Pretty::Fuller => {
+            let author = commit.author()?;
+            out.extend_from_slice(b"commit ");
+            out.extend_from_slice(id.as_bytes());
+            out.extend_from_slice(&ctx.extra);
+            out.push(b'\n');
 
             // A merge commit lists its abbreviated parents right after `commit`.
             let parents: Vec<_> = commit.parent_ids().collect();
@@ -719,29 +1027,99 @@ fn render_entry(
                 out.push(b'\n');
             }
 
-            out.extend_from_slice(b"Author: ");
-            out.extend_from_slice(author.name);
-            out.extend_from_slice(b" <");
-            out.extend_from_slice(author.email);
-            out.extend_from_slice(b">\n");
-
-            if matches!(pretty, Pretty::Medium) {
-                let time = author.time()?;
-                writeln!(out, "Date:   {}", format_git_date(time.seconds, time.offset))?;
+            match pretty {
+                Pretty::Fuller => {
+                    let committer = commit.committer()?;
+                    let at = author.time()?;
+                    let ct = committer.time()?;
+                    write_person(out, b"Author:     ", &author);
+                    writeln!(
+                        out,
+                        "AuthorDate: {}",
+                        format_date(at.seconds, at.offset, ctx.date_mode)
+                    )?;
+                    write_person(out, b"Commit:     ", &committer);
+                    writeln!(
+                        out,
+                        "CommitDate: {}",
+                        format_date(ct.seconds, ct.offset, ctx.date_mode)
+                    )?;
+                }
+                Pretty::Full => {
+                    let committer = commit.committer()?;
+                    write_person(out, b"Author: ", &author);
+                    write_person(out, b"Commit: ", &committer);
+                }
+                _ => {
+                    // medium / short
+                    write_person(out, b"Author: ", &author);
+                    if matches!(pretty, Pretty::Medium) {
+                        let time = author.time()?;
+                        writeln!(
+                            out,
+                            "Date:   {}",
+                            format_date(time.seconds, time.offset, ctx.date_mode)
+                        )?;
+                    }
+                }
             }
             out.push(b'\n');
 
-            // The message is indented four spaces; blank lines stay blank.
-            for line in commit.message_raw()?.lines() {
-                if !line.is_empty() {
-                    out.extend_from_slice(b"    ");
-                    out.extend_from_slice(line);
-                }
+            if matches!(pretty, Pretty::Short) {
+                // `short` shows only the subject, indented four spaces.
+                out.extend_from_slice(b"    ");
+                out.extend_from_slice(&subject(commit.message_raw()?));
                 out.push(b'\n');
+            } else {
+                indent_message(out, commit.message_raw()?);
             }
         }
     }
     Ok(())
+}
+
+/// Write git's `<label> <name> <<email>>` header line.
+fn write_person(out: &mut Vec<u8>, label: &[u8], sig: &gix::actor::SignatureRef<'_>) {
+    out.extend_from_slice(label);
+    out.extend_from_slice(sig.name);
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(sig.email);
+    out.extend_from_slice(b">\n");
+}
+
+/// Write a raw-format identity line: `<role> <name> <<email>> <seconds> +ZZZZ`.
+fn write_raw_ident(out: &mut Vec<u8>, role: &[u8], sig: &gix::actor::SignatureRef<'_>) -> Result<()> {
+    let t = sig.time()?;
+    let (sign, off) = if t.offset < 0 { ('-', -t.offset) } else { ('+', t.offset) };
+    out.extend_from_slice(role);
+    out.push(b' ');
+    out.extend_from_slice(sig.name);
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(sig.email);
+    out.push(b'>');
+    writeln!(
+        out,
+        " {} {sign}{:02}{:02}",
+        t.seconds,
+        off / 3600,
+        (off % 3600) / 60
+    )?;
+    Ok(())
+}
+
+/// Indent a commit message four spaces per line, exactly as git's `pp_remainder`:
+/// every line — blank ones included — is prefixed, and trailing blank lines are
+/// dropped.
+fn indent_message(out: &mut Vec<u8>, msg: &[u8]) {
+    let mut lines: Vec<&[u8]> = msg.split(|&b| b == b'\n').collect();
+    while lines.last() == Some(&&b""[..]) {
+        lines.pop();
+    }
+    for line in lines {
+        out.extend_from_slice(b"    ");
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,7 +1507,18 @@ fn emit_stat(out: &mut Vec<u8>, files: &[FileChange]) -> Result<()> {
         out.push(b'\n');
     }
 
-    let n = files.len();
+    write_stat_summary(out, files.len(), total_added, total_deleted)
+}
+
+/// git's `--stat`/`--shortstat` summary line: ` N files changed, A insertions(+),
+/// D deletions(-)`, with the `insertions`/`deletions` clauses appearing on git's
+/// same conditions.
+fn write_stat_summary(
+    out: &mut Vec<u8>,
+    n: usize,
+    total_added: usize,
+    total_deleted: usize,
+) -> Result<()> {
     write!(out, " {n} file{} changed", if n == 1 { "" } else { "s" })?;
     if total_added > 0 || total_deleted == 0 {
         write!(
@@ -1147,6 +1536,38 @@ fn emit_stat(out: &mut Vec<u8>, files: &[FileChange]) -> Result<()> {
     }
     out.push(b'\n');
     Ok(())
+}
+
+/// git's `--numstat`: `<added>\t<deleted>\t<path>` per file, with `-\t-` for a
+/// binary file whose line counts are undefined.
+fn emit_numstat(out: &mut Vec<u8>, files: &[FileChange]) {
+    for f in files {
+        if f.is_binary {
+            out.extend_from_slice(b"-\t-\t");
+        } else {
+            out.extend_from_slice(format!("{}\t{}\t", f.added, f.deleted).as_bytes());
+        }
+        out.extend_from_slice(&f.path);
+        out.push(b'\n');
+    }
+}
+
+/// git's `--shortstat`: the `--stat` summary line only. Binary files contribute
+/// nothing to the insertion/deletion totals, exactly as the full stat block.
+fn emit_shortstat(out: &mut Vec<u8>, files: &[FileChange]) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let mut total_added = 0usize;
+    let mut total_deleted = 0usize;
+    for f in files {
+        if f.is_binary {
+            continue;
+        }
+        total_added += f.added;
+        total_deleted += f.deleted;
+    }
+    write_stat_summary(out, files.len(), total_added, total_deleted)
 }
 
 /// Scale `it` into `width` columns, guaranteeing at least one column for any
@@ -1546,17 +1967,90 @@ fn pad_to(line: &mut Vec<u8>, width: usize) {
 // Dates
 // ---------------------------------------------------------------------------
 
+/// The `--date=` output modes this port renders byte-for-byte. Modes that depend
+/// on the wall clock or the process timezone (`relative`, `human`, `local`) are
+/// rejected rather than faked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DateMode {
+    /// git's `DATE_NORMAL`: `Www Mmm D HH:MM:SS YYYY +ZZZZ`.
+    Default,
+    /// `short`: `YYYY-MM-DD`.
+    Short,
+    /// `iso`/`iso8601`: `YYYY-MM-DD HH:MM:SS +ZZZZ`.
+    Iso,
+    /// `iso-strict`/`iso8601-strict`: `YYYY-MM-DDTHH:MM:SS+ZZ:ZZ`.
+    IsoStrict,
+    /// `rfc`/`rfc2822`: `Www, D Mmm YYYY HH:MM:SS +ZZZZ`.
+    Rfc,
+    /// `unix`: the raw epoch seconds, no timezone.
+    Unix,
+    /// `raw`: `<seconds> +ZZZZ`.
+    Raw,
+}
+
+/// Map a `--date=` value to a [`DateMode`]. `None` for a value git accepts but
+/// this port renders time/zone-dependently (surfaced terse) or does not know.
+fn parse_date_mode(spec: &str) -> Option<DateMode> {
+    Some(match spec {
+        "default" | "normal" => DateMode::Default,
+        "short" => DateMode::Short,
+        "iso" | "iso8601" => DateMode::Iso,
+        "iso-strict" | "iso8601-strict" => DateMode::IsoStrict,
+        "rfc" | "rfc2822" => DateMode::Rfc,
+        "unix" => DateMode::Unix,
+        "raw" => DateMode::Raw,
+        _ => return None,
+    })
+}
+
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Format a timestamp in the requested [`DateMode`], matching git byte-for-byte.
+fn format_date(seconds: i64, offset: i32, mode: DateMode) -> String {
+    match mode {
+        DateMode::Default => format_git_date(seconds, offset),
+        DateMode::Unix => format!("{seconds}"),
+        DateMode::Raw => {
+            let (sign, off) = if offset < 0 { ('-', -offset) } else { ('+', offset) };
+            format!("{seconds} {sign}{:02}{:02}", off / 3600, (off % 3600) / 60)
+        }
+        DateMode::Short | DateMode::Iso | DateMode::IsoStrict | DateMode::Rfc => {
+            let local = seconds + offset as i64;
+            let days = local.div_euclid(86_400);
+            let secs = local.rem_euclid(86_400);
+            let (hour, min, sec) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+            let weekday = ((days.rem_euclid(7)) + 4).rem_euclid(7) as usize;
+            let (year, month, day) = civil_from_days(days);
+            let (sign, off) = if offset < 0 { ('-', -offset) } else { ('+', offset) };
+            let (oh, om) = (off / 3600, (off % 3600) / 60);
+            match mode {
+                DateMode::Short => format!("{year}-{month:02}-{day:02}"),
+                DateMode::Iso => format!(
+                    "{year}-{month:02}-{day:02} {hour:02}:{min:02}:{sec:02} {sign}{oh:02}{om:02}"
+                ),
+                DateMode::IsoStrict => format!(
+                    "{year}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}{sign}{oh:02}:{om:02}"
+                ),
+                DateMode::Rfc => format!(
+                    "{}, {day} {} {year} {hour:02}:{min:02}:{sec:02} {sign}{oh:02}{om:02}",
+                    WEEKDAYS[weekday],
+                    MONTHS[(month - 1) as usize],
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
 /// Format a commit time exactly like stock `git log`'s default (`DATE_NORMAL`)
 /// mode: `Www Mmm <sp-padded-day> HH:MM:SS YYYY +ZZZZ`, in the commit's own
 /// timezone offset. Done by hand because gix's exported `DEFAULT` format uses an
 /// unpadded day (`%-d`) whereas git space-pads it (`%e`); nothing else in the
 /// crate lets us construct a custom format string.
 fn format_git_date(seconds: i64, offset: i32) -> String {
-    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-
     // Shift into the commit's local wall-clock time, then split into whole days
     // (since the Unix epoch) and the seconds within the day. `div_euclid` /
     // `rem_euclid` keep the split correct for pre-1970 (negative) timestamps.

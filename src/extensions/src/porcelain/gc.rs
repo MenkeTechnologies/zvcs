@@ -254,6 +254,12 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             | "--no-keep-largest-pack" | "--no-expire-to" => {}
             // `--prune=<date>` is the only optional-value option.
             _ if a.starts_with("--prune=") => {
+                // NB: git validates the expiry with its *approxidate* parser and
+                // dies 128 on an unreadable value (e.g. `abc`). gix::date is
+                // stricter than approxidate — it rejects `2.weeks.ago` and bare
+                // unix timestamps git accepts — so validating with it here would
+                // regress more cases than it fixes. Left unvalidated until a
+                // faithful approxidate is available.
                 prune = Some(match &a["--prune=".len()..] {
                     "now" => Prune::Now,
                     "never" => Prune::Disabled,

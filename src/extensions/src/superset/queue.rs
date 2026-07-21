@@ -51,6 +51,7 @@ pub fn zcommit(args: &[String]) -> Result<ExitCode> {
         "message": message,
         "push": push,
         "session": session(),
+        "env": carried_env(),
     });
     submit_or_run(&spec)
 }
@@ -75,6 +76,7 @@ pub fn zpush(args: &[String]) -> Result<ExitCode> {
         "workdir": workdir,
         "refspec": refspec,
         "session": session(),
+        "env": carried_env(),
     });
     submit_or_run(&spec)
 }
@@ -94,10 +96,34 @@ fn here() -> Result<(String, String)> {
     Ok((git_dir.to_string_lossy().into_owned(), workdir.to_string_lossy().into_owned()))
 }
 
-/// The submitting session key (for attribution/notify): `ZVCS_SESSION` env, else
-/// the parent process id.
+/// The submitting session key (for attribution/notify). Delegates to the shared
+/// [`crate::session_key`] so the empty-`ZVCS_SESSION` fallback is applied here too.
 fn session() -> String {
-    std::env::var("ZVCS_SESSION").unwrap_or_else(|_| format!("pid-{}", std::os::unix::process::parent_id()))
+    crate::session_key()
+}
+
+/// Identity/config env vars carried into the async job spec so the commit is
+/// attributed to the SUBMITTER, not the daemon's inherited environment. Without
+/// this, every agent's async `zcommit` takes the identity of whoever first
+/// autostarted the daemon.
+const CARRY_ENV: &[&str] = &[
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_DATE",
+];
+
+/// Snapshot the carried identity env of the submitting process as a JSON object.
+fn carried_env() -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    for k in CARRY_ENV {
+        if let Ok(v) = std::env::var(k) {
+            m.insert((*k).to_string(), serde_json::Value::String(v));
+        }
+    }
+    m
 }
 
 /// A push pre-flight verdict.

@@ -100,6 +100,27 @@ fn reconcile_repo_inner(repo: &gix::Repository, do_fetch: bool) -> Result<String
         return Ok(format!("local ahead/diverged of origin/{mainline}, skipped"));
     }
 
+    // Guard the BRANCH we are about to force-move (refs/heads/<mainline>), not only
+    // HEAD. A detached HEAD — the state `git submodule update` leaves — can sit at
+    // an ancestor of the remote while `refs/heads/<mainline>` itself carries
+    // unpushed commits. The HEAD check above passes, but force-moving the branch
+    // with `PreviousValue::Any` would then orphan those commits — the exact commits
+    // `ensure_attached` deliberately refuses to touch. Only advance a branch that is
+    // itself behind (an ancestor of) the remote tip; otherwise leave it untouched.
+    if let Some(branch_ref) = repo.try_find_reference(&format!("refs/heads/{mainline}"))? {
+        if let Ok(tip) = branch_ref.into_fully_peeled_id() {
+            let branch_tip = tip.detach();
+            let branch_behind = branch_tip == remote_id
+                || repo
+                    .merge_base(branch_tip, remote_id)
+                    .map(|b| b.detach() == branch_tip)
+                    .unwrap_or(false);
+            if !branch_behind {
+                return Ok(format!("local {mainline} ahead/diverged of origin/{mainline}, skipped"));
+            }
+        }
+    }
+
     // Capture the current (clean) index BEFORE mutating any ref. It mirrors the
     // worktree and the old tree, and carries real filesystem stats we can reuse
     // for the files that don't change.

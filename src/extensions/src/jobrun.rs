@@ -67,17 +67,21 @@ fn self_exe() -> Result<std::path::PathBuf> {
 
 /// Run one child `git <args>` in `cwd`; return `(success, combined-output)`.
 /// Registers the child's pid on `cancel` so a concurrent `zjob stop` can kill it.
-fn run(exe: &Path, cwd: &Path, args: &[String], cancel: &Cancel) -> (bool, String) {
+fn run(exe: &Path, cwd: &Path, args: &[String], env: &[(String, String)], cancel: &Cancel) -> (bool, String) {
     if cancel.cancelled() {
         return (false, "cancelled\n".to_string());
     }
-    let mut child = match Command::new(exe)
-        .args(args)
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::piped());
+    // Apply the submitter's carried identity env so the async commit is attributed
+    // to the agent that submitted it, not the daemon's inherited environment.
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return (false, format!("spawn `git {}` failed: {e}\n", args.join(" "))),
     };
@@ -121,10 +125,23 @@ fn execute_inner(spec: &Value, cancel: &Cancel) -> Result<JobResult> {
         .ok_or_else(|| anyhow!("job spec missing workdir"))?;
     let workdir = Path::new(workdir);
 
+    // Identity env the submitter carried into the spec (GIT_AUTHOR_*/COMMITTER_*),
+    // applied to every child `git` so attribution follows the submitter.
+    let env: Vec<(String, String)> = spec
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
     match kind {
         "commit" => {
             let mut output = String::new();
             let mut ok = true;
+            let mut commit_ok = false;
 
             // Stage the given paths (if any) first.
             let paths: Vec<String> = spec
@@ -135,7 +152,7 @@ fn execute_inner(spec: &Value, cancel: &Cancel) -> Result<JobResult> {
             if !paths.is_empty() {
                 let mut args = vec!["add".to_string()];
                 args.extend(paths);
-                let (a_ok, a_out) = run(&exe, workdir, &args, cancel);
+                let (a_ok, a_out) = run(&exe, workdir, &args, &env, cancel);
                 output.push_str(&a_out);
                 ok &= a_ok;
             }
@@ -150,21 +167,27 @@ fn execute_inner(spec: &Value, cancel: &Cancel) -> Result<JobResult> {
                     &exe,
                     workdir,
                     &["commit".into(), "-m".into(), message.to_string()],
+                    &env,
                     cancel,
                 );
                 output.push_str(&c_out);
                 ok &= c_ok;
+                commit_ok = c_ok;
             }
 
             // Optional push.
             if ok && spec.get("push").and_then(Value::as_bool).unwrap_or(false) {
-                let (p_ok, p_out) = run(&exe, workdir, &["push".into()], cancel);
+                let (p_ok, p_out) = run(&exe, workdir, &["push".into()], &env, cancel);
                 output.push_str(&p_out);
                 ok &= p_ok;
             }
 
-            // Only report the resulting HEAD when the commit actually succeeded.
-            let sha_after = if ok { head_sha(&exe, workdir) } else { None };
+            // Report the resulting HEAD whenever the COMMIT itself landed — even if
+            // a later push failed. Otherwise a `--push` job whose commit succeeded
+            // but push failed records no sha, so a bot can't tell a landed commit
+            // from a failed one and re-commits work that is already in. (`ok` still
+            // reflects the whole job, so the state stays `failed` on a push error.)
+            let sha_after = if commit_ok { head_sha(&exe, workdir) } else { None };
             Ok(JobResult { ok, output, sha_after, cancelled: false })
         }
         "push" => {
@@ -172,7 +195,7 @@ fn execute_inner(spec: &Value, cancel: &Cancel) -> Result<JobResult> {
             if let Some(rs) = spec.get("refspec").and_then(Value::as_str) {
                 args.extend(rs.split_whitespace().map(String::from));
             }
-            let (ok, output) = run(&exe, workdir, &args, cancel);
+            let (ok, output) = run(&exe, workdir, &args, &env, cancel);
             Ok(JobResult { ok, output, sha_after: None, cancelled: false })
         }
         other => Err(anyhow!("unknown job kind {other:?}")),

@@ -81,7 +81,13 @@ pub(crate) fn head_authored_by_zvcs(git_dir: &Path) -> bool {
 }
 
 fn short(sha: &str) -> &str {
-    &sha[..sha.len().min(12)]
+    // Truncate on a char boundary: a git sha is ASCII hex, but a hand-corrupted
+    // reflog could put a multibyte char across byte 12, and a raw byte slice there
+    // would panic.
+    match sha.char_indices().nth(12) {
+        Some((i, _)) => &sha[..i],
+        None => sha,
+    }
 }
 
 #[cfg(test)]

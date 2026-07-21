@@ -9,7 +9,7 @@
 //! the parent and its status is clean.
 
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
@@ -68,17 +68,28 @@ fn watcher_autobumps_submodule_pointer_on_commit() {
     git(&parent, &["config", "zvcs.autobump", "true"]);
     git(&parent, &["config", "zvcs.interval", "1"]);
 
-    // Isolated singleton socket; the daemon (cwd=parent) inherits it.
+    // Isolated singleton socket; the daemon (cwd=parent) inherits it. Capture its
+    // output so we can wait for the watcher to actually arm before we move a ref —
+    // `notify` does not replay events that predate the watch, so a fixed sleep is a
+    // race on a slow runner (the submodule commit below could land before the
+    // watches exist and be missed entirely).
     let sock = root.join("zvcs-test.sock");
     std::env::set_var("ZVCS_SOCK", &sock);
+    let daemon_log = root.join("daemon.log");
+    let logf = std::fs::File::create(&daemon_log).unwrap();
     let mut daemon: Child = Command::new(BIN)
         .args(["zdaemon", "start"])
         .current_dir(&parent)
+        .stdout(Stdio::from(logf.try_clone().unwrap()))
+        .stderr(Stdio::from(logf))
         .spawn()
         .expect("spawn zdaemon");
     wait_for(&sock, Duration::from_secs(5));
-    // Give the watcher a beat to arm its watches after the initial converge pass.
-    std::thread::sleep(Duration::from_millis(800));
+    // Block until the watch loop has armed its watches (printed only after the
+    // initial converge pass AND every `watcher.watch()` call in
+    // superset::watch::run). Best-effort: on timeout we proceed and let the 20s
+    // poll below be the real assertion.
+    wait_for_log(&daemon_log, "[zvcs watch] watching", Duration::from_secs(10));
 
     // Commit inside the checked-out submodule -> its HEAD moves -> parent shows
     // `modified: sub (new commits)`.
@@ -125,4 +136,19 @@ fn wait_for(sock: &Path, timeout: Duration) {
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("daemon socket never appeared at {}", sock.display());
+}
+
+/// Poll `log` until it contains `needle`, or `timeout` elapses. Best-effort: it
+/// does not panic on timeout — the caller's downstream assertion is the real gate.
+/// Used to confirm the daemon's watcher is armed before we mutate refs.
+fn wait_for_log(log: &Path, needle: &str, timeout: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(s) = std::fs::read_to_string(log) {
+            if s.contains(needle) {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

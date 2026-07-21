@@ -24,12 +24,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Tests spawn the real `git` binary to build fixtures (a `git commit`
       # requires a committer identity) and the zdaemon autobumps commits; a
-      # fresh runner has no global git identity, so configure one. Tests that
-      # set their own `-c user.*` still override this.
+      # fresh runner has no git identity. Export the identity via git's
+      # GIT_AUTHOR_*/GIT_COMMITTER_* env vars — they apply to every git
+      # invocation (including fixture repos in temp dirs) without mutating
+      # runner-persistent global config. Tests that set their own `-c user.*`
+      # still override these.
       - name: Configure git identity
         run: |
-          git config --global user.email "ci@zvcs.test"
-          git config --global user.name "zvcs ci"
+          {
+            echo "GIT_AUTHOR_NAME=zvcs ci"
+            echo "GIT_AUTHOR_EMAIL=ci@zvcs.test"
+            echo "GIT_COMMITTER_NAME=zvcs ci"
+            echo "GIT_COMMITTER_EMAIL=ci@zvcs.test"
+          } >> "$GITHUB_ENV"
       # The workspace member is the `zvcs` package (the `git` shadow binary +
       # coordination layer); src/ported gitoxide is a separate excluded
       # workspace. Build the binary, then run the coordination test that proves

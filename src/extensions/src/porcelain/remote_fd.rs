@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(strtoul(b"17"), (17, 2));
         // The separator is left for the caller to inspect.
         assert_eq!(strtoul(b"7,8"), (7, 1));
-        assert_eq!(strtoul(b"17/foo"), (17, 3));
+        assert_eq!(strtoul(b"17/foo"), (17, 2));
         // No digits at all: "no conversion performed", end == start.
         assert_eq!(strtoul(b"abc"), (0, 0));
         assert_eq!(strtoul(b""), (0, 0));

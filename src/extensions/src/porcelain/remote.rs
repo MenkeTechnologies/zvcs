@@ -22,7 +22,8 @@ use gix::refs::{FullName, Target};
 ///   * `git remote get-url [--push] [--all] <name>`
 ///   * `git remote set-url [--push] <name> <newurl> [<oldurl>]`,
 ///     `set-url --add`, `set-url --delete`
-///   * `git remote show [-n] [<name>…]`        → offline detail block
+///   * `git remote show [-n] [<name>…]`        → detail block; without `-n`
+///     the remote is contacted for the HEAD branch and per-branch status
 ///   * `git remote prune [-n] <name>`          → drop stale tracking refs
 ///   * `git remote update [-p] [<group>|<remote>]…`
 ///
@@ -30,13 +31,13 @@ use gix::refs::{FullName, Target};
 /// already exists", 128 fatal, 129 usage error.
 ///
 /// Known divergences:
-///   * `show` always renders the offline (`-n`) form — the HEAD branch and
-///     per-branch status are reported as `(not queried)` even without `-n`,
-///     because no status query is performed.
-///   * `set-head -a` needs the remote's advertised HEAD; it is rejected rather
-///     than guessed.
-///   * `set-url --delete <url>` matches the URL literally; stock git treats the
-///     argument as a POSIX regular expression.
+///   * Online `show` reports the HEAD branch and the remote-branch
+///     `new`/`tracked`/`stale` status from the ref advertisement, but the
+///     `'git push'` section is still rendered in its `-n` (`(status not
+///     queried)`) form: the per-ref push status (`up to date`,
+///     `fast-forwardable`, `local out of date`, …) needs the remote objects in
+///     the local object database to run the ahead/behind reachability check,
+///     which a bare ref advertisement does not provide.
 ///   * Creating `refs/remotes/<name>/HEAD` writes no reflog entry (gitoxide
 ///     skips reflogs for symbolic-target updates); stock `set-head` writes one.
 pub fn remote(args: &[String]) -> Result<ExitCode> {
@@ -836,9 +837,9 @@ fn remove(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 // remote set-head / set-branches
 // ---------------------------------------------------------------------------
 
-/// `git remote set-head <name> (-d | <branch>)` — point (or drop) the
-/// `refs/remotes/<name>/HEAD` symref. `-a` needs the remote's advertised HEAD
-/// and is rejected rather than guessed.
+/// `git remote set-head <name> (-a | -d | <branch>)` — point (or drop) the
+/// `refs/remotes/<name>/HEAD` symref. `-a` contacts the remote and derives the
+/// branch from its advertised HEAD.
 fn set_head(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut auto = false;
     let mut delete = false;
@@ -869,9 +870,42 @@ fn set_head(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if auto {
-        return fatal(format!(
-            "cannot determine the remote HEAD of '{name}' offline; pass the branch name explicitly"
-        ));
+        let map = match query_ref_map(repo, name) {
+            Ok(map) => map,
+            Err(e) => return fatal(e),
+        };
+        let heads = remote_head_names(&map);
+        if heads.is_empty() {
+            return error("Cannot determine remote HEAD", 1);
+        }
+        if heads.len() > 1 {
+            eprintln!("error: Multiple remote HEAD branches. Please choose one explicitly with:");
+            for h in &heads {
+                eprintln!("  git remote set-head {name} {h}");
+            }
+            return Ok(ExitCode::from(1));
+        }
+        let head_name = &heads[0];
+        let target = format!("refs/remotes/{name}/{head_name}");
+        if repo.try_find_reference(target.as_str())?.is_none() {
+            return error(format!("Not a valid ref: {target}"), 1);
+        }
+        let (prev, was_detached) = symref_prev(repo, head.as_str())?;
+        repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: "remote set-head".into(),
+                },
+                expected: PreviousValue::Any,
+                new: Target::Symbolic(full_name(&target)?),
+            },
+            name: full_name(&head)?,
+            deref: false,
+        })?;
+        report_set_head_auto(name, head_name, &prev, was_detached);
+        return Ok(ExitCode::SUCCESS);
     }
 
     let branch = pos[1];
@@ -979,8 +1013,8 @@ fn get_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 
 /// `git remote set-url` in its three forms.
 ///
-/// `--delete <url>` matches literally here; stock git treats the argument as a
-/// POSIX regular expression.
+/// `--delete <url>` treats its argument as an extended (POSIX ERE) regular
+/// expression, matching git's `regcomp(&old_regex, oldurl, REG_EXTENDED)`.
 fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut push = false;
     let mut append = false;
@@ -1020,14 +1054,27 @@ fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 
     let key = if push { "pushurl" } else { "url" };
 
-    // Deleting every non-push URL would leave the remote unusable; git refuses.
-    if delete && !push {
-        let remaining = effective_urls(repo, name, "url")
-            .into_iter()
-            .filter(|u| u.as_str() != value)
-            .count();
-        if remaining == 0 {
-            return fatal("Will not delete all non-push URLs");
+    // git compiles the --delete argument as an extended regular expression.
+    let delete_re = if delete {
+        match regex::bytes::RegexBuilder::new(value).unicode(false).build() {
+            Ok(re) => Some(re),
+            Err(_) => return fatal(format!("Invalid old URL pattern: {value}")),
+        }
+    } else {
+        None
+    };
+
+    // Deleting every non-push URL would leave the remote unusable; git refuses
+    // when the pattern matches all of them (no URL fails to match).
+    if let Some(re) = delete_re.as_ref() {
+        if !push {
+            let survives = effective_urls(repo, name, "url")
+                .into_iter()
+                .filter(|u| !re.is_match(u.as_bytes()))
+                .count();
+            if survives == 0 {
+                return fatal("Will not delete all non-push URLs");
+            }
         }
     }
 
@@ -1046,10 +1093,10 @@ fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             let mut v = current;
             v.push(value.to_string());
             v
-        } else if delete {
+        } else if let Some(re) = delete_re.as_ref() {
             current
                 .into_iter()
-                .filter(|u| u.as_str() != value)
+                .filter(|u| !re.is_match(u.as_bytes()))
                 .collect()
         } else if let Some(old) = pos.get(2) {
             current
@@ -1091,10 +1138,11 @@ fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 /// with names it renders one detail block per remote. An unknown name is not
 /// an error: git synthesizes a block whose URLs fall back to the name itself.
 fn show(repo: &gix::Repository, args: &[String], verbose: bool) -> Result<ExitCode> {
+    let mut no_query = false;
     let mut names: Vec<&str> = Vec::new();
     for a in args {
         match a.as_str() {
-            "-n" | "--no-query" => {}
+            "-n" | "--no-query" => no_query = true,
             s if s.starts_with('-') && s.len() > 1 => {
                 unknown_option(s);
                 return usage(USAGE_SHOW);
@@ -1106,13 +1154,32 @@ fn show(repo: &gix::Repository, args: &[String], verbose: bool) -> Result<ExitCo
         return list(repo, verbose);
     }
     for name in &names {
-        show_one(repo, name)?;
+        // Without `-n`, contact the remote once; a failure is fatal, exactly as
+        // git's `transport_get_remote_refs` dies.
+        let map = if no_query {
+            None
+        } else {
+            match query_ref_map(repo, name) {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    eprintln!("fatal: {e}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        };
+        show_one(repo, name, map.as_ref())?;
     }
     Ok(ExitCode::SUCCESS)
 }
 
-/// Render the offline (`-n`) detail block for a single remote.
-fn show_one(repo: &gix::Repository, name: &str) -> Result<()> {
+/// Render the detail block for a single remote. With `map` present the HEAD
+/// branch and per-branch status come from the advertisement; without it the
+/// offline (`-n`) form is rendered.
+fn show_one(
+    repo: &gix::Repository,
+    name: &str,
+    map: Option<&gix::remote::fetch::RefMap>,
+) -> Result<()> {
     let fetch = fetch_urls_or_name(repo, name);
     let push = push_urls_or_name(repo, name);
 
@@ -1122,18 +1189,55 @@ fn show_one(repo: &gix::Repository, name: &str) -> Result<()> {
         fetch.first().map_or(name, String::as_str)
     );
     println!("  Push  URL: {}", push.first().map_or(name, String::as_str));
-    println!("  HEAD branch: (not queried)");
 
-    // Remote-tracking branches selected by the fetch refspecs.
-    let branches = remote_branches(repo, name)?;
-    if !branches.is_empty() {
-        if branches.len() == 1 {
-            println!("  Remote branch: (status not queried)");
-        } else {
-            println!("  Remote branches: (status not queried)");
+    match map {
+        None => {
+            println!("  HEAD branch: (not queried)");
+
+            // Remote-tracking branches selected by the fetch refspecs.
+            let branches = remote_branches(repo, name)?;
+            if !branches.is_empty() {
+                if branches.len() == 1 {
+                    println!("  Remote branch: (status not queried)");
+                } else {
+                    println!("  Remote branches: (status not queried)");
+                }
+                for b in &branches {
+                    println!("    {b}");
+                }
+            }
         }
-        for b in &branches {
-            println!("    {b}");
+        Some(map) => {
+            let heads = remote_head_names(map);
+            match heads.len() {
+                0 => println!("  HEAD branch: (unknown)"),
+                1 => println!("  HEAD branch: {}", heads[0]),
+                _ => {
+                    println!(
+                        "  HEAD branch (remote HEAD is ambiguous, may be one of the following):"
+                    );
+                    for h in &heads {
+                        println!("    {h}");
+                    }
+                }
+            }
+
+            let rows = remote_branch_states(repo, name, map)?;
+            if !rows.is_empty() {
+                if rows.len() == 1 {
+                    println!("  Remote branch:");
+                } else {
+                    println!("  Remote branches:");
+                }
+                let width = rows
+                    .iter()
+                    .map(|(n, _)| n.chars().count())
+                    .max()
+                    .unwrap_or(0);
+                for (bname, status) in &rows {
+                    println!("    {bname:<width$}{status}");
+                }
+            }
         }
     }
 
@@ -1262,6 +1366,92 @@ fn remote_branches(repo: &gix::Repository, name: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Port of git's `get_ref_states`: each remote-tracking branch of `<name>`
+/// paired with its live status suffix, as `(display, status)` sorted by
+/// display name (git merges the four state lists through a sorted, de-duplicated
+/// `string_list`).
+///
+/// `new`/`tracked` entries carry the short remote-side name (`abbrev_branch` of
+/// the advertised ref); `stale` entries keep the full `refs/remotes/<name>/…`
+/// path, exactly as git's `abbrev_branch` leaves a non-`refs/heads/` name.
+/// A name present in more than one state takes the first that matches in git's
+/// order (new, then tracked, then stale — negative-refspec `skipped` refs are
+/// not modelled here).
+fn remote_branch_states(
+    repo: &gix::Repository,
+    name: &str,
+    map: &gix::remote::fetch::RefMap,
+) -> Result<Vec<(String, String)>> {
+    let mut new_set: BTreeSet<String> = BTreeSet::new();
+    let mut tracked_set: BTreeSet<String> = BTreeSet::new();
+
+    // Each mapping is a remote ref the fetch refspecs selected; it is `tracked`
+    // when its local counterpart already exists, else `new`.
+    for m in &map.mappings {
+        let Some(remote_name) = m.remote.as_name() else {
+            continue;
+        };
+        if remote_name == "HEAD" {
+            continue;
+        }
+        let display = abbrev_branch(remote_name);
+        let local_exists = m.local.as_ref().is_some_and(|l| {
+            repo.try_find_reference(l.to_str_lossy().as_ref())
+                .ok()
+                .flatten()
+                .is_some()
+        });
+        if local_exists {
+            tracked_set.insert(display);
+        } else {
+            new_set.insert(display);
+        }
+    }
+
+    // Stale (git's `get_stale_heads`): a local tracking ref selected by a fetch
+    // refspec that the remote no longer advertises. Symbolic refs (HEAD) are
+    // skipped, matching `REF_ISSYMREF`.
+    let live_locals: BTreeSet<String> = map
+        .mappings
+        .iter()
+        .filter_map(|m| m.local.as_ref())
+        .map(|l| l.to_str_lossy().into_owned())
+        .collect();
+    let dsts = fetch_refspec_dsts(repo, name);
+    let mut stale_set: BTreeSet<String> = BTreeSet::new();
+    for (ref_name, target) in tracking_refs(repo, name)? {
+        if matches!(target, Target::Symbolic(_)) {
+            continue;
+        }
+        let full = ref_name.as_bstr().to_str_lossy().into_owned();
+        if !dsts.iter().any(|d| refspec_dst_matches(d, &full)) {
+            continue;
+        }
+        if live_locals.contains(&full) {
+            continue;
+        }
+        stale_set.insert(full);
+    }
+
+    let mut names: BTreeSet<&String> = BTreeSet::new();
+    names.extend(&new_set);
+    names.extend(&tracked_set);
+    names.extend(&stale_set);
+
+    let mut out = Vec::with_capacity(names.len());
+    for n in names {
+        let status = if new_set.contains(n) {
+            format!(" new (next fetch will store in remotes/{name})")
+        } else if tracked_set.contains(n) {
+            " tracked".to_string()
+        } else {
+            " stale (use 'git remote prune' to remove)".to_string()
+        };
+        out.push((n.clone(), status));
+    }
+    Ok(out)
+}
+
 /// Local branches (sorted) whose `branch.<b>.remote` is `<name>` and that have
 /// at least one `branch.<b>.merge`, returned as `(branch, rebase, merges)` with
 /// merge refs shortened (`refs/heads/` stripped).
@@ -1373,16 +1563,123 @@ fn prune_one(repo: &gix::Repository, name: &str, dry_run: bool) -> Result<bool> 
     Ok(true)
 }
 
-/// Tracking refs of `<name>` that the remote no longer advertises, as full ref
-/// names. Contacting the remote is the only way to know, so this fails when the
-/// remote is unreachable.
-fn stale_tracking_refs(repo: &gix::Repository, name: &str) -> Result<Vec<String>> {
+/// Connect to `<name>` (fetch direction) and run the ref-advertisement
+/// handshake, returning the resulting ref map. Contacting the remote is the
+/// only way to learn what it advertises, so this fails when it is unreachable.
+fn query_ref_map(repo: &gix::Repository, name: &str) -> Result<gix::remote::fetch::RefMap> {
     let remote = repo.find_remote(name)?;
     let connection = remote.connect(gix::remote::Direction::Fetch)?;
     let (map, _handshake) = connection.ref_map(
         gix::progress::Discard,
         gix::remote::ref_map::Options::default(),
     )?;
+    Ok(map)
+}
+
+/// Port of git's `get_head_names` + `guess_remote_head` (invoked with
+/// `REMOTE_GUESS_HEAD_ALL`): the abbreviated branch name(s) the remote's HEAD
+/// resolves to, given the advertised refs.
+///
+/// When the advertisement carries a symbolic HEAD (the common case for both
+/// protocol v1's `symref` capability and v2's `ls-refs`), git peeks directly at
+/// its target and returns that single branch; otherwise it collects every
+/// `refs/heads/*` whose object matches HEAD's, which may be several.
+fn remote_head_names(map: &gix::remote::fetch::RefMap) -> Vec<String> {
+    use gix::protocol::handshake::Ref;
+
+    let Some(head) = map.remote_refs.iter().find(|r| r.unpack().0 == "HEAD") else {
+        return Vec::new();
+    };
+
+    // Advertised branch heads: (full name, ultimate object it points to).
+    let heads: Vec<(BString, gix::hash::ObjectId)> = map
+        .remote_refs
+        .iter()
+        .filter_map(|r| {
+            let (name, target, peeled) = r.unpack();
+            let oid = peeled.or(target)?;
+            name.starts_with_str("refs/heads/")
+                .then(|| (name.to_owned(), oid.to_owned()))
+        })
+        .collect();
+
+    // Transport peeked at where HEAD points: use it directly, if advertised.
+    if let Ref::Symbolic { target, .. } | Ref::Unborn { target, .. } = head {
+        return if heads.iter().any(|(n, _)| n == target) {
+            vec![abbrev_branch(target.as_bstr())]
+        } else {
+            Vec::new()
+        };
+    }
+
+    // No symref: match every head that points at the same object as HEAD.
+    let (_, head_target, head_peeled) = head.unpack();
+    let Some(head_oid) = head_peeled.or(head_target) else {
+        return Vec::new();
+    };
+    heads
+        .iter()
+        .filter(|(_, oid)| **oid == *head_oid)
+        .map(|(n, _)| abbrev_branch(n.as_bstr()))
+        .collect()
+}
+
+/// git's `abbrev_branch`: strip a leading `refs/heads/`, otherwise return the
+/// name unchanged (so remote-tracking refs keep their full path).
+fn abbrev_branch(name: &BStr) -> String {
+    let s = name.to_str_lossy();
+    s.strip_prefix("refs/heads/").unwrap_or(&s).to_string()
+}
+
+/// The current on-disk value of `refs/remotes/<name>/HEAD` before an update, as
+/// git's `refs_update_symref_extended` reports it: `Some(symref target)` /
+/// `Some(hex oid)` with the bool marking a detached (direct object) ref, or
+/// `None` when the ref does not yet exist.
+fn symref_prev(repo: &gix::Repository, head: &str) -> Result<(Option<String>, bool)> {
+    match repo.try_find_reference(head)? {
+        None => Ok((None, false)),
+        Some(reference) => match &reference.inner.target {
+            Target::Symbolic(target) => {
+                Ok((Some(target.as_bstr().to_str_lossy().into_owned()), false))
+            }
+            Target::Object(id) => Ok((Some(id.to_hex().to_string()), true)),
+        },
+    }
+}
+
+/// Port of git's `report_set_head_auto`: the line printed after `set-head -a`
+/// succeeds, describing how `refs/remotes/<remote>/HEAD` changed.
+fn report_set_head_auto(remote: &str, head_name: &str, prev: &Option<String>, was_detached: bool) {
+    let prefix = format!("refs/remotes/{remote}/");
+    match prev {
+        Some(local) => {
+            if let Some(prev_head) = local.strip_prefix(&prefix) {
+                if prev_head == head_name {
+                    println!("'{remote}/HEAD' is unchanged and points to '{head_name}'");
+                } else {
+                    println!(
+                        "'{remote}/HEAD' has changed from '{prev_head}' and now points to '{head_name}'"
+                    );
+                }
+            } else if was_detached {
+                println!(
+                    "'{remote}/HEAD' was detached at '{local}' and now points to '{head_name}'"
+                );
+            } else {
+                println!(
+                    "'{remote}/HEAD' used to point to '{local}' (which is not a remote branch), but now points to '{head_name}'"
+                );
+            }
+        }
+        None => println!("'{remote}/HEAD' is now created and points to '{head_name}'"),
+    }
+}
+
+/// Tracking refs of `<name>` that the remote no longer advertises, as full ref
+/// names. Contacting the remote is the only way to know, so this fails when the
+/// remote is unreachable.
+fn stale_tracking_refs(repo: &gix::Repository, name: &str) -> Result<Vec<String>> {
+    let map = query_ref_map(repo, name)?;
 
     let live: BTreeSet<String> = map
         .mappings

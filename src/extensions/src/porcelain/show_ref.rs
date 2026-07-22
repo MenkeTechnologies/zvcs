@@ -2,16 +2,17 @@
 //!
 //! Covered: the pattern-listing form (with `--head`, `--branches`/`--heads`,
 //! `--tags`, `-d`/`--dereference`, `-s`/`--hash[=<n>]`, `--abbrev[=<n>]`,
-//! `-q`/`--quiet` and trailing `<pattern>...`), the `--verify` form, and the
-//! `--exists` form, including their exit codes (1 for "nothing matched", 2 for
-//! "--exists: missing", 128 for the `fatal:` paths).
-//!
-//! Not covered: `--exclude-existing[=<pattern>]`, the stdin-filter form — it
-//! bails rather than producing output that would diverge from git.
+//! `-q`/`--quiet` and trailing `<pattern>...`), the `--verify` form, the
+//! `--exists` form, and the `--exclude-existing[=<pattern>]` stdin-filter form,
+//! including their exit codes (1 for "nothing matched", 2 for "--exists:
+//! missing", 128 for the `fatal:` paths).
 
-use anyhow::{bail, Result};
+use anyhow::Result;
+use std::collections::HashSet;
+use std::io::{BufRead, Write};
 use std::process::ExitCode;
 
+use gix::bstr::BStr;
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
 
@@ -60,6 +61,8 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
     };
     let mut verify = false;
     let mut exists = false;
+    let mut exclude_existing = false;
+    let mut exclude_pattern: Option<String> = None;
     let mut patterns: Vec<String> = Vec::new();
     let mut no_more_opts = false;
 
@@ -95,9 +98,10 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
                     Some(a) => opts.abbrev = a,
                     None => return numeric_error("abbrev"),
                 },
-                "exclude-existing" => bail!("unsupported flag \"--exclude-existing\" ({PORTED})"),
+                "exclude-existing" => exclude_existing = true,
                 _ if long.starts_with("exclude-existing=") => {
-                    bail!("unsupported flag \"--exclude-existing=\" ({PORTED})")
+                    exclude_existing = true;
+                    exclude_pattern = Some(long["exclude-existing=".len()..].to_string());
                 }
                 _ => return unknown_option("option", long),
             }
@@ -131,13 +135,28 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
 
     // git validates the parsed options (unknown flag / numeric value above, exit
     // 129) *before* this post-parse compatibility check, which is a plain `die()`
-    // — a single `fatal:` line and exit 128, with no usage block.
-    if exists && verify {
-        return die_incompatible("--verify", "--exists");
+    // — a single `fatal:` line and exit 128, with no usage block. git's
+    // `die_for_incompatible_opt3` names the first two enabled modes in the fixed
+    // order (--exclude-existing, --verify, --exists), regardless of CLI order.
+    let mut enabled = Vec::new();
+    if exclude_existing {
+        enabled.push("--exclude-existing");
+    }
+    if verify {
+        enabled.push("--verify");
+    }
+    if exists {
+        enabled.push("--exists");
+    }
+    if enabled.len() > 1 {
+        return die_incompatible(enabled[0], enabled[1]);
     }
 
     let repo = gix::discover(".")?;
 
+    if exclude_existing {
+        return run_exclude_existing(&repo, exclude_pattern.as_deref());
+    }
     if exists {
         return run_exists(&repo, &patterns);
     }
@@ -147,10 +166,6 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
     run_patterns(&repo, &opts, &patterns)
 }
 
-/// The flags this port implements, quoted in every rejection message.
-const PORTED: &str = "ported: --head, -d/--dereference, -s/--hash[=<n>], \
-                      --abbrev[=<n>], --branches/--heads, --tags, --verify, \
-                      --exists, -q/--quiet";
 
 /// git's `parse_opt_abbrev_cb` numeric-value rejection: prints
 /// `error: option `<name>' expects a numerical value` and exits 129 (the
@@ -364,6 +379,99 @@ fn run_exists(repo: &gix::Repository, refs: &[String]) -> Result<ExitCode> {
         eprintln!("error: reference does not exist");
         Ok(ExitCode::from(2))
     }
+}
+
+/// `--exclude-existing[=<pattern>]`: read ref lines from stdin and echo back
+/// only those whose ref is **not** already present in this repository.
+///
+/// Faithful port of git's `cmd_show_ref__exclude_existing`. git first collects
+/// every ref under `refs/` into a set, then, for each stdin line, (1) strips the
+/// trailing newline, (2) strips a trailing `^{}`, (3) takes the ref name as the
+/// text after the last whitespace (so `<oid> SP <ref>` lines yield `<ref>`),
+/// (4) with `--exclude-existing=<pattern>` keeps only refs whose name *begins*
+/// with `<pattern>` (a head match, not a glob), (5) warns and skips malformed
+/// ref names, and (6) prints the original line verbatim when the ref is absent.
+/// Exit status is always 0.
+fn run_exclude_existing(repo: &gix::Repository, pattern: Option<&str>) -> Result<ExitCode> {
+    // git's `existing_refs`: every ref under `refs/`, compared by exact full
+    // name. Broken refs are skipped, as git's ref iteration does.
+    let mut existing: HashSet<Vec<u8>> = HashSet::new();
+    for reference in repo.references()?.all()? {
+        let Ok(reference) = reference else { continue };
+        existing.insert(reference.name().as_bstr().to_vec());
+    }
+
+    let pat = pattern.map(str::as_bytes);
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut line: Vec<u8> = Vec::new();
+
+    loop {
+        line.clear();
+        if handle.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        // (1) drop the trailing newline, mirroring git's `buf[--len] = '\0'`.
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        // (2) trim a trailing "^{}" (peeled-tag marker) off the whole line.
+        let mut len = line.len();
+        if len >= 3 && &line[len - 3..] == b"^{}" {
+            len -= 3;
+            line.truncate(len);
+        }
+        // (3) the ref is the text after the last whitespace on the line; with no
+        // whitespace the entire line is the ref (git's backward `isspace` scan).
+        let mut start = 0;
+        let mut j = len;
+        while j > 0 {
+            if is_c_space(line[j - 1]) {
+                start = j;
+                break;
+            }
+            j -= 1;
+        }
+        let refname = &line[start..len];
+
+        // (4) `--exclude-existing=<pattern>` is a prefix (head) match on the ref.
+        if let Some(pat) = pat {
+            if refname.len() < pat.len() || &refname[..pat.len()] != pat {
+                continue;
+            }
+        }
+
+        // (5) git warns on and skips names that fail `check_refname_format(ref,
+        // 0)`. The vendored validator matches git's per-component rules but, with
+        // no `REFNAME_ALLOW_ONELEVEL` notion, still accepts an all-uppercase
+        // one-level name like `HEAD` that git's flags==0 rejects
+        // (gix-validate/src/reference.rs:136). git's "at least two components"
+        // rule is the extra `refname.contains('/')`: among validator-accepted
+        // names (no empty/leading/trailing/repeated-slash components) a slash is
+        // present iff there are >= 2 components.
+        let well_formed =
+            gix::validate::reference::name(BStr::new(refname)).is_ok() && refname.contains(&b'/');
+        if !well_formed {
+            eprintln!("warning: ref '{}' ignored", String::from_utf8_lossy(refname));
+            continue;
+        }
+
+        // (6) echo the line (newline- and `^{}`-stripped) for absent refs.
+        if !existing.contains(refname) {
+            out.write_all(&line)?;
+            out.write_all(b"\n")?;
+        }
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// C `isspace` in the default "C" locale: space, tab, and the four vertical
+/// whitespace controls. git splits the object id from the ref on these bytes.
+fn is_c_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
 }
 
 /// Look a ref up by its exact full name, following symbolic targets to an id.

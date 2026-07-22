@@ -73,6 +73,7 @@
 //!
 //! Supported: `-n`/`--dry-run`/`--no-dry-run`, `-v`/`--verbose`/`--no-verbose`,
 //! clustered short flags (`-nv`), `--progress`/`--no-progress`,
+//! `--exclude-promisor-objects`/`--no-exclude-promisor-objects`,
 //! `--expire <time>`/`--expire=<time>`/`--no-expire`, `--`, `<head>...`, and
 //! `-h`. Exit codes match stock git: 129 with git's usage block for `-h` and for
 //! an unknown option, 129 *without* the usage block for parse-options' value
@@ -85,9 +86,19 @@
 //! so it never appears in captured output, and it can never affect stdout, the
 //! exit code, or the resulting repository state.
 //!
+//! `--exclude-promisor-objects`/`--no-exclude-promisor-objects` are accepted and
+//! change nothing observable. In `builtin/prune.c` the flag's whole body is
+//! `fetch_if_missing = 0; revs.exclude_promisor_objects = 1;` — it never marks a
+//! promisor object reachable. That revision flag's only effect on the walk
+//! (`list-objects.c`) is to skip a link into an object that is both absent
+//! locally and named by a promisor pack, instead of fetching it or dying on the
+//! missing link. A present loose object — the only kind prune can remove — is
+//! reachable only through a chain of present objects, none of which the flag ever
+//! skips, so its reachability is identical either way. This port performs no lazy
+//! fetch and `close_over` already drops any unresolvable link, so its walk
+//! already matches the flagged walk byte-for-byte.
+//!
 //! Not ported, and rejected with a precise reason rather than approximated:
-//!   * `--exclude-promisor-objects`, which needs promisor-pack awareness that
-//!     the vendored `gix-pack` does not model.
 //!   * A shallow repository, because git additionally rewrites `.git/shallow`
 //!     via `prune_shallow()`, and there is no shallow-file writer here.
 //!   * A repository with linked worktrees, because git also seeds reachability
@@ -183,10 +194,22 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
                     None => return Ok(malformed_date(value)),
                 }
             }
-            "--exclude-promisor-objects" | "--no-exclude-promisor-objects" => bail!(
-                "unsupported flag {a:?}: promisor packs are not modelled by the vendored gix-pack \
-                 (ported: -n, -v, --progress, --expire, --, <head>..., -h)"
-            ),
+            // `OPT_BOOL(0, "exclude-promisor-objects", …)`. In `builtin/prune.c`
+            // this only does `fetch_if_missing = 0; revs.exclude_promisor_objects
+            // = 1;` — it never marks a promisor object reachable. That revision
+            // flag's sole effect on the walk (`list-objects.c`
+            // `process_blob`/`process_tree`) is to *skip* a link into an object
+            // that is both absent locally and named by a promisor pack, instead
+            // of lazily fetching it or `die()`ing on the missing link. A present
+            // loose object — the only kind prune can remove — is reached only
+            // through a chain of present objects, none of which the flag ever
+            // skips, so its SEEN status (and thus whether it is pruned) is
+            // identical with or without the flag. This port has no lazy-fetch
+            // backend (`find_object` reports not-found rather than fetching) and
+            // `close_over` already drops any link it cannot resolve, so the walk
+            // here already behaves exactly as it does under the flag. Accepting
+            // it is byte-for-byte parity; there is nothing further to do.
+            "--exclude-promisor-objects" | "--no-exclude-promisor-objects" => {}
             // A switch that takes no argument, given one. parse-options reports
             // this with the spelling the user typed and no usage block.
             _ if a.starts_with("--") && a.contains('=') && takes_no_value(a) => {

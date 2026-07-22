@@ -37,10 +37,23 @@
 //! and whose `NeedsUpdate` carries exactly the refreshed stat git would store.
 //! `--quiet` and `--no-refresh` suppress the report, as does a bare repository.
 //!
+//! ## `--intent-to-add` / `-N` and `--pathspec-from-file`
+//!
+//! `-N` (MIXED only) is git's `update_index_from_diff()` intent-to-add path: any
+//! index entry the reset would drop because it is absent from the target tree is
+//! kept as an intent-to-add stub instead — mode `100644`, the empty-blob object id,
+//! `CE_INTENT_TO_ADD` set — so the removed path stays tracked and re-appears in
+//! `git diff`. Entries present in the target tree reset to it as usual. `-N` with a
+//! non-MIXED mode dies `the option '-N' requires '--mixed'`.
+//!
+//! `--pathspec-from-file[=<file>]` / `--pathspec-file-nul` (git's
+//! `parse_pathspec_from_file()`) read the pathspec list from a file (or stdin for
+//! `-`), NUL- or newline-separated; they feed the same path form as inline
+//! pathspecs and reject being combined with inline pathspecs.
+//!
 //! ## Deferred
 //!
-//! `--patch`/`-p` (interactive hunk selection) and `--intent-to-add`/`-N` are
-//! unsupported.
+//! `--patch`/`-p` (interactive hunk selection) is unsupported.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -123,10 +136,21 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     let mut quiet = false;
     let mut refresh = true;
     let mut saw_dd = false;
+    let mut intent_to_add = false;
+    let mut pathspec_from_file: Option<String> = None;
+    let mut pathspec_file_nul = false;
+    let mut take_pff_value = false;
     let mut positionals: Vec<&str> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
 
     for a in args {
+        // `--pathspec-from-file <file>` (separate-argument form): parse-options
+        // consumes the very next token as the value regardless of what it looks like.
+        if take_pff_value {
+            pathspec_from_file = Some(a.clone());
+            take_pff_value = false;
+            continue;
+        }
         if saw_dd {
             paths.push(a.clone());
             continue;
@@ -143,8 +167,14 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             "--merge" => mode = Some(ResetMode::Merge),
             "--keep" => mode = Some(ResetMode::Keep),
             "-p" | "--patch" => bail!("--patch is unsupported (interactive hunk selection not ported)"),
-            "-N" | "--intent-to-add" => {
-                bail!("--intent-to-add is unsupported (intent-to-add markers not ported)")
+            "-N" | "--intent-to-add" => intent_to_add = true,
+            "--no-intent-to-add" => intent_to_add = false,
+            "--pathspec-from-file" => take_pff_value = true,
+            "--no-pathspec-from-file" => pathspec_from_file = None,
+            "--pathspec-file-nul" => pathspec_file_nul = true,
+            "--no-pathspec-file-nul" => pathspec_file_nul = false,
+            s if s.starts_with("--pathspec-from-file=") => {
+                pathspec_from_file = Some(s["--pathspec-from-file=".len()..].to_string());
             }
             other if other.starts_with("--") => {
                 eprintln!("error: unknown option `{}'", &other[2..]);
@@ -159,6 +189,12 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             }
             other => positionals.push(other),
         }
+    }
+
+    // parse-options rejects a dangling value-taking option with exit 129.
+    if take_pff_value {
+        eprintln!("error: option `pathspec-from-file' requires a value");
+        return Ok(ExitCode::from(129));
     }
 
     // ---- 2. Split positionals into an optional <commit> and pathspecs. ----
@@ -192,6 +228,38 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `parse_pathspec_from_file()` (builtin/reset.c): a NUL separator needs the file
+    // option; the file list and inline pathspecs are mutually exclusive; then the
+    // file/stdin is split into pathspecs that join the path form.
+    if pathspec_file_nul && pathspec_from_file.is_none() {
+        eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+        return Ok(ExitCode::from(128));
+    }
+    if let Some(f) = pathspec_from_file {
+        if !paths.is_empty() {
+            eprintln!("fatal: '--pathspec-from-file' and pathspec arguments cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
+        let data = if f == "-" {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
+            buf
+        } else {
+            std::fs::read(&f)?
+        };
+        let sep = if pathspec_file_nul { b'\0' } else { b'\n' };
+        for part in data.split(|&c| c == sep) {
+            let mut s = part;
+            if !pathspec_file_nul && s.last() == Some(&b'\r') {
+                s = &s[..s.len() - 1];
+            }
+            if s.is_empty() {
+                continue;
+            }
+            paths.push(String::from_utf8_lossy(s).into_owned());
+        }
+    }
+
     let with_paths = !paths.is_empty();
     if with_paths {
         if let Some(m @ (ResetMode::Soft | ResetMode::Hard | ResetMode::Merge | ResetMode::Keep)) =
@@ -206,6 +274,13 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     }
 
     let mode = mode.unwrap_or(ResetMode::Mixed);
+
+    // `-N` rides only on a MIXED reset (the with-paths guard above already fired for
+    // the non-MIXED path form, so this catches the whole-tree `--soft/--hard/… -N`).
+    if intent_to_add && mode != ResetMode::Mixed {
+        eprintln!("fatal: the option '-N' requires '--mixed'");
+        return Ok(ExitCode::from(128));
+    }
 
     let reflog_spec = commit_spec.unwrap_or("HEAD");
     let target = match repo.rev_parse_single(reflog_spec) {
@@ -228,7 +303,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
 
     // ---- 3. Path form: reset the named index entries only; no HEAD move. ----
     if with_paths {
-        let mut index = pathspec_index(&repo, &old_index, target_tree, &paths)?;
+        let mut index = pathspec_index(&repo, &old_index, target_tree, &paths, intent_to_add)?;
         finish_mixed(&repo, &mut index, quiet, refresh)?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -280,7 +355,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     match mode {
         ResetMode::Soft => {}
         ResetMode::Mixed => {
-            let mut index = reset_index_to_tree(&repo, &old_index, target_tree)?;
+            let mut index = reset_index_to_tree(&repo, &old_index, target_tree, intent_to_add)?;
             finish_mixed(&repo, &mut index, quiet, refresh)?;
         }
         ResetMode::Hard => {
@@ -447,10 +522,16 @@ fn refresh_index_report(repo: &gix::Repository, index: &mut gix::index::File) ->
 /// Build the `--mixed` index: `tree` verbatim, but preserving worktree stats for
 /// entries whose id and mode are unchanged so the following refresh does not have to
 /// re-hash every file and the index isn't spuriously reported as fully modified.
+///
+/// With `intent_to_add`, every old-index path absent from `tree` — which a mixed
+/// reset would otherwise drop — is re-added as git's intent-to-add stub instead
+/// (`update_index_from_diff()`, the `!is_in_reset_tree` branch): mode `100644`, the
+/// empty-blob id, `CE_INTENT_TO_ADD` set, and a zeroed stat so it is never up to date.
 fn reset_index_to_tree(
     repo: &gix::Repository,
     old: &gix::index::File,
     tree: ObjectId,
+    intent_to_add: bool,
 ) -> Result<gix::index::File> {
     let mut new_index = repo.index_from_tree(&tree)?;
 
@@ -462,6 +543,15 @@ fn reset_index_to_tree(
             old_map.insert(e.path_in(backing).to_owned(), (e.id, e.mode, e.stat));
         }
     }
+
+    let tree_paths: HashSet<BString> = {
+        let backing = new_index.path_backing();
+        new_index
+            .entries()
+            .iter()
+            .map(|e| e.path_in(backing).to_owned())
+            .collect()
+    };
     {
         let backing = new_index.path_backing().to_owned();
         for e in new_index.entries_mut() {
@@ -472,6 +562,28 @@ fn reset_index_to_tree(
                 }
             }
         }
+    }
+
+    if intent_to_add {
+        let ita = ObjectId::empty_blob(repo.object_hash());
+        let mut added: HashSet<BString> = HashSet::new();
+        let backing = old.path_backing();
+        for e in old.entries() {
+            let path = e.path_in(backing).to_owned();
+            if !tree_paths.contains(&path) && added.insert(path.clone()) {
+                // EXTENDED must accompany INTENT_TO_ADD: the writer upgrades to index
+                // V3 and emits the extended-flags word only when EXTENDED is set —
+                // without it the i-t-a bit (>0xffff) is truncated away on write.
+                new_index.dangerously_push_entry(
+                    Stat::default(),
+                    ita,
+                    Flags::INTENT_TO_ADD | Flags::EXTENDED,
+                    Mode::FILE,
+                    BStr::new(&path),
+                );
+            }
+        }
+        new_index.sort_entries();
     }
 
     Ok(new_index)
@@ -821,11 +933,16 @@ fn blob_oid(
 /// stages) reset to the target tree's version, or dropped if absent from the tree.
 /// The worktree is untouched. A pathspec that matches nothing is not an error: git
 /// only validates the *leading* positional, and that happens during setup.
+///
+/// With `intent_to_add`, a matched path that the reset would drop (present in the old
+/// index but absent from the target tree) becomes an intent-to-add stub instead of
+/// vanishing, matching `update_index_from_diff()`'s `!is_in_reset_tree` branch.
 fn pathspec_index(
     repo: &gix::Repository,
     old: &gix::index::File,
     tree: ObjectId,
     paths: &[String],
+    intent_to_add: bool,
 ) -> Result<gix::index::File> {
     // Pathspecs are given relative to the CWD; index paths are repo-root relative.
     let prefix = repo
@@ -892,11 +1009,22 @@ fn pathspec_index(
         return Ok(index);
     }
 
-    // Drop every stage of each selected path, then re-add the tree version if any.
+    // Drop every stage of each selected path, then re-add the tree version if any;
+    // a `-N` path missing from the tree comes back as an intent-to-add stub instead.
     index.remove_entries(|_, path, _| ops.contains(&path.to_owned()));
+    let ita = ObjectId::empty_blob(repo.object_hash());
     for path in &ops {
         if let Some((stat, id, flags, mode)) = target_map.get(path) {
             index.dangerously_push_entry(*stat, *id, *flags, *mode, BStr::new(path));
+        } else if intent_to_add {
+            // EXTENDED must accompany INTENT_TO_ADD so the writer keeps the bit (V3).
+            index.dangerously_push_entry(
+                Stat::default(),
+                ita,
+                Flags::INTENT_TO_ADD | Flags::EXTENDED,
+                Mode::FILE,
+                BStr::new(path),
+            );
         }
     }
     index.sort_entries();

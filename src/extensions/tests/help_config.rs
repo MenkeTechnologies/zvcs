@@ -116,3 +116,53 @@ fn unsupported_man_viewer_is_rejected() {
 
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
+
+/// `git help --config` prints git's configuration-variable-name list: one name
+/// per line, ASCII-sorted and unique, then a blank line and the
+/// `'git help config' for more information` trailer, exit 0. The exact set is
+/// pinned to git 2.55.0 in [`CONFIG_VARS`], so this asserts the structure and a
+/// few stable anchors rather than a byte diff against whatever git the CI host
+/// carries (the variable set drifts across git versions; this shape does not).
+#[test]
+fn config_lists_variable_names() {
+    let (repo, home) = fixture("config");
+
+    let out = run(&repo, &home, &["help", "--config"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+
+    // Structure: <names>\n\n<trailer>\n.
+    let trailer = "\n\n'git help config' for more information\n";
+    assert!(stdout.ends_with(trailer), "missing trailer:\n{stdout}");
+    let names: Vec<&str> = stdout[..stdout.len() - trailer.len()].lines().collect();
+
+    // Sorted, unique, non-empty — matching git's `string_list_sort` output.
+    assert!(!names.is_empty());
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "names must be ASCII-sorted");
+    let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+    assert_eq!(unique.len(), names.len(), "names must be unique");
+
+    // Anchors that have existed for many git releases, including a wildcard and a
+    // placeholder form git emits verbatim.
+    for anchor in ["user.name", "core.editor", "alias.*", "branch.<name>.remote"] {
+        assert!(names.contains(&anchor), "expected {anchor:?} in list");
+    }
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// The short spelling `-c` is the same cmdmode as `--config` and produces the
+/// identical listing.
+#[test]
+fn config_short_flag_matches_long() {
+    let (repo, home) = fixture("config-short");
+
+    let long = run(&repo, &home, &["help", "--config"]);
+    let short = run(&repo, &home, &["help", "-c"]);
+    assert!(short.status.success());
+    assert_eq!(short.stdout, long.stdout, "-c must match --config byte-for-byte");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}

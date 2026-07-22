@@ -52,7 +52,13 @@
 //!   * `--dirstat[=<params>]`, `--dirstat-by-file[=<params>]`, `--cumulative`.
 //!   * `--summary`, `--check`.
 //!   * `-w`, `-b`, `--ignore-space-at-eol`, `--ignore-cr-at-eol`.
-//!   * `-R`, `--diff-filter=<letters>`, `-S<string>`, `-G<pattern>`, `--pickaxe-all`.
+//!   * `-R`, `--diff-filter=<letters>`, `-S<string>`, `-G<regex>`, `--pickaxe-all`,
+//!     `--pickaxe-regex`, `--find-object=<id>`. `-G`, `-I` and `-S --pickaxe-regex`
+//!     compile with `regex::bytes` (Unicode off, byte semantics) to mirror git's
+//!     `regcomp`; `--find-object` is `pickaxe_match()`'s objfind branch and, because
+//!     git never hashes the worktree side for objfind, matches on the staged blob id.
+//!   * `-O<orderfile>` reorders the queued pairs by the order file's glob patterns
+//!     (`diffcore_order`); `--output=<file>` writes every rendered byte to `<file>`.
 //!   * `-c`/`--cc` and the free combined diff `git diff-files -p` produces for a
 //!     conflict: `run_diff_files()` routes an unmerged path that kept both stage #2
 //!     and stage #3 through `show_combined_diff()`, so the patch is a `diff --cc`
@@ -69,10 +75,15 @@
 //!
 //! ### Not implemented (bailed on with a precise message, never faked)
 //!
-//!   * `-I<regex>`/`--ignore-matching-lines=<regex>` beyond an optionally anchored
-//!     literal, and `-G`/`-S --pickaxe-regex` likewise: no regex engine is vendored.
+//!   * `-I<regex>`/`--ignore-matching-lines=<regex>` together with a *patch* format:
+//!     the counts drop `-I`-only hunks, but the unified writer renders in one pass and
+//!     cannot suppress a hunk mid-stream, so `-p -I` bails rather than print a wrong
+//!     patch. `-I` with raw/stat output is fully supported.
 //!   * `--binary` for content that is actually binary (the `GIT binary patch`
 //!     literal/delta encoding is not produced).
+//!   * `-M`/`--find-renames` rename *pairing* (an intent-to-add worktree file matched
+//!     to a staged deletion): accepted as a no-op, so such a pair is still reported as
+//!     a separate `D`+`A` rather than a single `R`.
 
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -89,6 +100,7 @@ use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, InternedInput, Res
 use gix::hash::ObjectId;
 use gix::objs::tree::EntryKind;
 use gix::prelude::ObjectIdExt;
+use regex::bytes::Regex;
 
 // ---------------------------------------------------------------------------
 // output formats — mirrors DIFF_FORMAT_* in diff.h
@@ -162,64 +174,47 @@ enum Anchor {
     Skip(BString),
 }
 
-/// An optionally anchored literal, the subset of POSIX ERE reachable without a
-/// regex engine. `^foo`, `foo$`, `^foo$` and `foo` are all expressible.
-struct Pattern {
-    literal: Vec<u8>,
-    anchored_start: bool,
-    anchored_end: bool,
+/// A search pattern: a literal substring (git's kwset path for a plain `-S`) or a
+/// compiled regular expression (git's `-G`, `-I`, and `-S --pickaxe-regex`, all of
+/// which call `regcomp` with `REG_EXTENDED | REG_NEWLINE`).
+enum Needle {
+    Literal(Vec<u8>),
+    Regex(Regex),
 }
 
-impl Pattern {
-    /// `None` when `src` uses ERE syntax this cannot represent faithfully.
-    fn parse(src: &str) -> Option<Pattern> {
-        let mut body = src;
-        let anchored_start = body.starts_with('^');
-        if anchored_start {
-            body = &body[1..];
+impl Needle {
+    /// Whether `hay` contains a match — used by `-G` on each changed line and by `-I`.
+    fn is_match(&self, hay: &[u8]) -> bool {
+        match self {
+            Needle::Literal(n) => count_occurrences(hay, n) > 0,
+            Needle::Regex(re) => re.is_match(hay),
         }
-        // A trailing `$` is an anchor unless it was escaped.
-        let anchored_end = body.ends_with('$') && !body.ends_with("\\$");
-        if anchored_end {
-            body = &body[..body.len() - 1];
-        }
-        if body.bytes().any(is_ere_meta) {
-            return None;
-        }
-        Some(Pattern {
-            literal: body.as_bytes().to_vec(),
-            anchored_start,
-            anchored_end,
-        })
     }
 
-    /// `regexec()` semantics: an unanchored pattern searches anywhere in `line`.
-    /// The line terminator is not part of the subject.
-    fn matches(&self, line: &[u8]) -> bool {
-        let line = strip_terminator(line);
-        match (self.anchored_start, self.anchored_end) {
-            (true, true) => line == self.literal.as_slice(),
-            (true, false) => line.starts_with(&self.literal),
-            (false, true) => line.ends_with(&self.literal),
-            (false, false) => {
-                if self.literal.is_empty() {
-                    return true;
-                }
-                line.windows(self.literal.len()).any(|w| w == self.literal)
-            }
+    /// Non-overlapping match count — used by `-S` to compare the two sides.
+    fn count(&self, hay: &[u8]) -> usize {
+        match self {
+            Needle::Literal(n) => count_occurrences(hay, n),
+            Needle::Regex(re) => re.find_iter(hay).count(),
         }
     }
 }
 
-fn matches_any(pats: &[Pattern], line: &[u8]) -> bool {
-    pats.iter().any(|p| p.matches(line))
+/// Compile a `-G`/`-I`/`-S --pickaxe-regex` pattern the way git's `regcomp` does: on
+/// bytes, without Unicode mode so `.` and the character classes carry git's C-locale
+/// byte semantics, and with multi-line mode standing in for `REG_NEWLINE` since matching
+/// is done a line at a time. `Err` carries the engine's message for the fatal.
+fn compile_regex(pat: &[u8]) -> std::result::Result<Regex, String> {
+    let s = std::str::from_utf8(pat).map_err(|_| "invalid byte sequence in pattern".to_owned())?;
+    regex::bytes::RegexBuilder::new(s)
+        .unicode(false)
+        .multi_line(true)
+        .build()
+        .map_err(|e| e.to_string())
 }
 
-fn is_ere_meta(b: u8) -> bool {
-    matches!(
-        b,
-        b'.' | b'[' | b']' | b'(' | b')' | b'{' | b'}' | b'*' | b'+' | b'?' | b'|' | b'\\' | b'^' | b'$'
-    )
+fn matches_any(pats: &[Needle], line: &[u8]) -> bool {
+    pats.iter().any(|p| p.is_match(line))
 }
 
 fn strip_terminator(line: &[u8]) -> &[u8] {
@@ -230,10 +225,15 @@ fn strip_terminator(line: &[u8]) -> &[u8] {
     }
 }
 
-/// `-S<string>` counts occurrences; `-G<pattern>` looks at the changed lines.
+/// `-S<string>` counts occurrences; `-G<pattern>` looks at the changed lines;
+/// `--find-object=<id>` keeps a pair that touches one of the named object ids.
 enum PickaxeKind {
-    String(Vec<u8>),
-    Grep(Pattern),
+    /// `-S`: a literal count by default, a regex count under `--pickaxe-regex`.
+    Occurrences(Needle),
+    /// `-G`: a regex over the added and removed lines.
+    Grep(Needle),
+    /// `--find-object=<id>`: `pickaxe_match()`'s `DIFF_PICKAXE_KIND_OBJFIND` branch.
+    ObjFind(Vec<ObjectId>),
 }
 
 struct Pickaxe {
@@ -309,7 +309,7 @@ struct Opts {
     ctx: u32,
     ws: Whitespace,
     /// `-I<re>`: set with the whitespace family, this forces `diff_from_contents`.
-    ignore_lines: Vec<Pattern>,
+    ignore_lines: Vec<Needle>,
     /// The spelling of the first `-I`, for the bail when a patch is also asked for.
     ignore_flag: Option<String>,
     /// A flag that rewrites content output (forced color, word diff). Harmless
@@ -326,7 +326,19 @@ struct Opts {
     irreversible_delete: bool,
     reverse: bool,
     filter: Option<Filter>,
+    /// The finalized pickaxe, built after the whole line is read so `--pickaxe-regex`
+    /// and `--pickaxe-all` (which may follow the `-S`/`-G`) can fold in.
     pickaxe: Option<Pickaxe>,
+    /// The raw `-S`/`-G` argument, kept until the finalize pass: `b'S'` counts
+    /// occurrences, `b'G'` greps changed lines. Only the last one on the line wins.
+    pickaxe_pending: Option<(u8, Vec<u8>)>,
+    /// `--find-object=<id>` arguments, resolved against the odb after parsing so a bad
+    /// id is reported only once every earlier argument has validated (git's deferral).
+    find_object_args: Vec<String>,
+    /// `-O<file>`: reorder the queued pairs by the glob patterns in `<file>`.
+    order_file: Option<String>,
+    /// `--output=<file>`: write every rendered byte to `<file>` instead of stdout.
+    output_file: Option<String>,
     /// `--pickaxe-all`, which may appear before or after the `-S`/`-G` it modifies.
     pickaxe_all: bool,
     /// `--pickaxe-regex`: makes `-S` a regex search rather than a literal count.
@@ -481,6 +493,16 @@ enum Fatal {
     /// used together`, exit 128. `diff_setup_done()` dies when `-s` (NO_OUTPUT) is
     /// left set alongside a name/status/check format.
     NameStatusNoPatch,
+    /// `fatal: invalid regex: <msg>`, exit 128. git compiles the `-G`/`-S --pickaxe-regex`
+    /// pattern in `diffcore_pickaxe` setup, after argument validation; the message tail
+    /// is the `regex` crate's rather than the platform `regerror`'s.
+    InvalidRegexPickaxe(String),
+    /// `error: invalid regex given to -I: '<pat>'`, exit 129. `diff_opt_ignore_regex`
+    /// compiles inline, so this fires at the flag's own argv position.
+    InvalidRegexIgnore(String),
+    /// `error: unable to resolve '<arg>'`, exit 128. `diff_opt_find_object` fails to
+    /// resolve the `--find-object` argument to an object id.
+    UnableToResolve(String),
 }
 
 impl Fatal {
@@ -562,6 +584,16 @@ impl Fatal {
                     "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
                 );
             }
+            Fatal::InvalidRegexPickaxe(msg) => {
+                let _ = writeln!(err, "fatal: invalid regex: {msg}");
+            }
+            Fatal::InvalidRegexIgnore(pat) => {
+                let _ = writeln!(err, "error: invalid regex given to -I: '{pat}'");
+                return ExitCode::from(129);
+            }
+            Fatal::UnableToResolve(arg) => {
+                let _ = writeln!(err, "error: unable to resolve '{arg}'");
+            }
         }
         ExitCode::from(128)
     }
@@ -572,7 +604,9 @@ const PORTED: &str = "--raw, --name-only, --name-status, -z, --abbrev[=<n>], --n
                       -p/-u/--patch, -U<n>, --stat[=<w>], --numstat, --shortstat, \
                       --compact-summary, --dirstat[=<p>], --dirstat-by-file, --cumulative, \
                       --summary, --check, -w, -b, --ignore-space-at-eol, --ignore-cr-at-eol, \
-                      -R, --diff-filter=<f>, -S<s>, -G<p>, -0/-1/-2/-3, --base/--ours/--theirs, \
+                      -R, --diff-filter=<f>, -S<s>, -G<re>, --pickaxe-regex, --pickaxe-all, \
+                      --find-object=<id>, -O<file>, --output=<file>, \
+                      -0/-1/-2/-3, --base/--ours/--theirs, \
                       --exit-code, --quiet, -s/--no-patch, -q, --no-renames, --full-index, \
                       --line-prefix=<s>, --rotate-to=<p>, --skip-to=<p>, --relative[=<p>], \
                       --ignore-submodules[=<when>]";
@@ -644,6 +678,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         reverse: false,
         filter: None,
         pickaxe: None,
+        pickaxe_pending: None,
+        find_object_args: Vec::new(),
+        order_file: None,
+        output_file: None,
         pickaxe_all: false,
         pickaxe_regex: false,
         stat: StatWidths::default(),
@@ -755,25 +793,45 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         opts.dense_combined = true;
     }
 
-    // `--pickaxe-all` / `--pickaxe-regex` may appear on either side of the `-S`
-    // they modify, so they are folded in once the whole line has been read.
-    let pickaxe_all = opts.pickaxe_all;
-    let pickaxe_regex = opts.pickaxe_regex;
-    if let Some(px) = opts.pickaxe.as_mut() {
-        px.all = pickaxe_all;
-        // `-S<re> --pickaxe-regex` still counts occurrences, it just counts regex
-        // matches. A metacharacter-free, unanchored pattern counts identically to
-        // the literal search already implemented; anything else needs a real engine.
-        if pickaxe_regex {
-            if let PickaxeKind::String(s) = &px.kind {
-                let src = String::from_utf8_lossy(s).into_owned();
-                let plain = Pattern::parse(&src)
-                    .is_some_and(|p| !p.anchored_start && !p.anchored_end && !p.literal.is_empty());
-                if !plain {
-                    return Ok(Parsed::Unsupported("--pickaxe-regex".to_owned()));
-                }
+    // `--pickaxe-all` / `--pickaxe-regex` may appear on either side of the `-S`/`-G`
+    // they modify, so the pickaxe is finalized once the whole line has been read.
+    // `-G` is always a regex; `-S` is a literal kwset search unless `--pickaxe-regex`
+    // promotes it. git compiles the regex in `diffcore_pickaxe` setup, after argument
+    // validation, so a bad pattern is `fatal: invalid regex` (128) only once every
+    // earlier argument has passed.
+    if let Some((kind, raw)) = opts.pickaxe_pending.take() {
+        let needle = if kind == b'S' && !opts.pickaxe_regex {
+            Needle::Literal(raw)
+        } else {
+            match compile_regex(&raw) {
+                Ok(re) => Needle::Regex(re),
+                Err(msg) => return Err(Fatal::InvalidRegexPickaxe(msg)),
+            }
+        };
+        opts.pickaxe = Some(Pickaxe {
+            kind: if kind == b'S' {
+                PickaxeKind::Occurrences(needle)
+            } else {
+                PickaxeKind::Grep(needle)
+            },
+            all: opts.pickaxe_all,
+        });
+    }
+    // `--find-object` is `DIFF_PICKAXE_KIND_OBJFIND`, which takes precedence over
+    // `-S`/`-G` in `pickaxe_match()`, so it overwrites any pending occurrence/grep
+    // pickaxe. Each argument is resolved to an object id (git's `repo_get_oid`).
+    if !opts.find_object_args.is_empty() {
+        let mut ids = Vec::with_capacity(opts.find_object_args.len());
+        for arg in std::mem::take(&mut opts.find_object_args) {
+            match repo.rev_parse_single(arg.as_str()) {
+                Ok(id) => ids.push(id.detach()),
+                Err(_) => return Err(Fatal::UnableToResolve(arg)),
             }
         }
+        opts.pickaxe = Some(Pickaxe {
+            kind: PickaxeKind::ObjFind(ids),
+            all: opts.pickaxe_all,
+        });
     }
 
     // Forced color and word-diff rewrite every content line but leave a raw
@@ -869,11 +927,12 @@ const ACCEPTED_NOOP_VALUED: &[&str] = &[
     "--find-renames=",
 ];
 
-/// Real git flags whose effect on the output we do not produce.
-const KNOWN_UNSUPPORTED: &[&str] = &["--find-object"];
+/// Real git flags whose effect on the output we do not produce. `--find-object`,
+/// `-O` and `--output=` were formerly here and are now implemented.
+const KNOWN_UNSUPPORTED: &[&str] = &[];
 
 /// Prefixes of real git flags in the same category as [`KNOWN_UNSUPPORTED`].
-const KNOWN_UNSUPPORTED_VALUED: &[&str] = &["--find-object=", "-O", "--output="];
+const KNOWN_UNSUPPORTED_VALUED: &[&str] = &[];
 
 fn classify(s: &str, opts: &mut Opts, quiet: &mut bool) -> Result<Flag, Fatal> {
     match s {
@@ -1132,23 +1191,30 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
         return record_ignore_lines(s, v, opts);
     }
     if let Some(v) = s.strip_prefix("-S") {
-        opts.pickaxe = Some(Pickaxe {
-            kind: PickaxeKind::String(v.as_bytes().to_vec()),
-            all: false,
-        });
+        // Finalized after the line is read, since `--pickaxe-regex` may still follow.
+        opts.pickaxe_pending = Some((b'S', v.as_bytes().to_vec()));
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("-G") {
-        return match Pattern::parse(v) {
-            Some(p) => {
-                opts.pickaxe = Some(Pickaxe {
-                    kind: PickaxeKind::Grep(p),
-                    all: false,
-                });
-                Ok(Flag::Handled)
-            }
-            None => Ok(Flag::Unsupported),
-        };
+        // `-G` is always a regex; it is compiled in the finalize pass so a bad pattern
+        // is reported after every earlier argument, as git's `diffcore_pickaxe` does.
+        opts.pickaxe_pending = Some((b'G', v.as_bytes().to_vec()));
+        return Ok(Flag::Handled);
+    }
+    if let Some(v) = s.strip_prefix("--find-object=") {
+        opts.find_object_args.push(v.to_owned());
+        return Ok(Flag::Handled);
+    }
+    if let Some(v) = s.strip_prefix("-O") {
+        if v.is_empty() {
+            return Err(Fatal::MissingArgument("-O"));
+        }
+        opts.order_file = Some(v.to_owned());
+        return Ok(Flag::Handled);
+    }
+    if let Some(v) = s.strip_prefix("--output=") {
+        opts.output_file = Some(v.to_owned());
+        return Ok(Flag::Handled);
     }
     // `-B<n>`, `-M<n>`, `-C<n>`: the score is irrelevant without renames.
     if let Some(v) = s.strip_prefix("-C") {
@@ -1208,15 +1274,17 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
 
 /// Record one `-I<re>` / `--ignore-matching-lines=<re>`.
 fn record_ignore_lines(flag: &str, value: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
-    match Pattern::parse(value) {
-        Some(p) => {
-            opts.ignore_lines.push(p);
+    // `diff_opt_ignore_regex` compiles inline, so a bad pattern is git's
+    // `error: invalid regex given to -I: '<pat>'` (exit 129) at this argv position.
+    match compile_regex(value.as_bytes()) {
+        Ok(re) => {
+            opts.ignore_lines.push(Needle::Regex(re));
             if opts.ignore_flag.is_none() {
                 opts.ignore_flag = Some(flag.to_owned());
             }
             Ok(Flag::Handled)
         }
-        None => Ok(Flag::Unsupported),
+        Err(_) => Err(Fatal::InvalidRegexIgnore(value.to_owned())),
     }
 }
 
@@ -1414,6 +1482,16 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
     combined.sort_by(|a, b| a.path.cmp(&b.path));
 
+    // `-O<file>` (`diffcore_order`): stably reorder the queue so pairs whose path
+    // matches an earlier pattern in the order file come first. This runs on the
+    // repository-root relative path, before `--relative` strips anything and before
+    // `--rotate-to`/`--skip-to` re-anchor, matching git's `diff_flush` order.
+    if let Some(of) = &opts.order_file {
+        let order = read_order_file(of);
+        deltas.sort_by_cached_key(|d| match_order(&order, d.path.as_slice()));
+        combined.sort_by_cached_key(|c| match_order(&order, c.path.as_slice()));
+    }
+
     if opts.reverse {
         for d in &mut deltas {
             reverse_delta(d);
@@ -1441,10 +1519,15 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     apply_relative_combined(repo, &mut combined, &opts.relative)?;
 
     // Content is needed by every non-raw format, by the whitespace family's
-    // pruning, and by the pickaxe.
+    // pruning, and by the `-S`/`-G` pickaxe. `--find-object` reads only the recorded
+    // object ids (git's objfind never populates a filespec), so it needs no content.
+    let pickaxe_needs_content = matches!(
+        opts.pickaxe.as_ref().map(|p| &p.kind),
+        Some(PickaxeKind::Occurrences(_) | PickaxeKind::Grep(_))
+    );
     let want_content = opts.fmt & (F_CONTENT | F_CHECKDIFF) != 0
         || opts.diff_from_contents()
-        || opts.pickaxe.is_some()
+        || pickaxe_needs_content
         || opts.find_copies;
     // `-G` inspects the added/removed lines, so it needs the rendered hunks even
     // when the requested output format is raw.
@@ -1605,9 +1688,16 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     }
     out.extend_from_slice(&rest);
 
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all(&out)?;
-    stdout.flush()?;
+    // `--output=<file>` points git's output `FILE*` at a file; every rendered byte
+    // goes there instead of stdout, while the exit status is still computed below.
+    match &opts.output_file {
+        Some(path) => std::fs::write(path, &out)?,
+        None => {
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(&out)?;
+            stdout.flush()?;
+        }
+    }
 
     // `diff_result_code()`: bit 0 is `--exit-code`, bit 1 is `--check`.
     let mut code = 0u8;
@@ -1753,48 +1843,50 @@ fn apply_pickaxe(px: &Pickaxe, deltas: &mut Vec<Delta>, analyses: &mut Vec<Analy
     retain_by(deltas, analyses, &keep);
 }
 
-/// `has_changes()` for `-S` and `diff_grep()` for `-G`.
+/// `has_changes()` for `-S`, `diff_grep()` for `-G`, and `pickaxe_match()`'s objfind
+/// branch for `--find-object`.
 fn pickaxe_hit(px: &Pickaxe, d: &Delta, an: &Analysis) -> bool {
+    // `DIFF_PICKAXE_KIND_OBJFIND`: a pair matches when either valid side's recorded
+    // object id is in the set. The worktree side's id is left null at this stage (git
+    // never hashes it for objfind), so in practice only the staged side can match.
+    if let PickaxeKind::ObjFind(ids) = &px.kind {
+        return (d.old_valid() && ids.contains(&d.src_id)) || (d.new_valid() && ids.contains(&d.dst_id));
+    }
     if !d.old_valid() && !d.new_valid() {
         return false;
     }
     match &px.kind {
-        PickaxeKind::String(needle) => {
-            if needle.is_empty() {
-                return false;
+        PickaxeKind::Occurrences(needle) => {
+            if let Needle::Literal(n) = needle {
+                if n.is_empty() {
+                    return false;
+                }
             }
-            let old = if d.old_valid() {
-                count_occurrences(&an.old_data, needle)
-            } else {
-                0
-            };
-            let new = if d.new_valid() {
-                count_occurrences(&an.new_data, needle)
-            } else {
-                0
-            };
+            let old = if d.old_valid() { needle.count(&an.old_data) } else { 0 };
+            let new = if d.new_valid() { needle.count(&an.new_data) } else { 0 };
             match (d.old_valid(), d.new_valid()) {
                 (false, true) => new != 0,
                 (true, false) => old != 0,
                 _ => old != new,
             }
         }
-        PickaxeKind::Grep(pat) => {
-            // With one side missing, git matches the whole surviving blob;
-            // otherwise only the added and removed lines are examined.
+        PickaxeKind::Grep(needle) => {
+            // With one side missing, git greps the whole surviving blob; otherwise
+            // only the added and removed lines are examined.
             if !d.old_valid() {
-                return byte_lines(&an.new_data).iter().any(|l| pat.matches(l));
+                return needle.is_match(&an.new_data);
             }
             if !d.new_valid() {
-                return byte_lines(&an.old_data).iter().any(|l| pat.matches(l));
+                return needle.is_match(&an.old_data);
             }
             match &an.hunks {
                 None => false,
                 Some(h) => byte_lines(h).iter().any(|l| {
-                    matches!(l.first().copied(), Some(b'+') | Some(b'-')) && pat.matches(&l[1..])
+                    matches!(l.first().copied(), Some(b'+') | Some(b'-')) && needle.is_match(&l[1..])
                 }),
             }
         }
+        PickaxeKind::ObjFind(_) => unreachable!("objfind handled above"),
     }
 }
 
@@ -1813,6 +1905,42 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> usize {
         }
     }
     n
+}
+
+/// `prepare_order()`: read the order file into a list of glob patterns. Blank lines
+/// and lines beginning with `#` are skipped; a leading `\#` is an escaped literal `#`.
+/// git silently proceeds with no patterns when the file cannot be read.
+fn read_order_file(path: &str) -> Vec<Vec<u8>> {
+    let data = std::fs::read(path).unwrap_or_default();
+    let mut order = Vec::new();
+    for line in data.split(|&b| b == b'\n') {
+        if line.is_empty() || line[0] == b'#' {
+            continue;
+        }
+        let pat = if line.starts_with(b"\\#") { &line[1..] } else { line };
+        order.push(pat.to_vec());
+    }
+    order
+}
+
+/// `match_order()`: the index of the first order-file pattern that matches `path`,
+/// or `order.len()` when none does. git matches the full path, then repeatedly strips
+/// the trailing `/component` and retries so a pattern can name a parent directory.
+fn match_order(order: &[Vec<u8>], path: &[u8]) -> usize {
+    use gix::glob::wildmatch::Mode;
+    for (i, pat) in order.iter().enumerate() {
+        let mut p = path;
+        loop {
+            if gix::glob::wildmatch(pat.as_bstr(), p.as_bstr(), Mode::empty()) {
+                return i;
+            }
+            match p.iter().rposition(|&b| b == b'/') {
+                Some(idx) => p = &p[..idx],
+                None => break,
+            }
+        }
+    }
+    order.len()
 }
 
 /// Emit `prefix` at the start of every line of `body`.

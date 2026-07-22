@@ -15,7 +15,7 @@
 //! where they would have changed the bytes on stdout.
 
 use anyhow::{anyhow, bail, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
@@ -297,6 +297,13 @@ pub fn annotate(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // `-p`/`--porcelain` and `--line-porcelain` render the machine format from
+    // the same blame outcome (`builtin/blame.c:emit_porcelain`), so they branch
+    // here rather than falling through to the compat renderer below.
+    if opts.porcelain || opts.line_porcelain {
+        return render_porcelain(&repo, &outcome, &rel_path, opts.line_porcelain, show_root);
+    }
+
     // Per-commit metadata (author display + date + boundary flag + hex), cached.
     struct CommitInfo {
         author: Vec<u8>,
@@ -452,14 +459,15 @@ impl Options {
     /// dressed as a right one.
     fn unimplementable(&self) -> Option<&'static str> {
         if self.incremental {
+            // `found_guilty_entry()` streams entries in the order the walk
+            // finds them guilty — a per-commit clustering that has nothing to do
+            // with the line-sorted `Outcome` gix-blame exposes. Reproducing that
+            // order needs the walk's internals, which are not surfaced.
             return Some("--incremental output");
         }
-        if self.line_porcelain {
-            return Some("--line-porcelain output");
-        }
-        if self.porcelain {
-            return Some("--porcelain output");
-        }
+        // `-p`/`--porcelain` and `--line-porcelain` are rendered in
+        // `render_porcelain()` from the same `Outcome`, so they are *not*
+        // refused here.
         if self.show_stats {
             // git prints its own walk counters (`num read blob` / `num get
             // patch` / `num commits`); gix-blame's `Statistics` counts
@@ -1014,6 +1022,232 @@ fn auto_abbrev(repo: &gix::Repository, hexsz: usize) -> usize {
 fn pad_left(buf: &mut Vec<u8>, field: &[u8], width: usize) {
     buf.resize(buf.len() + width.saturating_sub(field.len()), b' ');
     buf.extend_from_slice(field);
+}
+
+/// Render the blame `outcome` in git's porcelain (`-p`/`--porcelain`) or
+/// line-porcelain (`--line-porcelain`) format, porting `builtin/blame.c`'s
+/// `emit_porcelain` / `emit_one_suspect_detail` / `write_filename_info`.
+///
+/// Each hunk starts with a group header `<40-hex> <src-line> <dst-line>
+/// <num-lines>`; every subsequent line of the hunk gets the shorter
+/// `<40-hex> <src-line> <dst-line>` header. The commit-detail block
+/// (`author`/`author-mail`/`author-time`/`author-tz`, the four `committer-*`
+/// lines, `summary`, an optional `boundary`, an optional `previous`, and
+/// `filename`) is written the first time a commit is seen in plain porcelain,
+/// and before *every* line in line-porcelain (git's `repeat` flag). The object
+/// name is always the full hash here — porcelain ignores `--abbrev`/`-l`.
+///
+/// A file whose blame followed a rename (any entry carries a
+/// `source_file_name`) is refused: the faithful `previous <oid> <path>` line
+/// needs `find_rename`'s parent-path resolution, which gix-blame does not
+/// expose. This mirrors `-M`/`-C` being deferred.
+fn render_porcelain(
+    repo: &gix::Repository,
+    outcome: &gix::blame::Outcome,
+    rel_path: &str,
+    line_porcelain: bool,
+    show_root: bool,
+) -> Result<ExitCode> {
+    if outcome.entries.iter().any(|e| e.source_file_name.is_some()) {
+        bail!("annotate: porcelain output across a rename is not yet ported");
+    }
+
+    let quoted_path = quote_path(rel_path.as_bytes());
+
+    // Precomputed, per-commit `emit_porcelain_details` output: the detail block
+    // and the `filename`/`previous` block that follows it.
+    let mut cache: HashMap<ObjectId, PorcelainInfo> = HashMap::new();
+    // git's METAINFO_SHOWN flag: in plain porcelain the detail block is emitted
+    // only the first time each commit appears.
+    let mut shown: HashSet<ObjectId> = HashSet::new();
+
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
+    for (entry, tokens) in outcome.entries_with_lines() {
+        let id = entry.commit_id;
+        if !cache.contains_key(&id) {
+            let info = build_porcelain_info(repo, id, rel_path, &quoted_path, show_root)?;
+            cache.insert(id, info);
+        }
+        let info = &cache[&id];
+
+        let hex = id.to_hex().to_string();
+        let s0 = entry.start_in_source_file; // 0-based source line
+        let d0 = entry.start_in_blamed_file; // 0-based result line
+        let n = entry.len.get();
+
+        for (cnt, token) in tokens.into_iter().enumerate() {
+            let cnt = cnt as u32;
+            if cnt == 0 {
+                writeln!(out, "{hex} {} {} {}", s0 + 1, d0 + 1, n)?;
+            } else {
+                writeln!(out, "{hex} {} {}", s0 + 1 + cnt, d0 + 1 + cnt)?;
+            }
+            // Plain porcelain: details on the first sighting of the commit only.
+            // Line-porcelain (`repeat`): details before every line.
+            if line_porcelain || (cnt == 0 && !shown.contains(&id)) {
+                out.write_all(&info.details)?;
+                out.write_all(&info.filename_block)?;
+                shown.insert(id);
+            }
+            // `\t` then the line, always newline-terminated (git appends one for
+            // a final line that lacks its own terminator).
+            let mut content = token.to_vec();
+            if content.last() == Some(&b'\n') {
+                content.pop();
+            }
+            out.write_all(b"\t")?;
+            out.write_all(&content)?;
+            out.write_all(b"\n")?;
+        }
+    }
+
+    out.flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Build the porcelain detail block and filename block for one commit, porting
+/// `get_commit_info` + `emit_one_suspect_detail` + `write_filename_info`.
+fn build_porcelain_info(
+    repo: &gix::Repository,
+    id: ObjectId,
+    rel_path: &str,
+    quoted_path: &str,
+    show_root: bool,
+) -> Result<PorcelainInfo> {
+    let commit = repo.find_commit(id)?;
+    let author = commit.author()?;
+    let committer = commit.committer()?;
+
+    // git prints the raw seconds and the literal `[+-]HHMM` zone; the RAW form
+    // is exactly `"<seconds> <tz>"`.
+    let a_raw = author
+        .time()
+        .map(|t| t.format_or_unix(gix::date::time::format::RAW))
+        .unwrap_or_else(|_| author.time.to_string());
+    let c_raw = committer
+        .time()
+        .map(|t| t.format_or_unix(gix::date::time::format::RAW))
+        .unwrap_or_else(|_| committer.time.to_string());
+    let (a_time, a_tz) = split_raw_time(&a_raw);
+    let (c_time, c_tz) = split_raw_time(&c_raw);
+
+    // `summary` is the first line of the message body verbatim; git substitutes
+    // `(<oid>)` for an empty subject.
+    let body = commit.message_raw_sloppy().to_vec();
+    let subject: &[u8] = match body.iter().position(|&b| b == b'\n') {
+        Some(i) => &body[..i],
+        None => &body,
+    };
+
+    let mut details: Vec<u8> = Vec::with_capacity(256);
+    details.extend_from_slice(b"author ");
+    details.extend_from_slice(&author.name.to_vec());
+    details.extend_from_slice(b"\nauthor-mail <");
+    details.extend_from_slice(&author.email.to_vec());
+    details.extend_from_slice(b">\n");
+    writeln!(details, "author-time {a_time}")?;
+    writeln!(details, "author-tz {a_tz}")?;
+    details.extend_from_slice(b"committer ");
+    details.extend_from_slice(&committer.name.to_vec());
+    details.extend_from_slice(b"\ncommitter-mail <");
+    details.extend_from_slice(&committer.email.to_vec());
+    details.extend_from_slice(b">\n");
+    writeln!(details, "committer-time {c_time}")?;
+    writeln!(details, "committer-tz {c_tz}")?;
+    details.extend_from_slice(b"summary ");
+    if subject.is_empty() {
+        write!(details, "({})", id.to_hex())?;
+    } else {
+        details.extend_from_slice(subject);
+    }
+    details.push(b'\n');
+    // Only root commits are UNINTERESTING here; `--root` clears the flag.
+    if !show_root && commit.parent_ids().next().is_none() {
+        details.extend_from_slice(b"boundary\n");
+    }
+
+    // `previous <parent-oid> <path>`: the first parent (in scapegoat/parent
+    // order) that still contains the file. Absent when no parent has it (the
+    // file was introduced here, or this is a root commit).
+    let mut filename_block: Vec<u8> = Vec::with_capacity(quoted_path.len() + 16);
+    let mut previous: Option<ObjectId> = None;
+    for parent in commit.parent_ids() {
+        let pid = parent.detach();
+        let present = repo
+            .find_commit(pid)
+            .ok()
+            .and_then(|c| c.tree().ok())
+            .and_then(|t| t.lookup_entry_by_path(rel_path).ok().flatten())
+            .is_some();
+        if present {
+            previous = Some(pid);
+            break;
+        }
+    }
+    if let Some(pid) = previous {
+        write!(filename_block, "previous {} ", pid.to_hex())?;
+        filename_block.extend_from_slice(quoted_path.as_bytes());
+        filename_block.push(b'\n');
+    }
+    filename_block.extend_from_slice(b"filename ");
+    filename_block.extend_from_slice(quoted_path.as_bytes());
+    filename_block.push(b'\n');
+
+    Ok(PorcelainInfo {
+        details,
+        filename_block,
+    })
+}
+
+/// The per-commit porcelain blocks, returned by [`build_porcelain_info`].
+struct PorcelainInfo {
+    details: Vec<u8>,
+    filename_block: Vec<u8>,
+}
+
+/// Split gix's RAW time rendering (`"<seconds> <[+-]HHMM>"`) into git's
+/// `*-time` and `*-tz` fields.
+fn split_raw_time(raw: &str) -> (String, String) {
+    match raw.split_once(' ') {
+        Some((secs, tz)) => (secs.to_string(), tz.to_string()),
+        None => (raw.to_string(), "+0000".to_string()),
+    }
+}
+
+/// C-style path quoting matching `write_name_quoted` under the default
+/// `core.quotePath=true`: printable ASCII is emitted verbatim, otherwise the
+/// name is wrapped in double quotes with the usual escapes and octal escapes
+/// for control and high bytes.
+fn quote_path(bytes: &[u8]) -> String {
+    let needs = bytes
+        .iter()
+        .any(|&b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || b >= 0x80);
+    if !needs {
+        // All bytes are printable ASCII here, so this is lossless.
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut out = String::from("\"");
+    for &b in bytes {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x09 => out.push_str("\\t"),
+            0x0a => out.push_str("\\n"),
+            0x0b => out.push_str("\\v"),
+            0x0c => out.push_str("\\f"),
+            0x0d => out.push_str("\\r"),
+            b if b < 0x20 || b == 0x7f || b >= 0x80 => {
+                out.push_str(&format!("\\{b:03o}"));
+            }
+            b => out.push(b as char),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Turn a CWD-relative user path into a repo-root-relative path, so annotate

@@ -63,8 +63,11 @@ struct Opts {
     object_only: bool, // --object-only: print the object id alone
     abbrev: Abbrev,   // --abbrev[=N] / --no-abbrev
     format: Option<String>, // --format=<fmt>: custom per-entry template
-    paths: Vec<String>, // path filters (empty = whole tree)
+    paths: Vec<String>, // path filters (empty = whole tree); may carry a trailing '/'
     match_all: bool,  // an empty pathspec (e.g. `:` or `:(top)`) was given: selects everything
+    // When `Some("dir/")`, displayed paths are rendered relative to this prefix
+    // (git's `chomp_prefix` + `ls_tree_prefix`); `None` prints root-relative names.
+    strip_prefix: Option<String>,
 }
 
 /// Fatal usage error: `git` prints the message, a blank line, then the usage
@@ -100,6 +103,12 @@ fn fatal(msg: &str) -> ExitCode {
 /// fails to resolve or does not peel to a tree is a fatal (128) error, matching
 /// git's `Not a valid object name` / `not a tree object`.
 ///
+/// Run from a subdirectory, the listing is scoped to that directory's subtree
+/// and paths print relative to it (git's `prefix`/`chomp_prefix`), unless
+/// `--full-name` (full paths, same scope) or `--full-tree` (whole tree, full
+/// paths) is given. Operands are likewise taken relative to the current
+/// directory.
+///
 /// Not honoured: pathspec magic (`:(glob)` and friends) — that would silently
 /// select a different entry set than git, so it is rejected outright.
 pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
@@ -115,6 +124,7 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         format: None,
         paths: Vec::new(),
         match_all: false,
+        strip_prefix: None,
     };
 
     // The active `OPT_CMDMODE` value plus the spelling the user typed, which is
@@ -123,6 +133,10 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
     let mut treeish: Option<&str> = None;
     let mut positionals: Vec<&str> = Vec::new();
     let mut no_more_opts = false;
+    // git's `chomp_prefix = 0` (display full paths) and `full_tree` (widen the
+    // scope back to the whole tree, implying --full-name).
+    let mut full_name = false;
+    let mut full_tree = false;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -149,9 +163,13 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
                             return Ok(code);
                         }
                     }
-                    "full-name" | "full-tree" | "no-full-name" | "no-full-tree" => {
-                        // Output here is always root-relative already.
-                    }
+                    // `--full-name` clears git's `chomp_prefix` so paths print
+                    // root-relative; `--full-tree` also drops the cwd prefix,
+                    // widening the listing to the whole tree (implies --full-name).
+                    "full-name" => full_name = true,
+                    "no-full-name" => full_name = false,
+                    "full-tree" => full_tree = true,
+                    "no-full-tree" => full_tree = false,
                     "abbrev" => {
                         opts.abbrev = match inline {
                             None => Abbrev::Auto,
@@ -227,28 +245,79 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     };
 
+    let repo = gix::discover(".")?;
+
+    // git's `prefix` from setup_git_directory(): the path from the worktree root
+    // down to the current directory, carrying a trailing '/' (empty at the root).
+    // `--full-tree` drops it, so the whole tree is listed from the root.
+    let mut cwd_prefix = repo
+        .prefix()
+        .ok()
+        .flatten()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("{s}/"))
+        .unwrap_or_default();
+    if full_tree {
+        cwd_prefix.clear();
+    }
+
+    // git's `chomp_prefix`: display paths relative to the cwd prefix unless
+    // `--full-name`/`--full-tree` asked for full (root-relative) names.
+    opts.strip_prefix = if !full_name && !cwd_prefix.is_empty() {
+        Some(cwd_prefix.clone())
+    } else {
+        None
+    };
+
+    // git: "-d -r should imply -t, but -d by itself should not have to."
+    if opts.dirs_only && opts.recurse {
+        opts.show_trees = true;
+    }
+
     // Path filters. A `:`-prefixed operand carries pathspec magic: git's
     // ls-tree accepts only `top` (`:/`) and `literal`, rejecting every other
     // magic with a fatal (128) diagnostic. Parse it the way git does, then
-    // treat the magic-stripped remainder as an ordinary filter. One trailing
-    // '/' is stripped; an empty remainder (`:`, `:(top)`) matches everything.
+    // treat the magic-stripped remainder as an ordinary filter. Trailing '/' is
+    // significant (a directory filter `dir/` lists the directory's contents,
+    // while `dir` lists the directory entry itself); an empty remainder anchored
+    // at the root (`:/`, `:(top)`, or a bare `:` at the repo root) matches
+    // everything.
+    //
+    // Operands are interpreted relative to the cwd prefix (git's
+    // PATHSPEC_PREFER_CWD): each is prepended with `cwd_prefix`, except a
+    // `top`-magic operand, which is anchored at the root. With no operands and a
+    // non-empty prefix, the prefix itself becomes the sole pathspec — this is
+    // what limits a bare `git ls-tree` to the current directory's subtree.
     for p in &positionals {
-        let cleaned = if p.starts_with(':') {
+        let (cleaned, from_top) = if p.starts_with(':') {
             match parse_pathspec_magic(p) {
-                Ok(path) => path,
+                Ok(parsed) => parsed,
                 Err(code) => return Ok(code),
             }
         } else {
-            (*p).to_string()
+            ((*p).to_string(), false)
         };
-        if cleaned.is_empty() {
-            opts.match_all = true;
+        if from_top || cwd_prefix.is_empty() {
+            // Anchored at the root: an empty path (`:`, `:/`, `:(top)`) matches
+            // everything, otherwise the path is taken as-is (root-relative).
+            if cleaned.is_empty() {
+                opts.match_all = true;
+            } else {
+                opts.paths.push(cleaned);
+            }
+        } else if cleaned.is_empty() {
+            // Empty, cwd-relative (`:` with a prefix): git resolves it to the
+            // prefix itself, scoping the listing to the current directory.
+            opts.paths.push(cwd_prefix.clone());
         } else {
-            opts.paths.push(cleaned.trim_end_matches('/').to_string());
+            opts.paths.push(format!("{cwd_prefix}{cleaned}"));
         }
     }
+    if positionals.is_empty() && !cwd_prefix.is_empty() {
+        opts.paths.push(cwd_prefix.clone());
+    }
 
-    let repo = gix::discover(".")?;
     let Ok(id) = repo.rev_parse_single(spec) else {
         return Ok(fatal(&format!("Not a valid object name {spec}")));
     };
@@ -332,8 +401,10 @@ const MAGIC_TABLE: &[(&str, char, u32)] = &[
 const MAGIC_SUPPORTED: u32 = M_TOP | M_LITERAL;
 
 /// Parse the pathspec magic on a `:`-prefixed operand exactly as stock
-/// `git ls-tree` does, returning the magic-stripped path on success or a fatal
-/// (128) `ExitCode` carrying git's verbatim diagnostic on rejected magic.
+/// `git ls-tree` does, returning the magic-stripped path plus whether `top`
+/// magic was present (which anchors the path at the root rather than the cwd),
+/// or a fatal (128) `ExitCode` carrying git's verbatim diagnostic on rejected
+/// magic.
 ///
 /// Handles both spellings: long form `:(name,name,...)path` and the short
 /// mnemonic form `:/`, `:!`, `:^`, `::`. Rejections match git byte-for-byte:
@@ -341,7 +412,7 @@ const MAGIC_SUPPORTED: u32 = M_TOP | M_LITERAL;
 ///   * missing `)`        -> `Missing ')' at the end of pathspec magic in '<elt>'`
 ///   * `literal`+`glob`   -> `<elt>: 'literal' and 'glob' are incompatible`
 ///   * any other magic    -> `<elt>: pathspec magic not supported by this command: <list>`
-fn parse_pathspec_magic(elt: &str) -> std::result::Result<String, ExitCode> {
+fn parse_pathspec_magic(elt: &str) -> std::result::Result<(String, bool), ExitCode> {
     let after = &elt[1..]; // strip the leading ':'
     let mut magic: u32 = 0;
     let path: String;
@@ -424,7 +495,7 @@ fn parse_pathspec_magic(elt: &str) -> std::result::Result<String, ExitCode> {
         )));
     }
 
-    Ok(path)
+    Ok((path, magic & M_TOP != 0))
 }
 
 /// Recursively render `tree` (rooted at `prefix`, e.g. `"dir/"`) into `out`.
@@ -448,13 +519,18 @@ fn walk(
         let name = format!("{prefix}{filename}");
 
         if mode.is_tree() {
-            // A tree line is emitted when: -d (trees only), or we're not
-            // recursing (so trees are the leaves shown), or -t while recursing.
-            let emit = opts.dirs_only || !opts.recurse || opts.show_trees;
-            if emit && path_selects(&name, opts) {
+            // git's show_tree_common: a matched tree is recursed into when
+            // `show_recursive` (== should_descend) holds, and its own line is
+            // suppressed while recursing unless `-t` (LS_SHOW_TREES) is set.
+            // The entry is "interesting" — and therefore a candidate to print —
+            // when it matches a pathspec directly or is an ancestor of one (so
+            // ancestor trees still appear under `-t`, matching git).
+            let recurse = should_descend(&name, opts);
+            let interesting = path_selects(&name, opts) || is_ancestor_of_spec(&name, opts);
+            if interesting && (!recurse || opts.show_trees) {
                 write_entry(repo, out, mode, &oid, &name, opts)?;
             }
-            if should_descend(&name, opts) {
+            if recurse {
                 let child = repo.find_object(oid)?.peel_to_tree()?;
                 walk(repo, child, &format!("{name}/"), opts, out)?;
             }
@@ -467,28 +543,36 @@ fn walk(
 
 /// Whether `name` is selected by the path filters (empty filters select all).
 ///
-/// A filter `p` selects `name` when it names the entry exactly (`name == p`) or
-/// when the entry lives inside the directory `p` (`name` starts with `p/`).
+/// A filter `p` selects `name` when it names the entry exactly or when the entry
+/// lives inside the directory `p`. A trailing '/' on the filter is ignored for
+/// this test (`dir` and `dir/` both select `dir` and everything under it); the
+/// distinction between the two only affects whether the directory line is shown,
+/// which git decides via the recursion rules in `walk`.
 fn path_selects(name: &str, opts: &Opts) -> bool {
     opts.match_all
         || opts.paths.is_empty()
-        || opts
-            .paths
-            .iter()
-            .any(|p| name == p.as_str() || name.starts_with(&format!("{p}/")))
+        || opts.paths.iter().any(|p| {
+            let base = p.trim_end_matches('/');
+            name == base || name.starts_with(&format!("{base}/"))
+        })
 }
 
-/// Whether the sub-tree `name` must be descended into.
+/// Whether the sub-tree `name` is a strict ancestor of some path filter, i.e. a
+/// filter points at or below it (git's `tree_entry_interesting` visits such
+/// trees even when their own line is not shown). A `dir/` filter is an ancestor
+/// of `dir` (its contents live below), which is what makes a bare cwd-scoped
+/// `ls-tree` descend into the current directory.
+fn is_ancestor_of_spec(name: &str, opts: &Opts) -> bool {
+    opts.paths.iter().any(|p| p.starts_with(&format!("{name}/")))
+}
+
+/// Whether the sub-tree `name` must be descended into (git's `show_recursive`).
 ///
 /// Always when `-r` is set; otherwise only when a path filter points strictly
 /// below this tree (so an exact `<dir>` filter shows the tree line without
-/// recursing, while `<dir>/<file>` descends to reach the file).
+/// recursing, while `<dir>/<file>` or a `<dir>/` directory filter descends).
 fn should_descend(name: &str, opts: &Opts) -> bool {
-    opts.recurse
-        || opts
-            .paths
-            .iter()
-            .any(|p| p.starts_with(&format!("{name}/")))
+    opts.recurse || is_ancestor_of_spec(name, opts)
 }
 
 /// Render one entry into `out`, honouring `--format`, `--name-only`,
@@ -503,14 +587,17 @@ fn write_entry(
 ) -> Result<()> {
     let term = if opts.nul { '\0' } else { '\n' };
 
+    // git prints paths relative to `ls_tree_prefix` when `chomp_prefix` is set.
+    let disp = display_name(name, opts);
+
     if let Some(fmt) = &opts.format {
-        expand_format(repo, fmt, out, mode, oid, name, opts)?;
+        expand_format(repo, fmt, out, mode, oid, &disp, opts)?;
         out.push(term);
         return Ok(());
     }
 
     if opts.name_only {
-        out.push_str(name);
+        out.push_str(&disp);
         out.push(term);
         return Ok(());
     }
@@ -527,12 +614,49 @@ fn write_entry(
     if opts.long {
         let size = entry_size(repo, mode, oid)?;
         out.push_str(&format!(
-            "{mode_str} {type_str} {oid_str} {size:>7}\t{name}{term}"
+            "{mode_str} {type_str} {oid_str} {size:>7}\t{disp}{term}"
         ));
     } else {
-        out.push_str(&format!("{mode_str} {type_str} {oid_str}\t{name}{term}"));
+        out.push_str(&format!("{mode_str} {type_str} {oid_str}\t{disp}{term}"));
     }
     Ok(())
+}
+
+/// Render `name` (a root-relative path) as git would display it: relative to the
+/// cwd prefix when `--full-name`/`--full-tree` did not clear `chomp_prefix`,
+/// otherwise verbatim. Mirrors git's `write_name_quoted_relative` /
+/// `relative_path` (sans C-style quoting), including the `./` and `../` forms
+/// git emits for the prefix directory itself and for entries above it.
+fn display_name(name: &str, opts: &Opts) -> String {
+    match &opts.strip_prefix {
+        None => name.to_string(),
+        Some(prefix) => relative_path(name, prefix.trim_end_matches('/')),
+    }
+}
+
+/// git's `relative_path`: the path of `name` as seen from directory `base`, both
+/// given root-relative. Ascends with `../` segments and collapses an empty
+/// result to `./`, matching git byte-for-byte (`dir` from `dir/sub` -> `../`,
+/// `dir/sub` from `dir/sub` -> `./`, `dir/a` from `dir` -> `a`).
+fn relative_path(name: &str, base: &str) -> String {
+    let target: Vec<&str> = name.split('/').filter(|s| !s.is_empty()).collect();
+    let base: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
+
+    let common = target
+        .iter()
+        .zip(base.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let mut out = String::new();
+    for _ in 0..base.len() - common {
+        out.push_str("../");
+    }
+    out.push_str(&target[common..].join("/"));
+    if out.is_empty() {
+        out.push_str("./");
+    }
+    out
 }
 
 /// Expand one `--format` template for a single entry.

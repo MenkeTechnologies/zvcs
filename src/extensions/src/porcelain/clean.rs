@@ -205,6 +205,11 @@ fn parse(args: &[String]) -> std::result::Result<Parsed, u8> {
 ///   * `-q`/`--quiet`     — suppress the per-path lines, keep warnings.
 ///   * `-x`               — also remove ignored files.
 ///   * `-X`               — remove *only* ignored files.
+///   * `-i`/`--interactive` — git's prompt loop (`clean`, `filter by pattern`,
+///                          `select by numbers`, `ask each`, `quit`, `help`),
+///                          reading selections from stdin; the column layout,
+///                          menu wording, `Huh (…)?` diagnostics and per-command
+///                          semantics are ported from `builtin/clean.c`.
 ///   * `-e`/`--exclude=<pattern>` — extra ignore patterns, layered above every
 ///                          `.gitignore` exactly like git's `EXC_CMDL` group, so
 ///                          with `-X` they become removal targets and otherwise
@@ -226,10 +231,9 @@ fn parse(args: &[String]) -> std::result::Result<Parsed, u8> {
 /// C-quoted exactly as git's `quote_path` does.
 ///
 /// Faithfully unsupported — this `bail!`s rather than emit wrong results:
-/// `-i`/`--interactive` (git's own prompt loop), and running from inside a
-/// directory that is itself a deletion candidate, where git prints an unsorted,
-/// readdir-ordered `./`-prefixed listing after `Refusing to remove current
-/// working directory`.
+/// running from inside a directory that is itself a deletion candidate, where
+/// git prints an unsorted, readdir-ordered `./`-prefixed listing after `Refusing
+/// to remove current working directory`.
 pub fn clean(args: &[String]) -> Result<ExitCode> {
     let p = match parse(args) {
         Ok(p) => p,
@@ -264,10 +268,6 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
     if ignored_too && ignored_only {
         eprintln!("fatal: options '-x' and '-X' cannot be used together");
         return Ok(ExitCode::from(128));
-    }
-
-    if interactive {
-        bail!("unsupported flag \"-i\": git's interactive prompt loop is not ported");
     }
 
     // The prefix is the repo-relative current directory; it scopes the walk when
@@ -393,6 +393,13 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
     }
 
     targets.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // `-i` drives git's prompt loop over the sorted candidate set, narrowing it
+    // to the survivors that the removal pass below then deletes (or, with `-n`,
+    // reports). With nothing to clean the loop is a no-op, matching git.
+    if interactive {
+        targets = interactive_main_loop(&repo, targets, &prefix_parts);
+    }
 
     let mut out = String::new();
     let mut failed = false;
@@ -712,4 +719,533 @@ fn quote_path(path: impl AsRef<[u8]>) -> String {
     }
     out.push('"');
     out
+}
+
+// ---------------------------------------------------------------------------
+// `-i` / `--interactive`: a faithful port of `builtin/clean.c`'s prompt loop.
+//
+// A candidate is the same `(sort-key, repo-relative path, is_dir)` triple the
+// non-interactive path builds. `interactive_main_loop` mutates the live list in
+// place and returns the survivors, which `clean` then deletes (or, under `-n`,
+// reports) exactly as before. Colour is deliberately omitted: git's colour is
+// `auto`, so it is off whenever stdout is not a TTY — which is the byte-for-byte
+// case that matters for pipes and CI.
+// ---------------------------------------------------------------------------
+
+const PROMPT_HELP_SINGLETON: &str = concat!(
+    "Prompt help:\n",
+    "1          - select a numbered item\n",
+    "foo        - select item based on unique prefix\n",
+    "           - (empty) select nothing\n",
+);
+
+const PROMPT_HELP_MULTI: &str = concat!(
+    "Prompt help:\n",
+    "1          - select a single item\n",
+    "3-5        - select a range of items\n",
+    "2-3,6-9    - select multiple ranges\n",
+    "foo        - select item based on unique prefix\n",
+    "-...       - unselect specified items\n",
+    "*          - choose all items\n",
+    "           - (empty) finish selecting\n",
+);
+
+/// Read one line from `stdin` the way git's `git_read_line_interactively` does:
+/// flush stdout first, strip a trailing `\n` (and a preceding `\r`), and report
+/// end-of-input as `None` (git's `EOF`).
+fn read_line_interactively(stdin: &mut impl std::io::BufRead) -> Option<String> {
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    let mut buf = Vec::new();
+    if stdin.read_until(b'\n', &mut buf).ok()? == 0 {
+        return None;
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// git's `term_columns()` in the non-TTY case: honour `COLUMNS` if it parses to a
+/// positive integer, otherwise fall back to 80.
+fn term_columns() -> usize {
+    if let Ok(v) = std::env::var("COLUMNS") {
+        let n = atoi(&v);
+        if n > 0 {
+            return n as usize;
+        }
+    }
+    80
+}
+
+/// Render `items` with git's `print_columns(COL_ENABLED | COL_ROW)` layout used
+/// by `pretty_print_dels`/`print_highlight_menu_stuff`: indent `"  "`, padding 2,
+/// row-major fill into `term_columns() - 1` columns. Every string is ASCII once
+/// C-quoted, so byte length equals display width.
+fn print_columns_row(items: &[String]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    const INDENT: &str = "  ";
+    const PADDING: usize = 2;
+    let width = term_columns().saturating_sub(1);
+    let lens: Vec<usize> = items.iter().map(String::len).collect();
+    // `initial_width` in git: the widest cell plus the padding column.
+    let colwidth = lens.iter().max().copied().unwrap_or(0) + PADDING;
+    let mut cols = width.saturating_sub(INDENT.len()) / colwidth;
+    if cols == 0 {
+        cols = 1;
+    }
+    let rows = (items.len() + cols - 1) / cols;
+    let mut out = String::new();
+    for y in 0..rows {
+        for x in 0..cols {
+            let i = x + y * cols;
+            if i >= items.len() {
+                break;
+            }
+            let newline = x == cols - 1 || i == items.len() - 1;
+            if x == 0 {
+                out.push_str(INDENT);
+            }
+            out.push_str(&items[i]);
+            if newline {
+                out.push('\n');
+            } else {
+                out.extend(std::iter::repeat(' ').take(colwidth - lens[i]));
+            }
+        }
+    }
+    out
+}
+
+/// The display strings for the current del-list: each candidate rendered exactly
+/// as the removal pass would (`relative_to_prefix` then `quote_path`).
+fn shown_paths(del: &[(BString, BString, bool)], prefix_parts: &[&[u8]]) -> Vec<String> {
+    del.iter()
+        .map(|(key, _, _)| quote_path(relative_to_prefix(key.as_bstr(), prefix_parts)))
+        .collect()
+}
+
+/// C `atoi`: skip leading blanks, an optional sign, then consume leading digits.
+fn atoi(s: &str) -> i64 {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    let mut neg = false;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        neg = b[i] == b'-';
+        i += 1;
+    }
+    let mut n: i64 = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        n = n * 10 + i64::from(b[i] - b'0');
+        i += 1;
+    }
+    if neg {
+        -n
+    } else {
+        n
+    }
+}
+
+/// git's `parse_choice` classification: is the token a bare number, or a range
+/// (`a-b` / `a-`)? A second `-`, or any non-digit, makes it neither.
+fn classify(s: &str) -> (bool, bool) {
+    let mut is_range = false;
+    let mut is_number = true;
+    for &c in s.as_bytes() {
+        if c == b'-' {
+            if !is_range {
+                is_range = true;
+                is_number = false;
+            } else {
+                is_number = false;
+                is_range = false;
+                break;
+            }
+        } else if !c.is_ascii_digit() {
+            is_number = false;
+            is_range = false;
+            break;
+        }
+    }
+    (is_number, is_range)
+}
+
+/// git's `parse_choice`: split `input` (on `\n` for singleton menus, on `, `/
+/// space otherwise), resolve each token to a 1-based index or range, and toggle
+/// the corresponding `chosen` slots. Unresolvable tokens print `Huh (<tok>)?`.
+fn parse_choice(
+    nr: usize,
+    is_single: bool,
+    input: &str,
+    chosen: &mut [bool],
+    find: impl Fn(&str) -> i64,
+) {
+    let is_sep = |c: char| {
+        if is_single {
+            c == '\n'
+        } else {
+            c == ',' || c == ' '
+        }
+    };
+    for raw in input.split(is_sep) {
+        let s = raw.trim();
+        if s.is_empty() {
+            continue;
+        }
+        // A leading '-' unchooses the token's items.
+        let (choose, s) = match s.strip_prefix('-') {
+            Some(rest) => (false, rest),
+            None => (true, s),
+        };
+        let (is_number, is_range) = classify(s);
+        let (bottom, top): (i64, i64) = if is_number {
+            let b = atoi(s);
+            (b, b)
+        } else if is_range {
+            let b = atoi(s);
+            let after = &s[s.find('-').unwrap() + 1..];
+            let t = if after.is_empty() {
+                nr as i64
+            } else {
+                atoi(after)
+            };
+            (b, t)
+        } else if s == "*" {
+            (1, nr as i64)
+        } else {
+            let b = find(s);
+            (b, b)
+        };
+        if top <= 0
+            || bottom <= 0
+            || top > nr as i64
+            || bottom > top
+            || (is_single && bottom != top)
+        {
+            print!("Huh ({s})?\n");
+            continue;
+        }
+        for i in bottom..=top {
+            chosen[(i - 1) as usize] = choose;
+        }
+    }
+}
+
+/// git's `find_unique` for the command menu: a length-1 token matches a hotkey,
+/// otherwise a case-insensitive unique title prefix. Returns a 1-based index, 0
+/// for none/ambiguous, or -1 for an ambiguous hotkey (both rejected downstream).
+fn find_unique_menu(choice: &str) -> i64 {
+    const MENU: [(u8, &str); 6] = [
+        (b'c', "clean"),
+        (b'f', "filter by pattern"),
+        (b's', "select by numbers"),
+        (b'a', "ask each"),
+        (b'q', "quit"),
+        (b'h', "help"),
+    ];
+    let len = choice.len();
+    let cb = choice.as_bytes();
+    let mut found: i64 = 0;
+    for (i, (hotkey, title)) in MENU.iter().enumerate() {
+        if len == 1 && cb[0] == *hotkey {
+            found = (i + 1) as i64;
+            break;
+        }
+        if title.len() >= len && title.as_bytes()[..len].eq_ignore_ascii_case(cb) {
+            if found != 0 {
+                if len == 1 {
+                    found = -1;
+                } else {
+                    found = 0;
+                    break;
+                }
+            } else {
+                found = (i + 1) as i64;
+            }
+        }
+    }
+    found
+}
+
+/// git's `find_unique` for a string list: a case-insensitive unique prefix of a
+/// displayed item. Returns a 1-based index, or 0 for none/ambiguous.
+fn find_unique_strings(items: &[String], choice: &str) -> i64 {
+    let len = choice.len();
+    let cb = choice.as_bytes();
+    let mut found: i64 = 0;
+    for (i, s) in items.iter().enumerate() {
+        if s.len() >= len && s.as_bytes()[..len].eq_ignore_ascii_case(cb) {
+            if found != 0 {
+                found = 0;
+                break;
+            }
+            found = (i + 1) as i64;
+        }
+    }
+    found
+}
+
+/// git's `help_cmd`: the command reference, closed by the trailing newline
+/// `printf_ln` adds.
+fn help_cmd() {
+    print!(concat!(
+        "clean               - start cleaning\n",
+        "filter by pattern   - exclude items from deletion\n",
+        "select by numbers   - select items to be deleted by numbers\n",
+        "ask each            - confirm each deletion (like \"rm -i\")\n",
+        "quit                - stop cleaning\n",
+        "help                - this screen\n",
+        "?                   - help for prompt selection\n",
+    ));
+}
+
+/// git's singleton `list_and_choose` over the command menu. Reprints the header,
+/// the highlighted menu and the `What now> ` prompt until a command resolves;
+/// `?` prints prompt help, an empty line re-prompts, and EOF returns `None`.
+fn list_and_choose_menu(stdin: &mut impl std::io::BufRead) -> Option<usize> {
+    const MENU: [&str; 6] = [
+        "clean",
+        "filter by pattern",
+        "select by numbers",
+        "ask each",
+        "quit",
+        "help",
+    ];
+    loop {
+        print!("*** Commands ***\n");
+        let disp: Vec<String> = MENU
+            .iter()
+            .enumerate()
+            .map(|(i, title)| format!(" {:2}: {}", i + 1, title))
+            .collect();
+        print!("{}", print_columns_row(&disp));
+        print!("What now> ");
+        let line = read_line_interactively(stdin)?;
+        if line == "?" {
+            print!("{PROMPT_HELP_SINGLETON}");
+            continue;
+        }
+        let mut chosen = [false; 6];
+        parse_choice(MENU.len(), true, &line, &mut chosen, find_unique_menu);
+        if let Some(idx) = chosen.iter().position(|&c| c) {
+            return Some(idx);
+        }
+    }
+}
+
+/// git's multi-choice `list_and_choose` over a string list. Returns the selected
+/// 1-based-minus-one indices in ascending order; an empty line finishes with the
+/// current selection, `?` prints prompt help, and EOF discards all selections
+/// (git returns a bare `EOF`).
+fn list_and_choose_strings(
+    shown: &[String],
+    prompt: &str,
+    stdin: &mut impl std::io::BufRead,
+) -> Vec<usize> {
+    let nr = shown.len();
+    let mut chosen = vec![false; nr];
+    loop {
+        let disp: Vec<String> = shown
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("{}{:2}: {}", if chosen[i] { "*" } else { " " }, i + 1, s))
+            .collect();
+        print!("{}", print_columns_row(&disp));
+        print!("{prompt}>> ");
+        let line = match read_line_interactively(stdin) {
+            Some(l) => l,
+            None => {
+                // EOF: git returns no selection, discarding anything chosen so far.
+                chosen.iter_mut().for_each(|c| *c = false);
+                break;
+            }
+        };
+        if line == "?" {
+            print!("{PROMPT_HELP_MULTI}");
+            continue;
+        }
+        if line.is_empty() {
+            break;
+        }
+        parse_choice(nr, false, &line, &mut chosen, |s| {
+            find_unique_strings(shown, s)
+        });
+    }
+    (0..nr).filter(|&i| chosen[i]).collect()
+}
+
+/// git's `select_by_numbers_cmd`: keep only the chosen candidates, drop the rest.
+fn select_by_numbers_cmd(
+    del: &mut Vec<(BString, BString, bool)>,
+    prefix_parts: &[&[u8]],
+    stdin: &mut impl std::io::BufRead,
+) {
+    let shown = shown_paths(del, prefix_parts);
+    let keep: std::collections::HashSet<usize> =
+        list_and_choose_strings(&shown, "Select items to delete", stdin)
+            .into_iter()
+            .collect();
+    let mut i = 0usize;
+    del.retain(|_| {
+        let k = keep.contains(&i);
+        i += 1;
+        k
+    });
+}
+
+/// git's `ask_each_cmd`: confirm each candidate `Remove <path> [y/N]?`. Only a
+/// case-insensitive prefix of "yes" keeps it (so it is deleted); EOF spares the
+/// rest.
+fn ask_each_cmd(
+    del: &mut Vec<(BString, BString, bool)>,
+    prefix_parts: &[&[u8]],
+    stdin: &mut impl std::io::BufRead,
+) {
+    let mut eof = false;
+    let mut confirm = String::new();
+    del.retain(|(key, _, _)| {
+        if !eof {
+            let qname = quote_path(relative_to_prefix(key.as_bstr(), prefix_parts));
+            print!("Remove {qname} [y/N]? ");
+            match read_line_interactively(stdin) {
+                Some(l) => confirm = l,
+                None => {
+                    print!("\n");
+                    eof = true;
+                    confirm.clear();
+                }
+            }
+        }
+        let a = confirm.as_bytes();
+        !a.is_empty() && a.len() <= 3 && b"yes"[..a.len()].eq_ignore_ascii_case(a)
+    });
+}
+
+/// git's `filter_by_patterns_cmd`: read space-separated gitignore patterns and
+/// drop every candidate they match, looping until an empty line (or EOF). When a
+/// round matches nothing it warns; each non-empty round reprints the survivors.
+fn filter_by_patterns_cmd(
+    repo: &gix::Repository,
+    del: &mut Vec<(BString, BString, bool)>,
+    prefix_parts: &[&[u8]],
+    stdin: &mut impl std::io::BufRead,
+) {
+    let parse = gix::ignore::search::Ignore {
+        support_precious: repo
+            .config_snapshot()
+            .boolean("gitoxide.parsePrecious")
+            .unwrap_or(false),
+    };
+    // git's `changed` starts truthy so the first round always prints the list.
+    let mut changed: i64 = -1;
+    loop {
+        if del.is_empty() {
+            break;
+        }
+        if changed != 0 {
+            let shown = shown_paths(del, prefix_parts);
+            print!("{}", print_columns_row(&shown));
+        }
+        print!("Input ignore patterns>> ");
+        let line = match read_line_interactively(stdin) {
+            Some(l) => l,
+            None => {
+                print!("\n");
+                String::new()
+            }
+        };
+        if line.is_empty() {
+            break;
+        }
+        let patterns: Vec<String> = line
+            .split(' ')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        let search = gix::ignore::Search::from_overrides(patterns.iter().cloned(), parse);
+        changed = 0;
+        del.retain(|(_, rela, is_dir)| {
+            let excluded = search
+                .pattern_matching_relative_path(
+                    rela.as_bstr(),
+                    Some(*is_dir),
+                    gix::glob::pattern::Case::Sensitive,
+                )
+                .is_some_and(|m| !m.pattern.is_negative());
+            if excluded {
+                changed += 1;
+            }
+            !excluded
+        });
+        if changed == 0 {
+            print!("WARNING: Cannot find items matched by: {line}\n");
+        }
+    }
+}
+
+/// git's `interactive_main_loop`: show the del-list, run the command menu, and
+/// dispatch until a command finishes cleaning (`clean`/`ask each`), the list is
+/// emptied, or the user quits. Returns the survivors for the caller to remove.
+fn interactive_main_loop(
+    repo: &gix::Repository,
+    mut del: Vec<(BString, BString, bool)>,
+    prefix_parts: &[&[u8]],
+) -> Vec<(BString, BString, bool)> {
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+
+    while !del.is_empty() {
+        if del.len() == 1 {
+            print!("Would remove the following item:\n");
+        } else {
+            print!("Would remove the following items:\n");
+        }
+        let shown = shown_paths(&del, prefix_parts);
+        print!("{}", print_columns_row(&shown));
+
+        match list_and_choose_menu(&mut stdin) {
+            // EOF at the command prompt behaves exactly like `quit`.
+            None | Some(4) => {
+                del.clear();
+                print!("Bye.\n");
+                break;
+            }
+            // clean: remove everything still in the list.
+            Some(0) => break,
+            // filter by pattern.
+            Some(1) => {
+                filter_by_patterns_cmd(repo, &mut del, prefix_parts, &mut stdin);
+                if del.is_empty() {
+                    print!("No more files to clean, exiting.\n");
+                    break;
+                }
+            }
+            // select by numbers.
+            Some(2) => {
+                select_by_numbers_cmd(&mut del, prefix_parts, &mut stdin);
+                if del.is_empty() {
+                    print!("No more files to clean, exiting.\n");
+                    break;
+                }
+            }
+            // ask each, then remove the confirmed survivors.
+            Some(3) => {
+                ask_each_cmd(&mut del, prefix_parts, &mut stdin);
+                break;
+            }
+            // help, then re-display and loop.
+            Some(5) => help_cmd(),
+            Some(_) => unreachable!("the command menu has exactly six entries"),
+        }
+    }
+    del
 }

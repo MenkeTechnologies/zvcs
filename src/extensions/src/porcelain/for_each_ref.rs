@@ -4,8 +4,9 @@
 //! `refname`-ordered listing, the `<pattern>` / `--exclude` matching rules
 //! (literal path-prefix *or* `wildmatch` with pathname semantics), `--count`
 //! (including git's "0 means unlimited"), `--sort` (repeatable, `-` for
-//! descending, last key primary), `--points-at`, `--merged`/`--no-merged`,
-//! `--contains`/`--no-contains`, `--start-after`, `--color`, `--omit-empty`,
+//! descending, last key primary, `version:`/`v:` for version ordering),
+//! `--points-at`, `--merged`/`--no-merged`, `--contains`/`--no-contains`,
+//! `--start-after`, `--stdin`, `--color`, `--omit-empty`,
 //! `--ignore-case`, `--include-root-refs`, the `--shell`/`--perl`/`--python`/
 //! `--tcl` quoting styles (mutually exclusive, `--no-<style>` clears one), and
 //! the format language's `%%` / `%xx` escapes plus the `%(...)` atoms listed on
@@ -16,13 +17,12 @@
 //! `parse-options` paths (a missing option value, a bad `--contains` or
 //! `--points-at` operand, an unknown option).
 //!
-//! Not covered — rejected rather than silently producing divergent output:
-//! `--stdin`, and the atoms that need substrate this module does not build
-//! (`%(upstream)`, `%(push)`, `%(align)`, `%(if)`, `%(describe)`,
-//! `%(worktreepath)`, `%(trailers)`, `%(signature)`, `%(raw)`, `%(deltabase)`,
-//! `%(ahead-behind)`, `%(is-base)`, `%(objectsize:disk)`, `version:`/`v:` sort
-//! keys). Those names are still recognised as *valid* git atoms, so an unknown
-//! field name is reported the way git reports it.
+//! Not covered — rejected rather than silently producing divergent output: the
+//! atoms that need substrate this module does not build (`%(upstream)`,
+//! `%(push)`, `%(if)`, `%(describe)`, `%(worktreepath)`, `%(trailers)`,
+//! `%(signature)`, `%(raw)`, `%(deltabase)`, `%(ahead-behind)`, `%(is-base)`,
+//! `%(objectsize:disk)`). Those names are still recognised as *valid* git
+//! atoms, so an unknown field name is reported the way git reports it.
 //!
 //! One known divergence: `%(objectname:short)` takes its length from gitoxide's
 //! abbreviation logic, which honours `core.abbrev` but, when it is unset,
@@ -152,10 +152,12 @@ enum AlignPos {
     Middle,
 }
 
-/// A sort key: an atom plus its direction.
+/// A sort key: an atom, its direction, and whether to compare with `versioncmp`
+/// (the `version:` / `v:` prefix).
 struct SortKey {
     atom: Atom,
     descending: bool,
+    versioned: bool,
 }
 
 /// Everything known about one object referenced during a run.
@@ -319,6 +321,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     let mut omit_empty = false;
     let mut ignore_case = false;
     let mut include_root_refs = false;
+    let mut from_stdin = false;
     // Each quoting style is an independent bit, mirroring git's `OPT_BIT`.
     let mut quote_bits: u8 = 0;
 
@@ -454,14 +457,8 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             "--no-python" => quote_bits &= !Q_PYTHON,
             "--tcl" => quote_bits |= Q_TCL,
             "--no-tcl" => quote_bits &= !Q_TCL,
-            "--stdin" => {
-                bail!(
-                    "unsupported flag {name:?} (ported: --format, --count, --sort, --exclude, \
-                     --points-at, --start-after, --color, --merged, --no-merged, --contains, \
-                     --no-contains, --omit-empty, --ignore-case, --include-root-refs, --shell, \
-                     --perl, --python, --tcl)"
-                )
-            }
+            "--stdin" => from_stdin = true,
+            "--no-stdin" => from_stdin = false,
             s if s.starts_with('-') && s.len() > 1 => {
                 return Ok(usage_error(&format!(
                     "unknown option `{}'",
@@ -510,31 +507,60 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
         Err(e) => return report_atom_error(e),
     };
 
-    if start_after.is_some() {
-        if !sort_specs.is_empty() {
-            return Ok(fatal("cannot use --start-after with custom sort options"));
-        }
-        if !patterns.is_empty() {
-            return Ok(fatal("cannot use --start-after with patterns"));
-        }
+    // git checks the custom-sort conflict before parsing the sort keys, and the
+    // pattern conflict only after `--stdin` has populated the pattern list.
+    if start_after.is_some() && !sort_specs.is_empty() {
+        return Ok(fatal("cannot use --start-after with custom sort options"));
     }
 
     let mut sorts: Vec<SortKey> = Vec::new();
     for spec in &sort_specs {
+        // git strips a leading `-` (descending) first, then the `version:`/`v:`
+        // prefix, then parses the remainder as an ordinary sorting atom.
         let (spec, descending) = match spec.strip_prefix('-') {
             Some(r) => (r, true),
             None => (spec.as_str(), false),
         };
-        if spec.starts_with("version:") || spec.starts_with("v:") {
-            bail!("unsupported sort key {spec:?} (version sorting is not ported)");
-        }
+        let (spec, versioned) = match spec
+            .strip_prefix("version:")
+            .or_else(|| spec.strip_prefix("v:"))
+        {
+            Some(r) => (r, true),
+            None => (spec, false),
+        };
         match parse_atom(spec, color_on) {
-            Ok(atom) => sorts.push(SortKey { atom, descending }),
+            Ok(atom) => sorts.push(SortKey {
+                atom,
+                descending,
+                versioned,
+            }),
             Err(e) => return report_atom_error(e),
         }
     }
     // Later `--sort` options take precedence, so the last given key sorts first.
     sorts.reverse();
+
+    // `--stdin`: git dies if any positional patterns were also given, then reads
+    // newline-delimited patterns from stdin into the pattern list.
+    if from_stdin {
+        if !patterns.is_empty() {
+            return Ok(fatal("unknown arguments supplied with --stdin"));
+        }
+        patterns = read_stdin_patterns()?;
+    }
+
+    // git rejects `--start-after` combined with patterns only after `--stdin`
+    // has been folded in, so stdin-supplied patterns trigger it too.
+    if start_after.is_some() && !patterns.is_empty() {
+        return Ok(fatal("cannot use --start-after with patterns"));
+    }
+
+    // Version sorting reads its prerelease-suffix ordering from config once.
+    let prereleases = if sorts.iter().any(|s| s.versioned) {
+        read_prereleases(&repo)
+    } else {
+        Vec::new()
+    };
 
     let atoms = || {
         items
@@ -658,7 +684,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
         });
     }
 
-    let mut refs = sort_refs(&repo, refs, &sorts, ignore_case)?;
+    let mut refs = sort_refs(&repo, refs, &sorts, ignore_case, &prereleases)?;
     if let Some(n) = count {
         refs.truncate(n);
     }
@@ -1356,6 +1382,7 @@ fn sort_refs(
     refs: Vec<RefInfo>,
     sorts: &[SortKey],
     ignore_case: bool,
+    prereleases: &[Vec<u8>],
 ) -> Result<Vec<RefInfo>> {
     // Precompute each ref's key values: rendering can fail, and a comparator
     // cannot propagate errors.
@@ -1363,14 +1390,20 @@ fn sort_refs(
     for info in refs {
         let mut keys = Vec::with_capacity(sorts.len());
         for s in sorts {
-            keys.push(key_of(repo, &s.atom, &info)?);
+            keys.push(key_of(repo, s, &info)?);
         }
         rows.push((keys, info));
     }
 
     rows.sort_by(|(ka, a), (kb, b)| {
         for (n, s) in sorts.iter().enumerate() {
-            let ord = compare(&ka[n], &kb[n], ignore_case);
+            // The `version:`/`v:` prefix compares the string value with
+            // git's `versioncmp`, regardless of the atom's natural type.
+            let ord = if s.versioned {
+                versioncmp_key(&ka[n], &kb[n], prereleases)
+            } else {
+                compare(&ka[n], &kb[n], ignore_case)
+            };
             let ord = if s.descending { ord.reverse() } else { ord };
             if ord != std::cmp::Ordering::Equal {
                 return ord;
@@ -1388,8 +1421,14 @@ enum Key {
     Str(Vec<u8>),
 }
 
-/// Compute the sort value of `atom` for `info`.
-fn key_of(repo: &gix::Repository, atom: &Atom, info: &RefInfo) -> Result<Key> {
+/// Compute the sort value of `key`'s atom for `info`.
+fn key_of(repo: &gix::Repository, key: &SortKey, info: &RefInfo) -> Result<Key> {
+    let atom = &key.atom;
+    // A version-sorted key always compares the atom's rendered string, matching
+    // git's `versioncmp(va->s, vb->s)` even for otherwise-numeric atoms.
+    if key.versioned {
+        return Ok(Key::Str(render(repo, atom, info)?));
+    }
     match &atom.field {
         Field::ObjectSize => Ok(Key::Num(object_of(atom, info).map_or(0, |o| o.size as i64))),
         Field::Person(w, PersonPart::Date(DateFmt::Default)) => {
@@ -1419,6 +1458,224 @@ fn compare_bytes(a: &[u8], b: &[u8], ignore_case: bool) -> std::cmp::Ordering {
         lower(a).cmp(&lower(b))
     } else {
         a.cmp(b)
+    }
+}
+
+/// Compare two sort values with `versioncmp`; both are strings for a version key.
+fn versioncmp_key(a: &Key, b: &Key, prereleases: &[Vec<u8>]) -> std::cmp::Ordering {
+    match (a, b) {
+        (Key::Str(a), Key::Str(b)) => versioncmp(a, b, prereleases),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+/// The prerelease-suffix ordering `versioncmp` consults, read the way git's
+/// `versioncmp` reads it: `versionsort.suffix` wins over the deprecated
+/// `versionsort.prereleasesuffix`, and setting both warns.
+fn read_prereleases(repo: &gix::Repository) -> Vec<Vec<u8>> {
+    let snapshot = repo.config_snapshot();
+    let config = snapshot.plumbing();
+    let newl = config.strings("versionsort.suffix");
+    let oldl = config.strings("versionsort.prereleasesuffix");
+    match (newl, oldl) {
+        (Some(new), Some(_)) => {
+            eprintln!(
+                "warning: ignoring versionsort.prereleasesuffix because \
+                 versionsort.suffix is set"
+            );
+            new.into_iter().map(|s| s.to_vec()).collect()
+        }
+        (Some(new), None) => new.into_iter().map(|s| s.to_vec()).collect(),
+        (None, Some(old)) => old.into_iter().map(|s| s.to_vec()).collect(),
+        (None, None) => Vec::new(),
+    }
+}
+
+/// Read `--stdin` patterns the way git's `strbuf_getline` loop does: one pattern
+/// per newline-delimited line, stripping a trailing `\r` so CRLF input works.
+fn read_stdin_patterns() -> Result<Vec<String>> {
+    use std::io::Read;
+    let mut data = Vec::new();
+    std::io::stdin().read_to_end(&mut data)?;
+    let mut patterns = Vec::new();
+    let mut rest: &[u8] = &data;
+    while !rest.is_empty() {
+        let (line, next) = match rest.iter().position(|&b| b == b'\n') {
+            Some(i) => (&rest[..i], &rest[i + 1..]),
+            None => (rest, &rest[rest.len()..]),
+        };
+        let line = match line.last() {
+            Some(b'\r') => &line[..line.len() - 1],
+            _ => line,
+        };
+        patterns.push(
+            String::from_utf8(line.to_vec())
+                .map_err(|_| anyhow!("pattern from stdin is not valid utf-8"))?,
+        );
+        rest = next;
+    }
+    Ok(patterns)
+}
+
+/// A partial match of a configured prerelease suffix within a version string.
+struct SuffixMatch {
+    conf_pos: i32,
+    start: i32,
+    len: i32,
+}
+
+/// git's `find_better_matching_suffix`: try to improve `match` with an earlier
+/// (or same-offset-but-longer) placement of `suffix` in `tagname`.
+fn find_better_matching_suffix(
+    tagname: &[u8],
+    suffix: &[u8],
+    conf_pos: i32,
+    start: i32,
+    m: &mut SuffixMatch,
+) {
+    let suffix_len = suffix.len() as i32;
+    // A better match either starts earlier or starts at the same offset but is
+    // longer.
+    let end = if m.len < suffix_len { m.start } else { m.start - 1 };
+    let mut i = start;
+    while i <= end {
+        let at = i as usize;
+        if at <= tagname.len() && tagname[at..].starts_with(suffix) {
+            m.conf_pos = conf_pos;
+            m.start = i;
+            m.len = suffix_len;
+            break;
+        }
+        i += 1;
+    }
+}
+
+/// git's `swap_prereleases`: when a configured prerelease suffix straddles the
+/// first differing offset `off`, force the string carrying the earlier-ranked
+/// suffix to sort on top. Returns `Some(diff)` when it decides the order.
+fn swap_prereleases(
+    s1: &[u8],
+    s2: &[u8],
+    off: i32,
+    prereleases: &[Vec<u8>],
+) -> Option<i32> {
+    let mut match1 = SuffixMatch {
+        conf_pos: -1,
+        start: off,
+        len: -1,
+    };
+    let mut match2 = SuffixMatch {
+        conf_pos: -1,
+        start: off,
+        len: -1,
+    };
+
+    for (i, suffix) in prereleases.iter().enumerate() {
+        let suffix_len = suffix.len() as i32;
+        let start = if suffix_len < off {
+            off - suffix_len
+        } else {
+            0
+        };
+        find_better_matching_suffix(s1, suffix, i as i32, start, &mut match1);
+        find_better_matching_suffix(s2, suffix, i as i32, start, &mut match2);
+    }
+    if match1.conf_pos == -1 && match2.conf_pos == -1 {
+        return None;
+    }
+    if match1.conf_pos == match2.conf_pos {
+        // The same suffix in both (e.g. "-rc" in "v1.0-rcX" and "v1.0-rcY"):
+        // let the caller decide from what follows.
+        return None;
+    }
+    let diff = if match1.conf_pos >= 0 && match2.conf_pos >= 0 {
+        match1.conf_pos - match2.conf_pos
+    } else if match1.conf_pos >= 0 {
+        -1
+    } else {
+        1
+    };
+    Some(diff)
+}
+
+/// git's `versioncmp` (glibc `strverscmp` plus git's prerelease-suffix rule):
+/// compare two byte strings as version numbers.
+fn versioncmp(s1: &[u8], s2: &[u8], prereleases: &[Vec<u8>]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    // States S_N=0, S_I=3, S_F=6, S_Z=9; columns x=0 (other), d=1 (1-9), 0=2.
+    const NEXT_STATE: [u8; 12] = [
+        /* S_N */ 0, 3, 9, //
+        /* S_I */ 0, 3, 3, //
+        /* S_F */ 0, 6, 6, //
+        /* S_Z */ 0, 6, 9, //
+    ];
+    // CMP=2, LEN=3; every other cell is the literal result (-1 or +1).
+    const RESULT_TYPE: [i8; 36] = [
+        /* S_N */ 2, 2, 2, 2, 3, 2, 2, 2, 2, //
+        /* S_I */ 2, -1, -1, 1, 3, 3, 1, 3, 3, //
+        /* S_F */ 2, 2, 2, 2, 2, 2, 2, 2, 2, //
+        /* S_Z */ 2, 1, 1, -1, 2, 2, -1, 2, 2, //
+    ];
+
+    // git operates on NUL-terminated strings; reads past the end return 0.
+    let byte = |s: &[u8], i: usize| -> u8 { s.get(i).copied().unwrap_or(0) };
+    let col = |c: u8| -> usize { (c == b'0') as usize + (c.is_ascii_digit() as usize) };
+
+    let mut i1 = 0usize;
+    let mut i2 = 0usize;
+    let mut c1 = byte(s1, i1);
+    i1 += 1;
+    let mut c2 = byte(s2, i2);
+    i2 += 1;
+    // Hint: '0' is a digit too.
+    let mut state = col(c1);
+
+    let mut diff = c1 as i32 - c2 as i32;
+    while diff == 0 {
+        if c1 == 0 {
+            return Ordering::Equal;
+        }
+        state = NEXT_STATE[state] as usize;
+        c1 = byte(s1, i1);
+        i1 += 1;
+        c2 = byte(s2, i2);
+        i2 += 1;
+        state += col(c1);
+        diff = c1 as i32 - c2 as i32;
+    }
+
+    // A configured prerelease suffix straddling the first difference can flip
+    // the order outright.
+    if !prereleases.is_empty() {
+        if let Some(d) = swap_prereleases(s1, s2, (i1 - 1) as i32, prereleases) {
+            return d.cmp(&0);
+        }
+    }
+
+    match RESULT_TYPE[state * 3 + col(c2)] {
+        2 => diff.cmp(&0), // CMP
+        3 => {
+            // LEN: the longer run of leading digits is the larger number.
+            loop {
+                let a = byte(s1, i1);
+                i1 += 1;
+                if !a.is_ascii_digit() {
+                    break;
+                }
+                let b = byte(s2, i2);
+                i2 += 1;
+                if !b.is_ascii_digit() {
+                    return Ordering::Greater;
+                }
+            }
+            if byte(s2, i2).is_ascii_digit() {
+                Ordering::Less
+            } else {
+                diff.cmp(&0)
+            }
+        }
+        d => (d as i32).cmp(&0),
     }
 }
 

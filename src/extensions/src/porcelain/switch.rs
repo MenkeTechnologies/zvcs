@@ -799,6 +799,25 @@ fn install_tracking(
     file.set_raw_value_by("branch", Some(sub), "remote", remote.as_str())?;
     file.set_raw_value_by("branch", Some(sub), "merge", merge_ref.as_str())?;
 
+    // branch.autoSetupRebase also records `branch.<name>.rebase=true`, gated on
+    // whether the upstream is local (`remote == "."`) or remote-tracking. git's
+    // default is "never".
+    let is_local = remote == ".";
+    let want_rebase = match repo
+        .config_snapshot()
+        .string("branch.autoSetupRebase")
+        .map(|v| v.to_str_lossy().into_owned())
+        .as_deref()
+    {
+        Some("always") => true,
+        Some("local") => is_local,
+        Some("remote") => !is_local,
+        _ => false, // "never" (default) or unset
+    };
+    if want_rebase {
+        file.set_raw_value_by("branch", Some(sub), "rebase", "true")?;
+    }
+
     let bytes = file.to_bstring();
     let tmp = path.with_extension("zvcs-tmp");
     {

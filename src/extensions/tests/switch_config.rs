@@ -63,6 +63,34 @@ fn current_branch(repo: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+fn config_get(repo: &Path, key: &str) -> String {
+    let out = Command::new("git")
+        .args(["config", "--get", key])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn branch_auto_setup_rebase() {
+    let (repo, home) = fixture("autorebase");
+
+    // "always": a new branch tracking a remote gets branch.<name>.rebase=true.
+    git(&repo, &["config", "branch.autoSetupRebase", "always"]);
+    let out = switch(&repo, &home, &["-c", "feat", "origin/feature"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(config_get(&repo, "branch.feat.rebase"), "true");
+
+    // "never" (the default): no rebase key is written.
+    git(&repo, &["config", "branch.autoSetupRebase", "never"]);
+    let out = switch(&repo, &home, &["-c", "feat2", "origin/feature"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(config_get(&repo, "branch.feat2.rebase"), "");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
 #[test]
 fn checkout_guess_config_and_override() {
     let (repo, home) = fixture("guess");

@@ -69,6 +69,21 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
     let mut message: Option<String> = None;
     let mut refs: Vec<&str> = Vec::new();
 
+    // git reads merge.ff and merge.stat as the defaults; the CLI flags below
+    // override them (`--ff`/`--no-ff`/`--ff-only`, `--stat`/`--no-stat`).
+    if let Ok(repo) = gix::discover(".") {
+        let snap = repo.config_snapshot();
+        match snap.string("merge.ff").map(|v| v.to_string().to_ascii_lowercase()).as_deref() {
+            Some("only") => ff = Ff::Only,
+            Some("false" | "no" | "off" | "0") => ff = Ff::Never,
+            Some(_) => ff = Ff::Allow, // true/yes/on/1/valueless → allow
+            None => {}
+        }
+        if snap.boolean("merge.stat") == Some(false) {
+            show_stat = false;
+        }
+    }
+
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();

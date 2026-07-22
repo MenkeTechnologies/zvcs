@@ -122,6 +122,7 @@ mod prune;
 mod prune_packed;
 mod pull;
 mod push;
+mod push_proto;
 mod quiltimport;
 mod range_diff;
 mod read_tree;

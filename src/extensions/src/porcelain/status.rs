@@ -73,6 +73,11 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     // which one, last-format-flag winning.
     let mut porcelain = false;
     let mut branch_header = false;
+    // Whether the command line pinned the output format / branch header. When it
+    // did not, `status.short` / `status.branch` supply the default after the repo
+    // is opened (git resolves these in `wt_status_collect`/`git_status_config`).
+    let mut format_explicit = false;
+    let mut branch_explicit = false;
     // `--untracked-files` and `--ignored` are git OPT_STRING options: the raw
     // argument is *stored* during parsing (last occurrence wins; the `--no-`
     // form resets it to unspecified) and validated exactly once *after* the whole
@@ -90,19 +95,31 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             "-s" | "--short" => {
                 short = true;
                 porcelain = false;
+                format_explicit = true;
             }
             "--porcelain" | "--porcelain=v1" | "--porcelain=1" => {
                 short = true;
                 porcelain = true;
+                format_explicit = true;
             }
             "--long" => {
                 short = false;
                 porcelain = false;
+                format_explicit = true;
             }
-            "--porcelain=v2" | "--porcelain=2" => porcelain_v2 = true,
+            "--porcelain=v2" | "--porcelain=2" => {
+                porcelain_v2 = true;
+                format_explicit = true;
+            }
             "-z" | "--null" => anyhow::bail!("NUL-terminated output (-z) is not supported"),
-            "-b" | "--branch" => branch_header = true,
-            "--no-branch" => branch_header = false,
+            "-b" | "--branch" => {
+                branch_header = true;
+                branch_explicit = true;
+            }
+            "--no-branch" => {
+                branch_header = false;
+                branch_explicit = true;
+            }
             // Bare forms take git's default optarg ("all" / "traditional"); the
             // `--no-` forms reset to unspecified. Attached values (`--...=<v>`,
             // `-u<v>`) are captured raw below and validated after the loop.
@@ -159,8 +176,12 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                         's' => {
                             short = true;
                             porcelain = false;
+                            format_explicit = true;
                         }
-                        'b' => branch_header = true,
+                        'b' => {
+                            branch_header = true;
+                            branch_explicit = true;
+                        }
                         'v' => {}
                         'z' => anyhow::bail!("NUL-terminated output (-z) is not supported"),
                         'u' => {
@@ -225,6 +246,20 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     };
 
     let repo = gix::discover(".")?;
+
+    // With no format/branch flag on the command line, `status.short` selects the
+    // colored short display and `status.branch` adds the `## <branch>` header.
+    // A flag (including `--long` / `--no-branch`) always wins over the config.
+    {
+        let snap = repo.config_snapshot();
+        if !format_explicit && snap.boolean("status.short") == Some(true) {
+            short = true;
+            porcelain = false;
+        }
+        if !branch_explicit && snap.boolean("status.branch") == Some(true) {
+            branch_header = true;
+        }
+    }
 
     // Resolve the head into an owned description so the borrow ends before we
     // re-open references for the tracking computation.

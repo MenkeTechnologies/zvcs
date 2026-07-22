@@ -495,6 +495,21 @@ struct Packed {
 /// the reason the module docs give. That also makes the entry header trivial —
 /// `to_entry_header`'s base-distance callback exists only for `DeltaRef` and is
 /// therefore unreachable.
+/// Build a complete, undeltified packfile from an explicit set of object ids and
+/// return its raw bytes (`PACK` header … trailing hash). Used by `send-pack` to
+/// produce the pack streamed to a remote's receive-pack. Objects that cannot be
+/// read are dropped, matching [`write_pack`]'s own tolerance.
+pub(crate) fn pack_bytes_for(repo: &gix::Repository, ids: &[ObjectId]) -> Result<Vec<u8>> {
+    let counts: Vec<pack::data::output::Count> = ids
+        .iter()
+        .map(|id| pack::data::output::Count {
+            id: *id,
+            entry_pack_location: pack::data::output::count::PackLocation::NotLookedUp,
+        })
+        .collect();
+    Ok(write_pack(repo, &counts, gix::zlib::Compression::default())?.bytes)
+}
+
 fn write_pack(
     repo: &gix::Repository,
     counts: &[pack::data::output::Count],

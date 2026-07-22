@@ -72,11 +72,33 @@ const STAT_TERM_WIDTH: usize = 80;
 pub fn log(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
+    // Config supplies the defaults; the flags below override them. git reads
+    // these in `git_log_config` before parsing args, and validates `log.date`
+    // there — an invalid value is fatal even when `--date` later overrides it.
+    let (cfg_abbrev_commit, cfg_date_mode) = {
+        let snap = repo.config_snapshot();
+        let abbrev = snap.boolean("log.abbrevCommit").unwrap_or(false);
+        let date = match snap.string("log.date") {
+            Some(v) => {
+                let v = v.to_str_lossy();
+                match parse_date_mode(&v) {
+                    Some(m) => m,
+                    None => {
+                        eprintln!("fatal: unknown date format {v}");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+            }
+            None => DateMode::Default,
+        };
+        (abbrev, date)
+    };
+
     let mut max_count: Option<usize> = None;
     let mut skip: usize = 0;
     let mut pretty = Pretty::Medium;
     let mut terminator = false;
-    let mut abbrev_commit = false;
+    let mut abbrev_commit = cfg_abbrev_commit;
     let mut name_only = false;
     let mut name_status = false;
     let mut stat = false;
@@ -92,7 +114,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut show_parents = false;
     let mut min_parents: Option<usize> = None;
     let mut max_parents: Option<usize> = None;
-    let mut date_mode = DateMode::Default;
+    let mut date_mode = cfg_date_mode;
     let mut color = ColorWhen::Auto;
     let mut order = Order::Default;
     let mut revs: Vec<String> = Vec::new();

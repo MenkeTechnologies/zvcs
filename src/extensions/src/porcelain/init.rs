@@ -11,8 +11,12 @@ use crate::lock::RepoLock;
 ///
 /// Ported onto gitoxide's `gix::init` / `gix::init_bare`, which lay down the
 /// same on-disk layout git does (`.git/{HEAD,config,objects,refs,hooks,info}`)
-/// with an unborn `HEAD` pointing at the default branch (`init.defaultBranch`
-/// config, else `main`). Output mirrors stock git:
+/// with an unborn `HEAD` pointing at the initial branch. The initial branch is
+/// resolved with git's exact precedence: `-b`/`--initial-branch` on the command
+/// line, else the `init.defaultBranch` config value, else the compiled-in
+/// default `master`. (gix's own fallback is `main`; this port overrides it to
+/// git's `master` so the no-config case matches stock git byte-for-byte.)
+/// Output mirrors stock git:
 ///   * fresh repo:    `Initialized empty Git repository in <gitdir>/`
 ///   * existing repo: `Reinitialized existing Git repository in <gitdir>/`
 ///
@@ -107,31 +111,49 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         gix::init(&target).map_err(|e| anyhow::anyhow!("{e}"))?
     };
 
-    // `-b <name>` / `--initial-branch=<name>`: repoint the unborn HEAD symref.
-    // This is a ref mutation, so serialize it through the repo coordinator like
-    // every other write command.
-    if let Some(name) = initial_branch {
-        let branch: FullName = format!("refs/heads/{name}")
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("invalid initial branch name {name:?}: {e}"))?;
-        let _lock = RepoLock::acquire(repo.git_dir());
-        repo.edit_reference(RefEdit {
-            change: Change::Update {
-                log: LogChange {
-                    mode: RefLog::AndReference,
-                    force_create_reflog: false,
-                    message: "init: set initial branch".into(),
-                },
-                expected: PreviousValue::Any,
-                new: Target::Symbolic(branch),
+    // Resolve the initial branch name, matching git's precedence exactly:
+    //   1. `-b <name>` / `--initial-branch=<name>` on the command line, else
+    //   2. the `init.defaultBranch` config value (any scope), else
+    //   3. the compiled-in default `master`.
+    // gix::init already points the unborn HEAD at `init.defaultBranch` (or its
+    // own `main` fallback when that is unset), so recomputing here is what lets
+    // the no-config case land on git's `master` rather than gix's `main`. When
+    // the name gix already chose matches, the HEAD repoint below is a no-op.
+    let branch_name = match initial_branch {
+        Some(name) => name,
+        None => repo
+            .config_snapshot()
+            .string("init.defaultBranch")
+            .map(|v| v.to_string())
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "master".to_string()),
+    };
+
+    // Repoint the unborn HEAD symref to the resolved branch. This is a ref
+    // mutation, so serialize it through the repo coordinator like every other
+    // write command. gix writes no reflog for a symbolic update to an unborn
+    // branch, matching stock git init (which creates no `logs/HEAD`).
+    let branch: FullName = format!("refs/heads/{branch_name}")
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("invalid initial branch name {branch_name:?}: {e}"))?;
+    let _lock = RepoLock::acquire(repo.git_dir());
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: "init: set initial branch".into(),
             },
-            name: "HEAD"
-                .try_into()
-                .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
-            deref: false,
-        })
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
+            expected: PreviousValue::Any,
+            new: Target::Symbolic(branch),
+        },
+        name: "HEAD"
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
+        deref: false,
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    drop(_lock);
 
     if !quiet {
         println!(

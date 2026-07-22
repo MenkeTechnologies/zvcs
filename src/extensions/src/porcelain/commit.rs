@@ -45,6 +45,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut allow_empty_message = false;
     let mut quiet = false;
     let mut all = false;
+    let mut no_verify = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -61,6 +62,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "--allow-empty-message" => allow_empty_message = true,
             "-q" | "--quiet" => quiet = true,
             "-a" | "--all" => all = true,
+            "-n" | "--no-verify" => no_verify = true,
             "--" => {
                 if i + 1 < args.len() {
                     anyhow::bail!("pathspec-limited commits are not supported");
@@ -79,6 +81,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                     match c {
                         'a' => all = true,
                         'q' => quiet = true,
+                        'n' => no_verify = true,
                         'm' => {
                             let rest = &cluster[at + c.len_utf8()..];
                             if rest.is_empty() {
@@ -147,6 +150,13 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // high-level `Repository::edit_tree` wrapper is gated behind the
     // `tree-editor` feature, so the editor is constructed directly over the
     // public object database handle instead.
+    // `pre-commit` runs before the commit is built; a non-zero exit aborts it
+    // (the hook prints its own diagnostics, so we exit quietly). `--no-verify`
+    // skips it, as it does `commit-msg`.
+    if !no_verify && !crate::hooks::run(&repo, "pre-commit", &[], None)? {
+        return Ok(ExitCode::from(1));
+    }
+
     let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
     // Snapshot (path, mode, id) per staged file for the summary/short-stat below.
     let mut new_entries: Vec<(BString, EntryMode, ObjectId)> =
@@ -198,6 +208,17 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             message.push('\n');
         }
     }
+    // `commit-msg` gets the message file and may rewrite it (e.g. add a trailer);
+    // a non-zero exit aborts. Re-read afterward to pick up any edits.
+    if !no_verify {
+        let msg_path = repo.git_dir().join("COMMIT_EDITMSG");
+        std::fs::write(&msg_path, &message)?;
+        let arg = msg_path.to_string_lossy().into_owned();
+        if !crate::hooks::run(&repo, "commit-msg", &[&arg], None)? {
+            return Ok(ExitCode::from(1));
+        }
+        message = std::fs::read_to_string(&msg_path)?;
+    }
     let subject = message.lines().next().unwrap_or("").to_string();
 
     // --- write the commit and advance HEAD -------------------------------
@@ -206,6 +227,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `commit`/`commit (initial)` reflog message, requiring the first parent to
     // be the current tip — the same ref-safety check git performs.
     let commit_id = repo.commit("HEAD", &message, tree_id, parents)?;
+
+    // `post-commit` is a notification hook: it runs after the commit regardless of
+    // `--no-verify`, and its exit status is ignored.
+    let _ = crate::hooks::run(&repo, "post-commit", &[], None);
 
     if quiet {
         return Ok(ExitCode::SUCCESS);

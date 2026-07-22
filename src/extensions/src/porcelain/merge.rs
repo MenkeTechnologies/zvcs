@@ -11,16 +11,17 @@
 //!   exactly the tree of the ref being merged — when the merge-base *is* our
 //!   own commit, the three-way merge of every path resolves to theirs — so the
 //!   merge commit is written directly with no three-way machinery involved.
+//! * A real merge of diverged histories (with or without `--no-ff`), via the
+//!   shared three-way merge in [`crate::merge_apply`]: `Auto-merging`/`CONFLICT`
+//!   reporting, a clean two-parent merge commit, or — on conflict —
+//!   `MERGE_HEAD`/`MERGE_MSG` plus the conflicted index and worktree markers, then
+//!   `Automatic merge failed; fix conflicts and then commit the result.` (exit 1).
 //! * `--abort` / `--quit`: `--quit` drops the in-progress merge state files;
 //!   `--abort` additionally restores the index and the merge-affected worktree
 //!   paths to `HEAD`, as `git reset --merge` does.
 //!
 //! What is refused rather than faked:
 //!
-//! * A real merge of diverged histories (with or without `--no-ff`). It needs
-//!   the `Auto-merging`/`CONFLICT` reporting and the conflicted-index writing
-//!   that this module does not implement; producing a merge commit without them
-//!   would leave a repository state that only looks right.
 //! * An octopus merge (multiple refs).
 //! * Every flag outside the set the argument loop in `merge()` accepts
 //!   (`--ff`, `--no-ff`, `--ff-only`, `--stat`/`--no-stat`/`--summary`/
@@ -39,7 +40,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-use gix::bstr::{BString, ByteSlice};
+use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::index::entry::{Mode, Stat};
 use gix::object::tree::diff::{Action, Change as TreeChange};
@@ -245,12 +246,10 @@ fn do_merge(
         println!("Already up to date.");
         return Ok(ExitCode::SUCCESS);
     }
-    if base != local_id {
-        if ff == Ff::Only {
-            eprintln!("fatal: Not possible to fast-forward, aborting.");
-            return Ok(ExitCode::from(128));
-        }
-        anyhow::bail!("diverged histories need a real merge, which is not implemented");
+    let diverged = base != local_id;
+    if diverged && ff == Ff::Only {
+        eprintln!("fatal: Not possible to fast-forward, aborting.");
+        return Ok(ExitCode::from(128));
     }
 
     // From here on we mutate a ref, the index and the worktree. Serialize the
@@ -276,6 +275,78 @@ fn do_merge(
             .try_into()
             .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
     };
+
+    // Diverged histories: a genuine three-way merge (`ort` strategy) of HEAD and
+    // the target against their merge base. On a clean merge we write the two-parent
+    // merge commit; on conflict we record MERGE_HEAD/MERGE_MSG and stop, exactly as
+    // git does, leaving the conflicted index and worktree for the user to resolve.
+    if diverged {
+        let base_tree = repo.find_object(base)?.peel_to_tree()?.id;
+        let labels = gix::merge::blob::builtin_driver::text::Labels {
+            ancestor: Some(BStr::new(b"merged common ancestors")),
+            current: Some(BStr::new(b"HEAD")),
+            other: Some(BStr::new(spec.as_bytes())),
+        };
+        let applied = crate::merge_apply::three_way_merge(
+            &repo,
+            base_tree,
+            head_tree,
+            target_tree,
+            &old_index,
+            labels,
+            &should_interrupt,
+        )?;
+        let mut index = applied.index;
+        index.write(Default::default())?;
+        set_orig_head(&repo, local_id)?;
+
+        if applied.conflicts.is_empty() {
+            let msg = merge_message(&repo, spec, branch.as_ref(), message)?;
+            let author = repo
+                .author()
+                .ok_or_else(|| anyhow::anyhow!("author identity is not configured"))??;
+            let committer = repo
+                .committer()
+                .ok_or_else(|| anyhow::anyhow!("committer identity is not configured"))??;
+            let commit = gix::objs::Commit {
+                message: msg.into(),
+                tree: applied.tree_id,
+                author: author.to_owned()?,
+                committer: committer.to_owned()?,
+                encoding: None,
+                parents: [local_id, target_id].into_iter().collect(),
+                extra_headers: Default::default(),
+            };
+            let new_id = repo.write_object(&commit)?.detach();
+            advance(
+                &repo,
+                name,
+                local_id,
+                new_id,
+                format!("merge {spec}: Merge made by the 'ort' strategy."),
+            )?;
+            println!("Merge made by the 'ort' strategy.");
+            if show_stat {
+                print!("{}", diffstat(&repo, head_tree, applied.tree_id)?);
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        // Conflicts: record the in-progress merge and stop with git's message.
+        let git_dir = repo.git_dir();
+        std::fs::write(git_dir.join("MERGE_HEAD"), format!("{target_id}\n"))?;
+        std::fs::write(git_dir.join("MERGE_MODE"), b"")?;
+        let mut merge_msg = merge_message(&repo, spec, branch.as_ref(), message)?.into_bytes();
+        merge_msg.extend_from_slice(b"\n# Conflicts:\n");
+        for path in &applied.conflicts {
+            merge_msg.extend_from_slice(b"#\t");
+            merge_msg.extend_from_slice(&path[..]);
+            merge_msg.push(b'\n');
+        }
+        std::fs::write(git_dir.join("MERGE_MSG"), &merge_msg)?;
+        println!("Automatic merge failed; fix conflicts and then commit the result.");
+        return Ok(ExitCode::from(1));
+    }
 
     if ff == Ff::Never {
         // The merge-base is our own commit, so a three-way merge of every path

@@ -1,7 +1,10 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
+use std::cmp::Ordering;
 use std::process::ExitCode;
 
-use gix::bstr::{BStr, BString};
+use gix::bstr::{BStr, BString, ByteSlice};
+use gix::hash::ObjectId;
+use gix::objs::{CommitRef, Kind};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
@@ -105,6 +108,9 @@ struct Opts {
     explicit_list: bool,
     verbose: u8,
     format: Option<String>,
+    /// Raw `--sort=<key>` values in command-line order; an empty vec falls back
+    /// to the multi-valued `branch.sort` config at listing time.
+    sorts: Vec<String>,
     delete: bool,
     rename: bool,
     force: bool,
@@ -128,6 +134,9 @@ struct Entry<'repo> {
     current: bool,
     /// The detached-HEAD pseudo entry, which `--format` prints verbatim.
     detached: bool,
+    /// Precomputed `--sort` values, aligned positionally with the parsed sort
+    /// keys. Empty when no sort is in effect (default refname order).
+    keys: Vec<SortVal>,
 }
 
 /// `git branch` — list, create, rename, and delete branches, backed by the
@@ -135,11 +144,21 @@ struct Entry<'repo> {
 ///
 /// Implemented: listing (`-a`/`--all`, `-r`/`--remotes`, `-v`/`-vv`,
 /// `--format=<fmt>`, `-l`/`--list` with optional glob patterns),
-/// `--show-current`, creation at HEAD, `-m`/`-M` rename, and `-d`/`-D` delete.
+/// `--sort=[-][version:]<field>` (multi-level, defaulting to the multi-valued
+/// `branch.sort` config), `--show-current`, creation at HEAD, `-m`/`-M` rename,
+/// and `-d`/`-D` delete.
+///
+/// `--sort` backs the fields whose value a branch tip (always a commit) carries:
+/// `refname`, `version:refname`/`v:refname`, `committerdate`/`authordate`/
+/// `creatordate`/`taggerdate`, `objectname`/`objecttype`/`objectsize`,
+/// `committername`/`authorname`, the matching `*email`, and
+/// `subject`/`body`/`contents`. A field name git rejects fails with git's exact
+/// `unknown/malformed field name` fatal (exit 128); a field git accepts but this
+/// port cannot sort by is refused rather than mis-sorted.
 ///
 /// Not implemented, and rejected rather than ignored: `-c`/`-C` copy, `-t`/`-u`
 /// upstream configuration, `--contains`/`--merged`/`--points-at` filters,
-/// `--sort`, `--column`, `--color`, and creating a branch at an explicit
+/// `--column`, `--color`, and creating a branch at an explicit
 /// start-point. `--format` supports the `refname`, `refname:short`,
 /// `objectname`, `objectname:short`, and `HEAD` atoms; any other atom is
 /// rejected rather than rendered as empty.
@@ -153,6 +172,7 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         explicit_list: false,
         verbose: 0,
         format: None,
+        sorts: Vec::new(),
         delete: false,
         rename: false,
         force: false,
@@ -184,6 +204,16 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
             }
             _ if a.starts_with("--format=") => {
                 o.format = Some(a["--format=".len()..].to_string());
+            }
+            "--sort" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow!("option `sort' requires a value"))?;
+                o.sorts.push(v.clone());
+            }
+            _ if a.starts_with("--sort=") => {
+                o.sorts.push(a["--sort=".len()..].to_string());
             }
             // A single-dash argument is a bundle of short flags (`-vv`, `-dr`).
             _ if a.starts_with('-') && a.len() > 1 => {
@@ -248,7 +278,11 @@ fn show_current(repo: &gix::Repository) -> Result<ExitCode> {
 /// Collect the lines `git branch` would print, in git's order: the detached-HEAD
 /// pseudo entry first, then refs sorted by full name (which puts `refs/heads/*`
 /// ahead of `refs/remotes/*` for free).
-fn collect_entries<'repo>(repo: &'repo gix::Repository, o: &Opts) -> Result<Vec<Entry<'repo>>> {
+fn collect_entries<'repo>(
+    repo: &'repo gix::Repository,
+    o: &Opts,
+    sort_keys: &[SortKey],
+) -> Result<Vec<Entry<'repo>>> {
     let head = repo.head()?;
     let current_ref: Option<BString> = head.referent_name().map(|n| n.as_bstr().to_owned());
 
@@ -264,6 +298,7 @@ fn collect_entries<'repo>(repo: &'repo gix::Repository, o: &Opts) -> Result<Vec<
                 symref: None,
                 current: true,
                 detached: true,
+                keys: Vec::new(),
             });
         }
     }
@@ -284,6 +319,7 @@ fn collect_entries<'repo>(repo: &'repo gix::Repository, o: &Opts) -> Result<Vec<
                 id,
                 symref,
                 detached: false,
+                keys: Vec::new(),
             });
         }
     }
@@ -309,11 +345,38 @@ fn collect_entries<'repo>(repo: &'repo gix::Repository, o: &Opts) -> Result<Vec<
                 symref,
                 current: false,
                 detached: false,
+                keys: Vec::new(),
             });
         }
     }
 
-    refs.sort_by(|a, b| a.full.cmp(&b.full));
+    // Default order is git's implicit ascending refname; an explicit sort (from
+    // `--sort` or `branch.sort`) precomputes a comparable value per key per ref
+    // and orders by them, with the most-significant key given last and a final
+    // refname tie-break — matching git's `ref-filter` sort.
+    if sort_keys.is_empty() {
+        refs.sort_by(|a, b| a.full.cmp(&b.full));
+    } else {
+        for e in &mut refs {
+            let facts = e.id.and_then(|id| commit_facts(repo, id.detach()));
+            e.keys = sort_keys
+                .iter()
+                .map(|k| sort_value(e, facts.as_ref(), k))
+                .collect();
+        }
+        refs.sort_by(|a, b| {
+            for (idx, key) in sort_keys.iter().enumerate().rev() {
+                let mut ord = a.keys[idx].cmp(&b.keys[idx]);
+                if key.reverse {
+                    ord = ord.reverse();
+                }
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            a.full.cmp(&b.full)
+        });
+    }
 
     // `--list <pattern>...` keeps refs whose short name matches any glob. The
     // detached pseudo entry is not a ref and never matches a pattern.
@@ -348,7 +411,31 @@ fn target_of<'repo>(r: &gix::Reference<'repo>) -> (Option<gix::Id<'repo>>, Optio
 /// precedence over `-v`; `-v` pads names into a column and appends the
 /// abbreviated commit and its subject.
 fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
-    let entries = collect_entries(repo, o)?;
+    // git seeds the sort list from the multi-valued `branch.sort` config while
+    // reading config, then appends every `--sort` from the command line. The CLI
+    // keys therefore end up most significant (each key added later outranks the
+    // earlier ones), yet the config keys still participate and are still
+    // validated — so an invalid `branch.sort` is fatal even with a valid `--sort`.
+    let mut sorts: Vec<String> = repo
+        .config_snapshot()
+        .plumbing()
+        .values::<BString>("branch.sort")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect();
+    sorts.extend(o.sorts.iter().cloned());
+
+    // git validates every field name while reading options/config, dying on the
+    // first bad key with exit 128; a field it accepts but this port cannot back is
+    // refused rather than mis-sorted.
+    let sort_keys = match resolve_sort(&sorts) {
+        Err(SortErr::Fatal(msg)) => return fatal(msg),
+        Err(SortErr::Unsupported(spec)) => bail!("--sort={spec} is not supported by this port"),
+        Ok(keys) => keys,
+    };
+
+    let entries = collect_entries(repo, o, &sort_keys)?;
 
     if let Some(fmt) = &o.format {
         // Render every line before printing any, so a bad atom fails the command
@@ -696,4 +783,416 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// `--sort` / `branch.sort`
+//
+// git parses branch sort keys through the same `ref-filter` machinery as
+// `git tag --sort` / `git for-each-ref --sort`. A branch tip is always a commit,
+// so the annotated-tag layer that `git tag` needs is absent here; the field set
+// below is the subset of `ref-filter`'s atoms that a commit populates.
+// ---------------------------------------------------------------------------
+
+/// git's `ref-filter.c` `valid_atom[]` field names. Membership only decides
+/// git-rejects-it (`unknown field name`) vs git-accepts-it while validating a key.
+const VALID_SORT_ATOMS: &[&str] = &[
+    "refname",
+    "objecttype",
+    "objectsize",
+    "objectname",
+    "deltabase",
+    "tree",
+    "parent",
+    "numparent",
+    "object",
+    "type",
+    "tag",
+    "author",
+    "authorname",
+    "authoremail",
+    "authordate",
+    "committer",
+    "committername",
+    "committeremail",
+    "committerdate",
+    "tagger",
+    "taggername",
+    "taggeremail",
+    "taggerdate",
+    "creator",
+    "creatordate",
+    "subject",
+    "body",
+    "trailers",
+    "contents",
+    "signature",
+    "raw",
+    "upstream",
+    "push",
+    "symref",
+    "flag",
+    "HEAD",
+    "color",
+    "worktreepath",
+    "align",
+    "end",
+    "if",
+    "then",
+    "else",
+    "rest",
+    "ahead-behind",
+    "is-base",
+    "describe",
+];
+
+/// One resolved sort key.
+struct SortKey {
+    reverse: bool,
+    kind: SortKind,
+}
+
+/// What a sort key extracts and how it compares.
+enum SortKind {
+    /// Compare the full refname with git's `versioncmp`.
+    Version,
+    /// Compare a `long` numerically (dates by seconds, size by bytes).
+    Numeric(NumField),
+    /// Render this atom to bytes and compare bytewise.
+    Rendered(RenderField),
+}
+
+enum NumField {
+    CommitterDate,
+    AuthorDate,
+    CreatorDate,
+    /// A branch tip is a commit, so it has no tagger; the value is always 0,
+    /// matching git rendering `taggerdate` as empty for a non-tag object.
+    TaggerDate,
+    Size,
+}
+
+/// A bytewise-compared field. `refname` reads the ref; the rest read the commit.
+enum RenderField {
+    Refname,
+    ObjectName,
+    ObjectType,
+    CommitterName,
+    CommitterEmail,
+    AuthorName,
+    AuthorEmail,
+    Subject,
+    Body,
+    Contents,
+}
+
+/// A precomputed, comparable value for one sort key on one ref.
+enum SortVal {
+    Num(i64),
+    Bytes(Vec<u8>),
+    Version(Vec<u8>),
+}
+
+impl SortVal {
+    fn cmp(&self, other: &SortVal) -> Ordering {
+        match (self, other) {
+            (SortVal::Num(a), SortVal::Num(b)) => a.cmp(b),
+            (SortVal::Bytes(a), SortVal::Bytes(b)) => a.cmp(b),
+            (SortVal::Version(a), SortVal::Version(b)) => versioncmp(a, b),
+            _ => Ordering::Equal,
+        }
+    }
+}
+
+/// Why sort resolution failed.
+enum SortErr {
+    /// A field name git itself rejects: emit `fatal: {0}` and exit 128.
+    Fatal(String),
+    /// A field git accepts but this port cannot sort by.
+    Unsupported(String),
+}
+
+/// Split a sort key into its `-` (descending), `version:`/`v:` and `*`
+/// (dereference) markers and the remaining field atom.
+fn parse_sort_key(key: &str) -> (bool, bool, bool, &str) {
+    let mut s = key;
+    let mut reverse = false;
+    if let Some(rest) = s.strip_prefix('-') {
+        reverse = true;
+        s = rest;
+    }
+    let mut version = false;
+    if let Some(rest) = s.strip_prefix("version:").or_else(|| s.strip_prefix("v:")) {
+        version = true;
+        s = rest;
+    }
+    let mut star = false;
+    if let Some(rest) = s.strip_prefix('*') {
+        star = true;
+        s = rest;
+    }
+    (reverse, version, star, s)
+}
+
+/// git's `parse_ref_filter_atom`: an empty atom is a `malformed field name`, and
+/// a field name outside `valid_atom[]` is an `unknown field name`.
+fn git_sort_error(key: &str) -> Option<String> {
+    let (_, _, _, atom) = parse_sort_key(key);
+    if atom.is_empty() {
+        return Some(format!("malformed field name: {atom}"));
+    }
+    let name = atom.split(':').next().unwrap_or(atom);
+    if !VALID_SORT_ATOMS.contains(&name) {
+        return Some(format!("unknown field name: {atom}"));
+    }
+    None
+}
+
+/// Validate and interpret every sort key. git dies on the first syntactically
+/// invalid key in the order given, so that is checked first; only then is this
+/// port's narrower support considered.
+fn resolve_sort(sorts: &[String]) -> Result<Vec<SortKey>, SortErr> {
+    for key in sorts {
+        if let Some(msg) = git_sort_error(key) {
+            return Err(SortErr::Fatal(msg));
+        }
+    }
+    let mut keys = Vec::with_capacity(sorts.len());
+    for key in sorts {
+        let (reverse, version, star, atom) = parse_sort_key(key);
+        let field = atom.split(':').next().unwrap_or(atom);
+        // A `:suffix` (e.g. `refname:short`, `objectname:short`) changes the
+        // rendered bytes git sorts on, so a field carrying one this port does not
+        // interpret must be refused rather than mis-sorted. Date fields are the
+        // exception: their suffix is only a display format, while git — like this
+        // port — always sorts a date atom by its underlying timestamp.
+        let suffixed = atom != field;
+        let is_date = matches!(
+            field,
+            "committerdate" | "authordate" | "creatordate" | "taggerdate"
+        );
+        let kind = if version {
+            if field == "refname" && !star && !suffixed {
+                SortKind::Version
+            } else {
+                return Err(SortErr::Unsupported(key.clone()));
+            }
+        } else if star {
+            // Dereference (`*field`) only differs from the plain field for an
+            // annotated tag; a branch never points at one, so this port has no
+            // faithful value for it.
+            return Err(SortErr::Unsupported(key.clone()));
+        } else if suffixed && !is_date {
+            return Err(SortErr::Unsupported(key.clone()));
+        } else {
+            match field {
+                "refname" => SortKind::Rendered(RenderField::Refname),
+                "committerdate" => SortKind::Numeric(NumField::CommitterDate),
+                "authordate" => SortKind::Numeric(NumField::AuthorDate),
+                "creatordate" => SortKind::Numeric(NumField::CreatorDate),
+                "taggerdate" => SortKind::Numeric(NumField::TaggerDate),
+                "objectsize" => SortKind::Numeric(NumField::Size),
+                "objectname" => SortKind::Rendered(RenderField::ObjectName),
+                "objecttype" | "type" => SortKind::Rendered(RenderField::ObjectType),
+                "committername" => SortKind::Rendered(RenderField::CommitterName),
+                "committeremail" => SortKind::Rendered(RenderField::CommitterEmail),
+                "authorname" => SortKind::Rendered(RenderField::AuthorName),
+                "authoremail" => SortKind::Rendered(RenderField::AuthorEmail),
+                "subject" => SortKind::Rendered(RenderField::Subject),
+                "body" => SortKind::Rendered(RenderField::Body),
+                "contents" => SortKind::Rendered(RenderField::Contents),
+                _ => return Err(SortErr::Unsupported(key.clone())),
+            }
+        };
+        keys.push(SortKey { reverse, kind });
+    }
+    Ok(keys)
+}
+
+/// The commit facts a branch sort key can read, decoded once per ref.
+struct CommitFacts {
+    committer_time: i64,
+    author_time: i64,
+    committer_name: Vec<u8>,
+    committer_email: Vec<u8>,
+    author_name: Vec<u8>,
+    author_email: Vec<u8>,
+    message: Vec<u8>,
+    size: u64,
+    kind: Kind,
+}
+
+/// Decode the commit a branch tip names. `None` for a symbolic ref (e.g.
+/// `origin/HEAD`) or any tip that is not a readable commit — such a ref then
+/// sorts with empty/zero keys and falls through to the refname tie-break.
+fn commit_facts(repo: &gix::Repository, id: ObjectId) -> Option<CommitFacts> {
+    let obj = repo.find_object(id).ok()?;
+    let size = obj.data.len() as u64;
+    let kind = obj.kind;
+    if kind != Kind::Commit {
+        return None;
+    }
+    let c = CommitRef::from_bytes(&obj.data, id.kind()).ok()?;
+    let committer = c.committer().ok()?;
+    let author = c.author().ok()?;
+    Some(CommitFacts {
+        committer_time: committer.seconds(),
+        author_time: author.seconds(),
+        committer_name: committer.name.to_vec(),
+        committer_email: committer.email.to_vec(),
+        author_name: author.name.to_vec(),
+        author_email: author.email.to_vec(),
+        message: c.message.to_vec(),
+        size,
+        kind,
+    })
+}
+
+/// Compute the comparable value for one key on one ref.
+fn sort_value(e: &Entry<'_>, facts: Option<&CommitFacts>, key: &SortKey) -> SortVal {
+    match &key.kind {
+        SortKind::Version => SortVal::Version(e.full.to_vec()),
+        SortKind::Numeric(field) => {
+            let n = match field {
+                NumField::CommitterDate => facts.map_or(0, |f| f.committer_time),
+                // A commit's creator is its committer (git's `creatordate` for a
+                // non-tag object is the committer date).
+                NumField::CreatorDate => facts.map_or(0, |f| f.committer_time),
+                NumField::AuthorDate => facts.map_or(0, |f| f.author_time),
+                NumField::TaggerDate => 0,
+                NumField::Size => facts.map_or(0, |f| f.size as i64),
+            };
+            SortVal::Num(n)
+        }
+        SortKind::Rendered(field) => SortVal::Bytes(match field {
+            RenderField::Refname => e.full.to_vec(),
+            RenderField::ObjectName => e.id.map(|id| id.to_string().into_bytes()).unwrap_or_default(),
+            RenderField::ObjectType => match facts {
+                Some(f) => f.kind.as_bytes().to_vec(),
+                None => Vec::new(),
+            },
+            RenderField::CommitterName => facts.map(|f| f.committer_name.clone()).unwrap_or_default(),
+            RenderField::CommitterEmail => facts
+                .map(|f| bracket_email(&f.committer_email))
+                .unwrap_or_default(),
+            RenderField::AuthorName => facts.map(|f| f.author_name.clone()).unwrap_or_default(),
+            RenderField::AuthorEmail => facts
+                .map(|f| bracket_email(&f.author_email))
+                .unwrap_or_default(),
+            RenderField::Subject => facts.map(|f| subject_of(&f.message)).unwrap_or_default(),
+            RenderField::Body => facts.map(|f| body_of(&f.message)).unwrap_or_default(),
+            RenderField::Contents => facts.map(|f| f.message.clone()).unwrap_or_default(),
+        }),
+    }
+}
+
+/// git's `%(committeremail)`/`%(authoremail)` wrap the address in angle brackets;
+/// the sort value is the rendered atom, so match that framing.
+fn bracket_email(email: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(email.len() + 2);
+    v.push(b'<');
+    v.extend_from_slice(email);
+    v.push(b'>');
+    v
+}
+
+/// git's subject: the first paragraph, with internal newlines folded to spaces.
+fn subject_of(msg: &[u8]) -> Vec<u8> {
+    let trimmed = {
+        let end = msg.iter().rposition(|&b| b != b'\n').map_or(0, |i| i + 1);
+        &msg[..end]
+    };
+    let sub_end = trimmed
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .unwrap_or(trimmed.len());
+    trimmed[..sub_end]
+        .iter()
+        .map(|&b| if b == b'\n' { b' ' } else { b })
+        .collect()
+}
+
+/// git's body: everything after the blank line that ends the subject.
+fn body_of(msg: &[u8]) -> Vec<u8> {
+    match msg.windows(2).position(|w| w == b"\n\n") {
+        Some(p) => msg[p + 2..].to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// git's `versioncmp` (a modified glibc `strverscmp`), byte for byte.
+fn versioncmp(s1: &[u8], s2: &[u8]) -> Ordering {
+    const S_N: usize = 0;
+    const S_I: usize = 3;
+    const S_F: usize = 6;
+    const S_Z: usize = 9;
+    const CMP: i8 = 2;
+    const LEN: i8 = 3;
+    #[rustfmt::skip]
+    const NEXT_STATE: [usize; 12] = [
+        S_N, S_I, S_Z,
+        S_N, S_I, S_I,
+        S_N, S_F, S_F,
+        S_N, S_F, S_Z,
+    ];
+    #[rustfmt::skip]
+    const RESULT_TYPE: [i8; 36] = [
+        CMP, CMP, CMP, CMP, LEN, CMP, CMP, CMP, CMP,
+        CMP, -1,  -1,   1,  LEN, LEN,  1,  LEN, LEN,
+        CMP, CMP, CMP, CMP, CMP, CMP, CMP, CMP, CMP,
+        CMP,  1,   1,  -1,  CMP, CMP, -1,  CMP, CMP,
+    ];
+
+    let get = |p: &[u8], i: usize| -> u8 { p.get(i).copied().unwrap_or(0) };
+    let digit = |c: u8| -> usize { usize::from(c.is_ascii_digit()) };
+    let zero = |c: u8| -> usize { usize::from(c == b'0') };
+
+    let mut i1 = 0usize;
+    let mut i2 = 0usize;
+    let mut c1 = get(s1, i1);
+    i1 += 1;
+    let mut c2 = get(s2, i2);
+    i2 += 1;
+    let mut state = S_N + zero(c1) + digit(c1);
+    let mut diff;
+    loop {
+        diff = c1 as i32 - c2 as i32;
+        if diff != 0 {
+            break;
+        }
+        if c1 == 0 {
+            return Ordering::Equal;
+        }
+        state = NEXT_STATE[state];
+        c1 = get(s1, i1);
+        i1 += 1;
+        c2 = get(s2, i2);
+        i2 += 1;
+        state += zero(c1) + digit(c1);
+    }
+
+    let rt = RESULT_TYPE[state * 3 + zero(c2) + digit(c2)];
+    match rt {
+        CMP => diff.cmp(&0),
+        LEN => {
+            loop {
+                let d1 = get(s1, i1);
+                i1 += 1;
+                if !d1.is_ascii_digit() {
+                    break;
+                }
+                let d2 = get(s2, i2);
+                i2 += 1;
+                if !d2.is_ascii_digit() {
+                    return Ordering::Greater;
+                }
+            }
+            if get(s2, i2).is_ascii_digit() {
+                Ordering::Less
+            } else {
+                diff.cmp(&0)
+            }
+        }
+        other => (other as i32).cmp(&0),
+    }
 }

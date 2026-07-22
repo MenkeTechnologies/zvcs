@@ -59,34 +59,29 @@
 //!   stderr for the merge backend, the `rebase (pick)` reflog entries, and the
 //!   branch landing on the rewritten tip.
 //!
+//! ### Genuine picks
+//!
+//! A replay where `<onto>` is *not* already `<head>`'s ancestor is a genuine
+//! pick: each commit is cherry-picked with a real three-way merge (its tree
+//! against the growing tip over the commit's first parent) via
+//! [`crate::merge_apply`]. Clean picks reproduce git's rebased tree byte-for-byte;
+//! a conflict stops the rebase with `CONFLICT`/`could not apply` and the
+//! conflicted worktree/index in place, recoverable with `git reset --hard
+//! ORIG_HEAD`.
+//!
 //! ### What is NOT ported, and why
 //!
-//! Any replay that is a genuine pick, i.e. one where `<onto>` is *not* already
-//! `<head>`'s ancestor along a linear first-parent path. Two independent
-//! blockers stand in the way:
-//!
-//! 1. **No three-way tree merge wired up here.** A pick is a merge of the picked
-//!    commit's tree against `HEAD`'s over the commit's first parent.
-//! 2. **No patch-id equivalence.** Default `git rebase` *drops* every
-//!    to-be-rebased commit whose patch is already in `<upstream>`, printing
-//!    `warning: skipped previously applied commit <abbrev>`. Deciding that needs
-//!    a patch-id per commit on both sides of the symmetric difference; nothing
-//!    vendored computes one (`porcelain::patch_id` is a stdin filter over
-//!    pre-rendered diff text). Getting this wrong silently *keeps* commits git
-//!    would have dropped — duplicated history that looks like success.
-//!
-//! Neither blocker has anything to bite on in the `exact_replay` case above,
-//! which is why that one is ported and the general one is not. Elsewhere the
-//! replay is refused rather than approximated, and so are the few non-replay
-//! features that still need substrate this module does not have:
-//! `--continue`/`--skip`/`--abort`/`--quit`/`--edit-todo`/`--show-current-patch`
-//! (the `.git/rebase-merge` state directory), `--root` (it mints a root commit),
-//! `--fork-point` (`get_fork_point()` walks the upstream reflog), `--autostash`
-//! against a dirty tree (it writes a stash commit), `--signoff`/`--trailer`
-//! **over a range that actually picks commits** (they rewrite each commit's
-//! message, which the exact replay does not reproduce), `-v`/`--stat` past the
-//! up-to-date exit (the upstream diffstat), and an executable `pre-rebase` hook.
-//! Each is rejected with a message naming the reason; none is silently ignored.
+//! * **No patch-id equivalence.** Default `git rebase` *drops* a to-be-rebased
+//!   commit whose patch is already in `<upstream>` (`warning: skipped previously
+//!   applied commit <abbrev>`). Deciding that needs a patch-id per commit; nothing
+//!   vendored computes one, so such commits are re-picked (they usually merge to a
+//!   no-op) rather than dropped.
+//! * The **`--continue`/`--skip`/`--abort`/`--quit`/`--edit-todo`/
+//!   `--show-current-patch`** state machine (the `.git/rebase-merge` directory),
+//!   `--root` (mints a root commit), `--fork-point` (walks the upstream reflog),
+//!   `--autostash` against a dirty tree (writes a stash commit), and `-v`/`--stat`
+//!   past the up-to-date exit (the upstream diffstat). Each is rejected with a
+//!   message naming the reason; none is silently ignored.
 //!
 //! `--signoff`/`--trailer` are *not* refused up front, and *not* refused at all
 //! when the todo is empty: like git they only set `REBASE_FORCE`, so an
@@ -101,7 +96,7 @@ use std::collections::{HashMap, HashSet};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-use gix::bstr::{BString, ByteSlice};
+use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::index::entry::{Mode, Stat};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
@@ -1126,8 +1121,11 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    if !ok_to_skip_pre_rebase && hook_is_runnable(&repo, "pre-rebase") {
-        bail!("a pre-rebase hook is installed; running hooks is not ported");
+    // `pre-rebase` receives `<upstream> [<branch>]`; a non-zero exit aborts.
+    if !ok_to_skip_pre_rebase
+        && !crate::hooks::run(&repo, "pre-rebase", &[onto_spec.as_str(), branch_name.as_str()], None)?
+    {
+        return Ok(ExitCode::from(1));
     }
 
     if flags & DIFFSTAT != 0 {
@@ -1213,14 +1211,9 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 todo.len()
             );
         }
-    } else if !todo.is_empty() {
-        bail!(
-            "replaying {} commit(s) needs a three-way tree merge plus patch-id equivalence to drop \
-             already-upstream commits; neither is wired up here, so only the up-to-date and \
-             no-replay fast-forward paths are ported",
-            todo.len()
-        );
     }
+    // Genuine picks (a real three-way merge per commit) are replayed in the finish
+    // below via [`crate::merge_apply`]; no refusal here anymore.
 
     if !exec.is_empty() {
         // Reachable only with an empty todo list, where git appends no exec
@@ -1336,6 +1329,96 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 Target::Object(new),
                 &gix::reference::log::message("rebase (pick)", step.message.as_bstr(), 1)
                     .to_string(),
+            )?;
+            tip = new;
+        }
+    } else if !todo.is_empty() && !apply_backend {
+        // Genuine picks: cherry-pick each commit (oldest first) onto the growing
+        // tip with a real three-way merge. On a conflict the rebase stops with the
+        // conflicted worktree/index in place; recover with `git reset --hard
+        // ORIG_HEAD` (git's `--continue`/`--abort` state machine is not ported).
+        let committer = repo
+            .committer()
+            .ok_or_else(|| anyhow!("committer identity is not configured"))??
+            .to_owned()?;
+        let empty_tree = ObjectId::empty_tree(repo.object_hash());
+        let onto_tree = repo.find_commit(onto_oid)?.tree_id()?.detach();
+        let mut cur_index = repo.index_from_tree(&onto_tree)?;
+        let total = todo.len();
+        for (n, oid) in todo.iter().rev().enumerate() {
+            if flags & NO_QUIET != 0 {
+                eprint!(
+                    "Rebasing ({}/{total}){}",
+                    n + 1,
+                    if flags & VERBOSE != 0 { "\n" } else { "\r" }
+                );
+            }
+            let commit = repo.find_commit(*oid)?;
+            let message: BString = commit.message_raw()?.to_owned();
+            let subject: BString = match message.find_byte(b'\n') {
+                Some(p) => message[..p].as_bstr().to_owned(),
+                None => message.clone(),
+            };
+            let ctree = commit.tree_id()?.detach();
+            let base_tree = match commit.parent_ids().next() {
+                Some(p) => repo.find_commit(p.detach())?.tree_id()?.detach(),
+                None => empty_tree,
+            };
+            let tip_tree = repo.find_commit(tip)?.tree_id()?.detach();
+
+            let short = oid.to_hex_with_len(7).to_string();
+            let other_label = format!("{short} ({subject})", subject = subject.to_str_lossy());
+            let labels = gix::merge::blob::builtin_driver::text::Labels {
+                ancestor: Some(BStr::new(b"HEAD")),
+                current: Some(BStr::new(b"HEAD")),
+                other: Some(BStr::new(other_label.as_bytes())),
+            };
+            let applied = crate::merge_apply::three_way_merge(
+                &repo,
+                base_tree,
+                tip_tree,
+                ctree,
+                &cur_index,
+                labels,
+                &should_interrupt,
+            )?;
+            cur_index = applied.index;
+            cur_index.write(Default::default())?;
+
+            if !applied.conflicts.is_empty() {
+                eprintln!("error: could not apply {short}... {}", subject.to_str_lossy());
+                eprintln!(
+                    "hint: Resolve all conflicts manually, mark them as resolved with"
+                );
+                eprintln!(
+                    "hint: \"git add/rm <conflicted_files>\", then run \"git rebase --continue\"."
+                );
+                eprintln!(
+                    "hint: You can instead skip this commit: run \"git rebase --skip\"."
+                );
+                eprintln!(
+                    "hint: To abort and get back to the state before \"git rebase\", run \"git rebase --abort\"."
+                );
+                eprintln!("Could not apply {short}... {}", subject.to_str_lossy());
+                return Ok(ExitCode::from(1));
+            }
+
+            let author = commit.author()?.to_owned()?;
+            let new = repo
+                .write_object(&gix::objs::Commit {
+                    message: message.clone(),
+                    tree: applied.tree_id,
+                    author,
+                    committer: committer.clone(),
+                    encoding: None,
+                    parents: std::iter::once(tip).collect(),
+                    extra_headers: Default::default(),
+                })?
+                .detach();
+            set_head(
+                &repo,
+                Target::Object(new),
+                &gix::reference::log::message("rebase (pick)", message.as_bstr(), 1).to_string(),
             )?;
             tip = new;
         }

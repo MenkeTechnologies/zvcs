@@ -141,6 +141,29 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         bail!("no refspec to push");
     }
 
+    // `pre-push` runs before contacting the remote, receiving `<remote> <url>` as
+    // arguments and one `<local-ref> <local-sha> <remote-ref> <remote-sha>` line
+    // per update on stdin. A non-zero exit aborts the push (git behavior).
+    if !f.dry_run {
+        let url = remote
+            .url(Direction::Push)
+            .or_else(|| remote.url(Direction::Fetch))
+            .map(|u| u.to_bstring().to_string())
+            .unwrap_or_default();
+        let null = ObjectId::null(repo.object_hash());
+        let mut payload = String::new();
+        for req in &requests {
+            let remote_sha = tracking_oid(&repo, &remote, &req.name).unwrap_or(null);
+            payload.push_str(&format!(
+                "{0} {1} {0} {2}\n",
+                req.name, req.new, remote_sha
+            ));
+        }
+        if !crate::hooks::run(&repo, "pre-push", &[&remote_name, &url], Some(payload.as_bytes()))? {
+            return Ok(ExitCode::from(1));
+        }
+    }
+
     let outcome = push_proto::send_pack(&repo, &remote, &requests, f.dry_run)?;
 
     // A dry run performs no local writes; a real push advances the tracking refs

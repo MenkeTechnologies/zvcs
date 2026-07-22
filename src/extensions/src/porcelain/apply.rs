@@ -59,11 +59,21 @@
 //! Whitespace-error warnings (git's default `--whitespace=warn`) are not
 //! emitted; they go to stderr only and never alter the applied content.
 //!
+//! Config: `apply.whitespace` is read as the default `--whitespace` action, the
+//! same as git — the command line overrides it. A `warn`/`nowarn` default is the
+//! same no-op; a `fix`/`strip`/`error`/`error-all` default is deferred to the
+//! unsupported-flag path (as those byte-altering actions are unimplemented); an
+//! invalid value there is fatal (128) at startup, before the patch is opened and
+//! ahead of any `--whitespace` on the command line, matching git's config parse
+//! order. `apply.ignoreWhitespace` is not read: the `--ignore-whitespace`
+//! machinery it would default is itself unimplemented.
+//!
 //! `-q`/`--quiet` silences every `error:` diagnostic, matching git, where they
 //! all go through `error()`; exit codes are unaffected, and `fatal:` messages and
 //! usage errors are not silenced.
 
 use anyhow::{bail, Result};
+use gix::bstr::ByteSlice;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -153,6 +163,29 @@ fn mark(v: &mut Vec<Unhonoured>, key: &'static str, spelling: &str, why: &'stati
 
 fn unmark(v: &mut Vec<Unhonoured>, key: &'static str) {
     v.retain(|u| u.key != key);
+}
+
+/// How a `--whitespace`/`apply.whitespace` action classifies against the set
+/// git's `parse_whitespace_option` accepts.
+enum WsAction {
+    /// `warn`/`nowarn`: neither alters the applied bytes; this port emits no
+    /// whitespace warnings either, so both are a no-op.
+    Noop,
+    /// `fix`/`strip`/`error`/`error-all`: byte-altering or erroring at apply
+    /// time; not implemented, so deferred to the unsupported-flag path.
+    Defer,
+    /// Anything else: git rejects it as an unrecognized whitespace option.
+    Invalid,
+}
+
+/// Classify a whitespace action string exactly as git's `parse_whitespace_option`
+/// does (used for both the `--whitespace` flag and the `apply.whitespace` config).
+fn classify_whitespace(v: &str) -> WsAction {
+    match v {
+        "warn" | "nowarn" => WsAction::Noop,
+        "fix" | "strip" | "error" | "error-all" => WsAction::Defer,
+        _ => WsAction::Invalid,
+    }
 }
 
 /// Parsed command-line options for a single `apply` invocation. Only the flags
@@ -304,14 +337,13 @@ fn parse_opts(
                         unmark(unhonoured, "whitespace");
                     } else {
                         let v = long_value(args, &mut i, name, inline)?;
-                        match v.as_str() {
-                            // Neither warns nor alters the applied bytes, and we
-                            // emit no whitespace warnings.
-                            "warn" | "nowarn" => unmark(unhonoured, "whitespace"),
-                            "fix" | "strip" | "error" | "error-all" => {
-                                mark(unhonoured, "whitespace", &a, R_WS)
-                            }
-                            _ => {
+                        // A CLI action overrides any deferred `apply.whitespace`
+                        // default read from config: `Noop` clears it, `Defer`
+                        // replaces it with this spelling.
+                        match classify_whitespace(&v) {
+                            WsAction::Noop => unmark(unhonoured, "whitespace"),
+                            WsAction::Defer => mark(unhonoured, "whitespace", &a, R_WS),
+                            WsAction::Invalid => {
                                 eprintln!("error: unrecognized whitespace option '{v}'");
                                 return Err(ExitCode::from(129));
                             }
@@ -476,6 +508,30 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     let mut o = Opts::default();
     let mut sources: Vec<String> = Vec::new();
     let mut unhonoured: Vec<Unhonoured> = Vec::new();
+
+    // git reads `apply.whitespace` from config as the default `--whitespace`
+    // action, before it parses arguments. An invalid value there is fatal (128)
+    // immediately — before the patch input is even opened, and regardless of a
+    // valid `--whitespace` on the command line, which git parses only afterward.
+    // A byte-altering (`fix`/`strip`) or erroring (`error`/`error-all`) action is
+    // not implemented, so it is recorded as a deferred default exactly like the
+    // CLI flag: it bails only once the input holds a patch, and a later
+    // `--whitespace` on the command line overrides (clears) it.
+    if let Ok(repo) = gix::discover(".") {
+        if let Some(v) = repo.config_snapshot().string("apply.whitespace") {
+            let v = v.to_str_lossy();
+            match classify_whitespace(&v) {
+                WsAction::Noop => {}
+                WsAction::Defer => {
+                    mark(&mut unhonoured, "whitespace", &format!("apply.whitespace={v}"), R_WS)
+                }
+                WsAction::Invalid => {
+                    eprintln!("error: unrecognized whitespace option '{v}'");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
+    }
 
     if let Err(code) = parse_opts(args, &mut o, &mut sources, &mut unhonoured) {
         return Ok(code);

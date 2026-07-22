@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -86,7 +86,29 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     // git reads blame.showEmail as the default for `-e`/`--show-email`, still
     // overridable on the command line (including `--no-show-email`).
     let show_email_default = repo.config_snapshot().boolean("blame.showEmail") == Some(true);
+
+    // git reads blame.date as the default date mode for the human-format
+    // timestamp column, still overridable by `--date=<mode>`. git validates the
+    // config value at read time (before argument parsing), so an invalid mode
+    // there is fatal even when a valid `--date` is also on the command line.
+    let date_default = match repo.config_snapshot().string("blame.date") {
+        Some(v) => match resolve_date_mode(&v.to_str_lossy())? {
+            DateOutcome::Mode(m) => m,
+            DateOutcome::Fatal(code) => return Ok(code),
+        },
+        None => DateMode::Iso8601,
+    };
+
     let mut opts = Options::parse(args, show_email_default)?;
+
+    // `--date=<mode>` overrides blame.date; git validates it the same way.
+    opts.date_mode = match opts.date_arg.take() {
+        Some(s) => match resolve_date_mode(&s)? {
+            DateOutcome::Mode(m) => m,
+            DateOutcome::Fatal(code) => return Ok(code),
+        },
+        None => date_default,
+    };
 
     // Split the positional arguments into a revision and a single path following
     // git blame's DWIM grammar, then resolve the revision. This may short-circuit
@@ -318,7 +340,7 @@ fn collect_commit_info(
             CommitInfo {
                 display_author: display_author(author.name, author.email, opts.show_email),
                 display_date: author_time
-                    .map(|t| t.format_or_unix(gix::date::time::format::ISO8601))
+                    .map(|t| opts.date_mode.format_time(t.seconds, t.offset))
                     .unwrap_or_else(|| author.time.to_string()),
                 boundary,
                 hex: line.commit_id.to_hex().to_string(),
@@ -347,7 +369,7 @@ fn not_committed_info(id: ObjectId, opts: &Options, rel_path: &str) -> CommitInf
             NOT_COMMITTED_MAIL.as_bstr(),
             opts.show_email,
         ),
-        display_date: now.format_or_unix(gix::date::time::format::ISO8601),
+        display_date: opts.date_mode.format_time(now.seconds, now.offset),
         boundary: false,
         hex: id.to_hex().to_string(),
         author_name: NOT_COMMITTED_NAME.to_vec(),
@@ -467,7 +489,15 @@ fn emit_human(
             buf.extend_from_slice(&ci.display_author);
             pad(&mut buf, w_author.saturating_sub(ci.display_author.len()));
             buf.push(b' ');
+            // The date column is left-justified in a fixed, per-mode width
+            // (git's `blame_date_width`), so shorter renderings are padded out.
             buf.extend_from_slice(ci.display_date.as_bytes());
+            pad(
+                &mut buf,
+                opts.date_mode
+                    .width()
+                    .saturating_sub(ci.display_date.chars().count()),
+            );
         }
 
         // Final line number (right-justified) + content.
@@ -800,6 +830,216 @@ fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets
     Ok(Targets::Resolved)
 }
 
+/// The date-formatting modes zvcs blame reproduces byte-for-byte from git's
+/// `show_date`. git accepts more modes (`relative`, `human`, `format:<strftime>`,
+/// and every `-local` variant), but those need machinery blame.rs does not have
+/// (a relative-time renderer, strftime, local-timezone conversion), so they are
+/// rejected rather than emitting wrong bytes — matching this file's policy for
+/// unimplemented features.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DateMode {
+    /// git `DATE_NORMAL` (`default`): `Thu Oct 19 16:00:04 2006 -0700`.
+    Normal,
+    /// git `DATE_ISO8601` (`iso`/`iso8601`): `2006-10-19 16:00:04 -0700`. blame's default.
+    Iso8601,
+    /// git `DATE_ISO8601_STRICT` (`iso-strict`): `2006-10-19T16:00:04-07:00` (`Z` at UTC).
+    Iso8601Strict,
+    /// git `DATE_RFC2822` (`rfc`): `Thu, 19 Oct 2006 16:00:04 -0700`.
+    Rfc2822,
+    /// git `DATE_SHORT` (`short`): `2006-10-19`.
+    Short,
+    /// git `DATE_RAW` (`raw`): `1161298804 -0700`.
+    Raw,
+    /// git `DATE_UNIX` (`unix`): `1161298804`.
+    Unix,
+}
+
+impl DateMode {
+    /// git's fixed `blame_date_width` per mode: the width the date column is
+    /// left-justified into (`sizeof(reference) - 1`, i.e. the reference length).
+    fn width(self) -> usize {
+        match self {
+            DateMode::Normal => "Thu Oct 19 16:00:04 2006 -0700".len(),
+            DateMode::Iso8601 => "2006-10-19 16:00:04 -0700".len(),
+            DateMode::Iso8601Strict => "2006-10-19T16:00:04-07:00".len(),
+            DateMode::Rfc2822 => "Thu, 19 Oct 2006 16:00:04 -0700".len(),
+            DateMode::Short => "2006-10-19".len(),
+            DateMode::Raw => "1161298804 -0700".len(),
+            DateMode::Unix => "1161298804".len(),
+        }
+    }
+
+    /// Render `<seconds> @ <offset>` the way git's `show_date` does for this mode.
+    fn format_time(self, seconds: i64, offset: i32) -> String {
+        use gix::date::time::format;
+        let t = gix::date::Time { seconds, offset };
+        match self {
+            DateMode::Normal => t.format_or_unix(format::DEFAULT),
+            DateMode::Iso8601 => t.format_or_unix(format::ISO8601),
+            DateMode::Iso8601Strict => {
+                // git prints `Z` for a zero UTC offset; jiff's `%:z` (used by gix)
+                // would print `+00:00`, so fix that one case up to match.
+                let s = t.format_or_unix(format::ISO8601_STRICT);
+                if offset == 0 {
+                    if let Some(head) = s.strip_suffix("+00:00") {
+                        return format!("{head}Z");
+                    }
+                }
+                s
+            }
+            // gix's `RFC2822` zero-pads the day; git's `%-d` form (`GIT_RFC2822`)
+            // matches git's `show_date` exactly.
+            DateMode::Rfc2822 => t.format_or_unix(format::GIT_RFC2822),
+            DateMode::Short => t.format_or_unix(format::SHORT),
+            DateMode::Raw => t.format_or_unix(format::RAW),
+            DateMode::Unix => t.format_or_unix(format::UNIX),
+        }
+    }
+}
+
+/// git's `date_mode_type`, restricted to what the parser needs to classify.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DateType {
+    Relative,
+    Human,
+    IsoStrict,
+    Iso,
+    Rfc,
+    Short,
+    Normal,
+    Raw,
+    Unix,
+    Strftime,
+}
+
+/// The result of classifying a `--date` / blame.date value against git's grammar.
+enum DateClass {
+    /// A mode blame.rs renders byte-for-byte.
+    Supported(DateMode),
+    /// A mode git accepts but blame.rs does not implement; carries the effective
+    /// format string for the diagnostic.
+    Unsupported(String),
+    /// Not a recognized git date format → `fatal: unknown date format <s>`.
+    UnknownFormat(String),
+    /// A `format`/`format-local` mode with no `:` → git's missing-colon fatal.
+    MissingColon(String),
+}
+
+/// Classify a date-format string exactly the way git's `parse_date_format` /
+/// `parse_date_type` do: prefix-match the type in git's order, consume an
+/// optional `-local` suffix, then require the remainder to be empty (or a `:`
+/// for `format`). `auto:` and the `local` alias are handled first as git does.
+fn classify_date(input: &str) -> DateClass {
+    // `auto:foo` → foo when stdout is a terminal, else `default`.
+    let format = if let Some(rest) = input.strip_prefix("auto:") {
+        if std::io::stdout().is_terminal() {
+            rest.to_string()
+        } else {
+            "default".to_string()
+        }
+    } else {
+        input.to_string()
+    };
+    // Historical alias: `local` means `default-local`.
+    let format = if format == "local" {
+        "default-local".to_string()
+    } else {
+        format
+    };
+
+    // parse_date_type: first matching prefix wins, in git's exact order.
+    let f = format.as_str();
+    let (ty, rest) = if let Some(r) = f.strip_prefix("relative") {
+        (DateType::Relative, r)
+    } else if let Some(r) = f.strip_prefix("iso8601-strict").or_else(|| f.strip_prefix("iso-strict"))
+    {
+        (DateType::IsoStrict, r)
+    } else if let Some(r) = f.strip_prefix("iso8601").or_else(|| f.strip_prefix("iso")) {
+        (DateType::Iso, r)
+    } else if let Some(r) = f.strip_prefix("rfc2822").or_else(|| f.strip_prefix("rfc")) {
+        (DateType::Rfc, r)
+    } else if let Some(r) = f.strip_prefix("short") {
+        (DateType::Short, r)
+    } else if let Some(r) = f.strip_prefix("default") {
+        (DateType::Normal, r)
+    } else if let Some(r) = f.strip_prefix("human") {
+        (DateType::Human, r)
+    } else if let Some(r) = f.strip_prefix("raw") {
+        (DateType::Raw, r)
+    } else if let Some(r) = f.strip_prefix("unix") {
+        (DateType::Unix, r)
+    } else if let Some(r) = f.strip_prefix("format") {
+        (DateType::Strftime, r)
+    } else {
+        return DateClass::UnknownFormat(format);
+    };
+
+    // Optional `-local` suffix sets local mode on any type.
+    let (local, rest) = match rest.strip_prefix("-local") {
+        Some(r) => (true, r),
+        None => (false, rest),
+    };
+
+    if ty == DateType::Strftime {
+        // `format:<strftime>` requires a colon; the strftime renderer is not
+        // implemented, so a valid one is still "unsupported".
+        if !rest.starts_with(':') {
+            return DateClass::MissingColon(format);
+        }
+        return DateClass::Unsupported(format);
+    }
+
+    // Any other trailing text is not a valid format.
+    if !rest.is_empty() {
+        return DateClass::UnknownFormat(format);
+    }
+
+    // `-local` needs timezone conversion blame.rs does not do.
+    if local {
+        return DateClass::Unsupported(format);
+    }
+
+    match ty {
+        DateType::Iso => DateClass::Supported(DateMode::Iso8601),
+        DateType::IsoStrict => DateClass::Supported(DateMode::Iso8601Strict),
+        DateType::Rfc => DateClass::Supported(DateMode::Rfc2822),
+        DateType::Short => DateClass::Supported(DateMode::Short),
+        DateType::Normal => DateClass::Supported(DateMode::Normal),
+        DateType::Raw => DateClass::Supported(DateMode::Raw),
+        DateType::Unix => DateClass::Supported(DateMode::Unix),
+        DateType::Relative | DateType::Human => DateClass::Unsupported(format),
+        DateType::Strftime => unreachable!("strftime handled above"),
+    }
+}
+
+/// Outcome of resolving a date-format value: a mode to use, or a fatal exit
+/// (git's `128` for a malformed format, already reported to stderr).
+enum DateOutcome {
+    Mode(DateMode),
+    Fatal(ExitCode),
+}
+
+/// Resolve a `--date` / blame.date value, reproducing git's fatal messages and
+/// exit code for malformed formats and rejecting valid-but-unimplemented modes.
+fn resolve_date_mode(input: &str) -> Result<DateOutcome> {
+    match classify_date(input) {
+        DateClass::Supported(m) => Ok(DateOutcome::Mode(m)),
+        DateClass::Unsupported(f) => bail!("unsupported --date mode: {f}"),
+        DateClass::UnknownFormat(f) => {
+            let mut err = std::io::stderr().lock();
+            writeln!(err, "fatal: unknown date format {f}")?;
+            err.flush()?;
+            Ok(DateOutcome::Fatal(ExitCode::from(128)))
+        }
+        DateClass::MissingColon(f) => {
+            let mut err = std::io::stderr().lock();
+            writeln!(err, "fatal: date format missing colon separator: {f}")?;
+            err.flush()?;
+            Ok(DateOutcome::Fatal(ExitCode::from(128)))
+        }
+    }
+}
+
 struct Options {
     rev: Option<String>,
     file: String,
@@ -817,6 +1057,11 @@ struct Options {
     abbrev: Option<usize>,
     porcelain: bool,
     line_porcelain: bool,
+    /// Raw `--date` value before repo-side validation; `None` if not given.
+    date_arg: Option<String>,
+    /// Resolved date mode for the human-format timestamp column, after applying
+    /// blame.date and any `--date` override.
+    date_mode: DateMode,
 }
 
 impl Options {
@@ -830,6 +1075,8 @@ impl Options {
         let mut abbrev: Option<usize> = None;
         let mut porcelain = false;
         let mut line_porcelain = false;
+        // Raw `--date` value (last one wins); resolved against the repo in `blame`.
+        let mut date_arg: Option<String> = None;
         // Positionals before the first `--`; `post` collects those after it.
         // `post.is_some()` means a `--` separator was seen.
         let mut pre: Vec<String> = Vec::new();
@@ -874,6 +1121,19 @@ impl Options {
                         .ok_or_else(|| anyhow!("option `--abbrev` requires a value"))?;
                     abbrev = Some(v.parse().map_err(|_| anyhow!("invalid --abbrev value: {v}"))?);
                 }
+                // `--date <mode>` / `--date=<mode>` set the default date format for
+                // the human-format timestamp column (validated against the repo in
+                // `blame`, so the last one wins here and errors surface there).
+                "--date" => {
+                    i += 1;
+                    let v = args
+                        .get(i)
+                        .ok_or_else(|| anyhow!("option `--date` requires a value"))?;
+                    date_arg = Some(v.clone());
+                }
+                _ if a.starts_with("--date=") => {
+                    date_arg = Some(a["--date=".len()..].to_string());
+                }
                 _ if a.starts_with("-L") => parse_line_range(&a[2..], &mut ranges)?,
                 _ if a.starts_with("--abbrev=") => {
                     let v = &a["--abbrev=".len()..];
@@ -904,6 +1164,9 @@ impl Options {
             abbrev,
             porcelain,
             line_porcelain,
+            date_arg,
+            // Overwritten in `blame` once blame.date / `--date` are resolved.
+            date_mode: DateMode::Iso8601,
         })
     }
 }

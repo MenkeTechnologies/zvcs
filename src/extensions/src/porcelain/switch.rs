@@ -122,8 +122,9 @@ struct Parsed<'a> {
     quiet: bool,
     /// `None` default, `Some(true)` for `--track`, `Some(false)` for `--no-track`.
     track: Option<bool>,
-    /// `--guess` is the default; `--no-guess` clears it.
-    guess: bool,
+    /// `None` = unset on the CLI (fall back to `checkout.guess`, default on);
+    /// `Some(true)` for `--guess`, `Some(false)` for `--no-guess`.
+    guess: Option<bool>,
     positionals: Vec<&'a str>,
 }
 
@@ -144,7 +145,7 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
         force: false,
         quiet: false,
         track: None,
-        guess: true,
+        guess: None,
         positionals: Vec::new(),
     };
     let mut only_positional = false;
@@ -209,8 +210,8 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
                 "no-detach" => p.detach = false,
                 "force" | "discard-changes" => p.force = true,
                 "no-force" | "no-discard-changes" => p.force = false,
-                "guess" => p.guess = true,
-                "no-guess" => p.guess = false,
+                "guess" => p.guess = Some(true),
+                "no-guess" => p.guess = Some(false),
                 "track" => {
                     if let Some(v) = attached {
                         if v != "direct" && v != "inherit" {
@@ -323,6 +324,12 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
 
     let repo = gix::discover(".")?;
 
+    // DWIM default: `--[no-]guess` on the CLI wins, else `checkout.guess`
+    // (git's default is on).
+    let guess = p
+        .guess
+        .unwrap_or_else(|| repo.config_snapshot().boolean("checkout.guess") != Some(false));
+
     if let Some(name) = p.orphan {
         return switch_orphan(&repo, name, &p.positionals, p.force, p.quiet);
     }
@@ -346,7 +353,7 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
     if p.positionals.is_empty() {
         return fatal("missing branch or commit argument");
     }
-    switch_existing(&repo, &p.positionals, p.quiet, p.guess, p.force)
+    switch_existing(&repo, &p.positionals, p.quiet, guess, p.force)
 }
 
 /// `git switch <branch>` — attach `HEAD` to an existing local branch, with DWIM

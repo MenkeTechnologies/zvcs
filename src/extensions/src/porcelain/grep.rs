@@ -184,6 +184,35 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     let mut textconv = false;
     let mut deferred = Deferred::default();
     let mut dialect = Dialect::Basic;
+
+    // git's `grep_config`: config-provided defaults, applied before the CLI loop
+    // below overrides them (`--[no-]line-number`, `-E`/`-F`/`-G`/`-P`, …). Done
+    // via a cheap early discover so it also works ahead of the main repo open.
+    if let Ok(repo) = gix::discover(".") {
+        let snap = repo.config_snapshot();
+        if snap.boolean("grep.lineNumber") == Some(true) {
+            opts.line_number = true;
+        }
+        if snap.boolean("grep.column") == Some(true) {
+            opts.column = true;
+        }
+        if snap.boolean("grep.fullName") == Some(true) {
+            opts.full_name = true;
+        }
+        // `grep.patternType` selects the dialect; `default` (or unset) falls back
+        // to the legacy `grep.extendedRegexp` boolean. All CLI-overridable below.
+        match snap.string("grep.patternType").map(|v| v.to_string()).as_deref() {
+            Some("basic") => dialect = Dialect::Basic,
+            Some("extended") => dialect = Dialect::Extended,
+            Some("fixed") => dialect = Dialect::Fixed,
+            Some("perl") => dialect = Dialect::Perl,
+            _ => {
+                if snap.boolean("grep.extendedRegexp") == Some(true) {
+                    dialect = Dialect::Extended;
+                }
+            }
+        }
+    }
     let mut patterns: Vec<String> = Vec::new();
     // Whether any `-e`/`-f`/`--file` was given. git suppresses its "no pattern
     // given" fatal once one was, even if the file contributed no usable pattern,

@@ -161,6 +161,23 @@
       <hr class="section-rule">
 
       <section class="tutorial-section">
+        <h2>gitconfig coverage</h2>
+        <p>zvcs honors <strong>152 of the 1003</strong> configuration keys git&nbsp;2.55 documents via <code>git help --config</code> &mdash; about <strong>15%</strong>. This is a measured figure, not an estimate: git's key list intersected with the keys read in <code>src/extensions/src</code> and the keys the vendored <code>gix</code> engine declares in <code>config/tree</code>. A setting is only counted where the behavior that consumes it exists; the loader itself (<code>gix</code>) parses every key regardless.</p>
+        <table class="file-table">
+          <thead><tr><th>Source</th><th>Keys</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>git&nbsp;2.55 documented total</td><td>1003</td><td>Everything <code>git help --config</code> lists.</td></tr>
+            <tr><td>Honored by zvcs porcelain</td><td>92</td><td>Read and applied directly in the ported subcommands (e.g. <code>core.pager</code>, <code>alias.*</code>, <code>help.autocorrect</code>, <code>merge.ff</code>, <code>tag.sort</code>, <code>format.*</code>).</td></tr>
+            <tr><td>Honored by the gix engine</td><td>75</td><td>Applied when <code>gix</code> performs the operation &mdash; <code>core.autocrlf</code> on checkout, <code>diff.renames</code> on diff, and the rest of its typed config tree.</td></tr>
+            <tr><td><strong>Distinct union</strong></td><td><strong>152 (15%)</strong></td><td>Union of the two, de-duplicated against git's key list (15 keys overlap).</td></tr>
+          </tbody>
+        </table>
+        <p>The remaining ~851 keys are dominated by configuration for commands that are not yet ported or are server-side, where reading the key would be meaningless without the command behind it: <code>receive.*</code> (94), <code>fsck.*</code> (77), <code>sendemail.*</code> (42), and the <code>gui</code> / <code>gitweb</code> / <code>imap</code> / <code>gitcvs</code> / <code>uploadpack</code> / <code>instaweb</code> / <code>trace2</code> families. Coverage of the config surface reachable from ported commands is far higher than the headline 15%.</p>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
         <h2>Dependency posture</h2>
         <p>Dependencies are kept foundational and durable. The <code>src/extensions</code> crate has a deliberately small direct-dependency surface; everything git-related comes from the vendored, owned gitoxide tree rather than external crates.</p>
         <table class="file-table">

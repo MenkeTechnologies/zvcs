@@ -10,26 +10,45 @@
 //! `Could not get …. Skipping.` warnings on stderr, and the `fatal:` messages
 //! with exit code 128 / usage with 129 all match.
 //!
+//! Additionally covered, verified byte-for-byte against git 2.55.0's own
+//! `format-rev` output: `%d`/`%D` ref decoration (same reverse-sorted ordering
+//! and `HEAD -> `/`tag: ` prefixes git's log-tree walker produces), the
+//! mailmap-aware `%aN`/`%aE`/`%cN`/`%cE`, the `%C*` color placeholders (color is
+//! off for the piped, non-`--color` invocation, so every form expands to empty
+//! except an explicit `%C(always,<spec>)`, whose ANSI is emitted), `%m` (the
+//! revision mark, always `>` here), the reflog placeholders `%gD`/`%gd`/`%gn`/
+//! `%ge`/`%gs` (always empty — `format-rev` carries no reflog selector),
+//! `%(describe)`/`%(describe:tags)`/`%(describe:all)`, and the `%(...)` atoms
+//! git itself does not expand in `format-rev` — `%(align…)`, `%(if…)`/`%(then)`/
+//! `%(else)`/`%(end)` and any other unrecognised `%(…)` — which git echoes
+//! verbatim, as we do.
+//!
 //! Not covered — each rejected with a precise message rather than producing
-//! divergent output: `--notes=<ref>` (no notes lookup here, so `%N` is only
-//! correct with notes off, which is the default), the `email`/`mboxrd` builtin
-//! formats (RFC2047 subject encoding and MIME body handling are not built), and
-//! the placeholders `%C*` (color), `%G*` (signature), `%g*` (reflog), `%d`/`%D`
-//! (decoration), `%m`, `%w()`, `%<`/`%>`/`%|` (padding), `%+`/`%-`/`% `
-//! (conditional line feeds), `%(...)` (trailers/align/if/describe) and the
-//! mailmap-aware `%aN`/`%aE`/`%cN`/`%cE`, plus the relative/human date forms.
+//! divergent output: `--notes=<ref>` and the notes-on-by-default `%N`
+//! (the vendored `gix-note` crate is an empty stub, and `format-rev`'s
+//! `--no-notes`-is-a-no-op behaviour would need more verification to reproduce
+//! faithfully), the `email`/`mboxrd` builtin formats (RFC2047 subject encoding
+//! and MIME body handling are not built), the `%(trailers…)` atoms (a faithful
+//! port of git's `find_trailer_block_start` + folding + the full option matrix
+//! could not be validated to byte-parity here without an integration build),
+//! `%<`/`%>`/`%|` padding and `%w()` wrapping (git's utf-8 display-width and
+//! word-wrap machinery), the `%+`/`%-`/`% ` conditional line feeds, and `%G*`
+//! (signature verification needs GPG, which is absent).
 //! Placeholders git itself does not recognise are echoed verbatim, as git does.
 //!
 //! Known divergence: a commit carrying an `encoding` header is rendered from its
 //! stored bytes; stock git re-encodes the message to UTF-8 first. And `raw` is
 //! refused for commits with extra headers (`gpgsig`, `mergetag`, …) because they
-//! would have to be reproduced verbatim.
+//! would have to be reproduced verbatim. `%(describe)` for a non-exact match
+//! abbreviates the trailing hash to git's minimum-disambiguation length rather
+//! than git's `DEFAULT_ABBREV`; exact tag matches (the common case) are identical.
 
 use anyhow::{anyhow, bail, Result};
 use std::io::{BufRead, Write};
 use std::process::ExitCode;
 
 use gix::bstr::ByteSlice;
+use gix::commit::describe::SelectRef;
 use gix::hash::ObjectId;
 
 /// The usage block git prints alongside `error:` diagnostics from its option parser.
@@ -77,7 +96,8 @@ enum Format {
 
 /// One element of a parsed user format.
 enum Item {
-    /// Literal bytes, including the expansion of `%%`, `%n` and `%xNN`.
+    /// Literal bytes, including the expansion of `%%`, `%n`, `%xNN` and a
+    /// resolved `%C*` color code.
     Literal(Vec<u8>),
     Placeholder(Ph),
 }
@@ -92,6 +112,8 @@ enum Ph {
     Parents { abbrev: bool },
     /// `%a…` / `%c…`
     Person(Who, Part),
+    /// `%aN` / `%aE` / `%cN` / `%cE` — mailmap-resolved name (`email = false`) or email.
+    PersonMail(Who, bool),
     /// `%s`
     Subject,
     /// `%f`
@@ -104,6 +126,14 @@ enum Ph {
     Notes,
     /// `%e`
     Encoding,
+    /// `%m` — the revision mark. Always `>` in `format-rev` (no boundary/left flags).
+    Mark,
+    /// `%gD` / `%gd` / `%gn` / `%ge` / `%gs` — reflog data, always empty here.
+    Reflog,
+    /// `%d` (`wrap` = true, ` (…)`) / `%D` (`wrap` = false).
+    Decoration { wrap: bool },
+    /// `%(describe[:opts])`.
+    Describe(SelectRef),
 }
 
 /// Which ident header a person placeholder reads.
@@ -218,6 +248,10 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
 
     let repo = gix::discover(".")?;
     let hex_len = repo.object_hash().len_in_hex();
+    // Built once: `%aN`/`%aE`/`%cN`/`%cE` always resolve through the mailmap,
+    // regardless of `log.mailmap`. An absent `.mailmap` yields an empty snapshot
+    // whose resolution is the identity, matching git.
+    let mailmap = repo.open_mailmap();
 
     let in_term = if null_input { b'\0' } else { b'\n' };
     let out_term = if null_output { b'\0' } else { b'\n' };
@@ -239,8 +273,8 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
 
         let mut out: Vec<u8> = Vec::new();
         match mode {
-            Mode::Revs => emit_rev(&repo, &record, &format, &mut out)?,
-            Mode::Text => emit_text(&repo, &record, &format, hex_len, &mut out)?,
+            Mode::Revs => emit_rev(&repo, &record, &format, &mailmap, &mut out)?,
+            Mode::Text => emit_text(&repo, &record, &format, hex_len, &mailmap, &mut out)?,
         }
         out.push(out_term);
         writer.write_all(&out)?;
@@ -278,12 +312,14 @@ fn resolve_format(arg: &str) -> Result<Option<Format>> {
 /// Parse a user format string.
 ///
 /// Understood escapes: `%%`, `%n`, `%xNN`. Understood placeholders: `%H`, `%h`,
-/// `%T`, `%t`, `%P`, `%p`, `%s`, `%f`, `%b`, `%B`, `%N`, `%e`, and the person
-/// placeholders `%a`/`%c` followed by one of `n`, `e`, `l`, `d`, `D`, `i`, `I`,
-/// `s`, `t`.
+/// `%T`, `%t`, `%P`, `%p`, `%s`, `%f`, `%b`, `%B`, `%N`, `%e`, `%m`, `%d`, `%D`,
+/// the reflog placeholders `%g[Ddnes]`, the color placeholders `%C*`, the person
+/// placeholders `%a`/`%c` followed by one of `n`, `e`, `l`, `N`, `E`, `d`, `D`,
+/// `i`, `I`, `s`, `t`, and the atoms `%(describe[:opts])`.
 ///
-/// Placeholders git recognises but this module does not implement are rejected;
-/// sequences git does not recognise either are kept verbatim, as git does.
+/// `%(trailers…)` and other unsupported placeholders git *does* recognise are
+/// rejected; `%(align…)`/`%(if…)` and sequences git itself does not expand in
+/// `format-rev` are kept verbatim, as git does.
 fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
     let b = fmt.as_bytes();
     let mut items: Vec<Item> = Vec::new();
@@ -380,36 +416,69 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
                 push(&mut items, &mut lit, Ph::Encoding);
                 i += 2;
             }
+            b'm' => {
+                push(&mut items, &mut lit, Ph::Mark);
+                i += 2;
+            }
+            b'd' => {
+                push(&mut items, &mut lit, Ph::Decoration { wrap: true });
+                i += 2;
+            }
+            b'D' => {
+                push(&mut items, &mut lit, Ph::Decoration { wrap: false });
+                i += 2;
+            }
+            b'g' => {
+                // Reflog placeholders. In `format-rev` there is no reflog
+                // selector, so every recognised form expands to nothing.
+                match b.get(i + 2) {
+                    Some(b'D' | b'd' | b'n' | b'e' | b's') => {
+                        push(&mut items, &mut lit, Ph::Reflog);
+                        i += 3;
+                    }
+                    _ => {
+                        lit.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b'C' => {
+                i = parse_color(b, i, &mut items, &mut lit)?;
+            }
+            b'(' => {
+                i = parse_atom(b, i, &mut items, &mut lit)?;
+            }
             b'a' | b'c' => {
                 let ch = c as char;
                 let who = if c == b'a' { Who::Author } else { Who::Committer };
                 let Some(&sub) = b.get(i + 2) else {
                     bail!("unsupported placeholder \"%{ch}\"");
                 };
-                let part = match sub {
-                    b'n' => Part::Name,
-                    b'e' => Part::Email,
-                    b'l' => Part::EmailLocal,
-                    b'd' => Part::DateNormal,
-                    b'D' => Part::DateRfc2822,
-                    b'i' => Part::DateIso,
-                    b'I' => Part::DateIsoStrict,
-                    b's' => Part::DateShort,
-                    b't' => Part::DateUnix,
+                let ph = match sub {
+                    b'n' => Ph::Person(who, Part::Name),
+                    b'e' => Ph::Person(who, Part::Email),
+                    b'l' => Ph::Person(who, Part::EmailLocal),
+                    b'N' => Ph::PersonMail(who, false),
+                    b'E' => Ph::PersonMail(who, true),
+                    b'd' => Ph::Person(who, Part::DateNormal),
+                    b'D' => Ph::Person(who, Part::DateRfc2822),
+                    b'i' => Ph::Person(who, Part::DateIso),
+                    b'I' => Ph::Person(who, Part::DateIsoStrict),
+                    b's' => Ph::Person(who, Part::DateShort),
+                    b't' => Ph::Person(who, Part::DateUnix),
                     _ => {
                         let bad = sub as char;
                         bail!(
-                            "unsupported placeholder \"%{ch}{bad}\" (ported: %{ch}n, %{ch}e, %{ch}l, %{ch}d, %{ch}D, %{ch}i, %{ch}I, %{ch}s, %{ch}t)"
+                            "unsupported placeholder \"%{ch}{bad}\" (ported: %{ch}n, %{ch}e, %{ch}l, %{ch}N, %{ch}E, %{ch}d, %{ch}D, %{ch}i, %{ch}I, %{ch}s, %{ch}t)"
                         );
                     }
                 };
-                push(&mut items, &mut lit, Ph::Person(who, part));
+                push(&mut items, &mut lit, ph);
                 i += 3;
             }
-            b'C' | b'G' | b'g' | b'd' | b'D' | b'm' | b'w' | b'<' | b'>' | b'|' | b'+' | b'-'
-            | b' ' | b'(' => {
+            b'G' | b'w' | b'<' | b'>' | b'|' | b'+' | b'-' | b' ' => {
                 bail!(
-                    "unsupported placeholder \"%{}\" (color, signature, reflog, decoration, padding, conditional line feeds and %(...) atoms are not ported)",
+                    "unsupported placeholder \"%{}\" (signature, padding, wrapping and conditional line feeds are not ported)",
                     c as char
                 );
             }
@@ -427,9 +496,225 @@ fn parse_user_format(fmt: &str) -> Result<Vec<Item>> {
     Ok(items)
 }
 
+/// Parse a `%C*` color placeholder starting at `b[i] == '%'` (`b[i+1] == 'C'`),
+/// appending the resolved bytes to `lit`, and return the new index.
+///
+/// `format-rev` is invoked piped with no `--color`, so color output is off:
+/// every form expands to nothing except an explicit `%C(always,<spec>)`.
+fn parse_color(b: &[u8], i: usize, _items: &mut Vec<Item>, lit: &mut Vec<u8>) -> Result<usize> {
+    let after = &b[i + 2..];
+    if after.first() == Some(&b'(') {
+        // Find the matching ')'.
+        if let Some(rel) = after[1..].iter().position(|&x| x == b')') {
+            let inner = &after[1..1 + rel];
+            lit.extend_from_slice(&color_from_paren(inner)?);
+            // Consumed: '%', 'C', '(', inner, ')'.
+            return Ok(i + rel + 4);
+        }
+        // No closing ')': git treats `%C(` as unknown and echoes '%'.
+        lit.push(b'%');
+        return Ok(i + 1);
+    }
+    // Bare color words. With color off they all expand to nothing.
+    for (word, len) in [
+        (&b"reset"[..], 5usize),
+        (&b"green"[..], 5),
+        (&b"blue"[..], 4),
+        (&b"red"[..], 3),
+    ] {
+        if after.starts_with(word) {
+            return Ok(i + 2 + len);
+        }
+    }
+    // `%C` followed by anything else: unknown, echo '%'.
+    lit.push(b'%');
+    Ok(i + 1)
+}
+
+/// Resolve the content between `%C(` and `)`. Only an `always` spec produces
+/// output while color is off; every other form (`auto`, `auto,…`, a bare
+/// `<spec>`, `reset`) expands to nothing.
+fn color_from_paren(inner: &[u8]) -> Result<Vec<u8>> {
+    if inner == b"always".as_slice() {
+        return Ok(b"\x1b[m".to_vec());
+    }
+    if let Some(spec) = inner.strip_prefix(b"always,".as_slice()) {
+        return parse_always_color(spec);
+    }
+    Ok(Vec::new())
+}
+
+/// Turn a `%C(always,<spec>)` color spec into its ANSI SGR sequence, exactly as
+/// git's `color_parse_mem` does: attribute codes ascending, then the foreground
+/// color, then the background color.
+fn parse_always_color(spec: &[u8]) -> Result<Vec<u8>> {
+    let spec = spec.trim_ascii();
+    if spec.is_empty() {
+        return Ok(b"\x1b[m".to_vec());
+    }
+    let tokens: Vec<&[u8]> = spec.split(|&c| c == b' ').filter(|t| !t.is_empty()).collect();
+    if tokens.len() == 1 && tokens[0] == b"reset".as_slice() {
+        return Ok(b"\x1b[m".to_vec());
+    }
+    let mut attrs: Vec<u16> = Vec::new();
+    let mut colors: Vec<String> = Vec::new();
+    let mut color_count = 0usize;
+    for t in tokens {
+        if t == b"reset".as_slice() {
+            bail!("unsupported combined `reset` in %C(always,...)");
+        }
+        if let Some(a) = attr_code(t) {
+            attrs.push(a);
+            continue;
+        }
+        let is_bg = color_count >= 1;
+        if let Some(code) = color_code(t, is_bg)? {
+            colors.push(code);
+        }
+        color_count += 1;
+    }
+    attrs.sort_unstable();
+    attrs.dedup();
+    let mut codes: Vec<String> = attrs.iter().map(|a| a.to_string()).collect();
+    codes.extend(colors);
+    Ok(format!("\x1b[{}m", codes.join(";")).into_bytes())
+}
+
+/// Map an attribute token to its SGR code, or `None` if it is not an attribute.
+fn attr_code(t: &[u8]) -> Option<u16> {
+    const TABLE: [(&[u8], u16); 14] = [
+        (b"bold", 1),
+        (b"dim", 2),
+        (b"italic", 3),
+        (b"ul", 4),
+        (b"blink", 5),
+        (b"reverse", 7),
+        (b"strike", 9),
+        (b"nobold", 22),
+        (b"nodim", 22),
+        (b"noitalic", 23),
+        (b"noul", 24),
+        (b"noblink", 25),
+        (b"noreverse", 27),
+        (b"nostrike", 29),
+    ];
+    TABLE.iter().find(|(n, _)| *n == t).map(|(_, c)| *c)
+}
+
+/// Map a color token to its SGR code string for the foreground (`is_bg = false`)
+/// or background (`is_bg = true`) slot. `normal` fills the slot but emits no code
+/// (`Ok(None)`); an unrecognised token is rejected.
+fn color_code(t: &[u8], is_bg: bool) -> Result<Option<String>> {
+    let base = if is_bg { 10u16 } else { 0 };
+    if t == b"normal".as_slice() {
+        return Ok(None);
+    }
+    const NAMED: [&[u8]; 8] = [
+        b"black", b"red", b"green", b"yellow", b"blue", b"magenta", b"cyan", b"white",
+    ];
+    for (idx, name) in NAMED.iter().enumerate() {
+        if t == *name {
+            return Ok(Some((30 + base + idx as u16).to_string()));
+        }
+    }
+    if t == b"default".as_slice() {
+        return Ok(Some((39 + base).to_string()));
+    }
+    if let Some(rest) = t.strip_prefix(b"bright".as_slice()) {
+        for (idx, name) in NAMED.iter().enumerate() {
+            if rest == *name {
+                return Ok(Some((90 + base + idx as u16).to_string()));
+            }
+        }
+        bail!("unsupported color token in %C(always,...)");
+    }
+    if t.first() == Some(&b'#') && t.len() == 7 {
+        let hex = &t[1..];
+        let byte = |h: &[u8]| -> Option<u8> {
+            u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()
+        };
+        if let (Some(r), Some(g), Some(bl)) = (byte(&hex[0..2]), byte(&hex[2..4]), byte(&hex[4..6])) {
+            let lead = if is_bg { "48" } else { "38" };
+            return Ok(Some(format!("{lead};2;{r};{g};{bl}")));
+        }
+        bail!("unsupported color token in %C(always,...)");
+    }
+    if !t.is_empty() && t.iter().all(u8::is_ascii_digit) {
+        let n: u16 = std::str::from_utf8(t)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n <= 255)
+            .ok_or_else(|| anyhow!("unsupported color token in %C(always,...)"))?;
+        let s = if n < 8 {
+            (30 + base + n).to_string()
+        } else if n < 16 {
+            (90 + base + (n - 8)).to_string()
+        } else {
+            let lead = if is_bg { "48" } else { "38" };
+            format!("{lead};5;{n}")
+        };
+        return Ok(Some(s));
+    }
+    bail!("unsupported color token in %C(always,...)");
+}
+
+/// Parse a `%(…)` atom starting at `b[i] == '%'` (`b[i+1] == '('`), appending any
+/// resulting placeholder, and return the new index.
+///
+/// `%(describe[:opts])` is evaluated. `%(trailers…)` is rejected. Every other
+/// `%(…)` — `%(align…)`, `%(if…)`/`%(then)`/`%(else)`/`%(end)`, unknown atoms, or
+/// an unterminated `%(` — is echoed verbatim, matching git's `format-rev`, which
+/// does not expand these.
+fn parse_atom(b: &[u8], i: usize, items: &mut Vec<Item>, lit: &mut Vec<u8>) -> Result<usize> {
+    let after = &b[i + 2..]; // content following "%("
+    let Some(rel) = after.iter().position(|&x| x == b')') else {
+        // Unterminated: echo '%'.
+        lit.push(b'%');
+        return Ok(i + 1);
+    };
+    let content = &after[..rel];
+
+    if content == b"trailers".as_slice() || content.starts_with(b"trailers:".as_slice()) {
+        bail!("unsupported placeholder \"%(trailers…)\" (trailer parsing is not ported)");
+    }
+
+    if content == b"describe".as_slice() || content.starts_with(b"describe:".as_slice()) {
+        let opts = &content[b"describe".len()..];
+        let select = if opts.is_empty() {
+            SelectRef::AnnotatedTags
+        } else if opts == b":tags".as_slice() || opts == b":tags=true".as_slice() {
+            SelectRef::AllTags
+        } else if opts == b":tags=false".as_slice() {
+            SelectRef::AnnotatedTags
+        } else if opts == b":all".as_slice() {
+            SelectRef::AllRefs
+        } else {
+            bail!(
+                "unsupported %(describe) options (ported: %(describe), %(describe:tags), %(describe:all))"
+            );
+        };
+        if !lit.is_empty() {
+            items.push(Item::Literal(std::mem::take(lit)));
+        }
+        items.push(Item::Placeholder(Ph::Describe(select)));
+        // Consumed: '%', '(', content, ')'.
+        return Ok(i + 2 + rel + 1);
+    }
+
+    // Anything else: git does not expand it — echo '%'.
+    lit.push(b'%');
+    Ok(i + 1)
+}
+
 /// `--stdin-mode=revs`: resolve one record to a commit and render it, or warn and
 /// emit nothing (git still terminates the empty record).
-fn emit_rev(repo: &gix::Repository, record: &[u8], format: &Format, out: &mut Vec<u8>) -> Result<()> {
+fn emit_rev(
+    repo: &gix::Repository,
+    record: &[u8],
+    format: &Format,
+    mailmap: &gix::mailmap::Snapshot,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let Ok(id) = repo.rev_parse_single(record.as_bstr()) else {
         eprintln!("Could not get object name for {}. Skipping.", record.to_str_lossy());
         return Ok(());
@@ -443,7 +728,7 @@ fn emit_rev(repo: &gix::Repository, record: &[u8], format: &Format, out: &mut Ve
         eprintln!("Could not get commit for {oid}. Skipping.");
         return Ok(());
     };
-    render(repo, &commit, format, out)
+    render(repo, &commit, format, mailmap, out)
 }
 
 /// `--stdin-mode=text`: copy the record through, replacing every maximal run of
@@ -455,6 +740,7 @@ fn emit_text(
     record: &[u8],
     format: &Format,
     hex_len: usize,
+    mailmap: &gix::mailmap::Snapshot,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let mut i = 0;
@@ -478,7 +764,7 @@ fn emit_text(
             .and_then(|oid| repo.find_object(oid).ok())
             .and_then(|obj| obj.try_into_commit().ok());
         match rendered {
-            Some(commit) => render(repo, &commit, format, out)?,
+            Some(commit) => render(repo, &commit, format, mailmap, out)?,
             None => out.extend_from_slice(run),
         }
     }
@@ -495,12 +781,12 @@ fn render(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     format: &Format,
+    mailmap: &gix::mailmap::Snapshot,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let cr = commit.decode()?;
-    let id = commit.id;
     match format {
-        Format::User(items) => render_user(repo, &id, &cr, items, out),
+        Format::User(items) => render_user(repo, commit, &cr, items, mailmap, out),
         Format::Builtin(b) => render_builtin(repo, &cr, *b, out),
     }
 }
@@ -508,17 +794,19 @@ fn render(
 /// Evaluate a parsed user format against one commit.
 fn render_user(
     repo: &gix::Repository,
-    id: &ObjectId,
+    commit: &gix::Commit<'_>,
     cr: &gix::objs::CommitRef<'_>,
     items: &[Item],
+    mailmap: &gix::mailmap::Snapshot,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let id = commit.id;
     let msg = cr.message.as_bytes();
     for item in items {
         match item {
             Item::Literal(bytes) => out.extend_from_slice(bytes),
             Item::Placeholder(ph) => match ph {
-                Ph::Commit { abbrev } => push_oid(repo, out, id, *abbrev)?,
+                Ph::Commit { abbrev } => push_oid(repo, out, &id, *abbrev)?,
                 Ph::Tree { abbrev } => push_oid(repo, out, &cr.tree(), *abbrev)?,
                 Ph::Parents { abbrev } => {
                     for (n, p) in cr.parents().enumerate() {
@@ -544,6 +832,19 @@ fn render_user(
                         _ => out.extend_from_slice(format_date(sig.time()?, *part).as_bytes()),
                     }
                 }
+                Ph::PersonMail(who, email) => {
+                    let sig = match who {
+                        Who::Author => cr.author()?,
+                        Who::Committer => cr.committer()?,
+                    };
+                    let resolved = mailmap.try_resolve_ref(sig);
+                    let val = if *email {
+                        resolved.and_then(|r| r.email).unwrap_or(sig.email)
+                    } else {
+                        resolved.and_then(|r| r.name).unwrap_or(sig.name)
+                    };
+                    out.extend_from_slice(val.as_bytes());
+                }
                 Ph::Subject => out.extend_from_slice(&subject(&msg[subject_off(msg)..])),
                 Ph::SanitizedSubject => {
                     let from = &msg[subject_off(msg)..];
@@ -559,10 +860,119 @@ fn render_user(
                         out.extend_from_slice(enc.as_bytes());
                     }
                 }
+                // No boundary/left-right flags in `format-rev`: the mark is `>`.
+                Ph::Mark => out.push(b'>'),
+                // No reflog selector in `format-rev`: always empty.
+                Ph::Reflog => {}
+                Ph::Decoration { wrap } => push_decoration(repo, &id, *wrap, out)?,
+                Ph::Describe(select) => {
+                    if let Some(fmt) = commit.describe().names(*select).try_format()? {
+                        out.extend_from_slice(fmt.to_string().as_bytes());
+                    }
+                }
             },
         }
     }
     Ok(())
+}
+
+/// `%d`/`%D`: append the ref decoration for `id`. `%d` (`wrap`) wraps a non-empty
+/// decoration in ` (…)`; `%D` emits the bare list. Nothing is emitted when the
+/// commit carries no decoration.
+fn push_decoration(
+    repo: &gix::Repository,
+    id: &ObjectId,
+    wrap: bool,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let body = decoration_body(repo, id)?;
+    if body.is_empty() {
+        return Ok(());
+    }
+    if wrap {
+        out.extend_from_slice(b" (");
+        out.extend_from_slice(&body);
+        out.push(b')');
+    } else {
+        out.extend_from_slice(&body);
+    }
+    Ok(())
+}
+
+/// Build the `%D` decoration body for `id`: the refs pointing at the commit, in
+/// git's order (full refnames sorted descending — the reverse of the alphabetical
+/// order in which git prepends them), with `HEAD` (or `HEAD -> <branch>`) pulled
+/// to the front, tags prefixed `tag: `, and everything joined with `, `.
+fn decoration_body(repo: &gix::Repository, id: &ObjectId) -> Result<Vec<u8>> {
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    let refs = repo.references()?;
+    for r in refs.all()? {
+        let mut r = r.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let Ok(peeled) = r.peel_to_id() else { continue };
+        if peeled.detach() != *id {
+            continue;
+        }
+        names.push(r.name().as_bstr().to_vec());
+    }
+    names.sort_by(|a, b| b.cmp(a));
+
+    let head = repo.head()?;
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    match head.referent_name().map(|n| n.as_bstr().to_vec()) {
+        // HEAD is attached: if its branch points at this commit, render
+        // `HEAD -> <branch>` and drop the branch from the remaining list.
+        Some(ht) => {
+            if let Some(pos) = names.iter().position(|n| *n == ht) {
+                let mut p = b"HEAD -> ".to_vec();
+                p.extend_from_slice(prettify_ref(&ht));
+                parts.push(p);
+                names.remove(pos);
+            }
+        }
+        // Detached: prepend `HEAD` when it points at this commit.
+        None => {
+            if let Ok(hid) = repo.head_id() {
+                if hid.detach() == *id {
+                    parts.push(b"HEAD".to_vec());
+                }
+            }
+        }
+    }
+    for n in &names {
+        parts.push(format_ref_decoration(n));
+    }
+
+    let mut body = Vec::new();
+    for (n, p) in parts.iter().enumerate() {
+        if n > 0 {
+            body.extend_from_slice(b", ");
+        }
+        body.extend_from_slice(p);
+    }
+    Ok(body)
+}
+
+/// git's `prettify_refname`: strip a `refs/heads/`, `refs/tags/`, `refs/remotes/`
+/// or bare `refs/` prefix.
+fn prettify_ref(full: &[u8]) -> &[u8] {
+    for pfx in [&b"refs/heads/"[..], &b"refs/tags/"[..], &b"refs/remotes/"[..]] {
+        if let Some(rest) = full.strip_prefix(pfx) {
+            return rest;
+        }
+    }
+    full.strip_prefix(&b"refs/"[..]).unwrap_or(full)
+}
+
+/// Format one decoration entry: tags carry a `tag: ` prefix, everything else is
+/// its prettified short name.
+fn format_ref_decoration(full: &[u8]) -> Vec<u8> {
+    if let Some(rest) = full.strip_prefix(&b"refs/tags/"[..]) {
+        let mut v = b"tag: ".to_vec();
+        v.extend_from_slice(rest);
+        v
+    } else {
+        prettify_ref(full).to_vec()
+    }
 }
 
 /// Render one of the builtin header-plus-message formats.
@@ -841,4 +1251,80 @@ fn sanitize_subject(subject: &[u8]) -> Vec<u8> {
         out.pop();
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The expected bytes were captured from stock `git format-rev`
+    /// `--format='%C(always,<spec>)'` on git 2.55.0.
+    #[test]
+    fn always_color_specs_match_git() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"red", b"\x1b[31m"),
+            (b"green", b"\x1b[32m"),
+            (b"blue", b"\x1b[34m"),
+            (b"black", b"\x1b[30m"),
+            (b"white", b"\x1b[37m"),
+            (b"default", b"\x1b[39m"),
+            (b"bold", b"\x1b[1m"),
+            (b"ul", b"\x1b[4m"),
+            (b"reverse", b"\x1b[7m"),
+            (b"brightred", b"\x1b[91m"),
+            (b"brightblack", b"\x1b[90m"),
+            (b"7", b"\x1b[37m"),
+            (b"8", b"\x1b[90m"),
+            (b"15", b"\x1b[97m"),
+            (b"16", b"\x1b[38;5;16m"),
+            (b"123", b"\x1b[38;5;123m"),
+            (b"255", b"\x1b[38;5;255m"),
+            (b"#ff8800", b"\x1b[38;2;255;136;0m"),
+            (b"bold red", b"\x1b[1;31m"),
+            (b"red bold", b"\x1b[1;31m"),
+            (b"ul bold", b"\x1b[1;4m"),
+            (b"bold ul red", b"\x1b[1;4;31m"),
+            (b"blue ul", b"\x1b[4;34m"),
+            (b"red green", b"\x1b[31;42m"),
+            (b"black white", b"\x1b[30;47m"),
+            (b"normal red", b"\x1b[41m"),
+            (b"16 200", b"\x1b[38;5;16;48;5;200m"),
+            (b"red 200", b"\x1b[31;48;5;200m"),
+            (b"nobold", b"\x1b[22m"),
+            (b"noul", b"\x1b[24m"),
+            (b"", b"\x1b[m"),
+        ];
+        for &(spec, want) in cases {
+            let got = parse_always_color(spec).unwrap();
+            assert_eq!(got, want, "spec {:?}", spec.as_bstr());
+        }
+    }
+
+    #[test]
+    fn color_off_forms_are_empty_only_always_emits() {
+        // Color is off for the piped, non-`--color` invocation, so every paren
+        // form expands to nothing except an explicit `always`.
+        assert!(color_from_paren(b"auto").unwrap().is_empty());
+        assert!(color_from_paren(b"auto,red").unwrap().is_empty());
+        assert!(color_from_paren(b"red").unwrap().is_empty());
+        assert!(color_from_paren(b"reset").unwrap().is_empty());
+        assert_eq!(color_from_paren(b"always").unwrap(), b"\x1b[m");
+        assert_eq!(color_from_paren(b"always,reset").unwrap(), b"\x1b[m");
+        assert_eq!(color_from_paren(b"always,bold red").unwrap(), b"\x1b[1;31m");
+        // "underline" is not a valid attribute name in git (only "ul").
+        assert!(parse_always_color(b"underline").is_err());
+    }
+
+    #[test]
+    fn decoration_prefixes_and_prettify() {
+        assert_eq!(prettify_ref(b"refs/heads/main"), b"main");
+        assert_eq!(prettify_ref(b"refs/remotes/origin/main"), b"origin/main");
+        assert_eq!(prettify_ref(b"refs/tags/v1"), b"v1");
+        assert_eq!(format_ref_decoration(b"refs/tags/v1"), b"tag: v1");
+        assert_eq!(format_ref_decoration(b"refs/heads/main"), b"main");
+        assert_eq!(
+            format_ref_decoration(b"refs/remotes/origin/main"),
+            b"origin/main"
+        );
+    }
 }

@@ -7,9 +7,15 @@
 //!     — indexes a `.pack` already on disk, writes `<pack>.idx` (or the `-o`
 //!     path), writes the matching `.rev` unless `--no-rev-index` /
 //!     `pack.writeReverseIndex=false`, and prints the pack hash plus `\n`.
-//!   * `git index-pack --stdin [--keep[=<msg>]] [--[no-]rev-index]` — streams
-//!     the pack from stdin into `objects/pack/pack-<hash>.{pack,idx,rev}` and
-//!     prints `pack\t<hash>\n`, or `keep\t<hash>\n` when a `.keep` was created.
+//!   * `git index-pack --stdin [--fix-thin] [--keep[=<msg>]] [--[no-]rev-index]
+//!     [--max-input-size=<n>] [<pack-file>]` — streams the pack from stdin into
+//!     `objects/pack/pack-<hash>.{pack,idx,rev}` (or into `<pack-file>` when one
+//!     is named, opened `O_CREAT|O_EXCL`, with the index derived from it or from
+//!     `-o`) and prints `pack\t<hash>\n`, or `keep\t<hash>\n` when a `.keep` was
+//!     created. `--fix-thin` completes a thin pack by resolving its REF_DELTA
+//!     bases against the object database; `--max-input-size=<n>` bounds the
+//!     bytes read from stdin, dying with git's `pack exceeds maximum allowed
+//!     size (<n>)` when exceeded.
 //!   * `git index-pack --verify <pack-file>` — checks an existing `.idx`
 //!     against its pack and exits 0 with no output when they agree.
 //!   * `--threads=<n>` (`0` = auto), `--object-format=sha1`, and `-h` (usage on
@@ -48,18 +54,28 @@
 //! the pack checksum, then a SHA-1 over all of the above — because the
 //! vendored `gix-pack` has no reverse-index writer.
 //!
+//! Thin-pack completion (`--fix-thin`) is honoured through the object database:
+//! `gix_pack::data::input::LookupRefDeltaObjectsIter` resolves each REF_DELTA
+//! base from the odb and injects it, so a thin pack is completed and indexed.
+//! One caveat is documented rather than hidden: git appends the borrowed bases
+//! at the end of the pack while `gix` injects each one just before its first
+//! referencing delta, so a pack that actually needed completion is a valid,
+//! self-contained pack but its hash need not equal the one stock git would
+//! print. A self-contained stream (the common case) is copied through
+//! byte-for-byte, so its hash matches git exactly.
+//!
 //! Not covered, each rejected with a precise message rather than a plausible
-//! wrong answer: `--fix-thin` (completing a thin pack re-deflates the borrowed
-//! base objects, and `gix-pack`'s compression level and append order are not
-//! guaranteed to reproduce git's resulting pack hash), `--strict`,
-//! `--fsck-objects`, `--check-self-contained-and-connected`, `--max-input-size`,
+//! wrong answer: `--strict`, `--fsck-objects`,
+//! `--check-self-contained-and-connected` (all three need git's `check_objects()`
+//! connectivity/fsck pass, which exceeds the vendored `gix-fsck` primitive),
 //! `--promisor`, `--pack_header`, `--index-version` other than a plain `2`,
-//! `--object-format=sha256`, `--verify` combined with `--stdin`, `--stdin`
-//! combined with an explicit `<pack-file>` or with `-o`, `--keep` without
-//! `--stdin`, and a `<pack-file>` holding REF_DELTA entries — which stock git
-//! resolves in-pack — since `gix_pack::index::write_data_iter_to_stream`
-//! refuses ref-deltas outright. Packs written by `git pack-objects` use
-//! OFS_DELTA unless `--no-delta-base-offset` was passed.
+//! `--object-format=sha256`, `--verify` combined with `--stdin`, `--keep`
+//! without `--stdin`, and a `<pack-file>` on disk (or a self-contained pack read
+//! from stdin without `--fix-thin`) holding REF_DELTA entries — which stock git
+//! resolves in-pack — since `gix_pack::index::write_data_iter_to_stream` refuses
+//! ref-deltas outright and the odb lookup would duplicate an in-pack base rather
+//! than reference it. Packs written by `git pack-objects` use OFS_DELTA unless
+//! `--no-delta-base-offset` was passed.
 //!
 //! The fsck message-type list in `--strict=<id>=<severity>...` and
 //! `--fsck-objects=<id>=<severity>...` IS validated at parse time by
@@ -78,7 +94,7 @@
 
 use anyhow::{bail, Result};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -113,7 +129,7 @@ struct Opts {
     self_contained: bool,         // --check-self-contained-and-connected
     promisor: bool,               // --promisor[=<msg>]
     index_version: Option<(u64, Option<u64>)>, // --index-version=<v>[,<limit>]
-    max_input_size: bool,         // --max-input-size=<n>
+    max_input_size: Option<u64>,  // --max-input-size=<n> (None or 0 = no bound)
     object_format: Option<String>, // --object-format=<algo>
     pack_header: bool,            // --pack_header=<v>,<n> (internal fetch path)
     pack: Option<PathBuf>,        // the positional <pack-file>
@@ -134,7 +150,7 @@ impl Opts {
             self_contained: false,
             promisor: false,
             index_version: None,
-            max_input_size: false,
+            max_input_size: None,
             object_format: None,
             pack_header: false,
             pack: None,
@@ -228,7 +244,12 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
                 };
                 opts.threads = n;
             }
-            _ if a.starts_with("--max-input-size=") => opts.max_input_size = true,
+            _ if a.starts_with("--max-input-size=") => {
+                // git: `max_input_size = strtoumax(arg, NULL, 10)`; base 10,
+                // trailing junk ignored, and 0 leaves the bound disabled.
+                let (n, _) = strtoul(&a["--max-input-size=".len()..], 10);
+                opts.max_input_size = (n != 0).then_some(n);
+            }
             _ if a.starts_with("--pack_header=") => opts.pack_header = true,
             _ if a.starts_with("--object-format=") => {
                 let fmt = &a["--object-format=".len()..];
@@ -302,14 +323,8 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
     }
 
     if opts.stdin {
-        if opts.pack.is_some() {
-            bail!("unsupported: `--stdin <pack-file>` (the pack copy is always named pack-<hash>.pack under objects/pack)");
-        }
-        if opts.index_out.is_some() {
-            bail!("unsupported: `--stdin -o <index-file>` (the index is always written beside the pack)");
-        }
         reject_unported(&opts)?;
-        return index_from_stdin(&opts);
+        return index_from_stdin(&opts, opts.pack.as_deref(), index_name.as_deref());
     }
 
     let pack_path = opts.pack.clone().expect("checked above");
@@ -332,6 +347,18 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
             )));
         }
     };
+
+    // git bounds the pack it reads by `--max-input-size`; on disk the whole file
+    // is the input, so its size is the byte count git's `consumed_bytes` reaches.
+    if let Some(limit) = opts.max_input_size {
+        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if size > limit {
+            return Ok(fatal(format!(
+                "pack exceeds maximum allowed size ({})",
+                humanise(limit)
+            )));
+        }
+    }
 
     reject_unported(opts)?;
     if opts.keep.is_some() {
@@ -429,20 +456,81 @@ fn verify_existing(opts: &Opts, index_path: &Path) -> Result<ExitCode> {
     }
 }
 
-/// Stream a pack from stdin into `objects/pack`, then report it git's way.
-fn index_from_stdin(opts: &Opts) -> Result<ExitCode> {
+/// Stream a pack from stdin, then report it git's way.
+///
+/// With no `<pack-file>` the pack lands in `objects/pack/pack-<hash>.{pack,idx}`
+/// under a name derived from its content. A `<pack-file>` argument names the
+/// copy git writes instead — opened `O_CREAT|O_EXCL`, so an existing path is
+/// fatal — with the index name derived from it (or from `-o`). `--fix-thin`
+/// completes a thin pack by resolving its REF_DELTA bases against the object
+/// database; `--max-input-size=<n>` bounds the bytes read from stdin.
+fn index_from_stdin(
+    opts: &Opts,
+    target_pack: Option<&Path>,
+    target_index: Option<&Path>,
+) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
-    let pack_dir = repo.objects.store_ref().path().join("pack");
-    fs::create_dir_all(&pack_dir)?;
 
+    // git opens a named output pack with O_CREAT|O_EXCL before reading stdin, so
+    // a path that already exists is fatal with xopen's create-mode wording.
+    if let Some(p) = target_pack {
+        if let Err(e) = fs::OpenOptions::new().write(true).create_new(true).open(p) {
+            return Ok(fatal(format!(
+                "unable to create '{}': {}",
+                p.display(),
+                strerror(&e)
+            )));
+        }
+    }
+
+    // Where the pack is written before it is renamed onto its destination.
+    let write_dir = match target_pack {
+        Some(p) => match p.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => PathBuf::from("."),
+        },
+        None => {
+            let dir = repo.objects.store_ref().path().join("pack");
+            fs::create_dir_all(&dir)?;
+            dir
+        }
+    };
+
+    // Bound the input to `--max-input-size` by reading at most one byte past the
+    // limit: being able to read that extra byte proves the pack is too big,
+    // exactly as git's `consumed_bytes > max_input_size` check does.
     let stdin = io::stdin();
-    let mut input = stdin.lock();
+    let mut cursor;
+    let mut locked;
+    let input: &mut dyn io::BufRead = match opts.max_input_size {
+        Some(limit) => {
+            let mut buf = Vec::new();
+            stdin.lock().take(limit.saturating_add(1)).read_to_end(&mut buf)?;
+            if buf.len() as u64 > limit {
+                return Ok(fatal(format!(
+                    "pack exceeds maximum allowed size ({})",
+                    humanise(limit)
+                )));
+            }
+            cursor = io::Cursor::new(buf);
+            &mut cursor
+        }
+        None => {
+            locked = stdin.lock();
+            &mut locked
+        }
+    };
+
+    // With `--fix-thin` the object database resolves REF_DELTA bases missing from
+    // the pack, completing a thin pack in place; without it the pack is copied
+    // through byte-for-byte and a thin base is a fatal `NotFound`.
+    let resolver = opts.fix_thin.then(|| repo.objects.clone());
     let outcome = pack::Bundle::write_to_directory(
-        &mut input,
-        Some(&pack_dir),
+        input,
+        Some(&write_dir),
         &mut gix::progress::Discard,
         &AtomicBool::new(false),
-        None::<gix::odb::Handle>,
+        resolver,
         pack::bundle::write::Options {
             thread_limit: opts.threads,
             object_hash: Kind::Sha1,
@@ -451,32 +539,50 @@ fn index_from_stdin(opts: &Opts) -> Result<ExitCode> {
     )?;
 
     let hash = outcome.index.data_hash;
-    let (Some(data_path), Some(index_path)) = (&outcome.data_path, &outcome.index_path) else {
+    let (Some(gix_data), Some(gix_index)) = (&outcome.data_path, &outcome.index_path) else {
         bail!("empty packs are not supported (no objects were read from stdin)");
     };
 
-    if want_rev_index(opts) {
-        write_rev_index(index_path, &hash)?;
-    }
-    set_read_only(index_path)?;
-    set_read_only(data_path)?;
+    // Move gix's hash-named files onto git's chosen destinations, if any.
+    let (data_path, index_path): (PathBuf, PathBuf) = match (target_pack, target_index) {
+        (Some(tp), Some(ti)) => {
+            fs::rename(gix_index, ti)?;
+            fs::rename(gix_data, tp)?;
+            (tp.to_path_buf(), ti.to_path_buf())
+        }
+        (None, Some(ti)) => {
+            fs::rename(gix_index, ti)?;
+            (gix_data.clone(), ti.to_path_buf())
+        }
+        (Some(tp), None) => {
+            fs::rename(gix_data, tp)?;
+            (tp.to_path_buf(), gix_index.clone())
+        }
+        (None, None) => (gix_data.clone(), gix_index.clone()),
+    };
 
-    // `write_to_directory` always drops a `.keep` next to a freshly written
-    // pack; git only leaves one when asked, so reconcile before reporting.
-    let keep_path = data_path.with_extension("keep");
+    // `write_to_directory` always drops a `.keep` beside the pack it wrote; git
+    // only leaves one when asked, so drop gix's and, under `--keep`, write our
+    // own beside the final pack holding the requested message.
+    if let Some(kp) = &outcome.keep_path {
+        let _ = fs::remove_file(kp);
+    }
+
+    if want_rev_index(opts) {
+        write_rev_index(&index_path, &hash)?;
+    }
+    set_read_only(&index_path)?;
+    set_read_only(&data_path)?;
+
     match &opts.keep {
         Some(msg) => {
+            let keep_path = data_path.with_extension("keep");
             let body = msg.as_ref().map(|m| format!("{m}\n")).unwrap_or_default();
             fs::write(&keep_path, body)?;
             fs::set_permissions(&keep_path, fs::Permissions::from_mode(0o600))?;
             println!("keep\t{hash}");
         }
-        None => {
-            if outcome.keep_path.is_some() {
-                fs::remove_file(&keep_path)?;
-            }
-            println!("pack\t{hash}");
-        }
+        None => println!("pack\t{hash}"),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -500,14 +606,8 @@ fn reject_unported(opts: &Opts) -> Result<()> {
     if opts.promisor {
         bail!("unsupported flag \"--promisor\" (no .promisor file is written here)");
     }
-    if opts.max_input_size {
-        bail!("unsupported flag \"--max-input-size\" (input size is not bounded here)");
-    }
     if opts.pack_header {
         bail!("unsupported flag \"--pack_header\" (internal fetch fast-path is not ported)");
-    }
-    if opts.fix_thin {
-        bail!("unsupported flag \"--fix-thin\" (thin-pack completion would not reproduce git's pack hash)");
     }
     if let Some(fmt) = &opts.object_format {
         if fmt != "sha1" {
@@ -722,6 +822,29 @@ fn strtoul(s: &str, base: u32) -> (u64, &str) {
     let value = u64::from_str_radix(&body[..end], base).unwrap_or(u64::MAX);
     let value = if negative { value.wrapping_neg() } else { value };
     (value, &body[end..])
+}
+
+/// `strbuf_humanise_bytes()` from `strbuf.c`, used for the `--max-input-size`
+/// fatal's `(%s)`: git's truncating fraction arithmetic and its `>` (not `>=`)
+/// unit boundaries, so `1048576` renders as `1024.00 KiB` and `1` as `1 byte`.
+fn humanise(bytes: u64) -> String {
+    if bytes > 1 << 30 {
+        format!(
+            "{}.{:02} GiB",
+            bytes >> 30,
+            (bytes & ((1 << 30) - 1)) / 10_737_419
+        )
+    } else if bytes > 1 << 20 {
+        let x = bytes + 5243; // git's rounding nudge
+        format!("{}.{:02} MiB", x >> 20, ((x & ((1 << 20) - 1)) * 100) >> 20)
+    } else if bytes > 1 << 10 {
+        let x = bytes + 5;
+        format!("{}.{:02} KiB", x >> 10, ((x & ((1 << 10) - 1)) * 100) >> 10)
+    } else if bytes == 1 {
+        "1 byte".to_string()
+    } else {
+        format!("{bytes} bytes")
+    }
 }
 
 /// `std::io::Error`'s message without Rust's ` (os error N)` tail, so the

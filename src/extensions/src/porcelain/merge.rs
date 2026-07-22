@@ -20,19 +20,41 @@
 //!   `--abort` additionally restores the index and the merge-affected worktree
 //!   paths to `HEAD`, as `git reset --merge` does.
 //!
-//! What is refused rather than faked:
+//! Also served, as faithful ports of git's behaviour:
 //!
-//! * An octopus merge (multiple refs).
-//! * Every flag outside the set the argument loop in `merge()` accepts
-//!   (`--ff`, `--no-ff`, `--ff-only`, `--stat`/`--no-stat`/`--summary`/
-//!   `--no-summary`/`-n`, `-m`/`--message`, `--abort`, `--quit`).
+//! * `--squash`/`--no-squash`: fold the merge into the worktree/index without a
+//!   commit or ref move, writing `SQUASH_MSG` (a port of `squash_message()`,
+//!   including the `git log`-medium body).
+//! * `--commit`/`--no-commit`: `--no-commit` records `MERGE_HEAD`/`MERGE_MODE`/
+//!   `MERGE_MSG` and stops with `Automatic merge went well; stopped before
+//!   committing as requested`, leaving `git commit` (or `--continue`) to finish.
+//! * `--continue`: finalize a resolved, staged in-progress merge.
+//! * `-s ours` (and `-s ort`/`octopus`): `ours` records every head as a parent
+//!   but keeps our tree verbatim.
+//! * `--allow-unrelated-histories`: merge with an empty base tree; without it,
+//!   `fatal: refusing to merge unrelated histories` (exit 128).
+//! * `--signoff`, `-F`/`--file`, `--cleanup=<mode>`, `-q`/`--quiet`,
+//!   `-v`/`--verbose`, and `--no-verify` (bypassing the `pre-merge-commit` and
+//!   `commit-msg` hooks).
+//!
+//! What is refused or deferred rather than faked:
+//!
+//! * `-s recursive`/`resolve`/`subtree`: distinct conflict-resolution engines
+//!   that are not vendored, refused rather than aliased onto `ort`.
+//! * `-X`/`--strategy-option`, `--log[=<n>]`/`--no-log`, `--autostash`: these
+//!   need substrate not reachable from this file (blob-merge options threaded
+//!   through `merge_apply::three_way_merge`, the `fmt-merge-msg` shortlog
+//!   builder, and stash create/apply helpers respectively); left rejected.
+//! * `-e`/`--edit` (interactive editor), `-S`/`--gpg-sign`,
+//!   `--verify-signatures` (no signing/verification driver).
 //!
 //! Known fidelity gaps, stated rather than hidden: the diffstat is computed
 //! with rename detection off, while `git merge` enables it, so a merge that
 //! renames a file reports it as a delete plus a create instead of a `rename`
-//! summary line; and diffstat column widths measure Unicode scalar values
-//! rather than terminal columns, so a path containing wide characters pads
-//! differently.
+//! summary line; diffstat column widths measure Unicode scalar values rather
+//! than terminal columns; `--verbose`'s extra stderr diagnostics are not
+//! emitted; and a `pre-merge-commit` hook that edits the index is not reflected
+//! in the committed tree (the pre-computed merge tree is committed).
 
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -42,10 +64,12 @@ use std::sync::atomic::AtomicBool;
 
 use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
-use gix::index::entry::{Mode, Stat};
+use gix::index::entry::{Mode, Stage, Stat};
 use gix::object::tree::diff::{Action, Change as TreeChange};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
+use gix::revision::walk::Sorting;
+use gix::traverse::commit::simple::CommitTimeOrder;
 
 /// The mutually exclusive top-level modes of `git merge`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,6 +77,7 @@ enum Op {
     Merge,
     Abort,
     Quit,
+    Continue,
 }
 
 /// How the fast-forward question is answered, mirroring git's `fast_forward`.
@@ -63,12 +88,80 @@ enum Ff {
     Only,
 }
 
+/// The merge strategy selected by `-s`/`--strategy`. Only the strategies the
+/// vendored primitives implement byte-for-byte are represented; the remaining
+/// git strategies (`recursive`, `resolve`, `subtree`) are refused rather than
+/// aliased onto `ort`, since their conflict resolution genuinely differs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Strategy {
+    /// The default three-way merge (git's `ort`).
+    Ort,
+    /// `-s ours`: record every head as a parent but keep our tree verbatim.
+    Ours,
+}
+
+/// `--cleanup=<mode>` — how the commit message is stripped, a port of git's
+/// `cleanup_mode` / `strbuf_stripspace`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cleanup {
+    /// `whitespace` when a message is supplied without an editor (merge's default).
+    Default,
+    Verbatim,
+    Whitespace,
+    Strip,
+    Scissors,
+}
+
+/// Everything the argument loop gathers for a real merge, so the merge helpers
+/// take one struct rather than a growing parameter list.
+struct Opts {
+    ff: Ff,
+    /// Whether `--no-ff` was passed explicitly (needed for the `--squash`
+    /// incompatibility check, which git keys off the literal flag).
+    no_ff_given: bool,
+    show_stat: bool,
+    /// `-m`/`--message` or `-F`/`--file` contents (the latter read eagerly).
+    message: Option<String>,
+    squash: bool,
+    /// `--commit`/`--no-commit` as given; `None` leaves the default (`!squash`).
+    commit: Option<bool>,
+    /// `--commit` was given explicitly (for the `--squash` incompatibility check).
+    commit_given: bool,
+    signoff: bool,
+    allow_unrelated: bool,
+    no_verify: bool,
+    quiet: bool,
+    cleanup: Cleanup,
+    strategy: Strategy,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Opts {
+            ff: Ff::Allow,
+            no_ff_given: false,
+            show_stat: true,
+            message: None,
+            squash: false,
+            commit: None,
+            commit_given: false,
+            signoff: false,
+            allow_unrelated: false,
+            no_verify: false,
+            quiet: false,
+            cleanup: Cleanup::Default,
+            strategy: Strategy::Ort,
+        }
+    }
+}
+
 pub fn merge(args: &[String]) -> Result<ExitCode> {
     let mut op = Op::Merge;
-    let mut ff = Ff::Allow;
-    let mut show_stat = true;
-    let mut message: Option<String> = None;
-    let mut refs: Vec<&str> = Vec::new();
+    let mut opts = Opts::default();
+    let mut refs: Vec<String> = Vec::new();
+    // A pending `-F`/`--file` read, resolved after parsing so the diagnostic
+    // order matches git (options first, file open second).
+    let mut file: Option<String> = None;
 
     // git reads merge.ff and merge.stat as the defaults; the CLI flags below
     // override them (`--ff`/`--no-ff`/`--ff-only`, `--stat`/`--no-stat`).
@@ -77,13 +170,13 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
     if let Ok(repo) = gix::discover(".") {
         let snap = repo.config_snapshot();
         match snap.string("merge.ff").map(|v| v.to_string().to_ascii_lowercase()).as_deref() {
-            Some("only") => ff = Ff::Only,
-            Some("false" | "no" | "off" | "0") => ff = Ff::Never,
-            Some(_) => ff = Ff::Allow, // true/yes/on/1/valueless → allow
+            Some("only") => opts.ff = Ff::Only,
+            Some("false" | "no" | "off" | "0") => opts.ff = Ff::Never,
+            Some(_) => opts.ff = Ff::Allow, // true/yes/on/1/valueless → allow
             None => {}
         }
         if snap.boolean("merge.stat") == Some(false) {
-            show_stat = false;
+            opts.show_stat = false;
         }
     }
 
@@ -93,41 +186,158 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
         match a {
             "--abort" => op = Op::Abort,
             "--quit" => op = Op::Quit,
-            "--ff" => ff = Ff::Allow,
-            "--no-ff" => ff = Ff::Never,
-            "--ff-only" => ff = Ff::Only,
-            "--stat" | "--summary" => show_stat = true,
-            "--no-stat" | "--no-summary" | "-n" => show_stat = false,
+            "--continue" => op = Op::Continue,
+            "--ff" => opts.ff = Ff::Allow,
+            "--no-ff" => {
+                opts.ff = Ff::Never;
+                opts.no_ff_given = true;
+            }
+            "--ff-only" => opts.ff = Ff::Only,
+            "--stat" | "--summary" => opts.show_stat = true,
+            "--no-stat" | "--no-summary" | "-n" => opts.show_stat = false,
+            "--squash" => opts.squash = true,
+            "--no-squash" => opts.squash = false,
+            "--commit" => {
+                opts.commit = Some(true);
+                opts.commit_given = true;
+            }
+            "--no-commit" => opts.commit = Some(false),
+            "--signoff" => opts.signoff = true,
+            "--no-signoff" => opts.signoff = false,
+            "--allow-unrelated-histories" => opts.allow_unrelated = true,
+            "--no-allow-unrelated-histories" => opts.allow_unrelated = false,
+            "--no-verify" => opts.no_verify = true,
+            "--verify" => opts.no_verify = false,
+            // Verbosity: git keeps a signed level; only quiet has an observable
+            // effect on stdout (it silences the summary/diffstat). `--verbose`'s
+            // extra diagnostics go to stderr and are not reproduced.
+            "-q" | "--quiet" => opts.quiet = true,
+            "-v" | "--verbose" => opts.quiet = false,
+            // We never open an editor, so `--no-edit` is the natural state; `-e`
+            // is deferred (see the module docs).
+            "--no-edit" => {}
             "-m" | "--message" => {
                 i += 1;
                 match args.get(i) {
-                    Some(m) => message = Some(m.clone()),
+                    Some(m) => opts.message = Some(m.clone()),
                     None => {
                         eprintln!("error: option `{a}' requires a value");
                         return Ok(ExitCode::from(129));
                     }
                 }
             }
-            _ if a.starts_with("--message=") => message = Some(a["--message=".len()..].to_string()),
-            _ if a.len() > 2 && a.starts_with("-m") => message = Some(a[2..].to_string()),
+            _ if a.starts_with("--message=") => opts.message = Some(a["--message=".len()..].to_string()),
+            _ if a.len() > 2 && a.starts_with("-m") && !a.starts_with("--") => {
+                opts.message = Some(a[2..].to_string())
+            }
+            "-F" | "--file" => {
+                i += 1;
+                match args.get(i) {
+                    Some(p) => file = Some(p.clone()),
+                    None => {
+                        eprintln!("error: option `{a}' requires a value");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            _ if a.starts_with("--file=") => file = Some(a["--file=".len()..].to_string()),
+            _ if a.len() > 2 && a.starts_with("-F") && !a.starts_with("--") => {
+                file = Some(a[2..].to_string())
+            }
+            "--cleanup" => {
+                i += 1;
+                match args.get(i).and_then(|v| parse_cleanup(v)) {
+                    Some(mode) => opts.cleanup = mode,
+                    None => {
+                        let bad = args.get(i).map(String::as_str).unwrap_or("");
+                        eprintln!("fatal: Invalid cleanup mode {bad}");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+            }
+            _ if a.starts_with("--cleanup=") => match parse_cleanup(&a["--cleanup=".len()..]) {
+                Some(mode) => opts.cleanup = mode,
+                None => {
+                    eprintln!("fatal: Invalid cleanup mode {}", &a["--cleanup=".len()..]);
+                    return Ok(ExitCode::from(128));
+                }
+            },
+            "-s" | "--strategy" => {
+                i += 1;
+                match args.get(i).map(String::as_str).map(resolve_strategy) {
+                    Some(Ok(s)) => opts.strategy = s,
+                    Some(Err(code)) => return Ok(code),
+                    None => {
+                        eprintln!("error: option `{a}' requires a value");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            _ if a.starts_with("--strategy=") => match resolve_strategy(&a["--strategy=".len()..]) {
+                Ok(s) => opts.strategy = s,
+                Err(code) => return Ok(code),
+            },
+            _ if a.len() > 2 && a.starts_with("-s") && !a.starts_with("--") => {
+                match resolve_strategy(&a[2..]) {
+                    Ok(s) => opts.strategy = s,
+                    Err(code) => return Ok(code),
+                }
+            }
             _ if a.len() > 1 && a.starts_with('-') => {
                 anyhow::bail!("unsupported flag {a}")
             }
-            _ => refs.push(a),
+            _ => refs.push(a.to_string()),
         }
         i += 1;
     }
 
+    // `-F <path>` — read now, after option parsing. `-` and an empty value are
+    // stdin, matching git's `read_from_file`/`fix_filename`.
+    if let Some(path) = file {
+        let data = if path == "-" || path.is_empty() {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut buf)?;
+            buf
+        } else {
+            match std::fs::read(&path) {
+                Ok(buf) => buf,
+                Err(e) => {
+                    eprintln!("fatal: could not open '{path}' for reading: {}", strerror(&e));
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        };
+        opts.message = Some(String::from_utf8_lossy(&data).into_owned());
+    }
+
     match op {
-        // git: `--abort`/`--quit` expect no arguments; `usage_msg_opt` exits 129.
-        Op::Abort | Op::Quit if !refs.is_empty() => {
-            let which = if op == Op::Abort { "--abort" } else { "--quit" };
+        // git: `--abort`/`--quit`/`--continue` expect no arguments.
+        Op::Abort | Op::Quit | Op::Continue if !refs.is_empty() => {
+            let which = match op {
+                Op::Abort => "--abort",
+                Op::Quit => "--quit",
+                _ => "--continue",
+            };
             eprintln!("fatal: {which} expects no arguments");
             Ok(ExitCode::from(129))
         }
         Op::Abort => abort(),
         Op::Quit => quit(),
-        Op::Merge => do_merge(&refs, ff, show_stat, message),
+        Op::Continue => continue_merge(&opts),
+        Op::Merge => {
+            // git's `builtin/merge.c` incompatibility checks, keyed off the literal
+            // flags. `--squash` cannot fast-forward, so it clashes with `--no-ff`,
+            // and it never commits, so it clashes with `--commit`.
+            if opts.squash && opts.commit_given {
+                eprintln!("fatal: options '--squash' and '--commit.' cannot be used together");
+                return Ok(ExitCode::from(128));
+            }
+            if opts.squash && opts.no_ff_given {
+                eprintln!("fatal: options '--squash' and '--no-ff.' cannot be used together");
+                return Ok(ExitCode::from(128));
+            }
+            do_merge(&refs, &opts)
+        }
     }
 }
 
@@ -199,12 +409,7 @@ fn abort() -> Result<ExitCode> {
 // merge
 // ---------------------------------------------------------------------------
 
-fn do_merge(
-    refs: &[&str],
-    ff: Ff,
-    show_stat: bool,
-    message: Option<String>,
-) -> Result<ExitCode> {
+fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
     if repo.git_dir().join("MERGE_HEAD").exists() {
@@ -218,10 +423,6 @@ fn do_merge(
         eprintln!("fatal: No remote for the current branch.");
         return Ok(ExitCode::from(128));
     }
-    if refs.len() > 1 {
-        return do_octopus(&repo, refs, message);
-    }
-    let spec = refs[0];
 
     // Current HEAD state. An unborn branch has no commit to fast-forward from;
     // a real merge into it would be a checkout, which is out of scope.
@@ -235,19 +436,54 @@ fn do_merge(
         .detach();
     // Owned branch name when attached; `None` when detached.
     let branch: Option<FullName> = head.referent_name().map(std::borrow::ToOwned::to_owned);
+    // The ref to move: the attached branch, or HEAD itself when detached. Both
+    // are direct (non-symbolic) refs here, so `deref` is false either way.
+    let name: FullName = match &branch {
+        Some(b) => b.clone(),
+        None => "HEAD"
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
+    };
 
-    // Resolve the ref to merge and peel it to a commit (tags included).
-    let target_id = repo.rev_parse_single(spec)?.object()?.peel_to_commit()?.id;
+    // Resolve every ref to merge and peel it to a commit (tags included).
+    let mut targets: Vec<ObjectId> = Vec::with_capacity(refs.len());
+    for spec in refs {
+        let id = repo.rev_parse_single(spec.as_str())?.object()?.peel_to_commit()?.id;
+        targets.push(id);
+    }
 
-    let base = repo.merge_base(local_id, target_id)?.detach();
-    if base == target_id {
+    // `-s ours`: every head becomes a parent while our tree is kept verbatim.
+    // Handles any number of heads and never fast-forwards.
+    if opts.strategy == Strategy::Ours {
+        return merge_ours(&repo, name, branch.as_ref(), local_id, &targets, refs, opts);
+    }
+
+    // More than one head, default strategy → octopus.
+    if refs.len() > 1 {
+        return do_octopus(&repo, refs, &targets, local_id, branch.as_ref(), name, opts);
+    }
+
+    let spec = refs[0].as_str();
+    let target_id = targets[0];
+
+    // merge-base analysis. An empty set of merge bases means unrelated histories,
+    // which git refuses without `--allow-unrelated-histories`.
+    let bases = repo.merge_bases_many(local_id, &[target_id])?;
+    if bases.is_empty() && !opts.allow_unrelated {
+        eprintln!("fatal: refusing to merge unrelated histories");
+        return Ok(ExitCode::from(128));
+    }
+    if bases.iter().any(|b| b.detach() == target_id) {
         // Target already reachable from HEAD (or identical). git checks this
         // before it consults --no-ff, so --no-ff does not force a commit here.
-        println!("Already up to date.");
+        if !opts.quiet {
+            println!("Already up to date.");
+        }
         return Ok(ExitCode::SUCCESS);
     }
-    let diverged = base != local_id;
-    if diverged && ff == Ff::Only {
+    // Fast-forwardable exactly when HEAD is one of the merge bases.
+    let diverged = !bases.iter().any(|b| b.detach() == local_id);
+    if diverged && opts.ff == Ff::Only {
         eprintln!("fatal: Not possible to fast-forward, aborting.");
         return Ok(ExitCode::from(128));
     }
@@ -266,22 +502,21 @@ fn do_merge(
     let head_tree = repo.find_object(local_id)?.peel_to_tree()?.id;
     let target_tree = repo.find_object(target_id)?.peel_to_tree()?.id;
     let should_interrupt = AtomicBool::new(false);
-
-    // The ref to move: the attached branch, or HEAD itself when detached. Both
-    // are direct (non-symbolic) refs here, so `deref` is false either way.
-    let name: FullName = match &branch {
-        Some(b) => b.clone(),
-        None => "HEAD"
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
-    };
+    let message = merge_message(&repo, spec, branch.as_ref(), opts.message.clone())?;
 
     // Diverged histories: a genuine three-way merge (`ort` strategy) of HEAD and
-    // the target against their merge base. On a clean merge we write the two-parent
-    // merge commit; on conflict we record MERGE_HEAD/MERGE_MSG and stop, exactly as
-    // git does, leaving the conflicted index and worktree for the user to resolve.
+    // the target against their merge base (an empty tree for unrelated histories).
+    // On a clean merge the finish step commits/squashes/records per the options;
+    // on conflict we record MERGE_HEAD/MERGE_MSG and stop, exactly as git does.
     if diverged {
-        let base_tree = repo.find_object(base)?.peel_to_tree()?.id;
+        // `git`'s recursive base for the three-way; the empty tree stands in for an
+        // unrelated history (`--allow-unrelated-histories`), which has no base.
+        let base_tree = if bases.is_empty() {
+            gix::ObjectId::empty_tree(repo.object_hash())
+        } else {
+            let base = repo.merge_base(local_id, target_id)?.detach();
+            repo.find_object(base)?.peel_to_tree()?.id
+        };
         let labels = gix::merge::blob::builtin_driver::text::Labels {
             ancestor: Some(BStr::new(b"merged common ancestors")),
             current: Some(BStr::new(b"HEAD")),
@@ -298,45 +533,28 @@ fn do_merge(
         )?;
         let mut index = applied.index;
         index.write(Default::default())?;
-        set_orig_head(&repo, local_id)?;
 
         if applied.conflicts.is_empty() {
-            let msg = merge_message(&repo, spec, branch.as_ref(), message)?;
-            let author = repo
-                .author()
-                .ok_or_else(|| anyhow::anyhow!("author identity is not configured"))??;
-            let committer = repo
-                .committer()
-                .ok_or_else(|| anyhow::anyhow!("committer identity is not configured"))??;
-            let commit = gix::objs::Commit {
-                message: msg.into(),
-                tree: applied.tree_id,
-                author: author.to_owned()?,
-                committer: committer.to_owned()?,
-                encoding: None,
-                parents: [local_id, target_id].into_iter().collect(),
-                extra_headers: Default::default(),
-            };
-            let new_id = repo.write_object(&commit)?.detach();
-            advance(
+            return finalize_clean(
                 &repo,
                 name,
                 local_id,
-                new_id,
-                format!("merge {spec}: Merge made by the 'ort' strategy."),
-            )?;
-            println!("Merge made by the 'ort' strategy.");
-            if show_stat {
-                print!("{}", diffstat(&repo, head_tree, applied.tree_id)?);
-            }
-            return Ok(ExitCode::SUCCESS);
+                &[target_id],
+                message,
+                applied.tree_id,
+                head_tree,
+                opts,
+                "ort",
+                spec,
+            );
         }
 
         // Conflicts: record the in-progress merge and stop with git's message.
+        set_orig_head(&repo, local_id)?;
         let git_dir = repo.git_dir();
         std::fs::write(git_dir.join("MERGE_HEAD"), format!("{target_id}\n"))?;
-        std::fs::write(git_dir.join("MERGE_MODE"), b"")?;
-        let mut merge_msg = merge_message(&repo, spec, branch.as_ref(), message)?.into_bytes();
+        std::fs::write(git_dir.join("MERGE_MODE"), merge_mode(opts.ff))?;
+        let mut merge_msg = message.into_bytes();
         merge_msg.extend_from_slice(b"\n# Conflicts:\n");
         for path in &applied.conflicts {
             merge_msg.extend_from_slice(b"#\t");
@@ -344,82 +562,267 @@ fn do_merge(
             merge_msg.push(b'\n');
         }
         std::fs::write(git_dir.join("MERGE_MSG"), &merge_msg)?;
-        println!("Automatic merge failed; fix conflicts and then commit the result.");
+        if !opts.quiet {
+            println!("Automatic merge failed; fix conflicts and then commit the result.");
+        }
         return Ok(ExitCode::from(1));
     }
 
-    if ff == Ff::Never {
-        // The merge-base is our own commit, so a three-way merge of every path
-        // resolves to theirs: the merged tree is exactly the target's tree.
-        let msg = merge_message(&repo, spec, branch.as_ref(), message)?;
-        let author = repo
-            .author()
-            .ok_or_else(|| anyhow::anyhow!("author identity is not configured"))??;
-        let committer = repo
-            .committer()
-            .ok_or_else(|| anyhow::anyhow!("committer identity is not configured"))??;
-        let commit = gix::objs::Commit {
-            message: msg.into(),
-            tree: target_tree,
-            author: author.to_owned()?,
-            committer: committer.to_owned()?,
-            encoding: None,
-            parents: [local_id, target_id].into_iter().collect(),
-            extra_headers: Default::default(),
-        };
-        let new_id = repo.write_object(&commit)?.detach();
-
-        set_orig_head(&repo, local_id)?;
-        advance(&repo, name, local_id, new_id, format!("merge {spec}: Merge made by the 'ort' strategy."))?;
+    // `--no-ff` over a fast-forwardable history: the merge-base is our own commit,
+    // so a three-way merge of every path resolves to theirs — the merged tree is
+    // exactly the target's tree. Sync the worktree, then finish as a merge commit.
+    if opts.ff == Ff::Never {
         update_worktree(&repo, &old_index, target_tree, &should_interrupt)?;
+        return finalize_clean(
+            &repo,
+            name,
+            local_id,
+            &[target_id],
+            message,
+            target_tree,
+            head_tree,
+            opts,
+            "ort",
+            spec,
+        );
+    }
 
-        println!("Merge made by the 'ort' strategy.");
-    } else {
-        set_orig_head(&repo, local_id)?;
-        advance(&repo, name, local_id, target_id, format!("merge {spec}: Fast-forward"))?;
+    // Pure fast-forward territory. `--squash` fast-forwards the *content* but does
+    // not move the ref: git updates the worktree, prints the fast-forward summary,
+    // then the squash notice and writes SQUASH_MSG.
+    if opts.squash {
         update_worktree(&repo, &old_index, target_tree, &should_interrupt)?;
+        if !opts.quiet {
+            println!(
+                "Updating {}..{}",
+                local_id.to_hex_with_len(7),
+                target_id.to_hex_with_len(7)
+            );
+            println!("Fast-forward");
+            if opts.show_stat {
+                print!("{}", diffstat(&repo, head_tree, target_tree)?);
+            }
+        }
+        write_squash_msg(&repo, &[target_id], local_id)?;
+        if !opts.quiet {
+            println!("Squash commit -- not updating HEAD");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
 
+    // Normal fast-forward. `--no-commit` does not stop a fast-forward (there is no
+    // merge commit to stop before), matching git.
+    set_orig_head(&repo, local_id)?;
+    advance(&repo, name, local_id, target_id, format!("merge {spec}: Fast-forward"))?;
+    update_worktree(&repo, &old_index, target_tree, &should_interrupt)?;
+    if !opts.quiet {
         println!(
             "Updating {}..{}",
             local_id.to_hex_with_len(7),
             target_id.to_hex_with_len(7)
         );
         println!("Fast-forward");
-    }
-
-    if show_stat {
-        print!("{}", diffstat(&repo, head_tree, target_tree)?);
+        if opts.show_stat {
+            print!("{}", diffstat(&repo, head_tree, target_tree)?);
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The clean-merge finish shared by the diverged, `--no-ff`, and `-s ours` paths:
+/// records `ORIG_HEAD`, then squashes, stops before committing, or writes the
+/// merge commit, honouring `--signoff`, `--cleanup`, `--no-verify` and `--quiet`.
+/// `merged_tree` is the already-computed result tree (its worktree/index are
+/// assumed synced by the caller); `head_tree` feeds the diffstat.
+#[allow(clippy::too_many_arguments)]
+fn finalize_clean(
+    repo: &gix::Repository,
+    name: FullName,
+    local_id: ObjectId,
+    targets: &[ObjectId],
+    message: String,
+    merged_tree: ObjectId,
+    head_tree: ObjectId,
+    opts: &Opts,
+    strategy_name: &str,
+    spec_label: &str,
+) -> Result<ExitCode> {
+    set_orig_head(repo, local_id)?;
+    let do_commit = opts.commit.unwrap_or(!opts.squash);
+
+    // `--squash`: no commit, no ref move, no MERGE_HEAD — just SQUASH_MSG.
+    if opts.squash {
+        if !opts.quiet {
+            println!("Automatic merge went well; stopped before committing as requested");
+        }
+        write_squash_msg(repo, targets, local_id)?;
+        if !opts.quiet {
+            println!("Squash commit -- not updating HEAD");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // `--no-commit`: leave the merge in progress for `git commit` to finalize.
+    if !do_commit {
+        let git_dir = repo.git_dir();
+        let mut merge_head = String::new();
+        for t in targets {
+            merge_head.push_str(&format!("{t}\n"));
+        }
+        std::fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
+        std::fs::write(git_dir.join("MERGE_MODE"), merge_mode(opts.ff))?;
+        std::fs::write(git_dir.join("MERGE_MSG"), &message)?;
+        if !opts.quiet {
+            println!("Automatic merge went well; stopped before committing as requested");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // `pre-merge-commit` runs before the commit; a non-zero exit vetoes it. The
+    // hook's own output (inherited on stderr) is the whole diagnostic, as in git.
+    if !opts.no_verify && !crate::hooks::run(repo, "pre-merge-commit", &[], None)? {
+        return Ok(ExitCode::from(1));
+    }
+
+    let mut msg = message;
+    if opts.signoff {
+        append_signoff(repo, &mut msg)?;
+    }
+    let comment = comment_char(repo);
+    msg = cleanup_message(&msg, opts.cleanup, &comment);
+
+    // `commit-msg` gets the message file (via MERGE_MSG) and may rewrite it.
+    if !opts.no_verify {
+        let msg_path = repo.git_dir().join("MERGE_MSG");
+        std::fs::write(&msg_path, &msg)?;
+        let arg = msg_path.to_string_lossy().into_owned();
+        if !crate::hooks::run(repo, "commit-msg", &[&arg], None)? {
+            return Ok(ExitCode::from(1));
+        }
+        msg = std::fs::read_to_string(&msg_path)?;
+        let _ = std::fs::remove_file(&msg_path);
+    }
+
+    let author = repo
+        .author()
+        .ok_or_else(|| anyhow::anyhow!("author identity is not configured"))??;
+    let committer = repo
+        .committer()
+        .ok_or_else(|| anyhow::anyhow!("committer identity is not configured"))??;
+    let mut parents: Vec<ObjectId> = Vec::with_capacity(targets.len() + 1);
+    parents.push(local_id);
+    parents.extend_from_slice(targets);
+    let commit = gix::objs::Commit {
+        message: msg.into(),
+        tree: merged_tree,
+        author: author.to_owned()?,
+        committer: committer.to_owned()?,
+        encoding: None,
+        parents: parents.into_iter().collect(),
+        extra_headers: Default::default(),
+    };
+    let new_id = repo.write_object(&commit)?.detach();
+    advance(
+        repo,
+        name,
+        local_id,
+        new_id,
+        format!("merge {spec_label}: Merge made by the '{strategy_name}' strategy."),
+    )?;
+    if !opts.quiet {
+        println!("Merge made by the '{strategy_name}' strategy.");
+        if opts.show_stat {
+            print!("{}", diffstat(repo, head_tree, merged_tree)?);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `-s ours`: record every head as a parent, keep our tree verbatim. Never
+/// fast-forwards; already up to date only when every head is reachable from HEAD.
+fn merge_ours(
+    repo: &gix::Repository,
+    name: FullName,
+    branch: Option<&FullName>,
+    local_id: ObjectId,
+    targets: &[ObjectId],
+    refs: &[String],
+    opts: &Opts,
+) -> Result<ExitCode> {
+    let mut all_reachable = true;
+    for t in targets {
+        let bases = repo.merge_bases_many(local_id, &[*t])?;
+        if !bases.iter().any(|b| b.detach() == *t) {
+            all_reachable = false;
+            break;
+        }
+    }
+    if all_reachable {
+        if !opts.quiet {
+            println!("Already up to date.");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    if repo.is_dirty()? {
+        anyhow::bail!("worktree has uncommitted changes; refusing to merge");
+    }
+
+    let head_tree = repo.find_object(local_id)?.peel_to_tree()?.id;
+    let old_index = repo.index_or_load_from_head()?.into_owned();
+    let should_interrupt = AtomicBool::new(false);
+    // Our tree is unchanged; sync the index (a no-op checkout).
+    update_worktree(repo, &old_index, head_tree, &should_interrupt)?;
+
+    let message = match &opts.message {
+        Some(m) => {
+            let mut m = m.clone();
+            if !m.ends_with('\n') {
+                m.push('\n');
+            }
+            m
+        }
+        None if refs.len() == 1 => merge_message(repo, refs[0].as_str(), branch, None)?,
+        None => {
+            let specs: Vec<&str> = refs.iter().map(String::as_str).collect();
+            octopus_message(&specs)
+        }
+    };
+    let spec_label = refs.join(" ");
+    finalize_clean(
+        repo,
+        name,
+        local_id,
+        targets,
+        message,
+        head_tree,
+        head_tree,
+        opts,
+        "ours",
+        &spec_label,
+    )
 }
 
 /// `git merge <a> <b> [<c>...]` — the octopus strategy: fold each head into the
 /// result with a three-way merge, then write one commit carrying every head as a
 /// parent. Any head that cannot merge cleanly fails the octopus (git does not
 /// resolve conflicts under octopus), leaving the conflicted state and `MERGE_HEAD`.
-fn do_octopus(repo: &gix::Repository, refs: &[&str], message: Option<String>) -> Result<ExitCode> {
-    let head = repo.head()?;
-    if head.is_unborn() {
-        anyhow::bail!("cannot merge into an unborn branch");
-    }
-    let local_id = head
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("HEAD does not point to a commit"))?
-        .detach();
-    let branch: Option<FullName> = head.referent_name().map(std::borrow::ToOwned::to_owned);
-    let name: FullName = match &branch {
-        Some(b) => b.clone(),
-        None => "HEAD"
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
-    };
-
-    // Resolve every head up front so a bad ref fails before any mutation.
-    let mut heads: Vec<(String, ObjectId)> = Vec::with_capacity(refs.len());
-    for spec in refs {
-        let id = repo.rev_parse_single(*spec)?.object()?.peel_to_commit()?.id;
-        heads.push(((*spec).to_string(), id));
-    }
+fn do_octopus(
+    repo: &gix::Repository,
+    refs: &[String],
+    targets: &[ObjectId],
+    local_id: ObjectId,
+    _branch: Option<&FullName>,
+    name: FullName,
+    opts: &Opts,
+) -> Result<ExitCode> {
+    // Every head, resolved by the caller; pair each with its spec for messages.
+    let heads: Vec<(String, ObjectId)> = refs
+        .iter()
+        .cloned()
+        .zip(targets.iter().copied())
+        .collect();
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     if repo.is_dirty()? {
@@ -442,7 +845,9 @@ fn do_octopus(repo: &gix::Repository, refs: &[&str], message: Option<String>) ->
             repo.merge_base(local_id, *head_id)?.detach()
         };
         if common == *head_id {
-            println!("Already up to date with {spec}");
+            if !opts.quiet {
+                println!("Already up to date with {spec}");
+            }
             continue;
         }
         let head_tree = repo.find_object(*head_id)?.peel_to_tree()?.id;
@@ -486,7 +891,9 @@ fn do_octopus(repo: &gix::Repository, refs: &[&str], message: Option<String>) ->
             std::fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
             std::fs::write(git_dir.join("MERGE_MODE"), b"")?;
             set_orig_head(repo, local_id)?;
-            println!("Automatic merge failed; fix conflicts and then commit the result.");
+            if !opts.quiet {
+                println!("Automatic merge failed; fix conflicts and then commit the result.");
+            }
             return Ok(ExitCode::from(1));
         }
         mrt = applied.tree_id;
@@ -495,7 +902,9 @@ fn do_octopus(repo: &gix::Repository, refs: &[&str], message: Option<String>) ->
 
     // Nothing merged: every head was already reachable.
     if mrc.len() == 1 && mrc[0] == local_id {
-        println!("Already up to date.");
+        if !opts.quiet {
+            println!("Already up to date.");
+        }
         return Ok(ExitCode::SUCCESS);
     }
     // Everything collapsed onto one line via fast-forward — a plain fast-forward,
@@ -509,46 +918,39 @@ fn do_octopus(repo: &gix::Repository, refs: &[&str], message: Option<String>) ->
             mrc[0],
             format!("merge {}: Fast-forward", refs.join(" ")),
         )?;
-        println!("Fast-forward");
+        if !opts.quiet {
+            println!("Fast-forward");
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
-    let parents = mrc;
-    let msg = match message {
-        Some(mut m) => {
+    // The default octopus message, or the explicit `-m`/`-F` text.
+    let specs: Vec<&str> = refs.iter().map(String::as_str).collect();
+    let message = match &opts.message {
+        Some(m) => {
+            let mut m = m.clone();
             if !m.ends_with('\n') {
                 m.push('\n');
             }
             m
         }
-        None => octopus_message(refs),
+        None => octopus_message(&specs),
     };
-    let author = repo
-        .author()
-        .ok_or_else(|| anyhow::anyhow!("author identity is not configured"))??;
-    let committer = repo
-        .committer()
-        .ok_or_else(|| anyhow::anyhow!("committer identity is not configured"))??;
-    let commit = gix::objs::Commit {
-        message: msg.into(),
-        tree: mrt,
-        author: author.to_owned()?,
-        committer: committer.to_owned()?,
-        encoding: None,
-        parents: parents.into_iter().collect(),
-        extra_headers: Default::default(),
-    };
-    let new_id = repo.write_object(&commit)?.detach();
-    set_orig_head(repo, local_id)?;
-    advance(
+    // The finish (squash / stop-before-commit / commit) is shared with the two-head
+    // paths; every merged head becomes a parent (`mrc` minus HEAD).
+    let extra_parents: Vec<ObjectId> = mrc.iter().copied().filter(|p| *p != local_id).collect();
+    finalize_clean(
         repo,
         name,
         local_id,
-        new_id,
-        format!("merge {}: Merge made by the 'octopus' strategy.", refs.join(" ")),
-    )?;
-    println!("Merge made by the 'octopus' strategy.");
-    Ok(ExitCode::SUCCESS)
+        &extra_parents,
+        message,
+        mrt,
+        mrt, // no diffstat basis distinct from the octopus tree; git prints none
+        opts,
+        "octopus",
+        &refs.join(" "),
+    )
 }
 
 /// The default octopus commit subject: `Merge branches 'a', 'b' and 'c'`.
@@ -560,6 +962,312 @@ fn octopus_message(refs: &[&str]) -> String {
         None => String::new(),
     };
     format!("Merge branches {joined}\n")
+}
+
+// ---------------------------------------------------------------------------
+// Option plumbing: strategy, cleanup, squash message, signoff, --continue
+// ---------------------------------------------------------------------------
+
+/// `MERGE_MODE`'s body: git writes `no-ff` (no trailing newline) when the merge
+/// must not fast-forward, and an empty file otherwise.
+fn merge_mode(ff: Ff) -> &'static [u8] {
+    if ff == Ff::Never {
+        b"no-ff"
+    } else {
+        b""
+    }
+}
+
+/// Map a `--cleanup=<mode>` value to its mode, or `None` for an invalid one.
+fn parse_cleanup(value: &str) -> Option<Cleanup> {
+    Some(match value {
+        "default" => Cleanup::Default,
+        "verbatim" => Cleanup::Verbatim,
+        "whitespace" => Cleanup::Whitespace,
+        "strip" => Cleanup::Strip,
+        "scissors" => Cleanup::Scissors,
+        _ => return None,
+    })
+}
+
+/// Resolve a `-s`/`--strategy` value. Only `ort` and `ours` map to a real merge
+/// here; `octopus` folds onto the default path (which already selects the octopus
+/// engine for multiple heads). `recursive`/`resolve`/`subtree` are genuine git
+/// strategies with distinct conflict resolution that is not vendored, so they are
+/// refused rather than silently aliased onto `ort`. An unknown name reproduces
+/// git's `Could not find merge strategy` diagnostic.
+fn resolve_strategy(name: &str) -> std::result::Result<Strategy, ExitCode> {
+    match name {
+        "ort" | "octopus" => Ok(Strategy::Ort),
+        "ours" => Ok(Strategy::Ours),
+        "recursive" | "resolve" | "subtree" => {
+            eprintln!("merge: strategy '{name}' is not supported by this build (use 'ort' or 'ours')");
+            Err(ExitCode::from(128))
+        }
+        _ => {
+            eprintln!("Could not find merge strategy '{name}'.");
+            eprintln!("Available strategies are: octopus ours recursive resolve subtree.");
+            Err(ExitCode::from(128))
+        }
+    }
+}
+
+/// `core.commentChar` for cleanup, defaulting to `#` (and treating `auto` and an
+/// empty value as `#`). The full multi-valued `commentChar`/`commentString`
+/// interleaving lives in `fmt-merge-msg`; a single character covers the merge
+/// message paths.
+fn comment_char(repo: &gix::Repository) -> String {
+    match repo.config_snapshot().string("core.commentChar") {
+        Some(v) => {
+            let s = v.to_string();
+            if s.is_empty() || s == "auto" {
+                "#".to_string()
+            } else {
+                s
+            }
+        }
+        None => "#".to_string(),
+    }
+}
+
+/// Append git's `Signed-off-by:` trailer (from the committer identity) to a merge
+/// message, inserting a blank separator line when the message does not already end
+/// with one. This is the common title-only case; a message that already ends in a
+/// trailer block is not de-duplicated (git's `append_signoff` scans for that).
+fn append_signoff(repo: &gix::Repository, msg: &mut String) -> Result<()> {
+    let sig = repo
+        .committer()
+        .ok_or_else(|| anyhow::anyhow!("committer identity is not configured"))??;
+    let trailer = format!(
+        "Signed-off-by: {} <{}>",
+        sig.name.to_str_lossy(),
+        sig.email.to_str_lossy()
+    );
+    if !msg.ends_with('\n') {
+        msg.push('\n');
+    }
+    if !msg.ends_with("\n\n") {
+        msg.push('\n');
+    }
+    msg.push_str(&trailer);
+    msg.push('\n');
+    Ok(())
+}
+
+/// git's `cleanup_message()` / `strbuf_stripspace()` for the modes merge exposes.
+fn cleanup_message(input: &str, mode: Cleanup, comment: &str) -> String {
+    match mode {
+        Cleanup::Verbatim => input.to_string(),
+        Cleanup::Scissors => {
+            let marker = format!("{comment} ------------------------ >8 ------------------------");
+            stripspace(&input[..scissors_cut(input, &marker)], None)
+        }
+        Cleanup::Strip => stripspace(input, Some(comment)),
+        // merge's default when a message is supplied without an editor is
+        // `whitespace`: strip trailing whitespace and blank runs, keep comments.
+        Cleanup::Whitespace | Cleanup::Default => stripspace(input, None),
+    }
+}
+
+/// The byte offset of the scissors line (`# ----- >8 -----`), or the input length
+/// when it is absent; everything from there on is dropped.
+fn scissors_cut(input: &str, marker: &str) -> usize {
+    let mut pos = 0;
+    for line in input.split_inclusive('\n') {
+        if line.strip_suffix('\n').unwrap_or(line) == marker {
+            return pos;
+        }
+        pos += line.len();
+    }
+    input.len()
+}
+
+/// Port of `strbuf_stripspace()`: rtrim every line, drop leading/trailing blank
+/// lines and collapse consecutive blank lines to one; when `comment` is set,
+/// lines starting with it are removed entirely.
+fn stripspace(input: &str, comment: Option<&str>) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 1);
+    let mut empties = 0usize;
+    let mut rest = bytes;
+
+    while !rest.is_empty() {
+        let len = match rest.iter().position(|&b| b == b'\n') {
+            Some(offset) => offset + 1,
+            None => rest.len(),
+        };
+        let (line, tail) = rest.split_at(len);
+        rest = tail;
+
+        if let Some(c) = comment {
+            if line.starts_with(c.as_bytes()) {
+                continue;
+            }
+        }
+
+        let mut end = line.len();
+        while end > 0 && line[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end == 0 {
+            empties += 1;
+            continue;
+        }
+        if empties > 0 && !out.is_empty() {
+            out.push(b'\n');
+        }
+        empties = 0;
+        out.extend_from_slice(&line[..end]);
+        out.push(b'\n');
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Write `SQUASH_MSG`, a port of `squash_message()` (builtin/merge.c): the header
+/// line, then, for every non-merge commit reachable from `targets` but not from
+/// `head` (newest first), a `commit <id>` line and its `git log`-medium body.
+fn write_squash_msg(repo: &gix::Repository, targets: &[ObjectId], head: ObjectId) -> Result<()> {
+    let mut out = String::from("Squashed commit of the following:\n");
+    let walk = repo
+        .rev_walk(targets.iter().copied())
+        .with_hidden([head])
+        .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
+    for info in walk.all()? {
+        let commit = info?.object()?;
+        // `rev.ignore_merges = 1`: merge commits are skipped.
+        if commit.parent_ids().count() > 1 {
+            continue;
+        }
+        out.push('\n');
+        out.push_str(&format!("commit {}\n", commit.id));
+        let author = commit.author()?;
+        out.push_str(&format!(
+            "Author: {} <{}>\n",
+            author.name.to_str_lossy(),
+            author.email.to_str_lossy()
+        ));
+        let date = author.time()?.format_or_unix(gix::date::time::format::DEFAULT);
+        out.push_str(&format!("Date:   {date}\n\n"));
+        // medium format indents every message line by four spaces, empty ones too.
+        let raw = commit.message_raw()?;
+        let body = raw.to_str_lossy();
+        for line in body.trim_end_matches('\n').split('\n') {
+            out.push_str("    ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    std::fs::write(repo.git_dir().join("SQUASH_MSG"), out)?;
+    Ok(())
+}
+
+/// Build a tree object from `index` (all stage-0 entries) and return its id, the
+/// standard gix editor pass over the index in path order — the tree `--continue`
+/// commits.
+fn index_tree(repo: &gix::Repository, index: &gix::index::File) -> Result<ObjectId> {
+    let backing = index.path_backing();
+    let mut editor =
+        gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, repo.object_hash());
+    for entry in index.entries() {
+        let path = entry.path_in(backing);
+        let mode = entry
+            .mode
+            .to_tree_entry_mode()
+            .ok_or_else(|| anyhow::anyhow!("index entry `{path}` has an unrepresentable mode"))?;
+        editor.upsert(path.split(|&b| b == b'/').map(|c| c.as_bstr()), mode.kind(), entry.id)?;
+    }
+    Ok(editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?)
+}
+
+/// `git merge --continue`: finish a merge whose conflicts have been resolved and
+/// staged, writing the merge commit from the current index and clearing the
+/// in-progress state, exactly as `git commit` does when `MERGE_HEAD` is present.
+fn continue_merge(opts: &Opts) -> Result<ExitCode> {
+    let repo = gix::discover(".")?;
+    let git_dir = repo.git_dir().to_owned();
+    if !git_dir.join("MERGE_HEAD").exists() {
+        eprintln!("fatal: There is no merge in progress (MERGE_HEAD missing).");
+        return Ok(ExitCode::from(128));
+    }
+
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+
+    // Refuse while the index still carries conflicted (stage 1/2/3) entries.
+    let index = repo.open_index()?;
+    if index.entries().iter().any(|e| e.stage() != Stage::Unconflicted) {
+        eprintln!("error: Committing is not possible because you have unmerged files.");
+        eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
+        eprintln!("hint: as appropriate to mark resolution and make a commit.");
+        eprintln!("fatal: Exiting because of an unresolved conflict.");
+        return Ok(ExitCode::from(128));
+    }
+
+    let head = repo.head()?;
+    if head.is_unborn() {
+        anyhow::bail!("cannot conclude a merge on an unborn branch");
+    }
+    let local_id = head
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("HEAD does not point to a commit"))?
+        .detach();
+
+    // Parents: HEAD first, then every id listed in MERGE_HEAD.
+    let mut parents: Vec<ObjectId> = vec![local_id];
+    let merge_head = std::fs::read_to_string(git_dir.join("MERGE_HEAD"))?;
+    for line in merge_head.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        parents.push(
+            ObjectId::from_hex(line.as_bytes())
+                .map_err(|e| anyhow::anyhow!("invalid id in MERGE_HEAD: {e}"))?,
+        );
+    }
+
+    // Message from MERGE_MSG, comment lines (the `# Conflicts:` block) stripped as
+    // git's finalize cleanup does.
+    let raw = std::fs::read_to_string(git_dir.join("MERGE_MSG")).unwrap_or_default();
+    let comment = comment_char(&repo);
+    let mut msg = cleanup_message(&raw, Cleanup::Strip, &comment);
+    if opts.signoff {
+        append_signoff(&repo, &mut msg)?;
+    }
+    if !opts.no_verify {
+        let msg_path = git_dir.join("COMMIT_EDITMSG");
+        std::fs::write(&msg_path, &msg)?;
+        let arg = msg_path.to_string_lossy().into_owned();
+        if !crate::hooks::run(&repo, "commit-msg", &[&arg], None)? {
+            return Ok(ExitCode::from(1));
+        }
+        msg = std::fs::read_to_string(&msg_path)?;
+    }
+    let subject = msg.lines().next().unwrap_or("").to_string();
+
+    let tree_id = index_tree(&repo, &index)?;
+    let commit_id = repo.commit("HEAD", &msg, tree_id, parents)?;
+
+    remove_merge_state(&git_dir, true);
+    let _ = crate::hooks::run(&repo, "post-merge", &["0"], None);
+
+    if !opts.quiet {
+        let short = commit_id.shorten_or_id();
+        let branch_label = match repo.head_name()? {
+            Some(name) => name.shorten().to_string(),
+            None => "detached HEAD".to_string(),
+        };
+        println!("[{branch_label} {short}] {subject}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `strerror(errno)`: the bare message, without Rust's ` (os error <n>)` tail.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(at) => text[..at].to_owned(),
+        None => text,
+    }
 }
 
 /// Move `name` from `old` to `new`, writing `reflog` as the reflog message.

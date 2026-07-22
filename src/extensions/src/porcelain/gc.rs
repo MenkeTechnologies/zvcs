@@ -3,10 +3,10 @@
 //! `gc` is a driver: stock git parses its options, decides via `--auto` whether
 //! any work is warranted at all, and then shells out to `pack-refs`, `reflog
 //! expire`, `repack`, `prune`, `worktree prune`, `rerere gc` and `commit-graph
-//! write` in that order. This port reproduces the driver exactly, and runs the
-//! sub-commands that are themselves ported. The ones that are not are skipped
-//! rather than approximated — see "Not performed" below, which is the honest
-//! statement of what a successful `zvcs gc` has and has not done.
+//! write` in that order. This port reproduces the driver exactly, running the
+//! steps it has ported and skipping the rest rather than approximating them —
+//! see "Not performed" below, which is the honest statement of what a successful
+//! `zvcs gc` has and has not done.
 //!
 //! Verified against git 2.55.0.
 //!
@@ -55,6 +55,19 @@
 //!   * **`pack-refs --all --prune`**, delegated to [`super::pack_refs::pack_refs`],
 //!     which is a real port. This is what moves `refs/heads/*` and `refs/tags/*`
 //!     into `packed-refs`.
+//!   * **`reflog expire --all`**, as [`expire_reflogs`] below: a faithful port
+//!     of `reflog.c`'s `should_expire_reflog_ent()`. Each reflog under `logs/`
+//!     is rewritten in place, dropping entries older than `gc.reflogExpire`
+//!     (built-in default `now - 30 days`) and unreachable entries older than
+//!     `gc.reflogExpireUnreachable` (`now - 90 days`); every kept line is
+//!     preserved byte-for-byte, since `gc` passes neither `--rewrite` nor
+//!     `--updateref`. Runs unless both cutoffs are configured to `never`, git's
+//!     `cfg->prune_reflogs` gate.
+//!   * **`worktree prune`**, as [`prune_worktrees`] below: a port of
+//!     `worktree.c`'s `prune_worktrees()` for the checks `gc` reaches, removing
+//!     the administrative directory of every linked worktree whose checkout is
+//!     gone and whose `index` has aged past `gc.worktreePruneExpire` (default
+//!     `3.months.ago`). Locked worktrees are never pruned.
 //!   * **`rerere gc`**, delegated to [`super::rerere::rerere`], guarded on the
 //!     `rr-cache` directory existing so the delegate's `read_dir` error path is
 //!     never entered for a repository that simply never recorded a resolution.
@@ -96,16 +109,9 @@
 //!
 //! These are skipped, and a `gc` that exits 0 has **not** done them:
 //!
-//!   1. **Reflog expiry.** `gc` runs `git reflog expire --all`. `gix-ref` only
-//!      appends to a reflog as a side effect of a ref transaction and cannot
-//!      rewrite or truncate one; `reflog.rs` bails on `expire` for this reason.
-//!      Since every reflog entry is a reachability root, an unexpired reflog only
-//!      ever keeps *more* objects alive, which is the safe direction.
-//!   2. **`worktree prune`.** `worktree.rs` bails — there is no worktree
-//!      bookkeeping in the vendored crates.
-//!   3. **Reachability bitmaps** (`.bitmap`). git writes one for a large enough
+//!   1. **Reachability bitmaps** (`.bitmap`). git writes one for a large enough
 //!      repack; it is a lookup accelerator, and its absence changes no answer.
-//!   4. **`--aggressive`, `--keep-largest-pack`, `--max-cruft-size`.** All three
+//!   2. **`--aggressive`, `--keep-largest-pack`, `--max-cruft-size`.** All three
 //!      tune *how* git deltas or splits packs. With no delta search there is
 //!      nothing for the first two to tune, and the fixtures' cruft packs are far
 //!      below any size limit. They are accepted, and `--max-cruft-size` (with
@@ -119,13 +125,15 @@
 //! No `gc.pid` lock is taken, so `--force` has nothing to override.
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::bstr::ByteSlice;
 use gix::hash::ObjectId;
+use gix::objs::Kind;
 use gix::objs::Write as _;
 use gix::odb::pack;
 
@@ -397,9 +405,8 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         (_, false) => Unreachable::Leave,
     };
 
-    // git's order: pack-refs, then reflog expire (skipped), then repack, then
-    // prune, then worktree prune (skipped), then rerere gc, then commit-graph
-    // write.
+    // git's order: pack-refs, then reflog expire, then repack, then prune, then
+    // worktree prune, then rerere gc, then commit-graph write.
     if pack_refs_enabled(&repo) {
         super::pack_refs::pack_refs(&[
             "pack-refs".to_string(),
@@ -411,6 +418,15 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // Re-discovered because `pack-refs` rewrote the ref store underneath the
     // handle opened above, and the reachability walk has to see the packed refs.
     let repo = gix::discover(".").unwrap_or(repo);
+
+    // `reflog expire --all`, a foreground task git runs before the repack so an
+    // expired entry no longer keeps its object alive. Skipped only when both
+    // `gc.reflogExpire` and `gc.reflogExpireUnreachable` are `never`, exactly as
+    // git's `cfg->prune_reflogs` gate.
+    if reflog_expire_enabled(&repo) {
+        expire_reflogs(&repo)?;
+    }
+
     repack_all(&repo, unreachable)?;
 
     // `repack` has already removed every unreachable object under `Drop`, so the
@@ -419,6 +435,11 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     if prune == Prune::Now {
         super::prune::prune(&["prune".to_string()])?;
     }
+
+    // `worktree prune --expire <gc.worktreePruneExpire>`: git runs this after
+    // `prune`, removing the administrative directory of every linked worktree
+    // whose checkout has vanished and whose `index` has aged past the expiry.
+    prune_worktrees(&repo)?;
 
     // Guarded on the directory: `rerere gc` returns early when rerere is
     // disabled, but a repository with rerere on and no `rr-cache` yet would hit
@@ -731,7 +752,6 @@ fn write_bundle(
 
 /// The pack-entry header for a base object of `kind`.
 fn entry_header(kind: gix::objs::Kind) -> pack::data::entry::Header {
-    use gix::objs::Kind;
     match kind {
         Kind::Commit => pack::data::entry::Header::Commit,
         Kind::Tree => pack::data::entry::Header::Tree,
@@ -924,6 +944,568 @@ fn gc_needed(repo: &gix::Repository) -> bool {
     }
 
     false
+}
+
+// --- reflog expiry ---------------------------------------------------------
+//
+// A faithful port of git's `reflog expire --all` (`reflog.c` + `builtin/gc.c`).
+// The reflog files under `logs/` are rewritten in place, dropping only the
+// entries that `should_expire_reflog_ent()` would drop; every kept line is
+// preserved byte-for-byte, because `gc` passes neither `--rewrite` nor
+// `--updateref`, so the old/new ids and the ref value are never touched.
+//
+// git's `mark_reachable()` is a date-limited two-phase walk purely as a
+// performance optimisation: `is_unreachable()` digs down to the root the first
+// time a candidate is not already marked, so its boolean answer is exactly
+// "this commit is not in the full ancestor closure of the tip set". That
+// equivalence is what [`reachable_commits`] computes directly.
+//
+// Divergences, both edge-of-edge: per-pattern `gc.<pattern>.reflog*` matching
+// uses a `*`/`?` glob (git's `wildmatch` bracket classes are not honoured), and
+// only the main ref store's `logs/` are processed (git's `--all` also visits
+// each linked worktree's ref store, which `prune` already declines to support).
+
+/// git gc's `cfg->prune_reflogs`: `reflog expire --all` runs unless BOTH
+/// `gc.reflogExpire` and `gc.reflogExpireUnreachable` are configured to a value
+/// that resolves to the `never` sentinel (`0`). An unset value is not `never`,
+/// so the default is to run — matching `gc_config_is_timestamp_never()`.
+fn reflog_expire_enabled(repo: &gix::Repository) -> bool {
+    let now = SystemTime::now();
+    let cfg = repo.config_snapshot();
+    let is_never = |key: &str| {
+        cfg.string(key)
+            .and_then(|v| v.to_str().ok().map(str::to_owned))
+            .and_then(|v| parse_reflog_expiry(&v, now))
+            .is_some_and(|t| t == 0)
+    };
+    !(is_never("gc.reflogExpire") && is_never("gc.reflogExpireUnreachable"))
+}
+
+/// git's `parse_expiry_date` for a reflog cutoff: `never`/`false` are the `0`
+/// sentinel (never expire), `all`/`now` are `i64::MAX` (expire everything),
+/// `@<n>` is a raw epoch, and anything else is an approxidate resolved against
+/// `now`. A lighter approximation of [`super::prune`]'s approxidate handling:
+/// `.`/`,`/`_`/`/` split into words and a bare `<n> <unit>` is read as past.
+/// Unparseable values yield `None`, which callers treat as "unset".
+fn parse_reflog_expiry(value: &str, now: SystemTime) -> Option<i64> {
+    let v = value.trim();
+    match v {
+        "" => return None,
+        "never" | "false" => return Some(0),
+        "all" | "now" => return Some(i64::MAX),
+        _ => {}
+    }
+    if let Some(rest) = v.strip_prefix('@') {
+        return rest.trim().parse::<i64>().ok();
+    }
+    let spaced: String = v
+        .chars()
+        .map(|c| if matches!(c, '.' | ',' | '_' | '/') { ' ' } else { c })
+        .collect();
+    let spaced = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    for form in [v.to_owned(), spaced.clone(), format!("{spaced} ago")] {
+        if let Ok(t) = gix::date::parse(&form, Some(now)) {
+            return Some(t.seconds);
+        }
+    }
+    None
+}
+
+/// A per-pattern `gc.<pattern>.reflog*` override; a missing slot falls back to
+/// the corresponding default.
+struct ReflogEntryOpt {
+    pattern: String,
+    total: Option<i64>,
+    unreach: Option<i64>,
+}
+
+/// The resolved reflog-expire policy: the two default cutoffs plus any
+/// per-pattern overrides, mirroring `struct reflog_expire_options`.
+struct ReflogExpireConfig {
+    default_total: i64,
+    default_unreach: i64,
+    entries: Vec<ReflogEntryOpt>,
+}
+
+impl ReflogExpireConfig {
+    /// `reflog_expire_options_set_refname()`: the first pattern that matches
+    /// wins, `refs/stash` never expires when unconfigured, otherwise the
+    /// defaults apply. `gc` sets no explicit expiry, so the config always drives.
+    fn resolve(&self, refname: &str) -> (i64, i64) {
+        for ent in &self.entries {
+            if wildmatch0(ent.pattern.as_bytes(), refname.as_bytes()) {
+                return (
+                    ent.total.unwrap_or(self.default_total),
+                    ent.unreach.unwrap_or(self.default_unreach),
+                );
+            }
+        }
+        if refname == "refs/stash" {
+            return (0, 0);
+        }
+        (self.default_total, self.default_unreach)
+    }
+}
+
+/// Load `gc.reflogExpire`/`gc.reflogExpireUnreachable` and their per-pattern
+/// forms. The built-in defaults match `REFLOG_EXPIRE_OPTIONS_INIT`: total is
+/// `now - 30 days`, unreachable is `now - 90 days` (verified against git 2.55.0,
+/// whose macro values differ from the historical documentation).
+fn load_reflog_config(repo: &gix::Repository, now: SystemTime, now_secs: i64) -> ReflogExpireConfig {
+    let mut default_total = now_secs - 30 * 24 * 3600;
+    let mut default_unreach = now_secs - 90 * 24 * 3600;
+    let mut entries: Vec<ReflogEntryOpt> = Vec::new();
+
+    let config = repo.config_snapshot().plumbing().clone();
+    for section in config.sections() {
+        let header = section.header();
+        if !header.name().to_string().eq_ignore_ascii_case("gc") {
+            continue;
+        }
+        // Last value wins, as git's config reader does.
+        let mut total = None;
+        for value in section.body().values("reflogExpire") {
+            total = parse_reflog_expiry(value.to_str_lossy().as_ref(), now);
+        }
+        let mut unreach = None;
+        for value in section.body().values("reflogExpireUnreachable") {
+            unreach = parse_reflog_expiry(value.to_str_lossy().as_ref(), now);
+        }
+        match header.subsection_name() {
+            None => {
+                if let Some(t) = total {
+                    default_total = t;
+                }
+                if let Some(u) = unreach {
+                    default_unreach = u;
+                }
+            }
+            // Only a section that actually sets a reflog key contributes a
+            // pattern, matching git's `find_cfg_ent` being reached only from the
+            // two reflog keys.
+            Some(_) if total.is_none() && unreach.is_none() => {}
+            Some(sub) => {
+                let pattern = sub.to_str_lossy().into_owned();
+                let idx = match entries.iter().position(|e| e.pattern == pattern) {
+                    Some(i) => i,
+                    None => {
+                        entries.push(ReflogEntryOpt {
+                            pattern,
+                            total: None,
+                            unreach: None,
+                        });
+                        entries.len() - 1
+                    }
+                };
+                if total.is_some() {
+                    entries[idx].total = total;
+                }
+                if unreach.is_some() {
+                    entries[idx].unreach = unreach;
+                }
+            }
+        }
+    }
+    ReflogExpireConfig {
+        default_total,
+        default_unreach,
+        entries,
+    }
+}
+
+/// git's `wildmatch(pattern, text, 0)`: `*` spans any run including `/`, `?`
+/// matches one byte. Bracket expressions are not honoured (they do not occur in
+/// reflog-expire patterns in practice).
+fn wildmatch0(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some((p, t));
+            p += 1;
+        } else if let Some((sp, st)) = star {
+            p = sp + 1;
+            t = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+/// Which reachability rule an entry's unreachable window uses, mirroring git's
+/// `UE_ALWAYS`/`UE_HEAD`/`UE_NORMAL`.
+#[derive(PartialEq, Clone, Copy)]
+enum ReflogKind {
+    /// No reachability distinction: any entry in the unreachable window expires.
+    Always,
+    /// Reachability measured against every ref tip (the `HEAD` reflog).
+    Head,
+    /// Reachability measured against this ref's own tip.
+    Normal,
+}
+
+/// `reflog expire --all` over the main ref store's `logs/`.
+fn expire_reflogs(repo: &gix::Repository) -> Result<()> {
+    let now = SystemTime::now();
+    let now_secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let cfg = load_reflog_config(repo, now, now_secs);
+
+    let logs_dir = repo.common_dir().join("logs");
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    collect_reflog_files(&logs_dir, &logs_dir, &mut files);
+    files.sort();
+
+    // The `UE_HEAD` closure (all ref tips) is identical across reflogs, so it is
+    // computed at most once.
+    let mut head_reachable: Option<HashSet<ObjectId>> = None;
+    for (refname, path) in &files {
+        expire_one_reflog(repo, refname, path, &cfg, &mut head_reachable)?;
+    }
+    Ok(())
+}
+
+/// Every reflog file below `dir`, keyed by ref name (`logs/refs/heads/main` ->
+/// `refs/heads/main`, `logs/HEAD` -> `HEAD`).
+fn collect_reflog_files(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => collect_reflog_files(base, &path, out),
+            Ok(_) => {
+                if let Ok(rel) = path.strip_prefix(base) {
+                    let name = rel
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    out.push((name, path));
+                }
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// Rewrite one reflog file, dropping expired entries and keeping the rest
+/// verbatim.
+fn expire_one_reflog(
+    repo: &gix::Repository,
+    refname: &str,
+    path: &Path,
+    cfg: &ReflogExpireConfig,
+    head_reachable: &mut Option<HashSet<ObjectId>>,
+) -> Result<()> {
+    let (expire_total, expire_unreach) = cfg.resolve(refname);
+    let Ok(raw) = std::fs::read(path) else {
+        return Ok(());
+    };
+    if raw.is_empty() {
+        return Ok(());
+    }
+    let lines = split_reflog_lines(&raw);
+
+    // `reflog_expiry_prepare()`: choose the unreachable rule, then collapse to
+    // `UE_ALWAYS` when the unreachable cutoff is no later than the total one (in
+    // which case the reachability check can never change an outcome).
+    let is_head = refname == "HEAD";
+    let mut kind = if expire_unreach == 0 || is_head {
+        ReflogKind::Head
+    } else if ref_tip_commit(repo, refname).is_some() {
+        ReflogKind::Normal
+    } else {
+        ReflogKind::Always
+    };
+    if expire_unreach <= expire_total {
+        kind = ReflogKind::Always;
+    }
+
+    // The reachable set is only consulted for an entry in the half-open window
+    // [expire_total, expire_unreachable). Compute it only when such an entry
+    // exists and the ref actually distinguishes reachable from unreachable.
+    let need_reach = matches!(kind, ReflogKind::Head | ReflogKind::Normal)
+        && expire_total < expire_unreach
+        && lines.iter().any(|l| {
+            parse_reflog_line(l).is_some_and(|(_, _, ts)| ts >= expire_total && ts < expire_unreach)
+        });
+    let reach: HashSet<ObjectId> = if !need_reach {
+        HashSet::new()
+    } else if kind == ReflogKind::Head {
+        head_reachable
+            .get_or_insert_with(|| reachable_commits(repo, all_ref_tip_commits(repo)))
+            .clone()
+    } else {
+        reachable_commits(repo, ref_tip_commit(repo, refname).into_iter().collect())
+    };
+
+    let mut changed = false;
+    let mut kept: Vec<&[u8]> = Vec::with_capacity(lines.len());
+    for line in &lines {
+        let expire = match parse_reflog_line(line) {
+            Some((old, new, ts)) => {
+                should_expire_entry(repo, old, new, ts, expire_total, expire_unreach, kind, &reach)
+            }
+            // A line that does not parse names no entry to expire, so it is kept.
+            None => false,
+        };
+        if expire {
+            changed = true;
+        } else {
+            kept.push(*line);
+        }
+    }
+    if changed {
+        rewrite_reflog(path, &kept)?;
+    }
+    Ok(())
+}
+
+/// `should_expire_reflog_ent()` with `gc`'s flags (no `stalefix`, no `recno`).
+fn should_expire_entry(
+    repo: &gix::Repository,
+    old: ObjectId,
+    new: ObjectId,
+    ts: i64,
+    expire_total: i64,
+    expire_unreach: i64,
+    kind: ReflogKind,
+    reach: &HashSet<ObjectId>,
+) -> bool {
+    if ts < expire_total {
+        return true;
+    }
+    if ts < expire_unreach {
+        match kind {
+            ReflogKind::Always => return true,
+            ReflogKind::Head | ReflogKind::Normal => {
+                if is_unreachable(repo, reach, old) || is_unreachable(repo, reach, new) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `is_unreachable()`: a null id names nothing (keep), a non-commit peels to
+/// nothing and is kept, and a commit is unreachable exactly when it is absent
+/// from the tip closure.
+fn is_unreachable(repo: &gix::Repository, reach: &HashSet<ObjectId>, oid: ObjectId) -> bool {
+    if oid.is_null() {
+        return false;
+    }
+    match peel_to_commit(repo, oid) {
+        Some(commit) => !reach.contains(&commit),
+        None => false,
+    }
+}
+
+/// Split a reflog file into its lines, each including its trailing `\n`, so a
+/// kept line can be re-emitted byte-for-byte.
+fn split_reflog_lines(buf: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (i, b) in buf.iter().enumerate() {
+        if *b == b'\n' {
+            lines.push(&buf[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < buf.len() {
+        lines.push(&buf[start..]);
+    }
+    lines
+}
+
+/// Parse one reflog line into `(old, new, committer-seconds)`; `None` when the
+/// line is malformed.
+fn parse_reflog_line(line: &[u8]) -> Option<(ObjectId, ObjectId, i64)> {
+    let mut iter = gix::refs::file::log::iter::forward(line);
+    let parsed = iter.next()?.ok()?;
+    let ts = parsed.signature.time().ok()?.seconds;
+    Some((parsed.previous_oid(), parsed.new_oid(), ts))
+}
+
+/// Overwrite `path` with `kept` via a same-directory temporary and a rename, so
+/// a reader never sees a half-written reflog.
+fn rewrite_reflog(path: &Path, kept: &[&[u8]]) -> Result<()> {
+    let mut data = Vec::new();
+    for line in kept {
+        data.extend_from_slice(line);
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let fname = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = parent.join(format!(".{fname}.zvcs_gc_tmp"));
+    std::fs::write(&tmp, &data).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("install {}", path.display()))
+}
+
+/// The set of commits reachable from `tips`, following commit parents only —
+/// the closure `is_unreachable()` measures against.
+fn reachable_commits(repo: &gix::Repository, tips: Vec<ObjectId>) -> HashSet<ObjectId> {
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut stack: Vec<ObjectId> = Vec::new();
+    for tip in tips {
+        if seen.insert(tip) {
+            stack.push(tip);
+        }
+    }
+    while let Some(id) = stack.pop() {
+        let Ok(object) = repo.find_object(id) else {
+            continue;
+        };
+        if object.kind != Kind::Commit {
+            continue;
+        }
+        let commit = object.into_commit();
+        let parents: Vec<ObjectId> = match commit.decode() {
+            Ok(decoded) => decoded.parents().collect(),
+            Err(_) => continue,
+        };
+        for parent in parents {
+            if seen.insert(parent) {
+                stack.push(parent);
+            }
+        }
+    }
+    seen
+}
+
+/// Peel an id to the commit git's `lookup_commit_reference_gently()` would
+/// yield: an annotated-tag chain resolves to its commit, a non-commit-ish yields
+/// `None`.
+fn peel_to_commit(repo: &gix::Repository, mut oid: ObjectId) -> Option<ObjectId> {
+    for _ in 0..8 {
+        let object = repo.find_object(oid).ok()?;
+        match object.kind {
+            Kind::Commit => return Some(oid),
+            Kind::Tag => {
+                let tag = object.into_tag();
+                oid = tag.decode().ok()?.target();
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Every ref tip peeled to a commit — git's `push_tip_to_list` set for the
+/// `UE_HEAD` closure. A symref merely repeats a commit already contributed by
+/// its target, so following it here changes no closure.
+fn all_ref_tip_commits(repo: &gix::Repository) -> Vec<ObjectId> {
+    let mut tips = Vec::new();
+    if let Ok(platform) = repo.references() {
+        if let Ok(iter) = platform.all() {
+            for reference in iter.flatten() {
+                if let Ok(id) = reference.into_fully_peeled_id() {
+                    if let Some(commit) = peel_to_commit(repo, id.detach()) {
+                        tips.push(commit);
+                    }
+                }
+            }
+        }
+    }
+    tips
+}
+
+/// The commit a named ref resolves to, or `None` when the ref is gone or names
+/// a non-commit.
+fn ref_tip_commit(repo: &gix::Repository, refname: &str) -> Option<ObjectId> {
+    let reference = repo.find_reference(refname).ok()?;
+    let id = reference.into_fully_peeled_id().ok()?.detach();
+    peel_to_commit(repo, id)
+}
+
+// --- worktree prune --------------------------------------------------------
+
+/// `worktree prune --expire <gc.worktreePruneExpire>`, a faithful port of
+/// `builtin/worktree.c`'s `prune_worktrees()` restricted to the checks `gc`
+/// exercises. `gc` runs it non-verbose, so nothing is printed; a stale
+/// worktree's administrative directory is simply removed.
+fn prune_worktrees(repo: &gix::Repository) -> Result<()> {
+    let now = SystemTime::now();
+    let now_secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+
+    // `gc.worktreePruneExpire` (default `3.months.ago`); an empty value disables
+    // the step, matching git's `cfg.prune_worktrees_expire` guard.
+    let default_expire =
+        parse_reflog_expiry("3.months.ago", now).unwrap_or(now_secs - 90 * 24 * 3600);
+    let expire = match repo.config_snapshot().string("gc.worktreePruneExpire") {
+        Some(v) => {
+            let raw = v.to_str_lossy().into_owned();
+            if raw.is_empty() {
+                return Ok(());
+            }
+            parse_reflog_expiry(&raw, now).unwrap_or(default_expire)
+        }
+        None => default_expire,
+    };
+
+    let dir = repo.common_dir().join("worktrees");
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        return Ok(());
+    };
+    let mut any_left = false;
+    for entry in read.flatten() {
+        let admin = entry.path();
+        if should_prune_worktree(&admin, expire) {
+            let _ = std::fs::remove_dir_all(&admin);
+        } else {
+            any_left = true;
+        }
+    }
+    // `delete_worktrees_dir_if_empty()`: drop the container once nothing is left.
+    if !any_left {
+        let _ = std::fs::remove_dir(&dir);
+    }
+    Ok(())
+}
+
+/// `should_prune_worktree()`: a worktree is prunable when its administrative
+/// directory is invalid, its `gitdir` file is missing/empty, or the checkout it
+/// names is gone *and* the administrative `index` has aged past `expire`. A
+/// locked worktree is never pruned.
+fn should_prune_worktree(admin: &Path, expire: i64) -> bool {
+    if !admin.is_dir() {
+        return true;
+    }
+    if admin.join("locked").exists() {
+        return false;
+    }
+    let Ok(raw) = std::fs::read(admin.join("gitdir")) else {
+        return true;
+    };
+    let mut end = raw.len();
+    while end > 0 && (raw[end - 1] == b'\n' || raw[end - 1] == b'\r') {
+        end -= 1;
+    }
+    let trimmed = &raw[..end];
+    if trimmed.is_empty() {
+        return true;
+    }
+    let target = PathBuf::from(String::from_utf8_lossy(trimmed).into_owned());
+    if target.exists() {
+        return false;
+    }
+    // Gone: prune only once the administrative `index` has aged past `expire`
+    // (or cannot be stat'ed), matching git's `stat()`-failure branch.
+    match super::prune::mtime_of(&admin.join("index")) {
+        Some(mtime) => mtime <= expire,
+        None => true,
+    }
 }
 
 /// git's size parser for `--max-cruft-size`: a non-negative decimal integer with

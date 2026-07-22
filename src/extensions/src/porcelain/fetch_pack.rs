@@ -15,6 +15,16 @@
 //!   * `-q`/`--quiet`, `-v`, `--no-progress` — accepted; this port never paints
 //!     progress, so they only ever affected stderr.
 //!   * `--thin`/`--no-thin` — accepted, see the note on thin packs below.
+//!   * `--depth=<n>`, `--shallow-since=<date>`, `--shallow-exclude=<ref>`
+//!     (repeatable) and `--deepen-relative` — the shallow-clone family. Each is
+//!     mapped onto the vendored `Shallow` request, which puts the same
+//!     `deepen`/`deepen-since`/`deepen-not`/`deepen-relative` lines on the wire as
+//!     stock git. They only affect negotiation and the `.git/shallow` boundary:
+//!     exactly like stock `fetch-pack`, no `shallow`/`unshallow` line is printed
+//!     and no ref is written. The one representational limit is that the vendored
+//!     `Shallow` enum holds a single variant, so `--shallow-since`/`--shallow-exclude`
+//!     (which git can layer under a `--depth`) take precedence over a `--depth`
+//!     given in the same invocation rather than being sent alongside it.
 //!   * output: `<full-hex-oid> SP <refname> LF`, sorted by refname bytes and
 //!     deduplicated, with an annotated tag reported under its *tag* object id
 //!     (not the peeled commit), exactly as `upload-pack` advertises it.
@@ -34,15 +44,25 @@
 //!     checksum and writes no `.rev`, so the kept-pack end state cannot be
 //!     reproduced. The `keep <hash>` line git prints for that case would be
 //!     wrong for the same reason.
-//!   * `--include-tag` — gitoxide expresses "include tags" as an implicit
-//!     `refs/tags/*:refs/tags/*` refspec, which *creates local tag refs*;
-//!     `fetch-pack` must not write refs.
-//!   * `--depth=<n>`, `--shallow-since=<date>`, `--shallow-exclude=<ref>`,
-//!     `--deepen-relative`, `--refetch`.
-//!   * `--upload-pack=<exec>` / `--exec=<exec>` — the vendored transport takes
-//!     no per-invocation override for the remote program.
-//!   * `--check-self-contained-and-connected`, `--diag-url`, `--stateless-rpc`,
-//!     `--lock-pack`, `--filter=<spec>`, `-o`/`--server-option`.
+//!   * `--include-tag` — the high-level gitoxide fetch expresses "include tags"
+//!     only as an implicit `refs/tags/*:refs/tags/*` refspec, which *creates local
+//!     tag refs* (`fetch-pack` must not write refs); its negotiation path exposes
+//!     no `include-tag` capability toggle, and wanting every advertised tag instead
+//!     would download tags unrelated to the fetched objects, so the conditional
+//!     server-side auto-include cannot be reproduced.
+//!   * `--filter=<spec>` — the high-level negotiation never emits the `filter`
+//!     packet line (the vendored `Arguments::filter` is only reachable from the
+//!     low-level fetch function this port does not drive), so a partial-clone
+//!     filter cannot be requested faithfully.
+//!   * `--refetch`.
+//!   * `--upload-pack=<exec>` / `--exec=<exec>` — the vendored transport `connect`
+//!     takes no per-invocation override for the remote program.
+//!   * `--diag-url` — git prints its `Diag:` breakdown from `connect.c`'s own URL
+//!     parser (`url_scheme_name`, `hostandport`/`userandhost`, `path`, and the
+//!     possibly-rewritten `url=` echo); `gix-url` decomposes URLs differently
+//!     (scp-like host:path, port defaulting, path normalisation), so a reproduction
+//!     could not stay byte-for-byte.
+//!   * `--check-self-contained-and-connected`, `--stateless-rpc`, `--lock-pack`.
 //!   * a `<ref>` given as a raw object hash (`uploadpack.allowTipSHA1InWant`
 //!     and friends): the vendored refspec layer maps names, not bare ids.
 //!
@@ -55,6 +75,7 @@
 use anyhow::{bail, Result};
 use std::collections::HashSet;
 use std::io::BufRead;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
@@ -62,13 +83,14 @@ use std::sync::atomic::AtomicBool;
 use gix::hash::ObjectId;
 use gix::objs::Write as _;
 use gix::protocol::handshake::Ref;
-use gix::remote::fetch::{Status, Tags};
+use gix::remote::fetch::{Shallow, Status, Tags};
 
 /// The usage line stock `git fetch-pack` prints, verbatim (one line, then LF).
 const USAGE: &str = "usage: git fetch-pack [--all] [--stdin] [--quiet | -q] [--keep | -k] [--thin] [--include-tag] [--upload-pack=<git-upload-pack>] [--depth=<n>] [--no-progress] [--diag-url] [-v] [<host>:]<directory> [<refs>...]\n";
 
 /// The flags this port implements, quoted in every rejection message.
-const PORTED: &str = "ported: --all, --stdin, -q/--quiet, -v, --no-progress, --thin/--no-thin";
+const PORTED: &str = "ported: --all, --stdin, -q/--quiet, -v, --no-progress, --thin/--no-thin, \
+                      --depth, --shallow-since, --shallow-exclude, --deepen-relative";
 
 /// git's built-in `unpack_limit`, overridable via `fetch.unpackLimit` and then
 /// `transfer.unpackLimit`.
@@ -95,6 +117,14 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
     let mut from_stdin = false;
     let mut dest: Option<&str> = None;
     let mut sought: Vec<String> = Vec::new();
+    // The shallow-clone family. git keeps `depth` (`strtol` of `--depth=`),
+    // `deepen_relative` (a modifier on `depth`), a `deepen_since` string and a
+    // list of `deepen_not` refs, and folds them into the deepen request after
+    // parsing; we mirror that, collecting the raw pieces here.
+    let mut depth: Option<i64> = None;
+    let mut deepen_relative = false;
+    let mut shallow_since: Option<String> = None;
+    let mut shallow_exclude: Vec<String> = Vec::new();
 
     for a in args {
         let a = a.as_str();
@@ -129,19 +159,32 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
                 "unsupported flag {a:?} — gitoxide implements it as an implicit \
                  `refs/tags/*:refs/tags/*` refspec, which would create local tag refs ({PORTED})"
             ),
-            "--deepen-relative" | "--refetch" | "--unshallow" => {
-                bail!("unsupported flag {a:?} ({PORTED})")
-            }
+            // `--deepen-relative` is a modifier on `--depth`; git only appends the
+            // `deepen-relative` line when a depth is present, so we just record it.
+            "--deepen-relative" => deepen_relative = true,
+            "--refetch" => bail!("unsupported flag {a:?} ({PORTED})"),
             "--check-self-contained-and-connected" | "--diag-url" | "--stateless-rpc"
             | "--no-filter" => bail!("unsupported flag {a:?} ({PORTED})"),
-            "-o" | "--server-option" => bail!("unsupported flag {a:?} ({PORTED})"),
-            _ if a.starts_with("--depth=")
-                || a.starts_with("--shallow-since=")
-                || a.starts_with("--shallow-exclude=")
-                || a.starts_with("--upload-pack=")
+            // `--depth=<n>` — git does `strtol(arg, NULL, 0)`; a non-numeric value
+            // there degrades to 0 (no deepen), but we surface it as an error rather
+            // than silently dropping the request.
+            _ if a.starts_with("--depth=") => {
+                let v = &a["--depth=".len()..];
+                depth = Some(
+                    v.parse::<i64>()
+                        .map_err(|_| anyhow::anyhow!("--depth expects an integer, got {v:?}"))?,
+                );
+            }
+            _ if a.starts_with("--shallow-since=") => {
+                shallow_since = Some(a["--shallow-since=".len()..].to_string());
+            }
+            // Repeatable, exactly like git's `string_list_append(&deepen_not, arg)`.
+            _ if a.starts_with("--shallow-exclude=") => {
+                shallow_exclude.push(a["--shallow-exclude=".len()..].to_string());
+            }
+            _ if a.starts_with("--upload-pack=")
                 || a.starts_with("--exec=")
-                || a.starts_with("--filter=")
-                || a.starts_with("--server-option=") =>
+                || a.starts_with("--filter=") =>
             {
                 let flag = &a[..a.find('=').unwrap_or(a.len())];
                 bail!("unsupported flag {flag:?} ({PORTED})")
@@ -232,7 +275,8 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- phase 2: negotiate and receive the pack --------------------------
-    if let Err(e) = receive(&repo, dest, &selected) {
+    let shallow = build_shallow(depth, deepen_relative, shallow_since.as_deref(), &shallow_exclude)?;
+    if let Err(e) = receive(&repo, dest, &selected, shallow) {
         // A failed fetch surfaces as git's `fatal:` with 128 unless it is one of
         // our own refusals, which must stay loud and unmistakable.
         if let Some(refusal) = e.downcast_ref::<Refusal>() {
@@ -309,12 +353,70 @@ impl std::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
+/// Fold the parsed shallow-clone flags into a single vendored [`Shallow`] request,
+/// matching git's deepen wire lines.
+///
+/// git can layer `--shallow-since`/`--shallow-exclude` under a `--depth`, but the
+/// vendored `Shallow` enum is a single variant: `--shallow-exclude` (with an
+/// optional `--shallow-since` cutoff) wins over a lone `--shallow-since`, which in
+/// turn wins over `--depth`. `--deepen-relative` only takes effect together with a
+/// `--depth`, exactly as git only appends its `deepen-relative` line then.
+fn build_shallow(
+    depth: Option<i64>,
+    deepen_relative: bool,
+    shallow_since: Option<&str>,
+    shallow_exclude: &[String],
+) -> Result<Shallow> {
+    let parse_date = |s: &str| -> Result<gix::date::Time> {
+        gix::date::parse(s, Some(std::time::SystemTime::now()))
+            .map_err(|e| anyhow::anyhow!("invalid --shallow-since date {s:?}: {e}"))
+    };
+
+    if !shallow_exclude.is_empty() {
+        let remote_refs = shallow_exclude
+            .iter()
+            .map(|s| {
+                gix::refs::PartialName::try_from(s.as_str())
+                    .map_err(|e| anyhow::anyhow!("invalid --shallow-exclude ref {s:?}: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let since_cutoff = shallow_since.map(parse_date).transpose()?;
+        return Ok(Shallow::Exclude {
+            remote_refs,
+            since_cutoff,
+        });
+    }
+    if let Some(s) = shallow_since {
+        return Ok(Shallow::Since {
+            cutoff: parse_date(s)?,
+        });
+    }
+    if let Some(d) = depth {
+        // `--deepen-relative --depth=<n>` deepens the local boundary by `n`
+        // (`deepen <n>` + `deepen-relative`); a plain `--depth=<n>` sets the
+        // boundary to `n` from the remote tips (`deepen <n>`). git sends no deepen
+        // line for a non-positive depth, so a `NonZeroU32` guards that here.
+        if deepen_relative {
+            return Ok(Shallow::Deepen(d.max(0) as u32));
+        }
+        if let Some(n) = u32::try_from(d).ok().and_then(NonZeroU32::new) {
+            return Ok(Shallow::DepthAtRemote(n));
+        }
+    }
+    Ok(Shallow::NoChange)
+}
+
 /// Want exactly `selected`, receive the pack, and explode it into loose objects.
 ///
 /// Each ref is turned into a one-sided fetch refspec (`refs/heads/main` with no
 /// destination), which makes it a `want` without producing any ref edit — the
 /// property `fetch-pack` depends on.
-fn receive(repo: &gix::Repository, dest: &str, selected: &[(String, ObjectId)]) -> Result<()> {
+fn receive(
+    repo: &gix::Repository,
+    dest: &str,
+    selected: &[(String, ObjectId)],
+    shallow: Shallow,
+) -> Result<()> {
     let remote = repo
         .remote_at(dest)?
         .with_fetch_tags(Tags::None)
@@ -330,6 +432,9 @@ fn receive(repo: &gix::Repository, dest: &str, selected: &[(String, ObjectId)]) 
             gix::progress::Discard,
             gix::remote::ref_map::Options::default(),
         )?
+        // Deepen exactly as `--depth`/`--shallow-*` asked; `Shallow::NoChange`
+        // (the common case) leaves negotiation untouched.
+        .with_shallow(shallow)
         .receive(gix::progress::Discard, &should_interrupt)?;
 
     match outcome.status {

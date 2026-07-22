@@ -27,9 +27,11 @@
 //!   * **`-w <filename>`** — writes `refs/<filename>` after the walk, through a
 //!     ref update, so the reflog line git writes (`fetch from <url>/`, with the
 //!     URL always slash-terminated) is written too.
-//!   * **`-v`** — `got <oid>` per downloaded object, `walk <oid>` per commit
-//!     entered, `Getting alternates list for <base>` and `Getting pack list for
-//!     <base>` on the first loose miss, all on stderr, in git's order.
+//!   * **`-v`** — `got <oid>` per downloaded loose object, `walk <oid>` per
+//!     commit entered, and, on the first loose miss, `Getting pack list for
+//!     <base>` then (only if the pack fetch fails) `Getting alternates list for
+//!     <base>` — git's order, `fetch_pack` before `fetch_alternates`. Objects
+//!     obtained from a pack get no `got` line, matching git.
 //!   * **`-a`, `-c`, `-t`** — accepted and ignored, as git documents.
 //!   * **`--recover`** — skips the COMPLETE seeding so the full graph is
 //!     re-verified.
@@ -42,34 +44,43 @@
 //!     `Cannot obtain needed <type> <oid>` plus, when a commit was being walked,
 //!     `while processing commit <oid>.` for an object the server does not have.
 //!     Objects fetched before a failure stay on disk, as with git.
+//!   * **Packed remotes.** When a loose `GET` 404s, git's `fetch_pack` reads
+//!     `objects/info/packs`, downloads each listed pack's `.idx` to learn its
+//!     object set, and for a pack that holds the needed object downloads the
+//!     `.pack` and streams it through `index-pack --stdin`. That child writes
+//!     `pack-<hash>.{pack,idx}` and — since `pack.writeReverseIndex` defaults on
+//!     — `pack-<hash>.rev` into `objects/pack`, all `0444`, and its stdout is
+//!     suppressed (`ip.no_stdout`). This port reproduces that end state: the
+//!     downloaded index is parsed via `gix-pack` to find the right pack, the
+//!     pack is written with `pack::Bundle::write_to_directory`, and the `.rev`
+//!     is written directly against `gitformat-pack(5)` (the same encoder
+//!     `index-pack` uses here). Only packs whose objects are actually needed are
+//!     downloaded, as with `find_sha1_pack`; a static server's packs are
+//!     complete (`OFS_DELTA`), so the thin-pack path never arises.
 //!   * **stdout is never written**, which is also true of stock `http-fetch`
 //!     outside `--packfile`.
 //!
 //! Not ported — each bails rather than leaving a repository git would not have
 //! produced:
 //!
-//!   * **Packed remotes.** When a loose `GET` 404s, git falls back to
-//!     `objects/info/packs`, downloads the matching `.idx` and `.pack`, and
-//!     installs them — plus a `.rev` reverse index, which `pack.writeReverseIndex`
-//!     enables by default. `gix-pack` has no reverse-index writer at all (no
-//!     `RIDX` encoder anywhere in the vendored tree), so that end state cannot
-//!     be reproduced, and writing the pack without its `.rev` would leave a
-//!     repository that differs from git's. This port therefore serves
-//!     loose-object remotes only and bails the moment the pack list is
-//!     non-empty. `git update-server-info` on an unpacked repository is exactly
-//!     the loose case.
 //!   * **`objects/info/http-alternates` / `objects/info/alternates`.** A
-//!     non-empty alternates file makes git retry every miss against each listed
-//!     base, recursively. Following that would fabricate a fetch order this
-//!     port has not verified against git, so a non-empty list bails.
+//!     non-empty alternates file makes git resolve each listed base (with the
+//!     `../`-counting URL algebra of `process_alternates_response`) and retry
+//!     every miss — loose then pack — against each, recursively, interleaved
+//!     with the primary base's pack fetch. That fetch order across multiple
+//!     bases cannot be verified against git without a live multi-remote server,
+//!     so a non-empty list bails rather than fabricate an order.
 //!   * **`--packfile=<hash>` / `--index-pack-args=<args>`.** These bypass the
-//!     walker entirely: git downloads one pack and pipes it through
-//!     `git index-pack`, printing that program's stdout. It has the same `.rev`
-//!     problem, and the URL-decoded `--index-pack-args` are git's own
-//!     `index-pack` invocation, not something this port can honour. The
-//!     `--packfile` argument is still validated first so git's
-//!     `fatal: argument to --packfile must be a valid hash (got '<v>')` and its
-//!     exit code 128 are reproduced.
+//!     walker entirely: git downloads the one pack named by the positional URL
+//!     and pipes it through `index-pack` with the caller-supplied
+//!     `--index-pack-args` as that program's *entire* argument vector, with its
+//!     stdout preserved (`preserve_index_pack_stdout`). Those args are git's own
+//!     `index-pack` command line — arbitrary, and routinely including flags this
+//!     port's `index-pack` rejects (`--fix-thin`, `--keep=<msg>`, `--pack_header`)
+//!     — and reproducing that program's exact stdout under them is not something
+//!     the vendored partial `index-pack` can honour. The `--packfile` argument is
+//!     still validated first so git's `fatal: argument to --packfile must be a
+//!     valid hash (got '<v>')` and its exit code 128 are reproduced.
 //!   * **A `ref: <name>` response** to a target fetch (a symbolic ref served as
 //!     a plain file). git records the symref and then walks a null id; that is a
 //!     degenerate path this port refuses instead of imitating.
@@ -86,12 +97,15 @@
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BinaryHeap, HashSet, VecDeque};
-use std::io::{BufRead, Read};
-use std::path::PathBuf;
+use std::io::{BufRead, Cursor, Read};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
 
-use gix::hash::ObjectId;
+use gix::hash::{Kind as HashKind, ObjectId};
 use gix::objs::{CommitRef, Kind, TreeRef};
+use gix::odb::pack;
 use gix::protocol::transport::client::blocking_io::http::{reqwest::Remote, Http};
 use gix::refs::transaction::PreviousValue;
 
@@ -137,9 +151,11 @@ pub fn http_fetch(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
                 bail!(
-                    "unsupported flag \"--packfile\" — it installs a downloaded pack via \
-                     `git index-pack`, whose end state includes a `.rev` reverse index that \
-                     gix-pack cannot write (no RIDX encoder in the vendored crates) ({PORTED})"
+                    "unsupported flag \"--packfile\" — it pipes one downloaded pack through \
+                     `index-pack` with the caller-supplied --index-pack-args as that program's \
+                     entire argument vector and its stdout preserved; those args are git's own \
+                     index-pack command line (arbitrary, often including flags this port's \
+                     index-pack rejects), so its exact output cannot be reproduced ({PORTED})"
                 )
             }
             _ if a.starts_with("--index-pack-args=") => bail!(
@@ -274,6 +290,21 @@ struct Walker {
     current_commit: Option<ObjectId>,
     alternates_probed: bool,
     packs_probed: bool,
+    /// The remote packs advertised by `objects/info/packs`, each with the object
+    /// ids its downloaded index lists — git's `repo->packs` after `fetch_indices`.
+    packs: Vec<RemotePack>,
+}
+
+/// One entry of `objects/info/packs`: the pack's advertised name, the ids its
+/// index contains, and whether its `.pack` has been downloaded and installed.
+struct RemotePack {
+    /// The `.pack` basename as advertised, e.g. `pack-<hex>.pack`.
+    name: String,
+    /// Every object id the pack's index lists, used to decide whether the pack
+    /// is worth downloading for a given miss — git's `find_sha1_pack`.
+    objects: HashSet<ObjectId>,
+    /// Set once the `.pack` has been fetched and indexed into `objects/pack`.
+    installed: bool,
 }
 
 impl Walker {
@@ -291,6 +322,7 @@ impl Walker {
             current_commit: None,
             alternates_probed: false,
             packs_probed: false,
+            packs: Vec::new(),
         }
     }
 
@@ -461,8 +493,11 @@ impl Walker {
         Ok(())
     }
 
-    /// `fetch()`: try the loose object, and on a miss walk git's fallbacks far
-    /// enough to tell an empty server apart from a packed one.
+    /// `fetch()`: try the loose object, then git's `fetch_pack` fallback, then
+    /// `fetch_alternates`. The order matters for the verbose miss messages: git
+    /// prints `Getting pack list` (inside `fetch_pack` → `fetch_indices`) before
+    /// `Getting alternates list` (inside `fetch_alternates`), which runs only
+    /// after the pack fetch has failed.
     fn fetch(&mut self, id: ObjectId) -> Result<bool> {
         let hex = id.to_hex().to_string();
         let (dir, file) = hex.split_at(2);
@@ -474,9 +509,35 @@ impl Walker {
                 return Ok(true);
             }
         }
+        if self.fetch_from_packs(id)? {
+            return Ok(true);
+        }
         self.probe_alternates()?;
-        self.probe_packs()?;
         Ok(false)
+    }
+
+    /// git's `fetch_pack()`: consult `objects/info/packs`, and when a listed
+    /// pack's index contains this object, download that `.pack` and index it into
+    /// `objects/pack` — pack, `.idx` and (per `pack.writeReverseIndex`, on by
+    /// default) `.rev` — exactly as git's `index-pack --stdin` child does on the
+    /// pack it streams. Only packs whose objects are actually needed are
+    /// downloaded, mirroring `find_sha1_pack`.
+    fn fetch_from_packs(&mut self, id: ObjectId) -> Result<bool> {
+        self.probe_packs()?;
+        let Some(idx) = self.packs.iter().position(|p| p.objects.contains(&id)) else {
+            return Ok(false);
+        };
+        if !self.packs[idx].installed {
+            let name = self.packs[idx].name.clone();
+            let Some(body) = self.get(&format!("objects/pack/{name}")) else {
+                return Ok(false);
+            };
+            self.install_pack(&body)?;
+            self.packs[idx].installed = true;
+        }
+        // The odb refreshes its pack list on a miss (RefreshMode::AfterAllIndices-
+        // Loaded), so the freshly installed pack is now visible.
+        Ok(self.repo.has_object(id))
     }
 
     /// Install a downloaded loose object verbatim and verify it hashes to `id`,
@@ -537,8 +598,10 @@ impl Walker {
         Ok(())
     }
 
-    /// git's `fetch_indices()`, run once on the first miss. A non-empty pack
-    /// list is the unported case; see the module docs for the `.rev` gap.
+    /// git's `fetch_indices()`, run once on the first miss: fetch the pack list
+    /// and, for each listed pack, download its index so its object set is known.
+    /// A missing `objects/info/packs` (404) is git's `HTTP_MISSING_TARGET`, which
+    /// simply means no packs — the walk falls through to the alternates probe.
     fn probe_packs(&mut self) -> Result<()> {
         if self.packs_probed {
             return Ok(());
@@ -550,19 +613,103 @@ impl Walker {
         let Some(body) = self.get("objects/info/packs") else {
             return Ok(());
         };
-        // `objects/info/packs` is a list of `P <pack-name>.pack` lines.
-        let listed = body
+        // `objects/info/packs` is a list of `P <pack-name>.pack` lines; git skips
+        // anything else. `fetch_and_setup_pack_index` downloads each pack's index.
+        let names: Vec<String> = body
             .split(|b| *b == b'\n')
-            .any(|line| line.starts_with(b"P "));
-        if listed {
-            bail!(
-                "remote serves packs, which git installs alongside a `.rev` reverse index \
-                 (pack.writeReverseIndex, on by default); gix-pack has no RIDX encoder, so that \
-                 repository state cannot be reproduced. Only loose-object remotes are ported \
-                 ({PORTED})"
-            );
+            .filter_map(|line| line.strip_prefix(b"P "))
+            .map(|rest| String::from_utf8_lossy(rest).trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect();
+        for name in names {
+            if let Some(objects) = self.download_pack_index(&name)? {
+                self.packs.push(RemotePack {
+                    name,
+                    objects,
+                    installed: false,
+                });
+            }
         }
         Ok(())
+    }
+
+    /// Download and parse `objects/pack/<pack>.idx`, returning the object ids it
+    /// lists. git verifies the index it downloads to `tmp_pack_<hash>.idx`; here
+    /// the bytes are parsed through a sibling temporary (gix parses from a path)
+    /// which is removed once its object set has been read. A pack whose index the
+    /// server does not serve is skipped, as git skips one that fails to download.
+    fn download_pack_index(&mut self, name: &str) -> Result<Option<HashSet<ObjectId>>> {
+        let Some(stem) = name.strip_suffix(".pack") else {
+            return Ok(None);
+        };
+        let Some(bytes) = self.get(&format!("objects/pack/{stem}.idx")) else {
+            return Ok(None);
+        };
+        let pack_dir = self.repo.objects.store_ref().path().join("pack");
+        std::fs::create_dir_all(&pack_dir)?;
+        let temp = pack_dir.join(format!(
+            "tmp_pack_{}_{}.idx",
+            std::process::id(),
+            nonce()
+        ));
+        std::fs::write(&temp, &bytes)?;
+        // Read the full object set while the file still exists, then remove it.
+        let parsed = pack::index::File::at(&temp, HashKind::Sha1)
+            .map(|index| index.iter().map(|entry| entry.oid).collect::<HashSet<_>>());
+        let _ = std::fs::remove_file(&temp);
+        Ok(Some(parsed?))
+    }
+
+    /// Install a downloaded pack into `objects/pack`, mirroring the end state of
+    /// git's `index-pack --stdin`: the pack file, its `.idx`, and — unless
+    /// `pack.writeReverseIndex` is disabled — its `.rev`, all left read-only.
+    /// The `.keep` gix always drops is removed, since the walker's `index-pack`
+    /// is invoked without `--keep`.
+    fn install_pack(&self, body: &[u8]) -> Result<()> {
+        let pack_dir = self.repo.objects.store_ref().path().join("pack");
+        std::fs::create_dir_all(&pack_dir)?;
+
+        let mut input = Cursor::new(body);
+        let outcome = pack::Bundle::write_to_directory(
+            &mut input,
+            Some(&pack_dir),
+            &mut gix::progress::Discard,
+            &AtomicBool::new(false),
+            None::<gix::odb::Handle>,
+            pack::bundle::write::Options {
+                thread_limit: None,
+                object_hash: HashKind::Sha1,
+                ..Default::default()
+            },
+        )?;
+
+        let hash = outcome.index.data_hash;
+        let (Some(data_path), Some(index_path)) = (&outcome.data_path, &outcome.index_path) else {
+            bail!("downloaded pack held no objects (empty pack)");
+        };
+
+        if self.want_rev_index() {
+            write_rev_index(index_path, &hash)?;
+        }
+        set_read_only(index_path)?;
+        set_read_only(data_path)?;
+
+        // `write_to_directory` always drops a `.keep`; git's walker `index-pack`
+        // runs without `--keep`, so reconcile before returning.
+        if outcome.keep_path.is_some() {
+            let _ = std::fs::remove_file(data_path.with_extension("keep"));
+        }
+        Ok(())
+    }
+
+    /// Whether a `.rev` must accompany an installed pack: `pack.writeReverseIndex`,
+    /// which git defaults to true, so the walker's plain `index-pack --stdin`
+    /// writes one.
+    fn want_rev_index(&self) -> bool {
+        self.repo
+            .config_snapshot()
+            .boolean("pack.writeReverseIndex")
+            .unwrap_or(true)
     }
 
     /// One `GET` of `<base>/<tail>`, or `None` for any non-success status —
@@ -584,4 +731,61 @@ impl Walker {
         response.body.read_to_end(&mut body).ok()?;
         Some(body)
     }
+}
+
+/// Write the reverse index for `index_path` per `gitformat-pack(5)`, the same
+/// payload `git index-pack` writes and that this port's `index-pack` produces:
+/// `RIDX`, version 1, hash id 1 (SHA-1), one 4-byte big-endian index position
+/// per object ordered by pack offset, the pack checksum, then a SHA-1 trailer
+/// over everything preceding it. Lands beside the index with `.idx` → `.rev`.
+fn write_rev_index(index_path: &Path, pack_hash: &ObjectId) -> Result<()> {
+    let index = pack::index::File::at(index_path, HashKind::Sha1)?;
+
+    let mut by_offset: Vec<(u64, u32)> = (0..index.num_objects())
+        .map(|position| (index.pack_offset_at_index(position), position))
+        .collect();
+    by_offset.sort_unstable();
+
+    let mut buf = Vec::with_capacity(12 + 4 * by_offset.len() + 40);
+    buf.extend_from_slice(b"RIDX");
+    buf.extend_from_slice(&1u32.to_be_bytes()); // version
+    buf.extend_from_slice(&1u32.to_be_bytes()); // hash function id: SHA-1
+    for (_, position) in &by_offset {
+        buf.extend_from_slice(&position.to_be_bytes());
+    }
+    buf.extend_from_slice(pack_hash.as_slice());
+
+    let mut hasher = gix::hash::hasher(HashKind::Sha1);
+    hasher.update(&buf);
+    let checksum = hasher.try_finalize()?;
+    buf.extend_from_slice(checksum.as_slice());
+
+    let rev_path = index_path.with_extension("rev");
+    let tmp = with_suffix(&rev_path, ".tmp");
+    std::fs::write(&tmp, &buf)?;
+    std::fs::rename(&tmp, &rev_path)?;
+    set_read_only(&rev_path)?;
+    Ok(())
+}
+
+/// `<path><suffix>-<pid>`, for the sibling temporary the `.rev` is renamed from.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.to_path_buf().into_os_string();
+    name.push(format!("{suffix}-{}", std::process::id()));
+    PathBuf::from(name)
+}
+
+/// git leaves `.pack`, `.idx` and `.rev` world-readable but immutable (0444).
+fn set_read_only(path: &Path) -> Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))?;
+    Ok(())
+}
+
+/// A per-call disambiguator for sibling temporaries, so concurrent walkers do
+/// not collide on the same name.
+fn nonce() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default()
 }

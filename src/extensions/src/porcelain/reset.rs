@@ -16,6 +16,12 @@
 //! * `reset [<commit>] [--] <paths>...` — reset the given pathspecs in the index back
 //!   to the target tree's version (default `HEAD`), leaving the worktree. No `HEAD`
 //!   move, no `ORIG_HEAD`, but the same index refresh and report.
+//! * `reset --merge [<commit>]` / `reset --keep [<commit>]` — git's two-tree merge
+//!   (`unpack-trees.c` `oneway_merge` / `twoway_merge`): move the branch and update
+//!   the index and worktree toward the target, but preserve local changes to files
+//!   the reset does not touch, and abort (exit 128, `error: Entry '<p>' not
+//!   uptodate. Cannot merge.` + `fatal: Could not reset index file …`, HEAD
+//!   unmoved) if a file that must change has un-committed local modifications.
 //!
 //! ## The `Unstaged changes after reset:` report
 //!
@@ -33,7 +39,8 @@
 //!
 //! ## Deferred
 //!
-//! `--merge`, `--keep`, `--patch`/`-p` and `--intent-to-add`/`-N` are unsupported.
+//! `--patch`/`-p` (interactive hunk selection) and `--intent-to-add`/`-N` are
+//! unsupported.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -52,6 +59,8 @@ enum ResetMode {
     Soft,
     Mixed,
     Hard,
+    Merge,
+    Keep,
 }
 
 impl ResetMode {
@@ -60,6 +69,8 @@ impl ResetMode {
             ResetMode::Soft => "soft",
             ResetMode::Mixed => "mixed",
             ResetMode::Hard => "hard",
+            ResetMode::Merge => "merge",
+            ResetMode::Keep => "keep",
         }
     }
 }
@@ -129,8 +140,8 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             "--no-quiet" => quiet = false,
             "--refresh" => refresh = true,
             "--no-refresh" => refresh = false,
-            "--merge" => bail!("--merge is unsupported (three-way merge reset not ported)"),
-            "--keep" => bail!("--keep is unsupported (keep-local-changes reset not ported)"),
+            "--merge" => mode = Some(ResetMode::Merge),
+            "--keep" => mode = Some(ResetMode::Keep),
             "-p" | "--patch" => bail!("--patch is unsupported (interactive hunk selection not ported)"),
             "-N" | "--intent-to-add" => {
                 bail!("--intent-to-add is unsupported (intent-to-add markers not ported)")
@@ -183,7 +194,9 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
 
     let with_paths = !paths.is_empty();
     if with_paths {
-        if let Some(m @ (ResetMode::Soft | ResetMode::Hard)) = mode {
+        if let Some(m @ (ResetMode::Soft | ResetMode::Hard | ResetMode::Merge | ResetMode::Keep)) =
+            mode
+        {
             eprintln!("fatal: Cannot do {} reset with paths.", m.label());
             return Ok(ExitCode::from(128));
         }
@@ -221,8 +234,43 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     }
 
     // ---- 4. Whole-tree form. ----
-    // `reset_refs()` records the pre-reset HEAD in ORIG_HEAD before moving HEAD, and
-    // `remove_branch_state()` drops any in-progress merge/cherry-pick/revert state.
+    // `--merge`/`--keep` run git's two-tree merge (`unpack-trees.c`), which may
+    // abort on local changes. git does not move HEAD when it aborts, so the merge
+    // is computed and applied *before* any ref is touched.
+    if matches!(mode, ResetMode::Merge | ResetMode::Keep) {
+        let head_tree = match repo.head_id() {
+            Ok(h) => h.object()?.peel_to_commit()?.tree_id()?.detach(),
+            Err(_) => gix::ObjectId::empty_tree(repo.object_hash()),
+        };
+        let should_interrupt = AtomicBool::new(false);
+        let applied = reset_two_tree(
+            &repo,
+            &old_index,
+            head_tree,
+            target_tree,
+            mode == ResetMode::Keep,
+            &should_interrupt,
+        )?;
+        if !applied {
+            // git's `reset_index` failure: `fatal:` line, exit 128, HEAD untouched.
+            eprintln!("fatal: Could not reset index file to revision '{target_commit}'.");
+            return Ok(ExitCode::from(128));
+        }
+        if let Ok(prev) = repo.head_id() {
+            set_orig_head(&repo, prev.detach())?;
+        }
+        move_head(&repo, target_commit, reflog_spec)?;
+        remove_branch_state(repo.git_dir());
+        if !quiet {
+            let summary = commit.message()?.summary().into_owned();
+            println!("HEAD is now at {} {}", commit.short_id()?, summary);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // soft/mixed/hard: `reset_refs()` records the pre-reset HEAD in ORIG_HEAD
+    // before moving HEAD, and `remove_branch_state()` drops any in-progress
+    // merge/cherry-pick/revert state.
     if let Ok(prev) = repo.head_id() {
         set_orig_head(&repo, prev.detach())?;
     }
@@ -243,6 +291,8 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
                 println!("HEAD is now at {} {}", commit.short_id()?, summary);
             }
         }
+        // Handled above, before the ref move.
+        ResetMode::Merge | ResetMode::Keep => unreachable!(),
     }
 
     Ok(ExitCode::SUCCESS)
@@ -487,6 +537,284 @@ fn reset_worktree_hard(
     new_index.remove_tree();
     new_index.write(Default::default())?;
     Ok(())
+}
+
+/// The per-path outcome of the two-tree merge.
+enum Act {
+    /// Leave the index and worktree entry untouched (preserving local changes).
+    Keep,
+    /// Remove the path from the index and worktree.
+    Delete,
+    /// Set the index and worktree to the target version.
+    Update,
+    /// Local changes would be lost — abort the whole reset.
+    Conflict,
+}
+
+/// `oneway_merge` (`--merge`): compare the index entry `i` to the target `t`.
+fn classify_merge(t: Option<&(Mode, ObjectId)>, i: Option<&(Mode, ObjectId)>) -> Act {
+    match (i, t) {
+        (Some(_), None) => Act::Delete,
+        (None, None) => Act::Keep,
+        (Some(iv), Some(tv)) if iv == tv => Act::Keep,
+        (_, Some(_)) => Act::Update,
+    }
+}
+
+/// `twoway_merge` (`--keep`): compare HEAD `h`, target `t` and index `i`. Keeps
+/// files unchanged between HEAD and target (or already at target), updates files
+/// that changed only when the index still matches HEAD, and rejects everything
+/// else (staged divergence).
+fn classify_keep(
+    h: Option<&(Mode, ObjectId)>,
+    t: Option<&(Mode, ObjectId)>,
+    i: Option<&(Mode, ObjectId)>,
+) -> Act {
+    match i {
+        Some(iv) => {
+            if h == t || Some(iv) == t {
+                Act::Keep
+            } else if t.is_none() && h == Some(iv) {
+                Act::Delete
+            } else if t.is_some() && h == Some(iv) {
+                Act::Update
+            } else {
+                Act::Conflict
+            }
+        }
+        None => match (h, t) {
+            (_, None) => Act::Keep,
+            (Some(hv), Some(_)) if Some(hv) == t => Act::Keep, // staged deletion kept
+            (Some(_), Some(_)) => Act::Conflict,
+            (None, Some(_)) => Act::Update,
+        },
+    }
+}
+
+/// `--merge` / `--keep`: git's two-tree merge (`unpack-trees.c` `oneway_merge` /
+/// `twoway_merge`). Updates the index and worktree toward `target_tree` while
+/// preserving local changes to files the reset does not touch, and aborts —
+/// writing nothing and leaving HEAD in place — if a file that must change has
+/// un-committed local modifications.
+fn reset_two_tree(
+    repo: &gix::Repository,
+    old: &gix::index::File,
+    head_tree: ObjectId,
+    target_tree: ObjectId,
+    keep: bool,
+    should_interrupt: &AtomicBool,
+) -> Result<bool> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| {
+            anyhow!(
+                "{} reset not allowed in a bare repository",
+                if keep { "keep" } else { "merge" }
+            )
+        })?
+        .to_owned();
+
+    let target = tree_map(repo, target_tree)?;
+    let head = if keep {
+        tree_map(repo, head_tree)?
+    } else {
+        HashMap::new()
+    };
+    let index = index_entry_map(old);
+
+    let mut all: BTreeSet<BString> = BTreeSet::new();
+    all.extend(index.keys().cloned());
+    all.extend(target.keys().cloned());
+    all.extend(head.keys().cloned());
+
+    let mut updates: Vec<(BString, Mode, ObjectId)> = Vec::new();
+    let mut deletes: Vec<BString> = Vec::new();
+    // Each conflict carries git's per-entry reason: a worktree that no longer
+    // matches the index is "not uptodate"; a staged divergence "would be
+    // overwritten by merge" (unpack-trees.c `ERRORMSG`).
+    let mut conflicts: BTreeSet<(BString, &'static str)> = BTreeSet::new();
+
+    for path in &all {
+        let i = index.get(path);
+        let t = target.get(path);
+        let act = if keep {
+            classify_keep(head.get(path), t, i)
+        } else {
+            classify_merge(t, i)
+        };
+        match act {
+            Act::Keep => {}
+            Act::Delete => {
+                if worktree_uptodate(repo, BStr::new(path), i.map(|(_, o)| *o)) {
+                    deletes.push(path.clone());
+                } else {
+                    conflicts.insert((path.clone(), "not uptodate"));
+                }
+            }
+            Act::Update => {
+                let (tm, to) = *t.expect("update implies a target entry");
+                let clean = match i {
+                    Some((_, io)) => worktree_uptodate(repo, BStr::new(path), Some(*io)),
+                    None => worktree_absent_or_matches(repo, BStr::new(path), to),
+                };
+                if clean {
+                    updates.push((path.clone(), tm, to));
+                } else {
+                    conflicts.insert((path.clone(), "not uptodate"));
+                }
+            }
+            Act::Conflict => {
+                conflicts.insert((path.clone(), "would be overwritten by merge"));
+            }
+        }
+    }
+
+    // git's `unpack_trees` prints one `error:` line per conflicting entry, then the
+    // caller (`reset_index`) prints the `fatal:` line and exits 128. Nothing is
+    // written and HEAD is not moved.
+    if !conflicts.is_empty() {
+        for (path, reason) in &conflicts {
+            eprintln!("error: Entry '{path}' {reason}. Cannot merge.");
+        }
+        return Ok(false);
+    }
+
+    // No conflicts: apply. Start from the old index so kept paths retain their
+    // existing entry (and thus any staged content), then apply updates/deletes.
+    let mut new_index = old.clone();
+    let changed: HashSet<BString> = updates
+        .iter()
+        .map(|(p, _, _)| p.clone())
+        .chain(deletes.iter().cloned())
+        .collect();
+    new_index.remove_entries(|_, path, _| changed.contains(path));
+    for (p, mode, oid) in &updates {
+        new_index.dangerously_push_entry(Stat::default(), *oid, Flags::empty(), *mode, BStr::new(p));
+    }
+    new_index.sort_entries();
+
+    // Write the changed files to the worktree by checking out a filtered copy that
+    // holds only the updated entries — kept files (with their local changes) are
+    // never touched.
+    if !updates.is_empty() {
+        let upd: HashSet<BString> = updates.iter().map(|(p, _, _)| p.clone()).collect();
+        let mut wt = new_index.clone();
+        wt.remove_entries(|_, path, _| !upd.contains(path));
+        let mut opts =
+            repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
+        opts.destination_is_initially_empty = false;
+        opts.overwrite_existing = true;
+        let odb = repo.objects.clone().into_arc()?;
+        let discard_files = gix::progress::Discard;
+        let discard_bytes = gix::progress::Discard;
+        crate::worktree::checkout_subset(
+            &mut wt,
+            workdir.as_path(),
+            odb,
+            &discard_files,
+            &discard_bytes,
+            should_interrupt,
+            opts,
+        )?;
+        // Copy the fresh stats back onto the persisted index so the just-written
+        // files are not reported modified before the next refresh.
+        let stat_map: HashMap<BString, Stat> = {
+            let backing = wt.path_backing();
+            wt.entries()
+                .iter()
+                .map(|e| (e.path_in(backing).to_owned(), e.stat))
+                .collect()
+        };
+        let backing = new_index.path_backing().to_owned();
+        for e in new_index.entries_mut() {
+            if let Some(stat) = stat_map.get(e.path_in(&backing)) {
+                e.stat = *stat;
+            }
+        }
+    }
+
+    for p in &deletes {
+        if let Some(full) = repo.workdir_path(BStr::new(p)) {
+            let _ = std::fs::remove_file(full);
+        }
+    }
+
+    new_index.remove_tree();
+    new_index.write(Default::default())?;
+    Ok(true)
+}
+
+/// A tree flattened to `path -> (mode, oid)`, via a throwaway index built from it.
+fn tree_map(repo: &gix::Repository, tree: ObjectId) -> Result<HashMap<BString, (Mode, ObjectId)>> {
+    let index = repo.index_from_tree(&tree)?;
+    let backing = index.path_backing();
+    Ok(index
+        .entries()
+        .iter()
+        .map(|e| (e.path_in(backing).to_owned(), (e.mode, e.id)))
+        .collect())
+}
+
+/// The stage-0 entries of `index` as `path -> (mode, oid)`.
+fn index_entry_map(index: &gix::index::File) -> HashMap<BString, (Mode, ObjectId)> {
+    let backing = index.path_backing();
+    index
+        .entries()
+        .iter()
+        .filter(|e| e.stage() == gix::index::entry::Stage::Unconflicted)
+        .map(|e| (e.path_in(backing).to_owned(), (e.mode, e.id)))
+        .collect()
+}
+
+/// Whether the worktree file at `path` still matches the index (`index_oid`), so
+/// overwriting or removing it loses nothing. A missing file is up to date (git's
+/// `verify_uptodate` returns 0 on `ENOENT`); an unreadable one is treated as
+/// changed, so the reset errs on the side of aborting.
+fn worktree_uptodate(repo: &gix::Repository, path: &BStr, index_oid: Option<ObjectId>) -> bool {
+    let Some(full) = repo.workdir_path(path) else {
+        return true;
+    };
+    let meta = match std::fs::symlink_metadata(&full) {
+        Ok(m) => m,
+        Err(_) => return true,
+    };
+    let Some(oid) = index_oid else {
+        return true;
+    };
+    blob_oid(repo, &full, &meta) == Some(oid)
+}
+
+/// Whether it is safe to create `path` from the target: no worktree file exists,
+/// or the one that does already matches the target content (no untracked data lost).
+fn worktree_absent_or_matches(repo: &gix::Repository, path: &BStr, target_oid: ObjectId) -> bool {
+    let Some(full) = repo.workdir_path(path) else {
+        return true;
+    };
+    let meta = match std::fs::symlink_metadata(&full) {
+        Ok(m) => m,
+        Err(_) => return true,
+    };
+    blob_oid(repo, &full, &meta) == Some(target_oid)
+}
+
+/// The blob object id a worktree file would hash to (the link target for a
+/// symlink), without writing it, for the up-to-date comparison.
+fn blob_oid(
+    repo: &gix::Repository,
+    full: &std::path::Path,
+    meta: &std::fs::Metadata,
+) -> Option<ObjectId> {
+    let data = if meta.file_type().is_symlink() {
+        std::fs::read_link(full)
+            .ok()?
+            .into_os_string()
+            .into_string()
+            .ok()?
+            .into_bytes()
+    } else {
+        std::fs::read(full).ok()?
+    };
+    gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &data).ok()
 }
 
 /// `git reset [<commit>] [--] <paths>` — build the index with the named entries (all

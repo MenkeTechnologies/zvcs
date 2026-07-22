@@ -52,6 +52,17 @@
 //!     empty-patch taxonomy, and it needs no applier because there is nothing to
 //!     apply.
 //!   * `--show-current-patch[=(raw|diff)]` and `--quit` inside a live session.
+//!   * **Config defaults.** `git_am_config` runs before option parsing, so
+//!     `am.threeway` and `am.messageId` seed `--3way`/`--message-id` and the
+//!     command line overrides them. Both flow into the `threeway`/`messageid`
+//!     state files `am_setup` writes, which stay behind — and are therefore
+//!     observable — whenever the run stops (e.g. `Patch is empty.`). A malformed
+//!     boolean dies with git's `fatal: bad boolean config value ...` at
+//!     config-read time (exit 128), before any state directory is created.
+//!     `am.keepcr` is *not* honored: it only tunes `mailsplit`'s CR handling,
+//!     which this port does not implement (`split_mbox` copies the body
+//!     verbatim), so reading it would have no observable effect and it is left
+//!     unmapped rather than faked.
 //!
 //! ## What is not served, and why
 //!
@@ -184,6 +195,42 @@ impl Default for Opts {
 /// A parse failure. git prints the message and exits 129 without usage text.
 struct Usage(String);
 
+/// The `am.*` config values `git_am_config` reads before option parsing. Only
+/// the keys whose effect this port actually reproduces are carried: both feed a
+/// state file `am_setup` writes (`threeway`, `messageid`). `am.keepcr` is
+/// deliberately absent — it only governs `mailsplit` CR handling this port does
+/// not implement, so honoring it would change nothing observable.
+struct AmDefaults {
+    threeway: bool,
+    message_id: bool,
+}
+
+/// `git_am_config`: read `am.threeway`/`am.messageId` as booleans. A malformed
+/// value is git's exact `git_config_bool` fatal, returned so `am` can exit 128
+/// at config-read time. Keys are queried lowercased so the diagnostic matches
+/// git's (which reports the normalized variable name).
+fn am_config(repo: &gix::Repository) -> std::result::Result<AmDefaults, String> {
+    let snapshot = repo.config_snapshot();
+    let file = snapshot.plumbing();
+    Ok(AmDefaults {
+        threeway: config_bool(file, "am.threeway")?.unwrap_or(false),
+        message_id: config_bool(file, "am.messageid")?.unwrap_or(false),
+    })
+}
+
+fn config_bool(file: &gix::config::File, key: &str) -> std::result::Result<Option<bool>, String> {
+    match file.boolean(key) {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            let raw = file
+                .string(key)
+                .map(|v| String::from_utf8_lossy(&v).into_owned())
+                .unwrap_or_default();
+            Err(format!("fatal: bad boolean config value '{raw}' for '{key}'"))
+        }
+    }
+}
+
 pub fn am(args: &[String]) -> Result<ExitCode> {
     // Dispatch strips the subcommand today; tolerate it being present at [0].
     let args: &[String] = match args.first() {
@@ -191,7 +238,20 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
-    let opts = match parse(args) {
+    // `git_config(git_am_config, ...)` runs before `parse_options`, so a
+    // malformed `am.*` boolean is a config-time fatal (exit 128) that precedes
+    // any CLI usage error (exit 129), and the config values become the option
+    // defaults the command line then overrides.
+    let repo = gix::discover(".")?;
+    let defaults = match am_config(&repo) {
+        Ok(d) => d,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return Ok(ExitCode::from(128));
+        }
+    };
+
+    let opts = match parse(args, &defaults) {
         Ok(o) => o,
         Err(Usage(msg)) => {
             eprintln!("{msg}");
@@ -199,7 +259,6 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
         }
     };
 
-    let repo = gix::discover(".")?;
     let state_dir = repo.git_dir().join("rebase-apply");
 
     // `am_in_progress`: the directory alone is not a session — `next` and `last`
@@ -287,8 +346,12 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
 // Option parsing
 // ---------------------------------------------------------------------------
 
-fn parse(args: &[String]) -> Result<Opts, Usage> {
+fn parse(args: &[String], defaults: &AmDefaults) -> Result<Opts, Usage> {
     let mut o = Opts::default();
+    // `am_state_init` sets these from `git_am_config` before `parse_options`
+    // runs; a later `--3way`/`--no-3way`/`-m`/`--no-message-id` overrides them.
+    o.threeway = defaults.threeway;
+    o.message_id = defaults.message_id;
     let mut end_of_opts = false;
     let mut i = 0;
 

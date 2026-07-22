@@ -108,7 +108,8 @@ use gix::traverse::commit::simple::CommitTimeOrder;
 /// The version reported in the trailing `-- \n<version>\n` signature. Stock git
 /// emits its own `git_version_string` here, so this constant is what makes the
 /// signature line comparable; override per-invocation with `--signature=<s>`,
-/// `--no-signature`, or the `format.signature` config key.
+/// `--no-signature`, `--signature-file`, or the
+/// `format.signature`/`format.signatureFile` config keys.
 const SIGNATURE_VERSION: &str = "2.55.0";
 
 /// git's `MAIL_DEFAULT_WRAP` — the diffstat width used by format-patch.
@@ -152,6 +153,14 @@ struct Dirstat {
     permille: u32,
 }
 
+/// `--signature`/`--no-signature` state, mirroring git's `signature` pointer
+/// before resolution: the version default, an explicit value, or suppressed.
+enum SigCli {
+    Unset,
+    No,
+    Value(String),
+}
+
 struct Opts {
     // Output shape.
     to_stdout: bool,
@@ -162,7 +171,18 @@ struct Opts {
     suffix: String,
     subject_prefix: String,
     reroll: Option<String>,
+    /// The resolved trailing signature (empty means none). git resolves this
+    /// only after `setup_revisions()`, so it is filled in by `resolve_signature`
+    /// once the commit list is known, not during parsing.
     signature: String,
+    /// `--signature`/`--no-signature` state, git's `signature` variable.
+    sig_cli: SigCli,
+    /// `--signature-file <path>`, git's `signature_file_arg`; last occurrence wins.
+    sig_file_arg: Option<String>,
+    /// `format.signature`, git's `cfg.signature`.
+    cfg_signature: Option<String>,
+    /// `format.signatureFile`, git's `cfg.signature_file`.
+    cfg_signature_file: Option<String>,
     zero_commit: bool,
     /// `-p`/`--no-stat`: suppress git's `DIFFSTAT|SUMMARY` default entirely.
     use_patch_format: bool,
@@ -246,6 +266,15 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
     };
     if commits.is_empty() {
         return Ok(ExitCode::SUCCESS);
+    }
+
+    // git resolves the signature only here — after `setup_revisions()` and after
+    // confirming the series is non-empty — so a bad revision, and an empty commit
+    // list, both preempt an unreadable signature file (an empty range is exit 0,
+    // not the file error).
+    match resolve_signature(&opts) {
+        Ok(sig) => opts.signature = sig,
+        Err(code) => return Ok(code),
     }
 
     // git validates the `--range-diff` range after the walk
@@ -466,7 +495,11 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         suffix: cfg_str("format.suffix").unwrap_or_else(|| ".patch".to_owned()),
         subject_prefix: cfg_str("format.subjectPrefix").unwrap_or_else(|| "PATCH".to_owned()),
         reroll: None,
-        signature: cfg_str("format.signature").unwrap_or_else(|| SIGNATURE_VERSION.to_owned()),
+        signature: String::new(),
+        sig_cli: SigCli::Unset,
+        sig_file_arg: None,
+        cfg_signature: cfg_str("format.signature"),
+        cfg_signature_file: cfg_str("format.signatureFile"),
         zero_commit: false,
         use_patch_format: false,
         output_format: 0,
@@ -559,9 +592,9 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             }
             "--signature" => {
                 i += 1;
-                o.signature = value_at(args, i, a)?;
+                o.sig_cli = SigCli::Value(value_at(args, i, a)?);
             }
-            "--no-signature" => o.signature.clear(),
+            "--no-signature" => o.sig_cli = SigCli::No,
             "--zero-commit" => o.zero_commit = true,
             "--no-zero-commit" => o.zero_commit = false,
             "-p" | "--no-stat" => o.use_patch_format = true,
@@ -627,16 +660,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             }
             "--signature-file" => {
                 i += 1;
-                match read_signature_file(&value_at(args, i, a)?) {
-                    Ok(sig) => o.signature = sig,
-                    Err(code) => return Ok(Parsed::Exit(code)),
-                }
+                o.sig_file_arg = Some(value_at(args, i, a)?);
             }
             s if s.starts_with("--signature-file=") => {
-                match read_signature_file(&s["--signature-file=".len()..]) {
-                    Ok(sig) => o.signature = sig,
-                    Err(code) => return Ok(Parsed::Exit(code)),
-                }
+                o.sig_file_arg = Some(s["--signature-file=".len()..].to_owned());
             }
             "--rfc" => {
                 o.subject_prefix = "RFC PATCH".to_owned();
@@ -672,7 +699,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 o.reroll = Some(s["--reroll-count=".len()..].to_owned());
             }
             s if s.starts_with("--signature=") => {
-                o.signature = s["--signature=".len()..].to_owned();
+                o.sig_cli = SigCli::Value(s["--signature=".len()..].to_owned());
             }
             s if s.starts_with("--filename-max-length=") => {
                 o.name_max = parse_num(&s["--filename-max-length=".len()..])?;
@@ -1313,6 +1340,43 @@ fn read_signature_file(path: &str) -> std::result::Result<String, ExitCode> {
             Err(fatal(&format!(
                 "unable to read signature file '{path}': {reason}"
             )))
+        }
+    }
+}
+
+/// Port of the signature-resolution ladder in `cmd_format_patch` (builtin/log.c),
+/// run once revisions are resolved. git keeps four inputs — the `signature`
+/// pointer (`--signature`/`--no-signature`, else the version default),
+/// `signature_file_arg` (`--signature-file`), and the
+/// `format.signature`/`format.signatureFile` config — and resolves them in this
+/// order:
+///   * `--no-signature` inhibits every signature;
+///   * an explicit `--signature` is used verbatim (an empty value renders none);
+///   * else a `--signature-file`, or a `format.signatureFile` *only when no
+///     `format.signature` is set*, is read from disk — an unreadable file is
+///     `die_errno` → exit 128, with the `--signature-file` argument preferred
+///     over the config when both are present;
+///   * else `format.signature`;
+///   * else the version default.
+fn resolve_signature(o: &Opts) -> std::result::Result<String, ExitCode> {
+    match &o.sig_cli {
+        SigCli::No => Ok(String::new()),
+        SigCli::Value(s) => Ok(s.clone()),
+        SigCli::Unset => {
+            if o.sig_file_arg.is_some()
+                || (o.cfg_signature_file.is_some() && o.cfg_signature.is_none())
+            {
+                let path = o
+                    .sig_file_arg
+                    .as_deref()
+                    .or(o.cfg_signature_file.as_deref())
+                    .expect("a file path is present by the condition above");
+                read_signature_file(path)
+            } else if let Some(s) = &o.cfg_signature {
+                Ok(s.clone())
+            } else {
+                Ok(SIGNATURE_VERSION.to_owned())
+            }
         }
     }
 }

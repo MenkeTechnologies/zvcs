@@ -3,7 +3,7 @@
 //! The argument surface is covered byte-for-byte, and the command then does the
 //! repacking for real: it writes a pack, its `.idx` and its `.rev`, optionally
 //! prunes the loose objects it just packed (`-d`) and refreshes
-//! `objects/info/packs` (unless `-n`).
+//! `objects/info/packs` (unless `-n` or `repack.updateServerInfo` is false).
 //!
 //! # Pack bytes differ from git's by design
 //!
@@ -108,6 +108,12 @@
 //!   * `repack.writeBitmaps` / `pack.writeBitmaps` are not read, so the
 //!     incremental-with-bitmaps `fatal:` fires only when `-b` is given
 //!     explicitly.
+//!   * `repack.useDeltaBaseOffset`, `repack.packKeptObjects` and
+//!     `repack.cruftWindow` / `repack.cruftDepth` / `repack.cruftThreads` are not
+//!     read either: they tune a delta search, a kept-object exclusion and a cruft
+//!     pack that this delta-free, cruft-free writer never performs, so honouring
+//!     them would change nothing. `repack.updateServerInfo` *is* honoured, since
+//!     the closing `update-server-info` it gates is real; see [`execute`].
 //!   * `--filter=sparse:oid=<rev>` is accepted on syntax alone — git's rejection
 //!     of it depends on resolving and parsing the named blob;
 //!   * `combine:` sub-specs are not percent-decoded;
@@ -319,6 +325,17 @@ fn execute(st: &State) -> Result<ExitCode> {
     let objdir = repo.objects.store_ref().path().to_path_buf();
     let pack_dir = objdir.join("pack");
 
+    // git refreshes `objects/info/packs` at the end of a successful run unless
+    // `-n` was given or `repack.updateServerInfo` is false (default true). git
+    // keeps a single `run_update_server_info`, seeded from the config and cleared
+    // by `-n` (an `OPT_NEGBIT`), so `-n` always wins over a config that enables
+    // it and there is no way to turn it back on from the command line.
+    let run_server_info = !st.no_server_info
+        && repo
+            .config_snapshot()
+            .boolean("repack.updateServerInfo")
+            .unwrap_or(true);
+
     // git's `--all --reflog --indexed-objects`, which `prune` already builds.
     let mut roots = Vec::new();
     super::prune::collect_roots(&repo, &mut roots)?;
@@ -341,7 +358,7 @@ fn execute(st: &State) -> Result<ExitCode> {
         if !st.all_into_one && !st.quiet {
             println!("Nothing new to pack.");
         }
-        if !st.no_server_info {
+        if run_server_info {
             let _ = super::update_server_info::update_server_info(&["update-server-info".to_string()])?;
         }
         return Ok(ExitCode::SUCCESS);
@@ -392,7 +409,7 @@ fn execute(st: &State) -> Result<ExitCode> {
         let _ = super::prune_packed::prune_packed(&["prune-packed".to_string(), "-q".to_string()])?;
     }
 
-    if !st.no_server_info {
+    if run_server_info {
         let _ = super::update_server_info::update_server_info(&["update-server-info".to_string()])?;
     }
 

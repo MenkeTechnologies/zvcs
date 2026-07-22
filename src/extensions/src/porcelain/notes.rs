@@ -44,7 +44,9 @@ use gix::refs::Target;
 /// `--no-separator`, `--stripspace`/`--no-stripspace`, `--ignore-missing`,
 /// `--stdin`, `--for-rewrite=<cmd>`, and the merge strategies
 /// `ours`/`theirs`/`union`/`cat_sort_uniq`/`manual`.
-/// `GIT_NOTES_REF` and `core.notesRef` are honoured with git's precedence.
+/// `GIT_NOTES_REF` and `core.notesRef` are honoured with git's precedence, and
+/// `merge` without `-s` takes its strategy from `notes.<name>.mergeStrategy`
+/// then `notes.mergeStrategy`.
 ///
 /// The only paths kept as a terse bail are the genuinely interactive editor
 /// flows — a bare `edit`/`add`/`append` with no message option, and `-e` /
@@ -1637,15 +1639,17 @@ fn merge(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exi
         i += 1;
     }
 
-    // Validate the strategy name up front, exactly as git's callback does.
-    let strat = match strategy.as_deref() {
-        None => Strategy::Manual,
-        Some("manual") => Strategy::Manual,
-        Some("ours") => Strategy::Ours,
-        Some("theirs") => Strategy::Theirs,
-        Some("union") => Strategy::Union,
-        Some("cat_sort_uniq") => Strategy::CatSortUniq,
-        Some(other) => return merge_usage(&format!("unknown -s/--strategy: {other}")),
+    // An explicit `-s/--strategy` is validated up front, exactly as git's
+    // callback does. The config-driven default is resolved only once a real
+    // merge is known to be happening: git consults the merge-strategy config
+    // *after* the `--abort`/`--commit` early-outs, so a bad `notes.mergeStrategy`
+    // never aborts an abort.
+    let cli_strat = match strategy.as_deref() {
+        None => None,
+        Some(name) => match parse_strategy(name) {
+            Some(s) => Some(s),
+            None => return merge_usage(&format!("unknown -s/--strategy: {name}")),
+        },
     };
 
     if do_abort {
@@ -1657,6 +1661,15 @@ fn merge(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exi
     if positional.len() != 1 {
         return merge_usage("must specify a notes ref to merge");
     }
+    // Without `-s`, `notes.<name>.mergeStrategy` then the general
+    // `notes.mergeStrategy` supply the strategy, falling back to git's `manual`.
+    let strat = match cli_strat {
+        Some(s) => s,
+        None => match config_merge_strategy(repo, notes_ref) {
+            Ok(s) => s,
+            Err(code) => return Ok(code),
+        },
+    };
     do_merge(repo, notes_ref, &positional[0], strat, verbosity)
 }
 
@@ -1667,6 +1680,104 @@ enum Strategy {
     Theirs,
     Union,
     CatSortUniq,
+}
+
+/// `notes.c:parse_notes_merge_strategy()` — the name accepted by both the
+/// `-s/--strategy` option and the `notes.mergeStrategy` config keys.
+fn parse_strategy(name: &str) -> Option<Strategy> {
+    Some(match name {
+        "manual" => Strategy::Manual,
+        "ours" => Strategy::Ours,
+        "theirs" => Strategy::Theirs,
+        "union" => Strategy::Union,
+        "cat_sort_uniq" => Strategy::CatSortUniq,
+        _ => return None,
+    })
+}
+
+/// The merge strategy chosen when no `-s/--strategy` is given, from
+/// `builtin/notes.c:merge()`: `notes.<name>.mergeStrategy` (where `<name>` is
+/// the notes ref with its `refs/notes/` prefix removed) takes precedence over
+/// the general `notes.mergeStrategy`, and either overrides git's `manual`
+/// default. A present-but-unrecognised value is fatal, matching
+/// `notes-utils.c:git_config_get_notes_strategy()`.
+fn config_merge_strategy(
+    repo: &gix::Repository,
+    notes_ref: &str,
+) -> std::result::Result<Strategy, ExitCode> {
+    let config = repo.config_snapshot();
+    let file = config.plumbing();
+    // git BUGs if the notes ref is not under refs/notes/, so the per-ref key is
+    // only consulted when the prefix is present.
+    if let Some(name) = notes_ref.strip_prefix("refs/notes/") {
+        if let Some(s) = notes_strategy_config(file, Some(name))? {
+            return Ok(s);
+        }
+    }
+    if let Some(s) = notes_strategy_config(file, None)? {
+        return Ok(s);
+    }
+    Ok(Strategy::Manual)
+}
+
+/// The effective `notes[.<subsection>].mergeStrategy` value, parsed. `Ok(None)`
+/// when unset; a present-but-invalid value prints git's config error and yields
+/// exit 128.
+fn notes_strategy_config(
+    file: &gix::config::File,
+    subsection: Option<&str>,
+) -> std::result::Result<Option<Strategy>, ExitCode> {
+    // Walk the merged config in order so the last definition wins, keeping the
+    // winning value's source metadata for the error message.
+    let mut winner: Option<(BString, gix::config::file::Metadata)> = None;
+    for section in file.sections() {
+        let header = section.header();
+        if !header.name().to_string().eq_ignore_ascii_case("notes") {
+            continue;
+        }
+        // Subsection names are matched case-sensitively, byte for byte, exactly
+        // as git compares the `notes.<name>` subsection.
+        match (subsection, header.subsection_name()) {
+            (Some(want), Some(have)) if have.to_string() == want => {}
+            (None, None) => {}
+            _ => continue,
+        }
+        if let Some(v) = section.body().value("mergeStrategy") {
+            winner = Some((v, section.meta().clone()));
+        }
+    }
+    let Some((value, meta)) = winner else {
+        return Ok(None);
+    };
+    match parse_strategy(&value.to_str_lossy()) {
+        Some(s) => Ok(Some(s)),
+        None => {
+            let key = match subsection {
+                Some(name) => format!("notes.{name}.mergeStrategy"),
+                None => "notes.mergeStrategy".to_string(),
+            };
+            Err(notes_config_fatal(&key, &value.to_str_lossy(), &meta))
+        }
+    }
+}
+
+/// `notes-utils.c:git_config_get_notes_strategy()` reaching `git_die_config()`:
+/// the `error:` reason then a `fatal:` naming the config source, exit 128. gix
+/// records no per-value line number, so the `at line <n>` tail git appends is
+/// omitted — the same limitation the crate's other config-fatal paths carry.
+fn notes_config_fatal(key: &str, value: &str, meta: &gix::config::file::Metadata) -> ExitCode {
+    eprintln!("error: unknown notes merge strategy {value}");
+    let origin = match meta.source {
+        gix::config::Source::Cli | gix::config::Source::Env => {
+            format!("unable to parse '{key}' from command-line config")
+        }
+        _ => match &meta.path {
+            Some(path) => format!("bad config variable '{key}' in file '{}'", path.display()),
+            None => format!("bad config variable '{key}'"),
+        },
+    };
+    eprintln!("fatal: {origin}");
+    ExitCode::from(128)
 }
 
 /// Move a notes ref, writing git's `notes: `-prefixed reflog line.

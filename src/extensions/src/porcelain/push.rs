@@ -26,14 +26,20 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         .filter(|a| !a.starts_with('-'))
         .map(String::as_str)
         .collect();
-    let remote_name = positionals.first().copied().unwrap_or("origin");
     let refspecs: &[&str] = positionals.get(1..).unwrap_or(&[]);
 
     let repo = gix::discover(".")?;
 
+    // The default remote when none is given follows git's push order:
+    // branch.<name>.pushRemote, remote.pushDefault, branch.<name>.remote, origin.
+    let remote_name: String = match positionals.first() {
+        Some(r) => (*r).to_string(),
+        None => default_push_remote(&repo),
+    };
+
     // Resolve the remote as `git push <remote>` does — a bad name is a pre-flight
     // error, before any network access.
-    let remote = repo.find_remote(remote_name)?;
+    let remote = repo.find_remote(remote_name.as_str())?;
 
     // Determine what would be pushed. With an explicit refspec we echo it; with
     // none, git pushes the current branch, so resolve HEAD the way git does and
@@ -68,4 +74,30 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         "gitoxide has no git-receive-pack (send-pack) implementation; \
          cannot upload {target} to {dest}"
     )
+}
+
+/// The remote `git push` targets with no `<remote>` argument, in git's order:
+/// the current branch's `pushRemote`, then `remote.pushDefault`, then the
+/// branch's `remote`, then `origin`.
+fn default_push_remote(repo: &gix::Repository) -> String {
+    let snap = repo.config_snapshot();
+    let branch = repo
+        .head()
+        .ok()
+        .and_then(|h| h.referent_name().map(|n| n.shorten().to_string()));
+
+    if let Some(b) = &branch {
+        if let Some(r) = snap.string(&format!("branch.{b}.pushRemote")) {
+            return r.to_string();
+        }
+    }
+    if let Some(r) = snap.string("remote.pushDefault") {
+        return r.to_string();
+    }
+    if let Some(b) = &branch {
+        if let Some(r) = snap.string(&format!("branch.{b}.remote")) {
+            return r.to_string();
+        }
+    }
+    "origin".to_string()
 }

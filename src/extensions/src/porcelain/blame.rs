@@ -81,9 +81,12 @@ const NOT_COMMITTED_MAIL: &[u8] = b"not.committed.yet";
 /// `--ignore-rev`, regex/function `-L` forms, …) are rejected with a terse
 /// message rather than emitting wrong output.
 pub fn blame(args: &[String]) -> Result<ExitCode> {
-    let mut opts = Options::parse(args)?;
-
     let repo = gix::discover(".")?;
+
+    // git reads blame.showEmail as the default for `-e`/`--show-email`, still
+    // overridable on the command line (including `--no-show-email`).
+    let show_email_default = repo.config_snapshot().boolean("blame.showEmail") == Some(true);
+    let mut opts = Options::parse(args, show_email_default)?;
 
     // Split the positional arguments into a revision and a single path following
     // git blame's DWIM grammar, then resolve the revision. This may short-circuit
@@ -817,11 +820,11 @@ struct Options {
 }
 
 impl Options {
-    fn parse(args: &[String]) -> Result<Options> {
+    fn parse(args: &[String], show_email_default: bool) -> Result<Options> {
         let mut ranges: Vec<RangeInclusive<u32>> = Vec::new();
         let mut long = false;
         let mut suppress = false;
-        let mut show_email = false;
+        let mut show_email = show_email_default;
         let mut show_name = false;
         let mut show_number = false;
         let mut abbrev: Option<usize> = None;
@@ -847,6 +850,7 @@ impl Options {
                 "-l" | "--long" => long = true,
                 "-s" => suppress = true,
                 "-e" | "--show-email" => show_email = true,
+                "--no-show-email" => show_email = false,
                 "-f" | "--show-name" => show_name = true,
                 "-n" | "--show-number" => show_number = true,
                 // git's `--porcelain` and `--line-porcelain` are bit flags on one

@@ -13,6 +13,7 @@
 //!   * `git add --pathspec-from-file=<f>` (`-` = stdin, `--pathspec-file-nul`)
 //!   * `git add --ignore-removal|--no-all` — do not stage worktree deletions
 //!   * `git add --ignore-errors` — skip files that cannot be read, exit 1
+//!     (default from the `add.ignoreErrors` / `add.ignore-errors` config key)
 //!   * `git add --ignore-missing` — with `-n`, tolerate non-matching pathspecs
 //!   * flags `-f/--force`, `-n/--dry-run`, `-v/--verbose`, `--sparse`, and `--`
 //!
@@ -52,7 +53,15 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     let mut intent_to_add = false;
     let mut refresh = false;
     let mut renormalize = false;
-    let mut ignore_errors = false;
+    // `add.ignoreErrors` (alias `add.ignore-errors`) is the default for
+    // `--ignore-errors`; the explicit `--ignore-errors`/`--no-ignore-errors`
+    // flags parsed below override it, matching git's config-then-CLI precedence.
+    let mut ignore_errors = {
+        let cfg = repo.config_snapshot();
+        cfg.boolean("add.ignoreErrors")
+            .or_else(|| cfg.boolean("add.ignore-errors"))
+            .unwrap_or(false)
+    };
     let mut ignore_missing = false;
     // `--no-all`/`--ignore-removal`: stage adds+mods but not worktree deletions.
     let mut no_removal = false;
@@ -239,8 +248,9 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         was_tracked: bool,
     }
     let mut staged: Vec<Staged> = Vec::new();
-    // Paths that could not be read (only reported/handled for a real add).
-    let mut read_errors: Vec<BString> = Vec::new();
+    // Paths that could not be read, paired with the OS error text git reports
+    // (only surfaced for a real add). git prints `open("<p>"): <strerror>`.
+    let mut read_errors: Vec<(BString, String)> = Vec::new();
 
     for item in iter.by_ref() {
         let entry = item?.entry;
@@ -276,8 +286,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         let (bytes, mode) = if md.is_symlink() {
             let target = match std::fs::read_link(&abs) {
                 Ok(t) => t,
-                Err(_) => {
-                    read_errors.push(path);
+                Err(e) => {
+                    read_errors.push((path, os_err_message(&e)));
                     continue;
                 }
             };
@@ -292,8 +302,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         } else {
             let bytes = match std::fs::read(&abs) {
                 Ok(b) => b,
-                Err(_) => {
-                    read_errors.push(path);
+                Err(e) => {
+                    read_errors.push((path, os_err_message(&e)));
                     continue;
                 }
             };
@@ -432,8 +442,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // `--ignore-errors`: a real add reports unreadable files and, if any occurred
     // without `--ignore-errors`, aborts before touching the index.
     if !read_errors.is_empty() && !dry_run {
-        for p in &read_errors {
-            eprintln!("error: open(\"{p}\"): unable to read file");
+        for (p, msg) in &read_errors {
+            eprintln!("error: open(\"{p}\"): {msg}");
             eprintln!("error: unable to index file '{p}'");
         }
         if !ignore_errors {
@@ -565,11 +575,22 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
 
 /// The overall exit code: git returns 1 from a real add when `--ignore-errors`
 /// let it skip at least one unreadable file, else success.
-fn finish_code(read_errors: &[BString], ignore_errors: bool, dry_run: bool) -> ExitCode {
+fn finish_code(read_errors: &[(BString, String)], ignore_errors: bool, dry_run: bool) -> ExitCode {
     if ignore_errors && !dry_run && !read_errors.is_empty() {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// The `strerror`-equivalent text git prints for a failed `open()`, e.g.
+/// `Permission denied`. Rust renders an OS error as `<strerror> (os error N)`;
+/// git shows only the `<strerror>` prefix, so strip the trailing ` (os error N)`.
+fn os_err_message(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    match s.find(" (os error ") {
+        Some(idx) => s[..idx].to_string(),
+        None => s,
     }
 }
 

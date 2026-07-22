@@ -1274,10 +1274,23 @@ fn render_long(
 ) -> String {
     let mut out = String::new();
 
+    // git's long-format branch header (wt_longstatus_print): a leading empty
+    // `header`-slot write, then the prefix — `header` for a real branch, `nobranch`
+    // for detached HEAD — and finally the branch name / detached object name in the
+    // `branch` slot (`WT_STATUS_ONBRANCH`, config `color.status.branch`).
     match head_state {
-        HeadState::Branch(name) => out.push_str(&format!("On branch {name}\n")),
-        HeadState::Detached(short) => out.push_str(&format!("HEAD detached at {short}\n")),
-        HeadState::Unborn(name) => out.push_str(&format!("On branch {name}\n")),
+        HeadState::Branch(name) | HeadState::Unborn(name) => {
+            out.push_str(&colors.paint(Slot::Header, ""));
+            out.push_str(&colors.paint(Slot::Header, "On branch "));
+            out.push_str(&colors.paint(Slot::Branch, name));
+            out.push('\n');
+        }
+        HeadState::Detached(short) => {
+            out.push_str(&colors.paint(Slot::Header, ""));
+            out.push_str(&colors.paint(Slot::Nobranch, "HEAD detached at "));
+            out.push_str(&colors.paint(Slot::Branch, short));
+            out.push('\n');
+        }
     }
 
     // git prints a blank line after the tracking block and after each

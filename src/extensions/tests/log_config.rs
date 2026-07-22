@@ -117,6 +117,76 @@ fn log_date_config_and_override() {
 }
 
 #[test]
+fn log_show_root_default_and_config_suppress() {
+    let (repo, home) = fixture("showroot");
+
+    // Default (log.showRoot unset ⇒ true): the root commit shows its empty-tree
+    // diff, so `-p` renders the file's creation patch.
+    let d = stdout(&log(&repo, &home, &["-p"]));
+    assert!(
+        d.contains("diff --git a/f b/f"),
+        "default log.showRoot=true must show the root diff:\n{d}"
+    );
+
+    // log.showRoot=false hides the root commit's diff entirely.
+    git(&repo, &["config", "log.showRoot", "false"]);
+    let d = stdout(&log(&repo, &home, &["-p"]));
+    assert!(
+        !d.contains("diff --git"),
+        "log.showRoot=false must suppress the root diff:\n{d}"
+    );
+    // The commit header itself is still printed — only the diff is gone.
+    assert!(d.lines().next().unwrap().starts_with("commit "), "header still shown:\n{d}");
+
+    // --root forces the root diff back on, overriding log.showRoot=false. git has
+    // no --no-root, so the command line can only turn it on.
+    let d = stdout(&log(&repo, &home, &["-p", "--root"]));
+    assert!(
+        d.contains("diff --git a/f b/f"),
+        "--root must override log.showRoot=false:\n{d}"
+    );
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn log_show_root_false_suppresses_all_diff_formats() {
+    let (repo, home) = fixture("showroot-formats");
+    git(&repo, &["config", "log.showRoot", "false"]);
+
+    // log.showRoot gates the root commit at the tree-diff level, so every diff
+    // format the root would otherwise produce is suppressed — not just `-p`.
+    for fmt in ["--stat", "--name-only", "--name-status", "--numstat", "--shortstat"] {
+        let d = stdout(&log(&repo, &home, &[fmt]));
+        // Nothing beyond the commit header/message is emitted for the root: no
+        // diffstat, no name list, no numstat/shortstat summary.
+        let change_lines: Vec<&str> = d
+            .lines()
+            .filter(|l| {
+                !l.starts_with("commit ")
+                    && !l.starts_with("Author:")
+                    && !l.starts_with("Date:")
+                    && !l.trim_start().starts_with("c0")
+                    && !l.trim().is_empty()
+            })
+            .collect();
+        assert!(
+            change_lines.is_empty(),
+            "log.showRoot=false must emit no {fmt} change lines for the root:\n{d}\nleftover: {change_lines:?}"
+        );
+    }
+
+    // With --root the same formats do report the file.
+    let d = stdout(&log(&repo, &home, &["--stat", "--root"]));
+    assert!(
+        d.contains("1 file changed"),
+        "--root must restore the root's --stat summary:\n{d}"
+    );
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
 fn log_date_invalid_is_fatal() {
     let (repo, home) = fixture("baddate");
     git(&repo, &["config", "log.date", "bogus"]);

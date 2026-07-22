@@ -32,6 +32,10 @@ pub(crate) enum Slot {
     LocalBranch,
     /// `remoteBranch` — the upstream name / behind count in `-b`. Default red.
     RemoteBranch,
+    /// `branch` (git's `WT_STATUS_ONBRANCH`) — the branch name in the long-format
+    /// `On branch <name>` header and the object name in `HEAD detached at <sha>`.
+    /// git's default is uncolored.
+    Branch,
 }
 
 impl Slot {
@@ -46,13 +50,14 @@ impl Slot {
             Slot::Nobranch => "color.status.nobranch",
             Slot::LocalBranch => "color.status.localBranch",
             Slot::RemoteBranch => "color.status.remoteBranch",
+            Slot::Branch => "color.status.branch",
         }
     }
 
     /// git's built-in default spec for the slot; `""` means "no color".
     fn default_spec(self) -> &'static str {
         match self {
-            Slot::Header => "",
+            Slot::Header | Slot::Branch => "",
             Slot::Added | Slot::LocalBranch => "green",
             Slot::Changed
             | Slot::Untracked
@@ -75,6 +80,7 @@ pub(crate) struct StatusColors {
     nobranch: String,
     local_branch: String,
     remote_branch: String,
+    branch: String,
 }
 
 impl StatusColors {
@@ -90,6 +96,7 @@ impl StatusColors {
             nobranch: String::new(),
             local_branch: String::new(),
             remote_branch: String::new(),
+            branch: String::new(),
         }
     }
 
@@ -124,6 +131,7 @@ impl StatusColors {
             nobranch: slot(Slot::Nobranch),
             local_branch: slot(Slot::LocalBranch),
             remote_branch: slot(Slot::RemoteBranch),
+            branch: slot(Slot::Branch),
         }
     }
 
@@ -137,6 +145,7 @@ impl StatusColors {
             Slot::Nobranch => &self.nobranch,
             Slot::LocalBranch => &self.local_branch,
             Slot::RemoteBranch => &self.remote_branch,
+            Slot::Branch => &self.branch,
         }
     }
 

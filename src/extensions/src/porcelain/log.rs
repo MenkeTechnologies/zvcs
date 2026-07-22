@@ -53,7 +53,8 @@ const STAT_TERM_WIDTH: usize = 80;
 ///     first parent (the empty tree for a root commit), three lines of context; suppressed by
 ///     `--name-only`/`--name-status`, emitted after the count formats otherwise, and skipped
 ///     for merge commits (git shows no diff there without `-m`/`-c`/`--cc`). Rendered by the
-///     same pipeline as `git diff`, so the two produce byte-identical patches.
+///     same pipeline as `git diff`, so the two produce byte-identical patches. The root
+///     commit's empty-tree diff obeys `log.showRoot` (default true); `--root` forces it on.
 ///   * `--graph`                                 → git's ASCII commit graph (see below)
 ///
 /// Output separation follows git's `format:` (separator) versus `tformat:`
@@ -75,9 +76,14 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // Config supplies the defaults; the flags below override them. git reads
     // these in `git_log_config` before parsing args, and validates `log.date`
     // there — an invalid value is fatal even when `--date` later overrides it.
-    let (cfg_abbrev_commit, cfg_date_mode) = {
+    let (cfg_abbrev_commit, cfg_date_mode, cfg_show_root) = {
         let snap = repo.config_snapshot();
         let abbrev = snap.boolean("log.abbrevCommit").unwrap_or(false);
+        // `log.showRoot` defaults to true: the root commit is shown as a big
+        // creation event (a diff against the empty tree). `--root` on the command
+        // line forces it on but there is no `--no-root`, so config is the only way
+        // to suppress the root diff.
+        let show_root = snap.boolean("log.showRoot").unwrap_or(true);
         let date = match snap.string("log.date") {
             Some(v) => {
                 let v = v.to_str_lossy();
@@ -91,7 +97,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             }
             None => DateMode::Default,
         };
-        (abbrev, date)
+        (abbrev, date, show_root)
     };
 
     let mut max_count: Option<usize> = None;
@@ -115,6 +121,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut min_parents: Option<usize> = None;
     let mut max_parents: Option<usize> = None;
     let mut date_mode = cfg_date_mode;
+    let mut show_root = cfg_show_root;
     let mut color = ColorWhen::Auto;
     let mut order = Order::Default;
     let mut revs: Vec<String> = Vec::new();
@@ -263,6 +270,10 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             numstat = true;
         } else if a == "--shortstat" {
             shortstat = true;
+        } else if a == "--root" {
+            // Force the root commit's diff on (a diff against the empty tree),
+            // overriding `log.showRoot=false`. git has no `--no-root`.
+            show_root = true;
         } else if a == "--graph" {
             graph = true;
         } else if a == "--all" {
@@ -523,7 +534,13 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             block.push(b'\n');
         }
 
-        if (want_names || emit_patch) && node.parents.len() < 2 {
+        // A root commit's diff (against the empty tree) is only shown when
+        // `show_root` is set — git's `log.showRoot` (default true), forced on by
+        // `--root`. Non-root commits are unaffected.
+        if (want_names || emit_patch)
+            && node.parents.len() < 2
+            && (show_root || !node.parents.is_empty())
+        {
             let mut diff: Vec<u8> = Vec::new();
             if want_names {
                 // `--name-only`/`--name-status` are the reported format when

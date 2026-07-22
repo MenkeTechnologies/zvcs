@@ -197,6 +197,11 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
     // and only diagnoses them once the revision parser gets to them.
     let mut specs: Vec<String> = Vec::new();
     let mut no_more_opts = false;
+    // git reads `revert.reference` in `git_revert_config` before parse_options,
+    // so it is only the default: an explicit `--reference`/`--no-reference` on
+    // the command line wins. Track whether either was seen so the config is
+    // applied only when neither was.
+    let mut reference_explicit = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -214,8 +219,14 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             "--no-signoff" => o.signoff = false,
             "-e" | "--edit" => o.edit = true,
             "--no-edit" => o.edit = false,
-            "--reference" => o.reference = true,
-            "--no-reference" => o.reference = false,
+            "--reference" => {
+                o.reference = true;
+                reference_explicit = true;
+            }
+            "--no-reference" => {
+                o.reference = false;
+                reference_explicit = true;
+            }
             "--rerere-autoupdate" => o.rerere = Some(true),
             "--no-rerere-autoupdate" => o.rerere = Some(false),
             "--no-gpg-sign" => {}
@@ -301,12 +312,6 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    // `--reference` implies editing, which is what makes `--cleanup=default`
-    // behave as `strip` and drop the generated `#` title line.
-    if o.reference {
-        o.edit = true;
-    }
-
     // Post-parse, in git's order: cleanup mode, then command-mode compatibility.
     let cleanup = match o.cleanup.as_deref() {
         None => None,
@@ -323,6 +328,18 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
     if repo.workdir().is_none() {
         eprintln!("fatal: this operation must be run in a work tree");
         return Ok(ExitCode::from(128));
+    }
+    // `revert.reference` is the default for `--reference`; an explicit flag on
+    // the command line already set `o.reference` and takes precedence.
+    if !reference_explicit {
+        if let Some(v) = repo.config_snapshot().boolean("revert.reference") {
+            o.reference = v;
+        }
+    }
+    // `--reference` implies editing, which is what makes `--cleanup=default`
+    // behave as `strip` and drop the generated `#` title line.
+    if o.reference {
+        o.edit = true;
     }
     // Every step below mutates the index, the worktree and a ref: serialize the
     // whole sequence through the repo coordinator, as the other writers do.

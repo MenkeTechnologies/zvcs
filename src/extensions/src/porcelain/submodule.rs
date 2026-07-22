@@ -78,7 +78,7 @@ const SUBCOMMANDS: &[&str] = &[
 ///   * `git submodule [--quiet] init [--] [<path>...]`
 ///     Registers `submodule.<name>.active`, `submodule.<name>.url` and (when
 ///     `.gitmodules` carries one and the config does not) `submodule.<name>.update`
-///     into the repository-local config, printing
+///     into the repository-local config, printing (to stderr, as git does)
 ///     `Submodule '<name>' (<url>) registered for path '<path>'` per newly
 ///     registered url.
 ///
@@ -492,8 +492,11 @@ fn init(args: &[String], mut quiet: bool) -> Result<ExitCode> {
     if dirty {
         persist(&config_path, &config)?;
     }
+    // git's `init_submodule` prints this line to stderr (verified against git
+    // 2.55.0: `git submodule init 1>out 2>err` leaves `out` empty), so the port
+    // must too, or a caller redirecting stdout loses parity.
     for line in messages {
-        println!("{line}");
+        eprintln!("{line}");
     }
     Ok(ExitCode::SUCCESS)
 }

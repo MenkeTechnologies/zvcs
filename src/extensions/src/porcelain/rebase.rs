@@ -1898,6 +1898,17 @@ fn replay_picks(
             return Ok(ExitCode::from(1));
         }
 
+        // A pick whose changes are already present merges to no tree change — this
+        // is the observable result of git's patch-id equivalence, which drops a
+        // commit already applied upstream. git drops such a pick rather than
+        // recording an empty commit; so do we.
+        if applied.tree_id == tip_tree {
+            eprintln!(
+                "warning: skipped previously applied commit {short}"
+            );
+            continue;
+        }
+
         let author = commit.author()?.to_owned()?;
         let new = repo
             .write_object(&gix::objs::Commit {

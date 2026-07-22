@@ -192,6 +192,30 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // error surface in git's own argument order — `setup_revisions()` is one pass,
     // and the earliest failing token is the one whose exit code git reports.
     let repo = gix::discover(".")?;
+
+    // Config-provided defaults, overridden by the CLI flags parsed below (git's
+    // precedence: diff.context < -U, diff.srcPrefix/dstPrefix/noPrefix < the
+    // corresponding --*-prefix / --no-prefix flags).
+    {
+        let snap = repo.config_snapshot();
+        if let Some(n) = snap.integer("diff.context") {
+            if n >= 0 {
+                ctx = n as u32;
+            }
+        }
+        if snap.boolean("diff.noPrefix") == Some(true) {
+            src_prefix.clear();
+            dst_prefix.clear();
+        } else {
+            if let Some(p) = snap.string("diff.srcPrefix") {
+                src_prefix = p.into();
+            }
+            if let Some(p) = snap.string("diff.dstPrefix") {
+                dst_prefix = p.into();
+            }
+        }
+    }
+
     let mut revs: Vec<String> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
     let mut in_rev_region = true;

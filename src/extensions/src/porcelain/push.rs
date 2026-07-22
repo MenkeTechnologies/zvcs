@@ -1,7 +1,11 @@
 use anyhow::{anyhow, bail, Result};
 use std::process::ExitCode;
 
+use gix::bstr::ByteSlice;
 use gix::hash::ObjectId;
+use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+use gix::refs::Target;
+use gix::remote::Direction;
 
 use super::push_proto::{self, Request};
 
@@ -61,8 +65,80 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
 
     let outcome = push_proto::send_pack(&repo, &remote, &requests)?;
 
+    // After the remote accepts an update, git advances the local remote-tracking
+    // ref (via the remote's fetch refspec) so `git status`/`@{upstream}` see the
+    // push. Without this the branch keeps reporting "ahead" after a successful push.
+    update_tracking_refs(&repo, &remote, &outcome);
+
     // Print git's status block on stderr and derive the exit code.
     report(&outcome)
+}
+
+/// Advance (or delete) the local remote-tracking refs for every ref the remote
+/// accepted, mapping each pushed ref through the remote's fetch refspec — e.g.
+/// `refs/heads/main` under `+refs/heads/*:refs/remotes/origin/*` updates
+/// `refs/remotes/origin/main`. Best-effort: a failure to write a tracking ref
+/// does not fail the push, matching git, which reports it as a warning.
+fn update_tracking_refs(repo: &gix::Repository, remote: &gix::Remote<'_>, outcome: &push_proto::Outcome) {
+    let mut edits: Vec<RefEdit> = Vec::new();
+    for s in &outcome.statuses {
+        if s.result.is_err() {
+            continue;
+        }
+        let Some(tracking) = tracking_ref_for(remote, &s.name) else {
+            continue;
+        };
+        let Ok(name) = gix::refs::FullName::try_from(tracking.as_str()) else {
+            continue;
+        };
+        let change = if s.new.is_null() {
+            // The remote ref was deleted; drop its tracking ref too.
+            Change::Delete {
+                expected: PreviousValue::Any,
+                log: RefLog::AndReference,
+            }
+        } else {
+            Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: "update by push".into(),
+                },
+                expected: PreviousValue::Any,
+                new: Target::Object(s.new),
+            }
+        };
+        edits.push(RefEdit {
+            change,
+            name,
+            deref: false,
+        });
+    }
+    if !edits.is_empty() {
+        let _ = repo.edit_references(edits);
+    }
+}
+
+/// Map a pushed remote ref name to its local remote-tracking ref via the remote's
+/// fetch refspecs. Handles the wildcard form (`refs/heads/*:refs/remotes/origin/*`)
+/// and exact refspecs; `None` when no fetch refspec covers the ref (e.g. a URL
+/// push with no configured remote).
+fn tracking_ref_for(remote: &gix::Remote<'_>, pushed: &str) -> Option<String> {
+    for spec in remote.refspecs(Direction::Fetch) {
+        let spec = spec.to_ref();
+        let src = spec.source()?.to_str().ok()?;
+        let dst = spec.destination()?.to_str().ok()?;
+        match (src.strip_suffix('*'), dst.strip_suffix('*')) {
+            (Some(src_pre), Some(dst_pre)) => {
+                if let Some(rest) = pushed.strip_prefix(src_pre) {
+                    return Some(format!("{dst_pre}{rest}"));
+                }
+            }
+            _ if src == pushed => return Some(dst.to_string()),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Turn one `<refspec>` into a ref update. Handles a leading `+` (force),

@@ -40,7 +40,22 @@ const HELPER_PW_ONLY: &str = "!f() { echo password=p; }; f";
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            // Pin every write to the temp repo. `GIT_CEILING_DIRECTORIES` stops
+            // git's upward `.git` search at `dir`, so if the temp repo's `.git`
+            // were ever missing (a failed `init`, a racing cleanup) `git config`
+            // fails with "not a git repository" instead of walking up and writing
+            // into the real zvcs repo's config — which once leaked a fake
+            // credential helper and broke auth. Global/system config are neutered
+            // too, so a stray write cannot escape the temp repo in any direction.
+            .env("GIT_CEILING_DIRECTORIES", dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .unwrap()
+            .success(),
         "git {args:?} failed"
     );
 }
@@ -69,6 +84,8 @@ fn fill(bin: &str, repo: &Path, home: &Path, request: &str) -> Output {
         .args(["credential", "fill"])
         .current_dir(repo)
         .env("HOME", home)
+        // Never let discovery walk out of the temp repo into the real one.
+        .env("GIT_CEILING_DIRECTORIES", repo)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("ZVCS_HOME", home)

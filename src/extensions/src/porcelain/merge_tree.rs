@@ -62,7 +62,7 @@
 //!     `--quiet`, where no message text is emitted at all.
 
 use anyhow::{bail, Result};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -302,12 +302,71 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
 
     // git handles `--stdin` right here — after strategy validation and before
     // the operand-count switch, so it never enforces the two-operand rule and
-    // simply ignores any positional revs. It reads merges from stdin, one per
-    // line, and forces NUL termination.
+    // simply ignores any positional revs. It reads merges from stdin one per
+    // LF-delimited line (`strbuf_getline_lf`, regardless of `-z`), but forces
+    // `line_termination = '\0'` for the *output*: every record separator is a
+    // NUL and the message block uses the `-z` shape, so `-z` is a no-op here.
     if use_stdin {
-        // `--stdin` batch mode (one merge per line, NUL-terminated) is not
-        // implemented; the single-merge forms below are.
-        anyhow::bail!("--stdin batch merges are not supported");
+        let repo = gix::discover(".")?;
+        let sep = b'\0';
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if input.read_line(&mut line)? == 0 {
+                break;
+            }
+            // `strbuf_getline_lf` strips only the trailing LF. git then splits on
+            // single spaces with `STRING_LIST_SPLIT_TRIM` and maxsplit -1: each
+            // field is trimmed but empties are kept, so a run of spaces inflates
+            // `split.nr` into a malformed line.
+            let body = line.strip_suffix('\n').unwrap_or(&line);
+            let fields: Vec<&str> = body.split(' ').map(str::trim).collect();
+            if fields.len() < 2 {
+                eprintln!("fatal: malformed input line: '{body}'.");
+                return Ok(ExitCode::from(128));
+            }
+            // git sets the base whenever field[1] is `--`, then only merges when
+            // that leaves exactly `<base> -- <b1> <b2>` (nr==4) or, without a base
+            // marker, exactly `<b1> <b2>` (nr==2); anything else is malformed.
+            let (base, s1, s2) = if fields[1] == "--" && fields.len() == 4 {
+                (Some(fields[0]), fields[2], fields[3])
+            } else if fields[1] != "--" && fields.len() == 2 {
+                (None, fields[0], fields[1])
+            } else {
+                eprintln!("fatal: malformed input line: '{body}'.");
+                return Ok(ExitCode::from(128));
+            };
+
+            let tree_options = strategy.apply(repo.tree_merge_options()?)?;
+            let mut outcome =
+                match resolve_outcome(&repo, base, s1, s2, allow_unrelated, tree_options)? {
+                    Ok(o) => o,
+                    // A bad operand is a `die()` in git, aborting the whole batch.
+                    Err(code) => return Ok(code),
+                };
+            let conflicted = outcome.has_unresolved_conflicts(TreatAsUnresolved::git());
+
+            // Per-merge record: `printf("%d%c", result.clean, term)`, then the
+            // normal single-merge body, then a closing `putchar(term)`.
+            let mut rec: Vec<u8> = vec![if conflicted { b'0' } else { b'1' }, sep];
+            // `--stdin` forces NUL framing (git's `line_termination = '\0'`), so
+            // the body is always rendered in the `-z` shape regardless of `-z`.
+            rec.extend_from_slice(&render_outcome(
+                &repo,
+                &mut outcome,
+                name_only,
+                show_messages,
+                true,
+                conflicted,
+            )?);
+            rec.push(sep);
+            out.write_all(&rec)?;
+        }
+        return Ok(ExitCode::SUCCESS);
     }
 
     match mode {
@@ -338,10 +397,6 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    if use_stdin {
-        bail!("unsupported flag \"--stdin\" (the multi-merge batch protocol is not ported)");
-    }
-
     let repo = gix::discover(".")?;
 
     if mode == Mode::Trivial {
@@ -367,58 +422,101 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     }
 
     let (spec1, spec2) = (revs[0].as_str(), revs[1].as_str());
-    let labels = Labels {
-        ancestor: None,
-        current: Some(BStr::new(spec1)),
-        other: Some(BStr::new(spec2)),
-    };
     let tree_options = strategy.apply(repo.tree_merge_options()?)?;
-
-    // Both branches below produce the same tree-merge outcome; only how the
-    // ancestor is chosen differs.
-    let mut outcome: gix::merge::tree::Outcome<'_> = if let Some(base_spec) = &merge_base {
-        // With an explicit base, git accepts plain trees for all three sides,
-        // and reports any side that will not peel to one as a fatal error.
-        let (Some(base), Some(ours), Some(theirs)) = (
-            peel_tree(&repo, base_spec),
-            peel_tree(&repo, spec1),
-            peel_tree(&repo, spec2),
-        ) else {
-            let bad = [base_spec.as_str(), spec1, spec2]
-                .into_iter()
-                .find(|s| peel_tree(&repo, s).is_none())
-                .unwrap_or_default();
-            eprintln!("fatal: could not parse as tree '{bad}'");
-            return Ok(ExitCode::from(128));
-        };
-        repo.merge_trees(base, ours, theirs, labels, tree_options)?
-    } else {
-        let Some(ours) = peel_commit(&repo, spec1) else {
-            eprintln!("merge-tree: {spec1} - not something we can merge");
-            return Ok(ExitCode::FAILURE);
-        };
-        let Some(theirs) = peel_commit(&repo, spec2) else {
-            eprintln!("merge-tree: {spec2} - not something we can merge");
-            return Ok(ExitCode::FAILURE);
-        };
-        if !allow_unrelated && repo.merge_bases_many(ours, &[theirs])?.is_empty() {
-            eprintln!("fatal: refusing to merge unrelated histories");
-            return Ok(ExitCode::from(128));
-        }
-        let commit_options = gix::merge::commit::Options::from(tree_options)
-            .with_allow_missing_merge_base(allow_unrelated);
-        repo.merge_commits(ours, theirs, labels, commit_options)?
-            .tree_merge
+    let mut outcome = match resolve_outcome(
+        &repo,
+        merge_base.as_deref(),
+        spec1,
+        spec2,
+        allow_unrelated,
+        tree_options,
+    )? {
+        Ok(o) => o,
+        Err(code) => return Ok(code),
     };
 
-    let how = TreatAsUnresolved::git();
-    let conflicted = outcome.has_unresolved_conflicts(how);
+    let conflicted = outcome.has_unresolved_conflicts(TreatAsUnresolved::git());
 
     if quiet {
         // git suppresses all output here and only reports through the status.
         return Ok(exit_code(conflicted));
     }
 
+    let buf = render_outcome(&repo, &mut outcome, name_only, show_messages, nul, conflicted)?;
+    std::io::stdout().lock().write_all(&buf)?;
+    Ok(exit_code(conflicted))
+}
+
+/// Peel the operands into a merge outcome, shared by the single-merge and
+/// `--stdin` batch paths. Returns `Err(code)` when an operand does not name
+/// something mergeable — git's diagnostic is already printed and `code` is the
+/// exit status of its `die()`/failure (which, in batch mode, aborts the batch).
+fn resolve_outcome<'repo>(
+    repo: &'repo gix::Repository,
+    merge_base: Option<&str>,
+    spec1: &str,
+    spec2: &str,
+    allow_unrelated: bool,
+    tree_options: gix::merge::tree::Options,
+) -> Result<std::result::Result<gix::merge::tree::Outcome<'repo>, ExitCode>> {
+    let labels = Labels {
+        ancestor: None,
+        current: Some(BStr::new(spec1)),
+        other: Some(BStr::new(spec2)),
+    };
+    // Both branches produce the same tree-merge outcome; only how the ancestor
+    // is chosen differs.
+    let outcome = if let Some(base_spec) = merge_base {
+        // With an explicit base, git accepts plain trees for all three sides,
+        // and reports any side that will not peel to one as a fatal error.
+        let (Some(base), Some(ours), Some(theirs)) = (
+            peel_tree(repo, base_spec),
+            peel_tree(repo, spec1),
+            peel_tree(repo, spec2),
+        ) else {
+            let bad = [base_spec, spec1, spec2]
+                .into_iter()
+                .find(|s| peel_tree(repo, s).is_none())
+                .unwrap_or_default();
+            eprintln!("fatal: could not parse as tree '{bad}'");
+            return Ok(Err(ExitCode::from(128)));
+        };
+        repo.merge_trees(base, ours, theirs, labels, tree_options)?
+    } else {
+        let Some(ours) = peel_commit(repo, spec1) else {
+            eprintln!("merge-tree: {spec1} - not something we can merge");
+            return Ok(Err(ExitCode::FAILURE));
+        };
+        let Some(theirs) = peel_commit(repo, spec2) else {
+            eprintln!("merge-tree: {spec2} - not something we can merge");
+            return Ok(Err(ExitCode::FAILURE));
+        };
+        if !allow_unrelated && repo.merge_bases_many(ours, &[theirs])?.is_empty() {
+            eprintln!("fatal: refusing to merge unrelated histories");
+            return Ok(Err(ExitCode::from(128)));
+        }
+        let commit_options = gix::merge::commit::Options::from(tree_options)
+            .with_allow_missing_merge_base(allow_unrelated);
+        repo.merge_commits(ours, theirs, labels, commit_options)?
+            .tree_merge
+    };
+    Ok(Ok(outcome))
+}
+
+/// Render one resolved merge to git's single-merge byte layout: the toplevel
+/// tree id, then (when conflicted) the per-stage `<mode> <object> <stage>\t<path>`
+/// lines (or bare paths under `--name-only`), then the message block. This is
+/// exactly what `real_merge` prints for a non-`--stdin` merge; the batch path
+/// wraps it with the clean flag and trailing separator.
+fn render_outcome(
+    repo: &gix::Repository,
+    outcome: &mut gix::merge::tree::Outcome<'_>,
+    name_only: bool,
+    show_messages: Option<bool>,
+    nul: bool,
+    conflicted: bool,
+) -> Result<Vec<u8>> {
+    let how = TreatAsUnresolved::git();
     // Render everything up front so an unrenderable conflict class fails before
     // a single byte reaches stdout.
     let mut buf: Vec<u8> = Vec::new();
@@ -455,7 +553,7 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     }
 
     if show_messages.unwrap_or(conflicted) {
-        let messages = render_messages(&repo, &outcome.conflicts)?;
+        let messages = render_messages(repo, &outcome.conflicts)?;
         if nul {
             // The `-z` messages section opens with its own NUL separator, then
             // carries one `<count> <path>... <type> <message>` record per entry.
@@ -477,8 +575,7 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    std::io::stdout().lock().write_all(&buf)?;
-    Ok(exit_code(conflicted))
+    Ok(buf)
 }
 
 /// Select `wanted` as the command mode, reporting git's parse-options clash

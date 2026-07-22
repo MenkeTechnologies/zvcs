@@ -122,6 +122,52 @@ fn empty_message_aborts() {
 }
 
 #[test]
+fn commit_status_false_gives_empty_template() {
+    let (repo, home) = fixture("statusfalse");
+    git(&repo, &["config", "commit.status", "false"]);
+    // The editor records the size of the template it was handed, then writes the
+    // real message. With commit.status=false git omits the whole header, so the
+    // template is empty (0 bytes).
+    let out = commit_with_editor(
+        &repo,
+        &home,
+        r#"sh -c 'wc -c < "$1" | tr -d " " > tsize; printf "the subject\n" > "$1"' _"#,
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let size = std::fs::read_to_string(repo.join("tsize")).unwrap();
+    assert_eq!(size.trim(), "0", "template must be empty when commit.status=false");
+    assert_eq!(subject(&repo), "the subject");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn core_comment_string_multibyte_prefix() {
+    let (repo, home) = fixture("commentstring");
+    git(&repo, &["config", "core.commentString", "//"]);
+    // A `//`-prefixed line is stripped (multi-byte comment prefix), the real
+    // subject is kept.
+    let out = commit_with_editor(
+        &repo,
+        &home,
+        r#"sh -c 'printf "kept subject\n\n// dropped line\n" > "$1"' _"#,
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(subject(&repo), "kept subject");
+    let body = Command::new("git")
+        .args(["log", "-1", "--format=%b"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&body.stdout).contains("//"),
+        "the // comment line must be stripped"
+    );
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
 fn no_editor_on_dumb_terminal_refuses() {
     let (repo, home) = fixture("dumb");
     // No editor configured and a non-interactive stdin: git refuses rather than

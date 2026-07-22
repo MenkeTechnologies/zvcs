@@ -28,10 +28,11 @@ use gix::ObjectId;
 /// `0` insertions/deletions to the short-stat, just as `git` does.
 ///
 /// With no `-m`, the message is captured from an editor exactly as git does:
-/// a template (`commit.template` plus a commented status header) is opened with
-/// the `GIT_EDITOR` → `core.editor` → `$VISUAL` → `$EDITOR` editor, then cleaned
-/// up per `commit.cleanup` (default: strip comment/blank lines) with the comment
-/// character taken from `core.commentChar`.
+/// a template (`commit.template` plus a status header, unless `commit.status` is
+/// false) is opened with the `GIT_EDITOR` → `core.editor` → `$VISUAL` →
+/// `$EDITOR` editor, then cleaned up per `commit.cleanup` (default: strip
+/// comment/blank lines) with the comment prefix taken from `core.commentString`
+/// or `core.commentChar`.
 ///
 /// Options that change staging or history semantics (`--amend`, `-F`, `-C`,
 /// `--author`, `-p`, `-S`, pathspec-limited commits, …) are not backed by this
@@ -431,7 +432,7 @@ fn plural(n: u64) -> &'static str {
 /// editor, and return the cleaned-up message per `commit.cleanup`.
 fn obtain_message_via_editor(repo: &gix::Repository, is_root: bool) -> Result<String> {
     let snap = repo.config_snapshot();
-    let comment = comment_char(&snap);
+    let comment = comment_prefix(&snap);
 
     let mut buf = String::new();
 
@@ -448,23 +449,26 @@ fn obtain_message_via_editor(repo: &gix::Repository, is_root: bool) -> Result<St
     }
 
     // Commented help + a minimal status header, mirroring git's wt-status block.
-    let branch = repo.head_name()?.map(|n| n.shorten().to_string());
-    buf.push('\n');
-    buf.push_str(&format!(
-        "{comment} Please enter the commit message for your changes. Lines starting\n"
-    ));
-    buf.push_str(&format!(
-        "{comment} with '{comment}' will be ignored, and an empty message aborts the commit.\n"
-    ));
-    buf.push_str(&format!("{comment}\n"));
-    match &branch {
-        Some(b) => buf.push_str(&format!("{comment} On branch {b}\n")),
-        None => buf.push_str(&format!("{comment} HEAD detached\n")),
+    // Omitted entirely when `commit.status=false`, exactly as git does.
+    if snap.boolean("commit.status") != Some(false) {
+        let branch = repo.head_name()?.map(|n| n.shorten().to_string());
+        buf.push('\n');
+        buf.push_str(&format!(
+            "{comment} Please enter the commit message for your changes. Lines starting\n"
+        ));
+        buf.push_str(&format!(
+            "{comment} with '{comment}' will be ignored, and an empty message aborts the commit.\n"
+        ));
+        buf.push_str(&format!("{comment}\n"));
+        match &branch {
+            Some(b) => buf.push_str(&format!("{comment} On branch {b}\n")),
+            None => buf.push_str(&format!("{comment} HEAD detached\n")),
+        }
+        if is_root {
+            buf.push_str(&format!("{comment}\n{comment} Initial commit\n"));
+        }
+        buf.push_str(&format!("{comment}\n"));
     }
-    if is_root {
-        buf.push_str(&format!("{comment}\n{comment} Initial commit\n"));
-    }
-    buf.push_str(&format!("{comment}\n"));
 
     // Write the template to COMMIT_EDITMSG, edit in place, read it back.
     let path = repo.git_dir().join("COMMIT_EDITMSG");
@@ -472,20 +476,28 @@ fn obtain_message_via_editor(repo: &gix::Repository, is_root: bool) -> Result<St
     launch_editor(&snap, &path)?;
     let edited = std::fs::read_to_string(&path)?;
 
-    Ok(cleanup_message(&edited, comment, cleanup_mode(&snap)))
+    Ok(cleanup_message(&edited, &comment, cleanup_mode(&snap)))
 }
 
-/// The comment character for message templates: `core.commentChar` (first char),
+/// The comment prefix for message templates: `core.commentString` (a multi-byte
+/// prefix, git 2.45+) if set, else `core.commentChar` (a single character),
 /// defaulting to `#`. `auto` is treated as the default here.
-fn comment_char(snap: &gix::config::Snapshot<'_>) -> char {
+fn comment_prefix(snap: &gix::config::Snapshot<'_>) -> String {
+    if let Some(v) = snap.string("core.commentString") {
+        let v = v.to_string();
+        if !v.is_empty() && v != "auto" {
+            return v;
+        }
+    }
     match snap.string("core.commentChar") {
-        None => '#',
+        None => "#".to_string(),
         Some(v) => {
             let s = v.to_string();
             if s.is_empty() || s == "auto" {
-                '#'
+                "#".to_string()
             } else {
-                s.chars().next().unwrap_or('#')
+                // core.commentChar is a single character.
+                s.chars().next().unwrap_or('#').to_string()
             }
         }
     }
@@ -554,8 +566,8 @@ fn cleanup_mode(snap: &gix::config::Snapshot<'_>) -> Cleanup {
 /// Apply git's message cleanup: `verbatim` leaves the text untouched; otherwise
 /// trailing whitespace is trimmed, runs of blank lines are collapsed, and
 /// leading/trailing blank lines are dropped. `strip` additionally removes lines
-/// beginning with the comment character.
-fn cleanup_message(raw: &str, comment: char, mode: Cleanup) -> String {
+/// beginning with the comment prefix.
+fn cleanup_message(raw: &str, comment: &str, mode: Cleanup) -> String {
     if let Cleanup::Verbatim = mode {
         return raw.to_string();
     }

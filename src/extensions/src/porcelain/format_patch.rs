@@ -444,21 +444,29 @@ fn is_flag(arg: &str, name: &str) -> bool {
 }
 
 fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
+    // git reads the `format.*` config as the defaults for its options; the CLI
+    // flags below override scalars and append to the address/header lists.
+    let snap = repo.config_snapshot();
+    let cfg_str = |k: &str| snap.string(k).and_then(|v| v.to_str().ok().map(str::to_owned));
+    let cfg_list = |k: &str| {
+        snap.plumbing()
+            .values::<gix::bstr::BString>(k)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .collect::<Vec<String>>()
+    };
+
     let mut o = Opts {
         to_stdout: false,
-        outdir: None,
-        numbered: None,
+        outdir: cfg_str("format.outputDirectory"),
+        numbered: snap.boolean("format.numbered"),
         start_number: 1,
         numbered_files: false,
-        suffix: ".patch".to_owned(),
-        subject_prefix: "PATCH".to_owned(),
+        suffix: cfg_str("format.suffix").unwrap_or_else(|| ".patch".to_owned()),
+        subject_prefix: cfg_str("format.subjectPrefix").unwrap_or_else(|| "PATCH".to_owned()),
         reroll: None,
-        signature: repo
-            .config_snapshot()
-            .string("format.signature")
-            .as_ref()
-            .and_then(|v| v.to_str().ok().map(str::to_owned))
-            .unwrap_or_else(|| SIGNATURE_VERSION.to_owned()),
+        signature: cfg_str("format.signature").unwrap_or_else(|| SIGNATURE_VERSION.to_owned()),
         zero_commit: false,
         use_patch_format: false,
         output_format: 0,
@@ -469,13 +477,17 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             permille: DIRSTAT_PERMILLE_DEFAULT,
         },
         quiet: false,
-        name_max: NAME_MAX_DEFAULT,
-        cover_letter: false,
+        name_max: snap
+            .integer("format.filenameMaxLength")
+            .filter(|n| *n > 0)
+            .map(|n| n as usize)
+            .unwrap_or(NAME_MAX_DEFAULT),
+        cover_letter: snap.boolean("format.coverLetter") == Some(true),
         keep_subject: false,
         in_reply_to: None,
-        to: Vec::new(),
-        cc: Vec::new(),
-        add_header: Vec::new(),
+        to: cfg_list("format.to"),
+        cc: cfg_list("format.cc"),
+        add_header: cfg_list("format.headers"),
         root: false,
         max_count: None,
         skip: 0,

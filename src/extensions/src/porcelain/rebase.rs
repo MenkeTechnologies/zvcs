@@ -747,12 +747,27 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         if m == ModeOption::EditTodo && ty != Backend::Merge {
             die!("The --edit-todo action can only be used during interactive rebase.");
         }
-        // Every mode option resumes or unwinds a sequencer run recorded in the
-        // state directory this port never writes.
-        bail!(
-            "unsupported flag {:?} (resuming a rebase requires the .git/rebase-merge state directory and commit replay)",
-            m.flag()
-        );
+        // The apply backend's `.git/rebase-apply` state is written by `git am`,
+        // which is not ported; only the merge backend's `rebase-merge` resumes.
+        if apply_in_progress {
+            bail!(
+                "unsupported flag {:?} for an apply-backend rebase (only merge-backend \
+                 .git/rebase-merge state is resumable)",
+                m.flag()
+            );
+        }
+        return match m {
+            ModeOption::Abort => rebase_abort(&repo),
+            ModeOption::Quit => rebase_quit(&repo),
+            ModeOption::Continue => rebase_continue(&repo, false),
+            ModeOption::Skip => rebase_continue(&repo, true),
+            ModeOption::EditTodo => {
+                bail!("unsupported flag \"--edit-todo\" (interactive todo editing is not ported)")
+            }
+            ModeOption::ShowCurrentPatch => bail!(
+                "unsupported flag \"--show-current-patch\" (rendering the stopped patch is not ported)"
+            ),
+        };
     }
     if in_progress {
         let base = if apply_in_progress {
@@ -1333,95 +1348,21 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             tip = new;
         }
     } else if !todo.is_empty() && !apply_backend {
-        // Genuine picks: cherry-pick each commit (oldest first) onto the growing
-        // tip with a real three-way merge. On a conflict the rebase stops with the
-        // conflicted worktree/index in place; recover with `git reset --hard
-        // ORIG_HEAD` (git's `--continue`/`--abort` state machine is not ported).
+        // Genuine picks replayed with a three-way merge each; resumable via the
+        // .git/rebase-merge state on conflict (--continue/--skip/--abort).
         let committer = repo
             .committer()
             .ok_or_else(|| anyhow!("committer identity is not configured"))??
             .to_owned()?;
-        let empty_tree = ObjectId::empty_tree(repo.object_hash());
-        let onto_tree = repo.find_commit(onto_oid)?.tree_id()?.detach();
-        let mut cur_index = repo.index_from_tree(&onto_tree)?;
-        let total = todo.len();
-        for (n, oid) in todo.iter().rev().enumerate() {
-            if flags & NO_QUIET != 0 {
-                eprint!(
-                    "Rebasing ({}/{total}){}",
-                    n + 1,
-                    if flags & VERBOSE != 0 { "\n" } else { "\r" }
-                );
-            }
-            let commit = repo.find_commit(*oid)?;
-            let message: BString = commit.message_raw()?.to_owned();
-            let subject: BString = match message.find_byte(b'\n') {
-                Some(p) => message[..p].as_bstr().to_owned(),
-                None => message.clone(),
-            };
-            let ctree = commit.tree_id()?.detach();
-            let base_tree = match commit.parent_ids().next() {
-                Some(p) => repo.find_commit(p.detach())?.tree_id()?.detach(),
-                None => empty_tree,
-            };
-            let tip_tree = repo.find_commit(tip)?.tree_id()?.detach();
-
-            let short = oid.to_hex_with_len(7).to_string();
-            let other_label = format!("{short} ({subject})", subject = subject.to_str_lossy());
-            let labels = gix::merge::blob::builtin_driver::text::Labels {
-                ancestor: Some(BStr::new(b"HEAD")),
-                current: Some(BStr::new(b"HEAD")),
-                other: Some(BStr::new(other_label.as_bytes())),
-            };
-            let applied = crate::merge_apply::three_way_merge(
-                &repo,
-                base_tree,
-                tip_tree,
-                ctree,
-                &cur_index,
-                labels,
-                &should_interrupt,
-            )?;
-            cur_index = applied.index;
-            cur_index.write(Default::default())?;
-
-            if !applied.conflicts.is_empty() {
-                eprintln!("error: could not apply {short}... {}", subject.to_str_lossy());
-                eprintln!(
-                    "hint: Resolve all conflicts manually, mark them as resolved with"
-                );
-                eprintln!(
-                    "hint: \"git add/rm <conflicted_files>\", then run \"git rebase --continue\"."
-                );
-                eprintln!(
-                    "hint: You can instead skip this commit: run \"git rebase --skip\"."
-                );
-                eprintln!(
-                    "hint: To abort and get back to the state before \"git rebase\", run \"git rebase --abort\"."
-                );
-                eprintln!("Could not apply {short}... {}", subject.to_str_lossy());
-                return Ok(ExitCode::from(1));
-            }
-
-            let author = commit.author()?.to_owned()?;
-            let new = repo
-                .write_object(&gix::objs::Commit {
-                    message: message.clone(),
-                    tree: applied.tree_id,
-                    author,
-                    committer: committer.clone(),
-                    encoding: None,
-                    parents: std::iter::once(tip).collect(),
-                    extra_headers: Default::default(),
-                })?
-                .detach();
-            set_head(
-                &repo,
-                Target::Object(new),
-                &gix::reference::log::message("rebase (pick)", message.as_bstr(), 1).to_string(),
-            )?;
-            tip = new;
-        }
+        let picks: Vec<ObjectId> = todo.iter().rev().copied().collect();
+        let head_name = branch
+            .as_ref()
+            .map(|b| b.as_bstr().to_string())
+            .unwrap_or_else(|| "detached HEAD".to_string());
+        return replay_picks(
+            &repo, onto_oid, &picks, head_name, onto_oid, head_oid, &committer,
+            &should_interrupt,
+        );
     } else if apply_backend {
         println!("Fast-forwarded {branch_name} to {onto_spec}.");
     } else if flags & FORCE != 0 && flags & NO_QUIET != 0 {
@@ -1660,6 +1601,375 @@ fn full_name(name: &str) -> Result<FullName> {
 
 /// Point `HEAD` at `target` (an object for a detached `HEAD`, a ref to attach
 /// it), writing `message` to the `HEAD` reflog.
+/// The `.git/rebase-merge` state a stopped merge-backend rebase leaves behind for
+/// `--continue` / `--skip` / `--abort`.
+struct RebaseState {
+    /// Full name of the branch being rebased (`refs/heads/…`) or `detached HEAD`.
+    head_name: String,
+    onto: ObjectId,
+    orig_head: ObjectId,
+    /// Picks not yet applied, oldest first.
+    todo: Vec<ObjectId>,
+    /// The commit whose pick stopped on a conflict.
+    stopped: ObjectId,
+}
+
+fn rebase_merge_dir(repo: &gix::Repository) -> std::path::PathBuf {
+    repo.git_dir().join("rebase-merge")
+}
+
+/// Persist [`RebaseState`] into `.git/rebase-merge`, in git's file layout.
+fn write_rebase_state(repo: &gix::Repository, st: &RebaseState) -> Result<()> {
+    let dir = rebase_merge_dir(repo);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("head-name"), format!("{}\n", st.head_name))?;
+    std::fs::write(dir.join("onto"), format!("{}\n", st.onto))?;
+    std::fs::write(dir.join("orig-head"), format!("{}\n", st.orig_head))?;
+    std::fs::write(dir.join("interactive"), b"")?;
+    std::fs::write(dir.join("stopped-sha"), format!("{}\n", st.stopped))?;
+    let todo: String = st.todo.iter().map(|o| format!("pick {o}\n")).collect();
+    std::fs::write(dir.join("git-rebase-todo"), todo)?;
+    Ok(())
+}
+
+/// Read back the `.git/rebase-merge` state written by [`write_rebase_state`].
+fn read_rebase_state(repo: &gix::Repository) -> Result<RebaseState> {
+    let dir = rebase_merge_dir(repo);
+    let read = |f: &str| -> Result<String> {
+        Ok(std::fs::read_to_string(dir.join(f))
+            .map_err(|e| anyhow!("reading rebase state {f}: {e}"))?
+            .trim()
+            .to_string())
+    };
+    let head_name = read("head-name")?;
+    let onto = ObjectId::from_hex(read("onto")?.as_bytes())?;
+    let orig_head = ObjectId::from_hex(read("orig-head")?.as_bytes())?;
+    let stopped = read("stopped-sha")
+        .ok()
+        .and_then(|s| ObjectId::from_hex(s.as_bytes()).ok())
+        .unwrap_or_else(|| ObjectId::null(repo.object_hash()));
+    let todo = std::fs::read_to_string(dir.join("git-rebase-todo"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("pick "))
+        .filter_map(|rest| ObjectId::from_hex(rest.split_whitespace().next()?.as_bytes()).ok())
+        .collect();
+    Ok(RebaseState {
+        head_name,
+        onto,
+        orig_head,
+        todo,
+        stopped,
+    })
+}
+
+/// `git rebase --abort`: restore the worktree, index and branch to `orig-head`,
+/// re-attach `HEAD`, and drop the state directory.
+fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
+    let st = read_rebase_state(repo)?;
+    let should_interrupt = AtomicBool::new(false);
+    let old_index = repo.index_or_load_from_head()?.into_owned();
+    let orig_tree = repo.find_commit(st.orig_head)?.tree_id()?.detach();
+    // A hard restore: every tracked file (including any left with conflict markers)
+    // is overwritten from orig-head, and files the rebase added are removed. The
+    // diff-based `update_clean_worktree` cannot be used here because the index is
+    // conflicted (stage 1/2/3 entries), so it would leave markers in place.
+    restore_worktree_to_tree(repo, &old_index, orig_tree, &should_interrupt)?;
+
+    if st.head_name != "detached HEAD" {
+        let name = full_name(&st.head_name)?;
+        repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: "rebase (abort): updating HEAD".into(),
+                },
+                expected: PreviousValue::Any,
+                new: Target::Object(st.orig_head),
+            },
+            name: name.clone(),
+            deref: false,
+        })?;
+        set_head(repo, Target::Symbolic(name), "rebase (abort): returning")?;
+    } else {
+        set_head(repo, Target::Object(st.orig_head), "rebase (abort)")?;
+    }
+    let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Hard-restore the worktree and index to `tree`: overwrite every tracked file
+/// from it (discarding conflict markers and local changes) and delete files
+/// tracked in `old` but absent from `tree`. Like `reset --hard`, but starting
+/// from a possibly-conflicted index.
+fn restore_worktree_to_tree(
+    repo: &gix::Repository,
+    old: &gix::index::File,
+    tree: ObjectId,
+    should_interrupt: &AtomicBool,
+) -> Result<()> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| anyhow!("bare repository has no worktree to restore"))?
+        .to_owned();
+    let mut new_index = repo.index_from_tree(&tree)?;
+    let mut opts =
+        repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
+    opts.destination_is_initially_empty = false;
+    opts.overwrite_existing = true;
+    let odb = repo.objects.clone().into_arc()?;
+    crate::worktree::checkout_subset(
+        &mut new_index,
+        workdir.as_path(),
+        odb,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        should_interrupt,
+        opts,
+    )?;
+
+    // Remove files tracked before but not in the restored tree.
+    let new_paths: std::collections::HashSet<BString> = {
+        let backing = new_index.path_backing();
+        new_index
+            .entries()
+            .iter()
+            .map(|e| e.path_in(backing).to_owned())
+            .collect()
+    };
+    let backing = old.path_backing();
+    for e in old.entries() {
+        let path = e.path_in(backing);
+        if !new_paths.contains(&path.to_owned()) {
+            if let Some(full) = repo.workdir_path(path) {
+                let _ = std::fs::remove_file(full);
+            }
+        }
+    }
+
+    new_index.remove_tree();
+    new_index.write(Default::default())?;
+    Ok(())
+}
+
+/// `git rebase --quit`: drop the state directory and leave `HEAD` where it is.
+fn rebase_quit(repo: &gix::Repository) -> Result<ExitCode> {
+    let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git rebase --continue` / `--skip`: commit the staged resolution of the stopped
+/// commit (`--continue`) or drop it (`--skip`), then replay the remaining picks.
+fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
+    let st = read_rebase_state(repo)?;
+    let should_interrupt = AtomicBool::new(false);
+    let committer = repo
+        .committer()
+        .ok_or_else(|| anyhow!("committer identity is not configured"))??
+        .to_owned()?;
+    let mut tip = repo
+        .head_id()
+        .map_err(|_| anyhow!("HEAD does not point to a commit"))?
+        .detach();
+
+    if skip {
+        // Discard the stopped commit: reset the worktree/index back to the tip.
+        let old = repo.index_or_load_from_head()?.into_owned();
+        let tip_tree = repo.find_commit(tip)?.tree_id()?.detach();
+        update_clean_worktree(repo, &old, tip_tree, &should_interrupt)?;
+    } else {
+        // Commit the user's resolution from the current (staged) index.
+        let index = repo.index()?;
+        if index.entries().iter().any(|e| e.stage_raw() != 0) {
+            eprintln!("error: you must edit all merge conflicts and then");
+            eprintln!("mark them as resolved using git add");
+            return Ok(ExitCode::from(1));
+        }
+        let tree = tree_from_index(repo, &index)?;
+        let stopped = repo.find_commit(st.stopped)?;
+        let message: BString = stopped.message_raw()?.to_owned();
+        let author = stopped.author()?.to_owned()?;
+        let new = repo
+            .write_object(&gix::objs::Commit {
+                message: message.clone(),
+                tree,
+                author,
+                committer: committer.clone(),
+                encoding: None,
+                parents: std::iter::once(tip).collect(),
+                extra_headers: Default::default(),
+            })?
+            .detach();
+        set_head(
+            repo,
+            Target::Object(new),
+            &gix::reference::log::message("rebase (continue)", message.as_bstr(), 1).to_string(),
+        )?;
+        tip = new;
+    }
+
+    replay_picks(
+        repo,
+        tip,
+        &st.todo,
+        st.head_name,
+        st.onto,
+        st.orig_head,
+        &committer,
+        &should_interrupt,
+    )
+}
+
+/// Cherry-pick `picks` (oldest first) onto `tip` with a three-way merge each,
+/// then finish the rebase (re-point the branch, re-attach `HEAD`, drop the state
+/// directory). On a conflict it records `.git/rebase-merge` state and stops with
+/// exit 1. Shared by the initial rebase and `--continue`/`--skip`.
+#[allow(clippy::too_many_arguments)]
+fn replay_picks(
+    repo: &gix::Repository,
+    mut tip: ObjectId,
+    picks: &[ObjectId],
+    head_name: String,
+    onto: ObjectId,
+    orig_head: ObjectId,
+    committer: &gix::actor::Signature,
+    should_interrupt: &AtomicBool,
+) -> Result<ExitCode> {
+    let empty_tree = ObjectId::empty_tree(repo.object_hash());
+    let mut cur_index = repo.index_from_tree(&repo.find_commit(tip)?.tree_id()?.detach())?;
+    let total = picks.len();
+
+    for (n, oid) in picks.iter().enumerate() {
+        eprint!("Rebasing ({}/{total})\r", n + 1);
+        let commit = repo.find_commit(*oid)?;
+        let message: BString = commit.message_raw()?.to_owned();
+        let subject: BString = match message.find_byte(b'\n') {
+            Some(p) => message[..p].as_bstr().to_owned(),
+            None => message.clone(),
+        };
+        let ctree = commit.tree_id()?.detach();
+        let base_tree = match commit.parent_ids().next() {
+            Some(p) => repo.find_commit(p.detach())?.tree_id()?.detach(),
+            None => empty_tree,
+        };
+        let tip_tree = repo.find_commit(tip)?.tree_id()?.detach();
+        let short = oid.to_hex_with_len(7).to_string();
+        let other_label = format!("{short} ({subject})", subject = subject.to_str_lossy());
+        let labels = gix::merge::blob::builtin_driver::text::Labels {
+            ancestor: Some(BStr::new(b"HEAD")),
+            current: Some(BStr::new(b"HEAD")),
+            other: Some(BStr::new(other_label.as_bytes())),
+        };
+        let applied = crate::merge_apply::three_way_merge(
+            repo,
+            base_tree,
+            tip_tree,
+            ctree,
+            &cur_index,
+            labels,
+            should_interrupt,
+        )?;
+        cur_index = applied.index;
+        cur_index.write(Default::default())?;
+
+        if !applied.conflicts.is_empty() {
+            let remaining: Vec<ObjectId> = picks[n + 1..].to_vec();
+            write_rebase_state(
+                repo,
+                &RebaseState {
+                    head_name,
+                    onto,
+                    orig_head,
+                    todo: remaining,
+                    stopped: *oid,
+                },
+            )?;
+            eprintln!("error: could not apply {short}... {}", subject.to_str_lossy());
+            eprintln!("hint: Resolve all conflicts manually, mark them as resolved with");
+            eprintln!(
+                "hint: \"git add/rm <conflicted_files>\", then run \"git rebase --continue\"."
+            );
+            eprintln!("hint: You can instead skip this commit: run \"git rebase --skip\".");
+            eprintln!(
+                "hint: To abort and get back to the state before \"git rebase\", run \"git rebase --abort\"."
+            );
+            eprintln!("Could not apply {short}... {}", subject.to_str_lossy());
+            return Ok(ExitCode::from(1));
+        }
+
+        let author = commit.author()?.to_owned()?;
+        let new = repo
+            .write_object(&gix::objs::Commit {
+                message: message.clone(),
+                tree: applied.tree_id,
+                author,
+                committer: committer.clone(),
+                encoding: None,
+                parents: std::iter::once(tip).collect(),
+                extra_headers: Default::default(),
+            })?
+            .detach();
+        set_head(
+            repo,
+            Target::Object(new),
+            &gix::reference::log::message("rebase (pick)", message.as_bstr(), 1).to_string(),
+        )?;
+        tip = new;
+    }
+
+    // Finish: re-point the branch at the new tip and re-attach HEAD, then drop the
+    // state directory.
+    let label = if head_name != "detached HEAD" {
+        let name = full_name(&head_name)?;
+        let short = name.as_bstr().to_string();
+        let short = short.strip_prefix("refs/heads/").unwrap_or(&short).to_string();
+        repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: format!("rebase (finish): {} onto {onto}", name.as_bstr()).into(),
+                },
+                expected: PreviousValue::MustExistAndMatch(Target::Object(orig_head)),
+                new: Target::Object(tip),
+            },
+            name: name.clone(),
+            deref: false,
+        })?;
+        set_head(
+            repo,
+            Target::Symbolic(name),
+            &format!("rebase (finish): returning to {short}"),
+        )?;
+        short
+    } else {
+        "detached HEAD".to_string()
+    };
+    let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
+    eprintln!("Successfully rebased and updated {label}.");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Write a tree object capturing the stage-0 entries of `index`.
+fn tree_from_index(repo: &gix::Repository, index: &gix::index::File) -> Result<ObjectId> {
+    let hash = repo.object_hash();
+    let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
+    let backing = index.path_backing();
+    for entry in index.entries() {
+        if entry.stage_raw() != 0 {
+            continue;
+        }
+        let path = entry.path_in(backing);
+        let mode = entry
+            .mode
+            .to_tree_entry_mode()
+            .ok_or_else(|| anyhow!("index entry `{path}` has an unrepresentable mode"))?;
+        editor.upsert(path.split(|&b| b == b'/').map(|c| c.as_bstr()), mode.kind(), entry.id)?;
+    }
+    Ok(editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?)
+}
+
 fn set_head(repo: &gix::Repository, target: Target, message: &str) -> Result<()> {
     repo.edit_reference(RefEdit {
         change: Change::Update {

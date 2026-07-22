@@ -219,7 +219,7 @@ fn do_merge(
         return Ok(ExitCode::from(128));
     }
     if refs.len() > 1 {
-        anyhow::bail!("octopus merge (multiple refs) is not supported");
+        return do_octopus(&repo, refs, message);
     }
     let spec = refs[0];
 
@@ -391,6 +391,175 @@ fn do_merge(
         print!("{}", diffstat(&repo, head_tree, target_tree)?);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `git merge <a> <b> [<c>...]` — the octopus strategy: fold each head into the
+/// result with a three-way merge, then write one commit carrying every head as a
+/// parent. Any head that cannot merge cleanly fails the octopus (git does not
+/// resolve conflicts under octopus), leaving the conflicted state and `MERGE_HEAD`.
+fn do_octopus(repo: &gix::Repository, refs: &[&str], message: Option<String>) -> Result<ExitCode> {
+    let head = repo.head()?;
+    if head.is_unborn() {
+        anyhow::bail!("cannot merge into an unborn branch");
+    }
+    let local_id = head
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("HEAD does not point to a commit"))?
+        .detach();
+    let branch: Option<FullName> = head.referent_name().map(std::borrow::ToOwned::to_owned);
+    let name: FullName = match &branch {
+        Some(b) => b.clone(),
+        None => "HEAD"
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
+    };
+
+    // Resolve every head up front so a bad ref fails before any mutation.
+    let mut heads: Vec<(String, ObjectId)> = Vec::with_capacity(refs.len());
+    for spec in refs {
+        let id = repo.rev_parse_single(*spec)?.object()?.peel_to_commit()?.id;
+        heads.push(((*spec).to_string(), id));
+    }
+
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    if repo.is_dirty()? {
+        anyhow::bail!("worktree has uncommitted changes; refusing to merge");
+    }
+
+    let mut cur_index = repo.index_or_load_from_head()?.into_owned();
+    let mut mrt = repo.find_object(local_id)?.peel_to_tree()?.id; // merge result tree
+    // `MRC` (git's merge-result-commit list): the parents of the eventual commit.
+    // It starts as HEAD but, while still a single commit, is *replaced* by a head
+    // that fast-forwards it (so `merge a b` where main is an ancestor of `a` yields
+    // parents `[a, b]`, not `[main, a, b]`).
+    let mut mrc: Vec<ObjectId> = vec![local_id];
+    let should_interrupt = AtomicBool::new(false);
+
+    for (spec, head_id) in &heads {
+        let common = if mrc.len() == 1 {
+            repo.merge_base(mrc[0], *head_id)?.detach()
+        } else {
+            repo.merge_base(local_id, *head_id)?.detach()
+        };
+        if common == *head_id {
+            println!("Already up to date with {spec}");
+            continue;
+        }
+        let head_tree = repo.find_object(*head_id)?.peel_to_tree()?.id;
+
+        // Fast-forward: while MRC is still a single commit and it is the merge base,
+        // git advances the base line to this head rather than recording a parent.
+        if mrc.len() == 1 && common == mrc[0] {
+            update_worktree(repo, &cur_index, head_tree, &should_interrupt)?;
+            cur_index = repo.index_from_tree(&head_tree)?;
+            mrt = head_tree;
+            mrc = vec![*head_id];
+            continue;
+        }
+
+        let base_tree = repo.find_object(common)?.peel_to_tree()?.id;
+        let labels = gix::merge::blob::builtin_driver::text::Labels {
+            ancestor: Some(BStr::new(b"merged common ancestors")),
+            current: Some(BStr::new(b"HEAD")),
+            other: Some(BStr::new(spec.as_bytes())),
+        };
+        let applied = crate::merge_apply::three_way_merge(
+            repo,
+            base_tree,
+            mrt,
+            head_tree,
+            &cur_index,
+            labels,
+            &should_interrupt,
+        )?;
+        cur_index = applied.index;
+        cur_index.write(Default::default())?;
+
+        if !applied.conflicts.is_empty() {
+            // Octopus aborts on the first conflicting head, leaving the conflicted
+            // worktree/index and MERGE_HEAD listing every head, as git does.
+            let git_dir = repo.git_dir();
+            let mut merge_head = String::new();
+            for (_, h) in &heads {
+                merge_head.push_str(&format!("{h}\n"));
+            }
+            std::fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
+            std::fs::write(git_dir.join("MERGE_MODE"), b"")?;
+            set_orig_head(repo, local_id)?;
+            println!("Automatic merge failed; fix conflicts and then commit the result.");
+            return Ok(ExitCode::from(1));
+        }
+        mrt = applied.tree_id;
+        mrc.push(*head_id);
+    }
+
+    // Nothing merged: every head was already reachable.
+    if mrc.len() == 1 && mrc[0] == local_id {
+        println!("Already up to date.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    // Everything collapsed onto one line via fast-forward — a plain fast-forward,
+    // not an octopus commit.
+    if mrc.len() == 1 {
+        set_orig_head(repo, local_id)?;
+        advance(
+            repo,
+            name,
+            local_id,
+            mrc[0],
+            format!("merge {}: Fast-forward", refs.join(" ")),
+        )?;
+        println!("Fast-forward");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let parents = mrc;
+    let msg = match message {
+        Some(mut m) => {
+            if !m.ends_with('\n') {
+                m.push('\n');
+            }
+            m
+        }
+        None => octopus_message(refs),
+    };
+    let author = repo
+        .author()
+        .ok_or_else(|| anyhow::anyhow!("author identity is not configured"))??;
+    let committer = repo
+        .committer()
+        .ok_or_else(|| anyhow::anyhow!("committer identity is not configured"))??;
+    let commit = gix::objs::Commit {
+        message: msg.into(),
+        tree: mrt,
+        author: author.to_owned()?,
+        committer: committer.to_owned()?,
+        encoding: None,
+        parents: parents.into_iter().collect(),
+        extra_headers: Default::default(),
+    };
+    let new_id = repo.write_object(&commit)?.detach();
+    set_orig_head(repo, local_id)?;
+    advance(
+        repo,
+        name,
+        local_id,
+        new_id,
+        format!("merge {}: Merge made by the 'octopus' strategy.", refs.join(" ")),
+    )?;
+    println!("Merge made by the 'octopus' strategy.");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The default octopus commit subject: `Merge branches 'a', 'b' and 'c'`.
+fn octopus_message(refs: &[&str]) -> String {
+    let quoted: Vec<String> = refs.iter().map(|r| format!("'{r}'")).collect();
+    let joined = match quoted.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, init)) => format!("{} and {}", init.join(", "), last),
+        None => String::new(),
+    };
+    format!("Merge branches {joined}\n")
 }
 
 /// Move `name` from `old` to `new`, writing `reflog` as the reflog message.

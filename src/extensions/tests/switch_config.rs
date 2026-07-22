@@ -63,6 +63,43 @@ fn current_branch(repo: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+fn remote_url(repo: &Path, name: &str) -> String {
+    let out = Command::new("git")
+        .args(["remote", "get-url", name])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn checkout_default_remote_disambiguates() {
+    let (repo, home) = fixture("defaultremote");
+    // Add a second remote to the same upstream, so `feature` matches both
+    // origin/feature and upstream/feature — an ambiguous DWIM.
+    let url = remote_url(&repo, "origin");
+    git(&repo, &["remote", "add", "upstream", &url]);
+    git(&repo, &["fetch", "-q", "upstream"]);
+
+    // Without config: ambiguous, refused.
+    let out = switch(&repo, &home, &["feature"]);
+    assert!(!out.status.success(), "ambiguous DWIM must be refused");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("matched multiple"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // checkout.defaultRemote picks one of the candidates.
+    git(&repo, &["config", "checkout.defaultRemote", "upstream"]);
+    let out = switch(&repo, &home, &["feature"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(current_branch(&repo), "feature");
+    assert_eq!(config_get(&repo, "branch.feature.remote"), "upstream");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
 fn config_get(repo: &Path, key: &str) -> String {
     let out = Command::new("git")
         .args(["config", "--get", key])

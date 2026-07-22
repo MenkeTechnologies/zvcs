@@ -720,10 +720,20 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
     match matches.len() {
         0 => Ok(Dwim::None),
         1 => Ok(Dwim::One(format!("{}/{name}", matches[0]))),
-        n => Ok(Dwim::Many {
-            count: n,
-            hint_remote: matches[0].clone(),
-        }),
+        n => {
+            // checkout.defaultRemote disambiguates: if it names one of the
+            // matching remotes, DWIM to that one instead of erroring.
+            if let Some(def) = repo.config_snapshot().string("checkout.defaultRemote") {
+                let def = def.to_str_lossy().into_owned();
+                if matches.iter().any(|m| *m == def) {
+                    return Ok(Dwim::One(format!("{def}/{name}")));
+                }
+            }
+            Ok(Dwim::Many {
+                count: n,
+                hint_remote: matches[0].clone(),
+            })
+        }
     }
 }
 

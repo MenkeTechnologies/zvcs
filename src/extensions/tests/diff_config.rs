@@ -1,6 +1,7 @@
 //! `git diff` honors its config-provided defaults — `diff.context`,
-//! `diff.noPrefix`, `diff.srcPrefix`/`diff.dstPrefix` — with the CLI flags still
-//! overriding. Regression guard for these being hardcoded (context=3, `a/`/`b/`).
+//! `diff.noPrefix`, `diff.srcPrefix`/`diff.dstPrefix`, `diff.algorithm` — with the
+//! CLI flags still overriding. Regression guard for these being hardcoded
+//! (context=3, `a/`/`b/`, myers).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -53,6 +54,7 @@ fn out(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
+
 #[test]
 fn diff_context_default_and_override() {
     let (repo, home) = fixture("context");
@@ -76,6 +78,70 @@ fn diff_no_prefix_config() {
     let d = out(&diff(&repo, &home, &[]));
     assert!(d.contains("\n--- f\n"), "no a/ prefix:\n{d}");
     assert!(d.contains("\n+++ f\n"), "no b/ prefix:\n{d}");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn diff_algorithm_default_matches_flag_and_is_overridden() {
+    let (repo, home) = fixture("algo");
+    // Each valid `diff.algorithm` default must render exactly like the matching
+    // `--diff-algorithm=` flag: the config routes through the same selection.
+    for algo in ["myers", "minimal", "histogram", "default"] {
+        git(&repo, &["config", "diff.algorithm", algo]);
+        let cfg = out(&diff(&repo, &home, &[]));
+        let flag_name = if algo == "default" { "myers" } else { algo };
+        let flag = out(&diff(&repo, &home, &[&format!("--diff-algorithm={flag_name}")]));
+        assert_eq!(cfg, flag, "diff.algorithm={algo} must equal --diff-algorithm={flag_name}");
+        assert!(cfg.contains("@@ "), "diff.algorithm={algo} must still emit a patch:\n{cfg}");
+    }
+
+    // A `--diff-algorithm=` flag overrides the config default (flag wins).
+    git(&repo, &["config", "diff.algorithm", "histogram"]);
+    let overridden = out(&diff(&repo, &home, &["--diff-algorithm=myers"]));
+    git(&repo, &["config", "--unset", "diff.algorithm"]);
+    let plain_myers = out(&diff(&repo, &home, &[]));
+    assert_eq!(
+        overridden, plain_myers,
+        "--diff-algorithm=myers must override diff.algorithm=histogram"
+    );
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn diff_algorithm_invalid_value_errors() {
+    let (repo, home) = fixture("algobad");
+    git(&repo, &["config", "diff.algorithm", "bogus"]);
+    let o = diff(&repo, &home, &[]);
+    assert!(!o.status.success(), "invalid diff.algorithm must fail");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("diff algorithm \"bogus\" is not available"),
+        "stderr: {err}"
+    );
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn diff_algorithm_patience_bails_but_flag_overrides() {
+    let (repo, home) = fixture("algopat");
+    git(&repo, &["config", "diff.algorithm", "patience"]);
+
+    // `patience` is git-valid but has no imara-diff equivalent, so an unqualified
+    // run bails rather than faking myers/histogram output. This also proves the
+    // config is actually consumed by the algorithm selection.
+    let o = diff(&repo, &home, &[]);
+    assert!(!o.status.success(), "patience default must bail");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("diff algorithm \"patience\" is not available"),
+        "stderr: {err}"
+    );
+
+    // An overriding `--diff-algorithm=` flag is honored, matching git's precedence
+    // (git renders patience; a flag makes both agree).
+    let ok = diff(&repo, &home, &["--diff-algorithm=histogram"]);
+    assert!(ok.status.success(), "flag must override patience config");
+    assert!(out(&ok).contains("@@ "), "override must emit a patch");
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 

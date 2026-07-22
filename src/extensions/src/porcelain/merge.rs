@@ -71,6 +71,8 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
 
     // git reads merge.ff and merge.stat as the defaults; the CLI flags below
     // override them (`--ff`/`--no-ff`/`--ff-only`, `--stat`/`--no-stat`).
+    // merge.suppressDest is consulted later, in `dest_suppressed`, when the
+    // default merge message's title is composed.
     if let Ok(repo) = gix::discover(".") {
         let snap = repo.config_snapshot();
         match snap.string("merge.ff").map(|v| v.to_string().to_ascii_lowercase()).as_deref() {
@@ -369,8 +371,9 @@ fn set_orig_head(repo: &gix::Repository, id: ObjectId) -> Result<()> {
 ///
 /// Port of `merge_name()` (builtin/merge.c) feeding `fmt_merge_msg_title()`
 /// (fmt-merge-msg.c): the ref is described by the category it resolved into,
-/// and ` into <branch>` is appended unless the current branch is one of the
-/// default-suppressed `main`/`master`.
+/// and ` into <branch>` is appended unless the current branch matches a
+/// `merge.suppressDest` glob (defaulting to `main`/`master`), see
+/// `dest_suppressed`.
 fn merge_message(
     repo: &gix::Repository,
     spec: &str,
@@ -412,11 +415,52 @@ fn merge_message(
         None => "HEAD".to_string(),
     };
     let mut out = format!("Merge {described}");
-    if current != "main" && current != "master" {
+    if !dest_suppressed(repo, &current) {
         out.push_str(&format!(" into {current}"));
     }
     out.push('\n');
     Ok(out)
+}
+
+/// Port of `dest_suppressed()` and the default seeding in `fmt_merge_msg()`
+/// (fmt-merge-msg.c): the merge title's ` into <branch>` is dropped when the
+/// current branch matches any glob in `merge.suppressDest`, tested with
+/// `wildmatch(pattern, branch, WM_PATHNAME)` — case-sensitive, and `*` does not
+/// cross a `/`. The variable is multi-valued and accumulates in config order;
+/// an empty value clears whatever was gathered so far. When the key is never
+/// set at all, the list defaults to `main` then `master`.
+fn dest_suppressed(repo: &gix::Repository, branch: &str) -> bool {
+    let patterns = suppress_dest_patterns(repo);
+    let value = branch.as_bytes().as_bstr();
+    patterns
+        .iter()
+        .any(|p| gix::glob::wildmatch(p.as_bstr(), value, gix::glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL))
+}
+
+/// The accumulated `merge.suppressDest` pattern list, resolving git's
+/// empty-value-clears rule and its `main`/`master` default when unset.
+///
+/// Fidelity gap: a *valueless* `merge.suppressDest` (no `=`) makes git die with
+/// `config_error_nonbool` at config-parse time; gix reports it as an empty
+/// value, indistinguishable from `suppressDest=`, so here it clears the list
+/// rather than aborting. This is a config-subsystem limitation shared across
+/// keys, not specific to the merge logic.
+fn suppress_dest_patterns(repo: &gix::Repository) -> Vec<BString> {
+    match repo.config_snapshot().raw_values("merge.suppressDest") {
+        Ok(values) => {
+            let mut list: Vec<BString> = Vec::new();
+            for v in values {
+                if v.is_empty() {
+                    list.clear();
+                } else {
+                    list.push(v);
+                }
+            }
+            list
+        }
+        // `suppress_dest_pattern_seen` never set → the built-in default.
+        Err(_) => vec![BString::from("main"), BString::from("master")],
+    }
 }
 
 /// `merge_name()`'s second attempt: `<name>^^^` or `<name>~<number>` naming a

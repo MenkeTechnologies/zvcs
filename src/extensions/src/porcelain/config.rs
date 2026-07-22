@@ -455,6 +455,25 @@ fn set_with_value_pattern(
 
 /// Write `file` to `path` atomically: serialize to a sibling temp file, then
 /// rename over the target so a crash never leaves a half-written config.
+/// Set `branch.<branch>.remote` and `branch.<branch>.merge` in the local config,
+/// as `git push --set-upstream` / `git branch --set-upstream-to` do. Reuses the
+/// same lock + atomic-write path as `git config`.
+pub(crate) fn set_branch_upstream(
+    repo: &gix::Repository,
+    branch: &str,
+    remote: &str,
+    merge_ref: &str,
+) -> Result<()> {
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let path = repo.common_dir().join("config");
+    let mut file = ConfigFile::from_path_no_includes(path.clone(), Source::Local)?;
+    let sub = gix::bstr::BStr::new(branch);
+    file.set_raw_value_by("branch", Some(sub), "remote", remote)?;
+    file.set_raw_value_by("branch", Some(sub), "merge", merge_ref)?;
+    persist(&path, &file)?;
+    Ok(())
+}
+
 fn persist(path: &std::path::Path, file: &ConfigFile) -> Result<()> {
     let bytes = file.to_bstring();
     let tmp = path.with_extension("zvcs-tmp");

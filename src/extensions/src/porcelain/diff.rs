@@ -186,6 +186,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut diff_filter: Option<Vec<u8>> = None;
     let mut algorithm: Option<gix::diff::blob::Algorithm> = None;
     let mut abbrev: usize = 7;
+    // `diff.algorithm` default, applied after argument parsing so a `--minimal` /
+    // `--histogram` / `--diff-algorithm=` flag always wins (git precedence).
+    let mut config_algorithm: Option<ConfigAlgorithm> = None;
 
     // Revisions and pathspecs are classified in a single left-to-right pass, so an
     // invalid option value, an ambiguous positional, and any "too many operands"
@@ -213,6 +216,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             if let Some(p) = snap.string("diff.dstPrefix") {
                 dst_prefix = p.into();
             }
+        }
+        // `diff.algorithm` names the default algorithm. git validates it while
+        // loading config — an unknown name is a hard error (exit 128) even when a
+        // CLI flag would override it — so classify it eagerly here. `patience` is a
+        // valid name git renders, but imara-diff has no patience variant, so it is
+        // remembered as unrenderable and only rejected if actually used below.
+        if let Some(name) = snap.string("diff.algorithm") {
+            config_algorithm = Some(parse_config_algorithm(name.as_ref())?);
         }
     }
 
@@ -373,6 +384,21 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         }
     }
     paths.extend(trailing_paths);
+
+    // Apply the `diff.algorithm` default only when no `--minimal`/`--histogram`/
+    // `--diff-algorithm=` flag set the algorithm on the command line (git's
+    // precedence). A `patience` default is git-valid but has no imara-diff
+    // equivalent, so it bails exactly like `--diff-algorithm=patience` — but only
+    // here, where it would actually be used, so an overriding flag is honored.
+    if algorithm.is_none() {
+        match config_algorithm {
+            Some(ConfigAlgorithm::Use(a)) => algorithm = Some(a),
+            Some(ConfigAlgorithm::Patience) => {
+                bail!("diff algorithm {:?} is not available", "patience")
+            }
+            None => {}
+        }
+    }
 
     // `diff_setup_done()`: --name-only / --name-status / -s are mutually exclusive
     // and, when present, suppress every other output format.
@@ -925,6 +951,29 @@ fn tree_id_for(repo: &gix::Repository, spec: Option<&String>) -> Result<ObjectId
 /// contains `..` (e.g. `../foo`). Ranges don't contain `/` and don't start with `.`.
 fn looks_like_range(tok: &str) -> bool {
     !tok.starts_with('.') && !tok.contains('/')
+}
+
+/// A validated `diff.algorithm` config value: a renderable algorithm, or the
+/// git-valid-but-unrenderable `patience`.
+enum ConfigAlgorithm {
+    Use(gix::diff::blob::Algorithm),
+    Patience,
+}
+
+/// Parse a `diff.algorithm` config value the way git's config loader does:
+/// case-insensitively, accepting `myers`/`default`, `minimal`, `histogram` and
+/// `patience`. Any other name is a hard config error (git exits 128) — rendered
+/// here as the same "not available" bail the `--diff-algorithm=` flag uses.
+fn parse_config_algorithm(name: &gix::bstr::BStr) -> Result<ConfigAlgorithm> {
+    use gix::diff::blob::Algorithm::{Histogram, Myers, MyersMinimal};
+    let lower = name.to_ascii_lowercase();
+    Ok(match lower.as_slice() {
+        b"myers" | b"default" => ConfigAlgorithm::Use(Myers),
+        b"minimal" => ConfigAlgorithm::Use(MyersMinimal),
+        b"histogram" => ConfigAlgorithm::Use(Histogram),
+        b"patience" => ConfigAlgorithm::Patience,
+        _ => bail!("diff algorithm {:?} is not available", name.to_str_lossy()),
+    })
 }
 
 /// The three outcomes of parsing a `-U`/`--unified` value, mirroring the two

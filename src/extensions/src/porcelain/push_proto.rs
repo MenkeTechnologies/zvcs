@@ -53,6 +53,10 @@ pub struct Request {
     pub new: ObjectId,
     /// Whether a non-fast-forward update is permitted.
     pub force: bool,
+    /// `--force-with-lease`: the value the remote ref is expected to hold. When
+    /// set, this is sent as the command's old-oid so the server performs a
+    /// compare-and-swap, and the local fast-forward check is skipped.
+    pub expected: Option<ObjectId>,
 }
 
 /// The server's per-ref verdict, from `report-status`.
@@ -88,6 +92,7 @@ pub fn send_pack(
     repo: &gix::Repository,
     remote: &gix::Remote<'_>,
     requests: &[Request],
+    dry_run: bool,
 ) -> Result<Outcome> {
     let null = ObjectId::null(repo.object_hash());
     let url = remote
@@ -167,25 +172,31 @@ pub fn send_pack(
     let mut wire: Vec<Wire> = Vec::new();
     let mut statuses: Vec<RefStatus> = Vec::new();
     for req in requests {
-        let old = advertised.get(&req.name).copied().unwrap_or(null);
+        // The remote's current value of the ref; `--force-with-lease` overrides
+        // the old-oid we send with the leased value so the server compare-and-swaps.
+        let remote_current = advertised.get(&req.name).copied().unwrap_or(null);
+        let old = req.expected.unwrap_or(remote_current);
+        let force = req.force || req.expected.is_some();
         let deletion = req.new == null;
 
+        let reject = |reason: &str| RefStatus {
+            name: req.name.clone(),
+            old,
+            new: req.new,
+            result: Err(reason.to_owned()),
+            forced: false,
+            up_to_date: false,
+        };
+
         if deletion && !allow_deleting_refs {
-            statuses.push(RefStatus {
-                name: req.name.clone(),
-                old,
-                new: req.new,
-                result: Err("remote does not support deleting refs".into()),
-                forced: false,
-                up_to_date: false,
-            });
+            statuses.push(reject("remote does not support deleting refs"));
             continue;
         }
-        if old == req.new {
+        if remote_current == req.new {
             // Nothing to do — git reports this ref up to date and sends no command.
             statuses.push(RefStatus {
                 name: req.name.clone(),
-                old,
+                old: remote_current,
                 new: req.new,
                 result: Ok(()),
                 forced: false,
@@ -196,37 +207,24 @@ pub fn send_pack(
 
         // Fast-forward check: unless forced or creating/deleting, the new tip must
         // be a descendant of the old one. If we do not even have the old commit
-        // locally, we cannot prove it — git rejects with "fetch first".
+        // locally, we cannot prove it — git rejects with "fetch first". A lease
+        // (`--force-with-lease`) skips this and defers to the server's CAS.
         let mut forced = false;
-        if !deletion && old != null && !req.force {
-            match is_fast_forward(repo, old, req.new) {
+        if !deletion && remote_current != null && !force {
+            match is_fast_forward(repo, remote_current, req.new) {
                 Some(true) => {}
                 Some(false) => {
-                    statuses.push(RefStatus {
-                        name: req.name.clone(),
-                        old,
-                        new: req.new,
-                        result: Err("non-fast-forward".into()),
-                        forced: false,
-                        up_to_date: false,
-                    });
+                    statuses.push(reject("non-fast-forward"));
                     continue;
                 }
                 None => {
-                    statuses.push(RefStatus {
-                        name: req.name.clone(),
-                        old,
-                        new: req.new,
-                        result: Err("fetch first".into()),
-                        forced: false,
-                        up_to_date: false,
-                    });
+                    statuses.push(reject("fetch first"));
                     continue;
                 }
             }
-        } else if !deletion && old != null && req.force {
+        } else if !deletion && remote_current != null && force {
             // Forced past a non-descendant is flagged with a leading '+' in output.
-            forced = is_fast_forward(repo, old, req.new) == Some(false);
+            forced = is_fast_forward(repo, remote_current, req.new) == Some(false);
         }
 
         wire.push(Wire {
@@ -234,6 +232,27 @@ pub fn send_pack(
             old,
             new: req.new,
             forced,
+        });
+    }
+
+    // `--dry-run`: everything up to the wire request has run (handshake, the local
+    // fast-forward checks above), but nothing is sent. Report the surviving updates
+    // as they would land, exactly as git's dry run does.
+    if dry_run {
+        for w in &wire {
+            statuses.push(RefStatus {
+                name: w.name.clone(),
+                old: w.old,
+                new: w.new,
+                result: Ok(()),
+                forced: w.forced,
+                up_to_date: false,
+            });
+        }
+        return Ok(Outcome {
+            url,
+            statuses,
+            unpack: Ok(()),
         });
     }
 

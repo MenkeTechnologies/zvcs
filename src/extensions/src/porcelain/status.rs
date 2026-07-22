@@ -259,6 +259,24 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         if !branch_explicit && snap.boolean("status.branch") == Some(true) {
             branch_header = true;
         }
+        // `status.renames` supplies the rename-detection default when the command
+        // line carries no `--renames` / `--no-renames` / `-M`. git reads this key
+        // in `status_config` — *before* it parses the command line — and dies on a
+        // non-boolean value, so an invalid value is fatal even when a flag would
+        // otherwise override it; only the resolved value is what a flag supersedes.
+        match configured_renames(&snap) {
+            Ok(setting) => {
+                if renames.is_none() {
+                    if let Some(cfg) = setting {
+                        renames = Some(cfg);
+                    }
+                }
+            }
+            Err(bad) => {
+                eprintln!("fatal: bad boolean config value '{bad}' for 'status.renames'");
+                return Ok(ExitCode::from(128));
+            }
+        }
     }
 
     // Resolve the head into an owned description so the borrow ends before we
@@ -463,6 +481,45 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Resolve `status.renames`, git's `git_config_rename`: an explicit `copies` /
+/// `copy` (case-insensitive) enables copy detection, any other value is a
+/// boolean — truthy means rename detection, falsy disables it — and a valueless
+/// key (`[status]\n\trenames`) is git's NULL value, i.e. plain rename detection.
+///
+/// The three layers of the return value mirror the caller's `renames` field:
+/// `Ok(None)` — the key is unset, leave gitoxide's own default (which, like
+/// git's `diff.renames` default, detects renames); `Ok(Some(None))` — disabled;
+/// `Ok(Some(Some(rewrites)))` — enabled with those rewrite options. `Err(value)`
+/// is a non-boolean value, which git reports as a fatal config error (exit 128).
+fn configured_renames(
+    snap: &gix::config::Snapshot,
+) -> std::result::Result<Option<Option<gix::diff::Rewrites>>, String> {
+    use gix::bstr::ByteSlice;
+    let Some(value) = snap.string("status.renames") else {
+        // No string value: either the key is absent, or it is present but
+        // valueless — gitoxide reports the latter as boolean `true`, which git's
+        // NULL-value branch treats as plain rename detection.
+        return Ok(match snap.boolean("status.renames") {
+            Some(true) => Some(Some(gix::diff::Rewrites::default())),
+            _ => None,
+        });
+    };
+    let text = value.to_str_lossy();
+    if text.eq_ignore_ascii_case("copies") || text.eq_ignore_ascii_case("copy") {
+        return Ok(Some(Some(gix::diff::Rewrites {
+            copies: Some(gix::diff::rewrites::Copies::default()),
+            ..Default::default()
+        })));
+    }
+    // git_config_rename falls through to git_config_bool, which is exactly the
+    // `git_parse_maybe_bool` we already port for `--untracked-files`.
+    match parse_maybe_bool(&text) {
+        Some(true) => Ok(Some(Some(gix::diff::Rewrites::default()))),
+        Some(false) => Ok(Some(None)),
+        None => Err(text.into_owned()),
+    }
 }
 
 /// Resolve `status.showUntrackedFiles`, which stands in for an absent

@@ -1,7 +1,8 @@
 use anyhow::{anyhow, bail, Result};
-use std::collections::HashSet;
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::bstr::ByteSlice;
 use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
@@ -33,10 +34,17 @@ const STAT_TERM_WIDTH: usize = 80;
 ///   * `--oneline`, `--pretty=`/`--format=` with
 ///     `oneline`, `short`, `medium`, `full`, `fuller`, `raw`, `reference`, and
 ///     `format:`/`tformat:` strings (last flag wins; an invalid value is rejected
-///     exactly as git's `get_commit_format` does)
+///     exactly as git's `get_commit_format` does). User-format placeholders include
+///     `%C`/`%C(...)` colors (with `%C(auto)`), `%d`/`%D` ref decorations, and
+///     `%cr`/`%ar` relative dates, alongside the hash/tree/parent/author/committer/
+///     subject/body set
 ///   * `--abbrev-commit` / `--no-abbrev-commit`, `--parents`
 ///   * `--date=<mode>`                           → `default`/`short`/`iso`/`iso-strict`/
-///     `rfc`/`unix`/`raw` (clock/zone-relative modes surfaced terse)
+///     `rfc`/`unix`/`raw`/`relative` (the remaining zone-dependent modes `human`/`local`
+///     are surfaced terse)
+///   * `--color[=<when>]` / `--no-color`         → enable/disable the `%C` and
+///     `%C(auto)`-gated decoration colors (`always`/`never`/`auto`; auto colors when
+///     stdout is a terminal or a pager is in use)
 ///   * `--name-only`, `--name-status`, `--stat`,
 ///     `--numstat`, `--shortstat`                → per-commit diff against the first parent
 ///     (`--name-only`/`--name-status` are mutually exclusive and suppress the count
@@ -85,6 +93,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut min_parents: Option<usize> = None;
     let mut max_parents: Option<usize> = None;
     let mut date_mode = DateMode::Default;
+    let mut color = ColorWhen::Auto;
     let mut order = Order::Default;
     let mut revs: Vec<String> = Vec::new();
     let mut pathspecs: Vec<String> = Vec::new();
@@ -242,6 +251,21 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             only_merges = true;
         } else if a == "--no-merges" {
             no_merges = true;
+        } else if a == "--color" {
+            // Bare `--color` is git's `--color=always`.
+            color = ColorWhen::Always;
+        } else if a == "--no-color" {
+            color = ColorWhen::Never;
+        } else if let Some(v) = a.strip_prefix("--color=") {
+            match v {
+                "always" => color = ColorWhen::Always,
+                "never" => color = ColorWhen::Never,
+                "auto" => color = ColorWhen::Auto,
+                _ => {
+                    eprintln!("fatal: invalid color value: {v}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         } else if a == "--date-order" {
             order = Order::Date;
         } else if a == "--topo-order" {
@@ -409,6 +433,34 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // formats otherwise.
     let emit_patch = patch && !name_only && !name_status;
     let want_names = name_only || name_status || stat || numstat || shortstat;
+    // Whether `%C`/`%d` emit ANSI: git's auto rule is "stdout is a terminal, or we
+    // are paging to one" — `pager::maybe_setup` records the latter via the env flag.
+    let want_color = match color {
+        ColorWhen::Always => true,
+        ColorWhen::Never => false,
+        ColorWhen::Auto => {
+            std::io::stdout().is_terminal()
+                || matches!(
+                    std::env::var("GIT_PAGER_IN_USE").ok().as_deref(),
+                    Some("true" | "1" | "yes" | "on")
+                )
+        }
+    };
+    // `%d`/`%D` need a commit→refs map; build it only when the format asks for one
+    // so plain formats pay nothing for the ref scan.
+    let decorations = if pretty_uses_decoration(&pretty) {
+        Some(build_decorations(&repo)?)
+    } else {
+        None
+    };
+    // Relative dates (`%cr`/`%ar`, `--date=relative`) are measured against now.
+    let now = now_secs();
+
+    // git emits one terminated record per commit for any non-empty format, even
+    // when a given commit expands to nothing (e.g. `%d` on an undecorated commit).
+    // Only the genuinely empty user format (`--pretty=`, `tformat:`) emits nothing.
+    let empty_user_format = matches!(&pretty, Pretty::User(f) if f.is_empty());
+
     // `--graph` needs every commit's block up front to lay out the columns, so it
     // buffers; every other format streams commit-by-commit (see the write below).
     let mut blocks: Vec<Vec<u8>> = Vec::new();
@@ -436,12 +488,16 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             abbrev_commit,
             date_mode,
             extra,
+            want_color,
+            now,
+            decorations: decorations.as_ref(),
         };
         let mut block: Vec<u8> = Vec::new();
         render_entry(&mut block, &commit, &pretty, &ctx)?;
-        // A `tformat:` record is terminated by a newline, but an empty record
-        // (an empty user format) emits nothing at all — no stray terminator.
-        if terminator && !block.is_empty() {
+        // A `tformat:` record is terminated by a newline. git still terminates a
+        // record whose expansion happened to be empty (so `%d` prints one line per
+        // commit); only the genuinely empty user format emits no terminator.
+        if terminator && !empty_user_format {
             block.push(b'\n');
         }
 
@@ -834,6 +890,10 @@ fn get_commit_format(spec: &str) -> Result<Option<(Pretty, bool)>> {
 
 /// Reject any placeholder [`expand_format`] does not implement, so an unsupported
 /// format fails loudly instead of expanding to something plausible but wrong.
+///
+/// `%C` is always accepted: like git, an unrecognized color word after it renders
+/// literally rather than erroring, and its `(...)` argument is ordinary text the
+/// outer scan skips. `%d`/`%D` are the ref decorations.
 fn check_format(fmt: &str) -> Result<()> {
     let mut it = fmt.chars();
     while let Some(c) = it.next() {
@@ -841,14 +901,17 @@ fn check_format(fmt: &str) -> Result<()> {
             continue;
         }
         match it.next() {
-            Some('H' | 'h' | 'T' | 't' | 'P' | 'p' | 's' | 'b' | 'B' | 'f' | 'n' | '%') => {}
+            Some(
+                'H' | 'h' | 'T' | 't' | 'P' | 'p' | 's' | 'b' | 'B' | 'f' | 'n' | '%' | 'C' | 'd'
+                | 'D',
+            ) => {}
             Some('a') => match it.next() {
-                Some('n' | 'e' | 'd' | 'i' | 'I' | 't') => {}
+                Some('n' | 'e' | 'd' | 'i' | 'I' | 't' | 'r') => {}
                 Some(x) => bail!("unsupported format placeholder %a{x}"),
                 None => bail!("unsupported trailing % in format"),
             },
             Some('c') => match it.next() {
-                Some('n' | 'e' | 'd' | 'i' | 'I' | 't') => {}
+                Some('n' | 'e' | 'd' | 'i' | 'I' | 't' | 'r') => {}
                 Some(x) => bail!("unsupported format placeholder %c{x}"),
                 None => bail!("unsupported trailing % in format"),
             },
@@ -859,64 +922,468 @@ fn check_format(fmt: &str) -> Result<()> {
     Ok(())
 }
 
-/// Expand the placeholders accepted by [`check_format`] for `commit`. `date_mode`
-/// is the `--date=` setting that `%ad`/`%cd` follow.
+/// Expand the placeholders accepted by [`check_format`] for `commit`, using the
+/// render knobs in `ctx` (`--date=`, color enablement, decorations, and the clock
+/// for relative dates).
 fn expand_format(
     out: &mut Vec<u8>,
     commit: &gix::Commit<'_>,
     fmt: &str,
-    date_mode: DateMode,
+    ctx: &RenderCtx<'_>,
 ) -> Result<()> {
-    let mut it = fmt.chars();
-    while let Some(c) = it.next() {
+    let date_mode = ctx.date_mode;
+    // `%C(auto)` latches auto-coloring on for the placeholders that follow it —
+    // notably `%d`/`%D`, which stay uncolored until it appears (matching git).
+    let mut auto = false;
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
         if c != '%' {
             let mut buf = [0u8; 4];
             out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             continue;
         }
-        match it.next() {
-            Some('H') => out.extend_from_slice(commit.id().to_string().as_bytes()),
-            Some('h') => out.extend_from_slice(commit.id().shorten_or_id().to_string().as_bytes()),
-            Some('T') => out.extend_from_slice(commit.tree_id()?.to_string().as_bytes()),
-            Some('t') => {
+        let Some(&p) = chars.get(i) else { break };
+        i += 1;
+        match p {
+            // Under `%C(auto)`, git paints the commit hash magenta (`\e[35m`).
+            'H' => push_maybe_auto(out, &commit.id().to_string(), auto && ctx.want_color),
+            'h' => push_maybe_auto(
+                out,
+                &commit.id().shorten_or_id().to_string(),
+                auto && ctx.want_color,
+            ),
+            'T' => out.extend_from_slice(commit.tree_id()?.to_string().as_bytes()),
+            't' => {
                 out.extend_from_slice(commit.tree_id()?.shorten_or_id().to_string().as_bytes());
             }
-            Some('P') => write_parents(out, commit, false),
-            Some('p') => write_parents(out, commit, true),
-            Some('s') => out.extend_from_slice(&subject(commit.message_raw()?)),
-            Some('b') => out.extend_from_slice(&body(commit.message_raw()?)),
-            Some('B') => out.extend_from_slice(commit.message_raw()?),
-            Some('f') => out.extend_from_slice(&sanitized_subject(&subject(commit.message_raw()?))),
-            Some('n') => out.push(b'\n'),
-            Some('%') => out.push(b'%'),
-            Some('a') => {
+            'P' => write_parents(out, commit, false),
+            'p' => write_parents(out, commit, true),
+            's' => out.extend_from_slice(&subject(commit.message_raw()?)),
+            'b' => out.extend_from_slice(&body(commit.message_raw()?)),
+            'B' => out.extend_from_slice(commit.message_raw()?),
+            'f' => out.extend_from_slice(&sanitized_subject(&subject(commit.message_raw()?))),
+            'n' => out.push(b'\n'),
+            '%' => out.push(b'%'),
+            'C' => expand_color(out, &chars, &mut i, ctx.want_color, &mut auto),
+            'd' => expand_decoration(out, commit, ctx, auto, true),
+            'D' => expand_decoration(out, commit, ctx, auto, false),
+            'a' => {
                 let author = commit.author()?;
-                match it.next() {
+                match chars.get(i).copied() {
                     Some('n') => out.extend_from_slice(author.name),
                     Some('e') => out.extend_from_slice(author.email),
-                    Some('d') => expand_date(out, &author, date_mode)?,
-                    Some('i') => expand_date(out, &author, DateMode::Iso)?,
-                    Some('I') => expand_date(out, &author, DateMode::IsoStrict)?,
+                    Some('d') => expand_date(out, &author, date_mode, ctx.now)?,
+                    Some('i') => expand_date(out, &author, DateMode::Iso, ctx.now)?,
+                    Some('I') => expand_date(out, &author, DateMode::IsoStrict, ctx.now)?,
+                    Some('r') => expand_date(out, &author, DateMode::Relative, ctx.now)?,
                     Some('t') => write!(out, "{}", author.time()?.seconds)?,
                     _ => unreachable!("check_format rejected this already"),
                 }
+                i += 1;
             }
-            Some('c') => {
+            'c' => {
                 let committer = commit.committer()?;
-                match it.next() {
+                match chars.get(i).copied() {
                     Some('n') => out.extend_from_slice(committer.name),
                     Some('e') => out.extend_from_slice(committer.email),
-                    Some('d') => expand_date(out, &committer, date_mode)?,
-                    Some('i') => expand_date(out, &committer, DateMode::Iso)?,
-                    Some('I') => expand_date(out, &committer, DateMode::IsoStrict)?,
+                    Some('d') => expand_date(out, &committer, date_mode, ctx.now)?,
+                    Some('i') => expand_date(out, &committer, DateMode::Iso, ctx.now)?,
+                    Some('I') => expand_date(out, &committer, DateMode::IsoStrict, ctx.now)?,
+                    Some('r') => expand_date(out, &committer, DateMode::Relative, ctx.now)?,
                     Some('t') => write!(out, "{}", committer.time()?.seconds)?,
                     _ => unreachable!("check_format rejected this already"),
                 }
+                i += 1;
             }
             _ => unreachable!("check_format rejected this already"),
         }
     }
     Ok(())
+}
+
+/// Expand a `%C…` color placeholder starting just past the `C` (index `i` points
+/// at the first following char). Advances `i` over whatever the placeholder
+/// consumes. Recognizes git's `%Cred`/`%Cgreen`/`%Cblue`/`%Creset` shortcuts and
+/// the general `%C(<spec>)` form; anything else leaves `%C` rendered literally.
+fn expand_color(out: &mut Vec<u8>, chars: &[char], i: &mut usize, want_color: bool, auto: &mut bool) {
+    // git suppresses the `%C(auto)` reset when nothing has been emitted yet for
+    // this commit's format, so record that before appending anything.
+    let out_empty = out.is_empty();
+    let rest: String = chars[*i..].iter().collect();
+    // `%C(<spec>)`
+    if rest.starts_with('(') {
+        if let Some(close) = rest.find(')') {
+            let spec = &rest[1..close];
+            out.extend_from_slice(parse_color_spec(spec, want_color, auto, out_empty).as_bytes());
+            *i += close + 1; // consume through ')'
+            return;
+        }
+        // No closing paren: git prints the rest verbatim. Fall through to literal.
+    }
+    // Shortcuts.
+    for (name, ansi) in [
+        ("red", "\x1b[31m"),
+        ("green", "\x1b[32m"),
+        ("blue", "\x1b[34m"),
+        ("reset", "\x1b[m"),
+    ] {
+        if rest.starts_with(name) {
+            if want_color {
+                out.extend_from_slice(ansi.as_bytes());
+            }
+            *i += name.len();
+            return;
+        }
+    }
+    // Unrecognized: git renders the `%C` literally and continues.
+    out.extend_from_slice(b"%C");
+}
+
+/// Parse a `%C(<spec>)` color specification into an ANSI escape (empty when color
+/// is disabled). Handles `reset`, `auto`/`auto,<colors>` (which also latches the
+/// auto-color flag on), attribute words (`bold`, `dim`, `ul`, …), and up to two
+/// color names (foreground then background).
+fn parse_color_spec(spec: &str, want_color: bool, auto: &mut bool, out_empty: bool) -> String {
+    let spec = spec.trim();
+    let colors = if let Some(rest) = spec.strip_prefix("auto") {
+        // `%C(auto)` alone enables auto-coloring and emits a reset — but git omits
+        // that reset at the very start of a commit's output. `%C(auto,<colors>)`
+        // additionally applies those colors.
+        *auto = true;
+        let rest = rest.strip_prefix(',').unwrap_or(rest).trim();
+        if rest.is_empty() {
+            return if want_color && !out_empty {
+                "\x1b[m".to_string()
+            } else {
+                String::new()
+            };
+        }
+        rest
+    } else {
+        spec
+    };
+    if !want_color {
+        return String::new();
+    }
+    if colors == "reset" {
+        return "\x1b[m".to_string();
+    }
+    let mut codes: Vec<String> = Vec::new();
+    let mut foreground = true;
+    for tok in colors.split_whitespace() {
+        let attr = match tok {
+            "bold" => Some("1"),
+            "dim" => Some("2"),
+            "italic" => Some("3"),
+            "ul" | "underline" => Some("4"),
+            "blink" => Some("5"),
+            "reverse" => Some("7"),
+            "strike" => Some("9"),
+            "nobold" | "no-bold" => Some("22"),
+            _ => None,
+        };
+        if let Some(a) = attr {
+            codes.push(a.to_string());
+        } else if let Some(base) = color_base(tok) {
+            codes.push((if foreground { base } else { base + 10 }).to_string());
+            foreground = false;
+        }
+    }
+    if codes.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[{}m", codes.join(";"))
+    }
+}
+
+/// Emit `text`, painted magenta when `colored` (git's `%C(auto)` color for the
+/// commit hash `%h`/`%H`).
+fn push_maybe_auto(out: &mut Vec<u8>, text: &str, colored: bool) {
+    if colored {
+        out.extend_from_slice(b"\x1b[35m");
+        out.extend_from_slice(text.as_bytes());
+        out.extend_from_slice(b"\x1b[m");
+    } else {
+        out.extend_from_slice(text.as_bytes());
+    }
+}
+
+/// Map a color name to its SGR foreground base code (background is `+10`).
+fn color_base(name: &str) -> Option<u8> {
+    Some(match name {
+        "black" => 30,
+        "red" => 31,
+        "green" => 32,
+        "yellow" => 33,
+        "blue" => 34,
+        "magenta" => 35,
+        "cyan" => 36,
+        "white" => 37,
+        "default" | "normal" => 39,
+        _ => return None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Decorations (%d / %D)
+// ---------------------------------------------------------------------------
+
+/// The kinds of ref a commit can be decorated with, in git's color scheme.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecoKind {
+    Tag,
+    LocalBranch,
+    RemoteBranch,
+}
+
+/// One ref pointing at a commit: `origin/main`, `v1.0`, `main`, …
+struct Deco {
+    kind: DecoKind,
+    name: String,
+}
+
+/// The ref→commit map plus HEAD state needed to render `%d`/`%D`.
+struct Decorations {
+    /// Commit oid → the branch/tag/remote refs pointing at it (annotated tags
+    /// peeled through to their commit).
+    map: HashMap<ObjectId, Vec<Deco>>,
+    /// The commit HEAD resolves to (peeled), or `None` when HEAD is unborn.
+    head_oid: Option<ObjectId>,
+    /// The branch HEAD symbolically points to, for the `HEAD -> <branch>` form.
+    head_branch: Option<String>,
+}
+
+/// Does this format use a decoration placeholder, so the ref map is worth
+/// building? `%%d` (an escaped percent then a literal `d`) does not count.
+fn pretty_uses_decoration(pretty: &Pretty) -> bool {
+    let Pretty::User(fmt) = pretty else {
+        return false;
+    };
+    let mut it = fmt.chars();
+    while let Some(c) = it.next() {
+        if c == '%' && matches!(it.next(), Some('d' | 'D')) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build the commit→refs decoration map: every branch, remote-tracking branch,
+/// and tag (peeled to its commit), plus where HEAD points.
+fn build_decorations(repo: &gix::Repository) -> Result<Decorations> {
+    let mut map: HashMap<ObjectId, Vec<Deco>> = HashMap::new();
+    for r in repo.references()?.all()? {
+        let r = r.map_err(|e| anyhow!("{e}"))?;
+        let Ok(full) = r.name().as_bstr().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let kind_name = if let Some(n) = full.strip_prefix("refs/heads/") {
+            (DecoKind::LocalBranch, n.to_string())
+        } else if let Some(n) = full.strip_prefix("refs/remotes/") {
+            (DecoKind::RemoteBranch, n.to_string())
+        } else if let Some(n) = full.strip_prefix("refs/tags/") {
+            (DecoKind::Tag, n.to_string())
+        } else {
+            // HEAD, refs/stash, refs/notes/* and friends aren't shown by `%d`.
+            continue;
+        };
+        // Peel through annotated tags so a tag ref decorates its target commit.
+        let Ok(id) = r.into_fully_peeled_id() else {
+            continue;
+        };
+        map.entry(id.detach()).or_default().push(Deco {
+            kind: kind_name.0,
+            name: kind_name.1,
+        });
+    }
+
+    let mut head_oid = None;
+    let mut head_branch = None;
+    if let Ok(head) = repo.head() {
+        if let Some(name) = head.referent_name() {
+            if let Ok(full) = name.as_bstr().to_str() {
+                if let Some(b) = full.strip_prefix("refs/heads/") {
+                    head_branch = Some(b.to_string());
+                }
+            }
+        }
+        head_oid = head.id().map(|id| id.detach());
+    }
+
+    Ok(Decorations {
+        map,
+        head_oid,
+        head_branch,
+    })
+}
+
+/// Expand `%d` (`wrap` true: ` (…)`) or `%D` (`wrap` false: bare) for `commit`.
+/// Colored only when `auto` (set by a preceding `%C(auto)`) and color is enabled,
+/// matching git, whose decorations stay plain until `%C(auto)` appears.
+fn expand_decoration(
+    out: &mut Vec<u8>,
+    commit: &gix::Commit<'_>,
+    ctx: &RenderCtx<'_>,
+    auto: bool,
+    wrap: bool,
+) {
+    let Some(decos) = ctx.decorations else {
+        return;
+    };
+    let id = commit.id().detach();
+    let head_here = decos.head_oid == Some(id);
+    let refs_here = decos.map.get(&id);
+    if !head_here && refs_here.map_or(true, |v| v.is_empty()) {
+        return;
+    }
+
+    let color_on = auto && ctx.want_color;
+    const RESET: &str = "\x1b[m";
+    let paint = |text: &str, code: &str| -> String {
+        if color_on {
+            format!("{code}{text}{RESET}")
+        } else {
+            text.to_string()
+        }
+    };
+    // git colors: HEAD bold cyan, local branch bold green, remote bold red, tag
+    // bold yellow, all punctuation plain magenta.
+    let punct = |text: &str| paint(text, "\x1b[35m");
+
+    // The branch HEAD points to is folded into `HEAD -> <branch>`, so it is not
+    // also listed on its own.
+    let head_branch = if head_here { decos.head_branch.as_deref() } else { None };
+
+    let mut entries: Vec<String> = Vec::new();
+    if head_here {
+        match head_branch {
+            Some(b) => {
+                entries.push(format!(
+                    "{}{}{}",
+                    paint("HEAD", "\x1b[1;36m"),
+                    punct(" -> "),
+                    paint(b, "\x1b[1;32m")
+                ));
+            }
+            None => entries.push(paint("HEAD", "\x1b[1;36m")),
+        }
+    }
+
+    if let Some(refs) = refs_here {
+        // git's display order: local branches, then tags, then remote branches;
+        // remote `*/HEAD` symrefs sort after real remote branches.
+        let mut locals: Vec<&Deco> = refs
+            .iter()
+            .filter(|d| d.kind == DecoKind::LocalBranch && Some(d.name.as_str()) != head_branch)
+            .collect();
+        let mut tags: Vec<&Deco> = refs.iter().filter(|d| d.kind == DecoKind::Tag).collect();
+        let mut remotes: Vec<&Deco> =
+            refs.iter().filter(|d| d.kind == DecoKind::RemoteBranch).collect();
+        locals.sort_by(|a, b| a.name.cmp(&b.name));
+        tags.sort_by(|a, b| a.name.cmp(&b.name));
+        remotes.sort_by(|a, b| {
+            (a.name.ends_with("/HEAD"), &a.name).cmp(&(b.name.ends_with("/HEAD"), &b.name))
+        });
+        for d in locals {
+            entries.push(paint(&d.name, "\x1b[1;32m"));
+        }
+        for d in tags {
+            // git colors the `tag: ` prefix and the tag name as two separate spans
+            // (`\e[1;33mtag: \e[m\e[1;33m<name>\e[m`), both bold yellow.
+            entries.push(format!(
+                "{}{}",
+                paint("tag: ", "\x1b[1;33m"),
+                paint(&d.name, "\x1b[1;33m")
+            ));
+        }
+        for d in remotes {
+            entries.push(paint(&d.name, "\x1b[1;31m"));
+        }
+    }
+
+    if entries.is_empty() {
+        return;
+    }
+
+    // `%d` wraps in ` (…)`; `%D` emits the bare, comma-separated list.
+    if wrap {
+        out.extend_from_slice(punct(" (").as_bytes());
+    }
+    for (i, e) in entries.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(punct(", ").as_bytes());
+        }
+        out.extend_from_slice(e.as_bytes());
+    }
+    if wrap {
+        out.extend_from_slice(punct(")").as_bytes());
+    }
+}
+
+/// Current time in epoch seconds, for relative dates.
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// git's `show_date_relative`: render `then` as "N units ago" relative to `now`,
+/// with the same unit thresholds and rounding.
+fn format_relative(then: i64, now: i64) -> String {
+    if now < then {
+        return "in the future".to_string();
+    }
+    let mut diff = (now - then) as u64;
+    if diff < 90 {
+        return unit_ago(diff, "second");
+    }
+    diff = (diff + 30) / 60; // minutes
+    if diff < 90 {
+        return unit_ago(diff, "minute");
+    }
+    diff = (diff + 30) / 60; // hours
+    if diff < 36 {
+        return unit_ago(diff, "hour");
+    }
+    diff = (diff + 12) / 24; // days
+    if diff < 14 {
+        return unit_ago(diff, "day");
+    }
+    if diff < 70 {
+        return unit_ago((diff + 3) / 7, "week");
+    }
+    if diff < 365 {
+        return unit_ago((diff + 15) / 30, "month");
+    }
+    // Years and months for the first ~5 years, then years alone.
+    if diff < 1825 {
+        let totalmonths = diff * 12 * 10 / 365;
+        let years = totalmonths / 120;
+        let months = (totalmonths % 120) / 10;
+        if months > 0 {
+            return format!("{}, {} ago", unit(years, "year"), unit(months, "month"));
+        }
+        return unit_ago(years, "year");
+    }
+    unit_ago((diff + 183) / 365, "year")
+}
+
+/// `"N unit ago"` / `"N units ago"` with git's singular/plural rule.
+fn unit_ago(n: u64, name: &str) -> String {
+    format!("{} ago", unit(n, name))
+}
+
+/// `"1 unit"` or `"N units"`.
+fn unit(n: u64, name: &str) -> String {
+    if n == 1 {
+        format!("1 {name}")
+    } else {
+        format!("{n} {name}s")
+    }
 }
 
 /// Write a signature's timestamp in `mode`, the shared body of `%ad`/`%cd` and
@@ -925,10 +1392,20 @@ fn expand_date(
     out: &mut Vec<u8>,
     sig: &gix::actor::SignatureRef<'_>,
     mode: DateMode,
+    now: i64,
 ) -> Result<()> {
     let t = sig.time()?;
-    out.extend_from_slice(format_date(t.seconds, t.offset, mode).as_bytes());
+    out.extend_from_slice(fmt_time(t.seconds, t.offset, mode, now).as_bytes());
     Ok(())
+}
+
+/// Format a timestamp, routing the clock-relative `relative` mode (which needs
+/// `now`) to [`format_relative`] and everything else to [`format_date`].
+fn fmt_time(seconds: i64, offset: i32, mode: DateMode, now: i64) -> String {
+    match mode {
+        DateMode::Relative => format_relative(seconds, now),
+        other => format_date(seconds, offset, other),
+    }
 }
 
 /// git's `%b`: the message body — everything after the blank line that ends the
@@ -1013,7 +1490,7 @@ fn subject(msg: &[u8]) -> Vec<u8> {
 }
 
 /// The per-commit rendering knobs threaded down from [`log`].
-struct RenderCtx {
+struct RenderCtx<'a> {
     /// `--abbrev-commit`: shorten the commit id on the header/oneline.
     abbrev_commit: bool,
     /// `--date=`: the format `%ad`/`%cd` and the `Date`/`*Date` lines follow.
@@ -1021,6 +1498,14 @@ struct RenderCtx {
     /// `--parents`: the commit's own parent ids, decorating the header/oneline.
     /// Empty when the flag is off. Full-length ids unless `abbrev_commit`.
     extra: Vec<u8>,
+    /// Whether `%C`/`%C(...)` color placeholders and `%C(auto)`-gated decoration
+    /// emit ANSI escapes (git's `want_color`).
+    want_color: bool,
+    /// Current time in epoch seconds, for relative dates (`%cr`/`%ar`).
+    now: i64,
+    /// Commit→refs map plus HEAD info for `%d`/`%D`; `None` when the format has no
+    /// decoration placeholder.
+    decorations: Option<&'a Decorations>,
 }
 
 /// Render one commit's header in the selected format. Built-in formats end with
@@ -1030,7 +1515,7 @@ fn render_entry(
     out: &mut Vec<u8>,
     commit: &gix::Commit<'_>,
     pretty: &Pretty,
-    ctx: &RenderCtx,
+    ctx: &RenderCtx<'_>,
 ) -> Result<()> {
     let id = if ctx.abbrev_commit {
         commit.id().shorten_or_id().to_string()
@@ -1057,10 +1542,10 @@ fn render_entry(
             out.extend_from_slice(b" (");
             out.extend_from_slice(&subject(commit.message_raw()?));
             out.extend_from_slice(b", ");
-            out.extend_from_slice(format_date(t.seconds, t.offset, date_mode).as_bytes());
+            out.extend_from_slice(fmt_time(t.seconds, t.offset, date_mode, ctx.now).as_bytes());
             out.push(b')');
         }
-        Pretty::User(fmt) => expand_format(out, commit, fmt, ctx.date_mode)?,
+        Pretty::User(fmt) => expand_format(out, commit, fmt, ctx)?,
         Pretty::Raw => {
             let author = commit.author()?;
             let committer = commit.committer()?;
@@ -1105,13 +1590,13 @@ fn render_entry(
                     writeln!(
                         out,
                         "AuthorDate: {}",
-                        format_date(at.seconds, at.offset, ctx.date_mode)
+                        fmt_time(at.seconds, at.offset, ctx.date_mode, ctx.now)
                     )?;
                     write_person(out, b"Commit:     ", &committer);
                     writeln!(
                         out,
                         "CommitDate: {}",
-                        format_date(ct.seconds, ct.offset, ctx.date_mode)
+                        fmt_time(ct.seconds, ct.offset, ctx.date_mode, ctx.now)
                     )?;
                 }
                 Pretty::Full => {
@@ -1127,7 +1612,7 @@ fn render_entry(
                         writeln!(
                             out,
                             "Date:   {}",
-                            format_date(time.seconds, time.offset, ctx.date_mode)
+                            fmt_time(time.seconds, time.offset, ctx.date_mode, ctx.now)
                         )?;
                     }
                 }
@@ -2036,9 +2521,9 @@ fn pad_to(line: &mut Vec<u8>, width: usize) {
 // Dates
 // ---------------------------------------------------------------------------
 
-/// The `--date=` output modes this port renders byte-for-byte. Modes that depend
-/// on the wall clock or the process timezone (`relative`, `human`, `local`) are
-/// rejected rather than faked.
+/// The `--date=` output modes this port renders byte-for-byte, plus `relative`,
+/// which is measured against the current wall clock. The remaining process-time /
+/// zone-dependent modes (`human`, `local`) are still rejected rather than faked.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DateMode {
     /// git's `DATE_NORMAL`: `Www Mmm D HH:MM:SS YYYY +ZZZZ`.
@@ -2055,6 +2540,17 @@ enum DateMode {
     Unix,
     /// `raw`: `<seconds> +ZZZZ`.
     Raw,
+    /// `relative`: `N <unit> ago`, measured against the current time.
+    Relative,
+}
+
+/// `--color=<when>` (and `--color`/`--no-color`): whether `%C`/`%d` emit ANSI.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColorWhen {
+    Always,
+    Never,
+    /// Color when stdout is a terminal (or we are paging to one).
+    Auto,
 }
 
 /// Map a `--date=` value to a [`DateMode`]. `None` for a value git accepts but
@@ -2068,6 +2564,7 @@ fn parse_date_mode(spec: &str) -> Option<DateMode> {
         "rfc" | "rfc2822" => DateMode::Rfc,
         "unix" => DateMode::Unix,
         "raw" => DateMode::Raw,
+        "relative" => DateMode::Relative,
         _ => return None,
     })
 }
@@ -2081,6 +2578,9 @@ const MONTHS: [&str; 12] = [
 fn format_date(seconds: i64, offset: i32, mode: DateMode) -> String {
     match mode {
         DateMode::Default => format_git_date(seconds, offset),
+        // Relative dates need the current time; callers route them through
+        // `fmt_time`, but keep this arm self-contained rather than unreachable.
+        DateMode::Relative => format_relative(seconds, now_secs()),
         DateMode::Unix => format!("{seconds}"),
         DateMode::Raw => {
             let (sign, off) = if offset < 0 { ('-', -offset) } else { ('+', offset) };

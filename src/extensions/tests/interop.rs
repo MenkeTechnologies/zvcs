@@ -136,3 +136,79 @@ fn zvcs_zbump_pointer_matches_stock_git() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Run `bin` with `args`, feeding `input` on stdin, and return the raw output.
+/// Batch cat-file emits NUL-free text for these fixtures, but we compare bytes
+/// so any divergence (a stray newline, a wrong size) is caught exactly.
+fn run_stdin(bin: &str, dir: &Path, args: &[&str], input: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    let mut child = Command::new(bin)
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "zvcs-test")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "zvcs-test")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {bin} {args:?}: {e}"));
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input)
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// zvcs `cat-file` batch modes must be byte-identical to stock git: the
+/// `--batch-check` info lines, the `--batch` info+contents stream (including the
+/// `missing` line for an unknown name), and the sorted `--batch-all-objects`
+/// enumeration.
+#[test]
+fn zvcs_cat_file_batch_matches_stock_git() {
+    let Some(git) = stock_git() else {
+        eprintln!("no stock git found — skipping interop test");
+        return;
+    };
+
+    let repo = tmp("catfile-batch");
+    ok(&git, &repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), b"hello world\n").unwrap();
+    std::fs::write(repo.join("b.txt"), vec![b'x'; 5000]).unwrap();
+    ok(&git, &repo, &["add", "a.txt", "b.txt"]);
+    ok(&git, &repo, &["commit", "-q", "-m", "c0"]);
+
+    let stdin = b"HEAD\nHEAD:a.txt\nHEAD^{tree}\ndeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n";
+
+    for args in [
+        &["cat-file", "--batch-check"][..],
+        &["cat-file", "--batch"][..],
+        &["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize) %(rest)"][..],
+    ] {
+        let g = run_stdin(&git, &repo, args, stdin);
+        let z = run_stdin(BIN, &repo, args, stdin);
+        assert!(g.status.success(), "stock git {args:?} failed");
+        assert_eq!(
+            z.stdout, g.stdout,
+            "cat-file {args:?} stdout must match stock git\nzvcs: {:?}\ngit:  {:?}",
+            String::from_utf8_lossy(&z.stdout),
+            String::from_utf8_lossy(&g.stdout),
+        );
+    }
+
+    // --batch-all-objects is sorted+unique in both; the whole stream must agree.
+    let all_args = &["cat-file", "--batch-all-objects", "--batch-check"][..];
+    let g = run_stdin(&git, &repo, all_args, b"");
+    let z = run_stdin(BIN, &repo, all_args, b"");
+    assert_eq!(
+        z.stdout, g.stdout,
+        "cat-file --batch-all-objects --batch-check must match stock git\nzvcs: {:?}\ngit:  {:?}",
+        String::from_utf8_lossy(&z.stdout),
+        String::from_utf8_lossy(&g.stdout),
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}

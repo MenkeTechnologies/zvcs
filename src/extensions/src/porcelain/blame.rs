@@ -76,16 +76,26 @@ const NOT_COMMITTED_MAIL: &[u8] = b"not.committed.yet";
 /// filename column appears exactly when git would show it. Boundary commits
 /// (roots) are prefixed with `^` as git does.
 ///
+/// Also implemented: `-b`, `--root`, `-t`, `-c` (annotate-compat), `-l`,
+/// `--contents <file>` (and `--contents -` from stdin), `--diff-algorithm`, and
+/// `--date=relative`.
+///
 /// Flags that are not implemented (`--incremental`, `-M`/`-C` line-move
-/// detection, `--reverse`, `-w`, `-b`, `--root`, `-t`, `-c`, `--contents`,
-/// `--ignore-rev`, regex/function `-L` forms, …) are rejected with a terse
-/// message rather than emitting wrong output.
+/// detection, `--reverse`, `-w`, `--ignore-rev`, `--ignore-revs-file`, `-S`,
+/// regex/function `-L` forms, `--date=human`, the `-local` date variants, …)
+/// are rejected with a terse message rather than emitting wrong output.
 pub fn blame(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
     // git reads blame.showEmail as the default for `-e`/`--show-email`, still
     // overridable on the command line (including `--no-show-email`).
     let show_email_default = repo.config_snapshot().boolean("blame.showEmail") == Some(true);
+
+    // git reads blame.showRoot / blame.blankBoundary as the defaults for `--root`
+    // and `-b`, still overridable on the command line.
+    let show_root_default = repo.config_snapshot().boolean("blame.showRoot") == Some(true);
+    let blank_boundary_default =
+        repo.config_snapshot().boolean("blame.blankBoundary") == Some(true);
 
     // git reads blame.date as the default date mode for the human-format
     // timestamp column, still overridable by `--date=<mode>`. git validates the
@@ -99,7 +109,12 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         None => DateMode::Iso8601,
     };
 
-    let mut opts = Options::parse(args, show_email_default)?;
+    let mut opts = Options::parse(
+        args,
+        show_email_default,
+        show_root_default,
+        blank_boundary_default,
+    )?;
 
     // `--date=<mode>` overrides blame.date; git validates it the same way.
     opts.date_mode = match opts.date_arg.take() {
@@ -109,6 +124,12 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         },
         None => date_default,
     };
+    // `-t` (OUTPUT_RAW_TIMESTAMP) makes git's `format_time` ignore the date mode
+    // and print the raw `<seconds> <tz>`. Modelling it as the raw mode reproduces
+    // that byte-for-byte, including the fixed column width.
+    if opts.raw_timestamp {
+        opts.date_mode = DateMode::Raw;
+    }
 
     // Split the positional arguments into a revision and a single path following
     // git blame's DWIM grammar, then resolve the revision. This may short-circuit
@@ -120,11 +141,13 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         Targets::Resolved => {}
     }
 
-    // Resolve the suspect commit (default HEAD). `head_id` is only required for
-    // the working-tree overlay, so an unborn HEAD stays tolerable as long as an
-    // explicit revision was given.
+    // Resolve the suspect commit (default HEAD). The overlay (working tree or
+    // `--contents`) is layered on top of the suspect, so `head_id` — the commit a
+    // not-yet-committed line points back to via the porcelain `previous` field —
+    // is the suspect itself. An unborn HEAD stays tolerable as long as an explicit
+    // revision was given.
     let (suspect, head_id) = match opts.suspect_id {
-        Some(id) => (id, repo.head_id().ok().map(|h| h.detach())),
+        Some(id) => (id, Some(id)),
         None => {
             let id = repo.head_id()?.detach();
             (id, Some(id))
@@ -134,10 +157,21 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     // Translate the user's path (relative to CWD) into a repo-root-relative path.
     let rel_path = repo_relative_path(&repo, &opts.file)?;
 
-    // With no explicit revision git blames the working-tree file. The lines it
-    // shares with `HEAD` are blamed normally; the rest belong to a synthetic
-    // commit. Read the file first so we know whether that path is available.
-    let worktree_content = if opts.rev.is_none() {
+    // The final image is overlaid on top of the suspect when either no revision
+    // was given (git blames the working-tree copy) or `--contents` supplies an
+    // explicit image. `--contents -` reads standard input; `--contents <file>`
+    // reads that file. Lines shared with the suspect keep its blame; the rest
+    // belong to a synthetic commit (the null object id).
+    let worktree_content = if let Some(from) = &opts.contents {
+        let bytes = if from == "-" {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut buf)?;
+            buf
+        } else {
+            std::fs::read(from).map_err(|e| anyhow!("Cannot open '{from}': {e}"))?
+        };
+        Some(bytes)
+    } else if opts.rev.is_none() {
         repo.workdir()
             .map(|w| w.join(&rel_path))
             .and_then(|p| std::fs::read(p).ok())
@@ -154,7 +188,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
             .map_err(|e| anyhow!("{e}"))?
     };
     let blame_options = gix::repository::blame_file::Options {
-        diff_algorithm: None,
+        diff_algorithm: opts.diff_algorithm,
         ranges,
         since: None,
         rewrites: Some(gix::diff::Rewrites::default()),
@@ -167,7 +201,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     let mut lines = materialize_lines(&outcome);
 
     if let Some(content) = &worktree_content {
-        lines = overlay_worktree(&repo, lines, &outcome.blob, content)?;
+        lines = overlay_worktree(&repo, lines, &outcome.blob, content, opts.diff_algorithm)?;
         if !opts.ranges.is_empty() {
             let keep = |n: u32| opts.ranges.iter().any(|r| r.contains(&n));
             lines.retain(|l| keep(l.final_no));
@@ -237,9 +271,15 @@ fn overlay_worktree(
     head_lines: Vec<Line>,
     head_blob: &[u8],
     worktree: &[u8],
+    diff_algorithm: Option<gix::diff::blob::Algorithm>,
 ) -> Result<Vec<Line>> {
     let input = gix::diff::blob::InternedInput::new(head_blob, worktree);
-    let algorithm = repo.diff_algorithm()?;
+    // `--diff-algorithm` applies to the fake-commit diff too, matching git which
+    // threads its `xdl_opts` through every diff in the blame.
+    let algorithm = match diff_algorithm {
+        Some(a) => a,
+        None => repo.diff_algorithm()?,
+    };
     let mut diff = gix::diff::blob::Diff::compute(algorithm, &input);
     diff.postprocess_lines(&input);
 
@@ -335,7 +375,10 @@ fn collect_commit_info(
             // Reduced to owned values before the struct literal: the iterator
             // and the summary both borrow `commit`, which drops at the end of
             // this block while the literal's temporaries are still live.
-            let boundary = commit.parent_ids().next().is_none();
+            // `--root` (git's `show_root`) stops root commits counting as
+            // boundaries, dropping both the `^` marker and the porcelain
+            // `boundary` field for them.
+            let boundary = !opts.show_root && commit.parent_ids().next().is_none();
             let summary = Vec::from(commit.message()?.summary().into_owned());
             CommitInfo {
                 display_author: display_author(author.name, author.email, opts.show_email),
@@ -360,27 +403,39 @@ fn collect_commit_info(
     Ok(info)
 }
 
-/// The synthetic commit git invents for working-tree lines.
+/// The synthetic commit git invents for the final image (working tree, or the
+/// `--contents` file). git's `fake_working_tree_commit` uses a different author
+/// identity and message `from` field when `--contents` supplies the image.
 fn not_committed_info(id: ObjectId, opts: &Options, rel_path: &str) -> CommitInfo {
     let now = gix::date::Time::now_local_or_utc();
+    // git: `"External file (--contents)" / "external.file"` for `--contents`,
+    // else `"Not Committed Yet" / "not.committed.yet"`.
+    let (name, mail): (&[u8], &[u8]) = if opts.contents.is_some() {
+        (b"External file (--contents)", b"external.file")
+    } else {
+        (NOT_COMMITTED_NAME, NOT_COMMITTED_MAIL)
+    };
+    // git's message: `"Version of %s from %s"` where the second `%s` is the path,
+    // or the `--contents` argument (`"standard input"` for `-`).
+    let from = match opts.contents.as_deref() {
+        Some("-") => "standard input".to_string(),
+        Some(f) => f.to_string(),
+        None => rel_path.to_string(),
+    };
     CommitInfo {
-        display_author: display_author(
-            NOT_COMMITTED_NAME.as_bstr(),
-            NOT_COMMITTED_MAIL.as_bstr(),
-            opts.show_email,
-        ),
+        display_author: display_author(name.as_bstr(), mail.as_bstr(), opts.show_email),
         display_date: opts.date_mode.format_time(now.seconds, now.offset),
         boundary: false,
         hex: id.to_hex().to_string(),
-        author_name: NOT_COMMITTED_NAME.to_vec(),
-        author_mail: NOT_COMMITTED_MAIL.to_vec(),
+        author_name: name.to_vec(),
+        author_mail: mail.to_vec(),
         author_time: now.seconds,
         author_tz: format_tz(now.offset),
-        committer_name: NOT_COMMITTED_NAME.to_vec(),
-        committer_mail: NOT_COMMITTED_MAIL.to_vec(),
+        committer_name: name.to_vec(),
+        committer_mail: mail.to_vec(),
         committer_time: now.seconds,
         committer_tz: format_tz(now.offset),
-        summary: format!("Version of {rel_path} from {rel_path}").into_bytes(),
+        summary: format!("Version of {rel_path} from {from}").into_bytes(),
     }
 }
 
@@ -417,6 +472,73 @@ fn object_name_width(repo: &gix::Repository, opts: &Options) -> usize {
     width
 }
 
+/// Emit the object-name column into `buf`, following git's `print_marks` +
+/// `emit_other` interplay:
+///   * `-b` (`blank_boundary`) blanks a boundary commit's name to spaces — and
+///     also suppresses the `^` marker, so the whole column is `name_width` spaces.
+///   * otherwise a boundary commit takes one column for `^` (never in
+///     annotate-compat mode, which prints no marker) and `name_width - 1` hex digits.
+///   * a normal commit prints `name_width` hex digits.
+fn emit_object_name(buf: &mut Vec<u8>, ci: &CommitInfo, name_width: usize, opts: &Options) {
+    if ci.boundary && opts.blank_boundary {
+        pad(buf, name_width);
+    } else if ci.boundary && !opts.annotate_compat {
+        buf.push(b'^');
+        buf.extend_from_slice(&ci.hex.as_bytes()[..name_width - 1]);
+    } else {
+        buf.extend_from_slice(&ci.hex.as_bytes()[..name_width]);
+    }
+}
+
+/// Right-justify `s` into `buf` to a minimum byte width of `min`, matching C's
+/// `%*s` (spaces on the left, no truncation).
+fn pad_left(buf: &mut Vec<u8>, s: &[u8], min: usize) {
+    pad(buf, min.saturating_sub(s.len()));
+    buf.extend_from_slice(s);
+}
+
+/// git-annotate-compatible output (`-c` / OUTPUT_ANNOTATE_COMPAT): one line per
+/// blamed line, `<name>` right-justified to 10, the date to 10, tab-separated, and
+/// the final 1-based line number, all inside a single `(...)`. `-f`/`-n`/`-s` do
+/// not apply in this mode.
+fn emit_annotate_compat(
+    lines: &[Line],
+    info: &HashMap<ObjectId, CommitInfo>,
+    name_width: usize,
+    opts: &Options,
+) -> Result<ExitCode> {
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut buf: Vec<u8> = Vec::with_capacity(128);
+
+    for line in lines {
+        let ci = &info[&line.commit_id];
+        buf.clear();
+
+        emit_object_name(&mut buf, ci, name_width, opts);
+
+        // format_time pads the date to `blame_date_width` first; the trailing
+        // `%10s` then never fires because every mode's width is >= 10.
+        let mut date = ci.display_date.clone().into_bytes();
+        pad(&mut date, opts.date_mode.width().saturating_sub(ci.display_date.chars().count()));
+
+        buf.extend_from_slice(b"\t(");
+        pad_left(&mut buf, &ci.display_author, 10);
+        buf.push(b'\t');
+        pad_left(&mut buf, &date, 10);
+        buf.push(b'\t');
+        buf.extend_from_slice(line.final_no.to_string().as_bytes());
+        buf.push(b')');
+        buf.extend_from_slice(&line.content);
+        buf.push(b'\n');
+
+        out.write_all(&buf)?;
+    }
+
+    out.flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
 fn emit_human(
     repo: &gix::Repository,
     lines: &[Line],
@@ -425,6 +547,10 @@ fn emit_human(
     opts: &Options,
 ) -> Result<ExitCode> {
     let name_width = object_name_width(repo, opts);
+
+    if opts.annotate_compat {
+        return emit_annotate_compat(lines, info, name_width, opts);
+    }
 
     let show_file = opts.show_name || lines.iter().any(|l| l.source_name.is_some());
     let current_path = rel_path.as_bytes();
@@ -457,14 +583,8 @@ fn emit_human(
         let ci = &info[&line.commit_id];
         buf.clear();
 
-        // Object name. A boundary commit spends one column on the `^` marker,
-        // which git takes out of the hash rather than widening the field.
-        if ci.boundary {
-            buf.push(b'^');
-            buf.extend_from_slice(&ci.hex.as_bytes()[..name_width - 1]);
-        } else {
-            buf.extend_from_slice(&ci.hex.as_bytes()[..name_width]);
-        }
+        // Object name (boundary `^` marker, `-b` blanking).
+        emit_object_name(&mut buf, ci, name_width, opts);
 
         // Source filename column (left-justified).
         if show_file {
@@ -831,11 +951,11 @@ fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets
 }
 
 /// The date-formatting modes zvcs blame reproduces byte-for-byte from git's
-/// `show_date`. git accepts more modes (`relative`, `human`, `format:<strftime>`,
-/// and every `-local` variant), but those need machinery blame.rs does not have
-/// (a relative-time renderer, strftime, local-timezone conversion), so they are
-/// rejected rather than emitting wrong bytes — matching this file's policy for
-/// unimplemented features.
+/// `show_date`. git accepts a few more (`human`, `format:<strftime>`, and every
+/// `-local` variant); those need machinery blame.rs does not have (an strftime
+/// renderer, per-timestamp local-timezone conversion), so they are rejected
+/// rather than emitting wrong bytes — matching this file's policy for
+/// unimplemented features. `relative` is fully supported.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DateMode {
     /// git `DATE_NORMAL` (`default`): `Thu Oct 19 16:00:04 2006 -0700`.
@@ -852,6 +972,9 @@ enum DateMode {
     Raw,
     /// git `DATE_UNIX` (`unix`): `1161298804`.
     Unix,
+    /// git `DATE_RELATIVE` (`relative`): `3 days ago`, computed against the current
+    /// time. Independent of the recorded timezone offset.
+    Relative,
 }
 
 impl DateMode {
@@ -866,6 +989,9 @@ impl DateMode {
             DateMode::Short => "2006-10-19".len(),
             DateMode::Raw => "1161298804 -0700".len(),
             DateMode::Unix => "1161298804".len(),
+            // git: `utf8_strwidth("4 years, 11 months ago") + 1`, then the shared
+            // `blame_date_width -= 1` (strip the NUL) leaves the string width.
+            DateMode::Relative => "4 years, 11 months ago".len(),
         }
     }
 
@@ -893,7 +1019,74 @@ impl DateMode {
             DateMode::Short => t.format_or_unix(format::SHORT),
             DateMode::Raw => t.format_or_unix(format::RAW),
             DateMode::Unix => t.format_or_unix(format::UNIX),
+            DateMode::Relative => show_date_relative(seconds),
         }
+    }
+}
+
+/// Byte-for-byte port of git's `show_date_relative` (date.c): render `seconds`
+/// as a coarse "N units ago" string relative to the current wall-clock time.
+/// The recorded timezone offset is irrelevant, exactly as in git.
+fn show_date_relative(seconds: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if now < seconds {
+        return "in the future".to_string();
+    }
+    // git uses an unsigned `timestamp_t` for the difference and the divisions
+    // below, so mirror that with u64 arithmetic.
+    let mut diff = (now - seconds) as u64;
+    if diff < 90 {
+        return relative_unit(diff, "second");
+    }
+    diff = (diff + 30) / 60;
+    if diff < 90 {
+        return relative_unit(diff, "minute");
+    }
+    diff = (diff + 30) / 60;
+    if diff < 36 {
+        return relative_unit(diff, "hour");
+    }
+    // From here on we work in whole days.
+    diff = (diff + 12) / 24;
+    if diff < 14 {
+        return relative_unit(diff, "day");
+    }
+    if diff < 70 {
+        return relative_unit((diff + 3) / 7, "week");
+    }
+    if diff < 365 {
+        return relative_unit((diff + 15) / 30, "month");
+    }
+    if diff < 1825 {
+        let total_months = (diff * 12 * 2 + 365) / (365 * 2);
+        let years = total_months / 12;
+        let months = total_months % 12;
+        if months > 0 {
+            return format!(
+                "{}, {} ago",
+                plural(years, "year"),
+                plural(months, "month")
+            );
+        }
+        return relative_unit(years, "year");
+    }
+    relative_unit((diff + 183) / 365, "year")
+}
+
+/// `"<n> <unit> ago"` / `"<n> <unit>s ago"`, matching git's `Q_()` English plural.
+fn relative_unit(n: u64, unit: &str) -> String {
+    format!("{} ago", plural(n, unit))
+}
+
+/// `"<n> <unit>"` with git's English plural rule: singular only when `n == 1`.
+fn plural(n: u64, unit: &str) -> String {
+    if n == 1 {
+        format!("{n} {unit}")
+    } else {
+        format!("{n} {unit}s")
     }
 }
 
@@ -1007,7 +1200,10 @@ fn classify_date(input: &str) -> DateClass {
         DateType::Normal => DateClass::Supported(DateMode::Normal),
         DateType::Raw => DateClass::Supported(DateMode::Raw),
         DateType::Unix => DateClass::Supported(DateMode::Unix),
-        DateType::Relative | DateType::Human => DateClass::Unsupported(format),
+        DateType::Relative => DateClass::Supported(DateMode::Relative),
+        // `human` needs a time-relative renderer that also folds the current
+        // time into local-timezone broken-down form; not implemented.
+        DateType::Human => DateClass::Unsupported(format),
         DateType::Strftime => unreachable!("strftime handled above"),
     }
 }
@@ -1057,6 +1253,19 @@ struct Options {
     abbrev: Option<usize>,
     porcelain: bool,
     line_porcelain: bool,
+    /// `-b`: blank the object name of boundary commits instead of showing it.
+    blank_boundary: bool,
+    /// `--root`: do not treat root commits as boundaries.
+    show_root: bool,
+    /// `-t`: show the raw timestamp (overrides the resolved date mode).
+    raw_timestamp: bool,
+    /// `-c`: git-annotate-compatible output format.
+    annotate_compat: bool,
+    /// `--diff-algorithm=<algo>`; `None` falls back to `diff.algorithm`.
+    diff_algorithm: Option<gix::diff::blob::Algorithm>,
+    /// `--contents <file>`: use `<file>`'s contents (or stdin for `-`) as the
+    /// final image, on top of the suspect commit (default HEAD).
+    contents: Option<String>,
     /// Raw `--date` value before repo-side validation; `None` if not given.
     date_arg: Option<String>,
     /// Resolved date mode for the human-format timestamp column, after applying
@@ -1065,7 +1274,12 @@ struct Options {
 }
 
 impl Options {
-    fn parse(args: &[String], show_email_default: bool) -> Result<Options> {
+    fn parse(
+        args: &[String],
+        show_email_default: bool,
+        show_root_default: bool,
+        blank_boundary_default: bool,
+    ) -> Result<Options> {
         let mut ranges: Vec<RangeInclusive<u32>> = Vec::new();
         let mut long = false;
         let mut suppress = false;
@@ -1075,6 +1289,12 @@ impl Options {
         let mut abbrev: Option<usize> = None;
         let mut porcelain = false;
         let mut line_porcelain = false;
+        let mut blank_boundary = blank_boundary_default;
+        let mut show_root = show_root_default;
+        let mut raw_timestamp = false;
+        let mut annotate_compat = false;
+        let mut diff_algorithm: Option<gix::diff::blob::Algorithm> = None;
+        let mut contents: Option<String> = None;
         // Raw `--date` value (last one wins); resolved against the repo in `blame`.
         let mut date_arg: Option<String> = None;
         // Positionals before the first `--`; `post` collects those after it.
@@ -1100,6 +1320,16 @@ impl Options {
                 "--no-show-email" => show_email = false,
                 "-f" | "--show-name" => show_name = true,
                 "-n" | "--show-number" => show_number = true,
+                // `-b` blanks boundary object names; there is no `--no-b`.
+                "-b" => blank_boundary = true,
+                // `--root` stops treating root commits as boundaries.
+                "--root" => show_root = true,
+                "--no-root" => show_root = false,
+                // `-t` forces the raw timestamp regardless of the date mode.
+                "-t" => raw_timestamp = true,
+                // `-c` selects git-annotate-compatible output.
+                "-c" => annotate_compat = true,
+                "-w" => bail!("unsupported option: -w (ignore whitespace is not implemented)"),
                 // git's `--porcelain` and `--line-porcelain` are bit flags on one
                 // field, so `--line-porcelain` wins no matter the order.
                 "-p" | "--porcelain" => porcelain = true,
@@ -1134,6 +1364,27 @@ impl Options {
                 _ if a.starts_with("--date=") => {
                     date_arg = Some(a["--date=".len()..].to_string());
                 }
+                "--diff-algorithm" => {
+                    i += 1;
+                    let v = args
+                        .get(i)
+                        .ok_or_else(|| anyhow!("option `--diff-algorithm` requires a value"))?;
+                    diff_algorithm = Some(parse_diff_algorithm(v)?);
+                }
+                _ if a.starts_with("--diff-algorithm=") => {
+                    diff_algorithm = Some(parse_diff_algorithm(&a["--diff-algorithm=".len()..])?);
+                }
+                "--contents" => {
+                    i += 1;
+                    let v = args
+                        .get(i)
+                        .ok_or_else(|| anyhow!("option `--contents` requires a value"))?;
+                    contents = Some(v.clone());
+                }
+                _ if a.starts_with("--contents=") => {
+                    contents = Some(a["--contents=".len()..].to_string());
+                }
+                "--no-contents" => contents = None,
                 _ if a.starts_with("-L") => parse_line_range(&a[2..], &mut ranges)?,
                 _ if a.starts_with("--abbrev=") => {
                     let v = &a["--abbrev=".len()..];
@@ -1164,10 +1415,36 @@ impl Options {
             abbrev,
             porcelain,
             line_porcelain,
+            blank_boundary,
+            show_root,
+            raw_timestamp,
+            annotate_compat,
+            diff_algorithm,
+            contents,
             date_arg,
             // Overwritten in `blame` once blame.date / `--date` are resolved.
             date_mode: DateMode::Iso8601,
         })
+    }
+}
+
+/// git's `diff-algorithm` value parser: the names git accepts for `-A/--diff-algorithm`.
+/// `patience` is a valid git algorithm the vendored `gix-diff` does not implement, so
+/// it is reported as such rather than silently substituted.
+fn parse_diff_algorithm(name: &str) -> Result<gix::diff::blob::Algorithm> {
+    use gix::diff::blob::Algorithm;
+    if name.eq_ignore_ascii_case("myers") || name.eq_ignore_ascii_case("default") {
+        Ok(Algorithm::Myers)
+    } else if name.eq_ignore_ascii_case("minimal") {
+        Ok(Algorithm::MyersMinimal)
+    } else if name.eq_ignore_ascii_case("histogram") {
+        Ok(Algorithm::Histogram)
+    } else if name.eq_ignore_ascii_case("patience") {
+        bail!("diff algorithm 'patience' is not implemented")
+    } else {
+        bail!(
+            "option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\""
+        )
     }
 }
 

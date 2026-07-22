@@ -39,6 +39,14 @@
 //!     line count, and rendered through the same `gather_dirstat()` walk. Like git,
 //!     `--dirstat` on its own replaces the raw listing, while `--raw --dirstat`
 //!     prints both, and `--name-only`, `--name-status` and `-s` suppress it entirely.
+//!   * `-p`/`-u`/`--patch`, `-U<n>`/`--unified=<n>`, `--patch-with-raw`,
+//!     `--patch-with-stat` — the unified patch body (`builtin_diff()`), with git's
+//!     `diff --git`/`index`/mode-change/`--- +++`/`@@` framing and the `\ No newline at
+//!     end of file` marker. Context defaults to 3 and follows `-U<n>`.
+//!   * `--stat[=<w>[,<n>[,<c>]]]`, `--stat-width=`, `--stat-name-width=`,
+//!     `--stat-graph-width=`, `--stat-count=`, `--compact-summary`, `--numstat`,
+//!     `--shortstat`, `--summary` — the diffstat, numeric stat, short stat and the
+//!     create/delete/mode-change summary, all byte-identical to git.
 //!   * `[--] <path>...`                 — pathspec limiting, resolved relative to the cwd
 //!     while output paths stay repository-root relative, as git does. Positionals are
 //!     resolved the way `setup_revisions` does: the first that names an object is the
@@ -51,12 +59,17 @@
 //! Status letters produced: `A`, `D`, `T` (the `S_IFMT` bits of the two modes differ,
 //! e.g. file ↔ symlink), `M`, and `U` for unmerged paths under `--cached`.
 //!
-//! Options that only steer patch, stat or colour rendering (`--color` bare, `-D`,
-//! `--ws-error-highlight=`, `--src-prefix=`/`--dst-prefix=`/`--no-prefix`,
-//! `--diff-algorithm=`, `--anchored=`, `--color-moved[=]`, `--word-diff` bare,
-//! `--ignore-submodules` bare, `--ignore-blank-lines`, `-B`, `-l<n>`, `-a`/`--text`,
-//! `-W`, …) are accepted and ignored: stock git's raw, `--name-only` and `--name-status`
-//! bytes are identical with and without them. The full list is `render_only_option`.
+//! Options that only steer colour or patch/stat *shaping* (`--color` bare,
+//! `--ws-error-highlight=`, `--diff-algorithm=`, `--anchored=`, `--color-moved[=]`,
+//! `--word-diff` bare, `--ignore-submodules` bare, `--ignore-blank-lines`, `-B`,
+//! `-l<n>`, `-a`/`--text`, `-W`, …) are accepted and ignored for the raw, `--name-only`
+//! and `--name-status` listings — stock git's bytes there are identical with and without
+//! them. The full list is `render_only_option`. Because this module does not *port* those
+//! shapers, a run that also asks for a content format (a patch or a stat) is declined
+//! rather than rendering bytes that would diverge from git; the prefix family
+//! (`--src-prefix=`/`--dst-prefix=`/`--no-prefix`/`--default-prefix`), `--full-index` and
+//! `-D`/`--irreversible-delete` are the shapers this module does honour, so they compose
+//! with the patch instead.
 //!
 //! A handful of options carry a value git validates during its single left-to-right
 //! parse, so this module validates it too and reproduces git's exact code and message at
@@ -75,18 +88,30 @@
 //!     end); a `<path>` naming no queued pair is exit 128
 //!     `fatal: No such path '<path>' in the diff`, but only for a non-empty diff.
 //!
+//! Patch and stat rendering is produced for real: `-p`/`-u`/`--patch`,
+//! `-U<n>`/`--unified=<n>`, `--patch-with-raw`, `--patch-with-stat`, `--stat[=<w>]`,
+//! `--stat-*-width=`, `--stat-count=`, `--numstat`, `--shortstat`, `--summary` and
+//! `--compact-summary` all render git's exact bytes, through the same `builtin_diff()`,
+//! `compute_diffstat()`/`show_stats()` and `diff_summary()` ports `diff-files` uses.
+//! Every content format participates in git's content pruning: a pair whose two sides
+//! turn out identical (a stat-dirty-but-unchanged file) is dropped and the survivors are
+//! given the destination id the patch machinery hashed, exactly as git does.
+//!
 //! ### Honest limitations (bailed on with a precise message, never faked)
 //!
-//! * Patch and stat rendering (`-p`/`-u`/`--patch`, `-U<n>`/`--unified`, `--binary`,
-//!   `--stat`, `--numstat`, `--shortstat`, `--summary`, `--compact-summary`, `--check`,
-//!   `--patch-with-raw`, `--patch-with-stat`) is not produced. These formats *are*
-//!   content-driven in git, so when no pair survives the content comparison the correct
-//!   output is nothing at all and that is what is emitted; a run that would have produced
-//!   real patch or stat bytes is refused instead of approximated.
+//! * `--check` (whitespace-error report) and `--binary` (the base85 `GIT binary patch`
+//!   payload) are not produced. Both are content-driven in git, so when no pair survives
+//!   the content comparison the correct output is nothing at all and that is what is
+//!   emitted; a run that would have produced real bytes is refused, not approximated.
 //! * Rename/copy detection is off, which is git's default for `diff-index`. `-M`/`-C`
 //!   and friends are accepted for their *observable* side effect on this listing — git
 //!   hashes rename candidates, so an added path gains its real object id — but no rename
-//!   is ever reported.
+//!   is ever *paired*: additions and deletions stay separate `A`/`D` records rather than
+//!   collapsing into an `R`/`C` record. git's `diffcore_rename` (its exact-id and
+//!   similarity matching, the basename heuristic and the reported `R<score>` percentage)
+//!   is not vendored; gitoxide's `rewrites::Tracker` deliberately deviates from git's
+//!   algorithm, so it cannot reproduce git's pairing or scores byte for byte, and every
+//!   other command in this tree (`diff`, `whatchanged`, …) likewise leaves rewrites off.
 //! * `-G`/`-I`/`-S --pickaxe-regex` compile with the `regex` crate, not the platform's
 //!   POSIX engine, so a pattern the two engines disagree about (rare metacharacter edge
 //!   cases) can match differently, and an *invalid* pattern's fatal carries a different
@@ -113,6 +138,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gix::bstr::{BString, ByteSlice};
+use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
+use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, Diff, InternedInput, UnifiedDiff};
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
 use regex::bytes::Regex;
@@ -151,6 +178,29 @@ struct Ws {
 impl Ws {
     fn any(self) -> bool {
         self.all || self.change || self.at_eol || self.cr
+    }
+}
+
+/// The `--stat` geometry, in git's own `-1 == unset` encoding (`diff.c`'s
+/// `stat_width`/`stat_name_width`/`stat_graph_width`/`stat_count`).
+struct StatWidths {
+    width: i64,
+    name_width: i64,
+    graph_width: i64,
+    count: i64,
+    /// `--compact-summary`: annotate names with `(gone)`, `(new)`, `(mode +x)`, …
+    with_summary: bool,
+}
+
+impl Default for StatWidths {
+    fn default() -> Self {
+        StatWidths {
+            width: -1,
+            name_width: -1,
+            graph_width: -1,
+            count: 0,
+            with_summary: false,
+        }
     }
 }
 
@@ -217,6 +267,28 @@ struct Opts {
     pickaxe: Option<Pickaxe>,
     pickaxe_all: bool,
     detect_rename: bool, // -M/-C: git hashes rename candidates, so additions gain real ids
+    /// `-p`/`-u`/`--patch`: render the unified patch body.
+    patch: bool,
+    /// `-U<n>`/`--unified=<n>`: unified-diff context, git's default of 3.
+    ctx: u32,
+    /// `--numstat`: the `<added>\t<deleted>\t<path>` machine listing.
+    numstat: bool,
+    /// `--stat[=…]`/`--compact-summary`: the human diffstat.
+    diffstat: bool,
+    /// `--shortstat`: only the ` N files changed, …` summary line.
+    shortstat: bool,
+    /// `--summary`: the create/delete/mode-change extended listing.
+    summary: bool,
+    /// `--stat` geometry (`--stat=<w>,<n>,<c>`, `--stat-*-width=`, `--compact-summary`).
+    stat: StatWidths,
+    /// `--full-index`: emit the full object name on the patch `index` line.
+    full_index: bool,
+    /// `--src-prefix=`/`--no-prefix`; `-R` swaps the two. git's defaults are `a/`/`b/`.
+    src_prefix: String,
+    /// `--dst-prefix=`/`--no-prefix`.
+    dst_prefix: String,
+    /// `-D`/`--irreversible-delete`: a deletion shows its header and nothing else.
+    irreversible_delete: bool,
     /// `--dirstat`/`-X`/`--dirstat-by-file`/`--cumulative`, once any of them is seen.
     dirstat: Option<DirStat>,
     /// Whether the pair listing itself is printed. git defaults `output_format` to
@@ -261,6 +333,14 @@ impl Delta {
             b'M'
         }
     }
+
+    fn old_valid(&self) -> bool {
+        self.src_mode != 0
+    }
+
+    fn new_valid(&self) -> bool {
+        self.dst_mode != 0
+    }
 }
 
 /// What the index knows about one path, with the stages collapsed the way git's
@@ -279,7 +359,9 @@ const PORTED: &str = "--cached, --merge-base, -m, --raw, --name-only, --name-sta
                       --abbrev[=<n>], --no-abbrev, --full-index, --exit-code, --quiet, \
                       -s/--no-patch, -R, --diff-filter=, --line-prefix=, --relative[=], \
                       -w/-b/--ignore-*-space*, -I, -S, -G, --dirstat[=], -X, \
-                      --dirstat-by-file[=], --cumulative";
+                      --dirstat-by-file[=], --cumulative, -p/-u/--patch, -U<n>/--unified=, \
+                      --patch-with-raw, --patch-with-stat, --stat[=], --numstat, \
+                      --shortstat, --summary, --compact-summary";
 
 /// Stock `git diff-index`'s usage text, reproduced byte for byte (including the
 /// trailing blank line) because it is written to stderr on every usage error.
@@ -392,50 +474,43 @@ fn render_only_option(a: &str) -> bool {
     b.len() > 2 && b[0] == b'-' && (b[1] == b'B' || b[1] == b'l')
 }
 
-/// Options that select a patch-, stat- or check-style rendering this module does not
-/// produce. Every one of them is derived from file *contents* in git, so an all-clean
-/// pair list still renders as nothing and only a run with surviving pairs is refused.
+/// The two content-derived renderings this module still declines: `--check`
+/// (whitespace-error report) and `--binary` (the base85 `GIT binary patch` payload).
+/// Both are content-driven in git, so an all-clean pair list renders as nothing and
+/// only a run with surviving pairs is refused rather than approximated. The patch and
+/// stat families, by contrast, are ported below and rendered for real.
 fn unsupported_format(a: &str) -> bool {
-    const CONTENT_EXACT: &[&str] = &[
-        "-p",
-        "-u",
-        "--patch",
-        "--patch-with-raw",
-        "--patch-with-stat",
-        "--binary",
-        "--check",
-        "--compact-summary",
-        "--numstat",
-        "--shortstat",
-        "--stat",
-        "--summary",
-    ];
-    const CONTENT_PREFIX: &[&str] = &["--stat=", "--stat-width=", "--stat-name-width=", "--stat-count=", "--unified="];
-    // `-U<n>` sets the context count *and* selects the patch format.
-    CONTENT_EXACT.contains(&a)
-        || CONTENT_PREFIX.iter().any(|p| a.starts_with(*p))
-        || (a.len() > 2 && a.starts_with("-U"))
+    matches!(a, "--check" | "--binary")
 }
 
-/// Which output-format family an unsupported-format flag belongs to, as
-/// `(is_stat, is_patch)`. git's `diff_flush()` writes one separator line between the
-/// diffstat and the patch when both families are active, so both bits are tracked to
-/// reproduce that byte in the otherwise-empty case. `--check` and `--summary` set
-/// neither (they are separate formats that emit no such separator), and
-/// `--patch-with-raw` is deliberately excluded — it also renders the raw listing,
-/// which this path cannot combine, so it is left to the ordinary refusal.
-fn format_family(a: &str) -> (bool, bool) {
-    let stat = matches!(
-        a,
-        "--stat" | "--numstat" | "--shortstat" | "--compact-summary" | "--patch-with-stat"
-    ) || a.starts_with("--stat=")
-        || a.starts_with("--stat-width=")
-        || a.starts_with("--stat-name-width=")
-        || a.starts_with("--stat-count=");
-    let patch = matches!(a, "-p" | "-u" | "--patch" | "--binary" | "--patch-with-stat")
-        || a.starts_with("--unified=")
-        || (a.len() > 2 && a.starts_with("-U"));
-    (stat, patch)
+/// `--stat=<width>[,<name-width>[,<count>]]` (`diff_opt_stat()`), parsed leniently:
+/// each comma-separated field that is a valid integer updates its slot, anything else
+/// is left at its prior (`-1`/`0`) value. git validates these during its option scan;
+/// a malformed width there is exit 129, which this module does not reproduce.
+fn parse_stat_spec(v: &str, stat: &mut StatWidths) {
+    let mut it = v.split(',');
+    if let Some(w) = it.next() {
+        if let Ok(n) = w.parse() {
+            stat.width = n;
+        }
+    }
+    if let Some(n) = it.next() {
+        if let Ok(v) = n.parse() {
+            stat.name_width = v;
+        }
+    }
+    if let Some(c) = it.next() {
+        if let Ok(v) = c.parse() {
+            stat.count = v;
+        }
+    }
+}
+
+/// The context count of `-U<n>`/`--unified=<n>`: git reads it with `strtol`, so leading
+/// digits win and garbage yields the default of 3.
+fn parse_context(s: &str) -> u32 {
+    let digits: String = s.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().unwrap_or(3)
 }
 
 /// git parses `--abbrev=<n>` with `strtoul(arg, NULL, 10)`, which never fails: it skips
@@ -510,6 +585,17 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         pickaxe: None,
         pickaxe_all: false,
         detect_rename: false,
+        patch: false,
+        ctx: 3,
+        numstat: false,
+        diffstat: false,
+        shortstat: false,
+        summary: false,
+        stat: StatWidths::default(),
+        full_index: false,
+        src_prefix: "a/".to_owned(),
+        dst_prefix: "b/".to_owned(),
+        irreversible_delete: false,
         dirstat: None,
         emit_pairs: true,
         skip_or_rotate: None,
@@ -534,19 +620,22 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let mut positionals: Vec<(usize, String)> = Vec::new();
     let mut paths: Vec<BString> = Vec::new();
     let mut after_dashdash = false;
-    // Whether a stat-family and/or a patch-family output format was requested. git's
-    // `diff_flush()` writes one separator line between the two blocks when both are
-    // active, which is the only byte an otherwise-unrenderable format still produces.
-    let mut want_stat = false;
-    let mut want_patch = false;
     // The first option git understands but this module does not. Held back rather than
     // raised immediately: git parses the whole command line before it looks at the
     // tree-ish, so a missing or unresolvable revision still has to win, exactly as it
     // does in stock git, and only a run that would otherwise have produced output is
     // refused.
     let mut unsupported: Option<String> = None;
-    // The first patch/stat rendering asked for, which this module cannot produce.
+    // The first `--check`/`--binary` rendering asked for, which this module still
+    // declines; the patch and stat families are parsed into `opts` and rendered.
     let mut bad_format: Option<String> = None;
+    // An accepted-and-ignored option that would reshape the *content* rendering (patch
+    // prefixes, diff algorithm, word-diff, forced colour). Harmless for the raw and name
+    // listings — the only reason it can be ignored there — but it would make the ported
+    // patch/stat bytes diverge from git, so a run that also asks for a content format is
+    // refused rather than emitting the wrong bytes. git honours these; this module does
+    // not port them, so honesty wins over coverage.
+    let mut content_altering: Option<String> = None;
     // A `-G`/`-S --pickaxe-regex` pattern that failed to compile. git compiles these in
     // `diffcore_pickaxe`, after the tree-ish is resolved, and dies with
     // `fatal: invalid regex: <msg>` (exit 128); the message tail comes from the platform
@@ -619,6 +708,88 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             }
             "--relative" => opts.relative = Some(BString::default()),
             "--no-relative" => opts.relative = None,
+            // `diff_opt_*`: the patch and stat output formats. `--patch-with-raw` also
+            // keeps the raw listing, `--patch-with-stat` also prepends the diffstat.
+            "-p" | "-u" | "--patch" => opts.patch = true,
+            "--patch-with-raw" => {
+                opts.patch = true;
+                raw_explicit = true;
+            }
+            "--patch-with-stat" => {
+                opts.patch = true;
+                opts.diffstat = true;
+            }
+            "--stat" => opts.diffstat = true,
+            "--numstat" => opts.numstat = true,
+            "--shortstat" => opts.shortstat = true,
+            "--summary" => opts.summary = true,
+            "--compact-summary" => {
+                opts.diffstat = true;
+                opts.stat.with_summary = true;
+            }
+            "-U" | "--unified" => {
+                let Some(value) = args.get(i) else {
+                    eprint!("{}", USAGE);
+                    return Ok(ExitCode::from(129));
+                };
+                i += 1;
+                opts.patch = true;
+                opts.ctx = parse_context(value);
+            }
+            s if s.starts_with("--unified=") => {
+                opts.patch = true;
+                opts.ctx = parse_context(&s["--unified=".len()..]);
+            }
+            s if s.len() > 2 && s.starts_with("-U") => {
+                opts.patch = true;
+                opts.ctx = parse_context(&s[2..]);
+            }
+            s if s.starts_with("--stat=") => {
+                parse_stat_spec(&s["--stat=".len()..], &mut opts.stat);
+                opts.diffstat = true;
+            }
+            s if s.starts_with("--stat-width=") => {
+                if let Ok(n) = s["--stat-width=".len()..].parse() {
+                    opts.stat.width = n;
+                }
+                opts.diffstat = true;
+            }
+            s if s.starts_with("--stat-name-width=") => {
+                if let Ok(n) = s["--stat-name-width=".len()..].parse() {
+                    opts.stat.name_width = n;
+                }
+                opts.diffstat = true;
+            }
+            s if s.starts_with("--stat-graph-width=") => {
+                if let Ok(n) = s["--stat-graph-width=".len()..].parse() {
+                    opts.stat.graph_width = n;
+                }
+                opts.diffstat = true;
+            }
+            s if s.starts_with("--stat-count=") => {
+                if let Ok(n) = s["--stat-count=".len()..].parse() {
+                    opts.stat.count = n;
+                }
+                opts.diffstat = true;
+            }
+            // Patch-shaping options this module *does* honour, so they never trip the
+            // content-altering refusal below.
+            "--full-index" => opts.full_index = true,
+            "-D" | "--irreversible-delete" => opts.irreversible_delete = true,
+            "--no-prefix" => {
+                opts.src_prefix = String::new();
+                opts.dst_prefix = String::new();
+            }
+            "--default-prefix" => {
+                opts.src_prefix = "a/".to_owned();
+                opts.dst_prefix = "b/".to_owned();
+            }
+            s if s.starts_with("--src-prefix=") => {
+                opts.src_prefix = s["--src-prefix=".len()..].to_owned();
+            }
+            s if s.starts_with("--dst-prefix=") => {
+                opts.dst_prefix = s["--dst-prefix=".len()..].to_owned();
+            }
             "-M" | "-C" | "--find-renames" | "--find-copies" | "--find-copies-harder" => {
                 opts.detect_rename = true;
             }
@@ -696,12 +867,19 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 // included, is exit 129. Bare `--color` (below, `render_only_option`) means
                 // `always` and is always accepted.
                 let val = &s["--color=".len()..];
-                if !matches!(val.to_ascii_lowercase().as_str(), "always" | "auto" | "never") {
-                    deferred.get_or_insert((
-                        cur,
-                        129,
-                        b"error: option `color' expects \"always\", \"auto\", or \"never\"\n".to_vec(),
-                    ));
+                match val.to_ascii_lowercase().as_str() {
+                    "always" => {
+                        // Forced colour would tint the patch/stat; refuse if one is asked.
+                        content_altering.get_or_insert_with(|| s.to_owned());
+                    }
+                    "auto" | "never" => {}
+                    _ => {
+                        deferred.get_or_insert((
+                            cur,
+                            129,
+                            b"error: option `color' expects \"always\", \"auto\", or \"never\"\n".to_vec(),
+                        ));
+                    }
                 }
             }
             s if s.starts_with("--word-diff=") => {
@@ -709,12 +887,19 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 // `porcelain` or `none` (case-sensitively); anything else, empty included,
                 // is exit 129. Bare `--word-diff` means `plain` and is accepted above.
                 let val = &s["--word-diff=".len()..];
-                if !matches!(val, "plain" | "color" | "porcelain" | "none") {
-                    deferred.get_or_insert((
-                        cur,
-                        129,
-                        format!("error: bad --word-diff argument: {val}\n").into_bytes(),
-                    ));
+                match val {
+                    "plain" | "color" | "porcelain" => {
+                        // Word diff replaces the line-oriented patch body entirely.
+                        content_altering.get_or_insert_with(|| s.to_owned());
+                    }
+                    "none" => {}
+                    _ => {
+                        deferred.get_or_insert((
+                            cur,
+                            129,
+                            format!("error: bad --word-diff argument: {val}\n").into_bytes(),
+                        ));
+                    }
                 }
             }
             s if s.starts_with("--ignore-submodules=") => {
@@ -748,12 +933,12 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             }
             s => {
                 if unsupported_format(s) {
-                    let (st, pt) = format_family(s);
-                    want_stat |= st;
-                    want_patch |= pt;
                     bad_format.get_or_insert_with(|| s.to_owned());
                 } else if render_only_option(s) {
-                    // Accepted and ignored.
+                    // Ignored for the raw/name listings (their bytes are identical with
+                    // and without it); recorded so a content format refuses rather than
+                    // rendering the wrong bytes.
+                    content_altering.get_or_insert_with(|| s.to_owned());
                 } else if s.starts_with('-') && s.len() > 1 {
                     if short_option_takes_value(s) {
                         i += 1;
@@ -769,18 +954,41 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         opts.format = Format::Silent;
     }
     // `diff_setup_done()`: `--name-only`, `--name-status` and `-s` clear every other
-    // output format, and the raw listing is only defaulted in when nothing else was
-    // asked for — so `--dirstat` alone prints directories only.
-    if opts.dirstat.is_some() {
-        match opts.format {
-            Format::NameOnly | Format::NameStatus | Format::Silent => opts.dirstat = None,
-            Format::Raw => opts.emit_pairs = raw_explicit,
-        }
+    // output format, so `--dirstat`/`--stat`/`-p` next to one of them are dropped.
+    if matches!(opts.format, Format::NameOnly | Format::NameStatus | Format::Silent) {
+        opts.dirstat = None;
+        opts.patch = false;
+        opts.numstat = false;
+        opts.diffstat = false;
+        opts.shortstat = false;
+        opts.summary = false;
+    }
+    // `diff_setup_done()` defaults `output_format` to the raw listing only when nothing
+    // else was requested. Any positive non-raw format (patch, a stat family, a summary
+    // or a dirstat) suppresses it unless `--raw`/`--patch-with-raw` asked for it back —
+    // which is why a bare `--dirstat` or `-p` prints no raw records.
+    if opts.format == Format::Raw {
+        let any_other = opts.patch
+            || opts.numstat
+            || opts.diffstat
+            || opts.shortstat
+            || opts.summary
+            || opts.dirstat.is_some();
+        opts.emit_pairs = raw_explicit || !any_other;
     }
     // `-s`/`--quiet` mean "no output at all", which is exactly what an unrenderable
-    // patch or stat format would have produced here anyway.
+    // `--check`/`--binary` would have produced here anyway.
     if opts.format == Format::Silent {
         bad_format = None;
+    }
+    // A content format alongside an accepted-but-unported content-shaping option would
+    // render bytes that diverge from git; decline the run rather than emit them. The raw
+    // and name listings are unaffected, so those keep ignoring the option.
+    let content_format = opts.patch || opts.numstat || opts.diffstat || opts.shortstat || opts.summary;
+    if content_format && bad_format.is_none() {
+        if let Some(opt) = content_altering.take() {
+            bad_format = Some(opt);
+        }
     }
     if let Some((kind, pat)) = pickaxe_arg {
         // `-S` is a literal kwset search unless `--pickaxe-regex` promotes it; `-G` is
@@ -975,16 +1183,22 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     // git emits index order, which is a plain byte-wise sort of the paths.
     deltas.sort_by(|a, b| a.path.cmp(&b.path));
 
-    // The number of file pairs git would have queued (after pathspec limiting, before
-    // content comparison drops the stat-dirty-but-identical ones). git's `diff_flush()`
-    // separator between the diffstat and the patch is printed only when this is > 0.
-    let raw_delta_count = deltas.len();
-
     // git's `diffcore_std`: content comparison first (which also fills in the object id
-    // it had to compute), then the pickaxe, then `--diff-filter`.
+    // it had to compute), then the pickaxe, then `--diff-filter`. Every content-reading
+    // output format (patch, the stat family, `--summary`) participates: git runs each
+    // pair through the patch machinery, drops the ones whose content turns out identical
+    // (the stat-dirty-but-unchanged files), and hands the survivors the destination id it
+    // hashed on the way, exactly as the whitespace family and pickaxe do.
+    let content_output = (opts.patch
+        || opts.numstat
+        || opts.diffstat
+        || opts.shortstat
+        || opts.summary)
+        && opts.format != Format::Silent;
     let content_driven = opts.ws.any()
         || opts.ignore_lines.is_some()
         || opts.pickaxe.is_some()
+        || content_output
         || bad_format.is_some();
     if content_driven {
         apply_content_filter(&repo, &mut deltas, &opts)?;
@@ -1038,38 +1252,83 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     }
 
     if let Some(flag) = &bad_format {
+        // `--check`/`--binary` are still declined rather than approximated. Both are
+        // content-driven in git, so an all-clean pair list renders as nothing; only a run
+        // that would produce real bytes is refused.
         if !deltas.is_empty() {
             bail!("unsupported output format {flag:?} (ported: {PORTED})");
         }
-        // `diff_flush()` writes a single separator line between the (empty) diffstat
-        // and the (empty) patch whenever both a stat-family and a patch-family format
-        // are active and at least one file pair was queued — i.e. every pair was
-        // content-identical (stat-dirty), so both blocks render nothing but the
-        // separator survives. `-z` makes it a NUL; `--line-prefix` precedes it.
-        if want_stat && want_patch && opts.format == Format::Raw && raw_delta_count > 0 {
-            let mut sep = opts.line_prefix.clone();
-            sep.push(if opts.nul { 0 } else { b'\n' });
-            std::io::stdout().lock().write_all(&sep)?;
-        }
-    } else {
-        // git's `diff_flush()` order: the pair listing first, then the dirstat block.
-        let mut text = if opts.format != Format::Silent && opts.emit_pairs {
-            render(&repo, &deltas, &opts)?
+    } else if opts.format != Format::Silent {
+        // Per-pair blob analysis for the content formats. The stat family and the patch
+        // need the two sides' bytes and, for the patch, the rendered hunks; every other
+        // format reads only the recorded modes and ids.
+        let workdir = repo.workdir().map(Path::to_path_buf);
+        let need_analyses = opts.patch || opts.numstat || opts.diffstat || opts.shortstat;
+        let analyses: Vec<IdxAnalysis> = if need_analyses {
+            deltas
+                .iter()
+                .map(|d| analyze_index_delta(&repo, workdir.as_deref(), d, &opts))
+                .collect::<Result<_>>()?
         } else {
             Vec::new()
         };
-        if let Some(ds) = &opts.dirstat {
-            let files = dirstat_damage(&repo, &deltas, &opts, ds)?;
-            let mut block = Vec::new();
-            render_dirstat(&mut block, files, ds);
-            // `diff_line_prefix()` goes in front of every dirstat line too.
-            for line in block.split_inclusive(|&b| b == b'\n') {
-                text.extend_from_slice(&opts.line_prefix);
-                text.extend_from_slice(line);
+
+        // git's `diff_flush()` order: the raw/name listing, then the stat family, the
+        // dirstat and the summary, then a lone separator line and the patch. The raw
+        // block carries its own `--line-prefix`; everything below is prefixed in one pass.
+        let mut out: Vec<u8> = Vec::new();
+        let mut rest: Vec<u8> = Vec::new();
+        let mut separator = false;
+
+        if opts.emit_pairs {
+            out.extend_from_slice(&render(&repo, &deltas, &opts)?);
+            if !deltas.is_empty() {
+                separator = true;
             }
         }
-        let stdout = std::io::stdout();
-        stdout.lock().write_all(&text)?;
+
+        if !deltas.is_empty() {
+            if opts.numstat || opts.diffstat || opts.shortstat {
+                let stats = compute_diffstat(&deltas, &analyses, &opts);
+                if opts.numstat {
+                    render_numstat(&mut rest, &stats, &opts);
+                }
+                if opts.diffstat {
+                    render_stat(&mut rest, &stats, &opts);
+                }
+                if opts.shortstat {
+                    render_shortstat(&mut rest, &stats);
+                }
+                separator = true;
+            }
+            if let Some(ds) = &opts.dirstat {
+                let files = dirstat_damage(&repo, &deltas, &opts, ds)?;
+                render_dirstat(&mut rest, files, ds);
+            }
+            if opts.summary && !summary_is_empty(&deltas) {
+                for d in &deltas {
+                    render_summary(&mut rest, d, &opts);
+                }
+                separator = true;
+            }
+        }
+
+        if opts.patch && !deltas.is_empty() {
+            if separator {
+                rest.push(b'\n');
+            }
+            for (d, an) in deltas.iter().zip(&analyses) {
+                render_patch(&mut rest, d, an, &opts);
+            }
+        }
+
+        // `diff_line_prefix()` precedes every rendered line of the stat/dirstat/summary/
+        // patch block (the raw block already emitted its own prefix in `render`).
+        if !opts.line_prefix.is_empty() {
+            rest = prefix_lines(&rest, &opts.line_prefix);
+        }
+        out.extend_from_slice(&rest);
+        std::io::stdout().lock().write_all(&out)?;
     }
 
     Ok(if opts.exit_code && !deltas.is_empty() {
@@ -1213,8 +1472,6 @@ fn buffer_is_binary(buf: &[u8]) -> bool {
 
 /// The added and removed line counts a diffstat would report for the two sides.
 fn line_counts(one: &[u8], two: &[u8], opts: &Opts) -> (u64, u64) {
-    use gix::diff::blob::{Algorithm, Diff, InternedInput};
-
     let before = split_lines(one);
     let after = split_lines(two);
     let fold = opts.ws.any();
@@ -1776,8 +2033,6 @@ fn fold_line(line: &[u8], ws: Ws) -> Vec<u8> {
 
 /// Run a line diff and hand every added or removed line to `visit`.
 fn for_each_changed_line(before: &[&[u8]], after: &[&[u8]], mut visit: impl FnMut(&[u8])) {
-    use gix::diff::blob::{Algorithm, Diff, InternedInput};
-
     let one: Vec<u8> = before.concat();
     let two: Vec<u8> = after.concat();
     let input = InternedInput::new(one.as_slice(), two.as_slice());
@@ -1944,4 +2199,817 @@ fn quote_path(path: impl AsRef<[u8]>) -> String {
     }
     out.push('"');
     out
+}
+
+// ---------------------------------------------------------------------------
+// content formats (-p / --stat / --numstat / --shortstat / --summary)
+//
+// A direct port of git's `builtin_diff()`, `compute_diffstat()`/`show_stats()` and
+// `diff_summary()`, mirroring the byte-for-byte renderers `diff-files` already uses.
+// The pair list is diff-index's (a tree against the index or worktree), and the two
+// sides' bytes come from the object database or the worktree via [`content_of`].
+// ---------------------------------------------------------------------------
+
+/// Per-delta blob analysis: line counts, the binary flag and, when a patch is asked
+/// for, the rendered hunks. The two buffers are in the delta's own orientation, so
+/// `-R` (which already swapped the delta's sides) is reflected here too.
+struct IdxAnalysis {
+    added: u32,
+    deleted: u32,
+    binary: bool,
+    /// `None` when the two sides compare equal (a pure mode/type change) or a patch
+    /// was not requested.
+    hunks: Option<Vec<u8>>,
+    old_data: Vec<u8>,
+    new_data: Vec<u8>,
+}
+
+/// The bytes of one side of a pair, or `None` when that side does not exist. Unlike
+/// [`side_content`], a recorded id that is not in the object database (the destination
+/// id the content filter computed from the worktree, which is never written to the odb)
+/// falls back to reading the worktree file, so the analysis always sees real bytes.
+fn content_of(
+    repo: &gix::Repository,
+    workdir: Option<&Path>,
+    mode: u32,
+    id: ObjectId,
+    path: &BString,
+) -> Result<Option<Vec<u8>>> {
+    let null = ObjectId::null(repo.object_hash());
+    if mode == 0 {
+        return Ok(None);
+    }
+    if (mode & S_IFMT) == 0o160000 {
+        // A submodule has no blob; git uses its recorded commit id as the "content".
+        return Ok(Some(id.to_string().into_bytes()));
+    }
+    if id != null {
+        if let Ok(obj) = repo.find_object(id) {
+            return Ok(Some(obj.data.clone()));
+        }
+        // The id was hashed from the worktree, so read that instead of failing.
+    }
+    Ok(workdir.and_then(|wd| read_worktree(wd, path)))
+}
+
+/// `builtin_diff()`'s internal-diff branch: intern the two sides (folded for the
+/// whitespace family), count the added/removed lines the way `diffstat` does — dropping
+/// change groups every line of which matches `-I` — and render the unified hunks when a
+/// patch is wanted. Binary sides short-circuit to a byte-count analysis.
+fn analyze_index_delta(
+    repo: &gix::Repository,
+    workdir: Option<&Path>,
+    d: &Delta,
+    opts: &Opts,
+) -> Result<IdxAnalysis> {
+    if d.unmerged {
+        return Ok(IdxAnalysis {
+            added: 0,
+            deleted: 0,
+            binary: false,
+            hunks: None,
+            old_data: Vec::new(),
+            new_data: Vec::new(),
+        });
+    }
+
+    let old_data = content_of(repo, workdir, d.src_mode, d.src_id, &d.path)?.unwrap_or_default();
+    let new_data = content_of(repo, workdir, d.dst_mode, d.dst_id, &d.path)?.unwrap_or_default();
+
+    // `diff_filespec_is_binary()`: a diff is binary if either present side is binary.
+    let binary = (d.src_mode != 0 && buffer_is_binary(&old_data))
+        || (d.dst_mode != 0 && buffer_is_binary(&new_data));
+    if binary {
+        return Ok(IdxAnalysis {
+            added: 0,
+            deleted: 0,
+            binary: true,
+            hunks: None,
+            old_data,
+            new_data,
+        });
+    }
+
+    let before = split_lines(&old_data);
+    let after = split_lines(&new_data);
+    let fold = opts.ws.any();
+    let mut input: InternedInput<Vec<u8>> = InternedInput::default();
+    input.update_before(before.iter().map(|l| if fold { fold_line(l, opts.ws) } else { l.to_vec() }));
+    input.update_after(after.iter().map(|l| if fold { fold_line(l, opts.ws) } else { l.to_vec() }));
+
+    let diff = diff_with_slider_heuristics(Algorithm::Myers, &input);
+    // `xdl_mark_ignorable_regex()`: a change group whose every removed and added line
+    // matches the `-I` pattern contributes nothing to the counts.
+    let (added, deleted) = match &opts.ignore_lines {
+        None => (diff.count_additions(), diff.count_removals()),
+        Some(pat) => {
+            let mut add = 0u32;
+            let mut del = 0u32;
+            for hunk in diff.hunks() {
+                let ignorable = hunk.before.clone().all(|i| pat.is_match(before[i as usize]))
+                    && hunk.after.clone().all(|i| pat.is_match(after[i as usize]));
+                if ignorable {
+                    continue;
+                }
+                del += hunk.before.clone().count() as u32;
+                add += hunk.after.clone().count() as u32;
+            }
+            (add, del)
+        }
+    };
+
+    let hunks = if opts.patch && (added != 0 || deleted != 0) {
+        let sink = PatchSink {
+            buf: Vec::new(),
+            before: &before,
+            after: &after,
+        };
+        Some(UnifiedDiff::new(&diff, &input, sink, ContextSize::symmetrical(opts.ctx)).consume()?)
+    } else {
+        None
+    };
+    // `before`/`after` borrow the two buffers, so release them before the move.
+    drop(before);
+    drop(after);
+    Ok(IdxAnalysis {
+        added,
+        deleted,
+        binary: false,
+        hunks,
+        old_data,
+        new_data,
+    })
+}
+
+/// The path as rendered, after `--relative` stripping — the same amount [`render`]
+/// removes from the raw listing, so every format agrees on the printed name.
+fn display_path(path: &BString, opts: &Opts) -> BString {
+    match &opts.relative {
+        Some(r) if !r.is_empty() => {
+            let strip = (r.len() + 1).min(path.len());
+            BString::from(path.as_slice()[strip..].to_vec())
+        }
+        _ => path.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// diffstat (--numstat / --stat / --shortstat)
+// ---------------------------------------------------------------------------
+
+/// One `struct diffstat_file`.
+struct StatFile {
+    path: BString,
+    /// The name as printed, quoted and possibly annotated by `--compact-summary`.
+    print_name: Vec<u8>,
+    added: u32,
+    deleted: u32,
+    binary: bool,
+    is_unmerged: bool,
+}
+
+/// `compute_diffstat()`, including `builtin_diffstat()`'s rule that a plain `M` entry
+/// with no added, no deleted and an unchanged mode is dropped outright.
+fn compute_diffstat(deltas: &[Delta], analyses: &[IdxAnalysis], opts: &Opts) -> Vec<StatFile> {
+    let mut out = Vec::new();
+    for (d, an) in deltas.iter().zip(analyses) {
+        if d.unmerged {
+            out.push(StatFile {
+                path: display_path(&d.path, opts),
+                print_name: stat_print_name(d, opts),
+                added: 0,
+                deleted: 0,
+                binary: false,
+                is_unmerged: true,
+            });
+            continue;
+        }
+        let (added, deleted) = if an.binary {
+            // Binary counts are byte sizes, not lines.
+            (an.new_data.len() as u32, an.old_data.len() as u32)
+        } else {
+            (an.added, an.deleted)
+        };
+        if d.status() == b'M' && added == 0 && deleted == 0 && d.src_mode == d.dst_mode && !an.binary {
+            continue;
+        }
+        out.push(StatFile {
+            path: display_path(&d.path, opts),
+            print_name: stat_print_name(d, opts),
+            added,
+            deleted,
+            binary: an.binary,
+            is_unmerged: false,
+        });
+    }
+    out
+}
+
+/// `fill_print_name()` plus `get_compact_summary()`.
+fn stat_print_name(d: &Delta, opts: &Opts) -> Vec<u8> {
+    let path = display_path(&d.path, opts);
+    let mut name = quoted_name(&path);
+    if !opts.stat.with_summary {
+        return name;
+    }
+    let status = d.status();
+    let comment: Option<&str> = if status == b'A' {
+        Some(match d.dst_mode {
+            0o120000 => "new +l",
+            0o100755 => "new +x",
+            _ => "new",
+        })
+    } else if status == b'D' {
+        Some("gone")
+    } else if d.src_mode == 0o120000 && d.dst_mode != 0o120000 {
+        Some("mode -l")
+    } else if d.src_mode != 0o120000 && d.dst_mode == 0o120000 {
+        Some("mode +l")
+    } else if d.src_mode == 0o100644 && d.dst_mode == 0o100755 {
+        Some("mode +x")
+    } else if d.src_mode == 0o100755 && d.dst_mode == 0o100644 {
+        Some("mode -x")
+    } else {
+        None
+    };
+    if let Some(c) = comment {
+        name.extend_from_slice(b" (");
+        name.extend_from_slice(c.as_bytes());
+        name.push(b')');
+    }
+    name
+}
+
+/// `show_numstat()`.
+fn render_numstat(out: &mut Vec<u8>, files: &[StatFile], opts: &Opts) {
+    for f in files {
+        if f.binary {
+            out.extend_from_slice(b"-\t-\t");
+        } else {
+            out.extend_from_slice(format!("{}\t{}\t", f.added, f.deleted).as_bytes());
+        }
+        if opts.nul {
+            out.extend_from_slice(f.path.as_ref());
+            out.push(0);
+        } else {
+            out.extend_from_slice(&quoted_name(&f.path));
+            out.push(b'\n');
+        }
+    }
+}
+
+/// `show_shortstats()`.
+fn render_shortstat(out: &mut Vec<u8>, files: &[StatFile]) {
+    if files.is_empty() {
+        return;
+    }
+    let (total, adds, dels) = stat_totals(files);
+    stat_summary(out, total, adds, dels);
+}
+
+fn stat_totals(files: &[StatFile]) -> (u32, u32, u32) {
+    let mut total = files.len() as u32;
+    let (mut adds, mut dels) = (0u32, 0u32);
+    for f in files {
+        if f.is_unmerged {
+            total -= 1;
+        } else if !f.binary {
+            adds += f.added;
+            dels += f.deleted;
+        }
+    }
+    (total, adds, dels)
+}
+
+/// `print_stat_summary_inserts_deletes()`.
+fn stat_summary(out: &mut Vec<u8>, files: u32, insertions: u32, deletions: u32) {
+    if files == 0 {
+        out.extend_from_slice(b" 0 files changed\n");
+        return;
+    }
+    out.extend_from_slice(format!(" {files} file{} changed", if files == 1 { "" } else { "s" }).as_bytes());
+    if insertions != 0 || deletions == 0 {
+        out.extend_from_slice(
+            format!(", {insertions} insertion{}(+)", if insertions == 1 { "" } else { "s" }).as_bytes(),
+        );
+    }
+    if deletions != 0 || insertions == 0 {
+        out.extend_from_slice(
+            format!(", {deletions} deletion{}(-)", if deletions == 1 { "" } else { "s" }).as_bytes(),
+        );
+    }
+    out.push(b'\n');
+}
+
+fn decimal_width(n: u32) -> i64 {
+    let mut w = 1i64;
+    let mut n = n / 10;
+    while n > 0 {
+        w += 1;
+        n /= 10;
+    }
+    w
+}
+
+/// `scale_linear()` from `diff.c`.
+fn scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
+    if it == 0 {
+        return 0;
+    }
+    1 + (it * (width - 1) / max_change)
+}
+
+/// `show_stats()`. A non-tty terminal width is git's `term_columns()` fallback of 80.
+fn render_stat(out: &mut Vec<u8>, files: &[StatFile], opts: &Opts) {
+    if files.is_empty() {
+        return;
+    }
+    let sw = &opts.stat;
+    let mut count: i64 = if sw.count != 0 { sw.count } else { files.len() as i64 };
+
+    let mut max_change: i64 = 0;
+    let mut max_len: i64 = 0;
+    let mut bin_width: i64 = 0;
+    let mut number_width: i64 = 0;
+    let mut i: i64 = 0;
+    while i < count && i < files.len() as i64 {
+        let f = &files[i as usize];
+        let change = (f.added + f.deleted) as i64;
+        i += 1;
+        max_len = max_len.max(f.print_name.len() as i64);
+        if f.is_unmerged {
+            bin_width = bin_width.max(8); // "Unmerged"
+            continue;
+        }
+        if f.binary {
+            let w = 14 + decimal_width(f.added) + decimal_width(f.deleted);
+            bin_width = bin_width.max(w);
+            number_width = 3;
+            continue;
+        }
+        max_change = max_change.max(change);
+    }
+    count = i;
+
+    let mut width: i64 = if sw.width == -1 {
+        80
+    } else if sw.width != 0 {
+        sw.width
+    } else {
+        80
+    };
+    number_width = number_width.max(decimal_width(max_change as u32));
+    let stat_name_width = if sw.name_width == -1 { 0 } else { sw.name_width };
+    let stat_graph_width = if sw.graph_width == -1 { 0 } else { sw.graph_width };
+
+    if width < 16 + 6 + number_width {
+        width = 16 + 6 + number_width;
+    }
+
+    let mut graph_width = if max_change + 4 > bin_width {
+        max_change
+    } else {
+        bin_width - 4
+    };
+    if stat_graph_width > 0 && stat_graph_width < graph_width {
+        graph_width = stat_graph_width;
+    }
+    let mut name_width = if stat_name_width > 0 && stat_name_width < max_len {
+        stat_name_width
+    } else {
+        max_len
+    };
+
+    if name_width + number_width + 6 + graph_width > width {
+        if graph_width > width * 3 / 8 - number_width - 6 {
+            graph_width = width * 3 / 8 - number_width - 6;
+            if graph_width < 6 {
+                graph_width = 6;
+            }
+        }
+        if stat_graph_width > 0 && graph_width > stat_graph_width {
+            graph_width = stat_graph_width;
+        }
+        if name_width > width - number_width - 6 - graph_width {
+            name_width = width - number_width - 6 - graph_width;
+        } else {
+            graph_width = width - number_width - 6 - name_width;
+        }
+    }
+
+    for f in files.iter().take(count.max(0) as usize) {
+        let (added, deleted) = (f.added as i64, f.deleted as i64);
+
+        let full = &f.print_name;
+        let (prefix, name): (&str, &[u8]) = if name_width < full.len() as i64 {
+            let len = (name_width - 3).max(0);
+            let start = full.len() - len as usize;
+            let tail = &full[start..];
+            let tail = match tail.iter().position(|b| *b == b'/') {
+                Some(p) => &tail[p..],
+                None => tail,
+            };
+            ("...", tail)
+        } else {
+            ("", full.as_slice())
+        };
+        let padding = (name_width - prefix.len() as i64 - name.len() as i64).max(0) as usize;
+
+        out.push(b' ');
+        out.extend_from_slice(prefix.as_bytes());
+        out.extend_from_slice(name);
+        out.extend_from_slice(&b" ".repeat(padding));
+        out.extend_from_slice(b" | ");
+
+        if f.binary {
+            out.extend_from_slice(format!("{:>width$}", "Bin", width = number_width.max(0) as usize).as_bytes());
+            if added == 0 && deleted == 0 {
+                out.push(b'\n');
+                continue;
+            }
+            out.extend_from_slice(format!(" {deleted} -> {added} bytes\n").as_bytes());
+            continue;
+        }
+        if f.is_unmerged {
+            out.extend_from_slice(
+                format!("{:>width$}", "Unmerged", width = number_width.max(0) as usize).as_bytes(),
+            );
+            out.push(b'\n');
+            continue;
+        }
+
+        let (mut add, mut del) = (added, deleted);
+        if graph_width <= max_change {
+            let mut total = scale_linear(add + del, graph_width, max_change);
+            if total < 2 && add > 0 && del > 0 {
+                total = 2;
+            }
+            if add < del {
+                add = scale_linear(add, graph_width, max_change);
+                del = total - add;
+            } else {
+                del = scale_linear(del, graph_width, max_change);
+                add = total - del;
+            }
+        }
+        out.extend_from_slice(
+            format!("{:>width$}", added + deleted, width = number_width.max(0) as usize).as_bytes(),
+        );
+        if added + deleted != 0 {
+            out.push(b' ');
+        }
+        out.extend_from_slice(&b"+".repeat(add.max(0) as usize));
+        out.extend_from_slice(&b"-".repeat(del.max(0) as usize));
+        out.push(b'\n');
+    }
+
+    if (count as usize) < files.len() {
+        out.extend_from_slice(b" ...\n");
+    }
+
+    let (total, adds, dels) = stat_totals(files);
+    stat_summary(out, total, adds, dels);
+}
+
+// ---------------------------------------------------------------------------
+// --summary
+// ---------------------------------------------------------------------------
+
+/// `is_summary_empty()`.
+fn summary_is_empty(deltas: &[Delta]) -> bool {
+    for d in deltas {
+        match d.status() {
+            b'A' | b'D' => return false,
+            _ => {
+                if d.src_mode != 0 && d.dst_mode != 0 && d.src_mode != d.dst_mode {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// `diff_summary()`.
+fn render_summary(out: &mut Vec<u8>, d: &Delta, opts: &Opts) {
+    let path = display_path(&d.path, opts);
+    match d.status() {
+        b'D' => summary_mode_name(out, "delete", d.src_mode, &path),
+        b'A' => summary_mode_name(out, "create", d.dst_mode, &path),
+        _ => {
+            if d.src_mode != 0 && d.dst_mode != 0 && d.src_mode != d.dst_mode {
+                out.extend_from_slice(
+                    format!(" mode change {} => {} ", mode_str(d.src_mode), mode_str(d.dst_mode)).as_bytes(),
+                );
+                out.extend_from_slice(&quoted_name(&path));
+                out.push(b'\n');
+            }
+        }
+    }
+}
+
+/// `show_file_mode_name()`.
+fn summary_mode_name(out: &mut Vec<u8>, verb: &str, mode: u32, path: &BString) {
+    if mode != 0 {
+        out.extend_from_slice(format!(" {verb} mode {} ", mode_str(mode)).as_bytes());
+    } else {
+        out.extend_from_slice(format!(" {verb} ").as_bytes());
+    }
+    out.extend_from_slice(&quoted_name(path));
+    out.push(b'\n');
+}
+
+fn mode_str(mode: u32) -> String {
+    format!("{mode:06o}")
+}
+
+// ---------------------------------------------------------------------------
+// patch output
+// ---------------------------------------------------------------------------
+
+/// Render one delta as a `git diff` file section into `out` (`builtin_diff()`).
+fn render_patch(out: &mut Vec<u8>, d: &Delta, an: &IdxAnalysis, opts: &Opts) {
+    if d.unmerged {
+        out.extend_from_slice(b"* Unmerged path ");
+        out.extend_from_slice(display_path(&d.path, opts).as_ref());
+        out.push(b'\n');
+        return;
+    }
+
+    let path = display_path(&d.path, opts);
+    // `-R` swaps the two prefixes, leaving the paths themselves alone.
+    let (pa, pb): (&str, &str) = if opts.reverse {
+        (&opts.dst_prefix, &opts.src_prefix)
+    } else {
+        (&opts.src_prefix, &opts.dst_prefix)
+    };
+
+    // `--full-index` shows the whole object name; otherwise git abbreviates to 7.
+    let hexsz = d.src_id.kind().len_in_hex();
+    let hlen = if opts.full_index { hexsz } else { 7 };
+    let old_hash = if d.old_valid() {
+        d.src_id.to_hex_with_len(hlen).to_string()
+    } else {
+        "0".repeat(hlen)
+    };
+    let new_hash = if d.new_valid() {
+        d.dst_id.to_hex_with_len(hlen).to_string()
+    } else {
+        "0".repeat(hlen)
+    };
+    let content_differs = old_hash != new_hash;
+
+    // `builtin_diff()` only emits the header once it has something to attach to it. A
+    // stat-dirty file whose bytes and mode are unchanged produces nothing.
+    let must_show = !d.old_valid()
+        || !d.new_valid()
+        || d.src_mode != d.dst_mode
+        || content_differs
+        || an.binary
+        || an.hunks.is_some();
+    if !must_show {
+        return;
+    }
+
+    out.extend_from_slice(b"diff --git ");
+    out.extend_from_slice(&quote_two(pa, &path, pb, &path));
+    out.push(b'\n');
+
+    // File-creation / deletion / mode-change lines.
+    match (d.old_valid(), d.new_valid()) {
+        (false, true) => {
+            out.extend_from_slice(b"new file mode ");
+            out.extend_from_slice(mode_str(d.dst_mode).as_bytes());
+            out.push(b'\n');
+        }
+        (true, false) => {
+            out.extend_from_slice(b"deleted file mode ");
+            out.extend_from_slice(mode_str(d.src_mode).as_bytes());
+            out.push(b'\n');
+        }
+        (true, true) if d.src_mode != d.dst_mode => {
+            out.extend_from_slice(b"old mode ");
+            out.extend_from_slice(mode_str(d.src_mode).as_bytes());
+            out.extend_from_slice(b"\nnew mode ");
+            out.extend_from_slice(mode_str(d.dst_mode).as_bytes());
+            out.push(b'\n');
+        }
+        _ => {}
+    }
+
+    // The `index <old>..<new>[ <mode>]` line only appears when content differs.
+    if content_differs {
+        out.extend_from_slice(b"index ");
+        out.extend_from_slice(old_hash.as_bytes());
+        out.extend_from_slice(b"..");
+        out.extend_from_slice(new_hash.as_bytes());
+        if d.old_valid() && d.new_valid() && d.src_mode == d.dst_mode {
+            out.push(b' ');
+            out.extend_from_slice(mode_str(d.dst_mode).as_bytes());
+        }
+        out.push(b'\n');
+    }
+
+    // `-D`: a deletion is shown by its header alone, with no recoverable preimage.
+    if opts.irreversible_delete && !d.new_valid() {
+        return;
+    }
+
+    let old_label = if d.old_valid() {
+        quote_one(pa, &path)
+    } else {
+        b"/dev/null".to_vec()
+    };
+    let new_label = if d.new_valid() {
+        quote_one(pb, &path)
+    } else {
+        b"/dev/null".to_vec()
+    };
+
+    if an.binary {
+        out.extend_from_slice(b"Binary files ");
+        out.extend_from_slice(&old_label);
+        out.extend_from_slice(b" and ");
+        out.extend_from_slice(&new_label);
+        out.extend_from_slice(b" differ\n");
+    } else if let Some(hunks) = &an.hunks {
+        emit_file_line(out, b"--- ", &old_label);
+        emit_file_line(out, b"+++ ", &new_label);
+        // The hunk buffer already carries git's canonical `+`/`-`/` ` markers.
+        out.extend_from_slice(hunks);
+    }
+}
+
+/// `DIFF_SYMBOL_FILEPAIR_{MINUS,PLUS}`: a name containing a space gets a trailing tab so
+/// the header stays unambiguously parseable.
+fn emit_file_line(out: &mut Vec<u8>, lead: &[u8], label: &[u8]) {
+    out.extend_from_slice(lead);
+    out.extend_from_slice(label);
+    if label.contains(&b' ') {
+        out.push(b'\t');
+    }
+    out.push(b'\n');
+}
+
+/// `diff_line_prefix()` applied to every line of a rendered block.
+fn prefix_lines(body: &[u8], prefix: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + prefix.len());
+    for line in body.split_inclusive(|&b| b == b'\n') {
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(line);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// path quoting (quote.c), matching git's default `core.quotePath=true`
+// ---------------------------------------------------------------------------
+
+/// The escape character for `b`, or `None` if it can be emitted verbatim. `Some(0)`
+/// means "octal-escape this byte".
+fn cq_escape(b: u8) -> Option<u8> {
+    match b {
+        0x07 => Some(b'a'),
+        0x08 => Some(b'b'),
+        0x09 => Some(b't'),
+        0x0a => Some(b'n'),
+        0x0b => Some(b'v'),
+        0x0c => Some(b'f'),
+        0x0d => Some(b'r'),
+        b'"' => Some(b'"'),
+        b'\\' => Some(b'\\'),
+        0x00..=0x1f | 0x7f..=0xff => Some(0),
+        _ => None,
+    }
+}
+
+fn cq_needs_quote(s: &[u8]) -> bool {
+    s.iter().any(|b| cq_escape(*b).is_some())
+}
+
+/// The escaped body of `s`, without the surrounding double quotes.
+fn cq_body(s: &[u8], out: &mut Vec<u8>) {
+    for &b in s {
+        match cq_escape(b) {
+            None => out.push(b),
+            Some(0) => {
+                out.push(b'\\');
+                out.push(((b >> 6) & 0o3) + b'0');
+                out.push(((b >> 3) & 0o7) + b'0');
+                out.push((b & 0o7) + b'0');
+            }
+            Some(c) => {
+                out.push(b'\\');
+                out.push(c);
+            }
+        }
+    }
+}
+
+/// `write_name_quoted()`: the path, double-quoted and escaped only if needed.
+fn quoted_name(path: &BString) -> Vec<u8> {
+    let s = path.as_slice();
+    if !cq_needs_quote(s) {
+        return s.to_vec();
+    }
+    let mut out = vec![b'"'];
+    cq_body(s, &mut out);
+    out.push(b'"');
+    out
+}
+
+/// `quote_two_c_style()` for a single prefixed name (the `---`/`+++` lines).
+fn quote_one(prefix: &str, path: &BString) -> Vec<u8> {
+    let s = path.as_slice();
+    if !cq_needs_quote(prefix.as_bytes()) && !cq_needs_quote(s) {
+        let mut out = prefix.as_bytes().to_vec();
+        out.extend_from_slice(s);
+        return out;
+    }
+    let mut out = vec![b'"'];
+    cq_body(prefix.as_bytes(), &mut out);
+    cq_body(s, &mut out);
+    out.push(b'"');
+    out
+}
+
+/// The `diff --git <a> <b>` name pair.
+fn quote_two(pa: &str, a: &BString, pb: &str, b: &BString) -> Vec<u8> {
+    let mut out = quote_one(pa, a);
+    out.push(b' ');
+    out.extend_from_slice(&quote_one(pb, b));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// unified-diff hunk sink
+// ---------------------------------------------------------------------------
+
+/// Format one side of a hunk header (`@@ -<here> +<here> @@`), omitting the length when
+/// it is 1 and using the pre-hunk line number when it is 0, like `git diff`.
+fn fmt_range(start: u32, len: u32) -> String {
+    match len {
+        1 => format!("{start}"),
+        0 => format!("{},0", start.saturating_sub(1)),
+        _ => format!("{start},{len}"),
+    }
+}
+
+/// A [`ConsumeHunk`] sink that renders unified-diff hunks into a byte buffer. The tokens
+/// the differ compares may be whitespace-normalized, so line *content* is taken from the
+/// original line tables, tracked by the cursors the hunk header establishes.
+struct PatchSink<'a> {
+    buf: Vec<u8>,
+    before: &'a [&'a [u8]],
+    after: &'a [&'a [u8]],
+}
+
+impl ConsumeHunk for PatchSink<'_> {
+    type Out = Vec<u8>;
+
+    fn consume_hunk(&mut self, header: HunkHeader, lines: &[(DiffLineKind, &[u8])]) -> std::io::Result<()> {
+        self.buf.extend_from_slice(b"@@ -");
+        self.buf
+            .extend_from_slice(fmt_range(header.before_hunk_start, header.before_hunk_len).as_bytes());
+        self.buf.extend_from_slice(b" +");
+        self.buf
+            .extend_from_slice(fmt_range(header.after_hunk_start, header.after_hunk_len).as_bytes());
+        self.buf.extend_from_slice(b" @@\n");
+
+        let mut bi = header.before_hunk_start.saturating_sub(1) as usize;
+        let mut ai = header.after_hunk_start.saturating_sub(1) as usize;
+        for (kind, fallback) in lines {
+            let (marker, content): (u8, &[u8]) = match kind {
+                DiffLineKind::Context => {
+                    let c = self.before.get(bi).copied().unwrap_or(*fallback);
+                    bi += 1;
+                    ai += 1;
+                    (b' ', c)
+                }
+                DiffLineKind::Remove => {
+                    let c = self.before.get(bi).copied().unwrap_or(*fallback);
+                    bi += 1;
+                    (b'-', c)
+                }
+                DiffLineKind::Add => {
+                    let c = self.after.get(ai).copied().unwrap_or(*fallback);
+                    ai += 1;
+                    (b'+', c)
+                }
+            };
+            self.buf.push(marker);
+            self.buf.extend_from_slice(content);
+            // A token without a terminator is the last line of a file that lacks a
+            // trailing newline.
+            if content.last() != Some(&b'\n') {
+                self.buf.push(b'\n');
+                self.buf.extend_from_slice(b"\\ No newline at end of file\n");
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.buf
+    }
 }

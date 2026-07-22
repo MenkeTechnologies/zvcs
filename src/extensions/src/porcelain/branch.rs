@@ -1,12 +1,20 @@
 use anyhow::{anyhow, bail, Result};
 use std::cmp::Ordering;
+use std::io::{IsTerminal, Write as _};
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
+use gix::config::{File as ConfigFile, Source};
 use gix::hash::ObjectId;
 use gix::objs::{CommitRef, Kind};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
+
+/// git's smallest permitted abbreviation length, shared with `git blame`.
+const MINIMUM_ABBREV: usize = 4;
+
+/// The SGR reset git emits after a colored branch name (`\e[m`, not `\e[0m`).
+const RESET: &str = "\x1b[m";
 
 /// The exact usage block stock git prints for an option-parsing error,
 /// reproduced verbatim so `--list --show-current` and friends match byte for byte.
@@ -99,6 +107,28 @@ enum ListMode {
     All,
 }
 
+/// `-t`/`--track[=(direct|inherit)]` / `--no-track` selector, in git's option
+/// order (the last one wins).
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Track {
+    /// Neither `--track` nor `--no-track` given: auto-track per `branch.autoSetupMerge`.
+    Unset,
+    /// `--no-track`: never set up tracking.
+    No,
+    /// `-t` / `--track` / `--track=direct`: track the start-point's remote directly.
+    Direct,
+    /// `--track=inherit`: copy the start-point branch's own upstream configuration.
+    Inherit,
+}
+
+/// `--color[=<when>]` tri-state, matching `git branch`'s default of `auto`.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum ColorWhen {
+    Auto,
+    Always,
+    Never,
+}
+
 /// Parsed `git branch` command line.
 struct Opts {
     mode: ListMode,
@@ -113,8 +143,38 @@ struct Opts {
     sorts: Vec<String>,
     delete: bool,
     rename: bool,
+    copy: bool,
     force: bool,
+    quiet: bool,
+    ignore_case: bool,
+    create_reflog: bool,
+    edit_description: bool,
+    track: Track,
+    /// `-u <up>` / `--set-upstream-to=<up>`: the upstream spec to install.
+    set_upstream_to: Option<String>,
+    unset_upstream: bool,
+    color: ColorWhen,
+    /// `--abbrev=<n>` for `-v`: `None` = configured default, `Some(0)` = full hash.
+    abbrev: Option<usize>,
+    // Reachability filters (each entry is a raw rev spec, resolved at list time).
+    contains: Vec<String>,
+    no_contains: Vec<String>,
+    merged: Vec<String>,
+    no_merged: Vec<String>,
+    points_at: Vec<String>,
     names: Vec<String>,
+}
+
+impl Opts {
+    /// Whether any reachability/points-at filter is present. git forces list mode
+    /// when one is, so positionals become patterns rather than a branch to create.
+    fn has_filter(&self) -> bool {
+        !self.contains.is_empty()
+            || !self.no_contains.is_empty()
+            || !self.merged.is_empty()
+            || !self.no_merged.is_empty()
+            || !self.points_at.is_empty()
+    }
 }
 
 /// One line of `git branch` output.
@@ -132,6 +192,8 @@ struct Entry<'repo> {
     symref: Option<String>,
     /// Whether git marks this line with `*`.
     current: bool,
+    /// Whether this ref lives under `refs/remotes/` (colored with the remote slot).
+    remote: bool,
     /// The detached-HEAD pseudo entry, which `--format` prints verbatim.
     detached: bool,
     /// Precomputed `--sort` values, aligned positionally with the parsed sort
@@ -139,29 +201,45 @@ struct Entry<'repo> {
     keys: Vec<SortVal>,
 }
 
-/// `git branch` — list, create, rename, and delete branches, backed by the
+/// Reachability filters resolved to concrete commit ids, as git's `ref-filter`
+/// does before walking the ref list.
+struct Filters {
+    contains: Vec<ObjectId>,
+    no_contains: Vec<ObjectId>,
+    merged: Vec<ObjectId>,
+    no_merged: Vec<ObjectId>,
+    points_at: Vec<ObjectId>,
+}
+
+impl Filters {
+    fn is_empty(&self) -> bool {
+        self.contains.is_empty()
+            && self.no_contains.is_empty()
+            && self.merged.is_empty()
+            && self.no_merged.is_empty()
+            && self.points_at.is_empty()
+    }
+}
+
+/// `git branch` — list, create, copy, rename, and delete branches, backed by the
 /// vendored gitoxide ref store.
 ///
 /// Implemented: listing (`-a`/`--all`, `-r`/`--remotes`, `-v`/`-vv`,
 /// `--format=<fmt>`, `-l`/`--list` with optional glob patterns),
 /// `--sort=[-][version:]<field>` (multi-level, defaulting to the multi-valued
-/// `branch.sort` config), `--show-current`, creation at HEAD, `-m`/`-M` rename,
-/// and `-d`/`-D` delete.
+/// `branch.sort` config), `--show-current`, creation at an optional
+/// `<start-point>` with `-t`/`--track[=(direct|inherit)]`/`--no-track` upstream
+/// setup, `-m`/`-M` rename and `-c`/`-C` copy (both carrying the reflog and the
+/// `branch.<name>.*` config across), `-d`/`-D` delete, `-u`/`--set-upstream-to`
+/// and `--unset-upstream`, the `--contains`/`--no-contains`/`--merged`/
+/// `--no-merged`/`--points-at` reachability filters, `--abbrev[=<n>]`/
+/// `--no-abbrev`, `-i`/`--ignore-case`, `-q`/`--quiet`, `--color[=<when>]`/
+/// `--no-color`, and `--create-reflog`.
 ///
-/// `--sort` backs the fields whose value a branch tip (always a commit) carries:
-/// `refname`, `version:refname`/`v:refname`, `committerdate`/`authordate`/
-/// `creatordate`/`taggerdate`, `objectname`/`objecttype`/`objectsize`,
-/// `committername`/`authorname`, the matching `*email`, and
-/// `subject`/`body`/`contents`. A field name git rejects fails with git's exact
-/// `unknown/malformed field name` fatal (exit 128); a field git accepts but this
-/// port cannot sort by is refused rather than mis-sorted.
-///
-/// Not implemented, and rejected rather than ignored: `-c`/`-C` copy, `-t`/`-u`
-/// upstream configuration, `--contains`/`--merged`/`--points-at` filters,
-/// `--column`, `--color`, and creating a branch at an explicit
-/// start-point. `--format` supports the `refname`, `refname:short`,
-/// `objectname`, `objectname:short`, and `HEAD` atoms; any other atom is
-/// rejected rather than rendered as empty.
+/// `--format` supports the `refname`, `refname:short`, `objectname`,
+/// `objectname:short`, and `HEAD` atoms; any other atom is rejected rather than
+/// rendered as empty. `--edit-description` is refused: it needs an interactive
+/// editor loop that is not wired in this environment.
 ///
 /// The merge check for `-d` uses reachability from HEAD only (not a configured
 /// upstream), which is git's behavior when no upstream is set.
@@ -175,7 +253,22 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         sorts: Vec::new(),
         delete: false,
         rename: false,
+        copy: false,
         force: false,
+        quiet: false,
+        ignore_case: false,
+        create_reflog: false,
+        edit_description: false,
+        track: Track::Unset,
+        set_upstream_to: None,
+        unset_upstream: false,
+        color: ColorWhen::Auto,
+        abbrev: None,
+        contains: Vec::new(),
+        no_contains: Vec::new(),
+        merged: Vec::new(),
+        no_merged: Vec::new(),
+        points_at: Vec::new(),
         names: Vec::new(),
     };
 
@@ -191,10 +284,47 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
             "--remotes" => o.mode = ListMode::Remotes,
             "--list" => o.explicit_list = true,
             "--verbose" => o.verbose = o.verbose.saturating_add(1),
+            "--no-verbose" => o.verbose = 0,
             "--show-current" => o.show_current = true,
             "--delete" => o.delete = true,
             "--move" => o.rename = true,
+            "--copy" => o.copy = true,
             "--force" => o.force = true,
+            "--quiet" => o.quiet = true,
+            "--no-quiet" => o.quiet = false,
+            "--ignore-case" => o.ignore_case = true,
+            "--no-ignore-case" => o.ignore_case = false,
+            "--create-reflog" => o.create_reflog = true,
+            "--no-create-reflog" => o.create_reflog = false,
+            "--edit-description" => o.edit_description = true,
+            "--unset-upstream" => o.unset_upstream = true,
+            "--track" => o.track = Track::Direct,
+            "--no-track" => o.track = Track::No,
+            _ if a.starts_with("--track=") => {
+                o.track = match &a["--track=".len()..] {
+                    "direct" => Track::Direct,
+                    "inherit" => Track::Inherit,
+                    _ => return usage_exit(),
+                };
+            }
+            "--color" => o.color = ColorWhen::Always,
+            "--no-color" => o.color = ColorWhen::Never,
+            _ if a.starts_with("--color=") => {
+                o.color = match &a["--color=".len()..] {
+                    "always" => ColorWhen::Always,
+                    "never" | "false" => ColorWhen::Never,
+                    "auto" => ColorWhen::Auto,
+                    _ => return usage_exit(),
+                };
+            }
+            "--abbrev" => o.abbrev = None,
+            "--no-abbrev" => o.abbrev = Some(0),
+            _ if a.starts_with("--abbrev=") => {
+                let n = a["--abbrev=".len()..]
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("option `abbrev' expects a numerical value"))?;
+                o.abbrev = Some(n);
+            }
             "--format" => {
                 i += 1;
                 let v = args
@@ -215,14 +345,52 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--sort=") => {
                 o.sorts.push(a["--sort=".len()..].to_string());
             }
+            "--set-upstream-to" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow!("option `set-upstream-to' requires a value"))?;
+                o.set_upstream_to = Some(v.clone());
+            }
+            _ if a.starts_with("--set-upstream-to=") => {
+                o.set_upstream_to = Some(a["--set-upstream-to=".len()..].to_string());
+            }
+            // The reachability filters take git's `LASTARG_DEFAULT` value: an
+            // attached `=val`, else the next token, else `HEAD` when this is the
+            // last argument on the command line.
+            "--contains" => o.contains.push(lastarg_default(args, &mut i)),
+            _ if a.starts_with("--contains=") => {
+                o.contains.push(a["--contains=".len()..].to_string())
+            }
+            "--no-contains" => o.no_contains.push(lastarg_default(args, &mut i)),
+            _ if a.starts_with("--no-contains=") => {
+                o.no_contains.push(a["--no-contains=".len()..].to_string())
+            }
+            "--merged" => o.merged.push(lastarg_default(args, &mut i)),
+            _ if a.starts_with("--merged=") => o.merged.push(a["--merged=".len()..].to_string()),
+            "--no-merged" => o.no_merged.push(lastarg_default(args, &mut i)),
+            _ if a.starts_with("--no-merged=") => {
+                o.no_merged.push(a["--no-merged=".len()..].to_string())
+            }
+            "--points-at" => o.points_at.push(lastarg_default(args, &mut i)),
+            _ if a.starts_with("--points-at=") => {
+                o.points_at.push(a["--points-at=".len()..].to_string())
+            }
             // A single-dash argument is a bundle of short flags (`-vv`, `-dr`).
-            _ if a.starts_with('-') && a.len() > 1 => {
-                for c in a[1..].chars() {
-                    match c {
+            // Long options are matched explicitly above; an unrecognized `--foo`
+            // falls through to the positional arm, as it did before.
+            _ if a.starts_with('-') && a.len() > 1 && !a.starts_with("--") => {
+                let flags = &a[1..];
+                let bytes = flags.as_bytes();
+                let mut ci = 0;
+                while ci < bytes.len() {
+                    match bytes[ci] as char {
                         'a' => o.mode = ListMode::All,
                         'r' => o.mode = ListMode::Remotes,
                         'l' => o.explicit_list = true,
                         'v' => o.verbose = o.verbose.saturating_add(1),
+                        'q' => o.quiet = true,
+                        'i' => o.ignore_case = true,
                         'd' => o.delete = true,
                         'D' => {
                             o.delete = true;
@@ -233,9 +401,31 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
                             o.rename = true;
                             o.force = true;
                         }
+                        'c' => o.copy = true,
+                        'C' => {
+                            o.copy = true;
+                            o.force = true;
+                        }
+                        't' => o.track = Track::Direct,
                         'f' => o.force = true,
-                        _ => anyhow::bail!("unsupported flag {a:?}"),
+                        // `-u` takes an upstream: the rest of this token, else the
+                        // next argument.
+                        'u' => {
+                            let rest = &flags[ci + 1..];
+                            let v = if rest.is_empty() {
+                                i += 1;
+                                args.get(i).cloned().ok_or_else(|| {
+                                    anyhow!("option `set-upstream-to' requires a value")
+                                })?
+                            } else {
+                                rest.to_string()
+                            };
+                            o.set_upstream_to = Some(v);
+                            break;
+                        }
+                        _ => return usage_exit(),
                     }
+                    ci += 1;
                 }
             }
             _ => o.names.push(a.to_string()),
@@ -243,9 +433,15 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
+    // git forces list mode when a reachability filter is present, so a positional
+    // becomes a pattern rather than a branch to create.
+    if o.has_filter() {
+        o.explicit_list = true;
+    }
+
     // git's option table marks --show-current and the list options as mutually
     // exclusive, so `--list --show-current` is a usage error before any work.
-    if o.show_current && (o.explicit_list || o.delete || o.rename) {
+    if o.show_current && (o.explicit_list || o.delete || o.rename || o.copy) {
         return usage_exit();
     }
 
@@ -254,8 +450,22 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
     if o.rename {
         return rename_branch(&repo, &o);
     }
+    if o.copy {
+        return copy_branch(&repo, &o);
+    }
     if o.delete {
         return delete_branches(&repo, &o);
+    }
+    if o.edit_description {
+        // --edit-description opens the configured editor on the branch
+        // description; that interactive editor loop is not wired here.
+        bail!("--edit-description is not supported by this port");
+    }
+    if let Some(up) = o.set_upstream_to.clone() {
+        return set_upstream(&repo, &o, &up);
+    }
+    if o.unset_upstream {
+        return unset_upstream(&repo, &o);
     }
     if o.show_current {
         return show_current(&repo);
@@ -264,6 +474,17 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         return create_branch(&repo, &o);
     }
     list_branches(&repo, &o)
+}
+
+/// Consume git's `LASTARG_DEFAULT` value for a bare filter flag: the next token
+/// if there is one, otherwise `HEAD`. Advances `i` past a consumed token.
+fn lastarg_default(args: &[String], i: &mut usize) -> String {
+    if *i + 1 < args.len() {
+        *i += 1;
+        args[*i].clone()
+    } else {
+        "HEAD".to_string()
+    }
 }
 
 /// `--show-current`: the checked-out branch's short name, or nothing at all when
@@ -282,6 +503,7 @@ fn collect_entries<'repo>(
     repo: &'repo gix::Repository,
     o: &Opts,
     sort_keys: &[SortKey],
+    filters: &Filters,
 ) -> Result<Vec<Entry<'repo>>> {
     let head = repo.head()?;
     let current_ref: Option<BString> = head.referent_name().map(|n| n.as_bstr().to_owned());
@@ -297,6 +519,7 @@ fn collect_entries<'repo>(
                 id: Some(id),
                 symref: None,
                 current: true,
+                remote: false,
                 detached: true,
                 keys: Vec::new(),
             });
@@ -318,6 +541,7 @@ fn collect_entries<'repo>(
                 short,
                 id,
                 symref,
+                remote: false,
                 detached: false,
                 keys: Vec::new(),
             });
@@ -344,6 +568,7 @@ fn collect_entries<'repo>(
                 id,
                 symref,
                 current: false,
+                remote: true,
                 detached: false,
                 keys: Vec::new(),
             });
@@ -353,15 +578,17 @@ fn collect_entries<'repo>(
     // Default order is git's implicit ascending refname; an explicit sort (from
     // `--sort` or `branch.sort`) precomputes a comparable value per key per ref
     // and orders by them, with the most-significant key given last and a final
-    // refname tie-break — matching git's `ref-filter` sort.
+    // refname tie-break — matching git's `ref-filter` sort. `-i`/`--ignore-case`
+    // folds the string comparisons the way git's icase sort does.
+    let icase = o.ignore_case;
     if sort_keys.is_empty() {
-        refs.sort_by(|a, b| a.full.cmp(&b.full));
+        refs.sort_by(|a, b| icmp(&a.full, &b.full, icase));
     } else {
         for e in &mut refs {
             let facts = e.id.and_then(|id| commit_facts(repo, id.detach()));
             e.keys = sort_keys
                 .iter()
-                .map(|k| sort_value(e, facts.as_ref(), k))
+                .map(|k| fold_sort_val(sort_value(e, facts.as_ref(), k), icase))
                 .collect();
         }
         refs.sort_by(|a, b| {
@@ -374,20 +601,21 @@ fn collect_entries<'repo>(
                     return ord;
                 }
             }
-            a.full.cmp(&b.full)
+            icmp(&a.full, &b.full, icase)
         });
     }
 
     // `--list <pattern>...` keeps refs whose short name matches any glob. The
     // detached pseudo entry is not a ref and never matches a pattern.
     if !o.names.is_empty() {
+        let mode = if icase {
+            gix::glob::wildmatch::Mode::IGNORE_CASE
+        } else {
+            gix::glob::wildmatch::Mode::empty()
+        };
         refs.retain(|e| {
             o.names.iter().any(|p| {
-                gix::glob::wildmatch(
-                    BStr::new(p.as_bytes()),
-                    BStr::new(e.short.as_bytes()),
-                    gix::glob::wildmatch::Mode::empty(),
-                )
+                gix::glob::wildmatch(BStr::new(p.as_bytes()), BStr::new(e.short.as_bytes()), mode)
             })
         });
         detached = None;
@@ -396,7 +624,98 @@ fn collect_entries<'repo>(
     let mut out = Vec::with_capacity(refs.len() + 1);
     out.extend(detached);
     out.append(&mut refs);
+
+    // Reachability / points-at filters, applied to every candidate line (git's
+    // ref-filter drops any ref that is not a commit or fails a filter).
+    if !filters.is_empty() {
+        let mut kept = Vec::with_capacity(out.len());
+        for e in out {
+            if passes_filters(repo, filters, e.id.map(|id| id.detach()))? {
+                kept.push(e);
+            }
+        }
+        out = kept;
+    }
+
     Ok(out)
+}
+
+/// Whether a candidate line survives the reachability/points-at filters. A line
+/// with no commit id (a symbolic ref) is dropped whenever any filter is active,
+/// as git does when the ref does not peel to a commit.
+fn passes_filters(
+    repo: &gix::Repository,
+    filters: &Filters,
+    id: Option<ObjectId>,
+) -> Result<bool> {
+    let Some(tip) = id else {
+        return Ok(false);
+    };
+    if !filters.points_at.is_empty() && !filters.points_at.iter().any(|&o| o == tip) {
+        return Ok(false);
+    }
+    // `--contains=<c>`: the ref must be a descendant of `<c>`.
+    if !filters.contains.is_empty() {
+        let mut any = false;
+        for &c in &filters.contains {
+            if is_ancestor(repo, c, tip)? {
+                any = true;
+                break;
+            }
+        }
+        if !any {
+            return Ok(false);
+        }
+    }
+    for &c in &filters.no_contains {
+        if is_ancestor(repo, c, tip)? {
+            return Ok(false);
+        }
+    }
+    // `--merged=<m>`: the ref must be reachable from `<m>`.
+    if !filters.merged.is_empty() {
+        let mut any = false;
+        for &m in &filters.merged {
+            if is_ancestor(repo, tip, m)? {
+                any = true;
+                break;
+            }
+        }
+        if !any {
+            return Ok(false);
+        }
+    }
+    for &m in &filters.no_merged {
+        if is_ancestor(repo, tip, m)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// git's `repo_in_merge_bases`: whether `ancestor` is reachable from `descendant`.
+fn is_ancestor(repo: &gix::Repository, ancestor: ObjectId, descendant: ObjectId) -> Result<bool> {
+    if ancestor == descendant {
+        return Ok(true);
+    }
+    let bases = repo.merge_bases_many(descendant, &[ancestor])?;
+    Ok(bases.into_iter().any(|b| b.detach() == ancestor))
+}
+
+/// Resolve a filter operand to the commit git compares against: parse the rev,
+/// then peel to a commit. `--points-at` compares the object directly, so it does
+/// not peel. The error string is git's `malformed object name` fatal body.
+fn resolve_filter_commit(repo: &gix::Repository, spec: &str, peel: bool) -> Result<ObjectId> {
+    let bad = || anyhow!("malformed object name '{spec}'");
+    let id = repo
+        .rev_parse_single(BStr::new(spec.as_bytes()))
+        .map_err(|_| bad())?;
+    if !peel {
+        return Ok(id.detach());
+    }
+    let obj = id.object().map_err(|_| bad())?;
+    let commit = obj.peel_to_commit().map_err(|_| bad())?;
+    Ok(commit.id)
 }
 
 /// Split a reference's target into a commit id or a symbolic-ref short name.
@@ -405,6 +724,172 @@ fn target_of<'repo>(r: &gix::Reference<'repo>) -> (Option<gix::Id<'repo>>, Optio
         gix::refs::TargetRef::Object(_) => (Some(r.id()), None),
         gix::refs::TargetRef::Symbolic(name) => (None, Some(name.shorten().to_string())),
     }
+}
+
+/// Per-slot colors for the branch listing, resolved once. `on` is false when
+/// coloring is disabled, in which case no SGR (and no reset) is emitted.
+struct Colors {
+    on: bool,
+    current: String,
+    local: String,
+    remote: String,
+}
+
+impl Colors {
+    /// The SGR to open a line's color, given its slot. Local branches default to
+    /// `normal`, which renders as an empty SGR — but git still emits the reset.
+    fn open(&self, e: &Entry<'_>) -> &str {
+        if e.current || e.detached {
+            &self.current
+        } else if e.remote {
+            &self.remote
+        } else {
+            &self.local
+        }
+    }
+}
+
+/// Decide whether `git branch` colors its output and, if so, resolve every slot's
+/// SGR. Mirrors git: `--color` overrides, else `color.branch` falling back to
+/// `color.ui` (default `auto`); `auto` colors only on a terminal.
+fn resolve_colors(repo: &gix::Repository, when: ColorWhen) -> Colors {
+    let on = match when {
+        ColorWhen::Always => true,
+        ColorWhen::Never => false,
+        ColorWhen::Auto => {
+            let snap = repo.config_snapshot();
+            let raw = snap
+                .string("color.branch")
+                .or_else(|| snap.string("color.ui"))
+                .map(|v| v.to_string());
+            match raw.as_deref() {
+                Some("always") => true,
+                None | Some("auto" | "true" | "yes" | "on" | "1" | "") => {
+                    std::io::stdout().is_terminal()
+                }
+                _ => false,
+            }
+        }
+    };
+    if !on {
+        return Colors {
+            on: false,
+            current: String::new(),
+            local: String::new(),
+            remote: String::new(),
+        };
+    }
+    let snap = repo.config_snapshot();
+    let slot = |key: &str, default: &str| -> String {
+        let spec = snap
+            .string(key)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| default.to_string());
+        color_sgr(&spec)
+    };
+    Colors {
+        on: true,
+        current: slot("color.branch.current", "green"),
+        local: slot("color.branch.local", "normal"),
+        remote: slot("color.branch.remote", "red"),
+    }
+}
+
+/// Convert a git color spec (`"green"`, `"bold red"`, `"#ff00ff"`, `"reverse"`)
+/// into its SGR sequence, or an empty string when the spec sets nothing visible
+/// (git's `normal`). An unparsable spec yields an empty SGR rather than failing.
+fn color_sgr(spec: &str) -> String {
+    // git parses a spec into leading attributes then up to two colors (foreground
+    // then background); the SGR emits attributes first, then the color codes.
+    let mut codes: Vec<String> = Vec::new();
+    let mut color_words: Vec<&str> = Vec::new();
+    for word in spec.split_whitespace() {
+        if let Some(code) = attr_code(word) {
+            codes.push(code.to_string());
+        } else {
+            color_words.push(word);
+        }
+    }
+    for (idx, word) in color_words.iter().take(2).enumerate() {
+        // The foreground slot is consumed even when it renders no code (`normal`),
+        // so a following color still lands in the background slot.
+        if let Some(code) = color_code(word, idx == 1) {
+            codes.push(code);
+        }
+    }
+    if codes.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[{}m", codes.join(";"))
+    }
+}
+
+/// git's SGR attribute codes (`color.c`), with `no`/`no-` negations.
+fn attr_code(word: &str) -> Option<&'static str> {
+    let (word, neg) = match word.strip_prefix("no-").or_else(|| word.strip_prefix("no")) {
+        Some(rest) if !rest.is_empty() && rest != "rmal" => (rest, true),
+        _ => (word, false),
+    };
+    Some(match (word, neg) {
+        ("bold", false) => "1",
+        ("dim", false) => "2",
+        ("italic", false) => "3",
+        ("ul", false) => "4",
+        ("blink", false) => "5",
+        ("reverse", false) => "7",
+        ("strike", false) => "9",
+        ("bold", true) | ("dim", true) => "22",
+        ("italic", true) => "23",
+        ("ul", true) => "24",
+        ("blink", true) => "25",
+        ("reverse", true) => "27",
+        ("strike", true) => "29",
+        ("reset", false) => "0",
+        _ => return None,
+    })
+}
+
+/// git's SGR color code for a name, as foreground (`bg=false`) or background.
+/// `normal` produces no code (git's `-1`).
+fn color_code(word: &str, bg: bool) -> Option<String> {
+    let base = if bg { 40 } else { 30 };
+    let bright = if bg { 100 } else { 90 };
+    let (name, is_bright) = match word.strip_prefix("bright") {
+        Some(rest) => (rest, true),
+        None => (word, false),
+    };
+    let idx = match name {
+        "black" => 0,
+        "red" => 1,
+        "green" => 2,
+        "yellow" => 3,
+        "blue" => 4,
+        "magenta" => 5,
+        "cyan" => 6,
+        "white" => 7,
+        "normal" if !is_bright => return None,
+        "default" if !is_bright => return Some((base + 9).to_string()),
+        _ => {
+            if let Ok(n) = word.parse::<u8>() {
+                let sel = if bg { 48 } else { 38 };
+                return Some(format!("{sel};5;{n}"));
+            }
+            if let Some(hex) = word.strip_prefix('#') {
+                if hex.len() == 6 {
+                    if let (Ok(r), Ok(g), Ok(b)) = (
+                        u8::from_str_radix(&hex[0..2], 16),
+                        u8::from_str_radix(&hex[2..4], 16),
+                        u8::from_str_radix(&hex[4..6], 16),
+                    ) {
+                        let sel = if bg { 48 } else { 38 };
+                        return Some(format!("{sel};2;{r};{g};{b}"));
+                    }
+                }
+            }
+            return None;
+        }
+    };
+    Some(((if is_bright { bright } else { base }) + idx).to_string())
 }
 
 /// Print the branch listing. `--format` replaces the whole line and takes
@@ -435,7 +920,14 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         Ok(keys) => keys,
     };
 
-    let entries = collect_entries(repo, o, &sort_keys)?;
+    // Resolve every reachability filter before walking refs; a bad operand is
+    // git's fatal 128.
+    let filters = match resolve_filters(repo, o) {
+        Ok(f) => f,
+        Err(msg) => return fatal(msg),
+    };
+
+    let entries = collect_entries(repo, o, &sort_keys, &filters)?;
 
     if let Some(fmt) = &o.format {
         // Render every line before printing any, so a bad atom fails the command
@@ -456,6 +948,8 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    let colors = resolve_colors(repo, o.color);
+
     if o.verbose > 0 {
         // git pads every name into one column sized by the widest entry, then
         // separates it from the commit info by a single space.
@@ -468,38 +962,88 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             let marker = if e.current { "* " } else { "  " };
             let info = match &e.symref {
                 Some(sym) => format!("-> {sym}"),
-                None => verbose_info(e),
+                None => verbose_info(repo, e, o.abbrev),
             };
             let pad = " ".repeat(width - e.display.chars().count());
-            println!("{marker}{}{pad} {info}", e.display);
+            if colors.on {
+                println!("{marker}{}{}{pad}{RESET} {info}", colors.open(e), e.display);
+            } else {
+                println!("{marker}{}{pad} {info}", e.display);
+            }
         }
         return Ok(ExitCode::SUCCESS);
     }
 
     for e in &entries {
         let marker = if e.current { "* " } else { "  " };
-        println!("{marker}{}", e.display);
+        if colors.on {
+            println!("{marker}{}{}{RESET}", colors.open(e), e.display);
+        } else {
+            println!("{marker}{}", e.display);
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Resolve every `--contains`/`--no-contains`/`--merged`/`--no-merged`/
+/// `--points-at` operand to a concrete commit id (points-at is not peeled). A bad
+/// operand is reported as git's fatal string.
+fn resolve_filters(repo: &gix::Repository, o: &Opts) -> Result<Filters, String> {
+    let resolve = |specs: &[String], peel: bool| -> Result<Vec<ObjectId>, String> {
+        specs
+            .iter()
+            .map(|s| resolve_filter_commit(repo, s, peel).map_err(|e| e.to_string()))
+            .collect()
+    };
+    Ok(Filters {
+        contains: resolve(&o.contains, true)?,
+        no_contains: resolve(&o.no_contains, true)?,
+        merged: resolve(&o.merged, true)?,
+        no_merged: resolve(&o.no_merged, true)?,
+        points_at: resolve(&o.points_at, false)?,
+    })
 }
 
 /// The `-v` tail: abbreviated object name and the commit subject. A tip whose
 /// object cannot be read or is not a commit degrades to the abbreviation alone
 /// rather than failing the whole listing.
-fn verbose_info(e: &Entry<'_>) -> String {
+fn verbose_info(repo: &gix::Repository, e: &Entry<'_>, abbrev: Option<usize>) -> String {
     let Some(id) = e.id else {
         return String::new();
     };
-    let abbrev = id.shorten_or_id().to_string();
+    let short = abbrev_hex(repo, id, abbrev);
     let Ok(object) = id.object() else {
-        return abbrev;
+        return short;
     };
     let Ok(commit) = object.try_into_commit() else {
-        return abbrev;
+        return short;
     };
     match commit.message() {
-        Ok(msg) => format!("{abbrev} {}", msg.summary()),
-        Err(_) => abbrev,
+        Ok(msg) => format!("{short} {}", msg.summary()),
+        Err(_) => short,
+    }
+}
+
+/// git's `find_unique_abbrev` for the `-v` object column: `--abbrev=0`/
+/// `--no-abbrev` prints the full hash, an explicit `<n>` is clamped to at least
+/// `MINIMUM_ABBREV` and extended to a unique prefix, and the default follows
+/// `core.abbrev`.
+fn abbrev_hex(repo: &gix::Repository, id: gix::Id<'_>, abbrev: Option<usize>) -> String {
+    let hexsz = repo.object_hash().len_in_hex();
+    let want = match abbrev {
+        Some(0) => return id.detach().to_string(),
+        Some(n) => n.clamp(MINIMUM_ABBREV, hexsz),
+        None => return id.shorten_or_id().to_string(),
+    };
+    if want >= hexsz {
+        return id.detach().to_string();
+    }
+    match gix::odb::store::prefix::disambiguate::Candidate::new(id.detach(), want)
+        .ok()
+        .and_then(|c| repo.objects.disambiguate_prefix(c).ok().flatten())
+    {
+        Some(p) => p.to_string(),
+        None => id.detach().to_hex_with_len(want).to_string(),
     }
 }
 
@@ -549,11 +1093,12 @@ fn atom_value(atom: &str, e: &Entry<'_>) -> Result<String> {
     })
 }
 
-/// Create a single local branch at the current HEAD commit. A second positional
-/// (start-point) is rejected rather than ignored.
+/// Create a local branch. With no `<start-point>` it starts at the current HEAD
+/// commit; with one, at that resolved commit. `-t`/`--track`/`branch.autoSetupMerge`
+/// then records the upstream, and `-f` allows overwriting an existing branch.
 fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
-    if o.names.len() > 1 {
-        anyhow::bail!("creating a branch at an explicit start-point is not supported");
+    if o.names.len() > 2 {
+        return usage_exit();
     }
     let name = o.names[0].as_str();
     let full = format!("refs/heads/{name}");
@@ -566,22 +1111,71 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    // Resolve the target commit before locking so the error path is cheap.
-    let head = repo.head()?;
-    if head.is_unborn() {
-        return fatal("not a valid object name: 'HEAD'");
+    let start = o.names.get(1).map(|s| s.as_str());
+
+    // The reflog message names the start-point: the literal argument, or the
+    // current branch's short name when starting from HEAD.
+    let current_short = repo.head_name()?.map(|n| n.shorten().to_string());
+    let start_name = match start {
+        Some(s) => s.to_string(),
+        None => current_short.clone().unwrap_or_else(|| "HEAD".to_string()),
+    };
+
+    // Resolve the target commit and, when the start-point is itself a ref, its
+    // full name — used to decide tracking.
+    let (target, start_ref): (ObjectId, Option<BString>) = match start {
+        Some(s) => {
+            let id = match repo.rev_parse_single(BStr::new(s.as_bytes())) {
+                Ok(id) => id,
+                Err(_) => return fatal(format!("not a valid object name: '{s}'")),
+            };
+            let commit = match id.object() {
+                Ok(obj) => match obj.peel_to_commit() {
+                    Ok(c) => c.id,
+                    Err(_) => return fatal(format!("not a valid object name: '{s}'")),
+                },
+                Err(_) => return fatal(format!("not a valid object name: '{s}'")),
+            };
+            let start_ref = repo
+                .find_reference(s)
+                .ok()
+                .map(|r| r.name().as_bstr().to_owned());
+            (commit, start_ref)
+        }
+        None => {
+            let head = repo.head()?;
+            if head.is_unborn() {
+                return fatal("not a valid object name: 'HEAD'");
+            }
+            let id = head
+                .id()
+                .ok_or_else(|| anyhow!("HEAD does not point to a commit"))?
+                .detach();
+            let start_ref = repo.head_name()?.map(|n| n.as_bstr().to_owned());
+            (id, start_ref)
+        }
+    };
+
+    // Decide tracking before touching the ref: git dies (without creating the
+    // branch) if `--track` was explicit but the start-point is not a branch.
+    let start_ref_bstr = start_ref.as_ref().map(|b| b.as_bstr());
+    let upstream = tracking_upstream(repo, start_ref_bstr, o.track, name);
+    if matches!(o.track, Track::Direct | Track::Inherit) && upstream.is_none() {
+        return fatal(format!(
+            "cannot set up tracking information; starting point '{start_name}' is not a branch"
+        ));
     }
-    let target = head
-        .id()
-        .ok_or_else(|| anyhow!("HEAD does not point to a commit"))?
-        .detach();
 
     // Serialize the ref read-modify-write through the repo coordinator.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    if repo.try_find_reference(full.as_str())?.is_some() && !o.force {
+    let existed = repo.try_find_reference(full.as_str())?.is_some();
+    if existed && !o.force {
         return fatal(format!("a branch named '{name}' already exists"));
     }
+
+    let verb = if existed { "Reset to" } else { "Created from" };
+    let message = format!("branch: {verb} {start_name}");
 
     repo.reference(
         full,
@@ -591,14 +1185,257 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         } else {
             PreviousValue::MustNotExist
         },
-        "branch: Created from HEAD",
+        message,
     )?;
+
+    if let Some(up) = upstream {
+        install_tracking(repo, name, &up, o.quiet)?;
+    }
 
     Ok(ExitCode::SUCCESS)
 }
 
-/// `-m`/`-M`: rename a branch, carrying its reflog across and re-pointing HEAD
-/// when the renamed branch is the checked-out one.
+/// The upstream a branch should track: `(remote, merge_ref, short)`. Auto-set
+/// when the start-point is a remote-tracking branch (git's default
+/// `branch.autoSetupMerge=true`); a local branch is tracked only with an explicit
+/// `--track`. `--no-track` disables it. `--track=inherit` copies the start
+/// branch's own upstream. Mirrors `git switch`'s tracking logic.
+fn tracking_upstream(
+    repo: &gix::Repository,
+    start_ref: Option<&BStr>,
+    track: Track,
+    new_branch: &str,
+) -> Option<(String, String, String)> {
+    if track == Track::No {
+        return None;
+    }
+    let full = start_ref?;
+    let s = full.to_str_lossy();
+    let explicit = matches!(track, Track::Direct | Track::Inherit);
+
+    let snap = repo.config_snapshot();
+    let mode = snap
+        .string("branch.autoSetupMerge")
+        .map(|v| v.to_str_lossy().to_ascii_lowercase());
+    let mode = mode.as_deref();
+    let off = matches!(mode, Some("false" | "no" | "off" | "0"));
+
+    // `--track=inherit` (or `branch.autoSetupMerge=inherit`) copies the start
+    // branch's own upstream rather than pointing at the start branch itself.
+    if track == Track::Inherit || mode == Some("inherit") {
+        if let Some(b) = s.strip_prefix("refs/heads/") {
+            return inherited_upstream(&snap, b);
+        }
+    }
+
+    if let Some(rest) = s.strip_prefix("refs/remotes/") {
+        let (remote, branch) = rest.split_once('/')?;
+        let auto = if off {
+            false
+        } else if mode == Some("simple") {
+            branch == new_branch
+        } else {
+            true
+        };
+        if explicit || auto {
+            return Some((
+                remote.to_string(),
+                format!("refs/heads/{branch}"),
+                format!("{remote}/{branch}"),
+            ));
+        }
+        return None;
+    }
+
+    if let Some(branch) = s.strip_prefix("refs/heads/") {
+        if explicit || mode == Some("always") {
+            return Some((
+                ".".to_string(),
+                format!("refs/heads/{branch}"),
+                branch.to_string(),
+            ));
+        }
+    }
+    None
+}
+
+/// The upstream inherited from a local start branch's own `branch.<b>.remote`/
+/// `branch.<b>.merge`, if it has one.
+fn inherited_upstream(
+    snap: &gix::config::Snapshot<'_>,
+    branch: &str,
+) -> Option<(String, String, String)> {
+    let remote = snap
+        .string(&format!("branch.{branch}.remote"))?
+        .to_str_lossy()
+        .into_owned();
+    let merge = snap
+        .string(&format!("branch.{branch}.merge"))?
+        .to_str_lossy()
+        .into_owned();
+    let short = match merge.strip_prefix("refs/heads/") {
+        Some(b) if remote == "." => b.to_string(),
+        Some(b) => format!("{remote}/{b}"),
+        None => merge.clone(),
+    };
+    Some((remote, merge, short))
+}
+
+/// `-u`/`--set-upstream-to`: point a branch's upstream at `<upstream>`. Operates
+/// on the given branch, or the current one when no positional is present.
+fn set_upstream(repo: &gix::Repository, o: &Opts, upstream_spec: &str) -> Result<ExitCode> {
+    let branch_name = match o.names.first() {
+        Some(n) => n.clone(),
+        None => match repo.head_name()? {
+            Some(h) => h.shorten().to_string(),
+            None => {
+                return fatal(format!(
+                    "could not set upstream of HEAD to {upstream_spec} when it does not point to any branch"
+                ))
+            }
+        },
+    };
+
+    let full = format!("refs/heads/{branch_name}");
+    if repo.try_find_reference(full.as_str())?.is_none() {
+        return fatal(format!("branch '{branch_name}' does not exist"));
+    }
+
+    let up = match resolve_upstream(repo, upstream_spec)? {
+        Some(u) => u,
+        None => {
+            let code = fatal(format!(
+                "the requested upstream branch '{upstream_spec}' does not exist"
+            ))?;
+            if crate::advice::enabled("setUpstreamFailure") {
+                eprintln!("hint:");
+                eprintln!("hint: If you are planning on basing your work on an upstream");
+                eprintln!("hint: branch that already exists at the remote, you may need to");
+                eprintln!("hint: run \"git fetch\" to retrieve it.");
+                eprintln!("hint:");
+                eprintln!("hint: If you are planning to push out a new local branch that");
+                eprintln!("hint: will track its remote counterpart, you may want to use");
+                eprintln!("hint: \"git push -u\" to set the upstream config as you push.");
+                eprintln!(
+                    "hint: Disable this message with \"git config set advice.setUpstreamFailure false\""
+                );
+            }
+            return Ok(code);
+        }
+    };
+
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    install_tracking(repo, &branch_name, &up, o.quiet)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Resolve an upstream spec to `(remote, merge_ref, short)`. A remote-tracking
+/// ref maps to its remote and the remote-side branch; a local branch maps to the
+/// `.` remote. `None` when the spec does not name a ref.
+fn resolve_upstream(
+    repo: &gix::Repository,
+    spec: &str,
+) -> Result<Option<(String, String, String)>> {
+    let full: BString = match repo.find_reference(spec) {
+        Ok(r) => r.name().as_bstr().to_owned(),
+        Err(_) => return Ok(None),
+    };
+    let s = full.to_str_lossy();
+    if let Some(rest) = s.strip_prefix("refs/remotes/") {
+        if let Some((remote, branch)) = rest.split_once('/') {
+            return Ok(Some((
+                remote.to_string(),
+                format!("refs/heads/{branch}"),
+                format!("{remote}/{branch}"),
+            )));
+        }
+    }
+    if let Some(b) = s.strip_prefix("refs/heads/") {
+        return Ok(Some((".".to_string(), s.to_string(), b.to_string())));
+    }
+    // Any other ref (e.g. a tag): git records it against the `.` remote.
+    Ok(Some((".".to_string(), s.to_string(), spec.to_string())))
+}
+
+/// `--unset-upstream`: drop `branch.<name>.remote` and `branch.<name>.merge` for
+/// the given branch (or the current one). Refuses a branch with no upstream.
+fn unset_upstream(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
+    let branch_name = match o.names.first() {
+        Some(n) => n.clone(),
+        None => match repo.head_name()? {
+            Some(h) => h.shorten().to_string(),
+            None => {
+                return fatal("could not unset upstream of HEAD when it does not point to any branch")
+            }
+        },
+    };
+
+    let snap = repo.config_snapshot();
+    let has_upstream = snap
+        .string(&format!("branch.{branch_name}.remote"))
+        .is_some()
+        || snap
+            .string(&format!("branch.{branch_name}.merge"))
+            .is_some();
+    if !has_upstream {
+        return fatal(format!("branch '{branch_name}' has no upstream information"));
+    }
+    drop(snap);
+
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let path = repo.common_dir().join("config");
+    let mut file = ConfigFile::from_path_no_includes(path.clone(), Source::Local)?;
+    if let Ok(mut section) = file.section_mut("branch", Some(BStr::new(branch_name.as_bytes()))) {
+        while section.remove("remote").is_some() {}
+        while section.remove("merge").is_some() {}
+    }
+    write_config(&path, &file)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Write `branch.<name>.remote`/`branch.<name>.merge` (and, per
+/// `branch.autoSetupRebase`, `.rebase`) into the local config, then print git's
+/// `set up to track` notice on stdout unless `--quiet`. Called with the repo lock
+/// held.
+fn install_tracking(
+    repo: &gix::Repository,
+    branch: &str,
+    upstream: &(String, String, String),
+    quiet: bool,
+) -> Result<()> {
+    let (remote, merge_ref, short) = upstream;
+    let path = repo.common_dir().join("config");
+    let mut file = ConfigFile::from_path_no_includes(path.clone(), Source::Local)?;
+    let sub = BStr::new(branch.as_bytes());
+    file.set_raw_value_by("branch", Some(sub), "remote", remote.as_str())?;
+    file.set_raw_value_by("branch", Some(sub), "merge", merge_ref.as_str())?;
+
+    let is_local = remote == ".";
+    let want_rebase = match repo
+        .config_snapshot()
+        .string("branch.autoSetupRebase")
+        .map(|v| v.to_str_lossy().into_owned())
+        .as_deref()
+    {
+        Some("always") => true,
+        Some("local") => is_local,
+        Some("remote") => !is_local,
+        _ => false,
+    };
+    if want_rebase {
+        file.set_raw_value_by("branch", Some(sub), "rebase", "true")?;
+    }
+
+    write_config(&path, &file)?;
+
+    if !quiet {
+        println!("branch '{branch}' set up to track '{short}'.");
+    }
+    Ok(())
+}
+
+/// `-m`/`-M`: rename a branch, carrying its reflog and `branch.<name>.*` config
+/// across and re-pointing HEAD when the renamed branch is the checked-out one.
 ///
 /// With one positional the current branch is renamed; with two, the first names
 /// the branch to rename. git's reflog is a file keyed by ref name, so the rename
@@ -606,7 +1443,7 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 /// delete-and-create would drop it.
 fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let (old, new) = match o.names.len() {
-        0 => return usage_exit(),
+        0 => return fatal("branch name required"),
         1 => {
             let Some(head) = repo.head_name()? else {
                 return fatal("cannot rename the current branch while not on any");
@@ -669,7 +1506,7 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
-                force_create_reflog: false,
+                force_create_reflog: o.create_reflog,
                 message: message.clone().into(),
             },
             expected: PreviousValue::Any,
@@ -688,6 +1525,8 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             name: old_name,
             deref: false,
         })?;
+        // git renames the branch's config section along with the ref.
+        move_branch_config(repo, &old, &new, true)?;
     }
 
     if head_follows {
@@ -711,11 +1550,162 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `-c`/`-C`: copy a branch, duplicating its reflog and `branch.<name>.*` config
+/// into the new name and leaving the source (and HEAD) untouched.
+///
+/// With one positional the current branch is copied; with two, the first names
+/// the source. `-C` allows overwriting an existing target.
+fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
+    let (old, new) = match o.names.len() {
+        0 => return fatal("branch name required"),
+        1 => {
+            let Some(head) = repo.head_name()? else {
+                return fatal("cannot copy the current branch while not on any");
+            };
+            (head.shorten().to_string(), o.names[0].clone())
+        }
+        2 => (o.names[0].clone(), o.names[1].clone()),
+        _ => return fatal("too many branches for a copy operation"),
+    };
+
+    let old_full = format!("refs/heads/{old}");
+    let new_full = format!("refs/heads/{new}");
+
+    if gix::validate::reference::branch_name(BStr::new(new_full.as_bytes())).is_err() {
+        let code = fatal(format!("'{new}' is not a valid branch name"))?;
+        if crate::advice::enabled("refSyntax") {
+            ref_syntax_hints();
+        }
+        return Ok(code);
+    }
+
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+
+    let mut old_ref = match repo.try_find_reference(old_full.as_str())? {
+        Some(r) => r,
+        None => return fatal(format!("no branch named '{old}'")),
+    };
+    if old_full != new_full && repo.try_find_reference(new_full.as_str())?.is_some() && !o.force {
+        return fatal(format!("a branch named '{new}' already exists"));
+    }
+    let target = old_ref.peel_to_id_in_place()?.detach();
+
+    let new_name: FullName = new_full
+        .as_str()
+        .try_into()
+        .map_err(|e| anyhow!("invalid branch name '{new}': {e}"))?;
+
+    // Copy the reflog file first so the update below appends its "copied" entry to
+    // the carried-over history rather than starting a fresh log.
+    if old_full != new_full {
+        let logs = repo.git_dir().join("logs");
+        let from = logs.join(&old_full);
+        let to = logs.join(&new_full);
+        if from.exists() {
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&from, &to)?;
+        }
+    }
+
+    let message = format!("Branch: copied {old_full} to {new_full}");
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: o.create_reflog,
+                message: message.into(),
+            },
+            expected: if o.force {
+                PreviousValue::Any
+            } else {
+                PreviousValue::MustNotExist
+            },
+            new: Target::Object(target),
+        },
+        name: new_name,
+        deref: false,
+    })?;
+
+    // git duplicates the branch's config section into the new name.
+    if old_full != new_full {
+        move_branch_config(repo, &old, &new, false)?;
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Copy every `branch.<old>.*` value into `branch.<new>.*` in the local config.
+/// When `remove_old`, the old subsection is deleted afterward (a rename); a copy
+/// leaves it in place. Mirrors git's `git_config_copy_section` /
+/// `git_config_rename_section` for the `branch.<name>` section.
+fn move_branch_config(
+    repo: &gix::Repository,
+    old: &str,
+    new: &str,
+    remove_old: bool,
+) -> Result<()> {
+    let path = repo.common_dir().join("config");
+    let mut file = ConfigFile::from_path_no_includes(path.clone(), Source::Local)?;
+
+    // Gather the old subsection's key/value pairs in order, as owned data so the
+    // immutable borrow ends before the mutation below.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if let Some(iter) = file.sections_by_name("branch") {
+        for section in iter {
+            if section.header().subsection_name() == Some(BStr::new(old.as_bytes())) {
+                for name in section.value_names() {
+                    for value in section.values(&name) {
+                        pairs.push((name.clone(), value.to_str_lossy().into_owned()));
+                    }
+                }
+            }
+        }
+    }
+
+    if pairs.is_empty() && !remove_old {
+        return Ok(());
+    }
+
+    if !pairs.is_empty() {
+        let sub = BStr::new(new.as_bytes());
+        let mut section = file.section_mut_or_create_new("branch", Some(sub))?;
+        for (key, value) in &pairs {
+            section.push(key.as_str(), value.as_str())?;
+        }
+    }
+
+    if remove_old {
+        while file
+            .remove_section("branch", Some(BStr::new(old.as_bytes())))
+            .is_some()
+        {}
+    }
+
+    write_config(&path, &file)?;
+    Ok(())
+}
+
+/// Serialize `file` to `path` atomically: write a sibling temp file, then rename
+/// over the target so a crash never leaves a half-written config.
+fn write_config(path: &std::path::Path, file: &ConfigFile) -> Result<()> {
+    let bytes = file.to_bstring();
+    let tmp = path.with_extension("zvcs-tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Delete one or more local branches. Without `-D`, a branch not reachable from
 /// HEAD (not fully merged) is refused. The currently checked-out branch cannot
 /// be deleted. Successfully deleted branches are reported as
-/// `Deleted branch <name> (was <abbrev>).`; git stops at the first failure with
-/// exit 1, leaving earlier deletions committed.
+/// `Deleted branch <name> (was <abbrev>).` unless `-q`; git stops at the first
+/// failure with exit 1, leaving earlier deletions committed.
 fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     if o.names.is_empty() {
         return fatal("branch name required");
@@ -779,7 +1769,9 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             deref: false,
         })?;
 
-        println!("Deleted branch {name} (was {abbrev}).");
+        if !o.quiet {
+            println!("Deleted branch {name} (was {abbrev}).");
+        }
     }
 
     Ok(ExitCode::SUCCESS)
@@ -901,6 +1893,29 @@ impl SortVal {
             (SortVal::Version(a), SortVal::Version(b)) => versioncmp(a, b),
             _ => Ordering::Equal,
         }
+    }
+}
+
+/// Fold a string-valued sort key to lowercase for `-i`/`--ignore-case`; numeric
+/// keys are unaffected.
+fn fold_sort_val(v: SortVal, icase: bool) -> SortVal {
+    if !icase {
+        return v;
+    }
+    match v {
+        SortVal::Bytes(b) => SortVal::Bytes(b.to_ascii_lowercase()),
+        SortVal::Version(b) => SortVal::Version(b.to_ascii_lowercase()),
+        num => num,
+    }
+}
+
+/// Compare two byte strings, ASCII-folding when `icase` — the refname order used
+/// for the default sort and the final tie-break.
+fn icmp(a: &BString, b: &BString, icase: bool) -> Ordering {
+    if icase {
+        a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
+    } else {
+        a.cmp(b)
     }
 }
 

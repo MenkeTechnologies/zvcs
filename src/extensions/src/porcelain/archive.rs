@@ -38,7 +38,13 @@
 //!     one reported.
 //!   * Trailing `[--] <path>...` filters, with git's "pathspec did not match"
 //!     failure, and git's lazy directory-entry emission (a directory record is
-//!     written only once a file below it is written).
+//!     written only once a file below it is written). The specs go through the
+//!     vendored `gix-pathspec` (git parses them with
+//!     `parse_pathspec(..., 0, PATHSPEC_PREFER_CWD, prefix, argv)` and
+//!     `recursive = 1`), so the full magic grammar is honoured — `:(glob)`,
+//!     `:(literal)`, `:(icase)`, `:(top)`, `:(exclude)` / `:!`, and the `*` /
+//!     `?` / `[…]` wildcards — matched the way git's `match_pathspec()` matches,
+//!     with only a *positive* spec that matches nothing raising the failure.
 //!   * Being run from a subdirectory, which narrows the tree to that
 //!     subdirectory exactly as git does.
 //!   * `tar.umask` (numeric, and `tar.umask=user`, which git reads from the
@@ -89,8 +95,14 @@
 //!     archived blobs through `convert_to_working_tree()`; this port writes the
 //!     blob verbatim, so any of those inputs is rejected instead of producing a
 //!     wrong archive.
-//!   * Pathspec magic (`:(glob)`, `*`, `?`, `[`), which this port does not
-//!     implement.
+//!   * Two pathspec-magic corners that need substrate this port does not wire
+//!     into `git archive`: an `:(attr:<name>)` spec is matched as if no
+//!     attribute were set (the archive path selection deliberately does not
+//!     consult the attribute stack, since content-affecting attributes are a
+//!     hard error anyway), so an `:(attr:…)` spec selects nothing; and `:(top)`
+//!     given from a *subdirectory* re-roots at the repository top in git, but
+//!     here the tree is already narrowed to the subdirectory, so a `:(top)` spec
+//!     is matched against the narrowed tree. Every other magic works.
 
 use anyhow::{bail, Result};
 use std::io::Write;
@@ -99,6 +111,7 @@ use std::process::ExitCode;
 use gix::bstr::ByteSlice;
 use gix::hash::ObjectId;
 use gix::object::tree::EntryKind;
+use gix::pathspec::Search;
 
 /// git's `RECORDSIZE`: one `ustar` record.
 const RECORD: usize = 512;
@@ -378,12 +391,6 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    for p in &opts.paths {
-        if p.starts_with(':') || p.contains(['*', '?', '[']) {
-            bail!("pathspec magic is not supported: {p:?}");
-        }
-    }
-
     let repo = gix::discover(".")?;
 
     // git lets `tar.<fmt>.command` replace an archiver with an external filter.
@@ -456,26 +463,93 @@ pub fn archive(args: &[String]) -> Result<ExitCode> {
         reject_worktree_attributes(&repo)?;
     }
 
+    // Parse the trailing pathspecs into a `gix-pathspec` search so the whole
+    // magic grammar is matched exactly as git's `match_pathspec()` does. git
+    // parses these with `parse_pathspec(..., 0, PATHSPEC_PREFER_CWD, prefix,
+    // argv)` (no magic disallowed) and sets `recursive = 1`. The tree was
+    // already narrowed to the CWD subdirectory above, so the specs are matched
+    // against subdirectory-relative paths — the PREFER_CWD prefixing and the
+    // narrowing cancel out for every spec that is not `:(top)`. An empty spec
+    // list means "match everything", represented as `None` (no search built).
+    // `parsed` keeps the individual patterns so the "did not match" check can
+    // test each one independently, the way git's `path_exists()` does.
+    let root = repo.workdir().unwrap_or_else(|| repo.git_dir()).to_path_buf();
+    let parsed: Vec<gix::pathspec::Pattern> = if opts.paths.is_empty() {
+        Vec::new()
+    } else {
+        let defaults = repo.pathspec_defaults().unwrap_or_default();
+        let mut patterns = Vec::with_capacity(opts.paths.len());
+        for spec in &opts.paths {
+            match gix::pathspec::parse(spec.as_bytes(), defaults) {
+                Ok(p) => patterns.push(p),
+                Err(e) => {
+                    eprintln!("fatal: {e}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
+        patterns
+    };
+    let mut search = if parsed.is_empty() {
+        None
+    } else {
+        match Search::from_specs(parsed.clone(), None, &root) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("fatal: {e}");
+                return Ok(ExitCode::from(128));
+            }
+        }
+    };
+
     // Walk first, emit second: a pathspec that matches nothing must fail with an
-    // empty stdout.
-    let mut matched = vec![false; opts.paths.len()];
+    // empty stdout. Inclusion (and the exclude-aware directory pruning) uses the
+    // combined search; excludes sort ahead of includes so an excluded path never
+    // slips in.
     let mut pending: Vec<Item> = Vec::new();
     let mut items: Vec<Item> = Vec::new();
-    collect(
-        &repo,
-        tree.clone(),
-        b"",
-        &opts.paths,
-        &mut matched,
-        &mut pending,
-        &mut items,
-    )?;
-    if let Some(idx) = matched.iter().position(|m| !m) {
-        eprintln!(
-            "fatal: pathspec '{}' did not match any files",
-            opts.paths[idx]
-        );
-        return Ok(ExitCode::from(128));
+    collect(&repo, tree.clone(), b"", search.as_mut(), &mut pending, &mut items)?;
+
+    // git calls `path_exists()` for each argv pathspec independently, dying on
+    // the first *positive* one (in argv order) that matches nothing. Reproduce
+    // that per-spec existence test against the archived paths: build a one-spec
+    // search and look for any archived entry it matches. A negative
+    // (`:(exclude)` / `:!`) spec is never required to match.
+    for (idx, pat) in parsed.iter().enumerate() {
+        if pat.is_excluded() {
+            continue;
+        }
+        let mut one = match Search::from_specs([pat.clone()], None, &root) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("fatal: {e}");
+                return Ok(ExitCode::from(128));
+            }
+        };
+        let hit = items.iter().any(|it| {
+            let mut no_attrs = |_: &gix::bstr::BStr,
+                                _: gix::pathspec::attributes::glob::pattern::Case,
+                                _: bool,
+                                _: &mut gix::pathspec::attributes::search::Outcome|
+             -> bool { false };
+            // Directory and submodule records carry a trailing slash; strip it
+            // and flag directory-ness for the matcher (a gitlink matches as a
+            // file, like git).
+            let (rel, is_dir) = match it.kind {
+                EntryKind::Tree => (&it.path[..it.path.len() - 1], true),
+                EntryKind::Commit => (&it.path[..it.path.len() - 1], false),
+                _ => (&it.path[..], false),
+            };
+            one.pattern_matching_relative_path(rel.as_bstr(), Some(is_dir), &mut no_attrs)
+                .is_some_and(|m| !m.is_excluded())
+        });
+        if !hit {
+            eprintln!(
+                "fatal: pathspec '{}' did not match any files",
+                opts.paths[idx]
+            );
+            return Ok(ExitCode::from(128));
+        }
     }
 
     // Now that every git diagnostic with an exit code of its own has fired, the
@@ -905,8 +979,7 @@ fn collect(
     repo: &gix::Repository,
     tree: gix::Tree<'_>,
     base: &[u8],
-    specs: &[String],
-    matched: &mut [bool],
+    mut search: Option<&mut Search>,
     pending: &mut Vec<Item>,
     out: &mut Vec<Item>,
 ) -> Result<()> {
@@ -922,7 +995,15 @@ fn collect(
         path.extend_from_slice(&filename);
 
         if kind == EntryKind::Tree {
-            if !descend(&path, specs) {
+            // git returns `READ_TREE_RECURSIVE` for a directory that a pathspec
+            // could still match below; `can_match_relative_path` answers exactly
+            // that question from the shared prefix, so an unreachable sub-tree is
+            // pruned before it is decoded.
+            let recurse = match search.as_deref() {
+                None => true,
+                Some(s) => s.can_match_relative_path(path.as_bstr(), Some(true)),
+            };
+            if !recurse {
                 continue;
             }
             let mut dir = path.clone();
@@ -933,11 +1014,26 @@ fn collect(
                 oid,
             });
             let child = repo.find_object(oid)?.peel_to_tree()?;
-            collect(repo, child, &dir, specs, matched, pending, out)?;
+            collect(repo, child, &dir, search.as_deref_mut(), pending, out)?;
             continue;
         }
 
-        if !selects(&path, specs, matched) {
+        // A file (blob, executable blob, symlink or submodule gitlink) is matched
+        // as a non-directory. Attribute-driven pathspecs (`:(attr:…)`) are matched
+        // as if no attribute were set — see the module header.
+        let selected = match search.as_deref_mut() {
+            None => true,
+            Some(s) => {
+                let mut no_attrs = |_: &gix::bstr::BStr,
+                                    _: gix::pathspec::attributes::glob::pattern::Case,
+                                    _: bool,
+                                    _: &mut gix::pathspec::attributes::search::Outcome|
+                 -> bool { false };
+                s.pattern_matching_relative_path(path.as_bstr(), Some(false), &mut no_attrs)
+                    .is_some_and(|m| !m.is_excluded())
+            }
+        };
+        if !selected {
             continue;
         }
         // Submodules become directory records, so they carry a trailing slash.
@@ -959,35 +1055,6 @@ fn flush_pending(pending: &mut Vec<Item>, path: &[u8], out: &mut Vec<Item>) {
         .filter(|dir| path.starts_with(&dir.path))
         .collect();
     out.extend(ancestors);
-}
-
-/// Whether a file at `path` passes the path filters, marking the ones it matches.
-fn selects(path: &[u8], specs: &[String], matched: &mut [bool]) -> bool {
-    if specs.is_empty() {
-        return true;
-    }
-    let mut any = false;
-    for (idx, spec) in specs.iter().enumerate() {
-        let spec = spec.trim_end_matches('/').as_bytes();
-        if path == spec || (path.starts_with(spec) && path.get(spec.len()) == Some(&b'/')) {
-            matched[idx] = true;
-            any = true;
-        }
-    }
-    any
-}
-
-/// Whether the sub-tree at `path` can still contain a filtered-in file.
-fn descend(path: &[u8], specs: &[String]) -> bool {
-    if specs.is_empty() {
-        return true;
-    }
-    specs.iter().any(|spec| {
-        let spec = spec.trim_end_matches('/').as_bytes();
-        path == spec
-            || (path.starts_with(spec) && path.get(spec.len()) == Some(&b'/'))
-            || (spec.starts_with(path) && spec.get(path.len()) == Some(&b'/'))
-    })
 }
 
 /// The `ustar` writer: a direct port of git's `archive-tar.c`.

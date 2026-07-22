@@ -267,11 +267,12 @@ fn blame_date_invalid_is_fatal() {
 fn blame_date_unsupported_modes_rejected() {
     let (repo, home) = dated_fixture("unsup", "1700000000 +0000");
 
-    // These are valid git modes that need machinery blame.rs lacks (relative /
-    // human rendering, local-timezone conversion, strftime). They must be
-    // rejected rather than emitting wrong bytes, and must NOT be mislabeled as
-    // an unknown-format fatal (which would be exit 128).
-    for m in ["relative", "human", "iso-local", "default-local", "format:%Y"] {
+    // These are valid git modes that need machinery blame.rs lacks (human
+    // rendering, local-timezone conversion, strftime). They must be rejected
+    // rather than emitting wrong bytes, and must NOT be mislabeled as an
+    // unknown-format fatal (which would be exit 128). `relative` IS supported
+    // and is covered separately by `blame_date_relative_matches_git`.
+    for m in ["human", "iso-local", "default-local", "format:%Y"] {
         let flag = format!("--date={m}");
         let z = zvcs_blame(&repo, &home, &[&flag]);
         assert!(!z.status.success(), "--date={m} must be rejected");
@@ -293,6 +294,137 @@ fn blame_date_unsupported_modes_rejected() {
     assert_eq!(
         String::from_utf8_lossy(&z.stderr),
         "fatal: date format missing colon separator: format\n"
+    );
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Output-shaping flags that must match git byte-for-byte. The single-commit
+// fixture's only commit is a root, so it is a boundary by default — which
+// exercises `-b` (blank the name), `--root` (drop the boundary), `-c`
+// (annotate-compat, no caret) and `-t` (raw timestamp) directly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn blame_boundary_and_output_flags_match_git() {
+    let (repo, home) = dated_fixture("outflags", "1700000000 +0000");
+
+    for extra in [
+        &["-b"][..],
+        &["--root"][..],
+        &["--no-root"][..],
+        &["-t"][..],
+        &["-c"][..],
+        &["-c", "-e"][..],
+        &["-c", "-t"][..],
+        &["-l"][..],
+        &["-b", "-l"][..],
+    ] {
+        let z = zvcs_blame(&repo, &home, extra);
+        let g = real_blame(&repo, &home, extra);
+        assert!(
+            z.status.success(),
+            "zvcs blame {extra:?} failed: {}",
+            String::from_utf8_lossy(&z.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&g.stdout),
+            String::from_utf8_lossy(&z.stdout),
+            "blame {extra:?} must match git byte-for-byte"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn blame_diff_algorithm_matches_git_and_rejects_unknown() {
+    let (repo, home) = dated_fixture("diffalgo", "1700000000 +0000");
+
+    for algo in ["myers", "default", "minimal", "histogram"] {
+        let z = zvcs_blame(&repo, &home, &["--diff-algorithm", algo]);
+        let g = real_blame(&repo, &home, &["--diff-algorithm", algo]);
+        assert!(
+            z.status.success(),
+            "zvcs --diff-algorithm {algo} failed: {}",
+            String::from_utf8_lossy(&z.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&g.stdout),
+            String::from_utf8_lossy(&z.stdout),
+            "--diff-algorithm {algo} must match git"
+        );
+    }
+
+    // `--diff-algorithm=histogram` (glued form) is accepted too.
+    let z = zvcs_blame(&repo, &home, &["--diff-algorithm=histogram"]);
+    assert!(z.status.success(), "glued --diff-algorithm= form must parse");
+
+    // An unknown algorithm is rejected (git dies too).
+    let z = zvcs_blame(&repo, &home, &["--diff-algorithm", "bogus"]);
+    assert!(!z.status.success(), "unknown --diff-algorithm must be rejected");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn blame_contents_matches_git() {
+    let (repo, home) = dated_fixture("contents", "1700000000 +0000");
+
+    // Identical content: every line still resolves to the committed blob, so the
+    // output is fully deterministic and must match git byte-for-byte.
+    std::fs::write(repo.join("f.same"), "hello\n").unwrap();
+    let z = zvcs_blame(&repo, &home, &["--contents", "f.same"]);
+    let g = real_blame(&repo, &home, &["--contents", "f.same"]);
+    assert!(
+        z.status.success(),
+        "zvcs --contents failed: {}",
+        String::from_utf8_lossy(&z.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&g.stdout),
+        String::from_utf8_lossy(&z.stdout),
+        "--contents (identical image) must match git byte-for-byte"
+    );
+
+    // Divergent content: the added line is attributed to git's synthetic
+    // `External file (--contents)` author (the timestamp is "now", hence not
+    // compared for exact equality).
+    std::fs::write(repo.join("f.diff"), "hello\nextra\n").unwrap();
+    let z = zvcs_blame(&repo, &home, &["--contents", "f.diff"]);
+    let out = stdout(&z);
+    assert!(z.status.success(), "divergent --contents must succeed");
+    assert!(
+        out.contains("External file (--contents)"),
+        "added line uses git's --contents author identity:\n{out}"
+    );
+    assert!(out.contains("extra"), "added line content present:\n{out}");
+    assert!(out.contains("hello"), "committed line still shown:\n{out}");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn blame_date_relative_matches_git() {
+    // `relative` renders against the current wall clock; git and zvcs read the
+    // same clock microseconds apart on a fixed commit date, so the coarse bucket
+    // ("N years[, M months] ago") is identical.
+    let (repo, home) = dated_fixture("relative", "1700000000 +0000");
+
+    let z = zvcs_blame(&repo, &home, &["--date=relative"]);
+    let g = real_blame(&repo, &home, &["--date=relative"]);
+    assert!(
+        z.status.success(),
+        "zvcs --date=relative failed: {}",
+        String::from_utf8_lossy(&z.stderr)
+    );
+    let zs = stdout(&z);
+    assert!(zs.contains(" ago"), "relative renders an 'ago' phrase:\n{zs}");
+    assert_eq!(
+        String::from_utf8_lossy(&g.stdout),
+        zs,
+        "--date=relative must match git"
     );
 
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());

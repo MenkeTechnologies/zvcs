@@ -10,6 +10,16 @@
 //!   * `git checkout -B <name> [<start>]`      → create-or-reset branch at `<start>`, switch
 //!   * `git checkout [<tree-ish>] -- <path>…`  → restore paths (index+worktree from `<tree-ish>`; worktree-only from index when no tree-ish)
 //!   * `git checkout <path>…`                  → restore paths from the index (bare pathspec form)
+//!   * `git checkout <remote-only-name>`         → DWIM (`--guess`, the default):
+//!                                                create-and-track a local branch
+//!                                                when exactly one remote has it.
+//!   * `git checkout --no-overlay <tree-ish> -- <path>…` → also delete paths that
+//!                                                match the pathspec but are absent
+//!                                                from `<tree-ish>` (overlay mode,
+//!                                                the default, never removes).
+//!   * `git checkout --pathspec-from-file <file>` (`--pathspec-file-nul`) → read
+//!                                                pathspecs from `<file>` (or stdin
+//!                                                for `-`) instead of the argv.
 //!   * `-q`/`--quiet` suppress the transition messages
 //!
 //! Every transition message (`Switched to …`, `Already on …`, `Reset branch …`,
@@ -34,9 +44,14 @@
 //!     a plain switch, and the dirty case is governed by the same conservative
 //!     clean-check as every other switch here.
 //!   * `-p`/`--patch` (interactive hunk selection) still bails — it needs a TTY.
+//!   * `--conflict <style>` is validated and implies `-m`; the style only affects
+//!     the deferred dirty-merge rendering, so on the clean-switch path honored
+//!     here it is a no-op (the 3-way carry is refused by the same clean-check as
+//!     every other switch).
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
+use std::io::Read as _;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
@@ -64,12 +79,55 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     let mut pre: Vec<&str> = Vec::new(); // positionals before `--`
     let mut post: Vec<&str> = Vec::new(); // pathspecs after `--`
     let mut has_dashdash = false;
+    // `None` = fall back to `checkout.guess` (default on); `Some(b)` = `--[no-]guess`.
+    let mut guess_flag: Option<bool> = None;
+    // Overlay (default) never removes paths; `--no-overlay` deletes paths that
+    // match the pathspec but are absent from the source tree.
+    let mut overlay = true;
+    let mut pathspec_from_file: Option<String> = None;
+    let mut pathspec_file_nul = false;
 
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if has_dashdash {
             post.push(a);
+            i += 1;
+            continue;
+        }
+        // Long options that take a value, in `--opt=value` or `--opt value` form.
+        // `--conflict` implies `-m`; the style only affects the deferred dirty
+        // merge rendering, so here it is validated and otherwise ignored.
+        if a == "--conflict" || a.starts_with("--conflict=") {
+            let val = match a.strip_prefix("--conflict=") {
+                Some(v) => v.to_string(),
+                None => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow!("option `conflict' requires a value"))?;
+                    i += 1;
+                    v.clone()
+                }
+            };
+            if !matches!(val.as_str(), "merge" | "diff3" | "zdiff3") {
+                eprintln!("error: unknown style '{val}' given for '--conflict'");
+                return Ok(ExitCode::from(129));
+            }
+            i += 1;
+            continue;
+        }
+        if a == "--pathspec-from-file" || a.starts_with("--pathspec-from-file=") {
+            let val = match a.strip_prefix("--pathspec-from-file=") {
+                Some(v) => v.to_string(),
+                None => {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow!("option `pathspec-from-file' requires a value"))?;
+                    i += 1;
+                    v.clone()
+                }
+            };
+            pathspec_from_file = Some(val);
             i += 1;
             continue;
         }
@@ -103,6 +161,19 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             // checkout, so accept it and let the shared clean-check govern the
             // dirty case exactly as every other switch here does.
             "-m" | "--merge" => {}
+            "-l" => {} // create the branch reflog — always on here (RefLog::AndReference)
+            "--guess" => guess_flag = Some(true),
+            "--no-guess" => guess_flag = Some(false),
+            "--overlay" => overlay = true,
+            "--no-overlay" => overlay = false,
+            "--pathspec-file-nul" => pathspec_file_nul = true,
+            // Accepted no-ops: progress is discarded, ignored-file overwrite is the
+            // default, and the other-worktree / skip-worktree checks git guards
+            // against are not enforced here, so toggling them changes nothing.
+            "--progress" | "--no-progress" => {}
+            "--overwrite-ignore" | "--no-overwrite-ignore" => {}
+            "--ignore-other-worktrees" => {}
+            "--ignore-skip-worktree-bits" => {}
             "-p" | "--patch" => bail!("interactive patch checkout (-p) needs a TTY"),
             _ if a.starts_with('-') && a.len() > 1 => bail!("unsupported flag {a:?}"),
             _ => pre.push(a),
@@ -111,6 +182,25 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- Dispatch -----------------------------------------------------------
+    // `--pathspec-from-file`: pathspecs come from the file (or stdin for `-`),
+    // never the command line. A single positional may still precede them as the
+    // `<tree-ish>` source; anything else is git's incompatibility error.
+    if let Some(file) = pathspec_from_file {
+        if has_dashdash || !post.is_empty() {
+            bail!("--pathspec-from-file is incompatible with pathspec arguments");
+        }
+        if new_branch.is_some() || orphan.is_some() || writeout_stage.is_some() {
+            bail!("--pathspec-from-file cannot be combined with branch creation or --ours/--theirs");
+        }
+        let specs = read_pathspec_file(&file, pathspec_file_nul)?;
+        let refs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        return match pre.len() {
+            0 => restore_from_index(&repo, &refs, false, quiet),
+            1 => restore_from_tree(&repo, pre[0], &refs, overlay, quiet),
+            _ => bail!("only one <tree-ish> may precede pathspecs"),
+        };
+    }
+
     // `--orphan <name> [<start>]`: start an unborn branch off `<start>`'s tree.
     if let Some(name) = orphan {
         let start = pre.first().copied().unwrap_or("HEAD");
@@ -167,7 +257,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         }
         return match pre.len() {
             0 => restore_from_index(&repo, &post, false, quiet),
-            1 => restore_from_tree(&repo, pre[0], &post, quiet),
+            1 => restore_from_tree(&repo, pre[0], &post, overlay, quiet),
             _ => bail!("only one <tree-ish> may precede `--`"),
         };
     }
@@ -191,6 +281,32 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             let commit = id.object()?.peel_to_commit()?;
             return detached_checkout(&repo, spec, commit, quiet, detach);
         }
+        // DWIM (`--guess`, default on via `checkout.guess`): a bare name that is
+        // not a local ref and does not resolve as a rev, but names a branch on
+        // exactly one remote, becomes `-b <name> --track <remote>/<name>` — git's
+        // `dwim_new_local_branch` path in `builtin/checkout.c`.
+        if !detach {
+            let guess = guess_flag.unwrap_or_else(|| {
+                repo.config_snapshot().boolean("checkout.guess") != Some(false)
+            });
+            if guess {
+                match unique_remote_branch(&repo, spec)? {
+                    Dwim::One(remote_short) => {
+                        return create_and_switch(&repo, spec, false, &remote_short, quiet, true);
+                    }
+                    Dwim::Many { count, hint_remote } => {
+                        if crate::advice::enabled("checkoutAmbiguousRemoteBranchName") {
+                            print_ambiguous_remote_hint(&hint_remote);
+                        }
+                        eprintln!(
+                            "fatal: '{spec}' matched multiple ({count}) remote tracking branches"
+                        );
+                        return Ok(ExitCode::from(128));
+                    }
+                    Dwim::None => {}
+                }
+            }
+        }
         // Not a ref/rev — treat as a path restore from the index (bare form).
         return restore_from_index(&repo, &pre, true, quiet);
     }
@@ -198,7 +314,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // Multiple positionals, no `--`: if the first resolves to a tree-ish it is the
     // source and the rest are paths; otherwise all are paths from the index.
     if repo.rev_parse_single(pre[0]).is_ok() {
-        return restore_from_tree(&repo, pre[0], &pre[1..], quiet);
+        return restore_from_tree(&repo, pre[0], &pre[1..], overlay, quiet);
     }
     restore_from_index(&repo, &pre, true, quiet)
 }
@@ -649,6 +765,147 @@ fn write_tracking_config(repo: &gix::Repository, name: &str, info: &TrackInfo) -
     Ok(())
 }
 
+// --- DWIM (`--guess`) ------------------------------------------------------
+
+/// Result of resolving a bare `<name>` against the remote-tracking namespace.
+enum Dwim {
+    /// Exactly one remote has the branch; its short name (`<remote>/<name>`).
+    One(String),
+    /// More than one remote has it — ambiguous (unless `checkout.defaultRemote`).
+    Many { count: usize, hint_remote: String },
+    /// No remote has it.
+    None,
+}
+
+/// Find the remote-tracking branch a bare `<name>` should DWIM to: `refs/remotes/
+/// <remote>/<name>` across every configured remote. `checkout.defaultRemote`
+/// disambiguates a multi-remote match. Mirrors `switch`'s identical resolver.
+fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
+    let mut matches: Vec<String> = Vec::new();
+    for remote in repo.remote_names() {
+        let remote = remote.to_str_lossy();
+        let full = format!("refs/remotes/{remote}/{name}");
+        if repo.try_find_reference(full.as_str())?.is_some() {
+            matches.push(remote.into_owned());
+        }
+    }
+    matches.sort();
+    match matches.len() {
+        0 => Ok(Dwim::None),
+        1 => Ok(Dwim::One(format!("{}/{name}", matches[0]))),
+        n => {
+            if let Some(def) = repo.config_snapshot().string("checkout.defaultRemote") {
+                let def = def.to_str_lossy().into_owned();
+                if matches.iter().any(|m| *m == def) {
+                    return Ok(Dwim::One(format!("{def}/{name}")));
+                }
+            }
+            Ok(Dwim::Many {
+                count: n,
+                hint_remote: matches[0].clone(),
+            })
+        }
+    }
+}
+
+/// The `advice.checkoutAmbiguousRemoteBranchName` block git prints for an
+/// ambiguous DWIM name, verbatim (git 2.55.0, `builtin/checkout.c`).
+fn print_ambiguous_remote_hint(remote: &str) {
+    eprintln!("hint: If you meant to check out a remote tracking branch on, e.g. '{remote}',");
+    eprintln!("hint: you can do so by fully qualifying the name with the --track option:");
+    eprintln!("hint:");
+    eprintln!("hint:     git checkout --track {remote}/<name>");
+    eprintln!("hint:");
+    eprintln!("hint: If you'd like to always have checkouts of an ambiguous <name> prefer");
+    eprintln!("hint: one remote, e.g. the '{remote}' remote, consider setting");
+    eprintln!("hint: checkout.defaultRemote={remote} in your config.");
+    eprintln!(
+        "hint: Disable this message with \"git config set advice.checkoutAmbiguousRemoteBranchName false\""
+    );
+}
+
+// --- `--pathspec-from-file` ------------------------------------------------
+
+/// Read pathspecs from `file` (or stdin for `-`). With `nul`, entries are split
+/// on NUL and taken verbatim; otherwise on newlines (trailing `\r` stripped,
+/// blank lines skipped) and a C-quoted line (`"…"`) is unquoted — matching git's
+/// `parse_pathspec_from_file` / `strbuf_getline` + `unquote_c_style`.
+fn read_pathspec_file(file: &str, nul: bool) -> Result<Vec<String>> {
+    let raw = if file == "-" {
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        buf
+    } else {
+        std::fs::read(file)?
+    };
+
+    if nul {
+        return Ok(raw
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect());
+    }
+
+    let mut out = Vec::new();
+    for line in raw.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let spec = if line.first() == Some(&b'"') {
+            unquote_c_style(line)?
+        } else {
+            String::from_utf8_lossy(line).into_owned()
+        };
+        out.push(spec);
+    }
+    Ok(out)
+}
+
+/// Port of git's `unquote_c_style` (quote.c) for a double-quoted pathspec line:
+/// `\a \b \f \n \r \t \v \\ \"` and up to three octal digits `\NNN`.
+fn unquote_c_style(quoted: &[u8]) -> Result<String> {
+    let mut out: Vec<u8> = Vec::with_capacity(quoted.len());
+    let mut it = quoted[1..].iter().copied().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            b'"' => return Ok(String::from_utf8_lossy(&out).into_owned()),
+            b'\\' => {
+                let Some(e) = it.next() else {
+                    bail!("unterminated quoted pathspec");
+                };
+                match e {
+                    b'a' => out.push(0x07),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0c),
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'v' => out.push(0x0b),
+                    b'\\' | b'"' => out.push(e),
+                    b'0'..=b'7' => {
+                        let mut val = (e - b'0') as u32;
+                        for _ in 0..2 {
+                            match it.peek() {
+                                Some(&d @ b'0'..=b'7') => {
+                                    val = val * 8 + (d - b'0') as u32;
+                                    it.next();
+                                }
+                                _ => break,
+                            }
+                        }
+                        out.push(val as u8);
+                    }
+                    _ => bail!("invalid escape in quoted pathspec"),
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    bail!("missing closing quote in pathspec")
+}
+
 /// Restore `paths` in the worktree from the current index (index left unchanged;
 /// only stat info is refreshed). `bare` is true for the no-`--` pathspec form,
 /// which prints git's "Updated N path(s) from the index" confirmation.
@@ -692,11 +949,16 @@ fn restore_from_index(
 }
 
 /// Restore `paths` from `tree_ish` into both the index and the worktree
-/// (matching stock `git checkout <tree-ish> -- <path>`).
+/// (matching stock `git checkout <tree-ish> -- <path>`). In overlay mode (the
+/// default) paths absent from `tree_ish` are left untouched; with `overlay ==
+/// false` a pathspec-matched path that exists in the current index but not in
+/// `tree_ish` is deleted from both the worktree and the index, so the result
+/// matches `tree_ish` exactly (git's `--no-overlay`).
 fn restore_from_tree(
     repo: &gix::Repository,
     tree_ish: &str,
     paths: &[&str],
+    overlay: bool,
     _quiet: bool,
 ) -> Result<ExitCode> {
     let tree_id = repo.rev_parse_single(tree_ish)?.object()?.peel_to_tree()?.id;
@@ -704,7 +966,25 @@ fn restore_from_tree(
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     let src = repo.index_from_tree(&tree_id)?;
-    let matched = match_paths(&src, paths)?;
+
+    // Paths to write from the tree, and (no-overlay only) paths to delete.
+    let (matched, to_remove) = if overlay {
+        (match_paths(&src, paths)?, Vec::new())
+    } else {
+        let (tree_matched, tree_hit) = matches_in(&src, paths);
+        let cur = repo.open_index()?;
+        let (idx_matched, idx_hit) = matches_in(&cur, paths);
+        // A pathspec must match in the tree or the index; else git's "did not match".
+        if let Some(si) = (0..paths.len()).find(|&si| !tree_hit[si] && !idx_hit[si]) {
+            bail!(
+                "pathspec '{}' did not match any file(s) known to git",
+                paths[si]
+            );
+        }
+        let tset: HashSet<BString> = tree_matched.iter().cloned().collect();
+        let rm: Vec<BString> = idx_matched.into_iter().filter(|p| !tset.contains(p)).collect();
+        (tree_matched, rm)
+    };
 
     let mut subset = repo.index_from_tree(&tree_id)?;
     keep_only(&mut subset, &matched);
@@ -738,6 +1018,18 @@ fn restore_from_tree(
             }
         }
     }
+
+    // No-overlay: delete pathspec-matched paths that the tree does not carry.
+    if !to_remove.is_empty() {
+        for path in &to_remove {
+            if let Some(full) = repo.workdir_path(BStr::new(path)) {
+                let _ = std::fs::remove_file(full);
+            }
+        }
+        let rmset: HashSet<BString> = to_remove.into_iter().collect();
+        index.remove_entries(|_, path, _| rmset.contains(&path.to_owned()));
+    }
+
     if pushed {
         index.sort_entries();
     }
@@ -922,6 +1214,21 @@ fn describe(repo: &gix::Repository, id: ObjectId) -> Result<(String, String)> {
 /// Collect the index entries (by path) matching every pathspec in `specs`.
 /// Each spec must match at least one entry, else git's "did not match" error.
 fn match_paths(index: &gix::index::File, specs: &[&str]) -> Result<Vec<BString>> {
+    let (matched, hit) = matches_in(index, specs);
+    if let Some(si) = hit.iter().position(|h| !h) {
+        bail!(
+            "pathspec '{}' did not match any file(s) known to git",
+            specs[si]
+        );
+    }
+    Ok(matched)
+}
+
+/// The entries of `index` matching any pathspec, plus a per-spec "did it match
+/// anything" flag. Unlike [`match_paths`] this never fails, so callers that must
+/// consider several indexes (e.g. no-overlay's tree ∪ index) can decide the
+/// "did not match" error against their own union.
+fn matches_in(index: &gix::index::File, specs: &[&str]) -> (Vec<BString>, Vec<bool>) {
     let mut matched: Vec<BString> = Vec::new();
     let mut seen: HashSet<BString> = HashSet::new();
     let mut hit = vec![false; specs.len()];
@@ -940,14 +1247,7 @@ fn match_paths(index: &gix::index::File, specs: &[&str]) -> Result<Vec<BString>>
             }
         }
     }
-
-    if let Some(si) = hit.iter().position(|h| !h) {
-        bail!(
-            "pathspec '{}' did not match any file(s) known to git",
-            specs[si]
-        );
-    }
-    Ok(matched)
+    (matched, hit)
 }
 
 /// A pathspec matches a file path when it is `.`/empty (all), equals the path,

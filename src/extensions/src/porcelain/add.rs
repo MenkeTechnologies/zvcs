@@ -223,6 +223,27 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             .collect()
     };
 
+    // A bare `.` / `./` at the repository root is git's "everything under the
+    // current directory", i.e. the whole worktree. gitoxide's dirwalk mishandles
+    // it there: the pathspec normalizes to a *nil* pattern whose path is the
+    // literal `.` (gix-pathspec `Pattern::normalize`), and the walk then
+    // prefix-matches `.`, emitting only dot-prefixed entries before stopping. `:/`
+    // (match from the repo root) is the equivalent that gitoxide walks correctly.
+    // Only rewrite at the root: from a subdirectory `.` normalizes to the prefix
+    // path (not nil) and walks fine, so it is left untouched.
+    let at_root = repo
+        .prefix()
+        .ok()
+        .flatten()
+        .map_or(true, |p| p.as_os_str().is_empty());
+    if at_root {
+        for spec in pathspecs.iter_mut() {
+            if spec == "." || spec == "./" {
+                *spec = ":/".to_string();
+            }
+        }
+    }
+
     // --- directory walk over the worktree, filtered by the pathspecs --------
     // Emit tracked and untracked files individually; also emit ignored ones so a
     // path that is both tracked and gitignored can still be restaged. Ignored

@@ -92,6 +92,34 @@ fn branch_auto_setup_rebase() {
 }
 
 #[test]
+fn branch_auto_setup_merge_modes() {
+    let (repo, home) = fixture("autosetupmerge");
+
+    // false: a new branch off a remote-tracking start is NOT auto-tracked.
+    git(&repo, &["config", "branch.autoSetupMerge", "false"]);
+    let out = switch(&repo, &home, &["-c", "a", "origin/feature"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(config_get(&repo, "branch.a.remote"), "", "false must not track");
+
+    // always: a new branch off a LOCAL start tracks it (the "." remote).
+    git(&repo, &["config", "branch.autoSetupMerge", "always"]);
+    let out = switch(&repo, &home, &["-c", "b", "main"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(config_get(&repo, "branch.b.remote"), ".", "always tracks a local start");
+
+    // simple: tracks a remote start only when the names match.
+    git(&repo, &["config", "branch.autoSetupMerge", "simple"]);
+    let out = switch(&repo, &home, &["-c", "feature", "origin/feature"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(config_get(&repo, "branch.feature.remote"), "origin", "simple tracks on name match");
+    let out = switch(&repo, &home, &["-c", "other", "origin/feature"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(config_get(&repo, "branch.other.remote"), "", "simple skips on name mismatch");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
 fn checkout_guess_config_and_override() {
     let (repo, home) = fixture("guess");
 

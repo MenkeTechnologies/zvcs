@@ -496,7 +496,7 @@ fn switch_create(
     let from_desc = describe_head(repo)?;
 
     // Determine the upstream ref this branch should track, if any.
-    let upstream = tracking_upstream(repo, start, track);
+    let upstream = tracking_upstream(repo, start, track, branch);
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
@@ -750,6 +750,7 @@ fn tracking_upstream(
     repo: &gix::Repository,
     start: Option<&str>,
     track: Option<bool>,
+    new_branch: &str,
 ) -> Option<(String, String, String)> {
     if track == Some(false) {
         return None;
@@ -760,24 +761,58 @@ fn tracking_upstream(
         None => repo.head_name().ok()??.as_bstr().to_owned(),
     };
     let s = full.to_str_lossy();
+    let explicit = track == Some(true); // `--track` given
+
+    // branch.autoSetupMerge decides when tracking is auto-installed (no --track).
+    // git's default is "true". `--track` overrides it and always tracks.
+    let snap = repo.config_snapshot();
+    let mode = snap
+        .string("branch.autoSetupMerge")
+        .map(|v| v.to_str_lossy().to_ascii_lowercase());
+    let mode = mode.as_deref();
+    let off = matches!(mode, Some("false" | "no" | "off" | "0"));
 
     if let Some(rest) = s.strip_prefix("refs/remotes/") {
-        // Remote-tracking: auto-track by default and with explicit --track.
+        // Remote-tracking start-point.
         let (remote, branch) = rest.split_once('/')?;
-        return Some((
-            remote.to_string(),
-            format!("refs/heads/{branch}"),
-            format!("{remote}/{branch}"),
-        ));
+        let auto = if off {
+            false
+        } else if mode == Some("simple") {
+            // "simple": only when the local and remote branch names match.
+            branch == new_branch
+        } else {
+            true // "true"/"always"/"inherit"/unset auto-track a remote start
+        };
+        if explicit || auto {
+            return Some((
+                remote.to_string(),
+                format!("refs/heads/{branch}"),
+                format!("{remote}/{branch}"),
+            ));
+        }
+        return None;
     }
+
     if let Some(branch) = s.strip_prefix("refs/heads/") {
-        // Local branch: track only when explicitly requested.
-        if track == Some(true) {
+        // Local branch start-point.
+        if explicit || mode == Some("always") {
+            // Track the local branch itself (the "." remote).
             return Some((
                 ".".to_string(),
                 format!("refs/heads/{branch}"),
                 branch.to_string(),
             ));
+        }
+        if mode == Some("inherit") {
+            // Copy the start branch's own upstream, if it has one.
+            let remote = snap.string(&format!("branch.{branch}.remote"))?.to_str_lossy().into_owned();
+            let merge = snap.string(&format!("branch.{branch}.merge"))?.to_str_lossy().into_owned();
+            let short = match merge.strip_prefix("refs/heads/") {
+                Some(b) if remote == "." => b.to_string(),
+                Some(b) => format!("{remote}/{b}"),
+                None => merge.clone(),
+            };
+            return Some((remote, merge, short));
         }
     }
     None

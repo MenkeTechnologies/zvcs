@@ -214,6 +214,22 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // Without any `--sort` on the CLI, git falls back to the multi-valued
+    // `tag.sort` config — each value adds a sort level — validated below exactly
+    // like a CLI `--sort`.
+    if sorts.is_empty() {
+        if let Ok(repo) = gix::discover(".") {
+            sorts = repo
+                .config_snapshot()
+                .plumbing()
+                .values::<gix::bstr::BString>("tag.sort")
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| v.to_string())
+                .collect();
+        }
+    }
+
     // git validates every `--sort` field name while parsing options, dying on the
     // first syntactically invalid key with exit 128. Reproduce that here so a bad
     // sort key fails the same way regardless of mode.

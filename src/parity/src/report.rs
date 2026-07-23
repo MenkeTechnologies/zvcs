@@ -15,8 +15,12 @@ use crate::runner::{Outcome, Verdict};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// The subcommands stock git ships, straight from the installed git.
 ///
@@ -288,6 +292,7 @@ pub fn emit_html(
     stock: &[String],
     have: &[String],
     missing: &[String],
+    opts: &BTreeMap<String, CmdOpts>,
 ) -> Result<()> {
     let git_v = esc(&git_version());
     let date = esc(&report_date());
@@ -455,6 +460,63 @@ pub fn emit_html(
     html.push_str("<p class=\"muted\">Stock git subcommands whose zvcs dispatch arm still hits \"not yet ported\".</p>\n");
     let _ = write!(html, "<p class=\"chips\">{}</p>\n", list_cells(&missing_refs));
 
+    // Per-command option support matrix — every option in stock git's
+    // `git <cmd> -h`, probed against the binary.
+    let opt_total: usize = opts.values().map(|c| c.rows.len()).sum();
+    let opt_ok: usize = opts.values().map(CmdOpts::supported).sum();
+    let opt_cmds = opts.values().filter(|c| !c.rows.is_empty()).count();
+    let opt_pct = if opt_total == 0 {
+        0.0
+    } else {
+        100.0 * opt_ok as f64 / opt_total as f64
+    };
+
+    html.push_str("<hr class=\"section-rule\">\n");
+    let _ = write!(
+        html,
+        "<h3 class=\"section-h\">Option support matrix — {opt_ok}/{opt_total} options across {opt_cmds} commands ({opt_pct:.0}%)</h3>\n"
+    );
+    html.push_str(
+        "<p class=\"muted\">Every option stock git advertises in <code>git &lt;cmd&gt; -h</code>, \
+         probed against the binary: <span class=\"yes\">✓</span> the flag is parsed, \
+         <span class=\"no\">✗</span> it is rejected as unknown/unsupported. A parsed flag \
+         is not proof the behavior is complete — that is what the parity corpus tests — only \
+         that the flag is recognized. Click a command to expand its options.</p>\n",
+    );
+    html.push_str("<div class=\"controls\"><input id=\"q2\" type=\"search\" placeholder=\"// filter commands…\" autocomplete=\"off\" spellcheck=\"false\"><span id=\"cnt2\"></span></div>\n");
+    html.push_str("<div id=\"optmatrix\">\n");
+    for (cmd, co) in opts {
+        if co.rows.is_empty() {
+            continue;
+        }
+        let ok = co.supported();
+        let tot = co.rows.len();
+        let all = ok == tot;
+        let _ = write!(
+            html,
+            "<details class=\"optcmd\" data-h=\"{c}\"><summary><span class=\"oc-cmd\">{c}</span>\
+             <span class=\"oc-tally {cls}\">{ok}/{tot}</span></summary>\n\
+             <table class=\"file-table\"><thead><tr><th>option</th><th>short</th><th>arg</th><th>zvcs</th></tr></thead><tbody>\n",
+            c = esc(cmd),
+            cls = if all { "ok" } else { "part" },
+            ok = ok,
+            tot = tot,
+        );
+        for r in &co.rows {
+            let _ = write!(
+                html,
+                "<tr><td class=\"cmd\">{flag}</td><td>{short}</td><td>{arg}</td><td class=\"{cls}\">{mark}</td></tr>",
+                flag = esc(&r.flag),
+                short = r.short.as_deref().map(esc).unwrap_or_default(),
+                arg = if r.takes_arg { "&lt;arg&gt;" } else { "" },
+                cls = if r.supported { "ok" } else { "bad" },
+                mark = if r.supported { "✓" } else { "✗" },
+            );
+        }
+        html.push_str("</tbody></table></details>\n");
+    }
+    html.push_str("</div>\n");
+
     html.push_str("<hr class=\"section-rule\">\n<p class=\"muted\">Source of truth: the <code>zvcs-parity</code> harness (<code>src/parity</code>). Regenerate after any port work: <code>cargo run -p zvcs-parity -- --bin target/release/git --html docs/port_report.html</code>.</p>\n");
     html.push_str("</main>\n</div>\n<script src=\"hud-theme.js\"></script>\n<script>\n");
     html.push_str(REPORT_JS);
@@ -465,6 +527,196 @@ pub fn emit_html(
     }
     std::fs::write(path, html).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+/// One git option and whether the zvcs binary recognizes it.
+pub struct OptRow {
+    /// The flag as probed — the canonical long form (`--message`) when git lists
+    /// one, else the short form (`-m`).
+    pub flag: String,
+    /// The short alias for display, when the option has both forms.
+    pub short: Option<String>,
+    /// Whether the option takes a value (`<arg>` / `=<arg>` in git's usage).
+    pub takes_arg: bool,
+    /// True iff the zvcs binary parsed the flag instead of rejecting it as an
+    /// unknown/unsupported option.
+    pub supported: bool,
+}
+
+/// Every option stock git advertises for one command, with zvcs's support.
+pub struct CmdOpts {
+    pub rows: Vec<OptRow>,
+}
+
+impl CmdOpts {
+    pub fn supported(&self) -> usize {
+        self.rows.iter().filter(|r| r.supported).count()
+    }
+}
+
+/// Parse the option list out of a `git <cmd> -h` dump.
+///
+/// git prints an indented option list beneath the usage synopsis: lines like
+/// `    -m, --message <message>`. Synopsis and description lines are skipped —
+/// only lines indented ≥4 spaces whose first non-space is `-` are option specs.
+/// Both forms of each entry are captured; the long form is preferred for probing.
+fn parse_options(text: &str) -> Vec<(String, Option<String>, bool)> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if indent < 4 || !trimmed.starts_with('-') {
+            continue;
+        }
+        // The spec is everything before the 2+ space gap that precedes the
+        // description (or the whole line when the description wraps to the next).
+        let spec = match trimmed.find("  ") {
+            Some(i) => &trimmed[..i],
+            None => trimmed,
+        };
+        let takes_arg = spec.contains('<') || spec.contains('=');
+        let mut long: Option<String> = None;
+        let mut short: Option<String> = None;
+        for tok in spec.split(',') {
+            let tok = tok.trim();
+            if let Some(rest) = tok.strip_prefix("--") {
+                // `--[no-]quiet` → `--quiet`; stop at the first non-name byte.
+                let rest = rest.replacen("[no-]", "", 1);
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                if !name.is_empty() {
+                    long = Some(format!("--{name}"));
+                }
+            } else if tok.starts_with('-') && tok.len() >= 2 {
+                let c = tok.as_bytes()[1] as char;
+                if c.is_ascii_alphanumeric() {
+                    short = Some(format!("-{c}"));
+                }
+            }
+        }
+        if let Some(flag) = long.clone().or_else(|| short.clone()) {
+            if seen.insert(flag.clone()) {
+                out.push((flag, short, takes_arg));
+            }
+        }
+    }
+    out
+}
+
+/// The options stock git advertises for `cmd`, from `git <cmd> -h`.
+fn git_options(cmd: &str) -> Vec<(String, Option<String>, bool)> {
+    let out = match Command::new("git").arg(cmd).arg("-h").output() {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    // git prints `-h` usage to stderr; a few plumbing commands use stdout.
+    let mut text = String::from_utf8_lossy(&out.stderr).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&out.stdout));
+    parse_options(&text)
+}
+
+/// Probe whether the zvcs binary recognizes `flag` for `cmd`: invoke
+/// `<bin> <cmd> <flag>` in a throwaway repo and read the refusal. A flag the
+/// parser rejects prints a distinctive "unsupported option / unsupported flag /
+/// unknown option" (or the whole command is "not yet ported"); anything else —
+/// a usage error, a needs-a-value error, or the command actually running — means
+/// the flag was accepted. Bounded by a short timeout so a flag that starts real
+/// work can't hang the probe (that still counts as recognized).
+fn probe_supported(bin: &Path, home: &Path, cmd: &str, flag: &str, dir: &Path) -> bool {
+    let mut c = Command::new(bin);
+    env::harden(&mut c, home);
+    c.current_dir(dir)
+        .arg(cmd)
+        .arg(flag)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match c.spawn() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let start = Instant::now();
+    let timed_out = loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break false;
+        }
+        if start.elapsed() >= Duration::from_secs(5) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let mut stderr = Vec::new();
+    if let Some(mut h) = child.stderr.take() {
+        let _ = h.read_to_end(&mut stderr);
+    }
+    // A flag that ran long enough to be killed was parsed and accepted.
+    if timed_out {
+        return true;
+    }
+    let err = String::from_utf8_lossy(&stderr);
+    let rejected = err.contains("not yet ported")
+        || err.contains("unsupported option")
+        || err.contains("unsupported flag")
+        || err.contains("unknown option")
+        || err.contains("unknown switch");
+    !rejected
+}
+
+/// Build the per-command option support matrix: for every dispatched command,
+/// every option stock git advertises, probed against the zvcs binary.
+///
+/// Probes run across a worker pool, each worker owning its own instantiated repo
+/// (`probe_root/w<k>`) so concurrent probes never race on one worktree. A
+/// single-flag probe never deletes `.git`, so accumulated mutations across a
+/// worker's commands don't corrupt classification.
+pub fn option_matrix(
+    bin: &Path,
+    home: &Path,
+    cmds: &[String],
+    templates: &crate::fixture::Templates,
+    probe_root: &Path,
+) -> BTreeMap<String, CmdOpts> {
+    let n_workers = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).max(1))
+        .unwrap_or(4)
+        .min(cmds.len().max(1))
+        .min(16);
+    let next = AtomicUsize::new(0);
+    let out: Mutex<BTreeMap<String, CmdOpts>> = Mutex::new(BTreeMap::new());
+
+    std::thread::scope(|scope| {
+        for w in 0..n_workers {
+            let (next, out, cmds, templates) = (&next, &out, cmds, templates);
+            let dir = probe_root.join(format!("w{w}"));
+            scope.spawn(move || {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = templates.instantiate(crate::fixture::Shape::Linear, &dir);
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= cmds.len() {
+                        break;
+                    }
+                    let cmd = &cmds[i];
+                    let rows: Vec<OptRow> = git_options(cmd)
+                        .into_iter()
+                        .map(|(flag, short, takes_arg)| {
+                            let supported = probe_supported(bin, home, cmd, &flag, &dir);
+                            OptRow { flag, short, takes_arg, supported }
+                        })
+                        .collect();
+                    out.lock().unwrap().insert(cmd.clone(), CmdOpts { rows });
+                }
+            });
+        }
+    });
+
+    out.into_inner().unwrap()
 }
 
 /// Page-specific supplemental styles layered on the shared HUD chrome
@@ -499,6 +751,19 @@ const REPORT_CSS: &str = r#"
     .chips { line-height:2.1;margin:0.4rem 0 0.6rem; }
     .chip { display:inline-block;border:1px solid var(--border);background:var(--bg-card);color:var(--text-dim);border-radius:3px;padding:1px 7px;margin:0 0.25rem 0.35rem 0;font-family:'Share Tech Mono',monospace;font-size:11px; }
     .none { color:var(--green);font-weight:700; }
+    .yes { color:var(--green);font-weight:700; } .no { color:var(--red);font-weight:700; }
+    #optmatrix { margin-top:0.4rem; }
+    .optcmd { border:1px solid var(--border);border-radius:2px;background:var(--bg-card);margin:0 0 0.35rem;overflow:hidden; }
+    .optcmd > summary { cursor:pointer;list-style:none;display:flex;align-items:center;gap:0.6rem;padding:0.5rem 0.8rem;font-family:'Share Tech Mono',monospace; }
+    .optcmd > summary::-webkit-details-marker { display:none; }
+    .optcmd > summary::before { content:'▸';color:var(--accent);font-size:11px; }
+    .optcmd[open] > summary::before { content:'▾'; }
+    .optcmd[open] > summary { border-bottom:1px solid var(--border);background:var(--bg-secondary); }
+    .oc-cmd { color:var(--accent-light);font-weight:700;flex:0 0 auto;min-width:11rem; }
+    .oc-tally { font-family:'Orbitron',sans-serif;font-size:11px;font-weight:700;letter-spacing:1px; }
+    .oc-tally.ok { color:var(--green); } .oc-tally.part { color:var(--accent); }
+    .optcmd .file-table { margin:0; } .optcmd .file-table th { position:static; }
+    .optcmd .file-table td:last-child { text-align:center;font-weight:800;font-size:14px; }
 "#;
 
 /// Client-side filter for the per-command table. No framework, no external
@@ -506,9 +771,16 @@ const REPORT_CSS: &str = r#"
 const REPORT_JS: &str = r#"
 (function(){
  var q=document.getElementById('q'),cnt=document.getElementById('cnt'),tb=document.querySelector('#tbl tbody');
- if(!q||!tb)return;
- var rows=[].slice.call(tb.querySelectorAll('tr'));
- function upd(){var t=(q.value||'').toLowerCase().trim(),n=0;rows.forEach(function(r){var h=r.getAttribute('data-h')||'';var show=!t||h.indexOf(t)>=0;r.style.display=show?'':'none';if(show)n++;});cnt.textContent=n+' / '+rows.length;}
- q.addEventListener('input',upd);upd();
+ if(q&&tb){
+  var rows=[].slice.call(tb.querySelectorAll('tr'));
+  function upd(){var t=(q.value||'').toLowerCase().trim(),n=0;rows.forEach(function(r){var h=r.getAttribute('data-h')||'';var show=!t||h.indexOf(t)>=0;r.style.display=show?'':'none';if(show)n++;});cnt.textContent=n+' / '+rows.length;}
+  q.addEventListener('input',upd);upd();
+ }
+ var q2=document.getElementById('q2'),cnt2=document.getElementById('cnt2'),mx=document.getElementById('optmatrix');
+ if(q2&&mx){
+  var cards=[].slice.call(mx.querySelectorAll('.optcmd'));
+  function upd2(){var t=(q2.value||'').toLowerCase().trim(),n=0;cards.forEach(function(c){var h=c.getAttribute('data-h')||'';var show=!t||h.indexOf(t)>=0;c.style.display=show?'':'none';if(show)n++;if(t&&show)c.open=true;if(!t)c.open=false;});cnt2.textContent=n+' / '+cards.length;}
+  q2.addEventListener('input',upd2);upd2();
+ }
 })();
 "#;

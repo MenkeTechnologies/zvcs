@@ -211,9 +211,21 @@ fn real_main() -> Result<ExitCode> {
     rep.print((have.len(), stock.len()), &missing, args.verbose);
 
     // `--html <path>`: regenerate the HTML port report from THIS run's real
-    // numbers — dispatch coverage and per-command parity, nothing hand-typed.
+    // numbers — dispatch coverage, per-command parity, and the per-command option
+    // support matrix, all measured now; nothing hand-typed.
     if let Some(path) = &args.html {
-        report::emit_html(std::path::Path::new(path), &rep, &stock, &have, &missing)?;
+        eprintln!("probing option support ({} commands)…", have.len());
+        let opt_root = root.join("optprobe");
+        std::fs::create_dir_all(&opt_root)?;
+        let opts = report::option_matrix(&zvcs_bin, &templates.home, &have, &templates, &opt_root);
+        report::emit_html(
+            std::path::Path::new(path),
+            &rep,
+            &stock,
+            &have,
+            &missing,
+            &opts,
+        )?;
         eprintln!("wrote {path}");
     }
 

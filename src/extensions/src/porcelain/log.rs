@@ -111,6 +111,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut shortstat = false;
     let mut patch = false;
     let mut graph = false;
+    let mut decorate = false;
     let mut all = false;
     let mut reverse = false;
     let mut only_merges = false;
@@ -171,6 +172,12 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
             }
+        } else if a == "--decorate" {
+            decorate = true;
+        } else if let Some(m) = a.strip_prefix("--decorate=") {
+            decorate = m != "no";
+        } else if a == "--no-decorate" {
+            decorate = false;
         } else if a == "--oneline" {
             pretty = Pretty::Oneline;
             terminator = true;
@@ -594,7 +601,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     };
     // `%d`/`%D` need a commit→refs map; build it only when the format asks for one
     // so plain formats pay nothing for the ref scan.
-    let decorations = if pretty_uses_decoration(&pretty) {
+    let decorations = if pretty_uses_decoration(&pretty) || decorate {
         Some(build_decorations(&repo)?)
     } else {
         None
@@ -637,6 +644,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             want_color,
             now,
             decorations: decorations.as_ref(),
+            decorate,
         };
         let mut block: Vec<u8> = Vec::new();
         render_entry(&mut block, &commit, &pretty, &ctx)?;
@@ -1425,34 +1433,35 @@ fn expand_decoration(
     }
 
     if let Some(refs) = refs_here {
-        // git's display order: local branches, then tags, then remote branches;
-        // remote `*/HEAD` symrefs sort after real remote branches.
-        let mut locals: Vec<&Deco> = refs
+        // git prepends each decoration as it iterates refs in ascending
+        // full-refname order, so the display order is DESCENDING full refname:
+        // refs/heads/dev, refs/heads/feature, refs/tags/v1 -> (tag: v1, feature,
+        // dev). The branch HEAD points to is folded into `HEAD -> <branch>`.
+        let full = |d: &Deco| -> String {
+            let prefix = match d.kind {
+                DecoKind::LocalBranch => "refs/heads/",
+                DecoKind::RemoteBranch => "refs/remotes/",
+                DecoKind::Tag => "refs/tags/",
+            };
+            format!("{prefix}{}", d.name)
+        };
+        let mut ordered: Vec<&Deco> = refs
             .iter()
-            .filter(|d| d.kind == DecoKind::LocalBranch && Some(d.name.as_str()) != head_branch)
+            .filter(|d| !(d.kind == DecoKind::LocalBranch && Some(d.name.as_str()) == head_branch))
             .collect();
-        let mut tags: Vec<&Deco> = refs.iter().filter(|d| d.kind == DecoKind::Tag).collect();
-        let mut remotes: Vec<&Deco> =
-            refs.iter().filter(|d| d.kind == DecoKind::RemoteBranch).collect();
-        locals.sort_by(|a, b| a.name.cmp(&b.name));
-        tags.sort_by(|a, b| a.name.cmp(&b.name));
-        remotes.sort_by(|a, b| {
-            (a.name.ends_with("/HEAD"), &a.name).cmp(&(b.name.ends_with("/HEAD"), &b.name))
-        });
-        for d in locals {
-            entries.push(paint(&d.name, "\x1b[1;32m"));
-        }
-        for d in tags {
-            // git colors the `tag: ` prefix and the tag name as two separate spans
-            // (`\e[1;33mtag: \e[m\e[1;33m<name>\e[m`), both bold yellow.
-            entries.push(format!(
-                "{}{}",
-                paint("tag: ", "\x1b[1;33m"),
-                paint(&d.name, "\x1b[1;33m")
-            ));
-        }
-        for d in remotes {
-            entries.push(paint(&d.name, "\x1b[1;31m"));
+        ordered.sort_by(|a, b| full(b).cmp(&full(a)));
+        for d in ordered {
+            match d.kind {
+                DecoKind::LocalBranch => entries.push(paint(&d.name, "\x1b[1;32m")),
+                // git colors the `tag: ` prefix and the tag name as two separate
+                // bold-yellow spans.
+                DecoKind::Tag => entries.push(format!(
+                    "{}{}",
+                    paint("tag: ", "\x1b[1;33m"),
+                    paint(&d.name, "\x1b[1;33m")
+                )),
+                DecoKind::RemoteBranch => entries.push(paint(&d.name, "\x1b[1;31m")),
+            }
         }
     }
 
@@ -1674,6 +1683,9 @@ struct RenderCtx<'a> {
     /// Commit→refs map plus HEAD info for `%d`/`%D`; `None` when the format has no
     /// decoration placeholder.
     decorations: Option<&'a Decorations>,
+    /// `--decorate`: append ` (refs)` to the oneline/header even when the format
+    /// carries no `%d` placeholder.
+    decorate: bool,
 }
 
 /// Render one commit's header in the selected format. Built-in formats end with
@@ -1695,6 +1707,10 @@ fn render_entry(
         Pretty::Oneline => {
             out.extend_from_slice(id.as_bytes());
             out.extend_from_slice(&ctx.extra);
+            // `--decorate`: ` (HEAD -> main, tag: v1)` between the hash and subject.
+            if ctx.decorate {
+                expand_decoration(out, commit, ctx, ctx.want_color, true);
+            }
             out.push(b' ');
             out.extend_from_slice(&subject(commit.message_raw()?));
         }
@@ -1736,6 +1752,10 @@ fn render_entry(
             out.extend_from_slice(b"commit ");
             out.extend_from_slice(id.as_bytes());
             out.extend_from_slice(&ctx.extra);
+            // `--decorate`: ` (HEAD -> main, tag: v1)` after the commit id.
+            if ctx.decorate {
+                expand_decoration(out, commit, ctx, ctx.want_color, true);
+            }
             out.push(b'\n');
 
             // A merge commit lists its abbreviated parents right after `commit`.

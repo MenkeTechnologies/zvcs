@@ -68,6 +68,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "-q" | "--quiet" => quiet = true,
             "-a" | "--all" => all = true,
             "-n" | "--no-verify" => no_verify = true,
+            // `-v`/`--verbose` shows the diff in the commit-message editor; the
+            // recorded commit is identical, so it is accepted (a no-op for `-m`).
+            "-v" | "--verbose" => {}
             "--" => {
                 if i + 1 < args.len() {
                     anyhow::bail!("pathspec-limited commits are not supported");
@@ -100,6 +103,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                         'a' => all = true,
                         'q' => quiet = true,
                         'n' => no_verify = true,
+                        'v' => {}
                         'm' => {
                             let rest = &cluster[at + c.len_utf8()..];
                             if rest.is_empty() {

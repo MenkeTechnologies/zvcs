@@ -207,6 +207,51 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                         .parse()
                         .map_err(|_| anyhow!("unsupported option {a:?}"))?;
                     lines = Some(n);
+                } else if a.len() > 2
+                    && !a.starts_with("--")
+                    && a[1..2].chars().all(|c| "fadli".contains(c))
+                {
+                    // Bundled short flags, e.g. `-fam <msg>` = `-f -a -m <msg>`.
+                    // git's parse-options treats each char as its own option; a
+                    // value-taking one (`-m`/`-F`/`-n`) consumes the rest of the
+                    // cluster, or the next argv element when it ends the cluster.
+                    let cluster: Vec<char> = a[1..].chars().collect();
+                    let mut ci = 0;
+                    while ci < cluster.len() {
+                        match cluster[ci] {
+                            'f' => force = true,
+                            'a' => annotate = true,
+                            'd' => delete = true,
+                            'l' => list = true,
+                            'i' => ignore_case = true,
+                            's' | 'u' => bail!("signed tags (-{}) are not supported", cluster[ci]),
+                            'e' => bail!("editing tag messages (-e) is not supported"),
+                            'v' => bail!("tag verification (-v) is not supported"),
+                            c @ ('m' | 'F' | 'n') => {
+                                let rest: String = cluster[ci + 1..].iter().collect();
+                                let val = if rest.is_empty() {
+                                    take_value(args, &mut i, "message")?.to_string()
+                                } else {
+                                    rest
+                                };
+                                match c {
+                                    'm' => messages.push(val.into_bytes()),
+                                    'F' => message_file = Some(val),
+                                    _ => {
+                                        lines = Some(if val.is_empty() {
+                                            1
+                                        } else {
+                                            val.parse()
+                                                .map_err(|_| anyhow!("unsupported option {a:?}"))?
+                                        })
+                                    }
+                                }
+                                break; // the value flag consumed the rest of the cluster
+                            }
+                            _ => bail!("unsupported option {a:?}"),
+                        }
+                        ci += 1;
+                    }
                 } else {
                     bail!("unsupported option {a:?}")
                 }

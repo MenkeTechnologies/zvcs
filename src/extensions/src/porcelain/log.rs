@@ -134,6 +134,10 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut grep_ignore_case = false;
     let mut grep_all_match = false;
     let mut grep_invert = false;
+    // `--since`/`--after` and `--until`/`--before` commit-date range (committer
+    // time), parsed with git's approxidate.
+    let mut since: Option<i64> = None;
+    let mut until: Option<i64> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -340,6 +344,19 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             grep_all_match = true;
         } else if a == "--invert-grep" {
             grep_invert = true;
+        } else if let Some(v) = a.strip_prefix("--since=").or_else(|| a.strip_prefix("--after=")) {
+            since = Some(approxidate(v));
+        } else if a == "--since" || a == "--after" {
+            i += 1;
+            since = Some(approxidate(&args.get(i).cloned().unwrap_or_default()));
+        } else if let Some(v) = a
+            .strip_prefix("--until=")
+            .or_else(|| a.strip_prefix("--before="))
+        {
+            until = Some(approxidate(v));
+        } else if a == "--until" || a == "--before" {
+            i += 1;
+            until = Some(approxidate(&args.get(i).cloned().unwrap_or_default()));
         } else if a.starts_with('-') {
             let body = &a[1..];
             if let Some(num) = body.strip_prefix('n') {
@@ -494,10 +511,16 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         all_match: grep_all_match,
         invert_grep: grep_invert,
     };
-    if !commit_filter.is_empty() {
+    if !commit_filter.is_empty() || since.is_some() || until.is_some() {
         let mut kept = Vec::with_capacity(nodes.len());
         for node in nodes.into_iter() {
             let commit = repo.find_commit(node.id)?;
+            // `--since`/`--until` gate on committer time (git's default), then
+            // the header/message predicates.
+            let seconds = commit.time()?.seconds;
+            if since.is_some_and(|s| seconds < s) || until.is_some_and(|u| seconds > u) {
+                continue;
+            }
             if commit_filter.matches(&commit)? {
                 kept.push(node);
             }
@@ -1427,6 +1450,20 @@ fn expand_decoration(
 /// resolver so `%cr`/`%ar`/`--date=relative` honor `GIT_TEST_DATE_NOW` like git.
 fn now_secs() -> i64 {
     crate::date::now_seconds()
+}
+
+/// git's approxidate for `--since`/`--until`: parse an absolute or relative date
+/// to epoch seconds, resolving relative dates against `GIT_TEST_DATE_NOW`/now.
+/// An unparseable value falls back to now, matching git's lenient behavior.
+fn approxidate(value: &str) -> i64 {
+    let now_s = crate::date::now_seconds();
+    if value.trim() == "now" {
+        return now_s;
+    }
+    let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now_s.max(0) as u64);
+    gix::date::parse(value, Some(now))
+        .map(|t| t.seconds)
+        .unwrap_or(now_s)
 }
 
 /// git's `show_date_relative`, via the shared port (exact thresholds + the

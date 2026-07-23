@@ -24,10 +24,12 @@
 //! `%(objectsize:disk)`). Those names are still recognised as *valid* git
 //! atoms, so an unknown field name is reported the way git reports it.
 //!
-//! One known divergence: `%(objectname:short)` takes its length from gitoxide's
+//! One known divergence: the `:short` renderings (`%(objectname:short)`,
+//! `%(tree:short)`, `%(parent:short)`) take their length from gitoxide's
 //! abbreviation logic, which honours `core.abbrev` but, when it is unset,
 //! auto-scales off the packed-object count alone where git also counts loose
-//! objects. Set `core.abbrev`, or use `:short=<n>`, for an exact match.
+//! objects, and which does not extend a `:short=<n>` prefix to keep it unique
+//! the way git's `find_unique_abbrev` does. The full forms match byte-for-byte.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashSet;
@@ -48,6 +50,19 @@ enum Field {
     ObjectName(NameLen),
     ObjectType,
     ObjectSize,
+    /// `%(tree)` — a commit's tree, with `%(objectname)`-style abbreviation.
+    Tree(NameLen),
+    /// `%(parent)` — a commit's parents, space-joined, each abbreviated per the
+    /// modifier.
+    Parent(NameLen),
+    /// `%(numparent)` — a commit's parent count.
+    NumParent,
+    /// `%(object)` — the object a tag points at (empty for a non-tag).
+    TargetName,
+    /// `%(type)` — the type of the object a tag points at (empty for a non-tag).
+    TargetType,
+    /// `%(tag)` — a tag object's own tag name (empty for a non-tag).
+    TagName,
     Head,
     Person(Who, PersonPart),
     Contents(ContentPart),
@@ -68,7 +83,7 @@ enum NameMod {
 }
 
 /// Modifiers accepted by `%(objectname)`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum NameLen {
     Full,
     /// `:short` — length from `core.abbrev`, auto-scaled when unset.
@@ -571,7 +586,19 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             })
             .chain(sorts.iter().map(|s| &s.atom))
     };
-    let needs_data = atoms().any(|a| matches!(a.field, Field::Person(..) | Field::Contents(_)));
+    let needs_data = atoms().any(|a| {
+        matches!(
+            a.field,
+            Field::Person(..)
+                | Field::Contents(_)
+                | Field::Tree(_)
+                | Field::Parent(_)
+                | Field::NumParent
+                | Field::TargetName
+                | Field::TargetType
+                | Field::TagName
+        )
+    });
     let needs_peel = atoms().any(|a| a.deref);
     let needs_short = atoms().any(|a| matches!(a.field, Field::RefName(NameMod::Short)));
     let needs_symref_short = atoms().any(|a| matches!(a.field, Field::SymRef(NameMod::Short)));
@@ -1014,7 +1041,8 @@ const KNOWN_ATOMS: &[&str] = &[
 /// Parse one atom body (the text between `%(` and `)`), also used for sort keys.
 ///
 /// Understood: `refname[:short|:lstrip=<n>|:strip=<n>|:rstrip=<n>]`, `symref`
-/// with the same modifiers, `objectname[:short[=<n>]]`, `objecttype`,
+/// with the same modifiers, `objectname[:short[=<n>]]`, `tree[:short[=<n>]]`,
+/// `parent[:short[=<n>]]`, `numparent`, `object`, `type`, `tag`, `objecttype`,
 /// `objectsize`, `HEAD`, `color:<spec>`, `author`/`committer`/`tagger`/`creator`
 /// and their `name`, `email` (`:trim`, `:localpart`) and `date` (`:short`,
 /// `:iso8601`, `:iso8601-strict`, `:rfc2822`, `:unix`, `:raw`, `:default`)
@@ -1139,6 +1167,16 @@ fn parse_atom(spec: &str, color_on: bool) -> std::result::Result<Atom, AtomError
                 )))
             }
         }),
+        // `%(tree)` / `%(parent)` share `%(objectname)`'s `oid_atom_parser`, so
+        // they take the same `:short` / `:short=<n>` modifiers.
+        "tree" => Field::Tree(parse_oid_mod("tree", m)?),
+        "parent" => Field::Parent(parse_oid_mod("parent", m)?),
+        // These four carry no `parser` in git's atom table, so git silently
+        // ignores any `:arg` on them (`%(type:foo)` == `%(type)`).
+        "numparent" => Field::NumParent,
+        "object" => Field::TargetName,
+        "type" => Field::TargetType,
+        "tag" => Field::TagName,
         // A name git knows but this module does not evaluate is an honest gap,
         // not the "unknown field name" git reserves for a typo.
         n if KNOWN_ATOMS.contains(&n) => {
@@ -1172,6 +1210,35 @@ fn parse_name_mod(name: &str, m: Option<&str>) -> std::result::Result<NameMod, A
                 return Err(bad());
             }
         }
+    })
+}
+
+/// git's minimum abbreviation length (`minimum_abbrev`, default 4): `:short=<n>`
+/// values below it are raised to it, as `oid_atom_parser` does.
+const MINIMUM_ABBREV: usize = 4;
+
+/// git's `oid_atom_parser`, shared by `%(objectname)`, `%(tree)` and
+/// `%(parent)`: `:short` picks the configured abbreviation, `:short=<n>` a fixed
+/// length (a positive integer, floored to `MINIMUM_ABBREV`).
+fn parse_oid_mod(name: &str, m: Option<&str>) -> std::result::Result<NameLen, AtomError> {
+    Ok(match m {
+        None => NameLen::Full,
+        Some("short") => NameLen::Auto,
+        Some(m) => match m.strip_prefix("short=") {
+            Some(n) => {
+                let len = n
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&v| v != 0)
+                    .ok_or_else(|| {
+                        fatal_atom(format!("positive value expected '{n}' in %({name})"))
+                    })?;
+                NameLen::Fixed(len.max(MINIMUM_ABBREV))
+            }
+            None => {
+                return Err(fatal_atom(format!("unrecognized %({name}) argument: {m}")))
+            }
+        },
     })
 }
 
@@ -1431,6 +1498,16 @@ fn key_of(repo: &gix::Repository, key: &SortKey, info: &RefInfo) -> Result<Key> 
     }
     match &atom.field {
         Field::ObjectSize => Ok(Key::Num(object_of(atom, info).map_or(0, |o| o.size as i64))),
+        // `numparent` is `FIELD_ULONG`, so git compares it numerically; a
+        // non-commit (empty rendering) sorts as the 0 git leaves in `v->value`.
+        Field::NumParent => {
+            let s = render(repo, atom, info)?;
+            let n = std::str::from_utf8(&s)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            Ok(Key::Num(n))
+        }
         Field::Person(w, PersonPart::Date(DateFmt::Default)) => {
             let Some(obj) = object_of(atom, info) else {
                 return Ok(Key::Num(0));
@@ -1727,19 +1804,92 @@ fn render(repo: &gix::Repository, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>
     };
 
     match &atom.field {
-        Field::ObjectName(len) => Ok(match len {
-            NameLen::Full => obj.id.to_hex().to_string().into_bytes(),
-            NameLen::Auto => obj.id.attach(repo).shorten_or_id().to_string().into_bytes(),
-            NameLen::Fixed(n) => obj.id.to_hex_with_len(*n).to_string().into_bytes(),
-        }),
+        Field::ObjectName(len) => Ok(format_oid(repo, obj.id, len)),
         Field::ObjectType => Ok(obj.kind.as_bytes().to_vec()),
         Field::ObjectSize => Ok(obj.size.to_string().into_bytes()),
+        // `%(tree)` / `%(parent)` / `%(numparent)` are commit-only; git leaves
+        // them empty for any other object kind.
+        Field::Tree(len) => Ok(match commit_of(repo, obj)? {
+            Some(commit) => format_oid(repo, commit.tree(), len),
+            None => Vec::new(),
+        }),
+        Field::Parent(len) => Ok(match commit_of(repo, obj)? {
+            Some(commit) => {
+                let mut out: Vec<u8> = Vec::new();
+                for (n, parent) in commit.parents().enumerate() {
+                    if n > 0 {
+                        out.push(b' ');
+                    }
+                    out.extend_from_slice(&format_oid(repo, parent, len));
+                }
+                out
+            }
+            None => Vec::new(),
+        }),
+        Field::NumParent => Ok(match commit_of(repo, obj)? {
+            Some(commit) => commit.parents().count().to_string().into_bytes(),
+            None => Vec::new(),
+        }),
+        // `%(object)` / `%(type)` / `%(tag)` are tag-only; empty otherwise.
+        Field::TargetName => Ok(match tag_of(repo, obj)? {
+            Some(tag) => tag.target().to_hex().to_string().into_bytes(),
+            None => Vec::new(),
+        }),
+        Field::TargetType => Ok(match tag_of(repo, obj)? {
+            Some(tag) => tag.target_kind.as_bytes().to_vec(),
+            None => Vec::new(),
+        }),
+        Field::TagName => Ok(match tag_of(repo, obj)? {
+            Some(tag) => tag.name.to_vec(),
+            None => Vec::new(),
+        }),
         Field::Person(w, part) => render_person(repo, obj, *w, part),
         Field::Contents(part) => Ok(render_contents(obj, part)),
         Field::RefName(_) | Field::SymRef(_) | Field::Head | Field::Color(_) => {
             unreachable!("handled above")
         }
     }
+}
+
+/// Render an object id per an `%(objectname)`-style length modifier.
+///
+/// The `:short` / `:short=<n>` renderings take their length from gitoxide's
+/// abbreviation logic, which does not extend a prefix to guarantee uniqueness
+/// the way git's `find_unique_abbrev` does — the divergence the module header
+/// notes for `%(objectname:short)` applies to `%(tree)` / `%(parent)` too.
+fn format_oid(repo: &gix::Repository, id: ObjectId, len: &NameLen) -> Vec<u8> {
+    match len {
+        NameLen::Full => id.to_hex().to_string().into_bytes(),
+        NameLen::Auto => id.attach(repo).shorten_or_id().to_string().into_bytes(),
+        NameLen::Fixed(n) => id.to_hex_with_len(*n).to_string().into_bytes(),
+    }
+}
+
+/// Parse `obj` as a commit, or `None` when it is another kind (or its data was
+/// not loaded). Mirrors git only running `grab_commit_values` on commits.
+fn commit_of<'a>(
+    repo: &gix::Repository,
+    obj: &'a ObjInfo,
+) -> Result<Option<CommitRef<'a>>> {
+    if obj.kind != Kind::Commit {
+        return Ok(None);
+    }
+    let Some(data) = obj.data.as_deref() else {
+        return Ok(None);
+    };
+    Ok(Some(CommitRef::from_bytes(data, repo.object_hash())?))
+}
+
+/// Parse `obj` as a tag, or `None` when it is another kind (or its data was not
+/// loaded). Mirrors git only running `grab_tag_values` on tag objects.
+fn tag_of<'a>(repo: &gix::Repository, obj: &'a ObjInfo) -> Result<Option<TagRef<'a>>> {
+    if obj.kind != Kind::Tag {
+        return Ok(None);
+    }
+    let Some(data) = obj.data.as_deref() else {
+        return Ok(None);
+    };
+    Ok(Some(TagRef::from_bytes(data, repo.object_hash())?))
 }
 
 /// `%(refname:lstrip=<n>)` / `%(refname:rstrip=<n>)`.
@@ -2025,4 +2175,106 @@ fn tcl_quote(value: &[u8]) -> Vec<u8> {
     }
     out.push(b'"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Values verified against git 2.39: `%(tree)`/`%(parent)` route through
+    // `oid_atom_parser`, which accepts `:short` / `:short=<n>` and floors a
+    // sub-minimum length to `minimum_abbrev` (4).
+    #[test]
+    fn oid_mod_parses_like_oid_atom_parser() {
+        assert!(matches!(parse_oid_mod("tree", None), Ok(NameLen::Full)));
+        assert!(matches!(
+            parse_oid_mod("tree", Some("short")),
+            Ok(NameLen::Auto)
+        ));
+        // Above the floor, the length is used verbatim.
+        assert!(matches!(
+            parse_oid_mod("parent", Some("short=10")),
+            Ok(NameLen::Fixed(10))
+        ));
+        // git floors `minimum_abbrev` (4): `short=2` becomes a length of 4.
+        assert!(matches!(
+            parse_oid_mod("parent", Some("short=2")),
+            Ok(NameLen::Fixed(4))
+        ));
+    }
+
+    // `git for-each-ref --format='%(tree:short=0)'` dies with exactly this
+    // message and exit 128.
+    #[test]
+    fn oid_mod_rejects_zero_and_garbage() {
+        let e = parse_oid_mod("tree", Some("short=0")).unwrap_err();
+        assert!(matches!(e.kind, ErrKind::Fatal));
+        assert_eq!(e.msg, "positive value expected '0' in %(tree)");
+
+        let e = parse_oid_mod("tree", Some("short=xy")).unwrap_err();
+        assert!(matches!(e.kind, ErrKind::Fatal));
+        assert_eq!(e.msg, "positive value expected 'xy' in %(tree)");
+
+        let e = parse_oid_mod("parent", Some("bogus")).unwrap_err();
+        assert!(matches!(e.kind, ErrKind::Fatal));
+        assert_eq!(e.msg, "unrecognized %(parent) argument: bogus");
+    }
+
+    // git's atom table gives `object`/`type`/`tag`/`numparent` no parser, so a
+    // trailing `:arg` is silently ignored (e.g. `%(type:foo)` == `%(type)`),
+    // while `tree`/`parent` take an oid modifier.
+    #[test]
+    fn commit_and_tag_atoms_parse() {
+        assert!(matches!(
+            parse_atom("tree:short", false),
+            Ok(Atom {
+                deref: false,
+                field: Field::Tree(NameLen::Auto)
+            })
+        ));
+        assert!(matches!(
+            parse_atom("parent", false),
+            Ok(Atom {
+                field: Field::Parent(NameLen::Full),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_atom("numparent", false),
+            Ok(Atom {
+                field: Field::NumParent,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_atom("object", false),
+            Ok(Atom {
+                field: Field::TargetName,
+                ..
+            })
+        ));
+        // A modifier on a no-parser atom is ignored, not an error.
+        assert!(matches!(
+            parse_atom("type:foo", false),
+            Ok(Atom {
+                field: Field::TargetType,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_atom("tag", false),
+            Ok(Atom {
+                field: Field::TagName,
+                ..
+            })
+        ));
+        // The `*` deref form is allowed on these object atoms.
+        assert!(matches!(
+            parse_atom("*tree", false),
+            Ok(Atom {
+                deref: true,
+                field: Field::Tree(NameLen::Full)
+            })
+        ));
+    }
 }

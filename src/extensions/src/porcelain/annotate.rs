@@ -740,6 +740,7 @@ fn is_line_number(s: &str) -> bool {
 }
 
 /// Why a `-L` spec could not be turned into a range.
+#[derive(Debug)]
 enum LineSpecError {
     /// git dies with this message and exit 128.
     Fatal(String),
@@ -795,8 +796,25 @@ fn resolve_line_spec(
                 .map_err(|_| LineSpecError::Fatal(format!("-L invalid line number: {e}")))?;
             start.saturating_add(count.saturating_sub(1))
         }
+        // `-L<start>,-<n>` — n lines *ending* at start. `line-range.c:parse_loc`
+        // parses the end relative to `begin = start + 1`: with `spec[0] == '-'`
+        // it sets `num = -n`, then `*ret = begin + num > 0 ? begin + num : 1`, so
+        // `end = start + 1 - n`, floored at 1. `n == 0` first trips git's
+        // `die("-L invalid empty range")`. Verified vs git 2.55.0 (`-L10,-5` →
+        // 6..10, `-L10,-15` → 1..10, `-L3,-1` → 3, `-L10,-0` → empty-range die).
         Some(e) if e.starts_with('-') => {
-            return Err(LineSpecError::Unimplementable("-L<start>,-<n>"));
+            let n: u32 = e[1..]
+                .parse()
+                .map_err(|_| LineSpecError::Fatal(format!("-L invalid line number: {e}")))?;
+            if n == 0 {
+                return Err(LineSpecError::Fatal("-L invalid empty range".into()));
+            }
+            let raw = start as i64 + 1 - n as i64;
+            if raw > 0 {
+                raw as u32
+            } else {
+                1
+            }
         }
         Some(e) => e
             .parse()
@@ -1286,4 +1304,27 @@ fn repo_relative_path(repo: &gix::Repository, user_path: &str) -> Result<String>
         .to_str()
         .ok_or_else(|| anyhow!("path is not valid UTF-8: {user_path}"))?;
     Ok(s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `-L<start>,-<n>` (n lines ending at start). Expected ranges captured from
+    /// stock `git blame -L… --` on git 2.55.0 against a 10-line tracked file:
+    /// `-L10,-5` → 6..10, `-L10,-15` → 1..10, `-L3,-1` → 3..3, `-L10,-0` →
+    /// `fatal: -L invalid empty range`.
+    #[test]
+    fn line_spec_negative_relative_end_matches_git() {
+        let blob = b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
+        let n = count_lines(blob);
+        let ok = |spec: &str| resolve_line_spec(spec, blob, n, "f").expect(spec);
+        assert_eq!(ok("10,-5"), 6..=10);
+        assert_eq!(ok("10,-15"), 1..=10);
+        assert_eq!(ok("3,-1"), 3..=3);
+        match resolve_line_spec("10,-0", blob, n, "f") {
+            Err(LineSpecError::Fatal(msg)) => assert_eq!(msg, "-L invalid empty range"),
+            _ => panic!("expected empty-range fatal error"),
+        }
+    }
 }

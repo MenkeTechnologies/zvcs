@@ -17,6 +17,14 @@
 //!   (see below).
 //! * `drop` / `clear` — remove one / all entries, rewriting the reflog exactly
 //!   like `git reflog delete --rewrite --updateref`.
+//! * `create` — build the `I`/`W` commit graph and print the `W` id without
+//!   storing it or touching the worktree (`do_create_stash`).
+//! * `store` — point `refs/stash` at an existing stash-like commit, appending
+//!   the reflog entry (`do_store_stash`).
+//! * `show` — diff the stash base tree against its worktree tree, formatted per
+//!   the diff options / `stash.showStat`+`stash.showPatch` config; rendering is
+//!   delegated to the `diff` porcelain (git's own `diff_tree_oid` machinery).
+//! * `branch` — create+check out a branch at the stash base, apply there, drop.
 //!
 //! ### Honest boundaries (precise bail, never fake success)
 //!
@@ -83,9 +91,16 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
             clear(&repo)
         }
-        Some("show") => bail!("`stash show` is not ported yet"),
-        Some("branch") => bail!("`stash branch` is not ported yet"),
-        Some("create") | Some("store") => bail!("`stash create`/`store` plumbing is not ported yet"),
+        Some("show") => show_stash(&repo, &args[1..]),
+        Some("branch") => {
+            let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+            branch_stash(&repo, &args[1..])
+        }
+        Some("create") => create_stash(&repo, &args[1..]),
+        Some("store") => {
+            let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+            store_stash(&repo, &args[1..])
+        }
         Some(flag) if flag.starts_with('-') => {
             // Implicit push with options, e.g. `git stash -m msg` or `git stash -u`.
             let (msg, quiet) = parse_push_options(args)?;
@@ -111,6 +126,56 @@ fn push(repo: &gix::Repository, message: Option<String>, quiet: bool) -> Result<
         return Ok(ExitCode::SUCCESS);
     }
 
+    let StashBuild { w_commit, stash_msg, head_tree_id, affected } =
+        build_stash_commit(repo, message.as_deref())?;
+
+    // Append the reflog entry and move refs/stash to the new W commit.
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: true,
+                message: stash_msg.clone().into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(w_commit),
+        },
+        name: "refs/stash".try_into().map_err(|e| anyhow!("invalid ref name refs/stash: {e}"))?,
+        deref: false,
+    })?;
+
+    // Reset the tracked worktree + index back to HEAD (untracked files untouched).
+    let head_map = tree_map(repo, head_tree_id)?;
+    let should_interrupt = AtomicBool::new(false);
+    let fresh = sync_worktree(repo, head_tree_id, &affected, &head_map, &should_interrupt)?;
+    let old_index = repo.open_index()?;
+    write_target_index(repo, head_tree_id, &old_index, &fresh)?;
+
+    if !quiet {
+        println!("Saved working directory and index state {stash_msg}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The stash object graph produced from the current tracked changes: the `W`
+/// merge commit plus the data `push`/`create` need afterwards.
+struct StashBuild {
+    /// The stash (`W`) merge commit id — the value stored in `refs/stash`.
+    w_commit: ObjectId,
+    /// The reflog / commit message (`WIP on …` or `On <branch>: …`).
+    stash_msg: String,
+    /// HEAD's tree, used by `push` to reset the worktree/index afterwards.
+    head_tree_id: ObjectId,
+    /// Every path touched by the staged/unstaged changes, for the reset step.
+    affected: HashSet<BString>,
+}
+
+/// Build the stash commit graph (`I` index commit then `W` merge commit) from
+/// the current tracked staged + unstaged changes, without touching `refs/stash`
+/// or the worktree. Faithful port of `do_create_stash` (git builtin/stash.c),
+/// shared by `push` (which then stores + resets) and `create` (which prints the
+/// `W` id). The caller has already verified HEAD is born and the tree is dirty.
+fn build_stash_commit(repo: &gix::Repository, message: Option<&str>) -> Result<StashBuild> {
     let head_id = repo.head_id()?.detach();
     let head_tree_id = repo.head_tree_id()?.detach();
     let branch = match repo.head_name()? {
@@ -120,7 +185,7 @@ fn push(repo: &gix::Repository, message: Option<String>, quiet: bool) -> Result<
     let head_short = repo.head_id()?.shorten_or_id().to_string();
     let subject = repo.head_commit()?.message()?.summary().to_string();
 
-    let stash_msg = match &message {
+    let stash_msg = match message {
         Some(m) => format!("On {branch}: {m}"),
         None => format!("WIP on {branch}: {head_short} {subject}"),
     };
@@ -227,35 +292,173 @@ fn push(repo: &gix::Repository, message: Option<String>, quiet: bool) -> Result<
     // git 2.55.0 for the `push`, `push -m`, and `save` message forms.
     let index_commit = repo.new_commit(format!("{index_msg}\n"), i_tree_id, [head_id])?.id().detach();
     let w_commit = repo
-        .new_commit(&stash_msg, w_tree_id, [head_id, index_commit])?
+        .new_commit(stash_msg.as_str(), w_tree_id, [head_id, index_commit])?
         .id()
         .detach();
 
-    // Append the reflog entry and move refs/stash to the new W commit.
+    Ok(StashBuild { w_commit, stash_msg, head_tree_id, affected })
+}
+
+/// `git stash create [<message>…]` — build the stash commit graph and print the
+/// `W` commit id without storing it or touching the worktree. Port of
+/// `create_stash` (builtin/stash.c): the message is every remaining arg joined
+/// by a space (no option parsing), and a clean tree prints nothing (exit 0).
+fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
+    if repo.head_id().is_err() {
+        bail!("You do not have the initial commit yet");
+    }
+    // `check_changes_tracked_files`: no tracked changes → nothing to create.
+    if !repo.is_dirty()? {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let message = if args.is_empty() { None } else { Some(args.join(" ")) };
+    let built = build_stash_commit(repo, message.as_deref())?;
+    println!("{}", built.w_commit);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git stash store [-m <msg>] [-q] <commit>` — point `refs/stash` at an existing
+/// stash-like commit, appending the reflog entry. Port of `do_store_stash`.
+fn store_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
+    let (message, quiet, commit) = parse_store_options(args)?;
+    let oid = match repo.rev_parse_single(commit.as_str()) {
+        Ok(id) => id.detach(),
+        Err(_) => {
+            if !quiet {
+                eprintln!("Cannot update refs/stash with {commit}");
+            }
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    let stash_msg = message.unwrap_or_else(|| "Created via \"git stash store\".".to_string());
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: true,
-                message: stash_msg.clone().into(),
+                message: stash_msg.into(),
             },
             expected: PreviousValue::Any,
-            new: Target::Object(w_commit),
+            new: Target::Object(oid),
         },
         name: "refs/stash".try_into().map_err(|e| anyhow!("invalid ref name refs/stash: {e}"))?,
         deref: false,
     })?;
+    Ok(ExitCode::SUCCESS)
+}
 
-    // Reset the tracked worktree + index back to HEAD (untracked files untouched).
-    let head_map = tree_map(repo, head_tree_id)?;
-    let should_interrupt = AtomicBool::new(false);
-    let fresh = sync_worktree(repo, head_tree_id, &affected, &head_map, &should_interrupt)?;
-    let old_index = repo.open_index()?;
-    write_target_index(repo, head_tree_id, &old_index, &fresh)?;
-
-    if !quiet {
-        println!("Saved working directory and index state {stash_msg}");
+/// `git stash show [<diff-options>] [<stash>]` — show the change the stash would
+/// apply. Port of `show_stash`: the diff is always `b_commit`→`w_commit` (base
+/// tree vs. stashed worktree tree); the user's diff options only pick the format.
+/// With no options the `stash.showStat` (default on) / `stash.showPatch` config
+/// decides. Delegates the actual rendering to the `diff` porcelain, which is the
+/// same machinery git's `diff_tree_oid` drives, so output is byte-identical.
+fn show_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
+    let mut diff_flags: Vec<String> = Vec::new();
+    let mut stash_spec: Option<String> = None;
+    for a in args {
+        match a.as_str() {
+            "-u" | "--include-untracked" | "--only-untracked" => {
+                // These need the untracked (`^3`) tree, which is not stored.
+                bail!("showing untracked files in a stash is not ported");
+            }
+            s if s.starts_with('-') && s != "-" => diff_flags.push(a.clone()),
+            _ => {
+                if stash_spec.is_some() {
+                    bail!("Too many revisions specified");
+                }
+                stash_spec = Some(a.clone());
+            }
+        }
     }
+
+    // Resolve the stash: a `stash@{n}` / bare `N` / (default) `stash@{0}` goes
+    // through the reflog; anything else is resolved as an arbitrary stash-like
+    // commit, matching git's `get_stash_info`.
+    let commit_id = if let Ok(n) = parse_stash_index(stash_spec.as_deref()) {
+        let entries = read_stash_reflog(repo)?;
+        if entries.is_empty() {
+            bail!("No stash entries found.");
+        }
+        entries
+            .get(n)
+            .map(|(id, _)| *id)
+            .ok_or_else(|| anyhow!("{} is not a valid reference", stash_spec.as_deref().unwrap_or("stash@{0}")))?
+    } else {
+        let s = stash_spec.as_deref().expect("non-index spec is Some");
+        repo.rev_parse_single(s).map_err(|_| anyhow!("{s} is not a valid reference"))?.detach()
+    };
+
+    let commit = repo.find_commit(commit_id)?;
+    let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
+    if parents.len() < 2 {
+        bail!("'{commit_id}' is not a stash-like commit");
+    }
+    let b_commit = parents[0];
+
+    // No diff options given → apply config defaults (git: revision_args.nr == 1).
+    if diff_flags.is_empty() {
+        let snap = repo.config_snapshot();
+        let show_stat = snap.boolean("stash.showStat").unwrap_or(true);
+        let show_patch = snap.boolean("stash.showPatch").unwrap_or(false);
+        if !show_stat && !show_patch {
+            return Ok(ExitCode::SUCCESS);
+        }
+        if show_stat {
+            diff_flags.push("--stat".to_string());
+        }
+        if show_patch {
+            diff_flags.push("-p".to_string());
+        }
+    }
+
+    diff_flags.push(b_commit.to_string());
+    diff_flags.push(commit_id.to_string());
+    super::diff::diff(&diff_flags)
+}
+
+/// `git stash branch <branchname> [<stash>]` — create and check out `<branchname>`
+/// at the stash's base commit, apply the stash there (so a stash made on a since-
+/// changed branch applies cleanly), then drop it. Port of `branch_stash`.
+fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
+    let mut positionals: Vec<&str> = Vec::new();
+    for a in args {
+        if a.starts_with('-') && a.as_str() != "-" {
+            bail!("unsupported stash branch option '{a}'");
+        }
+        positionals.push(a);
+    }
+    let branch = match positionals.first() {
+        Some(b) => (*b).to_string(),
+        None => bail!("No branch name specified"),
+    };
+    let n = parse_stash_index(positionals.get(1).copied())?;
+
+    let entries = read_stash_reflog(repo)?;
+    if entries.is_empty() {
+        bail!("No stash entries found.");
+    }
+    let commit_id = entries.get(n).map(|(id, _)| *id).ok_or_else(|| anyhow!("stash@{{{n}}} is not a valid reference"))?;
+    let commit = repo.find_commit(commit_id)?;
+    let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
+    if parents.len() < 2 {
+        bail!("'{commit_id}' is not a stash-like commit");
+    }
+    let b_commit = parents[0];
+
+    // `git checkout -b <branch> <b_commit>`; only apply if the checkout succeeds.
+    super::checkout::checkout(&["-b".to_string(), branch, b_commit.to_string()])?;
+
+    // The checkout moved HEAD/worktree on disk; re-open so the restore sees it.
+    let repo = gix::discover(".")?;
+    restore_stash_commit(&repo, commit_id)?;
+
+    // `do_apply_stash` ends by running `git status` (non-quiet).
+    super::status::status(&[])?;
+
+    // The stash came from `refs/stash`, so `is_stash_ref` holds: drop it.
+    let dropped = drop_reflog_entry(&repo, n)?;
+    println!("Dropped refs/stash@{{{n}}} ({dropped})");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -275,6 +478,21 @@ fn apply_or_pop(repo: &gix::Repository, n: usize, pop: bool) -> Result<ExitCode>
     }
     let commit_id = entries.get(n).map(|(id, _)| *id).ok_or_else(|| anyhow!("stash@{{{n}}} is not a valid reference"))?;
 
+    restore_stash_commit(repo, commit_id)?;
+
+    if pop {
+        let dropped = drop_reflog_entry(repo, n)?;
+        println!("Dropped refs/stash@{{{n}}} ({dropped})");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Restore the index to the stash's `I` tree and the worktree to its `W` tree,
+/// for the clean-apply case only: the current tree must be clean and still at the
+/// stash's base (`b_tree`). A dirty/moved target needs a real 3-way merge, which
+/// is not backed. Shared by `apply`/`pop` and `branch` (where the prior checkout
+/// guarantees the clean base).
+fn restore_stash_commit(repo: &gix::Repository, commit_id: ObjectId) -> Result<()> {
     let commit = repo.find_commit(commit_id)?;
     let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
     if parents.len() < 2 {
@@ -315,12 +533,7 @@ fn apply_or_pop(repo: &gix::Repository, n: usize, pop: bool) -> Result<ExitCode>
     let fresh = sync_worktree(repo, w_tree, &affected, &w_map, &should_interrupt)?;
     let old_index = repo.open_index()?;
     write_target_index(repo, i_tree, &old_index, &fresh)?;
-
-    if pop {
-        let dropped = drop_reflog_entry(repo, n)?;
-        println!("Dropped refs/stash@{{{n}}} ({dropped})");
-    }
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
 /// `git stash clear` — remove every entry (ref + reflog), silently if none.
@@ -623,6 +836,39 @@ fn parse_save_message(args: &[String]) -> Result<Option<String>> {
     Ok(if words.is_empty() { None } else { Some(words.join(" ")) })
 }
 
+/// Parse `store` options: `-m/--message <msg>`, `-q/--quiet`, and exactly one
+/// positional `<commit>`. Port of `store_stash`'s option table, which requires
+/// precisely one non-option argument.
+fn parse_store_options(args: &[String]) -> Result<(Option<String>, bool, String)> {
+    let mut message = None;
+    let mut quiet = false;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-m" | "--message" => {
+                i += 1;
+                let m = args.get(i).ok_or_else(|| anyhow!("option '{a}' requires a value"))?;
+                message = Some(m.clone());
+            }
+            "-q" | "--quiet" => quiet = true,
+            other => {
+                if let Some(m) = other.strip_prefix("--message=") {
+                    message = Some(m.to_string());
+                } else {
+                    positionals.push(other.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+    if positionals.len() != 1 {
+        bail!("\"git stash store\" requires one <commit> argument");
+    }
+    Ok((message, quiet, positionals.into_iter().next().expect("exactly one")))
+}
+
 /// `apply` shares `pop`'s restrictions; `--index` needs staged-state restore.
 fn reject_apply_flags(args: &[String]) -> Result<()> {
     for a in args {
@@ -633,4 +879,43 @@ fn reject_apply_flags(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn store_options_parse_message_quiet_and_commit() {
+        // `-m <msg>` form.
+        let (msg, quiet, commit) = parse_store_options(&v(&["-m", "hello", "deadbeef"])).unwrap();
+        assert_eq!(msg.as_deref(), Some("hello"));
+        assert!(!quiet);
+        assert_eq!(commit, "deadbeef");
+
+        // `--message=` form plus `-q`.
+        let (msg, quiet, commit) = parse_store_options(&v(&["--message=hi", "-q", "cafe"])).unwrap();
+        assert_eq!(msg.as_deref(), Some("hi"));
+        assert!(quiet);
+        assert_eq!(commit, "cafe");
+
+        // Bare commit, no options.
+        let (msg, quiet, commit) = parse_store_options(&v(&["abc123"])).unwrap();
+        assert_eq!(msg, None);
+        assert!(!quiet);
+        assert_eq!(commit, "abc123");
+    }
+
+    #[test]
+    fn store_options_require_exactly_one_commit() {
+        // git: `"git stash store" requires one <commit> argument` on 0 or >1.
+        let none = parse_store_options(&v(&[])).unwrap_err().to_string();
+        assert_eq!(none, "\"git stash store\" requires one <commit> argument");
+        let many = parse_store_options(&v(&["a", "b"])).unwrap_err().to_string();
+        assert_eq!(many, "\"git stash store\" requires one <commit> argument");
+    }
 }

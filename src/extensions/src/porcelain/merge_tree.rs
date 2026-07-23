@@ -119,11 +119,14 @@ enum Mode {
 
 /// One informational message, in both the human and the `-z` shape.
 ///
-/// `ctype` is git's stable short conflict type (the `-z` field); `text` is the
-/// free-form line, which always carries its own trailing newline exactly as git
-/// emits it.
+/// `paths` are git's `logical_conflict_info.paths` for this message: the first
+/// entry is the *primary* path (git's strmap key, used to sort the messages),
+/// and any further entries follow in git's `path_msg()` order (e.g. the source
+/// then destination of a rename). `ctype` is git's stable short conflict type
+/// (the `-z` field); `text` is the free-form line, which always carries its own
+/// trailing newline exactly as git emits it via `puts()`.
 struct Message {
-    path: BString,
+    paths: Vec<BString>,
     ctype: &'static str,
     text: String,
 }
@@ -362,6 +365,8 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
                 show_messages,
                 true,
                 conflicted,
+                s1,
+                s2,
             )?);
             rec.push(sep);
             out.write_all(&rec)?;
@@ -442,7 +447,16 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
         return Ok(exit_code(conflicted));
     }
 
-    let buf = render_outcome(&repo, &mut outcome, name_only, show_messages, nul, conflicted)?;
+    let buf = render_outcome(
+        &repo,
+        &mut outcome,
+        name_only,
+        show_messages,
+        nul,
+        conflicted,
+        spec1,
+        spec2,
+    )?;
     std::io::stdout().lock().write_all(&buf)?;
     Ok(exit_code(conflicted))
 }
@@ -508,6 +522,7 @@ fn resolve_outcome<'repo>(
 /// lines (or bare paths under `--name-only`), then the message block. This is
 /// exactly what `real_merge` prints for a non-`--stdin` merge; the batch path
 /// wraps it with the clean flag and trailing separator.
+#[allow(clippy::too_many_arguments)]
 fn render_outcome(
     repo: &gix::Repository,
     outcome: &mut gix::merge::tree::Outcome<'_>,
@@ -515,6 +530,8 @@ fn render_outcome(
     show_messages: Option<bool>,
     nul: bool,
     conflicted: bool,
+    label1: &str,
+    label2: &str,
 ) -> Result<Vec<u8>> {
     let how = TreatAsUnresolved::git();
     // Render everything up front so an unrenderable conflict class fails before
@@ -553,15 +570,22 @@ fn render_outcome(
     }
 
     if show_messages.unwrap_or(conflicted) {
-        let messages = render_messages(repo, &outcome.conflicts)?;
+        let messages = render_messages(repo, &outcome.conflicts, label1, label2)?;
         if nul {
             // The `-z` messages section opens with its own NUL separator, then
-            // carries one `<count> <path>... <type> <message>` record per entry.
+            // carries one `<count>\0<path>\0...\0<type>\0<message>\0` record per
+            // entry, mirroring git's `merge_display_update_messages(detailed=1)`:
+            // it prints `info->paths.nr`, every path, the short type, then the
+            // message (whose own trailing newline is retained, since git emits it
+            // with `puts()` before the record-closing NUL).
             buf.push(b'\0');
             for m in &messages {
-                buf.extend_from_slice(b"1\0");
-                buf.extend_from_slice(m.path.as_slice());
+                buf.extend_from_slice(m.paths.len().to_string().as_bytes());
                 buf.push(b'\0');
+                for path in &m.paths {
+                    buf.extend_from_slice(path.as_slice());
+                    buf.push(b'\0');
+                }
                 buf.extend_from_slice(m.ctype.as_bytes());
                 buf.push(b'\0');
                 buf.extend_from_slice(m.text.as_bytes());
@@ -825,64 +849,211 @@ fn resolve_tree(repo: &gix::Repository, spec: &str) -> TreeResolution {
     }
 }
 
-/// Turn the structured conflict records into git's informational messages.
+/// Turn the structured conflict records into git's informational messages,
+/// reproducing `merge-ort`'s `path_msg()` text byte-for-byte.
 ///
-/// Only the content-merge family is rendered: git's text for those is
-/// reproduced exactly. Any other resolution class — and any content merge over
-/// binary data or symlinks, where git prepends a `warning:` line we cannot
-/// reconstruct — errors out instead of guessing.
-fn render_messages(repo: &gix::Repository, conflicts: &[Conflict]) -> Result<Vec<Message>> {
-    let mut out = Vec::new();
+/// The content-merge family (`Auto-merging`/`CONFLICT (content|add/add)`), its
+/// binary (`warning: Cannot merge binary files: …`) and symlink variants, and
+/// the `modify/delete`, `rename/delete` and `rename/rename` tree conflicts are
+/// rendered. `label1`/`label2` are git's `opt->branch1`/`opt->branch2`, i.e. the
+/// two branch operands exactly as spelled on the command line; because
+/// `gix-merge` normalizes *ours*/*theirs* independently of operand order, the
+/// side each conflicting path belongs to is recovered from tree membership
+/// (git derives the same labels positionally from `argv`).
+///
+/// The remaining exotic classes — directory/file, submodule, and the rename
+/// type-mismatch failures — cannot have their git text reconstructed here and
+/// are refused rather than approximated.
+fn render_messages(
+    repo: &gix::Repository,
+    conflicts: &[Conflict],
+    label1: &str,
+    label2: &str,
+) -> Result<Vec<Message>> {
+    // The tree-conflict classes need each path mapped back to the operand it
+    // came from. Peel both operand trees once, only when such a conflict is
+    // present, so plain content merges pay nothing.
+    let needs_labels = conflicts.iter().any(|c| {
+        matches!(
+            &c.resolution,
+            Err(ResolutionFailure::OursModifiedTheirsDeleted
+                | ResolutionFailure::OursDeletedTheirsRenamed
+                | ResolutionFailure::OursRenamedTheirsRenamedDifferently { .. })
+        )
+    });
+    let side_trees = if needs_labels {
+        Some((
+            repo.rev_parse_single(label1)?.object()?.peel_to_tree()?,
+            repo.rev_parse_single(label2)?.object()?.peel_to_tree()?,
+        ))
+    } else {
+        None
+    };
+
+    let mut out: Vec<Message> = Vec::new();
     for conflict in conflicts {
         let (ours, theirs) = conflict.changes_in_resolution();
-        let path = ours.location().to_owned();
-        let merged_blob = match &conflict.resolution {
+        match &conflict.resolution {
             Ok(Resolution::OursModifiedTheirsModifiedThenBlobContentMerge { merged_blob }) => {
-                merged_blob
+                let path = ours.location().to_owned();
+                let conflicted =
+                    merged_blob.resolution == gix::merge::blob::Resolution::Conflict;
+                // Both sides adding the same path is reported as `add/add`; every
+                // other content merge uses `content` (the `submodule` reason is
+                // unreachable here, as gitlink merges are refused below).
+                let reason = if matches!(ours, Change::Addition { .. })
+                    && matches!(theirs, Change::Addition { .. })
+                {
+                    "add/add"
+                } else {
+                    "content"
+                };
+                let (our_mode, _) = change_state(ours);
+                let (their_mode, _) = change_state(theirs);
+
+                if our_mode.is_link() && their_mode.is_link() {
+                    // Symlinks are content-merged via the binary driver, but
+                    // `merge-ort`'s `S_ISLNK` arm emits no `Auto-merging` line —
+                    // only the conflict notice, when the merge did not resolve.
+                    if conflicted {
+                        out.push(Message {
+                            paths: vec![path.clone()],
+                            ctype: "CONFLICT (contents)",
+                            text: format!("CONFLICT ({reason}): Merge conflict in {path}\n"),
+                        });
+                    }
+                } else if our_mode.is_blob() && their_mode.is_blob() {
+                    // A binary content merge prints `warning: Cannot merge binary
+                    // files` from inside `merge_3way()`, i.e. *before* the
+                    // `Auto-merging` line that `handle_content_merge()` adds
+                    // afterwards. The `(a vs. b)` labels are `opt->branch1`/`2`
+                    // verbatim (no rename is involved in this variant, so git's
+                    // `<branch>:<path>` form does not apply).
+                    if conflicted && conflict_is_binary(repo, conflict)? {
+                        out.push(Message {
+                            paths: vec![path.clone()],
+                            ctype: "CONFLICT (binary)",
+                            text: format!(
+                                "warning: Cannot merge binary files: {path} ({label1} vs. {label2})\n"
+                            ),
+                        });
+                    }
+                    out.push(Message {
+                        paths: vec![path.clone()],
+                        ctype: "Auto-merging",
+                        text: format!("Auto-merging {path}\n"),
+                    });
+                    if conflicted {
+                        out.push(Message {
+                            paths: vec![path.clone()],
+                            ctype: "CONFLICT (contents)",
+                            text: format!("CONFLICT ({reason}): Merge conflict in {path}\n"),
+                        });
+                    }
+                } else {
+                    bail!(
+                        "conflict at {path} is a submodule or type-mismatch content merge; its message text is not ported (retry with --no-messages or --quiet)"
+                    );
+                }
+            }
+            // Modify/delete: `changes_in_resolution()` orients `ours` to the
+            // modified side and `theirs` to the deleted side. git names the two
+            // by which operand still carries the file, which is exactly the tree
+            // that retains `path`.
+            Err(ResolutionFailure::OursModifiedTheirsDeleted) => {
+                let (s1, _) = side_trees.as_ref().expect("peeled when this class is present");
+                let path = ours.location().to_owned();
+                let modify_branch = if tree_has(s1, path.as_bstr())? {
+                    label1
+                } else {
+                    label2
+                };
+                let delete_branch = if modify_branch == label1 { label2 } else { label1 };
+                out.push(Message {
+                    paths: vec![path.clone()],
+                    ctype: "CONFLICT (modify/delete)",
+                    text: format!(
+                        "CONFLICT (modify/delete): {path} deleted in {delete_branch} and modified in {modify_branch}.  Version {modify_branch} of {path} left in tree.\n"
+                    ),
+                });
+            }
+            // Rename/delete: `theirs` is the rename (a rewrite carrying source and
+            // destination), `ours` the deletion. The renaming operand is the one
+            // whose tree holds the new name.
+            Err(ResolutionFailure::OursDeletedTheirsRenamed) => {
+                let (s1, _) = side_trees.as_ref().expect("peeled when this class is present");
+                let src = theirs.source_location().to_owned();
+                let dst = theirs.location().to_owned();
+                let rename_branch = if tree_has(s1, dst.as_bstr())? {
+                    label1
+                } else {
+                    label2
+                };
+                let delete_branch = if rename_branch == label1 { label2 } else { label1 };
+                out.push(Message {
+                    // git's primary path is the new name, followed by the old one.
+                    paths: vec![dst.clone(), src.clone()],
+                    ctype: "CONFLICT (rename/delete)",
+                    text: format!(
+                        "CONFLICT (rename/delete): {src} renamed to {dst} in {rename_branch}, but deleted in {delete_branch}.\n"
+                    ),
+                });
+            }
+            // Rename/rename(1to2): both operands renamed the same source to
+            // distinct destinations. git prints them positionally as `to <d1> in
+            // <branch1> and to <d2> in <branch2>`, so `d1` is whichever
+            // destination lives in operand 1's tree.
+            Err(ResolutionFailure::OursRenamedTheirsRenamedDifferently { .. }) => {
+                let (s1, _) = side_trees.as_ref().expect("peeled when this class is present");
+                let src = ours.source_location().to_owned();
+                let our_dst = ours.location().to_owned();
+                let their_dst = theirs.location().to_owned();
+                let (dst1, dst2) = if tree_has(s1, our_dst.as_bstr())? {
+                    (our_dst, their_dst)
+                } else {
+                    (their_dst, our_dst)
+                };
+                out.push(Message {
+                    // git's paths are the shared source, then both destinations.
+                    paths: vec![src.clone(), dst1.clone(), dst2.clone()],
+                    ctype: "CONFLICT (rename/rename)",
+                    text: format!(
+                        "CONFLICT (rename/rename): {src} renamed to {dst1} in {label1} and to {dst2} in {label2}.\n"
+                    ),
+                });
             }
             _ => bail!(
-                "conflict at {path} is not a content merge; message rendering for this conflict class is not ported (retry with --no-messages or --quiet)"
+                "conflict at {} is a class whose git message text is not ported (retry with --no-messages or --quiet)",
+                ours.location()
             ),
-        };
-
-        for change in [ours, theirs] {
-            let (mode, id) = change_state(change);
-            if !mode.is_blob() {
-                bail!(
-                    "conflict at {path} involves a symlink or submodule; message rendering is not ported (retry with --no-messages or --quiet)"
-                );
-            }
-            if is_binary(repo, &id)? {
-                bail!(
-                    "conflict at {path} is a binary content merge; git's `warning: Cannot merge binary files` line is not ported (retry with --no-messages or --quiet)"
-                );
-            }
-        }
-
-        out.push(Message {
-            path: path.clone(),
-            ctype: "Auto-merging",
-            text: format!("Auto-merging {path}\n"),
-        });
-        if merged_blob.resolution == gix::merge::blob::Resolution::Conflict {
-            // Both sides adding the same path is reported as `add/add` in the
-            // human message, but shares the `contents` short type with a plain
-            // content conflict.
-            let kind = if matches!(ours, Change::Addition { .. })
-                && matches!(theirs, Change::Addition { .. })
-            {
-                "add/add"
-            } else {
-                "content"
-            };
-            out.push(Message {
-                text: format!("CONFLICT ({kind}): Merge conflict in {path}\n"),
-                path,
-                ctype: "CONFLICT (contents)",
-            });
         }
     }
+
+    // git accumulates messages in a strmap keyed by the primary path, then emits
+    // them in sorted path order (`string_list_sort`), preserving insertion order
+    // among messages that share a path. A stable sort by the primary path
+    // reproduces that layout.
+    out.sort_by(|a, b| a.paths[0].cmp(&b.paths[0]));
     Ok(out)
+}
+
+/// git's binary-merge trigger: `merge_3way()` emits its `warning:` line when
+/// `ll_merge()` returns `LL_MERGE_BINARY_CONFLICT`, which happens when any of the
+/// base/ours/theirs blobs is binary. Mirror that by testing every populated
+/// stage of the conflict with git's NUL-in-first-8000-bytes heuristic.
+fn conflict_is_binary(repo: &gix::Repository, conflict: &Conflict) -> Result<bool> {
+    for entry in conflict.entries().into_iter().flatten() {
+        if is_binary(repo, &entry.id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `tree` contains an entry at the slash-separated `path`. Used to map a
+/// conflicting path back to the operand it belongs to for git's branch labels.
+fn tree_has(tree: &gix::Tree<'_>, path: &BStr) -> Result<bool> {
+    Ok(tree.lookup_entry(path.split(|&b| b == b'/'))?.is_some())
 }
 
 /// The post-change mode and id of `change` (the rename destination for rewrites).

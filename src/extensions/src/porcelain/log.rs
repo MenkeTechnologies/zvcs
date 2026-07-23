@@ -1780,9 +1780,10 @@ fn commit_touches(repo: &gix::Repository, node: &Node, pathspecs: &[String]) -> 
 
 /// Does a plain git pathspec match a repo-relative path? Matches git's default
 /// (non-magic) rules: an exact path, a leading directory (`src` matches
-/// `src/lib.rs`), or a wildcard where `*`/`?` span the whole path. Magic
-/// pathspecs (`:(glob)`, `:!exclude`, …) and bracket classes are surfaced terse
-/// rather than matched wrong.
+/// `src/lib.rs`), or a wildcard matched by git's `wildmatch.c` (flags=0) — `*`/`?`
+/// span the whole path and `[…]` bracket expressions (ranges, `!`/`^` negation,
+/// POSIX `[:class:]`) are honored. Magic pathspecs (`:(glob)`, `:!exclude`, …)
+/// are surfaced terse rather than matched wrong.
 fn pathspec_matches(spec: &str, path: &[u8]) -> Result<bool> {
     if spec.starts_with(':') {
         bail!("magic pathspecs are not ported");
@@ -1800,41 +1801,249 @@ fn pathspec_matches(spec: &str, path: &[u8]) -> Result<bool> {
     if path.len() > sb.len() && path.starts_with(sb) && path[sb.len()] == b'/' {
         return Ok(true);
     }
-    if spec.bytes().any(|b| b == b'[') {
-        bail!("bracket-class pathspecs are not ported");
-    }
-    if spec.bytes().any(|b| b == b'*' || b == b'?') {
+    // A `*`, `?`, or `[` makes this a wildcard pathspec (git's `is_glob_special`
+    // set), matched by `wildmatch` below. `[` covers bracket expressions and POSIX
+    // classes.
+    if spec.bytes().any(|b| b == b'*' || b == b'?' || b == b'[') {
         return Ok(wildmatch(sb, path));
     }
     Ok(false)
 }
 
-/// Glob match for a plain pathspec: `*` matches any run (slashes included, as
-/// git's default fnmatch does), `?` matches one byte. Linear-time with the usual
-/// single backtrack point for `*`.
+/// Glob match for a plain (non-magic) pathspec, delegating to the faithful
+/// `wildmatch.c:dowild` port below. Only git's `WM_MATCH` counts as a match, so a
+/// malformed pattern (`WM_ABORT_ALL`) is reported as no-match, exactly as git's
+/// pathspec callers treat `wildmatch(...) != 0`.
 fn wildmatch(pat: &[u8], text: &[u8]) -> bool {
-    let (mut p, mut t) = (0usize, 0usize);
-    let (mut star_p, mut star_t): (Option<usize>, usize) = (None, 0);
-    while t < text.len() {
-        if p < pat.len() && (pat[p] == b'?' || pat[p] == text[t]) {
-            p += 1;
-            t += 1;
-        } else if p < pat.len() && pat[p] == b'*' {
-            star_p = Some(p);
-            star_t = t;
-            p += 1;
-        } else if let Some(sp) = star_p {
-            p = sp + 1;
-            star_t += 1;
-            t = star_t;
-        } else {
-            return false;
+    matches!(dowild(pat, text), Wm::Match)
+}
+
+/// Return states of git's `wildmatch.c:dowild`, specialised to the `flags == 0`
+/// case a non-magic ("plain") git pathspec uses: `dir.c:git_fnmatch` calls
+/// `wildmatch(pattern, string, 0)` for a pathspec without `:(glob)`/`:(icase)`
+/// magic (dir.c: "wildmatch has not learned no FNM_PATHNAME mode yet"). With
+/// `flags == 0` there is no `WM_PATHNAME` (so `*`/`?`/`[…]` all span `/`) and no
+/// `WM_CASEFOLD`; that also means the `WM_ABORT_TO_STARSTAR` state cannot arise
+/// (it needs `match_slash == 0`, but here `*` behaves as `**`), so only these
+/// three outcomes remain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wm {
+    /// `WM_MATCH`.
+    Match,
+    /// `WM_NOMATCH`.
+    NoMatch,
+    /// `WM_ABORT_ALL`: text ended with the pattern still expecting a literal, or a
+    /// malformed bracket expression. A no-match at the top level.
+    AbortAll,
+}
+
+/// git's `is_glob_special`: the bytes `wildmatch` treats as metacharacters.
+fn is_glob_special(c: u8) -> bool {
+    matches!(c, b'*' | b'?' | b'[' | b'\\')
+}
+
+/// `pat.get(i)` as a byte, using `0` (git's NUL terminator) past the end.
+fn at(pat: &[u8], i: usize) -> u8 {
+    pat.get(i).copied().unwrap_or(0)
+}
+
+/// Faithful port of `wildmatch.c:dowild` for `flags == 0` (see [`Wm`]). Matches
+/// pattern `pat` against `text`.
+fn dowild(pat: &[u8], text: &[u8]) -> Wm {
+    let mut p = 0usize;
+    let mut t = 0usize;
+    while p < pat.len() {
+        let mut p_ch = pat[p];
+        let t_ch = if t < text.len() { text[t] } else { 0 };
+        // `if ((t_ch = *text) == '\0' && p_ch != '*') return WM_ABORT_ALL;`
+        if t_ch == 0 && p_ch != b'*' {
+            return Wm::AbortAll;
+        }
+        match p_ch {
+            // `case '?'`: flags=0 matches any char, `/` included.
+            b'?' => {}
+            b'*' => {
+                // Collapse a run of `*`; with flags=0, `*` behaves as `**`
+                // (`match_slash` is always true).
+                p += 1;
+                while p < pat.len() && pat[p] == b'*' {
+                    p += 1;
+                }
+                // Trailing `*`/`**` matches the remaining text unconditionally.
+                if p >= pat.len() {
+                    return Wm::Match;
+                }
+                loop {
+                    if t >= text.len() {
+                        break;
+                    }
+                    // When the char after `*` is a literal, fast-forward the text to
+                    // it: everything skipped must belong to the `*`.
+                    if !is_glob_special(pat[p]) {
+                        let lit = pat[p];
+                        while t < text.len() && text[t] != lit {
+                            t += 1;
+                        }
+                        if t >= text.len() {
+                            return Wm::NoMatch;
+                        }
+                    }
+                    match dowild(&pat[p..], &text[t..]) {
+                        Wm::NoMatch => {}
+                        other => return other,
+                    }
+                    t += 1;
+                }
+                return Wm::AbortAll;
+            }
+            b'[' => match bracket(pat, &mut p, t_ch) {
+                // On a match `p` is left on the `]`; the advance below steps past it.
+                Wm::Match => {}
+                nonmatch => return nonmatch,
+            },
+            b'\\' => {
+                // Literal match with the following char. `p[1] == '\0'` falls out as
+                // `p_ch == 0`, which the `t_ch != p_ch` test rejects (t_ch != 0
+                // here), exactly as git's `default` arm handles it.
+                p += 1;
+                p_ch = at(pat, p);
+                if t_ch != p_ch {
+                    return Wm::NoMatch;
+                }
+            }
+            _ => {
+                if t_ch != p_ch {
+                    return Wm::NoMatch;
+                }
+            }
+        }
+        p += 1;
+        t += 1;
+    }
+    if t < text.len() {
+        Wm::NoMatch
+    } else {
+        Wm::Match
+    }
+}
+
+/// Port of the `case '['` block of `wildmatch.c:dowild` (flags=0). `*p` enters on
+/// the `[` and, on a match/no-match decision, is left on the closing `]` so the
+/// caller's single advance steps past it. Returns [`Wm::AbortAll`] for a malformed
+/// class (missing `]`), matching git.
+fn bracket(pat: &[u8], p: &mut usize, t_ch: u8) -> Wm {
+    // `p_ch = *++p`
+    *p += 1;
+    let mut p_ch = at(pat, *p);
+    // NEGATE_CLASS2 `^` is normalised to NEGATE_CLASS `!`.
+    if p_ch == b'^' {
+        p_ch = b'!';
+    }
+    let negated = p_ch == b'!';
+    if negated {
+        *p += 1;
+        p_ch = at(pat, *p);
+    }
+    let mut prev_ch: u8 = 0;
+    let mut matched = false;
+    loop {
+        if p_ch == 0 {
+            return Wm::AbortAll;
+        }
+        if p_ch == b'\\' {
+            *p += 1;
+            p_ch = at(pat, *p);
+            if p_ch == 0 {
+                return Wm::AbortAll;
+            }
+            if t_ch == p_ch {
+                matched = true;
+            }
+        } else if p_ch == b'-' && prev_ch != 0 && at(pat, *p + 1) != 0 && at(pat, *p + 1) != b']' {
+            // `prev_ch`..`p_ch` inclusive range.
+            *p += 1;
+            p_ch = at(pat, *p);
+            if p_ch == b'\\' {
+                *p += 1;
+                p_ch = at(pat, *p);
+                if p_ch == 0 {
+                    return Wm::AbortAll;
+                }
+            }
+            if t_ch <= p_ch && t_ch >= prev_ch {
+                matched = true;
+            }
+            p_ch = 0; // makes prev_ch get set to 0 next iteration
+        } else if p_ch == b'[' && at(pat, *p + 1) == b':' {
+            // POSIX `[:class:]`.
+            *p += 2;
+            let s = *p;
+            while at(pat, *p) != 0 && at(pat, *p) != b']' {
+                *p += 1;
+            }
+            if at(pat, *p) == 0 {
+                return Wm::AbortAll;
+            }
+            // `*p` is now on `]`; the class name is `pat[s..*p-1]` and `pat[*p-1]`
+            // must be `:`. `i < 0` in git corresponds to `*p <= s` here.
+            if *p <= s || pat[*p - 1] != b':' {
+                // Not a real `[:class:]`: treat the inner `[` as a literal member.
+                *p = s - 2;
+                p_ch = b'[';
+                if t_ch == p_ch {
+                    matched = true;
+                }
+            } else {
+                match class_matches(&pat[s..*p - 1], t_ch) {
+                    Some(true) => matched = true,
+                    Some(false) => {}
+                    // Malformed `[:class:]` string.
+                    None => return Wm::AbortAll,
+                }
+                p_ch = 0;
+            }
+        } else if t_ch == p_ch {
+            matched = true;
+        }
+        // git's do-while tail: `prev_ch = p_ch, (p_ch = *++p) != ']'`.
+        prev_ch = p_ch;
+        *p += 1;
+        p_ch = at(pat, *p);
+        if p_ch == b']' {
+            break;
         }
     }
-    while p < pat.len() && pat[p] == b'*' {
-        p += 1;
+    // `if (matched == negated) return WM_NOMATCH;` (the `WM_PATHNAME`/`'/'` guard
+    // is inert at flags=0).
+    if matched == negated {
+        Wm::NoMatch
+    } else {
+        Wm::Match
     }
-    p == pat.len()
+}
+
+/// git's `wildmatch.c` POSIX character classes (`[:alpha:]`, `[:digit:]`, …),
+/// evaluated for ASCII byte `c`. `None` marks a class name git rejects as a
+/// malformed `[:class:]` string.
+fn class_matches(name: &[u8], c: u8) -> Option<bool> {
+    let m = match name {
+        b"alnum" => c.is_ascii_alphanumeric(),
+        b"alpha" => c.is_ascii_alphabetic(),
+        b"blank" => c == b' ' || c == b'\t',
+        b"cntrl" => c.is_ascii_control(),
+        b"digit" => c.is_ascii_digit(),
+        b"graph" => c.is_ascii_graphic(),
+        b"lower" => c.is_ascii_lowercase(),
+        // `isprint`: printable, space included.
+        b"print" => (0x20..=0x7e).contains(&c),
+        b"punct" => c.is_ascii_punctuation(),
+        // C's `isspace`: space, `\t`, `\n`, `\v`, `\f`, `\r`.
+        b"space" => matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'),
+        b"upper" => c.is_ascii_uppercase(),
+        b"xdigit" => c.is_ascii_hexdigit(),
+        _ => return None,
+    };
+    Some(m)
 }
 
 /// Turn one gix change into a [`FileChange`], or `None` for the directory entries
@@ -2722,4 +2931,71 @@ fn trim_end_ws(mut s: &[u8]) -> &[u8] {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Every expectation below was verified against stock `git log -- <spec>` on a
+    // real repository with git 2.55.0: a bracket pathspec is a wildcard pathspec,
+    // so it never gets the literal leading-directory shortcut, and its `[…]`
+    // expression follows git's `wildmatch.c:dowild` (flags=0) rules.
+    fn m(spec: &str, path: &[u8]) -> bool {
+        pathspec_matches(spec, path).unwrap()
+    }
+
+    #[test]
+    fn bracket_set_matches_a_listed_char() {
+        // `git log -- 'READM[Ee]'` shows the README commit; the set picks `E`.
+        assert!(m("READM[Ee]", b"README"));
+        assert!(m("f[oi]le", b"file"));
+        assert!(m("f[oi]le", b"fole"));
+        // `x` is not in the set, so no match.
+        assert!(!m("f[oi]le", b"fxle"));
+    }
+
+    #[test]
+    fn bracket_range() {
+        // `READM[A-Z]` matches (E in A-Z); `READM[a-d]` does not (E not in a-d).
+        assert!(m("READM[A-Z]", b"README"));
+        assert!(!m("READM[a-d]", b"README"));
+    }
+
+    #[test]
+    fn bracket_negation_both_forms() {
+        // `[!x]`/`[^x]` match `E` (not `x`); `[!E]` rejects `E`.
+        assert!(m("READM[!x]", b"README"));
+        assert!(m("READM[^x]", b"README"));
+        assert!(!m("READM[!E]", b"README"));
+    }
+
+    #[test]
+    fn posix_character_class() {
+        // `[[:upper:]]` matches `E`; `[[:digit:]]` does not.
+        assert!(m("READM[[:upper:]]", b"README"));
+        assert!(!m("READM[[:digit:]]", b"README"));
+    }
+
+    #[test]
+    fn malformed_bracket_is_no_match() {
+        // git prints nothing for an unterminated class (WM_ABORT_ALL → no-match).
+        assert!(!m("READM[Ee", b"README"));
+    }
+
+    #[test]
+    fn star_spans_slashes_and_bracket_dir_needs_full_match() {
+        // flags=0: `*` spans `/`, so `builtin*log.c` matches `builtin/log.c`.
+        assert!(m("builtin*log.c", b"builtin/log.c"));
+        // A wildcard pathspec that names a directory gets no leading-dir shortcut,
+        // and wildmatch leaves the trailing `/log.c` unmatched — git shows nothing.
+        assert!(!m("buil[dt]in", b"builtin/log.c"));
+    }
+
+    #[test]
+    fn magic_pathspec_still_surfaced_as_floor() {
+        // Magic pathspecs remain unported (an honest error, never a wrong match).
+        assert!(pathspec_matches(":(glob)foo", b"foo").is_err());
+        assert!(pathspec_matches(":!foo", b"foo").is_err());
+    }
 }

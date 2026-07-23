@@ -57,6 +57,7 @@ struct Opts {
     cached: bool,          // -c / --cached
     stage: bool,           // -s / --stage
     unmerged: bool,        // -u / --unmerged
+    resolve_undo: bool,    // --resolve-undo (show recorded conflict resolutions)
     deleted: bool,         // -d / --deleted
     modified: bool,        // -m / --modified
     others: bool,          // -o / --others
@@ -199,9 +200,9 @@ fn pathspec_parse_fatal(err: &gix::pathspec::parse::Error, raw: &str) -> Option<
 /// cached line, the deleted line, and the modified line in that order.
 ///
 /// Exclude handling (`-x`, `-X`, `-i`, `--exclude-standard`), `-v`, `-f`,
-/// `--debug` and `--format` are ported. `-k/--killed`, `--eol`, `--with-tree`
-/// and `--resolve-undo` are not ported and are rejected rather than silently
-/// ignored.
+/// `--debug`, `--format` and `--resolve-undo` are ported. `-k/--killed`,
+/// `--eol` and `--with-tree` are not ported and are rejected rather than
+/// silently ignored.
 pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     let mut opts = Opts::default();
     let mut no_more_flags = false;
@@ -229,6 +230,8 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             "--no-stage" => opts.stage = false,
             "--unmerged" => opts.unmerged = true,
             "--no-unmerged" => opts.unmerged = false,
+            "--resolve-undo" => opts.resolve_undo = true,
+            "--no-resolve-undo" => opts.resolve_undo = false,
             "--deleted" => opts.deleted = true,
             "--no-deleted" => opts.deleted = false,
             "--modified" => opts.modified = true,
@@ -355,10 +358,12 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    // `--format` shares git's exact incompatibility set (exit 129). `-k`, `--eol`
-    // and `--resolve-undo` aren't parsed here, so only `-s`/`-o`/`-t`/
-    // `--deduplicate` can actually co-occur.
-    if opts.format.is_some() && (opts.stage || opts.others || opts.tags || opts.dedup) {
+    // `--format` shares git's exact incompatibility set (exit 129). `-k` and
+    // `--eol` aren't parsed here, so `-s`/`-o`/`-t`/`--resolve-undo`/
+    // `--deduplicate` are the selectors that can actually co-occur.
+    if opts.format.is_some()
+        && (opts.stage || opts.others || opts.tags || opts.dedup || opts.resolve_undo)
+    {
         return Ok(usage_error(
             "--format cannot be used with -s, -o, -k, -t, --resolve-undo, --deduplicate, --eol",
         ));
@@ -377,6 +382,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         && !opts.modified
         && !opts.others
         && !opts.unmerged
+        && !opts.resolve_undo
     {
         opts.cached = true;
     }
@@ -537,6 +543,49 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             }
             if opts.modified && is_modified {
                 lines.push(render(&opts, "C ", Some(entry), &repo, display, quote, terminator));
+            }
+        }
+    }
+
+    // Phase 3: resolve-undo records (git's `show_ru_info`), emitted after every
+    // index line. Each recorded conflict contributes one line per surviving
+    // stage — `<tag><mode> <object> <stage>\t<name>` — with the `U ` tag present
+    // only under `-t`/`-v`/`-f`, exactly as git assigns `tag_resolve_undo`. The
+    // path is pathspec-matched like an index entry, so a spec that matches only a
+    // resolve-undo path still satisfies `--error-unmatch`.
+    if opts.resolve_undo {
+        if let Some(records) = index.resolve_undo() {
+            let ru_tag = if opts.tags || opts.valid_bit || opts.fsmonitor_bit {
+                "U "
+            } else {
+                ""
+            };
+            for rec in records {
+                let name = rec.name();
+                let Some(m) = ps.pattern_matching_relative_path(name, Some(false)) else {
+                    continue;
+                };
+                if m.is_excluded() {
+                    continue;
+                }
+                matched.insert(m.sequence_number);
+                let display = strip_prefix(name, prefix.as_ref());
+                let path_bytes = if quote {
+                    quote_path(display).into_bytes()
+                } else {
+                    display.to_vec()
+                };
+                for (i, stage) in rec.stages().iter().enumerate() {
+                    let Some(st) = stage else { continue };
+                    lines.push(resolve_undo_line(
+                        ru_tag,
+                        st.mode(),
+                        &abbrev_oid(st.id(), &repo, opts.abbrev),
+                        i + 1,
+                        &path_bytes,
+                        terminator,
+                    ));
+                }
             }
         }
     }
@@ -795,6 +844,37 @@ fn entry_worktree_change(
     (false, modified)
 }
 
+/// Render an object id the way git's `find_unique_abbrev` does for these
+/// columns: the full hex name when `--abbrev` was absent, the `core.abbrev`/auto
+/// length when `--abbrev` carried no value, or exactly `n` hex digits for
+/// `--abbrev=<n>` (already clamped to `MINIMUM_ABBREV` during parsing).
+fn abbrev_oid(id: gix::ObjectId, repo: &gix::Repository, abbrev: Option<Option<usize>>) -> String {
+    match abbrev {
+        None => id.to_hex().to_string(),
+        Some(None) => id.attach(repo).shorten_or_id().to_string(),
+        Some(Some(n)) => id.to_hex_with_len(n).to_string(),
+    }
+}
+
+/// Build one resolve-undo line, matching git's `show_ru_info`
+/// `printf("%s%06o %s %d\t", tag, mode, object, stage)` followed by the
+/// prefix-stripped, quoted name and the line terminator.
+fn resolve_undo_line(
+    tag: &str,
+    mode: u32,
+    object: &str,
+    stage: usize,
+    path_bytes: &[u8],
+    terminator: u8,
+) -> Vec<u8> {
+    let mut line = Vec::with_capacity(path_bytes.len() + 64);
+    line.extend_from_slice(tag.as_bytes());
+    line.extend_from_slice(format!("{mode:06o} {object} {stage}\t").as_bytes());
+    line.extend_from_slice(path_bytes);
+    line.push(terminator);
+    line
+}
+
 /// Build one output line: optional status tag, optional stage columns, path,
 /// the line terminator, and (under `--debug`) the trailing stat block.
 fn render(
@@ -829,11 +909,7 @@ fn render(
     }
     // Directory-walk results never carry stage columns, even under `-s`.
     if let (true, Some(entry)) = (opts.stage_format(), entry) {
-        let object = match opts.abbrev {
-            None => entry.id.to_hex().to_string(),
-            Some(None) => entry.id.attach(repo).shorten_or_id().to_string(),
-            Some(Some(n)) => entry.id.to_hex_with_len(n).to_string(),
-        };
+        let object = abbrev_oid(entry.id, repo, opts.abbrev);
         line.extend_from_slice(
             format!(
                 "{:06o} {} {}\t",
@@ -967,12 +1043,7 @@ fn expand_format(
                     }
                     "objectname" => {
                         if let Some(e) = entry {
-                            let name = match abbrev {
-                                None => e.id.to_hex().to_string(),
-                                Some(None) => e.id.attach(repo).shorten_or_id().to_string(),
-                                Some(Some(n)) => e.id.to_hex_with_len(n).to_string(),
-                            };
-                            out.extend_from_slice(name.as_bytes());
+                            out.extend_from_slice(abbrev_oid(e.id, repo, abbrev).as_bytes());
                         }
                     }
                     "objectsize" => {
@@ -1115,6 +1186,20 @@ mod tests {
         assert_eq!(normalize_pattern("./"), ":");
         assert_eq!(normalize_pattern("./src/lib.rs"), "src/lib.rs");
         assert_eq!(normalize_pattern("src/./lib.rs"), "src/lib.rs");
+    }
+
+    #[test]
+    fn resolve_undo_line_matches_git_format() {
+        // git's show_ru_info: printf("%s%06o %s %d\t", tag, mode, oid, i+1)
+        // followed by write_name (name + line terminator). `git ls-files -t
+        // --resolve-undo` on a resolved conflict prints e.g.
+        //   U 100644 <oid> 1\tpath/file
+        let line = resolve_undo_line("U ", 0o100644, "0123abc", 1, b"path/file", b'\n');
+        assert_eq!(line, b"U 100644 0123abc 1\tpath/file\n");
+        // Untagged (`git ls-files --resolve-undo`), the leading column is empty;
+        // under `-z` the NUL terminates and no quoting is applied by the caller.
+        let z = resolve_undo_line("", 0o100755, "def4567", 3, b"x", b'\0');
+        assert_eq!(z, b"100755 def4567 3\tx\0");
     }
 
     #[test]

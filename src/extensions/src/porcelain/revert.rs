@@ -49,8 +49,13 @@
 //!     an index that differs from `HEAD`, merge without `-m`, missing parent,
 //!     and affected files that are locally modified or would clobber untracked
 //!     files — same text, same exit codes (128/129)
-//!   * `--quit` (drops `.git/sequencer`), and the "nothing in progress"
-//!     refusals of `--abort`/`--skip`/`--continue`
+//!   * `--quit` (drops `.git/sequencer`); the single-pick `--abort`/`--skip`,
+//!     which reduce to `git reset --merge HEAD` through the ported `reset`; and
+//!     the "nothing in progress" refusals of `--abort`/`--skip`/`--continue`
+//!   * a no-op single pick against a dirty worktree, which git finishes by
+//!     running `git commit` — nothing to commit, so it prints the working-tree
+//!     status (byte-identical to `git status`) and exits 1; served by delegating
+//!     to the ported `status` driver
 //!   * the full three-way merge through `gix`'s tree merge (`gix-merge`, enabled
 //!     by this crate's `merge` feature): content-level blob merges and rename
 //!     following are served, not approximated. A path both sides changed away
@@ -62,12 +67,16 @@
 //!     `# Conflicts:` hint are written, and the exit status is 1
 //!
 //! What this port does NOT do, and refuses rather than approximates:
-//!   * resuming a sequence: `--continue`, and `--abort`/`--skip` when a revert
-//!     really is in progress, all need `git reset --merge`, which is not ported.
-//!     A stopped pick — whether it emptied out or conflicted — leaves the object
-//!     set, index, refs and worktree identical to git's, and prints git's status
-//!     block byte-for-byte, but the `.git/sequencer` todo/opts that would let
-//!     `--continue` resume it are not written, since nothing here can resume.
+//!   * `--continue`: git finishes a stopped pick by re-running `git commit`,
+//!     which recreates the revert commit from `MERGE_MSG`/`REVERT_HEAD`; this
+//!     port's commit path consumes neither, so `--continue` is not ported and
+//!     bails rather than committing a wrong message.
+//!   * resuming a *multi-commit* sequence: `--abort`/`--skip` on a walking pick
+//!     roll back to, or replay from, the `.git/sequencer` todo git persists when
+//!     such a pick stops. This port never writes that todo — a stopped pick
+//!     leaves the object set, index, refs and worktree identical to git's, but no
+//!     resumable sequencer state — so `--abort`/`--skip` are served only for the
+//!     single-pick fast path and bail once a real `.git/sequencer/head` exists.
 //!   * `-S`/`--gpg-sign` — bails, since nothing here can produce a signature.
 //!   * **spawning an editor.** `-e`/`--edit` is accepted and only changes which
 //!     `--cleanup=default` mode applies; the generated message is then taken as
@@ -420,12 +429,19 @@ fn set_mode(o: &mut Options, new: Cmd) -> Option<ExitCode> {
 
 /// Run a `--quit`/`--continue`/`--abort`/`--skip` command mode.
 ///
-/// Nothing here resumes a sequence: `--quit` drops the sequencer directory, and
-/// the others report the "nothing in progress" refusal when there is no state,
-/// which is the only branch this port can serve faithfully.
+/// `--quit` drops the sequencer directory. `--abort`/`--skip` are served for the
+/// single-pick fast path — git's `rollback_single_pick`/`skip_single_pick` reduce
+/// to `git reset --merge HEAD`, delegated to the ported `reset` — and refuse a
+/// real multi-commit sequence (`.git/sequencer/head`), whose rollback/replay needs
+/// the todo this port never persists. `--continue` refuses: git finishes a stopped
+/// pick by re-running `git commit` off `MERGE_MSG`/`REVERT_HEAD`, which this port's
+/// commit path does not consume.
 fn run_mode(repo: &gix::Repository, mode: Cmd) -> Result<ExitCode> {
     let git_dir = repo.git_dir();
     let sequencer = git_dir.join("sequencer");
+    // `git_path_head_file()`: a live `.git/sequencer/head` marks a walking,
+    // multi-commit sequence — the single-pick fast path never writes one.
+    let seq_head = sequencer.join("head").exists();
     let revert_head = git_dir.join("REVERT_HEAD").exists();
     let cherry_pick_head = git_dir.join("CHERRY_PICK_HEAD").exists();
 
@@ -434,24 +450,51 @@ fn run_mode(repo: &gix::Repository, mode: Cmd) -> Result<ExitCode> {
             let _ = std::fs::remove_dir_all(&sequencer);
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Abort | Cmd::Continue => {
-            if !sequencer.join("head").exists() && !revert_head && !cherry_pick_head {
+        Cmd::Abort => {
+            // `sequencer_rollback`: with a live `.git/sequencer/head` it rewinds to
+            // the stored pre-sequence HEAD and clears the sequencer state. This port
+            // never persists that todo, so a real sequence cannot be rolled back.
+            if seq_head {
+                bail!("--abort of a multi-commit revert sequence is not ported (rewinding to the stored pre-sequence HEAD needs the `.git/sequencer` state this port omits)");
+            }
+            // `rollback_single_pick`: refuse unless a single pick is in progress.
+            if !revert_head && !cherry_pick_head {
                 eprintln!("error: no cherry-pick or revert in progress");
                 eprintln!("fatal: revert failed");
                 return Ok(ExitCode::from(128));
             }
-            bail!(
-                "{} with a revert in progress is not supported (`git reset --merge` is not ported)",
-                mode.flag()
-            )
+            // `reset_merge(&head_oid)` == `git reset --merge HEAD`: the two-tree
+            // reset discards the staged single pick and restores its worktree paths
+            // while keeping unrelated local changes, and drops REVERT_HEAD/MERGE_MSG/
+            // AUTO_MERGE. git's reset_merge prints nothing (it is not a hard reset),
+            // so run the ported reset quiet to match its byte-empty output.
+            super::reset::reset(&["--merge".to_string(), "--quiet".to_string()])
         }
         Cmd::Skip => {
+            // `sequencer_skip` for a revert refuses unless REVERT_HEAD is present.
             if !revert_head {
                 eprintln!("error: no revert in progress");
                 eprintln!("fatal: revert failed");
                 return Ok(ExitCode::from(128));
             }
-            bail!("--skip with a revert in progress is not supported (`git reset --merge` is not ported)")
+            // `skip_single_pick` is the same `git reset --merge HEAD`; only when a
+            // `.git/sequencer` todo follows does git replay the rest of the sequence.
+            if seq_head {
+                bail!("--skip of a multi-commit revert sequence is not ported (replaying the remaining `.git/sequencer` todo is not implemented)");
+            }
+            super::reset::reset(&["--merge".to_string(), "--quiet".to_string()])
+        }
+        Cmd::Continue => {
+            // `continue_single_pick` re-runs `git commit --no-edit --cleanup=strip`,
+            // which recreates the revert commit from `MERGE_MSG`/`REVERT_HEAD`. This
+            // port's `commit` consumes neither, so it cannot finalize a stopped pick;
+            // committing anyway would produce a wrong message, so refuse instead.
+            if !seq_head && !revert_head && !cherry_pick_head {
+                eprintln!("error: no cherry-pick or revert in progress");
+                eprintln!("fatal: revert failed");
+                return Ok(ExitCode::from(128));
+            }
+            bail!("--continue is not ported (finalizing a stopped pick needs `git commit`'s MERGE_MSG/REVERT_HEAD recovery, which this port's commit path does not implement)")
         }
     }
 }
@@ -843,7 +886,20 @@ fn revert_one(
     // commit machinery and exits 1.
     if merged_tree == ours_tree {
         if !wt.modified.is_empty() || !wt.untracked.is_empty() {
-            bail!("revert is a no-op and the `git status` advice for a dirty worktree is not ported");
+            // git finishes a no-op pick by running `git commit`, which finds
+            // nothing to commit and prints the working-tree status — byte-identical
+            // to `git status` — before exiting 1. Reuse the ported status driver
+            // rather than re-rolling the changes/untracked sections. The single-pick
+            // fast path has no `.git/sequencer` todo on disk, so `git status` prints
+            // no in-progress block, which matches. A walked pick would need the
+            // "Revert currently in progress" block injected after the branch line,
+            // and this port persists no sequencer todo for the status driver to read
+            // — so it is left a floor rather than emitting status without that block.
+            if sequencer {
+                bail!("revert is a no-op with a dirty worktree mid-sequence: `git status`'s `Revert currently in progress` block needs the `.git/sequencer` todo this port omits");
+            }
+            super::status::status(&[])?;
+            return Ok(Step::Failed(ExitCode::from(1)));
         }
         match repo.head_name()? {
             Some(name) => println!("On branch {}", name.shorten()),

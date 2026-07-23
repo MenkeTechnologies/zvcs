@@ -34,10 +34,25 @@
 //!     built with a prerequisite is a thin pack, and a self-contained one would
 //!     differ from git's byte-for-byte — and since `create` writes nothing to
 //!     stdout and exits 0, a wrong bundle is indistinguishable from success.
-//!   * `unbundle` — needs `index-pack`. `gix-pack::Bundle::write_to_directory`
-//!     exists, but writes no `pack-*.rev` reverse index (grep for `rev` under
-//!     `gix-pack/src/bundle/write` finds none) while git 2.55 writes one for
-//!     every pack it stores, so the post-command object store diverges.
+//!   * `unbundle` — git runs `index-pack --fix-thin --stdin` on the pack that
+//!     follows the header, then lists its refs. That `index-pack` is already
+//!     ported (`porcelain/index_pack.rs`): its stdin path drives
+//!     `gix_pack::Bundle::write_to_directory` with the odb as the thin-pack
+//!     resolver (`index_pack.rs:527`) and writes the `pack-*.rev` reverse index
+//!     itself (`index_pack.rs:643`), so the earlier "`gix` cannot write a
+//!     `.rev`" reason no longer holds. What blocks a faithful port *from this
+//!     file* is reuse, not a missing gix capability: that pack drive and `.rev`
+//!     writer (`index_from_stdin` / `write_rev_index`) are module-private, so a
+//!     non-duplicating port needs them promoted to a shared helper — a change
+//!     to another module this task forbids. Two obstacles survive even that:
+//!     handing the pack to `index-pack` needs the *same* stream left positioned
+//!     exactly at the pack start (git's `read_bundle_header_fd` reads the header
+//!     one byte at a time via `strbuf_getwholeline_fd` for precisely this),
+//!     whereas the look-ahead `BufReader` in the `read_header` shared with the
+//!     verified `list-heads`/`verify` paths consumes the stdin (`-`) pack bytes;
+//!     and a *thin* bundle's stored pack still diverges from git's bytes because
+//!     `gix` injects borrowed bases mid-pack rather than appending them
+//!     (`index_pack.rs:60`).
 //!
 //! Two further deliberate gaps, so this doc claims no more than the code does:
 //! a v3 bundle carrying any capability other than `@object-format` is rejected
@@ -467,8 +482,13 @@ fn unbundle(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
     bail!(
-        "`bundle unbundle` is not ported: storing the bundle's pack needs index-pack, and \
-         gix-pack's Bundle::write_to_directory writes no pack-*.rev reverse index, which git \
-         2.55 creates for every pack it stores — the object store would diverge"
+        "`bundle unbundle` is not ported here: git runs `index-pack --fix-thin --stdin`, which \
+         porcelain/index_pack.rs already implements (including the .rev reverse index and thin-pack \
+         completion), but its pack drive and .rev writer are module-private and cannot be reused \
+         without promoting them to a shared helper outside this file; handing the pack to index-pack \
+         also needs the same stream positioned at the pack start, which the look-ahead BufReader in \
+         the shared read_header (used by the verified list-heads/verify paths) does not preserve for \
+         stdin, and a thin bundle's stored pack diverges from git's bytes because gix injects bases \
+         mid-pack rather than appending them"
     )
 }

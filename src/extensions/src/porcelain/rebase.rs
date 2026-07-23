@@ -764,9 +764,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             ModeOption::EditTodo => {
                 bail!("unsupported flag \"--edit-todo\" (interactive todo editing is not ported)")
             }
-            ModeOption::ShowCurrentPatch => bail!(
-                "unsupported flag \"--show-current-patch\" (rendering the stopped patch is not ported)"
-            ),
+            ModeOption::ShowCurrentPatch => rebase_show_current_patch(&repo),
         };
     }
     if in_progress {
@@ -1751,6 +1749,25 @@ fn restore_worktree_to_tree(
     new_index.remove_tree();
     new_index.write(Default::default())?;
     Ok(())
+}
+
+/// `git rebase --show-current-patch`: show the commit that the stopped merge-backend
+/// rebase was applying.
+///
+/// `builtin/rebase.c`'s `ACTION_SHOW_CURRENT_PATCH` runs `git show REBASE_HEAD --`
+/// (rebase.c:354-361). `REBASE_HEAD` names the commit whose pick stopped on a
+/// conflict — the same commit this module records as `stopped-sha` in the
+/// `.git/rebase-merge` state ([`RebaseState::stopped`]). `git show` prints the
+/// resolved commit's full object id on its `commit <oid>` line rather than the ref
+/// spelling, so showing the stopped id directly is byte-for-byte what `git show
+/// REBASE_HEAD --` emits. The trailing `--` reproduces git's empty pathspec.
+///
+/// Only reached for a merge-backend in-progress rebase: the caller bails out of the
+/// apply-backend (`git am`) state before this arm, and requires a rebase to be in
+/// progress at all, so [`read_rebase_state`] always has a `stopped-sha` to read.
+fn rebase_show_current_patch(repo: &gix::Repository) -> Result<ExitCode> {
+    let st = read_rebase_state(repo)?;
+    super::show(&[st.stopped.to_string(), "--".to_string()])
 }
 
 /// `git rebase --quit`: drop the state directory and leave `HEAD` where it is.

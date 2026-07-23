@@ -36,6 +36,10 @@
 //!     `-X<params>`, `--dirstat-by-file`, `--cumulative`), selected the way
 //!     git's `diff_flush()` selects them and separated the way `log_tree_diff()`
 //!     separates them (`---` only when the diffstat and the patch are both on).
+//!   * width-tuned diffstat — `--stat=<width>[,<name-width>[,<count>]]`,
+//!     `--stat-width`, `--stat-name-width`, `--stat-graph-width`,
+//!     `--stat-count`, a port of `diff_opt_stat()`'s field parsing and the
+//!     column scaling / `--stat-count` ` ...` truncation in `show_stats()`.
 //!   * `-I<regex>`/`--ignore-matching-lines=<regex>`, via a vendored POSIX ERE
 //!     engine (`regcomp(REG_EXTENDED | REG_NEWLINE)` semantics) and a port of
 //!     xdiff's `xdl_get_hunk()` hunk selection.
@@ -73,8 +77,7 @@
 //!   * threading (its auto-generated `Message-Id` embeds `time(NULL)`, so it
 //!     cannot be reproduced byte-for-byte), MIME attach/inline, signoff,
 //!     `--from`/`--force-in-body-from`, notes, interdiff and range-diff,
-//!     `--ignore-if-in-upstream`, `--compact-summary`, the width-tuned diffstat
-//!     (`--stat=<width>`, `--stat-width`, `--stat-name-width`, `--stat-count`),
+//!     `--ignore-if-in-upstream`, `--compact-summary`,
 //!     whitespace-insensitive diffing, patience diff (imara-diff has Myers,
 //!     MyersMinimal and Histogram only), and rename/copy detection.
 //!
@@ -189,6 +192,18 @@ struct Opts {
     /// The `DIFF_FORMAT_*` bits the caller asked for, before the default fills in.
     output_format: u32,
     dirstat: Dirstat,
+    /// `--stat=<w>`/`--stat-width`: the diffstat total width. 0 means git's
+    /// format-patch default of `MAIL_DEFAULT_WRAP` (72).
+    stat_width: i64,
+    /// `--stat-name-width`: cap on the filename column. 0 leaves it uncapped.
+    stat_name_width: i64,
+    /// `--stat-graph-width`: cap on the `+/-` graph column. 0 leaves it uncapped
+    /// (format-patch never sets git's `-1` sentinel, so the config default is
+    /// never consulted).
+    stat_graph_width: i64,
+    /// `--stat-count`: how many files to list before a trailing ` ...` line.
+    /// 0 lists every file.
+    stat_count: i64,
     quiet: bool,
     name_max: usize,
     cover_letter: bool,
@@ -424,9 +439,6 @@ const DEFERRED: &[&str] = &[
     "--always",
     "--ignore-if-in-upstream",
     "--compact-summary",
-    "--stat-width",
-    "--stat-name-width",
-    "--stat-count",
     "--patience",
     "--no-indent-heuristic",
     "--full-index",
@@ -509,6 +521,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             cumulative: false,
             permille: DIRSTAT_PERMILLE_DEFAULT,
         },
+        stat_width: 0,
+        stat_name_width: 0,
+        stat_graph_width: 0,
+        stat_count: 0,
         quiet: false,
         name_max: snap
             .integer("format.filenameMaxLength")
@@ -832,22 +848,58 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 }
             }
             // `--stat=<width>[,<name-width>[,<count>]]`: git's `diff_opt_stat()`
-            // parses each field with `strtoul(_, _, 10)` and rejects any leftover
-            // (`error(_("invalid --stat value: %s"))`, exit 129) before it would
-            // ever walk revisions. The width-tuned stat itself is not ported, so
-            // a value git accepts is still deferred.
+            // parses each field with `strtoul(_, _, 10)`, keeping the previous
+            // value for a field its comma never reaches, and rejects any leftover
+            // (`error(_("invalid --stat value: %s"))`, exit 129) from inside
+            // setup_revisions, so an earlier bad revision preempts it.
             s if s.starts_with("--stat=") => {
                 let val = &s["--stat=".len()..];
-                if stat_value_ok(val.as_bytes()) {
-                    o.deferred.push(a.to_owned());
-                } else {
-                    record_opt_error(
+                match parse_stat_value(val.as_bytes()) {
+                    Some((width, name_width, count)) => {
+                        o.stat_width = width;
+                        if let Some(nw) = name_width {
+                            o.stat_name_width = nw;
+                        }
+                        if let Some(c) = count {
+                            o.stat_count = c;
+                        }
+                        o.output_format |= FMT_DIFFSTAT;
+                    }
+                    None => record_opt_error(
                         &mut o.opt_error,
                         i,
                         129,
                         format!("error: invalid --stat value: {val}"),
-                    );
+                    ),
                 }
+            }
+            // The four scalar width knobs all route through `diff_opt_stat()`
+            // too, each rejecting trailing junk with
+            // `error(_("%s expects a numerical value"))` (exit 129) and each
+            // OR-ing in `DIFF_FORMAT_DIFFSTAT`. The value is a required arg, so
+            // the space-separated form consumes the next token.
+            "--stat-width" | "--stat-name-width" | "--stat-graph-width" | "--stat-count" => {
+                let flag = i;
+                i += 1;
+                let v = value_at(args, i, a)?;
+                parse_stat_scalar(&mut o, &a[2..], &v, flag);
+            }
+            s if s.starts_with("--stat-width=") => {
+                parse_stat_scalar(&mut o, "stat-width", &s["--stat-width=".len()..], i);
+            }
+            s if s.starts_with("--stat-name-width=") => {
+                parse_stat_scalar(&mut o, "stat-name-width", &s["--stat-name-width=".len()..], i);
+            }
+            s if s.starts_with("--stat-graph-width=") => {
+                parse_stat_scalar(
+                    &mut o,
+                    "stat-graph-width",
+                    &s["--stat-graph-width=".len()..],
+                    i,
+                );
+            }
+            s if s.starts_with("--stat-count=") => {
+                parse_stat_scalar(&mut o, "stat-count", &s["--stat-count=".len()..], i);
             }
             s if s.starts_with("--relative=") => {
                 o.deferred.push(a.to_owned());
@@ -1138,43 +1190,81 @@ fn validate_range_diff(repo: &gix::Repository, arg: &str) -> std::result::Result
     }
 }
 
-/// Emulate C `strtoul(nptr, &end, 10)`, returning the byte offset of `end` — the
-/// first character the conversion did not consume. Leading ASCII whitespace and a
-/// single optional sign are skipped; when no digit is consumed there is "no
-/// conversion", so `end` is the original pointer (offset 0), matching libc.
-fn strtoul10_end(s: &[u8]) -> usize {
+/// Emulate C `strtoul(nptr, &end, 10)`, returning the accumulated base-10 value
+/// and the byte offset of `end` — the first character the conversion did not
+/// consume. Leading ASCII whitespace and a single optional sign are skipped;
+/// when no digit is consumed there is "no conversion", so `end` is the original
+/// pointer (offset 0) and the value 0, matching libc. The value saturates rather
+/// than wrapping, which the callers' width arithmetic tolerates.
+fn strtoul10(s: &[u8]) -> (i64, usize) {
     let mut i = 0;
     while i < s.len() && matches!(s[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
         i += 1;
     }
-    if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
+    let neg = s.get(i) == Some(&b'-');
+    if matches!(s.get(i), Some(b'+') | Some(b'-')) {
         i += 1;
     }
     let digit_start = i;
+    let mut val: i64 = 0;
     while i < s.len() && s[i].is_ascii_digit() {
+        val = val.saturating_mul(10).saturating_add((s[i] - b'0') as i64);
         i += 1;
     }
     if i == digit_start {
-        return 0;
+        return (0, 0);
     }
-    i
+    (if neg { -val } else { val }, i)
 }
 
-/// Port of the value check in `diff_opt_stat()` (diff.c) for the `--stat=<v>`
-/// form: `width = strtoul(v); if (*end==',') name_width = strtoul(...); if
-/// (*end==',') count = strtoul(...);` and then the value is valid iff nothing is
-/// left over (`if (*end) return error(...)`).
-fn stat_value_ok(val: &[u8]) -> bool {
-    let mut rest = &val[strtoul10_end(val)..];
-    if rest.first() == Some(&b',') {
-        rest = &rest[1..];
-        rest = &rest[strtoul10_end(rest)..];
+/// Port of the `--stat` branch of `diff_opt_stat()` (diff.c):
+/// `width = strtoul(v); if (*end==',') name_width = strtoul(...); if
+/// (*end==',') count = strtoul(...);` returning the parsed fields, or `None`
+/// when anything is left over (`if (*end) return error(...)`). `width` is always
+/// parsed (an empty value yields 0, git's "use the default" sentinel); the later
+/// fields are `Some` only when their comma was reached, so an absent field keeps
+/// git's "leave the previous value" behavior.
+fn parse_stat_value(val: &[u8]) -> Option<(i64, Option<i64>, Option<i64>)> {
+    let (width, mut off) = strtoul10(val);
+    let mut name_width = None;
+    let mut count = None;
+    if val.get(off) == Some(&b',') {
+        let (nw, e) = strtoul10(&val[off + 1..]);
+        name_width = Some(nw);
+        off = off + 1 + e;
     }
-    if rest.first() == Some(&b',') {
-        rest = &rest[1..];
-        rest = &rest[strtoul10_end(rest)..];
+    if val.get(off) == Some(&b',') {
+        let (c, e) = strtoul10(&val[off + 1..]);
+        count = Some(c);
+        off = off + 1 + e;
     }
-    rest.is_empty()
+    (off == val.len()).then_some((width, name_width, count))
+}
+
+/// Port of the scalar branches of `diff_opt_stat()` (diff.c) —
+/// `--stat-width`/`--stat-name-width`/`--stat-graph-width`/`--stat-count`. Each
+/// is `strtoul(value); if (*end) error(_("%s expects a numerical value"))`
+/// (exit 129, recorded positionally like the other setup_revisions errors) and
+/// each turns the diffstat on. `name` is git's dashless `opt->long_name`.
+fn parse_stat_scalar(o: &mut Opts, name: &str, val: &str, idx: usize) {
+    let (v, off) = strtoul10(val.as_bytes());
+    if off != val.len() {
+        record_opt_error(
+            &mut o.opt_error,
+            idx,
+            129,
+            format!("error: {name} expects a numerical value"),
+        );
+        return;
+    }
+    match name {
+        "stat-width" => o.stat_width = v,
+        "stat-name-width" => o.stat_name_width = v,
+        "stat-graph-width" => o.stat_graph_width = v,
+        "stat-count" => o.stat_count = v,
+        _ => unreachable!("parse_stat_scalar called with an unknown option name"),
+    }
+    o.output_format |= FMT_DIFFSTAT;
 }
 
 /// The three outcomes of parsing an integer-with-suffix option value.
@@ -1811,7 +1901,7 @@ fn emit_stat_blocks(
             emit_numstat(out, stats)?;
         }
         if opts.output_format & FMT_DIFFSTAT != 0 {
-            emit_stats(out, stats)?;
+            emit_stats(out, stats, StatWidths::from_opts(opts))?;
         }
         if opts.output_format & FMT_SHORTSTAT != 0 {
             emit_stat_summary(out, stats)?;
@@ -1910,7 +2000,9 @@ fn render_cover_letter(
             for change in &changes {
                 stats.push(emit_change(repo, &mut discard, change, abbrev, opts)?);
             }
-            emit_stats(out, &stats)?;
+            // `show_diffstat()` memcpy's `rev->diffopt`, keeping the width knobs,
+            // so the cover letter's combined diffstat honors them too.
+            emit_stats(out, &stats, StatWidths::from_opts(opts))?;
             emit_summary(out, &changes)?;
             out.push(b'\n');
         }
@@ -2360,6 +2452,28 @@ struct StatEntry {
     deleted: u64,
 }
 
+/// The four `diff_options` knobs `show_stats()` reads, in git's own units (0 is
+/// each field's "unset" sentinel). Carried apart from `Opts` so `show_stats()`
+/// can be exercised without building the whole option set.
+#[derive(Clone, Copy)]
+struct StatWidths {
+    width: i64,
+    name_width: i64,
+    graph_width: i64,
+    count: i64,
+}
+
+impl StatWidths {
+    fn from_opts(o: &Opts) -> StatWidths {
+        StatWidths {
+            width: o.stat_width,
+            name_width: o.stat_name_width,
+            graph_width: o.stat_graph_width,
+            count: o.stat_count,
+        }
+    }
+}
+
 /// git's `decimal_width`.
 fn decimal_width(mut n: u64) -> usize {
     let mut w = 1;
@@ -2384,34 +2498,69 @@ fn display_width(s: &str) -> i64 {
     s.chars().count() as i64
 }
 
-/// Port of `show_stats()` (diff.c) at format-patch's fixed 72-column mail width,
-/// followed by `print_stat_summary_inserts_deletes()`.
-fn emit_stats(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
+/// Port of `show_stats()` (diff.c). format-patch's default width is
+/// `MAIL_DEFAULT_WRAP` (72), overridable by `--stat`/`--stat-width`; the filename
+/// and graph columns and the list length honor `--stat-name-width`,
+/// `--stat-graph-width` and `--stat-count`. Followed by
+/// `print_stat_summary_inserts_deletes()`.
+fn emit_stats(out: &mut Vec<u8>, files: &[StatEntry], sw: StatWidths) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
 
+    // git's `count = stat_count ? stat_count : nr`, then the scan loop
+    // `for (i = 0; i < count && i < nr; i++)` sets `count = i`, so a non-zero
+    // `--stat-count` is clamped into `[0, nr]` (a negative value shows nothing).
+    // Only the shown files are scanned for the longest name / largest change, so
+    // `--stat-count` narrows the columns too. Every file here is "interesting"
+    // (binary is refused, no unmerged entries), so no scan step is skipped.
+    let count = if sw.count != 0 {
+        sw.count.clamp(0, files.len() as i64) as usize
+    } else {
+        files.len()
+    };
+
     let mut max_change: i64 = 0;
     let mut max_len: i64 = 0;
-    for f in files {
+    for f in &files[..count] {
         max_len = max_len.max(display_width(&f.name));
         max_change = max_change.max((f.added + f.deleted) as i64);
     }
 
-    let mut width = MAIL_DEFAULT_WRAP;
+    // `width = stat_width ? stat_width : 80` in git, but format-patch first
+    // bumps a 0 to `MAIL_DEFAULT_WRAP` (72), so 72 is the effective default and
+    // the `: 80` branch is never taken here. `stat_width` is never git's `-1`
+    // sentinel for format-patch, so `term_columns()` is never consulted.
+    let mut width = if sw.width != 0 {
+        sw.width
+    } else {
+        MAIL_DEFAULT_WRAP
+    };
     let number_width = decimal_width(max_change as u64) as i64;
     if width < 16 + 6 + number_width {
         width = 16 + 6 + number_width;
     }
 
+    // bin_width is 0 (binary files are refused), so graph_width starts at
+    // max_change; a non-zero `--stat-graph-width` caps it.
     let mut graph_width = max_change;
-    let mut name_width = max_len;
+    if sw.graph_width != 0 && sw.graph_width < graph_width {
+        graph_width = sw.graph_width;
+    }
+    let mut name_width = if sw.name_width > 0 && sw.name_width < max_len {
+        sw.name_width
+    } else {
+        max_len
+    };
     if name_width + number_width + 6 + graph_width > width {
         if graph_width > width * 3 / 8 - number_width - 6 {
             graph_width = width * 3 / 8 - number_width - 6;
             if graph_width < 6 {
                 graph_width = 6;
             }
+        }
+        if sw.graph_width != 0 && graph_width > sw.graph_width {
+            graph_width = sw.graph_width;
         }
         if name_width > width - number_width - 6 - graph_width {
             name_width = width - number_width - 6 - graph_width;
@@ -2420,7 +2569,7 @@ fn emit_stats(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
         }
     }
 
-    for f in files {
+    for f in &files[..count] {
         // Scale the filename: elide the head, then resume at a path separator.
         let mut len = name_width;
         let mut prefix = "";
@@ -2480,6 +2629,13 @@ fn emit_stats(out: &mut Vec<u8>, files: &[StatEntry]) -> Result<()> {
             out.push(b'-');
         }
         out.push(b'\n');
+    }
+
+    // git's `DIFF_SYMBOL_STATS_SUMMARY_ABBREV`, emitted once when `--stat-count`
+    // hid at least one file. The insertions/deletions summary still counts every
+    // file, so it is fed the full slice.
+    if count < files.len() {
+        out.extend_from_slice(b" ...\n");
     }
 
     emit_stat_summary(out, files)
@@ -3962,5 +4118,94 @@ impl Parser {
                 set.ranges.push((c, c));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str, added: u64, deleted: u64) -> StatEntry {
+        StatEntry {
+            name: name.to_owned(),
+            raw_name: name.as_bytes().to_vec(),
+            added,
+            deleted,
+        }
+    }
+
+    fn stats(files: &[StatEntry], sw: StatWidths) -> String {
+        let mut out = Vec::new();
+        emit_stats(&mut out, files, sw).expect("emit_stats writes to a Vec");
+        String::from_utf8(out).expect("diffstat output is UTF-8")
+    }
+
+    /// Port of `diff_opt_stat()`'s `--stat=<w>[,<nw>[,<c>]]` field parse: `width`
+    /// is always taken (an empty value is 0), and each later field is `Some` only
+    /// when its comma is reached, so an absent field keeps the previous value.
+    #[test]
+    fn stat_value_fields() {
+        assert_eq!(parse_stat_value(b"20,10,3"), Some((20, Some(10), Some(3))));
+        assert_eq!(parse_stat_value(b"50"), Some((50, None, None)));
+        assert_eq!(parse_stat_value(b""), Some((0, None, None)));
+        assert_eq!(parse_stat_value(b",5"), Some((0, Some(5), None)));
+        assert_eq!(parse_stat_value(b"5,"), Some((5, Some(0), None)));
+        // Trailing junk is git's `error(_("invalid --stat value: %s"))`.
+        assert_eq!(parse_stat_value(b"5x"), None);
+        assert_eq!(parse_stat_value(b"5,6,7,8"), None);
+    }
+
+    /// `--stat-name-width` caps the filename column, and an over-long name is
+    /// elided with `...` and re-anchored, exactly as `show_stats()` does. Verified
+    /// against `git format-patch --stat-name-width=5`.
+    #[test]
+    fn stat_name_width_elides() {
+        let files = [entry("abcdefghij", 1, 0)];
+        let sw = StatWidths {
+            width: 0,
+            name_width: 5,
+            graph_width: 0,
+            count: 0,
+        };
+        assert_eq!(
+            stats(&files, sw),
+            " ...ij | 1 +\n 1 file changed, 1 insertion(+)\n"
+        );
+    }
+
+    /// `--stat-count` lists only the first N files, appends git's ` ...` abbrev
+    /// line, scales the columns to just the shown files, yet still counts every
+    /// file in the insertions/deletions summary. Verified against
+    /// `git format-patch --stat-count=2`.
+    #[test]
+    fn stat_count_truncates_but_totals_all() {
+        let files = [entry("a", 2, 0), entry("bb", 0, 2), entry("ccc", 10, 10)];
+        let sw = StatWidths {
+            width: 0,
+            name_width: 0,
+            graph_width: 0,
+            count: 2,
+        };
+        assert_eq!(
+            stats(&files, sw),
+            " a  | 2 ++\n bb | 2 --\n ...\n 3 files changed, 12 insertions(+), 12 deletions(-)\n"
+        );
+    }
+
+    /// The all-zero widths reproduce format-patch's default 72-column diffstat,
+    /// so a small unscaled change renders unchanged from before the port.
+    #[test]
+    fn default_widths_unscaled() {
+        let files = [entry("x", 3, 1)];
+        let sw = StatWidths {
+            width: 0,
+            name_width: 0,
+            graph_width: 0,
+            count: 0,
+        };
+        assert_eq!(
+            stats(&files, sw),
+            " x | 4 +++-\n 1 file changed, 3 insertions(+), 1 deletion(-)\n"
+        );
     }
 }

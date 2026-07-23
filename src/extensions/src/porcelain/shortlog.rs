@@ -19,9 +19,12 @@
 //!     type` / `with stdin is not supported` (single and multiple) failures.
 //!   * `--format=<fmt>` — builtin format names are ignored (git only consults
 //!     `--format` when it is a *user* format), user formats are expanded. The
-//!     supported placeholders are `%H %h %T %t %P %p %s %n %x## %%`, the author/
-//!     committer name/email pair `%a{n,e,N,E}`/`%c{n,e,N,E}`, and the date forms
-//!     `%a{t,i,I,D,d}`/`%c{t,i,I,D,d}` (`%ad`/`%cd` honour `--date`).
+//!     supported placeholders are `%H %h %T %t %P %p %s %B %n %x## %%`, the
+//!     author/committer name/email/local-part `%a{n,e,N,E,l,L}`/`%c{n,e,N,E,l,L}`,
+//!     and the date forms `%a{t,i,I,D,d,s}`/`%c{t,i,I,D,d,s}` (`%ad`/`%cd` honour
+//!     `--date`; `%as`/`%cs` is always the short date). A `%a`/`%c` at end of
+//!     string, and any unrecognised `%a`/`%c` sub-form, are copied through
+//!     verbatim exactly as git does (its `format_person_part` returns 0).
 //!   * `--date=<fmt>` — validated the way `parse_date_format()` validates it.
 //!   * revision selection: `<rev>`, `^<rev>`, `<a>..<b>`, `<a>...<b>`, `--not`,
 //!     `--all`, `--branches[=<glob>]`, `--tags[=<glob>]`, `--remotes[=<glob>]`,
@@ -1472,6 +1475,11 @@ fn expand_format(
                 let message = commit.message()?;
                 out.extend_from_slice(message.summary().as_bytes());
             }
+            // `%B`: the raw body — the commit message exactly as stored, from
+            // the first byte after the header separator. git's
+            // `msg + message_off + 1`; gix's `message_raw()` returns the same
+            // slice (the bytes after the header block).
+            b'B' => out.extend_from_slice(commit.message_raw()?),
             b'x' => match bytes.get(i..i + 2) {
                 // git's `%x##` needs exactly two hex digits (its `isxdigit`
                 // test, which — unlike `from_str_radix` — rejects a `+`/`-` sign).
@@ -1496,7 +1504,13 @@ fn expand_format(
                 };
                 let sig = raw.trim();
                 let Some(&which) = bytes.get(i) else {
-                    bail!("`--format` placeholder `%{}` is not ported", next as char);
+                    // `%a`/`%c` at end of string: git's `format_person_part`
+                    // sees a NUL sub-form, returns 0 (unknown), and the caller
+                    // copies the `%` plus the letter through verbatim, e.g.
+                    // `end%a` → `end%a`. Reproduce that byte-for-byte.
+                    out.push(b'%');
+                    out.push(next);
+                    continue;
                 };
                 i += 1;
                 let (mapped_name, mapped_email) = match mailmap.try_resolve_ref(sig) {
@@ -1508,19 +1522,37 @@ fn expand_format(
                     b'e' => out.extend_from_slice(sig.email),
                     b'N' => out.extend_from_slice(mapped_name.unwrap_or(sig.name)),
                     b'E' => out.extend_from_slice(mapped_email.unwrap_or(sig.email)),
+                    // `%al`/`%aL`: the local-part of the email (up to the first
+                    // `@`). git's `format_person_part` runs the mailmap for `L`
+                    // (part `N`/`E`/`L`) before taking the local-part, so `L`
+                    // reads the resolved address and `l` the commit's own.
+                    b'l' => out.extend_from_slice(local_part(sig.email)),
+                    b'L' => out.extend_from_slice(local_part(mapped_email.unwrap_or(sig.email))),
                     // Date sub-forms. `%at`/`%ct` epoch, `%ai`/`%ci` ISO,
-                    // `%aI`/`%cI` strict ISO, `%aD`/`%cD` RFC2822, `%ad`/`%cd`
-                    // the `--date`-controlled format. All read the ident's own
+                    // `%aI`/`%cI` strict ISO, `%aD`/`%cD` RFC2822, `%as`/`%cs`
+                    // short (always, independent of `--date`), `%ad`/`%cd` the
+                    // `--date`-controlled format. All read the ident's own
                     // timezone offset, matching git.
-                    b't' | b'i' | b'I' | b'D' | b'd' => {
+                    b't' | b'i' | b'I' | b'D' | b'd' | b's' => {
                         let time = raw.time().map_err(|e| anyhow!("{e}"))?;
                         out.extend_from_slice(sig_date(time, which, date_format)?.as_bytes());
                     }
-                    other => bail!(
+                    // `%ar`/`%ah`: relative and human dates need a "now"
+                    // reference and git's human-date rounding; left as an honest
+                    // floor rather than a render that would diverge.
+                    b'r' | b'h' => bail!(
                         "`--format` placeholder `%{}{}` is not ported",
                         next as char,
-                        other as char
+                        which as char
                     ),
+                    // Any other sub-form is unknown to git, whose
+                    // `format_person_part` returns 0 so the `%` and both letters
+                    // are copied through literally (`%aZ` → `%aZ`). Match it.
+                    other => {
+                        out.push(b'%');
+                        out.push(next);
+                        out.push(other);
+                    }
                 }
             }
             other => bail!("`--format` placeholder `%{}` is not ported", other as char),
@@ -1539,6 +1571,9 @@ fn sig_date(time: gix::date::Time, which: u8, date_format: Option<&str>) -> Resu
         b'i' => dfmt::ISO8601.into(),
         b'I' => dfmt::ISO8601_STRICT.into(),
         b'D' => dfmt::GIT_RFC2822.into(),
+        // `%as`/`%cs` is always the short date, independent of `--date`
+        // (git's `show_ident_date(&s, DATE_MODE(SHORT))`).
+        b's' => dfmt::SHORT.into(),
         // `%ad`/`%cd` honour `--date`; only the formats that reproduce git
         // byte-for-byte are supported, others (relative/human/local) bail.
         _ => match git_date_format(date_format) {
@@ -1616,6 +1651,16 @@ fn parse_wrap_args(opts: &mut Opts, arg: Option<&str>) -> bool {
     true
 }
 
+/// git's `%al`/`%aL` local-part: the email up to the first `@`, or the whole
+/// address when it carries none (`format_person_part`, pretty.c).
+fn local_part(email: &BStr) -> &[u8] {
+    let bytes = email.as_bytes();
+    match bytes.iter().position(|&b| b == b'@') {
+        Some(at) => &bytes[..at],
+        None => bytes,
+    }
+}
+
 /// The group key: the mailmap-resolved name, plus ` <email>` under `-e`.
 /// This is git's `%aN` / `%aN <%aE>` (or the `%c*` pair for `--committer`).
 fn format_ident(
@@ -1670,7 +1715,43 @@ fn insert_one_record(
         s = &s[1..];
     }
 
-    entry.onelines.push(BString::from(s.to_vec()));
+    // git runs `format_subject(&subject, oneline, " ")` — the stored record is
+    // the folded subject, not the raw expansion. This drops each line's trailing
+    // whitespace/newline and stops at the first blank line, so `%B`'s trailing
+    // "\n" (and any body past a blank line) does not leak into the output.
+    entry.onelines.push(format_subject(s));
+}
+
+/// Port of `format_subject()` (pretty.c): fold `msg` into a single subject line,
+/// joining non-blank lines with a space and stopping at the first blank line.
+/// `is_blank_line` trims trailing ASCII whitespace off each line, so a lone
+/// "first\n" collapses to "first".
+fn format_subject(mut msg: &[u8]) -> BString {
+    let mut sb = BString::default();
+    let mut first = true;
+    while !msg.is_empty() {
+        // get_one_line(): length through the next '\n' inclusive, else to end.
+        let linelen = msg
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(msg.len(), |p| p + 1);
+        let line = &msg[..linelen];
+        msg = &msg[linelen..];
+        // is_blank_line(): trailing-whitespace-trimmed length; empty ⇒ blank ⇒ stop.
+        let mut end = line.len();
+        while end > 0 && line[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end == 0 {
+            break;
+        }
+        if !first {
+            sb.push(b' ');
+        }
+        sb.extend_from_slice(&line[..end]);
+        first = false;
+    }
+    sb
 }
 
 /// Port of `shortlog_output()`.
@@ -1999,5 +2080,28 @@ fn add_wrapped_text(out: &mut Vec<u8>, text: &[u8], indent1: usize, indent2: usi
 
         w += 1;
         i += utf8_seq_len(byte).min(text.len() - i);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// git's `%al`/`%aL` take the email up to the *first* `@`; an address with
+    /// none is emitted whole. The primary case is verified against
+    /// `git log -1 --format='%al'` (→ `local` for `local@example.com`); the
+    /// first-`@` rule is pinned to pretty.c's `memchr(mail, '@', maillen)`.
+    #[test]
+    fn local_part_matches_git() {
+        fn lp(s: &[u8]) -> &[u8] {
+            local_part(s.as_bstr())
+        }
+        assert_eq!(lp(b"local@example.com"), &b"local"[..]);
+        // No `@`: the whole string is the local-part (git's memchr misses).
+        assert_eq!(lp(b"nobody"), &b"nobody"[..]);
+        // Two `@`: git stops at the first (memchr), keeping the rest verbatim.
+        assert_eq!(lp(b"a@b@c"), &b"a"[..]);
+        // Empty email → empty local-part.
+        assert_eq!(lp(b""), &b""[..]);
     }
 }

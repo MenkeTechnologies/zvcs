@@ -71,6 +71,12 @@
 //!     content-affecting attribute. With none set the flag cannot change a byte
 //!     of the archive, which is exactly what stock git produces.
 //!
+//!   * A regular blob larger than the 8 GiB `ustar` `size` field: git writes the
+//!     header `size` as `0` and spills the true length into a pax `size` record
+//!     (`strbuf_append_ext_header_uint(&ext_header, "size", size)`), appended
+//!     after any `path` / `linkpath` record. Reproduced here on the very pax path
+//!     the over-100-byte `path` overflow already drives.
+//!
 //! Not covered — every one of these fails loudly rather than emitting an
 //! archive that would silently differ from git's:
 //!   * `--format=zip`: git's `archive-zip.c` is a separate container format
@@ -85,9 +91,6 @@
 //!   * `--remote` / `--exec`: the `git-upload-archive` protocol against another
 //!     repository — a live transport handshake (or a spawned `git-upload-archive`
 //!     subprocess even for a local `--remote=.`), which this port does not drive.
-//!   * A regular blob larger than the 8 GiB `ustar` `size` field, which git spills
-//!     into a pax `size` record; not reproduced here (no fixture can exercise it
-//!     for byte comparison).
 //!   * Repositories whose archived tree carries content-affecting attributes
 //!     (`export-ignore`, `export-subst`, `text`, `eol`, `filter`, `ident`,
 //!     `working-tree-encoding`), or a `core.autocrlf` / `core.eol` /
@@ -1147,9 +1150,16 @@ impl<W: Write> Tar<W> {
             }
         }
 
-        let size = if is_regular { data.len() as u64 } else { 0 };
-        if size > SIZE_MAX {
-            bail!("blob {oid} exceeds the ustar size field and the pax `size` record is not ported");
+        // git's `write_tar_entry`: the plain `size` field caps at USTAR_MAX_SIZE
+        // (0o77777777777). A regular blob past it is written with a header `size`
+        // of 0 and its true length spilled into a pax `size` record, appended
+        // after any `path` / `linkpath` record: `strbuf_append_ext_header_uint(
+        // &ext_header, "size", size)`, whose value is the length in decimal
+        // (`%PRIuMAX`). Non-regular entries carry a plain size of 0 regardless.
+        let mut size = if is_regular { data.len() as u64 } else { 0 };
+        if is_regular && size > SIZE_MAX {
+            ext.extend_from_slice(&ext_record(b"size", size.to_string().as_bytes()));
+            size = 0;
         }
 
         if !ext.is_empty() {
@@ -2965,5 +2975,31 @@ mod gzip {
         }
 
         BState::NeedMore
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// git's `strbuf_append_ext_header_uint(&ext_header, "size", size)` for a
+    /// regular blob past `USTAR_MAX_SIZE`: the record is `"<len> size=<value>\n"`
+    /// with `<len>` counting its own decimal digits. For a length one byte over
+    /// the limit (0o77777777777 + 1 = 8589934592) git writes exactly
+    /// `19 size=8589934592\n`.
+    #[test]
+    fn pax_size_record_matches_git() {
+        assert_eq!(
+            ext_record(b"size", (SIZE_MAX + 1).to_string().as_bytes()),
+            b"19 size=8589934592\n".to_vec()
+        );
+    }
+
+    /// The overflow only fires for a regular blob strictly larger than the field;
+    /// a length exactly at `USTAR_MAX_SIZE` still fits the plain `size` field.
+    #[test]
+    fn ustar_size_boundary() {
+        assert_eq!(SIZE_MAX, 0o77777777777);
+        assert_eq!(SIZE_MAX, 8_589_934_591);
     }
 }

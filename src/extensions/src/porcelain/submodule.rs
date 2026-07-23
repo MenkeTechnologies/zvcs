@@ -62,7 +62,7 @@ const SUBCOMMANDS: &[&str] = &[
 
 /// `git submodule` — inspect and register the submodules recorded in the index.
 ///
-/// Four of the eleven stock subcommands are ported here, all aiming at
+/// Five of the eleven stock subcommands are ported here, all aiming at
 /// byte-for-byte parity with stock `git`:
 ///
 ///   * `git submodule [--quiet] [--cached] [status] [--recursive] [--] [<path>...]`
@@ -95,6 +95,16 @@ const SUBCOMMANDS: &[&str] = &[
 ///     `Entering '<displaypath>'` first unless quiet. A failing command aborts
 ///     the walk with git's `run_command returned non-zero status` fatal and 128.
 ///
+///   * `git submodule [--quiet] set-branch (--default|--branch <branch>) [--] <path>`
+///     Writes (or, under `--default`, removes) `submodule.<name>.branch` in the
+///     worktree `.gitmodules`, keyed by the submodule *name* resolved from `<path>`
+///     through the `.gitmodules` mapping. Matches stock git 2.55 (the installed
+///     `git`, newer than the v2.39 spec whose helper still keyed by raw `<path>`):
+///     an unmatched `<path>` dies with `no submodule mapping found in .gitmodules
+///     for path '<path>'` (128); giving neither or both of `--branch`/`--default`
+///     dies 128; a wrong operand count prints the set-branch usage and exits 129;
+///     `--default` exits 0 when it removed a branch key and 1 when there was none.
+///
 /// `--quiet` is accepted in front of every subcommand, but `--cached` is only
 /// declared by `status` and `summary`, so a leading `--cached` in front of any
 /// other subcommand is a usage error exiting 1 — `--quiet` does not suppress the
@@ -112,8 +122,8 @@ const SUBCOMMANDS: &[&str] = &[
 /// stage 4 and printing a name git would not have printed.
 ///
 /// Not ported, each rejected with a precise reason rather than approximated:
-/// `add`, `deinit`, `update`, `set-branch`, `set-url`, `sync` and
-/// `absorbgitdirs`. `init` additionally bails on `.gitmodules` urls that are
+/// `add`, `deinit`, `update`, `set-url`, `sync` and `absorbgitdirs`. `init`
+/// additionally bails on `.gitmodules` urls that are
 /// relative (`./`, `../`), which require git's `resolve_relative_url` against
 /// the superproject's default remote.
 pub fn submodule(args: &[String]) -> Result<ExitCode> {
@@ -166,7 +176,7 @@ pub fn submodule(args: &[String]) -> Result<ExitCode> {
         "update" => bail!("`submodule update` needs clone/fetch/checkout of submodules; not ported"),
         "deinit" => bail!("`submodule deinit` removes submodule worktrees; not ported"),
         "sync" => bail!("`submodule sync` rewrites remote urls inside submodules; not ported"),
-        "set-branch" => bail!("`submodule set-branch` edits .gitmodules; not ported"),
+        "set-branch" => set_branch(tail, quiet),
         "set-url" => bail!("`submodule set-url` edits .gitmodules; not ported"),
         "absorbgitdirs" => bail!("`submodule absorbgitdirs` relocates git dirs; not ported"),
         _ => usage_exit(),
@@ -957,6 +967,188 @@ fn run_in_submodule(
     Ok(proc.status()?)
 }
 
+// ------------------------------------------------------------ set-branch ----
+
+/// The `usage:` block stock git prints for a `set-branch` operand-count error,
+/// verbatim from `git submodule--helper`'s `parse_options` (exit 129). Captured
+/// byte-for-byte from git 2.55.0 (`git submodule set-branch -b x a b`); the help
+/// column is padded to 26 and the block ends with a trailing blank line.
+const SET_BRANCH_USAGE: &str = "\
+usage: git submodule set-branch [-q|--quiet] (-d|--default) <path>
+   or: git submodule set-branch [-q|--quiet] (-b|--branch) <branch> <path>
+
+    -d, --[no-]default    set the default tracking branch to master
+    -b, --[no-]branch <branch>
+                          set the default tracking branch
+
+";
+
+/// Print the set-branch usage block and hand back git's exit code (129) for a
+/// wrong operand count — distinct from the top-level `usage_exit` (1) that the
+/// porcelain wrapper raises for an unrecognized option.
+fn set_branch_usage_exit() -> Result<ExitCode> {
+    eprint!("{SET_BRANCH_USAGE}");
+    Ok(ExitCode::from(129))
+}
+
+/// The outcome of parsing a `set-branch` command line, before any repository is
+/// touched. Splitting the pure parse out keeps git's exact exit-code ladder
+/// (top-usage 1, subcommand-usage 129, `die` 128) unit-testable.
+#[derive(Debug, PartialEq)]
+enum SetBranch {
+    /// An unrecognized/malformed option: the porcelain wrapper's top-level usage
+    /// (exit 1). Covers `-b`/`--branch` with a missing or empty value.
+    UsageTop,
+    /// A wrong operand count: the set-branch subcommand usage (exit 129).
+    UsageSub,
+    /// Neither `--branch` nor `--default`: `die` with 128.
+    Required,
+    /// Both `--branch` and `--default`: `die` with 128.
+    Both,
+    /// A well-formed request: set `branch` to `Some(value)`, or remove it (i.e.
+    /// `--default`) when `branch` is `None`.
+    Apply { branch: Option<String>, path: String },
+}
+
+/// Mirror of `git-submodule.sh`'s `cmd_set_branch` porcelain parsing followed by
+/// `module_set_branch`'s validation ladder. The porcelain does exact-match option
+/// parsing (no bundling, no abbreviation) and stops at the first operand, forwards
+/// only `--branch`/`--default` plus the operands, and the helper then enforces the
+/// required/both/operand-count rules in that order.
+fn classify_set_branch(args: &[String]) -> SetBranch {
+    let mut default = false;
+    let mut branch: Option<String> = None;
+    let mut operands: Vec<String> = Vec::new();
+    let mut end_opts = false;
+    let mut i = 0;
+
+    while let Some(a) = args.get(i) {
+        if end_opts {
+            operands.push(a.clone());
+            i += 1;
+            continue;
+        }
+        match a.as_str() {
+            // Accepted for uniformity; there is nothing to quiet in set-branch.
+            "-q" | "--quiet" => {}
+            "-d" | "--default" => default = true,
+            // `-b`/`--branch` takes the next token as the value; a missing or
+            // empty value is the porcelain's `case "$2" in '') usage` (exit 1).
+            "-b" | "--branch" => match args.get(i + 1) {
+                Some(v) if !v.is_empty() => {
+                    branch = Some(v.clone());
+                    i += 1;
+                }
+                _ => return SetBranch::UsageTop,
+            },
+            // The `--branch=<v>` form is accepted verbatim, empty value included.
+            s if s.starts_with("--branch=") => {
+                branch = Some(s["--branch=".len()..].to_string());
+            }
+            "--" => end_opts = true,
+            // Any other dash-prefixed token (`-*`) is rejected by the wrapper.
+            s if s.starts_with('-') => return SetBranch::UsageTop,
+            // The first operand ends option parsing; the rest are operands too.
+            _ => {
+                operands.push(a.clone());
+                end_opts = true;
+            }
+        }
+        i += 1;
+    }
+
+    if branch.is_none() && !default {
+        return SetBranch::Required;
+    }
+    if branch.is_some() && default {
+        return SetBranch::Both;
+    }
+    if operands.len() != 1 {
+        return SetBranch::UsageSub;
+    }
+    SetBranch::Apply {
+        branch,
+        path: operands.pop().expect("checked len == 1"),
+    }
+}
+
+/// `git submodule set-branch` — record (or clear) a submodule's default tracking
+/// branch in `.gitmodules`. `_quiet` is consumed for parity; set-branch prints
+/// nothing on success either way.
+fn set_branch(args: &[String], _quiet: bool) -> Result<ExitCode> {
+    match classify_set_branch(args) {
+        SetBranch::UsageTop => usage_exit(),
+        SetBranch::UsageSub => set_branch_usage_exit(),
+        SetBranch::Required => {
+            eprintln!("fatal: --branch or --default required");
+            Ok(ExitCode::from(128))
+        }
+        SetBranch::Both => {
+            eprintln!("fatal: options '--branch' and '--default' cannot be used together");
+            Ok(ExitCode::from(128))
+        }
+        SetBranch::Apply { branch, path } => set_branch_apply(branch, path),
+    }
+}
+
+/// Resolve `<path>` to a submodule name via `.gitmodules`, then set or remove
+/// `submodule.<name>.branch`. git's `config_set_in_gitmodules_file_gently`
+/// returns `!!ret`, so a `--default` that removes nothing exits 1 with no output.
+fn set_branch_apply(branch: Option<String>, path: String) -> Result<ExitCode> {
+    let path = BString::from(path.as_str());
+    let repo = gix::discover(".")?;
+    let submodules = submodules(&repo)?;
+    let prefix = repo_prefix(&repo)?;
+
+    // git looks the path up relative to the repository root, so a run from a
+    // subdirectory carries the cwd prefix into the `.gitmodules` `path` match.
+    let full = match prefix.as_ref() {
+        Some(p) => {
+            let mut b = p.clone();
+            b.extend_from_slice(&path);
+            b
+        }
+        None => path,
+    };
+
+    let Some(sub) = find_submodule(&submodules, &full) else {
+        eprintln!("fatal: no submodule mapping found in .gitmodules for path '{full}'");
+        return Ok(ExitCode::from(128));
+    };
+    let sub_name = sub.name().to_owned();
+    let sub_name = sub_name.as_bstr();
+
+    let modules_path = match repo.workdir() {
+        Some(wd) => wd.join(".gitmodules"),
+        None => std::path::PathBuf::from(".gitmodules"),
+    };
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let mut modules = ConfigFile::from_path_no_includes(modules_path.clone(), Source::Local)?;
+
+    match branch {
+        // `set-branch --branch <b>`: write the key, keyed by submodule name.
+        Some(value) => {
+            modules.set_raw_value_by("submodule", Some(sub_name), "branch", value.as_str())?;
+            persist(&modules_path, &modules)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        // `set-branch --default`: drop the key; exit 1 when there was none to drop.
+        None => {
+            let removed = modules
+                .section_mut("submodule", Some(sub_name))
+                .ok()
+                .and_then(|mut s| s.remove("branch"))
+                .is_some();
+            if removed {
+                persist(&modules_path, &modules)?;
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Ok(ExitCode::from(1))
+            }
+        }
+    }
+}
+
 /// A `submodule.<name>.<field>` config key, built structurally so submodule
 /// names containing dots still resolve to the right subsection.
 fn key<'a>(name: &'a BStr, field: &'a str) -> KeyRef<'a> {
@@ -1250,5 +1442,70 @@ fn display_path(path: &BStr, prefix: Option<&BString>) -> String {
         "./".to_string()
     } else {
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cls(args: &[&str]) -> SetBranch {
+        classify_set_branch(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    fn apply(branch: Option<&str>, path: &str) -> SetBranch {
+        SetBranch::Apply {
+            branch: branch.map(str::to_string),
+            path: path.to_string(),
+        }
+    }
+
+    /// Every case below is the observed behavior of stock `git submodule
+    /// set-branch` (git 2.55.0); the enum variant maps 1:1 to git's exit code
+    /// (UsageTop=1, UsageSub=129, Required/Both=128, Apply=0/1).
+    #[test]
+    fn set_branch_parse_matches_git() {
+        // Well-formed writes.
+        assert_eq!(cls(&["-b", "feature", "sub/foo"]), apply(Some("feature"), "sub/foo"));
+        assert_eq!(cls(&["--branch", "feat", "sub/foo"]), apply(Some("feat"), "sub/foo"));
+        assert_eq!(cls(&["--branch=feat", "sub/foo"]), apply(Some("feat"), "sub/foo"));
+        assert_eq!(cls(&["--branch=", "sub/foo"]), apply(Some(""), "sub/foo"));
+        assert_eq!(cls(&["-q", "-b", "feature", "sub/foo"]), apply(Some("feature"), "sub/foo"));
+        assert_eq!(cls(&["-b", "feature", "--", "sub/foo"]), apply(Some("feature"), "sub/foo"));
+        // `--default` removes the key (branch == None).
+        assert_eq!(cls(&["-d", "sub/foo"]), apply(None, "sub/foo"));
+        assert_eq!(cls(&["--default", "sub/foo"]), apply(None, "sub/foo"));
+
+        // Neither flag -> `--branch or --default required` (128). A leading
+        // operand stops option parsing, so trailing `-b feature` is an operand.
+        assert_eq!(cls(&["sub/foo"]), SetBranch::Required);
+        assert_eq!(cls(&["sub/foo", "-b", "feature"]), SetBranch::Required);
+
+        // Both flags -> cannot be used together (128).
+        assert_eq!(cls(&["-b", "x", "-d", "sub/foo"]), SetBranch::Both);
+
+        // Wrong operand count -> subcommand usage (129). `--branch sub/foo`
+        // consumes the path as the value, leaving zero operands.
+        assert_eq!(cls(&["-b", "feature", "sub/foo", "extra"]), SetBranch::UsageSub);
+        assert_eq!(cls(&["--branch", "sub/foo"]), SetBranch::UsageSub);
+        assert_eq!(cls(&["-d"]), SetBranch::UsageSub);
+
+        // Malformed/unknown option -> top-level usage (exit 1).
+        assert_eq!(cls(&["-b", ""]), SetBranch::UsageTop);
+        assert_eq!(cls(&["-b", "", "sub/foo"]), SetBranch::UsageTop);
+        assert_eq!(cls(&["--branch"]), SetBranch::UsageTop);
+        assert_eq!(cls(&["--bogus", "sub/foo"]), SetBranch::UsageTop);
+        assert_eq!(cls(&["-db", "sub/foo"]), SetBranch::UsageTop);
+        assert_eq!(cls(&["--def", "sub/foo"]), SetBranch::UsageTop);
+    }
+
+    /// Pins the 129 usage block to the exact bytes git emits (see the const's
+    /// provenance note): the two `usage:`/`or:` lines and the trailing blank line.
+    #[test]
+    fn set_branch_usage_bytes_match_git() {
+        assert!(SET_BRANCH_USAGE.starts_with(
+            "usage: git submodule set-branch [-q|--quiet] (-d|--default) <path>\n   or: git submodule set-branch [-q|--quiet] (-b|--branch) <branch> <path>\n\n"
+        ));
+        assert!(SET_BRANCH_USAGE.ends_with("set the default tracking branch\n\n"));
     }
 }

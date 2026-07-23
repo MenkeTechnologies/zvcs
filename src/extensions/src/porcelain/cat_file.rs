@@ -117,16 +117,17 @@ enum BatchKind {
 ///   * `git cat-file <type> <object>` → raw content, after peeling to `<type>`
 ///   * `git cat-file (--batch | --batch-check | --batch-command)` → batch stream
 ///   * `git cat-file --filters <rev>:<path>` → object with worktree filters applied
+///   * `git cat-file --batch --filters` → batch stream, each blob smudged by path
 ///
 /// `--use-mailmap`/`--mailmap` rewrites author/committer/tagger identities in
 /// commit and tag output. `--batch-all-objects`, `--buffer`, `--unordered`, `-Z`
 /// and `--filter` shape the batch stream.
 ///
 /// Not ported: `--textconv` (needs the configured external `diff.*.textconv`
-/// program; gix-filter has no textconv driver), `--follow-symlinks`, the
-/// `%(objectsize:disk)` / `%(deltabase)` format atoms (require pack-entry
-/// internals gix's header lookup does not expose), and `--filter` specs beyond
-/// `blob:none` / `blob:limit=<n>` / `object:type=<t>`.
+/// program; gix-filter has no textconv driver, standalone or in batch),
+/// `--follow-symlinks`, the `%(objectsize:disk)` / `%(deltabase)` format atoms
+/// (require pack-entry internals gix's header lookup does not expose), and
+/// `--filter` specs beyond `blob:none` / `blob:limit=<n>` / `object:type=<t>`.
 pub fn cat_file(args: &[String]) -> Result<ExitCode> {
     let mut mode: Option<Mode> = None;
     let mut batch: Option<BatchKind> = None;
@@ -318,11 +319,14 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    if (textconv || filters) && batch.is_some() {
-        // Per-object conversion inside a batch needs a path per record; not ported.
-        eprintln!("fatal: git cat-file: --textconv/--filters with batch is not yet ported");
+    if textconv && batch.is_some() {
+        // Not ported: textconv inside a batch runs the external `diff.*.textconv`
+        // program per record, which gix-filter has no driver for.
+        eprintln!("fatal: git cat-file: --textconv with batch is not yet ported");
         return Ok(ExitCode::from(128));
     }
+    // `--filters` inside a batch (git's transform_mode 'w') is ported: each blob is
+    // smudged through the worktree pipeline using its per-line path (see run_batch).
 
     // ---- dispatch ----------------------------------------------------------
 
@@ -336,6 +340,7 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
             nul,
             filter.as_deref(),
             use_mailmap,
+            filters,
         );
     }
 
@@ -692,6 +697,7 @@ fn run_batch(
     nul: bool,
     filter: Option<&str>,
     use_mailmap: bool,
+    filters: bool,
 ) -> Result<ExitCode> {
     let delim: u8 = if nul { 0 } else { b'\n' };
 
@@ -723,6 +729,15 @@ fn run_batch(
         None
     };
 
+    // When `--filters` is combined with a batch mode, git sets transform_mode 'w'
+    // and smudges each blob through the worktree pipeline, keyed by the per-line
+    // path. Build the pipeline once and reuse it across every record.
+    let mut fpipe = if filters {
+        Some(repo.filter_pipeline(None)?.0)
+    } else {
+        None
+    };
+
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
@@ -747,7 +762,7 @@ fn run_batch(
                     continue;
                 }
             }
-            emit_object(
+            match emit_object(
                 &mut out,
                 &repo,
                 &fmt,
@@ -758,7 +773,14 @@ fn run_batch(
                 want_contents,
                 delim,
                 mailmap.as_ref(),
-            )?;
+                fpipe.as_mut(),
+            )? {
+                EmitOutcome::Ok => {}
+                EmitOutcome::Die(code) => {
+                    out.flush()?;
+                    return Ok(ExitCode::from(code));
+                }
+            }
             if !buffer {
                 out.flush()?;
             }
@@ -793,6 +815,7 @@ fn run_batch(
                     delim,
                     objfilter.as_ref(),
                     mailmap.as_ref(),
+                    fpipe.as_mut(),
                 )? {
                     CommandResult::Ok => {}
                     CommandResult::Die(code) => {
@@ -803,7 +826,7 @@ fn run_batch(
             }
             _ => {
                 let want_contents = kind == BatchKind::Contents;
-                process_request(
+                match process_request(
                     &mut out,
                     &repo,
                     &fmt,
@@ -812,9 +835,17 @@ fn run_batch(
                     delim,
                     objfilter.as_ref(),
                     mailmap.as_ref(),
-                )?;
-                if !buffer {
-                    out.flush()?;
+                    fpipe.as_mut(),
+                )? {
+                    EmitOutcome::Ok => {
+                        if !buffer {
+                            out.flush()?;
+                        }
+                    }
+                    EmitOutcome::Die(code) => {
+                        out.flush()?;
+                        return Ok(ExitCode::from(code));
+                    }
                 }
             }
         }
@@ -830,6 +861,14 @@ enum CommandResult {
     Die(u8),
 }
 
+/// Outcome of emitting one batch record. `Die` carries the process exit code for
+/// a fatal condition that aborts the whole batch (git's `die()`), e.g. a
+/// `--filters` blob request with no path.
+enum EmitOutcome {
+    Ok,
+    Die(u8),
+}
+
 /// `--batch-command` grammar: `info <obj>`, `contents <obj>`, `flush`.
 #[allow(clippy::too_many_arguments)]
 fn handle_command(
@@ -841,6 +880,7 @@ fn handle_command(
     delim: u8,
     filter: Option<&ObjFilter>,
     mailmap: Option<&gix::mailmap::Snapshot>,
+    filters_pipeline: Option<&mut gix::filter::Pipeline<'_>>,
 ) -> Result<CommandResult> {
     // Split the command word from its argument on the first ASCII space.
     let (word, arg) = match line.iter().position(|&b| b == b' ') {
@@ -858,18 +898,26 @@ fn handle_command(
             Ok(CommandResult::Ok)
         }
         b"contents" => {
-            process_request(out, repo, fmt, arg, true, delim, filter, mailmap)?;
-            if !buffer {
-                out.flush()?;
+            match process_request(out, repo, fmt, arg, true, delim, filter, mailmap, filters_pipeline)? {
+                EmitOutcome::Ok => {
+                    if !buffer {
+                        out.flush()?;
+                    }
+                    Ok(CommandResult::Ok)
+                }
+                EmitOutcome::Die(code) => Ok(CommandResult::Die(code)),
             }
-            Ok(CommandResult::Ok)
         }
         b"info" => {
-            process_request(out, repo, fmt, arg, false, delim, filter, mailmap)?;
-            if !buffer {
-                out.flush()?;
+            match process_request(out, repo, fmt, arg, false, delim, filter, mailmap, filters_pipeline)? {
+                EmitOutcome::Ok => {
+                    if !buffer {
+                        out.flush()?;
+                    }
+                    Ok(CommandResult::Ok)
+                }
+                EmitOutcome::Die(code) => Ok(CommandResult::Die(code)),
             }
-            Ok(CommandResult::Ok)
         }
         _ => {
             eprintln!(
@@ -893,10 +941,13 @@ fn process_request(
     delim: u8,
     filter: Option<&ObjFilter>,
     mailmap: Option<&gix::mailmap::Snapshot>,
-) -> Result<()> {
+    filters_pipeline: Option<&mut gix::filter::Pipeline<'_>>,
+) -> Result<EmitOutcome> {
     // `%(rest)` in the format splits the line at the first whitespace run: the
-    // head is the object name, the tail becomes `%(rest)`.
-    let (name, rest): (&[u8], &[u8]) = if fmt.has_rest {
+    // head is the object name, the tail becomes `%(rest)`. git also forces this
+    // split whenever a transform mode is active (`--filters`), because the tail
+    // is then consumed as the blob's path.
+    let (name, rest): (&[u8], &[u8]) = if fmt.has_rest || filters_pipeline.is_some() {
         match line.iter().position(|&b| b == b' ' || b == b'\t') {
             Some(ws) => {
                 let mut end = ws;
@@ -922,14 +973,14 @@ fn process_request(
         out.write_all(name)?;
         out.write_all(b" missing")?;
         out.write_all(&[delim])?;
-        return Ok(());
+        return Ok(EmitOutcome::Ok);
     };
 
     let Ok(header) = repo.find_header(oid) else {
         out.write_all(name)?;
         out.write_all(b" missing")?;
         out.write_all(&[delim])?;
-        return Ok(());
+        return Ok(EmitOutcome::Ok);
     };
 
     // On stdin, a filtered-out object reports "excluded" (keyed by its oid),
@@ -939,7 +990,7 @@ fn process_request(
             out.write_all(oid.to_hex().to_string().as_bytes())?;
             out.write_all(b" excluded")?;
             out.write_all(&[delim])?;
-            return Ok(());
+            return Ok(EmitOutcome::Ok);
         }
     }
 
@@ -954,6 +1005,7 @@ fn process_request(
         want_contents,
         delim,
         mailmap,
+        filters_pipeline,
     )
 }
 
@@ -971,24 +1023,46 @@ fn emit_object(
     want_contents: bool,
     delim: u8,
     mailmap: Option<&gix::mailmap::Snapshot>,
-) -> Result<()> {
+    filters_pipeline: Option<&mut gix::filter::Pipeline<'_>>,
+) -> Result<EmitOutcome> {
     let mut info = Vec::new();
     render_info(fmt, &oid, kind, size, rest, &mut info);
     out.write_all(&info)?;
     out.write_all(&[delim])?;
 
     if want_contents {
-        let object = repo.find_object(oid)?;
-        // `%(objectsize)` above stays the on-disk size; mailmap only rewrites
-        // the emitted bytes of commit/tag objects.
-        if let (Some(mm), true) = (mailmap, matches!(kind, Kind::Commit | Kind::Tag)) {
-            out.write_all(&apply_mailmap(&object.data, mm))?;
+        // git's `print_object_or_die`: under `--filters` (transform_mode 'w') a
+        // blob is smudged through the worktree pipeline using `rest` as its path;
+        // every other object is emitted raw.
+        if matches!((&filters_pipeline, kind), (Some(_), Kind::Blob)) {
+            if rest.is_empty() {
+                // git: die("missing path for '%s'", oid). The info line above was
+                // already written, matching git's ordering.
+                eprintln!("fatal: missing path for '{}'", oid.to_hex());
+                return Ok(EmitOutcome::Die(128));
+            }
+            let pipeline = filters_pipeline.expect("Some checked above");
+            let object = repo.find_object(oid)?;
+            let mut converted = pipeline.convert_to_worktree(
+                &object.data,
+                rest.as_bstr(),
+                gix::filter::plumbing::driver::apply::Delay::Forbid,
+            )?;
+            std::io::copy(&mut converted, out)?;
+            drop(converted);
         } else {
-            out.write_all(&object.data)?;
+            let object = repo.find_object(oid)?;
+            // `%(objectsize)` above stays the on-disk size; mailmap only rewrites
+            // the emitted bytes of commit/tag objects.
+            if let (Some(mm), true) = (mailmap, matches!(kind, Kind::Commit | Kind::Tag)) {
+                out.write_all(&apply_mailmap(&object.data, mm))?;
+            } else {
+                out.write_all(&object.data)?;
+            }
         }
         out.write_all(&[delim])?;
     }
-    Ok(())
+    Ok(EmitOutcome::Ok)
 }
 
 // ---- mailmap ---------------------------------------------------------------

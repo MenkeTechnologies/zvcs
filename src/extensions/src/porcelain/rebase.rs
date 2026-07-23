@@ -1083,11 +1083,17 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         upstream_oid
     };
 
-    if fork_point > 0 {
-        // `get_fork_point()` needs the upstream's reflog to find where the
-        // branch diverged; nothing here walks reflogs.
-        bail!("unsupported flag \"--fork-point\" (refining the upstream needs `merge-base --fork-point`, which walks the upstream reflog)");
-    }
+    // `--fork-point` (git's default when the upstream is the branch's tracking
+    // ref): refine the base to where the branch forked from the upstream, read
+    // off the upstream's reflog, so commits a rewound upstream dropped are dropped
+    // here too. When the reflog yields no unique fork point git falls back to the
+    // plain merge-base, i.e. `fork_point_oid` stays `None` and the replay walk
+    // below hides only the upstream — identical to `--no-fork-point`.
+    let fork_point_oid = if fork_point > 0 {
+        get_fork_point(&repo, &upstream_spec, head_oid)?
+    } else {
+        None
+    };
 
     // --- require_clean_work_tree() -----------------------------------------
     // `refresh_index()` runs first and reports unmerged paths on stdout, even
@@ -1151,8 +1157,17 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // The merge backend picks the right side of `<upstream>...<head>`; the apply
     // backend picks `<upstream>..<head>`. Both are empty exactly when
     // `<upstream>..<head>` is, which is what is measured here.
+    // Hide the upstream, plus the fork point when `--fork-point` refined it: any
+    // commit reachable from the fork point (a stale tip a rewound upstream
+    // dropped) is excluded from the replay. In the common case the fork point is
+    // the plain merge-base — an ancestor of the upstream — so hiding it changes
+    // nothing.
+    let mut hidden: Vec<ObjectId> = vec![upstream_oid];
+    if let Some(fp) = fork_point_oid {
+        hidden.push(fp);
+    }
     let mut todo: Vec<ObjectId> = Vec::new();
-    for info in repo.rev_walk([head_oid]).with_hidden([upstream_oid]).all()? {
+    for info in repo.rev_walk([head_oid]).with_hidden(hidden).all()? {
         todo.push(info?.id);
     }
 
@@ -1538,6 +1553,72 @@ fn merge_base_unique(
     } else {
         None
     })
+}
+
+/// Record `oid` as a fork-point candidate if it is a real, not-yet-seen commit.
+fn collect_fork_rev(
+    repo: &gix::Repository,
+    oid: ObjectId,
+    revs: &mut Vec<ObjectId>,
+    seen: &mut HashSet<ObjectId>,
+) {
+    if !oid.is_null() && seen.insert(oid) && repo.find_commit(oid).is_ok() {
+        revs.push(oid);
+    }
+}
+
+/// Port of git's `get_fork_point()`: where `head` forked from the `upstream`
+/// ref, refined via that ref's reflog so a rewound upstream's dropped commits
+/// are excluded from the rebase. It is the unique merge-base of `head` with the
+/// set of the upstream's historical reflog tips (every entry's new oid plus the
+/// oldest entry's old oid), and that base must itself be one of those tips —
+/// otherwise `None`, and the caller falls back to the plain merge-base, exactly
+/// as git does. A ref without a reflog falls back to its current tip.
+fn get_fork_point(
+    repo: &gix::Repository,
+    upstream_spec: &str,
+    head: ObjectId,
+) -> Result<Option<ObjectId>> {
+    let Some(reference) = repo.try_find_reference(upstream_spec)? else {
+        return Ok(None);
+    };
+
+    let mut revs: Vec<ObjectId> = Vec::new();
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    // Walk the reflog newest-first (owned lines); collect every `new` oid, and
+    // remember the last-seen (== oldest) entry's `old` oid to add afterwards.
+    let mut oldest_prev: Option<ObjectId> = None;
+    {
+        let mut platform = reference.log_iter();
+        if let Some(iter) = platform.rev()? {
+            for line in iter {
+                let line = line?;
+                collect_fork_rev(repo, line.new_oid, &mut revs, &mut seen);
+                oldest_prev = Some(line.previous_oid);
+            }
+        }
+    }
+    if let Some(prev) = oldest_prev {
+        collect_fork_rev(repo, prev, &mut revs, &mut seen);
+    }
+    if revs.is_empty() {
+        // No reflog: git falls back to the ref's current tip.
+        collect_fork_rev(repo, reference.id().detach(), &mut revs, &mut seen);
+    }
+    if revs.is_empty() {
+        return Ok(None);
+    }
+
+    let bases = repo.merge_bases_many(head, &revs)?;
+    if bases.len() != 1 {
+        return Ok(None);
+    }
+    let base = bases[0].detach();
+    // git requires the fork point to be one of the reflog entries.
+    if !revs.contains(&base) {
+        return Ok(None);
+    }
+    Ok(Some(base))
 }
 
 /// Resolve `spec` and peel it to a commit id, or `None` when either step fails —

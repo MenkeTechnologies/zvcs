@@ -11,6 +11,8 @@
 
 use anyhow::Result;
 use ignore::{WalkBuilder, WalkState};
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -19,6 +21,10 @@ use std::sync::Mutex;
 /// The walk is parallel and bounded: a whole-device scan (`git zreindex /`)
 /// touches millions of inodes, and it must never wander into the mount points
 /// that turn `/` into a hanging or bottomless walk (see [`is_skip_mount`]).
+///
+/// Progress streams to the singleton log as it goes — a start line, every repo
+/// as it is found, and a final count — so `git zdaemon log -f` shows a live
+/// crawl instead of a silent wait followed by one summary line at the end.
 pub fn crawl(roots: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
     let found = Mutex::new(Vec::new());
     // Cap threads so a burst crawl can't saturate the box; `ignore` fans the walk
@@ -26,7 +32,12 @@ pub fn crawl(roots: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get().min(8))
         .unwrap_or(4);
+    // One log handle for the whole walk, shared across the walk threads (opened
+    // once, not per line, to keep syscalls off the hot path). `File` is unbuffered,
+    // so each line is a single append that `tail -f`/`zdaemon log -f` sees at once.
+    let log = Mutex::new(open_log());
 
+    log_progress(&log, &format!("[zvcs crawl] scanning {} root(s)", roots.len()));
     for root in roots {
         let mut wb = WalkBuilder::new(root);
         // Traverse everything (hidden dirs included) but respect no ignore files —
@@ -40,6 +51,7 @@ pub fn crawl(roots: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
 
         wb.build_parallel().run(|| {
             let found = &found;
+            let log = &log;
             Box::new(move |result| {
                 let Ok(entry) = result else {
                     return WalkState::Continue; // permission-denied / transient: skip
@@ -53,13 +65,36 @@ pub fn crawl(roots: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
                     return WalkState::Continue;
                 }
                 if let Some(git_dir) = resolve_git_dir(dir, &dotgit) {
+                    log_progress(log, &format!("[zvcs crawl] + {}", dir.display()));
                     found.lock().unwrap().push((git_dir, dir.to_path_buf()));
                 }
                 WalkState::Continue
             })
         });
     }
-    found.into_inner().unwrap()
+    let out = found.into_inner().unwrap();
+    log_progress(&log, &format!("[zvcs crawl] walk done: {} repo(s)", out.len()));
+    out
+}
+
+/// Open the singleton daemon log (`$ZVCS_HOME/zvcs.log`) for append. `None` if it
+/// cannot be opened (progress logging then silently no-ops — never fatal).
+fn open_log() -> Option<File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(crate::superset::zdaemon::zvcs_home().join("zvcs.log"))
+        .ok()
+}
+
+/// Append one progress line to the shared log handle, if the log opened. Holding
+/// the mutex over the write keeps concurrent walk threads' lines from interleaving.
+fn log_progress(log: &Mutex<Option<File>>, msg: &str) {
+    if let Ok(mut guard) = log.lock() {
+        if let Some(f) = guard.as_mut() {
+            let _ = writeln!(f, "{msg}");
+        }
+    }
 }
 
 /// Directories that turn a whole-device crawl (`git zreindex /`) into a hang or an
@@ -139,7 +174,6 @@ pub fn spawn_if_configured() {
 /// foreground daemon still inherits stdout. Writing the log directly (rather than
 /// `println!`) keeps this chatter log-only no matter how the daemon was launched.
 fn log_line(msg: &str) {
-    use std::io::Write;
     let path = crate::superset::zdaemon::zvcs_home().join("zvcs.log");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{msg}");

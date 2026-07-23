@@ -72,7 +72,7 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
             push(&repo, msg, false)
         }
-        Some("list") => list(&repo),
+        Some("list") => list(&repo, &args[1..]),
         Some("pop") => {
             let n = parse_stash_index(positional(&args[1..]))?;
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
@@ -467,11 +467,26 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 }
 
 /// `git stash list` — newest first, `stash@{N}: <reflog message>`.
-fn list(repo: &gix::Repository) -> Result<ExitCode> {
-    for (i, (_, msg)) in read_stash_reflog(repo)?.iter().enumerate() {
-        println!("stash@{{{i}}}: {msg}");
+fn list(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
+    // `git stash list` is `git log --format="%gd: %gs" -g <log-opts> refs/stash`,
+    // so delegate to the reflog machinery on `refs/stash` rather than duplicate its
+    // format engine (`%H`, `%gd`, `%gs`, dates, `--pretty`, …). Only the default
+    // format differs: stash uses `%gd: %gs`, injected when the caller gives none.
+    // With no stash ref, git prints nothing (exit 0) — reflog would instead fatal
+    // on an unknown ref, so short-circuit that here.
+    if repo.try_find_reference("refs/stash")?.is_none() {
+        return Ok(ExitCode::SUCCESS);
     }
-    Ok(ExitCode::SUCCESS)
+    let has_format = args
+        .iter()
+        .any(|a| a.starts_with("--format") || a.starts_with("--pretty"));
+    let mut rf: Vec<String> = vec!["show".into()];
+    if !has_format {
+        rf.push("--format=%gd: %gs".into());
+    }
+    rf.extend(args.iter().cloned());
+    rf.push("refs/stash".into());
+    super::reflog(&rf)
 }
 
 /// `git stash apply` / `pop` — restore `stash@{n}` onto a clean worktree+index.

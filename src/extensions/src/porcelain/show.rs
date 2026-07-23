@@ -636,6 +636,37 @@ fn show_commit(
     // omits the blank line that would separate the header from the diff.
     let header_empty = matches!(pretty, Pretty::User(f) if f.is_empty());
 
+    // Resolve the file-level changes up front — before the header — so `-S`/`-G`
+    // can suppress the ENTIRE commit (header included) when the pickaxe matches no
+    // file, exactly as git does. `files` is computed only when a diff would be
+    // shown (a real diff selection, and either a non-root commit or `--root`).
+    let diff_shown =
+        selection != Selection::Disabled && !(parents.is_empty() && !disp.show_root);
+    // The pickaxe applies to the first-parent / non-merge path; a merge's combined
+    // `--cc` diff is never paired with pickaxe by git-fuzzy and is left unfiltered.
+    let pickaxe_path = pickaxe.active() && !(is_merge && !disp.first_parent);
+    let files: Vec<FileChange> = if diff_shown {
+        let mut f = collect_changes(repo, commit, parents.first().map(|p| p.detach()))?;
+        if !pathspecs.is_empty() {
+            f.retain(|c| matches_pathspec(&c.path, pathspecs));
+        }
+        if pickaxe_path {
+            // Keep only files whose own change text matches, testing each file's
+            // patch exactly as `git log` tests a commit's patch.
+            f.retain(|c| {
+                let mut buf = Vec::new();
+                emit_patch(repo, &mut buf, c).is_ok()
+                    && super::log::pickaxe_hit(&buf, pickaxe.s.as_deref(), pickaxe.g.as_ref())
+            });
+        }
+        f
+    } else {
+        Vec::new()
+    };
+    if pickaxe_path && diff_shown && files.is_empty() {
+        return Ok(());
+    }
+
     match pretty {
         Pretty::Oneline => {
             out.extend_from_slice(commit.id().shorten_or_id().to_string().as_bytes());
@@ -698,24 +729,6 @@ fn show_commit(
     // against the empty tree: the header prints, but no separator and no diff.
     if parents.is_empty() && !disp.show_root {
         return Ok(());
-    }
-
-    // Resolve the file-level changes up front: whether any survive the pathspec
-    // filter decides whether a separator is printed at all.
-    let mut files = collect_changes(repo, commit, parents.first().map(|p| p.detach()))?;
-    if !pathspecs.is_empty() {
-        files.retain(|f| matches_pathspec(&f.path, pathspecs));
-    }
-    // `-S`/`-G` (pickaxe): keep only files whose own change text matches, rendering
-    // each file's patch and testing it exactly as `git log` tests a commit's patch.
-    // Applies to the first-parent / non-merge path; a merge's combined `--cc` diff
-    // (never paired with pickaxe by git-fuzzy) is left unfiltered.
-    if pickaxe.active() && !(is_merge && !disp.first_parent) {
-        files.retain(|f| {
-            let mut buf = Vec::new();
-            emit_patch(repo, &mut buf, f).is_ok()
-                && super::log::pickaxe_hit(&buf, pickaxe.s.as_deref(), pickaxe.g.as_ref())
-        });
     }
 
     if is_merge && !disp.first_parent {

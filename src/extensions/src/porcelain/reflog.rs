@@ -1309,6 +1309,24 @@ fn full_name(repo: &gix::Repository, name: &str) -> String {
     }
 }
 
+/// git's `shorten_unambiguous_ref` for the reflog selector display (`%gd`): a full
+/// ref name is shown by its canonical short form regardless of how it was typed —
+/// `refs/heads/main` → `main`, `refs/stash` → `stash`, `HEAD` stays `HEAD`.
+fn shorten_ref(full: &str) -> String {
+    if full == "HEAD" {
+        return full.to_owned();
+    }
+    if full == "refs/stash" {
+        return "stash".to_owned();
+    }
+    for prefix in ["refs/heads/", "refs/remotes/", "refs/tags/"] {
+        if let Some(rest) = full.strip_prefix(prefix) {
+            return rest.to_owned();
+        }
+    }
+    full.strip_prefix("refs/").unwrap_or(full).to_owned()
+}
+
 // ---------------------------------------------------------------------------
 // ref sets
 // ---------------------------------------------------------------------------
@@ -1751,10 +1769,13 @@ fn expand_format(
         let two = b.get(i + 2).copied();
         match (one, two) {
             (Some(b'g'), Some(kind @ (b'd' | b'D'))) => {
+                // `%gd` is the short selector (git's `shorten_unambiguous_ref`:
+                // `refs/stash` → `stash`), `%gD` the full ref. Both are independent
+                // of the oneline path, which prints the ref as it was typed.
                 let name = if kind == b'd' {
-                    &section.display
+                    shorten_ref(&section.full)
                 } else {
-                    &section.full
+                    section.full.clone()
                 };
                 out.extend_from_slice(name.as_bytes());
                 out.extend_from_slice(format!("@{{{selector}}}").as_bytes());

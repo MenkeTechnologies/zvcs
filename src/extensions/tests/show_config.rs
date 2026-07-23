@@ -284,6 +284,10 @@ fn show_pickaxe_filters_files_like_git() {
     // Attached form and git-fuzzy's exact --first-parent template.
     assert_matches_git(&repo, &home, &[&c, "-GALPHA", "--name-only", "--format="]);
     assert_matches_git(&repo, &home, &["--first-parent", &c, "-G", "ALPHA", "--name-only", "--", "a"]);
+    // A pickaxe that matches no file suppresses the WHOLE commit — header and all
+    // (with a normal header format, not just `--format=`), exactly like git.
+    assert_matches_git(&repo, &home, &[&c, "-G", "zzznope"]);
+    assert_matches_git(&repo, &home, &[&c, "-G", "ALPHA"]); // a match keeps the header
 
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }

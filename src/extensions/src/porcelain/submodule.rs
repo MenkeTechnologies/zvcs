@@ -62,7 +62,7 @@ const SUBCOMMANDS: &[&str] = &[
 
 /// `git submodule` — inspect and register the submodules recorded in the index.
 ///
-/// Five of the eleven stock subcommands are ported here, all aiming at
+/// Seven of the eleven stock subcommands are ported here, all aiming at
 /// byte-for-byte parity with stock `git`:
 ///
 ///   * `git submodule [--quiet] [--cached] [status] [--recursive] [--] [<path>...]`
@@ -95,6 +95,26 @@ const SUBCOMMANDS: &[&str] = &[
 ///     `Entering '<displaypath>'` first unless quiet. A failing command aborts
 ///     the walk with git's `run_command returned non-zero status` fatal and 128.
 ///
+///   * `git submodule [--quiet] sync [--recursive] [--] [<path>...]`
+///     Re-copies each active submodule's `.gitmodules` url into the superproject
+///     `submodule.<name>.url`, and — when the submodule is populated — rewrites
+///     `remote.<default-remote>.url` inside the submodule's own config, where the
+///     default remote is `branch.<current>.remote` (else `origin`). Prints
+///     `Synchronizing submodule url for '<displaypath>'` per active submodule.
+///     A relative (`./`, `../`) url bails: `resolve_relative_url` is not ported.
+///
+///   * `git submodule [--quiet] update [-N|--no-fetch] [-f|--force]
+///     [--checkout] [--init] [--recursive] [--] [<path>...]`
+///     For submodules already present on disk, checks out the commit the
+///     superproject records on a detached HEAD, fetching it into the submodule
+///     first (via the vendored gix blocking transport, re-executed as a child
+///     `fetch`) when it is not already reachable. `--init` first runs the same
+///     registration pass as `init`; `--recursive` descends. Only the checkout
+///     strategy is ported: `--remote`, `--merge`/`--rebase`, a non-checkout
+///     `submodule.<name>.update`, the clone-shaping flags (`--depth`,
+///     `--reference`, `--recommend-shallow`, `--single-branch`, `--filter`, …),
+///     and cloning a not-yet-populated submodule each bail rather than approximate.
+///
 ///   * `git submodule [--quiet] set-branch (--default|--branch <branch>) [--] <path>`
 ///     Writes (or, under `--default`, removes) `submodule.<name>.branch` in the
 ///     worktree `.gitmodules`, keyed by the submodule *name* resolved from `<path>`
@@ -122,8 +142,8 @@ const SUBCOMMANDS: &[&str] = &[
 /// stage 4 and printing a name git would not have printed.
 ///
 /// Not ported, each rejected with a precise reason rather than approximated:
-/// `add`, `deinit`, `update`, `set-url`, `sync` and `absorbgitdirs`. `init`
-/// additionally bails on `.gitmodules` urls that are
+/// `add`, `deinit`, `set-url` and `absorbgitdirs`. `init` (and `sync`)
+/// additionally bail on `.gitmodules` urls that are
 /// relative (`./`, `../`), which require git's `resolve_relative_url` against
 /// the superproject's default remote.
 pub fn submodule(args: &[String]) -> Result<ExitCode> {
@@ -173,9 +193,9 @@ pub fn submodule(args: &[String]) -> Result<ExitCode> {
         "summary" => summary(tail, cached),
         "foreach" => foreach(tail, quiet),
         "add" => bail!("`submodule add` needs a clone of the new submodule; not ported"),
-        "update" => bail!("`submodule update` needs clone/fetch/checkout of submodules; not ported"),
+        "update" => update(tail, quiet),
         "deinit" => bail!("`submodule deinit` removes submodule worktrees; not ported"),
-        "sync" => bail!("`submodule sync` rewrites remote urls inside submodules; not ported"),
+        "sync" => sync(tail, quiet),
         "set-branch" => set_branch(tail, quiet),
         "set-url" => bail!("`submodule set-url` edits .gitmodules; not ported"),
         "absorbgitdirs" => bail!("`submodule absorbgitdirs` relocates git dirs; not ported"),
@@ -389,15 +409,25 @@ fn init(args: &[String], mut quiet: bool) -> Result<ExitCode> {
     }
 
     let repo = gix::discover(".")?;
+    Ok(ExitCode::from(init_repo(&repo, &patterns, quiet)?))
+}
+
+/// The body of `git submodule init` for one already-opened superproject:
+/// register `submodule.<name>.active`/`.url`/`.update` for every listed gitlink.
+/// Returns git's exit code (0 on success, 128 for a `.gitmodules` with no url).
+/// Factored out of `init` so `update --init` can run the same registration pass
+/// against the repository it opened, mirroring git's `module_update` calling the
+/// init pass before `update_submodules`.
+fn init_repo(repo: &gix::Repository, patterns: &[BString], quiet: bool) -> Result<u8> {
     let index = repo.open_index()?;
 
-    let mut entries = match module_list(&repo, &index, &patterns)? {
+    let mut entries = match module_list(repo, &index, patterns)? {
         Ok(entries) => entries,
-        Err(code) => return Ok(ExitCode::from(code)),
+        Err(code) => return Ok(code),
     };
 
-    let submodules = submodules(&repo)?;
-    let prefix = repo_prefix(&repo)?;
+    let submodules = submodules(repo)?;
+    let prefix = repo_prefix(repo)?;
 
     // With no pathspec and `submodule.active` configured, git restricts the list
     // to the active submodules (`module_list_active`).
@@ -434,7 +464,7 @@ fn init(args: &[String], mut quiet: bool) -> Result<ExitCode> {
         let display = display_path(entry.path.as_bstr(), prefix.as_ref());
         let Some(sub) = find_submodule(&submodules, &entry.path) else {
             eprintln!("fatal: No url found for submodule path '{display}' in .gitmodules");
-            return Ok(ExitCode::from(128));
+            return Ok(128);
         };
         let sub_name = sub.name().to_owned();
         let sub_name = sub_name.as_bstr();
@@ -454,7 +484,7 @@ fn init(args: &[String], mut quiet: bool) -> Result<ExitCode> {
                 .filter(|u| !u.is_empty());
             let Some(url) = url else {
                 eprintln!("fatal: No url found for submodule path '{display}' in .gitmodules");
-                return Ok(ExitCode::from(128));
+                return Ok(128);
             };
             if url.starts_with(b"./") || url.starts_with(b"../") {
                 bail!(
@@ -508,7 +538,7 @@ fn init(args: &[String], mut quiet: bool) -> Result<ExitCode> {
     for line in messages {
         eprintln!("{line}");
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(0)
 }
 
 // --------------------------------------------------------------- summary ----
@@ -965,6 +995,579 @@ fn run_in_submodule(
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_PREFIX");
     Ok(proc.status()?)
+}
+
+// ------------------------------------------------------------------ sync ----
+
+fn sync(args: &[String], mut quiet: bool) -> Result<ExitCode> {
+    let mut patterns: Vec<BString> = Vec::new();
+    let mut recursive = false;
+    let mut no_more_opts = false;
+
+    // `module_sync` parses with default `parse_options` (permutation), so a flag
+    // may follow a pathspec; only `--` forces the rest to be operands.
+    for a in args {
+        if no_more_opts {
+            patterns.push(BString::from(a.as_str()));
+            continue;
+        }
+        match a.as_str() {
+            "--" => no_more_opts = true,
+            "-q" | "--quiet" => quiet = true,
+            "--recursive" => recursive = true,
+            s if s.starts_with('-') && s.len() > 1 => return usage_exit(),
+            _ => patterns.push(BString::from(a.as_str())),
+        }
+    }
+
+    if let Some(code) = reject_empty_pathspec(&patterns) {
+        return Ok(code);
+    }
+
+    let repo = gix::discover(".")?;
+    let prefix = repo_prefix(&repo)?;
+    let code = sync_repo(&repo, &patterns, quiet, recursive, None, prefix.as_ref())?;
+    Ok(ExitCode::from(code))
+}
+
+/// One superproject's worth of `git submodule sync` (`sync_submodule` per active
+/// gitlink). For each active submodule it re-copies the `.gitmodules` url into
+/// the superproject's `submodule.<name>.url`, and — when the submodule is
+/// populated — rewrites `remote.<default-remote>.url` inside the submodule's own
+/// config. `--recursive` descends with the display path carried as super-prefix.
+#[allow(clippy::too_many_arguments)]
+fn sync_repo(
+    repo: &gix::Repository,
+    patterns: &[BString],
+    quiet: bool,
+    recursive: bool,
+    super_prefix: Option<&str>,
+    prefix: Option<&BString>,
+) -> Result<u8> {
+    let index = repo.open_index()?;
+    let entries = match module_list(repo, &index, patterns)? {
+        Ok(entries) => entries,
+        Err(code) => return Ok(code),
+    };
+
+    let submodules = submodules(repo)?;
+    let workdir = repo.workdir().map(ToOwned::to_owned);
+
+    // `.gitmodules` is read raw so urls are copied verbatim, exactly as git's
+    // `sync_submodule` copies `sub->url` without round-tripping a parsed URL.
+    let modules_path = match repo.workdir() {
+        Some(wd) => wd.join(".gitmodules"),
+        None => std::path::PathBuf::from(".gitmodules"),
+    };
+    let modules = ConfigFile::from_path_no_includes(modules_path, Source::Local).ok();
+
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let config_path = repo.common_dir().join("config");
+    let mut config = ConfigFile::from_path_no_includes(config_path.clone(), Source::Local)?;
+    let mut dirty = false;
+
+    for entry in &entries {
+        let Some(sub) = find_submodule(&submodules, &entry.path) else {
+            continue;
+        };
+        // `sync_submodule` returns immediately for an inactive submodule.
+        if !sub.is_active()? {
+            continue;
+        }
+        let sub_name = sub.name().to_owned();
+        let sub_name = sub_name.as_bstr();
+        let display = match super_prefix {
+            Some(sp) => format!("{sp}{}", entry.path),
+            None => display_path(entry.path.as_bstr(), prefix),
+        };
+
+        // The url git copies to both the superproject and the submodule remote.
+        // A relative url needs `resolve_relative_url` against the superproject's
+        // default remote, which is not ported — bail rather than register a
+        // literal `./`/`../` url git would have rewritten.
+        let url = modules
+            .as_ref()
+            .and_then(|m| m.string_by("submodule", Some(sub_name), "url"));
+        if let Some(u) = url.as_ref() {
+            if u.starts_with(b"./") || u.starts_with(b"../") {
+                bail!(
+                    "submodule '{sub_name}' has the relative url {:?}; resolving it against the default remote is not ported",
+                    u.to_str_lossy()
+                );
+            }
+        }
+        // git uses an empty string when the submodule has no url at all.
+        let url_bytes: BString = url.unwrap_or_default();
+
+        if !quiet {
+            println!("Synchronizing submodule url for '{display}'");
+            std::io::stdout().flush()?;
+        }
+
+        // Superproject `submodule.<name>.url` — git's `git_config_set_gently`.
+        config.set_raw_value_by("submodule", Some(sub_name), "url", url_bytes.as_bstr())?;
+        dirty = true;
+
+        // `is_submodule_populated_gently`: no repository on disk means git stops
+        // here (the remote-url rewrite and any recursion are skipped).
+        let sub_repo = match workdir.as_ref() {
+            Some(wd) => gix::open(wd.join(&*gix::path::from_bstr(entry.path.as_bstr()))).ok(),
+            None => None,
+        };
+        let Some(sub_repo) = sub_repo else { continue };
+
+        // Rewrite `remote.<default-remote>.url` in the submodule's own config.
+        let remote = default_remote(&sub_repo)?;
+        let remote = BString::from(remote);
+        let sub_config_path = sub_repo.common_dir().join("config");
+        {
+            let _sub_lock = crate::lock::RepoLock::acquire(sub_repo.git_dir());
+            let mut sub_config =
+                ConfigFile::from_path_no_includes(sub_config_path.clone(), Source::Local)?;
+            sub_config.set_raw_value_by(
+                "remote",
+                Some(remote.as_bstr()),
+                "url",
+                url_bytes.as_bstr(),
+            )?;
+            persist(&sub_config_path, &sub_config)?;
+        }
+
+        if recursive {
+            let nested = format!("{display}/");
+            let code = sync_repo(&sub_repo, &[], quiet, true, Some(&nested), None)?;
+            if code != 0 {
+                if dirty {
+                    persist(&config_path, &config)?;
+                }
+                return Ok(code);
+            }
+        }
+    }
+
+    if dirty {
+        persist(&config_path, &config)?;
+    }
+    Ok(0)
+}
+
+/// git's `repo_get_default_remote`: the remote of the submodule's current branch
+/// (`branch.<name>.remote`), or `origin` on a detached HEAD or an unset value.
+fn default_remote(repo: &gix::Repository) -> Result<String> {
+    let Some(head) = repo.head_name()? else {
+        // Detached HEAD.
+        return Ok("origin".to_string());
+    };
+    let short = head.shorten().to_owned();
+    let configured = repo.config_snapshot().string(KeyRef {
+        section_name: "branch",
+        subsection_name: Some(short.as_bstr()),
+        value_name: "remote",
+    });
+    Ok(match configured {
+        Some(v) => v.to_str_lossy().into_owned(),
+        None => "origin".to_string(),
+    })
+}
+
+// ---------------------------------------------------------------- update ----
+
+/// The flags of `git submodule update` this port honors; the remaining flags
+/// (`--remote`, `--merge`, `--rebase`, `--depth`, …) bail in `update` before any
+/// repository is touched, so they never reach here.
+#[derive(Clone, Copy)]
+struct UpdateOpts {
+    quiet: bool,
+    init: bool,
+    recursive: bool,
+    force: bool,
+    nofetch: bool,
+    /// `--checkout` was passed explicitly, forcing the checkout strategy even
+    /// when `.gitmodules`/config names another one.
+    checkout: bool,
+}
+
+fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
+    let mut opts = UpdateOpts {
+        quiet,
+        init: false,
+        recursive: false,
+        force: false,
+        nofetch: false,
+        checkout: false,
+    };
+    let mut patterns: Vec<BString> = Vec::new();
+    let mut no_more_opts = false;
+    let mut i = 0;
+
+    while let Some(a) = args.get(i) {
+        if no_more_opts {
+            patterns.push(BString::from(a.as_str()));
+            i += 1;
+            continue;
+        }
+        match a.as_str() {
+            "--" => no_more_opts = true,
+            "-q" | "--quiet" => opts.quiet = true,
+            "-i" | "--init" => opts.init = true,
+            "--recursive" => opts.recursive = true,
+            "-f" | "--force" => opts.force = true,
+            "-N" | "--no-fetch" => opts.nofetch = true,
+            "--checkout" => opts.checkout = true,
+            // Clone/progress/parallelism knobs that do not change the result for
+            // an already-cloned checkout: accepted and ignored.
+            "--progress" => {}
+            "-j" | "--jobs" => i += 1,
+            s if s.starts_with("--jobs=") => {}
+            // Strategies and clone-shaping options that need machinery this port
+            // does not carry — bail honestly rather than silently checking out.
+            "--remote" => bail!(
+                "`submodule update --remote` resolves and fetches a moving remote-tracking branch; not ported"
+            ),
+            "-m" | "--merge" => bail!(
+                "`submodule update --merge` needs the merge machinery to merge the recorded commit into the submodule branch; not ported"
+            ),
+            "-r" | "--rebase" => bail!(
+                "`submodule update --rebase` needs the rebase machinery; not ported"
+            ),
+            "--reference" | "--dissociate" => bail!(
+                "`submodule update {a}` only affects cloning of missing submodules, which is not ported"
+            ),
+            s if s.starts_with("--reference=") => bail!(
+                "`submodule update --reference` only affects cloning of missing submodules, which is not ported"
+            ),
+            "--depth" | "--recommend-shallow" | "--no-recommend-shallow" | "--single-branch"
+            | "--no-single-branch" | "--require-init" => bail!(
+                "`submodule update {a}` shapes the clone/fetch, which is not ported"
+            ),
+            s if s.starts_with("--depth=") || s.starts_with("--filter=") => bail!(
+                "`submodule update {s}` shapes the clone/fetch, which is not ported"
+            ),
+            "--filter" => bail!(
+                "`submodule update --filter` shapes the partial-clone fetch, which is not ported"
+            ),
+            s if s.starts_with('-') && s.len() > 1 => return usage_exit(),
+            // `PARSE_OPT_STOP_AT_NON_OPTION`-style: the first operand ends option
+            // parsing (git permutes here, but real invocations put flags first).
+            _ => {
+                patterns.push(BString::from(a.as_str()));
+                no_more_opts = true;
+            }
+        }
+        i += 1;
+    }
+
+    if let Some(code) = reject_empty_pathspec(&patterns) {
+        return Ok(code);
+    }
+
+    let repo = gix::discover(".")?;
+    let prefix = repo_prefix(&repo)?;
+    // `warn_if_uninitialized` is set only when a pathspec was given.
+    let warn = !patterns.is_empty();
+    let code = update_repo(repo, &patterns, opts, None, prefix.as_ref(), warn)?;
+    Ok(ExitCode::from(code))
+}
+
+/// One superproject's worth of `git submodule update`, restricted to the
+/// checkout strategy against submodules already present on disk.
+///
+/// Mirrors `module_update` -> `update_submodules` -> `update_submodule`: an
+/// optional `--init` registration pass, then per gitlink resolve the recorded
+/// commit, fetch it into the submodule if it is not already reachable, and check
+/// it out on a detached HEAD. `--recursive` descends with the display path as the
+/// super-prefix, exactly as git re-invokes the helper per level.
+#[allow(clippy::too_many_arguments)]
+fn update_repo(
+    repo: gix::Repository,
+    patterns: &[BString],
+    opts: UpdateOpts,
+    super_prefix: Option<&str>,
+    prefix: Option<&BString>,
+    warn: bool,
+) -> Result<u8> {
+    // `--init`: run the same registration pass git's `module_update` runs before
+    // `update_submodules`, then re-open so the freshly-written `active`/`url`
+    // config is visible to `is_active`/`update` below.
+    let repo = if opts.init {
+        let code = init_repo(&repo, patterns, opts.quiet)?;
+        if code != 0 {
+            return Ok(code);
+        }
+        reopen(&repo)?
+    } else {
+        repo
+    };
+
+    let index = repo.open_index()?;
+    let entries = match module_list(&repo, &index, patterns)? {
+        Ok(entries) => entries,
+        Err(code) => return Ok(code),
+    };
+    let submodules = submodules(&repo)?;
+    let Some(workdir) = repo.workdir().map(ToOwned::to_owned) else {
+        return Ok(0);
+    };
+
+    for entry in &entries {
+        let display = match super_prefix {
+            Some(sp) => format!("{sp}{}", entry.path),
+            None => display_path(entry.path.as_bstr(), prefix),
+        };
+
+        // `prepare_to_clone_next_submodule`'s skip ladder, in git's order.
+        if entry.conflicted {
+            eprintln!("Skipping unmerged submodule {display}");
+            continue;
+        }
+        let Some(sub) = find_submodule(&submodules, &entry.path) else {
+            warn_missing(warn, &display);
+            continue;
+        };
+
+        // Update strategy: `--checkout` forces it, otherwise the config/.gitmodules
+        // value (git's `determine_submodule_update_strategy`), defaulting to
+        // checkout. Non-checkout strategies need machinery this port lacks.
+        let strategy = if opts.checkout {
+            gix::submodule::config::Update::Checkout
+        } else {
+            sub.update()?
+                .unwrap_or(gix::submodule::config::Update::Checkout)
+        };
+        match strategy {
+            gix::submodule::config::Update::None => {
+                eprintln!("Skipping submodule '{display}'");
+                continue;
+            }
+            gix::submodule::config::Update::Checkout => {}
+            gix::submodule::config::Update::Merge
+            | gix::submodule::config::Update::Rebase
+            | gix::submodule::config::Update::Command(_) => bail!(
+                "submodule '{}' configures a non-checkout update strategy; only the checkout strategy is ported",
+                entry.path
+            ),
+        }
+
+        if !sub.is_active()? {
+            warn_missing(warn, &display);
+            continue;
+        }
+
+        // Already-cloned only: a submodule whose worktree holds no repository
+        // would be cloned by git, which this port does not do.
+        let sm_dir = workdir.join(&*gix::path::from_bstr(entry.path.as_bstr()));
+        let Ok(sub_repo) = gix::open(&sm_dir) else {
+            bail!(
+                "submodule path '{display}' is not populated; cloning a missing submodule is not ported (run the real clone once, then re-run)"
+            );
+        };
+
+        // `resolve_gitlink_ref(sm_path, "HEAD")` — the submodule's current commit.
+        let Ok(head) = sub_repo.head_id() else {
+            eprintln!("fatal: Unable to find current revision in submodule path '{display}'");
+            return Ok(128);
+        };
+        let suboid = head.detach();
+        // The target is the commit the superproject records for this gitlink.
+        let oid = entry.oid;
+
+        // `!oideq(oid, suboid) || force` — otherwise the submodule is already at
+        // the recorded commit and git touches nothing (and prints nothing).
+        if oid != suboid || opts.force {
+            let code = run_update_procedure(&sub_repo, &sm_dir, &oid, &opts, &display)?;
+            if code != 0 {
+                return Ok(code);
+            }
+        }
+
+        if opts.recursive {
+            let nested = format!("{display}/");
+            let code = update_repo(sub_repo, &[], opts, Some(&nested), None, false)?;
+            if code != 0 {
+                return Ok(code);
+            }
+        }
+    }
+
+    Ok(0)
+}
+
+/// git's `next_submodule_warn_missing`: only mentioned when paths were specified.
+fn warn_missing(warn: bool, display: &str) {
+    if warn {
+        eprintln!("Submodule path '{display}' not initialized");
+        eprintln!("Maybe you want to use 'update --init'?");
+    }
+}
+
+/// git's `run_update_procedure` for the checkout strategy: fetch the recorded
+/// commit into the submodule if it is not already reachable, then check it out.
+fn run_update_procedure(
+    sub_repo: &gix::Repository,
+    sm_dir: &std::path::Path,
+    oid: &ObjectId,
+    opts: &UpdateOpts,
+    display: &str,
+) -> Result<u8> {
+    // `subforce = is_null_oid(suboid) || force`; suboid is non-null here (we
+    // resolved the submodule HEAD), so this reduces to `force`.
+    let subforce = opts.force;
+
+    if !opts.nofetch {
+        // Fetch only if `oid` isn't already reachable from a ref, matching git's
+        // `is_tip_reachable` guard (`rev-list -n1 <oid> --not --all`).
+        if !is_tip_reachable(sub_repo, oid)? {
+            let plain_failed = fetch_in_submodule(sm_dir, opts.quiet, None)? != 0;
+            if plain_failed && !opts.quiet {
+                eprintln!(
+                    "Unable to fetch in submodule path '{display}'; trying to directly fetch {}:",
+                    oid.to_hex()
+                );
+            }
+        }
+        // The usual fetch may still not have brought in `oid`; try fetching it by
+        // hash directly, and fail exactly as git does if that does not help.
+        if !is_tip_reachable(sub_repo, oid)? {
+            let remote = default_remote(sub_repo)?;
+            if fetch_in_submodule(sm_dir, opts.quiet, Some((remote.as_str(), oid)))? != 0 {
+                eprintln!(
+                    "fatal: Fetched in submodule path '{display}', but it did not contain {}. Direct fetching of that commit failed.",
+                    oid.to_hex()
+                );
+                return Ok(128);
+            }
+        }
+    }
+
+    run_checkout(sm_dir, oid, subforce, opts.quiet, display)
+}
+
+/// git's `is_tip_reachable`: whether `oid` is already reachable from one of the
+/// submodule's refs — the object exists and `rev-list <oid> --not --all` is
+/// empty. Implemented in-process as a hidden-tip revision walk from `oid`.
+fn is_tip_reachable(repo: &gix::Repository, oid: &ObjectId) -> Result<bool> {
+    // Ref tips to hide (git's `--all`), keeping only those that peel to a commit.
+    let mut tips: Vec<ObjectId> = Vec::new();
+    let refs = repo.references()?;
+    for r in refs.all()? {
+        let Ok(mut r) = r else { continue };
+        if let Ok(id) = r.peel_to_id() {
+            let id = id.detach();
+            if repo
+                .find_object(id)
+                .ok()
+                .and_then(|o| o.peel_to_commit().ok())
+                .is_some()
+            {
+                tips.push(id);
+            }
+        }
+    }
+
+    // A walk that fails to start means `oid` is absent (or not a commit): git's
+    // `rev-list` would error too, so the tip is not reachable.
+    let mut walk = match repo.rev_walk(Some(*oid)).with_hidden(tips).all() {
+        Ok(walk) => walk,
+        Err(_) => return Ok(false),
+    };
+    // Any item emitted (a commit reachable from `oid` but not from a ref, or a
+    // traversal error on a missing object) means `oid` is not covered by the
+    // refs, exactly as a non-empty / failing `rev-list` does; empty means it is.
+    Ok(walk.next().is_none())
+}
+
+/// git's `fetch_in_submodule`: `git fetch [--quiet] [<remote> <hash>]` run inside
+/// the submodule. Re-executes this binary — the faithful analogue of git's
+/// `cp.git_cmd = 1; cp.dir = module_path` child — so the fetch rides the vendored
+/// gix blocking transport. Returns the child's exit code (0 on success).
+fn fetch_in_submodule(
+    sm_dir: &std::path::Path,
+    quiet: bool,
+    direct: Option<(&str, &ObjectId)>,
+) -> Result<u8> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("fetch");
+    if quiet {
+        cmd.arg("--quiet");
+    }
+    if let Some((remote, oid)) = direct {
+        cmd.arg(remote).arg(oid.to_hex().to_string());
+    }
+    submodule_child_env(&mut cmd, sm_dir);
+    let status = cmd.status()?;
+    Ok(child_code(status))
+}
+
+/// git's `run_update_command` for `SM_UPDATE_CHECKOUT`: `git checkout -q [-f]
+/// <oid>` inside the submodule, then git's success line. On failure git prints
+/// its own fatal and returns checkout's exit code, which the re-executed child
+/// reproduces here.
+fn run_checkout(
+    sm_dir: &std::path::Path,
+    oid: &ObjectId,
+    subforce: bool,
+    quiet: bool,
+    display: &str,
+) -> Result<u8> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("checkout").arg("-q");
+    if subforce {
+        cmd.arg("-f");
+    }
+    cmd.arg(oid.to_hex().to_string());
+    submodule_child_env(&mut cmd, sm_dir);
+    let status = cmd.status()?;
+    let code = child_code(status);
+    if code != 0 {
+        eprintln!(
+            "fatal: Unable to checkout '{}' in submodule path '{display}'",
+            oid.to_hex()
+        );
+        return Ok(code);
+    }
+    if !quiet {
+        println!("Submodule path '{display}': checked out '{}'", oid.to_hex());
+        std::io::stdout().flush()?;
+    }
+    Ok(0)
+}
+
+/// Point a re-executed child at the submodule worktree and clear the inherited
+/// repository env, git's `prepare_submodule_repo_env` for a `git_cmd` child.
+fn submodule_child_env(cmd: &mut std::process::Command, sm_dir: &std::path::Path) {
+    cmd.current_dir(sm_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_PREFIX");
+}
+
+/// A child process's exit code, mapping a signal death to git's `128 + signal`.
+fn child_code(status: std::process::ExitStatus) -> u8 {
+    if let Some(code) = status.code() {
+        return code as u8;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return (128 + signal) as u8;
+        }
+    }
+    128
+}
+
+/// Re-open a repository so a config change written to disk (e.g. by the `--init`
+/// registration pass) is reflected in the in-memory snapshot the update loop
+/// reads. gix caches config at open time, so the write is otherwise invisible.
+fn reopen(repo: &gix::Repository) -> Result<gix::Repository> {
+    let path = repo
+        .workdir()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| repo.git_dir().to_owned());
+    Ok(gix::open(path)?)
 }
 
 // ------------------------------------------------------------ set-branch ----

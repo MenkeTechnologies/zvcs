@@ -46,22 +46,25 @@
 //!     `usage_with_options` block (usage line plus a blank line) on stderr,
 //!     exit 129.
 //!
-//!   * **`status`** and **`init`** delegate to [`super::submodule`], which
-//!     implements them. `git submodule--helper status` and `git submodule
-//!     status` are the same C function upstream, and were confirmed to emit
-//!     identical bytes here (including the `../sm` display path from a
-//!     subdirectory).
+//!   * **`status`**, **`init`**, **`foreach`**, **`summary`** and
+//!     **`set-branch`** delegate to [`super::submodule`], which implements
+//!     them. Each of these helper subcommands is registered in
+//!     builtin/submodule--helper.c's `OPT_SUBCOMMAND` table against the very
+//!     same C function (`module_status`, `module_init`, `module_foreach`,
+//!     `module_summary`, `module_set_branch`) that `git submodule <name>`
+//!     dispatches to, so forwarding `[<name>, <tail>...]` into the porcelain
+//!     module reproduces the helper byte-for-byte. `status`/`init` were
+//!     confirmed to emit identical bytes here (including the `../sm` display
+//!     path from a subdirectory).
 //!
 //! Not ported — each bails naming the missing substrate rather than guessing:
 //!
 //!   * `clone`, `add`, `update` — need a working clone/fetch/checkout of the
 //!     submodule, i.e. transport plus worktree materialisation per submodule.
-//!   * `foreach` — runs an arbitrary shell command once per submodule.
-//!   * `sync`, `set-url`, `set-branch` — rewrite `.gitmodules` and the remote
-//!     urls inside each submodule.
+//!   * `sync`, `set-url` — rewrite `.gitmodules` and the remote urls inside
+//!     each submodule; [`super::submodule`] floors these too.
 //!   * `deinit`, `absorbgitdirs` — move or delete submodule git dirs and
 //!     worktrees.
-//!   * `summary` — the submodule log walk and its diff formatting.
 //!   * `push-check` — validates the push refspec against the submodule's
 //!     remote; needs the refspec/remote machinery.
 //!   * `create-branch` — `git branch` inside a submodule with `--track`
@@ -138,52 +141,46 @@ pub fn submodule__helper(args: &[String]) -> Result<ExitCode> {
     match name {
         "gitdir" => gitdir(tail),
         "get-default-remote" => get_default_remote(tail),
-        // Upstream these are literally the same functions `git submodule`
-        // dispatches to, so the porcelain module owns the implementation.
-        "status" | "init" => {
+        // Upstream these are literally the same C functions `git submodule`
+        // dispatches to (`module_status`, `module_init`, `module_foreach`,
+        // `module_summary`, `module_set_branch` — see the `OPT_SUBCOMMAND`
+        // table in builtin/submodule--helper.c), so the porcelain module owns
+        // the implementation and the helper forwards to it verbatim.
+        "status" | "init" | "foreach" | "summary" | "set-branch" => {
             let mut forwarded = Vec::with_capacity(tail.len() + 1);
             forwarded.push(name.to_string());
             forwarded.extend(tail.iter().cloned());
             super::submodule::submodule(&forwarded)
         }
         "clone" => bail!(
-            "unsupported subcommand \"clone\": cloning a submodule needs transport plus worktree checkout (ported: gitdir, get-default-remote, status, init)"
+            "unsupported subcommand \"clone\": cloning a submodule needs transport plus worktree checkout (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
         "add" => bail!(
-            "unsupported subcommand \"add\": needs a clone of the new submodule (ported: gitdir, get-default-remote, status, init)"
+            "unsupported subcommand \"add\": needs a clone of the new submodule (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
         "update" => bail!(
-            "unsupported subcommand \"update\": needs clone/fetch/checkout of submodules (ported: gitdir, get-default-remote, status, init)"
-        ),
-        "foreach" => bail!(
-            "unsupported subcommand \"foreach\": runs a shell command per submodule (ported: gitdir, get-default-remote, status, init)"
+            "unsupported subcommand \"update\": needs clone/fetch/checkout of submodules (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
         "sync" => bail!(
-            "unsupported subcommand \"sync\": rewrites remote urls inside submodules (ported: gitdir, get-default-remote, status, init)"
+            "unsupported subcommand \"sync\": rewrites remote urls inside submodules (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
         "deinit" => bail!(
-            "unsupported subcommand \"deinit\": removes submodule worktrees (ported: gitdir, get-default-remote, status, init)"
-        ),
-        "summary" => bail!(
-            "unsupported subcommand \"summary\": needs the submodule log walk (ported: gitdir, get-default-remote, status, init)"
+            "unsupported subcommand \"deinit\": removes submodule worktrees (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
         "push-check" => bail!(
-            "unsupported subcommand \"push-check\": needs the remote/refspec machinery (ported: gitdir, get-default-remote, status, init)"
+            "unsupported subcommand \"push-check\": needs the remote/refspec machinery (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
         "absorbgitdirs" => bail!(
-            "unsupported subcommand \"absorbgitdirs\": relocates submodule git dirs (ported: gitdir, get-default-remote, status, init)"
+            "unsupported subcommand \"absorbgitdirs\": relocates submodule git dirs (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
         "set-url" => bail!(
-            "unsupported subcommand \"set-url\": edits .gitmodules (ported: gitdir, get-default-remote, status, init)"
-        ),
-        "set-branch" => bail!(
-            "unsupported subcommand \"set-branch\": edits .gitmodules (ported: gitdir, get-default-remote, status, init)"
+            "unsupported subcommand \"set-url\": edits .gitmodules (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
         "create-branch" => bail!(
-            "unsupported subcommand \"create-branch\": creates a branch inside a submodule (ported: gitdir, get-default-remote, status, init)"
+            "unsupported subcommand \"create-branch\": creates a branch inside a submodule (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
         "migrate-gitdir-configs" => bail!(
-            "unsupported subcommand \"migrate-gitdir-configs\": the extensions.submodulePathConfig migration is not ported (ported: gitdir, get-default-remote, status, init)"
+            "unsupported subcommand \"migrate-gitdir-configs\": the extensions.submodulePathConfig migration is not ported (ported: gitdir, get-default-remote, status, init, foreach, summary, set-branch)"
         ),
         other => {
             eprintln!("error: unknown subcommand: `{other}'");

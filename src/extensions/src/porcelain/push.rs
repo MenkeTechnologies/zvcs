@@ -21,9 +21,15 @@ use super::push_proto::{self, Request};
 /// Implemented flags: `-f/--force`, `--force-with-lease[=…]`, `-n/--dry-run`,
 /// `-d/--delete`, `--all`/`--branches`, `--tags`, `-u/--set-upstream`,
 /// `--repo=<r>`, `--porcelain`, and the refspec forms `src`, `src:dst`, `+src:dst`,
-/// `:dst`. Flags whose semantics the send-pack scope cannot honor faithfully
+/// `:dst`. `--recurse-submodules=<check|on-demand|no|only>` is honored: `no` is a
+/// plain push, `check`/`on-demand`/`only` first detect submodules whose pushed
+/// commit is not yet on their remote (git's `find_unpushed_submodules`). When none
+/// need pushing these reduce to a plain push; `check` aborts if any do, and
+/// `on-demand`/`only` abort rather than silently skip the recursive submodule push
+/// (that transport recursion is not wired here — skipping it would be data-losing).
+/// Flags whose semantics the send-pack scope cannot honor faithfully
 /// (`--mirror`, `--signed=yes|if-asked`, `--atomic`, `-o/--push-option`,
-/// `--prune`, `--follow-tags`, `--recurse-submodules=on-demand|only`) are rejected
+/// `--prune`, `--follow-tags`) are rejected
 /// rather than silently ignored; inert or already-matched flags (`--thin`,
 /// `--receive-pack`, `-4/-6`, `--verify`, …) are accepted.
 pub fn push(args: &[String]) -> Result<ExitCode> {
@@ -77,14 +83,12 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             | "--thin" | "--no-thin" | "-4" | "--ipv4" | "-6" | "--ipv6"
             | "--force-if-includes" | "--no-force-if-includes" | "--verify" | "--no-verify"
             | "--no-signed" | "--no-atomic" | "--no-mirror" | "--no-prune"
-            | "--no-follow-tags" | "--no-recurse-submodules" => {}
+            | "--no-follow-tags" => {}
             "--receive-pack" | "--exec" => {
                 let _ = take_value(inline)?;
             }
-            "--recurse-submodules" => match take_value(inline)?.as_str() {
-                "no" | "check" => {}
-                other => bail!("--recurse-submodules={other} is not supported"),
-            },
+            "--recurse-submodules" => f.recurse = parse_recurse(&take_value(inline)?)?,
+            "--no-recurse-submodules" => f.recurse = Recurse::Off,
             // Rejected: cannot be honored faithfully by the send-pack scope, and
             // silently ignoring them would change the push's meaning.
             "--mirror" => bail!("--mirror is not supported"),
@@ -165,6 +169,57 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `--recurse-submodules` handling, ported from git's `transport_push`
+    // (transport.c): it runs after the pre-push hook and before the object upload.
+    // `no` is a plain push; the other modes first look for submodules whose pushed
+    // commit is not yet on their remote.
+    if f.recurse != Recurse::Off {
+        let needs = unpushed_submodules(&repo, &requests)?;
+        if !needs.is_empty() {
+            match f.recurse {
+                // git's `die_with_unpushed_submodules` (transport.c) — abort, no writes.
+                Recurse::Check => {
+                    eprintln!("The following submodule paths contain changes that can");
+                    eprintln!("not be found on any remote:");
+                    for p in &needs {
+                        eprintln!("  {p}");
+                    }
+                    eprintln!();
+                    eprintln!("Please try");
+                    eprintln!();
+                    eprintln!("\tgit push --recurse-submodules=on-demand");
+                    eprintln!();
+                    eprintln!("or cd to the path and use");
+                    eprintln!();
+                    eprintln!("\tgit push");
+                    eprintln!();
+                    eprintln!("to push them to a remote.");
+                    eprintln!();
+                    bail!("Aborting.");
+                }
+                // git's `push_unpushed_submodules` recursively runs `git push` inside
+                // each submodule (submodule.c). That transport recursion is not wired
+                // here; silently skipping it would upload a superproject commit whose
+                // submodule commits are absent from their remotes (data-losing), so
+                // abort and tell the user to push the submodules first.
+                Recurse::OnDemand | Recurse::Only => {
+                    let mode = if f.recurse == Recurse::Only { "only" } else { "on-demand" };
+                    let list = needs.join(", ");
+                    bail!(
+                        "--recurse-submodules={mode}: the submodule(s) [{list}] have commits not on their remote and must be pushed first (cd <path> && git push); recursive submodule push is not supported"
+                    );
+                }
+                Recurse::Off => unreachable!("guarded by the outer `!= Recurse::Off`"),
+            }
+        }
+        if f.recurse == Recurse::Only {
+            // git never pushes the superproject under `only` (transport.c skips
+            // `push_refs`); with no submodule to push, that leaves nothing to do.
+            eprintln!("Everything up-to-date");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+
     let outcome = push_proto::send_pack(&repo, &remote, &requests, f.dry_run)?;
 
     // A dry run performs no local writes; a real push advances the tracking refs
@@ -195,6 +250,50 @@ struct Flags {
     porcelain: bool,
     repo: Option<String>,
     lease: Lease,
+    recurse: Recurse,
+}
+
+/// `--recurse-submodules=<mode>` state. Ported from git's `RECURSE_SUBMODULES_*`
+/// (submodule.h) as resolved by `parse_push_recurse` (submodule-config.c).
+#[derive(Default, Clone, Copy, PartialEq)]
+enum Recurse {
+    /// `no` / `--no-recurse-submodules` — plain push, the flag is inert.
+    #[default]
+    Off,
+    /// `check` — abort if any pushed submodule commit is missing from its remote.
+    Check,
+    /// `on-demand` — push the needed submodules first, then the superproject.
+    OnDemand,
+    /// `only` — push the submodules only, never the superproject.
+    Only,
+}
+
+/// Parse a `--recurse-submodules` argument, a faithful port of git's
+/// `parse_push_recurse` (submodule-config.c): a boolean-true value is rejected
+/// (there is no plain "on" for pushing), boolean-false means `off`, and the named
+/// modes map through directly.
+fn parse_recurse(arg: &str) -> Result<Recurse> {
+    match maybe_bool(arg) {
+        Some(true) => bail!("bad recurse-submodules argument: {arg}"),
+        Some(false) => Ok(Recurse::Off),
+        None => match arg {
+            "on-demand" => Ok(Recurse::OnDemand),
+            "check" => Ok(Recurse::Check),
+            "only" => Ok(Recurse::Only),
+            _ => bail!("bad recurse-submodules argument: {arg}"),
+        },
+    }
+}
+
+/// git's `git_parse_maybe_bool`: recognized boolean spellings plus any integer
+/// (non-zero is true); anything else is `None` so the caller can treat it as a
+/// named value.
+fn maybe_bool(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" => Some(true),
+        "false" | "no" | "off" | "" => Some(false),
+        s => s.parse::<i64>().ok().map(|n| n != 0),
+    }
 }
 
 /// `--force-with-lease` state.
@@ -645,4 +744,111 @@ fn default_push_remote(repo: &gix::Repository) -> String {
         }
     }
     "origin".to_string()
+}
+
+/// The submodule paths whose commit referenced by the pushed superproject tips is
+/// present locally but not yet reachable from any of the submodule's remotes — the
+/// submodules `git push` would have to push first.
+///
+/// This ports git's `find_unpushed_submodules` / `submodule_needs_pushing`
+/// (submodule.c): for each active submodule, take the gitlink commit it is pinned
+/// to in each pushed superproject commit, and flag the submodule when that commit
+/// exists in the submodule's object store yet is not reachable from any
+/// `refs/remotes/*` ref (git's `rev-list <commit> --not --remotes`). A submodule
+/// that is not checked out, or has no remote-tracking refs, is treated as "no push
+/// needed" exactly as git does.
+///
+/// Scope note: git additionally walks the whole pushed commit range (`--not
+/// --remotes`) to collect submodule commits that appear only mid-range; here only
+/// the pushed ref tips are inspected, which is faithful for the ordinary
+/// tip-advancing push but does not catch a submodule bumped and then reverted
+/// within the pushed range.
+fn unpushed_submodules(repo: &gix::Repository, requests: &[Request]) -> Result<Vec<String>> {
+    let submodules = match repo.submodules()? {
+        Some(s) => s,
+        None => return Ok(Vec::new()),
+    };
+    // The superproject commit tips being pushed (git collects every non-null
+    // `ref->new_oid`).
+    let tips: Vec<ObjectId> = requests
+        .iter()
+        .filter(|r| !r.new.is_null())
+        .map(|r| r.new)
+        .collect();
+
+    let mut needs_pushing: Vec<String> = Vec::new();
+    for sub in submodules {
+        if !sub.is_active().unwrap_or(false) {
+            continue;
+        }
+        let path = match sub.path() {
+            Ok(p) => match p.to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        // The submodule's own repository. Absent (not checked out) => git considers
+        // it safe to skip (`submodule_has_commits` is 0).
+        let sub_repo = match sub.open() {
+            Ok(Some(r)) => r,
+            _ => continue,
+        };
+        // The submodule's remote-tracking refs (git's `--remotes`). With none, git
+        // reports "no push needed".
+        let remote_tips: Vec<ObjectId> = match sub_repo.references() {
+            Ok(platform) => match platform.remote_branches() {
+                Ok(iter) => iter
+                    .filter_map(|r| r.ok())
+                    .filter_map(|mut r| r.peel_to_id_in_place().ok().map(|id| id.detach()))
+                    .collect(),
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        if remote_tips.is_empty() {
+            continue;
+        }
+
+        let mut flagged = false;
+        for tip in &tips {
+            // The commit this submodule is pinned to in the pushed superproject tip.
+            let tree = match repo.find_commit(*tip) {
+                Ok(commit) => match commit.tree() {
+                    Ok(tree) => tree,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+            let gitlink = match tree.lookup_entry_by_path(std::path::Path::new(&path)) {
+                Ok(Some(entry)) if entry.mode().is_commit() => entry.object_id(),
+                _ => continue,
+            };
+            // Present in the submodule's object store? Absent => safe to skip.
+            if sub_repo.find_object(gitlink).is_err() {
+                continue;
+            }
+            // Already reachable from one of the submodule's remotes => nothing to push.
+            if !remote_tips.iter().any(|t| reachable(&sub_repo, gitlink, *t)) {
+                flagged = true;
+                break;
+            }
+        }
+        if flagged {
+            needs_pushing.push(path);
+        }
+    }
+    Ok(needs_pushing)
+}
+
+/// Whether `commit` is reachable from `tip` (git's `repo_in_merge_bases`): true
+/// when `commit` is a merge-base of `tip` with itself, i.e. an ancestor of `tip`.
+fn reachable(repo: &gix::Repository, commit: ObjectId, tip: ObjectId) -> bool {
+    if commit == tip {
+        return true;
+    }
+    match repo.merge_bases_many(tip, &[commit]) {
+        Ok(bases) => bases.iter().any(|b| b.detach() == commit),
+        Err(_) => false,
+    }
 }

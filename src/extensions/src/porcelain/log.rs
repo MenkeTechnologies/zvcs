@@ -138,6 +138,10 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // time), parsed with git's approxidate.
     let mut since: Option<i64> = None;
     let mut until: Option<i64> = None;
+    // Pickaxe: `-S<string>` (net occurrence count changed) / `-G<regex>` (a
+    // changed line matches). Both diff each commit against its first parent.
+    let mut pickaxe_s: Option<String> = None;
+    let mut pickaxe_g: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -357,6 +361,16 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         } else if a == "--until" || a == "--before" {
             i += 1;
             until = Some(approxidate(&args.get(i).cloned().unwrap_or_default()));
+        } else if a == "-S" {
+            i += 1;
+            pickaxe_s = Some(args.get(i).cloned().unwrap_or_default());
+        } else if let Some(v) = a.strip_prefix("-S") {
+            pickaxe_s = Some(v.to_string());
+        } else if a == "-G" {
+            i += 1;
+            pickaxe_g = Some(args.get(i).cloned().unwrap_or_default());
+        } else if let Some(v) = a.strip_prefix("-G") {
+            pickaxe_g = Some(v.to_string());
         } else if a.starts_with('-') {
             let body = &a[1..];
             if let Some(num) = body.strip_prefix('n') {
@@ -511,7 +525,14 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         all_match: grep_all_match,
         invert_grep: grep_invert,
     };
-    if !commit_filter.is_empty() || since.is_some() || until.is_some() {
+    // Pickaxe `-G<regex>` compiles once, in the same dialect as --grep.
+    let pickaxe_g_re = match &pickaxe_g {
+        Some(p) => Some(crate::revfilter::build_regex(p, grep_dialect, grep_ignore_case)?),
+        None => None,
+    };
+    let has_pickaxe = pickaxe_s.is_some() || pickaxe_g_re.is_some();
+
+    if !commit_filter.is_empty() || since.is_some() || until.is_some() || has_pickaxe {
         let mut kept = Vec::with_capacity(nodes.len());
         for node in nodes.into_iter() {
             let commit = repo.find_commit(node.id)?;
@@ -521,9 +542,17 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             if since.is_some_and(|s| seconds < s) || until.is_some_and(|u| seconds > u) {
                 continue;
             }
-            if commit_filter.matches(&commit)? {
-                kept.push(node);
+            if !commit_filter.matches(&commit)? {
+                continue;
             }
+            // Pickaxe: diff against the first parent and test the change text.
+            if has_pickaxe {
+                let patch = super::diff::commit_patch(&repo, &commit, node.parents.first().copied(), 0)?;
+                if !pickaxe_hit(&patch, pickaxe_s.as_deref(), pickaxe_g_re.as_ref()) {
+                    continue;
+                }
+            }
+            kept.push(node);
         }
         nodes = kept;
     }
@@ -1450,6 +1479,59 @@ fn expand_decoration(
 /// resolver so `%cr`/`%ar`/`--date=relative` honor `GIT_TEST_DATE_NOW` like git.
 fn now_secs() -> i64 {
     crate::date::now_seconds()
+}
+
+/// Whether a commit's patch satisfies the pickaxe filter, scanning only the
+/// added/removed content lines (git's `-S`/`-G` operate on the change text).
+///
+/// * `-S<string>`: the net occurrence count changed — occurrences on `+` lines
+///   minus occurrences on `-` lines is non-zero. This equals git's
+///   count-after − count-before, because only changed lines move the total.
+/// * `-G<regex>`: some added or removed line matches the regex.
+fn pickaxe_hit(
+    patch: &[u8],
+    needle: Option<&str>,
+    re: Option<&regex::bytes::Regex>,
+) -> bool {
+    let mut net: i64 = 0;
+    for line in patch.split(|&b| b == b'\n') {
+        // Only real content changes; skip the `+++`/`---` file headers.
+        let (sign, content) = match line.first() {
+            Some(b'+') if !line.starts_with(b"+++") => (1i64, &line[1..]),
+            Some(b'-') if !line.starts_with(b"---") => (-1i64, &line[1..]),
+            _ => continue,
+        };
+        if let Some(re) = re {
+            if re.is_match(content) {
+                return true;
+            }
+        }
+        if let Some(needle) = needle {
+            if !needle.is_empty() {
+                net += sign * count_occurrences(content, needle.as_bytes());
+            }
+        }
+    }
+    // `-G` reached here without matching (or was absent); `-S` hits on net != 0.
+    needle.is_some() && net != 0
+}
+
+/// Non-overlapping occurrences of `needle` in `hay`, matching git's pickaxe count.
+fn count_occurrences(hay: &[u8], needle: &[u8]) -> i64 {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return 0;
+    }
+    let mut n = 0i64;
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        if &hay[i..i + needle.len()] == needle {
+            n += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    n
 }
 
 /// git's approxidate for `--since`/`--until`: parse an absolute or relative date

@@ -31,6 +31,26 @@ impl Mode {
     }
 }
 
+/// Which config file a scoped read/write targets. `Default` keeps git's
+/// implicit behavior (merged read, repository-local write); the rest pin a
+/// single file selected by a `--local`/`--global`/`--system` flag.
+#[derive(PartialEq, Clone, Copy)]
+enum Scope {
+    Default,
+    Local,
+    Global,
+    System,
+}
+
+/// A resolved write destination: the file to rewrite, its config `Source` (so a
+/// freshly-created file carries the right provenance), and the coordinator lane
+/// key to serialize concurrent zvcs writers on.
+struct WriteTarget {
+    path: std::path::PathBuf,
+    source: Source,
+    lock_key: std::path::PathBuf,
+}
+
 /// Exit 129 — git's usage-error code — after emitting `error: <msg>` on stderr.
 ///
 /// `anyhow::bail!` would collapse to exit 1, so every usage diagnostic has to
@@ -59,11 +79,21 @@ fn is_synthetic(source: Source) -> bool {
 /// local, last-one-wins), matching stock `git config`'s default scope. Outside a
 /// repository a read still works, falling back to the global+system+env cascade
 /// exactly as stock `git config` does (so `config --list` / `config user.name`
-/// never require a repo). Writes target the repository-local file only
-/// (`<common_dir>/config`) and so still need a repo — attempting one without one
-/// fails with `not in a git directory`; the other scopes (`--global`,
-/// `--system`, `--worktree`, `--file`) are rejected with a precise error rather
-/// than silently mistargeted.
+/// never require a repo).
+///
+/// A scope flag narrows both reads and writes to a single file, like git:
+///   * `--local`  → the repository-local config (`<common_dir>/config`); requires
+///     a repo, else `--local can only be used inside a git repository`.
+///   * `--global` → the per-user config: `$XDG_CONFIG_HOME/git/config` and
+///     `~/.gitconfig` merged for reads; for writes, `~/.gitconfig` (git's target)
+///     unless only the XDG file exists, created if absent. Never needs a repo.
+///   * `--system` → `$(prefix)/etc/gitconfig` (honoring `GIT_CONFIG_SYSTEM` /
+///     `GIT_CONFIG_NOSYSTEM`). Never needs a repo.
+/// The default (no scope) write still targets the repository-local file and so
+/// still needs a repo — attempting one without one fails with `not in a git
+/// directory`. `--worktree` and `--file` are rejected with a precise error rather
+/// than silently mistargeted. Two scope flags at once → `only one config file at
+/// a time`.
 ///
 /// Supported forms:
 ///   * `git config <name>` / `--get <name>`   → last value, exit 1 if absent
@@ -83,6 +113,7 @@ fn is_synthetic(source: Source) -> bool {
 /// collapse to exit 1.
 pub fn config(args: &[String]) -> Result<ExitCode> {
     let mut mode = Mode::Auto;
+    let mut scope = Scope::Default;
     let mut name_only = false;
     let mut positional: Vec<&str> = Vec::new();
     // git config parses options with `PARSE_OPT_STOP_AT_NON_OPTION`: option
@@ -143,14 +174,30 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
+        // Scope flags (`OPT_CMDMODE` on `given_config_source.scope` in git): each
+        // pins the target file, and a second, different one is a usage error the
+        // moment it is parsed.
+        let new_scope = match a.as_str() {
+            "--local" => Some(Scope::Local),
+            "--global" => Some(Scope::Global),
+            "--system" => Some(Scope::System),
+            _ => None,
+        };
+        if let Some(new) = new_scope {
+            if scope != Scope::Default && scope != new {
+                return usage_error("only one config file at a time");
+            }
+            scope = new;
+            continue;
+        }
+
         match a.as_str() {
             "--name-only" => name_only = true,
-            // Default (repository-local) scope is the only writable target.
-            "--local" => {}
-            "--global" | "--system" | "--worktree" => {
-                bail!("only the default (local) scope is supported, got {a}")
-            }
-            "--file" => bail!("--file is not supported, only the repository-local config"),
+            // Per-worktree config needs `extensions.worktreeConfig`; not ported.
+            "--worktree" => bail!("--worktree scope is not supported"),
+            "--file" => bail!(
+                "--file is not supported, only the --local, --global and --system scopes"
+            ),
             other if other.starts_with('-') => bail!("unknown option {other}"),
             other => positional.push(other),
         }
@@ -184,23 +231,45 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     // here — only an attempted write without a repo is.
     let repo = gix::discover(".").ok();
 
-    // The config to READ from: the repo's fully-merged snapshot when inside one,
-    // else the global+system+env cascade that `git config` falls back to.
+    // The config to READ from, by scope. Owned holders live to the end of the
+    // function so `file` can borrow whichever one this scope selects:
+    //   * Default → the repo's fully-merged snapshot inside one, else the
+    //     global+system+env cascade git falls back to.
+    //   * Local   → the repository-local file alone (requires a repo).
+    //   * Global  → the XDG + `~/.gitconfig` pair, merged (last wins).
+    //   * System  → `$(prefix)/etc/gitconfig` alone.
     let snapshot = repo.as_ref().map(gix::Repository::config_snapshot);
-    let global;
-    let file: &gix::config::File = match snapshot.as_ref() {
-        Some(s) => s.plumbing(),
-        None => {
-            global = crate::config::global_config();
-            &global
+    let default_global;
+    let scoped;
+    let file: &gix::config::File = match scope {
+        Scope::Default => match snapshot.as_ref() {
+            Some(s) => s.plumbing(),
+            None => {
+                default_global = crate::config::global_config();
+                &default_global
+            }
+        },
+        Scope::Local => {
+            let repo = repo
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--local can only be used inside a git repository"))?;
+            let path = repo.common_dir().join("config");
+            scoped = load_or_empty(&path, Source::Local)?;
+            &scoped
+        }
+        Scope::Global => {
+            scoped = read_scope(&[Source::Git, Source::User]);
+            &scoped
+        }
+        Scope::System => {
+            scoped = read_scope(&[Source::System]);
+            &scoped
         }
     };
 
-    // Writes need the local scope; outside a repo they fail the way git does.
-    let for_write = || {
-        repo.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("not in a git directory"))
-    };
+    // Resolve the write destination for this scope, erroring like git when a
+    // repository is required but absent.
+    let write_target = || resolve_write_target(scope, repo.as_ref());
 
     match mode {
         Mode::List => list(file, name_only),
@@ -215,22 +284,24 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         // No action flag: one positional reads, two set the value.
         Mode::Auto if positional.len() == 1 => get(file, positional[0], false),
         Mode::Auto if positional.len() == 2 => {
-            write_local(for_write()?, positional[0], positional[1], WriteOp::Set)
+            write_scoped(&write_target()?, positional[0], positional[1], WriteOp::Set)
         }
         // `<name> <value> <value-pattern>` rewrites the values whose text matches
         // the POSIX ERE, or adds a new value when none match.
-        Mode::Auto => set_with_value_pattern(for_write()?, positional[0], positional[1], positional[2]),
+        Mode::Auto => {
+            set_with_value_pattern(&write_target()?, positional[0], positional[1], positional[2])
+        }
         Mode::Add => {
             let (name, value) = name_and_value(&positional)?;
-            write_local(for_write()?, name, value, WriteOp::Add)
+            write_scoped(&write_target()?, name, value, WriteOp::Add)
         }
         Mode::Unset => {
             let name = one_name(&positional)?;
-            write_local(for_write()?, name, "", WriteOp::Unset)
+            write_scoped(&write_target()?, name, "", WriteOp::Unset)
         }
         Mode::UnsetAll => {
             let name = one_name(&positional)?;
-            write_local(for_write()?, name, "", WriteOp::UnsetAll)
+            write_scoped(&write_target()?, name, "", WriteOp::UnsetAll)
         }
     }
 }
@@ -347,18 +418,103 @@ enum WriteOp {
     UnsetAll,
 }
 
-/// Mutate the repository-local config file (`<common_dir>/config`) and persist
-/// it atomically. Serialized through the repo coordinator so a concurrent
-/// zvcs writer can't interleave a partial rewrite.
-fn write_local(repo: &gix::Repository, name: &str, value: &str, op: WriteOp) -> Result<ExitCode> {
+/// Load the config file at `path` for `source`, or an empty file carrying that
+/// source/path metadata when it does not exist yet (git creates a fresh
+/// `~/.gitconfig` on first `--global` write). Only a missing file is treated as
+/// empty; a malformed existing file still errors, as git's parser does.
+fn load_or_empty(path: &std::path::Path, source: Source) -> Result<ConfigFile> {
+    if path.exists() {
+        Ok(ConfigFile::from_path_no_includes(path.to_path_buf(), source)?)
+    } else {
+        Ok(gix::config::File::new(
+            gix::config::file::Metadata::from(source).at(path),
+        ))
+    }
+}
+
+/// The read file for a whole scope: every existing file among `sources`, merged
+/// in order so the last (highest-precedence) one wins — `~/.gitconfig` over the
+/// XDG file for `--global`, for instance. Missing files are skipped.
+fn read_scope(sources: &[Source]) -> ConfigFile {
+    let mut env = |k: &str| std::env::var_os(k);
+    let mut acc = gix::config::File::new(gix::config::file::Metadata::default());
+    for &source in sources {
+        if let Some(path) = source.storage_location(&mut env) {
+            if path.exists() {
+                if let Ok(f) = ConfigFile::from_path_no_includes(path, source) {
+                    let _ = acc.append(f);
+                }
+            }
+        }
+    }
+    acc
+}
+
+/// Resolve the single file a scoped write targets, mirroring git's
+/// `given_config_source` resolution.
+fn resolve_write_target(scope: Scope, repo: Option<&gix::Repository>) -> Result<WriteTarget> {
+    match scope {
+        Scope::Default | Scope::Local => {
+            let repo = repo.ok_or_else(|| match scope {
+                Scope::Local => {
+                    anyhow::anyhow!("--local can only be used inside a git repository")
+                }
+                _ => anyhow::anyhow!("not in a git directory"),
+            })?;
+            Ok(WriteTarget {
+                path: repo.common_dir().join("config"),
+                source: Source::Local,
+                lock_key: repo.git_dir().to_path_buf(),
+            })
+        }
+        Scope::Global => {
+            let mut env = |k: &str| std::env::var_os(k);
+            let user = Source::User.storage_location(&mut env); // ~/.gitconfig
+            let xdg = Source::Git.storage_location(&mut env); // $XDG_CONFIG_HOME/git/config
+            // git writes `~/.gitconfig` unless it is absent while the XDG file exists.
+            let (path, source) = match (user, xdg) {
+                (Some(u), Some(x)) if !u.exists() && x.exists() => (x, Source::Git),
+                (Some(u), _) => (u, Source::User),
+                (None, Some(x)) => (x, Source::Git),
+                (None, None) => bail!("could not determine the global config path (HOME unset)"),
+            };
+            Ok(WriteTarget {
+                lock_key: path.clone(),
+                path,
+                source,
+            })
+        }
+        Scope::System => {
+            let mut env = |k: &str| std::env::var_os(k);
+            let path = Source::System
+                .storage_location(&mut env)
+                .ok_or_else(|| anyhow::anyhow!("the system config is unavailable"))?;
+            Ok(WriteTarget {
+                lock_key: path.clone(),
+                path,
+                source: Source::System,
+            })
+        }
+    }
+}
+
+/// Mutate the scoped config file (`<common_dir>/config` for `--local`,
+/// `~/.gitconfig` for `--global`, …) and persist it atomically. Serialized
+/// through the coordinator (keyed on the target file) so a concurrent zvcs writer
+/// can't interleave a partial rewrite; the parent directory is created for a
+/// first-time global/system write.
+fn write_scoped(target: &WriteTarget, name: &str, value: &str, op: WriteOp) -> Result<ExitCode> {
     let key = parse_key(name)?;
     let section_lc = key.section_name.to_lowercase();
     let value_lc = key.value_name.to_lowercase();
 
-    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
 
-    let path = repo.common_dir().join("config");
-    let mut file = ConfigFile::from_path_no_includes(path.clone(), Source::Local)?;
+    if let Some(parent) = target.path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let path = &target.path;
+    let mut file = load_or_empty(path, target.source)?;
 
     match op {
         WriteOp::Set => {
@@ -389,16 +545,16 @@ fn write_local(repo: &gix::Repository, name: &str, value: &str, op: WriteOp) -> 
         }
     }
 
-    persist(&path, &file)?;
+    persist(path, &file)?;
     Ok(ExitCode::SUCCESS)
 }
 
 /// `git config <name> <value> <value-pattern>` — the value-pattern set form.
 ///
-/// Among the existing values of `<name>` in the repository-local file, the
-/// POSIX ERE `<value-pattern>` selects which are rewritten to `<value>`
-/// (a leading `!` inverts the match, matching against the value text as bytes,
-/// unanchored — git's `regexec`). The outcomes mirror stock git exactly:
+/// Among the existing values of `<name>` in the scoped file, the POSIX ERE
+/// `<value-pattern>` selects which are rewritten to `<value>` (a leading `!`
+/// inverts the match, matching against the value text as bytes, unanchored —
+/// git's `regexec`). The outcomes mirror stock git exactly:
 ///
 ///   * no value matches   → append `<value>` as a new line (exit 0)
 ///   * exactly one matches → rewrite that value in place (exit 0)
@@ -407,7 +563,7 @@ fn write_local(repo: &gix::Repository, name: &str, value: &str, op: WriteOp) -> 
 ///                           leaves the file untouched, and exits 5
 ///   * invalid ERE         → `error: invalid pattern: <pattern>`, exit 6
 fn set_with_value_pattern(
-    repo: &gix::Repository,
+    target: &WriteTarget,
     name: &str,
     value: &str,
     value_pattern: &str,
@@ -431,10 +587,13 @@ fn set_with_value_pattern(
         }
     };
 
-    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
 
-    let path = repo.common_dir().join("config");
-    let mut file = ConfigFile::from_path_no_includes(path.clone(), Source::Local)?;
+    if let Some(parent) = target.path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let path = &target.path;
+    let mut file = load_or_empty(path, target.source)?;
 
     // Existing values of the key in this file, in order of occurrence. An absent
     // key yields an empty list, which routes to the append branch below.
@@ -473,7 +632,7 @@ fn set_with_value_pattern(
         }
     }
 
-    persist(&path, &file)?;
+    persist(path, &file)?;
     Ok(ExitCode::SUCCESS)
 }
 

@@ -1497,7 +1497,7 @@ fn now_secs() -> i64 {
 ///   minus occurrences on `-` lines is non-zero. This equals git's
 ///   count-after − count-before, because only changed lines move the total.
 /// * `-G<regex>`: some added or removed line matches the regex.
-fn pickaxe_hit(
+pub(crate) fn pickaxe_hit(
     patch: &[u8],
     needle: Option<&str>,
     re: Option<&regex::bytes::Regex>,

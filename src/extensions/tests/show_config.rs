@@ -263,6 +263,32 @@ fn show_first_parent_on_merge_matches_git() {
 }
 
 #[test]
+fn show_pickaxe_filters_files_like_git() {
+    // Regression: `git show -G<re>` / `-S<str>` was rejected, breaking git-fuzzy's
+    // in-commit search (`show --first-parent <ref> -G <query> --name-only`). The
+    // pickaxe filters per file: a commit that changed several files shows only the
+    // ones whose own diff matches. Verified byte-for-byte against real git.
+    let (repo, home) = fixture("pickaxe");
+    // Add a second commit touching two files with distinct content.
+    std::fs::write(repo.join("a"), "base\nALPHA\n").unwrap();
+    std::fs::write(repo.join("b"), "base\nBETA\n").unwrap();
+    git(&repo, &["add", "a", "b"]);
+    git(&repo, &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "two", "--date", DATE]);
+    let c = rev(&repo, "HEAD");
+
+    // -G matches only `a` (ALPHA); -S matches only `b` (BETA); a miss shows nothing.
+    assert_matches_git(&repo, &home, &[&c, "-G", "ALPHA", "--name-only", "--format="]);
+    assert_matches_git(&repo, &home, &[&c, "-S", "BETA", "--name-only", "--format="]);
+    assert_matches_git(&repo, &home, &[&c, "-G", "ALPHA", "--format="]); // patch mode
+    assert_matches_git(&repo, &home, &[&c, "-G", "zzznope", "--name-only", "--format="]);
+    // Attached form and git-fuzzy's exact --first-parent template.
+    assert_matches_git(&repo, &home, &[&c, "-GALPHA", "--name-only", "--format="]);
+    assert_matches_git(&repo, &home, &["--first-parent", &c, "-G", "ALPHA", "--name-only", "--", "a"]);
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
 fn show_date_invalid_is_fatal() {
     let (repo, home) = fixture("baddate");
     git(&repo, &["config", "log.date", "bogus"]);

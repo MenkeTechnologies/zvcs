@@ -70,6 +70,13 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut cli_date: Option<DateMode> = None;
     let mut force_root = false;
     let mut first_parent = false;
+    // Pickaxe search (`-S<string>` / `-G<regex>`), which limits the shown diff to
+    // the file pairs whose change text matches — git-fuzzy's in-commit search uses
+    // `-G <query>`. `pending_pickaxe` holds the kind while the separate value form
+    // (`-G` then the query in the next argv token) waits for that value.
+    let mut pickaxe_s: Option<String> = None;
+    let mut pickaxe_g: Option<String> = None;
+    let mut pending_pickaxe: Option<char> = None;
 
     for a in args {
         let s = a.as_str();
@@ -79,7 +86,16 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             pathspecs.push(a.as_bytes().to_vec());
             continue;
         }
+        if let Some(kind) = pending_pickaxe.take() {
+            match kind {
+                'S' => pickaxe_s = Some(a.clone()),
+                _ => pickaxe_g = Some(a.clone()),
+            }
+            continue;
+        }
         match s {
+            "-S" => pending_pickaxe = Some('S'),
+            "-G" => pending_pickaxe = Some('G'),
             "--" => after_dashdash = true,
             "-p" | "-u" | "--patch" => formats.patch = true,
             // `-s` resets the diff output format rather than adding to it, which is
@@ -118,6 +134,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                         Some(p) => pretty = p,
                         None => return Ok(fatal(&format!("invalid --pretty format: {spec}\n"))),
                     }
+                } else if let Some(v) = s.strip_prefix("-S") {
+                    pickaxe_s = Some(v.to_string());
+                } else if let Some(v) = s.strip_prefix("-G") {
+                    pickaxe_g = Some(v.to_string());
                 } else if s.starts_with('-') {
                     bail!("unsupported option {s}");
                 } else {
@@ -221,6 +241,19 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         }
     };
 
+    // Compile `-G` once, in git's default (basic-regex) dialect, matching `git log`.
+    let pickaxe = Pickaxe {
+        s: pickaxe_s,
+        g: match &pickaxe_g {
+            Some(p) => Some(crate::revfilter::build_regex(
+                p,
+                crate::revfilter::Dialect::Basic,
+                false,
+            )?),
+            None => None,
+        },
+    };
+
     let mut out: Vec<u8> = Vec::new();
     // git marks each commit it prints as SHOWN, so a commit named twice (or reached
     // twice by a walk) is printed once. Blobs, trees, and tags are not deduplicated.
@@ -234,12 +267,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         for info in walk {
             let id = info?.id;
             let disp = DisplayOpts { abbrev_commit, date_mode, show_root, first_parent };
-            show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &pathspecs, &disp, &mut shown)?;
+            show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown)?;
         }
     } else {
         for (spec, id) in &plain {
             let disp = DisplayOpts { abbrev_commit, date_mode, show_root, first_parent };
-            show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &disp, &mut shown)?;
+            show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown)?;
         }
     }
 
@@ -476,6 +509,23 @@ struct DisplayOpts {
     first_parent: bool,
 }
 
+/// Pickaxe search (`-S`/`-G`): limits the shown diff to file pairs whose change
+/// text matches, as git's `diffcore-pickaxe` does. Filtering is per file, so a
+/// commit that touched several files shows only the ones that match.
+struct Pickaxe {
+    /// `-S<string>`: a filepair hits when the string's count differs between the
+    /// two sides (a net add or remove).
+    s: Option<String>,
+    /// `-G<regex>`: a filepair hits when any added/removed line matches.
+    g: Option<regex::bytes::Regex>,
+}
+
+impl Pickaxe {
+    fn active(&self) -> bool {
+        self.s.is_some() || self.g.is_some()
+    }
+}
+
 /// Render the object `id` (named `spec` on the command line), peeling annotated
 /// tags to their target after printing the tag header.
 fn show_one(
@@ -487,6 +537,7 @@ fn show_one(
     selection: Selection,
     pathspecs: &[Vec<u8>],
     disp: &DisplayOpts,
+    pickaxe: &Pickaxe,
     shown: &mut Vec<ObjectId>,
 ) -> Result<()> {
     let mut obj = repo.find_object(id)?;
@@ -507,7 +558,7 @@ fn show_one(
                 }
                 shown.push(obj.id);
                 let commit = obj.try_into_commit()?;
-                show_commit(repo, out, &commit, pretty, selection, pathspecs, disp)?;
+                show_commit(repo, out, &commit, pretty, selection, pathspecs, disp, pickaxe)?;
                 break;
             }
             Kind::Tag => {
@@ -577,6 +628,7 @@ fn show_commit(
     selection: Selection,
     pathspecs: &[Vec<u8>],
     disp: &DisplayOpts,
+    pickaxe: &Pickaxe,
 ) -> Result<()> {
     let parents: Vec<_> = commit.parent_ids().collect();
     let is_merge = parents.len() > 1;
@@ -653,6 +705,17 @@ fn show_commit(
     let mut files = collect_changes(repo, commit, parents.first().map(|p| p.detach()))?;
     if !pathspecs.is_empty() {
         files.retain(|f| matches_pathspec(&f.path, pathspecs));
+    }
+    // `-S`/`-G` (pickaxe): keep only files whose own change text matches, rendering
+    // each file's patch and testing it exactly as `git log` tests a commit's patch.
+    // Applies to the first-parent / non-merge path; a merge's combined `--cc` diff
+    // (never paired with pickaxe by git-fuzzy) is left unfiltered.
+    if pickaxe.active() && !(is_merge && !disp.first_parent) {
+        files.retain(|f| {
+            let mut buf = Vec::new();
+            emit_patch(repo, &mut buf, f).is_ok()
+                && super::log::pickaxe_hit(&buf, pickaxe.s.as_deref(), pickaxe.g.as_ref())
+        });
     }
 
     if is_merge && !disp.first_parent {

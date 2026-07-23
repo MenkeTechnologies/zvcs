@@ -12,3 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# Wildcard matching of `section.<name>.key` config variables against the source
+# when generating the port report's config-support matrix.
+regex = "1"

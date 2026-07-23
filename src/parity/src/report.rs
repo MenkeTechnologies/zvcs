@@ -293,6 +293,7 @@ pub fn emit_html(
     have: &[String],
     missing: &[String],
     opts: &BTreeMap<String, CmdOpts>,
+    cfg: &BTreeMap<String, bool>,
 ) -> Result<()> {
     let git_v = esc(&git_version());
     let date = esc(&report_date());
@@ -309,6 +310,8 @@ pub fn emit_html(
     let mismatches = scored - matched;
     let corpus_cmds = rep.by_cmd.len();
     let parity = pct_str(matched, scored);
+    let cfg_total = cfg.len();
+    let cfg_ok = cfg.values().filter(|v| **v).count();
 
     // Commands dispatched but not yet exercised by any corpus case — the honest
     // limit of the behavioral number: parity is 100% *of what was tested*, and
@@ -443,6 +446,7 @@ pub fn emit_html(
     let _ = write!(html, "<div class=\"stat-card\"><div class=\"stat-val ok\">{parity}</div><div class=\"stat-label\">Parity ({matched}/{scored})</div></div>\n");
     let _ = write!(html, "<div class=\"stat-card\"><div class=\"stat-val {mm}\">{mismatches}</div><div class=\"stat-label\">Mismatches</div></div>\n", mm = if mismatches == 0 { "ok" } else { "bad" });
     let _ = write!(html, "<div class=\"stat-card\"><div class=\"stat-val accent\">{corpus_cmds}</div><div class=\"stat-label\">Cmds in corpus</div></div>\n");
+    let _ = write!(html, "<div class=\"stat-card\"><div class=\"stat-val\">{cfg_ok}/{cfg_total}</div><div class=\"stat-label\">Config vars ref'd</div></div>\n");
     html.push_str("</div>\n");
 
     // Per-command parity table (HUD .file-table).
@@ -511,6 +515,66 @@ pub fn emit_html(
                 arg = if r.takes_arg { "&lt;arg&gt;" } else { "" },
                 cls = if r.supported { "ok" } else { "bad" },
                 mark = if r.supported { "✓" } else { "✗" },
+            );
+        }
+        html.push_str("</tbody></table></details>\n");
+    }
+    html.push_str("</div>\n");
+
+    // Config-variable support matrix, grouped by section.
+    let cfg_pct = if cfg_total == 0 {
+        0.0
+    } else {
+        100.0 * cfg_ok as f64 / cfg_total as f64
+    };
+    // Group keys by their top-level section (the part before the first dot).
+    let mut sections: BTreeMap<&str, Vec<(&String, bool)>> = BTreeMap::new();
+    for (k, v) in cfg {
+        let sec = k.split('.').next().unwrap_or(k);
+        sections.entry(sec).or_default().push((k, *v));
+    }
+
+    html.push_str("<hr class=\"section-rule\">\n");
+    let _ = write!(
+        html,
+        "<h3 class=\"section-h\">Config variable support — {cfg_ok}/{cfg_total} referenced in source ({cfg_pct:.0}%)</h3>\n"
+    );
+    html.push_str(
+        "<p class=\"muted\">Every variable from stock <code>git help --config</code>, checked against the \
+         source the <code>git</code> binary is built from — the extensions crate plus the vendored \
+         gitoxide. <span class=\"yes\">✓</span> the key is referenced (read/honored somewhere), \
+         <span class=\"no\">✗</span> no reference found. This is source evidence, not a behavioral \
+         guarantee, and it undercounts keys gitoxide reaches through split section/name access rather \
+         than a dotted literal. Grouped by section; click to expand.</p>\n",
+    );
+    html.push_str("<div class=\"controls\"><input id=\"q3\" type=\"search\" placeholder=\"// filter config sections + keys…\" autocomplete=\"off\" spellcheck=\"false\"><span id=\"cnt3\"></span></div>\n");
+    html.push_str("<div id=\"cfgmatrix\">\n");
+    for (sec, mut rows) in sections {
+        rows.sort_by(|a, b| a.0.cmp(b.0));
+        let ok = rows.iter().filter(|(_, v)| *v).count();
+        let tot = rows.len();
+        let all = ok == tot;
+        let keys_h: String = rows
+            .iter()
+            .map(|(k, _)| k.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = write!(
+            html,
+            "<details class=\"optcmd\" data-h=\"{sec} {keys}\"><summary><span class=\"oc-cmd\">{sec}</span>\
+             <span class=\"oc-tally {cls}\">{ok}/{tot}</span></summary>\n\
+             <table class=\"file-table\"><thead><tr><th>variable</th><th>zvcs</th></tr></thead><tbody>\n",
+            sec = esc(sec),
+            keys = esc(&keys_h),
+            cls = if all { "ok" } else { "part" },
+        );
+        for (k, v) in &rows {
+            let _ = write!(
+                html,
+                "<tr><td class=\"cmd\">{key}</td><td class=\"{cls}\">{mark}</td></tr>",
+                key = esc(k),
+                cls = if *v { "ok" } else { "bad" },
+                mark = if *v { "✓" } else { "✗" },
             );
         }
         html.push_str("</tbody></table></details>\n");
@@ -719,6 +783,104 @@ pub fn option_matrix(
     out.into_inner().unwrap()
 }
 
+/// The full list of git configuration variables, straight from
+/// `git help --config` (camelCase `section.key` / `section.<name>.key`).
+/// Derived at runtime so it tracks the installed git, never a hand list.
+pub fn git_config_keys() -> Vec<String> {
+    let out = match Command::new("git").args(["help", "--config"]).output() {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut keys: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            l.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+                && l.contains('.')
+                && !l.chars().any(char::is_whitespace)
+        })
+        .map(str::to_string)
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// True iff `key` (already lowercased) occurs in `hay` bounded by non-identifier
+/// bytes on both sides — so `core.editor` does not match inside
+/// `core.editorconfig`, which would overcount support.
+fn referenced_flat(hay: &str, key: &str) -> bool {
+    let bytes = hay.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    hay.match_indices(key).any(|(i, _)| {
+        let before_ok = i == 0 || !is_ident(bytes[i - 1]);
+        let end = i + key.len();
+        let after_ok = end >= bytes.len() || !is_ident(bytes[end]);
+        before_ok && after_ok
+    })
+}
+
+/// For every git config variable, whether it is referenced anywhere in the
+/// source the `git` binary is built from — the extensions crate plus the
+/// vendored gitoxide. A referenced key is read/honored somewhere; this is source
+/// evidence, not a behavioral guarantee, and it undercounts keys gitoxide reaches
+/// through split section/subsection/name access rather than a dotted literal.
+///
+/// The whole tree is slurped once into a lowercased haystack; flat keys use a
+/// boundary-checked substring test, `section.<name>.key` keys a wildcard regex.
+pub fn config_support(keys: &[String], src_roots: &[std::path::PathBuf]) -> BTreeMap<String, bool> {
+    let mut hay = String::new();
+    let mut stack: Vec<std::path::PathBuf> = src_roots.to_vec();
+    while let Some(p) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&p) else { continue };
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                // Skip the files that *enumerate* config keys for documentation or
+                // a dump — `git help --config` (help.rs) and `git bugreport`
+                // (bugreport.rs) both embed the full key list, which would mark
+                // every variable "referenced" and defeat the whole measurement.
+                // We want keys the code READS to change behavior, not lists it prints.
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name == "help.rs" || name == "bugreport.rs" {
+                    continue;
+                }
+                if let Ok(s) = std::fs::read_to_string(&path) {
+                    hay.push_str(&s.to_lowercase());
+                    hay.push('\n');
+                }
+            }
+        }
+    }
+
+    let ph = regex::Regex::new(r"<[^>]*>").unwrap();
+    let mut out = BTreeMap::new();
+    for key in keys {
+        let lower = key.to_lowercase();
+        let supported = if lower.contains('<') {
+            // Replace each `<name>` placeholder with a non-dot identifier run.
+            let mut pat = String::new();
+            let mut last = 0;
+            for m in ph.find_iter(&lower) {
+                pat.push_str(&regex::escape(&lower[last..m.start()]));
+                pat.push_str(r#"[^.\s"'/]+"#);
+                last = m.end();
+            }
+            pat.push_str(&regex::escape(&lower[last..]));
+            regex::Regex::new(&pat)
+                .map(|re| re.is_match(&hay))
+                .unwrap_or(false)
+        } else {
+            referenced_flat(&hay, &lower)
+        };
+        out.insert(key.clone(), supported);
+    }
+    out
+}
+
 /// Page-specific supplemental styles layered on the shared HUD chrome
 /// (`hud-static.css` provides the color-scheme variables, the `.app` shell, the
 /// toolbar buttons, and the scheme-strip; these classes are the report's own
@@ -784,11 +946,14 @@ const REPORT_JS: &str = r#"
   function upd(){var t=(q.value||'').toLowerCase().trim(),n=0;rows.forEach(function(r){var h=r.getAttribute('data-h')||'';var show=!t||h.indexOf(t)>=0;r.style.display=show?'':'none';if(show)n++;});cnt.textContent=n+' / '+rows.length;}
   q.addEventListener('input',upd);upd();
  }
- var q2=document.getElementById('q2'),cnt2=document.getElementById('cnt2'),mx=document.getElementById('optmatrix');
- if(q2&&mx){
+ function bindDetails(qid,cntid,wrapid){
+  var q=document.getElementById(qid),cnt=document.getElementById(cntid),mx=document.getElementById(wrapid);
+  if(!q||!mx)return;
   var cards=[].slice.call(mx.querySelectorAll('.optcmd'));
-  function upd2(){var t=(q2.value||'').toLowerCase().trim(),n=0;cards.forEach(function(c){var h=c.getAttribute('data-h')||'';var show=!t||h.indexOf(t)>=0;c.style.display=show?'':'none';if(show)n++;if(t&&show)c.open=true;if(!t)c.open=false;});cnt2.textContent=n+' / '+cards.length;}
-  q2.addEventListener('input',upd2);upd2();
+  function upd(){var t=(q.value||'').toLowerCase().trim(),n=0;cards.forEach(function(c){var h=c.getAttribute('data-h')||'';var show=!t||h.indexOf(t)>=0;c.style.display=show?'':'none';if(show)n++;if(t&&show)c.open=true;if(!t)c.open=false;});cnt.textContent=n+' / '+cards.length;}
+  q.addEventListener('input',upd);upd();
  }
+ bindDetails('q2','cnt2','optmatrix');
+ bindDetails('q3','cnt3','cfgmatrix');
 })();
 "#;

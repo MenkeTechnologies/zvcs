@@ -218,6 +218,16 @@ fn real_main() -> Result<ExitCode> {
         let opt_root = root.join("optprobe");
         std::fs::create_dir_all(&opt_root)?;
         let opts = report::option_matrix(&zvcs_bin, &templates.home, &have, &templates, &opt_root);
+
+        // Config-variable support: scan the source the `git` binary is built from
+        // (the extensions crate + vendored gitoxide) for every `git help --config`
+        // key. Paths are relative to this crate at compile time.
+        let cfg_keys = report::git_config_keys();
+        eprintln!("scanning config support ({} variables)…", cfg_keys.len());
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src_roots = vec![base.join("../extensions/src"), base.join("../ported")];
+        let cfg = report::config_support(&cfg_keys, &src_roots);
+
         report::emit_html(
             std::path::Path::new(path),
             &rep,
@@ -225,6 +235,7 @@ fn real_main() -> Result<ExitCode> {
             &have,
             &missing,
             &opts,
+            &cfg,
         )?;
         eprintln!("wrote {path}");
     }

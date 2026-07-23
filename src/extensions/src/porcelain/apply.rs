@@ -13,6 +13,8 @@
 //!   * `git apply <patch>...` / stdin (no operand, or `-`)
 //!   * `-p<n>`, `-R`/`--reverse`, `--check`, `--numstat`, `--stat`, `--summary`,
 //!     `-z`, `--apply`, `--allow-empty`, `--unidiff-zero`, `--no-add`,
+//!     `--index`/`--cached` (stage the result into the index; `--cached` skips the
+//!     worktree write — see below),
 //!     `--exclude=<glob>`/`--include=<glob>` (path filtering via wildmatch),
 //!     `-v`/`--verbose` (the `Checking patch`/`Applied patch` progress on
 //!     stderr), `--reject` (partial apply, `*.rej` files, exit 1),
@@ -44,9 +46,29 @@
 //! report what git reports (`can't open patch` / `No valid patches in input`,
 //! exit 128) rather than a premature unsupported-flag error.
 //!
+//! `--index`/`--cached` update the index (`git apply`'s `update_index` path,
+//! served natively through the vendored `gix-index` writer, so tools on PATH — and
+//! `git am`, which re-execs `apply --index` — see the same staged state). Both read
+//! each file's pre-image from the index blob, exactly as git does when
+//! `check_index` is set (`load_patch_target`). After the shared apply engine
+//! computes a file's new content, the new blob is written to the odb and the index
+//! entry for that path is added (creation), removed (deletion), or replaced with
+//! the new oid/mode (modification, rename — remove old path, add new path). The
+//! whole index is written once, under the repo lock. `--index` additionally writes
+//! the worktree (the engine's usual write) and, matching git's `verify_index_match`
+//! gate, refuses (`does not match index`) when the worktree file's content differs
+//! from the index blob; git would instead check the file out when it is missing,
+//! which this port floors by refusing rather than silently diverging. `--cached`
+//! skips every worktree read, check, and write. Not implemented under these
+//! (they still `bail!`/floor honestly): binary patches to the index (the binary
+//! path bails before any index touch), `--reject` combined with `--index`/`--cached`,
+//! and the executable-bit of a plain modification whose diff carries no `index`
+//! mode line and whose pre-image is not in the index.
+//!
 //! Not implemented — these `bail!` rather than produce plausible-looking wrong
-//! results: `--index`/`--cached`/`-N`/`--intent-to-add` (index mutation, needs a
-//! `gix-index` writer), `-3`/`--3way` and `--ours`/`--theirs`/`--union` (3-way
+//! results: `-N`/`--intent-to-add` (index mutation with the intent-to-add flag and
+//! empty-blob placeholder, git's `ita_only` path), `-3`/`--3way` and
+//! `--ours`/`--theirs`/`--union` (3-way
 //! merge against the object store), `--build-fake-ancestor` (writes a temporary
 //! index), `-C<n>` (fuzzy context reduction), the whitespace-fixing
 //! `--whitespace` actions (`fix`/`strip`/`error`/`error-all`, byte-altering),
@@ -73,8 +95,10 @@
 //! usage errors are not silenced.
 
 use anyhow::{bail, Result};
-use gix::bstr::ByteSlice;
-use std::collections::HashMap;
+use gix::bstr::{BString, ByteSlice};
+use gix::hash::ObjectId;
+use gix::index::entry::{Flags, Mode as IndexMode, Stat};
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -82,6 +106,7 @@ use std::process::ExitCode;
 /// The flag set this port honours, quoted verbatim in the unsupported-flag error.
 const PORTED: &str = "-p<n>, -R/--reverse, --check, --numstat, --stat, --summary, \
                       -z, --apply, --allow-empty, --unidiff-zero, --no-add, \
+                      --index, --cached, \
                       --exclude, --include, -v/--verbose, --reject, --binary, \
                       -q/--quiet, --whitespace=warn|nowarn, --recount, \
                       --directory=<root>";
@@ -205,6 +230,8 @@ struct Opts {
     reject: bool,               // --reject: apply what fits, write *.rej for the rest
     quiet: bool,                // -q/--quiet: silence `error:` diagnostics
     recount: bool,              // --recount: derive hunk sizes from the body, not the header
+    index: bool,                // --index: apply to the worktree AND the index
+    cached: bool,               // --cached: apply to the index only (no worktree touch)
     directory: Option<String>,  // --directory=<root>: prepend <root> to every path
     limits: Vec<(bool, String)>, // --include/--exclude rules in argv order (true = include)
     has_include: bool,          // whether any rule is an --include
@@ -229,6 +256,8 @@ impl Default for Opts {
             reject: false,
             quiet: false,
             recount: false,
+            index: false,
+            cached: false,
             directory: None,
             limits: Vec::new(),
             has_include: false,
@@ -374,14 +403,9 @@ fn parse_opts(
                         mark(unhonoured, "3way", &a, R_3WAY);
                     }
                 }
-                "index" | "cached" => {
-                    let key = if name == "index" { "index" } else { "cached" };
-                    if neg {
-                        unmark(unhonoured, key);
-                    } else {
-                        mark(unhonoured, key, &a, R_INDEX);
-                    }
-                }
+                // --index (worktree + index) and --cached (index only) are honoured.
+                "index" => o.index = !neg,
+                "cached" => o.cached = !neg,
                 "intent-to-add" => {
                     if neg {
                         unmark(unhonoured, "intent-to-add");
@@ -537,6 +561,16 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
+    // `--index`/`--cached` both require a repository, and git rejects them outside
+    // one (`check_apply_state`) before it even opens the patch input. `--index`'s
+    // message wins when both are given, matching git's check order.
+    let check_index = o.index || o.cached;
+    if check_index && gix::discover(".").is_err() {
+        let flag = if o.index { "--index" } else { "--cached" };
+        eprintln!("error: '{flag}' outside a repository");
+        return Ok(ExitCode::from(128));
+    }
+
     // ---- read the patch text ------------------------------------------------
     let mut buf: Vec<u8> = Vec::new();
     if sources.is_empty() {
@@ -622,12 +656,42 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // The reject path applies each file independently and writes *.rej; it does not
+    // stage the index. Rather than silently leave the index un-updated, refuse the
+    // combination (git supports it; this port floors it honestly).
+    if o.reject && check_index {
+        bail!("--reject with --index/--cached is not implemented (ported: {PORTED})");
+    }
+
     // --reject takes a wholly separate path: it applies each file's hunks
     // independently (not all-or-nothing), writes partial results, and drops the
     // hunks that did not land into a `<name>.rej` file. git forces verbose there.
     if o.reject {
         return reject_apply(&patches, &o);
     }
+
+    // ---- index substrate (only when --index/--cached) -----------------------
+    // Hold the repo lock across the whole check-and-write span so the index we read
+    // pre-images from is the same one we mutate and write — no concurrent writer can
+    // slip in between, mirroring how git holds `lock_file` for the operation.
+    let (idx_repo, mut idx_index, _idx_lock) = if check_index {
+        let repo = gix::discover(".")?;
+        let lock = crate::lock::RepoLock::acquire(repo.git_dir());
+        let index = if repo.index_path().exists() {
+            repo.open_index()?
+        } else {
+            gix::index::File::from_state(
+                gix::index::State::new(repo.object_hash()),
+                repo.index_path(),
+            )
+        };
+        (Some(repo), Some(index), Some(lock))
+    } else {
+        (None, None, None)
+    };
+    // `update_index` gates the mutation itself: with `--check`/`--stat` (apply off)
+    // the pre-image still comes from the index, but nothing is written.
+    let update_index = check_index && o.apply;
 
     // ---- check phase: build every result in memory, touching nothing --------
     let mut staged: HashMap<String, Option<Vec<u8>>> = HashMap::new();
@@ -648,13 +712,31 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             eprintln!("Checking patch {name}...");
         }
 
+        // A view of the index for this iteration; recomputed each time so no
+        // immutable borrow of `idx_index` is held into the mutable write phase.
+        let idx_view = idx_repo.as_ref().zip(idx_index.as_ref());
+
         // A path that must not already exist: a creation target, or a rename
-        // destination.
+        // destination. git's `check_to_create` reports it against the index when
+        // `--index`/`--cached`, otherwise against the worktree.
         if let Some(new) = &p.new_name {
-            if (p.is_new || p.is_rename) && exists(&staged, new) {
-                err(o.quiet, &format!("error: {new}: already exists in working directory"));
-                failed = true;
-                continue;
+            if p.is_new || p.is_rename {
+                match create_block(&staged, idx_view, o.cached, new) {
+                    Some(Block::InIndex) => {
+                        err(o.quiet, &format!("error: {new}: already exists in index"));
+                        failed = true;
+                        continue;
+                    }
+                    Some(Block::InWorktree) => {
+                        err(
+                            o.quiet,
+                            &format!("error: {new}: already exists in working directory"),
+                        );
+                        failed = true;
+                        continue;
+                    }
+                    None => {}
+                }
             }
         }
 
@@ -662,10 +744,22 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             Vec::new()
         } else {
             let old = p.old_name.as_deref().unwrap_or_default();
-            match read_current(&staged, old) {
-                Some(bytes) => split_lines(&bytes).into_iter().map(|l| l.to_vec()).collect(),
-                None => {
+            match read_preimage(&staged, idx_view, o.cached, old) {
+                PreRead::Found(bytes) => {
+                    split_lines(&bytes).into_iter().map(|l| l.to_vec()).collect()
+                }
+                PreRead::MissingWorktree => {
                     err(o.quiet, &format!("error: {old}: No such file or directory"));
+                    failed = true;
+                    continue;
+                }
+                PreRead::MissingIndex => {
+                    err(o.quiet, &format!("error: {old}: does not exist in index"));
+                    failed = true;
+                    continue;
+                }
+                PreRead::Mismatch => {
+                    err(o.quiet, &format!("error: {old}: does not match index"));
                     failed = true;
                     continue;
                 }
@@ -706,7 +800,25 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
 
         let new = p.new_name.clone().unwrap_or_default();
         let data: Vec<u8> = image.concat();
-        let mode = p.new_mode.unwrap_or(0o100644);
+        // git defaults a modification's new mode to the pre-image mode; under
+        // `--index`/`--cached` that pre-image mode is the index entry's, so an
+        // executable file stays executable even when the diff carries no mode line.
+        let mode = match p.new_mode {
+            Some(m) => m,
+            None => {
+                let from_index = if p.is_new {
+                    None
+                } else {
+                    idx_view.and_then(|(_, index)| {
+                        let old = p.old_name.as_deref()?;
+                        index
+                            .entry_by_path(old.as_bytes().as_bstr())
+                            .map(|e| e.mode.bits())
+                    })
+                };
+                from_index.unwrap_or(0o100644)
+            }
+        };
         if let Some(old) = &p.old_name {
             if old != &new {
                 staged.insert(old.clone(), None);
@@ -729,23 +841,187 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     }
 
     // ---- write phase: nothing here may fail on a well-formed patch ----------
+    // Index mutations are accumulated by path and replayed once at the end (git's
+    // `remove_file`/`add_index_file`); `--cached` skips every worktree touch.
+    let mut idx_remove: Vec<BString> = Vec::new();
+    let mut idx_add: Vec<(BString, ObjectId, IndexMode, Stat)> = Vec::new();
+
     for op in ops {
         if let Some(old) = &op.remove {
-            let _ = std::fs::remove_file(old);
-            if op.prune_dirs {
-                prune_empty_parents(Path::new(old));
+            if !o.cached {
+                let _ = std::fs::remove_file(old);
+                if op.prune_dirs {
+                    prune_empty_parents(Path::new(old));
+                }
+            }
+            if update_index {
+                idx_remove.push(old.clone().into_bytes().into());
             }
         }
         if let Some((path, mode, data)) = op.create {
-            create_leading_dirs(Path::new(&path))?;
-            write_created(Path::new(&path), mode, &data)?;
+            if !o.cached {
+                create_leading_dirs(Path::new(&path))?;
+                write_created(Path::new(&path), mode, &data)?;
+            }
+            if update_index {
+                let repo = idx_repo.as_ref().expect("repo present when update_index");
+                let id = repo.write_blob(&data)?.detach();
+                // For `--index` the entry's stat comes from the file just written
+                // (git's `fill_stat_cache_info`); `--cached` writes no file, so the
+                // stat is zeroed, exactly as `make_empty_cache_entry` leaves it.
+                let stat = if o.cached {
+                    Stat::default()
+                } else {
+                    let md = gix::index::fs::Metadata::from_path_no_follow(Path::new(&path))?;
+                    Stat::from_fs(&md)?
+                };
+                idx_add.push((path.clone().into_bytes().into(), id, to_index_mode(mode), stat));
+            }
         }
         if o.verbose {
             eprintln!("Applied patch {} cleanly.", op.name);
         }
     }
 
+    if update_index {
+        let index = idx_index.as_mut().expect("index present when update_index");
+        // If two patches in one input touched the same path, keep only the last
+        // add for it — git's `add_index_entry` replaces in place, so the final
+        // state wins. Reverse, keep first-seen (= original last), let the later
+        // `sort_entries` re-order.
+        idx_add.reverse();
+        let mut seen: HashSet<BString> = HashSet::new();
+        idx_add.retain(|(p, _, _, _)| seen.insert(p.clone()));
+        // Every touched path is dropped (any prior stage) before its fresh stage-0
+        // entry is pushed; a pure deletion contributes only a removal.
+        let drop_set: HashSet<BString> = idx_remove
+            .iter()
+            .cloned()
+            .chain(idx_add.iter().map(|(p, _, _, _)| p.clone()))
+            .collect();
+        index.remove_entries(|_, path, _| drop_set.contains(&path.to_owned()));
+        for (path, id, mode, stat) in &idx_add {
+            index.dangerously_push_entry(*stat, *id, Flags::empty(), *mode, path.as_ref());
+        }
+        index.sort_entries();
+        // Drop the cached tree so a later commit cannot capture a stale subtree.
+        index.remove_tree();
+        index.write(gix::index::write::Options::default())?;
+    }
+
     Ok(ExitCode::SUCCESS)
+}
+
+/// Whether a creation/rename target is already taken, and where. git's
+/// `check_to_create`: under `--index`/`--cached` the index is consulted first, then
+/// (unless `--cached`) the worktree; without index mode only the worktree.
+enum Block {
+    InIndex,
+    InWorktree,
+}
+
+fn create_block(
+    staged: &HashMap<String, Option<Vec<u8>>>,
+    idx: Option<(&gix::Repository, &gix::index::File)>,
+    cached: bool,
+    new: &str,
+) -> Option<Block> {
+    // An in-run result (a previous patch in this same invocation) wins first.
+    match staged.get(new) {
+        Some(Some(_)) => {
+            return Some(if idx.is_some() {
+                Block::InIndex
+            } else {
+                Block::InWorktree
+            })
+        }
+        Some(None) => return None, // deleted earlier this run: the path is free
+        None => {}
+    }
+    match idx {
+        Some((_, index)) => {
+            if index.entry_by_path(new.as_bytes().as_bstr()).is_some() {
+                return Some(Block::InIndex);
+            }
+            if !cached && std::fs::symlink_metadata(new).is_ok() {
+                return Some(Block::InWorktree);
+            }
+            None
+        }
+        None if std::fs::symlink_metadata(new).is_ok() => Some(Block::InWorktree),
+        None => None,
+    }
+}
+
+/// The outcome of reading a patch's pre-image.
+enum PreRead {
+    Found(Vec<u8>),
+    MissingWorktree,
+    MissingIndex,
+    Mismatch,
+}
+
+/// Load a patch's pre-image, from an earlier in-run result if present, else from
+/// the index blob (git's `load_patch_target` when `check_index`) or the worktree.
+/// Under `--index` (not `--cached`) the worktree content is verified against the
+/// index blob — git's `verify_index_match` — refusing on any divergence (git would
+/// instead check out a missing file, which this port floors by refusing).
+fn read_preimage(
+    staged: &HashMap<String, Option<Vec<u8>>>,
+    idx: Option<(&gix::Repository, &gix::index::File)>,
+    cached: bool,
+    old: &str,
+) -> PreRead {
+    if let Some(entry) = staged.get(old) {
+        return match entry {
+            Some(bytes) => PreRead::Found(bytes.clone()),
+            None => PreRead::MissingWorktree,
+        };
+    }
+    match idx {
+        Some((repo, index)) => {
+            let Some(ce) = index.entry_by_path(old.as_bytes().as_bstr()) else {
+                return PreRead::MissingIndex;
+            };
+            let bytes = match repo.find_object(ce.id) {
+                Ok(obj) => obj.data.clone(),
+                Err(_) => return PreRead::MissingIndex,
+            };
+            if !cached {
+                let empty = HashMap::new();
+                match read_current(&empty, old) {
+                    Some(wt) => {
+                        match gix::objs::compute_hash(
+                            repo.object_hash(),
+                            gix::objs::Kind::Blob,
+                            &wt,
+                        ) {
+                            Ok(h) if h == ce.id => {}
+                            _ => return PreRead::Mismatch,
+                        }
+                    }
+                    None => return PreRead::Mismatch,
+                }
+            }
+            PreRead::Found(bytes)
+        }
+        None => match read_current(staged, old) {
+            Some(bytes) => PreRead::Found(bytes),
+            None => PreRead::MissingWorktree,
+        },
+    }
+}
+
+/// Map a patch's raw file mode to the canonical index entry mode git records
+/// (`create_ce_mode`): symlink, gitlink, or a regular file normalised to
+/// executable/non-executable.
+fn to_index_mode(mode: u32) -> IndexMode {
+    match mode & 0o170000 {
+        0o120000 => IndexMode::SYMLINK,
+        0o160000 => IndexMode::COMMIT,
+        _ if mode & 0o111 != 0 => IndexMode::FILE_EXECUTABLE,
+        _ => IndexMode::FILE,
+    }
 }
 
 /// One file's worth of work, resolved during the check phase and replayed
@@ -1812,13 +2088,6 @@ fn read_current(staged: &HashMap<String, Option<Vec<u8>>>, path: &str) -> Option
         );
     }
     std::fs::read(path).ok()
-}
-
-fn exists(staged: &HashMap<String, Option<Vec<u8>>>, path: &str) -> bool {
-    match staged.get(path) {
-        Some(entry) => entry.is_some(),
-        None => std::fs::symlink_metadata(path).is_ok(),
-    }
 }
 
 fn create_leading_dirs(path: &Path) -> Result<()> {

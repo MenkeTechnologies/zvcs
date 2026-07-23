@@ -81,10 +81,22 @@ pub fn spawn_if_configured() {
     std::thread::spawn(|| {
         let roots = configured_roots();
         match crawl_into_db(&roots) {
-            Ok(n) => println!("[zvcs crawl] indexed {n} repo(s)"),
-            Err(e) => println!("[zvcs crawl] error: {e:#}"),
+            Ok(n) => log_line(&format!("[zvcs crawl] indexed {n} repo(s)")),
+            Err(e) => log_line(&format!("[zvcs crawl] error: {e:#}")),
         }
     });
+}
+
+/// Append one line to the singleton daemon log (`$ZVCS_HOME/zvcs.log`). The crawl
+/// runs on a detached thread, so its result must never touch the terminal — a
+/// foreground daemon still inherits stdout. Writing the log directly (rather than
+/// `println!`) keeps this chatter log-only no matter how the daemon was launched.
+fn log_line(msg: &str) {
+    use std::io::Write;
+    let path = crate::superset::zdaemon::zvcs_home().join("zvcs.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{msg}");
+    }
 }
 
 /// The configured crawl roots: `[zvcs] crawlroots` (whitespace/comma separated),

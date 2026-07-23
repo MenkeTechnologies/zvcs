@@ -185,7 +185,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut dst_prefix: Vec<u8> = b"b/".to_vec();
     let mut diff_filter: Option<Vec<u8>> = None;
     let mut algorithm: Option<gix::diff::blob::Algorithm> = None;
+    // Default resolved from `core.abbrev` after repo discovery (see below);
+    // `7` is only a placeholder until then. `--abbrev[=<n>]` overrides explicitly.
     let mut abbrev: usize = 7;
+    let mut abbrev_explicit = false;
     // `diff.algorithm` default, applied after argument parsing so a `--minimal` /
     // `--histogram` / `--diff-algorithm=` flag always wins (git precedence).
     let mut config_algorithm: Option<ConfigAlgorithm> = None;
@@ -291,7 +294,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 let raw = &s["--abbrev=".len()..];
                 match raw.parse::<usize>() {
                     // git clamps `--abbrev` to the range [4, hexsz].
-                    Ok(n) => abbrev = n.clamp(4, repo.object_hash().len_in_hex()),
+                    Ok(n) => {
+                        abbrev = n.clamp(4, repo.object_hash().len_in_hex());
+                        abbrev_explicit = true;
+                    }
                     Err(_) => {
                         eprintln!("error: option `abbrev' expects a numerical value");
                         return Ok(ExitCode::from(129));
@@ -524,6 +530,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 algorithm,
             )?);
         }
+    }
+
+    // With no explicit `--abbrev`, the `index` line honors `core.abbrev`
+    // (git's DEFAULT_ABBREV / auto), not a hardcoded 7. `--full-index` still
+    // wins at render time regardless of this length.
+    if !abbrev_explicit {
+        abbrev = crate::abbrev::configured_abbrev(&repo, repo.object_hash().len_in_hex());
     }
 
     let r = Render {

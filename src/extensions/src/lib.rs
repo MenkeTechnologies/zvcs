@@ -123,7 +123,7 @@ pub fn run() -> ExitCode {
     // on `-v`/`--version`/`-h`/`--help`, then `cmd_main` rewrites the command token
     // (`argv[0] = "version"` / `argv[0] = "help"`) before dispatch. Without this,
     // `git --version` reaches the dispatch table as an unknown verb and errors
-    // "not yet ported" instead of printing the version.
+    // "is not a git command" instead of printing the version.
     let sub = match sub.as_str() {
         "--version" | "-v" => "version",
         "--help" | "-h" => "help",

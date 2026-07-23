@@ -79,7 +79,7 @@ pub fn resolve(sub: &str, rest: &[String], pager_forced: &mut Option<bool>) -> O
 
         let Some(value) = lookup(&head) else {
             // Not a verb and not an alias: let dispatch produce its own error
-            // (the existing "not yet ported" message).
+            // (git's "is not a git command" message).
             return Outcome::Command(head, args[1..].to_vec());
         };
 

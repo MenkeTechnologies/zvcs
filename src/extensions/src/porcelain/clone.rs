@@ -28,6 +28,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `Some(true)` = `--progress` forced, `Some(false)` = `--no-progress`,
     // `None` = default (progress iff stderr is a terminal), matching git.
     let mut force_progress: Option<bool> = None;
+    let mut recurse_submodules = false;
     let mut positionals: Vec<&str> = Vec::new();
     let mut end_of_options = false;
 
@@ -45,6 +46,15 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "-v" | "--verbose" => {}
             "--progress" => force_progress = Some(true),
             "--no-progress" => force_progress = Some(false),
+            // `--recursive` / `--recurse-submodules[=<pathspec>]`: after the
+            // clone, initialize and update submodules recursively.
+            "--recursive" | "--recurse-submodules" => recurse_submodules = true,
+            other if other.starts_with("--recurse-submodules=") => {
+                // A pathspec-limited recurse; this port does the full recursive
+                // update rather than honoring the pathspec.
+                recurse_submodules = true;
+                let _ = other;
+            }
             other if other.starts_with('-') => {
                 bail!("unsupported option {other:?}");
             }
@@ -170,6 +180,21 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         handle.shutdown_and_wait();
     }
     result?;
+
+    // `--recursive` / `--recurse-submodules`: after a successful non-bare clone,
+    // initialize and update submodules recursively by re-executing this binary's
+    // own ported `submodule update --init --recursive` in the new worktree.
+    if recurse_submodules && !bare {
+        let exe = std::env::current_exe()?;
+        let status = std::process::Command::new(&exe)
+            .arg("-C")
+            .arg(&dir)
+            .args(["submodule", "update", "--init", "--recursive"])
+            .status()?;
+        if !status.success() {
+            return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
+        }
+    }
 
     Ok(ExitCode::SUCCESS)
 }

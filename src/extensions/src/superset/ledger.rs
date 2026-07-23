@@ -9,7 +9,17 @@ use std::io::IsTerminal;
 use std::process::ExitCode;
 
 /// `git zrepos` — list every repository in the index.
-pub fn zrepos(_args: &[String]) -> Result<ExitCode> {
+pub fn zrepos(args: &[String]) -> Result<ExitCode> {
+    // Positional (non-flag) arguments are case-insensitive substring filters:
+    // `git zrepos cask` lists only repos whose path contains "cask", and multiple
+    // patterns narrow further (every one must match). Flags are ignored here (`-h`
+    // is handled by the dispatcher before this runs).
+    let patterns: Vec<String> = args
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .map(|s| s.to_lowercase())
+        .collect();
+
     // One clean path per line on stdout — safe to pipe into fzf/xargs. The count
     // and any hints go to stderr, and only when interactive, so scripts see just
     // the list.
@@ -24,11 +34,20 @@ pub fn zrepos(_args: &[String]) -> Result<ExitCode> {
         }
     };
     let repos = crate::db::list_repos(&conn)?;
+    let mut shown = 0usize;
     for r in &repos {
-        println!("{}", r.workdir.as_deref().unwrap_or(&r.git_dir));
+        let path = r.workdir.as_deref().unwrap_or(&r.git_dir);
+        if !patterns.is_empty() {
+            let haystack = path.to_lowercase();
+            if !patterns.iter().all(|p| haystack.contains(p)) {
+                continue;
+            }
+        }
+        println!("{path}");
+        shown += 1;
     }
     if interactive {
-        eprintln!("{} repo(s)", repos.len());
+        eprintln!("{shown} repo(s)");
     }
     Ok(ExitCode::SUCCESS)
 }

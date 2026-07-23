@@ -214,7 +214,51 @@ pub fn is_verb(sub: &str) -> bool {
     SUPERSET_VERBS.contains(&sub) || PORCELAIN_VERBS.contains(&sub)
 }
 
+/// One-line usage for each z-verb, printed on `-h`/`--help`. `None` for anything
+/// that is not a z-verb, so the dispatcher leaves other commands' `-h` alone.
+fn z_usage(sub: &str) -> Option<&'static str> {
+    Some(match sub {
+        "zsync" => "usage: git zsync — fetch and fast-forward every submodule to origin/main",
+        "zbump" => "usage: git zbump [<submodule-path>...] — forward-only submodule gitlink bumps",
+        "zdaemon" => "usage: git zdaemon <start|stop|restart|status|info|ping|log>",
+        "zrepos" => "usage: git zrepos [<pattern>...] — list indexed repos; patterns filter by case-insensitive substring",
+        "zreindex" => "usage: git zreindex [--sync|--async] [<path>...] — (re)crawl for git repos and refresh the index",
+        "zdashed" => "usage: git zdashed [<dir>] — install a git-<verb> symlink for every builtin",
+        "zjobs" => "usage: git zjobs [-n <count>] — list recent ledger jobs (newest first)",
+        "zjob" => "usage: git zjob <id> | git zjob <stop|restart> <id> — show or control a job",
+        "zcommit" => "usage: git zcommit [<path>...] -m <msg> [--push] — queue an atomic staged-commit job",
+        "zpush" => "usage: git zpush [<refspec>] — queue an async push job with a network-free ff pre-flight",
+        "zrepl" => "usage: git zrepl — interactive console over the z-verbs",
+        "zclaim" => "usage: git zclaim [<path>] — lease a repo for this session",
+        "zunclaim" => "usage: git zunclaim [--force] [<path>] — release a lease on a repo",
+        "zwho" => "usage: git zwho — list active claims (who is working what)",
+        "zstatus" => "usage: git zstatus [--all] — cached working-tree status of indexed repos",
+        "zlog" => "usage: git zlog [-n <count>] — machine-wide reflog timeline across all indexed repos",
+        "zundo" => "usage: git zundo [<path>] — rewind a repo one reflog step (reset --hard to previous HEAD)",
+        "zsnapshot" => "usage: git zsnapshot <name> — record the tree's HEADs as a restore point",
+        "zrestore" => "usage: git zrestore <name> — reset the whole tree back to a snapshot",
+        "zsnapshots" => "usage: git zsnapshots — list snapshot names and their repo counts",
+        "zworktree" => "usage: git zworktree <add <name>|list|remove <name>> — tree-wide private worktrees",
+        "zstash" => "usage: git zstash [<name>] — stash every dirty repo in the tree under <name>",
+        "zunstash" => "usage: git zunstash [<name>] — pop the tree-wide stash back (LIFO)",
+        "zstashes" => "usage: git zstashes — list tree-wide stashes and their repo counts",
+        "zup" => "usage: git zup [<path>] — reconcile the tree at cwd (or <path>) to latest",
+        "zforeach" => "usage: git zforeach [--repo <sub>|--dirty|--ahead|--behind|--claimed|--session <s>] [--] <command>...",
+        "zhook" => "usage: git zhook <set <command>|unset|show|list|test>",
+        _ => return None,
+    })
+}
+
 pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
+    // Every z-verb answers `-h`/`--help` with a one-line usage, uniformly and
+    // before dispatch. `z_usage` returns `None` for anything that is not a known
+    // z-verb, so this never intercepts a porcelain command's own `-h`.
+    if sub.starts_with('z') && args.iter().any(|a| a == "-h" || a == "--help") {
+        if let Some(usage) = z_usage(sub) {
+            println!("{usage}");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
     match sub {
         // ---- superset (novel) ----
         "zsync" => superset::zsync(args),

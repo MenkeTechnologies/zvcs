@@ -40,6 +40,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--" => end_of_options = true,
             "--bare" => bare = true,
             "-q" | "--quiet" => quiet = true,
+            // `-v`/`--verbose` only adds output detail in git; the clone result
+            // is identical, so it is accepted without changing behavior.
+            "-v" | "--verbose" => {}
             "--progress" => force_progress = Some(true),
             "--no-progress" => force_progress = Some(false),
             other if other.starts_with('-') => {

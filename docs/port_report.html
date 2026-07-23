@@ -15,6 +15,13 @@
 
     .tutorial-main { max-width: 76rem; }
     .tutorial-subtitle b { color:var(--cyan); }
+    /* Center the color-scheme strip like index.html / report.html (these live in
+       the page style on every fleet page, not in hud-static.css). */
+    .hub-scheme-strip { border-bottom:1px dashed var(--border);background:color-mix(in srgb, var(--bg-secondary) 85%, transparent);padding:0.55rem 1.5rem 0.65rem;position:relative; }
+    .hub-scheme-strip-inner { max-width:76rem;margin:0 auto;display:flex;align-items:center;gap:0.85rem; }
+    .hub-scheme-strip .hud-scheme-label { flex:0 0 auto;text-align:left; }
+    .hub-scheme-strip .scheme-grid { flex:1 1 auto;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px; }
+    @media (max-width:720px){ .hub-scheme-strip-inner{flex-direction:column;align-items:stretch}.hub-scheme-strip .scheme-grid{grid-template-columns:repeat(2,minmax(0,1fr))} }
     .section-h { font-family:'Orbitron',sans-serif;font-size:12px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--accent);margin:2rem 0 0.7rem;border-bottom:1px dashed var(--border);padding-bottom:0.4rem; }
     .muted { color:var(--text-dim);font-size:12px;line-height:1.6;max-width:60rem; }
     .section-rule { border:none;border-top:1px dashed var(--border);margin:2.2rem 0 1.2rem; }
@@ -25,10 +32,11 @@
     .stat-card .stat-val.ok { color:var(--green);text-shadow:0 0 18px var(--green-bg); }
     .stat-card .stat-val.bad { color:var(--red);text-shadow:none; }
     .stat-card .stat-label { font-family:'Orbitron',sans-serif;font-size:9px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--text-muted);margin-top:0.5rem; }
-    .controls { display:flex;gap:10px;align-items:center;margin:0.5rem 0 0.8rem; }
-    #q { flex:1;padding:8px 12px;background:var(--bg-card);border:1px solid var(--border);border-radius:3px;color:var(--text);font-family:'Share Tech Mono',ui-monospace,monospace;font-size:12px; }
-    #q:focus { outline:none;border-color:var(--cyan); }
-    #cnt { font-size:11px;color:var(--text-muted);white-space:nowrap; }
+    .controls { display:flex;gap:10px;align-items:center;margin:0.5rem 0 0.8rem;flex-wrap:wrap; }
+    #q, #q2 { flex:0 1 26rem;min-width:12rem;max-width:100%;padding:8px 12px;background:var(--bg-card);border:1px solid var(--border);border-radius:3px;color:var(--text);font-family:'Share Tech Mono',ui-monospace,monospace;font-size:12px; }
+    #q::placeholder, #q2::placeholder { color:var(--text-muted);opacity:0.8; }
+    #q:focus, #q2:focus { outline:none;border-color:var(--cyan);box-shadow:0 0 0 2px var(--cyan-glow); }
+    #cnt, #cnt2 { font-size:11px;color:var(--text-muted);white-space:nowrap;font-family:'Share Tech Mono',monospace; }
     .file-table { width:100%;border-collapse:collapse;margin:0.4rem 0;font-size:12px; }
     .file-table th { background:var(--bg-secondary);color:var(--cyan);font-family:'Orbitron',sans-serif;font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;text-align:left;padding:7px 10px;border:1px solid var(--border); }
     .file-table td { padding:6px 10px;border:1px solid var(--border);color:var(--text-dim);vertical-align:middle;text-align:right; }

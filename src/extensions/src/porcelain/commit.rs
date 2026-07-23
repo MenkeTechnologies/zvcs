@@ -14,9 +14,13 @@ use gix::ObjectId;
 /// Supported invocation forms (the ones the meta workflow relies on):
 ///   * `git commit -m <msg>` (repeatable; paragraphs joined by a blank line)
 ///   * `--message=<msg>` / `-m<msg>` (attached value)
+///   * `-F <file>` / `--file=<file>` (message from a file; `-` is stdin)
+///   * `-C <commit>` / `-c <commit>` (reuse a commit's message + author; `-c`
+///     opens the editor), `--reset-author`, `--author=<ident>`, `--date=<date>`
+///   * `--amend` (replace `HEAD`; `--no-edit` keeps its message)
 ///   * `--allow-empty`, `--allow-empty-message`, `-q`/`--quiet`
 ///   * `-a`/`--all` (auto-stage tracked modifications and deletions)
-///   * bundled short flags, e.g. `-am <msg>` / `-qam <msg>`
+///   * bundled short flags, e.g. `-am <msg>` / `-qam <msg>` / `-C<commit>`
 ///
 /// The tree is built from the current index (staging area), the commit is
 /// written with `author`/`committer` from configuration, and `HEAD` is advanced
@@ -35,10 +39,9 @@ use gix::ObjectId;
 /// comment/blank lines) with the comment prefix taken from `core.commentString`
 /// or `core.commentChar`.
 ///
-/// Options that change staging or history semantics (`--amend`, `-F`, `-C`,
-/// `--author`, `-p`, `-S`, pathspec-limited commits, …) are not backed by this
-/// port and fail with a precise message rather than silently doing the wrong
-/// thing.
+/// Options still not backed (`-p`/`--patch`, `-S`/`--gpg-sign`, `-s`/`--signoff`,
+/// `--fixup`/`--squash`, `--dry-run`, `--porcelain`, pathspec-limited commits, …)
+/// fail with a precise message rather than silently doing the wrong thing.
 pub fn commit(args: &[String]) -> Result<ExitCode> {
     // --- argument parsing ------------------------------------------------
     let mut messages: Vec<String> = Vec::new();
@@ -51,6 +54,13 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut no_edit = false;
     let mut reset_author = false;
     let mut author_arg: Option<String> = None;
+    let mut date_arg: Option<String> = None;
+    // `-C`/`-c` reuse an existing commit's message (and author); `-c` also opens
+    // the editor. `-F` reads the message from a file. All are message *sources*
+    // like `-m`, resolved once the repo is open.
+    let mut reuse_arg: Option<String> = None;
+    let mut reedit = false;
+    let mut file_args: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -63,6 +73,48 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                     .ok_or_else(|| anyhow::anyhow!("option `{a}` requires a value"))?;
                 messages.push(m.clone());
             }
+            "-F" | "--file" => {
+                i += 1;
+                file_args.push(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("option `{a}` requires a value"))?
+                        .clone(),
+                );
+            }
+            "-C" | "--reuse-message" => {
+                i += 1;
+                reuse_arg = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("option `{a}` requires a value"))?
+                        .clone(),
+                );
+            }
+            "-c" | "--reedit-message" => {
+                i += 1;
+                reuse_arg = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("option `{a}` requires a value"))?
+                        .clone(),
+                );
+                reedit = true;
+            }
+            "--date" => {
+                i += 1;
+                date_arg = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("option `--date` requires a value"))?
+                        .clone(),
+                );
+            }
+            s if s.starts_with("--file=") => file_args.push(s["--file=".len()..].to_string()),
+            s if s.starts_with("--reuse-message=") => {
+                reuse_arg = Some(s["--reuse-message=".len()..].to_string())
+            }
+            s if s.starts_with("--reedit-message=") => {
+                reuse_arg = Some(s["--reedit-message=".len()..].to_string());
+                reedit = true;
+            }
+            s if s.starts_with("--date=") => date_arg = Some(s["--date=".len()..].to_string()),
             "--allow-empty" => allow_empty = true,
             "--allow-empty-message" => allow_empty_message = true,
             "-q" | "--quiet" => quiet = true,
@@ -104,16 +156,29 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                         'q' => quiet = true,
                         'n' => no_verify = true,
                         'v' => {}
-                        'm' => {
+                        'm' | 'F' | 'C' | 'c' => {
+                            // Value-taking flags consume the rest of the cluster,
+                            // else the next argv element. `-c` also sets reedit.
                             let rest = &cluster[at + c.len_utf8()..];
-                            if rest.is_empty() {
+                            let val = if rest.is_empty() {
                                 i += 1;
-                                let m = args.get(i).ok_or_else(|| {
-                                    anyhow::anyhow!("option `-m` requires a value")
-                                })?;
-                                messages.push(m.clone());
+                                args.get(i)
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("option `-{c}` requires a value")
+                                    })?
+                                    .clone()
                             } else {
-                                messages.push(rest.to_string());
+                                rest.to_string()
+                            };
+                            match c {
+                                'm' => messages.push(val),
+                                'F' => file_args.push(val),
+                                'C' => reuse_arg = Some(val),
+                                'c' => {
+                                    reuse_arg = Some(val);
+                                    reedit = true;
+                                }
+                                _ => unreachable!(),
                             }
                             break;
                         }
@@ -126,10 +191,25 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    // A `-m`/`--message` value is validated now; without one, the message is
-    // captured from the editor below, but only once we know there is something
-    // to commit (git opens the editor only then).
-    let from_flags = !messages.is_empty();
+    // `-F <file>` (repeatable) supplies the message from a file, joined with any
+    // `-m` blocks in the order given; `-` reads stdin. Read here so it feeds the
+    // same `from_flags`/no-editor path as `-m`.
+    for f in &file_args {
+        let content = if f == "-" {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+            s
+        } else {
+            std::fs::read_to_string(f)
+                .map_err(|e| anyhow::anyhow!("could not read message file `{f}`: {e}"))?
+        };
+        messages.push(content);
+    }
+
+    // A `-m`/`--message`/`-F` value is validated now; without one, the message is
+    // captured from the editor below (or reused via `-C`), but only once we know
+    // there is something to commit (git opens the editor only then).
+    let mut from_flags = !messages.is_empty();
     let mut message = messages.join("\n\n");
     if from_flags {
         if message.trim().is_empty() && !allow_empty_message {
@@ -146,6 +226,37 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // Serialize tree build + commit + HEAD update through the repo coordinator so
     // concurrent zvcs writers queue instead of racing. Held across the whole op.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+
+    // `-C`/`-c <commit>`: resolve the commit whose message and author are reused.
+    let reuse_commit = match &reuse_arg {
+        Some(spec) => Some(
+            repo.find_commit(
+                repo.rev_parse_single(spec.as_str())
+                    .map_err(|e| anyhow::anyhow!("could not resolve `{spec}`: {e}"))?
+                    .detach(),
+            )?,
+        ),
+        None => None,
+    };
+    // `-C` (unlike `-c`) supplies the message directly, with no editor.
+    if let Some(rc) = &reuse_commit {
+        if !reedit && !from_flags {
+            message = rc.message_raw()?.to_string();
+            if !message.ends_with('\n') {
+                message.push('\n');
+            }
+            from_flags = true;
+        }
+    }
+    // `--date=<date>` overrides the author date (git accepts fixed and relative
+    // forms; `gix::date::parse` covers the same grammar).
+    let date_override: Option<gix::date::Time> = match &date_arg {
+        Some(d) => Some(
+            gix::date::parse(d, Some(std::time::SystemTime::now()))
+                .map_err(|e| anyhow::anyhow!("invalid date format `{d}`: {e}"))?,
+        ),
+        None => None,
+    };
 
     let hash = repo.object_hash();
 
@@ -256,7 +367,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 message.push('\n');
             }
         } else {
-            let seed = if amend {
+            // Seed the editor with the reused message (`-c`) if any, else HEAD's
+            // on an `--amend`, else the empty status template.
+            let seed = if let Some(rc) = &reuse_commit {
+                Some(rc.message_raw()?.to_string())
+            } else if amend {
                 Some(
                     amend_head
                         .as_ref()
@@ -297,37 +412,70 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         None => None,
     };
 
-    // --- write the commit and advance HEAD -------------------------------
-    let commit_id = if amend {
-        // `--amend`: the new commit keeps HEAD's author (unless `--reset-author`)
-        // and takes a fresh committer. `Repository::commit`'s ref update requires
-        // the ref to equal the new commit's first parent, which is false for an
-        // amend (HEAD points at the commit being replaced, not its parent), so
-        // write the object with `new_commit_as` and move HEAD ourselves, gating
-        // on HEAD's current tip and writing git's `commit (amend):` reflog line.
-        let hc = amend_head.as_ref().expect("amend implies HEAD");
-        let committer = repo
-            .committer()
-            .transpose()?
-            .ok_or_else(|| anyhow::anyhow!("unable to determine committer identity"))?;
-        let base_author = if reset_author {
-            repo.author()
+    // The effective author identity, computed once as an owned signature so its
+    // parts outlive the write. Precedence for the base: `--reset-author` → config
+    // identity; `-C`/`-c` → the reused commit; `--amend` → HEAD; else config.
+    // `--author` then swaps name/email, `--date` the time. `None` means no
+    // override — the plain `repo.commit()` fast path (config author + canonical
+    // reflog) runs unchanged, so a bare `git commit` is byte-for-byte as before.
+    let needs_author = amend
+        || reset_author
+        || author_override.is_some()
+        || date_override.is_some()
+        || reuse_commit.is_some();
+    let author_owned: Option<gix::actor::Signature> = if needs_author {
+        let cfg_author = || -> Result<gix::actor::Signature> {
+            Ok(repo
+                .author()
                 .transpose()?
                 .ok_or_else(|| anyhow::anyhow!("unable to determine author identity"))?
+                .to_owned()?)
+        };
+        let mut base = if reset_author {
+            cfg_author()?
+        } else if let Some(rc) = &reuse_commit {
+            rc.author()?.to_owned()?
+        } else if let Some(hc) = &amend_head {
+            hc.author()?.to_owned()?
         } else {
-            hc.author()?
+            cfg_author()?
         };
-        // `--author` swaps name/email but keeps the base author's date.
-        let author = match &author_override {
-            Some((name, email)) => gix::actor::SignatureRef {
-                name: name.as_bytes().as_bstr(),
-                email: email.as_bytes().as_bstr(),
-                time: base_author.time,
-            },
-            None => base_author,
-        };
+        if let Some((name, email)) = &author_override {
+            base.name = name.as_str().into();
+            base.email = email.as_str().into();
+        }
+        if let Some(t) = date_override {
+            base.time = t;
+        }
+        Some(base)
+    } else {
+        None
+    };
+    let committer_owned = || -> Result<gix::actor::Signature> {
+        Ok(repo
+            .committer()
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("unable to determine committer identity"))?
+            .to_owned()?)
+    };
+
+    // --- write the commit and advance HEAD -------------------------------
+    let commit_id = if amend {
+        // `--amend`: `Repository::commit`'s ref update requires the ref to equal
+        // the new commit's first parent, which is false for an amend (HEAD points
+        // at the commit being replaced, not its parent), so write the object with
+        // `new_commit_as` and move HEAD ourselves, gating on HEAD's current tip
+        // and writing git's `commit (amend):` reflog line.
+        let author = author_owned.as_ref().expect("amend computes an author");
+        let committer = committer_owned()?;
         let new: ObjectId = repo
-            .new_commit_as(committer, author, &message, tree_id, parents)?
+            .new_commit_as(
+                committer.to_ref(&mut gix::date::parse::TimeBuf::default()),
+                author.to_ref(&mut gix::date::parse::TimeBuf::default()),
+                &message,
+                tree_id,
+                parents,
+            )?
             .id;
         let prev = head_tip.expect("amend implies HEAD");
         repo.edit_reference(gix::refs::transaction::RefEdit {
@@ -348,25 +496,19 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             deref: true,
         })?;
         new.attach(&repo)
-    } else if let Some((name, email)) = &author_override {
-        // A normal commit with `--author`: the config committer, but the author
-        // name/email come from `--author` (author date = the config author's
-        // time). `Repository::commit` only uses the config author, so drop to
+    } else if let Some(author) = &author_owned {
+        // A normal commit with an author override (`-C`/`-c`/`--author`/`--date`/
+        // `--reset-author`): the config committer, the computed author. Drop to
         // `commit_as` to inject the override.
-        let committer = repo
-            .committer()
-            .transpose()?
-            .ok_or_else(|| anyhow::anyhow!("unable to determine committer identity"))?;
-        let base = repo
-            .author()
-            .transpose()?
-            .ok_or_else(|| anyhow::anyhow!("unable to determine author identity"))?;
-        let author = gix::actor::SignatureRef {
-            name: name.as_bytes().as_bstr(),
-            email: email.as_bytes().as_bstr(),
-            time: base.time,
-        };
-        repo.commit_as(committer, author, "HEAD", &message, tree_id, parents)?
+        let committer = committer_owned()?;
+        repo.commit_as(
+            committer.to_ref(&mut gix::date::parse::TimeBuf::default()),
+            author.to_ref(&mut gix::date::parse::TimeBuf::default()),
+            "HEAD",
+            &message,
+            tree_id,
+            parents,
+        )?
     } else {
         // `Repository::commit` writes the commit object, then updates `HEAD`
         // (write-through to its branch, or the detached ref) with the canonical

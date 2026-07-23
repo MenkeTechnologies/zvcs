@@ -1106,9 +1106,11 @@ fn render(
                         fallback_len,
                         decorations.as_ref(),
                     );
-                    // git prints nothing at all for an empty expansion, and
-                    // terminates a non-empty one with a newline.
-                    if !line.is_empty() {
+                    // git emits a line per entry whenever the format STRING is
+                    // non-empty — even when it expands to nothing (e.g. `%D` on a
+                    // commit with no refs prints a blank line). An empty format
+                    // string (`--pretty=`) prints nothing at all.
+                    if !fmt.is_empty() {
                         out.extend_from_slice(&line);
                         out.push(b'\n');
                         // A user format is separated from the diff by a blank line,

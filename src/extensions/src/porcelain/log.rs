@@ -125,6 +125,15 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut order = Order::Default;
     let mut revs: Vec<String> = Vec::new();
     let mut pathspecs: Vec<String> = Vec::new();
+    // History filtering (`--grep`/`--author`/`--committer` + dialect flags),
+    // matched through the shared `revfilter` so log and shortlog agree.
+    let mut grep_pats: Vec<String> = Vec::new();
+    let mut author_pats: Vec<String> = Vec::new();
+    let mut committer_pats: Vec<String> = Vec::new();
+    let mut grep_dialect = crate::revfilter::Dialect::Basic;
+    let mut grep_ignore_case = false;
+    let mut grep_all_match = false;
+    let mut grep_invert = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -302,6 +311,35 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             order = Order::Date;
         } else if a == "--topo-order" {
             order = Order::Topo;
+        } else if let Some(v) = a.strip_prefix("--grep=") {
+            grep_pats.push(v.to_string());
+        } else if a == "--grep" {
+            i += 1;
+            grep_pats.push(args.get(i).cloned().unwrap_or_default());
+        } else if let Some(v) = a.strip_prefix("--author=") {
+            author_pats.push(v.to_string());
+        } else if a == "--author" {
+            i += 1;
+            author_pats.push(args.get(i).cloned().unwrap_or_default());
+        } else if let Some(v) = a.strip_prefix("--committer=") {
+            committer_pats.push(v.to_string());
+        } else if a == "--committer" {
+            i += 1;
+            committer_pats.push(args.get(i).cloned().unwrap_or_default());
+        } else if a == "-i" || a == "--regexp-ignore-case" {
+            grep_ignore_case = true;
+        } else if a == "-E" || a == "--extended-regexp" {
+            grep_dialect = crate::revfilter::Dialect::Extended;
+        } else if a == "-F" || a == "--fixed-strings" {
+            grep_dialect = crate::revfilter::Dialect::Fixed;
+        } else if a == "-P" || a == "--perl-regexp" {
+            grep_dialect = crate::revfilter::Dialect::Perl;
+        } else if a == "--basic-regexp" {
+            grep_dialect = crate::revfilter::Dialect::Basic;
+        } else if a == "--all-match" {
+            grep_all_match = true;
+        } else if a == "--invert-grep" {
+            grep_invert = true;
         } else if a.starts_with('-') {
             let body = &a[1..];
             if let Some(num) = body.strip_prefix('n') {
@@ -441,6 +479,30 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     }
     if let Some(max) = max_parents {
         nodes.retain(|n| n.parents.len() <= max);
+    }
+
+    // `--grep`/`--author`/`--committer` header/message filtering, applied during
+    // selection — before `--skip`/`--max-count`, exactly as git does.
+    let commit_filter = crate::revfilter::CommitFilter {
+        author_res: crate::revfilter::compile_patterns(&author_pats, grep_dialect, grep_ignore_case)?,
+        committer_res: crate::revfilter::compile_patterns(
+            &committer_pats,
+            grep_dialect,
+            grep_ignore_case,
+        )?,
+        grep_res: crate::revfilter::compile_patterns(&grep_pats, grep_dialect, grep_ignore_case)?,
+        all_match: grep_all_match,
+        invert_grep: grep_invert,
+    };
+    if !commit_filter.is_empty() {
+        let mut kept = Vec::with_capacity(nodes.len());
+        for node in nodes.into_iter() {
+            let commit = repo.find_commit(node.id)?;
+            if commit_filter.matches(&commit)? {
+                kept.push(node);
+            }
+        }
+        nodes = kept;
     }
 
     // `--skip` drops the first N of the selected commits, then `--max-count` caps

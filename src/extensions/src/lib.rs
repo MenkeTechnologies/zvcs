@@ -22,6 +22,7 @@ pub mod lock;
 pub mod merge_apply;
 pub mod pager;
 pub mod porcelain;
+pub mod revfilter;
 pub mod superset;
 pub mod worktree;
 

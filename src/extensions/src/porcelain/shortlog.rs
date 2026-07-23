@@ -103,6 +103,8 @@ use gix::prelude::ObjectIdExt;
 use gix::revision::walk::Sorting;
 use gix::traverse::commit::simple::CommitTimeOrder;
 
+use crate::revfilter::{compile_patterns, ident_line, Dialect};
+
 /// The `usage_with_options` block git prints for `-h`, and again after every
 /// `error: unknown option ...`. It ends with a blank line.
 const USAGE: &str = "\
@@ -192,17 +194,6 @@ enum Order {
     Default,
     Date,
     Topo,
-}
-
-/// Which regex dialect `--grep`/`--author` patterns are written in. git's default
-/// is POSIX basic (BRE); `-E`/`-P` select extended/perl, `-F` a literal. The last
-/// of these on the command line wins, exactly as in git's `grep_config`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Dialect {
-    Basic,
-    Extended,
-    Fixed,
-    Perl,
 }
 
 /// The `rev_info` fields shortlog's walk actually reads.
@@ -972,96 +963,6 @@ fn approxidate(value: &str) -> i64 {
     }
 }
 
-/// Compile each `--grep`/`--author` pattern into a byte regex, translating from
-/// its dialect the way git's `regcomp` reads it. An empty pattern compiles to a
-/// match-everything regex, matching git ("an empty string ... matches all").
-fn compile_patterns(
-    patterns: &[String],
-    dialect: Dialect,
-    ignore_case: bool,
-) -> Result<Vec<regex::bytes::Regex>> {
-    patterns
-        .iter()
-        .map(|p| build_regex(p, dialect, ignore_case))
-        .collect()
-}
-
-/// Build one byte regex from a pattern in `dialect`, mirroring git's engine as
-/// far as the `regex` crate allows: `-F` escapes to a literal, ERE/PCRE pass
-/// through, BRE is translated by swapping which operators are escaped.
-fn build_regex(pattern: &str, dialect: Dialect, ignore_case: bool) -> Result<regex::bytes::Regex> {
-    let translated = match dialect {
-        Dialect::Fixed => regex::escape(pattern),
-        Dialect::Extended | Dialect::Perl => pattern.to_string(),
-        Dialect::Basic => bre_to_regex(pattern),
-    };
-    let compile = |pat: &str| {
-        regex::bytes::RegexBuilder::new(pat)
-            .case_insensitive(ignore_case)
-            .unicode(false) // git greps bytes, not scalar values
-            .build()
-    };
-    match compile(&translated) {
-        Ok(re) => Ok(re),
-        // git's POSIX engine treats a `{`/`}` that forms no valid interval as a
-        // literal; the crate rejects it. Recover that leniency by literalising
-        // the braces and retrying — a genuine error still surfaces.
-        Err(_) => {
-            let lenient = translated.replace('{', "\\{").replace('}', "\\}");
-            compile(&lenient).map_err(|e| anyhow!("invalid regex: {e}"))
-        }
-    }
-}
-
-/// GNU BRE → `regex`-crate syntax. In BRE the grouping/quantifier operators are
-/// the *escaped* forms (`\(` `\)` `\{` `\}` `\+` `\?` `\|`) while the bare
-/// characters are literals; ERE (and this crate) are the reverse. Bytes inside a
-/// `[...]` bracket expression are copied verbatim.
-fn bre_to_regex(p: &str) -> String {
-    let b = p.as_bytes();
-    let mut out = String::new();
-    let mut i = 0;
-    let mut in_class = false;
-    while i < b.len() {
-        let c = b[i];
-        if in_class {
-            out.push(c as char);
-            if c == b']' {
-                in_class = false;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'[' => {
-                in_class = true;
-                out.push('[');
-            }
-            b'\\' if i + 1 < b.len() => {
-                let n = b[i + 1];
-                match n {
-                    // BRE's escaped operators become bare operators.
-                    b'(' | b')' | b'{' | b'}' | b'+' | b'?' | b'|' => out.push(n as char),
-                    // Everything else keeps its backslash (`\.`, `\\`, `\b`, …).
-                    _ => {
-                        out.push('\\');
-                        out.push(n as char);
-                    }
-                }
-                i += 1;
-            }
-            // Bare operators are literals in BRE, so escape them for the crate.
-            b'(' | b')' | b'{' | b'}' | b'+' | b'?' | b'|' => {
-                out.push('\\');
-                out.push(c as char);
-            }
-            _ => out.push(c as char),
-        }
-        i += 1;
-    }
-    out
-}
-
 /// git's `--glob`/`--branches`/`--tags`/`--remotes` ref expansion, including
 /// the implicit `/*` `for_each_glob_ref_in()` appends to a plain prefix.
 fn select_refs(
@@ -1337,17 +1238,6 @@ fn message_matches(commit: &gix::Commit<'_>, filters: &Filters) -> Result<bool> 
     Ok(hit != filters.invert_grep)
 }
 
-/// The raw `author`/`committer` header value git greps against.
-fn ident_line(sig: gix::actor::SignatureRef<'_>) -> BString {
-    let mut out = BString::from(sig.name.to_vec());
-    out.push(b' ');
-    out.push(b'<');
-    out.extend_from_slice(sig.email);
-    out.push(b'>');
-    out.push(b' ');
-    out.extend_from_slice(sig.time.as_bytes());
-    out
-}
 
 /// The group key(s) a commit files under, across every requested group field.
 /// git iterates its `groups` bitfield and (for `--group=trailer`/`format`) each

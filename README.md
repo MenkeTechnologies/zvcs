@@ -151,7 +151,10 @@ repo whose HEAD moved is reported and its stash kept intact).
 
 **Repo index.** `git zreindex [<path>...]` crawls for git repositories and
 records them in the ledger, pruning ones deleted from disk; `git zrepos` lists
-them (pipe-clean, one path per line) — a drop-in for a shell git-repo index.
+them (pipe-clean, one path per line) — a drop-in for a shell git-repo index. The
+walk is parallel and skips the mounts that would hang or loop a whole-device scan
+(`zreindex /`): kernel pseudo-filesystems, automounted/network volumes, and the
+macOS data-volume firmlink reflection.
 
 **Async queue.** `git zcommit <paths> -m <msg> [--push]` and `git zpush` submit
 fire-and-forget jobs to the daemon (with a network-free / live `ls-refs` push

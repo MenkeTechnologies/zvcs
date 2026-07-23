@@ -13,7 +13,8 @@
 //!
 //! # Wire protocol (line-based, one request per line, over the unix socket)
 //!
-//! Socket path: `~/.zvcs/zvcs.sock` (override with `ZVCS_SOCK`).
+//! Socket path: `~/.zvcs/zvcs.sock` (override with `ZVCS_SOCK`; a `ZVCS_HOME`
+//! too deep to fit `sun_path` falls back to a short, stable `/tmp` socket).
 //!
 //! Client -> daemon:
 //!   * `ACQUIRE <client-id> <git-dir>` — enqueue a lock request for the repo at
@@ -33,6 +34,7 @@
 
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -79,12 +81,39 @@ pub fn zvcs_home() -> PathBuf {
     dir
 }
 
-/// The singleton socket path: `$ZVCS_SOCK`, else `~/.zvcs/zvcs.sock`.
+/// A unix-domain socket path must fit the platform's `sockaddr_un.sun_path`
+/// array (incl. its NUL terminator): 104 bytes on macOS/BSD, 108 on Linux. Use
+/// the tighter limit so the overflow fallback below triggers identically on
+/// every OS. `bind()` fails when the path length reaches this bound.
+const SUN_PATH_MAX: usize = 104;
+
+/// The singleton socket path: `$ZVCS_SOCK`, else `~/.zvcs/zvcs.sock`, except a
+/// derived default that would overflow [`SUN_PATH_MAX`] (a deep `ZVCS_HOME`,
+/// e.g. a nested scratchpad) falls back to a short, stable `/tmp` path keyed on
+/// the home dir — otherwise `bind()` fails with "path must be shorter than
+/// SUN_LEN" and the daemon can never start. An explicit `$ZVCS_SOCK` is always
+/// honored verbatim (the caller owns its length).
 pub fn socket_path() -> PathBuf {
     if let Some(s) = std::env::var_os("ZVCS_SOCK") {
         return PathBuf::from(s);
     }
-    zvcs_home().join("zvcs.sock")
+    let home = zvcs_home();
+    let default = home.join("zvcs.sock");
+    if default.as_os_str().len() < SUN_PATH_MAX {
+        return default;
+    }
+    short_fallback_socket(&home)
+}
+
+/// A short `/tmp` socket path derived from `home`, for when the default under
+/// `ZVCS_HOME` is too long to bind. Deterministic (same binary → same digest via
+/// the fixed-seed `DefaultHasher`), so the daemon and every client compute the
+/// same path, and keyed on `home` so isolated daemons (distinct `ZVCS_HOME`s)
+/// never collide on one socket.
+fn short_fallback_socket(home: &Path) -> PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    home.hash(&mut hasher);
+    PathBuf::from(format!("/tmp/zvcs-{:016x}.sock", hasher.finish()))
 }
 
 /// Best-effort single-line reply. Never panics.

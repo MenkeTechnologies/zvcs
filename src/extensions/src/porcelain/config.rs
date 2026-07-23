@@ -56,10 +56,14 @@ fn is_synthetic(source: Source) -> bool {
 /// `git config` — get/set/list configuration values, backed by gitoxide.
 ///
 /// Reads resolve through the fully-merged config snapshot (system + global +
-/// local, last-one-wins), matching stock `git config`'s default scope. Writes
-/// target the repository-local file only (`<common_dir>/config`); the other
-/// scopes (`--global`, `--system`, `--worktree`, `--file`) are rejected with a
-/// precise error rather than silently mistargeted.
+/// local, last-one-wins), matching stock `git config`'s default scope. Outside a
+/// repository a read still works, falling back to the global+system+env cascade
+/// exactly as stock `git config` does (so `config --list` / `config user.name`
+/// never require a repo). Writes target the repository-local file only
+/// (`<common_dir>/config`) and so still need a repo — attempting one without one
+/// fails with `not in a git directory`; the other scopes (`--global`,
+/// `--system`, `--worktree`, `--file`) are rejected with a precise error rather
+/// than silently mistargeted.
 ///
 /// Supported forms:
 ///   * `git config <name>` / `--get <name>`   → last value, exit 1 if absent
@@ -174,37 +178,76 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         _ => {}
     }
 
-    let repo = gix::discover(".")?;
+    // A repository is optional: reads resolve fine outside one (git reads global
+    // and system config with no repo present), while writes target the local
+    // scope and still require a repo. Discovery failure is therefore not fatal
+    // here — only an attempted write without a repo is.
+    let repo = gix::discover(".").ok();
+
+    // The config to READ from: the repo's fully-merged snapshot when inside one,
+    // else the global+system+env cascade that `git config` falls back to.
+    let snapshot = repo.as_ref().map(gix::Repository::config_snapshot);
+    let global;
+    let file: &gix::config::File = match snapshot.as_ref() {
+        Some(s) => s.plumbing(),
+        None => {
+            global = global_config()?;
+            &global
+        }
+    };
+
+    // Writes need the local scope; outside a repo they fail the way git does.
+    let for_write = || {
+        repo.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("not in a git directory"))
+    };
 
     match mode {
-        Mode::List => list(&repo, name_only),
+        Mode::List => list(file, name_only),
         // `--get <name> <value-pattern>` filters returned values by an ERE — a
         // read-side feature distinct from the value-pattern *set* form below and
         // not yet implemented; the two-argument read is refused rather than faked.
         Mode::Get | Mode::GetAll if positional.len() == 2 => {
             bail!("value-pattern filtering is not supported")
         }
-        Mode::Get => get(&repo, positional[0], false),
-        Mode::GetAll => get(&repo, positional[0], true),
+        Mode::Get => get(file, positional[0], false),
+        Mode::GetAll => get(file, positional[0], true),
         // No action flag: one positional reads, two set the value.
-        Mode::Auto if positional.len() == 1 => get(&repo, positional[0], false),
-        Mode::Auto if positional.len() == 2 => write_local(&repo, positional[0], positional[1], WriteOp::Set),
+        Mode::Auto if positional.len() == 1 => get(file, positional[0], false),
+        Mode::Auto if positional.len() == 2 => {
+            write_local(for_write()?, positional[0], positional[1], WriteOp::Set)
+        }
         // `<name> <value> <value-pattern>` rewrites the values whose text matches
         // the POSIX ERE, or adds a new value when none match.
-        Mode::Auto => set_with_value_pattern(&repo, positional[0], positional[1], positional[2]),
+        Mode::Auto => set_with_value_pattern(for_write()?, positional[0], positional[1], positional[2]),
         Mode::Add => {
             let (name, value) = name_and_value(&positional)?;
-            write_local(&repo, name, value, WriteOp::Add)
+            write_local(for_write()?, name, value, WriteOp::Add)
         }
         Mode::Unset => {
             let name = one_name(&positional)?;
-            write_local(&repo, name, "", WriteOp::Unset)
+            write_local(for_write()?, name, "", WriteOp::Unset)
         }
         Mode::UnsetAll => {
             let name = one_name(&positional)?;
-            write_local(&repo, name, "", WriteOp::UnsetAll)
+            write_local(for_write()?, name, "", WriteOp::UnsetAll)
         }
     }
+}
+
+/// The merged global+system config `git config` reads when run outside a
+/// repository: git-installation, system, and per-user (`~/.gitconfig`) files,
+/// with `GIT_CONFIG_*` environment overrides layered on top (highest
+/// precedence), mirroring the snapshot a repo would expose minus its local file.
+fn global_config() -> Result<gix::config::File> {
+    let mut file = gix::config::File::from_globals()?;
+    if let Ok(env) = gix::config::File::from_environment_overrides() {
+        // `append` only errors on a malformed section header it just parsed from
+        // the environment; treat that as "no valid overrides" rather than failing
+        // an otherwise-good global read.
+        let _ = file.append(env);
+    }
+    Ok(file)
 }
 
 fn one_name<'a>(positional: &[&'a str]) -> Result<&'a str> {
@@ -232,10 +275,8 @@ fn parse_key(name: &str) -> Result<KeyRef<'_>> {
 /// `git config <name>` / `--get` / `--get-all` — read from the merged snapshot.
 ///
 /// Exit code 1 (no output) when the key is absent, matching stock git.
-fn get(repo: &gix::Repository, name: &str, all: bool) -> Result<ExitCode> {
+fn get(file: &gix::config::File, name: &str, all: bool) -> Result<ExitCode> {
     let key = parse_key(name)?;
-    let snapshot = repo.config_snapshot();
-    let file = snapshot.plumbing();
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -273,10 +314,7 @@ fn get(repo: &gix::Repository, name: &str, all: bool) -> Result<ExitCode> {
 /// Entries are emitted in the order they appear in their file, multivars
 /// included: an `a=1 / b=2 / a=3` section lists as `a=1`, `b=2`, `a=3`, not with
 /// the two `a`s collapsed together.
-fn list(repo: &gix::Repository, name_only: bool) -> Result<ExitCode> {
-    let snapshot = repo.config_snapshot();
-    let file = snapshot.plumbing();
-
+fn list(file: &gix::config::File, name_only: bool) -> Result<ExitCode> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 

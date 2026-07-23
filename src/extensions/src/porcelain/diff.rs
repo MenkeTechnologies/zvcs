@@ -1181,7 +1181,9 @@ pub(crate) fn commit_patch(
     let hash_kind = repo.object_hash();
     let mut cache = repo.diff_resource_cache_for_tree_diff()?;
     let r = Render {
-        abbrev: 7,
+        // `git log -p`/`git show` honor core.abbrev on the index line, same as
+        // `git diff` — resolved once here rather than hardcoded.
+        abbrev: crate::abbrev::configured_abbrev(repo, hash_kind.len_in_hex()),
         full_index: false,
         z: false,
         src_prefix: b"a/".to_vec(),
@@ -2145,15 +2147,16 @@ fn combined_multi(
         out.extend_from_slice(&quoted_name(path));
         out.push(b'\n');
         push_str(&mut out, "index ");
+        let abbrev = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
         for (i, pid) in parent_ids.iter().enumerate() {
             if i != 0 {
                 out.push(b',');
             }
-            push_str(&mut out, &pid.to_hex_with_len(7).to_string());
+            push_str(&mut out, &pid.to_hex_with_len(abbrev).to_string());
         }
         push_str(&mut out, "..");
         let res_short = if res_present { res_id } else { null };
-        push_str(&mut out, &res_short.to_hex_with_len(7).to_string());
+        push_str(&mut out, &res_short.to_hex_with_len(abbrev).to_string());
         out.push(b'\n');
         emit_file_line(&mut out, b"--- ", &quote_one(b"a/", path));
         emit_file_line(&mut out, b"+++ ", &quote_one(b"b/", path));
@@ -2202,12 +2205,13 @@ fn render_combined(
     out.extend_from_slice(&quoted_name(&delta.path));
     out.push(b'\n');
     push_str(out, "index ");
-    push_str(out, &ours.to_hex_with_len(7).to_string());
+    let abbrev = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
+    push_str(out, &ours.to_hex_with_len(abbrev).to_string());
     push_str(out, ",");
-    push_str(out, &theirs.to_hex_with_len(7).to_string());
+    push_str(out, &theirs.to_hex_with_len(abbrev).to_string());
     push_str(out, "..");
     // The result lives only in the worktree, so it has no object id.
-    push_str(out, &repo.object_hash().null().to_hex_with_len(7).to_string());
+    push_str(out, &repo.object_hash().null().to_hex_with_len(abbrev).to_string());
     out.push(b'\n');
     emit_file_line(out, b"--- ", &quote_one(b"a/", &delta.path));
     emit_file_line(out, b"+++ ", &quote_one(b"b/", &delta.path));

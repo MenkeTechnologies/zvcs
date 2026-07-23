@@ -1326,11 +1326,15 @@ fn content_of(repo: &gix::Repository, id: ObjectId, is_submodule: bool) -> Resul
 /// side is all zeros, and a submodule commit (which this odb does not have) is
 /// plainly truncated.
 fn short_oid(repo: &gix::Repository, id: &ObjectId, plain: bool) -> Result<String> {
+    // git abbreviates the `index` line to `core.abbrev` (default auto), and pads
+    // the all-zero/submodule side to that same width — never a hardcoded 7.
+    let abbrev = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex())
+        .max(MINIMUM_ABBREV);
     if id.is_null() {
-        return Ok("0".repeat(MINIMUM_ABBREV));
+        return Ok("0".repeat(abbrev));
     }
     if plain {
-        return Ok(id.to_hex_with_len(MINIMUM_ABBREV).to_string());
+        return Ok(id.to_hex_with_len(abbrev).to_string());
     }
     Ok(id.attach(repo).shorten()?.to_string())
 }

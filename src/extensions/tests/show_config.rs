@@ -232,6 +232,37 @@ fn show_tag_honors_log_date() {
 }
 
 #[test]
+fn show_first_parent_on_merge_matches_git() {
+    // Regression: `git show --first-parent <merge>` was rejected as an unsupported
+    // option, breaking git-fuzzy's commit preview. It must render a merge as a
+    // plain diff against its first parent (not the dense combined `--cc` diff),
+    // while the default `show <merge>` keeps the combined diff.
+    let (repo, home) = fixture("firstparent");
+
+    // Diverge from HEAD (`c1`) on a feature branch, advance main, then merge.
+    git(&repo, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(repo.join("f"), "hello\nworld\nfeature\n").unwrap();
+    git(&repo, &["add", "f"]);
+    git(&repo, &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "feat", "--date", DATE]);
+    git(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("g"), "main-side\n").unwrap();
+    git(&repo, &["add", "g"]);
+    git(&repo, &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "mainwork", "--date", DATE]);
+    git(&repo, &["-c", "commit.gpgsign=false", "merge", "-q", "--no-ff", "feature", "-m", "merge feature"]);
+
+    let merge = rev(&repo, "HEAD");
+    // The merge introduces a real first-parent change (feature's `f` edit), so the
+    // first-parent diff is non-empty and distinct from the combined diff.
+    assert_matches_git(&repo, &home, &["--first-parent", &merge]);
+    // Default combined (`--cc`) rendering must be unaffected by the new flag.
+    assert_matches_git(&repo, &home, &[&merge]);
+    // No-op on a non-merge commit: identical to plain show.
+    assert_matches_git(&repo, &home, &["--first-parent", "HEAD~1"]);
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
 fn show_date_invalid_is_fatal() {
     let (repo, home) = fixture("baddate");
     git(&repo, &["config", "log.date", "bogus"]);

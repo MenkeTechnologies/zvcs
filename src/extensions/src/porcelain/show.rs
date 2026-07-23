@@ -69,6 +69,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut cli_abbrev: Option<bool> = None;
     let mut cli_date: Option<DateMode> = None;
     let mut force_root = false;
+    let mut first_parent = false;
 
     for a in args {
         let s = a.as_str();
@@ -93,6 +94,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             "--abbrev-commit" => cli_abbrev = Some(true),
             "--no-abbrev-commit" => cli_abbrev = Some(false),
             "--root" => force_root = true,
+            // `--first-parent`: follow only the first parent in a walk, and show a
+            // merge as a plain diff against its first parent instead of the dense
+            // combined (`--cc`) diff. A no-op for a single non-merge commit.
+            "--first-parent" => first_parent = true,
+            "--no-first-parent" => first_parent = false,
             // We never colorize; accept the flags that request no/auto color.
             "--no-color" | "--color=never" | "--color=auto" => {}
             _ => {
@@ -220,15 +226,19 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // twice by a walk) is printed once. Blobs, trees, and tags are not deduplicated.
     let mut shown: Vec<ObjectId> = Vec::new();
     if needs_walk {
-        let walk = repo.rev_walk(walk_tips).with_hidden(walk_hidden).all()?;
+        let mut platform = repo.rev_walk(walk_tips).with_hidden(walk_hidden);
+        if first_parent {
+            platform = platform.first_parent_only();
+        }
+        let walk = platform.all()?;
         for info in walk {
             let id = info?.id;
-            let disp = DisplayOpts { abbrev_commit, date_mode, show_root };
+            let disp = DisplayOpts { abbrev_commit, date_mode, show_root, first_parent };
             show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &pathspecs, &disp, &mut shown)?;
         }
     } else {
         for (spec, id) in &plain {
-            let disp = DisplayOpts { abbrev_commit, date_mode, show_root };
+            let disp = DisplayOpts { abbrev_commit, date_mode, show_root, first_parent };
             show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &disp, &mut shown)?;
         }
     }
@@ -461,6 +471,9 @@ struct DisplayOpts {
     /// `log.showRoot` / `--root`: whether a root commit's diff against the empty
     /// tree is shown (default true).
     show_root: bool,
+    /// `--first-parent`: render a merge as a plain diff against its first parent
+    /// rather than the dense combined (`--cc`) diff.
+    first_parent: bool,
 }
 
 /// Render the object `id` (named `spec` on the command line), peeling annotated
@@ -642,11 +655,13 @@ fn show_commit(
         files.retain(|f| matches_pathspec(&f.path, pathspecs));
     }
 
-    if is_merge {
+    if is_merge && !disp.first_parent {
         // git shows a blank line after a merge's message regardless of format,
         // then — by default — the dense combined diff (`--cc`) against all
         // parents, plus `--stat` (against the first parent) when requested. The
         // empty user format prints neither the blank line nor a header.
+        // `--first-parent` opts out: the merge falls through to the plain
+        // single-parent path below, diffing against `parents[0]` like any commit.
         if !header_empty {
             out.push(b'\n');
         }

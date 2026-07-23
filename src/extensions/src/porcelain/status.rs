@@ -61,10 +61,11 @@ enum Untracked {
 ///   * `git status --ignored[=<mode>]`   — the `!!` / `Ignored files:` listing.
 ///   * `git status --no-renames | --renames | -M | --find-renames[=<n>]`.
 ///   * unmerged (conflicted) paths, in both long and short form.
+///   * `git status [--] <pathspec>...` — limits the report to matching paths
+///     (the gix status iterator is given the patterns), across every format.
 ///
 /// Faithfully unsupported cases `bail!` with a precise reason rather than
-/// emitting wrong output: `--porcelain=v2`, `-z`, intent-to-add entries, and
-/// pathspec-limited status.
+/// emitting wrong output: `-z` and intent-to-add entries.
 pub fn status(args: &[String]) -> Result<ExitCode> {
     let mut short = false;
     let mut porcelain_v2 = false;
@@ -88,9 +89,16 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     let mut ignored_arg: Option<String> = None;
     // `None` keeps git's configured default (`status.renames`/`diff.renames`).
     let mut renames: Option<Option<gix::diff::Rewrites>> = None;
+    // `git status [--] <pathspec>...` limits the report to matching paths.
+    let mut pathspecs: Vec<BString> = Vec::new();
+    let mut operands_only = false;
 
     for a in args {
         let s = a.as_str();
+        if operands_only {
+            pathspecs.push(s.into());
+            continue;
+        }
         match s {
             "-s" | "--short" => {
                 short = true;
@@ -129,7 +137,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             "--no-ignored" => ignored_arg = None,
             // Everything after `--` is a pathspec; the pathspec arm below rejects
             // any that follow, and a trailing `--` on its own is a no-op.
-            "--" => {}
+            "--" => operands_only = true,
             "--no-renames" => renames = Some(None),
             "--renames" | "-M" | "--find-renames" => {
                 renames = Some(Some(gix::diff::Rewrites::default()));
@@ -214,7 +222,8 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-            _ => anyhow::bail!("pathspec-limited status ({a:?}) is not supported"),
+            // A non-flag token is a pathspec: `git status <path>...`.
+            _ => pathspecs.push(s.into()),
         }
     }
 
@@ -306,7 +315,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     // richer per-path fields (HEAD/index/worktree modes + oids); it shares none
     // of the v1/long collection below, so the two cannot regress each other.
     if porcelain_v2 {
-        return porcelain_v2_output(&repo, untracked, show_ignored, renames, branch_header);
+        return porcelain_v2_output(&repo, untracked, show_ignored, renames, branch_header, &pathspecs);
     }
 
     // Collect the four change classes from the unified status iterator.
@@ -339,7 +348,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         });
     }
 
-    let patterns: Vec<BString> = Vec::new();
+    let patterns: Vec<BString> = pathspecs.to_vec();
     for item in platform.into_iter(patterns)? {
         match item? {
             gix::status::Item::TreeIndex(change) => {
@@ -772,6 +781,7 @@ fn porcelain_v2_output(
     show_ignored: bool,
     renames: Option<Option<gix::diff::Rewrites>>,
     branch_header: bool,
+    pathspecs: &[BString],
 ) -> Result<ExitCode> {
     use gix::bstr::ByteSlice;
     use std::collections::BTreeMap;
@@ -843,7 +853,7 @@ fn porcelain_v2_output(
         });
     }
 
-    let patterns: Vec<BString> = Vec::new();
+    let patterns: Vec<BString> = pathspecs.to_vec();
     for item in platform.into_iter(patterns)? {
         match item? {
             gix::status::Item::TreeIndex(change) => {

@@ -24,7 +24,7 @@ fn zforeach_reports_failures_and_exits_nonzero() {
         git(&r, &["init", "-q", "-b", "main"]);
         git(&r, &["commit", "--allow-empty", "-q", "-m", "c0"]);
     }
-    assert!(Command::new(BIN).args(["zreindex", root.to_str().unwrap()]).current_dir(&root).env("ZVCS_HOME", &home).status().unwrap().success());
+    assert!(Command::new(BIN).args(["zreindex", "--sync", root.to_str().unwrap()]).current_dir(&root).env("ZVCS_HOME", &home).status().unwrap().success());
 
     // A command that fails in every repo (unknown ref).
     let out = Command::new(BIN)

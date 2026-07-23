@@ -33,15 +33,42 @@ pub fn zrepos(_args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `git zreindex [<path>...]` — (re)crawl for git repos and refresh the index,
-/// pruning repos that have since been deleted. With no argument, crawls the
-/// configured roots (`[zvcs] crawlroots`, else `$HOME`); with paths, crawls
-/// exactly those.
+/// `git zreindex [--sync|--async] [<path>...]` — (re)crawl for git repos and
+/// refresh the index, pruning repos that have since been deleted. With no path,
+/// crawls the configured roots (`[zvcs] crawlroots`, else `$HOME`); with paths,
+/// crawls exactly those.
+///
+/// A whole-device scan (`zreindex /`) can take many seconds, so by default it
+/// runs **async** when invoked at a terminal: the crawl is handed to a detached
+/// child (results → `zvcs.log`) and the prompt returns immediately. When stdout
+/// is piped or redirected (a script), it runs **inline** so `indexed N, pruned M`
+/// stays on stdout and the index is populated before the next command. `--sync`
+/// forces inline, `--async` forces detached; either overrides the tty default.
 pub fn zreindex(args: &[String]) -> Result<ExitCode> {
-    let roots: Vec<std::path::PathBuf> = if args.is_empty() {
+    let mut forced: Option<bool> = None; // Some(true)=sync, Some(false)=async
+    let mut roots_args: Vec<String> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "--sync" | "-s" => forced = Some(true),
+            "--async" | "-a" => forced = Some(false),
+            _ => roots_args.push(a.clone()),
+        }
+    }
+    // Interactive (tty stdout) defaults to async; piped/scripted to inline.
+    let sync = forced.unwrap_or_else(|| !std::io::stdout().is_terminal());
+
+    if !sync {
+        let mut child: Vec<&str> = vec!["zreindex", "--sync"];
+        child.extend(roots_args.iter().map(String::as_str));
+        crate::autostart::spawn_detached_self(&child);
+        eprintln!("zvcs: reindex crawling in background — watch with `git zdaemon log -f`");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let roots: Vec<std::path::PathBuf> = if roots_args.is_empty() {
         crate::crawler::configured_roots()
     } else {
-        args.iter().map(std::path::PathBuf::from).collect()
+        roots_args.iter().map(std::path::PathBuf::from).collect()
     };
     let n = crate::crawler::crawl_into_db(&roots)?;
     let pruned = {

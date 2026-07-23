@@ -49,7 +49,7 @@ fn crawler_indexes_repos_and_zrepos_lists_them() {
     }
     std::fs::create_dir_all(root.join("not_a_repo")).unwrap();
 
-    let out = zvcs(&home, &root, &["zreindex", root.to_str().unwrap()]);
+    let out = zvcs(&home, &root, &["zreindex", "--sync", root.to_str().unwrap()]);
     assert!(
         out.contains("indexed 2 repo(s)"),
         "expected 2 repos indexed, got: {out}"
@@ -78,13 +78,13 @@ fn zreindex_prunes_deleted_repos() {
         git(&r, &["init", "-q", "-b", "main"]);
     }
 
-    zvcs(&home, &root, &["zreindex", root.to_str().unwrap()]);
+    zvcs(&home, &root, &["zreindex", "--sync", root.to_str().unwrap()]);
     let before = zvcs(&home, &root, &["zrepos"]);
     assert!(before.contains("keep") && before.contains("gone"), "both indexed:\n{before}");
 
     // Delete one repo from disk, then reindex → it must be pruned.
     std::fs::remove_dir_all(root.join("gone")).unwrap();
-    let out = zvcs(&home, &root, &["zreindex", root.to_str().unwrap()]);
+    let out = zvcs(&home, &root, &["zreindex", "--sync", root.to_str().unwrap()]);
     assert!(out.contains("pruned 1"), "expected 1 pruned, got: {out}");
 
     let after = zvcs(&home, &root, &["zrepos"]);

@@ -30,7 +30,7 @@ fn zforeach_runs_across_all_and_subset() {
         git(&r, &["commit", "--allow-empty", "-q", "-m", "c0"]);
     }
     // Index both.
-    assert!(Command::new(BIN).args(["zreindex", root.to_str().unwrap()]).current_dir(&root).env("ZVCS_HOME", &home).status().unwrap().success());
+    assert!(Command::new(BIN).args(["zreindex", "--sync", root.to_str().unwrap()]).current_dir(&root).env("ZVCS_HOME", &home).status().unwrap().success());
 
     // Across all: both repos appear.
     let all = zvcs(&home, &root, &["zforeach", "--", "git", "rev-parse", "HEAD"]);
@@ -61,7 +61,7 @@ fn double_dash_shields_command_args_from_selector_parsing() {
         git(&r, &["init", "-q", "-b", "main"]);
         git(&r, &["commit", "--allow-empty", "-q", "-m", "c0"]);
     }
-    assert!(Command::new(BIN).args(["zreindex", root.to_str().unwrap()]).current_dir(&root).env("ZVCS_HOME", &home).status().unwrap().success());
+    assert!(Command::new(BIN).args(["zreindex", "--sync", root.to_str().unwrap()]).current_dir(&root).env("ZVCS_HOME", &home).status().unwrap().success());
 
     // `--session prod` here is part of the COMMAND (echo's args), not a selector.
     // No repo is claimed by "prod", so the buggy path narrows to zero → "no repos

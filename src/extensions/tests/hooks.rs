@@ -46,7 +46,7 @@ fn hook_fires_on_ref_change_in_watched_repo() {
     // autostart) makes the explicit start below the sole daemon, reading a
     // fully-committed ledger. Do NOT hoist the hook config above this line.
     let ok = Command::new(BIN)
-        .args(["zreindex", repo.to_str().unwrap()])
+        .args(["zreindex", "--sync", repo.to_str().unwrap()])
         .current_dir(&repo)
         .status()
         .unwrap()

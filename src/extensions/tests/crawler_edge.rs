@@ -49,7 +49,7 @@ fn crawler_indexes_submodule_git_file_and_nested_repo() {
     git(&nested, &["init", "-q", "-b", "main"]);
     std::fs::create_dir_all(root.join("not_a_repo/deep")).unwrap();
 
-    let out = Command::new(BIN).args(["zreindex", root.to_str().unwrap()]).current_dir(&root).env("ZVCS_HOME", &home).output().unwrap();
+    let out = Command::new(BIN).args(["zreindex", "--sync", root.to_str().unwrap()]).current_dir(&root).env("ZVCS_HOME", &home).output().unwrap();
     assert!(out.status.success(), "zreindex failed");
 
     let repos = String::from_utf8(Command::new(BIN).args(["zrepos"]).current_dir(&root).env("ZVCS_HOME", &home).output().unwrap().stdout).unwrap();
@@ -88,7 +88,7 @@ fn crawlroots_tilde_expands_to_home() {
 
     // No path arg → configured_roots() → expand_tilde against the child's HOME.
     let out = Command::new(BIN)
-        .args(["zreindex"])
+        .args(["zreindex", "--sync"])
         .current_dir(&cwd)
         .env("HOME", &fake_home)
         .env("ZVCS_HOME", &zvcs_home)

@@ -45,7 +45,7 @@ fn hook_receives_typed_commit_event() {
     // wins; on CI the daemon wins, deterministically. Indexing first (no hook set
     // yet ⇒ no autostart) makes the explicit start below the sole daemon, and it
     // reads a fully-committed ledger. Do NOT hoist the hook config above this line.
-    assert!(Command::new(BIN).args(["zreindex", repo.to_str().unwrap()]).current_dir(&repo).status().unwrap().success());
+    assert!(Command::new(BIN).args(["zreindex", "--sync", repo.to_str().unwrap()]).current_dir(&repo).status().unwrap().success());
 
     let marker = root.join("event.txt");
     let hook = format!("printf '%s %s' \"$ZVCS_EVENT\" \"$ZVCS_NEW_SHA\" > {}", marker.display());

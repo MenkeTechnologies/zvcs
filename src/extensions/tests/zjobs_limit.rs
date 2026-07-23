@@ -38,7 +38,7 @@ fn zjobs_negative_n_is_clamped_not_unlimited() {
         git(&r, &["init", "-q", "-b", "main"]);
         git(&r, &["commit", "--allow-empty", "-q", "-m", "c0"]);
     }
-    assert!(Command::new(BIN).args(["zreindex", root.to_str().unwrap()]).current_dir(&root).env("ZVCS_HOME", &home).status().unwrap().success());
+    assert!(Command::new(BIN).args(["zreindex", "--sync", root.to_str().unwrap()]).current_dir(&root).env("ZVCS_HOME", &home).status().unwrap().success());
     Command::new(BIN)
         .args(["zforeach", "--", "git", "rev-parse", "--verify", "--quiet", "no-such-ref"])
         .current_dir(&root).env("ZVCS_HOME", &home).output().unwrap();

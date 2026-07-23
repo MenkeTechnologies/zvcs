@@ -30,7 +30,7 @@ fn daemon_populates_zstatus_all() {
     git(&repo, &["commit", "--allow-empty", "-q", "-m", "root"]);
 
     // Index the repo so the daemon watches it; enable status maintenance.
-    assert!(Command::new(BIN).args(["zreindex", repo.to_str().unwrap()]).current_dir(&repo).status().unwrap().success());
+    assert!(Command::new(BIN).args(["zreindex", "--sync", repo.to_str().unwrap()]).current_dir(&repo).status().unwrap().success());
     git(&repo, &["config", "zvcs.autostatus", "true"]);
 
     let mut daemon: Child = Command::new(BIN)

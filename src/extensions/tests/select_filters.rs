@@ -37,7 +37,7 @@ fn selector_dirty_and_claimed_filters() {
         git(&r, &["add", "f.txt"]);
         git(&r, &["commit", "-q", "-m", "c0"]);
     }
-    zvcs(&home, None, &root, &["zreindex", root.to_str().unwrap()]);
+    zvcs(&home, None, &root, &["zreindex", "--sync", root.to_str().unwrap()]);
 
     // Make alpha dirty (tracked change) and record status for both.
     std::fs::write(root.join("alpha/f.txt"), b"2\n").unwrap();
@@ -78,7 +78,7 @@ fn record_failure_preserves_workdir_mapping() {
     std::fs::create_dir_all(&a).unwrap();
     git(&a, &["init", "-q", "-b", "main"]);
     git(&a, &["commit", "--allow-empty", "-q", "-m", "c0"]);
-    zvcs(&home, None, &root, &["zreindex", root.to_str().unwrap()]);
+    zvcs(&home, None, &root, &["zreindex", "--sync", root.to_str().unwrap()]);
 
     // Index recorded the workdir → zrepos shows the workdir path, not the git_dir.
     let before = zvcs(&home, None, &root, &["zrepos"]);
@@ -128,7 +128,7 @@ fn status_filters_intersect_with_and() {
     git(&dirtyonly, &["commit", "-q", "-m", "c0"]);
     std::fs::write(dirtyonly.join("g.txt"), b"2\n").unwrap();
 
-    zvcs(&home, None, &root, &["zreindex", root.to_str().unwrap()]);
+    zvcs(&home, None, &root, &["zreindex", "--sync", root.to_str().unwrap()]);
     zvcs(&home, None, &both, &["zstatus"]);       // cache status
     zvcs(&home, None, &dirtyonly, &["zstatus"]);
 

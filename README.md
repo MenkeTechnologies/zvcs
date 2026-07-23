@@ -149,12 +149,16 @@ in the tree as one named unit, `git zunstash [<name>]` restores it (LIFO), and
 on (3-way apply onto a moved HEAD is the not-yet-ported porcelain territory; a
 repo whose HEAD moved is reported and its stash kept intact).
 
-**Repo index.** `git zreindex [<path>...]` crawls for git repositories and
-records them in the ledger, pruning ones deleted from disk; `git zrepos` lists
-them (pipe-clean, one path per line) — a drop-in for a shell git-repo index. The
-walk is parallel and skips the mounts that would hang or loop a whole-device scan
-(`zreindex /`): kernel pseudo-filesystems, automounted/network volumes, and the
-macOS data-volume firmlink reflection.
+**Repo index.** `git zreindex [--sync|--async] [<path>...]` crawls for git
+repositories and records them in the ledger, pruning ones deleted from disk;
+`git zrepos` lists them (pipe-clean, one path per line) — a drop-in for a shell
+git-repo index. The walk is parallel and skips the mounts that would hang or loop
+a whole-device scan (`zreindex /`): kernel pseudo-filesystems, automounted/network
+volumes, and the macOS data-volume firmlink reflection. At a terminal it runs
+**async** by default — the crawl detaches to the background (results → `zvcs.log`,
+follow with `git zdaemon log -f`) and the prompt returns immediately; piped or
+scripted it runs **inline** so `indexed N, pruned M` stays on stdout. `--sync`
+and `--async` override the default.
 
 **Async queue.** `git zcommit <paths> -m <msg> [--push]` and `git zpush` submit
 fire-and-forget jobs to the daemon (with a network-free / live `ls-refs` push

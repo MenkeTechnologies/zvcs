@@ -39,7 +39,7 @@ fn zhook_set_show_list_test() {
     assert!(show.contains("ZVCS_EVENT") && show.contains("hook-ran"), "zhook show:\n{show}");
 
     // list (after indexing) includes this repo.
-    assert!(Command::new(BIN).args(["zreindex", repo.to_str().unwrap()]).current_dir(&repo).env("ZVCS_HOME", &home).status().unwrap().success());
+    assert!(Command::new(BIN).args(["zreindex", "--sync", repo.to_str().unwrap()]).current_dir(&repo).env("ZVCS_HOME", &home).status().unwrap().success());
     let (list, _) = zvcs(&home, &repo, &["zhook", "list"]);
     assert!(list.contains("repo"), "zhook list missing repo:\n{list}");
 

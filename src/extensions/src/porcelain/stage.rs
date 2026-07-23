@@ -18,6 +18,8 @@
 //!   * `--pathspec-from-file=<file>` / `--pathspec-file-nul` — read pathspecs from
 //!     `<file>` (or stdin for `-`), NUL- or newline-separated, C-quoting honored
 //!   * `-n/--dry-run`, `-v/--verbose`, `-f/--force`, `--sparse/--no-sparse`, `--`
+//!   * `--warn-embedded-repo`/`--no-warn-embedded-repo` — accepted no-op: the
+//!     embedded-repo warning is moot since gitlinks are never staged here
 //!
 //! Deviations (bailed or noted, never faked):
 //!   * `.gitattributes` content filters (autocrlf, `clean`/`smudge`) are NOT
@@ -29,6 +31,12 @@
 //!   * submodule gitlinks are skipped here (use `git zbump`).
 //!   * interactive/patch/edit are rejected with a precise message rather than
 //!     silently ignored (they require a TTY this port does not drive).
+//!   * `-U/--unified`, `--inter-hunk-context`, `--[no-]auto-advance` only configure
+//!     the interactive/patch diff: their values are magnitude-validated exactly as
+//!     git's `OPT_MAGNITUDE` (bad value ⇒ exit 129), then — since patch mode is
+//!     never entered — git's `fatal: the option '<x>' requires '--interactive/--patch'`
+//!     (exit 128) is reproduced. A bare `--auto-advance` is the default and stages
+//!     normally; only `--no-auto-advance` triggers the fatal.
 //!   * pathspecs are resolved relative to the repository root, not to the current
 //!     working directory's prefix.
 //!
@@ -74,6 +82,16 @@ struct Opts {
     /// The validated form of `chmod_arg`: `Some(true)` for `+x`, `Some(false)`
     /// for `-x`. Filled in after option validation, never during parsing.
     chmod: Option<bool>,
+    /// `-U`/`--unified` and `--inter-hunk-context` only feed the interactive/patch
+    /// diff this port never runs. Their values are magnitude-validated during parse
+    /// and then discarded; only whether the option appeared is kept, to raise git's
+    /// `requires '--interactive/--patch'` fatal in `stage()`.
+    unified_seen: bool,
+    interhunk_seen: bool,
+    /// Final value of `--[no-]auto-advance` (last occurrence wins). `Some(false)`
+    /// (turned off) is the only setting that raises that same fatal; the default-on
+    /// `--auto-advance` stages normally.
+    auto_advance: Option<bool>,
     pathspec_file_nul: bool,
     pathspec_from_file: bool,
     /// The `<file>` argument of `--pathspec-from-file=<file>` (or its separate-arg
@@ -128,6 +146,31 @@ fn parse(args: &[String]) -> Result<std::result::Result<Opts, ExitCode>> {
             i += 2;
             continue;
         }
+        // `-U`/`--unified` and `--inter-hunk-context` also take a separate value,
+        // which git magnitude-validates (bad value ⇒ usage exit 129) and then only
+        // consumes under `--patch`/`--interactive`. git always eats the next argv
+        // element as the value — so `-U -A` treats `-A` as the value — so consume it
+        // unconditionally here, mirroring the `--chmod` handling above.
+        if a == "-U" || a == "--unified" || a == "--inter-hunk-context" {
+            let short = a == "-U";
+            let name = if short {
+                "U"
+            } else if a == "--unified" {
+                "unified"
+            } else {
+                "inter-hunk-context"
+            };
+            if let Err(code) = check_magnitude(args.get(i + 1).map(String::as_str), short, name) {
+                return Ok(Err(code));
+            }
+            if a == "--inter-hunk-context" {
+                o.interhunk_seen = true;
+            } else {
+                o.unified_seen = true;
+            }
+            i += 2;
+            continue;
+        }
         match a.as_str() {
             "--" => positional_only = true,
 
@@ -157,6 +200,15 @@ fn parse(args: &[String]) -> Result<std::result::Result<Opts, ExitCode>> {
             "--no-ignore-missing" => o.ignore_missing = false,
             "--sparse" => o.sparse = Some(true),
             "--no-sparse" => o.sparse = Some(false),
+            // `--warn-embedded-repo`/`--no-warn-embedded-repo` (hidden in git,
+            // builtin/add.c:393 `OPT_HIDDEN_BOOL`, default on) only toggles the
+            // `adding embedded git repository:` warning `check_embedded_repo`
+            // emits when a matched worktree directory is itself a git repo. This
+            // port never stages gitlinks/embedded repos (the walk keeps only
+            // File/Symlink entries), so the warning is never produced and both
+            // toggles are accepted no-ops — matching git's exit-0 accept for the
+            // non-embedded-repo case.
+            "--warn-embedded-repo" | "--no-warn-embedded-repo" => {}
             "--pathspec-file-nul" => o.pathspec_file_nul = true,
             "--no-pathspec-file-nul" => o.pathspec_file_nul = false,
 
@@ -171,6 +223,46 @@ fn parse(args: &[String]) -> Result<std::result::Result<Opts, ExitCode>> {
                 o.pathspec_from_file = true;
                 o.pathspec_from_file_value =
                     Some(other["--pathspec-from-file=".len()..].to_string());
+            }
+
+            // Interactive/patch-only diff toggles. A bare `--auto-advance` is git's
+            // default (stages normally); `--no-auto-advance` raises the requires
+            // fatal in `stage()`. A `=value` on either is a usage error.
+            "--auto-advance" => o.auto_advance = Some(true),
+            "--no-auto-advance" => o.auto_advance = Some(false),
+            other if other.starts_with("--auto-advance=") => {
+                eprintln!("error: option `auto-advance' takes no value");
+                return Ok(Err(ExitCode::from(USAGE)));
+            }
+            other if other.starts_with("--no-auto-advance=") => {
+                eprintln!("error: option `no-auto-advance' takes no value");
+                return Ok(Err(ExitCode::from(USAGE)));
+            }
+            // Sticky value forms `-U<n>`, `--unified=<n>`, `--inter-hunk-context=<n>`
+            // (the separate-value forms are consumed in the pre-match block above).
+            other if other.starts_with("-U") && !other.starts_with("--") && other.len() > 2 => {
+                if let Err(code) = check_magnitude(Some(&other[2..]), true, "U") {
+                    return Ok(Err(code));
+                }
+                o.unified_seen = true;
+            }
+            other if other.starts_with("--unified=") => {
+                if let Err(code) =
+                    check_magnitude(Some(&other["--unified=".len()..]), false, "unified")
+                {
+                    return Ok(Err(code));
+                }
+                o.unified_seen = true;
+            }
+            other if other.starts_with("--inter-hunk-context=") => {
+                if let Err(code) = check_magnitude(
+                    Some(&other["--inter-hunk-context=".len()..]),
+                    false,
+                    "inter-hunk-context",
+                ) {
+                    return Ok(Err(code));
+                }
+                o.interhunk_seen = true;
             }
 
             // Recognized git flags that this port does not implement: name them.
@@ -306,6 +398,72 @@ fn unquote_c_style(line: &[u8]) -> Option<String> {
     None // reached end without a closing quote
 }
 
+/// Validate a `-U`/`--unified`/`--inter-hunk-context` value the way git's
+/// `parse_options` does for an `OPT_MAGNITUDE`, emitting git's exact `error:` line
+/// and usage exit 129 on failure. `short` selects the `switch `U'` vs
+/// `option `<name>'` wording; `value` is `None` when the option carried no argument.
+///
+/// git's own error text differs by failure kind (verified against git 2.55.0):
+///   * no argument             -> `<label> requires a value`
+///   * present but empty        -> `<label> expects a numerical value`
+///   * non-empty, not a number  -> `<label> expects an integer value with an optional k/m/g suffix`
+/// A value error is printed alone — it carries no usage block.
+fn check_magnitude(value: Option<&str>, short: bool, name: &str) -> std::result::Result<(), ExitCode> {
+    let label = if short {
+        format!("switch `{name}'")
+    } else {
+        format!("option `{name}'")
+    };
+    match value {
+        None => eprintln!("error: {label} requires a value"),
+        Some("") => eprintln!("error: {label} expects a numerical value"),
+        Some(v) if is_valid_magnitude(v) => return Ok(()),
+        Some(_) => {
+            eprintln!("error: {label} expects an integer value with an optional k/m/g suffix")
+        }
+    }
+    Err(ExitCode::from(USAGE))
+}
+
+/// git's `OPT_MAGNITUDE` acceptance test, ported from `git_parse_unsigned` +
+/// `get_unit_factor` (config.c): reject any `-`; `strtoumax(_, 0)` must consume at
+/// least one digit (base auto-detected — `0x` hex, a leading `0` octal, else
+/// decimal); the trailing unit must be empty or one of `k`/`m`/`g` (case-insensitive).
+/// The parsed magnitude is discarded — only its validity is observable — so the
+/// overflow-past-`ULONG_MAX` arm (which also fails, with the same exit code) is not
+/// reproduced.
+fn is_valid_magnitude(s: &str) -> bool {
+    if s.contains('-') {
+        return false;
+    }
+    let b = s.as_bytes();
+    let mut i = 0;
+    // strtoumax skips leading ASCII whitespace and an optional leading `+`.
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i < b.len() && b[i] == b'+' {
+        i += 1;
+    }
+    // Auto-detect the base the way strtoumax(_, 0) does.
+    let (radix, digits_start) = if i + 1 < b.len() && b[i] == b'0' && (b[i + 1] | 0x20) == b'x' {
+        (16u32, i + 2)
+    } else if i < b.len() && b[i] == b'0' {
+        // A lone leading `0` is itself an octal digit, so the run is never empty.
+        (8u32, i)
+    } else {
+        (10u32, i)
+    };
+    let mut j = digits_start;
+    while j < b.len() && (b[j] as char).to_digit(radix).is_some() {
+        j += 1;
+    }
+    if j == digits_start {
+        return false; // no digit consumed (e.g. "0x", "abc", "")
+    }
+    matches!(&s[j..], "" | "k" | "K" | "m" | "M" | "g" | "G")
+}
+
 // ---------------------------------------------------------------------------
 // entry point
 // ---------------------------------------------------------------------------
@@ -315,6 +473,26 @@ pub fn stage(args: &[String]) -> Result<ExitCode> {
         Ok(o) => o,
         Err(code) => return Ok(code),
     };
+
+    // `-U`/`--unified`, `--inter-hunk-context`, and `--no-auto-advance` only feed
+    // the interactive/patch diff machinery, which this port does not serve. git
+    // collects them into `add_p_opt` and, when neither `--patch` nor `--interactive`
+    // is active, dies here — before every other validation, including the `-A`/`-u`
+    // conflict (verified against git 2.55.0). `-p`/`-i`/`-e` already bailed in
+    // `parse`, so reaching this point means patch mode is off; reproduce the fatal.
+    // The cited option follows git's fixed precedence: `--unified`, then
+    // `--inter-hunk-context`, then `--no-auto-advance`.
+    if o.unified_seen || o.interhunk_seen || o.auto_advance == Some(false) {
+        let opt = if o.unified_seen {
+            "--unified"
+        } else if o.interhunk_seen {
+            "--inter-hunk-context"
+        } else {
+            "--no-auto-advance"
+        };
+        eprintln!("fatal: the option '{opt}' requires '--interactive/--patch'");
+        return Ok(ExitCode::from(FATAL));
+    }
 
     // --- option validation, in git's own order ------------------------------
     // The order matters when an invocation violates several rules at once, and it

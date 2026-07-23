@@ -14,14 +14,18 @@ use std::process::ExitCode;
 /// Consequences of that delegation, stated plainly so this doc claims nothing
 /// the code does not do:
 ///   * Every flag `init` ports (`--bare`, `-q`/`--quiet`, `-b`/
-///     `--initial-branch[=<name>]`, `--`, one optional `<directory>`) is ported
-///     here, byte-for-byte identical on stdout and in post-command repo state.
-///   * Every flag `init` refuses is refused here with `init`'s own message.
-///     That covers the remaining flags listed in the `init-db` synopsis —
-///     `--template=<dir>`, `--separate-git-dir <dir>`, `--shared[=<perms>]` —
-///     plus `--object-format` and `--ref-format`: they `bail!` rather than
-///     being silently ignored, so no run ever produces a repo that differs from
-///     what the flag asked for.
+///     `--initial-branch[=<name>]`, `--template=<dir>`,
+///     `--separate-git-dir <dir>`, `--shared[=<perms>]`,
+///     `--object-format=<hash>`, `--ref-format=<format>`, each flag's
+///     auto-generated `--no-` negation, `--`, one optional `<directory>`) is
+///     ported here, byte-for-byte identical on stdout and in post-command repo
+///     state.
+///   * The defaults `--object-format=sha1` and `--ref-format=files` are honored
+///     as no-ops; `--object-format=sha256` and `--ref-format=reftable` are
+///     rejected with an honest "not supported" error (unverified sha256 write
+///     path / no vendored reftable backend) rather than being silently ignored,
+///     so no run ever produces a repo that differs from what the flag asked for.
+///     An otherwise unrecognized value reproduces git's exact error text.
 ///   * The divergences documented on [`super::init::init`] apply here unchanged:
 ///     reinitialization does not re-copy missing template hooks or
 ///     `info/exclude`, and `--bare` into a non-empty directory surfaces gix's

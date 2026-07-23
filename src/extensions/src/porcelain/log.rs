@@ -48,6 +48,14 @@ const STAT_TERM_WIDTH: usize = 80;
 ///     `--numstat`, `--shortstat`                → per-commit diff against the first parent
 ///     (`--name-only`/`--name-status` are mutually exclusive and suppress the count
 ///     formats); `-s`/`--no-patch` accepted as no-ops
+///   * `-q`/`--quiet` / `--no-quiet`               → git's position-independent
+///     NO_OUTPUT: with no diff requested it changes nothing (`git log` shows no diff
+///     by default), and any explicit `-p`/`--stat` still wins, so its only visible
+///     effect is the `--name-only`/`--name-status` + NO_OUTPUT conflict
+///   * `--source` / `--no-source`                  → annotate each commit with the
+///     ref/argument it was first reached from (`\t<source>` after the hash), on the
+///     built-in header formats (not the user or `reference` formats), with git's
+///     parent-inheritance during the walk
 ///   * `-p`/`--patch`/`-u`                        → per-commit `diff --git` patch against the
 ///     first parent (the empty tree for a root commit), three lines of context; suppressed by
 ///     `--name-only`/`--name-status`, emitted after the count formats otherwise, and skipped
@@ -110,6 +118,13 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let mut numstat = false;
     let mut shortstat = false;
     let mut patch = false;
+    // `-q`/`--quiet`: git pre-sets DIFF_FORMAT_NO_OUTPUT before the other diff-format
+    // flags parse, so it is position-independent. On `git log` (which shows no diff by
+    // default) its only observable effect is the name-only/name-status conflict below.
+    let mut quiet = false;
+    // `--source`: annotate each commit with the ref/argument it was first reached
+    // from (`\t<source>` after the hash), for the built-in header formats.
+    let mut source_mode = false;
     let mut graph = false;
     let mut decorate = false;
     let mut all = false;
@@ -274,6 +289,16 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         } else if a == "-p" || a == "--patch" || a == "-u" {
             // `-u` is git's documented synonym for `-p`.
             patch = true;
+        } else if a == "-q" || a == "--quiet" {
+            // Position-independent NO_OUTPUT (git applies it before `setup_revisions`
+            // parses `-p`/`--stat`), so a later or earlier format flag always wins.
+            quiet = true;
+        } else if a == "--no-quiet" {
+            quiet = false;
+        } else if a == "--source" {
+            source_mode = true;
+        } else if a == "--no-source" {
+            source_mode = false;
         } else if a == "-s" || a == "--no-patch" {
             // Suppress diff output — git treats `-s` as order-sensitive, so a
             // later `--stat`/`-p` re-enables whichever format follows it.
@@ -415,9 +440,13 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    // `--name-only` and `--name-status` are mutually exclusive diff formats;
-    // git rejects the pair in `diff_setup_done` before any traversal.
-    if name_only && name_status {
+    // git's `diff_setup_done` rejects using more than one of `--name-only`,
+    // `--name-status`, `--check`, and `-s` (NO_OUTPUT) together. `--quiet` pre-sets
+    // NO_OUTPUT, but the stat/patch output formats clear it again, so `--quiet`
+    // counts toward this conflict only when none of them are present (matching
+    // `git log --name-only --stat --quiet`, which git accepts).
+    let quiet_no_output = quiet && !patch && !stat && !numstat && !shortstat;
+    if name_only as u8 + name_status as u8 + quiet_no_output as u8 > 1 {
         eprintln!(
             "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
         );
@@ -427,9 +456,18 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // Collect the starting tips in git's order: the named revision (or HEAD),
     // then every ref sorted by full name, then HEAD again for `--all`.
     let mut tips: Vec<ObjectId> = Vec::new();
+    // Parallel to `tips` and populated only under `--source`: the name each tip was
+    // reached from (a rev argument, a full refname for `--all`, or `HEAD`). A commit
+    // inherits the source of the tip that first reaches it during the walk.
+    let mut tip_sources: Vec<String> = Vec::new();
     for spec in &revs {
         match repo.rev_parse_single(spec.as_str()) {
-            Ok(id) => tips.push(id.detach()),
+            Ok(id) => {
+                tips.push(id.detach());
+                if source_mode {
+                    tip_sources.push(spec.clone());
+                }
+            }
             Err(_) => {
                 let hex_len = repo.object_hash().len_in_hex();
                 eprint!("{}", bad_revision_message(spec, hex_len));
@@ -461,6 +499,9 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             if let Ok(obj) = repo.find_object(oid) {
                 if obj.kind == gix::objs::Kind::Commit {
                     tips.push(oid);
+                    if source_mode {
+                        tip_sources.push(full.to_string());
+                    }
                 }
             }
         }
@@ -477,13 +518,16 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         }
         if let Some(id) = repo.head()?.try_peel_to_id()? {
             tips.push(id.detach());
+            if source_mode {
+                tip_sources.push("HEAD".to_string());
+            }
         }
     }
 
     // Walk in git's default commit-date order, then re-sort if a topological
     // order was asked for. `--graph` implies `--topo-order` unless `--date-order`
     // was given explicitly.
-    let mut nodes = walk(&repo, &tips, first_parent)?;
+    let mut nodes = walk(&repo, &tips, &tip_sources, first_parent)?;
     let effective_order = match (order, graph) {
         (Order::Default, true) => Order::Topo,
         (o, _) => o,
@@ -645,6 +689,11 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             now,
             decorations: decorations.as_ref(),
             decorate,
+            source: if source_mode {
+                Some(node.source.as_bytes())
+            } else {
+                None
+            },
         };
         let mut block: Vec<u8> = Vec::new();
         render_entry(&mut block, &commit, &pretty, &ctx)?;
@@ -853,6 +902,9 @@ struct Node {
     id: ObjectId,
     parents: Vec<ObjectId>,
     time: i64,
+    /// `--source`: the ref/argument this commit was first reached from. Empty when
+    /// `--source` is off (the field is never rendered in that case).
+    source: String,
 }
 
 fn read_node(repo: &gix::Repository, id: ObjectId) -> Result<Node> {
@@ -861,6 +913,7 @@ fn read_node(repo: &gix::Repository, id: ObjectId) -> Result<Node> {
         id,
         parents: commit.parent_ids().map(|p| p.detach()).collect(),
         time: commit.time()?.seconds,
+        source: String::new(),
     })
 }
 
@@ -878,12 +931,23 @@ fn insert_by_date(list: &mut Vec<Node>, node: Node) {
 /// Breadth-first walk over the reachable history, newest commit first. With
 /// `first_parent`, only the first parent of each commit is followed — git's
 /// `--first-parent`.
-fn walk(repo: &gix::Repository, tips: &[ObjectId], first_parent: bool) -> Result<Vec<Node>> {
+fn walk(
+    repo: &gix::Repository,
+    tips: &[ObjectId],
+    tip_sources: &[String],
+    first_parent: bool,
+) -> Result<Vec<Node>> {
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut pending: Vec<Node> = Vec::new();
-    for tip in tips {
+    for (idx, tip) in tips.iter().enumerate() {
         if seen.insert(*tip) {
-            insert_by_date(&mut pending, read_node(repo, *tip)?);
+            let mut node = read_node(repo, *tip)?;
+            // `--source` names each tip; without it `tip_sources` is empty and the
+            // source stays blank (never rendered). Parents inherit below.
+            if let Some(src) = tip_sources.get(idx) {
+                node.source = src.clone();
+            }
+            insert_by_date(&mut pending, node);
         }
     }
 
@@ -897,7 +961,11 @@ fn walk(repo: &gix::Repository, tips: &[ObjectId], first_parent: bool) -> Result
         };
         for parent in parents {
             if seen.insert(*parent) {
-                insert_by_date(&mut pending, read_node(repo, *parent)?);
+                let mut pnode = read_node(repo, *parent)?;
+                // git's `add_parents_to_list`: a parent inherits the source of the
+                // commit that first reaches it (an empty-string clone when off).
+                pnode.source = node.source.clone();
+                insert_by_date(&mut pending, pnode);
             }
         }
         out.push(node);
@@ -1686,6 +1754,10 @@ struct RenderCtx<'a> {
     /// `--decorate`: append ` (refs)` to the oneline/header even when the format
     /// carries no `%d` placeholder.
     decorate: bool,
+    /// `--source`: the ref/argument this commit was reached from, rendered as
+    /// `\t<source>` after the hash on the built-in header formats. `None` when
+    /// `--source` is off (and for user/`reference` formats, which git leaves bare).
+    source: Option<&'a [u8]>,
 }
 
 /// Render one commit's header in the selected format. Built-in formats end with
@@ -1707,6 +1779,7 @@ fn render_entry(
         Pretty::Oneline => {
             out.extend_from_slice(id.as_bytes());
             out.extend_from_slice(&ctx.extra);
+            write_source(out, ctx);
             // `--decorate`: ` (HEAD -> main, tag: v1)` between the hash and subject.
             if ctx.decorate {
                 expand_decoration(out, commit, ctx, ctx.want_color, true);
@@ -1737,6 +1810,7 @@ fn render_entry(
             // Raw always shows the full commit id; `--parents` still decorates it.
             out.extend_from_slice(commit.id().to_string().as_bytes());
             out.extend_from_slice(&ctx.extra);
+            write_source(out, ctx);
             out.push(b'\n');
             writeln!(out, "tree {}", commit.tree_id()?)?;
             for pid in commit.parent_ids() {
@@ -1752,6 +1826,7 @@ fn render_entry(
             out.extend_from_slice(b"commit ");
             out.extend_from_slice(id.as_bytes());
             out.extend_from_slice(&ctx.extra);
+            write_source(out, ctx);
             // `--decorate`: ` (HEAD -> main, tag: v1)` after the commit id.
             if ctx.decorate {
                 expand_decoration(out, commit, ctx, ctx.want_color, true);
@@ -1818,6 +1893,16 @@ fn render_entry(
         }
     }
     Ok(())
+}
+
+/// `--source`: git's `show_log` prints `\t<source>` right after the commit hash
+/// (and any `--parents` ids) on the built-in header formats. A no-op when `--source`
+/// is off. User and `reference` formats never call this, matching git.
+fn write_source(out: &mut Vec<u8>, ctx: &RenderCtx<'_>) {
+    if let Some(src) = ctx.source {
+        out.push(b'\t');
+        out.extend_from_slice(src);
+    }
 }
 
 /// Write git's `<label> <name> <<email>>` header line.

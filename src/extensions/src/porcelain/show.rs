@@ -35,8 +35,11 @@ const STAT_TERM_WIDTH: usize = 80;
 /// with the placeholder subset listed in [`expand_format`]. Any other placeholder
 /// is rejected rather than silently dropped.
 ///
-/// Diff output formats: `-p`/`--patch`, `--stat`, `--raw`, `--name-only`, and
-/// `-s`/`--no-patch`. Their interaction is git's, reproduced in [`Formats`].
+/// Diff output formats: `-p`/`--patch`, `--stat`, `--raw`, `--name-only`,
+/// `-s`/`--no-patch`, and `-q`/`--quiet`. Their interaction is git's, reproduced in
+/// [`Formats`]; `-q`/`--quiet` suppresses the default patch but yields to any
+/// explicit format flag regardless of position (git applies its NO_OUTPUT bit
+/// before the other diff flags parse).
 ///
 /// The patch uses git's default settings: Myers diff with the indent (slider)
 /// heuristic, three lines of context, `@@`-hunk function-context, binary-file
@@ -70,6 +73,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut cli_date: Option<DateMode> = None;
     let mut force_root = false;
     let mut first_parent = false;
+    // `-q`/`--quiet`: git pre-sets DIFF_FORMAT_NO_OUTPUT before `setup_revisions`
+    // parses the other diff-format flags, so it is position-independent (an explicit
+    // `-p`/`--stat`/… overrides it) rather than order-sensitive like `-s`. Tracked
+    // as its own flag (last `--quiet`/`--no-quiet` wins) and folded into `no_output`
+    // after parsing.
+    let mut quiet = false;
     // Pickaxe search (`-S<string>` / `-G<regex>`), which limits the shown diff to
     // the file pairs whose change text matches — git-fuzzy's in-commit search uses
     // `-G <query>`. `pending_pickaxe` holds the kind while the separate value form
@@ -101,6 +110,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             // `-s` resets the diff output format rather than adding to it, which is
             // why `-s --name-only` and `--name-only -s` behave differently.
             "-s" | "--no-patch" => formats = Formats::only_no_output(),
+            // `-q`/`--quiet` (position-independent, unlike `-s`): folded into
+            // `no_output` after parsing so an explicit `-p`/`--stat` still wins.
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
             "--name-only" => formats.name_only = true,
             "--raw" => formats.raw = true,
             "--stat" => formats.stat = true,
@@ -145,6 +158,13 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
+    }
+    // `-q`/`--quiet` sets git's NO_OUTPUT bit low-priority: `git show -q` suppresses
+    // the default patch, but `-q -p`/`-q --stat` still render because the explicit
+    // format bit wins in `Formats::resolve`. `--name-only -q` (NO_OUTPUT + NAME with
+    // no third format) is rejected there, matching git's `diff_setup_done`.
+    if quiet {
+        formats.no_output = true;
     }
     if let Pretty::User(fmt) = &pretty {
         // Reject unknown placeholders before any output is produced.

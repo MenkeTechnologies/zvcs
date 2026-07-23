@@ -121,7 +121,9 @@ enum BatchKind {
 ///
 /// `--use-mailmap`/`--mailmap` rewrites author/committer/tagger identities in
 /// commit and tag output. `--batch-all-objects`, `--buffer`, `--unordered`, `-Z`
-/// and `--filter` shape the batch stream.
+/// (NUL stdin+stdout), `-z` (NUL stdin only) and `--filter` shape the batch
+/// stream. `--allow-unknown-type` is accepted as a hidden no-op (git only uses
+/// it to read loose objects of an unknown type, which gix cannot decode).
 ///
 /// Not ported: `--textconv` (needs the configured external `diff.*.textconv`
 /// program; gix-filter has no textconv driver, standalone or in batch),
@@ -136,7 +138,9 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
     let mut all_objects = false;
     let mut buffer = false;
     let mut unordered = false;
-    let mut nul = false;
+    let mut nul_in = false;
+    let mut nul_out = false;
+    let mut nul_flag: Option<&'static str> = None;
     let mut textconv = false;
     let mut filters = false;
     let mut path: Option<String> = None;
@@ -183,6 +187,12 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                 "batch-check" => set_batch!(BatchKind::Check, attached),
                 "batch-command" => set_batch!(BatchKind::Command, attached),
                 "batch-all-objects" => all_objects = true,
+                // Hidden compat boolean. git accepts it (and its `--no-` form)
+                // as a no-op for every object gix can represent; it only alters
+                // reading of loose objects whose type header is not one of the
+                // known types, which gix cannot decode at all — so there is no
+                // additional behavior to port for the representable domain.
+                "allow-unknown-type" | "no-allow-unknown-type" => {}
                 "buffer" => buffer = true,
                 "no-buffer" => buffer = false,
                 "unordered" => unordered = true,
@@ -240,7 +250,17 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                         'p' => Some(Mode::Print),
                         'e' => Some(Mode::Exists),
                         'Z' => {
-                            nul = true;
+                            // `-Z`: NUL-terminate both stdin records and stdout.
+                            nul_in = true;
+                            nul_out = true;
+                            nul_flag = Some("-Z");
+                            None
+                        }
+                        'z' => {
+                            // `-z`: deprecated form — NUL-terminate stdin only;
+                            // stdout records stay newline-delimited.
+                            nul_in = true;
+                            nul_flag = Some("-z");
                             None
                         }
                         'h' => {
@@ -301,6 +321,15 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
+    // `-z`/`-Z` only shape a batch stream; outside batch mode git rejects them
+    // with `usage_msg_optf`, naming the exact flag that was supplied. This check
+    // follows the `--path`/`--filter` diagnostics, matching git's option order.
+    if let Some(flag) = nul_flag {
+        if batch.is_none() {
+            return die_usage(&format!("'{flag}' requires a batch mode"));
+        }
+    }
+
     if batch.is_some() && !all_objects && !positional.is_empty() {
         return die_usage("batch modes take no arguments");
     }
@@ -337,7 +366,8 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
             all_objects,
             buffer,
             unordered,
-            nul,
+            nul_in,
+            nul_out,
             filter.as_deref(),
             use_mailmap,
             filters,
@@ -694,12 +724,15 @@ fn run_batch(
     all_objects: bool,
     buffer: bool,
     unordered: bool,
-    nul: bool,
+    input_nul: bool,
+    output_nul: bool,
     filter: Option<&str>,
     use_mailmap: bool,
     filters: bool,
 ) -> Result<ExitCode> {
-    let delim: u8 = if nul { 0 } else { b'\n' };
+    // `-Z` sets both; `-z` sets only the input delimiter (stdout stays newline).
+    let input_delim: u8 = if input_nul { 0 } else { b'\n' };
+    let output_delim: u8 = if output_nul { 0 } else { b'\n' };
 
     // Format compilation and validation happen before any object is touched,
     // exactly like git — a bad format fails without reading stdin.
@@ -771,7 +804,7 @@ fn run_batch(
                 header.size(),
                 b"",
                 want_contents,
-                delim,
+                output_delim,
                 mailmap.as_ref(),
                 fpipe.as_mut(),
             )? {
@@ -796,11 +829,11 @@ fn run_batch(
 
     loop {
         line.clear();
-        let n = input.read_until(delim, &mut line)?;
+        let n = input.read_until(input_delim, &mut line)?;
         if n == 0 {
             break;
         }
-        if line.last() == Some(&delim) {
+        if line.last() == Some(&input_delim) {
             line.pop();
         }
 
@@ -812,7 +845,7 @@ fn run_batch(
                     &fmt,
                     &line,
                     buffer,
-                    delim,
+                    output_delim,
                     objfilter.as_ref(),
                     mailmap.as_ref(),
                     fpipe.as_mut(),
@@ -832,7 +865,7 @@ fn run_batch(
                     &fmt,
                     &line,
                     want_contents,
-                    delim,
+                    output_delim,
                     objfilter.as_ref(),
                     mailmap.as_ref(),
                     fpipe.as_mut(),

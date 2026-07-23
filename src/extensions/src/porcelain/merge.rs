@@ -36,15 +36,37 @@
 //! * `--signoff`, `-F`/`--file`, `--cleanup=<mode>`, `-q`/`--quiet`,
 //!   `-v`/`--verbose`, and `--no-verify` (bypassing the `pre-merge-commit` and
 //!   `commit-msg` hooks).
+//! * `-m`/`--message` accumulation: repeated `-m` values are joined into
+//!   paragraphs by a blank line (a port of `option_parse_message`), so
+//!   `-m a -m b` produces `a\n\nb`.
+//! * The value-clearing negations `--no-message` (empty the accumulated
+//!   message), `--no-into-name` (restore the real target destination) and
+//!   `--no-cleanup` (back to the default `whitespace` mode) — ports of git's
+//!   OPT_STRING/OPT_CLEANUP `unset` behaviour.
+//! * `--into-name <name>`: a port of git's `into_name` — override the merge
+//!   message's destination (the ` into <name>` title and the
+//!   `merge.suppressDest` test), rather than the real current branch.
+//! * The default-matching negations `--no-log`, `--no-rerere-autoupdate`,
+//!   `--no-verify-signatures`, `--no-gpg-sign`, `--no-autostash`,
+//!   `--no-progress`, `--no-compact-summary`, `--no-strategy` (git's
+//!   `option_parse_strategy` no-ops on `unset`), and `--overwrite-ignore`,
+//!   accepted as no-ops: each names behaviour this build already performs
+//!   (no shortlog,
+//!   no rerere, no signature verification, unsigned commit, no autostash, no
+//!   progress, ordinary diffstat, ignored files overwritten), so passing them
+//!   reproduces stock git rather than erroring.
 //!
 //! What is refused or deferred rather than faked:
 //!
 //! * `-s recursive`/`resolve`/`subtree`: distinct conflict-resolution engines
 //!   that are not vendored, refused rather than aliased onto `ort`.
-//! * `-X`/`--strategy-option`, `--log[=<n>]`/`--no-log`, `--autostash`: these
-//!   need substrate not reachable from this file (blob-merge options threaded
-//!   through `merge_apply::three_way_merge`, the `fmt-merge-msg` shortlog
-//!   builder, and stash create/apply helpers respectively); left rejected.
+//! * `-X`/`--strategy-option`, `--log[=<n>]` (positive counts), the enabling
+//!   `--autostash`, `--rerere-autoupdate`, `--progress`, `--compact-summary`,
+//!   and `--no-overwrite-ignore`: these need substrate not reachable from this
+//!   file (blob-merge options threaded through `merge_apply::three_way_merge`,
+//!   the `fmt-merge-msg` shortlog builder, stash create/apply, the rerere store,
+//!   a progress meter, the compact-summary diff renderer, and gitignore-aware
+//!   checkout respectively); left rejected.
 //! * `-e`/`--edit` (interactive editor), `-S`/`--gpg-sign`,
 //!   `--verify-signatures` (no signing/verification driver).
 //!
@@ -133,6 +155,10 @@ struct Opts {
     quiet: bool,
     cleanup: Cleanup,
     strategy: Strategy,
+    /// `--into-name <name>`: use `<name>` instead of the real target branch when
+    /// composing the merge message's ` into <name>` title (a port of git's
+    /// `into_name`, which overrides `current_branch` in `fmt_merge_msg`).
+    into_name: Option<String>,
 }
 
 impl Default for Opts {
@@ -151,6 +177,7 @@ impl Default for Opts {
             quiet: false,
             cleanup: Cleanup::Default,
             strategy: Strategy::Ort,
+            into_name: None,
         }
     }
 }
@@ -208,6 +235,48 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             "--no-allow-unrelated-histories" => opts.allow_unrelated = false,
             "--no-verify" => opts.no_verify = true,
             "--verify" => opts.no_verify = false,
+            // `--into-name <name>` / `--into-name=<name>`: override the merge
+            // message's destination (port of git's `into_name`).
+            "--into-name" => {
+                i += 1;
+                match args.get(i) {
+                    Some(n) => opts.into_name = Some(n.clone()),
+                    None => {
+                        eprintln!("error: option `{a}' requires a value");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            _ if a.starts_with("--into-name=") => {
+                opts.into_name = Some(a["--into-name=".len()..].to_string())
+            }
+            // `--no-into-name`: git's OPT_STRING negation sets `into_name` to
+            // NULL, restoring the real target branch as the message destination.
+            "--no-into-name" => opts.into_name = None,
+            // Flags whose git behaviour is already this build's default, accepted
+            // as no-ops so they match stock git rather than erroring:
+            //  * `--no-log`: no shortlog is added to the merge message (this build
+            //    never adds one).
+            //  * `--no-rerere-autoupdate`: no rerere machinery runs here anyway.
+            //  * `--no-verify-signatures`: signatures are never verified.
+            //  * `--no-gpg-sign`: commits are never signed.
+            //  * `--no-autostash`: no stash is taken (a dirty worktree is refused,
+            //    as git does without autostash).
+            //  * `--overwrite-ignore`: ignored files are overwritten (git's default).
+            //  * `--no-progress`: no progress is emitted (as under a non-tty).
+            //  * `--no-compact-summary`: the ordinary diffstat is shown.
+            //  * `--no-strategy`: git's `option_parse_strategy` returns early on
+            //    `unset` without clearing the strategy list, so it is a no-op that
+            //    leaves any earlier `-s` in force (default `ort` when none given).
+            "--no-log"
+            | "--no-rerere-autoupdate"
+            | "--no-verify-signatures"
+            | "--no-gpg-sign"
+            | "--no-autostash"
+            | "--overwrite-ignore"
+            | "--no-progress"
+            | "--no-compact-summary"
+            | "--no-strategy" => {}
             // Verbosity: git keeps a signed level; only quiet has an observable
             // effect on stdout (it silences the summary/diffstat). `--verbose`'s
             // extra diagnostics go to stderr and are not reproduced.
@@ -216,19 +285,27 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             // We never open an editor, so `--no-edit` is the natural state; `-e`
             // is deferred (see the module docs).
             "--no-edit" => {}
+            // `-m`/`--message` accumulate into one buffer, joined by a blank line
+            // (git's `option_parse_message`: `buf->len ? "\n\n" : ""`), so
+            // `-m a -m b` yields the two-paragraph message `a\n\nb`.
             "-m" | "--message" => {
                 i += 1;
                 match args.get(i) {
-                    Some(m) => opts.message = Some(m.clone()),
+                    Some(m) => append_message(&mut opts.message, m),
                     None => {
                         eprintln!("error: option `{a}' requires a value");
                         return Ok(ExitCode::from(129));
                     }
                 }
             }
-            _ if a.starts_with("--message=") => opts.message = Some(a["--message=".len()..].to_string()),
+            // `--no-message`: clear the accumulated message (git's
+            // `option_parse_message` on `unset` does `strbuf_setlen(buf, 0)`).
+            "--no-message" => opts.message = None,
+            _ if a.starts_with("--message=") => {
+                append_message(&mut opts.message, &a["--message=".len()..])
+            }
             _ if a.len() > 2 && a.starts_with("-m") && !a.starts_with("--") => {
-                opts.message = Some(a[2..].to_string())
+                append_message(&mut opts.message, &a[2..])
             }
             "-F" | "--file" => {
                 i += 1;
@@ -262,6 +339,10 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
             },
+            // `--no-cleanup`: git's OPT_CLEANUP is an OPT_STRING, so the negation
+            // sets `cleanup_arg` to NULL and `get_cleanup_mode(NULL, 0)` returns
+            // the default (`whitespace` without an editor) — our `Cleanup::Default`.
+            "--no-cleanup" => opts.cleanup = Cleanup::Default,
             "-s" | "--strategy" => {
                 i += 1;
                 match args.get(i).map(String::as_str).map(resolve_strategy) {
@@ -502,7 +583,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     let head_tree = repo.find_object(local_id)?.peel_to_tree()?.id;
     let target_tree = repo.find_object(target_id)?.peel_to_tree()?.id;
     let should_interrupt = AtomicBool::new(false);
-    let message = merge_message(&repo, spec, branch.as_ref(), opts.message.clone())?;
+    let message = merge_message(&repo, spec, branch.as_ref(), opts.message.clone(), opts.into_name.as_deref())?;
 
     // Diverged histories: a genuine three-way merge (`ort` strategy) of HEAD and
     // the target against their merge base (an empty tree for unrelated histories).
@@ -783,7 +864,9 @@ fn merge_ours(
             }
             m
         }
-        None if refs.len() == 1 => merge_message(repo, refs[0].as_str(), branch, None)?,
+        None if refs.len() == 1 => {
+            merge_message(repo, refs[0].as_str(), branch, None, opts.into_name.as_deref())?
+        }
         None => {
             let specs: Vec<&str> = refs.iter().map(String::as_str).collect();
             octopus_message(&specs)
@@ -975,6 +1058,19 @@ fn merge_mode(ff: Ff) -> &'static [u8] {
         b"no-ff"
     } else {
         b""
+    }
+}
+
+/// Append one `-m`/`--message` value to the accumulating message buffer, joining
+/// paragraphs with a blank line. Port of `option_parse_message()`
+/// (builtin/merge.c): `strbuf_addf(buf, "%s%s", buf->len ? "\n\n" : "", arg)`.
+fn append_message(buf: &mut Option<String>, arg: &str) {
+    match buf {
+        Some(existing) => {
+            existing.push_str("\n\n");
+            existing.push_str(arg);
+        }
+        None => *buf = Some(arg.to_string()),
     }
 }
 
@@ -1327,6 +1423,7 @@ fn merge_message(
     spec: &str,
     branch: Option<&FullName>,
     explicit: Option<String>,
+    into_name: Option<&str>,
 ) -> Result<String> {
     if let Some(mut m) = explicit {
         if !m.ends_with('\n') {
@@ -1358,9 +1455,15 @@ fn merge_message(
         },
     };
 
-    let current = match branch {
-        Some(b) => b.shorten().to_str_lossy().into_owned(),
-        None => "HEAD".to_string(),
+    // git's `into_name` overrides the destination name verbatim (used both for
+    // the ` into <name>` title and the `merge.suppressDest` test); otherwise the
+    // shortened current branch name (or `HEAD` when detached) is used.
+    let current = match into_name {
+        Some(n) => n.to_string(),
+        None => match branch {
+            Some(b) => b.shorten().to_str_lossy().into_owned(),
+            None => "HEAD".to_string(),
+        },
     };
     let mut out = format!("Merge {described}");
     if !dest_suppressed(repo, &current) {

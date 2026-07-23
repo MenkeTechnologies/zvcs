@@ -60,6 +60,16 @@ enum Untracked {
 ///   * `git status -u<mode>`             — all three `--untracked-files` modes.
 ///   * `git status --ignored[=<mode>]`   — the `!!` / `Ignored files:` listing.
 ///   * `git status --no-renames | --renames | -M | --find-renames[=<n>]`.
+///   * `git status --show-stash` — the trailing stash-count line (long) / the
+///     `# stash <n>` header (porcelain v2), driven by `status.showStash`.
+///   * `git status --[no-]ahead-behind` — FULL counts vs. git's QUICK (`[different]`
+///     / `+? -?` / "refer to different commits") mode, driven by `status.aheadBehind`.
+///   * `git status --ignore-submodules[=<when>]` — `all` hides every submodule
+///     change (staged gitlink bumps included), while `dirty` / `untracked` /
+///     `none` tune which index↔worktree submodule differences surface via gix's
+///     submodule-status ignore level; an invalid `<when>` is fatal (exit 128).
+///   * `git status --no-short | --no-long | --no-porcelain` — reset to the long
+///     format and pin it against `status.short`.
 ///   * unmerged (conflicted) paths, in both long and short form.
 ///   * `git status [--] <pathspec>...` — limits the report to matching paths
 ///     (the gix status iterator is given the patterns), across every format.
@@ -87,11 +97,25 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     // lets `status.showUntrackedFiles` win, for ignored it means "do not show".
     let mut untracked_arg: Option<String> = None;
     let mut ignored_arg: Option<String> = None;
+    // `--ignore-submodules[=<when>]` is git's OPTION_STRING with a `PARSE_OPT_OPTARG`
+    // default of "all": the raw value is stored during parsing (last wins; `--no-`
+    // resets to unspecified) and validated once by `handle_ignore_submodules_arg`
+    // *after* the command line is parsed. `None` leaves each submodule's own
+    // configured ignore level in force (gix's `AsConfigured` default).
+    let mut ignore_submodules_arg: Option<String> = None;
     // `None` keeps git's configured default (`status.renames`/`diff.renames`).
     let mut renames: Option<Option<gix::diff::Rewrites>> = None;
     // `git status [--] <pathspec>...` limits the report to matching paths.
     let mut pathspecs: Vec<BString> = Vec::new();
     let mut operands_only = false;
+    // `--show-stash` / `--no-show-stash` (`OPT_BOOL`): `None` defers to
+    // `status.showStash`. Only the long and porcelain-v2 formats render it.
+    let mut show_stash: Option<bool> = None;
+    // `--ahead-behind` / `--no-ahead-behind` (`OPT_BOOL` over git's tri-state
+    // `ahead_behind_flags`): `Some(true)` = `AHEAD_BEHIND_FULL`, `Some(false)` =
+    // `AHEAD_BEHIND_QUICK`, `None` = unspecified (resolved from `status.aheadBehind`
+    // for the human formats, else FULL).
+    let mut ahead_behind: Option<bool> = None;
 
     for a in args {
         let s = a.as_str();
@@ -115,6 +139,16 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 porcelain = false;
                 format_explicit = true;
             }
+            // git's `--short`/`--long` are `OPT_SET_INT` and `--porcelain` an
+            // `OPT_CALLBACK`; every `--no-` form resets the format to
+            // `STATUS_FORMAT_NONE`, which renders long and — crucially — pins the
+            // format so `status.short` config can no longer promote it to short.
+            "--no-short" | "--no-long" | "--no-porcelain" => {
+                short = false;
+                porcelain = false;
+                porcelain_v2 = false;
+                format_explicit = true;
+            }
             "--porcelain=v2" | "--porcelain=2" => {
                 porcelain_v2 = true;
                 format_explicit = true;
@@ -128,6 +162,12 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 branch_header = false;
                 branch_explicit = true;
             }
+            "--show-stash" => show_stash = Some(true),
+            "--no-show-stash" => show_stash = Some(false),
+            // `--ahead-behind` selects FULL counts, `--no-ahead-behind` the QUICK
+            // (eq/neq) mode; either flag wins over `status.aheadBehind`.
+            "--ahead-behind" => ahead_behind = Some(true),
+            "--no-ahead-behind" => ahead_behind = Some(false),
             // Bare forms take git's default optarg ("all" / "traditional"); the
             // `--no-` forms reset to unspecified. Attached values (`--...=<v>`,
             // `-u<v>`) are captured raw below and validated after the loop.
@@ -135,6 +175,11 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             "--no-untracked-files" => untracked_arg = None,
             "--ignored" => ignored_arg = Some("traditional".to_string()),
             "--no-ignored" => ignored_arg = None,
+            // Bare `--ignore-submodules` takes git's "all" default optarg; the
+            // `--no-` form resets to unspecified. An attached `=<when>` is captured
+            // raw below and validated after the loop.
+            "--ignore-submodules" => ignore_submodules_arg = Some("all".to_string()),
+            "--no-ignore-submodules" => ignore_submodules_arg = None,
             // Everything after `--` is a pathspec; the pathspec arm below rejects
             // any that follow, and a trailing `--` on its own is a no-op.
             "--" => operands_only = true,
@@ -155,6 +200,9 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             }
             _ if s.starts_with("--ignored=") => {
                 ignored_arg = Some(s["--ignored=".len()..].to_string());
+            }
+            _ if s.starts_with("--ignore-submodules=") => {
+                ignore_submodules_arg = Some(s["--ignore-submodules=".len()..].to_string());
             }
             _ if s.starts_with("--find-renames=") || s.starts_with("-M") => {
                 let raw = s
@@ -253,6 +301,31 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         },
         None => false,
     };
+    // git validates `--ignore-submodules` last (in `wt_status_collect` via
+    // `handle_ignore_submodules_arg`, after untracked and ignored). Only the final
+    // stored value is checked; a bad value dies with exit 128. `None` leaves gix on
+    // its `AsConfigured` default (each submodule's own configured ignore level).
+    let ignore_submodules: Option<gix::submodule::config::Ignore> = match &ignore_submodules_arg {
+        Some(v) => match v.as_str() {
+            "all" => Some(gix::submodule::config::Ignore::All),
+            "dirty" => Some(gix::submodule::config::Ignore::Dirty),
+            "untracked" => Some(gix::submodule::config::Ignore::Untracked),
+            "none" => Some(gix::submodule::config::Ignore::None),
+            _ => {
+                eprintln!("fatal: bad --ignore-submodules argument: {v}");
+                return Ok(ExitCode::from(128));
+            }
+        },
+        None => None,
+    };
+    // `--ignore-submodules=all` also hides *staged* gitlink changes: git sets
+    // `diffopt.ignore_submodules` for the tree↔index diff, not only the worktree
+    // pass. The gix platform's `index_worktree_submodules` covers only the latter,
+    // so the tree↔index collection filters commit-mode entries itself for `all`.
+    let ignore_all = matches!(
+        ignore_submodules,
+        Some(gix::submodule::config::Ignore::All)
+    );
 
     let repo = gix::discover(".")?;
 
@@ -286,7 +359,26 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(128));
             }
         }
+        // `status.showStash` is git's default for `--show-stash`; a command-line
+        // flag (`Some`) always wins.
+        if show_stash.is_none() {
+            show_stash = Some(snap.boolean("status.showStash") == Some(true));
+        }
+        // `finalize_deferred_config`: only the human formats (long / short display)
+        // inherit `status.aheadBehind`; the porcelain machine formats keep FULL for
+        // backwards compatibility, and an explicit flag always wins.
+        if ahead_behind.is_none() && !porcelain && !porcelain_v2 {
+            if let Some(v) = snap.boolean("status.aheadBehind") {
+                ahead_behind = Some(v);
+            }
+        }
     }
+
+    // Resolve the deferred booleans: absent `--show-stash`/config means off;
+    // `quick` is git's `AHEAD_BEHIND_QUICK` (only `--no-ahead-behind` /
+    // `status.aheadBehind=false` selects it, everything else is FULL).
+    let show_stash = show_stash.unwrap_or(false);
+    let quick = ahead_behind == Some(false);
 
     // Resolve the head into an owned description so the borrow ends before we
     // re-open references for the tracking computation.
@@ -315,7 +407,18 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     // richer per-path fields (HEAD/index/worktree modes + oids); it shares none
     // of the v1/long collection below, so the two cannot regress each other.
     if porcelain_v2 {
-        return porcelain_v2_output(&repo, untracked, show_ignored, renames, branch_header, &pathspecs);
+        return porcelain_v2_output(
+            &repo,
+            untracked,
+            show_ignored,
+            renames,
+            branch_header,
+            &pathspecs,
+            show_stash,
+            quick,
+            ignore_submodules,
+            ignore_all,
+        );
     }
 
     // Collect the four change classes from the unified status iterator.
@@ -347,12 +450,34 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             None => gix::status::tree_index::TrackRenames::Disabled,
         });
     }
+    // `--ignore-submodules=<when>` fixes the index↔worktree submodule check at the
+    // requested ignore level (git's `handle_ignore_submodules_arg`); absent the
+    // flag, gix keeps each submodule's own configured level.
+    if let Some(ignore) = ignore_submodules {
+        platform = platform.index_worktree_submodules(gix::status::Submodule::Given {
+            ignore,
+            check_dirty: true,
+        });
+    }
 
     let patterns: Vec<BString> = pathspecs.to_vec();
     for item in platform.into_iter(patterns)? {
         match item? {
             gix::status::Item::TreeIndex(change) => {
                 use gix::diff::index::ChangeRef;
+                // `--ignore-submodules=all` suppresses staged gitlink (submodule)
+                // changes too; skip any tree↔index change on a commit-mode entry.
+                if ignore_all {
+                    let mode = match &change {
+                        ChangeRef::Addition { entry_mode, .. }
+                        | ChangeRef::Deletion { entry_mode, .. }
+                        | ChangeRef::Modification { entry_mode, .. }
+                        | ChangeRef::Rewrite { entry_mode, .. } => *entry_mode,
+                    };
+                    if type_class(mode) == 2 {
+                        continue;
+                    }
+                }
                 match change {
                     ChangeRef::Addition { location, .. } => {
                         staged.push((StageKind::New, location.into_owned(), None));
@@ -458,7 +583,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     if short {
         let mut out = String::new();
         if branch_header {
-            out.push_str(&short_branch_header(&head_state, tracking.as_ref(), &colors));
+            out.push_str(&short_branch_header(&head_state, tracking.as_ref(), quick, &colors));
         }
         out.push_str(&render_short(
             staged,
@@ -470,11 +595,14 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         ));
         print!("{out}");
     } else {
+        // `--show-stash` appends a stash-count summary after the trailer; the count
+        // is the number of `refs/stash` reflog entries (git's `count_stash_entries`).
+        let stash_count = if show_stash { count_stash_entries(&repo) } else { 0 };
         print!(
             "{}",
             render_long(
                 &head_state,
-                &tracking_lines(tracking.as_ref()),
+                &tracking_lines(tracking.as_ref(), quick),
                 unborn,
                 merging,
                 untracked,
@@ -484,6 +612,8 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 &unmerged,
                 &untracked_paths,
                 &ignored_paths,
+                show_stash,
+                stash_count,
                 &colors,
             )
         );
@@ -775,6 +905,7 @@ fn worktree_mode(repo: &gix::Repository, path: &gix::bstr::BStr) -> u32 {
 /// unmerged paths as `u …`, and untracked / ignored as `? <path>` / `! <path>`;
 /// with `--branch` the `# branch.*` header precedes them. A separate renderer
 /// from v1/long — it shares no collection, so neither can regress the other.
+#[allow(clippy::too_many_arguments)]
 fn porcelain_v2_output(
     repo: &gix::Repository,
     untracked: Untracked,
@@ -782,6 +913,10 @@ fn porcelain_v2_output(
     renames: Option<Option<gix::diff::Rewrites>>,
     branch_header: bool,
     pathspecs: &[BString],
+    show_stash: bool,
+    quick: bool,
+    ignore_submodules: Option<gix::submodule::config::Ignore>,
+    ignore_all: bool,
 ) -> Result<ExitCode> {
     use gix::bstr::ByteSlice;
     use std::collections::BTreeMap;
@@ -808,8 +943,23 @@ fn porcelain_v2_output(
         if let Some(t) = tracking_info(repo)? {
             out.push_str(&format!("# branch.upstream {}\n", t.upstream));
             if !t.gone {
-                out.push_str(&format!("# branch.ab +{} -{}\n", t.ahead, t.behind));
+                // FULL prints the exact counts (`+0 -0` when identical); QUICK knows
+                // only whether the branches diverged, so a divergence is `+? -?`.
+                if quick && (t.ahead > 0 || t.behind > 0) {
+                    out.push_str("# branch.ab +? -?\n");
+                } else {
+                    out.push_str(&format!("# branch.ab +{} -{}\n", t.ahead, t.behind));
+                }
             }
+        }
+    }
+
+    // `# stash <n>` follows the branch header (independent of `--branch`), before
+    // the change entries; git omits it when there are no stash entries.
+    if show_stash {
+        let n = count_stash_entries(repo);
+        if n > 0 {
+            out.push_str(&format!("# stash {n}\n"));
         }
     }
 
@@ -852,12 +1002,30 @@ fn porcelain_v2_output(
             None => gix::status::tree_index::TrackRenames::Disabled,
         });
     }
+    if let Some(ignore) = ignore_submodules {
+        platform = platform.index_worktree_submodules(gix::status::Submodule::Given {
+            ignore,
+            check_dirty: true,
+        });
+    }
 
     let patterns: Vec<BString> = pathspecs.to_vec();
     for item in platform.into_iter(patterns)? {
         match item? {
             gix::status::Item::TreeIndex(change) => {
                 use gix::diff::index::ChangeRef;
+                // `--ignore-submodules=all` hides staged gitlink changes too.
+                if ignore_all {
+                    let mode = match &change {
+                        ChangeRef::Addition { entry_mode, .. }
+                        | ChangeRef::Deletion { entry_mode, .. }
+                        | ChangeRef::Modification { entry_mode, .. }
+                        | ChangeRef::Rewrite { entry_mode, .. } => *entry_mode,
+                    };
+                    if type_class(mode) == 2 {
+                        continue;
+                    }
+                }
                 match change {
                     ChangeRef::Addition {
                         location,
@@ -1173,7 +1341,7 @@ fn tracking_info(repo: &gix::Repository) -> Result<Option<Tracking>> {
 /// Build the tracking header line(s) for the long format, matching git's
 /// `format_tracking_info` output including advice hints. Empty when there is no
 /// upstream configured.
-fn tracking_lines(tracking: Option<&Tracking>) -> String {
+fn tracking_lines(tracking: Option<&Tracking>, quick: bool) -> String {
     let Some(t) = tracking else {
         return String::new();
     };
@@ -1186,6 +1354,11 @@ fn tracking_lines(tracking: Option<&Tracking>) -> String {
     let (ahead, behind) = (t.ahead, t.behind);
     if ahead == 0 && behind == 0 {
         format!("Your branch is up to date with '{upstream}'.\n")
+    } else if quick {
+        // AHEAD_BEHIND_QUICK: git knows the branches differ but not by how much.
+        format!(
+            "Your branch and '{upstream}' refer to different commits.\n  (use \"git status --ahead-behind\" for details)\n"
+        )
     } else if behind == 0 {
         let noun = if ahead == 1 { "commit" } else { "commits" };
         format!(
@@ -1207,6 +1380,7 @@ fn tracking_lines(tracking: Option<&Tracking>) -> String {
 fn short_branch_header(
     head_state: &HeadState,
     tracking: Option<&Tracking>,
+    quick: bool,
     colors: &StatusColors,
 ) -> String {
     // git wraps the fixed scaffolding (`## `, `...`, the `[ahead …]` labels) in the
@@ -1238,6 +1412,12 @@ fn short_branch_header(
     out.push_str(&colors.paint(Slot::RemoteBranch, &t.upstream));
     if t.gone {
         out.push_str(&h(" [gone]"));
+    } else if quick {
+        // AHEAD_BEHIND_QUICK collapses any divergence to `[different]`; an
+        // up-to-date branch still prints no bracket at all.
+        if t.ahead > 0 || t.behind > 0 {
+            out.push_str(&h(" [different]"));
+        }
     } else if t.ahead > 0 && t.behind > 0 {
         out.push_str(&h(" [ahead "));
         out.push_str(&colors.paint(Slot::LocalBranch, &t.ahead.to_string()));
@@ -1280,6 +1460,8 @@ fn render_long(
     unmerged: &[(u8, BString)],
     untracked: &[BString],
     ignored: &[BString],
+    show_stash: bool,
+    stash_count: usize,
     colors: &StatusColors,
 ) -> String {
     let mut out = String::new();
@@ -1424,7 +1606,35 @@ fn render_long(
         out.push('\n');
     }
 
+    // `wt_longstatus_print_stash_summary`: an unconditional trailing line after
+    // the summary, emitted only when there is at least one stash entry.
+    if show_stash && stash_count > 0 {
+        let noun = if stash_count == 1 { "entry" } else { "entries" };
+        out.push_str(&format!("Your stash currently has {stash_count} {noun}\n"));
+    }
+
     out
+}
+
+/// Count `refs/stash` reflog entries — git's `count_stash_entries`, which drives
+/// the `--show-stash` line. Zero when the stash ref (and thus its reflog) is absent.
+fn count_stash_entries(repo: &gix::Repository) -> usize {
+    let reference = match repo.try_find_reference("refs/stash") {
+        Ok(Some(r)) => r,
+        _ => return 0,
+    };
+    let mut platform = reference.log_iter();
+    let mut n = 0;
+    if let Ok(Some(iter)) = platform.all() {
+        for line in iter {
+            if line.is_ok() {
+                n += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    n
 }
 
 fn render_short(

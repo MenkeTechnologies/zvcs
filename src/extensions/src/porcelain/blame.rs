@@ -80,6 +80,16 @@ const NOT_COMMITTED_MAIL: &[u8] = b"not.committed.yet";
 /// `--contents <file>` (and `--contents -` from stdin), `--diff-algorithm`, and
 /// `--date=relative`.
 ///
+/// The `--[no-]` negation forms git advertises are honored with git's exact
+/// bit-clearing semantics: `--no-show-name`, `--no-show-number`, `--no-porcelain`
+/// (clears the porcelain bit only), `--no-line-porcelain` (clears both porcelain
+/// bits, so it also cancels a preceding `-p`), and `--no-abbrev` (equivalent to
+/// `--abbrev=0`, i.e. the full hash). The `--no-` forms of the unimplemented
+/// options (`--no-incremental`, `--no-show-stats`, `--no-progress`,
+/// `--no-score-debug`, `--no-color-lines`, `--no-color-by-age`,
+/// `--no-ignore-rev`, `--no-ignore-revs-file`) each select git's default, which
+/// this port already produces, so they are accepted as no-ops.
+///
 /// Flags that are not implemented (`--incremental`, `-M`/`-C` line-move
 /// detection, `--reverse`, `-w`, `--ignore-rev`, `--ignore-revs-file`, `-S`,
 /// regex/function `-L` forms, `--date=human`, the `-local` date variants, …)
@@ -1260,7 +1270,12 @@ impl Options {
                 "-e" | "--show-email" => show_email = true,
                 "--no-show-email" => show_email = false,
                 "-f" | "--show-name" => show_name = true,
+                // git's `--[no-]show-name` clears OUTPUT_SHOW_NAME; auto-detection
+                // in `find_alignment` still re-shows the column when a rename put a
+                // differing source path on a line, exactly as git does.
+                "--no-show-name" => show_name = false,
                 "-n" | "--show-number" => show_number = true,
+                "--no-show-number" => show_number = false,
                 // `-b` blanks boundary object names; there is no `--no-b`.
                 "-b" => blank_boundary = true,
                 // `--root` stops treating root commits as boundaries.
@@ -1274,9 +1289,21 @@ impl Options {
                 // git's `--porcelain` and `--line-porcelain` are bit flags on one
                 // field, so `--line-porcelain` wins no matter the order.
                 "-p" | "--porcelain" => porcelain = true,
+                // git's `--no-porcelain` clears only the OUTPUT_PORCELAIN bit,
+                // leaving OUTPUT_LINE_PORCELAIN untouched; the output selector keys
+                // off OUTPUT_PORCELAIN, so this drops back to the human format.
+                "--no-porcelain" => porcelain = false,
                 "--line-porcelain" => {
                     porcelain = true;
                     line_porcelain = true;
+                }
+                // `--line-porcelain`'s OPT_BIT value is OUTPUT_PORCELAIN |
+                // OUTPUT_LINE_PORCELAIN, so its `--no-` form clears BOTH bits — even
+                // after a bare `-p` (verified against stock git: `-p
+                // --no-line-porcelain` yields the human format).
+                "--no-line-porcelain" => {
+                    porcelain = false;
+                    line_porcelain = false;
                 }
                 "-L" => {
                     i += 1;
@@ -1326,6 +1353,28 @@ impl Options {
                     contents = Some(a["--contents=".len()..].to_string());
                 }
                 "--no-contents" => contents = None,
+                // git's OPT__ABBREV `--no-abbrev` sets abbrev to 0, which its
+                // post-parse `else if (!abbrev) abbrev = hexsz` turns into the full
+                // hash. `object_name_width` already treats `Some(0)` as "no
+                // abbreviation", so `--no-abbrev` is exactly `--abbrev=0` (verified
+                // identical to `-l` on stock git).
+                "--no-abbrev" => abbrev = Some(0),
+                // The `--no-` forms of options whose positive form needs substrate
+                // this port does not have (`--incremental`, `--show-stats`,
+                // `--progress`, `--score-debug`, `--color-lines`, `--color-by-age`,
+                // `--ignore-rev`, `--ignore-revs-file`). Each positive default is
+                // off/empty, so the negated form requests exactly the behavior this
+                // port already produces; stock git emits byte-identical stdout for
+                // them (verified), so they are accepted as no-ops rather than
+                // rejected. The positive forms remain refused below.
+                "--no-incremental"
+                | "--no-show-stats"
+                | "--no-progress"
+                | "--no-score-debug"
+                | "--no-color-lines"
+                | "--no-color-by-age"
+                | "--no-ignore-rev"
+                | "--no-ignore-revs-file" => {}
                 _ if a.starts_with("-L") => parse_line_range(&a[2..], &mut ranges)?,
                 _ if a.starts_with("--abbrev=") => {
                     let v = &a["--abbrev=".len()..];

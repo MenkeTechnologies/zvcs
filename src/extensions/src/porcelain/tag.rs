@@ -19,7 +19,14 @@
 //!                                       `creator`, `subject`/`body`/`contents`.
 //!   * `git tag --format=<fmt>`        → render each tag through `<fmt>`.
 //!   * `git tag --contains/--no-contains/--merged/--no-merged/--points-at`
-//!                                       → ancestry / points-at listing filters.
+//!                                       → ancestry / points-at listing filters
+//!                                       (`--with`/`--without` are hidden aliases
+//!                                       for `--contains`/`--no-contains`).
+//!   * `git tag --no-<flag>`             → the negations git's parse-options accepts:
+//!                                       `--no-annotate`/`--no-force`/`--no-ignore-case`/
+//!                                       `--no-omit-empty`/`--no-color`/`--no-file`/
+//!                                       `--no-format`/`--no-sign`/`--no-local-user`/
+//!                                       `--no-edit`/`--no-column`.
 //!   * `git tag -i|--ignore-case`      → case-insensitive match and sort.
 //!   * `git tag --omit-empty`          → drop refs whose `--format` output is empty.
 //!   * `git tag <name> [<commit>]`     → create a lightweight tag at `<commit>`.
@@ -27,6 +34,8 @@
 //!   * `git tag --cleanup=<mode>`      → `verbatim`/`whitespace`/`strip` message
 //!                                       cleanup for `-m`/`-F`.
 //!   * `git tag -f …`                  → force, printing the `Updated tag` line.
+//!   * `git tag --create-reflog …`     → force-create the tag's reflog, writing git's
+//!                                       `tag: tagging <abbrev> (<subject>, <date>)` line.
 //!   * `git tag -d <name>…`            → delete each tag.
 //!
 //! Exit codes follow git: fatal errors exit 128, a bad object name for a filter
@@ -35,7 +44,7 @@
 //! Genuinely not backed here, and refused rather than faked: cryptographic
 //! signing (`-s`, `-u`) and verification (`-v`), an editor-supplied message (`-a`
 //! with neither `-m` nor `-F`, `-e`), forced ANSI color (`--color`/`--color=always`),
-//! `--column`, `--create-reflog`, the git gecos identity fallback, and `--format`
+//! `--column`, custom trailers (`--trailer`), the git gecos identity fallback, and `--format`
 //! atoms outside the set handled by [`render_atom`] (`align`, `describe`,
 //! `upstream`, relative/custom dates, …).
 
@@ -49,8 +58,8 @@ use gix::glob::wildmatch;
 use gix::glob::wildmatch::Mode;
 use gix::hash::ObjectId;
 use gix::objs::{CommitRef, Kind, TagRef};
-use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
-use gix::refs::FullName;
+use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+use gix::refs::{FullName, Target};
 
 /// A parsed actor identity captured from a tag/commit header.
 #[derive(Clone)]
@@ -117,6 +126,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     let mut annotate = false;
     let mut ignore_case = false;
     let mut omit_empty = false;
+    let mut create_reflog = false;
     let mut want_color = false;
     let mut lines: Option<usize> = None;
     let mut sorts: Vec<String> = Vec::new();
@@ -147,10 +157,33 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             "-d" | "--delete" => delete = true,
             "-l" | "--list" => list = true,
             "-f" | "--force" => force = true,
+            "--no-force" => force = false,
             "-a" | "--annotate" => annotate = true,
+            "--no-annotate" => annotate = false,
             "-i" | "--ignore-case" => ignore_case = true,
+            "--no-ignore-case" => ignore_case = false,
             "--omit-empty" => omit_empty = true,
+            "--no-omit-empty" => omit_empty = false,
+            "--create-reflog" => create_reflog = true,
+            "--no-create-reflog" => create_reflog = false,
             "--color" => want_color = true,
+            "--no-color" => want_color = false,
+            // Negations of unsupported creation flags: the feature they toggle is
+            // off already, so git accepts these and does nothing. Turning an option
+            // off is never faking work, so unlike the positive `-s`/`-u`/`-e` these
+            // are honored silently.
+            "--no-sign" | "--no-local-user" | "--no-edit" => {}
+            // Column display is not ported; the default single-name-per-line output
+            // already matches `--no-column`, so accept it as the no-op it names.
+            "--no-column" => {}
+            // Clear an accumulated message/file/format the way git's OPT_FILENAME /
+            // OPT_STRING negations do.
+            "--no-file" => message_file = None,
+            "--no-format" => format = None,
+            // Hidden `--with`/`--without` aliases for `--contains`/`--no-contains`
+            // (git's OPT_WITH/OPT_WITHOUT), same `LASTARG_DEFAULT` HEAD semantics.
+            "--with" => contains = Some(optarg(args, &mut i)),
+            "--without" => no_contains = Some(optarg(args, &mut i)),
             "-s" | "--sign" | "-u" | "--local-user" => {
                 bail!("signed tags ({a}) are not supported")
             }
@@ -184,7 +217,11 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                     points_at = Some(rest.to_string());
                 } else if let Some(rest) = a.strip_prefix("--contains=") {
                     contains = Some(rest.to_string());
+                } else if let Some(rest) = a.strip_prefix("--with=") {
+                    contains = Some(rest.to_string());
                 } else if let Some(rest) = a.strip_prefix("--no-contains=") {
+                    no_contains = Some(rest.to_string());
+                } else if let Some(rest) = a.strip_prefix("--without=") {
                     no_contains = Some(rest.to_string());
                 } else if let Some(rest) = a.strip_prefix("--merged=") {
                     merged = Some(rest.to_string());
@@ -346,6 +383,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         &messages,
         message_file.as_deref(),
         cleanup.as_deref(),
+        create_reflog,
     )
 }
 
@@ -1394,7 +1432,42 @@ fn strip_components(name: &[u8], n: i64, from_left: bool) -> Vec<u8> {
     kept.join(&b'/')
 }
 
+/// Port of git's `create_reflog_msg`: the reflog line written under `--create-reflog`,
+/// describing the *target* object (never the new tag object). `GIT_REFLOG_ACTION`, when
+/// set, replaces the whole message; otherwise it is `tag: tagging <abbrev> (<detail>)`,
+/// where `<detail>` is the target commit's first subject line plus its committer date in
+/// `SHORT` (`%Y-%m-%d`, UTC — git passes tz 0 to `show_date`), or a fixed phrase for a
+/// tree/blob/tag/unknown target.
+fn reflog_message(repo: &gix::Repository, target: ObjectId) -> Result<BString> {
+    if let Ok(rla) = std::env::var("GIT_REFLOG_ACTION") {
+        return Ok(BString::from(rla));
+    }
+    let mut sb = format!("tag: tagging {} (", short_hex(repo, target)).into_bytes();
+    let obj = repo.find_object(target)?;
+    match obj.kind {
+        Kind::Commit => {
+            let c = CommitRef::from_bytes(&obj.data, target.kind())?;
+            // git's `find_commit_subject`: the first physical line of the message,
+            // taken verbatim (no whitespace folding).
+            let message: &[u8] = &c.message;
+            let subject_end = message.iter().position(|&b| b == b'\n').unwrap_or(message.len());
+            sb.extend_from_slice(&message[..subject_end]);
+            let committed = sig_from(c.committer()?);
+            // `show_date(c->date, 0, DATE_MODE(SHORT))` — the committer timestamp at UTC.
+            let utc = gix::date::Time::new(committed.time.seconds, 0);
+            sb.extend_from_slice(b", ");
+            sb.extend_from_slice(&fmt_date(utc, "short")?);
+        }
+        Kind::Tree => sb.extend_from_slice(b"tree object"),
+        Kind::Blob => sb.extend_from_slice(b"blob object"),
+        Kind::Tag => sb.extend_from_slice(b"other tag object"),
+    }
+    sb.push(b')');
+    Ok(BString::from(sb))
+}
+
 /// Create a lightweight or annotated tag `<name>` at `[<commit>]` (default `HEAD`).
+#[allow(clippy::too_many_arguments)]
 fn create_tag(
     repo: &gix::Repository,
     positionals: &[&str],
@@ -1403,6 +1476,7 @@ fn create_tag(
     messages: &[Vec<u8>],
     message_file: Option<&str>,
     cleanup: Option<&str>,
+    create_reflog: bool,
 ) -> Result<ExitCode> {
     if positionals.len() > 2 {
         return fatal("too many arguments");
@@ -1483,13 +1557,38 @@ fn create_tag(
             message: BString::from(message),
             pgp_signature: None,
         };
-        let id = repo.write_object(&object)?.detach();
-        repo.tag_reference(name, id, constraint)?;
-        id
+        repo.write_object(&object)?.detach()
     } else {
-        repo.tag_reference(name, target, constraint)?;
         target
     };
+
+    // git always computes a reflog message describing the *target* object (built
+    // before the tag object exists), then writes the ref with `REF_FORCE_CREATE_REFLOG`
+    // only under `--create-reflog`. Mirror that: force the reflog via an explicit
+    // transaction when asked, else keep the plain `tag_reference` path (whose default
+    // `LogChange` never forces a tag reflog), matching stock git for both cases.
+    if create_reflog {
+        let message = reflog_message(repo, target)?;
+        let full: FullName = ref_name
+            .as_str()
+            .try_into()
+            .map_err(|e| anyhow!("invalid tag name {name:?}: {e}"))?;
+        repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: true,
+                    message,
+                },
+                expected: constraint,
+                new: Target::Object(new_id),
+            },
+            name: full,
+            deref: false,
+        })?;
+    } else {
+        repo.tag_reference(name, new_id, constraint)?;
+    }
 
     if let Some(old) = prev {
         if old != new_id {

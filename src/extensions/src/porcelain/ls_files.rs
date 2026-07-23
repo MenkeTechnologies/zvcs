@@ -63,6 +63,11 @@ struct Opts {
     others: bool,          // -o / --others
     ignored: bool,         // -i / --ignored (show only excluded paths)
     directory: bool,       // --directory (collapse wholly-untracked directories)
+    /// git's `DIR_HIDE_EMPTY_DIRECTORIES` (wired as `OPT_NEGBIT`): default off,
+    /// so an empty untracked directory is shown as `dir/` under `--directory`.
+    /// `--no-empty-directory` sets the bit (hide them); `--empty-directory` (and
+    /// the default) clears it (show them).
+    hide_empty_dir: bool,  // --no-empty-directory
     tags: bool,            // -t
     valid_bit: bool,       // -v (lowercase tag for 'assume unchanged' entries)
     fsmonitor_bit: bool,   // -f (lowercase tag for 'fsmonitor clean' entries)
@@ -72,6 +77,9 @@ struct Opts {
     zero: bool,            // -z
     full_name: bool,       // --full-name
     exclude_standard: bool, // --exclude-standard (add the standard git exclusions)
+    /// `--with-tree <tree-ish>`: overlay the named tree onto the index so paths
+    /// removed since that tree still appear. Holds the raw tree-ish spelling.
+    with_tree: Option<String>,
     /// `--format` template; when set, replaces the default per-entry rendering.
     format: Option<String>,
     /// `-x/--exclude <pattern>` command-line exclude patterns, highest priority.
@@ -191,8 +199,9 @@ fn pathspec_parse_fatal(err: &gix::pathspec::parse::Error, raw: &str) -> Option<
 /// Supported invocations:
 ///   * `-c/--cached` (the default), `-s/--stage`, `-u/--unmerged`
 ///   * `-d/--deleted`, `-m/--modified`, `-o/--others`, `--directory`
+///   * `--empty-directory`/`--no-empty-directory` (show/hide empty untracked dirs)
 ///   * `-t` (status tags), `--deduplicate`, `--error-unmatch`
-///   * `--full-name`, `-z`, `--abbrev[=<n>]`
+///   * `--full-name`, `-z`, `--abbrev[=<n>]`, `--with-tree <tree-ish>`
 ///   * trailing pathspecs, optionally after `--`
 ///
 /// Output ordering mirrors git exactly: the directory walk (`--others`) is
@@ -200,9 +209,10 @@ fn pathspec_parse_fatal(err: &gix::pathspec::parse::Error, raw: &str) -> Option<
 /// cached line, the deleted line, and the modified line in that order.
 ///
 /// Exclude handling (`-x`, `-X`, `-i`, `--exclude-standard`), `-v`, `-f`,
-/// `--debug`, `--format` and `--resolve-undo` are ported. `-k/--killed`,
-/// `--eol` and `--with-tree` are not ported and are rejected rather than
-/// silently ignored.
+/// `--debug`, `--format`, `--resolve-undo` and `--with-tree` are ported.
+/// `-k/--killed`, `--eol`, `--sparse`, `--exclude-per-directory` and
+/// `--recurse-submodules` are not ported (each needs substrate gix does not
+/// expose) and are rejected rather than silently ignored.
 pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     let mut opts = Opts::default();
     let mut no_more_flags = false;
@@ -242,6 +252,8 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             "--no-ignored" => opts.ignored = false,
             "--directory" => opts.directory = true,
             "--no-directory" => opts.directory = false,
+            "--empty-directory" => opts.hide_empty_dir = false,
+            "--no-empty-directory" => opts.hide_empty_dir = true,
             "--deduplicate" => opts.dedup = true,
             "--no-deduplicate" => opts.dedup = false,
             "--error-unmatch" => opts.error_unmatch = true,
@@ -282,6 +294,17 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             _ if s.starts_with("--format=") => {
                 opts.format = Some(s["--format=".len()..].to_string());
             }
+            "--with-tree" => match args.get(i + 1) {
+                Some(v) => {
+                    opts.with_tree = Some(v.clone());
+                    i += 1;
+                }
+                None => return Ok(usage_error("option `with-tree' requires a value")),
+            },
+            _ if s.starts_with("--with-tree=") => {
+                opts.with_tree = Some(s["--with-tree=".len()..].to_string());
+            }
+            "--no-with-tree" => opts.with_tree = None,
             _ if s.starts_with("--abbrev=") => {
                 let raw = &s["--abbrev=".len()..];
                 let Ok(n) = raw.parse::<usize>() else {
@@ -399,7 +422,73 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     }
 
     let repo = gix::discover(".")?;
-    let index = repo.open_index()?;
+    let mut index = repo.open_index()?;
+
+    // `--with-tree <tree-ish>` overlays the named tree onto the index so that
+    // paths removed since that tree are still listed (git's
+    // `overlay_tree_on_index`). git rejects it alongside `-s`/`-u` ("show-stages
+    // and show-unmerged would not make any sense"); the message and exit 128 are
+    // git's. Tree paths that already have a stage-0 index entry stay hidden (git
+    // marks them `CE_UPDATE`); the rest are appended as stage-1 entries, so they
+    // render with git's `tag_unmerged` (`M `) and, under `-d`/`-m`, are compared
+    // against the worktree directly. The overlaid paths are tracked so those
+    // per-entry worktree checks bypass the index-status pass, which never saw
+    // them (it runs over the on-disk index, not this in-memory overlay).
+    let mut overlaid: HashSet<BString> = HashSet::new();
+    if let Some(spec) = opts.with_tree.clone() {
+        if opts.stage {
+            eprintln!(
+                "fatal: options 'ls-files --with-tree' and '-s/-u' cannot be used together"
+            );
+            return Ok(ExitCode::from(128));
+        }
+        // git's `get_oid` failure is "tree-ish %s not found."; a resolvable name
+        // that will not peel to a tree is "bad tree-ish %s".
+        let tree = match repo.rev_parse_single(spec.as_str()) {
+            Err(_) => {
+                eprintln!("fatal: tree-ish {spec} not found.");
+                return Ok(ExitCode::from(128));
+            }
+            Ok(id) => {
+                let peeled = id.object().ok().and_then(|o| o.peel_to_tree().ok());
+                match peeled {
+                    Some(t) => t,
+                    None => {
+                        eprintln!("fatal: bad tree-ish {spec}");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+            }
+        };
+
+        // Paths already carried at stage 0 keep their index entry (git's
+        // `last_stage0` / `CE_UPDATE` dedup); collect them before mutating so the
+        // overlay never double-lists a still-tracked path.
+        let stage0: HashSet<BString> = index
+            .entries()
+            .iter()
+            .filter(|e| e.stage_raw() == 0)
+            .map(|e| e.path(&index).to_owned())
+            .collect();
+
+        let tree_entries = tree.traverse().breadthfirst.files()?;
+        for te in tree_entries {
+            if stage0.contains(te.filepath.as_bstr()) {
+                continue;
+            }
+            index.dangerously_push_entry(
+                gix::index::entry::Stat::default(),
+                te.oid,
+                gix::index::entry::Flags::from_stage(gix::index::entry::Stage::Base),
+                gix::index::entry::Mode::from(te.mode),
+                te.filepath.as_bstr(),
+            );
+            overlaid.insert(te.filepath);
+        }
+        // Restore the sort invariant the raw pushes broke, so the emit pass and
+        // any path lookups iterate in git's name order.
+        index.sort_entries();
+    }
 
     // Index paths are repository-root relative; unless `--full-name` was asked
     // for, git prints them relative to the current directory.
@@ -443,11 +532,17 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
 
     // `-i` needs the walk to surface ignored paths too, which gix normally drops.
     let worktree = if opts.others || opts.modified || opts.deleted {
+        // git shows empty untracked directories (`dir/`) under `--directory` by
+        // default; `--no-empty-directory` suppresses them. gix's walk hides them
+        // unless `emit_empty_directories` is set, so enable it to match git's
+        // default whenever a collapsed `--directory` walk is in play.
+        let emit_empty = opts.others && opts.directory && !opts.hide_empty_dir;
         Some(collect_worktree(
             &repo,
             opts.others,
             opts.directory,
             opts.ignored,
+            emit_empty,
         )?)
     } else {
         None
@@ -537,7 +632,12 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
 
         if opts.deleted || opts.modified {
             let state = worktree.as_ref().expect("collected when -d/-m is set");
-            let (is_deleted, is_modified) = entry_worktree_change(&repo, state, entry, path);
+            // Overlaid (`--with-tree`) entries never appeared in the index-status
+            // pass, so force the direct worktree comparison for them, exactly as
+            // git's `show_files` lstats every cache entry uniformly.
+            let direct = overlaid.contains(path);
+            let (is_deleted, is_modified) =
+                entry_worktree_change(&repo, state, entry, path, direct);
             if opts.deleted && is_deleted {
                 lines.push(render(&opts, "R ", Some(entry), &repo, display, quote, terminator));
             }
@@ -723,6 +823,7 @@ fn collect_worktree(
     others: bool,
     directory: bool,
     want_ignored: bool,
+    emit_empty: bool,
 ) -> Result<Worktree> {
     use gix::status::index_worktree::Item;
     use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
@@ -748,10 +849,17 @@ fn collect_worktree(
         .status(gix::progress::Discard)?
         .untracked_files(untracked);
     // `-i` needs ignored entries emitted individually (git lists ignored files,
-    // not collapsed directories, by default).
-    if want_ignored {
-        platform = platform.dirwalk_options(|o| {
-            o.emit_ignored(Some(gix::dir::walk::EmissionMode::Matching))
+    // not collapsed directories, by default); `emit_empty` surfaces empty
+    // untracked directories so `--directory` can show them like git's default.
+    if want_ignored || emit_empty {
+        platform = platform.dirwalk_options(|mut o| {
+            if want_ignored {
+                o = o.emit_ignored(Some(gix::dir::walk::EmissionMode::Matching));
+            }
+            if emit_empty {
+                o = o.emit_empty_directories(true);
+            }
+            o
         });
     }
     for item in platform.into_index_worktree_iter(Vec::<BString>::new())? {
@@ -810,8 +918,12 @@ fn entry_worktree_change(
     state: &Worktree,
     entry: &gix::index::Entry,
     path: &BStr,
+    direct: bool,
 ) -> (bool, bool) {
-    if !state.conflicted.contains(path) {
+    // `direct` (an `--with-tree` overlay entry) forces the per-entry lstat+hash
+    // path below; otherwise a non-conflicted entry is resolved from the cached
+    // index-status buckets.
+    if !direct && !state.conflicted.contains(path) {
         let deleted = state.removed.contains(path);
         return (deleted, deleted || state.modified.contains(path));
     }

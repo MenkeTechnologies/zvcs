@@ -29,6 +29,13 @@ use crate::lock::RepoLock;
 ///   * `git init --template=<dir>` / `--template <dir>`   (seed from a template)
 ///   * `git init --separate-git-dir=<gitdir>`             (real git dir elsewhere + `.git` link file)
 ///   * `git init --shared[=<permissions>]`                (group/world/octal sharing)
+///   * `git init --object-format=<hash>` / `--object-format <hash>`
+///                                                        (`sha1` accepted; `sha256` rejected — see deviations)
+///   * `git init --ref-format=<format>` / `--ref-format <format>`
+///                                                        (`files` accepted; `reftable` rejected — see deviations)
+///   * `--no-bare` / `--no-quiet` / `--no-template` / `--no-separate-git-dir` /
+///     `--no-initial-branch` / `--no-object-format` / `--no-ref-format`
+///                                                        (git's auto-generated negations; reset to default, last-wins)
 ///   * `--` to terminate option parsing
 ///
 /// Ported from git's `builtin/init-db.c` + `setup.c` (`create_default_files`,
@@ -44,10 +51,14 @@ use crate::lock::RepoLock;
 ///     already-initialized repo is not re-templated, re-shared, or migrated to a
 ///     separate git dir. The overwhelmingly common `git init` into a fresh dir
 ///     is unaffected.
-///   * `--object-format=sha256` and `--ref-format=reftable` are rejected (not
-///     "silently accepted"): the sha256 write path is unverified against gix and
-///     there is no vendored reftable backend. `--object-format=sha1` /
-///     `--ref-format=files` (the defaults) are likewise not special-cased.
+///   * `--object-format=sha256` and `--ref-format=reftable` are rejected with an
+///     honest "not supported" error (not "silently accepted", and never faked
+///     into a mismatched-format repo): the sha256 object write path is unverified
+///     against gix and there is no vendored reftable backend. The defaults
+///     `--object-format=sha1` and `--ref-format=files` ARE honored — they are
+///     no-ops that match the repository gix already writes — and an otherwise
+///     unrecognized value reproduces git's exact error text (`unknown hash
+///     algorithm '<v>'` / `unknown ref storage format '<v>'`).
 pub fn init(args: &[String]) -> Result<ExitCode> {
     let mut bare = false;
     let mut quiet = false;
@@ -55,6 +66,10 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     let mut directory: Option<String> = None;
     let mut template: Option<String> = None;
     let mut separate_git_dir: Option<String> = None;
+    // The requested `--object-format`/`--ref-format` values (validated after the
+    // parse loop, exactly like git validates `object_format` after parse-options).
+    let mut object_format: Option<String> = None;
+    let mut ref_format: Option<String> = None;
     // The `git_config_perm` value: `None` = `--shared` not given; `Some(0)` =
     // umask/false (no sharing); `Some(0o660)` = group; `Some(0o664)` = everybody;
     // `Some(neg)` = an explicit `0xxx` file mode (stored negated, as git does).
@@ -75,7 +90,14 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         match arg.as_str() {
             "--" => positional_only = true,
             "--bare" => bare = true,
+            // git's parse-options auto-generates a `--no-` form for every OPT_BOOL
+            // and OPT_STRING; the negation resets the option to its default (false
+            // for booleans, unset for strings), and parsing is last-wins. `--shared`
+            // uses a custom callback with no negation, so `--no-shared` is NOT
+            // accepted (git reports it as an unknown option) and is left unhandled.
+            "--no-bare" => bare = false,
             "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
             "-b" | "--initial-branch" => {
                 i += 1;
                 let name = args
@@ -83,6 +105,7 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
                     .ok_or_else(|| anyhow::anyhow!("option `{arg}' requires a value"))?;
                 initial_branch = Some(name.clone());
             }
+            "--no-initial-branch" => initial_branch = None,
             "--template" => {
                 i += 1;
                 let dir = args
@@ -90,6 +113,7 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
                     .ok_or_else(|| anyhow::anyhow!("option `{arg}' requires a value"))?;
                 template = Some(dir.clone());
             }
+            "--no-template" => template = None,
             "--separate-git-dir" => {
                 i += 1;
                 let dir = args
@@ -97,6 +121,26 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
                     .ok_or_else(|| anyhow::anyhow!("option `{arg}' requires a value"))?;
                 separate_git_dir = Some(dir.clone());
             }
+            "--no-separate-git-dir" => separate_git_dir = None,
+            // `--object-format <hash>` / `--ref-format <format>` take a required
+            // value (space or `=`), validated after the loop. Their `--no-` forms
+            // unset the request, matching git's OPT_STRING negation.
+            "--object-format" => {
+                i += 1;
+                let fmt = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("option `{arg}' requires a value"))?;
+                object_format = Some(fmt.clone());
+            }
+            "--no-object-format" => object_format = None,
+            "--ref-format" => {
+                i += 1;
+                let fmt = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("option `{arg}' requires a value"))?;
+                ref_format = Some(fmt.clone());
+            }
+            "--no-ref-format" => ref_format = None,
             // `--shared` takes an OPTIONAL argument, attached with `=` only (git's
             // PARSE_OPT_OPTARG). `--shared group` treats `group` as a positional.
             "--shared" => shared = Some(0o660),
@@ -112,12 +156,55 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             _ if arg.starts_with("--shared=") => {
                 shared = Some(parse_shared_value(&arg["--shared=".len()..])?);
             }
+            _ if arg.starts_with("--object-format=") => {
+                object_format = Some(arg["--object-format=".len()..].to_string());
+            }
+            _ if arg.starts_with("--ref-format=") => {
+                ref_format = Some(arg["--ref-format=".len()..].to_string());
+            }
             _ if arg.starts_with("-b") => {
                 initial_branch = Some(arg[2..].to_string());
             }
             _ => anyhow::bail!("unknown option `{arg}'"),
         }
         i += 1;
+    }
+
+    // Validate `--object-format` / `--ref-format` before any repository is
+    // touched, matching git (`builtin/init-db.c` calls `hash_algo_by_name` and
+    // dies on an unknown value before `create_default_files`; the same holds on
+    // reinit — `git init --object-format=bogus <existing>` dies rather than
+    // reprinting the reinit line).
+    //
+    // git's `hash_algo_by_name` recognizes exactly `sha1` and `sha256`; anything
+    // else is `unknown hash algorithm '<v>'`. gix lays down sha1 repositories, so
+    // `sha1` (also the default) is a no-op that matches stock git byte-for-byte.
+    // `sha256` requires a verified sha256 object write path that is not vendored,
+    // so it is rejected honestly rather than silently producing a sha1 repo.
+    if let Some(fmt) = object_format.as_deref() {
+        match fmt {
+            "sha1" => {}
+            "sha256" => anyhow::bail!(
+                "the sha256 object format is not supported: no vendored, verified \
+                 sha256 object write path"
+            ),
+            other => anyhow::bail!("unknown hash algorithm '{other}'"),
+        }
+    }
+
+    // `--ref-format` recognizes exactly `files` and `reftable` (verified against
+    // stock git: `--ref-format=bogus` dies with `unknown ref storage format
+    // '<v>'`). `files` is the default backend gix writes, so it is a no-op match.
+    // `reftable` has no vendored backend and is rejected honestly.
+    if let Some(fmt) = ref_format.as_deref() {
+        match fmt {
+            "files" => {}
+            "reftable" => anyhow::bail!(
+                "the reftable ref storage format is not supported: no vendored \
+                 reftable backend"
+            ),
+            other => anyhow::bail!("unknown ref storage format '{other}'"),
+        }
     }
 
     // umask/false/0 leaves the repository unshared, exactly like `--shared` never

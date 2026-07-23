@@ -42,6 +42,11 @@ pub fn run() -> ExitCode {
     // silently mishandled.
     let mut idx = 0;
     let mut pager_forced: Option<bool> = None;
+    // `-c <name>=<value>` overrides, collected and injected into gix's config
+    // resolution via git's `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_N`/…_VALUE_N env
+    // mechanism (which gix-config reads), so `git -c foo.bar=x <verb>` behaves
+    // exactly as git does — tooling and the submodule re-exec path rely on it.
+    let mut config_overrides: Vec<String> = Vec::new();
     while idx < raw.len() {
         match raw[idx].as_str() {
             "-C" => {
@@ -52,6 +57,11 @@ pub fn run() -> ExitCode {
                 }
                 idx += 2;
             }
+            "-c" => {
+                let Some(pair) = raw.get(idx + 1) else { break };
+                config_overrides.push(pair.clone());
+                idx += 2;
+            }
             "-p" | "--paginate" => {
                 pager_forced = Some(true);
                 idx += 1;
@@ -60,8 +70,35 @@ pub fn run() -> ExitCode {
                 pager_forced = Some(false);
                 idx += 1;
             }
+            // `--git-dir`/`--work-tree`/`--namespace` set the well-known env vars
+            // gix honors, in both the `--flag <val>` and `--flag=<val>` forms.
+            "--git-dir" | "--work-tree" | "--namespace" => {
+                let key = match raw[idx].as_str() {
+                    "--git-dir" => "GIT_DIR",
+                    "--work-tree" => "GIT_WORK_TREE",
+                    _ => "GIT_NAMESPACE",
+                };
+                let Some(val) = raw.get(idx + 1) else { break };
+                std::env::set_var(key, val);
+                idx += 2;
+            }
+            s if s.starts_with("--git-dir=") => {
+                std::env::set_var("GIT_DIR", &s["--git-dir=".len()..]);
+                idx += 1;
+            }
+            s if s.starts_with("--work-tree=") => {
+                std::env::set_var("GIT_WORK_TREE", &s["--work-tree=".len()..]);
+                idx += 1;
+            }
+            s if s.starts_with("--namespace=") => {
+                std::env::set_var("GIT_NAMESPACE", &s["--namespace=".len()..]);
+                idx += 1;
+            }
             _ => break,
         }
+    }
+    if !config_overrides.is_empty() {
+        apply_config_overrides(&config_overrides);
     }
     let args = &raw[idx..];
 
@@ -145,6 +182,28 @@ pub fn run() -> ExitCode {
     };
     pager::finish();
     code
+}
+
+/// Translate `git -c <name>=<value>` overrides into the `GIT_CONFIG_COUNT` /
+/// `GIT_CONFIG_KEY_N` / `GIT_CONFIG_VALUE_N` environment sequence that
+/// `gix-config` reads, appending to any count a parent process already set. A
+/// bare `-c <name>` (no `=`) is git's boolean-true form, encoded as an empty
+/// value (which gix reads as true for boolean keys), matching git.
+fn apply_config_overrides(overrides: &[String]) {
+    let mut count: usize = std::env::var("GIT_CONFIG_COUNT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    for pair in overrides {
+        let (key, value) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair.as_str(), ""),
+        };
+        std::env::set_var(format!("GIT_CONFIG_KEY_{count}"), key);
+        std::env::set_var(format!("GIT_CONFIG_VALUE_{count}"), value);
+        count += 1;
+    }
+    std::env::set_var("GIT_CONFIG_COUNT", count.to_string());
 }
 
 /// The current session key for attributing operations to an agent: `ZVCS_SESSION`

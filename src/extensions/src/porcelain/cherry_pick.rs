@@ -52,9 +52,11 @@
 //! carrying git's `# Conflicts:` hint are written, an `Auto-merging` and a
 //! `CONFLICT (...)` line go to stdout, and the exit status is 1.
 //!
-//! `--continue`, `--skip` and `--abort` against a genuinely stopped pick are
-//! still refused: this port can enter the stopped state but not resume from it,
-//! which needs the `.git/sequencer` todo-list machinery.
+//! `--continue`, `--skip` and `--abort` resume a stopped single pick: `--abort`
+//! and `--skip` hard-reset to the (unmoved) pre-pick `HEAD`, and `--continue`
+//! commits the resolved index with the pick's message and author. Multi-commit
+//! ranges are still unsupported (they need the `.git/sequencer` todo list), but a
+//! single pick — all this port ever starts — resumes fully.
 //!
 //! ## Empty results
 //!
@@ -86,9 +88,9 @@
 //! no-ops `-r`, `--no-gpg-sign` (we never sign) and `--rerere-autoupdate`
 //! (rerere only participates in conflicts, which are refused anyway).
 //!
-//! Refused with a precise message: `-e`/`--edit`, `-n`/`--no-commit`,
-//! `--strategy`, `-X`, `-S`, commit *ranges*, and `--continue`/`--skip`/
-//! `--abort` against a pick that is genuinely in progress.
+//! Refused with a precise message: `-e`/`--edit`, `--strategy`, `-X`, `-S`, and
+//! commit *ranges*. (`--continue`/`--skip`/`--abort` now resume a stopped single
+//! pick; see above.)
 //!
 //! Repository state for a successful pick matches git: the author signature
 //! (name, email and time) is preserved from the picked commit, the committer
@@ -863,13 +865,130 @@ fn handle_verb(verb: Verb, opts: &Opts<'_>) -> Result<ExitCode> {
         Verb::Continue | Verb::Abort if !in_progress => {
             sequencer_failed("no cherry-pick or revert in progress")
         }
-        // A pick really is stopped, but resuming needs the staged-conflict and
-        // `.git/sequencer` machinery this port does not write.
-        other => anyhow::bail!(
-            "a cherry-pick is in progress, but resuming it (`{}`) is not implemented",
-            other.name()
-        ),
+        // A single pick is stopped (ranges are unsupported, so the sequence is
+        // exactly one commit and HEAD has not moved). `--abort`/`--skip` return to
+        // that pre-pick HEAD; with one pick, `--skip` has nothing left to apply,
+        // so it also ends clean.
+        Verb::Abort | Verb::Skip => {
+            super::reset(&["--hard".to_string(), "-q".to_string()])?;
+            clear_in_progress(&git_dir);
+            ExitCode::SUCCESS
+        }
+        // `--continue`: the user resolved the conflict and staged it; commit the
+        // resolved index, preserving the stopped pick's message and author.
+        Verb::Continue => continue_pick(&repo, &git_dir)?,
     })
+}
+
+/// Remove the files a stopped pick left behind.
+fn clear_in_progress(git_dir: &std::path::Path) {
+    let _ = std::fs::remove_file(git_dir.join("CHERRY_PICK_HEAD"));
+    let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
+    let _ = std::fs::remove_file(git_dir.join("AUTO_MERGE"));
+    let _ = std::fs::remove_dir_all(git_dir.join("sequencer"));
+}
+
+/// Write a tree object from the stage-0 entries of the current index.
+fn tree_from_index(repo: &gix::Repository, index: &gix::index::File) -> Result<ObjectId> {
+    let hash = repo.object_hash();
+    let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
+    let backing = index.path_backing();
+    for entry in index.entries() {
+        if entry.stage_raw() != 0 {
+            continue;
+        }
+        let path = entry.path_in(backing);
+        let mode = entry
+            .mode
+            .to_tree_entry_mode()
+            .ok_or_else(|| anyhow::anyhow!("index entry `{path}` has an unrepresentable mode"))?;
+        editor.upsert(path.split(|&b| b == b'/').map(|c| c.as_bstr()), mode.kind(), entry.id)?;
+    }
+    Ok(editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?)
+}
+
+/// `git cherry-pick --continue` for a single stopped pick: require a fully
+/// resolved index, then commit its tree with the picked commit's message and
+/// author (from `CHERRY_PICK_HEAD` / `MERGE_MSG`) onto the current `HEAD`, and
+/// clear the in-progress state. The worktree already holds the resolution, so it
+/// is not touched.
+fn continue_pick(repo: &gix::Repository, git_dir: &std::path::Path) -> Result<ExitCode> {
+    let raw = std::fs::read_to_string(git_dir.join("CHERRY_PICK_HEAD"))?;
+    let pick_id = ObjectId::from_hex(raw.trim().as_bytes())
+        .map_err(|e| anyhow::anyhow!("invalid CHERRY_PICK_HEAD: {e}"))?;
+    let pick = repo.find_commit(pick_id)?;
+
+    // The resolution must be complete: any conflict stage left blocks the commit,
+    // exactly as git's `git commit` does when resuming.
+    let index = repo.open_index()?;
+    if index.entries().iter().any(|e| e.stage_raw() != 0) {
+        eprintln!("error: Committing is not possible because you have unmerged files.");
+        eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
+        eprintln!("hint: as appropriate to mark resolution and make a commit.");
+        eprintln!("fatal: Exiting because of an unresolved conflict.");
+        return Ok(ExitCode::from(128));
+    }
+    let tree_id = tree_from_index(repo, &index)?;
+    let head_id = repo
+        .head_id()
+        .map_err(|_| anyhow::anyhow!("HEAD does not point to a commit"))?
+        .detach();
+
+    // The message git commits is `MERGE_MSG` with the default cleanup applied
+    // (comment lines dropped) — which is the picked message the stop recorded,
+    // carrying any `-x`/`-s` trailer, plus whatever the user edited in.
+    let merge_msg = std::fs::read_to_string(git_dir.join("MERGE_MSG"))
+        .unwrap_or_else(|_| pick.message_raw().map(|m| m.to_string()).unwrap_or_default());
+    let mut message: BString = clean_message(&merge_msg).into();
+
+    let committer = repo
+        .committer()
+        .ok_or_else(|| anyhow::anyhow!("committer identity is not configured"))??;
+    let author = pick.author()?;
+    let commit = gix::objs::Commit {
+        message: std::mem::take(&mut message),
+        tree: tree_id,
+        author: author.to_owned()?,
+        committer: committer.to_owned()?,
+        encoding: None,
+        parents: std::iter::once(head_id).collect(),
+        extra_headers: Default::default(),
+    };
+    let new_id = repo.write_object(&commit)?.detach();
+    let reflog = gix::reference::log::message("cherry-pick", commit.message.as_bstr(), 1);
+    advance_head(repo, head_id, new_id, reflog)?;
+    clear_in_progress(git_dir);
+
+    let subject = gix::objs::commit::MessageRef::from_bytes(commit.message.as_bstr())
+        .summary()
+        .to_str_lossy()
+        .into_owned();
+    let branch_label = match repo.head_name()? {
+        Some(name) => name.shorten().to_string(),
+        None => "detached HEAD".to_string(),
+    };
+    println!("[{branch_label} {}] {subject}", new_id.attach(repo).shorten_or_id());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// git's default message cleanup: drop whole-line comments (`#…`) and collapse
+/// trailing blank lines, ensuring a single trailing newline.
+fn clean_message(raw: &str) -> String {
+    let mut out = String::new();
+    for line in raw.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    while out.ends_with("\n\n") {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push('\n');
+    }
+    out
 }
 
 /// git's stopped-on-empty state: record `CHERRY_PICK_HEAD`, `AUTO_MERGE` and

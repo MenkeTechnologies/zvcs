@@ -54,3 +54,7 @@ ignore = "0.4"
 serde_json = "1"
 # Terminal paging: dup2/isatty/close to splice the pager onto fd 1/2, as git does.
 libc = "0.2"
+# Interactive line editor for `git zrepl` (history, cursor motion, ctrl-c/ctrl-d).
+# crossterm 0.29 matches prodash's copy above, so no second crossterm is pulled in.
+# Only the interactive (tty) path uses it; piped stdin stays a raw line reader.
+reedline = "0.49"

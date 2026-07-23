@@ -14,6 +14,7 @@ pub mod crawler;
 pub mod date;
 pub mod db;
 pub mod dispatch;
+pub mod external;
 pub mod hooks;
 pub mod index_commit;
 pub mod jobpool;
@@ -31,7 +32,18 @@ use std::process::ExitCode;
 /// Parse `argv`, dispatch the subcommand, and return the process exit code.
 /// Errors are reported terse on stderr as `zvcs: <command>: <reason>`.
 pub fn run() -> ExitCode {
-    let raw: Vec<String> = std::env::args().skip(1).collect();
+    // Dashed invocation: run as `git-<verb>` (a symlink in `~/.zvcs/bin`, or any
+    // `git-*` on PATH) and git dispatches `<verb>` — git.c strips the `git-` prefix
+    // from argv[0]. We fold it in by prepending the verb to the argument list;
+    // `from_dashed` then suppresses external re-dispatch of that verb (it would
+    // re-exec this same binary and loop). No git-global option layer applies to a
+    // dashed form — `git-add -C x` is git-add's own `-C`, not the wrapper's.
+    let from_dashed = dashed_subcommand(&std::env::args().next().unwrap_or_default());
+    let mut raw: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(verb) = &from_dashed {
+        raw.insert(0, verb.clone());
+    }
+    let from_dashed = from_dashed.is_some();
 
     // Consume the leading git-global options we support, so `git -C <dir> <verb>`
     // (extremely common in scripts and tooling) reaches the verb instead of
@@ -146,13 +158,27 @@ pub fn run() -> ExitCode {
         alias::Outcome::Command(head, args) => (head, args),
     };
 
-    // An unknown verb (not a builtin, not an alias) goes through git's
+    // An unknown verb (not a builtin, not an alias) follows git's exact
+    // precedence: `execv_dashed_external` first — exec `git-<verb>` from PATH so
+    // third-party subcommands (`git fuzzy`, `git lfs`, `git flow`, …) work when
+    // zvcs shadows `git` — and only if none is found does it fall to git's
     // `help_unknown_cmd`: `help.autocorrect` may auto-run the nearest command,
     // otherwise git's "not a git command" message + suggestions is printed. A
     // correction may itself be an alias, so it is re-resolved before dispatch.
     let (sub, rest): (String, Vec<String>) = if dispatch::is_verb(&sub) {
         (sub, rest)
     } else {
+        // Not a builtin. Try an external `git-<verb>` from PATH first (git's
+        // precedence: builtin → external → help_unknown_cmd). Skip it when we were
+        // ourselves invoked AS `git-<verb>` — the matching external is this very
+        // binary, so re-execing it would loop.
+        if !from_dashed {
+            if let Some(code) = external::try_dashed(&sub, &rest) {
+                // The external existed and either was exec'd (never returns) or
+                // failed to exec (returns a failure code). `None` falls through.
+                return code;
+            }
+        }
         match autocorrect::correct(&sub) {
             autocorrect::Correction::None => return ExitCode::FAILURE,
             autocorrect::Correction::Use(corrected) => {
@@ -182,6 +208,16 @@ pub fn run() -> ExitCode {
     };
     pager::finish();
     code
+}
+
+/// If this binary was invoked as `git-<verb>` (a dashed external form — a symlink
+/// in `~/.zvcs/bin` or any `git-*` on PATH), return `<verb>`. Bare `git`, an empty
+/// name, or a name lacking the `git-` prefix yields `None`. Mirrors git.c stripping
+/// the `git-` prefix from argv[0] before dispatch.
+fn dashed_subcommand(arg0: &str) -> Option<String> {
+    let base = std::path::Path::new(arg0).file_name()?.to_str()?;
+    let verb = base.strip_prefix("git-")?;
+    (!verb.is_empty()).then(|| verb.to_string())
 }
 
 /// Translate `git -c <name>=<value>` overrides into the `GIT_CONFIG_COUNT` /

@@ -15,6 +15,7 @@
 
 pub mod attach;
 pub mod claim;
+pub mod dashed;
 pub mod hooks;
 pub mod ledger;
 pub mod oplog;
@@ -36,6 +37,7 @@ mod zsync;
 
 pub use attach::{ensure_attached, Attached};
 pub use claim::{zclaim, zunclaim, zwho};
+pub use dashed::zdashed;
 pub use oplog::{zlog, zundo};
 pub use snapshot::{zrestore, zsnapshot, zsnapshots};
 pub use status::zstatus;

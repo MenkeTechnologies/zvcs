@@ -14,6 +14,7 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
     "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
     "zsnapshots", "zworktree", "zstash", "zunstash", "zstashes", "zup", "zforeach", "zhook",
+    "zdashed",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -221,6 +222,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zdaemon" => superset::zdaemon(args),
         "zrepos" => superset::zrepos(args),
         "zreindex" => superset::zreindex(args),
+        "zdashed" => superset::zdashed(args),
         "zjobs" => superset::zjobs(args),
         "zjob" => superset::zjob(args),
         "zcommit" => superset::zcommit(args),

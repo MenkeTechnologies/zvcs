@@ -118,6 +118,16 @@ the same as agreeing with git, and the two are measured separately — an
 unimplemented flag errors terse rather than guessing, and the parity harness
 scores that as a failure.
 
+**External and dashed forms (full shadow).** An unknown verb follows git's exact
+precedence — builtin → `git-<verb>` on `PATH` (git.c's `execv_dashed_external`) →
+`help_unknown_cmd` — so third-party subcommands (`git fuzzy`, `git lfs`,
+`git flow`, …) work under the shim; without this, git-fuzzy breaks (it recurses
+through `git fuzzy helper` on every keystroke). The binary also honors dashed
+invocation: run as `git-<verb>` it strips the prefix from argv[0] and dispatches
+`<verb>`. `git zdashed [<dir>]` installs a `git-<verb>` symlink for every verb
+into `<dir>` (default `~/.zvcs/bin`), so the dashed forms exist once stock git is
+removed. Verbs come from the dispatch tables, so the set never drifts.
+
 Run the harness to see current depth per subcommand:
 
 ```sh

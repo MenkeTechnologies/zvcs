@@ -25,8 +25,11 @@
 //!   * `git tag --no-<flag>`             → the negations git's parse-options accepts:
 //!                                       `--no-annotate`/`--no-force`/`--no-ignore-case`/
 //!                                       `--no-omit-empty`/`--no-color`/`--no-file`/
-//!                                       `--no-format`/`--no-sign`/`--no-local-user`/
-//!                                       `--no-edit`/`--no-column`.
+//!                                       `--no-format`/`--no-cleanup`/`--no-sign`/
+//!                                       `--no-local-user`/`--no-edit`/`--no-column`/
+//!                                       `--no-points-at` (drops the points-at filter) and
+//!                                       `--no-sort` (clears every CLI *and* `tag.sort`
+//!                                       config sort key, falling back to refname order).
 //!   * `git tag -i|--ignore-case`      → case-insensitive match and sort.
 //!   * `git tag --omit-empty`          → drop refs whose `--format` output is empty.
 //!   * `git tag <name> [<commit>]`     → create a lightweight tag at `<commit>`.
@@ -130,6 +133,10 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     let mut want_color = false;
     let mut lines: Option<usize> = None;
     let mut sorts: Vec<String> = Vec::new();
+    // Set once `--no-sort` is seen: git's `OPT_STRING_LIST` negation clears the
+    // accumulated sort list *and* the `tag.sort` config values already loaded, so
+    // the config fallback below must be suppressed too.
+    let mut sort_negated = false;
     let mut format: Option<String> = None;
     let mut cleanup: Option<String> = None;
     let mut messages: Vec<Vec<u8>> = Vec::new();
@@ -176,10 +183,21 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             // Column display is not ported; the default single-name-per-line output
             // already matches `--no-column`, so accept it as the no-op it names.
             "--no-column" => {}
-            // Clear an accumulated message/file/format the way git's OPT_FILENAME /
-            // OPT_STRING negations do.
+            // Clear an accumulated message/file/format/cleanup the way git's
+            // OPT_FILENAME / OPT_STRING negations do (each sets its target back to
+            // NULL when unset).
             "--no-file" => message_file = None,
             "--no-format" => format = None,
+            "--no-cleanup" => cleanup = None,
+            // git's `points-at` is a `parse_opt_object_name` callback whose unset
+            // branch clears the oid array, dropping the filter entirely.
+            "--no-points-at" => points_at = None,
+            // git's `OPT_STRING_LIST` unset (`string_list_clear`) empties every
+            // sort key gathered so far, CLI and `tag.sort` config alike.
+            "--no-sort" => {
+                sorts.clear();
+                sort_negated = true;
+            }
             // Hidden `--with`/`--without` aliases for `--contains`/`--no-contains`
             // (git's OPT_WITH/OPT_WITHOUT), same `LASTARG_DEFAULT` HEAD semantics.
             "--with" => contains = Some(optarg(args, &mut i)),
@@ -299,7 +317,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     // Without any `--sort` on the CLI, git falls back to the multi-valued
     // `tag.sort` config — each value adds a sort level — validated below exactly
     // like a CLI `--sort`.
-    if sorts.is_empty() {
+    if sorts.is_empty() && !sort_negated {
         if let Ok(repo) = gix::discover(".") {
             sorts = repo
                 .config_snapshot()

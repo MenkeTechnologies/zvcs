@@ -26,7 +26,9 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 ///   * `-P`/`--prune-tags`            → add the tags refspec and (with `-p`) prune stale tags
 ///   * `-f`/`--force`                 → force updates (treat every refspec as `+`)
 ///   * `--depth <n>`/`--deepen <n>`/`--unshallow` → shallow-clone history controls
-///   * `-v`/`--verbose`, `-q`/`--quiet`, `--dry-run`
+///   * `--shallow-since <time>`       → set the shallow boundary at a cutoff date
+///   * `--shallow-exclude <ref>`      → exclude history reachable from a ref (repeatable)
+///   * `-v`/`--verbose`, `-q`/`--quiet`, `--dry-run` (and their `--no-…` negations)
 ///
 /// The per-ref summary is written to stderr in `git fetch` layout (`From <url>`
 /// header plus one aligned line per changed or pruned ref). Options that require
@@ -41,6 +43,13 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     let mut all = false;
     let mut multiple = false;
     let mut positionals: Vec<&str> = Vec::new();
+
+    // Shallow-boundary selectors that combine (git's `--shallow-exclude` is a
+    // repeatable OPT_STRING_LIST → `deepen_not`, `--shallow-since` → `deepen_since`,
+    // and the two may be given together). Accumulated here and resolved into a
+    // single `Shallow` value after parsing.
+    let mut shallow_exclude: Vec<gix::refs::PartialName> = Vec::new();
+    let mut shallow_since: Option<gix::date::Time> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -84,6 +93,16 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             "-p" | "--prune" => opts.prune = true,
             "-P" | "--prune-tags" => opts.prune_tags = true,
             "-f" | "--force" => opts.force = true,
+            // Negations git's parse-options accepts for the `--[no-]…` booleans:
+            // resetting each flag to its default (git clears the corresponding bit).
+            "--no-verbose" => opts.verbose = false,
+            "--no-quiet" => opts.quiet = false,
+            "--no-dry-run" => opts.dry_run = false,
+            "--no-all" => all = false,
+            "--no-multiple" => multiple = false,
+            "--no-prune" => opts.prune = false,
+            "--no-prune-tags" => opts.prune_tags = false,
+            "--no-force" => opts.force = false,
             "--unshallow" => opts.shallow = Some(Shallow::undo()),
             "--depth" => {
                 let v = take_value!("--depth");
@@ -100,6 +119,21 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                     .parse()
                     .map_err(|_| anyhow::anyhow!("--deepen expects an integer, got {v:?}"))?;
                 opts.shallow = Some(Shallow::Deepen(n));
+            }
+            // Shallow boundary at a cutoff date (git's `deepen_since`). Parsed with
+            // gitoxide's git-compatible date parser, relative to the current time.
+            "--shallow-since" => {
+                let v = take_value!("--shallow-since");
+                let t = gix::date::parse(&v, Some(std::time::SystemTime::now()))
+                    .map_err(|_| anyhow::anyhow!("--shallow-since expects a valid date, got {v:?}"))?;
+                shallow_since = Some(t);
+            }
+            // Exclude history reachable from a ref (git's repeatable `deepen_not`).
+            "--shallow-exclude" => {
+                let v = take_value!("--shallow-exclude");
+                let name = gix::refs::PartialName::try_from(v.as_str())
+                    .map_err(|_| anyhow::anyhow!("--shallow-exclude expects a valid ref, got {v:?}"))?;
+                shallow_exclude.push(name);
             }
             // Options requiring substrate the high-level fetch does not expose.
             "--filter" => {
@@ -123,6 +157,20 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with('-') && s.len() > 1 => anyhow::bail!("unsupported option {s:?}"),
             s => positionals.push(s),
         }
+    }
+
+    // Resolve the accumulated shallow-boundary selectors. `--shallow-exclude`
+    // (repeatable) may be combined with `--shallow-since`, mirroring git's
+    // `deepen_not` + `deepen_since`; a lone `--shallow-since` sets only the cutoff.
+    // Either form supersedes an earlier `--depth`/`--deepen`/`--unshallow`, as git
+    // treats the shallow selectors as one group.
+    if !shallow_exclude.is_empty() {
+        opts.shallow = Some(Shallow::Exclude {
+            remote_refs: shallow_exclude,
+            since_cutoff: shallow_since,
+        });
+    } else if let Some(cutoff) = shallow_since {
+        opts.shallow = Some(Shallow::Since { cutoff });
     }
 
     // Serialize ref mutations through the repo coordinator, as the write

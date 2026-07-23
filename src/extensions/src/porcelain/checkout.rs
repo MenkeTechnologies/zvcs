@@ -5,7 +5,7 @@
 //! Supported invocations (the common forms):
 //!   * `git checkout <branch>`                 → switch to an existing local branch
 //!   * `git checkout <commit-ish>`             → detach `HEAD` at a commit
-//!   * `git checkout --detach <rev>`           → detach even when `<rev>` is a branch
+//!   * `git checkout -d|--detach <rev>`        → detach even when `<rev>` is a branch
 //!   * `git checkout -b <name> [<start>]`      → create branch at `<start>` (default HEAD), switch
 //!   * `git checkout -B <name> [<start>]`      → create-or-reset branch at `<start>`, switch
 //!   * `git checkout [<tree-ish>] -- <path>…`  → restore paths (index+worktree from `<tree-ish>`; worktree-only from index when no tree-ish)
@@ -116,6 +116,25 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // `--track=(direct|inherit)`: the optional-value form of `-t`/`--track`
+        // (`git`'s `parse_opt_tracking_mode`). `direct` is the default explicit
+        // tracking already implemented here; `inherit` needs upstream-inheritance
+        // substrate that is not vendored, so it errors honestly rather than
+        // silently behaving like `direct`. An unknown value is git's 129.
+        if let Some(val) = a.strip_prefix("--track=") {
+            match val {
+                "direct" => track = true,
+                "inherit" => bail!(
+                    "--track=inherit is not supported (upstream-inheritance tracking not implemented)"
+                ),
+                _ => {
+                    eprintln!("error: option `--track' expects \"direct\" or \"inherit\"");
+                    return Ok(ExitCode::from(129));
+                }
+            }
+            i += 1;
+            continue;
+        }
         if a == "--pathspec-from-file" || a.starts_with("--pathspec-from-file=") {
             let val = match a.strip_prefix("--pathspec-from-file=") {
                 Some(v) => v.to_string(),
@@ -149,9 +168,13 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 orphan = Some(name.clone());
                 i += 1;
             }
-            "--detach" => detach = true,
+            // `-d` is git's short form of `--detach` (OPT_BOOL('d', "detach")).
+            "-d" | "--detach" => detach = true,
+            "--no-detach" => detach = false,
             "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
             "-f" | "--force" => {} // accepted; a clean switch needs no forcing here
+            "--no-force" => {}     // negation of --force; the forced path is a no-op here
             "-t" | "--track" => track = true,
             "--no-track" => {} // accepted; auto-tracking is off unless -t is given
             "--ours" | "-2" => writeout_stage = Some(2),
@@ -161,6 +184,13 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             // checkout, so accept it and let the shared clean-check govern the
             // dirty case exactly as every other switch here does.
             "-m" | "--merge" => {}
+            // Negation of -m: turns the 3-way carry off, which is already the only
+            // behavior on the clean-switch path honored here, so it is a no-op.
+            "--no-merge" => {}
+            // `--no-conflict` clears the conflict style (git sets it to NULL); the
+            // style is only consulted on the deferred dirty-merge path that is
+            // refused here, so clearing it changes nothing.
+            "--no-conflict" => {}
             "-l" => {} // create the branch reflog — always on here (RefLog::AndReference)
             "--guess" => guess_flag = Some(true),
             "--no-guess" => guess_flag = Some(false),
@@ -172,8 +202,8 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             // against are not enforced here, so toggling them changes nothing.
             "--progress" | "--no-progress" => {}
             "--overwrite-ignore" | "--no-overwrite-ignore" => {}
-            "--ignore-other-worktrees" => {}
-            "--ignore-skip-worktree-bits" => {}
+            "--ignore-other-worktrees" | "--no-ignore-other-worktrees" => {}
+            "--ignore-skip-worktree-bits" | "--no-ignore-skip-worktree-bits" => {}
             "-p" | "--patch" => bail!("interactive patch checkout (-p) needs a TTY"),
             _ if a.starts_with('-') && a.len() > 1 => bail!("unsupported flag {a:?}"),
             _ => pre.push(a),

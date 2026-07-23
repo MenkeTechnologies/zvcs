@@ -39,9 +39,15 @@ use gix::ObjectId;
 /// comment/blank lines) with the comment prefix taken from `core.commentString`
 /// or `core.commentChar`.
 ///
-/// Options still not backed (`-p`/`--patch`, `-S`/`--gpg-sign`, `-s`/`--signoff`,
-/// `--fixup`/`--squash`, `--dry-run`, `--porcelain`, pathspec-limited commits, …)
-/// fail with a precise message rather than silently doing the wrong thing.
+/// `-s`/`--signoff` (`--no-signoff`) appends a `Signed-off-by:` trailer with the
+/// committer identity, a faithful port of `append_signoff()`. `--squash <commit>`
+/// and `--fixup <commit>` (including `--fixup=amend:<commit>`) build git's
+/// autosquash-formatted message from the referenced commit.
+///
+/// Options still not backed (`-p`/`--patch`, `-S`/`--gpg-sign`, `--fixup=reword:`,
+/// `-e`/`--edit`, `-t`/`--template`, `--cleanup`, `--dry-run`, `--porcelain`,
+/// pathspec-limited commits, …) fail with a precise message rather than silently
+/// doing the wrong thing.
 pub fn commit(args: &[String]) -> Result<ExitCode> {
     // --- argument parsing ------------------------------------------------
     let mut messages: Vec<String> = Vec::new();
@@ -61,6 +67,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut reuse_arg: Option<String> = None;
     let mut reedit = false;
     let mut file_args: Vec<String> = Vec::new();
+    // `-s`/`--signoff` adds a `Signed-off-by:` trailer with the committer ident;
+    // `--squash`/`--fixup` build an autosquash-formatted message from a commit.
+    let mut signoff = false;
+    let mut squash_arg: Option<String> = None;
+    let mut fixup_arg: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -120,6 +131,28 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "-q" | "--quiet" => quiet = true,
             "-a" | "--all" => all = true,
             "-n" | "--no-verify" => no_verify = true,
+            "-s" | "--signoff" => signoff = true,
+            "--no-signoff" => signoff = false,
+            "--squash" => {
+                i += 1;
+                squash_arg = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("option `--squash` requires a value"))?
+                        .clone(),
+                );
+            }
+            "--fixup" => {
+                i += 1;
+                fixup_arg = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("option `--fixup` requires a value"))?
+                        .clone(),
+                );
+            }
+            s if s.starts_with("--squash=") => {
+                squash_arg = Some(s["--squash=".len()..].to_string())
+            }
+            s if s.starts_with("--fixup=") => fixup_arg = Some(s["--fixup=".len()..].to_string()),
             // `-v`/`--verbose` shows the diff in the commit-message editor; the
             // recorded commit is identical, so it is accepted (a no-op for `-m`).
             "-v" | "--verbose" => {}
@@ -155,6 +188,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                         'a' => all = true,
                         'q' => quiet = true,
                         'n' => no_verify = true,
+                        's' => signoff = true,
                         'v' => {}
                         'm' | 'F' | 'C' | 'c' => {
                             // Value-taking flags consume the rest of the cluster,
@@ -246,6 +280,90 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 message.push('\n');
             }
             from_flags = true;
+        }
+    }
+
+    // --- `--squash` / `--fixup`: autosquash-formatted messages -----------
+    // Port of the message shaping in `prepare_to_commit()`/`cmd_commit()`
+    // (builtin/commit.c). The subject is git's folded `%s` of the referenced
+    // commit. `--fixup` (default) writes `fixup! <subject>` and skips the
+    // editor; `--squash` writes `squash! <subject>` and opens the editor unless
+    // a `-m` body is given; `--fixup=amend:` writes `amend! <subject>` followed
+    // by the whole original message and allows an empty change so a later
+    // rebase can reword. `squash_fixup_seed`, when set, seeds the editor path.
+    let mut squash_fixup_seed: Option<String> = None;
+    if squash_arg.is_some() && fixup_arg.is_some() {
+        anyhow::bail!("options '--squash' and '--fixup' cannot be used together");
+    }
+    if let Some(spec) = &squash_arg {
+        if reuse_arg.is_some() {
+            anyhow::bail!("--squash together with -c/-C is not supported");
+        }
+        let c = repo.find_commit(
+            repo.rev_parse_single(spec.as_str())
+                .map_err(|e| anyhow::anyhow!("could not lookup commit {spec}: {e}"))?
+                .detach(),
+        )?;
+        let subject = folded_subject(c.message_raw()?.to_str_lossy().as_ref());
+        if from_flags {
+            // A `-m`/`-F` body follows the `squash!` subject line.
+            message = format!("squash! {subject}\n\n{message}");
+        } else {
+            squash_fixup_seed = Some(format!("squash! {subject}\n\n"));
+        }
+    }
+    if let Some(raw) = &fixup_arg {
+        // `-c`/`-C`/`-F` are rejected with `--fixup` in every form.
+        if reuse_arg.is_some() || !file_args.is_empty() {
+            anyhow::bail!("options '-c/-C/-F' and '--fixup' cannot be used together");
+        }
+        // Parse `[(amend|reword):]<commit>`: only a leading run of alpha
+        // characters immediately followed by `:` is treated as a suboption.
+        let bytes = raw.as_bytes();
+        let alpha = bytes.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+        let (fixup_spec, fixup_prefix): (&str, &str) =
+            if alpha > 0 && bytes.get(alpha) == Some(&b':') {
+                let sub = &raw[..alpha];
+                let commit = &raw[alpha + 1..];
+                match sub {
+                    "amend" => (commit, "amend"),
+                    "reword" => anyhow::bail!(
+                        "--fixup=reword: requires a paths-limited (--only) commit, which is not ported"
+                    ),
+                    _ => anyhow::bail!("unknown option: --fixup={sub}:{commit}"),
+                }
+            } else {
+                (raw.as_str(), "fixup")
+            };
+        let c = repo.find_commit(
+            repo.rev_parse_single(fixup_spec)
+                .map_err(|e| anyhow::anyhow!("could not lookup commit {fixup_spec}: {e}"))?
+                .detach(),
+        )?;
+        let subject = folded_subject(c.message_raw()?.to_str_lossy().as_ref());
+        if fixup_prefix == "fixup" {
+            // Default `--fixup`: no editor; a `-m` body follows the subject line.
+            message = if from_flags {
+                format!("fixup! {subject}\n\n{message}")
+            } else {
+                format!("fixup! {subject}\n")
+            };
+            from_flags = true;
+        } else {
+            // `--fixup=amend:` — incompatible with `-m`, allows an empty change,
+            // and carries the original message (its body only when the original
+            // is itself an `amend!` commit, mirroring `prepare_amend_commit()`).
+            if from_flags {
+                anyhow::bail!("options '-m' and '--fixup=amend:<commit>' cannot be used together");
+            }
+            allow_empty = true;
+            let orig = c.message_raw()?.to_str_lossy().into_owned();
+            let carried = if subject_line(&orig).starts_with("amend!") {
+                message_body(&orig)
+            } else {
+                orig
+            };
+            squash_fixup_seed = Some(format!("amend! {subject}\n\n{carried}"));
         }
     }
     // `--date=<date>` overrides the author date (git accepts fixed and relative
@@ -367,9 +485,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 message.push('\n');
             }
         } else {
-            // Seed the editor with the reused message (`-c`) if any, else HEAD's
-            // on an `--amend`, else the empty status template.
-            let seed = if let Some(rc) = &reuse_commit {
+            // Seed the editor with the `--squash`/`--fixup=amend:` template if
+            // any, else the reused message (`-c`), else HEAD's on an `--amend`,
+            // else the empty status template.
+            let seed = if let Some(s) = &squash_fixup_seed {
+                Some(s.clone())
+            } else if let Some(rc) = &reuse_commit {
                 Some(rc.message_raw()?.to_string())
             } else if amend {
                 Some(
@@ -391,6 +512,18 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+    // `-s`/`--signoff`: append a `Signed-off-by:` trailer with the committer
+    // identity, exactly as `append_signoff()` (sequencer.c) does — placed before
+    // the `commit-msg` hook so it, like git, sees the final message.
+    if signoff {
+        let committer = repo
+            .committer()
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("unable to determine committer identity"))?;
+        let ident = format!("{} <{}>", committer.name, committer.email);
+        append_signoff(&mut message, &ident);
+    }
+
     // `commit-msg` gets the message file and may rewrite it (e.g. add a trailer);
     // a non-zero exit aborts. Re-read afterward to pick up any edits.
     if !no_verify {
@@ -967,4 +1100,363 @@ fn expand_tilde(tok: &str) -> std::path::PathBuf {
         }
     }
     std::path::PathBuf::from(tok)
+}
+
+/// git's folded `%s` subject: skip leading blank lines, then join the lines of
+/// the first paragraph (each right-trimmed) with a single space, stopping at the
+/// first blank line — `format_subject()` in pretty.c with a `" "` separator.
+fn folded_subject(msg: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut started = false;
+    for line in msg.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            if started {
+                break;
+            }
+            continue;
+        }
+        started = true;
+        out.push(line);
+    }
+    out.join(" ")
+}
+
+/// The first non-blank line of a commit message — git's raw subject start, used
+/// to detect an existing `amend!` subject in `prepare_amend_commit()`.
+fn subject_line(msg: &str) -> &str {
+    msg.lines().find(|l| !l.trim_end().is_empty()).unwrap_or("")
+}
+
+/// git's `%b`: the message with its subject paragraph and the blank line(s)
+/// terminating it removed, leaving the body verbatim.
+fn message_body(msg: &str) -> String {
+    let b = msg.as_bytes();
+    let n = b.len();
+    let line_end = |i: usize| {
+        b[i..]
+            .iter()
+            .position(|&c| c == b'\n')
+            .map(|p| i + p + 1)
+            .unwrap_or(n)
+    };
+    let blank = |i: usize, e: usize| b[i..e].iter().all(|&c| matches!(c, b'\n' | b'\r' | b' ' | b'\t'));
+    let mut i = 0usize;
+    // leading blank lines, the subject paragraph, then its trailing blank lines.
+    while i < n {
+        let e = line_end(i);
+        if blank(i, e) {
+            i = e;
+        } else {
+            break;
+        }
+    }
+    while i < n {
+        let e = line_end(i);
+        if blank(i, e) {
+            break;
+        }
+        i = e;
+    }
+    while i < n {
+        let e = line_end(i);
+        if blank(i, e) {
+            i = e;
+        } else {
+            break;
+        }
+    }
+    msg[i..].to_string()
+}
+
+/// `-s`/`--signoff`: append a `Signed-off-by: <ident>` trailer, a faithful port
+/// of `append_signoff()` (sequencer.c) with `flag == 0` (no dedup). The trailer
+/// is merged into an existing trailer block, or set off by a blank line after a
+/// message body, and is skipped only when it is already the last trailer.
+fn append_signoff(msg: &mut String, ident: &str) {
+    let sob = format!("Signed-off-by: {ident}\n");
+    let ignore_footer = ignore_non_trailer(msg.as_bytes());
+    // strbuf_complete_line: only when there is no trailing footer to preserve.
+    if ignore_footer == 0 && !msg.is_empty() && !msg.ends_with('\n') {
+        msg.push('\n');
+    }
+    let cut = msg.len() - ignore_footer;
+    let sob_bytes = sob.as_bytes();
+    // If the whole (footer-stripped) buffer equals the sob, treat it as present.
+    let has_footer: u8 = if cut == sob_bytes.len() && &msg.as_bytes()[..cut] == sob_bytes {
+        3
+    } else {
+        has_conforming_footer(&msg.as_bytes()[..cut], sob_bytes)
+    };
+    if has_footer == 0 {
+        // Leave a blank line between a message body and the sob.
+        let append = if cut == 0 {
+            Some("\n\n")
+        } else if cut == 1 {
+            Some("\n")
+        } else if msg.as_bytes()[cut - 2] != b'\n' {
+            Some("\n")
+        } else {
+            None
+        };
+        if let Some(a) = append {
+            let pos = msg.len() - ignore_footer;
+            msg.insert_str(pos, a);
+        }
+    }
+    if has_footer != 3 {
+        let pos = msg.len() - ignore_footer;
+        msg.insert_str(pos, &sob);
+    }
+}
+
+/// Port of `has_conforming_footer()` (sequencer.c) for the default `flag == 0`
+/// path: returns `0` when the tail has no trailer block, `3` when `sob` is the
+/// last trailer, `2` when `sob` appears earlier, `1` otherwise. `sub` is the
+/// message truncated to `len - ignore_footer`.
+fn has_conforming_footer(sub: &[u8], sob: &[u8]) -> u8 {
+    let start = find_trailer_start(sub);
+    let end = sub.len() - ignore_non_trailer(sub);
+    if start >= end {
+        return 0;
+    }
+    // Trailer starts are the non-comment, non-continuation, non-blank lines.
+    let mut trailer_starts: Vec<usize> = Vec::new();
+    let mut off = start;
+    while off < end {
+        let e = next_line_off(sub, off);
+        let line = &sub[off..e];
+        let is_comment = line.first() == Some(&b'#');
+        let is_cont = matches!(line.first(), Some(&b' ') | Some(&b'\t'));
+        if !is_comment && !is_cont && !sig_is_blank_line(&sub[off..]) {
+            trailer_starts.push(off);
+        }
+        off = e;
+    }
+    let last_idx = trailer_starts.len().wrapping_sub(1);
+    let mut found_sob = false;
+    let mut found_sob_last = false;
+    for (k, &o) in trailer_starts.iter().enumerate() {
+        if sub[o..].starts_with(sob) {
+            found_sob = true;
+            if k == last_idx {
+                found_sob_last = true;
+            }
+        }
+    }
+    if found_sob_last {
+        3
+    } else if found_sob {
+        2
+    } else {
+        1
+    }
+}
+
+/// Port of `find_trailer_start()` (trailer.c) for the default configuration
+/// (separator `:`, comment char `#`, no configured trailer tokens). Returns the
+/// offset of the first trailer line, or `buf.len()` when there is no trailer
+/// block. `recognized_prefix` is set only by the git-generated prefixes below,
+/// since the user's trailer config is empty in this port's signoff path.
+fn find_trailer_start(buf: &[u8]) -> usize {
+    let len = buf.len();
+    const GEN: [&[u8]; 2] = [b"Signed-off-by: ", b"(cherry picked from commit "];
+
+    // The first paragraph is the title and cannot hold trailers.
+    let mut s = 0usize;
+    while s < len {
+        if buf[s] == b'#' {
+            s = next_line_off(buf, s);
+            continue;
+        }
+        if sig_is_blank_line(&buf[s..]) {
+            break;
+        }
+        s = next_line_off(buf, s);
+    }
+    let end_of_title = s as isize;
+
+    let mut only_spaces = true;
+    let mut recognized_prefix = false;
+    let mut trailer_lines: i64 = 0;
+    let mut non_trailer_lines: i64 = 0;
+    let mut possible_continuation_lines: i64 = 0;
+
+    let mut l = last_line(buf, len);
+    while l >= end_of_title {
+        let bol = l as usize;
+        let line = &buf[bol..];
+        if line.first() == Some(&b'#') {
+            non_trailer_lines += possible_continuation_lines;
+            possible_continuation_lines = 0;
+            l = last_line(buf, bol);
+            continue;
+        }
+        if sig_is_blank_line(line) {
+            if only_spaces {
+                l = last_line(buf, bol);
+                continue;
+            }
+            non_trailer_lines += possible_continuation_lines;
+            if recognized_prefix && trailer_lines * 3 >= non_trailer_lines {
+                return next_line_off(buf, bol);
+            } else if trailer_lines > 0 && non_trailer_lines == 0 {
+                return next_line_off(buf, bol);
+            }
+            return len;
+        }
+        only_spaces = false;
+
+        let mut matched_gen = false;
+        for g in GEN.iter() {
+            if line.starts_with(g) {
+                trailer_lines += 1;
+                possible_continuation_lines = 0;
+                recognized_prefix = true;
+                matched_gen = true;
+                break;
+            }
+        }
+        if matched_gen {
+            l = last_line(buf, bol);
+            continue;
+        }
+
+        let sep = find_separator(line);
+        if sep >= 1 && !line[0].is_ascii_whitespace() {
+            // A `token: value` line; the empty trailer config never promotes it
+            // to a recognized prefix, matching git with no `trailer.*` set.
+            trailer_lines += 1;
+            possible_continuation_lines = 0;
+        } else if line[0].is_ascii_whitespace() {
+            possible_continuation_lines += 1;
+        } else {
+            non_trailer_lines += 1;
+            non_trailer_lines += possible_continuation_lines;
+            possible_continuation_lines = 0;
+        }
+        l = last_line(buf, bol);
+    }
+    len
+}
+
+/// Port of `find_separator()` (trailer.c) with the default `:` separator: the
+/// index of the separator that ends the token, or `-1` if the line is not a
+/// trailer. The token may contain alphanumerics, `-`, and internal whitespace.
+fn find_separator(line: &[u8]) -> isize {
+    let mut whitespace_found = false;
+    for (idx, &c) in line.iter().enumerate() {
+        if c == b':' {
+            return idx as isize;
+        }
+        if !whitespace_found && (c.is_ascii_alphanumeric() || c == b'-') {
+            continue;
+        }
+        if idx != 0 && (c == b' ' || c == b'\t') {
+            whitespace_found = true;
+            continue;
+        }
+        break;
+    }
+    -1
+}
+
+/// Port of `is_blank_line()` (trailer.c): a line (up to the next `\n` or the end
+/// of the buffer) that is empty or all whitespace.
+fn sig_is_blank_line(s: &[u8]) -> bool {
+    for &c in s {
+        if c == b'\n' {
+            return true;
+        }
+        if !c.is_ascii_whitespace() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Port of `next_line()` (trailer.c): the offset just past the next `\n` at or
+/// after `off`, or `buf.len()` when there is none.
+fn next_line_off(buf: &[u8], off: usize) -> usize {
+    match buf[off..].iter().position(|&c| c == b'\n') {
+        Some(p) => off + p + 1,
+        None => buf.len(),
+    }
+}
+
+/// Port of `last_line()` (trailer.c): the start offset of the last line within
+/// `buf[..len]`, or `-1` when `len == 0`.
+fn last_line(buf: &[u8], len: usize) -> isize {
+    if len == 0 {
+        return -1;
+    }
+    if len == 1 {
+        return 0;
+    }
+    let mut i = len as isize - 2;
+    while i >= 0 {
+        if buf[i as usize] == b'\n' {
+            return i + 1;
+        }
+        i -= 1;
+    }
+    0
+}
+
+/// Port of `ignore_non_trailer()` (builtin/commit.c): the number of trailing
+/// bytes to ignore — a run of comment/blank lines (and an old `Conflicts:`
+/// block) at the very end, or everything past a `>8` scissors line.
+fn ignore_non_trailer(buf: &[u8]) -> usize {
+    let len = buf.len();
+    let mut boc = 0usize; // beginning of the trailing comment run (0 = none)
+    let mut bol = 0usize;
+    let mut in_conflicts = false;
+    let cutoff = wt_status_locate_end(buf);
+    while bol < cutoff {
+        let next = match buf[bol..].iter().position(|&c| c == b'\n') {
+            Some(p) => bol + p + 1,
+            None => len,
+        };
+        if buf[bol] == b'#' || buf[bol] == b'\n' {
+            if boc == 0 {
+                boc = bol;
+            }
+        } else if buf[bol..].starts_with(b"Conflicts:\n") {
+            in_conflicts = true;
+            if boc == 0 {
+                boc = bol;
+            }
+        } else if in_conflicts && buf[bol] == b'\t' {
+            // a pathname in the conflicts block — still part of the run
+        } else if boc != 0 {
+            boc = 0;
+            in_conflicts = false;
+        }
+        bol = next;
+    }
+    if boc != 0 {
+        len - boc
+    } else {
+        len - cutoff
+    }
+}
+
+/// Port of `wt_status_locate_end()` (wt-status.c): the length up to a `>8`
+/// scissors line (`# ------------------------ >8 ------------------------`), or
+/// the full length when there is none.
+fn wt_status_locate_end(s: &[u8]) -> usize {
+    let cut: &[u8] = b"------------------------ >8 ------------------------\n";
+    let mut pattern: Vec<u8> = Vec::with_capacity(3 + cut.len());
+    pattern.extend_from_slice(b"\n# ");
+    pattern.extend_from_slice(cut);
+    if s.starts_with(&pattern[1..]) {
+        return 0;
+    }
+    if let Some(p) = s
+        .windows(pattern.len())
+        .position(|w| w == pattern.as_slice())
+    {
+        return p + 1;
+    }
+    s.len()
 }

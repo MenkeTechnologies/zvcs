@@ -4,8 +4,8 @@
 //! `pull` is `fetch` followed by an integration step. The fetch is delegated to
 //! the ported [`fetch`](super::fetch), so its option surface is available to
 //! `pull` verbatim: `--all`, `-f`/`--force`, `-t`/`--tags`, `-p`/`--prune`,
-//! `--depth`/`--deepen`/`--unshallow`, `-q`/`-v`, and the `From …` per-ref
-//! summary git prints to stderr.
+//! `--depth`/`--deepen`/`--unshallow`, `--shallow-since`/`--shallow-exclude`,
+//! `-q`/`-v`, and the `From …` per-ref summary git prints to stderr.
 //!
 //! The integration step is the ported [`merge`](super::merge) by default, or the
 //! ported [`rebase`](super::rebase) when a rebase is requested. The rebase is
@@ -107,6 +107,8 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let mut f_unshallow = false;
     let mut f_depth: Option<String> = None;
     let mut f_deepen: Option<String> = None;
+    let mut f_shallow_since: Option<String> = None;
+    let mut f_shallow_exclude: Vec<String> = Vec::new();
     let mut f_quiet = false;
     let mut f_verbose = false;
 
@@ -171,6 +173,8 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "--unshallow" => f_unshallow = true,
             "--depth" => f_depth = Some(take_value!("depth")),
             "--deepen" => f_deepen = Some(take_value!("deepen")),
+            "--shallow-since" => f_shallow_since = Some(take_value!("shallow-since")),
+            "--shallow-exclude" => f_shallow_exclude.push(take_value!("shallow-exclude")),
             "-q" | "--quiet" => f_quiet = true,
             "-v" | "--verbose" => f_verbose = true,
 
@@ -283,6 +287,14 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     if let Some(d) = &f_deepen {
         fetch_args.push("--deepen".into());
         fetch_args.push(d.clone());
+    }
+    if let Some(t) = &f_shallow_since {
+        fetch_args.push("--shallow-since".into());
+        fetch_args.push(t.clone());
+    }
+    for r in &f_shallow_exclude {
+        fetch_args.push("--shallow-exclude".into());
+        fetch_args.push(r.clone());
     }
     if f_quiet {
         fetch_args.push("--quiet".into());

@@ -21,8 +21,9 @@
 //!
 //! Known gaps:
 //!
-//! * `--upload-pack=<exec>` bails: `Remote::connect` exposes no hook for the
-//!   remote helper path, so honouring it is not possible in the vendored crates.
+//! * `--upload-pack=<exec>` (and its hidden synonym `--exec`) bails:
+//!   `Remote::connect` exposes no hook for the remote helper path, so honouring
+//!   it is not possible in the vendored crates.
 //! * `-o`/`--server-option` is parsed and validated but *not* transmitted:
 //!   gitoxide has no protocol-v2 server-option plumbing (no `server_option`
 //!   symbol exists anywhere under `gix-protocol`). Servers that would reject an
@@ -375,10 +376,13 @@ fn parse_args<'a>(
                     opts.sort.push(value);
                 }
             }
-            "upload-pack" => {
-                // Honouring this needs a remote-helper path hook `Remote::connect`
-                // does not expose; bail rather than silently ignore it.
-                bail_unsupported("--upload-pack");
+            "upload-pack" | "exec" => {
+                // `--exec` is git's hidden synonym for `--upload-pack` (both set
+                // the same `uploadpack` variable in builtin/ls-remote.c). Honouring
+                // either needs a remote-helper path hook `Remote::connect` does not
+                // expose; bail rather than silently ignore it. Stock git accepts
+                // `--exec`, so it must not fall through to "unknown option".
+                bail_unsupported(&format!("--{name}"));
                 return Err(ExitCode::from(128));
             }
             other => {

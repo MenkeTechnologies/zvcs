@@ -73,9 +73,15 @@ enum Untracked {
 ///   * unmerged (conflicted) paths, in both long and short form.
 ///   * `git status [--] <pathspec>...` — limits the report to matching paths
 ///     (the gix status iterator is given the patterns), across every format.
+///   * `git status -z|--null` — NUL-terminated, unquoted entries. Per git's
+///     `finalize_deferred_config` it forces a machine format (an unset/`--no-…`
+///     format becomes porcelain v1, `--long` is rejected, an explicit short /
+///     porcelain / v2 keeps its format) and turns off the deferred `status.*`
+///     config inheritance. Output is uncolored (git only colors `-z` under a
+///     forced color, which is not a real workflow).
 ///
 /// Faithfully unsupported cases `bail!` with a precise reason rather than
-/// emitting wrong output: `-z` and intent-to-add entries.
+/// emitting wrong output: intent-to-add entries.
 pub fn status(args: &[String]) -> Result<ExitCode> {
     let mut short = false;
     let mut porcelain_v2 = false;
@@ -116,6 +122,15 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     // `AHEAD_BEHIND_QUICK`, `None` = unspecified (resolved from `status.aheadBehind`
     // for the human formats, else FULL).
     let mut ahead_behind: Option<bool> = None;
+    // `-z` / `--null` (`OPT_BOOL`): NUL-terminate entries and emit paths raw. It
+    // also forces a machine format and disables the deferred `status.*` config
+    // inheritance (git's `finalize_deferred_config` / `use_deferred_config`);
+    // resolved after the loop once the whole command line is known.
+    let mut null_term = false;
+    // Tracks whether the last format flag was specifically `--long` (git's
+    // `STATUS_FORMAT_LONG`). Only that combination is fatal with `-z`; a
+    // `--no-…`-reset (`STATUS_FORMAT_NONE`) instead becomes porcelain v1.
+    let mut long_format = false;
 
     for a in args {
         let s = a.as_str();
@@ -128,16 +143,19 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 short = true;
                 porcelain = false;
                 format_explicit = true;
+                long_format = false;
             }
             "--porcelain" | "--porcelain=v1" | "--porcelain=1" => {
                 short = true;
                 porcelain = true;
                 format_explicit = true;
+                long_format = false;
             }
             "--long" => {
                 short = false;
                 porcelain = false;
                 format_explicit = true;
+                long_format = true;
             }
             // git's `--short`/`--long` are `OPT_SET_INT` and `--porcelain` an
             // `OPT_CALLBACK`; every `--no-` form resets the format to
@@ -148,12 +166,15 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 porcelain = false;
                 porcelain_v2 = false;
                 format_explicit = true;
+                long_format = false;
             }
             "--porcelain=v2" | "--porcelain=2" => {
                 porcelain_v2 = true;
                 format_explicit = true;
+                long_format = false;
             }
-            "-z" | "--null" => anyhow::bail!("NUL-terminated output (-z) is not supported"),
+            "-z" | "--null" => null_term = true,
+            "--no-null" => null_term = false,
             "-b" | "--branch" => {
                 branch_header = true;
                 branch_explicit = true;
@@ -233,13 +254,14 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                             short = true;
                             porcelain = false;
                             format_explicit = true;
+                            long_format = false;
                         }
                         'b' => {
                             branch_header = true;
                             branch_explicit = true;
                         }
                         'v' => {}
-                        'z' => anyhow::bail!("NUL-terminated output (-z) is not supported"),
+                        'z' => null_term = true,
                         'u' => {
                             // A bare `-u` (no attached value) is git's `all` default;
                             // an attached value is captured raw and validated after
@@ -318,6 +340,23 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         },
         None => None,
     };
+    // `-z` finalize (git's `finalize_deferred_config`): NUL output forces a
+    // machine format. `--long` is fatal, an unset/`--no-…`-reset format renders
+    // as porcelain v1, and any explicit short/porcelain/v2 keeps its format;
+    // pinning the format here also stops `status.short` from promoting the
+    // display below (the branch / ahead-behind config guards test `null_term`).
+    if null_term {
+        if long_format {
+            eprintln!("fatal: options '--long' and '-z' cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
+        if !short && !porcelain_v2 {
+            short = true;
+            porcelain = true;
+        }
+        format_explicit = true;
+    }
+
     // `--ignore-submodules=all` also hides *staged* gitlink changes: git sets
     // `diffopt.ignore_submodules` for the tree↔index diff, not only the worktree
     // pass. The gix platform's `index_worktree_submodules` covers only the latter,
@@ -338,7 +377,10 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             short = true;
             porcelain = false;
         }
-        if !branch_explicit && snap.boolean("status.branch") == Some(true) {
+        // `-z` disables git's `use_deferred_config`, so `status.branch` (like
+        // `status.short` above, already pinned via `format_explicit`) no longer
+        // promotes the branch header.
+        if !branch_explicit && !null_term && snap.boolean("status.branch") == Some(true) {
             branch_header = true;
         }
         // `status.renames` supplies the rename-detection default when the command
@@ -367,7 +409,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         // `finalize_deferred_config`: only the human formats (long / short display)
         // inherit `status.aheadBehind`; the porcelain machine formats keep FULL for
         // backwards compatibility, and an explicit flag always wins.
-        if ahead_behind.is_none() && !porcelain && !porcelain_v2 {
+        if ahead_behind.is_none() && !porcelain && !porcelain_v2 && !null_term {
             if let Some(v) = snap.boolean("status.aheadBehind") {
                 ahead_behind = Some(v);
             }
@@ -418,6 +460,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             quick,
             ignore_submodules,
             ignore_all,
+            null_term,
         );
     }
 
@@ -581,19 +624,38 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     let colors = super::color::StatusColors::resolve(&repo, porcelain);
 
     if short {
-        let mut out = String::new();
-        if branch_header {
-            out.push_str(&short_branch_header(&head_state, tracking.as_ref(), quick, &colors));
+        if null_term {
+            // `-z`: NUL-terminated, unquoted, uncolored — raw bytes straight to
+            // stdout so binary paths survive (a String would be lossy).
+            let mut out: Vec<u8> = Vec::new();
+            if branch_header {
+                short_branch_header_z(&mut out, &head_state, tracking.as_ref(), quick);
+            }
+            render_short_z(
+                &mut out,
+                &staged,
+                &unstaged,
+                &unmerged,
+                &untracked_paths,
+                &ignored_paths,
+            );
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(&out);
+        } else {
+            let mut out = String::new();
+            if branch_header {
+                out.push_str(&short_branch_header(&head_state, tracking.as_ref(), quick, &colors));
+            }
+            out.push_str(&render_short(
+                staged,
+                unstaged,
+                unmerged,
+                &untracked_paths,
+                &ignored_paths,
+                &colors,
+            ));
+            print!("{out}");
         }
-        out.push_str(&render_short(
-            staged,
-            unstaged,
-            unmerged,
-            &untracked_paths,
-            &ignored_paths,
-            &colors,
-        ));
-        print!("{out}");
     } else {
         // `--show-stash` appends a stash-count summary after the trailer; the count
         // is the number of `refs/stash` reflog entries (git's `count_stash_entries`).
@@ -917,6 +979,7 @@ fn porcelain_v2_output(
     quick: bool,
     ignore_submodules: Option<gix::submodule::config::Ignore>,
     ignore_all: bool,
+    null_term: bool,
 ) -> Result<ExitCode> {
     use gix::bstr::ByteSlice;
     use std::collections::BTreeMap;
@@ -925,7 +988,10 @@ fn porcelain_v2_output(
     let mut out = String::new();
 
     // ---------------------------------------------------------------- header
-    if branch_header {
+    // With `-z` the header is emitted as NUL-terminated raw bytes further down
+    // (git's `use_deferred_config` is off and every terminator becomes NUL), so
+    // the LF/`String` header below is built only for the non-`-z` formats.
+    if branch_header && !null_term {
         match repo.head_id() {
             Ok(id) => out.push_str(&format!("# branch.oid {}\n", id.detach())),
             Err(_) => out.push_str("# branch.oid (initial)\n"),
@@ -955,8 +1021,9 @@ fn porcelain_v2_output(
     }
 
     // `# stash <n>` follows the branch header (independent of `--branch`), before
-    // the change entries; git omits it when there are no stash entries.
-    if show_stash {
+    // the change entries; git omits it when there are no stash entries. (`-z`
+    // renders it as NUL-terminated bytes in the null-termination branch below.)
+    if show_stash && !null_term {
         let n = count_stash_entries(repo);
         if n > 0 {
             out.push_str(&format!("# stash {n}\n"));
@@ -1158,6 +1225,151 @@ fn porcelain_v2_output(
             b'.' => r.m_i, // worktree matches the index
             _ => worktree_mode(repo, path.as_bstr()),
         };
+    }
+
+    // ------------------------------------------------- -z (null-terminated)
+    // A separate byte renderer: every terminator is NUL, the rename separator
+    // is NUL (with the current path first), and paths are emitted raw — never
+    // C-quoted — so binary paths survive (a `String` would be lossy). This keeps
+    // the LF/`String` renderer below byte-for-byte unchanged for the common case.
+    if null_term {
+        let mut b: Vec<u8> = Vec::new();
+
+        // Header — same fields as the LF form (git's `wt_porcelain_v2_print_tracking`
+        // with `eol = '\0'`), NUL-terminated and uncolored.
+        if branch_header {
+            match repo.head_id() {
+                Ok(id) => b.extend_from_slice(format!("# branch.oid {}", id.detach()).as_bytes()),
+                Err(_) => b.extend_from_slice(b"# branch.oid (initial)"),
+            }
+            b.push(0);
+            let head = repo.head()?;
+            let head_name = if head.is_detached() {
+                "(detached)".to_string()
+            } else {
+                head.referent_name()
+                    .map(|n| n.shorten().to_str_lossy().into_owned())
+                    .unwrap_or_else(|| "(detached)".to_string())
+            };
+            drop(head);
+            b.extend_from_slice(format!("# branch.head {head_name}").as_bytes());
+            b.push(0);
+            if let Some(t) = tracking_info(repo)? {
+                b.extend_from_slice(format!("# branch.upstream {}", t.upstream).as_bytes());
+                b.push(0);
+                if !t.gone {
+                    if quick && (t.ahead > 0 || t.behind > 0) {
+                        b.extend_from_slice(b"# branch.ab +? -?");
+                    } else {
+                        b.extend_from_slice(
+                            format!("# branch.ab +{} -{}", t.ahead, t.behind).as_bytes(),
+                        );
+                    }
+                    b.push(0);
+                }
+            }
+        }
+        if show_stash {
+            let n = count_stash_entries(repo);
+            if n > 0 {
+                b.extend_from_slice(format!("# stash {n}").as_bytes());
+                b.push(0);
+            }
+        }
+
+        // 1/2/u entry lines, together and sorted by path.
+        let mut lines: Vec<(BString, Vec<u8>)> = Vec::new();
+        for (path, r) in &recs {
+            let xy = format!("{}{}", r.x as char, r.y as char);
+            let mut line: Vec<u8> = Vec::new();
+            if let Some((kind, score, ref orig)) = r.rename {
+                line.extend_from_slice(
+                    format!(
+                        "2 {xy} N... {:06o} {:06o} {:06o} {} {} {}{} ",
+                        r.m_h, r.m_i, r.m_w, r.h_h, r.h_i, kind as char, score,
+                    )
+                    .as_bytes(),
+                );
+                line.extend_from_slice(path);
+                line.push(0);
+                line.extend_from_slice(orig);
+            } else {
+                line.extend_from_slice(
+                    format!(
+                        "1 {xy} N... {:06o} {:06o} {:06o} {} {} ",
+                        r.m_h, r.m_i, r.m_w, r.h_h, r.h_i,
+                    )
+                    .as_bytes(),
+                );
+                line.extend_from_slice(path);
+            }
+            lines.push((path.clone(), line));
+        }
+        for (mask, path) in &unmerged {
+            let xy = match mask {
+                1 => "DD",
+                2 => "AU",
+                3 => "UD",
+                4 => "UA",
+                5 => "DU",
+                6 => "AA",
+                _ => "UU",
+            };
+            let mut sm = [0u32; 3];
+            let mut sh = [zero; 3];
+            for e in index.entries() {
+                if e.path(&index) == path.as_bstr() {
+                    match e.stage_raw() {
+                        1 => {
+                            sm[0] = e.mode.bits();
+                            sh[0] = e.id;
+                        }
+                        2 => {
+                            sm[1] = e.mode.bits();
+                            sh[1] = e.id;
+                        }
+                        3 => {
+                            sm[2] = e.mode.bits();
+                            sh[2] = e.id;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let m_w = worktree_mode(repo, path.as_bstr());
+            let mut line: Vec<u8> = Vec::new();
+            line.extend_from_slice(
+                format!(
+                    "u {xy} N... {:06o} {:06o} {:06o} {:06o} {} {} {} ",
+                    sm[0], sm[1], sm[2], m_w, sh[0], sh[1], sh[2],
+                )
+                .as_bytes(),
+            );
+            line.extend_from_slice(path);
+            lines.push((path.clone(), line));
+        }
+        lines.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, line) in lines {
+            b.extend_from_slice(&line);
+            b.push(0);
+        }
+
+        untracked_paths.sort();
+        ignored_paths.sort();
+        for p in &untracked_paths {
+            b.extend_from_slice(b"? ");
+            b.extend_from_slice(p);
+            b.push(0);
+        }
+        for p in &ignored_paths {
+            b.extend_from_slice(b"! ");
+            b.extend_from_slice(p);
+            b.push(0);
+        }
+
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(&b);
+        return Ok(ExitCode::SUCCESS);
     }
 
     // ------------------------------------------------------------- render
@@ -1719,6 +1931,123 @@ fn render_short(
         out.push_str(&format!("{} {}\n", colors.paint(Slot::Untracked, "!!"), quote_path(path)));
     }
     out
+}
+
+/// `-z` short / porcelain-v1 body (git's `wt_shortstatus_status` /
+/// `wt_shortstatus_other` in null-termination mode): each entry is
+/// `XY <path>\0`, a rename is `XY <path>\0<source>\0` with the *current* path
+/// first, and untracked / ignored are `?? <path>\0` / `!! <path>\0`. Paths are
+/// emitted raw — never C-quoted — and the output is uncolored.
+fn render_short_z(
+    out: &mut Vec<u8>,
+    staged: &[(StageKind, BString, Option<BString>)],
+    unstaged: &[(WorkKind, BString)],
+    unmerged: &[(u8, BString)],
+    untracked: &[BString],
+    ignored: &[BString],
+) {
+    struct Short {
+        x: u8,
+        y: u8,
+        orig: Option<BString>,
+    }
+
+    // Merge the change streams per path exactly as `render_short` does: X is the
+    // staged (index) column, Y the worktree column, and a conflicted path sets
+    // both columns from its stagemask.
+    let mut map: BTreeMap<BString, Short> = BTreeMap::new();
+    for (kind, path, orig) in staged {
+        let e = map.entry(path.clone()).or_insert(Short {
+            x: b' ',
+            y: b' ',
+            orig: None,
+        });
+        e.x = stage_char(*kind);
+        if orig.is_some() {
+            e.orig = orig.clone();
+        }
+    }
+    for (kind, path) in unstaged {
+        let e = map.entry(path.clone()).or_insert(Short {
+            x: b' ',
+            y: b' ',
+            orig: None,
+        });
+        e.y = work_char(*kind);
+    }
+    for (mask, path) in unmerged {
+        let (x, y) = unmerged_chars(*mask);
+        map.insert(path.clone(), Short { x, y, orig: None });
+    }
+
+    for (path, e) in &map {
+        out.push(e.x);
+        out.push(e.y);
+        out.push(b' ');
+        out.extend_from_slice(path);
+        out.push(0);
+        if let Some(o) = &e.orig {
+            out.extend_from_slice(o);
+            out.push(0);
+        }
+    }
+    for path in untracked {
+        out.extend_from_slice(b"?? ");
+        out.extend_from_slice(path);
+        out.push(0);
+    }
+    for path in ignored {
+        out.extend_from_slice(b"!! ");
+        out.extend_from_slice(path);
+        out.push(0);
+    }
+}
+
+/// The `## …` line of `git status -sbz` — git's `wt_shortstatus_print_tracking`
+/// in null-termination mode: identical text to the non-`-z` header but
+/// NUL-terminated and uncolored.
+fn short_branch_header_z(
+    out: &mut Vec<u8>,
+    head_state: &HeadState,
+    tracking: Option<&Tracking>,
+    quick: bool,
+) {
+    out.extend_from_slice(b"## ");
+    match head_state {
+        HeadState::Detached(_) => {
+            out.extend_from_slice(b"HEAD (no branch)");
+            out.push(0);
+            return;
+        }
+        HeadState::Unborn(name) => {
+            out.extend_from_slice(b"No commits yet on ");
+            out.extend_from_slice(name.as_bytes());
+            out.push(0);
+            return;
+        }
+        HeadState::Branch(name) => out.extend_from_slice(name.as_bytes()),
+    }
+
+    let Some(t) = tracking else {
+        out.push(0);
+        return;
+    };
+    out.extend_from_slice(b"...");
+    out.extend_from_slice(t.upstream.as_bytes());
+    if t.gone {
+        out.extend_from_slice(b" [gone]");
+    } else if quick {
+        if t.ahead > 0 || t.behind > 0 {
+            out.extend_from_slice(b" [different]");
+        }
+    } else if t.ahead > 0 && t.behind > 0 {
+        out.extend_from_slice(format!(" [ahead {}, behind {}]", t.ahead, t.behind).as_bytes());
+    } else if t.ahead > 0 {
+        out.extend_from_slice(format!(" [ahead {}]", t.ahead).as_bytes());
+    } else if t.behind > 0 {
+        out.extend_from_slice(format!(" [behind {}]", t.behind).as_bytes());
+    }
+    out.push(0);
 }
 
 /// One short-format status column: a blank column is an uncolored space; a set

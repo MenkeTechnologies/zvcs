@@ -1,9 +1,13 @@
 use anyhow::{bail, Result};
 use prodash::Root as _;
 use std::io::IsTerminal;
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
+use std::time::SystemTime;
+
+use gix::remote::fetch::{Shallow, Tags};
 
 /// `git clone <url> [<directory>]` — clone a repository into a new directory.
 ///
@@ -17,6 +21,15 @@ use std::sync::atomic::AtomicBool;
 ///   * `git clone <url>`             → clone into a directory named after the URL
 ///   * `git clone <url> <directory>` → clone into an explicit directory
 ///   * `git clone --bare <url> [<directory>]`
+///   * `-o`/`--origin <name>`        → track upstream under `<name>` instead of `origin`
+///   * `-b`/`--branch <branch>`      → check out `<branch>` instead of the remote's `HEAD`
+///   * `-n`/`--no-checkout`          → set up refs/`HEAD` but do not populate a worktree
+///   * `--depth <n>`                 → shallow clone truncated to `<n>` commits
+///   * `--shallow-since <time>`      → shallow boundary at a cutoff date
+///   * `--shallow-exclude <ref>`     → exclude history reachable from a ref (repeatable)
+///   * `--no-tags`                   → do not fetch tags
+///   * `--reject-shallow`            → refuse to clone from a shallow remote
+///   * `--recursive`/`--recurse-submodules[=<pathspec>]` → update submodules after clone
 ///
 /// Progress (remote sideband + local receive/resolve/checkout) is rendered to
 /// stderr like git: shown when stderr is a terminal, forced on with `--progress`,
@@ -29,33 +42,118 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `None` = default (progress iff stderr is a terminal), matching git.
     let mut force_progress: Option<bool> = None;
     let mut recurse_submodules = false;
+    let mut no_checkout = false;
+    let mut origin: Option<String> = None;
+    let mut branch: Option<String> = None;
+    // `--no-tags` → `Tags::None`. Left `None` for git's default (fetch all tags).
+    let mut tags: Option<Tags> = None;
+    // `--reject-shallow` (`true`) / `--no-reject-shallow` (`false`); `None` leaves
+    // it unspecified so the `clone.rejectShallow` config value, if any, decides.
+    let mut reject_shallow: Option<bool> = None;
+    // Shallow-boundary selectors that combine (git's `--shallow-exclude` is a
+    // repeatable list → `deepen_not`, `--shallow-since` → `deepen_since`, and the
+    // two may be given together). Resolved into a single `Shallow` after parsing.
+    let mut depth: Option<NonZeroU32> = None;
+    let mut shallow_exclude: Vec<gix::refs::PartialName> = Vec::new();
+    let mut shallow_since: Option<gix::date::Time> = None;
     let mut positionals: Vec<&str> = Vec::new();
-    let mut end_of_options = false;
 
-    for arg in args {
+    let mut i = 0;
+    let mut end_of_options = false;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+
         if end_of_options {
-            positionals.push(arg);
+            positionals.push(a);
             continue;
         }
-        match arg.as_str() {
+
+        // Split `--opt=value` for the value-taking long options.
+        let (key, inline_val) = match (a.starts_with("--"), a.split_once('=')) {
+            (true, Some((k, v))) => (k, Some(v.to_string())),
+            _ => (a, None),
+        };
+
+        // Fetch the value for a value-taking option (inline `=v` or next arg).
+        // Kept as a plain expression (not a closure) so the `i` cursor stays
+        // freely borrowable in the other match arms.
+        macro_rules! take_value {
+            ($name:literal) => {
+                match inline_val.clone() {
+                    Some(v) => v,
+                    None => {
+                        let v = args
+                            .get(i)
+                            .cloned()
+                            .ok_or_else(|| anyhow::anyhow!(concat!($name, " requires a value")))?;
+                        i += 1;
+                        v
+                    }
+                }
+            };
+        }
+
+        match key {
             "--" => end_of_options = true,
             "--bare" => bare = true,
+            "--no-bare" => bare = false,
             "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
             // `-v`/`--verbose` only adds output detail in git; the clone result
             // is identical, so it is accepted without changing behavior.
-            "-v" | "--verbose" => {}
+            "-v" | "--verbose" | "--no-verbose" => {}
             "--progress" => force_progress = Some(true),
             "--no-progress" => force_progress = Some(false),
-            // `--recursive` / `--recurse-submodules[=<pathspec>]`: after the
-            // clone, initialize and update submodules recursively.
-            "--recursive" | "--recurse-submodules" => recurse_submodules = true,
-            other if other.starts_with("--recurse-submodules=") => {
-                // A pathspec-limited recurse; this port does the full recursive
-                // update rather than honoring the pathspec.
-                recurse_submodules = true;
-                let _ = other;
+            // Local-clone optimizations: git uses these to control hardlinking /
+            // copying of objects when the source is a local path. gitoxide always
+            // copies objects over its transport, so the resulting repository is
+            // identical regardless of these flags — accept them as no-ops.
+            "-l" | "--local" | "--no-local" | "--no-hardlinks" | "--hardlinks" => {}
+            // `-n`/`--no-checkout`: fetch refs and set `HEAD`, but do not populate
+            // a worktree (leaves an empty index, exactly like git).
+            "-n" | "--no-checkout" => no_checkout = true,
+            "--checkout" => no_checkout = false,
+            "-o" | "--origin" => origin = Some(take_value!("--origin")),
+            "--no-origin" => origin = None,
+            "-b" | "--branch" => branch = Some(take_value!("--branch")),
+            "--no-branch" => branch = None,
+            "--no-tags" => tags = Some(Tags::None),
+            // `--tags` resets to git's default (all tags fetched).
+            "--tags" => tags = None,
+            "--reject-shallow" => reject_shallow = Some(true),
+            "--no-reject-shallow" => reject_shallow = Some(false),
+            "--depth" => {
+                let v = take_value!("--depth");
+                let n: u32 = v
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("depth {v:?} is not a positive number"))?;
+                depth = Some(
+                    NonZeroU32::new(n)
+                        .ok_or_else(|| anyhow::anyhow!("depth {v:?} is not a positive number"))?,
+                );
             }
-            other if other.starts_with('-') => {
+            // Shallow boundary at a cutoff date (git's `deepen_since`). Parsed with
+            // gitoxide's git-compatible date parser, relative to the current time.
+            "--shallow-since" => {
+                let v = take_value!("--shallow-since");
+                let t = gix::date::parse(&v, Some(SystemTime::now()))
+                    .map_err(|_| anyhow::anyhow!("--shallow-since expects a valid date, got {v:?}"))?;
+                shallow_since = Some(t);
+            }
+            // Exclude history reachable from a ref (git's repeatable `deepen_not`).
+            "--shallow-exclude" => {
+                let v = take_value!("--shallow-exclude");
+                let name = gix::refs::PartialName::try_from(v.as_str())
+                    .map_err(|_| anyhow::anyhow!("--shallow-exclude expects a valid ref, got {v:?}"))?;
+                shallow_exclude.push(name);
+            }
+            // `--recursive` / `--recurse-submodules[=<pathspec>]`: after the clone,
+            // initialize and update submodules recursively. A pathspec-limited
+            // recurse is honored as a full recursive update.
+            "--recursive" | "--recurse-submodules" => recurse_submodules = true,
+            "--no-recursive" | "--no-recurse-submodules" => recurse_submodules = false,
+            other if other.starts_with('-') && other.len() > 1 => {
                 bail!("unsupported option {other:?}");
             }
             other => positionals.push(other),
@@ -72,6 +170,22 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
 
     // Parse the URL up front so a malformed one is reported before touching disk.
     let url = gix::url::parse(url_str.into())?;
+
+    // Resolve the shallow-boundary selectors into a single `Shallow` value. The
+    // exclude form supersedes a lone `--shallow-since`, which supersedes
+    // `--depth`, matching git's treatment of them as one deepen group.
+    let shallow = if !shallow_exclude.is_empty() {
+        Shallow::Exclude {
+            remote_refs: shallow_exclude,
+            since_cutoff: shallow_since,
+        }
+    } else if let Some(cutoff) = shallow_since {
+        Shallow::Since { cutoff }
+    } else if let Some(n) = depth {
+        Shallow::DepthAtRemote(n)
+    } else {
+        Shallow::NoChange
+    };
 
     // Destination directory: explicit second positional, else derived from the
     // URL the way git's `guess_dir_name` does (humanish last component).
@@ -117,6 +231,35 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         eprintln!("Cloning into '{dir}'...");
     }
 
+    // Build the clone platform and apply the parsed options. `--origin` renames
+    // the remote (and its tracking refspec), `--branch` selects the ref to fetch
+    // and check out, `--depth`/`--shallow-*` set the shallow boundary, `--no-tags`
+    // suppresses tag fetching, and `--reject-shallow` is injected as an in-memory
+    // `clone.rejectShallow` override so the fetch aborts on a shallow remote.
+    let mut prepare = if bare {
+        gix::prepare_clone_bare(url, dst)?
+    } else {
+        gix::prepare_clone(url, dst)?
+    };
+    if let Some(name) = &origin {
+        prepare = prepare
+            .with_remote_name(name.as_str())
+            .map_err(|_| anyhow::anyhow!("{name:?} is not a valid remote name"))?;
+    }
+    if let Some(name) = &branch {
+        prepare = prepare
+            .with_ref_name(Some(name.as_str()))
+            .map_err(|_| anyhow::anyhow!("--branch expects a valid branch name, got {name:?}"))?;
+    }
+    prepare = prepare.with_shallow(shallow);
+    if let Some(tags) = tags {
+        prepare = prepare.configure_remote(move |r| Ok(r.with_fetch_tags(tags)));
+    }
+    if let Some(reject) = reject_shallow {
+        prepare = prepare
+            .with_in_memory_config_overrides(Some(format!("clone.rejectShallow={reject}")));
+    }
+
     // Drive gitoxide's fetch/checkout through a prodash tree and render it to
     // stderr with the line renderer. The tree relays the remote's sideband
     // progress (Enumerating/Counting/Compressing objects, Total …) as well as the
@@ -159,14 +302,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // Run the clone, capturing the result so the renderer is always torn down
     // (cursor restored, thread joined) before any error is propagated.
     let result = (|| -> Result<()> {
-        if bare {
-            // `git clone --bare 'url'...`: a bare clone never checks out a
-            // worktree; fetching the pack and writing the refs is the whole job.
-            let mut prepare = gix::prepare_clone_bare(url, dst)?;
+        if bare || no_checkout {
+            // A bare clone never checks out a worktree; `--no-checkout` likewise
+            // fetches the pack and writes the refs/`HEAD` but leaves the worktree
+            // (and index) empty. Fetching is the whole job in both cases.
             prepare.fetch_only(op.add_child("fetch"), &should_interrupt)?;
         } else {
             // `git clone 'url'...`
-            let mut prepare = gix::prepare_clone(url, dst)?;
             let (mut checkout, _) =
                 prepare.fetch_then_checkout(op.add_child("fetch"), &should_interrupt)?;
             // Check out the branch `HEAD` points to. This is a no-op for an empty
@@ -186,10 +328,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         eprintln!("done.");
     }
 
-    // `--recursive` / `--recurse-submodules`: after a successful non-bare clone,
-    // initialize and update submodules recursively by re-executing this binary's
-    // own ported `submodule update --init --recursive` in the new worktree.
-    if recurse_submodules && !bare {
+    // `--recursive` / `--recurse-submodules`: after a successful non-bare,
+    // checked-out clone, initialize and update submodules recursively by
+    // re-executing this binary's own ported `submodule update --init --recursive`
+    // in the new worktree.
+    if recurse_submodules && !bare && !no_checkout {
         let exe = std::env::current_exe()?;
         let status = std::process::Command::new(&exe)
             .arg("-C")

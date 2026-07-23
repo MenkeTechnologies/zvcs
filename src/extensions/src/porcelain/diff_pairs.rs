@@ -36,6 +36,8 @@
 //! * the pickaxe: `-S<string>` (with `--pickaxe-regex`), `-G<regex>`, `--find-object=<id>`,
 //!   `--pickaxe-all`
 //! * `--relative[=<prefix>]` / `--no-relative`, `--rotate-to=<p>` / `--skip-to=<p>`
+//! * `--output-indicator-new`/`-old`/`-context=<char>` — remap the `+`/`-`/` ` markers on
+//!   body lines (a value longer than one byte errors with exit 129, like `diff_opt_char`)
 //! * `--exit-code`, `--quiet` (implies `-s` and `--exit-code`)
 //! * `--abbrev[=<n>]` — accepted and ignored, which is what stock git does here.
 //!   `core.abbrev` itself *is* honoured.
@@ -49,7 +51,7 @@
 //!   supported`, exit 128 — this matches stock git's `builtin/diff-pairs.c`, which dies
 //!   with the same message rather than recursing.
 //! * `--color`, `--color-moved`, `--word-diff`, `--check`, `--binary`, `--line-prefix`,
-//!   `--output`, `--output-indicator-*`, `--inter-hunk-context`, `-a`/`--text`,
+//!   `--output`, `--inter-hunk-context`, `-a`/`--text`,
 //!   `-W`/`--function-context`, `--dirstat`, `--diff-algorithm`/`--patience`/`--histogram`/
 //!   `--minimal`/`--anchored`, `-O`/`--order`, `--textconv`/`--ext-diff`, `--submodule`,
 //!   and `-I` combined with a *patch* format (git marks the ignorable hunks via
@@ -426,6 +428,11 @@ struct Opts {
     relative: Relative,
     anchor: Option<Anchor>, // --rotate-to / --skip-to
     stat: StatWidths,
+    // --output-indicator-new / -old / -context: the character printed at the start of an
+    // added / removed / context body line, replacing '+' / '-' / ' '.
+    ind_new: u8,
+    ind_old: u8,
+    ind_context: u8,
 }
 
 /// One raw-format record: a pre-computed file pair.
@@ -504,6 +511,9 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         relative: Relative::No,
         anchor: None,
         stat: StatWidths::default(),
+        ind_new: b'+',
+        ind_old: b'-',
+        ind_context: b' ',
     };
     let mut nul = false;
     // Deferred until the whole line is read so `--pickaxe-regex`/`--pickaxe-all`, which
@@ -674,6 +684,45 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
                 opts.formats.patch = true;
             }
             "--unified" => opts.formats.patch = true,
+            // --output-indicator-new / -old / -context: each takes a single character.
+            // git's `diff_opt_char` errors (exit 129) if the value is longer than one byte.
+            "--output-indicator-new" => {
+                let v = want_value!(s.len());
+                if let Err(c) = set_indicator(&mut opts.ind_new, &v, "output-indicator-new") {
+                    return Ok(c);
+                }
+            }
+            _ if s.starts_with("--output-indicator-new=") => {
+                let v = &s["--output-indicator-new=".len()..];
+                if let Err(c) = set_indicator(&mut opts.ind_new, v, "output-indicator-new") {
+                    return Ok(c);
+                }
+            }
+            "--output-indicator-old" => {
+                let v = want_value!(s.len());
+                if let Err(c) = set_indicator(&mut opts.ind_old, &v, "output-indicator-old") {
+                    return Ok(c);
+                }
+            }
+            _ if s.starts_with("--output-indicator-old=") => {
+                let v = &s["--output-indicator-old=".len()..];
+                if let Err(c) = set_indicator(&mut opts.ind_old, v, "output-indicator-old") {
+                    return Ok(c);
+                }
+            }
+            "--output-indicator-context" => {
+                let v = want_value!(s.len());
+                if let Err(c) = set_indicator(&mut opts.ind_context, &v, "output-indicator-context")
+                {
+                    return Ok(c);
+                }
+            }
+            _ if s.starts_with("--output-indicator-context=") => {
+                let v = &s["--output-indicator-context=".len()..];
+                if let Err(c) = set_indicator(&mut opts.ind_context, v, "output-indicator-context") {
+                    return Ok(c);
+                }
+            }
             _ if s.starts_with("--src-prefix=") => {
                 opts.src_prefix = BString::from(s["--src-prefix=".len()..].as_bytes());
             }
@@ -688,6 +737,7 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
                  -R, --diff-filter=<f>, -w/-b/--ignore-space-at-eol/--ignore-cr-at-eol, \
                  -I<re>, -S<s>/-G<re>/--find-object=<id>/--pickaxe-regex/--pickaxe-all, \
                  --relative[=<p>]/--no-relative, --rotate-to=<p>/--skip-to=<p>, \
+                 --output-indicator-new/-old/-context=<char>, \
                  --exit-code, --quiet, --abbrev[=<n>], -h)"
             ),
         }
@@ -821,6 +871,20 @@ fn parse_ctx(s: &str) -> Result<u32> {
 /// Parse a bare integer for the `--stat-*` width options; git treats a bad value as unset.
 fn parse_i64(s: &str) -> i64 {
     s.parse::<i64>().unwrap_or(-1)
+}
+
+/// `diff_opt_char`: the value for a `--output-indicator-*` option must be a single byte.
+/// git errors with `error: <name> expects a character, got '<val>'` (exit 129) for any
+/// value longer than one byte; an empty value leaves the marker as a NUL byte, matching
+/// git's read past the empty string.
+fn set_indicator(slot: &mut u8, val: &str, name: &str) -> std::result::Result<(), ExitCode> {
+    if val.len() <= 1 {
+        *slot = val.as_bytes().first().copied().unwrap_or(0);
+        Ok(())
+    } else {
+        eprintln!("error: {name} expects a character, got '{val}'");
+        Err(ExitCode::from(129))
+    }
 }
 
 /// Parse `--stat=<width>[,<name-width>[,<count>]]`.
@@ -2155,7 +2219,37 @@ fn emit_patch(
         out.extend_from_slice(b"+++ ");
         out.extend_from_slice(&new_label);
         out.push(b'\n');
-        out.extend_from_slice(&an.hunks);
+        write_hunks(out, &an.hunks, opts);
+    }
+}
+
+/// Write the rendered hunk body, remapping each context/removed/added line's leading
+/// marker to the configured `--output-indicator-*` character.
+///
+/// The stored `Analysis::hunks` always carry git's canonical `' '`/`'-'`/`'+'` markers
+/// (so `-G` and the diffstat see the real diff); the display characters are substituted
+/// only here, at emit time, exactly as `diff.c` applies `output_indicators` in
+/// `emit_line_0`. Hunk-header (`@@`) and `\ No newline at end of file` lines start with
+/// `'@'`/`'\'` and are left untouched. The common default triple is a straight copy.
+fn write_hunks(out: &mut Vec<u8>, hunks: &[u8], opts: &Opts) {
+    if opts.ind_context == b' ' && opts.ind_old == b'-' && opts.ind_new == b'+' {
+        out.extend_from_slice(hunks);
+        return;
+    }
+    for line in byte_lines(hunks) {
+        let marker = match line.first() {
+            Some(b' ') => Some(opts.ind_context),
+            Some(b'-') => Some(opts.ind_old),
+            Some(b'+') => Some(opts.ind_new),
+            _ => None,
+        };
+        match marker {
+            Some(m) => {
+                out.push(m);
+                out.extend_from_slice(&line[1..]);
+            }
+            None => out.extend_from_slice(line),
+        }
     }
 }
 

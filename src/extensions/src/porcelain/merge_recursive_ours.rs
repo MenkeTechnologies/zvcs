@@ -1,69 +1,47 @@
-//! `git merge-recursive-ours` — the `recursive` merge strategy back-end.
+//! `git merge-recursive-ours` — the `recursive` merge strategy back-end,
+//! invoked under its `-ours` alias name.
 //!
 //! `merge-recursive-ours` is not a separate implementation: `git.c` registers
 //! `merge-recursive`, `merge-recursive-ours`, `merge-recursive-theirs` and
 //! `merge-subtree` as four names for the single builtin `cmd_merge_recursive`,
 //! and that function only ever inspects `argv[0]` to test for a `-subtree`
-//! suffix. The `-ours` suffix is **not** read, so this command is byte-for-byte
-//! `git merge-recursive` with a different usage string. Verified against git
-//! 2.55.0: `merge-recursive-ours <base> -- <ours> <theirs>` and
+//! suffix (`builtin/merge-recursive.c:34`, `ends_with(argv[0], "-subtree")`).
+//! The `-ours` suffix is **not** read, so this command is byte-for-byte
+//! `git merge-recursive` with a different usage string — the "ours" *preference*
+//! is `--ours`, an option, not the command name. Verified against git 2.55.0:
+//! `merge-recursive-ours <base> -- <ours> <theirs>` and
 //! `merge-recursive <base> -- <ours> <theirs>` produced identical stdout,
 //! identical exit status and an identical conflicted index (same three stage
-//! entries, same blob ids) — the "ours" preference is `--ours`, an *option*,
-//! not the command name.
+//! entries, same blob ids).
 //!
-//! ### Not covered: the merge itself
+//! ### Structure: one driver, reused
 //!
-//! The command is `RUN_SETUP | NEED_WORK_TREE`; its entire product is a mutated
-//! index (stage 1/2/3 entries for conflicted paths) and a mutated worktree
-//! (merged content, conflict-marker files, deletions, renames). The vendored
-//! `gix` in this tree is built with `merge` but **not** `worktree-mutation`
-//! (`src/extensions/Cargo.toml:24`), so `gix-worktree-state` — the only
-//! checkout substrate gitoxide has — is not compiled in, and `Cargo.toml` is
-//! not this module's to change. `gix::Repository::merge_commits` is available
-//! and computes a merged tree, but it explicitly makes "no change to the
-//! worktree or index" (`src/ported/gix/src/repository/merge.rs:168`), and there
-//! is no ported `unpack_trees` equivalent to apply a result to the worktree —
-//! the same gap `read-tree` documents for `-u -m`.
+//! Because the `-ours` suffix is inert, the merge proper is delegated to the
+//! sibling [`super::merge_recursive`], which ports `cmd_merge_recursive`'s body
+//! (`builtin/merge-recursive.c:37-91`): the option/base scan, the 20-base cap
+//! warning, base/`<head>`/`<remote>` resolution, the unmerged-index
+//! precondition, the three-way recursive merge (`gix` tree merge, recursive
+//! merge-base consolidation), and materialising the result into the index and
+//! worktree. Re-porting that here would duplicate the driver, so only the
+//! command-name-specific framing lives in this file:
 //!
-//! Therefore the merge is **not** attempted. Everything `cmd_merge_recursive`
-//! does before `merge_recursive_generic()` is reproduced exactly; the merge call
-//! itself bails naming the missing substrate rather than writing a tree that
-//! would leave the repository in a state stock git never produces. A partially
-//! applied merge is worse than a refused one.
+//! * `-h` / `--help-all` as the *sole* argument — the usage line for **this**
+//!   name on **stdout**, exit 129, answered before `setup_git_directory()` (so
+//!   it works outside a repository and in a bare one).
+//! * `RUN_SETUP` / `NEED_WORK_TREE`: `fatal: not a git repository …` (128) and
+//!   `fatal: this operation must be run in a work tree` (128), both before any
+//!   argument is examined. `merge_recursive` reports repo-discovery failure as a
+//!   generic error, so these faithful messages are emitted here first.
+//! * `argc < 4` (fewer than three arguments here): the usage line for **this**
+//!   name on **stderr**, exit 129 (`usagef()`).
 //!
-//! ### Covered (stdout, stderr and exit code verified against git 2.55.0)
-//!
-//! * `-h` or `--help-all` as the *sole* argument — usage line on **stdout**,
-//!   exit 129, without requiring a repository (`git.c` answers it before
-//!   `setup_git_directory()`). With any other argument alongside, both are
-//!   ordinary arguments and take the `argc < 4` path below (stderr, 129).
-//! * Outside a repository: `fatal: not a git repository (or any of the parent
-//!   directories): .git`, exit 128 — before any argument is examined.
-//! * In a bare repository: `fatal: this operation must be run in a work tree`,
-//!   exit 128 — the `NEED_WORK_TREE` check, also before argument handling.
-//! * `argc < 4` (fewer than three arguments here): the usage line on
-//!   **stderr**, exit 129 (`usagef()`).
-//! * Argument scan, in `cmd_merge_recursive`'s order:
-//!   - a bare `--` ends the scan;
-//!   - `--<opt>` goes through [`parse_merge_opt`], and an unaccepted one is
-//!     `fatal: unknown option --<opt>`, exit 128;
-//!   - anything else is a merge base, resolved with
-//!     `fatal: could not parse object '<arg>'`, exit 128 on failure;
-//!   - past 20 bases, `warning: cannot handle more than 20 bases. Ignoring
-//!     <arg>.` on stderr and the base is dropped.
-//! * Exactly three arguments must follow the `--`, else `fatal: not handling
-//!   anything other than two heads merge.`, exit 128.
-//! * An index carrying unmerged entries is `die_resolve_conflict("merge")`: the
-//!   four-line `error:`/`hint:`/`hint:`/`fatal:` block on stderr, exit 128 —
-//!   and this precedes head resolution, so a bogus `<head>` is not reported.
-//! * `<head>` / `<remote>` resolution failure: `fatal: could not resolve ref
-//!   '<arg>'`, exit 128.
-//!
-//! Reaching the end of that list means the arguments are valid and the merge
-//! would run; that is where this port stops.
+//! Everything past that framing is handed to the driver. `git.c`'s dispatch
+//! strips `argv[0]` before this function sees `args`, but `cmd_merge_recursive`
+//! (and its Rust port) indexes `argv` starting at `1` with `argc` counting the
+//! command name; a single synthetic leading element is prepended so the driver's
+//! argument grammar lines up exactly with git's.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::process::ExitCode;
 
 /// Stock git's usage line for this name (`builtin_merge_recursive_usage` with
@@ -71,14 +49,15 @@ use std::process::ExitCode;
 /// `<remote>` and the absence of any trailing space.
 const USAGE: &str = "usage: git merge-recursive-ours <base>... -- <head> <remote> ...\n";
 
-/// `bases[]` in `cmd_merge_recursive` is `ARRAY_SIZE(bases)-1` deep.
-const MAX_BASES: usize = 20;
-
-/// `git merge-recursive-ours` — validate a recursive-strategy invocation.
+/// `git merge-recursive-ours` — the recursive-strategy merge under its `-ours`
+/// alias.
 ///
-/// Performs every check `cmd_merge_recursive` performs, in the same order and
-/// with the same messages and exit codes, then refuses the merge itself (see
-/// the module docs for the missing substrate).
+/// Handles the three command-name-specific paths (`-h`, `RUN_SETUP` /
+/// `NEED_WORK_TREE`, and the `argc < 4` usage line), then delegates the merge
+/// itself — argument scan, resolution and the three-way merge into the index and
+/// worktree — to the shared [`super::merge_recursive`] driver. The `-ours`
+/// suffix is inert (see the module docs), so this is `git merge-recursive` with
+/// a different usage string.
 pub fn merge_recursive_ours(args: &[String]) -> Result<ExitCode> {
     // `git.c` answers a lone `-h`/`--help-all` on stdout before RUN_SETUP, so
     // it works outside a repository and in a bare one.
@@ -87,7 +66,9 @@ pub fn merge_recursive_ours(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    // RUN_SETUP, then NEED_WORK_TREE — both before any argument is looked at.
+    // RUN_SETUP, then NEED_WORK_TREE — both before any argument is looked at,
+    // and with git's exact messages (the driver reports discovery failure as a
+    // generic error, so the faithful text is produced here).
     let Ok(repo) = gix::discover(".") else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
@@ -97,84 +78,31 @@ pub fn merge_recursive_ours(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    // `if (argc < 4) usagef(...)` — argc counts argv[0], which `args` omits.
+    // `if (argc < 4) usagef(...)` — argc counts argv[0], which `args` omits, so
+    // git's `< 4` is `< 3` here. Emit this command's usage line, not the
+    // driver's `merge-recursive` one.
     if args.len() < 3 {
         eprint!("{USAGE}");
         return Ok(ExitCode::from(129));
     }
 
-    // The argument scan. `end` is where a bare `--` stopped it, or args.len().
-    let mut bases: Vec<gix::hash::ObjectId> = Vec::new();
-    let mut end = args.len();
-    for (idx, arg) in args.iter().enumerate() {
-        if let Some(opt) = arg.strip_prefix("--") {
-            if opt.is_empty() {
-                end = idx;
-                break;
-            }
-            if !parse_merge_opt(opt) {
-                eprintln!("fatal: unknown option {arg}");
-                return Ok(ExitCode::from(128));
-            }
-            continue;
-        }
-        if bases.len() < MAX_BASES {
-            let Ok(id) = repo.rev_parse_single(arg.as_str()) else {
-                eprintln!("fatal: could not parse object '{arg}'");
-                return Ok(ExitCode::from(128));
-            };
-            bases.push(id.detach());
-        } else {
-            eprintln!("warning: cannot handle more than {MAX_BASES} bases. Ignoring {arg}.");
-        }
-    }
-
-    // `if (argc - i != 3)` — exactly `--`, <head>, <remote> may remain. With no
-    // `--` at all, `end == args.len()` and nothing remains, which also dies.
-    if args.len() - end != 3 {
-        eprintln!("fatal: not handling anything other than two heads merge.");
-        return Ok(ExitCode::from(128));
-    }
-
-    // `repo_read_index_unmerged()` → `die_resolve_conflict("merge")`. This runs
-    // *before* the two heads are resolved, so it wins over a bad ref name.
-    let index = repo.index_or_empty()?;
-    if index
-        .entries()
-        .iter()
-        .any(|e| e.stage() != gix::index::entry::Stage::Unconflicted)
-    {
-        eprintln!("error: Merging is not possible because you have unmerged files.");
-        eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
-        eprintln!("hint: as appropriate to mark resolution and make a commit.");
-        eprintln!("fatal: Exiting because of an unresolved conflict.");
-        return Ok(ExitCode::from(128));
-    }
-
-    let branch1 = &args[end + 1];
-    let branch2 = &args[end + 2];
-    for branch in [branch1, branch2] {
-        if repo.rev_parse_single(branch.as_str()).is_err() {
-            eprintln!("fatal: could not resolve ref '{branch}'");
-            return Ok(ExitCode::from(128));
-        }
-    }
-
-    // merge_recursive_generic() would run here, writing the merged result to
-    // the index and the worktree.
-    bail!(
-        "unsupported: the recursive merge itself (ported: argument validation, \
-         base/head resolution, and every usage/fatal path). Applying a merge \
-         result needs worktree checkout, which gitoxide only provides through \
-         gix-worktree-state behind the `worktree-mutation` feature; this crate \
-         builds gix with `merge` only, and gix's merge_commits/merge_trees make \
-         no change to the index or worktree"
-    )
+    // Delegate to the shared driver. `cmd_merge_recursive` (and its port) counts
+    // `argv[0]` and scans from index 1; dispatch stripped the command name, so
+    // prepend one synthetic element to realign the grammar. Its value is never
+    // read (the port's scan starts at index 1), and `args.len() >= 3` here means
+    // the forwarded slice is `>= 4` long, so the driver's own `< 4` usage path —
+    // which would print the wrong command name — is never reached.
+    let mut forwarded = Vec::with_capacity(args.len() + 1);
+    forwarded.push(String::from("merge-recursive-ours"));
+    forwarded.extend_from_slice(args);
+    super::merge_recursive(&forwarded)
 }
 
 /// `parse_merge_opt()` from `merge-recursive.c`: whether `s` (the text after
-/// `--`) names a recursive-strategy option. Returns false for `return -1`,
-/// which the caller turns into `fatal: unknown option --<s>`.
+/// `--`) names a recursive-strategy option. Retained as a spec-lock of git
+/// 2.55.0's accepted option set; the live parser is the shared driver's
+/// [`super::merge_recursive`], so this is compiled only under test.
+#[cfg(test)]
 fn parse_merge_opt(s: &str) -> bool {
     match s {
         "ours"
@@ -210,6 +138,7 @@ fn parse_merge_opt(s: &str) -> bool {
 
 /// `parse_algorithm_value()` from `diff.c` — the four accepted names, matched
 /// case-insensitively (`--diff-algorithm=MYERS` is accepted by git).
+#[cfg(test)]
 fn parse_algorithm_value(v: &str) -> bool {
     matches!(
         v.to_ascii_lowercase().as_str(),
@@ -221,6 +150,7 @@ fn parse_algorithm_value(v: &str) -> bool {
 /// `*arg != 0` check: digits with at most one `.`, optionally closed by a
 /// single trailing `%` and nothing after it. An empty value is accepted (git
 /// reads it as the score 0).
+#[cfg(test)]
 fn parse_rename_score(v: &str) -> bool {
     let mut seen_dot = false;
     let mut chars = v.chars();

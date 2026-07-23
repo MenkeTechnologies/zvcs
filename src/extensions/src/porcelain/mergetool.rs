@@ -31,27 +31,37 @@
 //!   * `show_tool_help`, i.e. all of `--tool-help[=<mode>]` — see [`show_tool_help`]
 //!     and [`TOOLS`] for how the backend catalogue it lists is represented here.
 //!
-//! What is *not* ported is the substrate that begins once the prompt is answered:
-//! materialising index stages 1/2/3 into `BASE`/`LOCAL`/`REMOTE` temp files, the
-//! `mergetools/` shell backend that exec's the (usually graphical) program, and
-//! the resolve loops for the exotic conflict shapes. With stdin at EOF — the
-//! non-interactive path the parity harness drives — `read` fails, `merge_file`
-//! returns 1, and a single conflicted path makes `main` `exit 1`, all before that
-//! substrate is reached; that byte-exact path is reproduced here. If the prompt is
-//! actually answered (a tty), or the conflict is one of the resolve-loop shapes,
-//! this bails rather than fake the tool run.
+//! For a **user-defined** tool — one with a `mergetool.<tool>.cmd` config — the
+//! rest of `merge_file` is ported too: `mergetool_tmpdir_init`, staging index
+//! stages 1/2/3 into `BASE`/`LOCAL`/`REMOTE` temp files (`checkout_staged_file`,
+//! blob bytes verbatim — the no-filter floor `add.rs` also takes), the backup of
+//! `MERGED`, running `( eval $cmd )` in a child `sh`, `trust_exit_code` /
+//! `check_unchanged`, and installing the result with `git add` (reusing the native
+//! `add` porcelain) or restoring the backup on failure. `main`'s multi-file loop —
+//! `prompt_after_failed_merge` and the `exit $rc` accounting — is ported around it.
 //!
-//! One post-state caveat: the unported temp-file staging is *also* the only reason
-//! stock leaves `<name>_{BASE,LOCAL,REMOTE,BACKUP}_$$.<ext>` files in the worktree
-//! on this path, and the `$$` in those names is the git-mergetool shell's PID —
-//! non-deterministic run to run. `git status` therefore differs between two stock
-//! runs, so no implementation can byte-match that state; the observable
-//! stdout/stderr/exit reproduced here are deterministic.
+//! What still bails, rather than fake a run:
+//!   * a **built-in** tool (no `.cmd`): its `merge_cmd` lives in a
+//!     `$(git --exec-path)/mergetools/<tool>` shell backend that the vendored
+//!     crates do not carry, so there is nothing faithful to exec;
+//!   * the interactive **resolve loops** for deleted/symlink/submodule conflicts
+//!     once an answer is actually given — their checkout-index/add/rm/update-index
+//!     mutation is not wired up. At stdin EOF these instead print their prompt and
+//!     `read` fails, so `merge_file` returns 1 exactly as stock does — that
+//!     non-interactive path (which the parity harness drives) is reproduced;
+//!   * `mergetool.hideResolved`, which needs `git merge-file --ours/--theirs`.
+//!
+//! Post-state: for the user-defined-tool path the same `<name>_{BASE,LOCAL,REMOTE,
+//! BACKUP}_$$.<ext>` temp files stock creates are created here, and the `$$` is
+//! this process's PID — so, as with stock, `git status` between two runs is not
+//! byte-identical; the temp files are cleaned up on the resolved/failed paths just
+//! as stock's `cleanup_temp_files` does. On the bailing paths above no temp files
+//! are created, keeping stdout/stderr/exit deterministic.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::io::Write;
-use std::path::Path;
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
 
 use gix::bstr::{BString, ByteSlice};
 
@@ -187,85 +197,440 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // `printf "Merging:\n"; printf "%s\n" "$files"`, then the per-file loop.
-    let index = repo.open_index()?;
-    let mut out = std::io::stdout().lock();
-    let mut buf: Vec<u8> = Vec::new();
-    buf.extend_from_slice(b"Merging:\n");
-    for f in &files {
-        buf.extend_from_slice(f.as_slice());
-        buf.push(b'\n');
-    }
+    // `cd_to_toplevel` (git-mergetool.sh:523). Every per-file path below is an
+    // index path relative to the work-tree root, and the `git add` that installs a
+    // resolved file runs from there. Pathspecs were already resolved against the
+    // original prefix above, matching the script's capture-prefix-then-cd ordering.
+    let workdir = repo.workdir().expect("work tree checked above").to_path_buf();
 
-    let tool = selection.tool.as_deref().unwrap_or("");
+    // `merge_tool` plus the config that steers `merge_file`'s tool run.
+    let tool = selection.tool.as_deref().unwrap_or("").to_string();
+    // `get_merge_tool_cmd` (merge mode): a non-empty `mergetool.<tool>.cmd` marks a
+    // *user-defined* tool whose `merge_cmd` is `( eval $cmd )` — portable. A tool
+    // with no `.cmd` is a `mergetools/` catalogue backend, absent from the vendored
+    // crates, so running it bails (see [`SUBSTRATE`]).
+    let tool_cmd: Option<String> = if tool.is_empty() {
+        None
+    } else {
+        snapshot
+            .string(&format!("mergetool.{tool}.cmd"))
+            .map(|v| v.to_str_lossy().into_owned())
+            .filter(|v| !v.is_empty())
+    };
+    // `trust_exit_code`: user tools default to false, so only an explicit
+    // `mergetool.<tool>.trustExitCode=true` lets the tool's exit code decide.
+    let trust_exit_code = !tool.is_empty()
+        && snapshot.boolean(&format!("mergetool.{tool}.trustExitCode")) == Some(true);
+    // `mergetool.keepBackup` defaults true; `mergetool.keepTemporaries` false.
+    let keep_backup = snapshot.boolean("mergetool.keepBackup") != Some(false);
+    let keep_temporaries = snapshot.boolean("mergetool.keepTemporaries") == Some(true);
+    let write_to_temp = snapshot.boolean("mergetool.writeToTemp") == Some(true);
+    // `mergetool.hideResolved` hierarchy: a tool-specific key wins, else the global
+    // (with `hide_resolved_enabled` defaulting true for user tools), else off.
+    let hide_resolved = snapshot
+        .boolean(&format!("mergetool.{tool}.hideResolved"))
+        .or_else(|| snapshot.boolean("mergetool.hideResolved"))
+        .unwrap_or(false);
+
+    // `if test "$guessed_merge_tool" = true || test "$prompt" = true`.
+    let show_prompt = selection.guessed || show_prompt_default;
+    let index = repo.open_index()?;
+
+    std::env::set_current_dir(&workdir)?;
+
+    // `printf "Merging:\n"; printf "%s\n" "$files"`.
+    let mut out = std::io::stdout();
+    let mut banner: Vec<u8> = Vec::from(&b"Merging:\n"[..]);
+    for f in &files {
+        banner.extend_from_slice(f.as_slice());
+        banner.push(b'\n');
+    }
+    out.write_all(&banner)?;
+    out.flush()?;
+
+    // `rc=0; set -- $files; while test $# -ne 0 ...`.
     let n = files.len();
+    let mut rc = ExitCode::SUCCESS;
     for (idx, f) in files.iter().enumerate() {
         // `printf "\n"` at the top of each iteration.
-        buf.push(b'\n');
-        let msg = merge_file_message(&repo, &index, f.as_bstr())?;
-        buf.extend_from_slice(&msg.text);
+        out.write_all(b"\n")?;
+        out.flush()?;
 
-        match msg.after {
-            AfterMessage::Resolve => {
-                // `resolve_{deleted,symlink,submodule}_merge` drive their own
-                // prompt/read loops or a tool; unported. The description block is
-                // faithful; stop before the resolve loop.
-                out.write_all(&buf)?;
-                out.flush()?;
-                bail!(SUBSTRATE);
-            }
-            AfterMessage::Normal => {
-                // `if guessed_merge_tool = true || prompt = true` — the prompt.
-                let show_prompt = selection.guessed || show_prompt_default;
-                if show_prompt {
-                    buf.extend_from_slice(b"Hit return to start merge resolution tool (");
-                    buf.extend_from_slice(tool.as_bytes());
-                    buf.extend_from_slice(b"): ");
-                }
-                out.write_all(&buf)?;
-                out.flush()?;
-                buf.clear();
+        let outcome = merge_file(
+            &repo,
+            &index,
+            f.as_bstr(),
+            &tool,
+            tool_cmd.as_deref(),
+            trust_exit_code,
+            keep_backup,
+            keep_temporaries,
+            write_to_temp,
+            hide_resolved,
+            show_prompt,
+            &mut out,
+        )?;
 
-                if !show_prompt {
-                    // No prompt: stock goes straight to `run_merge_tool` — unported.
-                    bail!(SUBSTRATE);
+        if let MergeOutcome::Failed = outcome {
+            rc = ExitCode::from(1);
+            // `test $# -ne 1 && prompt_after_failed_merge || exit 1`.
+            if n - idx != 1 {
+                if !prompt_after_failed_merge(&mut out)? {
+                    return Ok(ExitCode::from(1));
                 }
-                // `read ans || return 1`. With stdin at EOF the read fails and
-                // `merge_file` returns 1.
-                let mut line = String::new();
-                if std::io::stdin().read_line(&mut line)? == 0 {
-                    // `test $# -ne 1 && prompt_after_failed_merge || exit 1`.
-                    if n - idx == 1 {
-                        return Ok(ExitCode::from(1));
-                    }
-                    out.write_all(b"Continue merging other unresolved paths [y/n]? ")?;
-                    out.flush()?;
-                    let mut ans = String::new();
-                    if std::io::stdin().read_line(&mut ans)? == 0 {
-                        // First `read` in the loop fails -> return 1 -> exit 1.
-                        return Ok(ExitCode::from(1));
-                    }
-                    // An answer other than EOF would let git keep going, but that
-                    // needs the unported tool run for the paths already prompted.
-                    bail!(SUBSTRATE);
-                }
-                // The prompt was answered: stock now `run_merge_tool`s — unported.
-                bail!(SUBSTRATE);
+            } else {
+                return Ok(ExitCode::from(1));
             }
         }
     }
 
-    // The loop returns or bails for every conflicted path; reaching here would
-    // mean `files` was empty, which is handled above.
-    out.write_all(&buf)?;
-    out.flush()?;
-    Ok(ExitCode::from(1))
+    // `exit $rc`.
+    Ok(rc)
 }
 
-/// Message shared by the substrate-not-ported bails once the ported prefix ends.
-const SUBSTRATE: &str = "starting a merge resolution tool needs git's mergetools/ \
-     shell backends and the BASE/LOCAL/REMOTE temp-file staging around them, which is \
-     not in the vendored gitoxide crates (ported up to and including the prompt)";
+/// Whether `merge_file` resolved a path (returns 0) or not (returns 1).
+enum MergeOutcome {
+    Success,
+    Failed,
+}
+
+/// Port of `merge_file` for one conflicted path (its description block factored
+/// into [`merge_file_message`]). Prints the block, then either drives the resolve
+/// prompt (deleted/symlink/submodule) or the `Hit return` prompt and the tool run
+/// (normal). Returns whether the path was resolved.
+#[allow(clippy::too_many_arguments)]
+fn merge_file(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    path: &gix::bstr::BStr,
+    tool: &str,
+    tool_cmd: Option<&str>,
+    trust_exit_code: bool,
+    keep_backup: bool,
+    keep_temporaries: bool,
+    write_to_temp: bool,
+    hide_resolved: bool,
+    show_prompt: bool,
+    out: &mut impl Write,
+) -> Result<MergeOutcome> {
+    let msg = merge_file_message(repo, index, path)?;
+    out.write_all(&msg.text)?;
+
+    match msg.after {
+        AfterMessage::Resolve { prompt } => {
+            // `resolve_{deleted,symlink,submodule}_merge` print this prompt and then
+            // `read ans || return 1`.
+            out.write_all(prompt.as_bytes())?;
+            out.flush()?;
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line)? == 0 {
+                // End of input: the first read fails, so `merge_file` returns 1.
+                return Ok(MergeOutcome::Failed);
+            }
+            // A real answer drives the resolve loop's checkout-index/add/rm/
+            // update-index mutation — interactive and not ported (see [`SUBSTRATE`]).
+            bail!(SUBSTRATE);
+        }
+        AfterMessage::Normal => {
+            if show_prompt {
+                out.write_all(b"Hit return to start merge resolution tool (")?;
+                out.write_all(tool.as_bytes())?;
+                out.write_all(b"): ")?;
+                out.flush()?;
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line)? == 0 {
+                    // `read ans || return 1`.
+                    return Ok(MergeOutcome::Failed);
+                }
+            } else {
+                out.flush()?;
+            }
+            // `run_merge_tool`: only a user-defined `.cmd` tool is portable here.
+            let Some(cmd) = tool_cmd else {
+                bail!(SUBSTRATE);
+            };
+            run_user_tool(
+                repo,
+                index,
+                path,
+                cmd,
+                trust_exit_code,
+                keep_backup,
+                keep_temporaries,
+                write_to_temp,
+                hide_resolved,
+                out,
+            )
+        }
+    }
+}
+
+/// The tail of `merge_file` for a user-defined tool: stage stages 1/2/3 into
+/// `BASE`/`LOCAL`/`REMOTE`, back up `MERGED`, run `( eval $cmd )`, judge success,
+/// then install with `git add` or restore the backup.
+///
+/// Content filters are not applied to the staged temp files — the blob bytes are
+/// written verbatim, the same floor `git add` records here (see `add.rs`).
+#[allow(clippy::too_many_arguments)]
+fn run_user_tool(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    path: &gix::bstr::BStr,
+    cmd: &str,
+    trust_exit_code: bool,
+    keep_backup: bool,
+    keep_temporaries: bool,
+    write_to_temp: bool,
+    hide_resolved: bool,
+    out: &mut impl Write,
+) -> Result<MergeOutcome> {
+    let merged = match path.to_str() {
+        Ok(s) => s.to_owned(),
+        Err(_) => bail!("cannot stage a merge tool for a non-UTF-8 path {path:?}"),
+    };
+
+    if hide_resolved {
+        // `hide_resolved` rewrites LOCAL/REMOTE via `git merge-file --ours/--theirs`,
+        // which is not wired up; refuse rather than run the tool on unfiltered sides.
+        bail!("mergetool.hideResolved needs 'git merge-file --ours/--theirs' staging, not ported");
+    }
+
+    // `mergetool_tmpdir_init`.
+    let tmpdir = if write_to_temp { Some(mktemp_dir()?) } else { None };
+
+    // The `BASE`/`ext` split and the `_BACKUP_/_LOCAL_/_REMOTE_/_BASE_$$<ext>` names.
+    let (base_no_ext, ext) = split_ext(&merged);
+    let stem: String = match &tmpdir {
+        // `BASE=${BASE##*/}` when writing into a temp dir.
+        Some(_) => base_no_ext.rsplit('/').next().unwrap_or(base_no_ext).to_owned(),
+        None => base_no_ext.to_owned(),
+    };
+    let pid = std::process::id();
+    let dir = tmpdir.as_deref();
+    let backup = temp_path(dir, &stem, "BACKUP", pid, ext);
+    let local = temp_path(dir, &stem, "LOCAL", pid, ext);
+    let remote = temp_path(dir, &stem, "REMOTE", pid, ext);
+    let base = temp_path(dir, &stem, "BASE", pid, ext);
+
+    let merged_path = Path::new(&merged);
+
+    // `if test -f "$MERGED": mv MERGED BACKUP; cp BACKUP MERGED`.
+    if merged_path.is_file() {
+        std::fs::rename(merged_path, &backup)?;
+        std::fs::copy(&backup, merged_path)?;
+    }
+    // `mkdir -p "$(dirname "$MERGED")"`.
+    if let Some(parent) = merged_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    // `checkout_staged_file 1/2/3` → BASE/LOCAL/REMOTE.
+    checkout_staged_file(repo, index, path, 1, &base)?;
+    checkout_staged_file(repo, index, path, 2, &local)?;
+    checkout_staged_file(repo, index, path, 3, &remote)?;
+
+    // `run_merge_cmd`: a trusted exit code, else touch-then-`check_unchanged`.
+    let temps: [&Path; 4] = [&local, &remote, &base, &backup];
+    let success = if trust_exit_code {
+        run_merge_cmd(cmd, &base, &local, &remote, &merged)? == 0
+    } else {
+        // `touch "$BACKUP"` so `check_unchanged` can compare mtimes.
+        touch(&backup)?;
+        let _ = run_merge_cmd(cmd, &base, &local, &remote, &merged)?;
+        check_unchanged(&merged, &backup, out)?
+    };
+
+    if !success {
+        // `merge_file`'s failure branch.
+        eprintln!("merge of {merged} failed");
+        let _ = std::fs::rename(&backup, merged_path);
+        if !keep_temporaries {
+            cleanup_temp_files(&temps, dir);
+        }
+        return Ok(MergeOutcome::Failed);
+    }
+
+    // Success: dispose of the backup, then `git add -- "$MERGED"`.
+    if keep_backup {
+        let _ = std::fs::rename(&backup, Path::new(&format!("{merged}.orig")));
+    } else {
+        let _ = std::fs::remove_file(&backup);
+    }
+    // Reuse the native `git add` porcelain to hash the resolved work-tree file and
+    // collapse stages 1/2/3 to a single stage-0 entry.
+    super::add::add(&["add".to_string(), merged.clone()])?;
+    cleanup_temp_files(&temps, dir);
+    Ok(MergeOutcome::Success)
+}
+
+/// `checkout_staged_file`: write the given stage of `path` to `dest`, or an empty
+/// file when that stage is absent. The blob is written verbatim (no smudge
+/// filter), the same floor `add.rs` records.
+fn checkout_staged_file(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    path: &gix::bstr::BStr,
+    stage: u32,
+    dest: &Path,
+) -> Result<()> {
+    for entry in index.entries() {
+        if entry.path(index) == path && entry.stage_raw() == stage {
+            let obj = repo.find_object(entry.id)?;
+            std::fs::write(dest, &obj.data)?;
+            return Ok(());
+        }
+    }
+    std::fs::write(dest, b"")?;
+    Ok(())
+}
+
+/// `( eval $merge_tool_cmd )` with BASE/LOCAL/REMOTE/MERGED in scope, run in a
+/// child `sh` (as git's user-tool `merge_cmd` does), returning the `$?` a shell
+/// would see.
+fn run_merge_cmd(cmd: &str, base: &Path, local: &Path, remote: &Path, merged: &str) -> Result<i32> {
+    const SCRIPT: &str = r#"BASE="$1"
+LOCAL="$2"
+REMOTE="$3"
+MERGED="$4"
+GIT_PREFIX="${GIT_PREFIX:-.}"
+export GIT_PREFIX
+eval "$5""#;
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(SCRIPT)
+        .arg("sh")
+        .arg(base)
+        .arg(local)
+        .arg(remote)
+        .arg(merged)
+        .arg(cmd)
+        .stdin(std::process::Stdio::inherit())
+        .status()?;
+    Ok(wait_status(status))
+}
+
+/// `check_unchanged`: success when `MERGED` is newer than `BACKUP` (`test -nt`),
+/// otherwise the interactive `Was the merge successful` loop.
+fn check_unchanged(merged: &str, backup: &Path, out: &mut impl Write) -> Result<bool> {
+    let mtime = std::fs::metadata(merged).and_then(|m| m.modified()).ok();
+    let btime = std::fs::metadata(backup).and_then(|m| m.modified()).ok();
+    // `test A -nt B`: true if A exists and (B is missing or A is strictly newer).
+    let newer = match (mtime, btime) {
+        (Some(_), None) => true,
+        (Some(a), Some(b)) => a > b,
+        (None, _) => false,
+    };
+    if newer {
+        return Ok(true);
+    }
+    loop {
+        writeln!(out, "{merged} seems unchanged.")?;
+        write!(out, "Was the merge successful [y/n]? ")?;
+        out.flush()?;
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            return Ok(false);
+        }
+        match line.trim_start_matches([' ', '\t']).chars().next() {
+            Some('y') | Some('Y') => return Ok(true),
+            Some('n') | Some('N') => return Ok(false),
+            _ => {}
+        }
+    }
+}
+
+/// `prompt_after_failed_merge`: `y` continues the loop, `n`/end-of-input stops it.
+fn prompt_after_failed_merge(out: &mut impl Write) -> Result<bool> {
+    loop {
+        write!(out, "Continue merging other unresolved paths [y/n]? ")?;
+        out.flush()?;
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            return Ok(false);
+        }
+        match line.trim_start_matches([' ', '\t']).chars().next() {
+            Some('y') | Some('Y') => return Ok(true),
+            Some('n') | Some('N') => return Ok(false),
+            _ => {}
+        }
+    }
+}
+
+/// `cleanup_temp_files` with no `--save-backup`: remove the temp files, then the
+/// temp dir if `mergetool.writeToTemp` created one.
+fn cleanup_temp_files(files: &[&Path], tmpdir: Option<&Path>) {
+    for f in files {
+        let _ = std::fs::remove_file(f);
+    }
+    if let Some(d) = tmpdir {
+        let _ = std::fs::remove_dir(d);
+    }
+}
+
+/// `mergetool_tmpdir_init` for `mergetool.writeToTemp=true`: a dir under the system
+/// temp location (git uses `mktemp -d -t git-mergetool-XXXXXX`).
+fn mktemp_dir() -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("git-mergetool-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)
+        .context("error: mktemp is needed when 'mergetool.writeToTemp' is true")?;
+    Ok(dir)
+}
+
+/// `touch "$file"`: create it if absent and set its mtime to now, so a later
+/// `test -nt` sees a tool-modified `MERGED` as newer.
+fn touch(file: &Path) -> Result<()> {
+    let f = std::fs::OpenOptions::new().create(true).write(true).open(file)?;
+    f.set_modified(std::time::SystemTime::now())?;
+    Ok(())
+}
+
+/// The `case "${MERGED##*/}" in *.*) ...` split: `(base_without_ext, ext)` where
+/// `ext` keeps its leading dot, taken from the last dot of the last path
+/// component; a component with no dot yields an empty `ext`.
+fn split_ext(merged: &str) -> (&str, &str) {
+    let last = merged.rsplit('/').next().unwrap_or(merged);
+    if last.contains('.') {
+        let dot = merged.rfind('.').expect("last component contains a dot");
+        (&merged[..dot], &merged[dot..])
+    } else {
+        (merged, "")
+    }
+}
+
+/// Build one `${stem}_${kind}_${pid}${ext}` temp path, under `dir` when writing to
+/// a temp dir or relative to the work-tree root (the cwd) otherwise.
+fn temp_path(dir: Option<&Path>, stem: &str, kind: &str, pid: u32, ext: &str) -> PathBuf {
+    let name = format!("{stem}_{kind}_{pid}{ext}");
+    match dir {
+        Some(d) => d.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// The `$?` a shell would record for a finished child: its exit code, or `128 + n`
+/// when it died of signal `n`.
+fn wait_status(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        128 + status.signal().unwrap_or(0)
+    }
+    #[cfg(not(unix))]
+    {
+        128
+    }
+}
+
+/// Message shared by the substrate-not-ported bails.
+const SUBSTRATE: &str = "this path needs git's mergetools/ shell-backend catalogue \
+     (a built-in tool's merge_cmd) or a resolve loop's interactive index/worktree \
+     mutation, neither of which is in the vendored gitoxide crates; user-defined \
+     mergetool.<tool>.cmd tools are staged and run";
 
 /// Outcome of the selected merge tool, mirroring `get_merge_tool`'s three signals:
 /// the tool name (empty when the guess found nothing), whether it was *guessed*
@@ -390,8 +755,9 @@ enum AfterMessage {
     /// The `Normal merge conflict` shape, which reaches the `Hit return` prompt.
     Normal,
     /// A `Deleted`/`Symbolic link`/`Submodule` conflict, which drives a resolve
-    /// loop instead of the prompt — unported past the description.
-    Resolve,
+    /// loop. `prompt` is the loop's `Use ...` line; the mutation past a real answer
+    /// is unported (at stdin EOF the read fails and `merge_file` returns 1).
+    Resolve { prompt: &'static str },
 }
 
 /// The bytes `merge_file` prints for one conflicted path, and what it does next.
@@ -441,17 +807,26 @@ fn merge_file_message(
         header(&mut text, "Submodule merge conflict");
         describe_file(repo, &mut text, "local", local, base_present)?;
         describe_file(repo, &mut text, "remote", remote, base_present)?;
-        AfterMessage::Resolve
+        // `resolve_submodule_merge`.
+        AfterMessage::Resolve { prompt: "Use (l)ocal or (r)emote, or (a)bort? " }
     } else if local_mode.is_none() || remote_mode.is_none() {
         header(&mut text, "Deleted merge conflict");
         describe_file(repo, &mut text, "local", local, base_present)?;
         describe_file(repo, &mut text, "remote", remote, base_present)?;
-        AfterMessage::Resolve
+        // `resolve_deleted_merge`: the prompt wording depends on `base_present`.
+        AfterMessage::Resolve {
+            prompt: if base_present {
+                "Use (m)odified or (d)eleted file, or (a)bort? "
+            } else {
+                "Use (c)reated or (d)eleted file, or (a)bort? "
+            },
+        }
     } else if is_symlink(local_mode) || is_symlink(remote_mode) {
         header(&mut text, "Symbolic link merge conflict");
         describe_file(repo, &mut text, "local", local, base_present)?;
         describe_file(repo, &mut text, "remote", remote, base_present)?;
-        AfterMessage::Resolve
+        // `resolve_symlink_merge`.
+        AfterMessage::Resolve { prompt: "Use (l)ocal or (r)emote, or (a)bort? " }
     } else {
         header(&mut text, "Normal merge conflict");
         describe_file(repo, &mut text, "local", local, base_present)?;

@@ -1,71 +1,75 @@
-//! `git merge-resolve` — resolve two trees using the multi-base `read-tree`
-//! strategy (the "resolve" merge strategy back-end).
+//! `git merge-resolve` — resolve two trees using the `read-tree` "resolve" merge
+//! strategy back-end.
 //!
 //! Stock `git-merge-resolve` is a 60-line POSIX shell driver
 //! (`git-merge-resolve.sh`) that sources `git-sh-setup` and then chains five
 //! plumbing commands: `git diff-index`, `git update-index -q --refresh`,
 //! `git read-tree -u -m --aggressive $bases $head $remotes`, `git write-tree`,
-//! and `git merge-index -o git-merge-one-file -a`. The merge itself lives
-//! entirely in the two that have no substrate here:
+//! and `git merge-index -o git-merge-one-file -a`.
 //!
-//! * `read-tree -u -m --aggressive <base> <ours> <theirs>` — the three-way index
-//!   merge with worktree update. The ported `read-tree` rejects `--aggressive`
-//!   (`read_tree.rs:120`) and rejects more than one tree-ish with `-m`
-//!   (`read_tree.rs:183`), because gitoxide has no `unpack_trees` equivalent.
-//!   `gix`'s `merge` feature provides blob and tree merges, not the index
-//!   unpack-trees state machine with its stage-1/2/3 bookkeeping and worktree
-//!   writes, so it is not a substitute.
-//! * `git-merge-one-file` — the per-path shell resolver `merge-index` spawns.
-//!   The ported `merge-index` execs whatever program it is handed
-//!   (`merge_index.rs:43`); there is no `git-merge-one-file` binary in this tree
-//!   to hand it.
+//! The standard `git merge -s resolve` invocation is `<base> -- <head>
+//! <remote>` — a single merge base with one head and one remote. That case is
+//! served here as a real three-way merge: the merge is computed by the vendored
+//! `gix-merge` tree merge with rename detection **disabled** (the resolve
+//! strategy, unlike recursive, never detects renames — matching
+//! `read-tree --aggressive` + `git-merge-one-file`, neither of which does), the
+//! resulting tree is materialised into the worktree, and `.git/index` is written
+//! with stage 1/2/3 entries for every path that stayed conflicted. This is the
+//! same tree-merge/worktree/index machinery `merge_recursive.rs` drives
+//! (`repo.merge_trees`, `crate::worktree::checkout_subset`,
+//! `index_changed_after_applying_conflicts`).
 //!
-//! Everything the script does *before* it touches the index is reproduced
-//! natively and byte-for-byte; every path that would mutate the index or the
-//! worktree bails with a message naming the missing substrate rather than
-//! writing an approximation of a merge.
+//! The script's control-flow output is reproduced on top of that result:
+//! `Trying simple merge.` is printed once the merge succeeds; when any path
+//! changed on both sides — i.e. `read-tree --aggressive` would have left it
+//! unmerged and `write-tree` would have failed — `Simple merge failed, trying
+//! Automatic merge.` follows, then `git-merge-one-file`'s per-path lines
+//! (`Auto-merging <path>` / `Added <path> in both, but differently.`) with an
+//! `ERROR: content conflict in <path>` on stderr for each path that stayed
+//! conflicted. Exit 0 for a clean merge, 1 when a conflict remains.
 //!
-//! ### Covered (verified against git 2.55.0 on Darwin: stdout, stderr, exit code)
+//! ### Covered (verified against git on Darwin: stdout, stderr, exit code)
 //!
-//! * `-h` as the first argument — `git-sh-setup`'s `$LONG_USAGE` path with an
-//!   empty `USAGE`, i.e. the single line `usage: git merge-resolve ` (note the
-//!   trailing space) on **stdout**, exit 0. It is handled at source time, so it
-//!   wins over every check below, including a dirty index, and needs no
-//!   repository.
-//! * `git_dir_init` running before any argument is looked at: outside a
-//!   repository, `fatal: not a git repository (or any of the parent
-//!   directories): .git` on stderr, exit 128.
-//! * The `git diff-index --quiet --cached HEAD --` pre-flight, which the script
-//!   runs *first*, before it parses a single argument: on any tree↔index
-//!   difference, `Error: Your local changes to the following files would be
-//!   overwritten by merge` followed by the changed paths each indented by four
-//!   spaces — both on **stdout**, as `gettextln` and the script's `sed` pipeline
-//!   emit them — then exit 2. Paths are quoted per `core.quotePath`.
-//! * The argument split: everything before the first `--` is a merge base, the
-//!   first argument after it is `$head`, the rest are the heads to merge.
-//! * The "not handling octopus" guard — two or more heads after `$head` exits 2
-//!   silently, so `git merge` can fall back to another strategy.
-//! * The baseless-merge guard — no merge base before `--` exits 2 silently. A
-//!   bare `git merge-resolve` with no arguments at all lands here.
+//! * `-h`, the outside-a-repository fatal, the `git diff-index --quiet --cached
+//!   HEAD --` pre-flight (`Error: Your local changes …`, exit 2, `core.quotePath`
+//!   quoting), the argument split, the octopus guard (exit 2), and the baseless
+//!   guard (exit 2) — all as before.
+//! * The single-base three-way merge: index stages, worktree contents, the
+//!   `Trying simple merge.` / `Simple merge failed …` framing, the per-path
+//!   `Auto-merging` / `Added … differently.` lines, and the exit code.
 //!
-//! ### Not covered
+//! ### Floors (bail rather than approximate)
 //!
-//! Any invocation that survives all four guards reaches `read-tree -u -m
-//! --aggressive` and bails. Nothing is written: no index refresh, no worktree
-//! update, no `write-tree`, and no `Trying simple merge.` /
-//! `Simple merge failed, trying Automatic merge.` output is faked. The
-//! script's exit-1 path (`merge-index` reporting an unresolved conflict) is
-//! likewise unreachable from here.
+//! * Two or more merge bases: `read-tree`'s multi-base `--aggressive` merge is a
+//!   stage-collapsing `unpack_trees` state machine gitoxide has no equivalent
+//!   for, and the recursive strategy's virtual merge base is a *different*
+//!   algorithm, so it is not substituted.
+//! * Any shape other than exactly one head and one remote (which would drive
+//!   `read-tree`'s two-way or multi-tree merge).
+//! * Conflict classes outside the content-merge family (rename/delete,
+//!   modify/delete, directory/file, symlink, submodule) and binary content
+//!   merges: `git-merge-one-file`'s refusals / `git merge-file`'s binary handling
+//!   are not rendered here, exactly as `merge_recursive.rs` refuses them.
+//! * `merge.conflictStyle` other than the default `merge`.
+//! * An unborn `HEAD`, an already-unmerged index, and a worktree with local
+//!   changes that would be overwritten.
 //!
-//! An unborn `HEAD` also bails: stock git lets `diff-index`'s
-//! `fatal: ambiguous argument 'HEAD'` through, which is not reproduced. So does
-//! an unmerged index, whose `U` records the ported `diff-index` does not emit.
+//! Conflicted file *contents* are only identical to stock git up to the
+//! conflict-marker labels, which git derives from `git merge-file`'s random
+//! temp-file names — the same documented non-fidelity as `merge_one_file.rs`.
 
-use anyhow::{bail, Result};
-use std::collections::BTreeSet;
+use anyhow::{anyhow, bail, Result};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
 
-use gix::bstr::BString;
+use gix::bstr::{BStr, BString, ByteSlice};
+use gix::diff::tree_with_rewrites::Change;
+use gix::hash::ObjectId;
+use gix::index::entry::{Mode, Stat};
+use gix::merge::blob::builtin_driver::text::Labels;
+use gix::merge::tree::apply_index_entries::RemovalMode;
+use gix::merge::tree::{Conflict, Resolution, TreatAsUnresolved};
 use gix::Repository;
 
 /// `git-sh-setup`'s `$LONG_USAGE` for a script that sets neither `USAGE` nor
@@ -154,16 +158,325 @@ pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
 
     // Past this point the script refreshes the index, reads three or more trees
     // into it, and updates the worktree.
-    let heads = parsed.remotes.len() + usize::from(parsed.head.is_some());
-    bail!(
-        "unsupported: merging {} base(s) and {heads} head(s) needs \
-         `read-tree -u -m --aggressive` (the three-way index merge with worktree update, which \
-         gitoxide has no unpack_trees equivalent for) and, on fallback, \
-         `merge-index -o git-merge-one-file -a` (no git-merge-one-file in this tree) \
-         (ported: -h usage, the dirty-index pre-flight, the argument split, the octopus and \
-         baseless guards)",
-        parsed.bases.len()
-    );
+
+    // Multiple merge bases route through read-tree's multi-base --aggressive
+    // merge — a stage-collapsing unpack_trees state machine with no gitoxide
+    // equivalent. The recursive strategy's virtual merge base is a *different*
+    // algorithm, so it is not substituted here.
+    if parsed.bases.len() > 1 {
+        bail!(
+            "unsupported: {} merge bases need read-tree's multi-base --aggressive merge \
+             (a stage-collapsing unpack_trees state machine gitoxide has no equivalent for); \
+             the recursive strategy's virtual merge base is a different algorithm and is not \
+             substituted (ported: the single-base three-way resolve merge)",
+            parsed.bases.len()
+        );
+    }
+
+    // The standard invocation is `<base> -- <head> <remote>`: exactly one head
+    // and one remote. Anything else would drive read-tree's two-way or
+    // multi-tree merge, which is not ported.
+    let (head_spec, remote_spec) = match (parsed.head.as_deref(), parsed.remotes.as_slice()) {
+        (Some(head), [remote]) => (head, remote.as_str()),
+        _ => bail!(
+            "unsupported: merge-resolve without exactly one head and one remote \
+             (`<base> -- <head> <remote>`) would drive read-tree's two-way or multi-tree merge, \
+             which is not ported (ported: the standard single-base three-way resolve merge)"
+        ),
+    };
+    let base_spec = parsed.bases[0].as_str();
+
+    // `git read-tree … $bases $head $remotes` resolves each argument as a
+    // tree-ish; a failure there makes the script exit 2 (`read-tree … || exit 2`).
+    let base_tree = match resolve_tree(&repo, base_spec)? {
+        Ok(id) => id,
+        Err(code) => return Ok(code),
+    };
+    let head_tree = match resolve_tree(&repo, head_spec)? {
+        Ok(id) => id,
+        Err(code) => return Ok(code),
+    };
+    let remote_tree = match resolve_tree(&repo, remote_spec)? {
+        Ok(id) => id,
+        Err(code) => return Ok(code),
+    };
+
+    // The resolve strategy never detects renames (only recursive does), matching
+    // read-tree --aggressive + git-merge-one-file, so rewrite tracking is off.
+    let mut plumbing_opts: gix::merge::plumbing::tree::Options = repo.tree_merge_options()?.into();
+    plumbing_opts.rewrites = None;
+    let tree_options: gix::merge::tree::Options = plumbing_opts.into();
+
+    // A non-default conflict style changes the marker text git merge-file would
+    // emit, and gix cannot reproduce the diff3/zdiff3 ancestor label, so refuse
+    // rather than write different markers.
+    if let Some(style) = repo.config_snapshot().string("merge.conflictStyle") {
+        if style != "merge" {
+            bail!(
+                "unsupported: merge.conflictStyle={style} (only the default `merge` style is ported)"
+            );
+        }
+    }
+
+    let labels = Labels {
+        ancestor: None,
+        current: Some(BStr::new(head_spec.as_bytes())),
+        other: Some(BStr::new(remote_spec.as_bytes())),
+    };
+    let mut outcome = repo.merge_trees(base_tree, head_tree, remote_tree, labels, tree_options)?;
+
+    // Render git-merge-one-file's per-path messages first: a conflict class this
+    // port cannot render must fail before a single byte of index or worktree is
+    // written.
+    let rendered = render_resolve_messages(&repo, &outcome.conflicts)?;
+
+    // write-tree fails exactly when read-tree --aggressive left unmerged entries,
+    // i.e. whenever a path changed on both sides — that is the automatic phase.
+    let had_unmerged = !outcome.conflicts.is_empty();
+
+    // The `diff-index --cached HEAD` guard above proved the index equals HEAD;
+    // guard the worktree too, as merge-recursive does, before writing.
+    if repo.is_dirty()? {
+        bail!("your local changes would be overwritten by merge; commit or stash them first");
+    }
+
+    let old_index = repo.index_or_load_from_head()?.into_owned();
+    let how = TreatAsUnresolved::git();
+    // A missing base makes git-merge-one-file report a conflict even when the two
+    // additions merge cleanly, so the add/add signal is folded in here.
+    let conflicted = outcome.has_unresolved_conflicts(how) || rendered.add_add_conflict;
+    let merged_tree = outcome.tree.write()?.detach();
+
+    let old_stats = stats_by_path(&old_index);
+    let written = apply_to_worktree(&repo, &old_stats, merged_tree)?;
+
+    // Fresh stats for the files we just wrote, previous stats for the ones we
+    // left alone, so a following `git status` does not see the tree as dirty.
+    let mut index = repo.index_from_tree(&merged_tree)?;
+    {
+        let backing = index.path_backing().to_owned();
+        for e in index.entries_mut() {
+            let path = e.path_in(&backing).to_owned();
+            if let Some((_, _, stat)) = written.get(&path) {
+                e.stat = *stat;
+            } else if let Some((oid, mode, stat)) = old_stats.get(&path) {
+                if *oid == e.id && *mode == e.mode {
+                    e.stat = *stat;
+                }
+            }
+        }
+    }
+    outcome.index_changed_after_applying_conflicts(&mut index, how, RemovalMode::Prune);
+    index.remove_tree();
+    index.write(Default::default())?;
+
+    // `echo "Trying simple merge."` — printed once read-tree succeeds.
+    println!("Trying simple merge.");
+    if had_unmerged {
+        println!("Simple merge failed, trying Automatic merge.");
+    }
+    for line in &rendered.stdout {
+        println!("{line}");
+    }
+    for line in &rendered.stderr {
+        eprintln!("{line}");
+    }
+
+    Ok(if conflicted {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Resolve `spec` to a tree id the way `git read-tree` does. On failure the
+/// script's `read-tree … || exit 2` takes over, so this reports git's fatal and
+/// asks the caller to exit 2.
+fn resolve_tree(repo: &Repository, spec: &str) -> Result<std::result::Result<ObjectId, ExitCode>> {
+    let Ok(obj) = repo.rev_parse_single(spec) else {
+        eprintln!("fatal: Not a valid object name {spec}");
+        return Ok(Err(ExitCode::from(2)));
+    };
+    let peeled = obj
+        .object()
+        .map_err(anyhow::Error::from)
+        .and_then(|obj| obj.peel_to_tree().map_err(anyhow::Error::from));
+    let Ok(tree) = peeled else {
+        eprintln!("fatal: failed to unpack tree object {spec}");
+        return Ok(Err(ExitCode::from(2)));
+    };
+    Ok(Ok(tree.id))
+}
+
+/// The stdout/stderr `git-merge-index git-merge-one-file -a` would produce for
+/// the merge outcome, plus the exit-code signal an add/add carries.
+struct Rendered {
+    /// `Auto-merging …` / `Added … differently.` lines, ordered by path as
+    /// `merge-index` drives `merge-one-file` over the sorted unmerged index.
+    stdout: Vec<String>,
+    /// `ERROR: content conflict in <path>` for each path that stayed conflicted.
+    stderr: Vec<String>,
+    /// Whether any add/add path forced a conflict independent of the blob merge.
+    add_add_conflict: bool,
+}
+
+/// Turn gix's structured conflicts into `git-merge-one-file`'s messages.
+///
+/// Only the content-merge family is rendered — the same family
+/// `merge_recursive.rs` handles. Any other resolution class, a symlink/submodule
+/// mode, or a binary blob errors out (a documented floor) before anything is
+/// written, rather than inventing text `git-merge-one-file` would not print.
+fn render_resolve_messages(repo: &Repository, conflicts: &[Conflict]) -> Result<Rendered> {
+    let mut rows: Vec<(BString, String, Option<String>)> = Vec::new();
+    let mut add_add_conflict = false;
+
+    for conflict in conflicts {
+        let (ours, theirs) = conflict.changes_in_resolution();
+        let path = ours.location().to_owned();
+        let merged_blob = match &conflict.resolution {
+            Ok(Resolution::OursModifiedTheirsModifiedThenBlobContentMerge { merged_blob }) => {
+                merged_blob
+            }
+            _ => bail!(
+                "unsupported: conflict at {path} is not a content merge; read-tree --aggressive + \
+                 git-merge-one-file resolve rename/delete, modify/delete, directory/file and \
+                 submodule cases this port does not render"
+            ),
+        };
+
+        for change in [ours, theirs] {
+            let (mode, id) = change_state(change);
+            if !mode.is_blob() {
+                bail!(
+                    "unsupported: conflict at {path} involves a symlink or submodule; \
+                     git-merge-one-file's `Not merging …` refusals are not ported"
+                );
+            }
+            if is_binary(repo, &id)? {
+                bail!(
+                    "unsupported: conflict at {path} is a binary content merge; git merge-file's \
+                     binary handling is not ported"
+                );
+            }
+        }
+
+        let is_add_add =
+            matches!(ours, Change::Addition { .. }) && matches!(theirs, Change::Addition { .. });
+        let (line, conflicted) = if is_add_add {
+            // Base absent: git-merge-one-file always reports a content conflict
+            // here, even when the two additions merge without markers.
+            add_add_conflict = true;
+            (format!("Added {path} in both, but differently."), true)
+        } else {
+            let conflicted = merged_blob.resolution == gix::merge::blob::Resolution::Conflict;
+            (format!("Auto-merging {path}"), conflicted)
+        };
+        let err = conflicted.then(|| format!("ERROR: content conflict in {path}"));
+        rows.push((path, line, err));
+    }
+
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    for (_, line, err) in rows {
+        stdout.push(line);
+        if let Some(e) = err {
+            stderr.push(e);
+        }
+    }
+    Ok(Rendered {
+        stdout,
+        stderr,
+        add_add_conflict,
+    })
+}
+
+/// The post-change mode and id of `change` (the rename destination for rewrites).
+fn change_state(change: &Change) -> (gix::object::tree::EntryMode, ObjectId) {
+    match change {
+        Change::Addition { entry_mode, id, .. }
+        | Change::Deletion { entry_mode, id, .. }
+        | Change::Modification { entry_mode, id, .. }
+        | Change::Rewrite { entry_mode, id, .. } => (*entry_mode, *id),
+    }
+}
+
+/// git's binary heuristic: a NUL byte within the first 8000 bytes of the blob.
+fn is_binary(repo: &Repository, id: &ObjectId) -> Result<bool> {
+    let data = repo.find_object(*id)?.data.clone();
+    let head = &data[..data.len().min(8000)];
+    Ok(head.contains(&0))
+}
+
+/// Index entries keyed by path, carrying the id, mode and stat data.
+fn stats_by_path(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode, Stat)> {
+    let backing = index.path_backing();
+    index
+        .entries()
+        .iter()
+        .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat)))
+        .collect()
+}
+
+/// Materialise `merged_tree` into the worktree: write the files whose content or
+/// mode changed relative to `old_stats`, and delete the ones the merge dropped.
+/// Returns the freshly written entries, with the stat data checkout recorded.
+///
+/// This mirrors `merge_recursive.rs`'s private `apply_to_worktree`; the shared
+/// primitive it drives is `crate::worktree::checkout_subset`.
+fn apply_to_worktree(
+    repo: &Repository,
+    old_stats: &HashMap<BString, (ObjectId, Mode, Stat)>,
+    merged_tree: ObjectId,
+) -> Result<HashMap<BString, (ObjectId, Mode, Stat)>> {
+    let should_interrupt = AtomicBool::new(false);
+
+    let mut subset = repo.index_from_tree(&merged_tree)?;
+    subset.remove_entries(|_, path, entry| match old_stats.get(&path.to_owned()) {
+        Some((oid, mode, _)) => *oid == entry.id && *mode == entry.mode,
+        None => false,
+    });
+
+    if !subset.entries().is_empty() {
+        let workdir = repo
+            .workdir()
+            .ok_or_else(|| anyhow!("bare repository has no worktree to update"))?
+            .to_owned();
+        let mut opts =
+            repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
+        opts.destination_is_initially_empty = false;
+        opts.overwrite_existing = true;
+        let odb = repo.objects.clone().into_arc()?;
+        crate::worktree::checkout_subset(
+            &mut subset,
+            workdir.as_path(),
+            odb,
+            &gix::progress::Discard,
+            &gix::progress::Discard,
+            &should_interrupt,
+            opts,
+        )?;
+    }
+
+    // Anything tracked before the merge but absent from the merged tree is gone.
+    let merged_index = repo.index_from_tree(&merged_tree)?;
+    let kept: HashSet<BString> = {
+        let backing = merged_index.path_backing();
+        merged_index
+            .entries()
+            .iter()
+            .map(|e| e.path_in(backing).to_owned())
+            .collect()
+    };
+    for path in old_stats.keys() {
+        if !kept.contains(path) {
+            if let Some(full) = repo.workdir_path(path.as_bstr()) {
+                let _ = std::fs::remove_file(full);
+            }
+        }
+    }
+
+    Ok(stats_by_path(&subset))
 }
 
 /// The paths `git diff-index --cached --name-only HEAD --` would print, sorted

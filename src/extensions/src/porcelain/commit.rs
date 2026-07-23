@@ -228,7 +228,16 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     };
     // `--amend` always produces a new commit (a message- or author-only amend is
     // valid), so it is exempt from the empty-change guard.
-    if unchanged && !allow_empty && !amend {
+    if unchanged && !allow_empty {
+        if amend {
+            // git refuses an amend whose result would be empty (tree unchanged
+            // from the parent) unless --allow-empty, with its own message.
+            anyhow::bail!(
+                "You asked to amend the most recent commit, but doing so would make\n\
+                 it empty. You can repeat your command with --allow-empty, or you can\n\
+                 remove the commit entirely with \"git reset HEAD^\"."
+            );
+        }
         anyhow::bail!("nothing to commit (no changes staged)");
     }
 
@@ -383,12 +392,17 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let root_marker = if is_root { " (root-commit)" } else { "" };
     println!("[{branch_label}{root_marker} {short}] {subject}");
 
-    // git prints a ` Date:` line in the summary when the author date is
-    // "interesting" — i.e. it differs from the committer date, as `--amend`
-    // (preserved author, fresh committer) and an explicit GIT_AUTHOR_DATE do.
+    // git prints ` Author:` when the author identity differs from the
+    // committer's (as `--author` and `--amend`-preserved authors do), and
+    // ` Date:` when the author date differs from the committer date.
     let written = repo.find_commit(commit_id.detach())?;
-    let a_time = written.author()?.time()?;
-    let c_time = written.committer()?.time()?;
+    let author = written.author()?;
+    let committer = written.committer()?;
+    if author.name != committer.name || author.email != committer.email {
+        println!(" Author: {} <{}>", author.name, author.email);
+    }
+    let a_time = author.time()?;
+    let c_time = committer.time()?;
     if a_time.seconds != c_time.seconds || a_time.offset != c_time.offset {
         let dt = a_time
             .format(gix::date::time::format::DEFAULT)

@@ -204,6 +204,20 @@ fn try_op_or_unlink<T>(
                 try_unlink_path_recursively(path, &std::fs::symlink_metadata(path)?)?;
                 op(path)
             }
+            // A read-only existing file makes the write fail with PermissionDenied
+            // even though it can be replaced: git checks out over a read-only
+            // worktree file by unlinking it first (which needs write access to the
+            // directory, not the file). If the path exists, unlink and retry;
+            // otherwise it is a genuine permission problem, so propagate it.
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                match std::fs::symlink_metadata(path) {
+                    Ok(meta) => {
+                        try_unlink_path_recursively(path, &meta)?;
+                        op(path)
+                    }
+                    Err(_) => Err(err),
+                }
+            }
             Err(err) => Err(err),
         }
     } else {

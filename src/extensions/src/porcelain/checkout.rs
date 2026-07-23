@@ -271,8 +271,13 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // detach); fall back to a bare path restore from the index.
     if pre.len() == 1 {
         let spec = pre[0];
+        // A revspec like `HEAD~3` is not a valid ref *name* (`~` is rejected by
+        // ref validation), so treat a lookup error as "not a branch" and let the
+        // `rev_parse_single` path below resolve and detach-checkout it.
         let is_branch = repo
-            .try_find_reference(format!("refs/heads/{spec}").as_str())?
+            .try_find_reference(format!("refs/heads/{spec}").as_str())
+            .ok()
+            .flatten()
             .is_some();
         if is_branch && !detach {
             return switch_to_branch(&repo, spec, quiet);

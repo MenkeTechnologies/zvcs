@@ -112,9 +112,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // git prints the "Cloning into ..." banner before any progress; keep it above
     // the live renderer so the two don't overdraw each other.
     if bare {
-        eprintln!("Cloning into bare repository {dir:?}...");
+        eprintln!("Cloning into bare repository '{dir}'...");
     } else {
-        eprintln!("Cloning into {dir:?}...");
+        eprintln!("Cloning into '{dir}'...");
     }
 
     // Drive gitoxide's fetch/checkout through a prodash tree and render it to
@@ -180,6 +180,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         handle.shutdown_and_wait();
     }
     result?;
+
+    // git closes the clone banner with `done.` (suppressed by `-q`).
+    if !quiet {
+        eprintln!("done.");
+    }
 
     // `--recursive` / `--recurse-submodules`: after a successful non-bare clone,
     // initialize and update submodules recursively by re-executing this binary's

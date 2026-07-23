@@ -58,3 +58,14 @@ libc = "0.2"
 # crossterm 0.29 matches prodash's copy above, so no second crossterm is pulled in.
 # Only the interactive (tty) path uses it; piped stdin stays a raw line reader.
 reedline = "0.49"
+
+# macOS Keychain FFI for `git credential-osxkeychain` <get|store|erase>. The
+# vendored gitoxide TLS stack already pulls this crate in transitively; naming it
+# directly gives the helper the raw Security.framework symbols git's
+# contrib/credential/osxkeychain/git-credential-osxkeychain.c calls
+# (SecKeychainFindInternetPassword / SecKeychainAddInternetPassword /
+# SecKeychainItemDelete / SecKeychainItemFreeContent). SecKeychainItemCopyContent
+# — the one symbol the crate omits — is declared locally in that helper. Only
+# linked on macOS; every other target compiles the helper to a silent no-op.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework-sys = "2"

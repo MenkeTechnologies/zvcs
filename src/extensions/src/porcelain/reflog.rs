@@ -592,6 +592,13 @@ impl Decorations {
     /// out in descending full-name order; `HEAD` is placed first, as `HEAD ->
     /// <branch>` when it symrefs to a branch at this commit, else a bare `HEAD`.
     fn for_commit(&self, oid: ObjectId) -> Option<String> {
+        self.bare_for_commit(oid).map(|inner| format!("({inner})"))
+    }
+
+    /// The decoration content without the surrounding parentheses — the `%D` form
+    /// (`HEAD -> main, tag: v1`). `%d` wraps this in ` (...)`, and the oneline
+    /// `--decorate` output uses the parenthesised [`for_commit`](Self::for_commit).
+    fn bare_for_commit(&self, oid: ObjectId) -> Option<String> {
         let mut names: Vec<String> = self.by_oid.get(&oid).cloned().unwrap_or_default();
         names.sort();
         names.reverse();
@@ -612,7 +619,7 @@ impl Decorations {
         if items.is_empty() {
             return None;
         }
-        Some(format!("({})", items.join(", ")))
+        Some(items.join(", "))
     }
 
     /// A ref name shortened per the decorate mode, without the `tag:` prefix.
@@ -1007,8 +1014,13 @@ fn render(
     let mut diff_cache = (opts.diff.any() || !opts.pathspecs.is_empty())
         .then(|| repo.diff_resource_cache_for_tree_diff().ok())
         .flatten();
-    // The ref-set that decorates each entry's commit, resolved once.
-    let decorations = opts.decorate.map(|mode| Decorations::build(repo, mode));
+    // The ref-set that decorates each entry's commit, resolved once. `--decorate`
+    // fixes the mode; a `%d`/`%D` in a user format needs decorations too and, with
+    // no `--decorate`, git defaults it to the short form.
+    let deco_mode = opts.decorate.or_else(|| {
+        matches!(&opts.out, OutFmt::Custom(f) if format_uses_decoration(f)).then_some(Decorate::Short)
+    });
+    let decorations = deco_mode.map(|mode| Decorations::build(repo, mode));
 
     'outer: for section in sections {
         // `--date` forces every section to date form; otherwise only a section
@@ -1092,6 +1104,7 @@ fn render(
                         opts,
                         field_fmt,
                         fallback_len,
+                        decorations.as_ref(),
                     );
                     // git prints nothing at all for an empty expansion, and
                     // terminates a non-empty one with a newline.
@@ -1590,6 +1603,27 @@ fn classify_pretty(value: &str) -> Pretty {
     }
 }
 
+/// Whether a user `--pretty`/`--format` string uses the `%d`/`%D` decoration,
+/// walking `%`-escapes so a two-char placeholder (`%gd`, `%ad`), a literal `%%d`,
+/// or a `%xNN` hex byte is not mistaken for a bare `%d`.
+fn format_uses_decoration(fmt: &str) -> bool {
+    let b = fmt.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        match b.get(i + 1) {
+            Some(b'd') | Some(b'D') => return true,
+            Some(b'x') => i += 4, // `%xNN` hex escape — skip both hex digits
+            Some(_) => i += 2,
+            None => i += 1,
+        }
+    }
+    false
+}
+
 /// The first placeholder in `fmt` that this renderer does not implement.
 fn unsupported_placeholder(fmt: &str) -> Option<String> {
     let b = fmt.as_bytes();
@@ -1604,7 +1638,8 @@ fn unsupported_placeholder(fmt: &str) -> Option<String> {
         };
         match next {
             b'n' | b'%' => i += 2,
-            b'H' | b'T' | b'P' | b'p' | b'h' | b's' => i += 2,
+            // `%d`/`%D` are the ref decorations (parenthesised / bare).
+            b'H' | b'T' | b'P' | b'p' | b'h' | b's' | b'd' | b'D' => i += 2,
             b'x' => {
                 if b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
                     && b.get(i + 3).is_some_and(u8::is_ascii_hexdigit)
@@ -1620,7 +1655,9 @@ fn unsupported_placeholder(fmt: &str) -> Option<String> {
                 };
                 let ok = match next {
                     b'g' => matches!(third, b'd' | b'D' | b'n' | b'e' | b's'),
-                    _ => matches!(third, b'n' | b'e' | b'd'),
+                    // `%ad`/`%cd` plus the fixed-format date atoms `%ai`/`%aI`
+                    // (ISO), `%at` (unix), and `%ar`/`%cr` (relative).
+                    _ => matches!(third, b'n' | b'e' | b'd' | b'i' | b'I' | b't' | b'r'),
                 };
                 if ok {
                     i += 3;
@@ -1681,6 +1718,7 @@ fn custom_has_field_date(fmt: &str) -> bool {
 
 /// Expand a validated `--format` string for one entry.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn expand_format(
     repo: &gix::Repository,
     fmt: &str,
@@ -1690,6 +1728,7 @@ fn expand_format(
     opts: &Opts,
     field_fmt: DateFormat,
     fallback_len: usize,
+    decorations: Option<&Decorations>,
 ) -> Vec<u8> {
     let commit = repo.find_commit(entry.oid).ok();
     let b = fmt.as_bytes();
@@ -1729,7 +1768,7 @@ fn expand_format(
                 out.extend_from_slice(&entry.message);
                 i += 3;
             }
-            (Some(who @ (b'a' | b'c')), Some(field @ (b'n' | b'e' | b'd'))) => {
+            (Some(who @ (b'a' | b'c')), Some(field @ (b'n' | b'e' | b'd' | b'i' | b'I' | b't' | b'r'))) => {
                 // Bound the signature to `commit` explicitly: it borrows the
                 // commit's decoded buffer, so it cannot escape a closure.
                 let sig = match &commit {
@@ -1741,6 +1780,25 @@ fn expand_format(
                     match field {
                         b'n' => out.extend_from_slice(sig.name),
                         b'e' => out.extend_from_slice(sig.email),
+                        b'r' => {
+                            let t = sig.time().ok().unwrap_or_default();
+                            let rel = crate::date::show_date_relative(t.seconds, crate::date::now_seconds());
+                            out.extend_from_slice(rel.as_bytes());
+                        }
+                        b't' => {
+                            let t = sig.time().ok().unwrap_or_default();
+                            out.extend_from_slice(t.seconds.to_string().as_bytes());
+                        }
+                        b'i' | b'I' => {
+                            let t = sig.time().ok().unwrap_or_default();
+                            let df = if field == b'i' {
+                                DateFormat { fmt: tfmt::ISO8601.into(), local: false, iso_strict: false }
+                            } else {
+                                DateFormat { fmt: tfmt::ISO8601_STRICT.into(), local: false, iso_strict: true }
+                            };
+                            out.extend_from_slice(df.render(t).as_bytes());
+                        }
+                        // `d`: the `--date=`/`log.date` format.
                         _ => {
                             let t = sig.time().ok().unwrap_or_default();
                             out.extend_from_slice(field_fmt.render(t).as_bytes());
@@ -1755,6 +1813,22 @@ fn expand_format(
             }
             (Some(b'n'), _) => {
                 out.push(b'\n');
+                i += 2;
+            }
+            // `%D` is the bare ref decoration; `%d` wraps it in ` (...)`. Both are
+            // empty when nothing points at the entry's commit.
+            (Some(b'D'), _) => {
+                if let Some(text) = decorations.and_then(|d| d.bare_for_commit(entry.oid)) {
+                    out.extend_from_slice(text.as_bytes());
+                }
+                i += 2;
+            }
+            (Some(b'd'), _) => {
+                if let Some(text) = decorations.and_then(|d| d.bare_for_commit(entry.oid)) {
+                    out.extend_from_slice(b" (");
+                    out.extend_from_slice(text.as_bytes());
+                    out.push(b')');
+                }
                 i += 2;
             }
             (Some(b'H'), _) => {

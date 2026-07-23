@@ -512,9 +512,6 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
     if opts.edit {
         anyhow::bail!("`-e`/`--edit` (editor mode) is not supported");
     }
-    if opts.no_commit {
-        anyhow::bail!("`-n`/`--no-commit` is not supported; each pick is committed");
-    }
     if opts.strategy || opts.xopts {
         anyhow::bail!("merge strategies are not supported; only trivially-resolvable picks are served");
     }
@@ -551,6 +548,10 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
     // Index mirroring the current (clean) worktree; carried forward across picks
     // so filesystem stats are reused and a later `status` stays cheap.
     let mut index = repo.index_or_load_from_head()?.into_owned();
+    // `-n`/`--no-commit` applies picks to the index and worktree without
+    // committing; `pending_tree` accumulates the applied tree so a run of picks
+    // squashes onto each other while HEAD stays put.
+    let mut pending_tree: Option<ObjectId> = None;
 
     for (spec, pick_id) in opts.specs.iter().zip(picks) {
         let pick = repo.find_commit(pick_id)?;
@@ -590,7 +591,10 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
             Some(id) => repo.find_commit(id)?.tree_id()?.detach(),
             None => ObjectId::empty_tree(hash),
         };
-        let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
+        let head_tree = match pending_tree {
+            Some(t) => t,
+            None => repo.find_commit(head_id)?.tree_id()?.detach(),
+        };
 
         // `--ff`: HEAD is exactly the picked commit's parent, so replaying the
         // change is a fast-forward. git prints nothing in this case.
@@ -741,6 +745,15 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
             eprintln!("hint: To abort and get back to the state before \"git cherry-pick\",");
             eprintln!("hint: run \"git cherry-pick --abort\".");
             return Ok(ExitCode::from(1));
+        }
+
+        // --- `--no-commit`: stage the applied tree, do not commit ---------
+        // git leaves the result in the index and worktree and never moves HEAD;
+        // `pending_tree` carries it forward so a following pick squashes onto it.
+        if opts.no_commit {
+            index = update_clean_worktree(&repo, &index, tree_id, &should_interrupt)?;
+            pending_tree = Some(tree_id);
+            continue;
         }
 
         // --- empty-result guards -----------------------------------------

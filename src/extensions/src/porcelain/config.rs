@@ -191,7 +191,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     let file: &gix::config::File = match snapshot.as_ref() {
         Some(s) => s.plumbing(),
         None => {
-            global = global_config()?;
+            global = crate::config::global_config();
             &global
         }
     };
@@ -235,20 +235,6 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     }
 }
 
-/// The merged global+system config `git config` reads when run outside a
-/// repository: git-installation, system, and per-user (`~/.gitconfig`) files,
-/// with `GIT_CONFIG_*` environment overrides layered on top (highest
-/// precedence), mirroring the snapshot a repo would expose minus its local file.
-fn global_config() -> Result<gix::config::File> {
-    let mut file = gix::config::File::from_globals()?;
-    if let Ok(env) = gix::config::File::from_environment_overrides() {
-        // `append` only errors on a malformed section header it just parsed from
-        // the environment; treat that as "no valid overrides" rather than failing
-        // an otherwise-good global read.
-        let _ = file.append(env);
-    }
-    Ok(file)
-}
 
 fn one_name<'a>(positional: &[&'a str]) -> Result<&'a str> {
     match positional {

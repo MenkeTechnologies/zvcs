@@ -17,7 +17,7 @@ use std::process::ExitCode;
 
 use reedline::{
     FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus,
-    Reedline, Signal,
+    PromptViMode, Reedline, Signal, Vi,
 };
 
 pub fn zrepl(_args: &[String]) -> Result<ExitCode> {
@@ -70,6 +70,12 @@ fn run_interactive() -> Result<ExitCode> {
     if let Ok(history) = FileBackedHistory::with_file(1000, history_path) {
         editor = editor.with_history(Box::new(history));
     }
+    // `zvcs.replvimode` (repo config, or global when run outside a repo) swaps the
+    // default emacs keybindings for vi. The prompt indicator then reflects the vi
+    // mode (`:` normal, `>` insert); emacs stays `>`.
+    if crate::config::config_bool("zvcs.replvimode").unwrap_or(false) {
+        editor = editor.with_edit_mode(Box::new(Vi::default()));
+    }
     let prompt = ZreplPrompt;
 
     loop {
@@ -111,8 +117,12 @@ impl Prompt for ZreplPrompt {
         Cow::Borrowed("")
     }
 
-    fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
-        Cow::Borrowed("> ")
+    fn render_prompt_indicator(&self, mode: PromptEditMode) -> Cow<'_, str> {
+        // In vi mode show the sub-mode; emacs and everything else stay `> `.
+        match mode {
+            PromptEditMode::Vi(PromptViMode::Normal) => Cow::Borrowed(": "),
+            _ => Cow::Borrowed("> "),
+        }
     }
 
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {

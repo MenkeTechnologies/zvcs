@@ -8,7 +8,12 @@
 //!     autoreconcile = true   ; keep every CLEAN repo (this one + submodules) at origin/main
 //!     autobump      = true   ; forward-only submodule gitlink bumps
 //!     interval      = 30     ; seconds between autonomous passes (default 30)
+//!     replvimode    = true   ; vi keybindings in the `git zrepl` console (default emacs)
 //! ```
+//!
+//! `replvimode` is a `git zrepl` UI setting rather than daemon behavior, but it
+//! lives in the same `[zvcs]` namespace and is read via [`config_bool`] so it
+//! works whether or not `zrepl` is launched inside a repository.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -111,5 +116,31 @@ impl ZvcsConfig {
     /// switch (which fires each repo's own local hook).
     pub fn hooks_enabled(&self) -> bool {
         self.hook.is_some() || self.autohook
+    }
+}
+
+/// The global+system config `git config` reads outside a repository:
+/// git-installation, system, and per-user (`~/.gitconfig`) files, with
+/// `GIT_CONFIG_*` environment overrides layered on top (highest precedence).
+/// Empty (never an error) when no such files exist.
+pub fn global_config() -> gix::config::File {
+    let mut file = gix::config::File::from_globals().unwrap_or_default();
+    if let Ok(env) = gix::config::File::from_environment_overrides() {
+        // `append` only errors on a malformed section header it just parsed from
+        // the environment; ignore that and keep the good global read rather than
+        // discarding it wholesale.
+        let _ = file.append(env);
+    }
+    file
+}
+
+/// Read a boolean `[zvcs]` key from the current directory's config whether or
+/// not it is inside a repository: the repo's merged snapshot when present, else
+/// the [`global_config`] cascade. Used by verbs (e.g. `git zrepl`) that must
+/// honor settings even when run outside a repo. `None` if the key is unset.
+pub fn config_bool(key: &str) -> Option<bool> {
+    match gix::discover(".") {
+        Ok(repo) => repo.config_snapshot().boolean(key),
+        Err(_) => global_config().boolean(key).ok().flatten(),
     }
 }

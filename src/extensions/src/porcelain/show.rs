@@ -643,14 +643,46 @@ fn show_commit(
     }
 
     if is_merge {
-        // git shows a blank line after a merge's message regardless of format, then
-        // (by default) only `--stat`, measured against the first parent. The empty
-        // user format prints neither the blank line nor a header.
+        // git shows a blank line after a merge's message regardless of format,
+        // then — by default — the dense combined diff (`--cc`) against all
+        // parents, plus `--stat` (against the first parent) when requested. The
+        // empty user format prints neither the blank line nor a header.
         if !header_empty {
             out.push(b'\n');
         }
-        if let Selection::Blocks { stat: true, .. } = selection {
-            emit_stat(out, &files)?;
+        match selection {
+            Selection::Blocks { stat, patch, .. } => {
+                let mut wrote = false;
+                if stat {
+                    emit_stat(out, &files)?;
+                    wrote = true;
+                }
+                if patch {
+                    // Dense combined diff of the merge's tree against every
+                    // parent tree, rendered by the shared `diff --cc` engine.
+                    let result_tree = commit.tree()?;
+                    let mut parent_trees = Vec::with_capacity(parents.len());
+                    for p in &parents {
+                        parent_trees.push(repo.find_commit(p.detach())?.tree()?);
+                    }
+                    let ps: Vec<String> = pathspecs
+                        .iter()
+                        .map(|p| String::from_utf8_lossy(p).into_owned())
+                        .collect();
+                    let cc = super::diff::combined_trees_patch(
+                        repo,
+                        &result_tree,
+                        &parent_trees,
+                        &ps,
+                        3,
+                    )?;
+                    if wrote && !cc.is_empty() {
+                        out.push(b'\n');
+                    }
+                    out.extend_from_slice(&cc);
+                }
+            }
+            _ => {}
         }
         return Ok(());
     }

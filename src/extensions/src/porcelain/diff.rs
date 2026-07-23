@@ -2099,12 +2099,31 @@ fn combined_multi(
         parent_trees.push(repo.rev_parse_single(r.as_str())?.object()?.peel_to_tree()?);
     }
 
+    let out = combined_trees_patch(repo, &result_tree, &parent_trees, paths, ctx)?;
+
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(&out)?;
+    stdout.flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The dense combined diff (`diff --cc`) of `result_tree` against every parent
+/// tree, returned as bytes. Shared by `git diff -c`/`--cc` and `git show` on a
+/// merge commit. A path appears only where the result differs from *all*
+/// parents (git's dense-combined elision).
+pub(crate) fn combined_trees_patch(
+    repo: &gix::Repository,
+    result_tree: &gix::Tree<'_>,
+    parent_trees: &[gix::Tree<'_>],
+    paths: &[String],
+    ctx: u32,
+) -> Result<Vec<u8>> {
     // Candidate paths: everything that differs between the result and any parent.
     let mut cand: BTreeSet<BString> = BTreeSet::new();
-    for pt in &parent_trees {
+    for pt in parent_trees {
         let changes = repo.diff_tree_to_tree(
             Some(pt),
-            Some(&result_tree),
+            Some(result_tree),
             Some(gix::diff::Options::default()),
         )?;
         for change in changes {
@@ -2120,10 +2139,10 @@ fn combined_multi(
     let null = repo.object_hash().null();
     let mut out: Vec<u8> = Vec::new();
     for path in &cand {
-        let (res_id, res_present, res_bytes) = tree_blob(repo, &result_tree, path)?;
+        let (res_id, res_present, res_bytes) = tree_blob(repo, result_tree, path)?;
         let mut parent_ids: Vec<ObjectId> = Vec::with_capacity(parent_trees.len());
         let mut parent_bytes: Vec<Vec<u8>> = Vec::with_capacity(parent_trees.len());
-        for pt in &parent_trees {
+        for pt in parent_trees {
             let (pid, _present, pbytes) = tree_blob(repo, pt, path)?;
             parent_ids.push(pid);
             parent_bytes.push(pbytes);
@@ -2162,11 +2181,7 @@ fn combined_multi(
         emit_file_line(&mut out, b"+++ ", &quote_one(b"b/", path));
         dump_sline(&mut out, &sline, cnt, ctx);
     }
-
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all(&out)?;
-    stdout.flush()?;
-    Ok(ExitCode::SUCCESS)
+    Ok(out)
 }
 
 /// A combined diff of the two conflict stages against the working-tree file, as

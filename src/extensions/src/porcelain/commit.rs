@@ -50,6 +50,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut amend = false;
     let mut no_edit = false;
     let mut reset_author = false;
+    let mut author_arg: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -75,6 +76,17 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "--amend" => amend = true,
             "--no-edit" => no_edit = true,
             "--reset-author" => reset_author = true,
+            "--author" => {
+                i += 1;
+                author_arg = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("option `--author` requires a value"))?
+                        .clone(),
+                );
+            }
+            s if s.starts_with("--author=") => {
+                author_arg = Some(s["--author=".len()..].to_string())
+            }
             s if s.starts_with("--message=") => messages.push(s["--message=".len()..].to_string()),
             s if s.starts_with("--") => anyhow::bail!("unsupported option `{s}`"),
             // A bundled short-flag cluster, e.g. `-am <msg>`, `-qam <msg>`,
@@ -264,6 +276,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
     let subject = message.lines().next().unwrap_or("").to_string();
 
+    // `--author="Name <email>"` overrides the author identity. The author *date*
+    // is unchanged: HEAD's on an amend (git preserves it), the configured author
+    // time (now / GIT_AUTHOR_DATE) on a new commit.
+    let author_override: Option<(String, String)> = match &author_arg {
+        Some(a) => Some(parse_author_ident(a)?),
+        None => None,
+    };
+
     // --- write the commit and advance HEAD -------------------------------
     let commit_id = if amend {
         // `--amend`: the new commit keeps HEAD's author (unless `--reset-author`)
@@ -277,12 +297,21 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             .committer()
             .transpose()?
             .ok_or_else(|| anyhow::anyhow!("unable to determine committer identity"))?;
-        let author = if reset_author {
+        let base_author = if reset_author {
             repo.author()
                 .transpose()?
                 .ok_or_else(|| anyhow::anyhow!("unable to determine author identity"))?
         } else {
             hc.author()?
+        };
+        // `--author` swaps name/email but keeps the base author's date.
+        let author = match &author_override {
+            Some((name, email)) => gix::actor::SignatureRef {
+                name: name.as_bytes().as_bstr(),
+                email: email.as_bytes().as_bstr(),
+                time: base_author.time,
+            },
+            None => base_author,
         };
         let new: ObjectId = repo
             .new_commit_as(committer, author, &message, tree_id, parents)?
@@ -306,6 +335,25 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             deref: true,
         })?;
         new.attach(&repo)
+    } else if let Some((name, email)) = &author_override {
+        // A normal commit with `--author`: the config committer, but the author
+        // name/email come from `--author` (author date = the config author's
+        // time). `Repository::commit` only uses the config author, so drop to
+        // `commit_as` to inject the override.
+        let committer = repo
+            .committer()
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("unable to determine committer identity"))?;
+        let base = repo
+            .author()
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("unable to determine author identity"))?;
+        let author = gix::actor::SignatureRef {
+            name: name.as_bytes().as_bstr(),
+            email: email.as_bytes().as_bstr(),
+            time: base.time,
+        };
+        repo.commit_as(committer, author, "HEAD", &message, tree_id, parents)?
     } else {
         // `Repository::commit` writes the commit object, then updates `HEAD`
         // (write-through to its branch, or the detached ref) with the canonical
@@ -554,6 +602,19 @@ fn plural(n: u64) -> &'static str {
 /// git's editor path for `git commit` without `-m`: build a template from
 /// `commit.template` and a commented status header, open it in the configured
 /// editor, and return the cleaned-up message per `commit.cleanup`.
+/// Parse a `--author` value of the form `Name <email>` into (name, email),
+/// splitting on the last `<`…`>` as git's `split_ident_line` does. git also
+/// accepts a bare string that searches existing commits' authors; that lookup
+/// form is not ported.
+fn parse_author_ident(s: &str) -> Result<(String, String)> {
+    match (s.rfind('<'), s.rfind('>')) {
+        (Some(o), Some(c)) if c > o => Ok((s[..o].trim().to_string(), s[o + 1..c].to_string())),
+        _ => anyhow::bail!(
+            "--author '{s}': only the `Name <email>` form is supported (author search is not ported)"
+        ),
+    }
+}
+
 fn obtain_message_via_editor(
     repo: &gix::Repository,
     is_root: bool,

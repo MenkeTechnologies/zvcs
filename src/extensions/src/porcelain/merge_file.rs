@@ -13,6 +13,16 @@
 //! `merge.conflictStyle` config default. Unique-prefix abbreviation of long
 //! options is *not* accepted.
 //!
+//! `merge.conflictStyle` is read and validated the way git's `git_xmerge_config`
+//! does: it runs before option parsing, so an unknown value (`Diff3`, `zealous`,
+//! empty, …) is fatal (exit 128) even when a `--diff3`/`--zdiff3` flag would
+//! have overridden it, when `-h` is present, or when the operands are wrong. The
+//! one deviation is the `fatal:` line for a file-backed value — `gix_config`
+//! does not expose the config line number, so it reads
+//! `bad config variable 'merge.conflictstyle' in file '<path>'` where git
+//! appends ` at line <n>`. As before, the value is consulted only inside a
+//! repository; a global-only setting outside one still resolves to `merge`.
+//!
 //! `patience` is accepted as a *value* exactly as git accepts it, so command
 //! lines that name it and then fail for an unrelated reason (a bad operand
 //! count, a later bad `--diff-algorithm`, a missing file) fail identically to
@@ -35,6 +45,7 @@ use std::iter::Peekable;
 use std::ops::Range;
 use std::process::ExitCode;
 
+use gix::config::Source;
 use gix::diff::blob::sources::byte_lines;
 use gix::diff::blob::{Algorithm, Diff, InternedInput, Interner, Token};
 
@@ -90,6 +101,15 @@ struct Labels<'a> {
 /// `git merge-file` — see the module docs for the covered surface.
 pub fn merge_file(args: &[String]) -> Result<ExitCode> {
     let argv = args;
+
+    // git reads and validates config at the very start of `cmd_merge_file`,
+    // before option parsing, `-h`, or the operand count check, so an invalid
+    // `merge.conflictStyle` is fatal (exit 128) regardless of the command line.
+    let repo = gix::discover(".").ok();
+    let config_style = match conflict_style_config(repo.as_ref()) {
+        Ok(style) => style,
+        Err(code) => return Ok(code),
+    };
 
     let mut to_stdout = false;
     let mut quiet = false;
@@ -213,18 +233,15 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    // The repository is mandatory for `--object-id`, and otherwise consulted
-    // only for `merge.conflictStyle`.
-    let repo = gix::discover(".").ok();
+    // `--object-id` additionally requires the repository the config came from.
     if object_id && repo.is_none() {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
     }
 
-    let style = match style {
-        Some(style) => style,
-        None => repo.as_ref().map_or(ConflictStyle::Merge, config_style),
-    };
+    // A CLI style flag (`--diff3`/`--zdiff3`) overrides the validated
+    // `merge.conflictStyle` default.
+    let style = style.unwrap_or(config_style);
     // git's `xdl_merge` substitutes the default for any non-positive size.
     let marker_size = if marker_size <= 0 { 7 } else { marker_size as usize };
     let conflict = favor.unwrap_or(Conflict::Keep { style, marker_size });
@@ -394,17 +411,69 @@ fn parse_int_arg(text: &str) -> std::result::Result<Option<i64>, ()> {
     Ok(Some(value))
 }
 
-/// The `merge.conflictStyle` default; unknown values fall back to `merge`.
-fn config_style(repo: &gix::Repository) -> ConflictStyle {
-    let snapshot = repo.config_snapshot();
-    let Some(value) = snapshot.string("merge.conflictStyle") else {
-        return ConflictStyle::Merge;
+/// The `merge.conflictStyle` default, validated the way git's
+/// `git_xmerge_config` validates it: every occurrence in the merged
+/// configuration is checked, an unknown value is fatal (exit 128), the last
+/// valid value wins, and an absent value resolves to `merge`. Value matching is
+/// case-sensitive (`Diff3` is rejected), matching git.
+///
+/// Config is read only when inside a repository — the same scope the previous
+/// default honored — so a global-only `merge.conflictStyle` outside a repo
+/// keeps resolving to `merge` rather than being consulted (or validated) here.
+fn conflict_style_config(
+    repo: Option<&gix::Repository>,
+) -> std::result::Result<ConflictStyle, ExitCode> {
+    let Some(repo) = repo else {
+        return Ok(ConflictStyle::Merge);
     };
-    match value.as_slice() {
-        b"diff3" => ConflictStyle::Diff3,
-        b"zdiff3" => ConflictStyle::ZealousDiff3,
-        _ => ConflictStyle::Merge,
+    let snapshot = repo.config_snapshot();
+    let config = snapshot.plumbing();
+
+    let mut chosen = ConflictStyle::Merge;
+    // `sections()` yields in merged configuration order, so a later value wins.
+    for section in config.sections() {
+        let header = section.header();
+        if header.subsection_name().is_some()
+            || !header.name().to_string().eq_ignore_ascii_case("merge")
+        {
+            continue;
+        }
+        for value in section.body().values("conflictStyle") {
+            chosen = match value.as_slice() {
+                b"merge" => ConflictStyle::Merge,
+                b"diff3" => ConflictStyle::Diff3,
+                b"zdiff3" => ConflictStyle::ZealousDiff3,
+                other => {
+                    let value = String::from_utf8_lossy(other);
+                    return Err(style_fatal(&value, section.meta()));
+                }
+            };
+        }
     }
+    Ok(chosen)
+}
+
+/// Report an unknown `merge.conflictStyle` value the way git's
+/// `git_xmerge_config` does — the `error:` reason, then a `fatal:` line naming
+/// where the value came from — and yield exit 128.
+///
+/// gix does not expose the config line number, so a file-backed section omits
+/// git's trailing ` at line <n>`; the command-line/environment forms match.
+fn style_fatal(value: &str, meta: &gix::config::file::Metadata) -> ExitCode {
+    eprintln!("error: unknown style '{value}' given for 'merge.conflictstyle'");
+    let origin = match meta.source {
+        Source::Cli | Source::Env => {
+            "unable to parse 'merge.conflictstyle' from command-line config".to_string()
+        }
+        _ => match &meta.path {
+            Some(path) => {
+                format!("bad config variable 'merge.conflictstyle' in file '{}'", path.display())
+            }
+            None => "bad config variable 'merge.conflictstyle'".to_string(),
+        },
+    };
+    eprintln!("fatal: {origin}");
+    ExitCode::from(128)
 }
 
 /// Read one operand from the worktree, mirroring git's `stat` then `open`

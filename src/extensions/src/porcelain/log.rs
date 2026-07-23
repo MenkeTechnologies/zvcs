@@ -2639,9 +2639,16 @@ fn format_date(seconds: i64, offset: i32, mode: DateMode) -> String {
                 DateMode::Iso => format!(
                     "{year}-{month:02}-{day:02} {hour:02}:{min:02}:{sec:02} {sign}{oh:02}{om:02}"
                 ),
-                DateMode::IsoStrict => format!(
-                    "{year}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}{sign}{oh:02}:{om:02}"
-                ),
+                // git renders a zero UTC offset as `Z` in iso-strict (RFC 3339),
+                // not `+00:00` (verified against git 2.55).
+                DateMode::IsoStrict => {
+                    let tz = if offset == 0 {
+                        "Z".to_string()
+                    } else {
+                        format!("{sign}{oh:02}:{om:02}")
+                    };
+                    format!("{year}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}{tz}")
+                }
                 DateMode::Rfc => format!(
                     "{}, {day} {} {year} {hour:02}:{min:02}:{sec:02} {sign}{oh:02}{om:02}",
                     WEEKDAYS[weekday],
@@ -2654,10 +2661,10 @@ fn format_date(seconds: i64, offset: i32, mode: DateMode) -> String {
 }
 
 /// Format a commit time exactly like stock `git log`'s default (`DATE_NORMAL`)
-/// mode: `Www Mmm <sp-padded-day> HH:MM:SS YYYY +ZZZZ`, in the commit's own
-/// timezone offset. Done by hand because gix's exported `DEFAULT` format uses an
-/// unpadded day (`%-d`) whereas git space-pads it (`%e`); nothing else in the
-/// crate lets us construct a custom format string.
+/// mode: `Www Mmm <day> HH:MM:SS YYYY +ZZZZ`, in the commit's own timezone
+/// offset. The day is **unpadded** — git's `show_date` builds this with a bare
+/// `%d` (printf integer), so a single-digit day gets one space, not two
+/// (verified against git 2.55: `Mon Jan 2 ...`, not `Mon Jan  2 ...`).
 fn format_git_date(seconds: i64, offset: i32) -> String {
     // Shift into the commit's local wall-clock time, then split into whole days
     // (since the Unix epoch) and the seconds within the day. `div_euclid` /
@@ -2675,7 +2682,7 @@ fn format_git_date(seconds: i64, offset: i32) -> String {
     let (off_h, off_m) = (off / 3600, (off % 3600) / 60);
 
     format!(
-        "{} {} {:>2} {:02}:{:02}:{:02} {} {}{:02}{:02}",
+        "{} {} {} {:02}:{:02}:{:02} {} {}{:02}{:02}",
         WEEKDAYS[weekday],
         MONTHS[(month - 1) as usize],
         day,

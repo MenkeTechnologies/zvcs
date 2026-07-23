@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Result};
+use std::collections::{HashMap, HashSet};
 use std::process::ExitCode;
 
 use gix::bstr::ByteSlice;

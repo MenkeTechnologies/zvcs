@@ -1,10 +1,8 @@
 //! `git quiltimport` — apply a quilt patchset onto the current branch.
-//! **The import itself is not ported: the first patch that would actually be
-//! applied bails.**
 //!
 //! Stock `git-quiltimport` is a POSIX shell script
 //! (`$(git --exec-path)/git-quiltimport`, `#!/bin/sh` on line 1). Its per-patch
-//! body is four `git` invocations glued together:
+//! body is five `git` invocations glued together:
 //!
 //! ```text
 //! git mailinfo $MAILINFO_OPT "$tmp_msg" "$tmp_patch" <"$QUILT_PATCHES/$patch_name" >"$tmp_info"
@@ -14,17 +12,17 @@
 //! git update-ref -m "quiltimport: $patch_name" HEAD $commit
 //! ```
 //!
-//! `git mailinfo` is the missing substrate. It is what splits each quilt patch
-//! into a message body, a diff, and the `Author:`/`Email:`/`Date:`/`Subject:`
-//! info block the script then `sed`s the ident out of — and there is no
-//! mailinfo port in this tree (`src/extensions/src/porcelain/` has `apply.rs`,
-//! `write_tree.rs`, `commit_tree.rs` and `update_ref.rs`, but no `mailinfo.rs`),
-//! nor any RFC-2822/mbox splitter under the vendored gitoxide crates in
-//! `src/ported/` — gitoxide has no `gix-mailinfo` equivalent. Without it the
-//! author ident, the subject, the message body and the diff hunk boundaries all
-//! have to be invented, and the resulting commits (the whole observable result
-//! of the command) would differ from stock. So the loop stops at the first
-//! patch it would have to feed to mailinfo rather than approximating it.
+//! This port reproduces that glue faithfully: it re-invokes the running binary's
+//! own ported subcommands — `mailinfo`, `apply`, `write-tree`, `commit-tree`,
+//! `update-ref` — as child processes with the same redirections, exactly as the
+//! shell shells out to `git <subcommand>`. `mailinfo` (a full port in
+//! `porcelain/mailinfo.rs`) splits each quilt patch into a message body
+//! (`$tmp_msg`), a diff (`$tmp_patch`) and the `Author:`/`Email:`/`Subject:`/
+//! `Date:` block (`$tmp_info`); the ident is `sed`-extracted from that block and
+//! handed to `commit-tree` through `GIT_AUTHOR_*`, and the resulting commits
+//! chain off the initial `HEAD`. `--keep-non-patch` passes `-b` to `mailinfo`,
+//! and the `Patch is empty.  Was it split wrong?` guard (`test -s "$tmp_patch"`)
+//! is in place.
 //!
 //! ### Covered (byte-identical stdout/stderr and exit code against git 2.55.0)
 //!
@@ -69,15 +67,22 @@
 //!   names no existing patch therefore completes exactly as stock does:
 //!   `rm -rf` the temp dir, exit 0.
 //!
-//! ### Not covered
+//! ### Deferred and platform notes
 //!
-//! * Any patch that exists: mailinfo, `git apply --index -C1`, `write-tree`,
-//!   `commit-tree`, `update-ref`, and the `Patch is empty.  Was it split
-//!   wrong?` guard. This bails, after removing the temp dir it created so the
-//!   repository is not left mid-import.
-//! * `--dry-run` past that same point — it still runs mailinfo per patch, so
-//!   `No author found in <patch>` and the interactive `Author: ` prompt are
-//!   unreachable here.
+//! * The interactive no-author fallback: when a patch is imported for real (not
+//!   `--dry-run`), no `--author` was given, and `mailinfo` found neither an
+//!   `Author:` nor an `Email:`, stock git prints the message, cats it to the
+//!   terminal, and `read`s the author from the tty in a re-prompt loop. That
+//!   tty loop is not wired, so this narrow path is rejected rather than faked.
+//!   `--dry-run`, which substitutes `dry-run-not-found` for a missing author
+//!   instead of prompting, is fully reproduced — as is the whole `--dry-run`
+//!   pass, which runs `mailinfo` per patch and stops short of `apply`.
+//! * `git apply --index -C1`: the script always passes `-C1`, and
+//!   `porcelain/apply.rs` does not implement context reduction, so it rejects
+//!   the `-C` flag. A real (non-`--dry-run`) import therefore reaches `apply`,
+//!   which fails, and the script's `|| exit 4` fires. That gap lives in
+//!   `apply.rs`, not here; once `apply` honours `-C`, the import completes
+//!   end-to-end with no change to this file.
 //! * `read`'s backslash processing (the script uses plain `read`, not
 //!   `read -r`), so a series line containing `\` is field-split literally.
 //! * The `mkdir` failure line is the platform `mkdir(1)` text. The BSD form
@@ -85,8 +90,10 @@
 //!   target; GNU coreutils words it differently.
 
 use anyhow::{bail, Result};
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 
 /// The usage block parseopt renders from `OPTIONS_SPEC`: 307 bytes, help
 /// column 22.
@@ -446,13 +453,19 @@ pub fn quiltimport(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // Quilt author. Both `expr`s must match non-empty or the script dies.
-    if let Some(author) = quilt_author.as_deref().filter(|a| !a.is_empty()) {
-        if author_name(author).is_none() || author_email(author).is_none() {
-            eprintln!("malformed --author parameter");
-            return Ok(ExitCode::from(1));
-        }
-    }
+    // Quilt author. Both `expr`s must match non-empty or the script dies; when
+    // they match, the parsed name/email seed the per-patch no-author fallback.
+    let (quilt_author_name, quilt_author_email) =
+        match quilt_author.as_deref().filter(|a| !a.is_empty()) {
+            Some(author) => match (author_name(author), author_email(author)) {
+                (Some(name), Some(email)) => (Some(name.to_string()), Some(email.to_string())),
+                _ => {
+                    eprintln!("malformed --author parameter");
+                    return Ok(ExitCode::from(1));
+                }
+            },
+            None => (None, None),
+        };
 
     // `: ${QUILT_PATCHES:=patches}` — the flag wins, then the environment.
     let patches_dir = match quilt_patches.filter(|p| !p.is_empty()) {
@@ -475,14 +488,21 @@ pub fn quiltimport(args: &[String]) -> Result<ExitCode> {
     }
 
     // `commit=$(git rev-parse HEAD)` — unchecked, so an unborn HEAD only
-    // produces git's diagnostic and the script continues.
+    // produces git's diagnostic on stderr; the captured stdout is the literal
+    // `HEAD`, which the loop later feeds to `commit-tree -p` (where it fails,
+    // exactly as the script's does). `commit` is rebound to each new commit as
+    // the import chains them.
+    let mut commit = String::from("HEAD");
     if let Ok(repo) = gix::discover(".") {
-        if repo.head_id().is_err() {
-            eprintln!(
-                "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree."
-            );
-            eprintln!("Use '--' to separate paths from revisions, like this:");
-            eprintln!("'git <command> [<revision>...] -- [<file>...]'");
+        match repo.head_id() {
+            Ok(id) => commit = id.detach().to_string(),
+            Err(_) => {
+                eprintln!(
+                    "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree."
+                );
+                eprintln!("Use '--' to separate paths from revisions, like this:");
+                eprintln!("'git <command> [<revision>...] -- [<file>...]'");
+            }
         }
     }
 
@@ -498,15 +518,30 @@ pub fn quiltimport(args: &[String]) -> Result<ExitCode> {
         eprintln!("{}", mkdir_error(&tmp_dir, &e));
         return Ok(ExitCode::from(2));
     }
+    let tmp_msg = tmp_dir.join("msg");
+    let tmp_patch = tmp_dir.join("patch");
+    let tmp_info = tmp_dir.join("info");
+
+    // The shell shells out to `git <subcommand>`; this binary provides those
+    // subcommands, so re-invoke it the same way `for-each-repo` does.
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("cannot locate the running executable: {e}"))?;
 
     for line in complete_lines(&series) {
         let SeriesLine { patch_name, level, garbage } = read_fields(line);
         if patch_name.is_empty() || patch_name.starts_with('#') {
             continue;
         }
-        if !(level.is_empty() || level.starts_with('#') || level.starts_with("-p")) {
-            println!("unable to parse patch level, ignoring it.");
-        }
+        // The script keeps `level` only for a `-p*` value; a blank, comment or
+        // unparseable field is emptied so it is never passed to `git apply`.
+        let level = if level.starts_with("-p") {
+            level.as_str()
+        } else {
+            if !(level.is_empty() || level.starts_with('#')) {
+                println!("unable to parse patch level, ignoring it.");
+            }
+            ""
+        };
         if !(garbage.is_empty() || garbage.starts_with('#')) {
             println!("trailing garbage found in series file: {garbage}");
             // The script exits here without removing the temp directory.
@@ -518,16 +553,160 @@ pub fn quiltimport(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
-        // Everything past this point needs `git mailinfo`. Remove the temp
-        // directory first so the repository is not left mid-import.
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        let _ = (dry_run, keep_non_patch);
-        bail!(
-            "unsupported: applying {patch_name:?} needs `git mailinfo` to split the quilt patch \
-             into message, diff and author ident; no mailinfo port exists in this tree and \
-             gitoxide provides no mbox/RFC-2822 splitter (ported: option parsing, --author \
-             validation, QUILT_PATCHES/QUILT_SERIES resolution, series-file parsing)"
-        );
+        // `echo $patch_name`
+        println!("{patch_name}");
+
+        // git mailinfo $MAILINFO_OPT "$tmp_msg" "$tmp_patch" <patch >info || exit 3
+        let patch_in = match File::open(&patch_path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("{}: {e}", patch_path.display());
+                return Ok(ExitCode::from(3));
+            }
+        };
+        let info_out = File::create(&tmp_info)
+            .map_err(|e| anyhow::anyhow!("cannot create {tmp_info:?}: {e}"))?;
+        let mut mailinfo = Command::new(&exe);
+        mailinfo.arg("mailinfo");
+        if keep_non_patch {
+            mailinfo.arg("-b");
+        }
+        let mailinfo_ok = mailinfo
+            .arg(&tmp_msg)
+            .arg(&tmp_patch)
+            .stdin(patch_in)
+            .stdout(info_out)
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to run mailinfo: {e}"))?
+            .success();
+        if !mailinfo_ok {
+            return Ok(ExitCode::from(3));
+        }
+
+        // test -s "$tmp_patch"
+        let patch_nonempty = std::fs::metadata(&tmp_patch)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+        if !patch_nonempty {
+            println!("Patch is empty.  Was it split wrong?");
+            return Ok(ExitCode::from(1));
+        }
+
+        // Parse the author information from the mailinfo info block.
+        let info = std::fs::read_to_string(&tmp_info).unwrap_or_default();
+        let mut author_name = sed_extract(&info, "Author: ");
+        let mut author_email = sed_extract(&info, "Email: ");
+        while author_email.is_empty() && author_name.is_empty() {
+            match (&quilt_author_name, &quilt_author_email) {
+                (Some(name), Some(email)) => {
+                    author_name = name.clone();
+                    author_email = email.clone();
+                }
+                _ if dry_run => {
+                    eprintln!("No author found in {patch_name}");
+                    author_name = "dry-run-not-found".to_string();
+                    author_email = "dry-run-not-found".to_string();
+                }
+                _ => {
+                    // The interactive branch prints the message, cats the log to
+                    // the terminal, then `read`s the author from the tty. That
+                    // tty prompt loop is not wired, so refuse rather than fake.
+                    eprintln!("No author found in {patch_name}");
+                    bail!(
+                        "importing {patch_name:?} found no author and none was given: git's \
+                         interactive `Author:` tty prompt is not ported (pass --author, or use \
+                         --dry-run)"
+                    );
+                }
+            }
+        }
+
+        let author_date = sed_extract(&info, "Date: ");
+        let mut subject = sed_extract(&info, "Subject: ");
+        if subject.is_empty() {
+            // SUBJECT=$(echo $patch_name | sed -e 's/.patch$//')
+            subject = strip_patch_suffix(&patch_name);
+        }
+
+        if dry_run {
+            continue;
+        }
+
+        // git apply --index -C1 ${level:+"$level"} "$tmp_patch"
+        let mut apply = Command::new(&exe);
+        apply.arg("apply").arg("--index").arg("-C1");
+        if !level.is_empty() {
+            apply.arg(level);
+        }
+        let applied = apply
+            .arg(&tmp_patch)
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to run apply: {e}"))?
+            .success();
+        if !applied {
+            return Ok(ExitCode::from(4));
+        }
+
+        // tree=$(git write-tree)
+        let tree = match capture(&exe, &["write-tree"])? {
+            Some(t) => t,
+            None => return Ok(ExitCode::from(4)),
+        };
+
+        // commit=$( { echo "$SUBJECT"; echo; cat "$tmp_msg"; } | \
+        //   GIT_AUTHOR_* git commit-tree $tree -p $commit )
+        let mut message = Vec::new();
+        message.extend_from_slice(subject.as_bytes());
+        message.push(b'\n');
+        message.push(b'\n');
+        message.extend_from_slice(&std::fs::read(&tmp_msg).unwrap_or_default());
+
+        let mut commit_tree = Command::new(&exe);
+        commit_tree
+            .arg("commit-tree")
+            .arg(&tree)
+            .arg("-p")
+            .arg(&commit)
+            .env("GIT_AUTHOR_NAME", &author_name)
+            .env("GIT_AUTHOR_EMAIL", &author_email)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        // git treats an empty GIT_AUTHOR_DATE as "now"; leaving it unset is the
+        // same, and avoids feeding an empty string to the date parser.
+        if !author_date.is_empty() {
+            commit_tree.env("GIT_AUTHOR_DATE", &author_date);
+        }
+        let mut child = commit_tree
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to run commit-tree: {e}"))?;
+        child
+            .stdin
+            .take()
+            .expect("commit-tree stdin was piped")
+            .write_all(&message)?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| anyhow::anyhow!("failed to run commit-tree: {e}"))?;
+        if !out.status.success() {
+            return Ok(ExitCode::from(4));
+        }
+        let new_commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        // git update-ref -m "quiltimport: $patch_name" HEAD $commit
+        let updated = Command::new(&exe)
+            .arg("update-ref")
+            .arg("-m")
+            .arg(format!("quiltimport: {patch_name}"))
+            .arg("HEAD")
+            .arg(&new_commit)
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to run update-ref: {e}"))?
+            .success();
+        if !updated {
+            return Ok(ExitCode::from(4));
+        }
+        commit = new_commit;
     }
 
     // `rm -rf $tmp_dir || exit 5`
@@ -535,4 +714,52 @@ pub fn quiltimport(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(5));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Run `exe <args>` capturing stdout (with stderr inherited, as a `$(...)`
+/// capture leaves it), and return the trimmed stdout or `None` when the child
+/// exited non-zero — the shell `&&` short-circuit.
+fn capture(exe: &Path, args: &[&str]) -> Result<Option<String>> {
+    let child = Command::new(exe)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to run {}: {e}", args.join(" ")))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| anyhow::anyhow!("failed to run {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string()))
+}
+
+/// `sed -ne 's/<prefix>//p'` over the info block: for every line that contains
+/// `prefix`, drop its first occurrence and keep the remainder; join the kept
+/// lines with newlines, as a `$(...)` capture would (which also strips the
+/// trailing newline the join already omits).
+fn sed_extract(text: &str, prefix: &str) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if let Some(at) = line.find(prefix) {
+            let mut out = String::with_capacity(line.len() - prefix.len());
+            out.push_str(&line[..at]);
+            out.push_str(&line[at + prefix.len()..]);
+            kept.push(out);
+        }
+    }
+    kept.join("\n")
+}
+
+/// `echo $patch_name | sed -e 's/.patch$//'`: the BRE `.patch$` strips a
+/// trailing six-byte run — any single character followed by the literal
+/// `patch` — from the end of the name.
+fn strip_patch_suffix(name: &str) -> String {
+    let b = name.as_bytes();
+    if b.len() >= 6 && &b[b.len() - 5..] == b"patch" {
+        name[..b.len() - 6].to_string()
+    } else {
+        name.to_string()
+    }
 }

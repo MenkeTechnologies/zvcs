@@ -51,24 +51,23 @@
 //!     files — same text, same exit codes (128/129)
 //!   * `--quit` (drops `.git/sequencer`), and the "nothing in progress"
 //!     refusals of `--abort`/`--skip`/`--continue`
+//!   * the full three-way merge through `gix`'s tree merge (`gix-merge`, enabled
+//!     by this crate's `merge` feature): content-level blob merges and rename
+//!     following are served, not approximated. A path both sides changed away
+//!     from the base is merged hunk-by-hunk. An unresolved conflict stops the
+//!     revert exactly as git's sequencer does: the merge result — `<<<<<<<` /
+//!     `>>>>>>>` markers included — is checked out, the conflicting paths get
+//!     stage 1/2/3 index entries, an `Auto-merging`/`CONFLICT (...)` line goes to
+//!     stdout, `REVERT_HEAD`, `AUTO_MERGE` and a `MERGE_MSG` carrying the
+//!     `# Conflicts:` hint are written, and the exit status is 1
 //!
 //! What this port does NOT do, and refuses rather than approximates:
-//!   * **content-level (blob) three-way merge.** The vendored `gix` in this
-//!     crate is built without the `merge` feature, so `gix-merge` — both the
-//!     blob and the tree merge drivers — is not linked in. Only the trivial
-//!     resolutions are performed here: a path taken from *theirs* when *ours*
-//!     never moved off the base, from *ours* when *theirs* never moved, or the
-//!     shared value when both agree. A path that both sides changed away from
-//!     the base needs a real blob merge and is refused. Rename detection is part
-//!     of the same missing substrate, so a reverted path that was later renamed
-//!     lands in that refused set too.
 //!   * resuming a sequence: `--continue`, and `--abort`/`--skip` when a revert
 //!     really is in progress, all need `git reset --merge`, which is not ported.
-//!     A multi-pick (sequencer) revert whose pick empties out prints git's
-//!     `Revert currently in progress` status block byte-for-byte, but the
-//!     `.git/sequencer` todo/opts backing that block is not written, since
-//!     nothing here can resume it — the object set, index, refs and worktree
-//!     an empty pick leaves are already identical to git's.
+//!     A stopped pick — whether it emptied out or conflicted — leaves the object
+//!     set, index, refs and worktree identical to git's, and prints git's status
+//!     block byte-for-byte, but the `.git/sequencer` todo/opts that would let
+//!     `--continue` resume it are not written, since nothing here can resume.
 //!   * `-S`/`--gpg-sign` — bails, since nothing here can produce a signature.
 //!   * **spawning an editor.** `-e`/`--edit` is accepted and only changes which
 //!     `--cleanup=default` mode applies; the generated message is then taken as
@@ -80,7 +79,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-use gix::bstr::{BString, ByteSlice};
+use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::index::entry::{Flags, Mode, Stat};
 use gix::objs::tree::{EntryKind, EntryMode};
@@ -660,13 +659,64 @@ fn revert_one(
     };
 
     // --- the merge --------------------------------------------------------
-    let base = flatten(repo, base_tree)?;
+    //
+    // A revert is a three-way merge with the roles rotated: the *ancestor* is the
+    // reverted commit's tree, *ours* is `HEAD` (or the index under `-n`), *theirs*
+    // is the reverted commit's parent. The marker labels match git's sequencer
+    // `get_message`: the ancestor is `<short> (<subject>)` of the reverted commit,
+    // *theirs* is `parent of <that>`, and *ours* is the literal `HEAD`.
+    let short = target_id.attach(repo).shorten_or_id().to_string();
+    let subject_label = gix::objs::commit::MessageRef::from_bytes(target.message_raw()?)
+        .summary()
+        .to_str_lossy()
+        .into_owned();
+    let ancestor_label = format!("{short} ({subject_label})");
+    let other_label = if parent_id.is_some() {
+        format!("parent of {ancestor_label}")
+    } else {
+        "(empty tree)".to_string()
+    };
+    let mut merge = repo.merge_trees(
+        base_tree,
+        ours_tree,
+        theirs_tree,
+        gix::merge::blob::builtin_driver::text::Labels {
+            ancestor: Some(BStr::new(ancestor_label.as_bytes())),
+            current: Some(BStr::new("HEAD")),
+            other: Some(BStr::new(other_label.as_bytes())),
+        },
+        repo.tree_merge_options()?,
+    )?;
+    // The tree — conflict markers and all — is written before anything is checked
+    // out, so the object exists even when a checkout below is refused.
+    let merged_tree = merge.tree.write()?.detach();
+    let merged = flatten(repo, merged_tree)?;
     let ours = flatten(repo, ours_tree)?;
-    let theirs = flatten(repo, theirs_tree)?;
-    let merged = merge_trivially(&base, &ours, &theirs, target_id)?;
-    // The merge machinery writes its result tree before anything is checked out,
-    // so the object exists even when the checkout below is refused.
-    let merged_tree = write_tree(repo, &merged)?;
+
+    // git's merge-ort emits an `Auto-merging` line for every path it ran a blob
+    // merge on, then a `CONFLICT (...)` line for the ones left unresolved; a path
+    // both sides changed identically resolves trivially and is reported by
+    // neither, which is why reverting an already-reverted change stays silent.
+    let unresolved = gix::merge::tree::TreatAsUnresolved::git();
+    let mut conflicted: Vec<BString> = Vec::new();
+    for conflict in &merge.conflicts {
+        let path = conflict.changes_in_resolution().0.location().to_owned();
+        if conflict.content_merge().is_some() {
+            println!("Auto-merging {path}");
+        }
+        if !conflict.is_unresolved(unresolved) {
+            continue;
+        }
+        // merge-ort's `filemask == 6`: no ancestor stage means both sides added
+        // the path, reported as `add/add` rather than `content`.
+        let kind = if conflict.entries()[0].is_none() {
+            "add/add"
+        } else {
+            "content"
+        };
+        println!("CONFLICT ({kind}): Merge conflict in {path}");
+        conflicted.push(path);
+    }
 
     // --- refuse to clobber ------------------------------------------------
     let changed: Vec<BString> = ours
@@ -733,6 +783,52 @@ fn revert_one(
 
     // --- apply to index + worktree ---------------------------------------
     let changed_set: HashSet<BString> = changed.iter().cloned().collect();
+
+    // An unresolved merge stops the revert the way git's sequencer does: check out
+    // the marker'd tree, give the conflicting paths stage 1/2/3 index entries, and
+    // record `REVERT_HEAD`/`AUTO_MERGE`/`MERGE_MSG` before exiting 1. Resuming from
+    // here (`--continue`) needs the `.git/sequencer` todo this port omits.
+    if !conflicted.is_empty() {
+        let mut new_index = apply(repo, &changed_set, merged_tree, &merged)?;
+        merge.index_changed_after_applying_conflicts(
+            &mut new_index,
+            unresolved,
+            gix::merge::tree::apply_index_entries::RemovalMode::Prune,
+        );
+        new_index.write(Default::default())?;
+
+        let git_dir = repo.git_dir();
+        std::fs::write(git_dir.join("REVERT_HEAD"), format!("{target_id}\n"))?;
+        // git records the merge result — markers and all — as `AUTO_MERGE` so a
+        // later `--continue` could diff against it.
+        std::fs::write(git_dir.join("AUTO_MERGE"), format!("{merged_tree}\n"))?;
+
+        // git's `append_conflicts_hint`: a blank line, `# Conflicts:`, then one
+        // commented path per unresolved conflict, appended to the commit message.
+        let mut merge_msg = message.clone();
+        if !merge_msg.ends_with('\n') {
+            merge_msg.push('\n');
+        }
+        merge_msg.push_str("\n# Conflicts:\n");
+        for path in &conflicted {
+            merge_msg.push_str("#\t");
+            merge_msg.push_str(&path.to_str_lossy());
+            merge_msg.push('\n');
+        }
+        std::fs::write(git_dir.join("MERGE_MSG"), &merge_msg)?;
+
+        // git's `do_pick_commit` names the reverted commit and *its* subject here,
+        // not the generated `Revert "…"` message, then prints the revert advice.
+        eprintln!("error: could not revert {short}... {subject_label}");
+        eprintln!("hint: After resolving the conflicts, mark them with");
+        eprintln!("hint: \"git add/rm <pathspec>\", then run");
+        eprintln!("hint: \"git revert --continue\".");
+        eprintln!("hint: You can instead skip this commit with \"git revert --skip\".");
+        eprintln!("hint: To abort and get back to the state before \"git revert\",");
+        eprintln!("hint: run \"git revert --abort\".");
+        return Ok(Step::Failed(ExitCode::from(1)));
+    }
+
     apply(repo, &changed_set, merged_tree, &merged)?;
 
     if o.no_commit {
@@ -895,45 +991,6 @@ fn read_index_state(repo: &gix::Repository, head_tree: ObjectId) -> Result<Index
     })
 }
 
-/// Three-way merge restricted to the trivially resolvable cases.
-///
-/// For each path, with `b`/`o`/`t` the base/ours/theirs values: identical sides
-/// resolve to that value, a side equal to the base yields the other side. A path
-/// both sides moved off the base needs a content merge, which is not available
-/// here (see the module note) and is refused instead of guessed.
-fn merge_trivially(base: &Flat, ours: &Flat, theirs: &Flat, target: ObjectId) -> Result<Flat> {
-    let mut paths: Vec<&BString> = base.keys().chain(ours.keys()).chain(theirs.keys()).collect();
-    paths.sort();
-    paths.dedup();
-
-    let mut out = Flat::new();
-    let mut conflicts: Vec<&BString> = Vec::new();
-    for p in paths {
-        let (b, o, t) = (base.get(p), ours.get(p), theirs.get(p));
-        let resolved = if o == t {
-            o
-        } else if o == b {
-            t
-        } else if t == b {
-            o
-        } else {
-            conflicts.push(p);
-            continue;
-        };
-        if let Some(v) = resolved {
-            out.insert(p.clone(), *v);
-        }
-    }
-    if !conflicts.is_empty() {
-        let list: Vec<String> = conflicts.iter().map(|p| p.to_string()).collect();
-        bail!(
-            "reverting {target} needs a content-level merge for {} (gix-merge is not linked in this build; only trivial three-way resolutions are ported)",
-            list.join(", ")
-        );
-    }
-    Ok(out)
-}
-
 /// Write a flattened tree back into the object database.
 fn write_tree(repo: &gix::Repository, flat: &Flat) -> Result<ObjectId> {
     let mut editor =
@@ -1002,9 +1059,9 @@ fn apply(
     changed: &HashSet<BString>,
     merged_tree: ObjectId,
     merged: &Flat,
-) -> Result<()> {
+) -> Result<gix::index::File> {
     if changed.is_empty() {
-        return Ok(());
+        return Ok(repo.index_or_load_from_head()?.into_owned());
     }
     let workdir = repo
         .workdir()
@@ -1076,7 +1133,7 @@ fn apply(
     index.sort_entries();
     index.remove_tree();
     index.write(Default::default())?;
-    Ok(())
+    Ok(index)
 }
 
 /// Build the revert commit message exactly as `sequencer_format_revert_message`

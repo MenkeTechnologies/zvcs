@@ -12,14 +12,18 @@
 //!   * `git restore --merge [--conflict=<style>] ...` worktree ← recreated conflict
 //!   * `git restore --overlay ...`                    keep target files absent in source
 //!   * `git restore --pathspec-from-file=<f> ...`     read pathspecs from a file/stdin
+//!   * `git restore --recurse-submodules <pathspec>`  also restore matched submodule worktrees
 //!
 //! The default restore source is the index for `--worktree`, and `HEAD` when
 //! `--staged` is given (either alone or combined). Restore is no-overlay by
 //! default: a path present in the target but not the source is removed; with
 //! `--overlay` such files are kept. `--ours`/`--theirs` pick the stage-2/stage-3
 //! blob of an unmerged path; `--merge`/`--conflict` recreate the 3-way conflict
-//! (with markers) in the worktree. Interactive `--patch` and submodule recursion
-//! stay unimplemented (no non-interactive semantics / no submodule checkout here).
+//! (with markers) in the worktree. With `--recurse-submodules`, any matched,
+//! active submodule whose gitlink appears in the restore source has its worktree
+//! reset to the recorded commit (local modifications overwritten, submodule HEAD
+//! detached), matching git-restore(1). Interactive `--patch` stays unimplemented
+//! (no non-interactive hunk-selection semantics here).
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -33,6 +37,8 @@ use gix::diff::blob::{Algorithm, InternedInput};
 use gix::hash::ObjectId;
 use gix::index::entry::{Flags, Mode, Stat};
 use gix::merge::blob::builtin_driver::text::{Conflict, ConflictStyle, Labels, Options};
+use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+use gix::refs::Target;
 
 /// True if `path` matches any of the (repo-root-relative, slash-separated)
 /// pathspecs. A spec matches its own exact path, or any path under it as a
@@ -138,6 +144,108 @@ fn three_way_merge(
     Ok(out)
 }
 
+/// Reset a submodule's worktree to `commit`, overwriting local modifications,
+/// and detach its `HEAD` there — the behavior `git restore --recurse-submodules`
+/// applies to each matched active submodule (git-restore(1), `submodule_move_head`
+/// in git's `builtin/checkout.c`).
+///
+/// The recorded commit is peeled to its tree, unpacked into an index, and checked
+/// out over the existing worktree with overwrite; files tracked before but absent
+/// in the target tree are deleted, the submodule index is rewritten with fresh
+/// stats, and `HEAD` is repointed to the detached commit.
+fn restore_submodule_worktree(
+    sm_repo: &gix::Repository,
+    commit: ObjectId,
+    should_interrupt: &AtomicBool,
+) -> Result<()> {
+    let sm_workdir = match sm_repo.workdir() {
+        Some(w) => w.to_owned(),
+        // A bare submodule checkout has no worktree to restore.
+        None => return Ok(()),
+    };
+    let tree_id = sm_repo.find_object(commit)?.peel_to_tree()?.id;
+
+    // Target index (all target-tree entries) — the write target and deletion set.
+    let mut target_index = sm_repo.index_from_tree(&tree_id)?;
+    let new_paths: HashSet<BString> = {
+        let b = target_index.path_backing();
+        target_index.entries().iter().map(|e| e.path_in(b).to_owned()).collect()
+    };
+
+    // Files tracked in the submodule's current index but gone from the target.
+    let old_paths: Vec<BString> = match sm_repo.open_index() {
+        Ok(idx) => {
+            let b = idx.path_backing();
+            idx.entries().iter().map(|e| e.path_in(b).to_owned()).collect()
+        }
+        Err(_) => Vec::new(),
+    };
+
+    // Check out the full target index over the existing worktree (a separate copy
+    // is passed since `checkout` takes the index's path backing out).
+    let mut subset = target_index.clone();
+    let mut opts =
+        sm_repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
+    opts.destination_is_initially_empty = false;
+    opts.overwrite_existing = true;
+    let odb = sm_repo.objects.clone().into_arc()?;
+    let discard_files = gix::progress::Discard;
+    let discard_bytes = gix::progress::Discard;
+    crate::worktree::checkout_subset(
+        &mut subset,
+        sm_workdir.as_path(),
+        odb,
+        &discard_files,
+        &discard_bytes,
+        should_interrupt,
+        opts,
+    )?;
+
+    // Remove files that the target tree no longer tracks.
+    for p in &old_paths {
+        if !new_paths.contains(p) {
+            if let Some(full) = sm_repo.workdir_path(BStr::new(p)) {
+                let _ = std::fs::remove_file(full);
+            }
+        }
+    }
+
+    // Copy the fresh checkout stats into the target index before persisting it.
+    let mut fresh: HashMap<BString, Stat> = HashMap::with_capacity(subset.entries().len());
+    {
+        let b = subset.path_backing();
+        for e in subset.entries() {
+            fresh.insert(e.path_in(b).to_owned(), e.stat);
+        }
+    }
+    {
+        let b = target_index.path_backing().to_owned();
+        for e in target_index.entries_mut() {
+            if let Some(stat) = fresh.get(&e.path_in(&b).to_owned()) {
+                e.stat = *stat;
+            }
+        }
+    }
+    target_index.remove_tree();
+    target_index.write(gix::index::write::Options::default())?;
+
+    // Detach the submodule HEAD at the restored commit (git detaches here).
+    sm_repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: format!("restore: moving to {commit}").into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(commit),
+        },
+        name: "HEAD".try_into().map_err(|e| anyhow!("invalid ref name HEAD: {e}"))?,
+        deref: false,
+    })?;
+    Ok(())
+}
+
 pub fn restore(args: &[String]) -> Result<ExitCode> {
     // --- Argument parsing ---------------------------------------------------
     let mut staged = false;
@@ -153,6 +261,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     let mut ignore_unmerged = false;
     let mut pathspec_from_file: Option<String> = None;
     let mut pathspec_file_nul = false;
+    let mut recurse_submodules = false;
 
     // Parse a `--conflict` style value; git errors with exit 129 on unknown.
     let parse_conflict = |v: &str| -> Option<ConflictStyle> {
@@ -226,13 +335,14 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             }
             // Accepted no-ops: quiet/progress/default no-recurse/diff-context knobs
             // (context knobs only affect interactive `--patch`, unsupported here).
-            "-q" | "--quiet" | "--progress" | "--no-progress" | "--no-recurse-submodules"
+            "-q" | "--quiet" | "--progress" | "--no-progress"
             | "--ignore-skip-worktree-bits" | "--no-ignore-skip-worktree-bits" => {}
             "-U" | "--unified" | "--inter-hunk-context" => {
                 i += 1;
             }
             "-p" | "--patch" => bail!("interactive patch mode (-p/--patch) is not supported"),
-            "--recurse-submodules" => bail!("--recurse-submodules is not supported"),
+            "--recurse-submodules" => recurse_submodules = true,
+            "--no-recurse-submodules" => recurse_submodules = false,
             s if s.starts_with("--source=") => source = Some(s["--source=".len()..].to_string()),
             s if s.starts_with("--conflict=") => {
                 let v = &s["--conflict=".len()..];
@@ -599,6 +709,38 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         for path in &resolved_remove {
             if let Some(full) = repo.workdir_path(BStr::new(path)) {
                 let _ = std::fs::remove_file(full);
+            }
+        }
+
+        // --- Recurse into matched submodules --------------------------------
+        // git-restore(1): when the restore location includes the working tree
+        // and `--recurse-submodules` is given, every matched *active* submodule
+        // has its worktree reset to the commit recorded in the superproject
+        // (the restore source), overwriting local modifications and detaching
+        // the submodule HEAD. Without the flag submodule worktrees are left
+        // untouched. A submodule whose gitlink is absent from the source, is
+        // inactive, or is uninitialized (no checked-out repo) is skipped.
+        if recurse_submodules {
+            if let Some(subs) = repo.submodules()? {
+                for sm in subs {
+                    let sm_path = sm.path()?;
+                    if !path_matches(BStr::new(&sm_path), match_all, &specs_bytes) {
+                        continue;
+                    }
+                    // Target commit = the gitlink recorded in the restore source.
+                    let target = match source_map.get(&sm_path) {
+                        Some((id, _, _, _)) => *id,
+                        None => continue,
+                    };
+                    if !sm.is_active().unwrap_or(false) {
+                        continue;
+                    }
+                    let sm_repo = match sm.open()? {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    restore_submodule_worktree(&sm_repo, target, &should_interrupt)?;
+                }
             }
         }
     }

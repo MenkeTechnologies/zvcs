@@ -1,8 +1,9 @@
 use anyhow::{bail, Result};
 use std::io::Write;
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use gix::bstr::BStr;
+use gix::bstr::{BStr, ByteSlice};
 use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
 use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, InternedInput, UnifiedDiff};
 use gix::hash::ObjectId;
@@ -62,6 +63,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut formats = Formats::default();
     let mut pretty = Pretty::Medium;
     let mut after_dashdash = false;
+    // Display config shared with `git log`, overridable on the command line. The
+    // config defaults are resolved after the repo is discovered; these hold the
+    // CLI overrides in the meantime (`None` = fall back to config).
+    let mut cli_abbrev: Option<bool> = None;
+    let mut cli_date: Option<DateMode> = None;
+    let mut force_root = false;
 
     for a in args {
         let s = a.as_str();
@@ -81,10 +88,20 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             "--raw" => formats.raw = true,
             "--stat" => formats.stat = true,
             "--oneline" => pretty = Pretty::Oneline,
+            // `log.abbrevCommit`/`log.date`/`log.showRoot` overrides, mirroring
+            // `git log`. There is no `--no-root`; `--root` only forces it on.
+            "--abbrev-commit" => cli_abbrev = Some(true),
+            "--no-abbrev-commit" => cli_abbrev = Some(false),
+            "--root" => force_root = true,
             // We never colorize; accept the flags that request no/auto color.
             "--no-color" | "--color=never" | "--color=auto" => {}
             _ => {
-                if let Some(spec) = s
+                if let Some(v) = s.strip_prefix("--date=") {
+                    match parse_date_mode(v) {
+                        Some(m) => cli_date = Some(m),
+                        None => return Ok(fatal(&format!("unknown date format {v}\n"))),
+                    }
+                } else if let Some(spec) = s
                     .strip_prefix("--format=")
                     .or_else(|| s.strip_prefix("--pretty="))
                 {
@@ -113,6 +130,34 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
 
     let repo = gix::discover(".")?;
     let hex_len = repo.object_hash().len_in_hex();
+
+    // Config supplies the defaults for the display knobs `git show` shares with
+    // `git log`; the CLI flags parsed above win where present. git reads these in
+    // `git_log_config` and validates `log.date` there — an invalid value is fatal
+    // even when `--date` later overrides it, so it is checked unconditionally.
+    let (abbrev_commit, date_mode, show_root) = {
+        let snap = repo.config_snapshot();
+        let cfg_abbrev = snap.boolean("log.abbrevCommit").unwrap_or(false);
+        // `log.showRoot` defaults to true: a root commit is shown as a creation
+        // event (its diff against the empty tree). `--root` forces it on; there is
+        // no `--no-root`, so config is the only way to suppress the root diff.
+        let cfg_show_root = snap.boolean("log.showRoot").unwrap_or(true);
+        let cfg_date = match snap.string("log.date") {
+            Some(v) => {
+                let v = v.to_str_lossy();
+                match parse_date_mode(&v) {
+                    Some(m) => m,
+                    None => return Ok(fatal(&format!("unknown date format {v}\n"))),
+                }
+            }
+            None => DateMode::Default,
+        };
+        (
+            cli_abbrev.unwrap_or(cfg_abbrev),
+            cli_date.unwrap_or(cfg_date),
+            force_root || cfg_show_root,
+        )
+    };
 
     // git resolves every revision before rendering anything, so a bad revision
     // produces no stdout at all even when an earlier one was fine. Ranges (`a..b`),
@@ -178,11 +223,13 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         let walk = repo.rev_walk(walk_tips).with_hidden(walk_hidden).all()?;
         for info in walk {
             let id = info?.id;
-            show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &pathspecs, &mut shown)?;
+            let disp = DisplayOpts { abbrev_commit, date_mode, show_root };
+            show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &pathspecs, &disp, &mut shown)?;
         }
     } else {
         for (spec, id) in &plain {
-            show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &mut shown)?;
+            let disp = DisplayOpts { abbrev_commit, date_mode, show_root };
+            show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &disp, &mut shown)?;
         }
     }
 
@@ -403,6 +450,19 @@ impl Formats {
 // Object rendering
 // ---------------------------------------------------------------------------
 
+/// The display knobs `git show` shares with `git log`, resolved once from config
+/// and the command line.
+#[derive(Clone, Copy)]
+struct DisplayOpts {
+    /// `log.abbrevCommit` / `--abbrev-commit`: abbreviate the `commit <id>` line.
+    abbrev_commit: bool,
+    /// `log.date` / `--date=<mode>`: the format of the `Date:` line.
+    date_mode: DateMode,
+    /// `log.showRoot` / `--root`: whether a root commit's diff against the empty
+    /// tree is shown (default true).
+    show_root: bool,
+}
+
 /// Render the object `id` (named `spec` on the command line), peeling annotated
 /// tags to their target after printing the tag header.
 fn show_one(
@@ -413,6 +473,7 @@ fn show_one(
     pretty: &Pretty,
     selection: Selection,
     pathspecs: &[Vec<u8>],
+    disp: &DisplayOpts,
     shown: &mut Vec<ObjectId>,
 ) -> Result<()> {
     let mut obj = repo.find_object(id)?;
@@ -433,11 +494,11 @@ fn show_one(
                 }
                 shown.push(obj.id);
                 let commit = obj.try_into_commit()?;
-                show_commit(repo, out, &commit, pretty, selection, pathspecs)?;
+                show_commit(repo, out, &commit, pretty, selection, pathspecs, disp)?;
                 break;
             }
             Kind::Tag => {
-                let target = show_tag(out, &obj)?;
+                let target = show_tag(out, &obj, disp.date_mode)?;
                 obj = repo.find_object(target)?;
             }
         }
@@ -464,7 +525,7 @@ fn show_tree(out: &mut Vec<u8>, obj: &gix::Object<'_>, name: &str) -> Result<()>
 
 /// Annotated-tag header. Returns the id of the object the tag points to so the
 /// caller can continue rendering the target.
-fn show_tag(out: &mut Vec<u8>, obj: &gix::Object<'_>) -> Result<ObjectId> {
+fn show_tag(out: &mut Vec<u8>, obj: &gix::Object<'_>, date_mode: DateMode) -> Result<ObjectId> {
     let tag = obj.try_to_tag_ref()?;
 
     out.extend_from_slice(b"tag ");
@@ -477,7 +538,8 @@ fn show_tag(out: &mut Vec<u8>, obj: &gix::Object<'_>) -> Result<ObjectId> {
         out.extend_from_slice(b" <");
         out.extend_from_slice(tagger.email);
         out.extend_from_slice(b">\n");
-        let date = tagger.time()?.format(gix::date::time::format::DEFAULT)?;
+        let t = tagger.time()?;
+        let date = format_date(t.seconds, t.offset, date_mode);
         writeln!(out, "Date:   {date}")?;
     }
 
@@ -501,6 +563,7 @@ fn show_commit(
     pretty: &Pretty,
     selection: Selection,
     pathspecs: &[Vec<u8>],
+    disp: &DisplayOpts,
 ) -> Result<()> {
     let parents: Vec<_> = commit.parent_ids().collect();
     let is_merge = parents.len() > 1;
@@ -524,7 +587,13 @@ fn show_commit(
             }
         }
         Pretty::Medium => {
-            writeln!(out, "commit {}", commit.id())?;
+            // `log.abbrevCommit`/`--abbrev-commit` shortens the `commit` line; the
+            // `Merge:` parents are always abbreviated, as in git.
+            if disp.abbrev_commit {
+                writeln!(out, "commit {}", commit.id().shorten_or_id())?;
+            } else {
+                writeln!(out, "commit {}", commit.id())?;
+            }
             if is_merge {
                 out.extend_from_slice(b"Merge:");
                 for p in &parents {
@@ -540,7 +609,8 @@ fn show_commit(
             out.extend_from_slice(b" <");
             out.extend_from_slice(author.email);
             out.extend_from_slice(b">\n");
-            let date = author.time()?.format(gix::date::time::format::DEFAULT)?;
+            let t = author.time()?;
+            let date = format_date(t.seconds, t.offset, disp.date_mode);
             writeln!(out, "Date:   {date}")?;
             out.push(b'\n');
 
@@ -556,6 +626,12 @@ fn show_commit(
     }
 
     if selection == Selection::Disabled {
+        return Ok(());
+    }
+
+    // `log.showRoot=false` (with no `--root`) suppresses a root commit's diff
+    // against the empty tree: the header prints, but no separator and no diff.
+    if parents.is_empty() && !disp.show_root {
         return Ok(());
     }
 
@@ -1296,4 +1372,202 @@ fn trim_end_ws(mut s: &[u8]) -> &[u8] {
         }
     }
     s
+}
+
+// ---------------------------------------------------------------------------
+// Dates (shared with `git log`; see log.rs for the same machinery)
+// ---------------------------------------------------------------------------
+
+/// The `log.date` / `--date=<mode>` output modes rendered byte-for-byte, plus
+/// `relative`, measured against the current wall clock. The remaining zone- or
+/// process-time-dependent modes (`human`, `local`) are rejected rather than faked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DateMode {
+    /// git's `DATE_NORMAL`: `Www Mmm D HH:MM:SS YYYY +ZZZZ`.
+    Default,
+    /// `short`: `YYYY-MM-DD`.
+    Short,
+    /// `iso`/`iso8601`: `YYYY-MM-DD HH:MM:SS +ZZZZ`.
+    Iso,
+    /// `iso-strict`/`iso8601-strict`: `YYYY-MM-DDTHH:MM:SS+ZZ:ZZ`.
+    IsoStrict,
+    /// `rfc`/`rfc2822`: `Www, D Mmm YYYY HH:MM:SS +ZZZZ`.
+    Rfc,
+    /// `unix`: the raw epoch seconds, no timezone.
+    Unix,
+    /// `raw`: `<seconds> +ZZZZ`.
+    Raw,
+    /// `relative`: `N <unit> ago`, measured against the current time.
+    Relative,
+}
+
+/// Map a `log.date` / `--date=` value to a [`DateMode`]. `None` for a value git
+/// accepts but renders time/zone-dependently (surfaced terse) or does not know.
+fn parse_date_mode(spec: &str) -> Option<DateMode> {
+    Some(match spec {
+        "default" | "normal" => DateMode::Default,
+        "short" => DateMode::Short,
+        "iso" | "iso8601" => DateMode::Iso,
+        "iso-strict" | "iso8601-strict" => DateMode::IsoStrict,
+        "rfc" | "rfc2822" => DateMode::Rfc,
+        "unix" => DateMode::Unix,
+        "raw" => DateMode::Raw,
+        "relative" => DateMode::Relative,
+        _ => return None,
+    })
+}
+
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Format a timestamp in the requested [`DateMode`], matching git byte-for-byte.
+fn format_date(seconds: i64, offset: i32, mode: DateMode) -> String {
+    match mode {
+        DateMode::Default => format_git_date(seconds, offset),
+        DateMode::Relative => format_relative(seconds, now_secs()),
+        DateMode::Unix => format!("{seconds}"),
+        DateMode::Raw => {
+            let (sign, off) = if offset < 0 { ('-', -offset) } else { ('+', offset) };
+            format!("{seconds} {sign}{:02}{:02}", off / 3600, (off % 3600) / 60)
+        }
+        DateMode::Short | DateMode::Iso | DateMode::IsoStrict | DateMode::Rfc => {
+            let local = seconds + offset as i64;
+            let days = local.div_euclid(86_400);
+            let secs = local.rem_euclid(86_400);
+            let (hour, min, sec) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+            let weekday = ((days.rem_euclid(7)) + 4).rem_euclid(7) as usize;
+            let (year, month, day) = civil_from_days(days);
+            let (sign, off) = if offset < 0 { ('-', -offset) } else { ('+', offset) };
+            let (oh, om) = (off / 3600, (off % 3600) / 60);
+            match mode {
+                DateMode::Short => format!("{year}-{month:02}-{day:02}"),
+                DateMode::Iso => format!(
+                    "{year}-{month:02}-{day:02} {hour:02}:{min:02}:{sec:02} {sign}{oh:02}{om:02}"
+                ),
+                DateMode::IsoStrict => {
+                    // git's `iso-strict` renders a zero (UTC) offset as `Z`, not
+                    // `+00:00`; a non-zero offset uses the `±HH:MM` form.
+                    let zone = if offset == 0 {
+                        "Z".to_string()
+                    } else {
+                        format!("{sign}{oh:02}:{om:02}")
+                    };
+                    format!("{year}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}{zone}")
+                }
+                DateMode::Rfc => format!(
+                    "{}, {day} {} {year} {hour:02}:{min:02}:{sec:02} {sign}{oh:02}{om:02}",
+                    WEEKDAYS[weekday],
+                    MONTHS[(month - 1) as usize],
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+/// git's default (`DATE_NORMAL`) commit-time rendering: `Www Mmm D HH:MM:SS YYYY
+/// +ZZZZ` in the commit's own timezone. The day is an unpadded decimal (git's
+/// `%d`), matching a single-digit day to one space — unlike a `%e`-style pad.
+fn format_git_date(seconds: i64, offset: i32) -> String {
+    let local = seconds + offset as i64;
+    let days = local.div_euclid(86_400);
+    let secs = local.rem_euclid(86_400);
+    let (hour, min, sec) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    // 1970-01-01 (day 0) was a Thursday, index 4 with Sunday = 0.
+    let weekday = ((days.rem_euclid(7)) + 4).rem_euclid(7) as usize;
+    let (year, month, day) = civil_from_days(days);
+    let (sign, off) = if offset < 0 { ('-', -offset) } else { ('+', offset) };
+    let (off_h, off_m) = (off / 3600, (off % 3600) / 60);
+    format!(
+        "{} {} {} {:02}:{:02}:{:02} {} {}{:02}{:02}",
+        WEEKDAYS[weekday],
+        MONTHS[(month - 1) as usize],
+        day,
+        hour,
+        min,
+        sec,
+        year,
+        sign,
+        off_h,
+        off_m,
+    )
+}
+
+/// Convert a day count since the Unix epoch into a civil `(year, month, day)`,
+/// month and day 1-based (Howard Hinnant's `civil_from_days`).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if month <= 2 { year + 1 } else { year }, month as u32, day)
+}
+
+/// Current time in epoch seconds, for relative dates.
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// git's `show_date_relative`: render `then` as "N units ago" relative to `now`,
+/// with the same unit thresholds and rounding.
+fn format_relative(then: i64, now: i64) -> String {
+    if now < then {
+        return "in the future".to_string();
+    }
+    let mut diff = (now - then) as u64;
+    if diff < 90 {
+        return unit_ago(diff, "second");
+    }
+    diff = (diff + 30) / 60; // minutes
+    if diff < 90 {
+        return unit_ago(diff, "minute");
+    }
+    diff = (diff + 30) / 60; // hours
+    if diff < 36 {
+        return unit_ago(diff, "hour");
+    }
+    diff = (diff + 12) / 24; // days
+    if diff < 14 {
+        return unit_ago(diff, "day");
+    }
+    if diff < 70 {
+        return unit_ago((diff + 3) / 7, "week");
+    }
+    if diff < 365 {
+        return unit_ago((diff + 15) / 30, "month");
+    }
+    if diff < 1825 {
+        let totalmonths = diff * 12 * 10 / 365;
+        let years = totalmonths / 120;
+        let months = (totalmonths % 120) / 10;
+        if months > 0 {
+            return format!("{}, {} ago", unit(years, "year"), unit(months, "month"));
+        }
+        return unit_ago(years, "year");
+    }
+    unit_ago((diff + 183) / 365, "year")
+}
+
+/// `"N unit ago"` / `"N units ago"` with git's singular/plural rule.
+fn unit_ago(n: u64, name: &str) -> String {
+    format!("{} ago", unit(n, name))
+}
+
+/// `"1 unit"` or `"N units"`.
+fn unit(n: u64, name: &str) -> String {
+    if n == 1 {
+        format!("1 {name}")
+    } else {
+        format!("{n} {name}s")
+    }
 }

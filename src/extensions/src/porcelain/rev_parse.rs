@@ -22,11 +22,15 @@
 //! stock git's left-to-right emission.
 //!
 //! Implemented: `--verify`, `-q`/`--quiet`, `--short[=n]`, `--abbrev-ref`,
-//! `--symbolic`, `--symbolic-full-name`, `--git-dir`, `--show-toplevel`,
-//! `--is-inside-work-tree`, `--is-bare-repository`, `--all`, `--branches`,
-//! `--tags`, plus revision and path arguments. Every other option stock git
-//! recognizes is rejected rather than ignored; options git does *not* recognize
-//! are echoed, which is what git itself does with them.
+//! `--symbolic`, `--symbolic-full-name`, `--git-dir`, `--absolute-git-dir`,
+//! `--git-common-dir`, `--show-toplevel`, `--is-inside-work-tree`,
+//! `--is-inside-git-dir`, `--is-bare-repository`, `--is-shallow-repository`,
+//! `--show-cdup`, `--show-prefix`, `--show-object-format`, `--show-ref-format`,
+//! `--all`, `--branches`, `--tags`, `--remotes[=<pattern>]`, `--glob=<pattern>`,
+//! `--exclude=<pattern>`, `--disambiguate=<prefix>`, `--sq-quote`, plus revision
+//! and path arguments. Every other option stock git recognizes is rejected
+//! rather than ignored; options git does *not* recognize are echoed, which is
+//! what git itself does with them.
 
 use anyhow::Result;
 use std::io::Write;

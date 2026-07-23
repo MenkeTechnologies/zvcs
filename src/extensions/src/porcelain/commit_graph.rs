@@ -19,6 +19,13 @@
 //!   set writes no file and exits 0, and a successful non-split write removes
 //!   any existing split chain.
 //!
+//! `commitGraph.generationVersion` selects the generation-number version, as in
+//! git: value 2 (git's default, and the value used when the key is unset) writes
+//! the corrected-commit-date `GDA2` chunk (plus `GDO2` on overflow); any other
+//! value — 0, 1, 3, negatives — keeps only the topological level already stored
+//! in the `CDAT` generation bits and omits the corrected-date chunks. git gates
+//! this on the value being exactly 2, and a non-numeric value is fatal.
+//!
 //! The vendored `gix-commitgraph` is read-only (`src/{init,access,verify}.rs`,
 //! `src/file/`), so the serializer here is written against git's
 //! `commit-graph-format.txt` layout and validated against files produced by
@@ -211,6 +218,35 @@ fn fatal(msg: &str) -> ExitCode {
 fn error_exit(msg: &str) -> ExitCode {
     eprintln!("error: {msg}");
     ExitCode::from(1)
+}
+
+/// git's `config_error_nonbool`/`git_config_int` shape for a numeric config
+/// value that will not parse: `fatal: bad numeric config value '<raw>' for
+/// '<lowercased-key>': <reason>`, exit 128. git reports `out of range` when the
+/// magnitude overflows and `invalid unit` otherwise.
+fn bad_numeric_config(raw: &str, lowercased_key: &str) -> ExitCode {
+    let reason = if is_overflowing_integer(raw) {
+        "out of range"
+    } else {
+        "invalid unit"
+    };
+    fatal(&format!(
+        "bad numeric config value '{raw}' for '{lowercased_key}': {reason}"
+    ))
+}
+
+/// Whether `raw` is syntactically an integer (optional sign, digits, optional
+/// single `k`/`m`/`g`/`t` scale suffix) whose value cannot fit — the only way a
+/// well-formed integer still fails to parse, which git reports as `out of range`.
+fn is_overflowing_integer(raw: &str) -> bool {
+    let digits = match raw.as_bytes().last() {
+        Some(c) if matches!(c.to_ascii_lowercase(), b'k' | b'm' | b'g' | b't') => {
+            &raw[..raw.len() - 1]
+        }
+        _ => raw,
+    };
+    let digits = digits.strip_prefix(['+', '-']).unwrap_or(digits);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Split `--name=value`, returning the value when `arg` names `name`.
@@ -500,6 +536,29 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
     }
 
     let repo = gix::discover(".")?;
+
+    // `commitGraph.generationVersion` selects the generation-number version.
+    // Version 2 (git's default) additionally records the corrected commit date
+    // in the `GDA2` chunk (and `GDO2` on overflow); version 1 stores only the
+    // topological level, which already lives in the `CDAT` generation bits, so
+    // the corrected-date chunks are omitted. git gates this on the value being
+    // exactly 2: 0, 1, 3 and negatives all drop the chunk, an absent key means
+    // 2, and a non-numeric value is fatal.
+    let write_generation_data = match repo
+        .config_snapshot()
+        .try_integer("commitGraph.generationVersion")
+    {
+        Ok(v) => v.unwrap_or(2) == 2,
+        Err(_) => {
+            let raw = repo
+                .config_snapshot()
+                .string("commitGraph.generationVersion")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            return Ok(bad_numeric_config(&raw, "commitgraph.generationversion"));
+        }
+    };
+
     let objects = match object_directory(&repo, object_dir.as_deref()) {
         Ok(p) => p,
         Err(code) => return Ok(code),
@@ -539,7 +598,7 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         return Ok(ExitCode::SUCCESS);
     }
 
-    let bytes = match serialize(repo.object_hash(), &entries) {
+    let bytes = match serialize(repo.object_hash(), &entries, write_generation_data) {
         Ok(b) => b,
         Err(code) => return Ok(code),
     };
@@ -725,6 +784,7 @@ fn close_over_ancestors(
 fn serialize(
     hash: gix::hash::Kind,
     entries: &[Entry],
+    write_generation_data: bool,
 ) -> std::result::Result<Vec<u8>, ExitCode> {
     let hash_len = hash.len_in_bytes();
     let n = entries.len();
@@ -830,26 +890,36 @@ fn serialize(
         cdat.extend_from_slice(&word.to_be_bytes());
     }
 
-    let mut gda2 = Vec::with_capacity(n * 4);
-    let mut gdo2: Vec<u8> = Vec::new();
-    for (idx, e) in entries.iter().enumerate() {
-        let offset = corrected[idx].saturating_sub(e.time);
-        if offset > OFFSET_MAX {
-            let slot = (gdo2.len() / 8) as u32;
-            gdo2.extend_from_slice(&offset.to_be_bytes());
-            gda2.extend_from_slice(&(slot | OFFSET_OVERFLOW_MASK).to_be_bytes());
-        } else {
-            gda2.extend_from_slice(&(offset as u32).to_be_bytes());
+    // The corrected-date chunks are only emitted under generation-number
+    // version 2; version 1 keeps the topological level in `CDAT` and writes no
+    // `GDA2`/`GDO2`, so their construction is skipped entirely.
+    let (gda2, gdo2) = if write_generation_data {
+        let mut gda2 = Vec::with_capacity(n * 4);
+        let mut gdo2: Vec<u8> = Vec::new();
+        for (idx, e) in entries.iter().enumerate() {
+            let offset = corrected[idx].saturating_sub(e.time);
+            if offset > OFFSET_MAX {
+                let slot = (gdo2.len() / 8) as u32;
+                gdo2.extend_from_slice(&offset.to_be_bytes());
+                gda2.extend_from_slice(&(slot | OFFSET_OVERFLOW_MASK).to_be_bytes());
+            } else {
+                gda2.extend_from_slice(&(offset as u32).to_be_bytes());
+            }
         }
-    }
+        (Some(gda2), gdo2)
+    } else {
+        (None, Vec::new())
+    };
 
     // git's chunk order: OIDF, OIDL, CDAT, GDA2, GDO2, EDGE.
     let mut chunks: Vec<(&[u8; 4], Vec<u8>)> = vec![
         (b"OIDF", oidf),
         (b"OIDL", oidl),
         (b"CDAT", cdat),
-        (b"GDA2", gda2),
     ];
+    if let Some(gda2) = gda2 {
+        chunks.push((b"GDA2", gda2));
+    }
     if !gdo2.is_empty() {
         chunks.push((b"GDO2", gdo2));
     }

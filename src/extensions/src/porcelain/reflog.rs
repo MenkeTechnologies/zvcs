@@ -66,6 +66,15 @@ use regex::bytes::{Regex, RegexBuilder};
 /// to date form, as git does. `local` re-anchors the entry's timestamp to the zone
 /// named by `$TZ` (or `/etc/localtime`), read straight out of the TZif database.
 ///
+/// `log.date` supplies the default *field* date format — the one used for the
+/// `%ad`/`%cd` placeholders and the `Date:`/`AuthorDate:`/`CommitDate:` header
+/// lines — which `--date=` then overrides. It never changes the reflog selector
+/// column (that stays in count form unless an explicit `--date=` or a `@{<date>}`
+/// argument switches it), and git validates it before argv, so an unknown value is
+/// fatal ahead of any option or revision error. Its `relative`, `human` and
+/// `format:...` modes are deferred exactly like `--date`'s: the command still
+/// succeeds whenever nothing renders a field date.
+///
 /// Filtering: `--merges`, `--no-merges` (by parent count of the entry's commit).
 /// `--since=`/`--after=` and `--until=`/`--before=` keep entries by their own
 /// reflog timestamp — the instant the ref was updated, which is what git's `-g`
@@ -311,6 +320,17 @@ struct Opts {
     abbrev: Abbrev,
     /// Set by `--date=<fmt>`.
     date: Option<DateFormat>,
+    /// `log.date`: the default field date format for `%ad`/`%cd` and the
+    /// `Date:`/`AuthorDate:`/`CommitDate:` header lines, used when no `--date=`
+    /// overrides it. It never touches the reflog selector column, which stays in
+    /// count form unless an explicit `--date=` or a `@{<date>}` argument switches
+    /// it to date form.
+    log_date: Option<DateFormat>,
+    /// A recognized but unrenderable `log.date` mode (`relative`/`human`/
+    /// `format:...`). Deferred like the other unimplemented options: it only fails
+    /// when an entry is actually printed in a format that renders a field date,
+    /// and only when no `--date=` overrode it.
+    log_date_unsupported: Option<String>,
     /// The output layout: `--oneline` (git's default for reflog), a `--format=`/
     /// `--pretty=<placeholders>` string, or a built-in multi-line format.
     out: OutFmt,
@@ -467,6 +487,8 @@ impl Default for Opts {
             skip: 0,
             abbrev: Abbrev::Auto,
             date: None,
+            log_date: None,
+            log_date_unsupported: None,
             out: OutFmt::Oneline,
             grep: None,
             parents: false,
@@ -626,6 +648,27 @@ fn show(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
             .unwrap_or(true),
         ..Opts::default()
     };
+
+    // git validates `log.date` in its log-config callback, which runs before the
+    // argument scan, so an unknown value is fatal ahead of any option or revision
+    // error (verified against git 2.55.0). An empty value is unknown too, where
+    // `parse_date_mode("")` would otherwise accept it as the default layout.
+    if let Some(raw) = repo.config_snapshot().string("log.date") {
+        let value = raw.to_str_lossy().into_owned();
+        match if value.is_empty() {
+            DateMode::Unknown
+        } else {
+            parse_date_mode(&value)
+        } {
+            DateMode::Known(f) => opts.log_date = Some(f),
+            DateMode::Unimplemented => opts.log_date_unsupported = Some(value),
+            DateMode::Unknown => {
+                eprintln!("fatal: unknown date format {value}");
+                return Ok(ExitCode::from(128));
+            }
+        }
+    }
+
     let mut sections: Vec<Section> = Vec::new();
     let mut excludes: Vec<String> = Vec::new();
     // Whether argv named any reflog to read; if not, `show` defaults to HEAD.
@@ -947,7 +990,12 @@ fn render(
     unimplemented: &Option<String>,
 ) -> Result<ExitCode> {
     let fallback_len = abbrev_len(repo, full_hex);
-    let field_fmt: DateFormat = opts.date.unwrap_or_else(|| DateFormat::plain(tfmt::DEFAULT));
+    // The field date format (`%ad`/`%cd`, the `Date:` header lines): an explicit
+    // `--date=` wins, then `log.date`, then git's default layout.
+    let field_fmt: DateFormat = opts
+        .date
+        .or(opts.log_date)
+        .unwrap_or_else(|| DateFormat::plain(tfmt::DEFAULT));
 
     let mut skipped = 0usize;
     let mut printed = 0usize;
@@ -1017,6 +1065,17 @@ fn render(
             // output is impossible now — fail rather than print a wrong answer.
             if let Some(what) = unimplemented {
                 bail!("`reflog show {what}` is not ported");
+            }
+            // An unrenderable `log.date` mode only matters once an entry is about
+            // to print in a format that renders a field date, and only when no
+            // `--date=` overrode it (git validated the value itself at startup).
+            if let Some(value) = &opts.log_date_unsupported {
+                if opts.date.is_none() && renders_field_date(&opts.out) {
+                    bail!(
+                        "`reflog show` with log.date={value} is not ported: it needs the \
+                         current time or a strftime user format, which gix-date does not expose"
+                    );
+                }
             }
             let selector = match selector_fmt {
                 Some(f) => f.render(entry.time),
@@ -1573,6 +1632,47 @@ fn unsupported_placeholder(fmt: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether the selected output renders a field date — the `%ad`/`%cd` placeholders
+/// or the `Date:`/`AuthorDate:`/`CommitDate:` header lines. That is the only place
+/// `log.date` takes effect: the reflog selector, the `reference` short-date and the
+/// `raw` verbatim times are all independent of it (verified against git 2.55.0).
+fn renders_field_date(out: &OutFmt) -> bool {
+    match out {
+        OutFmt::Oneline => false,
+        OutFmt::Builtin(b) => matches!(b, Builtin::Medium | Builtin::Fuller),
+        OutFmt::Custom(fmt) => custom_has_field_date(fmt),
+    }
+}
+
+/// Whether a validated `--format`/`--pretty` string contains a `%ad` or `%cd`
+/// placeholder. Walks placeholders the way [`expand_format`] does so a literal
+/// `%%ad` or a `%an`/`%cn` cannot be mistaken for a field date.
+fn custom_has_field_date(fmt: &str) -> bool {
+    let b = fmt.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        match b.get(i + 1) {
+            // `%x<hh>` is a four-byte hex escape.
+            Some(b'x') => i += 4,
+            // `%g<x>` and `%a<x>`/`%c<x>` are three bytes; only `%ad`/`%cd` are dates.
+            Some(b'g') => i += 3,
+            Some(b'a') | Some(b'c') => {
+                if b.get(i + 2) == Some(&b'd') {
+                    return true;
+                }
+                i += 3;
+            }
+            // Everything else recognized here (`%H %h %T %P %p %s %n %%`) is two bytes.
+            _ => i += 2,
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------

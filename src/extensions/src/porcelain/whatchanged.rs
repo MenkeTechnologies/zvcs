@@ -75,6 +75,20 @@
 //! * Object ids are abbreviated the way git's `diff_aligned_abbrev` does: `core.abbrev`
 //!   when set, otherwise an auto width floored at 7, extended per id until unambiguous;
 //!   an absent side renders as that many `0`s.
+//! * **`log.*` display config, read by [`read_log_config`] the way git's `git_log_config`
+//!   does, with the command line overriding — matching `git log`'s own handling.**
+//!   * `log.abbrevCommit` (default false) abbreviates the `commit <id>` header to the same
+//!     `find_unique_abbrev` width the raw diff uses; `--abbrev-commit` / `--no-abbrev-commit`
+//!     override it.
+//!   * `log.showRoot` (default true) shows the root commit's empty-tree diff. Set false it
+//!     is suppressed, so — being TREESAME-empty — the root commit drops out of the output
+//!     entirely and consumes no `--max-count` slot; `--root` forces it back on (git has no
+//!     `--no-root`).
+//!   * `log.date` is validated at read time exactly like git: an unknown value is
+//!     `fatal: unknown date format <v>` (exit 128), raised ahead of the deprecation gate and
+//!     of any `--date` override. `default` is a no-op; every other valid mode selects a date
+//!     format `whatchanged` does not render, so it is deferred to the unported bail below
+//!     (identical treatment to a command-line `--date`).
 //! * **Path-limited traversal.** Everything after `--` — and any pre-`--` argument that
 //!   resolved as a filename rather than a revision — is a pathspec. A commit is shown
 //!   iff its `--raw` change list, filtered down to the paths the pathspec matches, is
@@ -263,8 +277,6 @@ const FLAG_OPTS: &[&str] = &[
     "--name-status",
     "--abbrev",
     "--no-abbrev",
-    "--abbrev-commit",
-    "--no-abbrev-commit",
     "--oneline",
     "--pretty",
     "--relative-date",
@@ -277,6 +289,9 @@ const FLAG_OPTS: &[&str] = &[
     "--no-min-parents",
     "--no-max-parents",
     "--first-parent",
+    // NB: `--abbrev-commit`, `--no-abbrev-commit` and `--root` are recognised but handled
+    // explicitly in `consume_option` (they drive `log.abbrevCommit`/`log.showRoot`), so
+    // they are intentionally absent from this generic recognised-but-unported list.
     "--all",
     "--branches",
     "--tags",
@@ -312,7 +327,6 @@ const FLAG_OPTS: &[&str] = &[
     "--dense",
     "--ancestry-path",
     "--remove-empty",
-    "--root",
     "--full-diff",
     "--follow",
     "--no-follow",
@@ -654,6 +668,12 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 #[derive(Default)]
 struct Parsed {
     no_renames: bool,
+    /// `log.abbrevCommit` (default) as overridden by `--abbrev-commit`/`--no-abbrev-commit`:
+    /// abbreviate the `commit <id>` header line to git's `find_unique_abbrev` width.
+    abbrev_commit: bool,
+    /// `log.showRoot` (default true) as overridden by `--root`: when false the root commit's
+    /// empty-tree diff is suppressed, so — like any TREESAME commit — it is dropped entirely.
+    show_root: bool,
     max_count: Option<usize>,
     revs: Vec<String>,
     pathspecs: Vec<String>,
@@ -677,6 +697,45 @@ struct Parsed {
     set_broadening: Option<String>,
 }
 
+/// The `log.*` display config `whatchanged` shares with `git log`, read once up front by
+/// [`read_log_config`] the way git's `git_log_config` does.
+struct LogConfig {
+    /// `log.abbrevCommit` (default false): abbreviate the `commit <id>` header.
+    abbrev_commit: bool,
+    /// `log.showRoot` (default true): show the root commit's empty-tree diff.
+    show_root: bool,
+    /// `log.date` is set to a valid mode other than `default`. `whatchanged` only renders
+    /// git's `DATE_NORMAL`, so any other mode is deferred to the unported bail (like a
+    /// command-line `--date`). An *invalid* `log.date` is fatal at read time instead.
+    date_unsupported: bool,
+}
+
+/// Read the `log.*` display config, reproducing `git_log_config`'s validation of
+/// `log.date`: an unknown value is `fatal: unknown date format <v>` (exit 128), raised
+/// before the deprecation gate and before argument parsing, matching stock git 2.55.0.
+fn read_log_config(repo: &gix::Repository) -> Result<LogConfig, Fatal> {
+    let snap = repo.config_snapshot();
+    let abbrev_commit = snap.boolean("log.abbrevCommit").unwrap_or(false);
+    // git's `log.showRoot` defaults to true; only an explicit false suppresses the root.
+    let show_root = snap.boolean("log.showRoot").unwrap_or(true);
+    let date_unsupported = match snap.string("log.date") {
+        None => false,
+        Some(v) => {
+            let v = v.to_str_lossy();
+            // Same validation git applies via `parse_date_format`; invalid ⇒ fatal 128.
+            validate_date_format(&v)?;
+            // `default` renders exactly `DATE_NORMAL`, which is all `whatchanged` produces,
+            // so it is a no-op; every other (valid) mode changes the `Date:` line.
+            v.as_ref() != "default"
+        }
+    };
+    Ok(LogConfig {
+        abbrev_commit,
+        show_root,
+        date_unsupported,
+    })
+}
+
 /// `git whatchanged` — see the module documentation for the covered surface.
 pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
     // Dispatch passes the subcommand itself at index 0.
@@ -688,6 +747,18 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
     // git runs the deprecation check inside `cmd_whatchanged`, i.e. after repository
     // setup, so a missing repository is still reported first.
     let repo = gix::discover(".")?;
+
+    // git reads `log.*` display config in `git_log_config`, before `setup_revisions` and
+    // before the deprecation gate. An invalid `log.date` is fatal here — ahead of the
+    // deprecation notice and of any argument-parse error — even when a valid `--date` on
+    // the command line would otherwise take over. Verified against stock git 2.55.0.
+    let cfg = match read_log_config(&repo) {
+        Ok(c) => c,
+        Err(f) => {
+            eprint!("{}", f.text);
+            return Ok(ExitCode::from(f.code));
+        }
+    };
 
     // `cmd_log_init` runs its own `parse_options` pass over `builtin_log_options` and
     // *removes* what it matches before `setup_revisions` ever sees the array. Those
@@ -702,7 +773,7 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
     };
     let (opted_in, args) = (phase1.opted_in, phase1.rest);
 
-    let mut parsed = match parse_args(&repo, &args, phase1.quiet) {
+    let mut parsed = match parse_args(&repo, &args, phase1.quiet, &cfg) {
         Ok(p) => p,
         Err(f) => {
             eprint!("{}", f.text);
@@ -711,6 +782,13 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
     };
     if parsed.unimplemented.is_none() {
         parsed.unimplemented = phase1.unimplemented;
+    }
+    // A valid but non-default `log.date` selects a date format `whatchanged` does not
+    // render (it only produces `DATE_NORMAL`), exactly like a command-line `--date`: defer
+    // it to the render-time unported bail rather than silently emitting a wrong `Date:`
+    // line. A filter that empties the walk still exits 0, matching git.
+    if parsed.unimplemented.is_none() && cfg.date_unsupported {
+        parsed.unimplemented = Some("log.date".to_string());
     }
 
     if !opted_in {
@@ -806,8 +884,16 @@ fn extract_log_options(args: &[String]) -> Result<Phase1, Fatal> {
 
 /// Reproduce `setup_revisions` and the checks that follow it, in git's order.
 /// Everything that can end the command with a message lives here.
-fn parse_args(repo: &gix::Repository, args: &[String], quiet: bool) -> Result<Parsed, Fatal> {
+fn parse_args(
+    repo: &gix::Repository,
+    args: &[String],
+    quiet: bool,
+    cfg: &LogConfig,
+) -> Result<Parsed, Fatal> {
     let mut p = Parsed::default();
+    // Config supplies the defaults; the flags parsed below override them.
+    p.abbrev_commit = cfg.abbrev_commit;
+    p.show_root = cfg.show_root;
     let mut st = OptState::default();
     if quiet {
         st.out_bits = OUT_NO_OUTPUT;
@@ -1046,6 +1132,22 @@ fn consume_option(
         "--raw" | "--no-merges" => return Ok(1),
         "--no-renames" => {
             p.no_renames = true;
+            return Ok(1);
+        }
+        // `log.abbrevCommit` command-line overrides. git has both spellings; there is no
+        // value form here (that is `--abbrev=<n>`, which controls the width, not this flag).
+        "--abbrev-commit" => {
+            p.abbrev_commit = true;
+            return Ok(1);
+        }
+        "--no-abbrev-commit" => {
+            p.abbrev_commit = false;
+            return Ok(1);
+        }
+        // `--root` forces the root commit's diff on, overriding `log.showRoot=false`. git
+        // has no `--no-root`, so config is the only way to turn it off.
+        "--root" => {
+            p.show_root = true;
             return Ok(1);
         }
         "-n" => {
@@ -1656,6 +1758,13 @@ fn run(repo: &gix::Repository, mut parsed: Parsed) -> Result<ExitCode> {
             continue;
         }
 
+        // `log.showRoot=false` suppresses the root commit's empty-tree diff. With nothing
+        // to diff it is TREESAME-empty, so — like the empty-diff case below — the commit is
+        // dropped entirely and consumes no `--max-count` slot. `--root` turns it back on.
+        if !parsed.show_root && parents.is_empty() {
+            continue;
+        }
+
         // `--grep`: git filters on the commit message during traversal, before the diff,
         // and an excluded commit is dropped whether or not it changed anything.
         if apply_grep {
@@ -1697,7 +1806,8 @@ fn run(repo: &gix::Repository, mut parsed: Parsed) -> Result<ExitCode> {
             bail!(
                 "{flag} is recognised but not ported (ported: --i-still-use-this, --raw, \
                  --no-merges, --no-renames, --grep, --all/--branches/--tags/--remotes, \
-                 -n/--max-count/-nN/-N)"
+                 -n/--max-count/-nN/-N, --abbrev-commit/--no-abbrev-commit, --root, \
+                 and log.abbrevCommit/log.showRoot/log.date config)"
             );
         }
 
@@ -1718,7 +1828,7 @@ fn run(repo: &gix::Repository, mut parsed: Parsed) -> Result<ExitCode> {
         if shown > 0 {
             out.push(b'\n');
         }
-        render_commit(repo, &commit, &changes, abbrev, &mut out)?;
+        render_commit(repo, &commit, &changes, parsed.abbrev_commit, abbrev, &mut out)?;
         shown += 1;
     }
 
@@ -1832,13 +1942,22 @@ fn render_commit(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     changes: &[Change],
+    abbrev_commit: bool,
     abbrev: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let author = commit.author()?;
     let time = author.time()?;
 
-    out.extend_from_slice(format!("commit {}\n", commit.id()).as_bytes());
+    // `log.abbrevCommit`/`--abbrev-commit`: git shortens the header id with
+    // `find_unique_abbrev` at the same default width the raw diff uses.
+    if abbrev_commit {
+        out.extend_from_slice(
+            format!("commit {}\n", short(repo, commit.id().detach(), abbrev)?).as_bytes(),
+        );
+    } else {
+        out.extend_from_slice(format!("commit {}\n", commit.id()).as_bytes());
+    }
     out.extend_from_slice(b"Author: ");
     out.extend_from_slice(&author.name[..]);
     out.extend_from_slice(b" <");
@@ -2050,9 +2169,9 @@ fn join(prefix: &BStr, name: &BStr) -> BString {
 }
 
 /// Format a commit time exactly like git's default `DATE_NORMAL`:
-/// `Www Mmm <sp-padded-day> HH:MM:SS YYYY +ZZZZ`, in the commit's own offset. Done by
-/// hand because gix's exported `DEFAULT` format uses an unpadded day (`%-d`) where git
-/// space-pads it (`%e`), and the crate exposes no custom format string.
+/// `Www Mmm <day> HH:MM:SS YYYY +ZZZZ`, in the commit's own offset. Done by hand because
+/// gix exposes no custom format string. git's `date.c` renders the day with `%d`, which
+/// is *unpadded* — a single-digit day is one character (`Jan 2`), never space-padded.
 fn format_git_date(seconds: i64, offset: i32) -> String {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const MONTHS: [&str; 12] = [
@@ -2075,7 +2194,7 @@ fn format_git_date(seconds: i64, offset: i32) -> String {
     let (off_h, off_m) = (off / 3600, (off % 3600) / 60);
 
     format!(
-        "{} {} {:>2} {:02}:{:02}:{:02} {} {}{:02}{:02}",
+        "{} {} {} {:02}:{:02}:{:02} {} {}{:02}{:02}",
         WEEKDAYS[weekday],
         MONTHS[(month - 1) as usize],
         day,

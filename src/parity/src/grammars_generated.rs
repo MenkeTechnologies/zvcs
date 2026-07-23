@@ -96,6 +96,12 @@ pub fn generated() -> Vec<Grammar> {
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
         Grammar {
+            cmd: "column",
+            flags: &["--mode=always", "--mode=never", "--padding=2", "--width=80"],
+            positionals: &[""],
+            shapes: &[Shape::Linear],
+        },
+        Grammar {
             cmd: "commit-graph",
             flags: &["--reachable", "--append", "--changed-paths", "--no-changed-paths", "--split", "--split=no-merge", "--split=replace", "--max-commits=1", "--max-commits=1000", "--size-multiple=2", "--max-new-filters=0", "--max-new-filters=-1", "--no-max-new-filters", "--expire-time=1970-01-01", "--progress", "--no-progress", "--shallow", "--object-dir=.git/objects", "--object-dir=does-not-exist"],
             positionals: &["write", "verify", "", "does-not-exist"],
@@ -162,6 +168,12 @@ pub fn generated() -> Vec<Grammar> {
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
         },
         Grammar {
+            cmd: "fsck-objects",
+            flags: &["--unreachable", "--dangling", "--no-dangling", "--root", "--tags", "--cache", "--no-reflogs", "--full", "--no-full", "--connectivity-only", "--strict", "--verbose", "--name-objects", "--no-name-objects", "--progress", "--no-progress", "--references", "--no-references"],
+            positionals: &["", "HEAD", "main", "feature", "v0.1.0", "v0.2.0", "HEAD^{tree}", "HEAD:README.md", "does-not-exist"],
+            shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Dirty, Shape::Conflicted, Shape::Detached, Shape::AwkwardPaths, Shape::Submodule],
+        },
+        Grammar {
             cmd: "fsck",
             flags: &["--unreachable", "--dangling", "--no-dangling", "--root", "--tags", "--cache", "--no-reflogs", "--full", "--no-full", "--connectivity-only", "--strict", "--verbose", "--name-objects", "--no-name-objects", "--progress", "--no-progress", "--references", "--no-references"],
             positionals: &["", "HEAD", "main", "feature", "v0.1.0", "v0.2.0", "HEAD^{tree}", "HEAD:README.md", "does-not-exist"],
@@ -190,6 +202,18 @@ pub fn generated() -> Vec<Grammar> {
             flags: &["-v", "--verify", "--rev-index", "--no-rev-index", "--keep", "--keep=parity-harness", "--strict", "--strict=missingEmail=ignore,badTagName=error", "--fsck-objects", "--fsck-objects=missingEmail=ignore", "--check-self-contained-and-connected", "--promisor", "--promisor=parity", "--threads=1", "--threads=0", "--index-version=2", "--max-input-size=1", "--max-input-size=1073741824", "--object-format=sha1"],
             positionals: &["", ".git/objects/pack/pack-does-not-exist.pack", "README.md", "does-not-exist.pack", "does-not-exist"],
             shapes: &[Shape::Linear, Shape::Branched, Shape::Merged, Shape::Detached],
+        },
+        Grammar {
+            cmd: "init-db",
+            flags: &["-q", "--quiet", "--bare", "--initial-branch=trunk", "--object-format=sha1"],
+            positionals: &["", "newrepo", "nested/dir"],
+            shapes: &[Shape::Linear, Shape::Detached],
+        },
+        Grammar {
+            cmd: "init",
+            flags: &["-q", "--quiet", "--bare", "--initial-branch=trunk", "--object-format=sha1"],
+            positionals: &["", "newrepo", "nested/dir"],
+            shapes: &[Shape::Linear, Shape::Detached],
         },
         Grammar {
             cmd: "interpret-trailers",

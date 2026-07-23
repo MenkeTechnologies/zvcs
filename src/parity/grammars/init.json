@@ -1,0 +1,7 @@
+{
+  "command": "init",
+  "mutating": true,
+  "flags": ["-q", "--quiet", "--bare", "--initial-branch=trunk", "--object-format=sha1"],
+  "positionals": ["", "newrepo", "nested/dir"],
+  "shapes": ["linear", "detached"]
+}

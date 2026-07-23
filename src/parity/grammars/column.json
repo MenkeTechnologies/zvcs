@@ -1,0 +1,7 @@
+{
+  "command": "column",
+  "mutating": false,
+  "flags": ["--mode=always", "--mode=never", "--padding=2", "--width=80"],
+  "positionals": [""],
+  "shapes": ["linear"]
+}

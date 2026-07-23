@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use gix::bstr::{BString, ByteSlice};
 use gix::index::entry::{Flags, Mode, Stage, Stat};
 use gix::objs::tree::EntryMode;
+use gix::prelude::ObjectIdExt;
 use gix::ObjectId;
 
 /// `git commit` — record a commit from the staged index.
@@ -46,6 +47,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut quiet = false;
     let mut all = false;
     let mut no_verify = false;
+    let mut amend = false;
+    let mut no_edit = false;
+    let mut reset_author = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -68,7 +72,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                     anyhow::bail!("pathspec-limited commits are not supported");
                 }
             }
-            "--amend" => anyhow::bail!("`--amend` is not supported"),
+            "--amend" => amend = true,
+            "--no-edit" => no_edit = true,
+            "--reset-author" => reset_author = true,
             s if s.starts_with("--message=") => messages.push(s["--message=".len()..].to_string()),
             s if s.starts_with("--") => anyhow::bail!("unsupported option `{s}`"),
             // A bundled short-flag cluster, e.g. `-am <msg>`, `-qam <msg>`,
@@ -177,13 +183,25 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
 
     // --- parents ---------------------------------------------------------
+    // `--amend` replaces HEAD: the new commit takes HEAD's *parents*, and the
+    // summary/nothing-to-commit checks compare against HEAD's first parent tree,
+    // not HEAD itself.
     let mut head = repo.head()?;
-    let parent = head.try_peel_to_id()?.map(|id| id.detach());
-    let is_root = parent.is_none();
-    let parents: Vec<ObjectId> = parent.into_iter().collect();
+    let head_tip = head.try_peel_to_id()?.map(|id| id.detach());
+    let amend_head = if amend {
+        let hid = head_tip.ok_or_else(|| anyhow::anyhow!("You have nothing to amend."))?;
+        Some(repo.find_commit(hid)?)
+    } else {
+        None
+    };
+    let parents: Vec<ObjectId> = match &amend_head {
+        Some(hc) => hc.parent_ids().map(|id| id.detach()).collect(),
+        None => head_tip.into_iter().collect(),
+    };
+    let is_root = parents.is_empty();
 
-    let parent_tree_id = match parent {
-        Some(p) => Some(repo.find_commit(p)?.tree_id()?.detach()),
+    let parent_tree_id = match parents.first() {
+        Some(p) => Some(repo.find_commit(*p)?.tree_id()?.detach()),
         None => None,
     };
 
@@ -192,20 +210,45 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         Some(pt) => pt == tree_id,
         None => tree_id == ObjectId::empty_tree(hash),
     };
-    if unchanged && !allow_empty {
+    // `--amend` always produces a new commit (a message- or author-only amend is
+    // valid), so it is exempt from the empty-change guard.
+    if unchanged && !allow_empty && !amend {
         anyhow::bail!("nothing to commit (no changes staged)");
     }
 
-    // --- editor mode (no `-m`) -------------------------------------------
-    // There is something to commit: open the editor on the template and read
-    // the message back, git's behavior when no message was given on the CLI.
+    // --- message when none was given on the CLI --------------------------
+    // `--amend --no-edit` reuses HEAD's message verbatim. Otherwise git opens
+    // the editor (seeded with HEAD's message for a plain `--amend`), or, for a
+    // normal commit, on the status template.
     if !from_flags {
-        message = obtain_message_via_editor(&repo, is_root)?;
-        if message.trim().is_empty() && !allow_empty_message {
-            anyhow::bail!("Aborting commit due to empty commit message.");
-        }
-        if !message.ends_with('\n') {
-            message.push('\n');
+        if amend && no_edit {
+            message = amend_head
+                .as_ref()
+                .expect("amend implies HEAD")
+                .message_raw()?
+                .to_string();
+            if !message.ends_with('\n') {
+                message.push('\n');
+            }
+        } else {
+            let seed = if amend {
+                Some(
+                    amend_head
+                        .as_ref()
+                        .expect("amend implies HEAD")
+                        .message_raw()?
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            message = obtain_message_via_editor(&repo, is_root, seed.as_deref())?;
+            if message.trim().is_empty() && !allow_empty_message {
+                anyhow::bail!("Aborting commit due to empty commit message.");
+            }
+            if !message.ends_with('\n') {
+                message.push('\n');
+            }
         }
     }
     // `commit-msg` gets the message file and may rewrite it (e.g. add a trailer);
@@ -222,11 +265,54 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let subject = message.lines().next().unwrap_or("").to_string();
 
     // --- write the commit and advance HEAD -------------------------------
-    // `Repository::commit` writes the commit object, then updates `HEAD`
-    // (write-through to its branch, or the detached ref) with the canonical
-    // `commit`/`commit (initial)` reflog message, requiring the first parent to
-    // be the current tip — the same ref-safety check git performs.
-    let commit_id = repo.commit("HEAD", &message, tree_id, parents)?;
+    let commit_id = if amend {
+        // `--amend`: the new commit keeps HEAD's author (unless `--reset-author`)
+        // and takes a fresh committer. `Repository::commit`'s ref update requires
+        // the ref to equal the new commit's first parent, which is false for an
+        // amend (HEAD points at the commit being replaced, not its parent), so
+        // write the object with `new_commit_as` and move HEAD ourselves, gating
+        // on HEAD's current tip and writing git's `commit (amend):` reflog line.
+        let hc = amend_head.as_ref().expect("amend implies HEAD");
+        let committer = repo
+            .committer()
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("unable to determine committer identity"))?;
+        let author = if reset_author {
+            repo.author()
+                .transpose()?
+                .ok_or_else(|| anyhow::anyhow!("unable to determine author identity"))?
+        } else {
+            hc.author()?
+        };
+        let new: ObjectId = repo
+            .new_commit_as(committer, author, &message, tree_id, parents)?
+            .id;
+        let prev = head_tip.expect("amend implies HEAD");
+        repo.edit_reference(gix::refs::transaction::RefEdit {
+            change: gix::refs::transaction::Change::Update {
+                log: gix::refs::transaction::LogChange {
+                    mode: gix::refs::transaction::RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: format!("commit (amend): {subject}").into(),
+                },
+                expected: gix::refs::transaction::PreviousValue::MustExistAndMatch(
+                    gix::refs::Target::Object(prev),
+                ),
+                new: gix::refs::Target::Object(new),
+            },
+            name: "HEAD"
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
+            deref: true,
+        })?;
+        new.attach(&repo)
+    } else {
+        // `Repository::commit` writes the commit object, then updates `HEAD`
+        // (write-through to its branch, or the detached ref) with the canonical
+        // `commit`/`commit (initial)` reflog message, requiring the first parent
+        // to be the current tip — the same ref-safety check git performs.
+        repo.commit("HEAD", &message, tree_id, parents)?
+    };
 
     // `post-commit` is a notification hook: it runs after the commit regardless of
     // `--no-verify`, and its exit status is ignored.
@@ -244,6 +330,19 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     };
     let root_marker = if is_root { " (root-commit)" } else { "" };
     println!("[{branch_label}{root_marker} {short}] {subject}");
+
+    // git prints a ` Date:` line in the summary when the author date is
+    // "interesting" — i.e. it differs from the committer date, as `--amend`
+    // (preserved author, fresh committer) and an explicit GIT_AUTHOR_DATE do.
+    let written = repo.find_commit(commit_id.detach())?;
+    let a_time = written.author()?.time()?;
+    let c_time = written.committer()?.time()?;
+    if a_time.seconds != c_time.seconds || a_time.offset != c_time.offset {
+        let dt = a_time
+            .format(gix::date::time::format::DEFAULT)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!(" Date: {dt}");
+    }
 
     // --- short-stat + create/delete/mode-change summary ------------------
     // Old file set (path -> mode, id) flattened from the parent tree; empty for
@@ -455,11 +554,24 @@ fn plural(n: u64) -> &'static str {
 /// git's editor path for `git commit` without `-m`: build a template from
 /// `commit.template` and a commented status header, open it in the configured
 /// editor, and return the cleaned-up message per `commit.cleanup`.
-fn obtain_message_via_editor(repo: &gix::Repository, is_root: bool) -> Result<String> {
+fn obtain_message_via_editor(
+    repo: &gix::Repository,
+    is_root: bool,
+    seed: Option<&str>,
+) -> Result<String> {
     let snap = repo.config_snapshot();
     let comment = comment_prefix(&snap);
 
     let mut buf = String::new();
+
+    // `--amend` seeds the buffer with HEAD's existing message so the editor opens
+    // pre-filled, exactly as git does.
+    if let Some(seed) = seed {
+        buf.push_str(seed);
+        if !buf.is_empty() && !buf.ends_with('\n') {
+            buf.push('\n');
+        }
+    }
 
     // `commit.template`, if configured, seeds the buffer (git reads it verbatim).
     if let Some(path) = snap.string("commit.template") {

@@ -15,6 +15,7 @@
 //!   zvcs-parity --only status,log    # restrict to some subcommands
 //!   zvcs-parity --verbose            # print every failure in detail
 //!   zvcs-parity --bin path/to/git    # explicit binary under test
+//!   zvcs-parity --html docs/port_report.html   # regenerate the HTML report
 
 mod corpus;
 mod env;
@@ -36,6 +37,9 @@ struct Args {
     bin: Option<String>,
     keep: bool,
     shrink: bool,
+    /// `--html <path>`: also write the HTML port report to this path from the
+    /// run's real coverage + parity numbers (regenerates `docs/port_report.html`).
+    html: Option<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -48,6 +52,7 @@ fn parse_args() -> Result<Args> {
         bin: None,
         keep: false,
         shrink: false,
+        html: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -83,6 +88,10 @@ fn parse_args() -> Result<Args> {
             "--shrink" => {
                 a.shrink = true;
                 i += 1;
+            }
+            "--html" => {
+                a.html = Some(next(i)?);
+                i += 2;
             }
             other => anyhow::bail!("unknown argument {other:?}"),
         }
@@ -200,6 +209,13 @@ fn real_main() -> Result<ExitCode> {
 
     let rep = report::tally(outcomes);
     rep.print((have.len(), stock.len()), &missing, args.verbose);
+
+    // `--html <path>`: regenerate the HTML port report from THIS run's real
+    // numbers — dispatch coverage and per-command parity, nothing hand-typed.
+    if let Some(path) = &args.html {
+        report::emit_html(std::path::Path::new(path), &rep, &stock, &have, &missing)?;
+        eprintln!("wrote {path}");
+    }
 
     // Minimizing is opt-in: it costs a re-run per dropped argument, but turns a
     // three-flag failure into the one flag actually responsible.

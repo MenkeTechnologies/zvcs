@@ -243,7 +243,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zunstash" => "usage: git zunstash [<name>] — pop the tree-wide stash back (LIFO)",
         "zstashes" => "usage: git zstashes — list tree-wide stashes and their repo counts",
         "zup" => "usage: git zup [<path>] — reconcile the tree at cwd (or <path>) to latest",
-        "zforeach" => "usage: git zforeach [--repo <sub>|--dirty|--ahead|--behind|--claimed|--session <s>] [--] <command>...",
+        "zforeach" => "usage: git zforeach [<pattern>...|--repo <p>|--dirty|--ahead|--behind|--claimed|--session <s>] -- <command>...",
         "zhook" => "usage: git zhook <set <command>|unset|show|list|test>",
         _ => return None,
     })
@@ -473,7 +473,11 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "write-tree" => porcelain::write_tree(args),
         // ---- END generated porcelain arms ----
 
-        // Not yet ported. No fallthrough to stock git — this is a from-scratch engine.
-        _ => anyhow::bail!("not yet ported (superset verbs: {})", SUPERSET_VERBS.join(", ")),
+        // An unrecognized verb: a typo or a name this engine has no command for.
+        // The CLI never reaches here (it routes unknowns through the external
+        // `git-<verb>` / autocorrect path in lib.rs); direct callers like `zrepl`
+        // do, so give git's own honest wording rather than implying the verb is a
+        // real command merely awaiting a port.
+        _ => anyhow::bail!("is not a git command. See 'git --help'."),
     }
 }

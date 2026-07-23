@@ -3,7 +3,9 @@
 //!
 //! Filters compose (all must match) and are fast db queries, not walks:
 //!   * default        — every indexed repo
-//!   * `--repo <sub>` — workdir path contains `<sub>`
+//!   * `<pattern>` / `--repo <pattern>` — workdir path contains `<pattern>`
+//!     (case-insensitive); repeatable, and every pattern must match (like
+//!     `git zrepos <pattern>...`)
 //!   * `--dirty`      — dirty in the status cache
 //!   * `--ahead` / `--behind` — sync state in the status cache
 //!   * `--claimed`    — has an active claim
@@ -15,7 +17,9 @@ use std::path::PathBuf;
 
 #[derive(Default)]
 pub struct Selector {
-    pub repo: Option<String>,
+    /// Case-insensitive substring filters on the workdir path; every one must
+    /// match. Fed by `--repo <pattern>` and by bare positional patterns.
+    pub patterns: Vec<String>,
     pub dirty: bool,
     pub ahead: bool,
     pub behind: bool,
@@ -34,7 +38,9 @@ impl Selector {
             match args[i].as_str() {
                 "--repo" => {
                     i += 1;
-                    sel.repo = args.get(i).cloned();
+                    if let Some(p) = args.get(i) {
+                        sel.patterns.push(p.clone());
+                    }
                 }
                 "--dirty" => sel.dirty = true,
                 "--ahead" => sel.ahead = true,
@@ -94,8 +100,9 @@ impl Selector {
         let mut out = Vec::new();
         for r in crate::db::list_repos(&conn)? {
             let workdir = r.workdir.clone().unwrap_or_else(|| r.git_dir.clone());
-            if let Some(sub) = &self.repo {
-                if !workdir.contains(sub.as_str()) {
+            if !self.patterns.is_empty() {
+                let haystack = workdir.to_lowercase();
+                if !self.patterns.iter().all(|p| haystack.contains(&p.to_lowercase())) {
                     continue;
                 }
             }

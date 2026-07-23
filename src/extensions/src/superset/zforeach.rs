@@ -27,7 +27,12 @@ pub fn zforeach(args: &[String]) -> Result<ExitCode> {
     // remainder is the command, as before.
     let (sel, cmd): (Selector, Vec<String>) = match args.iter().position(|a| a == "--") {
         Some(p) => {
-            let (sel, _left_over) = Selector::parse(&args[..p]);
+            // Left of `--`: selector flags plus any bare positional tokens, which
+            // become case-insensitive path-substring filters (like `git zrepos
+            // <pattern>`). `git zforeach cask -- git status` runs only in repos
+            // whose path contains "cask".
+            let (mut sel, patterns) = Selector::parse(&args[..p]);
+            sel.patterns.extend(patterns);
             (sel, args[p + 1..].to_vec())
         }
         None => {
@@ -36,7 +41,7 @@ pub fn zforeach(args: &[String]) -> Result<ExitCode> {
         }
     };
     if cmd.is_empty() {
-        bail!("usage: git zforeach [--repo <sub>|--dirty|--ahead|--behind|--claimed|--session <s>] [--] <command>...");
+        bail!("usage: git zforeach [<pattern>...|--repo <p>|--dirty|--ahead|--behind|--claimed|--session <s>] -- <command>...");
     }
 
     let repos = sel.select()?;

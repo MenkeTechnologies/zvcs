@@ -25,6 +25,10 @@
 //!   the diff options / `stash.showStat`+`stash.showPatch` config; rendering is
 //!   delegated to the `diff` porcelain (git's own `diff_tree_oid` machinery).
 //! * `branch` — create+check out a branch at the stash base, apply there, drop.
+//! * `create_autostash` / `apply_autostash` — the rebase/pull `--autostash`
+//!   helpers. Unlike `apply`/`pop`, the re-apply here IS a real three-way merge
+//!   (`merge_apply::three_way_merge`) of the stash onto the moved `HEAD`, since
+//!   autostash by definition re-applies over a tree the rebase/merge advanced.
 //!
 //! ### Honest boundaries (precise bail, never fake success)
 //!
@@ -42,7 +46,7 @@ use std::collections::{HashMap, HashSet};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-use gix::bstr::{BString, ByteSlice};
+use gix::bstr::{BStr, BString, ByteSlice};
 use gix::diff::index::ChangeRef;
 use gix::hash::ObjectId;
 use gix::index::entry::{Mode, Stat};
@@ -534,6 +538,79 @@ fn restore_stash_commit(repo: &gix::Repository, commit_id: ObjectId) -> Result<(
     let old_index = repo.open_index()?;
     write_target_index(repo, i_tree, &old_index, &fresh)?;
     Ok(())
+}
+
+/// Create an *autostash* from the current dirty worktree+index: build the
+/// stash-like `W` commit (as `git stash create` does) and reset the tracked
+/// worktree and index back to `HEAD`, leaving a clean tree. Returns the `W`
+/// commit id. Unlike [`push`] it never touches `refs/stash` — the caller
+/// (rebase/pull `--autostash`) owns the commit and re-applies it directly via
+/// [`apply_autostash`]. The caller has already checked the tree is dirty.
+pub fn create_autostash(repo: &gix::Repository) -> Result<ObjectId> {
+    let StashBuild { w_commit, head_tree_id, affected, .. } =
+        build_stash_commit(repo, Some("autostash"))?;
+
+    // Reset the tracked worktree + index back to HEAD (untracked files untouched),
+    // exactly as `push` does after storing the stash.
+    let head_map = tree_map(repo, head_tree_id)?;
+    let should_interrupt = AtomicBool::new(false);
+    let fresh = sync_worktree(repo, head_tree_id, &affected, &head_map, &should_interrupt)?;
+    let old_index = repo.open_index()?;
+    write_target_index(repo, head_tree_id, &old_index, &fresh)?;
+    Ok(w_commit)
+}
+
+/// Re-apply an autostash `W` commit onto the *current* `HEAD` with a real
+/// three-way merge — the case `apply`/`pop` refuse. The three sides are the
+/// stash's base (`W`'s first parent tree = `HEAD` when the stash was made),
+/// *ours* (the current `HEAD` tree, e.g. the just-rebased tip), and *theirs*
+/// (the stashed worktree tree `W`). Prints git's `Applied autostash.` on a clean
+/// apply, or the conflict notice (leaving the changes recoverable) otherwise.
+/// Returns the conflicted paths (empty on a clean apply).
+pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool) -> Result<Vec<BString>> {
+    let commit = repo.find_commit(commit_id)?;
+    let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
+    if parents.len() < 2 {
+        bail!("'{commit_id}' is not a stash-like commit");
+    }
+    let base = repo.find_commit(parents[0])?.tree_id()?.detach();
+    let theirs = commit.tree_id()?.detach();
+    let ours = repo.head_tree_id()?.detach();
+    let old_index = repo.index_or_load_from_head()?.into_owned();
+
+    let labels = gix::merge::blob::builtin_driver::text::Labels {
+        ancestor: Some(BStr::new(b"stash base")),
+        current: Some(BStr::new(b"HEAD")),
+        other: Some(BStr::new(b"Stashed changes")),
+    };
+    let should_interrupt = AtomicBool::new(false);
+    let applied = crate::merge_apply::three_way_merge(
+        repo, base, ours, theirs, &old_index, labels, &should_interrupt,
+    )?;
+
+    if applied.conflicts.is_empty() {
+        // three_way_merge already wrote the merged content to the worktree. git's
+        // autostash re-applies with `stash apply` (no `--index`), so the restored
+        // changes stay UNSTAGED: reset the index to HEAD rather than persisting the
+        // merged index, leaving worktree-vs-index as the user's local changes.
+        let mut head_index = repo.index_from_tree(&ours)?;
+        head_index.write(Default::default())?;
+        if !quiet {
+            println!("Applied autostash.");
+        }
+    } else {
+        // Keep the conflicted index (stages 1/2/3) so the user can resolve, exactly
+        // as a conflicting `git stash apply` leaves it.
+        let mut index = applied.index;
+        index.write(Default::default())?;
+        if !quiet {
+            // git keeps the changes recoverable in the stash on a conflicting apply.
+            eprintln!("Applying autostash resulted in conflicts.");
+            eprintln!("Your changes are safe in the stash.");
+            eprintln!("You can run \"git stash pop\" or \"git stash drop\" at any time.");
+        }
+    }
+    Ok(applied.conflicts)
 }
 
 /// `git stash clear` — remove every entry (ref + reflog), silently if none.

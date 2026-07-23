@@ -1093,13 +1093,15 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // `refresh_index()` runs first and reports unmerged paths on stdout, even
     // under --quiet, before either error line.
     let (unstaged, staged, conflicts) = dirty_state(&repo)?;
-    if autostash && (unstaged || staged) {
-        bail!("unsupported flag \"--autostash\" (stashing a dirty worktree requires writing a stash commit)");
-    }
+    // `--autostash` over a dirty tree is honored: the actual stash is created
+    // later, right before the finish moves HEAD (so every early refusal below
+    // still leaves the worktree untouched), and re-applied on completion. A tree
+    // with unmerged (conflicted) entries cannot be autostashed and still refuses.
+    let autostash_wanted = autostash && (unstaged || staged) && conflicts.is_empty();
     for path in &conflicts {
         println!("{path}: needs merge");
     }
-    if unstaged || staged {
+    if !autostash_wanted && (unstaged || staged) {
         if unstaged {
             eprintln!("error: cannot rebase: You have unstaged changes.");
             if staged {
@@ -1239,6 +1241,21 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // no-op when no daemon is running), matching the merge/zsync write path.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
+    // `--autostash`: now that the rebase is committed to moving HEAD (every early
+    // refusal is behind us), snapshot the dirty tree and reset it clean. The
+    // stash `W` commit is re-applied with a three-way merge onto the rebased tip
+    // at each completion point below (and, on a conflict-stop, by
+    // `--continue`/`--abort` via the persisted `autostash` state file).
+    let autostash_oid = if autostash_wanted {
+        let oid = crate::porcelain::stash::create_autostash(&repo)?;
+        if flags & NO_QUIET != 0 {
+            println!("Created autostash: {}", oid.to_hex_with_len(7));
+        }
+        Some(oid)
+    } else {
+        None
+    };
+
     // Capture the current (clean) index BEFORE any ref moves: it mirrors the old
     // tree and carries the filesystem stats reused for unchanged files. Taken
     // first because `index_or_load_from_head` would otherwise fall back to the
@@ -1359,7 +1376,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             .unwrap_or_else(|| "detached HEAD".to_string());
         return replay_picks(
             &repo, onto_oid, &picks, head_name, onto_oid, head_oid, &committer,
-            &should_interrupt,
+            &should_interrupt, autostash_oid,
         );
     } else if apply_backend {
         println!("Fast-forwarded {branch_name} to {onto_spec}.");
@@ -1401,6 +1418,11 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         None => "detached HEAD".to_string(),
     };
 
+    // The single-shot rebase completed; re-apply the autostash onto the new tip
+    // (before the summary line, matching git's finish_rebase ordering).
+    if let Some(oid) = autostash_oid {
+        crate::porcelain::stash::apply_autostash(&repo, oid, flags & NO_QUIET == 0)?;
+    }
     // The apply backend's fast-forward finishes silently; only the sequencer
     // announces itself.
     if !apply_backend && flags & NO_QUIET != 0 {
@@ -1661,6 +1683,14 @@ fn read_rebase_state(repo: &gix::Repository) -> Result<RebaseState> {
     })
 }
 
+/// The autostash commit a stopped `--autostash` rebase saved in its state dir,
+/// if any. Written by [`replay_picks`] on a conflict-stop, consumed by
+/// `--continue`/`--abort` to re-apply the user's changes once the rebase ends.
+fn read_autostash(repo: &gix::Repository) -> Option<ObjectId> {
+    let raw = std::fs::read_to_string(rebase_merge_dir(repo).join("autostash")).ok()?;
+    ObjectId::from_hex(raw.trim().as_bytes()).ok()
+}
+
 /// `git rebase --abort`: restore the worktree, index and branch to `orig-head`,
 /// re-attach `HEAD`, and drop the state directory.
 fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
@@ -1693,7 +1723,13 @@ fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
     } else {
         set_head(repo, Target::Object(st.orig_head), "rebase (abort)")?;
     }
+    // Re-apply any autostash the interrupted rebase saved, onto the restored
+    // orig-head tree, before dropping the state dir that holds its reference.
+    let autostash = read_autostash(repo);
     let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
+    if let Some(oid) = autostash {
+        crate::porcelain::stash::apply_autostash(repo, oid, false)?;
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1835,6 +1871,8 @@ fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
         st.orig_head,
         &committer,
         &should_interrupt,
+        // Carry any autostash the stopped rebase saved through to its conclusion.
+        read_autostash(repo),
     )
 }
 
@@ -1852,6 +1890,7 @@ fn replay_picks(
     orig_head: ObjectId,
     committer: &gix::actor::Signature,
     should_interrupt: &AtomicBool,
+    autostash: Option<ObjectId>,
 ) -> Result<ExitCode> {
     let empty_tree = ObjectId::empty_tree(repo.object_hash());
     let mut cur_index = repo.index_from_tree(&repo.find_commit(tip)?.tree_id()?.detach())?;
@@ -1902,6 +1941,15 @@ fn replay_picks(
                     stopped: *oid,
                 },
             )?;
+            // The rebase stopped for conflicts; hand the autostash to the
+            // in-progress state so `--continue`/`--abort` re-applies it once the
+            // rebase actually concludes (git's `$state_dir/autostash`).
+            if let Some(oid) = autostash {
+                let _ = std::fs::write(
+                    rebase_merge_dir(repo).join("autostash"),
+                    format!("{oid}\n"),
+                );
+            }
             eprintln!("error: could not apply {short}... {}", subject.to_str_lossy());
             eprintln!("hint: Resolve all conflicts manually, mark them as resolved with");
             eprintln!(
@@ -1975,6 +2023,11 @@ fn replay_picks(
         "detached HEAD".to_string()
     };
     let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
+    // The replay completed; re-apply the autostash onto the new tip before the
+    // summary line, matching git's finish_rebase ordering.
+    if let Some(oid) = autostash {
+        crate::porcelain::stash::apply_autostash(repo, oid, false)?;
+    }
     eprintln!("Successfully rebased and updated {label}.");
     Ok(ExitCode::SUCCESS)
 }

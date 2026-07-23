@@ -48,10 +48,10 @@
 
   <div class="cards">
     <div class="card"><div class="v">181</div><div class="l">Dispatched cmds</div></div>
-    <div class="card"><div class="v g">62</div><div class="l">Full parity</div></div>
+    <div class="card"><div class="v g">63</div><div class="l">Full parity</div></div>
     <div class="card"><div class="v a">89</div><div class="l">Partial</div></div>
-    <div class="card"><div class="v r">29</div><div class="l">Stub / fake</div></div>
-    <div class="card"><div class="v">~34%</div><div class="l">Full-parity rate</div></div>
+    <div class="card"><div class="v r">28</div><div class="l">Stub / fake</div></div>
+    <div class="card"><div class="v">~35%</div><div class="l">Full-parity rate</div></div>
   </div>
 
   <div class="callout fixed">
@@ -59,14 +59,18 @@
     In the real (large) zvcs repo, <code>zvcs add .</code> from root matched <strong>zero</strong> files while stock git staged them. Root cause: a bare <code>.</code> normalizes to a <em>nil pathspec</em> whose path is the literal <code>"."</code> (<code>gix-pathspec/src/pattern.rs:112</code>); gitoxide's <code>dirwalk_iter</code> then prefix-matches <code>"."</code> and emits only dot-prefixed entries (4 items) instead of the full tree (3188). Fix: at the repo root, rewrite a bare <code>.</code>/<code>./</code> pathspec to <code>:/</code> (a <code>.</code> from a subdirectory normalizes to its prefix path and already walked correctly, so it is left untouched). Verified byte-parity with git — <code>add -n .</code> now stages 17 = git's 17; subdir/small-repo/real-stage cases unaffected. Commit <code>51cc283176</code>.
   </div>
 
+  <div class="callout fixed">
+    <h3>✓ Fixed — HTTPS-push credentials (was: skeleton bailed, then re-prompted every push)</h3>
+    Daily-driver dogfood surfaced three credential gaps, all now closed. (1) <code>credential-osxkeychain</code> was a STUB whose get/store/erase bailed — ported over the legacy Security.framework internet-password API (<code>SecKeychainFindInternetPassword</code> / <code>AddInternetPassword</code> / <code>ItemDelete</code> / <code>ItemCopyContent</code>) via <code>security-framework-sys</code>, so an HTTPS push retrieves the stored token instead of failing. (2) <code>store</code> was add-only (git's contrib helper ignores <code>errSecDuplicateItem</code>), so a re-authenticated/rotated secret silently kept the old value and every later <code>get</code> re-prompted — now overwrites in place via <code>SecKeychainItemModifyAttributesAndData</code>, matching modern git. (3) <code>config</code> rejected <code>--global</code>/<code>--system</code> outright, breaking every repo-independent write (<code>user.email</code>, <code>credential.helper</code>, aliases) — now reads and writes both scopes git-compatibly. Verified vs stock <code>git 2.55.0</code>: keychain store→get→erase roundtrip, cross-tool interop, and byte-identical <code>config --global --list</code>. Commits <code>739f8b2ff3</code>, <code>951fa00fd5</code>.
+  </div>
+
   <h2>Fake / stub commands — accept args, then bail (do nothing real)</h2>
-  <p class="note">These carry full flag parsing and git-faithful usage/error surfaces, but the command's actual function is unimplemented (missing substrate named in each). 23 STUB + 6 PLUMBING-STUB.</p>
+  <p class="note">These carry full flag parsing and git-faithful usage/error surfaces, but the command's actual function is unimplemented (missing substrate named in each). 22 STUB + 6 PLUMBING-STUB.</p>
   <table>
     <thead><tr><th>command</th><th>kind</th><th>what's missing (the command's core)</th></tr></thead>
     <tbody>
       <tr><td class="cmd">am</td><td><span class="badge b-stub">STUB</span></td><td class="miss">core apply→commit bails; <code>--continue/-r/--skip/--abort/--allow-empty/--retry</code> all bail (only <code>--quit</code> real)</td></tr>
       <tr><td class="cmd">archimport</td><td><span class="badge b-stub">STUB</span></td><td class="miss">entire GNU-Arch import bails unconditionally</td></tr>
-      <tr><td class="cmd">credential-osxkeychain</td><td><span class="badge b-stub">STUB</span></td><td class="miss">get/store/erase bail — no Security.framework FFI</td></tr>
       <tr><td class="cmd">cvsexportcommit</td><td><span class="badge b-stub">STUB</span></td><td class="miss">all export logic bails — no CVS client / patch(1)</td></tr>
       <tr><td class="cmd">cvsimport</td><td><span class="badge b-stub">STUB</span></td><td class="miss">entire import bails — no cvs/cvsps</td></tr>
       <tr><td class="cmd">cvsserver</td><td><span class="badge b-stub">STUB</span></td><td class="miss">server bails (only <code>--version</code>) — no CVS wire protocol</td></tr>
@@ -122,7 +126,7 @@
       <tr><td class="cmd">commit-graph</td><td>13</td><td class="miss"><code>--changed-paths</code>, <code>--split</code></td></tr>
       <tr><td class="cmd">commit-tree</td><td>4</td><td class="miss"><code>-S/--gpg-sign</code></td></tr>
       <tr><td class="cmd">commit</td><td>39</td><td class="miss"><code>--amend</code>, <code>-F/-C/-c</code>, <code>--author/--date</code>, <code>--fixup/--squash</code>, <code>-s</code>, <code>--cleanup</code>, <code>-o/-i</code>, <code>-p</code>, <code>-S</code>, <code>--dry-run</code>, <code>--porcelain/-z</code>, <code>--reset-author</code>, <code>--pathspec-from-file</code></td></tr>
-      <tr><td class="cmd">config</td><td>8</td><td class="miss">get/set/list/unset subcommand syntax, <code>--global/--system/--worktree/--file</code>, <code>--get-regexp/--get-urlmatch</code>, <code>--type/--bool/--int</code>, <code>--replace-all</code>, <code>--show-origin/--show-scope</code>, <code>-z</code>, <code>--default</code>, edit, rename/remove-section</td></tr>
+      <tr><td class="cmd">config</td><td>8</td><td class="miss">get/set/list/unset subcommand syntax (with <code>--local/--global/--system</code> scopes); still missing <code>--worktree/--file</code>, <code>--get-regexp/--get-urlmatch</code>, <code>--type/--bool/--int</code>, <code>--replace-all</code>, <code>--show-origin/--show-scope</code>, <code>-z</code>, <code>--default</code>, edit, rename/remove-section</td></tr>
       <tr><td class="cmd">describe</td><td>14</td><td class="miss"><code>--contains</code>, <code>--match</code>, <code>--exclude</code></td></tr>
       <tr><td class="cmd">diff-files</td><td>~28</td><td class="miss"><code>-M/-C/-B</code> rename-copy, <code>-O</code>, <code>-I</code> full-regex, real binary patch</td></tr>
       <tr><td class="cmd">diff-index</td><td>~24</td><td class="miss">real <code>-p</code> output (no-op), <code>-M/-C/-B</code>, <code>--color/--word-diff</code></td></tr>
@@ -186,7 +190,7 @@
     </tbody>
   </table>
 
-  <h2>Full-parity commands (62)</h2>
+  <h2>Full-parity commands (63)</h2>
   <p class="note">Real implementations with all/nearly-all of git's options. Genuinely on par with stock git for their surface.</p>
   <table>
     <thead><tr><th colspan="4">command</th></tr></thead>
@@ -206,7 +210,7 @@
       <tr><td class="cmd">sparse-checkout</td><td class="cmd">stripspace</td><td class="cmd">symbolic-ref</td><td class="cmd">unpack-file</td></tr>
       <tr><td class="cmd">unpack-objects</td><td class="cmd">update-index</td><td class="cmd">update-ref</td><td class="cmd">update-server-info</td></tr>
       <tr><td class="cmd">upload-archive</td><td class="cmd">url-parse</td><td class="cmd">var</td><td class="cmd">verify-pack</td></tr>
-      <tr><td class="cmd">web--browse</td><td class="cmd">write-tree</td><td class="cmd">clone*</td><td class="cmd"></td></tr>
+      <tr><td class="cmd">web--browse</td><td class="cmd">write-tree</td><td class="cmd">clone*</td><td class="cmd">credential-osxkeychain</td></tr>
     </tbody>
   </table>
   <p class="note">* <code>clone</code> does real fetch+checkout but supports only 3 of 38 flags → listed PARTIAL above; the pipeline itself is full.</p>

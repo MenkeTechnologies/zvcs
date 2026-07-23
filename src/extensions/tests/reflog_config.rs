@@ -235,3 +235,48 @@ fn reflog_log_date_relative_deferred_no_fabrication() {
 
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
+
+#[test]
+fn reflog_decoration_and_relative_date_placeholders() {
+    // Regression: git-fuzzy's log/reflog preview runs
+    // `reflog --decorate=full --pretty=%D|%cr|%an`, which zvcs rejected on the
+    // `%D` decoration and `%cr` relative-date atoms. Verify byte-for-byte against
+    // real git with a pinned clock so relative output is reproducible.
+    let (repo, home) = fixture("deco");
+    git(&repo, &["tag", "v1"]);
+
+    let now = "1136300000"; // fixed "now" so %cr / %ar are deterministic
+    let run = |bin: &str, extra: &[&str]| -> String {
+        let mut args = vec!["reflog"];
+        args.extend_from_slice(extra);
+        let out = Command::new(bin)
+            .args(&args)
+            .current_dir(&repo)
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("ZVCS_HOME", &home)
+            .env("GIT_TEST_DATE_NOW", now)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    for extra in [
+        &["show", "--pretty=%D|%cr|%an"][..],   // git-fuzzy's exact atoms
+        &["--decorate=full", "--pretty=%D|%cr|%an"][..],
+        &["show", "--pretty=%d|%an"][..],       // %d wraps in " (...)"
+        &["show", "--pretty=%D"][..],           // blank line per undecorated entry
+        &["show", "--pretty="][..],             // empty format prints nothing
+        &["show", "--pretty=%cr"][..],
+        &["show", "--pretty=%ci"][..],
+        &["show", "--pretty=%ct"][..],
+    ] {
+        assert_eq!(
+            run("git", extra),
+            run(BIN, extra),
+            "reflog {extra:?} must match real git byte-for-byte"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}

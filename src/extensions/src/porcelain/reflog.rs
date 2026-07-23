@@ -126,7 +126,9 @@ use regex::bytes::{Regex, RegexBuilder};
 ///
 ///   * Diff output that needs the rest of git's diff driver — `-p`, `--patch`,
 ///     `--stat` (column-width scaling against the terminal width), `--dirstat`.
-///   * The `%d`/`%D` decoration placeholders, `%C(...)` color, and `--color=always`.
+///   * `%C(...)` color placeholders and `--color=always`. (The `%d`/`%D` ref
+///     decorations and the `%ar`/`%cr` relative and `%ai`/`%at` date atoms are
+///     supported.)
 ///   * The `email`/`mboxrd` patch `--pretty` formats, which need git's mbox driver.
 ///     These are deferred: when a filter (a date limiter or a pathspec) drops every
 ///     entry the format is never exercised and the command succeeds with empty

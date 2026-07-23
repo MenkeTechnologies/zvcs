@@ -1537,10 +1537,21 @@ fn expand_format(
                         let time = raw.time().map_err(|e| anyhow!("{e}"))?;
                         out.extend_from_slice(sig_date(time, which, date_format)?.as_bytes());
                     }
-                    // `%ar`/`%ah`: relative and human dates need a "now"
-                    // reference and git's human-date rounding; left as an honest
-                    // floor rather than a render that would diverge.
-                    b'r' | b'h' => bail!(
+                    // `%ar`/`%cr`: relative date, rendered by the shared
+                    // `show_date_relative` port against git's "now" reference.
+                    b'r' => {
+                        let time = raw.time().map_err(|e| anyhow!("{e}"))?;
+                        out.extend_from_slice(
+                            crate::date::show_date_relative(
+                                time.seconds,
+                                crate::date::now_seconds(),
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    // `%ah`/`%ch`: human dates need git's separate rounding;
+                    // left as an honest floor rather than a divergent render.
+                    b'h' => bail!(
                         "`--format` placeholder `%{}{}` is not ported",
                         next as char,
                         which as char
@@ -1574,12 +1585,20 @@ fn sig_date(time: gix::date::Time, which: u8, date_format: Option<&str>) -> Resu
         // `%as`/`%cs` is always the short date, independent of `--date`
         // (git's `show_ident_date(&s, DATE_MODE(SHORT))`).
         b's' => dfmt::SHORT.into(),
-        // `%ad`/`%cd` honour `--date`; only the formats that reproduce git
-        // byte-for-byte are supported, others (relative/human/local) bail.
-        _ => match git_date_format(date_format) {
-            Some(f) => f,
-            None => bail!("`--format` %ad/%cd with --date={date_format:?} is not ported"),
-        },
+        // `%ad`/`%cd` honour `--date`. `relative` is rendered by the shared
+        // port; the other unmapped selectors (human/local/format:) still bail.
+        _ => {
+            if date_format == Some("relative") {
+                return Ok(crate::date::show_date_relative(
+                    time.seconds,
+                    crate::date::now_seconds(),
+                ));
+            }
+            match git_date_format(date_format) {
+                Some(f) => f,
+                None => bail!("`--format` %ad/%cd with --date={date_format:?} is not ported"),
+            }
+        }
     };
     time.format(fmt).map_err(|e| anyhow!("{e}"))
 }

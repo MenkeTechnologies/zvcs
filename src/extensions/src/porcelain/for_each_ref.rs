@@ -124,6 +124,7 @@ enum DateFmt {
     Rfc2822,
     Unix,
     Raw,
+    Relative,
 }
 
 /// Which slice of a commit/tag message a contents atom extracts.
@@ -1139,10 +1140,11 @@ fn parse_atom(spec: &str, color_on: bool) -> std::result::Result<Atom, AtomError
                 Some("rfc2822") => DateFmt::Rfc2822,
                 Some("unix") => DateFmt::Unix,
                 Some("raw") => DateFmt::Raw,
+                Some("relative") => DateFmt::Relative,
                 Some(m) => {
                     return Err(unported_atom(format!(
                         "date format `:{m}` is not ported (ported: default, short, iso8601, \
-                         iso8601-strict, rfc2822, unix, raw)"
+                         iso8601-strict, rfc2822, unix, raw, relative)"
                     )))
                 }
             };
@@ -2000,6 +2002,9 @@ fn format_date(time: gix::date::Time, fmt: DateFmt) -> String {
         DateFmt::Rfc2822 => time.format_or_unix(format::GIT_RFC2822),
         DateFmt::Unix => time.format_or_unix(format::UNIX),
         DateFmt::Raw => time.format_or_unix(format::RAW),
+        DateFmt::Relative => {
+            crate::date::show_date_relative(time.seconds, crate::date::now_seconds())
+        }
     }
 }
 

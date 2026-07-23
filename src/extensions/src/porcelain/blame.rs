@@ -1024,70 +1024,11 @@ impl DateMode {
     }
 }
 
-/// Byte-for-byte port of git's `show_date_relative` (date.c): render `seconds`
-/// as a coarse "N units ago" string relative to the current wall-clock time.
-/// The recorded timezone offset is irrelevant, exactly as in git.
+/// git's `show_date_relative` (date.c), via the shared port — so `--date=relative`
+/// in blame honors `GIT_TEST_DATE_NOW` and matches every other command exactly.
+/// The recorded timezone offset is irrelevant, as in git.
 fn show_date_relative(seconds: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    if now < seconds {
-        return "in the future".to_string();
-    }
-    // git uses an unsigned `timestamp_t` for the difference and the divisions
-    // below, so mirror that with u64 arithmetic.
-    let mut diff = (now - seconds) as u64;
-    if diff < 90 {
-        return relative_unit(diff, "second");
-    }
-    diff = (diff + 30) / 60;
-    if diff < 90 {
-        return relative_unit(diff, "minute");
-    }
-    diff = (diff + 30) / 60;
-    if diff < 36 {
-        return relative_unit(diff, "hour");
-    }
-    // From here on we work in whole days.
-    diff = (diff + 12) / 24;
-    if diff < 14 {
-        return relative_unit(diff, "day");
-    }
-    if diff < 70 {
-        return relative_unit((diff + 3) / 7, "week");
-    }
-    if diff < 365 {
-        return relative_unit((diff + 15) / 30, "month");
-    }
-    if diff < 1825 {
-        let total_months = (diff * 12 * 2 + 365) / (365 * 2);
-        let years = total_months / 12;
-        let months = total_months % 12;
-        if months > 0 {
-            return format!(
-                "{}, {} ago",
-                plural(years, "year"),
-                plural(months, "month")
-            );
-        }
-        return relative_unit(years, "year");
-    }
-    relative_unit((diff + 183) / 365, "year")
-}
-
-/// `"<n> <unit> ago"` / `"<n> <unit>s ago"`, matching git's `Q_()` English plural.
-fn relative_unit(n: u64, unit: &str) -> String {
-    format!("{} ago", plural(n, unit))
-}
-
-/// `"<n> <unit>"` with git's English plural rule: singular only when `n == 1`.
-fn plural(n: u64, unit: &str) -> String {
-    if n == 1 {
-        format!("{n} {unit}")
-    } else {
-        format!("{n} {unit}s")
-    }
+    crate::date::show_date_relative(seconds, crate::date::now_seconds())
 }
 
 /// git's `date_mode_type`, restricted to what the parser needs to classify.

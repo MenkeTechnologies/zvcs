@@ -2,7 +2,6 @@ use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::bstr::ByteSlice;
 use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
@@ -1362,67 +1361,16 @@ fn expand_decoration(
     }
 }
 
-/// Current time in epoch seconds, for relative dates.
+/// Current time in epoch seconds, for relative dates. Delegates to the shared
+/// resolver so `%cr`/`%ar`/`--date=relative` honor `GIT_TEST_DATE_NOW` like git.
 fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::date::now_seconds()
 }
 
-/// git's `show_date_relative`: render `then` as "N units ago" relative to `now`,
-/// with the same unit thresholds and rounding.
+/// git's `show_date_relative`, via the shared port (exact thresholds + the
+/// `(diff*24+365)/730` years/months rounding).
 fn format_relative(then: i64, now: i64) -> String {
-    if now < then {
-        return "in the future".to_string();
-    }
-    let mut diff = (now - then) as u64;
-    if diff < 90 {
-        return unit_ago(diff, "second");
-    }
-    diff = (diff + 30) / 60; // minutes
-    if diff < 90 {
-        return unit_ago(diff, "minute");
-    }
-    diff = (diff + 30) / 60; // hours
-    if diff < 36 {
-        return unit_ago(diff, "hour");
-    }
-    diff = (diff + 12) / 24; // days
-    if diff < 14 {
-        return unit_ago(diff, "day");
-    }
-    if diff < 70 {
-        return unit_ago((diff + 3) / 7, "week");
-    }
-    if diff < 365 {
-        return unit_ago((diff + 15) / 30, "month");
-    }
-    // Years and months for the first ~5 years, then years alone.
-    if diff < 1825 {
-        let totalmonths = diff * 12 * 10 / 365;
-        let years = totalmonths / 120;
-        let months = (totalmonths % 120) / 10;
-        if months > 0 {
-            return format!("{}, {} ago", unit(years, "year"), unit(months, "month"));
-        }
-        return unit_ago(years, "year");
-    }
-    unit_ago((diff + 183) / 365, "year")
-}
-
-/// `"N unit ago"` / `"N units ago"` with git's singular/plural rule.
-fn unit_ago(n: u64, name: &str) -> String {
-    format!("{} ago", unit(n, name))
-}
-
-/// `"1 unit"` or `"N units"`.
-fn unit(n: u64, name: &str) -> String {
-    if n == 1 {
-        format!("1 {name}")
-    } else {
-        format!("{n} {name}s")
-    }
+    crate::date::show_date_relative(then, now)
 }
 
 /// Write a signature's timestamp in `mode`, the shared body of `%ad`/`%cd` and

@@ -11,6 +11,7 @@ pub mod autocorrect;
 pub mod autostart;
 pub mod config;
 pub mod crawler;
+pub mod date;
 pub mod db;
 pub mod dispatch;
 pub mod hooks;

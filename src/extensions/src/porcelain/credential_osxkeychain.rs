@@ -14,10 +14,12 @@ use std::process::ExitCode;
 ///     the caller supplied no username, the stored account via
 ///     `SecKeychainItemCopyContent` (`kSecAccountItemAttr`) as `username=<data>`.
 ///     A miss is silent success — git reads that as "nothing stored".
-///   * `store` → `SecKeychainAddInternetPassword`, but only for a complete
-///     credential (protocol, host, username and password all present), matching
-///     upstream's guard. git erases before re-storing a rotated secret, so the
-///     add-only path (no update-on-duplicate) still refreshes correctly.
+///   * `store` → `SecKeychainAddInternetPassword` for a complete credential
+///     (protocol, host, username and password all present), matching upstream's
+///     guard; on `errSecDuplicateItem` it overwrites the existing item's password
+///     via `SecKeychainItemModifyAttributesAndData`. (git's contrib helper is
+///     add-only and silently keeps the old secret on a re-store — the daily-driver
+///     bug where every later `get` re-prompts; modern git updates, and so do we.)
 ///   * `erase` → `SecKeychainFindInternetPassword` then `SecKeychainItemDelete`,
 ///     gated on at least a protocol and host, exactly as upstream requires.
 ///
@@ -181,7 +183,9 @@ mod keychain {
         SecAuthenticationType, SecKeychainAddInternetPassword, SecKeychainFindInternetPassword,
         SecProtocolType,
     };
-    use security_framework_sys::keychain_item::{SecKeychainItemDelete, SecKeychainItemFreeContent};
+    use security_framework_sys::keychain_item::{
+        SecKeychainItemDelete, SecKeychainItemFreeContent, SecKeychainItemModifyAttributesAndData,
+    };
     use std::io::Write;
     use std::os::raw::{c_char, c_void};
     use std::ptr;
@@ -204,6 +208,10 @@ mod keychain {
     /// `kSecAccountItemAttr`, the four-char-code `'acct'`, selecting the stored
     /// account (username) attribute in `SecKeychainItemCopyContent`.
     const K_SEC_ACCOUNT_ITEM_ATTR: u32 = 0x6163_6374;
+
+    /// `errSecDuplicateItem` — `SecKeychainAddInternetPassword` returns this when
+    /// an item for the same {protocol, host, account, path, port} already exists.
+    const ERR_SEC_DUPLICATE_ITEM: i32 = -25299;
 
     /// Upstream's `KEYCHAIN_ITEM(x)` macro: `(len, ptr)` for a present string,
     /// `(0, NULL)` for an absent one. The bytes are borrowed from `cred`, so the
@@ -360,11 +368,7 @@ mod keychain {
         let (user_len, user_ptr) = item(&cred.username);
         let (path_len, path_ptr) = item(&cred.path);
         unsafe {
-            // The return status is ignored exactly as upstream does: a duplicate
-            // item leaves the existing secret untouched, and git issues an
-            // `erase` before re-storing a rotated secret, so this add-only path
-            // still refreshes credentials correctly.
-            SecKeychainAddInternetPassword(
+            let status = SecKeychainAddInternetPassword(
                 ptr::null_mut(), // default keychain
                 host_len,
                 host_ptr,
@@ -381,6 +385,23 @@ mod keychain {
                 password.as_ptr() as *const c_void,
                 ptr::null_mut(), // itemRef out — unused
             );
+
+            // git's contrib helper is add-only: it ignores the return, so a store
+            // against an existing item silently keeps the OLD secret. That breaks
+            // the daily driver — a re-authenticated or rotated credential never
+            // lands, and every later `get` returns the stale value (or nothing),
+            // so git keeps prompting. Modern git updates on duplicate; match it by
+            // overwriting the existing item's password in place.
+            if status == ERR_SEC_DUPLICATE_ITEM {
+                if let Some((_, existing)) = find(cred, false) {
+                    SecKeychainItemModifyAttributesAndData(
+                        existing,
+                        ptr::null(),
+                        password.len() as u32,
+                        password.as_ptr() as *const c_void,
+                    );
+                }
+            }
         }
     }
 

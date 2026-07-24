@@ -6818,6 +6818,18 @@ _git_commands () {
     zauthors:'zvcs: commit counts by author across indexed repos'
     zhot:'zvcs: indexed repos ranked by recent commit activity'
     zconflicts:'zvcs: indexed repos mid-merge/rebase or conflicted'
+    zfetch:'zvcs: parallel git fetch across every indexed repo'
+    zgc:'zvcs: parallel git gc across every indexed repo'
+    zfsck:'zvcs: parallel git fsck across every indexed repo'
+    zprune:'zvcs: parallel git prune across every indexed repo'
+    zcheckout:'zvcs: check out a branch in every repo that has it'
+    ztagall:'zvcs: create a tag at HEAD in every indexed repo'
+    zcommitall:'zvcs: commit tracked changes across every dirty repo'
+    zpushall:'zvcs: push every indexed repo that is ahead'
+    zclean:'zvcs: remove untracked files across indexed repos (-f)'
+    zwait:'zvcs: block until a repo'\''s async jobs drain'
+    zqueue:'zvcs: list queued/running async jobs'
+    zbarrier:'zvcs: block until the async queue is idle'
   )
 
   zstyle -a :completion:$curcontext: user-commands user_commands

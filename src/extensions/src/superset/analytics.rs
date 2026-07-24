@@ -111,7 +111,7 @@ fn ahead_behind_verb(args: &[String], want_ahead: bool) -> Result<ExitCode> {
 
 /// `(ahead, behind)` commit counts of HEAD vs its configured upstream, or `None`
 /// when there is no upstream. Mirrors `porcelain::status`'s tracking logic.
-fn ahead_behind(repo: &gix::Repository) -> Option<(usize, usize)> {
+pub(crate) fn ahead_behind(repo: &gix::Repository) -> Option<(usize, usize)> {
     let branch_ref = repo.head_ref().ok().flatten()?;
     let Some(Ok(upstream_name)) = branch_ref.remote_tracking_ref_name(gix::remote::Direction::Fetch)
     else {

@@ -428,6 +428,78 @@ pub const DOCS: &[Doc] = &[
         synopsis: "git zconflicts [selectors]",
         desc: &["Lists the indexed repositories that are in the middle of a merge, rebase, cherry-pick, revert, or bisect, or that have unmerged (conflicted) index entries, with the operation(s) named \\(em so a stuck repo among many is found at a glance."],
     },
+    Doc {
+        verb: "zfetch",
+        summary: "parallel git fetch across indexed repos",
+        synopsis: "git zfetch [selectors]",
+        desc: &["Runs `git fetch` in every selected indexed repository concurrently, through this binary's own porcelain and fair per-repo lane. Output is grouped per repo and failures are recorded in the ledger."],
+    },
+    Doc {
+        verb: "zgc",
+        summary: "parallel git gc across indexed repos",
+        synopsis: "git zgc [selectors]",
+        desc: &["Runs `git gc` in every selected indexed repository concurrently \\(em machine-wide maintenance in one command."],
+    },
+    Doc {
+        verb: "zfsck",
+        summary: "parallel git fsck across indexed repos",
+        synopsis: "git zfsck [selectors]",
+        desc: &["Runs `git fsck` in every selected indexed repository concurrently, to check object integrity across the whole tree at once."],
+    },
+    Doc {
+        verb: "zprune",
+        summary: "parallel git prune across indexed repos",
+        synopsis: "git zprune [selectors]",
+        desc: &["Runs `git prune` in every selected indexed repository concurrently, removing unreachable objects tree-wide."],
+    },
+    Doc {
+        verb: "zcheckout",
+        summary: "check out a branch in every repo that has it",
+        synopsis: "git zcheckout [selectors] <branch>",
+        desc: &["Checks out `<branch>` in every selected indexed repository that already has it, in parallel. A repo without the branch is skipped \\(em the branch is never created \\(em so this is a safe way to move a whole tree onto a shared branch name."],
+    },
+    Doc {
+        verb: "ztagall",
+        summary: "create a tag at HEAD in every indexed repo",
+        synopsis: "git ztagall [selectors] <tag>",
+        desc: &["Creates tag `<tag>` at HEAD in every selected indexed repository, in parallel. A repo that already has the tag reports the failure rather than moving it."],
+    },
+    Doc {
+        verb: "zcommitall",
+        summary: "commit tracked changes across every dirty repo",
+        synopsis: "git zcommitall [selectors] -m <msg>",
+        desc: &["Commits tracked changes (`git commit -a`) with message `<msg>` in every selected indexed repository whose worktree is dirty, in parallel. Clean repos are skipped. Untracked files are not staged (as with `commit -a`)."],
+    },
+    Doc {
+        verb: "zpushall",
+        summary: "push every indexed repo that is ahead",
+        synopsis: "git zpushall [selectors]",
+        desc: &["Runs `git push` in every selected indexed repository that is ahead of its upstream, in parallel. Repos that are not ahead (or have no upstream) are skipped, so no needless network calls are made."],
+    },
+    Doc {
+        verb: "zclean",
+        summary: "remove untracked files across indexed repos",
+        synopsis: "git zclean -f [selectors]",
+        desc: &["Runs `git clean -fd` \\(em remove untracked files and directories \\(em in every selected indexed repository, in parallel. Because it deletes, the `-f` flag is required; ignored files are left (as `git clean` does without `-x`)."],
+    },
+    Doc {
+        verb: "zwait",
+        summary: "block until a repo's async jobs drain",
+        synopsis: "git zwait [<path>]",
+        desc: &["Blocks until the repository at `<path>` (or the current directory) has no queued or running async jobs (`zcommit`/`zpush`) left in the ledger \\(em the join for that repo's fire-and-forget work. With no daemon there are no jobs, so it returns at once."],
+    },
+    Doc {
+        verb: "zqueue",
+        summary: "list queued and running async jobs",
+        synopsis: "git zqueue",
+        desc: &["Lists the async jobs currently queued or running in the ledger (id, state, kind, repo) \\(em what the daemon is working through right now."],
+    },
+    Doc {
+        verb: "zbarrier",
+        summary: "block until the async queue is idle",
+        synopsis: "git zbarrier",
+        desc: &["Blocks until the entire async job queue is idle \\(em every repository's queued and running jobs have drained \\(em the global join after a burst of `zcommit`/`zpush`."],
+    },
 ];
 
 /// The manual for `verb`, or `None` if it is not a superset verb.

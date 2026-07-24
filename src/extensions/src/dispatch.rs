@@ -18,6 +18,8 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "zdoctor", "zmkdir", "ztouch", "zrm", "zcp", "zmv", "zcat", "zln",
     "zheads", "zdirty", "zbranches", "ztags", "zremotes", "zsize", "zage", "zpull",
     "zgrep", "zahead", "zbehind", "zauthors", "zhot", "zconflicts",
+    "zfetch", "zgc", "zfsck", "zprune", "zcheckout", "ztagall", "zcommitall", "zpushall", "zclean",
+    "zwait", "zqueue", "zbarrier",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -279,6 +281,18 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zauthors" => "usage: git zauthors [selectors] — commit counts by author across indexed repos, ranked",
         "zhot" => "usage: git zhot [selectors] [<days>] — indexed repos ranked by commits in the last <days> (default 30)",
         "zconflicts" => "usage: git zconflicts [selectors] — indexed repos mid-merge/rebase/cherry-pick/revert/bisect or with conflicts",
+        "zfetch" => "usage: git zfetch [selectors] — parallel git fetch across every indexed repo",
+        "zgc" => "usage: git zgc [selectors] — parallel git gc across every indexed repo",
+        "zfsck" => "usage: git zfsck [selectors] — parallel git fsck across every indexed repo",
+        "zprune" => "usage: git zprune [selectors] — parallel git prune across every indexed repo",
+        "zcheckout" => "usage: git zcheckout [selectors] <branch> — check out <branch> in every indexed repo that has it",
+        "ztagall" => "usage: git ztagall [selectors] <tag> — create <tag> at HEAD in every indexed repo",
+        "zcommitall" => "usage: git zcommitall [selectors] -m <msg> — commit tracked changes (commit -a) in every dirty repo",
+        "zpushall" => "usage: git zpushall [selectors] — push every indexed repo that is ahead of its upstream",
+        "zclean" => "usage: git zclean -f [selectors] — remove untracked files (git clean -fd) in every indexed repo (-f required)",
+        "zwait" => "usage: git zwait [<path>] — block until the repo's async jobs drain",
+        "zqueue" => "usage: git zqueue — list queued/running async jobs",
+        "zbarrier" => "usage: git zbarrier — block until the whole async job queue is idle",
         _ => return None,
     })
 }
@@ -365,6 +379,18 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zauthors" => superset::zauthors(args),
         "zhot" => superset::zhot(args),
         "zconflicts" => superset::zconflicts(args),
+        "zfetch" => superset::zfetch(args),
+        "zgc" => superset::zgc(args),
+        "zfsck" => superset::zfsck(args),
+        "zprune" => superset::zprune(args),
+        "zcheckout" => superset::zcheckout(args),
+        "ztagall" => superset::ztagall(args),
+        "zcommitall" => superset::zcommitall(args),
+        "zpushall" => superset::zpushall(args),
+        "zclean" => superset::zclean(args),
+        "zwait" => superset::zwait(args),
+        "zqueue" => superset::zqueue(args),
+        "zbarrier" => superset::zbarrier(args),
 
         // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----
         "add" => porcelain::add(args),

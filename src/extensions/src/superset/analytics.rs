@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use anyhow::{bail, Result};
 use gix::bstr::ByteSlice;
 
-use crate::superset::query::{parallel_map, probe, select_repos, selected};
+use crate::superset::query::{emit_json, json_flag, parallel_map, probe, select_repos, selected};
 use crate::superset::select::Selector;
 
 /// `git zgrep [selectors] [-i] <pattern>` — search the tracked file content of
@@ -88,9 +88,18 @@ pub fn zbehind(args: &[String]) -> Result<ExitCode> {
 }
 
 fn ahead_behind_verb(args: &[String], want_ahead: bool) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let counts = parallel_map(&repos, |gd, _| probe(gd, ahead_behind, |_| None));
     let label = if want_ahead { "ahead" } else { "behind" };
+    if json {
+        emit_json(repos.iter().zip(&counts).filter_map(|((_, wd), ab)| {
+            let (ahead, behind) = (*ab)?;
+            let n = if want_ahead { ahead } else { behind };
+            (n > 0).then(|| serde_json::json!({"repo": wd.to_string_lossy(), label: n}))
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
     let mut shown = 0usize;
     for ((_, wd), ab) in repos.iter().zip(&counts) {
         if let Some((ahead, behind)) = ab {
@@ -143,9 +152,16 @@ pub fn zunpulled(args: &[String]) -> Result<ExitCode> {
 }
 
 fn unsynced_verb(args: &[String], unpushed: bool) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let per = parallel_map(&repos, |gd, _| probe(gd, |r| unsynced_lines(r, unpushed), |_| Vec::new()));
     let label = if unpushed { "zunpushed" } else { "zunpulled" };
+    if json {
+        emit_json(repos.iter().zip(&per).filter(|(_, lines)| !lines.is_empty()).map(|((_, wd), lines)| {
+            serde_json::json!({"repo": wd.to_string_lossy(), "commits": lines})
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
     let mut shown = 0usize;
     for ((_, wd), lines) in repos.iter().zip(&per) {
         if !lines.is_empty() {
@@ -195,7 +211,8 @@ fn count_commits(repo: &gix::Repository, tip: gix::ObjectId, hidden: gix::Object
 /// `git zauthors [selectors]` — commit counts by author across every indexed
 /// repo's history, aggregated and ranked.
 pub fn zauthors(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let per = parallel_map(&repos, |gd, _| probe(gd, author_counts, |_| HashMap::new()));
     let mut total: HashMap<String, usize> = HashMap::new();
     for m in per {
@@ -205,6 +222,10 @@ pub fn zauthors(args: &[String]) -> Result<ExitCode> {
     }
     let mut rows: Vec<(usize, String)> = total.into_iter().map(|(k, v)| (v, k)).collect();
     rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    if json {
+        emit_json(rows.iter().map(|(n, who)| serde_json::json!({"author": who, "commits": n})));
+        return Ok(ExitCode::SUCCESS);
+    }
     for (n, who) in &rows {
         println!("{n:>7}  {who}");
     }
@@ -230,7 +251,8 @@ fn author_counts(repo: &gix::Repository) -> HashMap<String, usize> {
 /// `git zhot [selectors] [<days>]` — indexed repos ranked by commits made in the
 /// last `<days>` (default 30), most active first.
 pub fn zhot(args: &[String]) -> Result<ExitCode> {
-    let (sel, rest) = Selector::parse(args);
+    let (json, args) = json_flag(args);
+    let (sel, rest) = Selector::parse(&args);
     let days: i64 = rest.iter().find_map(|a| a.parse().ok()).unwrap_or(30);
     let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     let cutoff = crate::date::now_seconds() - days * 86_400;
@@ -241,6 +263,10 @@ pub fn zhot(args: &[String]) -> Result<ExitCode> {
         .map(|((_, wd), c)| (*c, wd.display().to_string()))
         .collect();
     rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    if json {
+        emit_json(rows.iter().map(|(c, p)| serde_json::json!({"repo": p, "commits": c})));
+        return Ok(ExitCode::SUCCESS);
+    }
     let width = rows.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
     for (c, p) in &rows {
         println!("{p:<width$}  {c} commit(s)");
@@ -318,8 +344,17 @@ fn conflict_state(git_dir: &Path) -> Option<String> {
 /// `git zdivergent [selectors]` — indexed repos that are both ahead of and behind
 /// their upstream (history has forked; a merge or rebase is needed).
 pub fn zdivergent(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let ab = parallel_map(&repos, |gd, _| probe(gd, ahead_behind, |_| None));
+    if json {
+        emit_json(repos.iter().zip(&ab).filter_map(|((_, wd), x)| {
+            let (ahead, behind) = (*x)?;
+            (ahead > 0 && behind > 0)
+                .then(|| serde_json::json!({"repo": wd.to_string_lossy(), "ahead": ahead, "behind": behind}))
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
     let mut shown = 0usize;
     for ((_, wd), x) in repos.iter().zip(&ab) {
         if let Some((ahead, behind)) = x {
@@ -336,8 +371,15 @@ pub fn zdivergent(args: &[String]) -> Result<ExitCode> {
 /// `git zorphans [selectors]` — indexed repos with no remote configured (nothing
 /// to fetch from or push to).
 pub fn zorphans(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let no_remote = parallel_map(&repos, |gd, _| probe(gd, |r| r.remote_names().is_empty(), |_| false));
+    if json {
+        emit_json(repos.iter().zip(&no_remote).filter(|(_, o)| **o).map(|((_, wd), _)| {
+            serde_json::json!({"repo": wd.to_string_lossy()})
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
     let mut shown = 0usize;
     for ((_, wd), orphan) in repos.iter().zip(&no_remote) {
         if *orphan {

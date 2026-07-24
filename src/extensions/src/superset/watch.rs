@@ -428,21 +428,27 @@ fn react(cfg: &ZvcsConfig) {
         // The top-level repo too — `autoreconcile` is documented as "this one +
         // submodules". reconcile_repo_local is ff-only and skips a dirty worktree,
         // so this is safe (and usually a no-op while bots leave gitlinks dirty).
-        if let Err(e) = crate::superset::reconcile_repo_local(&repo) {
-            println!("[zvcs reconcile] (top): error: {e:#}");
-            let _ = crate::db::record_failure(repo.git_dir(), "reconcile", &format!("{e:#}"));
+        match crate::superset::reconcile_repo_local(&repo) {
+            Ok(msg) => record_reconcile_event(&repo, &msg),
+            Err(e) => {
+                println!("[zvcs reconcile] (top): error: {e:#}");
+                let _ = crate::db::record_failure(repo.git_dir(), "reconcile", &format!("{e:#}"));
+            }
         }
         if let Ok(Some(subs)) = repo.submodules() {
             for sm in subs {
                 if let Ok(Some(sub)) = sm.open() {
-                    if let Err(e) = crate::superset::reconcile_repo_local(&sub) {
-                        let path = sm.path().map(|p| p.to_string()).unwrap_or_default();
-                        println!("[zvcs reconcile] {path}: error: {e:#}");
-                        let _ = crate::db::record_failure(
-                            sub.git_dir(),
-                            "reconcile",
-                            &format!("{path}: {e:#}"),
-                        );
+                    match crate::superset::reconcile_repo_local(&sub) {
+                        Ok(msg) => record_reconcile_event(&sub, &msg),
+                        Err(e) => {
+                            let path = sm.path().map(|p| p.to_string()).unwrap_or_default();
+                            println!("[zvcs reconcile] {path}: error: {e:#}");
+                            let _ = crate::db::record_failure(
+                                sub.git_dir(),
+                                "reconcile",
+                                &format!("{path}: {e:#}"),
+                            );
+                        }
                     }
                 }
             }
@@ -465,6 +471,19 @@ fn react(cfg: &ZvcsConfig) {
                 let _ = crate::db::record_failure(repo.git_dir(), "autobump", &format!("{e:#}"));
             }
         }
+    }
+}
+
+/// A real fast-forward reconcile becomes a `reconcile` event in the live feed
+/// (`git zevents`/`ztail`). No-ops — "up to date", "…skipped", unborn/dirty —
+/// carry those words in their message and are not worth surfacing.
+fn record_reconcile_event(repo: &gix::Repository, msg: &str) {
+    if msg.contains("skipped") || msg.contains("up to date") {
+        return;
+    }
+    if let Ok(conn) = crate::db::open_rw() {
+        let repo_id = crate::db::upsert_repo(&conn, repo.git_dir(), repo.workdir()).ok();
+        let _ = crate::db::record_event(&conn, "reconcile", repo_id, Some(msg), None, None);
     }
 }
 

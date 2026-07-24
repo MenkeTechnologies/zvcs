@@ -48,6 +48,7 @@ pub mod repl;
 pub mod watch;
 mod zbump;
 pub mod zdaemon;
+mod zevents;
 mod zsync;
 
 pub use attach::{ensure_attached, Attached};
@@ -85,4 +86,5 @@ pub use repl::zrepl;
 pub use reconcile::reconcile_tree;
 pub use zbump::{zbump, zbump_run, BumpOutcome};
 pub use zdaemon::zdaemon;
+pub use zevents::zevents;
 pub use zsync::{reconcile_repo, reconcile_repo_local, sync_dups, zsync};

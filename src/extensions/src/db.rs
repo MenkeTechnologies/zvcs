@@ -86,6 +86,37 @@ CREATE TABLE IF NOT EXISTS triggers (
     created_at  INTEGER,
     throttle_ms INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY,
+    ts         INTEGER NOT NULL,
+    kind       TEXT NOT NULL,
+    repo_id    INTEGER REFERENCES repos(id),
+    detail     TEXT,
+    sha_before TEXT,
+    sha_after  TEXT
+);
+-- The unified live feed behind `git zevents`/`ztail`. Two triggers turn every
+-- repo_status change into a typed event, so BOTH the whole-tree poller (statusd)
+-- and the instant notify path (watch) feed it through `upsert_status` with no
+-- caller changes. They fire on UPDATE only — a repo's first (INSERT) status row
+-- never floods the feed at cold start. Reconciles are recorded explicitly by the
+-- daemon's reconcile path (they do not reliably move through upsert_status).
+CREATE TRIGGER IF NOT EXISTS ev_commit AFTER UPDATE ON repo_status
+    WHEN NEW.head IS NOT OLD.head
+    BEGIN
+        INSERT INTO events (ts, kind, repo_id, detail, sha_before, sha_after)
+        VALUES (CAST(strftime('%s','now') AS INTEGER), 'commit', NEW.repo_id, NULL, OLD.head, NEW.head);
+    END;
+CREATE TRIGGER IF NOT EXISTS ev_status AFTER UPDATE ON repo_status
+    WHEN NEW.dirty IS NOT OLD.dirty OR NEW.sync IS NOT OLD.sync
+    BEGIN
+        INSERT INTO events (ts, kind, repo_id, detail, sha_before, sha_after)
+        VALUES (CAST(strftime('%s','now') AS INTEGER), 'status', NEW.repo_id,
+                CASE WHEN NEW.dirty IS NOT OLD.dirty
+                     THEN (CASE WHEN NEW.dirty THEN 'dirty' ELSE 'clean' END)
+                     ELSE NEW.sync END,
+                NULL, NULL);
+    END;
 ";
 
 /// `~/.zvcs/db.sqlite` (honors `ZVCS_HOME`).
@@ -380,6 +411,106 @@ pub fn prune_stale_jobs(conn: &Connection, retention_secs: i64) -> Result<usize>
         rusqlite::params![cutoff],
     )?;
     Ok(n)
+}
+
+/// Prune feed events older than the retention window, so the `events` table stays
+/// bounded like the job ledger. Returns rows deleted.
+pub fn prune_stale_events(conn: &Connection, retention_secs: i64) -> Result<usize> {
+    let cutoff = now() - retention_secs;
+    let n = conn.execute("DELETE FROM events WHERE ts < ?1", rusqlite::params![cutoff])?;
+    Ok(n)
+}
+
+/// One row of the unified event feed (`git zevents`/`ztail`), resolved to its
+/// repo path for display. `commit`/`status` events come from the `repo_status`
+/// triggers; `reconcile` events are inserted by the daemon's reconcile path.
+pub struct EventRow {
+    pub id: i64,
+    pub ts: i64,
+    pub kind: String,
+    pub git_dir: Option<String>,
+    pub workdir: Option<String>,
+    pub detail: Option<String>,
+    pub sha_before: Option<String>,
+    pub sha_after: Option<String>,
+}
+
+/// Append one event to the unified feed. Used for `reconcile` events the
+/// `repo_status` triggers cannot observe; `commit`/`status` events are inserted
+/// by those triggers.
+pub fn record_event(
+    conn: &Connection,
+    kind: &str,
+    repo_id: Option<i64>,
+    detail: Option<&str>,
+    sha_before: Option<&str>,
+    sha_after: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO events (ts, kind, repo_id, detail, sha_before, sha_after)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![now(), kind, repo_id, detail, sha_before, sha_after],
+    )?;
+    Ok(())
+}
+
+/// Highest event id (0 if empty) — the follow cursor's starting point so a live
+/// tail only prints events that arrive after it attaches.
+pub fn max_event_id(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0)).unwrap_or(0)
+}
+
+// Shared SELECT for both feed queries; `%` filters bind as NULL to disable.
+const EVENT_SELECT: &str = "SELECT e.id, e.ts, e.kind, r.git_dir, r.workdir, e.detail, e.sha_before, e.sha_after \
+     FROM events e LEFT JOIN repos r ON r.id = e.repo_id \
+    WHERE e.id > ?1 \
+      AND (?2 IS NULL OR e.kind = ?2) \
+      AND (?3 IS NULL OR r.git_dir LIKE ?3 OR r.workdir LIKE ?3)";
+
+fn row_to_event(r: &rusqlite::Row) -> rusqlite::Result<EventRow> {
+    Ok(EventRow {
+        id: r.get(0)?,
+        ts: r.get(1)?,
+        kind: r.get(2)?,
+        git_dir: r.get(3)?,
+        workdir: r.get(4)?,
+        detail: r.get(5)?,
+        sha_before: r.get(6)?,
+        sha_after: r.get(7)?,
+    })
+}
+
+/// The most recent `limit` events (ascending order for display) — the backlog a
+/// live tail prints before it starts following. Optional kind / repo-substring filters.
+pub fn events_recent(
+    conn: &Connection,
+    limit: usize,
+    kind: Option<&str>,
+    repo_like: Option<&str>,
+) -> Result<Vec<EventRow>> {
+    let like = repo_like.map(|p| format!("%{p}%"));
+    let sql = format!("{EVENT_SELECT} ORDER BY e.id DESC LIMIT ?4");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params![0i64, kind, like, limit as i64], row_to_event)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows.into_iter().rev().collect()) // newest-first query → oldest-first display
+}
+
+/// Events with id greater than `after_id`, oldest first — the follow poll.
+pub fn events_since(
+    conn: &Connection,
+    after_id: i64,
+    kind: Option<&str>,
+    repo_like: Option<&str>,
+) -> Result<Vec<EventRow>> {
+    let like = repo_like.map(|p| format!("%{p}%"));
+    let sql = format!("{EVENT_SELECT} ORDER BY e.id ASC LIMIT 500");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params![after_id, kind, like], row_to_event)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Record an autonomous-op failure (autobump/reconcile) so the next `git`
@@ -737,10 +868,11 @@ pub fn mark_notified(conn: &Connection, ids: &[i64]) -> Result<()> {
 #[cfg(test)]
 mod snapshot_atomic_tests {
     use super::{
-        insert_job, job_finished, load_snapshot, prune_stale_jobs, root_mtime_advanced,
-        save_snapshot, upsert_repo, SCHEMA,
+        events_recent, events_since, insert_job, job_finished, load_snapshot, prune_stale_jobs,
+        record_event, root_mtime_advanced, save_snapshot, upsert_repo, upsert_status, SCHEMA,
     };
     use rusqlite::Connection;
+    use std::path::Path;
 
     #[test]
     fn save_snapshot_rolls_back_on_mid_write_failure() {
@@ -850,6 +982,46 @@ mod snapshot_atomic_tests {
 
         // A second prune with nothing aged removes nothing.
         assert_eq!(prune_stale_jobs(&conn, week).unwrap(), 0, "idempotent once nothing is stale");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn events_feed_via_status_triggers() {
+        let dir = std::env::temp_dir().join(format!("zvcs-events-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("t.sqlite")).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let id = upsert_repo(&conn, Path::new("/x/repo/.git"), Some(Path::new("/x/repo"))).unwrap();
+
+        // First status row is an INSERT — the triggers fire on UPDATE only, so a
+        // repo joining the index must NOT flood the feed with a bogus event.
+        upsert_status(&conn, id, false, false, "clean", "aaaaaaaaaa00").unwrap();
+        assert_eq!(events_recent(&conn, 10, None, None).unwrap().len(), 0, "cold-start INSERT emits nothing");
+
+        // HEAD moves → one `commit` event carrying the sha delta.
+        upsert_status(&conn, id, false, false, "clean", "bbbbbbbbbb11").unwrap();
+        // Goes dirty → one `status` event; sync change → another.
+        upsert_status(&conn, id, true, false, "clean", "bbbbbbbbbb11").unwrap();
+        upsert_status(&conn, id, true, false, "ahead 1", "bbbbbbbbbb11").unwrap();
+        // A reconcile is recorded directly (triggers can't see it).
+        record_event(&conn, "reconcile", Some(id), Some("fast-forwarded"), None, None).unwrap();
+
+        let evs = events_recent(&conn, 10, None, None).unwrap();
+        assert_eq!(evs.len(), 4, "commit + 2 status + reconcile");
+        assert_eq!(evs[0].kind, "commit");
+        assert_eq!(evs[0].sha_before.as_deref(), Some("aaaaaaaaaa00"));
+        assert_eq!(evs[0].sha_after.as_deref(), Some("bbbbbbbbbb11"));
+        assert_eq!(evs[3].kind, "reconcile");
+        assert_eq!(evs[0].workdir.as_deref(), Some("/x/repo"), "path resolved via JOIN");
+
+        // Filters + incremental follow cursor.
+        assert_eq!(events_recent(&conn, 10, Some("status"), None).unwrap().len(), 2, "kind filter");
+        assert_eq!(events_recent(&conn, 10, None, Some("repo")).unwrap().len(), 4, "repo substring filter");
+        assert_eq!(events_recent(&conn, 10, None, Some("nomatch")).unwrap().len(), 0);
+        let after_first = events_since(&conn, evs[0].id, None, None).unwrap();
+        assert_eq!(after_first.len(), 3, "follow only sees events past the cursor");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

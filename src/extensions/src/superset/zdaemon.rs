@@ -346,6 +346,7 @@ fn start() -> Result<ExitCode> {
                 Ok(n) if n > 0 => log_line(&format!("[zvcs job] pruned {n} stale job(s)")),
                 _ => {}
             }
+            let _ = crate::db::prune_stale_events(&conn, JOB_RETENTION_SECS);
         }
     });
 

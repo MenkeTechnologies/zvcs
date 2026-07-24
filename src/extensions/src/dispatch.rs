@@ -12,7 +12,7 @@ use std::process::ExitCode;
 /// zvcs-native extension verbs — the superset that stock git does not have.
 pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zconfig", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
-    "zsubmit",
+    "zsubmit", "zevents", "ztail",
     "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
     "zsnapshots", "zworktree", "zstash", "zunstash", "zstashes", "zup", "zforeach", "zhook",
     "ztrigger", "zwatch", "zdashed", "zverbs", "zselectors", "zcd", "zpwd", "zls", "zenv", "zunset", "zecho",
@@ -227,6 +227,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
     Some(match sub {
         "zsync" => "usage: git zsync [--force] — reconcile submodules to origin/main AND fan this checkout's HEAD out to all its local dups (offline); --force hard-resets every dup (diverged/dirty included)",
         "zbump" => "usage: git zbump [<submodule-path>...] — forward-only submodule gitlink bumps",
+        "zevents" | "ztail" => "usage: git zevents [-n <count>] [--kind commit|status|reconcile] [--repo <substr>] [--json] [--no-follow] — one live feed of commits/reconciles/status-changes across the whole tree",
         "zdaemon" => "usage: git zdaemon <start|stop|restart|status|info|ping|log>",
         "zconfig" => "usage: git zconfig [<name> [on|off|<count>|default]] — toggle daemon features (see `git help zconfig`)",
         "zrepos" => "usage: git zrepos [<pattern>...] — list indexed repos; patterns filter by case-insensitive substring",
@@ -381,6 +382,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         // ---- superset (novel) ----
         "zsync" => superset::zsync(args),
         "zbump" => superset::zbump(args),
+        "zevents" | "ztail" => superset::zevents(args),
         "zdaemon" => superset::zdaemon(args),
         "zconfig" => superset::zconfig(args),
         "zrepos" => superset::zrepos(args),

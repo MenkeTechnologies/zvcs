@@ -505,6 +505,16 @@ and session attribution. All tested.
     Caveats: fires on **every** change under the dir (including a repo's `.git`
     churn), and a command that writes into the watched dir self-retriggers. Tests:
     `trigger.rs`, `watch.rs::armed_repo_matches_plain_worktree_file_events`.
+  - **Leading-edge throttle + live views** (`trigger.rs`, `watch.rs`). One file
+    action emits several fs events, so a naive trigger fires ~5× per save. Each
+    trigger carries `throttle_ms` (default 500ms): the daemon fires on the first
+    event, then coalesces events within the window into one fire (counted, not
+    run) — immediate, not the laggy trailing debounce. `--throttle <dur>` sets it,
+    `0` disables. Every real fire is appended to `~/.zvcs/fires.log`
+    (`epoch\tok\tcoalesced\tpath`, self-bounding at ~1MB). `git ztrigger tail`
+    follows it live; `git ztrigger top` redraws an in-place HUD (per-trigger fire
+    count, coalesced events, fires/sec over a 10s window, last-fired) — the model
+    is zthrottle's live gauge cluster. Proven: one file = one fire (was ~5).
 
 **New `[zvcs]` config keys:** `autostatus` (maintain `zstatus --all`) and
 `autohook` (fire per-repo local hooks), plus the existing

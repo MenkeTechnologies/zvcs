@@ -116,7 +116,7 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Profiling | `zstale [<days>]` `zlast` `zbig [<n>]` `zfiles` `zdivergent` `zorphans` | native, fanned in parallel — abandoned repos, most-recently-committed, largest tracked files, file counts, repos diverged from upstream, repos with no remote |
 | Multi-agent view | `zsessions` `zidle` `zdashboard` | sessions ranked by repos held; repos free to pick up; and a one-screen health summary of the whole tree (dirty/ahead/behind/diverged/conflicted/stale + claims/queue/size) |
 | Hooks | `zhook set/unset/show/list/test` | manage & test the current repo's ref-change hook (`zvcs.hook`); `zvcs.autohook` fires each repo's own local hook |
-| Triggers | `ztrigger DIR <cmd>` `ztrigger list/rm/test` | watch **any directory** (git repo or not) and run a command on **any file change** under it — stored in the `triggers` index, fired immediately (no debounce), command runs with the dir as cwd and `$ZVCS_DIR` set |
+| Triggers | `ztrigger DIR <cmd> [--throttle <dur>]` `ztrigger list/rm/test/tail/top` | watch **any directory** (git repo or not) and run a command on **any file change** under it — command runs with the dir as cwd and `$ZVCS_DIR` set; a leading-edge throttle (default 500ms) collapses the event burst of one file action into a single fire; `tail` streams fires live, `top` is an in-place fire-rate HUD |
 | Watch | `zwatch DIR` `zwatch list/rm` | watch any directory and log each change to the daemon log (a trigger with a built-in logging command) |
 | Console | `zrepl` | interactive line console over **every** command — each line runs as `git <line>`, so the `z*` verbs and all git porcelain work alike (startup stats banner + Tab completion of every verb) |
 | Shell | `zcd` `zpwd` `zls` `zenv` `zunset` `zecho` `zmkdir` `ztouch` `zrm` `zcp` `zmv` `zcat` `zln` | shell builtins so `zrepl` drives like a shell — `zcd`/`zenv`/`zunset` mutate the console's cwd/environment and persist across lines; `zls` is a git-aware listing (per-file status like `eza --git`); `zmkdir`/`ztouch`/`zrm`/`zcp`/`zmv`/`zcat`/`zln` are native filesystem commands (`zrm`/`zmv` are on-disk, distinct from `git rm`/`git mv`) |
@@ -309,23 +309,27 @@ so no git config is involved:
 ```console
 $ git ztrigger ~/Desktop  'say 45'           # any dir works — not just repos
 $ git ztrigger ~/src/api  'make test'        # a repo works too (watches worktree + .git)
-$ git ztrigger .          'echo "$ZVCS_DIR changed"'
-$ git ztrigger list                          # every trigger (path <tab> command)
+$ git ztrigger ~/logs 'reload' --throttle 2s # coalesce bursts to one fire per 2s
+$ git ztrigger list                          # path <tab> command <tab> throttle
 $ git ztrigger test ~/Desktop                # run its command once now
 $ git ztrigger rm   ~/Desktop                # remove it
 
-$ git zwatch ~/Downloads                      # watch a dir and log each change
-$ git zwatch list / rm ~/Downloads
+$ git ztrigger tail                          # live stream of fires as they happen
+$ git ztrigger top                           # in-place HUD: fires, events, /sec, last
+$ git zwatch ~/Downloads                     # watch a dir and log each change
 ```
 
-The command runs the instant an event arrives (**no debounce**), via `sh -c` with
-the watched directory as cwd and `$ZVCS_DIR` set. The daemon watches only the
+The command runs via `sh -c` with the watched directory as cwd and `$ZVCS_DIR`
+set. One file action emits several filesystem events, so each trigger has a
+**leading-edge throttle** (default 500ms, `--throttle <dur>`, `0` disables): the
+first event fires immediately, the rest of the burst is coalesced into that one
+fire — so a save fires once, not five times. The daemon records every fire to
+`~/.zvcs/fires.log`; `ztrigger tail` streams them and `ztrigger top` shows a live
+per-trigger rate HUD (spot a runaway trigger at a glance). It watches only the
 directories you triggered, so startup stays instant no matter how many repos are
-indexed. Two caveats: it fires on **every** change under the dir — including a
-repo's `.git` churn (index writes from prompt `git status`, etc.), which can be
-frequent — and a command that writes back into the watched dir re-fires on its own
-writes. Keep commands side-effect-free, point them elsewhere, or watch a quieter
-directory. For a repo's *git* hook (ref-change semantics in `.git/config`), use
+indexed. Caveats: it fires on **every** change under the dir — including a repo's
+`.git` churn — and a command that writes back into the watched dir re-fires on its
+own writes. For a repo's *git* hook (ref-change semantics in `.git/config`), use
 `git zhook` instead.
 
 ## [0x06] LAYOUT

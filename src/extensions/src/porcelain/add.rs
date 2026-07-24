@@ -15,9 +15,13 @@
 //!   * `git add --ignore-errors` — skip files that cannot be read, exit 1
 //!     (default from the `add.ignoreErrors` / `add.ignore-errors` config key)
 //!   * `git add --ignore-missing` — with `-n`, tolerate non-matching pathspecs
+//!   * `git add <submodule>` — stage a moved submodule's current HEAD as the
+//!     parent gitlink (mode 160000), the same way stock git does; no
+//!     fast-forward gate and no commit (that is `git zbump`)
 //!   * flags `-f/--force`, `-n/--dry-run`, `-v/--verbose`, `--sparse`, `--`, and
 //!     `--warn-embedded-repo`/`--no-warn-embedded-repo` (accepted no-op: the
-//!     embedded-repo warning is moot since gitlinks are never staged here)
+//!     embedded-repo warning is moot since untracked embedded repos are never
+//!     staged here — only *tracked* submodule gitlinks are updated)
 //!
 //! For each matched worktree file the blob is hashed into the object database and
 //! its index entry is (re)written with the current mode and filesystem stat.
@@ -29,7 +33,9 @@
 //!   * `.gitattributes` content filters (autocrlf, `clean`/`smudge`) are NOT
 //!     applied — the blob is the verbatim worktree bytes. `--renormalize` therefore
 //!     re-stages current bytes without re-running EOL filters.
-//!   * submodule gitlinks are skipped here (use `git zbump`).
+//!   * untracked embedded git repositories are not auto-converted to submodules
+//!     (git's "adding embedded git repository" path); a *tracked* submodule's
+//!     gitlink IS updated to its current HEAD (see the gitlink pass below).
 //!   * interactive/patch/edit modes are rejected — they require a TTY here.
 //!   * `-U/--unified`, `--inter-hunk-context`, `--[no-]auto-advance` only configure
 //!     the interactive/patch diff. Their values are magnitude-validated exactly as
@@ -380,8 +386,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
 
     for item in iter.by_ref() {
         let entry = item?.entry;
-        // Only regular files and symlinks are stageable content; skip directories,
-        // submodule repositories, and anything untrackable.
+        // Only regular files and symlinks are stageable *content* here; skip
+        // directories and anything untrackable. Submodule repositories
+        // (`Kind::Repository`) are staged as gitlinks in the dedicated index-driven
+        // pass after this loop, not as blobs.
         match entry.disk_kind {
             Some(gix::dir::entry::Kind::File) | Some(gix::dir::entry::Kind::Symlink) => {}
             _ => continue,
@@ -468,6 +476,54 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         None => bail!("directory walk did not complete"),
     };
 
+    let staged_set: HashSet<BString> = staged.iter().map(|s| s.path.clone()).collect();
+
+    // --- submodule gitlinks: stage a moved submodule's new HEAD (mode 160000) ---
+    // `git add <submodule>` records the submodule worktree's current HEAD as the
+    // parent's gitlink. The worktree walk above yields only blobs and symlinks (a
+    // submodule dir is `Kind::Repository`, dropped there), so tracked gitlinks are
+    // staged from the index here — driven by the index rather than the walk, so it
+    // does not depend on how the walk treats a repository directory. These are
+    // plain `git add` semantics: whatever HEAD the submodule sits at, with NO
+    // fast-forward gate and NO commit (that is `git zbump`). An unchanged gitlink
+    // stages nothing, matching git. `--refresh` returns before the write below, so
+    // it still only refreshes stat and never records a pointer move.
+    {
+        let backing = index.path_backing();
+        for e in index.entries() {
+            if e.stage() != Stage::Unconflicted || e.mode != Mode::COMMIT {
+                continue; // only stage-0 gitlinks
+            }
+            let path = e.path_in(backing);
+            if !pathspec.is_included(path, Some(false)) || staged_set.contains(&path.to_owned()) {
+                continue;
+            }
+            // Resolve the submodule worktree's current HEAD commit. gix::open reads
+            // its `.git` gitfile, so this works whether or not the gitlink is also
+            // declared in .gitmodules (git add does not require it to be).
+            let Some(abs) = repo.workdir_path(path) else { continue };
+            let Some(new_id) = gix::open(&abs)
+                .ok()
+                .and_then(|sr| sr.head_id().ok().map(|h| h.detach()))
+            else {
+                continue; // uninitialized or unborn HEAD → nothing to stage
+            };
+            if new_id == e.id {
+                continue; // gitlink already at HEAD → git stages nothing
+            }
+            let stat = gix::index::fs::Metadata::from_path_no_follow(&abs)
+                .ok()
+                .and_then(|md| Stat::from_fs(&md).ok())
+                .unwrap_or_default();
+            staged.push(Staged {
+                path: path.to_owned(),
+                id: new_id,
+                mode: Mode::COMMIT,
+                stat,
+                was_tracked: true,
+            });
+        }
+    }
     let staged_set: HashSet<BString> = staged.iter().map(|s| s.path.clone()).collect();
 
     // --- deletions: tracked stage-0 paths, matched, whose file is gone ------

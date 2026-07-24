@@ -87,6 +87,7 @@ fn run_job(id: i64, spec_json: String) {
                 registry().lock().unwrap().remove(&id);
                 return; // was stopped-while-queued (or vanished)
             }
+            crate::superset::zdaemon::log_line(&format!("[zvcs job] #{id} running"));
         }
         Err(_) => {
             registry().lock().unwrap().remove(&id);
@@ -119,6 +120,7 @@ fn run_job(id: i64, spec_json: String) {
         "failed"
     };
     let exit = if result.ok { 0 } else { 1 };
+    crate::superset::zdaemon::log_line(&format!("[zvcs job] #{id} {state} exit={exit}"));
 
     // Retry the finalize so transient lock contention (SQLITE_BUSY — expected with
     // many concurrent instances) can't strand the row in `running` forever with

@@ -89,6 +89,17 @@ pub fn zvcs_home() -> PathBuf {
     dir
 }
 
+/// Append one line to the singleton daemon log (`$ZVCS_HOME/zvcs.log`) so daemon
+/// activity — job queue/exec lifecycle included — is grep-able alongside the
+/// `[zvcs watch]`/`[zvcs crawl]` lines. Best-effort: a log that cannot be opened
+/// silently no-ops and never fails the caller.
+pub(crate) fn log_line(msg: &str) {
+    let path = zvcs_home().join("zvcs.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
 /// A unix-domain socket path must fit the platform's `sockaddr_un.sun_path`
 /// array (incl. its NUL terminator): 104 bytes on macOS/BSD, 108 on Linux. Use
 /// the tighter limit so the overflow fallback below triggers identically on
@@ -222,6 +233,13 @@ fn hold_start_lock(at: &Path) -> Option<gix::lock::Marker> {
 /// NEVER treated as stale: removing it would let this starter bind a second daemon
 /// while the first is still coming up. Only a socket that stays connectable but
 /// never answers STATUS within the window is a zombie worth replacing.
+/// Whether a daemon is currently live (bound and answering). Public so other
+/// verbs (e.g. `git zconfig`) can decide whether a live reload is warranted
+/// without starting one.
+pub fn is_running() -> bool {
+    socket_is_live(&socket_path())
+}
+
 fn socket_is_live(path: &Path) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -589,6 +607,12 @@ fn handle_submit(json: &str) -> Option<i64> {
     };
     let id = crate::db::insert_job(&conn, repo_id, kind, json, session).ok()?;
     drop(conn);
+    // Grep-able queue record: `grep '#<id>' zvcs.log` ties the job number to its
+    // command (and, below in jobpool, to its terminal state + exit code).
+    log_line(&format!(
+        "[zvcs job] #{id} queued: {kind}{}",
+        git_dir.map(|g| format!(" (repo {g})")).unwrap_or_default()
+    ));
 
     // Hand to the bounded pool. The child porcelain each job spawns acquires its
     // repo's lane itself, so ordering is preserved; the pool caps concurrency and

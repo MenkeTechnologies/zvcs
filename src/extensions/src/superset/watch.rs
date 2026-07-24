@@ -19,10 +19,11 @@
 //! contacts a remote.
 
 use notify::{Event, RecursiveMode, Watcher};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::config::ZvcsConfig;
 
@@ -40,6 +41,10 @@ struct Target {
     /// read from the repo's own `zvcs.hook`). Present ⇒ always fires, independent
     /// of the git-hook config.
     command: Option<String>,
+    /// Leading-edge throttle (ms) for a directory trigger: after firing, suppress
+    /// further fires for this long, coalescing the burst of events a single file
+    /// action emits into one fire. 0 = fire on every event.
+    throttle_ms: u64,
 }
 
 impl Target {
@@ -133,12 +138,11 @@ fn run(cfg: ZvcsConfig) {
         cfg.hooks_enabled(),
     );
 
-    // No debounce: react to each filesystem event the instant it arrives, so a
-    // triggered hook fires immediately on the change. (A coalescing window that
-    // waits for global silence never fires on a busy machine — many watched
-    // repos, concurrent agents, a background crawl — because the silence never
-    // comes.) One event may carry several paths; `collect` dedups them to the set
-    // of affected repos, so a repo fires once per event, not once per path.
+    // Leading-edge throttle state per directory trigger: (last fire, events
+    // coalesced since). No global debounce — we fire on the FIRST event of a
+    // burst immediately, then suppress for `throttle_ms` so one file action (which
+    // emits several fs events) fires once, not N times.
+    let mut last_fired: HashMap<PathBuf, (Option<Instant>, u32)> = HashMap::new();
     loop {
         let ev = match rx.recv() {
             Ok(ev) => ev,
@@ -168,10 +172,23 @@ fn run(cfg: ZvcsConfig) {
                 continue;
             }
             if let Some(cmd) = &t.command {
-                // Directory trigger (`git ztrigger`): run the stored command on any
-                // change. Always fires — independent of the git-hook config, and
-                // the directory need not be a repo.
-                crate::superset::hooks::run_command(&t.workdir, cmd);
+                // Directory trigger: fire the command, subject to a leading-edge
+                // throttle. The first event fires immediately; events arriving
+                // within `throttle_ms` of that fire are coalesced (counted, not
+                // run), so a single file action fires once. Each real fire is
+                // recorded for `git ztrigger tail`/`top`.
+                let entry = last_fired.entry(t.git_dir.clone()).or_insert((None, 0));
+                let now = Instant::now();
+                let suppressed = t.throttle_ms > 0
+                    && entry.0.is_some_and(|last| now.duration_since(last) < Duration::from_millis(t.throttle_ms));
+                if suppressed {
+                    entry.1 += 1;
+                } else {
+                    let coalesced = entry.1;
+                    let ok = crate::superset::hooks::run_command(&t.workdir, cmd);
+                    crate::superset::trigger::record_fire(&t.workdir, ok, coalesced);
+                    *entry = (Some(now), 0);
+                }
             } else if cfg.hooks_enabled() {
                 if t.armed {
                     // Repo hook, whole-dir: fire on ANY change. No reflog-author
@@ -226,9 +243,9 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
     //    active when triggers exist. Read straight from the index.
     if let Ok(conn) = crate::db::open_ro() {
         if let Ok(triggers) = crate::db::list_triggers(&conn) {
-            for (path, cmd) in triggers {
-                let p = PathBuf::from(path);
-                add_target(&mut seen, &mut targets, p.clone(), p, true, Some(cmd));
+            for t in triggers {
+                let p = PathBuf::from(t.path);
+                add_target(&mut seen, &mut targets, p.clone(), p, true, Some(t.command), t.throttle_ms.max(0) as u64);
                 if targets.len() >= MAX_WATCHED {
                     break;
                 }
@@ -251,7 +268,7 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
                 if let Ok(repos) = crate::db::list_repos(&conn) {
                     for r in repos {
                         let wd = r.workdir.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&r.git_dir));
-                        add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd, false, None);
+                        add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd, false, None, 0);
                         if targets.len() >= MAX_WATCHED {
                             break;
                         }
@@ -260,7 +277,7 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
             } else if let Ok(armed) = crate::db::list_armed(&conn) {
                 for (git_dir, workdir) in armed {
                     let wd = workdir.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&git_dir));
-                    add_target(&mut seen, &mut targets, PathBuf::from(git_dir), wd, true, None);
+                    add_target(&mut seen, &mut targets, PathBuf::from(git_dir), wd, true, None, 0);
                     if targets.len() >= MAX_WATCHED {
                         break;
                     }
@@ -276,7 +293,7 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
                 for sm in subs {
                     if let Ok(Some(sub)) = sm.open() {
                         if let Some(wd) = sub.workdir() {
-                            add_target(&mut seen, &mut targets, sub.git_dir().to_path_buf(), wd.to_path_buf(), false, None);
+                            add_target(&mut seen, &mut targets, sub.git_dir().to_path_buf(), wd.to_path_buf(), false, None, 0);
                         }
                     }
                 }
@@ -293,7 +310,7 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
                         .workdir
                         .map(PathBuf::from)
                         .unwrap_or_else(|| PathBuf::from(&r.git_dir));
-                    add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd, false, None);
+                    add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd, false, None, 0);
                     if targets.len() >= MAX_WATCHED {
                         println!(
                             "[zvcs watch] capped at {MAX_WATCHED} watched repos; \
@@ -319,11 +336,12 @@ fn add_target(
     workdir: PathBuf,
     armed: bool,
     command: Option<String>,
+    throttle_ms: u64,
 ) {
     let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
     let workdir = workdir.canonicalize().unwrap_or(workdir);
     if seen.insert(git_dir.clone()) {
-        targets.push(Target { git_dir, workdir, armed, command });
+        targets.push(Target { git_dir, workdir, armed, command, throttle_ms });
     }
 }
 
@@ -405,8 +423,8 @@ mod tests {
         let parent = PathBuf::from("/x/.git");
         let sub = PathBuf::from("/x/.git/modules/foo");
         let targets = vec![
-            Target { git_dir: parent.clone(), workdir: PathBuf::from("/x"), armed: false, command: None },
-            Target { git_dir: sub.clone(), workdir: PathBuf::from("/x/foo"), armed: false, command: None },
+            Target { git_dir: parent.clone(), workdir: PathBuf::from("/x"), armed: false, command: None, throttle_ms: 0 },
+            Target { git_dir: sub.clone(), workdir: PathBuf::from("/x/foo"), armed: false, command: None, throttle_ms: 0 },
         ];
 
         // Event under the submodule → only the submodule is marked.
@@ -432,7 +450,7 @@ mod tests {
         // target would miss entirely.
         let git_dir = PathBuf::from("/repo/.git");
         let workdir = PathBuf::from("/repo");
-        let targets = vec![Target { git_dir: git_dir.clone(), workdir, armed: true, command: None }];
+        let targets = vec![Target { git_dir: git_dir.clone(), workdir, armed: true, command: None, throttle_ms: 0 }];
 
         for rel in ["newfile.txt", ".git/index", "src/main.rs"] {
             let ev = notify::Event::new(notify::EventKind::Any).add_path(PathBuf::from("/repo").join(rel));

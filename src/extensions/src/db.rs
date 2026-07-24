@@ -80,9 +80,10 @@ CREATE TABLE IF NOT EXISTS stashes (
 );
 CREATE INDEX IF NOT EXISTS stashes_name ON stashes(name);
 CREATE TABLE IF NOT EXISTS triggers (
-    path       TEXT PRIMARY KEY,
-    command    TEXT NOT NULL,
-    created_at INTEGER
+    path        TEXT PRIMARY KEY,
+    command     TEXT NOT NULL,
+    created_at  INTEGER,
+    throttle_ms INTEGER NOT NULL DEFAULT 0
 );
 ";
 
@@ -108,6 +109,7 @@ pub fn open_rw() -> Result<Connection> {
     // it. `CREATE TABLE IF NOT EXISTS` won't add a column to an existing table, so
     // ALTER explicitly and ignore the "duplicate column" error when it's present.
     let _ = conn.execute("ALTER TABLE repos ADD COLUMN hook TEXT", []);
+    let _ = conn.execute("ALTER TABLE triggers ADD COLUMN throttle_ms INTEGER NOT NULL DEFAULT 0", []);
     Ok(conn)
 }
 
@@ -204,11 +206,11 @@ pub fn list_armed(conn: &Connection) -> Result<Vec<(String, Option<String>)>> {
 /// directory, run this command on any change" mechanism, independent of git. The
 /// key is the canonical directory path; setting the same path again replaces the
 /// command.
-pub fn set_trigger(conn: &Connection, path: &Path, command: &str) -> Result<()> {
+pub fn set_trigger(conn: &Connection, path: &Path, command: &str, throttle_ms: i64) -> Result<()> {
     conn.execute(
-        "INSERT INTO triggers (path, command, created_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(path) DO UPDATE SET command = ?2",
-        rusqlite::params![path.to_string_lossy(), command, now()],
+        "INSERT INTO triggers (path, command, created_at, throttle_ms) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(path) DO UPDATE SET command = ?2, throttle_ms = ?4",
+        rusqlite::params![path.to_string_lossy(), command, now(), throttle_ms],
     )?;
     Ok(())
 }
@@ -218,11 +220,21 @@ pub fn remove_trigger(conn: &Connection, path: &Path) -> Result<usize> {
     Ok(conn.execute("DELETE FROM triggers WHERE path = ?1", [path.to_string_lossy()])?)
 }
 
-/// Every directory trigger as `(path, command)`. The watch set the daemon builds
-/// for `ztrigger`.
-pub fn list_triggers(conn: &Connection) -> Result<Vec<(String, String)>> {
-    let mut stmt = conn.prepare("SELECT path, command FROM triggers ORDER BY path")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+/// One directory trigger.
+pub struct TriggerRow {
+    pub path: String,
+    pub command: String,
+    /// Leading-edge throttle: after a fire, suppress further fires for this many
+    /// milliseconds (0 = fire on every event).
+    pub throttle_ms: i64,
+}
+
+/// Every directory trigger. The watch set the daemon builds for `ztrigger`.
+pub fn list_triggers(conn: &Connection) -> Result<Vec<TriggerRow>> {
+    let mut stmt = conn.prepare("SELECT path, command, throttle_ms FROM triggers ORDER BY path")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(TriggerRow { path: r.get(0)?, command: r.get(1)?, throttle_ms: r.get(2)? })
+    })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 

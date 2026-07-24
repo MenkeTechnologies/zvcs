@@ -141,7 +141,7 @@ pub fn list() -> Result<Vec<(String, String)>> {
 /// watched directory as cwd and `ZVCS_DIR` in the environment. Best-effort;
 /// output goes to the daemon log. Independent of git — the directory need not be
 /// a repository.
-pub fn run_command(dir: &Path, cmd: &str) {
+pub fn run_command(dir: &Path, cmd: &str) -> bool {
     let out = Command::new("sh")
         .arg("-c")
         .arg(cmd)
@@ -154,13 +154,16 @@ pub fn run_command(dir: &Path, cmd: &str) {
             if !s.trim().is_empty() {
                 println!("[zvcs trigger] {}: {}", dir.display(), s.trim());
             }
+            true
         }
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
             println!("[zvcs trigger] {}: FAILED: {}", dir.display(), err.trim());
+            false
         }
         Err(e) => {
             println!("[zvcs trigger] {}: could not run: {e}", dir.display());
+            false
         }
     }
 }

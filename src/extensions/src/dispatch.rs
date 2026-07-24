@@ -20,6 +20,7 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "zgrep", "zahead", "zbehind", "zauthors", "zhot", "zconflicts",
     "zfetch", "zgc", "zfsck", "zprune", "zcheckout", "ztagall", "zcommitall", "zpushall", "zclean",
     "zwait", "zqueue", "zbarrier",
+    "zstale", "zlast", "zbig", "zfiles", "zdivergent", "zorphans", "zsessions", "zidle", "zdashboard",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -250,7 +251,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zup" => "usage: git zup [<path>] — reconcile the tree at cwd (or <path>) to latest",
         "zforeach" => "usage: git zforeach [<pattern>...|--repo <p>|--dirty|--ahead|--behind|--claimed|--session <s>] -- <command>...",
         "zhook" => "usage: git zhook <set <command>|unset|show|list|test>",
-        "ztrigger" => "usage: git ztrigger <DIR> <command>... | git ztrigger <list|rm DIR|test DIR> — run a command on any file change in DIR (worktree + .git)",
+        "ztrigger" => "usage: git ztrigger <DIR> <command>... [--throttle <dur>] | git ztrigger <list|rm DIR|test DIR|tail|top> — run a command on any file change in DIR (leading-edge throttle, default 500ms; tail/top show fires live)",
         "zwatch" => "usage: git zwatch <DIR> | git zwatch <list|rm DIR> — watch DIR (index + cached status) without a command",
         "zverbs" => "usage: git zverbs — list every zvcs extension verb and its usage",
         "zcd" => "usage: git zcd [<dir>|-] — change the working directory (for the zrepl console)",
@@ -293,6 +294,15 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zwait" => "usage: git zwait [<path>] — block until the repo's async jobs drain",
         "zqueue" => "usage: git zqueue — list queued/running async jobs",
         "zbarrier" => "usage: git zbarrier — block until the whole async job queue is idle",
+        "zstale" => "usage: git zstale [selectors] [<days>] — indexed repos whose HEAD is older than <days> (default 90)",
+        "zlast" => "usage: git zlast [selectors] — indexed repos ordered by HEAD commit time, newest first",
+        "zbig" => "usage: git zbig [selectors] [<n>] — largest tracked files across indexed repos (top <n>, default 20)",
+        "zfiles" => "usage: git zfiles [selectors] — tracked file count of each indexed repo (largest first)",
+        "zdivergent" => "usage: git zdivergent [selectors] — indexed repos both ahead of and behind their upstream",
+        "zorphans" => "usage: git zorphans [selectors] — indexed repos with no remote configured",
+        "zsessions" => "usage: git zsessions — active sessions ranked by repos held",
+        "zidle" => "usage: git zidle [selectors] — indexed repos with no active claim (free to pick up)",
+        "zdashboard" => "usage: git zdashboard [selectors] — one-screen health summary of the indexed tree",
         _ => return None,
     })
 }
@@ -391,6 +401,15 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zwait" => superset::zwait(args),
         "zqueue" => superset::zqueue(args),
         "zbarrier" => superset::zbarrier(args),
+        "zstale" => superset::zstale(args),
+        "zlast" => superset::zlast(args),
+        "zbig" => superset::zbig(args),
+        "zfiles" => superset::zfiles(args),
+        "zdivergent" => superset::zdivergent(args),
+        "zorphans" => superset::zorphans(args),
+        "zsessions" => superset::zsessions(args),
+        "zidle" => superset::zidle(args),
+        "zdashboard" => superset::zdashboard(args),
 
         // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----
         "add" => porcelain::add(args),

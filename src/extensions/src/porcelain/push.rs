@@ -1010,8 +1010,14 @@ fn reachable(repo: &gix::Repository, commit: ObjectId, tip: ObjectId) -> bool {
 mod tests {
     use super::*;
 
-    /// Build a fixture repo with stock git (the CI image and every dev box has
-    /// one; zvcs cannot create annotated tag objects yet) laid out as:
+    /// Build the fixture repo with **no external git and no subprocess** — every
+    /// object is written through `gix`, the same library the engine itself runs
+    /// on. A test suite for a VCS must not ask another VCS to set up its state:
+    /// on a machine where `git` on `PATH` *is* this binary that is circular, and
+    /// on one where it is not, the fixture is whatever foreign implementation
+    /// happened to be installed.
+    ///
+    /// Layout:
     ///
     ///   main:  c1 ──(v1, annotated)── c2 ──(light, lightweight)
     ///   side:  c1 ── s1 ──(vside, annotated)
@@ -1019,32 +1025,83 @@ mod tests {
     /// so one tag of each kind sits on `main`'s history and one annotated tag
     /// sits off it.
     fn fixture(tag: &str) -> std::path::PathBuf {
+        use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+
         let dir = std::env::temp_dir().join(format!("zvcs-followtags-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir fixture");
-        let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&dir)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@e")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@e")
-                .output()
-                .expect("run git")
-                .status
-                .success();
-            assert!(ok, "git {args:?} failed");
+        let repo = gix::init(&dir).expect("init fixture");
+
+        let sig = gix::actor::Signature {
+            name: "t".into(),
+            email: "t@e".into(),
+            time: gix::date::Time::new(0, 0),
         };
-        git(&["init", "-q", "-b", "main"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "c1"]);
-        git(&["tag", "-a", "v1", "-m", "annotated on main"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "c2"]);
-        git(&["tag", "light"]);
-        git(&["checkout", "-q", "-b", "side"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "s1"]);
-        git(&["tag", "-a", "vside", "-m", "annotated off main"]);
-        git(&["checkout", "-q", "main"]);
+        let empty_tree = repo.write_object(gix::objs::Tree::empty()).expect("tree").detach();
+
+        // One commit on top of `parents`, returning its id.
+        let commit = |message: &str, parents: Vec<ObjectId>| -> ObjectId {
+            repo.write_object(gix::objs::Commit {
+                tree: empty_tree,
+                parents: parents.into(),
+                author: sig.clone(),
+                committer: sig.clone(),
+                encoding: None,
+                message: message.into(),
+                extra_headers: Vec::new(),
+            })
+            .expect("commit")
+            .detach()
+        };
+        // An annotated tag object pointing at `target`, returning the TAG's id —
+        // the thing that makes the ref annotated rather than lightweight.
+        let annotate = |name: &str, target: ObjectId| -> ObjectId {
+            repo.write_object(gix::objs::Tag {
+                target,
+                target_kind: gix::object::Kind::Commit,
+                name: name.into(),
+                tagger: Some(sig.clone()),
+                message: format!("annotated {name}").into(),
+                pgp_signature: None,
+            })
+            .expect("tag object")
+            .detach()
+        };
+        let point = |full_name: &str, id: ObjectId| {
+            repo.edit_reference(RefEdit {
+                change: Change::Update {
+                    log: LogChange { mode: RefLog::AndReference, force_create_reflog: false, message: "fixture".into() },
+                    expected: PreviousValue::Any,
+                    new: Target::Object(id),
+                },
+                name: full_name.try_into().expect("ref name"),
+                deref: false,
+            })
+            .expect("edit ref");
+        };
+
+        let c1 = commit("c1", vec![]);
+        let c2 = commit("c2", vec![c1]);
+        let s1 = commit("s1", vec![c1]);
+
+        point("refs/heads/main", c2);
+        point("refs/heads/side", s1);
+        point("refs/tags/v1", annotate("v1", c1)); // annotated, on main
+        point("refs/tags/light", c2); // lightweight, on main
+        point("refs/tags/vside", annotate("vside", s1)); // annotated, off main
+
+        // HEAD → main, so `head_id()` is the tip the tests push.
+        repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange { mode: RefLog::AndReference, force_create_reflog: false, message: "fixture".into() },
+                expected: PreviousValue::Any,
+                new: Target::Symbolic("refs/heads/main".try_into().expect("ref name")),
+            },
+            name: "HEAD".try_into().expect("ref name"),
+            deref: false,
+        })
+        .expect("point HEAD");
+
         dir
     }
 

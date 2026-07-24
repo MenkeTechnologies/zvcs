@@ -10,6 +10,12 @@ rust-version = "1.85"
 name = "zvcs"
 path = "src/lib.rs"
 
+# build.rs harvests each porcelain verb's option/subcommand literals from source
+# into the `git zrepl` completion table — the parser is the source of truth, so
+# the completion set can never drift from what the verb actually accepts.
+[build-dependencies]
+regex = "1"
+
 # The one and only binary: `git`. It shadows stock git on PATH and serves every
 # subcommand natively via the vendored gitoxide crates — no fork/exec of old git.
 [[bin]]

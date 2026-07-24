@@ -8,8 +8,11 @@
 //! On a terminal it opens with a stats banner (logo + live verb/repo counts,
 //! [`crate::superset::banner`]) and edits the line with [`reedline`]: real cursor
 //! motion, Tab completion of the command word against every dispatchable verb
-//! (superset + porcelain) and of the second word against a verb's subcommands
-//! (`zdaemon <Tab>` → start/stop/…), Ctrl-C to abandon the current line, Ctrl-D to quit,
+//! (superset + porcelain), of the second word against a verb's subcommands
+//! (`zdaemon <Tab>` → start/stop/…), and of any `-`-prefixed word against that
+//! verb's options (`commit -<Tab>` → --amend/…; porcelain options are harvested
+//! at build time from each verb's own parser, so they can't drift). Ctrl-C to
+//! abandon the current line, Ctrl-D to quit,
 //! and history persisted to `~/.zvcs/repl_history` across sessions. Emacs or vi
 //! keys per `zvcs.replvimode`; the Tab/Shift+Tab menu bindings attach to whichever
 //! insert keymap is active. Piped/non-tty stdin falls back to a raw line reader
@@ -97,28 +100,50 @@ fn completion_word_start(line: &str, pos: usize) -> (usize, &str) {
     (start, line.get(start..pos).unwrap_or(""))
 }
 
-/// The fixed subcommand vocabulary of a verb, for second-token completion, or
-/// `&[]` for verbs whose next token is free-form (a name, path, refspec, id).
-/// Mirrors each verb's own subcommand parser — the source of truth is the named
-/// file — the way a zsh `_git` completer enumerates subcommands. Only the
-/// documented primary spellings are offered (aliases like `run`/`reload` still
-/// work when typed, they just don't clutter the menu).
-fn verb_subcommands(verb: &str) -> &'static [&'static str] {
-    match verb {
-        "zdaemon" => &["start", "stop", "restart", "status", "info", "ping", "log"], // superset/zdaemon.rs
-        "zhook" => &["set", "unset", "show", "list", "test"],                        // superset/zhook.rs
-        "zworktree" => &["add", "list", "remove"],                                   // superset/zworktree.rs
-        "zjob" => &["stop", "restart"],                                              // superset/ledger.rs
-        "ztrigger" => &["list", "rm", "test"],                                       // superset/trigger.rs
-        "zwatch" => &["list", "rm"],                                                 // superset/trigger.rs
-        _ => &[],
+// The porcelain completion table (`PORCELAIN_SPEC`: sorted `(verb, opts, subs)`),
+// harvested from each porcelain module's own arg parser at build time so it can
+// never drift from what the verb actually accepts. See build.rs.
+include!(concat!(env!("OUT_DIR"), "/porcelain_spec.rs"));
+
+/// `(options, subcommands)` for a superset (`z*`) verb. Hand-authored because the
+/// z-verb parsers span multi-verb modules (so they aren't harvested 1:1 like
+/// porcelain); options track each verb's documented usage in dispatch.rs. `None`
+/// for a non-superset verb, so the caller falls through to [`PORCELAIN_SPEC`].
+fn superset_spec(verb: &str) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    Some(match verb {
+        "zdaemon" => (&["-n", "-f"], &["start", "stop", "restart", "reload", "status", "info", "ping", "log"]),
+        "zstatus" => (&["--all"], &[]),
+        "zreindex" => (&["--sync", "--async"], &[]),
+        "zforeach" => (&["--repo", "--dirty", "--ahead", "--behind", "--claimed", "--session"], &[]),
+        "zunclaim" => (&["--force"], &[]),
+        "zjobs" => (&["-n"], &[]),
+        "zjob" => (&[], &["stop", "restart"]),
+        "zhook" => (&[], &["set", "unset", "show", "list", "test"]),
+        "zworktree" => (&[], &["add", "list", "remove"]),
+        "ztrigger" => (&[], &["list", "rm", "test"]),
+        "zwatch" => (&[], &["list", "rm"]),
+        "zlog" => (&["-n"], &[]),
+        _ => return None,
+    })
+}
+
+/// `(options, subcommands)` for any verb: the superset hand-spec, else the
+/// build-time-harvested porcelain table, else empty.
+fn verb_spec(verb: &str) -> (&'static [&'static str], &'static [&'static str]) {
+    if let Some(spec) = superset_spec(verb) {
+        return spec;
+    }
+    match PORCELAIN_SPEC.binary_search_by(|(v, _, _)| (*v).cmp(verb)) {
+        Ok(i) => (PORCELAIN_SPEC[i].1, PORCELAIN_SPEC[i].2),
+        Err(_) => (&[], &[]),
     }
 }
 
 /// Tab completion for `git zrepl`: the command word completes against the full
-/// verb set; the second word completes against that verb's fixed subcommands
-/// (e.g. `zdaemon <Tab>` → start/stop/restart/…). Deeper positions and
-/// free-form-argument verbs yield nothing — there is no fixed vocabulary there.
+/// verb set; the second word completes a verb's subcommands (`zdaemon <Tab>` →
+/// start/stop/…); and a `-`-prefixed word at any position completes that verb's
+/// options (`git commit -<Tab>` → --amend/--message/…). Positions with no fixed
+/// vocabulary (a path, name, refspec) yield nothing.
 struct ZreplCompleter {
     verbs: Vec<String>,
 }
@@ -156,12 +181,18 @@ impl Completer for ZreplCompleter {
         if before.is_empty() {
             return suggestions(self.verbs.iter().map(String::as_str), prefix, span);
         }
-        // Second token, and the first is exactly one verb → complete its
-        // subcommands. `before` with no interior whitespace is that lone verb.
-        if !before.contains(char::is_whitespace) {
-            return suggestions(verb_subcommands(before).iter().copied(), prefix, span);
+        let verb = before.split_whitespace().next().unwrap_or("");
+        let (opts, subs) = verb_spec(verb);
+        // A `-`-prefixed word completes that verb's options, at any position.
+        if prefix.starts_with('-') {
+            return suggestions(opts.iter().copied(), prefix, span);
         }
-        // Deeper positions have no fixed vocabulary.
+        // The second token completes the verb's subcommands. `before` being just
+        // the verb (no interior whitespace) means the cursor word is the second.
+        if !before.contains(char::is_whitespace) {
+            return suggestions(subs.iter().copied(), prefix, span);
+        }
+        // Deeper non-option positions have no fixed vocabulary.
         Vec::new()
     }
 }
@@ -331,5 +362,24 @@ mod tests {
         assert!(values("zsnapshot ").is_empty());
         // Deeper than the subcommand offers nothing.
         assert!(values("zdaemon status ").is_empty());
+    }
+
+    #[test]
+    fn porcelain_subcommands_come_from_the_harvested_spec() {
+        // build.rs harvested these from remote.rs's own `Some("add")`-style arms.
+        let remote = values("remote ");
+        for sub in ["add", "remove", "rename", "set-url", "show"] {
+            assert!(remote.contains(&sub.to_string()), "remote missing `{sub}`: {remote:?}");
+        }
+    }
+
+    #[test]
+    fn dash_prefix_completes_options_at_any_depth() {
+        // Superset option (dispatch.rs usage) and porcelain option (harvested).
+        assert!(values("zstatus --").contains(&"--all".to_string()));
+        let commit = values("commit --a");
+        assert!(commit.contains(&"--amend".to_string()), "commit -<Tab> should offer --amend: {commit:?}");
+        // Options complete after a subcommand too (any depth), not just at token 2.
+        assert!(values("remote add --").iter().all(|s| s.starts_with('-')));
     }
 }

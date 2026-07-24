@@ -6787,6 +6787,7 @@ _git_commands () {
     zhook:'zvcs: manage ref-change hooks'
     ztrigger:'zvcs: run a command on every ref-change in a DIR'
     zwatch:'zvcs: watch a DIR (index + cached status) without a command'
+    zdashed:'zvcs: install git-<verb> symlinks for every verb (dashed forms)'
     zrepl:'zvcs: interactive console over every command (z-verbs + git porcelain)'
     zverbs:'zvcs: list every extension verb and its usage'
     zcd:'zvcs: change the working directory (zrepl console)'
@@ -9258,8 +9259,8 @@ done
   _describe -t zvcs-stashes stash names
 }
 
-# Verbs that take submodule paths → complete directories.
-for _zv in zsync zbump zup; do
+# Verbs that take a directory path → complete directories.
+for _zv in zsync zbump zup zdashed; do
   (( $+functions[_git-$_zv] )) || functions[_git-$_zv]='_files -/'
 done
 unset _zv

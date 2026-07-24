@@ -25,7 +25,7 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "zfetch", "zgc", "zfsck", "zprune", "zreset", "zabort", "zcheckout", "ztagall", "zcommitall", "zpushall", "zclean",
     "zwait", "zqueue", "zbarrier",
     "zstale", "zlast", "zbig", "zfiles", "zcommits", "zpristine", "zdivergent", "zorphans", "zsessions", "zidle", "zdashboard", "ztop",
-    "zppid", "zprocs",
+    "zppid",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -341,7 +341,6 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zidle" => "usage: git zidle [selectors] — indexed repos with no active claim (free to pick up)",
         "zdashboard" => "usage: git zdashboard — instant one-screen health summary from the status cache + ledger",
         "zppid" => "usage: git zppid [--json] — per-process commit tally: each invoking process (ppid) and how many commits it has landed",
-        "zprocs" => "usage: git zprocs [--json] — per-process command breakdown: how many of each mutating verb (commit/push/add/merge/…) each process has run",
         "ztop" => "usage: git ztop [selectors] [--interval <secs>] [--once] [--mono] — live htop-style fleet monitor, most churn on top",
         _ => return None,
     })
@@ -470,7 +469,6 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // `.then` skips the gix probe entirely for every non-commit verb, so the hot
     // path pays nothing.
     let commit_head_before = superset::zppid::is_commit_verb(sub).then(superset::zppid::head_commit);
-    let track_mutating = superset::zppid::is_mutating_verb(sub);
 
     let result = match sub {
         // ---- superset (novel) ----
@@ -585,7 +583,6 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zidle" => superset::zidle(args),
         "zdashboard" => superset::zdashboard(args),
         "zppid" => superset::zppid(args),
-        "zprocs" => superset::zprocs(args),
         "ztop" => superset::ztop(args),
 
         // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----
@@ -780,11 +777,10 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         _ => anyhow::bail!("is not a git command. See 'git --help'."),
     };
 
-    // Per-process activity: for a mutating verb, credit the running process (commit
-    // tally on a real HEAD advance, per-verb count otherwise). `commit_head_before`
-    // is Some only for commit verbs, so it drives the effective-commit path.
-    if track_mutating {
-        superset::zppid::note_mutating(sub, commit_head_before.flatten());
+    // Per-process commit tally: `commit_head_before` is Some only for a commit verb,
+    // so a real HEAD advance credits the invoking process.
+    if let Some(before) = commit_head_before {
+        superset::zppid::note_commit(before);
     }
 
     // Lock contention → queue, the second half of the rule the pre-flight gate

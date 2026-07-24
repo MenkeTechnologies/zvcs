@@ -19,6 +19,8 @@ use std::process::ExitCode;
 use anyhow::Result;
 use gix::bstr::{BString, ByteSlice};
 
+use crate::superset::lscolors::Theme;
+
 /// Parsed `zls` options.
 struct Opts {
     all: bool,
@@ -32,6 +34,8 @@ pub fn zls(args: &[String]) -> Result<ExitCode> {
     let opts = parse(args)?;
     let colored = std::io::IsTerminal::is_terminal(&std::io::stdout())
         && std::env::var_os("NO_COLOR").is_none();
+    // eza-compatible palette from LS_COLORS + EXA_COLORS/EZA_COLORS.
+    let theme = crate::superset::lscolors::Theme::from_env(colored);
 
     // Entries to list: the directory's children, or the single named file.
     let meta = std::fs::symlink_metadata(&opts.path)
@@ -91,7 +95,7 @@ pub fn zls(args: &[String]) -> Result<ExitCode> {
     let mut w = std::io::BufWriter::new(out.lock());
     use std::io::Write;
     for row in &rows {
-        row.render(&mut w, opts.long, has_git, colored, size_w, date_w)?;
+        row.render(&mut w, opts.long, has_git, &theme, size_w, date_w)?;
     }
     w.flush().ok();
     Ok(ExitCode::SUCCESS)
@@ -311,42 +315,101 @@ impl Row {
         w: &mut W,
         long: bool,
         has_git: bool,
-        colored: bool,
+        theme: &Theme,
         size_w: usize,
         date_w: usize,
     ) -> std::io::Result<()> {
         if long {
-            write!(
-                w,
-                "{} {:>size_w$} {:>date_w$}  ",
-                perm_string(self.perms),
-                self.size_str,
-                self.date_str
-            )?;
+            // Pad to width on the PLAIN text, then color — coloring first would
+            // put ANSI bytes inside the field and break alignment.
+            let size = size_field(&self.size_str, size_w, theme);
+            let date_pad = " ".repeat(date_w.saturating_sub(self.date_str.len()));
+            let date = format!("{date_pad}{}", theme.paint(theme.sgr("da"), &self.date_str));
+            write!(w, "{} {size} {date}  ", self.perm_string(theme))?;
         }
         if has_git {
-            write!(w, "{} ", git_field(self.git, colored))?;
+            write!(w, "{} ", self.git_field(theme))?;
         }
-        writeln!(w, "{}", self.colored_name(colored))
+        writeln!(w, "{}", self.colored_name(theme))
     }
 
-    fn colored_name(&self, colored: bool) -> String {
-        let suffix = if matches!(self.kind, Kind::Dir) { "/" } else { "" };
-        if !colored {
-            return format!("{}{suffix}", self.name);
-        }
-        let color = match self.kind {
-            Kind::Dir => "\x1b[1;34m",
-            Kind::Symlink => "\x1b[36m",
-            Kind::Exec => "\x1b[32m",
-            Kind::File => "",
+    /// The colored, `ls -l`-style permission string: the type char in the entry's
+    /// kind color, each rwx bit in its permission color, and `-` fillers in the
+    /// punctuation color.
+    fn perm_string(&self, theme: &Theme) -> String {
+        let (type_ch, type_key) = match self.perms & 0o170000 {
+            0o040000 => ('d', "di"),
+            0o120000 => ('l', "ln"),
+            0o140000 => ('s', "so"),
+            0o060000 => ('b', "bd"),
+            0o020000 => ('c', "cd"),
+            0o010000 => ('p', "pi"),
+            _ => ('-', "xx"),
         };
-        if color.is_empty() {
-            format!("{}{suffix}", self.name)
-        } else {
-            format!("{color}{}{suffix}\x1b[0m", self.name)
+        let mut s = theme.paint(theme.sgr(type_key), &type_ch.to_string());
+        // (shift, [read_key, write_key, exec_key]) per owner/group/other triad.
+        for (shift, keys) in [(6, ["ur", "uw", "ux"]), (3, ["gr", "gw", "gx"]), (0, ["tr", "tw", "tx"])] {
+            let bits = (self.perms >> shift) & 0o7;
+            for (i, (set, ch)) in [(bits & 0o4, 'r'), (bits & 0o2, 'w'), (bits & 0o1, 'x')].iter().enumerate() {
+                if *set != 0 {
+                    s.push_str(&theme.paint(theme.sgr(keys[i]), &ch.to_string()));
+                } else {
+                    s.push_str(&theme.paint(theme.sgr("xx"), "-"));
+                }
+            }
         }
+        s
     }
+
+    /// The two-column git field, each letter in its eza git color.
+    fn git_field(&self, theme: &Theme) -> String {
+        format!("{}{}", git_char(self.git.0, theme), git_char(self.git.1, theme))
+    }
+
+    /// The entry name colored by extension (`*.ext`) if matched, else by kind,
+    /// with a trailing `/` on directories.
+    fn colored_name(&self, theme: &Theme) -> String {
+        let suffix = if matches!(self.kind, Kind::Dir) { "/" } else { "" };
+        let text = format!("{}{suffix}", self.name);
+        let sgr = theme.ext_sgr(&self.name).unwrap_or_else(|| {
+            theme.sgr(match self.kind {
+                Kind::Dir => "di",
+                Kind::Symlink => "ln",
+                Kind::Exec => "ex",
+                Kind::File => "fi",
+            })
+        });
+        theme.paint(sgr, &text)
+    }
+}
+
+/// The size column: right-aligned to `width` on the plain text, then the number
+/// painted in the size color and the unit in the unit color (eza splits them).
+fn size_field(size_str: &str, width: usize, theme: &Theme) -> String {
+    let unit_at = size_str
+        .rfind(|c: char| !c.is_ascii_alphabetic())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let (num, unit) = size_str.split_at(unit_at);
+    let lead = " ".repeat(width.saturating_sub(size_str.len()));
+    format!("{lead}{}{}", theme.paint(theme.sgr("sn"), num), theme.paint(theme.sgr("sb"), unit))
+}
+
+/// One git status letter, painted in its eza color (`ga`/`gm`/`gd`/…), with `-`
+/// and ignored `I` in the punctuation color.
+fn git_char(ch: u8, theme: &Theme) -> String {
+    let c = (ch as char).to_string();
+    let key = match ch {
+        b'N' => "ga", // new
+        b'M' => "gm", // modified
+        b'D' => "gd", // deleted
+        b'R' | b'C' => "gv", // renamed / copied
+        b'T' => "gt", // type-change
+        b'U' => "gc", // conflicted
+        b'I' => "gi", // ignored
+        _ => "xx",    // '-' unchanged
+    };
+    theme.paint(theme.sgr(key), &c)
 }
 
 /// Fold the status of `rel` (a file's exact path, or every path under a dir).
@@ -378,52 +441,6 @@ fn combine(acc: u8, ch: u8) -> u8 {
         (a, c) if a == c => a,
         _ => b'M',
     }
-}
-
-/// The two-column git field, colored per letter.
-fn git_field(git: (u8, u8), colored: bool) -> String {
-    format!("{}{}", git_char(git.0, colored), git_char(git.1, colored))
-}
-
-fn git_char(ch: u8, colored: bool) -> String {
-    let c = ch as char;
-    if !colored {
-        return c.to_string();
-    }
-    let color = match ch {
-        b'N' => "\x1b[32m",       // new — green
-        b'M' => "\x1b[33m",       // modified — yellow
-        b'D' => "\x1b[31m",       // deleted — red
-        b'R' => "\x1b[35m",       // renamed — magenta
-        b'C' => "\x1b[35m",       // copied — magenta
-        b'T' => "\x1b[36m",       // type-change — cyan
-        b'U' => "\x1b[1;31m",     // conflicted — bold red
-        _ => "\x1b[2m",           // '-' unchanged / 'I' ignored — dim
-    };
-    format!("{color}{c}\x1b[0m")
-}
-
-/// A `ls -l`-style permission string, e.g. `drwxr-xr-x`.
-fn perm_string(mode: u32) -> String {
-    let type_ch = match mode & 0o170000 {
-        0o040000 => 'd',
-        0o120000 => 'l',
-        0o140000 => 's',
-        0o060000 => 'b',
-        0o020000 => 'c',
-        0o010000 => 'p',
-        _ => '-',
-    };
-    let rwx = |shift: u32| {
-        let bits = (mode >> shift) & 0o7;
-        format!(
-            "{}{}{}",
-            if bits & 0o4 != 0 { 'r' } else { '-' },
-            if bits & 0o2 != 0 { 'w' } else { '-' },
-            if bits & 0o1 != 0 { 'x' } else { '-' },
-        )
-    };
-    format!("{type_ch}{}{}{}", rwx(6), rwx(3), rwx(0))
 }
 
 /// Human-readable byte size (1024-based, one decimal above K).

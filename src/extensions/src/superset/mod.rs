@@ -21,6 +21,7 @@ pub mod doctor;
 pub mod gitls;
 pub mod hooks;
 pub mod ledger;
+pub mod lscolors;
 pub mod manpage;
 pub mod oplog;
 pub mod select;

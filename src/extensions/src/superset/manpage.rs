@@ -259,7 +259,8 @@ pub const DOCS: &[Doc] = &[
         synopsis: "git zls [-alrt] [<path>]",
         desc: &[
             "Lists a directory with a two-column git status field per entry, like `eza --git`: the first column is the staged status (index vs HEAD), the second the unstaged status (worktree vs index). Letters follow eza: N new, M modified, D deleted, R renamed, C copied, T type-change, U conflicted, I ignored, and - unchanged. A directory folds the status of the paths under it, so a subtree with any change is flagged. Outside a git repository the column is omitted.",
-            "Flags: -a includes dotfiles, -l is a long listing (permissions, size, relative mtime), -t sorts by modification time (newest first), and -r reverses. Names are colored by type on a terminal. The per-path status is the same walk `git status` performs.",
+            "Flags: -a includes dotfiles, -l is a long listing (permissions, size, relative mtime), -t sorts by modification time (newest first), and -r reverses. The per-path status is the same walk `git status` performs.",
+            "On a terminal the output is colored from the same palette eza uses: LS_COLORS for file kinds and *.ext extensions, then EXA_COLORS/EZA_COLORS for the permission bits, size, date, git columns, and punctuation \\(em so it matches the user's eza. NO_COLOR disables color.",
         ],
     },
     Doc {

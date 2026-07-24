@@ -214,7 +214,9 @@ shell verbs make it navigable like a shell: `git zcd [<dir>|-]` changes the
 working directory (persisting across lines, `~`/`-` supported), `git zpwd` prints
 it, and `git zls [-alrt] [<path>]` is a git-aware listing — each entry carries a
 two-column git status field (staged, then unstaged) like `eza --git`, a directory
-folding the status of the paths under it. `git zenv [<NAME=VALUE>...]` prints,
+folding the status of the paths under it, colored from the same palette eza reads
+(`LS_COLORS` for file kinds/extensions, `EXA_COLORS`/`EZA_COLORS` for permissions,
+size, date, and git columns). `git zenv [<NAME=VALUE>...]` prints,
 sets, or queries environment variables —
 anything set persists so every later `git` line sees it — `git zunset <NAME>...`
 clears them, and `git zecho [-n] <arg>...` prints its arguments. The mutating

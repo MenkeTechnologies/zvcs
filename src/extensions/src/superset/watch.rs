@@ -23,7 +23,6 @@ use notify::{Event, RecursiveMode, Watcher};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 
 use crate::config::ZvcsConfig;
@@ -124,26 +123,26 @@ fn run(cfg: ZvcsConfig) {
         }
     }
     println!(
-        "[zvcs watch] watching {} repo(s) ({watched} tree(s), {armed_n} whole-dir), hooks={}, debounce={:?}",
+        "[zvcs watch] watching {} repo(s) ({watched} tree(s), {armed_n} whole-dir), hooks={}",
         targets.len(),
         cfg.hooks_enabled(),
-        cfg.interval
     );
 
-    let debounce = cfg.interval;
+    // No debounce: react to each filesystem event the instant it arrives, so a
+    // triggered hook fires immediately on the change. (A coalescing window that
+    // waits for global silence never fires on a busy machine — many watched
+    // repos, concurrent agents, a background crawl — because the silence never
+    // comes.) One event may carry several paths; `collect` dedups them to the set
+    // of affected repos, so a repo fires once per event, not once per path.
     loop {
-        let first = match rx.recv() {
+        let ev = match rx.recv() {
             Ok(ev) => ev,
             Err(_) => return,
         };
         let mut affected: HashSet<PathBuf> = HashSet::new();
-        collect(&first, &targets, &mut affected);
-        loop {
-            match rx.recv_timeout(debounce) {
-                Ok(ev) => collect(&ev, &targets, &mut affected),
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
+        collect(&ev, &targets, &mut affected);
+        if affected.is_empty() {
+            continue;
         }
 
         // Autonomy (working tree), then per-repo status + hooks for repos changed.

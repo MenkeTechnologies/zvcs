@@ -499,9 +499,11 @@ and session attribution. All tested.
     the hook, not only ref moves; unarmed repos keep the lighter `refs/`+`logs/`
     watch for autonomy/status. `Target::armed`/`watch_root()` drive registration,
     event attribution (`collect`), and the fire loop (no reflog-author gate for
-    armed repos — a file event leaves the reflog untouched). Fires coalesce over
-    `zvcs.interval`; a hook that writes into the watched dir self-retriggers.
-    Test: `watch.rs::armed_repo_matches_plain_worktree_file_events`.
+    armed repos — a file event leaves the reflog untouched). There is **no
+    debounce** — the hook fires the instant an event arrives (a coalescing window
+    that waits for global silence never fires on a busy machine with many watched
+    repos and concurrent agents); a hook that writes into the watched dir
+    self-retriggers. Test: `watch.rs::armed_repo_matches_plain_worktree_file_events`.
 
 **New `[zvcs]` config keys:** `autostatus` (maintain `zstatus --all`) and
 `autohook` (fire per-repo local hooks), plus the existing

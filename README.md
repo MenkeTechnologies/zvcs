@@ -305,10 +305,10 @@ $ git zwatch list                      # indexed repos, flagged watch|trigger
 ```
 
 An armed repo watches its entire directory, so file changes fire — not only ref
-moves. Fires are coalesced over `zvcs.interval` (default 30s); lower it for a
-snappier trigger (`git config --global zvcs.interval 2`). A hook that writes back
-into the watched directory will re-fire on its own writes — keep trigger commands
-side-effect-free or point them at another repo.
+moves — and there is **no debounce**: the hook runs the instant an event arrives.
+One filesystem event may carry several paths, but a repo fires once per event.
+A hook that writes back into the watched directory will re-fire on its own writes
+— keep trigger commands side-effect-free or point them at another repo.
 
 Only repos you `ztrigger` carry a hook, and the daemon is a no-op for the rest —
 so the set of firing repos is exactly the ones you armed, with no extra list to

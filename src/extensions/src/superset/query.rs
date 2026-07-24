@@ -344,6 +344,48 @@ pub fn zpull(args: &[String]) -> Result<ExitCode> {
     Ok(if failed > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS })
 }
 
+/// `git zattach [selectors]` — re-attach every detached-HEAD indexed repo to its
+/// mainline branch, fleet-wide. The kill-switch for `git submodule update`'s
+/// detached HEADs across the whole index. Uses the same local, no-clobber attach
+/// `zsync` applies to submodules (`ensure_attached`): it never contacts a remote,
+/// never moves the checked-out commit, and never touches the worktree/index, so it
+/// is safe even on a dirty repo. A repo whose local mainline is ahead of or
+/// diverged from HEAD is refused (never clobbered), and one with no main/master
+/// anywhere is skipped.
+pub fn zattach(args: &[String]) -> Result<ExitCode> {
+    use crate::superset::Attached;
+    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let results = parallel_map(&repos, |gd, _| match gix::open(gd) {
+        Ok(repo) => crate::superset::ensure_attached(&repo).map_err(|e| e.to_string()),
+        Err(e) => Err(format!("open failed: {e}")),
+    });
+    let (mut attached, mut already, mut nomain, mut refused, mut failed) = (0, 0, 0, 0, 0);
+    for ((git_dir, wd), res) in repos.iter().zip(&results) {
+        match res {
+            Ok(Attached::Attached { mainline }) => {
+                println!("{}: attached to {mainline}", wd.display());
+                attached += 1;
+            }
+            Ok(Attached::AlreadyAttached) => already += 1,
+            Ok(Attached::NoMainline) => nomain += 1,
+            Ok(Attached::Refused(why)) => {
+                eprintln!("{}: refused ({why})", wd.display());
+                refused += 1;
+            }
+            Err(e) => {
+                eprintln!("{}: {e}", wd.display());
+                let _ = crate::db::record_failure(git_dir, "zattach", &format!("{}: {e}", wd.display()));
+                failed += 1;
+            }
+        }
+    }
+    eprintln!(
+        "zattach: {attached} attached, {already} already on a branch, {nomain} no mainline, {refused} refused, {failed} failed ({} repos)",
+        repos.len()
+    );
+    Ok(if failed > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+}
+
 /// HEAD commit time (unix seconds) of a repo, or `None` when unborn.
 fn head_seconds(repo: &gix::Repository) -> Option<i64> {
     repo.head_commit().ok().and_then(|c| c.time().ok()).map(|t| t.seconds)

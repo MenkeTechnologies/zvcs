@@ -147,6 +147,34 @@ fn zreset_hard_and_zabort_cleanup() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn zattach_reattaches_detached_head() {
+    let root = std::env::temp_dir().join(format!("zvcs-attach-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let home = root.join("home");
+    let sock = root.join("sock");
+
+    // A repo on main, committed, then deliberately detached at that commit.
+    let repo = work.join("det");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("f"), "hi\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "c1"]);
+    git(&repo, &["checkout", "-q", "--detach", "HEAD"]);
+    assert_eq!(head_branch(&repo), "HEAD", "repo should be detached before zattach");
+
+    assert!(zvcs(&home, &sock, &["zreindex", "--sync", work.to_str().unwrap()]).0.contains("indexed 1"));
+    let (out, ok) = zvcs(&home, &sock, &["zattach"]);
+    assert!(ok, "zattach succeeds: {out}");
+    assert!(out.contains("attached to main"), "zattach reports the attach: {out}");
+    assert_eq!(head_branch(&repo), "main", "repo is re-attached to main after zattach");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 fn status_clean(repo: &Path) -> bool {
     let out = Command::new("git").args(["status", "--porcelain"]).current_dir(repo).output().unwrap();
     out.stdout.is_empty()

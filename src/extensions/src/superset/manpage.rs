@@ -422,6 +422,15 @@ pub const DOCS: &[Doc] = &[
         ],
     },
     Doc {
+        verb: "zattach",
+        summary: "re-attach every detached-HEAD indexed repo to its mainline",
+        synopsis: "git zattach [selectors]",
+        desc: &[
+            "Re-attaches every selected indexed repository that is on a detached HEAD to its mainline branch (main, else master), fleet-wide \\(em the kill-switch for the detached HEADs `git submodule update` leaves behind across the whole index.",
+            "It uses the same local, no-clobber attach zsync applies to submodules: it never contacts a remote, never moves the checked-out commit, and never touches the worktree or index \\(em it only creates or fast-forwards the local mainline branch to the commit HEAD is already at and makes HEAD symbolic to it, so it is safe even on a dirty repo. A repo whose local mainline is ahead of or diverged from HEAD is refused rather than clobbered (catching the worktree up is zpull/zsync's clean-only job); a repo with no main or master anywhere is skipped. It reports how many were attached, already on a branch, had no mainline, or were refused.",
+        ],
+    },
+    Doc {
         verb: "zgrep",
         summary: "parallel content search across indexed repos",
         synopsis: "git zgrep [selectors] [-i] <pattern> [--json]",

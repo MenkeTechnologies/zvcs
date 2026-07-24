@@ -138,7 +138,7 @@ impl Col {
             Col::Age => "AGE",
         }
     }
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         COLS.iter().position(|c| *c == self).unwrap_or(0)
     }
 }
@@ -632,11 +632,11 @@ const DEFAULT_ELEMS: Elems = Elems {
 };
 
 /// A theme's 6-color palette: 256-color indices `(c1..c6)`.
-type Palette = [u8; 6];
+pub(crate) type Palette = [u8; 6];
 
 /// htoprs's 31 built-in themes (theme.rs `ThemeName`).
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum ThemeName {
+pub(crate) enum ThemeName {
     NeonSprawl, AcidRain, IceBreaker, SynthWave, RustBelt, GhostWire, RedSector,
     SakuraDen, DataStream, SolarFlare, NeonNoir, ChromeHeart, BladeRunner,
     VoidWalker, ToxicWaste, CyberFrost, PlasmaCore, SteelNerve, DarkSignal,
@@ -644,7 +644,7 @@ enum ThemeName {
     Darkwave, Overlock, Megacorp, Zaibatsu, Iftopcolor,
 }
 
-const THEMES: [ThemeName; 31] = [
+pub(crate) const THEMES: [ThemeName; 31] = [
     ThemeName::NeonSprawl, ThemeName::AcidRain, ThemeName::IceBreaker, ThemeName::SynthWave,
     ThemeName::RustBelt, ThemeName::GhostWire, ThemeName::RedSector, ThemeName::SakuraDen,
     ThemeName::DataStream, ThemeName::SolarFlare, ThemeName::NeonNoir, ThemeName::ChromeHeart,
@@ -657,7 +657,7 @@ const THEMES: [ThemeName; 31] = [
 
 impl ThemeName {
     /// Display name (theme.rs `display_name`).
-    fn display_name(self) -> &'static str {
+    pub(crate) fn display_name(self) -> &'static str {
         match self {
             ThemeName::NeonSprawl => "Neon Sprawl",
             ThemeName::AcidRain => "Acid Rain",
@@ -694,7 +694,7 @@ impl ThemeName {
     }
 
     /// The exact 6-color palette (theme.rs `palette`).
-    fn palette(self) -> Palette {
+    pub(crate) fn palette(self) -> Palette {
         match self {
             ThemeName::NeonSprawl => [27, 48, 135, 141, 63, 99],
             ThemeName::AcidRain => [28, 46, 34, 40, 22, 35],
@@ -730,10 +730,10 @@ impl ThemeName {
         }
     }
 
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         THEMES.iter().position(|t| *t == self).unwrap_or(0)
     }
-    fn from_name(s: &str) -> Option<ThemeName> {
+    pub(crate) fn from_name(s: &str) -> Option<ThemeName> {
         THEMES.iter().copied().find(|t| t.display_name().eq_ignore_ascii_case(s))
     }
 }
@@ -755,7 +755,7 @@ fn remap(n: i16, p: Palette) -> u8 {
 
 /// An ANSI color number through the active palette → a 256-index ratatui color
 /// (terminal-default for -1).
-fn cn_themed(n: i16, p: Palette) -> Color {
+pub(crate) fn cn_themed(n: i16, p: Palette) -> Color {
     if (0..=8).contains(&n) {
         Color::Indexed(remap(n, p))
     } else {
@@ -863,7 +863,7 @@ impl Theme {
 
 /// Read the persisted theme: a custom palette when `zvcs.topscheme` is "Custom"
 /// (palette in `zvcs.toppalette`), else the named theme, else Neon Sprawl.
-fn load_palette() -> (Palette, String) {
+pub(crate) fn load_palette() -> (Palette, String) {
     let cfg = crate::config::global_config();
     let name = cfg.string("zvcs.topscheme").map(|s| s.to_string()).unwrap_or_default();
     if name.eq_ignore_ascii_case("Custom") {
@@ -885,7 +885,7 @@ fn parse_palette(s: &str) -> Option<Palette> {
 
 /// Persist the chosen theme (and, for a custom palette, its values), like
 /// htoprs's theme chooser + editor save.
-fn save_palette(label: &str, pal: Palette) {
+pub(crate) fn save_palette(label: &str, pal: Palette) {
     let Ok(exe) = std::env::current_exe() else { return };
     let _ = Command::new(&exe).args(["config", "--global", "zvcs.topscheme", label]).status();
     if label.eq_ignore_ascii_case("Custom") {
@@ -1162,7 +1162,7 @@ fn render(buf: &mut Buffer, app: &App) {
     // Overlays on top.
     match &app.overlay {
         Overlay::None => {}
-        Overlay::Help => render_help(buf, t),
+        Overlay::Help => render_help(buf),
         Overlay::SortPick(cur) => render_pick(buf, t, "Sort by", &COLS.iter().map(|c| c.title()).collect::<Vec<_>>(), *cur, Some(app.sort.col.index())),
         Overlay::ThemeChooser(cur) => render_theme_chooser(buf, *cur),
         Overlay::ThemeEditor(chan) => render_theme_editor(buf, app.palette, *chan),
@@ -1171,7 +1171,7 @@ fn render(buf: &mut Buffer, app: &App) {
 
 /// The THEME CHOOSER — 31 named themes with a color swatch each, cursor
 /// highlighted, live preview. Ported from htoprs's theme chooser.
-fn render_theme_chooser(buf: &mut Buffer, cursor: usize) {
+pub(crate) fn render_theme_chooser(buf: &mut Buffer, cursor: usize) {
     let bg = Style::default().fg(Color::White).bg(HELP_BG);
     let border = Style::default().fg(HELP_TITLE).bg(HELP_BG).add_modifier(Modifier::BOLD);
     let sel = Style::default().fg(Color::Black).bg(HELP_KEY).add_modifier(Modifier::BOLD);
@@ -1208,7 +1208,7 @@ fn render_theme_chooser(buf: &mut Buffer, cursor: usize) {
 
 /// The palette EDITOR — the active theme's six channels, one selectable, with a
 /// live swatch; ←/→ change the 256-color index, s saves it as a custom theme.
-fn render_theme_editor(buf: &mut Buffer, pal: Palette, channel: usize) {
+pub(crate) fn render_theme_editor(buf: &mut Buffer, pal: Palette, channel: usize) {
     let bg = Style::default().fg(Color::White).bg(HELP_BG);
     let border = Style::default().fg(HELP_TITLE).bg(HELP_BG).add_modifier(Modifier::BOLD);
     let sel = Style::default().fg(Color::Black).bg(HELP_KEY).add_modifier(Modifier::BOLD);
@@ -1252,7 +1252,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
 /// Draw the F1 help — a centered box, bold title, bold section headers, keys in
 /// the help-key color, descriptions in white; two columns. Ported style from
 /// htoprs `overlay::draw_help`.
-fn render_help(buf: &mut Buffer, _t: &Theme) {
+pub(crate) fn render_help(buf: &mut Buffer) {
     let bg = Style::default().fg(Color::White).bg(HELP_BG);
     let border = Style::default().fg(HELP_TITLE).bg(HELP_BG).add_modifier(Modifier::BOLD);
     let section_s = Style::default().fg(HELP_SECTION).bg(HELP_BG).add_modifier(Modifier::BOLD);

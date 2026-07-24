@@ -6,8 +6,10 @@
 //! rows' HEAD state live-refreshed so nothing is stale), the **events** feed
 //! (`zevents`: commits / reconciles / status changes), and the **commands** feed
 //! (`zcommands`: every git command run across the machine, with the agent that
-//! ran it). A header row carries the aggregate totals. The non-interactive path
-//! (`--once`, `--json`, or a non-tty stdout) keeps the old instant text summary.
+//! ran it). A header row carries the aggregate totals. It shares ztop's theme
+//! system: `c` opens the 31-scheme chooser, `~`/`e` the palette editor, F1 the
+//! help overlay. The non-interactive path (`--once` / `--json` / a non-tty
+//! stdout) keeps the instant text summary.
 
 use std::io::{stdout, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -26,13 +28,18 @@ use ratatui::crossterm::{
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::Terminal;
 
-use crate::superset::ztop::{fill_row, set_cell, set_str};
+use crate::superset::ztop::{
+    cn_themed, fill_row, load_palette, render_help, render_theme_chooser, render_theme_editor,
+    save_palette, set_cell, set_str, Palette, ThemeName, THEMES,
+};
 
 const POLL: Duration = Duration::from_millis(700);
 const FEED: usize = 200; // rows pulled per feed before the tile clips them
 
-/// A fixed palette (htop DEFAULT-flavored): cyan chrome, htop's semantic accents.
-struct Palette {
+/// Concrete styles for the dashboard, derived from the active theme palette via
+/// the same remap ztop uses (so both recolor identically). ANSI slots: accent=6,
+/// green=2, yellow=3, red=1, magenta=5, blue=4, gray=8, black=0, default=-1.
+struct Colors {
     title: Style,
     border: Style,
     label: Style,
@@ -50,27 +57,62 @@ struct Palette {
     blue: Style,
 }
 
-impl Palette {
-    fn new() -> Self {
-        let b = |c: Color| Style::default().fg(c).add_modifier(Modifier::BOLD);
-        Palette {
-            title: b(Color::Cyan),
-            border: Style::default().fg(Color::Cyan),
-            label: Style::default().fg(Color::Cyan),
-            row: Style::default().fg(Color::Gray),
-            dim: Style::default().fg(Color::Indexed(240)),
-            ok: Style::default().fg(Color::Green),
-            warn: b(Color::Yellow),
-            error: b(Color::Red),
-            behind: Style::default().fg(Color::Red),
-            diverged: b(Color::Magenta),
-            bar: Style::default().fg(Color::Black).bg(Color::Cyan),
-            cyan: Style::default().fg(Color::Cyan),
-            green: Style::default().fg(Color::Green),
-            magenta: Style::default().fg(Color::Magenta),
-            blue: Style::default().fg(Color::Blue),
+impl Colors {
+    fn from_theme(pal: Palette, mono: bool) -> Self {
+        if mono {
+            return Colors::mono();
+        }
+        let c = |n: i16| cn_themed(n, pal);
+        let f = |n: i16| Style::default().fg(c(n));
+        let b = |n: i16| Style::default().fg(c(n)).add_modifier(Modifier::BOLD);
+        Colors {
+            title: b(6),
+            border: f(6),
+            label: f(6),
+            row: Style::default(),
+            dim: f(8),
+            ok: f(2),
+            warn: b(3),
+            error: b(1),
+            behind: f(1),
+            diverged: b(5),
+            bar: Style::default().fg(c(0)).bg(c(6)),
+            cyan: f(6),
+            green: f(2),
+            magenta: f(5),
+            blue: f(4),
         }
     }
+    fn mono() -> Self {
+        let p = Style::default();
+        let b = p.add_modifier(Modifier::BOLD);
+        let rev = p.add_modifier(Modifier::REVERSED);
+        Colors {
+            title: b,
+            border: p,
+            label: p,
+            row: p,
+            dim: p.add_modifier(Modifier::DIM),
+            ok: p,
+            warn: b,
+            error: b,
+            behind: b,
+            diverged: b,
+            bar: rev,
+            cyan: p,
+            green: p,
+            magenta: p,
+            blue: p,
+        }
+    }
+}
+
+/// A theme overlay open over the dashboard.
+enum Overlay {
+    None,
+    Help,
+    Chooser(usize),
+    Editor(usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -116,11 +158,52 @@ struct Dash {
     events: Vec<crate::db::EventRow>,
     commands: Vec<CmdRec>,
     daemon_up: bool,
+    // Theme state (shared with ztop).
+    pal: Palette,
+    label: String,
+    mono: bool,
+    colors: Colors,
+    overlay: Overlay,
+    restore: Option<(Palette, String, bool)>,
 }
 
 impl Dash {
-    fn empty() -> Self {
-        Dash { totals: Totals::default(), fleet: Vec::new(), events: Vec::new(), commands: Vec::new(), daemon_up: false }
+    fn new() -> Self {
+        let (pal, label) = load_palette();
+        let mono = std::env::var_os("NO_COLOR").is_some();
+        Dash {
+            totals: Totals::default(),
+            fleet: Vec::new(),
+            events: Vec::new(),
+            commands: Vec::new(),
+            daemon_up: false,
+            pal,
+            label,
+            mono,
+            colors: Colors::from_theme(pal, mono),
+            overlay: Overlay::None,
+            restore: None,
+        }
+    }
+
+    fn set_palette(&mut self, pal: Palette, label: impl Into<String>) {
+        self.pal = pal;
+        self.label = label.into();
+        self.mono = false;
+        self.colors = Colors::from_theme(pal, false);
+    }
+
+    fn snapshot_theme(&mut self) {
+        self.restore = Some((self.pal, self.label.clone(), self.mono));
+    }
+
+    fn revert_theme(&mut self) {
+        if let Some((p, l, m)) = self.restore.take() {
+            self.pal = p;
+            self.label = l;
+            self.mono = m;
+            self.colors = Colors::from_theme(p, m);
+        }
     }
 
     /// Re-read all three sources. `visible_fleet` is how many fleet rows the tile
@@ -149,7 +232,7 @@ impl Dash {
                 if let Ok(it) = rows {
                     for row in it.flatten() {
                         if !row.path.starts_with('/') {
-                            continue; // skip malformed index entries
+                            continue;
                         }
                         t.cached += 1;
                         if row.dirty {
@@ -184,7 +267,6 @@ impl Dash {
             self.events = crate::db::events_recent(&conn, FEED, None, None).unwrap_or_default();
         }
 
-        // Live-refresh the on-screen fleet rows' HEAD state (kills stale detached).
         for row in fleet.iter_mut().take(visible_fleet) {
             if let Ok(repo) = gix::open(&row.git_dir) {
                 let name = repo.head_name().ok().flatten();
@@ -210,12 +292,10 @@ fn commands_log() -> PathBuf {
     crate::superset::zdaemon::zvcs_home().join("commands.log")
 }
 
-/// The last `n` command-log records, oldest-first.
 fn read_commands(n: usize) -> Vec<CmdRec> {
     let path = commands_log();
     let Ok(len) = std::fs::metadata(&path).map(|m| m.len()) else { return Vec::new() };
     let Ok(mut f) = std::fs::File::open(&path) else { return Vec::new() };
-    // Read only the tail (256 bytes per line is plenty).
     let want = (n as u64 * 256).min(len);
     let _ = f.seek(SeekFrom::Start(len - want));
     let mut buf = Vec::new();
@@ -270,14 +350,12 @@ fn fmt_ago(secs: i64) -> String {
     }
 }
 
-/// Draw a bordered tile at `(x,y)` of size `w×h` with a title; return the inner
-/// `(x, y, w, h)` content rectangle.
-fn tile(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, title: &str, p: &Palette) -> (u16, u16, u16, u16) {
+fn tile(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, title: &str, c: &Colors) -> (u16, u16, u16, u16) {
     if w < 2 || h < 2 {
         return (x, y, 0, 0);
     }
     let (x1, y1) = (x + w - 1, y + h - 1);
-    let bs = p.border;
+    let bs = c.border;
     set_cell(buf, x, y, "┌", bs);
     set_cell(buf, x1, y, "┐", bs);
     set_cell(buf, x, y1, "└", bs);
@@ -290,49 +368,48 @@ fn tile(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, title: &str, p: &Palet
         set_cell(buf, x, cy, "│", bs);
         set_cell(buf, x1, cy, "│", bs);
     }
-    set_str(buf, x + 2, y, &format!(" {title} "), p.title, w.saturating_sub(4));
+    set_str(buf, x + 2, y, &format!(" {title} "), c.title, w.saturating_sub(4));
     (x + 2, y + 1, w.saturating_sub(4), h.saturating_sub(2))
 }
 
-fn render(buf: &mut Buffer, d: &Dash, p: &Palette) {
+fn render(buf: &mut Buffer, d: &Dash) {
+    let c = &d.colors;
     let area = buf.area();
     let (cols, rows) = (area.width, area.height);
     for y in area.y..area.y + rows {
-        fill_row(buf, y, p.row);
+        fill_row(buf, y, c.row);
     }
     if cols < 40 || rows < 12 {
-        set_str(buf, 0, 0, "terminal too small for the dashboard", p.error, cols);
+        set_str(buf, 0, 0, "terminal too small for the dashboard", c.error, cols);
         return;
     }
 
-    // Header (rows 0..3).
     let t = &d.totals;
-    set_str(buf, 0, 0, "zvcs dashboard", p.title, 16);
-    set_str(buf, 16, 0, &format!("— {} repos ({} cached)", t.repos, t.cached), p.label, cols.saturating_sub(16));
+    set_str(buf, 0, 0, "zvcs dashboard", c.title, 16);
+    set_str(buf, 16, 0, &format!("— {} repos ({} cached)", t.repos, t.cached), c.label, cols.saturating_sub(16));
     let daemon = if d.daemon_up { "daemon up" } else { "daemon down" };
     let dtxt = format!("{daemon}  {}", hms(crate::date::now_seconds()));
-    set_str(buf, cols.saturating_sub(dtxt.len() as u16 + 1), 0, &dtxt, if d.daemon_up { p.ok } else { p.error }, dtxt.len() as u16);
+    set_str(buf, cols.saturating_sub(dtxt.len() as u16 + 1), 0, &dtxt, if d.daemon_up { c.ok } else { c.error }, dtxt.len() as u16);
 
     let counts = [
-        ("dirty", t.dirty, p.warn),
-        ("ahead", t.ahead, p.ok),
-        ("behind", t.behind, p.behind),
-        ("diverged", t.diverged, p.diverged),
-        ("detached", t.detached, p.error),
-        ("clean", t.clean, p.dim),
+        ("dirty", t.dirty, c.warn),
+        ("ahead", t.ahead, c.ok),
+        ("behind", t.behind, c.behind),
+        ("diverged", t.diverged, c.diverged),
+        ("detached", t.detached, c.error),
+        ("clean", t.clean, c.dim),
     ];
     let mut x = 0u16;
     for (label, n, style) in counts {
         let seg = format!("{label} ");
-        set_str(buf, x, 1, &seg, p.label, cols.saturating_sub(x));
+        set_str(buf, x, 1, &seg, c.label, cols.saturating_sub(x));
         x += seg.len() as u16;
         let num = format!("{n}  ");
         set_str(buf, x, 1, &num, style, cols.saturating_sub(x));
         x += num.len() as u16;
     }
-    set_str(buf, 0, 2, &format!("claims {}  sessions {}  queue {} active", t.claims, t.sessions, t.queue), p.label, cols);
+    set_str(buf, 0, 2, &format!("claims {}  sessions {}  queue {} active   theme: {}", t.claims, t.sessions, t.queue, if d.mono { "Monochrome" } else { &d.label }), c.label, cols);
 
-    // Body tiles.
     let top = 3u16;
     let foot = rows - 1;
     let body_h = foot.saturating_sub(top);
@@ -342,94 +419,97 @@ fn render(buf: &mut Buffer, d: &Dash, p: &Palette) {
     let ev_h = body_h / 2;
     let cmd_h = body_h - ev_h;
 
-    render_fleet(buf, 0, top, left_w, body_h, d, p);
-    render_events(buf, right_x, top, right_w, ev_h, d, p);
-    render_commands(buf, right_x, top + ev_h, right_w, cmd_h, d, p);
+    render_fleet(buf, 0, top, left_w, body_h, d);
+    render_events(buf, right_x, top, right_w, ev_h, d);
+    render_commands(buf, right_x, top + ev_h, right_w, cmd_h, d);
 
-    // Footer.
-    fill_row(buf, foot, p.bar);
-    set_str(buf, 0, foot, " q Quit   live — fleet · events · commands · reads the daemon status cache ", p.bar, cols);
+    fill_row(buf, foot, c.bar);
+    set_str(buf, 0, foot, " q Quit   c Colors   ~ Edit   F1 Help   live — fleet · events · commands ", c.bar, cols);
+
+    match &d.overlay {
+        Overlay::None => {}
+        Overlay::Help => render_help(buf),
+        Overlay::Chooser(cur) => render_theme_chooser(buf, *cur),
+        Overlay::Editor(chan) => render_theme_editor(buf, d.pal, *chan),
+    }
 }
 
-fn render_fleet(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash, p: &Palette) {
-    let (ix, iy, iw, ih) = tile(buf, x, y, w, h, "FLEET · most active", p);
+fn render_fleet(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash) {
+    let c = &d.colors;
+    let (ix, iy, iw, ih) = tile(buf, x, y, w, h, "FLEET · most active", c);
     for (i, row) in d.fleet.iter().take(ih as usize).enumerate() {
         let cy = iy + i as u16;
-        let (word, style) = state_of(row, p);
+        let (word, style) = state_of(row, c);
         let namew = iw.saturating_sub(20);
-        set_str(buf, ix, cy, &basename(&row.path), p.row, namew);
+        set_str(buf, ix, cy, &basename(&row.path), c.row, namew);
         set_str(buf, ix + namew + 1, cy, word, style, 10);
-        set_str(buf, ix + namew + 12, cy, &fmt_ago(row.age_secs), p.dim, 6);
+        set_str(buf, ix + namew + 12, cy, &fmt_ago(row.age_secs), c.dim, 6);
     }
 }
 
-/// The salient state word + style for a fleet row.
-fn state_of<'a>(row: &FleetRow, p: &'a Palette) -> (&'static str, Style) {
+fn state_of(row: &FleetRow, c: &Colors) -> (&'static str, Style) {
     if row.detached {
-        ("detached", p.error)
+        ("detached", c.error)
     } else if row.sync == "diverged" {
-        ("diverged", p.diverged)
+        ("diverged", c.diverged)
     } else if row.dirty {
-        ("dirty", p.warn)
+        ("dirty", c.warn)
     } else if row.sync == "behind" {
-        ("behind", p.behind)
+        ("behind", c.behind)
     } else if row.sync == "ahead" {
-        ("ahead", p.ok)
+        ("ahead", c.ok)
     } else {
-        ("clean", p.dim)
+        ("clean", c.dim)
     }
 }
 
-fn render_events(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash, p: &Palette) {
-    let (ix, iy, iw, ih) = tile(buf, x, y, w, h, "EVENTS · commits · reconciles · status", p);
-    // Newest last, so the freshest sits at the bottom of the tile.
+fn render_events(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash) {
+    let c = &d.colors;
+    let (ix, iy, iw, ih) = tile(buf, x, y, w, h, "EVENTS · commits · reconciles · status", c);
     let take = ih as usize;
     let start = d.events.len().saturating_sub(take);
     for (i, e) in d.events[start..].iter().enumerate() {
         let cy = iy + i as u16;
         let (glyph, style) = match e.kind.as_str() {
-            "commit" => ("●", p.green),
-            "reconcile" => ("↻", p.magenta),
-            "status" => ("◑", p.warn),
-            "stage" => ("+", p.blue),
-            _ => ("•", p.dim),
+            "commit" => ("●", c.green),
+            "reconcile" => ("↻", c.magenta),
+            "status" => ("◑", c.warn),
+            "stage" => ("+", c.blue),
+            _ => ("•", c.dim),
         };
-        set_str(buf, ix, cy, &hms(e.ts), p.dim, 8);
+        set_str(buf, ix, cy, &hms(e.ts), c.dim, 8);
         set_cell(buf, ix + 9, cy, glyph, style);
-        let repo = event_repo(e);
-        set_str(buf, ix + 11, cy, &repo, p.cyan, 18);
-        let detail = e.detail.clone().unwrap_or_default();
-        set_str(buf, ix + 30, cy, &detail, p.row, iw.saturating_sub(30));
+        set_str(buf, ix + 11, cy, &event_repo(e), c.cyan, 18);
+        set_str(buf, ix + 30, cy, &e.detail.clone().unwrap_or_default(), c.row, iw.saturating_sub(30));
     }
 }
 
 fn event_repo(e: &crate::db::EventRow) -> String {
     let src = e.workdir.clone().or_else(|| e.git_dir.clone()).unwrap_or_default();
-    let base = basename(&src);
-    base.trim_end_matches(".git").to_string()
+    basename(&src).trim_end_matches(".git").to_string()
 }
 
-fn render_commands(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash, p: &Palette) {
-    let (ix, iy, iw, ih) = tile(buf, x, y, w, h, "COMMANDS · every git across the fleet", p);
+fn render_commands(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash) {
+    let c = &d.colors;
+    let (ix, iy, iw, ih) = tile(buf, x, y, w, h, "COMMANDS · every git across the fleet", c);
     if d.commands.is_empty() {
-        set_str(buf, ix, iy, "run `git zcommands` once to enable command logging", p.dim, iw);
+        set_str(buf, ix, iy, "run `git zcommands` once to enable command logging", c.dim, iw);
         return;
     }
     let take = ih as usize;
     let start = d.commands.len().saturating_sub(take);
-    for (i, c) in d.commands[start..].iter().enumerate() {
+    for (i, cmd) in d.commands[start..].iter().enumerate() {
         let cy = iy + i as u16;
-        set_str(buf, ix, cy, &hms(c.ts), p.dim, 8);
-        let who = format!("{}\u{2190}{}", c.pid, c.ppid);
-        set_str(buf, ix + 9, cy, &who, p.dim, 13);
-        set_str(buf, ix + 23, cy, &basename(&c.cwd), p.cyan, 14);
-        set_str(buf, ix + 38, cy, "git", p.green, 3);
-        set_str(buf, ix + 42, cy, &c.argv, p.row, iw.saturating_sub(42));
+        set_str(buf, ix, cy, &hms(cmd.ts), c.dim, 8);
+        set_str(buf, ix + 9, cy, &format!("{}\u{2190}{}", cmd.pid, cmd.ppid), c.dim, 13);
+        set_str(buf, ix + 23, cy, &basename(&cmd.cwd), c.cyan, 14);
+        set_str(buf, ix + 38, cy, "git", c.green, 3);
+        set_str(buf, ix + 42, cy, &cmd.argv, c.row, iw.saturating_sub(42));
     }
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle.
+// Lifecycle + input.
 // ---------------------------------------------------------------------------
 
 struct TermGuard;
@@ -440,19 +520,16 @@ impl Drop for TermGuard {
     }
 }
 
-/// Run the interactive tiled dashboard.
 pub fn run() -> Result<ExitCode> {
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen, cursor::Hide)?;
     let _guard = TermGuard;
     let mut term = Terminal::new(CrosstermBackend::new(stdout()))?;
-    let p = Palette::new();
-    let mut dash = Dash::empty();
+    let mut dash = Dash::new();
     loop {
-        // Fleet tile height ≈ body height; refresh with a generous visible count.
         let visible = ratatui::crossterm::terminal::size().map(|(_, h)| h.saturating_sub(6) as usize).unwrap_or(40);
         dash.refresh(visible);
-        term.draw(|f| render(f.buffer_mut(), &dash, &p))?;
+        term.draw(|f| render(f.buffer_mut(), &dash))?;
 
         let deadline = Instant::now() + POLL;
         loop {
@@ -464,14 +541,97 @@ pub fn run() -> Result<ExitCode> {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                match (k.code, k.modifiers) {
-                    (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => return Ok(ExitCode::SUCCESS),
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(ExitCode::SUCCESS),
-                    _ => {}
+                if handle_key(&mut dash, k.code, k.modifiers) {
+                    return Ok(ExitCode::SUCCESS);
                 }
+                break; // redraw immediately after a handled key
             }
         }
     }
+}
+
+/// Handle one key. Returns true to quit. Theme overlays (chooser/editor/help)
+/// mirror ztop's controls so the two feel identical.
+fn handle_key(d: &mut Dash, code: KeyCode, mods: KeyModifiers) -> bool {
+    if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+    match d.overlay {
+        Overlay::Help => {
+            d.overlay = Overlay::None;
+            return false;
+        }
+        Overlay::Chooser(cur) => {
+            let n = THEMES.len();
+            match code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let c = (cur + n - 1) % n;
+                    d.overlay = Overlay::Chooser(c);
+                    d.set_palette(THEMES[c].palette(), THEMES[c].display_name());
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let c = (cur + 1) % n;
+                    d.overlay = Overlay::Chooser(c);
+                    d.set_palette(THEMES[c].palette(), THEMES[c].display_name());
+                }
+                KeyCode::Enter => {
+                    d.overlay = Overlay::None;
+                    d.restore = None;
+                    save_palette(&d.label, d.pal);
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    d.overlay = Overlay::None;
+                    d.revert_theme();
+                }
+                _ => {}
+            }
+            return false;
+        }
+        Overlay::Editor(chan) => {
+            match code {
+                KeyCode::Up | KeyCode::Char('k') => d.overlay = Overlay::Editor(chan.saturating_sub(1)),
+                KeyCode::Down | KeyCode::Char('j') => d.overlay = Overlay::Editor((chan + 1).min(5)),
+                KeyCode::Left | KeyCode::Char('-') => {
+                    let mut p = d.pal;
+                    p[chan] = p[chan].wrapping_sub(1);
+                    d.set_palette(p, "Custom");
+                }
+                KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => {
+                    let mut p = d.pal;
+                    p[chan] = p[chan].wrapping_add(1);
+                    d.set_palette(p, "Custom");
+                }
+                KeyCode::Char('s') | KeyCode::Enter => {
+                    d.overlay = Overlay::None;
+                    d.restore = None;
+                    save_palette("Custom", d.pal);
+                }
+                KeyCode::Esc => {
+                    d.overlay = Overlay::None;
+                    d.revert_theme();
+                }
+                _ => {}
+            }
+            return false;
+        }
+        Overlay::None => {}
+    }
+
+    match (code, mods) {
+        (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => return true,
+        (KeyCode::F(1), _) | (KeyCode::Char('h'), _) | (KeyCode::Char('?'), _) => d.overlay = Overlay::Help,
+        (KeyCode::F(2), _) | (KeyCode::Char('c'), _) => {
+            d.snapshot_theme();
+            let cur = ThemeName::from_name(&d.label).map(|t| t.index()).unwrap_or(0);
+            d.overlay = Overlay::Chooser(cur);
+        }
+        (KeyCode::Char('~'), _) | (KeyCode::Char('e'), _) => {
+            d.snapshot_theme();
+            d.overlay = Overlay::Editor(0);
+        }
+        _ => {}
+    }
+    false
 }
 
 #[cfg(test)]
@@ -492,10 +652,10 @@ mod tests {
     #[test]
     fn basename_and_state() {
         assert_eq!(basename("/a/b/zpwr"), "zpwr");
-        let p = Palette::new();
+        let c = Colors::mono();
         let detached = FleetRow { path: "/x".into(), git_dir: "/x/.git".into(), head: "h".into(), dirty: false, detached: true, sync: "up-to-date".into(), age_secs: 0 };
-        assert_eq!(state_of(&detached, &p).0, "detached");
+        assert_eq!(state_of(&detached, &c).0, "detached");
         let dirty = FleetRow { path: "/y".into(), git_dir: "/y/.git".into(), head: "h".into(), dirty: true, detached: false, sync: "up-to-date".into(), age_secs: 0 };
-        assert_eq!(state_of(&dirty, &p).0, "dirty");
+        assert_eq!(state_of(&dirty, &c).0, "dirty");
     }
 }

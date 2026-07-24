@@ -50,6 +50,11 @@ const CHURN_DECAY: f64 = 0.90; // the spike fades over ~a minute at 2s frames
 const CHURN_CAP: f64 = 6.0;
 const CHURN_BAR_W: u16 = 8;
 
+/// How many rows around the scroll position to live-refresh (attached/detached +
+/// branch) each frame — enough to cover any terminal's visible window, small
+/// enough that the cheap ref reads stay instant.
+const LIVE_WINDOW: usize = 80;
+
 /// `git ztop [selectors] [--interval <secs>] [--once] [--mono]`.
 pub fn ztop(args: &[String]) -> Result<ExitCode> {
     let (sel, rest) = Selector::parse(args);
@@ -187,6 +192,7 @@ struct Churn {
 /// query so it never has to touch the shared `db.rs` API.
 struct Snap {
     path: String,
+    git_dir: String,
     dirty: bool,
     detached: bool,
     sync: String,
@@ -211,6 +217,7 @@ fn read_snaps() -> Vec<Snap> {
             let gd: String = r.get(1)?;
             Ok(Snap {
                 path: resolve_path(wd.as_deref(), &gd),
+                git_dir: gd,
                 dirty: r.get::<_, i64>(2)? != 0,
                 detached: r.get::<_, i64>(3)? != 0,
                 sync: r.get(4)?,
@@ -247,6 +254,7 @@ fn resolve_path(workdir: Option<&str>, git_dir: &str) -> String {
 #[derive(Clone)]
 struct Row {
     path: String,
+    git_dir: String, // to live-refresh this row's HEAD state (fixes stale cache)
     head: String,
     dirty: bool,
     detached: bool,
@@ -411,6 +419,7 @@ impl App {
 
             rows.push(Row {
                 path: s.path.clone(),
+                git_dir: s.git_dir.clone(),
                 head: s.head.clone(),
                 dirty: s.dirty,
                 detached: s.detached,
@@ -451,6 +460,28 @@ impl App {
         let max = self.rows.len().saturating_sub(1);
         if self.scroll > max {
             self.scroll = max;
+        }
+        self.live_refresh_window();
+    }
+
+    /// Live-refresh the HEAD state (attached/detached + branch) of the rows around
+    /// the current scroll — the ones actually on screen — so a stale status-cache
+    /// entry (e.g. a repo re-attached since the daemon last scanned it) never shows
+    /// wrong. Cheap ref reads only (no worktree scan, no rev-walk), bounded to a
+    /// small window, so it stays instant across thousands of repos.
+    fn live_refresh_window(&mut self) {
+        let end = (self.scroll + LIVE_WINDOW).min(self.rows.len());
+        for row in &mut self.rows[self.scroll..end] {
+            let Ok(repo) = gix::open(&row.git_dir) else { continue };
+            let name = repo.head_name().ok().flatten();
+            row.detached = name.is_none();
+            row.head = match name {
+                Some(n) => n.shorten().to_string(),
+                None => match repo.head().ok().and_then(|mut h| h.try_peel_to_id().ok().flatten()) {
+                    Some(id) => format!("detached@{}", id.to_hex_with_len(12)),
+                    None => "(unborn)".into(),
+                },
+            };
         }
     }
 
@@ -1519,6 +1550,7 @@ mod tests {
     fn row(path: &str, dirty: bool, detached: bool, sync: &str, churn: f64) -> Row {
         Row {
             path: path.into(),
+            git_dir: String::new(),
             head: "abc123".into(),
             dirty,
             detached,

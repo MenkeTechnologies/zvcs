@@ -13,6 +13,7 @@ use std::process::ExitCode;
 pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zconfig", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
     "zsubmit", "zevents", "ztail", "zcommands", "zintercept", "zaudit", "zscan", "zreview", "zremote",
+    "zrollback", "zsched",
     "zpin", "zunpin", "zbroadcast", "zhandoff", "zon", "zsince", "zcontend", "zwaitfor", "zgraph", "zrewind",
     "zguard", "zpolicy",
     "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
@@ -24,6 +25,7 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "zfetch", "zgc", "zfsck", "zprune", "zreset", "zabort", "zcheckout", "ztagall", "zcommitall", "zpushall", "zclean",
     "zwait", "zqueue", "zbarrier",
     "zstale", "zlast", "zbig", "zfiles", "zcommits", "zpristine", "zdivergent", "zorphans", "zsessions", "zidle", "zdashboard", "ztop",
+    "zppid",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -248,6 +250,8 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zscan" => "usage: git zscan [selectors] — parallel secret scan of tracked content across indexed repos (exits non-zero if any found)",
         "zreview" => "usage: git zreview [selectors] — aggregate the pending uncommitted change (short status + diffstat) of every dirty indexed repo",
         "zremote" => "usage: git zremote set <old> <new> [selectors] [-n|--dry-run] — rewrite remote URLs across the fleet, replacing substring <old> with <new>",
+        "zrollback" => "usage: git zrollback [selectors] [--steps <n>] [--apply] [--force] — fleet-wide undo of the last mutating op (reset --hard HEAD@{n}); dry-run unless --apply; skips dirty/mid-op/would-diverge repos unless --force",
+        "zsched" => "usage: git zsched add <duration> -- <cmd> | list | rm <id> | clear | run <id> — daemon-hosted scheduled fleet commands (a built-in cron for the tree)",
         "zdaemon" => "usage: git zdaemon <start|stop|restart|status|info|ping|log>",
         "zconfig" => "usage: git zconfig [<name> [on|off|<count>|default]] — toggle daemon features (see `git help zconfig`)",
         "zrepos" => "usage: git zrepos [<pattern>...] — list indexed repos; patterns filter by case-insensitive substring",
@@ -335,6 +339,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zsessions" => "usage: git zsessions — active sessions ranked by repos held",
         "zidle" => "usage: git zidle [selectors] — indexed repos with no active claim (free to pick up)",
         "zdashboard" => "usage: git zdashboard — instant one-screen health summary from the status cache + ledger",
+        "zppid" => "usage: git zppid [--json] — per-process commit tally: each invoking process (ppid) and how many commits it has landed",
         "ztop" => "usage: git ztop [selectors] [--interval <secs>] [--once] [--mono] — live htop-style fleet monitor, most churn on top",
         _ => return None,
     })
@@ -444,7 +449,13 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         None
     };
 
-    match sub {
+    // Per-process commit tally: for a commit-producing verb, capture HEAD now so we
+    // can credit the running process (by ppid) after the command if HEAD advanced.
+    // `.then` skips the gix probe entirely for every non-commit verb, so the hot
+    // path pays nothing.
+    let commit_head_before = superset::zppid::is_commit_verb(sub).then(superset::zppid::head_commit);
+
+    let result = match sub {
         // ---- superset (novel) ----
         "zsync" => superset::zsync(args),
         "zbump" => superset::zbump(args),
@@ -466,6 +477,8 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zscan" => superset::zscan(args),
         "zreview" => superset::zreview(args),
         "zremote" => superset::zremote(args),
+        "zrollback" => superset::zrollback(args),
+        "zsched" => superset::zsched(args),
         "zdaemon" => superset::zdaemon(args),
         "zconfig" => superset::zconfig(args),
         "zrepos" => superset::zrepos(args),
@@ -553,6 +566,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zsessions" => superset::zsessions(args),
         "zidle" => superset::zidle(args),
         "zdashboard" => superset::zdashboard(args),
+        "zppid" => superset::zppid(args),
         "ztop" => superset::ztop(args),
 
         // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----
@@ -745,5 +759,11 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         // do, so give git's own honest wording rather than implying the verb is a
         // real command merely awaiting a port.
         _ => anyhow::bail!("is not a git command. See 'git --help'."),
+    };
+
+    // If a commit-producing verb advanced HEAD, credit the running process's tally.
+    if let Some(before) = commit_head_before {
+        superset::zppid::note_commit(before);
     }
+    result
 }

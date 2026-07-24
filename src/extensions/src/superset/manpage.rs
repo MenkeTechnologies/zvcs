@@ -717,6 +717,25 @@ pub const DOCS: &[Doc] = &[
         ],
     },
     Doc {
+        verb: "zrollback",
+        summary: "fleet-wide undo of the last mutating operation",
+        synopsis: "git zrollback [selectors] [--steps <n>] [--apply] [--force]",
+        desc: &[
+            "The multi-repo evolution of `zundo`: across every selected repo it resolves `HEAD@{n}` from the reflog (n = --steps, default 1) and rewinds to it with `reset --hard`, undoing the last commit / merge / rebase / reset. The reset is itself reflogged, so a rollback is undoable.",
+            "It is **dry-run by default** \\(em with no --apply it prints what each repo *would* do (`<current> → <target>`) and changes nothing. --apply executes the rollback on the repos that pass the guards.",
+            "The guards refuse to lose work: a repo is skipped, not rolled back, when its worktree is dirty, when it is mid-operation (merge/rebase/cherry-pick/revert), or when rolling back would diverge from its remote \\(em the discarded commits are already pushed (sync is up-to-date, behind, or diverged). Rollback is allowed by default only when the commits are local-only (ahead or no-upstream). --force overrides every guard.",
+        ],
+    },
+    Doc {
+        verb: "zsched",
+        summary: "daemon-hosted scheduled fleet commands (a built-in cron)",
+        synopsis: "git zsched add <duration> -- <cmd> | list | rm <id> | clear | run <id>",
+        desc: &[
+            "Schedules a command to run on an interval, hosted by the daemon \\(em a built-in cron for the whole tree. `git zsched add 5m -- git zpull --dirty` fast-forwards every dirty repo every five minutes; durations are 30s / 5m / 1h / 1h30m style. `list` shows every schedule with its id and interval, `rm <id>` removes one, `clear` removes them all, and `run <id>` fires one now (synchronously) for testing.",
+            "Schedules persist to $ZVCS_HOME/schedule.tsv as `id\\tinterval\\tcommand`. The CLI owns every write to that file; the daemon's scheduler thread only reads it (re-reading each tick, so add/rm take effect within one tick with no reload) and tracks each schedule's last-fire time in memory \\(em so the CLI and daemon never contend on the file. A schedule fires one full interval after the daemon first sees it, not on daemon start.",
+        ],
+    },
+    Doc {
         verb: "zpin",
         summary: "freeze a repo from daemon autonomy",
         synopsis: "git zpin [<path>...|list] [--json]",

@@ -341,6 +341,10 @@ fn start() -> Result<ExitCode> {
     // events fire. No-op-cheap while there are no subscriptions.
     crate::superset::zon::spawn_daemon_loop();
 
+    // Scheduled fleet commands (`git zsched`): fire each schedule on its interval.
+    // One file read per tick while there are no schedules.
+    crate::superset::zsched::spawn_scheduler();
+
     // Ledger housekeeping: terminal jobs older than the retention window are pruned
     // on a slow timer so the jobs table stays bounded across millions of commands.
     thread::spawn(|| loop {

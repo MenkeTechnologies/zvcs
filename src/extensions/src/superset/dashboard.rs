@@ -150,6 +150,9 @@ struct Totals {
     claims: usize,
     sessions: usize,
     queue: usize,
+    procs: usize,
+    /// The most productive tracked process: `(ppid, commits)`, if any.
+    top_ppid: Option<(i64, i64)>,
 }
 
 struct Dash {
@@ -264,6 +267,11 @@ impl Dash {
             t.queue = crate::db::list_jobs(&conn, 1000)
                 .map(|j| j.iter().filter(|x| x.state == "queued" || x.state == "running").count())
                 .unwrap_or(0);
+            // Per-process commit tallies (`zppid`): count of tracked processes and
+            // the busiest one (list_ppids is ordered commits-desc, so first = top).
+            let ppids = crate::db::list_ppids(&conn).unwrap_or_default();
+            t.procs = ppids.len();
+            t.top_ppid = ppids.first().map(|p| (p.ppid, p.commits));
             self.events = crate::db::events_recent(&conn, FEED, None, None).unwrap_or_default();
         }
 
@@ -408,7 +416,11 @@ fn render(buf: &mut Buffer, d: &Dash) {
         set_str(buf, x, 1, &num, style, cols.saturating_sub(x));
         x += num.len() as u16;
     }
-    set_str(buf, 0, 2, &format!("claims {}  sessions {}  queue {} active   theme: {}", t.claims, t.sessions, t.queue, if d.mono { "Monochrome" } else { &d.label }), c.label, cols);
+    let top = match t.top_ppid {
+        Some((ppid, n)) if n > 0 => format!("  top ppid {ppid} ({n}c)"),
+        _ => String::new(),
+    };
+    set_str(buf, 0, 2, &format!("claims {}  sessions {}  queue {} active  procs {}{}   theme: {}", t.claims, t.sessions, t.queue, t.procs, top, if d.mono { "Monochrome" } else { &d.label }), c.label, cols);
 
     let top = 3u16;
     let foot = rows - 1;

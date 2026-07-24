@@ -592,6 +592,20 @@ overlay, sort-by-column, `/` search, and a toast, drawn with htoprs's own
 `Buffer`/`Style` cell primitives. `zcommands` and `zevents` are the streaming
 counterparts (§16 and the events table).
 
+`zppid` (`superset/zppid.rs`) is the per-process commit tally that shares the
+dashboard header. The same dispatcher seam that logs commands also credits
+commits: for a commit-producing verb (`commit`, `commit-tree`, `merge`,
+`cherry-pick`, `revert`, `am`, `rebase`), `dispatch::run` snapshots HEAD before
+the command and, if it advanced to a new tip afterward, upserts one row per
+invoking process into the `ppids` table (keyed by `session_key()` — an exported
+`ZVCS_SESSION` or `pid-<ppid>`; the stored `ppid` is `getppid()`, refreshed each
+commit). Attribution is at command time by the invoking process, which a
+daemon-side HEAD-delta observer could not do; a no-op `commit` or rejected merge
+never advances HEAD, so it counts nothing. `.then` skips the gix HEAD probe for
+every non-commit verb, so the hot path is unchanged. `git zppid` lists the table
+(ppid, live/dead via `kill(ppid,0)`, commits, last-seen), and the dashboard header
+shows the process count plus the busiest ppid.
+
 ## 16. Command logging + AOP interception
 
 Because the one binary is the sole dispatcher (`dispatch::run`), it is the natural

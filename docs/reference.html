@@ -20,7 +20,7 @@ p{margin:.6rem 0}a{color:var(--accent)}
 </style>
 </head><body>
 <h1>zvcs extension verbs</h1>
-<p class="sub">105 superset (<code>z*</code>) verbs — the coordination layer stock git has no equivalent for. Generated from the same source as the man pages (<code>git help &lt;verb&gt;</code>).</p>
+<p class="sub">112 superset (<code>z*</code>) verbs — the coordination layer stock git has no equivalent for. Generated from the same source as the man pages (<code>git help &lt;verb&gt;</code>).</p>
 <nav class="toc">
 <a href="#zsync"><code>zsync</code></a>
 <a href="#zbump"><code>zbump</code></a>
@@ -77,6 +77,7 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <a href="#zsize"><code>zsize</code></a>
 <a href="#zage"><code>zage</code></a>
 <a href="#zpull"><code>zpull</code></a>
+<a href="#zattach"><code>zattach</code></a>
 <a href="#zgrep"><code>zgrep</code></a>
 <a href="#zahead"><code>zahead</code></a>
 <a href="#zbehind"><code>zbehind</code></a>
@@ -110,11 +111,18 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <a href="#zsessions"><code>zsessions</code></a>
 <a href="#zidle"><code>zidle</code></a>
 <a href="#zdashboard"><code>zdashboard</code></a>
+<a href="#zppid"><code>zppid</code></a>
 <a href="#ztop"><code>ztop</code></a>
 <a href="#zevents"><code>zevents</code></a>
 <a href="#ztail"><code>ztail</code></a>
 <a href="#zintercept"><code>zintercept</code></a>
 <a href="#zcommands"><code>zcommands</code></a>
+<a href="#zaudit"><code>zaudit</code></a>
+<a href="#zscan"><code>zscan</code></a>
+<a href="#zreview"><code>zreview</code></a>
+<a href="#zremote"><code>zremote</code></a>
+<a href="#zrollback"><code>zrollback</code></a>
+<a href="#zsched"><code>zsched</code></a>
 <a href="#zpin"><code>zpin</code></a>
 <a href="#zunpin"><code>zunpin</code></a>
 <a href="#zbroadcast"><code>zbroadcast</code></a>
@@ -429,6 +437,12 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <p>Fetches and fast-forwards every selected indexed repository to its tracked mainline, in parallel, using the same native ff-only reconcile as zsync: a dirty or diverged repo is reported and skipped, never forced.</p>
 <p>Where zsync/zup act on the current submodule tree, zpull acts on the machine-wide index, so selectors (--repo, --behind, …) scope which repos are pulled.</p>
 </section>
+<section id="zattach">
+<h2><code>git zattach</code> <span class="summary">— re-attach every detached-HEAD indexed repo to its mainline</span></h2>
+<pre class="synopsis">git zattach [selectors]</pre>
+<p>Re-attaches every selected indexed repository that is on a detached HEAD to its mainline branch (main, else master), fleet-wide — the kill-switch for the detached HEADs <code>git submodule update</code> leaves behind across the whole index.</p>
+<p>It uses the same local, no-clobber attach zsync applies to submodules: it never contacts a remote, never moves the checked-out commit, and never touches the worktree or index — it only creates or fast-forwards the local mainline branch to the commit HEAD is already at and makes HEAD symbolic to it, so it is safe even on a dirty repo. A repo whose local mainline is ahead of or diverged from HEAD is refused rather than clobbered (catching the worktree up is zpull/zsync's clean-only job); a repo with no main or master anywhere is skipped. It reports how many were attached, already on a branch, had no mainline, or were refused.</p>
+</section>
 <section id="zgrep">
 <h2><code>git zgrep</code> <span class="summary">— parallel content search across indexed repos</span></h2>
 <pre class="synopsis">git zgrep [selectors] [-i] &lt;pattern&gt; [--json]</pre>
@@ -593,9 +607,15 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <section id="zdashboard">
 <h2><code>git zdashboard</code> <span class="summary">— live tiled TUI: fleet, events, and commands on one screen</span></h2>
 <pre class="synopsis">git zdashboard [--once] [--json]</pre>
-<p>A live, tiled dashboard of the whole indexed tree on one screen: a header of aggregate totals (dirty, ahead, behind, diverged, detached, clean, claims, sessions, queue, and whether the daemon is up) over three tiles — a FLEET table (every repo, most recently active first, with the on-screen rows' HEAD state live-refreshed so nothing is stale), an EVENTS feed (commits, reconciles, status changes, as zevents shows), and a COMMANDS feed (every git command run across the machine, with the agent that ran it, as zcommands shows). Press q or Esc to quit.</p>
+<p>A live, tiled dashboard of the whole indexed tree on one screen: a header of aggregate totals (dirty, ahead, behind, diverged, detached, clean, claims, sessions, queue, tracked processes and the busiest committing ppid, and whether the daemon is up) over three tiles — a FLEET table (every repo, most recently active first, with the on-screen rows' HEAD state live-refreshed so nothing is stale), an EVENTS feed (commits, reconciles, status changes, as zevents shows), and a COMMANDS feed (every git command run across the machine, with the agent that ran it, as zcommands shows). Press q or Esc to quit.</p>
 <p>Every tile reads the daemon-maintained status cache and ledger, not a live per-repo walk, so the dashboard stays responsive across thousands of repos. The COMMANDS tile is populated once command logging is on (<code>git zcommands</code> enables it).</p>
 <p>For scripting, <code>--once</code> or <code>--json</code> (or a non-terminal stdout) prints the instant text summary instead of the TUI — the same aggregate counts, one screen, no interaction.</p>
+</section>
+<section id="zppid">
+<h2><code>git zppid</code> <span class="summary">— per-process commit tally (each invoking ppid and commits landed)</span></h2>
+<pre class="synopsis">git zppid [--json]</pre>
+<p>Lists every process that has committed through zvcs — any shell, agent, or program that ran git — one row per invoking process, most commits first. Each row shows the session key (an exported <code>ZVCS_SESSION</code> or the <code>pid-&lt;ppid&gt;</code> fallback), the invoking process id (the git process's parent, <code>getppid()</code>), whether that process is still live (<code>kill(ppid, 0)</code>), how many commits it has landed, and when it last committed.</p>
+<p>A commit is credited at command time by the process that ran it: for a commit-producing verb (<code>commit</code>, <code>commit-tree</code>, <code>merge</code>, <code>cherry-pick</code>, <code>revert</code>, <code>am</code>, <code>rebase</code>) the dispatcher snapshots HEAD before the command and, if it advanced to a new tip afterward, increments the running process's tally — so a no-op <code>commit</code> (nothing staged) or a rejected merge counts nothing. The tally persists in the <code>ppids</code> table and also drives the <code>zdashboard</code> header. <code>--json</code> emits one array of objects for scripting.</p>
 </section>
 <section id="ztop">
 <h2><code>git ztop</code> <span class="summary">— live htop-style fleet monitor, most churn on top</span></h2>
@@ -627,6 +647,44 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <pre class="synopsis">git zcommands [-n &lt;count&gt;] [--repo &lt;substr&gt;] [--json] [--no-follow] [--off] [--clear]</pre>
 <p>Streams every <code>git</code> command run anywhere on the machine, in real time. Because the zvcs <code>git</code> binary shadows real git on PATH, every invocation flows through one dispatcher; when logging is on, each records a line — time, pid, working directory, and the command — to its own log at $ZVCS_HOME/commands.log (separate from the daemon log). This verb prints a backlog and then follows the log live, so commands from every repo and every concurrent shell scroll past as they run.</p>
 <p>Running it turns logging on (a marker file, so the cost on every other git command is a single stat when it is off) and notes where the log lives. -n sets the backlog size, --no-follow prints the backlog and exits, --repo filters to commands whose directory contains a substring, and --json emits NDJSON for tooling. --off stops logging; --clear truncates the log. The live viewers (zcommands, zevents, ztail, ztop) are excluded so watching does not feed itself.</p>
+</section>
+<section id="zaudit">
+<h2><code>git zaudit</code> <span class="summary">— queryable audit trail over the fleet command log</span></h2>
+<pre class="synopsis">git zaudit [--agent &lt;ppid&gt;] [--repo &lt;substr&gt;] [--cmd &lt;substr&gt;] [--mutating] [--summary] [-n &lt;count&gt;] [--json]</pre>
+<p>The historical, accountable side of the same command log <code>zcommands</code> feeds — $ZVCS_HOME/commands.log. Where zcommands follows the live stream, zaudit queries the record: it answers "which agent ran which command against which repo, and when" across a fleet of concurrent agents. Each logged line carries the time, the command's pid, its parent pid (the agent that launched it), the working directory, and the git argv.</p>
+<p>Filters compose: --agent &lt;ppid&gt; restricts to one agent, --repo &lt;substr&gt; to repos whose directory contains a substring, --cmd &lt;substr&gt; to commands whose argv contains a substring, and --mutating to state-changing subcommands only (commit, push, reset, rebase, merge, checkout, and the mutating z-verbs). -n limits how many matching records print (newest last); --json emits NDJSON.</p>
+<p>--summary replaces the record list with tallies: how many commands each agent ran, and how many of each subcommand, ranked by count — an at-a-glance accountability view of who did what across the tree.</p>
+</section>
+<section id="zscan">
+<h2><code>git zscan</code> <span class="summary">— parallel secret scan of tracked content across the fleet</span></h2>
+<pre class="synopsis">git zscan [selectors]</pre>
+<p>Scans the tracked file content of every selected indexed repo, in parallel over the shared worker pool, for common credential patterns — AWS access keys, PEM private keys, GitHub/Slack/Google tokens, JWTs, and high-entropy <code>key = "..."</code> assignments — using the same native, fork-free content walk <code>zgrep</code> does. Each hit prints as path:line:pattern:snippet.</p>
+<p>Binary files are skipped, output is capped per repo so one flooded tree cannot drown the rest, and the whole run exits non-zero when anything is found — so <code>git zscan</code> drops straight into a pre-push hook or CI gate. [selectors] narrows the set the same way every fleet verb does.</p>
+</section>
+<section id="zreview">
+<h2><code>git zreview</code> <span class="summary">— aggregate the pending uncommitted change across the fleet</span></h2>
+<pre class="synopsis">git zreview [selectors]</pre>
+<p>The read-side companion to <code>zcommitall</code>: for every selected repo with uncommitted work, it prints the repo's <code>git status --short</code> block grouped under its path, plus the summary line of its diffstat against HEAD, so you can review everything about to be committed across a whole tree of submodules on one screen.</p>
+<p>Clean repos are omitted; a trailing line reports how many repos have pending change and how many total entries. The status probe runs through this binary over the shared worker pool, so it is fleet-parallel and reads consistently with every other z-verb.</p>
+</section>
+<section id="zremote">
+<h2><code>git zremote</code> <span class="summary">— fleet-wide remote-URL rewrite</span></h2>
+<pre class="synopsis">git zremote set &lt;old&gt; &lt;new&gt; [selectors] [-n|--dry-run]</pre>
+<p>Rewrites remote URLs across the fleet in one command: in every selected repo, any remote whose URL contains the substring &lt;old&gt; is rewritten with &lt;old&gt; replaced by &lt;new&gt;. This is the one-shot answer to moving an org, changing a host, or switching ssh\(&lt;-&gt;https across a tree of submodules.</p>
+<p>Each change prints as <code>set &lt;repo&gt;::&lt;remote&gt;  &lt;from&gt; → &lt;to&gt;</code>; -n / --dry-run previews every change as <code>would set</code> without touching anything. Writes go through this binary's own <code>remote set-url</code> porcelain over the shared worker pool; the run exits non-zero if any set-url fails.</p>
+</section>
+<section id="zrollback">
+<h2><code>git zrollback</code> <span class="summary">— fleet-wide undo of the last mutating operation</span></h2>
+<pre class="synopsis">git zrollback [selectors] [--steps &lt;n&gt;] [--apply] [--force]</pre>
+<p>The multi-repo evolution of <code>zundo</code>: across every selected repo it resolves <code>HEAD@{n}</code> from the reflog (n = --steps, default 1) and rewinds to it with <code>reset --hard</code>, undoing the last commit / merge / rebase / reset. The reset is itself reflogged, so a rollback is undoable.</p>
+<p>It is **dry-run by default** — with no --apply it prints what each repo *would* do (<code>&lt;current&gt; → &lt;target&gt;</code>) and changes nothing. --apply executes the rollback on the repos that pass the guards.</p>
+<p>The guards refuse to lose work: a repo is skipped, not rolled back, when its worktree is dirty, when it is mid-operation (merge/rebase/cherry-pick/revert), or when rolling back would diverge from its remote — the discarded commits are already pushed (sync is up-to-date, behind, or diverged). Rollback is allowed by default only when the commits are local-only (ahead or no-upstream). --force overrides every guard.</p>
+</section>
+<section id="zsched">
+<h2><code>git zsched</code> <span class="summary">— daemon-hosted scheduled fleet commands (a built-in cron)</span></h2>
+<pre class="synopsis">git zsched add &lt;duration&gt; -- &lt;cmd&gt; | list | rm &lt;id&gt; | clear | run &lt;id&gt;</pre>
+<p>Schedules a command to run on an interval, hosted by the daemon — a built-in cron for the whole tree. <code>git zsched add 5m -- git zpull --dirty</code> fast-forwards every dirty repo every five minutes; durations are 30s / 5m / 1h / 1h30m style. <code>list</code> shows every schedule with its id and interval, <code>rm &lt;id&gt;</code> removes one, <code>clear</code> removes them all, and <code>run &lt;id&gt;</code> fires one now (synchronously) for testing.</p>
+<p>Schedules persist to $ZVCS_HOME/schedule.tsv as <code>id\tinterval\tcommand</code>. The CLI owns every write to that file; the daemon's scheduler thread only reads it (re-reading each tick, so add/rm take effect within one tick with no reload) and tracks each schedule's last-fire time in memory — so the CLI and daemon never contend on the file. A schedule fires one full interval after the daemon first sees it, not on daemon start.</p>
 </section>
 <section id="zpin">
 <h2><code>git zpin</code> <span class="summary">— freeze a repo from daemon autonomy</span></h2>

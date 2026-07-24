@@ -139,16 +139,18 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     command    TEXT NOT NULL,
     created_at INTEGER
 );
--- Per-bot productivity ledger (`zbots`, `zdashboard` header). One row per agent
--- session (`session_key()`: an exported `ZVCS_SESSION` or `pid-<ppid>`), keyed by
--- that session string. `pid` is the invoking process (the tmux-pane shell / agent
--- that ran the git command), refreshed on each commit so it tracks the live PID
--- even when the session key is a stable `ZVCS_SESSION`. `commits` accumulates every
--- commit-producing verb that advanced HEAD (see superset::bots). This table is a
--- pure client-side counter — the daemon never touches it.
-CREATE TABLE IF NOT EXISTS bots (
+-- Per-process commit ledger (`zppid`, `zdashboard` header). One row per invoking
+-- process — any shell, agent, or program that runs git — identified by
+-- `session_key()` (an exported `ZVCS_SESSION` or the `pid-<ppid>` fallback), keyed
+-- by that session string. `ppid` is the git process's parent (`getppid()`): the
+-- shell/agent/program that actually ran the command, refreshed on each commit so it
+-- tracks the live process even when the session key is a stable `ZVCS_SESSION`.
+-- `commits` accumulates every commit-producing verb that advanced HEAD (see
+-- superset::zppid). This table is a pure client-side counter — the daemon never
+-- touches it.
+CREATE TABLE IF NOT EXISTS ppids (
     session    TEXT PRIMARY KEY,
-    pid        INTEGER,
+    ppid       INTEGER,
     commits    INTEGER NOT NULL DEFAULT 0,
     first_seen INTEGER,
     last_seen  INTEGER
@@ -1137,46 +1139,47 @@ pub fn all_status(conn: &Connection) -> Result<Vec<(String, bool, String, String
     Ok(rows)
 }
 
-// ---- zbots: per-bot commit productivity -----------------------------------
+// ---- zppid: per-process commit productivity -------------------------------
 
-/// One bot's row: an agent session, its live invoking PID, and its accumulated
+/// One process row: an invoking session, its live parent PID, and its accumulated
 /// commit tally with first/last activity timestamps.
-pub struct BotRow {
+pub struct PpidRow {
     pub session: String,
-    pub pid: i64,
+    pub ppid: i64,
     pub commits: i64,
     pub first_seen: i64,
     pub last_seen: i64,
 }
 
-/// Credit one commit to `session`, upserting the bot row. `pid` (the invoking
-/// process) is refreshed on every commit so a stable `ZVCS_SESSION` key still
-/// tracks the currently-live PID. Called only when a commit-producing verb
-/// advanced HEAD, so the count reflects real commits, not attempts.
-pub fn bot_record_commit(conn: &Connection, session: &str, pid: i64) -> Result<()> {
+/// Credit one commit to `session`, upserting the process row. `ppid` (the git
+/// process's parent — the invoking shell/agent/program) is refreshed on every
+/// commit so a stable `ZVCS_SESSION` key still tracks the currently-live process.
+/// Called only when a commit-producing verb advanced HEAD, so the count reflects
+/// real commits, not attempts.
+pub fn ppid_record_commit(conn: &Connection, session: &str, ppid: i64) -> Result<()> {
     let ts = now();
     conn.execute(
-        "INSERT INTO bots (session, pid, commits, first_seen, last_seen)
+        "INSERT INTO ppids (session, ppid, commits, first_seen, last_seen)
          VALUES (?1, ?2, 1, ?3, ?3)
          ON CONFLICT(session) DO UPDATE SET
-             commits = commits + 1, pid = ?2, last_seen = ?3",
-        rusqlite::params![session, pid, ts],
+             commits = commits + 1, ppid = ?2, last_seen = ?3",
+        rusqlite::params![session, ppid, ts],
     )?;
     Ok(())
 }
 
-/// Every bot, most productive first (ties broken by most-recent activity) — the
-/// full table behind `git zbots` and the dashboard's bot summary.
-pub fn list_bots(conn: &Connection) -> Result<Vec<BotRow>> {
+/// Every tracked process, most productive first (ties broken by most-recent
+/// activity) — the full table behind `git zppid` and the dashboard's summary.
+pub fn list_ppids(conn: &Connection) -> Result<Vec<PpidRow>> {
     let mut stmt = conn.prepare(
-        "SELECT session, COALESCE(pid,0), commits, COALESCE(first_seen,0), COALESCE(last_seen,0)
-           FROM bots ORDER BY commits DESC, last_seen DESC",
+        "SELECT session, COALESCE(ppid,0), commits, COALESCE(first_seen,0), COALESCE(last_seen,0)
+           FROM ppids ORDER BY commits DESC, last_seen DESC",
     )?;
     let rows = stmt
         .query_map([], |r| {
-            Ok(BotRow {
+            Ok(PpidRow {
                 session: r.get(0)?,
-                pid: r.get(1)?,
+                ppid: r.get(1)?,
                 commits: r.get(2)?,
                 first_seen: r.get(3)?,
                 last_seen: r.get(4)?,

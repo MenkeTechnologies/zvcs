@@ -240,7 +240,7 @@ fn parse(args: &[String]) -> std::result::Result<Opts, ExitCode> {
         }
 
         // A short-option cluster: `-w`, `-tblob`, `-wtblob`, `-t blob`.
-        let mut chars = a[1..].char_indices();
+        let chars = a[1..].char_indices();
         for (at, c) in chars {
             match c {
                 'w' => opts.write = true,

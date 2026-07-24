@@ -201,7 +201,7 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
 
         // Short options, grouped left to right. `-L` consumes the rest of the
         // token as its value, or the next argument if the token ends there.
-        let mut chars = arg[1..].char_indices();
+        let chars = arg[1..].char_indices();
         for (at, c) in chars {
             match c {
                 'p' => to_stdout = true,

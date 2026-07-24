@@ -449,6 +449,11 @@ pub fn zdashboard(args: &[String]) -> Result<ExitCode> {
         .map(|j| j.iter().filter(|x| x.state == "queued" || x.state == "running").count())
         .unwrap_or(0);
 
+    // Per-process commit tallies (`zppid`): tracked process count and total commits.
+    let ppids = crate::db::list_ppids(&conn).unwrap_or_default();
+    let procs = ppids.len();
+    let commits: i64 = ppids.iter().map(|p| p.commits).sum();
+
     if _args.iter().any(|a| a == "--json") {
         println!(
             "{}",
@@ -457,6 +462,7 @@ pub fn zdashboard(args: &[String]) -> Result<ExitCode> {
                 "ahead": ahead, "behind": behind, "diverged": diverged,
                 "detached": detached, "no_upstream": no_upstream,
                 "claims": claims, "sessions": sessions, "queue_active": queue,
+                "procs": procs, "commits": commits,
             })
         );
         return Ok(ExitCode::SUCCESS);
@@ -467,6 +473,7 @@ pub fn zdashboard(args: &[String]) -> Result<ExitCode> {
     println!("  detached      {detached:>5}    no upstream {no_upstream:>5}");
     println!("  claims        {claims:>5}    sessions {sessions:>5}");
     println!("  queue         {queue:>5} active");
+    println!("  procs         {procs:>5}    commits {commits:>5}  (`git zppid` for the breakdown)");
     if with_status < repos {
         println!("  (status cached for {with_status}/{repos} — `git zstatus --all` refreshes it)");
     }

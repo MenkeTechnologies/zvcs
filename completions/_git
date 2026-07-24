@@ -6781,6 +6781,8 @@ _git_commands () {
     zscan:'zvcs: parallel secret scan of tracked content across the fleet'
     zreview:'zvcs: aggregate pending uncommitted change across the fleet'
     zremote:'zvcs: fleet-wide remote-URL rewrite'
+    zrollback:'zvcs: fleet-wide undo of the last mutating op (dry-run unless --apply)'
+    zsched:'zvcs: daemon-hosted scheduled fleet commands (built-in cron)'
     zjobs:'zvcs: list async jobs'
     zjob:'zvcs: show/stop/restart a job'
     zclaim:'zvcs: lease a repo for this session'
@@ -6858,6 +6860,7 @@ _git_commands () {
     zidle:'zvcs: indexed repos with no active claim'
     zdashboard:'zvcs: one-screen health summary of the tree'
     ztop:'zvcs: live htop-style fleet monitor, most churn on top'
+    zppid:'zvcs: per-process commit tally (each invoking ppid and commits landed)'
     zpin:'zvcs: freeze a repo from daemon autonomy (no autobump/reconcile)'
     zunpin:'zvcs: unfreeze pinned repos'
     zbroadcast:'zvcs: post or read inter-agent messages'
@@ -9382,7 +9385,7 @@ done
 for _zv in zheads zdirty zbranches ztags zremotes zsize zage zstale zlast zfiles \
            zpristine zcommits zbig zahead zbehind zunpushed zunpulled zauthors \
            zhot zdivergent zorphans zconflicts zgrep zrepos zjobs zwho zsessions \
-           zdashboard; do
+           zdashboard zppid; do
   (( $+functions[_git-$_zv] )) || functions[_git-$_zv]='_arguments "--json[emit NDJSON for scripting]" "*::selector or pattern:"'
 done
 unset _zv

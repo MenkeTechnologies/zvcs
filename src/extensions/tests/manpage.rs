@@ -21,6 +21,20 @@ fn docs_cover_exactly_the_superset_verbs() {
 }
 
 #[test]
+fn html_reference_covers_every_verb() {
+    let html = manpage::html_reference();
+    assert!(html.starts_with("<!doctype html>"), "must be a full HTML document");
+    for verb in SUPERSET_VERBS {
+        assert!(
+            html.contains(&format!("id=\"{verb}\"")),
+            "docs/reference.html has no section for `{verb}` (regenerate: `git zverbs --html > docs/reference.html`)"
+        );
+    }
+    // No stray unclosed code spans from the backtick converter.
+    assert_eq!(html.matches("<code>").count(), html.matches("</code>").count(), "unbalanced <code> tags");
+}
+
+#[test]
 fn roff_has_the_mandatory_sections() {
     for doc in DOCS {
         let page = manpage::roff(doc);

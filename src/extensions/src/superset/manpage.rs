@@ -814,6 +814,85 @@ fn esc_line(text: &str) -> String {
     }
 }
 
+/// Self-contained CSS for the HTML reference — inlined so the page needs no
+/// assets, works offline, and adapts to light/dark.
+const HTML_STYLE: &str = "<style>\n\
+:root{--bg:#0d1117;--fg:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--code:#1f2430;--line:#21262d}\n\
+@media(prefers-color-scheme:light){:root{--bg:#fff;--fg:#1f2328;--dim:#57606a;--accent:#0969da;--code:#f2f4f8;--line:#d0d7de}}\n\
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;max-width:60rem;margin:0 auto;padding:2rem 1.25rem}\n\
+h1{font-size:1.9rem;margin:0 0 .25rem}.sub{color:var(--dim);margin:0 0 1.5rem}\n\
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}\n\
+code{background:var(--code);padding:.1em .35em;border-radius:4px;font-size:.9em}\n\
+.toc{display:flex;flex-wrap:wrap;gap:.4rem .6rem;padding:1rem;background:var(--code);border-radius:8px;margin-bottom:2rem}\n\
+.toc a{text-decoration:none;color:var(--accent)}.toc a code{background:transparent;padding:0}\n\
+section{border-top:1px solid var(--line);padding-top:1.25rem;margin-top:1.25rem}\n\
+h2{font-size:1.15rem;margin:0 0 .5rem;scroll-margin-top:1rem}h2 code{background:transparent;padding:0;color:var(--accent)}\n\
+.summary{color:var(--dim);font-weight:400;font-size:.95rem}\n\
+pre.synopsis{background:var(--code);padding:.6rem .8rem;border-radius:6px;overflow-x:auto;font-size:.9em;margin:.5rem 0 1rem}\n\
+p{margin:.6rem 0}a{color:var(--accent)}\n\
+</style>\n";
+
+/// Render every verb's [`Doc`] into one self-contained HTML reference page, from
+/// the same `DOCS` table as the man pages — so it can't drift. `git zverbs --html`
+/// prints this; `docs/reference.html` is a committed snapshot for the docs site.
+pub fn html_reference() -> String {
+    let mut s = String::new();
+    s.push_str("<!doctype html>\n<html lang=\"en\"><head>\n<meta charset=\"utf-8\">\n");
+    s.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    s.push_str("<title>zvcs — extension verb reference</title>\n");
+    s.push_str(HTML_STYLE);
+    s.push_str("</head><body>\n");
+    s.push_str("<h1>zvcs extension verbs</h1>\n");
+    s.push_str(&format!(
+        "<p class=\"sub\">{} superset (<code>z*</code>) verbs — the coordination layer stock git has no equivalent for. Generated from the same source as the man pages (<code>git help &lt;verb&gt;</code>).</p>\n",
+        DOCS.len()
+    ));
+    s.push_str("<nav class=\"toc\">\n");
+    for d in DOCS {
+        s.push_str(&format!("<a href=\"#{v}\"><code>{v}</code></a>\n", v = d.verb));
+    }
+    s.push_str("</nav>\n");
+    for d in DOCS {
+        s.push_str(&format!("<section id=\"{v}\">\n", v = d.verb));
+        s.push_str(&format!(
+            "<h2><code>git {v}</code> <span class=\"summary\">— {sum}</span></h2>\n",
+            v = d.verb,
+            sum = html_esc(d.summary)
+        ));
+        s.push_str(&format!("<pre class=\"synopsis\">{}</pre>\n", html_esc(d.synopsis)));
+        for para in d.desc {
+            s.push_str(&format!("<p>{}</p>\n", html_inline(para)));
+        }
+        s.push_str("</section>\n");
+    }
+    s.push_str("</body></html>\n");
+    s
+}
+
+fn html_esc(t: &str) -> String {
+    t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// HTML-escape a description paragraph, turn the roff em-dash `\(em` into `—`, and
+/// `` `code` `` spans into `<code>`.
+fn html_inline(t: &str) -> String {
+    let esc = html_esc(t).replace("\\(em", "\u{2014}");
+    let mut out = String::new();
+    let mut in_code = false;
+    for c in esc.chars() {
+        if c == '`' {
+            out.push_str(if in_code { "</code>" } else { "<code>" });
+            in_code = !in_code;
+        } else {
+            out.push(c);
+        }
+    }
+    if in_code {
+        out.push_str("</code>");
+    }
+    out
+}
+
 /// Write a single verb's page under `man_dir()/man1/`, returning the man root
 /// (for `man -M`). `None` if `verb` is not a superset verb.
 pub fn ensure_page(verb: &str) -> io::Result<Option<PathBuf>> {

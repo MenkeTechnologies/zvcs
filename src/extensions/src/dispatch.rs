@@ -271,7 +271,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zhook" => "usage: git zhook <set <command>|unset|show|list|test>",
         "ztrigger" => "usage: git ztrigger <DIR> <command>... [--throttle <dur>] | git ztrigger <list|rm DIR|test DIR|tail|top> — run a command on any file change in DIR (leading-edge throttle, default 500ms; tail/top show fires live)",
         "zwatch" => "usage: git zwatch <DIR> | git zwatch <list|rm DIR> — watch DIR (index + cached status) without a command",
-        "zverbs" => "usage: git zverbs — list every zvcs extension verb and its usage",
+        "zverbs" => "usage: git zverbs [--json|--html] — list every zvcs extension verb and its usage (--json for scripting, --html emits the full docs/reference.html reference page)",
         "zselectors" => "usage: git zselectors — print the shared [selectors] grammar (see also `git help zselectors`)",
         "zcd" => "usage: git zcd [<dir>|-] — change the working directory (for the zrepl console)",
         "zpwd" => "usage: git zpwd — print the working directory",
@@ -337,6 +337,10 @@ fn z_usage(sub: &str) -> Option<&'static str> {
 /// text is [`z_usage`] itself, minus the `usage: git ` lead-in, so the listing is
 /// the same source of truth each verb's own `-h` prints and can never drift.
 fn print_verbs(args: &[String]) -> Result<ExitCode> {
+    if args.iter().any(|a| a == "--html") {
+        print!("{}", superset::manpage::html_reference());
+        return Ok(ExitCode::SUCCESS);
+    }
     let json = args.iter().any(|a| a == "--json");
     for verb in SUPERSET_VERBS {
         if let Some(usage) = z_usage(verb) {

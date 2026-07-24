@@ -42,9 +42,11 @@ use crate::superset::select::Selector;
 /// just-committed repo rises to the top and stays there for a while — not the
 /// 20-second fade the old per-frame counter gave. `CAP` maps a score onto the
 /// churn bar's full width; `BUMP`/`DECAY` govern the live burst.
-const RECENCY_WINDOW: f64 = 3600.0; // 1 hour: hot → cold
-const CHURN_BUMP: f64 = 3.0;
-const CHURN_DECAY: f64 = 0.85;
+const RECENCY_WINDOW: f64 = 3600.0; // 1 hour: recency baseline fades to 0
+const RECENCY_WEIGHT: f64 = 2.0; // recency fills at most 2/CAP (~1/3) of the bar,
+                                 // so a recently-swept repo is NOT a full bar
+const CHURN_BUMP: f64 = 6.0; // a live change (commit/dirty) → a full-height spike
+const CHURN_DECAY: f64 = 0.90; // the spike fades over ~a minute at 2s frames
 const CHURN_CAP: f64 = 6.0;
 const CHURN_BAR_W: u16 = 8;
 
@@ -71,10 +73,10 @@ pub fn ztop(args: &[String]) -> Result<ExitCode> {
     }
 
     let allowed = selector_set(&sel)?;
-    // Start on the saved scheme (htop persists the Setup choice), or Monochrome
-    // when color is off.
-    let start = if force_mono { Scheme::Monochrome } else { load_scheme() };
-    let mut app = App::new(start, Duration::from_secs_f64(interval));
+    // Start on the saved theme (persisted like htoprs's chooser/editor), or the
+    // monochrome theme when color is off.
+    let (palette, label) = load_palette();
+    let mut app = App::new(palette, label, force_mono, Duration::from_secs_f64(interval));
 
     if once || !stdout().is_terminal() {
         app.sort = SortSpec { col: Col::State, desc: false };
@@ -166,8 +168,9 @@ impl StatusMsg {
 enum Overlay {
     None,
     Help,
-    SortPick(usize),   // cursor over COLS
-    SchemePick(usize), // cursor over SCHEMES; applied live as it moves
+    SortPick(usize),      // cursor over COLS
+    ThemeChooser(usize),  // cursor over THEMES; applied live as it moves
+    ThemeEditor(usize),   // cursor over the 6 palette channels; edits live
 }
 
 /// Per-repo live-burst accumulator: a decaying score bumped when the commit id
@@ -268,8 +271,11 @@ struct Totals {
 }
 
 struct App {
-    scheme: Scheme,
+    palette: Palette,
+    label: String, // active theme's display name, or "Custom"
+    mono: bool,    // --mono / NO_COLOR: render the monochrome theme
     theme: Theme,
+    restore: Option<(Palette, String, bool)>, // pre-open (palette,label,mono) for Esc
     churn: HashMap<String, Churn>,
     status: Option<StatusMsg>,
     sort: SortSpec,
@@ -285,10 +291,14 @@ struct App {
 }
 
 impl App {
-    fn new(scheme: Scheme, interval: Duration) -> Self {
+    fn new(palette: Palette, label: String, mono: bool, interval: Duration) -> Self {
+        let theme = if mono { Theme::monochrome() } else { Theme::from_palette(palette) };
         App {
-            scheme,
-            theme: scheme.theme(),
+            palette,
+            label,
+            mono,
+            theme,
+            restore: None,
             churn: HashMap::new(),
             status: None,
             sort: SortSpec { col: Col::Churn, desc: true },
@@ -308,9 +318,27 @@ impl App {
         self.status = Some(StatusMsg { text: msg.into(), since: Instant::now() });
     }
 
-    fn set_scheme(&mut self, scheme: Scheme) {
-        self.scheme = scheme;
-        self.theme = scheme.theme();
+    /// Apply a palette live (turns color on if it was mono).
+    fn set_palette(&mut self, palette: Palette, label: impl Into<String>) {
+        self.palette = palette;
+        self.label = label.into();
+        self.mono = false;
+        self.theme = Theme::from_palette(palette);
+    }
+
+    /// Remember the current theme before opening a chooser/editor, so Esc reverts.
+    fn snapshot_theme(&mut self) {
+        self.restore = Some((self.palette, self.label.clone(), self.mono));
+    }
+
+    /// Revert to the pre-open theme (chooser/editor Esc).
+    fn revert_theme(&mut self) {
+        if let Some((p, l, m)) = self.restore.take() {
+            self.palette = p;
+            self.label = l;
+            self.mono = m;
+            self.theme = if m { Theme::monochrome() } else { Theme::from_palette(p) };
+        }
     }
 
     fn refresh(&mut self, allowed: &Option<HashSet<String>>) {
@@ -373,10 +401,11 @@ impl App {
                 t.clean += 1;
             }
 
-            // Steady-state churn = how recently the daemon last touched this repo.
+            // Churn = a small recency baseline (recently-touched repos sit a bit
+            // up the list) plus a live change-spike that dominates and fades.
             let age = (now - s.updated_at).max(0);
             let recency = (1.0 - age as f64 / RECENCY_WINDOW).clamp(0.0, 1.0);
-            let churn = recency * CHURN_CAP + entry.burst;
+            let churn = recency * RECENCY_WEIGHT + entry.burst;
 
             rows.push(Row {
                 path: s.path.clone(),
@@ -521,161 +550,203 @@ fn severity_label(r: &Row) -> (&'static str, u8) {
 }
 
 // ---------------------------------------------------------------------------
-// Colorschemes — ported from htoprs `ColorScheme` (src/ported/crt.rs). Each is a
-// small `Palette`; `Theme` derives the concrete `Style`s. Persisted to
-// `zvcs.topscheme`, like htop's Setup.
+// Colorschemes — htoprs's 31 themes (src/extensions/theme.rs). Each theme is a
+// 6-color 256-index palette `(c1..c6)`; the UI is htop's DEFAULT element layout
+// recolored by remapping the 8 ANSI slots onto the palette (src/extensions/
+// colors.rs `remap_from_palette`). A live THEME CHOOSER (c / F2) and a palette
+// EDITOR (~ / e) both persist to `zvcs.topscheme` / `zvcs.toppalette`, like
+// htoprs's theme chooser + editor.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Scheme {
-    Default,
-    Monochrome,
-    BlackOnWhite,
-    LightTerminal,
-    Midnight,
-    BlackNight,
-    BrokenGray,
-    Nord,
-}
-
-const SCHEMES: [Scheme; 8] = [
-    Scheme::Default, Scheme::Monochrome, Scheme::BlackOnWhite, Scheme::LightTerminal,
-    Scheme::Midnight, Scheme::BlackNight, Scheme::BrokenGray, Scheme::Nord,
-];
-
-// htop ncurses base color numbers (crt.rs:120), for the exact scheme tables below.
+/// htop ncurses base color numbers, for the DEFAULT element layout below.
 const K: i16 = 0; // Black
 const RD: i16 = 1; // Red
 const GR: i16 = 2; // Green
 const YL: i16 = 3; // Yellow
-const BL: i16 = 4; // Blue
-const MG: i16 = 5; // Magenta
 const CY: i16 = 6; // Cyan
-const WH: i16 = 7; // White
+const MG: i16 = 5; // Magenta
 const DF: i16 = -1; // terminal default
 
-/// One `CRT_colorSchemes` element: (fg, bg, bold), htop color numbers.
+/// One element: (fg, bg, bold), htop color numbers.
 type E = (i16, i16, bool);
 
-/// The ten elements ztop borrows from htop's per-scheme color table.
+/// The elements ztop uses, and htop's DEFAULT `CRT_colorSchemes` values for them
+/// (crt.rs) — the structure a theme recolors.
 struct Elems {
-    header_bar: E,   // PANEL_HEADER_FOCUS — the table header row
-    function_bar: E, // FUNCTION_BAR — the footer key bar
-    selection: E,    // PANEL_SELECTION_FOCUS — toast / accent
-    meter_text: E,   // METER_TEXT — header labels
-    meter_value: E,  // METER_VALUE — header values
-    ok: E,           // METER_VALUE_OK
-    warn: E,         // METER_VALUE_WARN
-    error: E,        // METER_VALUE_ERROR
-    process: E,      // PROCESS — data rows (carries the scheme background)
-    megabytes: E,    // PROCESS_MEGABYTES — the churn bar
+    header_bar: E,
+    function_bar: E,
+    selection: E,
+    meter_text: E,
+    meter_value: E,
+    ok: E,
+    warn: E,
+    error: E,
+    process: E,
+    megabytes: E,
 }
 
-impl Scheme {
-    fn name(self) -> &'static str {
+const DEFAULT_ELEMS: Elems = Elems {
+    header_bar: (K, GR, false),
+    function_bar: (K, CY, false),
+    selection: (K, CY, false),
+    meter_text: (CY, K, false),
+    meter_value: (CY, K, true),
+    ok: (GR, K, false),
+    warn: (YL, K, true),
+    error: (RD, K, true),
+    process: (DF, DF, false),
+    megabytes: (CY, K, false),
+};
+
+/// A theme's 6-color palette: 256-color indices `(c1..c6)`.
+type Palette = [u8; 6];
+
+/// htoprs's 31 built-in themes (theme.rs `ThemeName`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ThemeName {
+    NeonSprawl, AcidRain, IceBreaker, SynthWave, RustBelt, GhostWire, RedSector,
+    SakuraDen, DataStream, SolarFlare, NeonNoir, ChromeHeart, BladeRunner,
+    VoidWalker, ToxicWaste, CyberFrost, PlasmaCore, SteelNerve, DarkSignal,
+    GlitchPop, HoloShift, NightCity, DeepNet, LaserGrid, QuantumFlux, BioHazard,
+    Darkwave, Overlock, Megacorp, Zaibatsu, Iftopcolor,
+}
+
+const THEMES: [ThemeName; 31] = [
+    ThemeName::NeonSprawl, ThemeName::AcidRain, ThemeName::IceBreaker, ThemeName::SynthWave,
+    ThemeName::RustBelt, ThemeName::GhostWire, ThemeName::RedSector, ThemeName::SakuraDen,
+    ThemeName::DataStream, ThemeName::SolarFlare, ThemeName::NeonNoir, ThemeName::ChromeHeart,
+    ThemeName::BladeRunner, ThemeName::VoidWalker, ThemeName::ToxicWaste, ThemeName::CyberFrost,
+    ThemeName::PlasmaCore, ThemeName::SteelNerve, ThemeName::DarkSignal, ThemeName::GlitchPop,
+    ThemeName::HoloShift, ThemeName::NightCity, ThemeName::DeepNet, ThemeName::LaserGrid,
+    ThemeName::QuantumFlux, ThemeName::BioHazard, ThemeName::Darkwave, ThemeName::Overlock,
+    ThemeName::Megacorp, ThemeName::Zaibatsu, ThemeName::Iftopcolor,
+];
+
+impl ThemeName {
+    /// Display name (theme.rs `display_name`).
+    fn display_name(self) -> &'static str {
         match self {
-            Scheme::Default => "Default",
-            Scheme::Monochrome => "Monochrome",
-            Scheme::BlackOnWhite => "Black on White",
-            Scheme::LightTerminal => "Light Terminal",
-            Scheme::Midnight => "Midnight",
-            Scheme::BlackNight => "Black Night",
-            Scheme::BrokenGray => "Broken Gray",
-            Scheme::Nord => "Nord",
+            ThemeName::NeonSprawl => "Neon Sprawl",
+            ThemeName::AcidRain => "Acid Rain",
+            ThemeName::IceBreaker => "Ice Breaker",
+            ThemeName::SynthWave => "Synth Wave",
+            ThemeName::RustBelt => "Rust Belt",
+            ThemeName::GhostWire => "Ghost Wire",
+            ThemeName::RedSector => "Red Sector",
+            ThemeName::SakuraDen => "Sakura Den",
+            ThemeName::DataStream => "Data Stream",
+            ThemeName::SolarFlare => "Solar Flare",
+            ThemeName::NeonNoir => "Neon Noir",
+            ThemeName::ChromeHeart => "Chrome Heart",
+            ThemeName::BladeRunner => "Blade Runner",
+            ThemeName::VoidWalker => "Void Walker",
+            ThemeName::ToxicWaste => "Toxic Waste",
+            ThemeName::CyberFrost => "Cyber Frost",
+            ThemeName::PlasmaCore => "Plasma Core",
+            ThemeName::SteelNerve => "Steel Nerve",
+            ThemeName::DarkSignal => "Dark Signal",
+            ThemeName::GlitchPop => "Glitch Pop",
+            ThemeName::HoloShift => "Holo Shift",
+            ThemeName::NightCity => "Night City",
+            ThemeName::DeepNet => "Deep Net",
+            ThemeName::LaserGrid => "Laser Grid",
+            ThemeName::QuantumFlux => "Quantum Flux",
+            ThemeName::BioHazard => "Bio Hazard",
+            ThemeName::Darkwave => "Darkwave",
+            ThemeName::Overlock => "Overlock",
+            ThemeName::Megacorp => "Megacorp",
+            ThemeName::Zaibatsu => "Zaibatsu",
+            ThemeName::Iftopcolor => "Iftopcolor",
         }
     }
+
+    /// The exact 6-color palette (theme.rs `palette`).
+    fn palette(self) -> Palette {
+        match self {
+            ThemeName::NeonSprawl => [27, 48, 135, 141, 63, 99],
+            ThemeName::AcidRain => [28, 46, 34, 40, 22, 35],
+            ThemeName::IceBreaker => [19, 39, 25, 33, 21, 32],
+            ThemeName::SynthWave => [91, 177, 128, 134, 93, 97],
+            ThemeName::RustBelt => [172, 214, 178, 220, 166, 130],
+            ThemeName::GhostWire => [37, 50, 44, 87, 30, 23],
+            ThemeName::RedSector => [160, 203, 196, 210, 124, 88],
+            ThemeName::SakuraDen => [175, 218, 182, 225, 169, 132],
+            ThemeName::DataStream => [22, 46, 28, 119, 34, 22],
+            ThemeName::SolarFlare => [202, 220, 196, 213, 160, 125],
+            ThemeName::NeonNoir => [201, 231, 93, 219, 57, 53],
+            ThemeName::ChromeHeart => [250, 255, 246, 253, 243, 239],
+            ThemeName::BladeRunner => [208, 37, 166, 73, 130, 23],
+            ThemeName::VoidWalker => [55, 99, 54, 141, 92, 17],
+            ThemeName::ToxicWaste => [118, 190, 154, 226, 82, 58],
+            ThemeName::CyberFrost => [159, 195, 153, 189, 111, 67],
+            ThemeName::PlasmaCore => [199, 213, 163, 207, 126, 89],
+            ThemeName::SteelNerve => [68, 110, 60, 146, 24, 236],
+            ThemeName::DarkSignal => [30, 43, 23, 79, 29, 16],
+            ThemeName::GlitchPop => [201, 51, 226, 47, 196, 21],
+            ThemeName::HoloShift => [123, 219, 159, 183, 87, 133],
+            ThemeName::NightCity => [214, 227, 209, 223, 172, 94],
+            ThemeName::DeepNet => [19, 33, 17, 75, 26, 16],
+            ThemeName::LaserGrid => [46, 201, 51, 226, 196, 21],
+            ThemeName::QuantumFlux => [135, 75, 171, 111, 98, 61],
+            ThemeName::BioHazard => [148, 184, 106, 192, 64, 22],
+            ThemeName::Darkwave => [53, 140, 89, 176, 127, 52],
+            ThemeName::Overlock => [196, 208, 160, 214, 124, 52],
+            ThemeName::Megacorp => [252, 39, 245, 81, 242, 236],
+            ThemeName::Zaibatsu => [167, 216, 131, 224, 95, 52],
+            ThemeName::Iftopcolor => [21, 46, 28, 48, 33, 19],
+        }
+    }
+
     fn index(self) -> usize {
-        SCHEMES.iter().position(|s| *s == self).unwrap_or(0)
+        THEMES.iter().position(|t| *t == self).unwrap_or(0)
     }
-    fn from_name(s: &str) -> Option<Scheme> {
-        SCHEMES.iter().copied().find(|c| c.name().eq_ignore_ascii_case(s))
-    }
-    fn theme(self) -> Theme {
-        if self == Scheme::Monochrome {
-            return Theme::monochrome();
-        }
-        Theme::from_elems(self.elems(), matches!(self, Scheme::BlackNight))
-    }
-
-    /// The exact `CRT_colorSchemes` values (htoprs `src/ported/crt.rs`) for the
-    /// elements ztop uses. Broken Gray equals Default for all of them.
-    fn elems(self) -> Elems {
-        let (f, t) = (false, true);
-        match self {
-            Scheme::Default | Scheme::BrokenGray | Scheme::Monochrome => Elems {
-                header_bar: (K, GR, f), function_bar: (K, CY, f), selection: (K, CY, f),
-                meter_text: (CY, K, f), meter_value: (CY, K, t),
-                ok: (GR, K, f), warn: (YL, K, t), error: (RD, K, t),
-                process: (DF, DF, f), megabytes: (CY, K, f),
-            },
-            Scheme::BlackOnWhite => Elems {
-                header_bar: (K, GR, f), function_bar: (K, CY, f), selection: (K, CY, f),
-                meter_text: (BL, WH, f), meter_value: (K, WH, f),
-                ok: (GR, WH, f), warn: (YL, WH, t), error: (RD, WH, t),
-                process: (K, WH, f), megabytes: (BL, WH, f),
-            },
-            Scheme::LightTerminal => Elems {
-                header_bar: (K, GR, f), function_bar: (K, CY, f), selection: (K, CY, f),
-                meter_text: (BL, K, f), meter_value: (K, K, f),
-                ok: (GR, K, f), warn: (YL, K, t), error: (RD, K, t),
-                process: (K, K, f), megabytes: (BL, K, f),
-            },
-            Scheme::Midnight => Elems {
-                header_bar: (K, CY, f), function_bar: (K, CY, f), selection: (K, WH, f),
-                meter_text: (CY, BL, f), meter_value: (CY, BL, t),
-                ok: (GR, BL, f), warn: (YL, K, t), error: (RD, BL, t),
-                process: (WH, BL, f), megabytes: (CY, BL, f),
-            },
-            Scheme::BlackNight => Elems {
-                header_bar: (K, GR, f), function_bar: (K, GR, f), selection: (K, CY, f),
-                meter_text: (CY, K, f), meter_value: (GR, K, f),
-                ok: (GR, K, f), warn: (YL, K, t), error: (RD, K, t),
-                process: (CY, K, f), megabytes: (GR, K, t),
-            },
-            Scheme::Nord => Elems {
-                header_bar: (K, CY, f), function_bar: (K, CY, f), selection: (K, CY, f),
-                meter_text: (DF, DF, f), meter_value: (DF, DF, t),
-                ok: (DF, DF, f), warn: (DF, DF, t), error: (DF, DF, t),
-                process: (DF, DF, f), megabytes: (WH, K, t),
-            },
-        }
+    fn from_name(s: &str) -> Option<ThemeName> {
+        THEMES.iter().copied().find(|t| t.display_name().eq_ignore_ascii_case(s))
     }
 }
 
-/// Map an ncurses color number to a ratatui color, exactly as htop's `to_color`
-/// resolves 0-7 (8=gray, -1=terminal default).
-fn cn(n: i16) -> Color {
+/// Remap an ANSI color number (0-8) onto a theme palette channel — htoprs
+/// `remap_from_palette` (colors.rs): 0/8→c6, 1→c5, 2/6→c2, 3→c4, 4/5→c3, 7→c1.
+fn remap(n: i16, p: Palette) -> u8 {
+    let [c1, c2, c3, c4, c5, c6] = p;
     match n {
-        0 => Color::Black,
-        1 => Color::Red,
-        2 => Color::Green,
-        3 => Color::Yellow,
-        4 => Color::Blue,
-        5 => Color::Magenta,
-        6 => Color::Cyan,
-        7 => Color::Gray,
-        8 => Color::DarkGray,
-        _ => Color::Reset,
+        0 | 8 => c6,
+        1 => c5,
+        2 | 6 => c2,
+        3 => c4,
+        4 | 5 => c3,
+        7 => c1,
+        _ => c6,
     }
 }
 
-/// Build a `Style` from an htop element, applying htop's rule that a `Black`
-/// background collapses to the terminal default in every scheme but Black Night.
-fn mk((fg, bg, bold): E, blacknight: bool) -> Style {
-    let bg = if !blacknight && bg == K { DF } else { bg };
-    let mut s = Style::default().fg(cn(fg)).bg(cn(bg));
+/// An ANSI color number through the active palette → a 256-index ratatui color
+/// (terminal-default for -1).
+fn cn_themed(n: i16, p: Palette) -> Color {
+    if (0..=8).contains(&n) {
+        Color::Indexed(remap(n, p))
+    } else {
+        Color::Reset
+    }
+}
+
+/// Build a `Style` from an element, recolored by the palette. A `Black`
+/// background collapses to the terminal default (the theme never fills row bg).
+fn mk_t((fg, bg, bold): E, p: Palette) -> Style {
+    let bg = if bg == K { DF } else { bg };
+    let mut s = Style::default().fg(cn_themed(fg, p)).bg(cn_themed(bg, p));
     if bold {
         s = s.add_modifier(Modifier::BOLD);
     }
     s
 }
 
-/// Concrete styles for one scheme.
+/// Concrete styles for the active palette.
 struct Theme {
     header_label: Style,
     header_value: Style,
-    header_bar: Style,   // table header row (PANEL_HEADER_FOCUS)
-    function_bar: Style, // footer key bar (FUNCTION_BAR)
+    header_bar: Style,
+    function_bar: Style,
     row: Style,
     dim: Style,
     ok: Style,
@@ -684,38 +755,36 @@ struct Theme {
     behind: Style,
     diverged: Style,
     churn: Style,
-    sort_col: Style, // active sort column: the header bar inverted
+    sort_col: Style,
     accent_bg: Color,
     fg_on_accent: Color,
 }
 
 impl Theme {
-    fn from_elems(e: Elems, bn: bool) -> Self {
-        let row = mk(e.process, bn);
-        let row_bg = row.bg.unwrap_or(Color::Reset);
-        // Derived states not in htop's table share the scheme's row background.
-        let on_row = |fg: i16, bold: bool| {
-            let mut s = Style::default().fg(cn(fg)).bg(row_bg);
+    fn from_palette(p: Palette) -> Self {
+        let e = &DEFAULT_ELEMS;
+        let hdr = mk_t(e.header_bar, p);
+        let sel = mk_t(e.selection, p);
+        let on_row = |n: i16, bold: bool| {
+            let mut s = Style::default().fg(cn_themed(n, p));
             if bold {
                 s = s.add_modifier(Modifier::BOLD);
             }
             s
         };
-        let hdr = mk(e.header_bar, bn);
-        let sel = mk(e.selection, bn);
         Theme {
-            header_label: mk(e.meter_text, bn),
-            header_value: mk(e.meter_value, bn),
+            header_label: mk_t(e.meter_text, p),
+            header_value: mk_t(e.meter_value, p),
             header_bar: hdr,
-            function_bar: mk(e.function_bar, bn),
-            row,
+            function_bar: mk_t(e.function_bar, p),
+            row: mk_t(e.process, p),
             dim: on_row(8, false),
-            ok: mk(e.ok, bn),
-            warn: mk(e.warn, bn),
-            error: mk(e.error, bn),
+            ok: mk_t(e.ok, p),
+            warn: mk_t(e.warn, p),
+            error: mk_t(e.error, p),
             behind: on_row(RD, false),
             diverged: on_row(MG, true),
-            churn: mk(e.megabytes, bn),
+            churn: mk_t(e.megabytes, p),
             sort_col: Style::default()
                 .fg(hdr.bg.unwrap_or(Color::Reset))
                 .bg(hdr.fg.unwrap_or(Color::Reset)),
@@ -759,20 +828,36 @@ impl Theme {
     }
 }
 
-/// Read the persisted scheme (`zvcs.topscheme`), defaulting to Default.
-fn load_scheme() -> Scheme {
-    crate::config::global_config()
-        .string("zvcs.topscheme")
-        .and_then(|s| Scheme::from_name(&s.to_string()))
-        .unwrap_or(Scheme::Default)
+/// Read the persisted theme: a custom palette when `zvcs.topscheme` is "Custom"
+/// (palette in `zvcs.toppalette`), else the named theme, else Neon Sprawl.
+fn load_palette() -> (Palette, String) {
+    let cfg = crate::config::global_config();
+    let name = cfg.string("zvcs.topscheme").map(|s| s.to_string()).unwrap_or_default();
+    if name.eq_ignore_ascii_case("Custom") {
+        if let Some(p) = cfg.string("zvcs.toppalette").and_then(|s| parse_palette(&s.to_string())) {
+            return (p, "Custom".into());
+        }
+    }
+    if let Some(tn) = ThemeName::from_name(&name) {
+        return (tn.palette(), tn.display_name().into());
+    }
+    (ThemeName::NeonSprawl.palette(), ThemeName::NeonSprawl.display_name().into())
 }
 
-/// Persist the scheme choice to the global config (htop saves the Setup choice).
-fn save_scheme(scheme: Scheme) {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = Command::new(exe)
-            .args(["config", "--global", "zvcs.topscheme", scheme.name()])
-            .status();
+/// Parse a `c1,c2,...,c6` palette string.
+fn parse_palette(s: &str) -> Option<Palette> {
+    let v: Vec<u8> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    (v.len() == 6).then(|| [v[0], v[1], v[2], v[3], v[4], v[5]])
+}
+
+/// Persist the chosen theme (and, for a custom palette, its values), like
+/// htoprs's theme chooser + editor save.
+fn save_palette(label: &str, pal: Palette) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let _ = Command::new(&exe).args(["config", "--global", "zvcs.topscheme", label]).status();
+    if label.eq_ignore_ascii_case("Custom") {
+        let s = pal.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+        let _ = Command::new(&exe).args(["config", "--global", "zvcs.toppalette", &s]).status();
     }
 }
 
@@ -951,8 +1036,8 @@ fn render(buf: &mut Buffer, app: &App) {
         0,
         2,
         &format!(
-            "claims {}  sessions {}  queue {} active   scheme: {}   every {:.1}s",
-            g.claims, g.sessions, g.queue, app.scheme.name(), app.interval.as_secs_f64()
+            "claims {}  sessions {}  queue {} active   theme: {}   every {:.1}s",
+            g.claims, g.sessions, g.queue, if app.mono { "Monochrome" } else { &app.label }, app.interval.as_secs_f64()
         ),
         t.header_label,
         cols,
@@ -1038,8 +1123,69 @@ fn render(buf: &mut Buffer, app: &App) {
         Overlay::None => {}
         Overlay::Help => render_help(buf, t),
         Overlay::SortPick(cur) => render_pick(buf, t, "Sort by", &COLS.iter().map(|c| c.title()).collect::<Vec<_>>(), *cur, Some(app.sort.col.index())),
-        Overlay::SchemePick(cur) => render_pick(buf, t, "Color scheme (live)", &SCHEMES.iter().map(|s| s.name()).collect::<Vec<_>>(), *cur, Some(app.scheme.index())),
+        Overlay::ThemeChooser(cur) => render_theme_chooser(buf, *cur),
+        Overlay::ThemeEditor(chan) => render_theme_editor(buf, app.palette, *chan),
     }
+}
+
+/// The THEME CHOOSER — 31 named themes with a color swatch each, cursor
+/// highlighted, live preview. Ported from htoprs's theme chooser.
+fn render_theme_chooser(buf: &mut Buffer, cursor: usize) {
+    let bg = Style::default().fg(Color::White).bg(HELP_BG);
+    let border = Style::default().fg(HELP_TITLE).bg(HELP_BG).add_modifier(Modifier::BOLD);
+    let sel = Style::default().fg(Color::Black).bg(HELP_KEY).add_modifier(Modifier::BOLD);
+    let hint_s = Style::default().fg(HELP_HINT).bg(HELP_BG);
+
+    let name_w = 16u16;
+    let swatch_w = 6 * 2u16; // 6 palette colors, 2 cells each
+    let inner = name_w + 1 + swatch_w;
+    let bw = (inner + 4).min(buf.area().width);
+    // Fit as many rows as the box allows; scroll to keep the cursor visible.
+    let max_rows = buf.area().height.saturating_sub(6) as usize;
+    let visible = max_rows.min(THEMES.len()).max(1);
+    let top = cursor.saturating_sub(visible.saturating_sub(1)).min(THEMES.len().saturating_sub(visible));
+    let bh = (visible as u16 + 4).min(buf.area().height);
+    let (ix, iy) = draw_box(buf, bw, bh, bg, border);
+    set_str(buf, ix, iy, "THEME CHOOSER", border, bw - 3);
+
+    for (row, ti) in (top..top + visible).enumerate() {
+        let name = THEMES[ti].display_name();
+        let y = iy + 2 + row as u16;
+        let ns = if ti == cursor { sel } else { bg };
+        let padded = format!(" {name:<w$}", w = name_w as usize);
+        set_str(buf, ix, y, &padded, ns, name_w + 1);
+        // swatch: six palette colors as ██ blocks
+        let pal = THEMES[ti].palette();
+        for (i, c) in pal.iter().enumerate() {
+            let sx = ix + name_w + 2 + i as u16 * 2;
+            set_cell(buf, sx, y, "█", Style::default().fg(Color::Indexed(*c)).bg(HELP_BG));
+            set_cell(buf, sx + 1, y, "█", Style::default().fg(Color::Indexed(*c)).bg(HELP_BG));
+        }
+    }
+    set_str(buf, ix, iy + bh.saturating_sub(2), "j/k:nav  Enter:select  Esc:cancel", hint_s, bw - 3);
+}
+
+/// The palette EDITOR — the active theme's six channels, one selectable, with a
+/// live swatch; ←/→ change the 256-color index, s saves it as a custom theme.
+fn render_theme_editor(buf: &mut Buffer, pal: Palette, channel: usize) {
+    let bg = Style::default().fg(Color::White).bg(HELP_BG);
+    let border = Style::default().fg(HELP_TITLE).bg(HELP_BG).add_modifier(Modifier::BOLD);
+    let sel = Style::default().fg(Color::Black).bg(HELP_KEY).add_modifier(Modifier::BOLD);
+    let hint_s = Style::default().fg(HELP_HINT).bg(HELP_BG);
+    let labels = ["c1 primary", "c2 accent", "c3 mid-a", "c4 mid-b", "c5 dim", "c6 dark/bg"];
+
+    let bw = 34u16.min(buf.area().width);
+    let bh = (labels.len() as u16 + 4).min(buf.area().height);
+    let (ix, iy) = draw_box(buf, bw, bh, bg, border);
+    set_str(buf, ix, iy, "THEME EDITOR", border, bw - 3);
+    for (i, lab) in labels.iter().enumerate() {
+        let y = iy + 2 + i as u16;
+        let rs = if i == channel { sel } else { bg };
+        set_str(buf, ix, y, &format!(" {lab:<12} {:>3} ", pal[i]), rs, bw - 3 - 3);
+        set_cell(buf, ix + bw - 5, y, "█", Style::default().fg(Color::Indexed(pal[i])).bg(HELP_BG));
+        set_cell(buf, ix + bw - 4, y, "█", Style::default().fg(Color::Indexed(pal[i])).bg(HELP_BG));
+    }
+    set_str(buf, ix, iy + bh.saturating_sub(2), "↑↓:chan ←→:value s:save Esc", hint_s, bw - 3);
 }
 
 // The help overlay's palette, matching htoprs's F1 help (overlay.rs `draw_help`,
@@ -1054,7 +1200,8 @@ const HELP_HINT: Color = Color::Indexed(240);
 /// The F1 help content: sections of `(key, description)`, laid out in two columns
 /// like htop's keyboard-shortcuts screen.
 const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
-    ("GENERAL", &[("F1 h ?", "This help"), ("F2 C", "Color scheme"), ("q Esc", "Quit"), ("^C", "Quit")]),
+    ("GENERAL", &[("F1 h ?", "This help"), ("q Esc", "Quit"), ("^C", "Quit")]),
+    ("THEME", &[("F2 c", "Theme chooser"), ("~ e", "Theme editor")]),
     ("SEARCH", &[("/", "Search / filter"), ("Esc", "Clear search")]),
     ("SORT", &[("F6 s", "Sort by column"), (">", "Next column"), ("<", "Prev column"), ("I", "Invert order")]),
     ("NAVIGATE", &[("↑ ↓ k j", "Move up / down"), ("PgUp PgDn", "Page up / down"), ("g G", "Top / bottom")]),
@@ -1243,24 +1390,58 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> KeyOutcome {
             }
             return KeyOutcome::Redraw;
         }
-        Overlay::SchemePick(cur) => {
+        Overlay::ThemeChooser(cur) => {
+            let n = THEMES.len();
             match code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    let n = cur.saturating_sub(1);
-                    app.overlay = Overlay::SchemePick(n);
-                    app.set_scheme(SCHEMES[n]); // live preview
+                    let c = (cur + n - 1) % n;
+                    app.overlay = Overlay::ThemeChooser(c);
+                    app.set_palette(THEMES[c].palette(), THEMES[c].display_name()); // live preview
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    let n = (cur + 1).min(SCHEMES.len() - 1);
-                    app.overlay = Overlay::SchemePick(n);
-                    app.set_scheme(SCHEMES[n]);
+                    let c = (cur + 1) % n;
+                    app.overlay = Overlay::ThemeChooser(c);
+                    app.set_palette(THEMES[c].palette(), THEMES[c].display_name());
                 }
                 KeyCode::Enter => {
                     app.overlay = Overlay::None;
-                    save_scheme(app.scheme);
-                    app.set_status(format!("scheme: {}", app.scheme.name()));
+                    app.restore = None;
+                    save_palette(&app.label, app.palette);
+                    app.set_status(format!("theme: {}", app.label));
                 }
-                KeyCode::Esc | KeyCode::Char('q') => app.overlay = Overlay::None,
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.overlay = Overlay::None;
+                    app.revert_theme();
+                }
+                _ => return KeyOutcome::Ignore,
+            }
+            return KeyOutcome::Redraw;
+        }
+        Overlay::ThemeEditor(chan) => {
+            match code {
+                KeyCode::Up | KeyCode::Char('k') => app.overlay = Overlay::ThemeEditor(chan.saturating_sub(1)),
+                KeyCode::Down | KeyCode::Char('j') => app.overlay = Overlay::ThemeEditor((chan + 1).min(5)),
+                KeyCode::Left | KeyCode::Char('-') | KeyCode::Char('_') => {
+                    let mut p = app.palette;
+                    p[chan] = p[chan].wrapping_sub(1);
+                    app.set_palette(p, "Custom");
+                }
+                KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => {
+                    let mut p = app.palette;
+                    p[chan] = p[chan].wrapping_add(1);
+                    app.set_palette(p, "Custom");
+                }
+                KeyCode::Char('s') | KeyCode::Enter => {
+                    app.overlay = Overlay::None;
+                    app.restore = None;
+                    app.set_palette(app.palette, "Custom");
+                    save_palette("Custom", app.palette);
+                    app.set_status("saved custom theme");
+                }
+                KeyCode::Esc => {
+                    app.overlay = Overlay::None;
+                    app.revert_theme();
+                }
                 _ => return KeyOutcome::Ignore,
             }
             return KeyOutcome::Redraw;
@@ -1273,7 +1454,15 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> KeyOutcome {
         (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => return KeyOutcome::Quit,
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => return KeyOutcome::Quit,
         (KeyCode::F(1), _) | (KeyCode::Char('h'), _) | (KeyCode::Char('?'), _) => app.overlay = Overlay::Help,
-        (KeyCode::F(2), _) | (KeyCode::Char('C'), _) => app.overlay = Overlay::SchemePick(app.scheme.index()),
+        (KeyCode::F(2), _) | (KeyCode::Char('c'), _) => {
+            app.snapshot_theme();
+            let cur = ThemeName::from_name(&app.label).map(|t| t.index()).unwrap_or(0);
+            app.overlay = Overlay::ThemeChooser(cur);
+        }
+        (KeyCode::Char('~'), _) | (KeyCode::Char('e'), _) => {
+            app.snapshot_theme();
+            app.overlay = Overlay::ThemeEditor(0);
+        }
         (KeyCode::F(6), _) | (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) => app.overlay = Overlay::SortPick(app.sort.col.index()),
         (KeyCode::Char('>'), _) | (KeyCode::Char('.'), _) => {
             let n = (app.sort.col.index() + 1) % COLS.len();
@@ -1309,6 +1498,10 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> KeyOutcome {
 mod tests {
     use super::*;
 
+    fn test_app() -> App {
+        App::new(ThemeName::NeonSprawl.palette(), "Neon Sprawl".into(), true, Duration::from_secs(2))
+    }
+
     fn row(path: &str, dirty: bool, detached: bool, sync: &str, churn: f64) -> Row {
         Row {
             path: path.into(),
@@ -1331,7 +1524,7 @@ mod tests {
 
     #[test]
     fn churn_sort_desc_puts_most_active_on_top() {
-        let app = App::new(Scheme::Monochrome, Duration::from_secs(2));
+        let app = test_app();
         let mut rows = vec![
             row("low", false, false, "up-to-date", 0.5),
             row("high", true, false, "up-to-date", 5.0),
@@ -1344,7 +1537,7 @@ mod tests {
 
     #[test]
     fn sort_by_name_ascending() {
-        let mut app = App::new(Scheme::Monochrome, Duration::from_secs(2));
+        let mut app = test_app();
         app.sort = SortSpec { col: Col::Repo, desc: false };
         let mut rows = vec![row("charlie", false, false, "up-to-date", 0.0), row("alpha", false, false, "up-to-date", 0.0), row("bravo", false, false, "up-to-date", 0.0)];
         app.sort_rows(&mut rows);
@@ -1353,7 +1546,7 @@ mod tests {
 
     #[test]
     fn filter_narrows_by_path_substring_case_insensitively() {
-        let mut app = App::new(Scheme::Monochrome, Duration::from_secs(2));
+        let mut app = test_app();
         app.all = vec![
             row("/x/cask-repo", false, false, "up-to-date", 0.0),
             row("/x/web-app", false, false, "up-to-date", 0.0),
@@ -1368,11 +1561,25 @@ mod tests {
     }
 
     #[test]
-    fn scheme_roundtrips_by_name() {
-        for s in SCHEMES {
-            assert_eq!(Scheme::from_name(s.name()), Some(s));
+    fn all_31_themes_roundtrip_and_have_full_palettes() {
+        assert_eq!(THEMES.len(), 31, "all of htoprs's 31 themes");
+        for t in THEMES {
+            assert_eq!(ThemeName::from_name(t.display_name()), Some(t));
+            assert_eq!(t.palette().len(), 6);
         }
-        assert_eq!(Scheme::from_name("nonsense"), None);
+        assert_eq!(ThemeName::from_name("nonsense"), None);
+    }
+
+    #[test]
+    fn custom_palette_persists_and_parses() {
+        assert_eq!(parse_palette("1,2,3,4,5,6"), Some([1, 2, 3, 4, 5, 6]));
+        assert_eq!(parse_palette("bad"), None);
+        // remap follows htoprs's channel mapping (accent = c2 on Green/Cyan slots).
+        let p = [10, 20, 30, 40, 50, 60];
+        assert_eq!(remap(2, p), 20);
+        assert_eq!(remap(6, p), 20);
+        assert_eq!(remap(7, p), 10);
+        assert_eq!(remap(0, p), 60);
     }
 
     #[test]

@@ -680,6 +680,43 @@ pub const DOCS: &[Doc] = &[
         ],
     },
     Doc {
+        verb: "zaudit",
+        summary: "queryable audit trail over the fleet command log",
+        synopsis: "git zaudit [--agent <ppid>] [--repo <substr>] [--cmd <substr>] [--mutating] [--summary] [-n <count>] [--json]",
+        desc: &[
+            "The historical, accountable side of the same command log `zcommands` feeds \\(em $ZVCS_HOME/commands.log. Where zcommands follows the live stream, zaudit queries the record: it answers \"which agent ran which command against which repo, and when\" across a fleet of concurrent agents. Each logged line carries the time, the command's pid, its parent pid (the agent that launched it), the working directory, and the git argv.",
+            "Filters compose: --agent <ppid> restricts to one agent, --repo <substr> to repos whose directory contains a substring, --cmd <substr> to commands whose argv contains a substring, and --mutating to state-changing subcommands only (commit, push, reset, rebase, merge, checkout, and the mutating z-verbs). -n limits how many matching records print (newest last); --json emits NDJSON.",
+            "--summary replaces the record list with tallies: how many commands each agent ran, and how many of each subcommand, ranked by count \\(em an at-a-glance accountability view of who did what across the tree.",
+        ],
+    },
+    Doc {
+        verb: "zscan",
+        summary: "parallel secret scan of tracked content across the fleet",
+        synopsis: "git zscan [selectors]",
+        desc: &[
+            "Scans the tracked file content of every selected indexed repo, in parallel over the shared worker pool, for common credential patterns \\(em AWS access keys, PEM private keys, GitHub/Slack/Google tokens, JWTs, and high-entropy `key = \"...\"` assignments \\(em using the same native, fork-free content walk `zgrep` does. Each hit prints as path:line:pattern:snippet.",
+            "Binary files are skipped, output is capped per repo so one flooded tree cannot drown the rest, and the whole run exits non-zero when anything is found \\(em so `git zscan` drops straight into a pre-push hook or CI gate. [selectors] narrows the set the same way every fleet verb does.",
+        ],
+    },
+    Doc {
+        verb: "zreview",
+        summary: "aggregate the pending uncommitted change across the fleet",
+        synopsis: "git zreview [selectors]",
+        desc: &[
+            "The read-side companion to `zcommitall`: for every selected repo with uncommitted work, it prints the repo's `git status --short` block grouped under its path, plus the summary line of its diffstat against HEAD, so you can review everything about to be committed across a whole tree of submodules on one screen.",
+            "Clean repos are omitted; a trailing line reports how many repos have pending change and how many total entries. The status probe runs through this binary over the shared worker pool, so it is fleet-parallel and reads consistently with every other z-verb.",
+        ],
+    },
+    Doc {
+        verb: "zremote",
+        summary: "fleet-wide remote-URL rewrite",
+        synopsis: "git zremote set <old> <new> [selectors] [-n|--dry-run]",
+        desc: &[
+            "Rewrites remote URLs across the fleet in one command: in every selected repo, any remote whose URL contains the substring <old> is rewritten with <old> replaced by <new>. This is the one-shot answer to moving an org, changing a host, or switching ssh\\(<->https across a tree of submodules.",
+            "Each change prints as `set <repo>::<remote>  <from> → <to>`; -n / --dry-run previews every change as `would set` without touching anything. Writes go through this binary's own `remote set-url` porcelain over the shared worker pool; the run exits non-zero if any set-url fails.",
+        ],
+    },
+    Doc {
         verb: "zpin",
         summary: "freeze a repo from daemon autonomy",
         synopsis: "git zpin [<path>...|list] [--json]",

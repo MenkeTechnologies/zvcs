@@ -12,7 +12,7 @@ use std::process::ExitCode;
 /// zvcs-native extension verbs — the superset that stock git does not have.
 pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zconfig", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
-    "zsubmit", "zevents", "ztail", "zcommands", "zintercept",
+    "zsubmit", "zevents", "ztail", "zcommands", "zintercept", "zaudit", "zscan", "zreview", "zremote",
     "zpin", "zunpin", "zbroadcast", "zhandoff", "zon", "zsince", "zcontend", "zwaitfor", "zgraph", "zrewind",
     "zguard", "zpolicy",
     "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
@@ -244,6 +244,10 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "ztail" => "usage: git ztail [-n <count>] [--kind commit|stage|status|reconcile] [--repo <substr>] [--json] [--no-follow] — alias of git zevents",
         "zcommands" => "usage: git zcommands [-n <count>] [--repo <substr>] [--json] [--no-follow] [--off] [--clear] — live feed of every git command run across the fleet",
         "zintercept" => "usage: git zintercept before|after|around <pattern> -- <cmd> | list | remove <id> | clear — AOP hooks that run advice around matching git commands",
+        "zaudit" => "usage: git zaudit [--agent <ppid>] [--repo <substr>] [--cmd <substr>] [--mutating] [--summary] [-n <count>] [--json] — queryable audit trail over the fleet command log",
+        "zscan" => "usage: git zscan [selectors] — parallel secret scan of tracked content across indexed repos (exits non-zero if any found)",
+        "zreview" => "usage: git zreview [selectors] — aggregate the pending uncommitted change (short status + diffstat) of every dirty indexed repo",
+        "zremote" => "usage: git zremote set <old> <new> [selectors] [-n|--dry-run] — rewrite remote URLs across the fleet, replacing substring <old> with <new>",
         "zdaemon" => "usage: git zdaemon <start|stop|restart|status|info|ping|log>",
         "zconfig" => "usage: git zconfig [<name> [on|off|<count>|default]] — toggle daemon features (see `git help zconfig`)",
         "zrepos" => "usage: git zrepos [<pattern>...] — list indexed repos; patterns filter by case-insensitive substring",
@@ -424,7 +428,10 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // command's own inner `acquire` is a reentrant no-op). `ZVCS_QUEUED` marks a
     // job's own re-run so it BLOCKS on the lock rather than re-queueing (loop guard);
     // no daemon → run inline exactly as before.
-    let _queue_guard = if LOCK_VERBS.contains(&sub) && std::env::var_os("ZVCS_QUEUED").is_none() {
+    // `-h`/`--help` never writes the index, so a contended repo must not turn a
+    // help request into a queued job with empty output.
+    let is_help = args.iter().any(|a| a == "-h" || a == "--help");
+    let _queue_guard = if LOCK_VERBS.contains(&sub) && !is_help && std::env::var_os("ZVCS_QUEUED").is_none() {
         match gix::discover(".") {
             Ok(repo) => match crate::lock::RepoLock::try_acquire(repo.git_dir()) {
                 crate::lock::TryLock::Held(g) => Some(g),
@@ -455,6 +462,10 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zguard" | "zpolicy" => superset::guard::zguard(args),
         "zcommands" => superset::zcommands(args),
         "zintercept" => superset::zintercept(args),
+        "zaudit" => superset::zaudit(args),
+        "zscan" => superset::zscan(args),
+        "zreview" => superset::zreview(args),
+        "zremote" => superset::zremote(args),
         "zdaemon" => superset::zdaemon(args),
         "zconfig" => superset::zconfig(args),
         "zrepos" => superset::zrepos(args),

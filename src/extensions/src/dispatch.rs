@@ -14,7 +14,7 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
     "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
     "zsnapshots", "zworktree", "zstash", "zunstash", "zstashes", "zup", "zforeach", "zhook",
-    "zdashed",
+    "zdashed", "zverbs",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -245,8 +245,21 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zup" => "usage: git zup [<path>] — reconcile the tree at cwd (or <path>) to latest",
         "zforeach" => "usage: git zforeach [<pattern>...|--repo <p>|--dirty|--ahead|--behind|--claimed|--session <s>] -- <command>...",
         "zhook" => "usage: git zhook <set <command>|unset|show|list|test>",
+        "zverbs" => "usage: git zverbs — list every zvcs extension verb and its usage",
         _ => return None,
     })
+}
+
+/// `git zverbs` — print every superset (`z*`) verb with its one-line usage. The
+/// text is [`z_usage`] itself, minus the `usage: git ` lead-in, so the listing is
+/// the same source of truth each verb's own `-h` prints and can never drift.
+fn print_verbs() -> Result<ExitCode> {
+    for verb in SUPERSET_VERBS {
+        if let Some(usage) = z_usage(verb) {
+            println!("{}", usage.strip_prefix("usage: git ").unwrap_or(usage));
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
@@ -288,6 +301,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zup" => superset::zup(args),
         "zforeach" => superset::zforeach(args),
         "zhook" => superset::zhook(args),
+        "zverbs" => print_verbs(),
 
         // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----
         "add" => porcelain::add(args),

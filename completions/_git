@@ -6786,6 +6786,7 @@ _git_commands () {
     zforeach:'zvcs: run a command across all/subset of repos'
     zhook:'zvcs: manage ref-change hooks'
     zrepl:'zvcs: interactive console over the verbs'
+    zverbs:'zvcs: list every extension verb and its usage'
   )
 
   zstyle -a :completion:$curcontext: user-commands user_commands

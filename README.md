@@ -110,6 +110,7 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Fan-out | `zforeach [selectors] -- <cmd>` | run a command across all/subset of indexed repos, in parallel (selectors: `--repo`/`--dirty`/`--ahead`/`--behind`/`--claimed`/`--session`) |
 | Hooks | `zhook set/unset/show/list/test` | manage & test ref-change hooks (`zvcs.hook`); `zvcs.autohook` fires each repo's own local hook |
 | Console | `zrepl` | interactive line console over the verbs |
+| Discovery | `zverbs` | list every extension verb and its one-line usage (sourced from each verb's own `-h`) |
 | git-compat | every stock subcommand | dispatched natively; depth varies — see the parity report |
 
 Every subcommand stock git ships has a dispatch arm, so nothing reaches the

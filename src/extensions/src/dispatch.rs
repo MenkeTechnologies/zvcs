@@ -339,10 +339,11 @@ const LOCK_VERBS: &[&str] = &[
     "mv", "rebase", "reset", "restore", "revert", "rm", "stage", "stash", "switch",
     "read-tree", "update-index", "write-tree", "tag", "branch", "notes", "replace",
     "replay", "rerere", "sparse-checkout", "submodule", "mktag", "mktree",
-    // Superset verbs that stage+commit the parent index. `zbump` (forward-only
+    // Superset verbs that take the repo's write lane. `zbump` (forward-only
     // submodule gitlink bumps) is THE pointer-bump path — `git add` deliberately
-    // skips gitlinks — so it must queue under meta-root contention like `commit`.
-    "zbump",
+    // skips gitlinks. `zsync` fast-forwards local dups off the source repo's lane.
+    // Both must queue under contention like `commit` rather than block.
+    "zbump", "zsync",
 ];
 
 pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {

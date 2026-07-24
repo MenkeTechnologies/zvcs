@@ -470,9 +470,15 @@ fn build_requests(
             bail!("--tags can't be combined with refspecs");
         }
         for r in repo.references()?.tags()? {
-            let mut r = r.map_err(|e| anyhow!("{e}"))?;
+            let r = r.map_err(|e| anyhow!("{e}"))?;
             let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
-            if let Ok(id) = r.peel_to_id_in_place() {
+            // The ref's OWN target, never the peeled commit: for an annotated tag
+            // that is the tag object, and pushing the peeled commit instead would
+            // publish a LIGHTWEIGHT tag under an annotated tag's name — the
+            // message, tagger and signature silently dropped, and every later
+            // fetch reporting "would clobber existing tag" because the two sides
+            // now name different objects.
+            if let Some(id) = r.try_id() {
                 requests.push(Request { name, new: id.detach(), force: f.force, expected: None, only_if_absent: false });
             }
         }
@@ -546,10 +552,16 @@ fn append_followed_tags(repo: &gix::Repository, requests: &mut Vec<Request>) -> 
             continue;
         }
         // Annotated means the ref's own target is a tag object; peeling it yields
-        // the commit the tag names.
-        let target = r.id();
-        let is_annotated = target
-            .object()
+        // the commit the tag names. BOTH ids matter and they are not
+        // interchangeable: reachability is asked of the peeled commit, but what
+        // gets pushed is the tag object itself. Pushing the peeled id would put a
+        // lightweight tag on the remote under an annotated tag's name.
+        let tag_object = match r.try_id() {
+            Some(id) => id.detach(),
+            None => continue,
+        };
+        let is_annotated = repo
+            .find_object(tag_object)
             .map(|o| o.kind == gix::object::Kind::Tag)
             .unwrap_or(false);
         if !is_annotated {
@@ -560,7 +572,7 @@ fn append_followed_tags(repo: &gix::Repository, requests: &mut Vec<Request>) -> 
         if tips.iter().any(|tip| reachable(repo, peeled, *tip)) {
             // Never forced: a followed tag is an addition, and git refuses to
             // clobber a differing remote tag here just as it does for `--tags`.
-            requests.push(Request { name, new: peeled, force: false, expected: None, only_if_absent: true });
+            requests.push(Request { name, new: tag_object, force: false, expected: None, only_if_absent: true });
         }
     }
     Ok(())
@@ -1148,6 +1160,12 @@ mod tests {
 
         let tag = requests.last().expect("a tag was added");
         assert_eq!(tag.name, "refs/tags/v1");
+        // The pushed id must be the TAG OBJECT, not the commit it peels to.
+        // Pushing the peeled id publishes a lightweight tag under an annotated
+        // tag's name and makes every later fetch report "would clobber
+        // existing tag" — which is exactly what happened to six real tags.
+        let pushed = repo.find_object(tag.new).expect("pushed object exists");
+        assert_eq!(pushed.kind, gix::object::Kind::Tag, "pushed the tag object");
         assert!(!tag.force, "a followed tag is an addition, never a clobber");
         assert!(tag.only_if_absent, "the wire layer drops it when the remote has it");
     }

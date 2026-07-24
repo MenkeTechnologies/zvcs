@@ -15,6 +15,23 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+/// The selector flag vocabulary, defined once so the parser, the usage docs, and
+/// the repl's completion cannot drift apart. `--repo`/`--session` take a value;
+/// the rest are boolean. [`Selector::parse`] recognizes exactly these — the
+/// `every_selector_flag_is_parsed` test fails if the two ever diverge.
+pub const SELECTOR_FLAGS: &[&str] =
+    &["--repo", "--dirty", "--ahead", "--behind", "--claimed", "--session"];
+
+/// The superset verbs that accept a [`Selector`], for repl completion — kept
+/// beside the parser so what completion offers matches what the verbs consume.
+/// (`selectors_are_real_verbs`, an integration test, guards these are real.)
+pub const SELECTOR_VERBS: &[&str] = &[
+    "zforeach", "zheads", "zdirty", "zbranches", "ztags", "zremotes", "zsize",
+    "zage", "zpull", "zgrep", "zahead", "zbehind", "zauthors", "zhot",
+    "zconflicts", "zfetch", "zgc", "zfsck", "zprune", "zcheckout", "ztagall",
+    "zcommitall", "zpushall", "zclean",
+];
+
 #[derive(Default)]
 pub struct Selector {
     /// Case-insensitive substring filters on the workdir path; every one must
@@ -119,5 +136,27 @@ impl Selector {
             out.push((PathBuf::from(r.git_dir), PathBuf::from(workdir)));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every flag the completion advertises must be consumed by the parser (left
+    /// in neither the selector's leftovers). Guards `SELECTOR_FLAGS` against
+    /// drifting from `Selector::parse`.
+    #[test]
+    fn every_selector_flag_is_parsed() {
+        for flag in SELECTOR_FLAGS {
+            // `--repo`/`--session` take a value; give one so parse consumes both.
+            let args = if *flag == "--repo" || *flag == "--session" {
+                vec![flag.to_string(), "x".to_string()]
+            } else {
+                vec![flag.to_string()]
+            };
+            let (_sel, rest) = Selector::parse(&args);
+            assert!(rest.is_empty(), "`{flag}` is not consumed by Selector::parse (list drifted)");
+        }
     }
 }

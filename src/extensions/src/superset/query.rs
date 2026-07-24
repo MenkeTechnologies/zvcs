@@ -50,7 +50,14 @@ where
 /// Select repos and print a "no repos matched" note when empty. Returns the
 /// selected repos, or `None` when there is nothing to do.
 pub(crate) fn selected(args: &[String]) -> Result<Option<Vec<(PathBuf, PathBuf)>>> {
-    let (sel, _rest) = Selector::parse(args);
+    select_repos(&Selector::parse(args).0)
+}
+
+/// Resolve a parsed selector to its repos, printing "no repos matched" and
+/// returning `None` when empty. The shared tail of every selector verb — those
+/// with no positional call [`selected`], those with a positional peel it off
+/// `Selector::parse`'s leftovers and then call this.
+pub(crate) fn select_repos(sel: &Selector) -> Result<Option<Vec<(PathBuf, PathBuf)>>> {
     let repos = sel.select()?;
     if repos.is_empty() {
         println!("no repos matched");

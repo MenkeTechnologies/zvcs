@@ -114,7 +114,6 @@ fn superset_spec(verb: &str) -> Option<(&'static [&'static str], &'static [&'sta
         "zdaemon" => (&["-n", "-f"], &["start", "stop", "restart", "reload", "status", "info", "ping", "log"]),
         "zstatus" => (&["--all"], &[]),
         "zreindex" => (&["--sync", "--async"], &[]),
-        "zforeach" => (&["--repo", "--dirty", "--ahead", "--behind", "--claimed", "--session"], &[]),
         "zunclaim" => (&["--force"], &[]),
         "zjobs" => (&["-n"], &[]),
         "zjob" => (&[], &["stop", "restart"]),
@@ -123,6 +122,11 @@ fn superset_spec(verb: &str) -> Option<(&'static [&'static str], &'static [&'sta
         "ztrigger" => (&[], &["list", "rm", "test"]),
         "zwatch" => (&[], &["list", "rm"]),
         "zlog" => (&["-n"], &[]),
+        // Every selector-taking verb offers the one selector vocabulary, sourced
+        // from `select.rs` so this can never drift from the parser.
+        v if crate::superset::select::SELECTOR_VERBS.contains(&v) => {
+            (crate::superset::select::SELECTOR_FLAGS, &[])
+        }
         _ => return None,
     })
 }

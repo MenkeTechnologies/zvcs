@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use anyhow::{bail, Result};
 use gix::bstr::ByteSlice;
 
-use crate::superset::query::{parallel_map, probe, selected};
+use crate::superset::query::{parallel_map, probe, select_repos, selected};
 use crate::superset::select::Selector;
 
 /// `git zgrep [selectors] [-i] <pattern>` — search the tracked file content of
@@ -38,11 +38,7 @@ pub fn zgrep(args: &[String]) -> Result<ExitCode> {
         .build()
         .map_err(|e| anyhow::anyhow!("bad pattern: {e}"))?;
 
-    let repos = sel.select()?;
-    if repos.is_empty() {
-        println!("no repos matched");
-        return Ok(ExitCode::SUCCESS);
-    }
+    let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     let re = &re;
     let results = parallel_map(&repos, |gd, wd| grep_repo(gd, wd, re));
     let mut total = 0usize;
@@ -173,11 +169,7 @@ fn author_counts(repo: &gix::Repository) -> HashMap<String, usize> {
 pub fn zhot(args: &[String]) -> Result<ExitCode> {
     let (sel, rest) = Selector::parse(args);
     let days: i64 = rest.iter().find_map(|a| a.parse().ok()).unwrap_or(30);
-    let repos = sel.select()?;
-    if repos.is_empty() {
-        println!("no repos matched");
-        return Ok(ExitCode::SUCCESS);
-    }
+    let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     let cutoff = crate::date::now_seconds() - days * 86_400;
     let counts = parallel_map(&repos, |gd, _| probe(gd, |r| recent_commits(r, cutoff), |_| 0usize));
     let mut rows: Vec<(usize, String)> = repos

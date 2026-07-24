@@ -15,7 +15,7 @@ use std::process::{Command, ExitCode};
 
 use anyhow::{bail, Result};
 
-use crate::superset::query::{parallel_map, selected};
+use crate::superset::query::{parallel_map, select_repos, selected};
 use crate::superset::select::Selector;
 
 /// What happened to one repo.
@@ -111,11 +111,7 @@ pub fn zcheckout(args: &[String]) -> Result<ExitCode> {
     let Some(branch) = rest.into_iter().next() else {
         bail!("usage: git zcheckout [selectors] <branch>");
     };
-    let repos = sel.select()?;
-    if repos.is_empty() {
-        println!("no repos matched");
-        return Ok(ExitCode::SUCCESS);
-    }
+    let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     let branch = &branch;
     Ok(fan_out(&repos, "zcheckout", |gd, wd| {
         let exists = gix::open(gd)
@@ -136,11 +132,7 @@ pub fn ztagall(args: &[String]) -> Result<ExitCode> {
     let Some(tag) = rest.into_iter().next() else {
         bail!("usage: git ztagall [selectors] <tag>");
     };
-    let repos = sel.select()?;
-    if repos.is_empty() {
-        println!("no repos matched");
-        return Ok(ExitCode::SUCCESS);
-    }
+    let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     let tag = &tag;
     Ok(fan_out(&repos, "ztagall", |_gd, wd| git_in(wd, "tag", &[tag.as_str()])))
 }
@@ -153,11 +145,7 @@ pub fn zcommitall(args: &[String]) -> Result<ExitCode> {
     let Some(msg) = msg else {
         bail!("usage: git zcommitall [selectors] -m <msg>");
     };
-    let repos = sel.select()?;
-    if repos.is_empty() {
-        println!("no repos matched");
-        return Ok(ExitCode::SUCCESS);
-    }
+    let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     let msg = &msg;
     Ok(fan_out(&repos, "zcommitall", |gd, wd| {
         let dirty = gix::open(gd).ok().map(|r| r.is_dirty().unwrap_or(false)).unwrap_or(false);
@@ -192,10 +180,6 @@ pub fn zclean(args: &[String]) -> Result<ExitCode> {
     if !rest.iter().any(|a| a == "-f" || a == "--force") {
         bail!("git zclean deletes untracked files across every repo; pass -f to confirm");
     }
-    let repos = sel.select()?;
-    if repos.is_empty() {
-        println!("no repos matched");
-        return Ok(ExitCode::SUCCESS);
-    }
+    let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     Ok(fan_out(&repos, "zclean", |_gd, wd| git_in(wd, "clean", &["-fd"])))
 }

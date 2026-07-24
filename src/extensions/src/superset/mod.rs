@@ -31,6 +31,7 @@ pub mod select;
 pub mod shell;
 pub mod snapshot;
 pub mod status;
+pub mod statusd;
 pub mod trigger;
 pub mod zforeach;
 pub mod zhook;

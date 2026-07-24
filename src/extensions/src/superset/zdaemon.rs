@@ -269,6 +269,12 @@ fn start() -> Result<ExitCode> {
     // Background repo crawl on start, iff `[zvcs] autocrawl` is enabled.
     crate::crawler::spawn_if_configured();
 
+    // Background status maintainer: the worker pool keeps repo_status warm for
+    // every indexed repo, so `zdashboard` / `zstatus --all` are instant AND
+    // accurate without needing `[zvcs] autostatus`. Tunable via
+    // `zvcs.statusinterval` (seconds between passes; 0 disables).
+    crate::superset::statusd::spawn_if_enabled();
+
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(s) => s,

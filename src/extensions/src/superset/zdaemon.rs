@@ -234,6 +234,44 @@ fn hold_start_lock(at: &Path) -> Option<gix::lock::Marker> {
     Marker::acquire_to_hold_resource(at, Fail::Immediately, None).ok()
 }
 
+/// The one hard guarantee that there is exactly ONE live daemon across the
+/// 16-instance workload. Acquired once at the top of [`start`] with a
+/// non-blocking exclusive `flock`, and the returned handle is held for the whole
+/// process — the kernel releases the lock automatically when the process dies
+/// (clean exit, panic, or `kill -9`), so there is never a stale lock *file* to
+/// reap: the lock lives on the open fd, not the path. A second daemon simply
+/// cannot acquire it and refuses to start.
+///
+/// This is strictly stronger than the socket check, which is racy: a daemon that
+/// is bound but slow to answer `STATUS` can be misjudged a zombie and have its
+/// socket stolen, orphaning it as a headless process that never exits — the exact
+/// leak that let 13 daemons pile up. Under this lock the loser never reaches the
+/// socket at all.
+///
+/// Polls for a few seconds so a restart's handoff — the old daemon still tearing
+/// down after `STOP` before the kernel drops its lock — is waited out rather than
+/// misreported as "already running".
+fn acquire_singleton_lock() -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let _ = std::fs::create_dir_all(zvcs_home());
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(zvcs_home().join("zvcsd.lock"))
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        // LOCK_EX | LOCK_NB: take it or fail at once — never block on the fd.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Some(file);
+        }
+        if Instant::now() >= deadline {
+            return None; // another daemon held it the whole window → it is live
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Whether a daemon is actually serving on `path`. `connect` distinguishes a stale
 /// socket *file* (whose daemon died → connect refused) from a bound one (live, or
 /// mid-startup with the request sitting in the listen backlog). A bound socket is
@@ -291,6 +329,12 @@ fn start_detached() -> Result<ExitCode> {
 
 fn start() -> Result<ExitCode> {
     let path = socket_path();
+    // Singleton gate: exactly one daemon may live. Held (via the leading-underscore
+    // binding, which drops only at scope end — NOT bare `_`, which drops at once)
+    // for the whole of `start`, which blocks on `listener.incoming()` for the
+    // process's life. A second starter fails here and never touches the socket.
+    let _singleton_lock = acquire_singleton_lock()
+        .ok_or_else(|| anyhow::anyhow!("daemon already running"))?;
     // An explicit start re-enables autostart, clearing any prior manual stop.
     let _ = std::fs::remove_file(autostart_disabled_path());
 
@@ -847,5 +891,40 @@ fn query(path: &Path, request: &str) -> Option<String> {
         Ok(0) => None,
         Ok(_) => Some(line.trim_end().to_string()),
         Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::io::AsRawFd;
+
+    /// A non-blocking exclusive `flock`.
+    fn try_lock(f: &std::fs::File) -> bool {
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    }
+
+    /// The daemon's singleton rests on two `flock` guarantees: a second exclusive
+    /// holder is refused while the first lives, and closing the first fd releases
+    /// the lock (the kernel does this on process death too — the reason there is no
+    /// stale lock file to reap). This test pins both.
+    #[test]
+    fn flock_is_exclusive_and_released_on_close() {
+        let dir = std::env::temp_dir().join(format!("zvcsd-lock-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zvcsd.lock");
+
+        let a = std::fs::OpenOptions::new().create(true).write(true).open(&path).unwrap();
+        assert!(try_lock(&a), "first holder must acquire");
+
+        // A distinct open fd for the same file — the second "daemon" — is refused.
+        let b = std::fs::OpenOptions::new().create(true).write(true).open(&path).unwrap();
+        assert!(!try_lock(&b), "second holder must be refused while the first lives");
+
+        // First "daemon" exits → its fd closes → the lock frees → the next acquires.
+        drop(a);
+        assert!(try_lock(&b), "lock must be free once the prior holder's fd is closed");
+
+        drop(b);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -322,6 +322,23 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     }
 
     // ---- phase 2: integrate ----------------------------------------------
+
+    // Nothing was fetched that we do not already have: git reports this as the
+    // PULL being up to date and never starts the integration step, so the line
+    // is `Already up to date.` — not the rebase's own `Current branch <b> is up
+    // to date.`, which git prints only when the branch has commits the upstream
+    // lacks (the rebase runs and finds nothing to replay). Both cases are
+    // exercised against stock git in tests/pull_up_to_date.rs.
+    if let (Ok(head), Ok(upstream)) = (
+        repo.head_id().map(|id| id.detach()),
+        repo.rev_parse_single(target_ref.as_str()).map(|id| id.detach()),
+    ) {
+        if head == upstream {
+            println!("Already up to date.");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+
     if rebasing {
         if rebase_mode == RebaseMode::Interactive {
             bail!(

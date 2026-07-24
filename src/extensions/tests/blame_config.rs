@@ -7,9 +7,27 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
+/// Run stock git in `dir` with the ambient identity stripped.
+///
+/// The fixture below establishes `Alice` through the repository's own config,
+/// and the blame output asserted on is that author name. git resolves the
+/// identity from `GIT_AUTHOR_*`/`GIT_COMMITTER_*` ahead of any config, so an
+/// environment that exports them — CI does, to give the runner an identity at
+/// all — would author the fixture commit as someone else and every assertion
+/// here would read that name instead. Removing the four variables hands the
+/// decision back to the config this test is about.
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL")
+            .status()
+            .unwrap()
+            .success(),
         "git {args:?} failed"
     );
 }

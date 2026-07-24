@@ -340,7 +340,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         .prefix()
         .ok()
         .flatten()
-        .map_or(true, |p| p.as_os_str().is_empty());
+        .is_none_or(|p| p.as_os_str().is_empty());
     if at_root {
         for spec in pathspecs.iter_mut() {
             if spec == "." || spec == "./" {
@@ -798,7 +798,7 @@ fn is_valid_magnitude(s: &str) -> bool {
         (10u32, i)
     };
     let mut j = digits_start;
-    while j < b.len() && (b[j] as char).to_digit(radix).is_some() {
+    while j < b.len() && (b[j] as char).is_digit(radix) {
         j += 1;
     }
     if j == digits_start {

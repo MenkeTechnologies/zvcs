@@ -581,7 +581,7 @@ fn droppable(st: &State, index_path: &Path) -> bool {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    !st.keep_packs.iter().any(|k| *k == pack_name)
+    !st.keep_packs.contains(&pack_name)
 }
 
 /// Walk `args` exactly the way git's parse-options walks them, emitting git's

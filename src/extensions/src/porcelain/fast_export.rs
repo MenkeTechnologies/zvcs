@@ -1230,9 +1230,9 @@ fn rewrite_one(mut id: ObjectId, simpl: &HashMap<ObjectId, Simpl>) -> Option<Obj
             // Outside the walked set (e.g. a boundary): treat as shown.
             None => return Some(id),
             Some(s) if !s.treesame => return Some(id),
-            Some(s) => match s.followed.first() {
-                Some(p) => id = *p,
-                None => return None,
+            Some(s) => {
+                let p = s.followed.first()?;
+                id = *p
             },
         }
     }
@@ -2079,7 +2079,7 @@ fn print_path(out: &mut Vec<u8>, path: &BStr) {
                 b'\r' => out.extend_from_slice(b"\\r"),
                 b'"' => out.extend_from_slice(b"\\\""),
                 b'\\' => out.extend_from_slice(b"\\\\"),
-                b if b < 0x20 || b >= 0x7f => {
+                b if !(0x20..0x7f).contains(&b) => {
                     out.extend_from_slice(format!("\\{b:03o}").as_bytes());
                 }
                 b => out.push(b),

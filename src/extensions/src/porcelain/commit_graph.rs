@@ -368,7 +368,7 @@ fn verify(args: &[String], inherited_object_dir: Option<String>) -> Result<ExitC
 /// The last entry of a `commit-graph-chain` file, resolved to its `.graph` path.
 fn chain_tip(chain: &Path) -> Option<PathBuf> {
     let body = std::fs::read_to_string(chain).ok()?;
-    let last = body.lines().map(str::trim).filter(|l| !l.is_empty()).next_back()?;
+    let last = body.lines().map(str::trim).rfind(|l| !l.is_empty())?;
     Some(
         chain
             .parent()?
@@ -776,7 +776,7 @@ fn close_over_ancestors(
         });
     }
 
-    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.sort_by_key(|a| a.id);
     Ok(out)
 }
 

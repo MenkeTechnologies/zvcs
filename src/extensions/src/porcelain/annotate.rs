@@ -1057,9 +1057,9 @@ fn render_porcelain(
 
     for (entry, tokens) in outcome.entries_with_lines() {
         let id = entry.commit_id;
-        if !cache.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(id) {
             let info = build_porcelain_info(repo, id, rel_path, &quoted_path, show_root)?;
-            cache.insert(id, info);
+            e.insert(info);
         }
         let info = &cache[&id];
 
@@ -1134,16 +1134,16 @@ fn build_porcelain_info(
 
     let mut details: Vec<u8> = Vec::with_capacity(256);
     details.extend_from_slice(b"author ");
-    details.extend_from_slice(&author.name.to_vec());
+    details.extend_from_slice(author.name);
     details.extend_from_slice(b"\nauthor-mail <");
-    details.extend_from_slice(&author.email.to_vec());
+    details.extend_from_slice(author.email);
     details.extend_from_slice(b">\n");
     writeln!(details, "author-time {a_time}")?;
     writeln!(details, "author-tz {a_tz}")?;
     details.extend_from_slice(b"committer ");
-    details.extend_from_slice(&committer.name.to_vec());
+    details.extend_from_slice(committer.name);
     details.extend_from_slice(b"\ncommitter-mail <");
-    details.extend_from_slice(&committer.email.to_vec());
+    details.extend_from_slice(committer.email);
     details.extend_from_slice(b">\n");
     writeln!(details, "committer-time {c_time}")?;
     writeln!(details, "committer-tz {c_tz}")?;

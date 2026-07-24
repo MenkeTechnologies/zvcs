@@ -824,9 +824,9 @@ fn subpath_matches(path: &BStr, filter: &BStr) -> Option<usize> {
         if gix::glob::wildmatch(filter, sub, Mode::empty()) {
             return Some(offset);
         }
-        match sub.find_byte(b'/') {
-            Some(pos) => offset += pos + 1,
-            None => return None,
+        {
+            let pos = sub.find_byte(b'/')?;
+            offset += pos + 1
         }
     }
 }

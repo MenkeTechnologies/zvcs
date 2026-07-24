@@ -276,7 +276,7 @@ fn lsrefs_verdict(repo: &gix::Repository) -> Verdict {
             Direct { full_ref_name, object }
             | Peeled { full_ref_name, object, .. }
             | Symbolic { full_ref_name, object, .. }
-                if full_ref_name.to_string() == target =>
+                if *full_ref_name == target =>
             {
                 Some(*object)
             }

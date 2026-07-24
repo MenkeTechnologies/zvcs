@@ -1420,7 +1420,7 @@ fn print_summary(
 fn quote_path(path: &BString) -> String {
     let needs_quoting = path
         .iter()
-        .any(|&b| b < 0x20 || b >= 0x7f || b == b'"' || b == b'\\');
+        .any(|&b| !(0x20..0x7f).contains(&b) || b == b'"' || b == b'\\');
     if !needs_quoting {
         return path.to_string();
     }
@@ -1437,7 +1437,7 @@ fn quote_path(path: &BString) -> String {
             0x0d => out.push_str("\\r"),
             b'"' => out.push_str("\\\""),
             b'\\' => out.push_str("\\\\"),
-            _ if b < 0x20 || b >= 0x7f => out.push_str(&format!("\\{b:03o}")),
+            _ if !(0x20..0x7f).contains(&b) => out.push_str(&format!("\\{b:03o}")),
             _ => out.push(b as char),
         }
     }

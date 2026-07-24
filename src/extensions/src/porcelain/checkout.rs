@@ -443,7 +443,7 @@ fn maybe_recurse_submodules(repo: &gix::Repository, recurse: bool, quiet: bool) 
 fn switch_to_branch(repo: &gix::Repository, spec: &str, quiet: bool) -> Result<ExitCode> {
     // Already on it → no-op, matching git's "Already on 'x'".
     if let Some(cur) = repo.head_name()? {
-        if cur.shorten().to_string() == spec {
+        if cur.shorten() == spec {
             if !quiet {
                 eprintln!("Already on '{spec}'");
             }
@@ -600,7 +600,7 @@ fn create_and_switch(
     // Whether HEAD is already attached to the branch we're (re)creating.
     let already_on = head
         .referent_name()
-        .map(|n| n.shorten().to_string() == name)
+        .map(|n| n.shorten() == name)
         .unwrap_or(false);
     let cur_tree = repo.head_tree_id_or_empty()?.detach();
 
@@ -915,7 +915,7 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
         n => {
             if let Some(def) = repo.config_snapshot().string("checkout.defaultRemote") {
                 let def = def.to_str_lossy().into_owned();
-                if matches.iter().any(|m| *m == def) {
+                if matches.contains(&def) {
                     return Ok(Dwim::One(format!("{def}/{name}")));
                 }
             }

@@ -153,7 +153,7 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
                 None => (long, None),
             };
             // Pull `--opt <value>` from the next argument when no `=` was used.
-            let mut value = |i: &mut usize| -> Result<String> {
+            let value = |i: &mut usize| -> Result<String> {
                 match inline {
                     Some(v) => Ok(v.to_string()),
                     None => {

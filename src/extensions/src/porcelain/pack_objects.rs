@@ -414,7 +414,7 @@ fn execute(st: &State) -> Result<ExitCode> {
     // Sorted by object id: that is the order the `.idx` stores entries in, and
     // the order `.rev` and `.mtimes` index into.
     let mut by_oid = packed.entries.clone();
-    by_oid.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+    by_oid.sort_unstable_by_key(|a| a.id);
 
     let kind = repo.object_hash();
     let mut files = vec![

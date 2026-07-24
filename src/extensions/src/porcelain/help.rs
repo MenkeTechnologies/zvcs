@@ -1845,12 +1845,12 @@ fn reject_unsupported_viewer_config() -> Result<()> {
     };
     let config = repo.config_snapshot();
     if let Some(format) = config.string("help.format") {
-        if format.to_string() != "man" {
+        if format != "man" {
             bail!("help.format={format} is not supported: only the plain `man` viewer is");
         }
     }
     if let Some(viewer) = config.string("man.viewer") {
-        if viewer.to_string() != "man" {
+        if viewer != "man" {
             bail!("man.viewer={viewer} is not supported: only the plain `man` viewer is");
         }
     }

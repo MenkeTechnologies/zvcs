@@ -546,7 +546,7 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
     // git's `get_exact_ref_match` bsearches the tip table sorted by object id.
     let mut by_oid: Vec<(ObjectId, &str)> =
         tips.iter().map(|t| (t.oid, t.refname.as_str())).collect();
-    by_oid.sort_by(|a, b| a.0.cmp(&b.0));
+    by_oid.sort_by_key(|a| a.0);
     let exact = |oid: &ObjectId| -> Option<String> {
         by_oid
             .binary_search_by(|probe| probe.0.cmp(oid))
@@ -926,9 +926,9 @@ fn subpath_matches(path: &str, filter: &str) -> Option<usize> {
         ) {
             return Some(offset);
         }
-        match sub.find('/') {
-            Some(ix) => offset += ix + 1,
-            None => return None,
+        {
+            let ix = sub.find('/')?;
+            offset += ix + 1
         }
     }
 }

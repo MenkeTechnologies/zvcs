@@ -730,7 +730,7 @@ fn diff_filter_selected(filter: &[u8], status: u8) -> bool {
     }
     let has_include = filter.iter().any(|f| f.is_ascii_uppercase());
     if has_include {
-        filter.iter().any(|&f| f == up)
+        filter.contains(&up)
     } else {
         true
     }
@@ -2365,7 +2365,7 @@ pub(crate) fn combined_trees_patch(
 
         // Dense combined diff shows a path only when the result differs from all
         // parents; matching any parent makes the change one-sided and elided.
-        if parent_bytes.iter().any(|b| *b == res_bytes) {
+        if parent_bytes.contains(&res_bytes) {
             continue;
         }
         if parent_bytes.len() != NUM_PARENT {
@@ -2544,7 +2544,7 @@ fn interesting(sl: &SLine) -> bool {
 
 /// `adjust_hunk_tail()`.
 fn adjust_hunk_tail(sline: &[SLine], hunk_begin: usize, i: usize) -> usize {
-    if hunk_begin + 1 <= i && sline[i - 1].flag & ALL_MASK == 0 {
+    if hunk_begin < i && sline[i - 1].flag & ALL_MASK == 0 {
         i - 1
     } else {
         i
@@ -2635,7 +2635,7 @@ fn make_hunks(sline: &mut [SLine], cnt: usize, context: u32) {
                 let mut la = adjust_hunk_tail(sline, hunk_begin, j);
                 la = (la + context).min(cnt + 1);
                 let mut contin = false;
-                while la > 0 && j <= la - 1 {
+                while la > 0 && j < la {
                     la -= 1;
                     if sline[la].flag & MARK != 0 {
                         contin = true;

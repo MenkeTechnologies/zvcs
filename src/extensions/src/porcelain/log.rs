@@ -566,8 +566,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             pickaxe_g = Some(args.get(i).cloned().unwrap_or_default());
         } else if let Some(v) = a.strip_prefix("-G") {
             pickaxe_g = Some(v.to_string());
-        } else if a.starts_with('-') {
-            let body = &a[1..];
+        } else if let Some(body) = a.strip_prefix('-') {
             if let Some(num) = body.strip_prefix('n') {
                 // `-nN` shorthand (e.g. `-n5`).
                 match parse_max_count(num) {
@@ -1630,7 +1629,7 @@ fn expand_decoration(
     let id = commit.id().detach();
     let head_here = decos.head_oid == Some(id);
     let refs_here = decos.map.get(&id);
-    if !head_here && refs_here.map_or(true, |v| v.is_empty()) {
+    if !head_here && refs_here.is_none_or(|v| v.is_empty()) {
         return;
     }
 
@@ -2876,7 +2875,7 @@ fn scale_linear(it: usize, width: usize, max_change: usize) -> usize {
 /// Shorten an over-long path the way git does: a `...` prefix, cut back to a
 /// directory boundary when one falls inside the retained tail. A name column
 /// narrower than the 3-column `...` prefix keeps only the prefix (git prints "...").
-fn elide_name<'p>(path: &'p [u8], name_width: usize) -> (&'static str, &'p [u8]) {
+fn elide_name(path: &[u8], name_width: usize) -> (&'static str, &[u8]) {
     if display_width(path) <= name_width {
         return ("", path);
     }

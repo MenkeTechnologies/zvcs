@@ -150,7 +150,7 @@ fn parse_args(args: &[String]) -> std::result::Result<Parsed, UsageError> {
             continue;
         }
         // Short switches; only `-h` is known.
-        for c in a[1..].chars() {
+        if let Some(c) = a[1..].chars().next() {
             if c == 'h' {
                 return Err(UsageError::Help);
             }

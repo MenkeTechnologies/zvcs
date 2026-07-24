@@ -1522,7 +1522,7 @@ fn reflog_message(repo: &gix::Repository, target: ObjectId) -> Result<BString> {
             let c = CommitRef::from_bytes(&obj.data, target.kind())?;
             // git's `find_commit_subject`: the first physical line of the message,
             // taken verbatim (no whitespace folding).
-            let message: &[u8] = &c.message;
+            let message: &[u8] = c.message;
             let subject_end = message.iter().position(|&b| b == b'\n').unwrap_or(message.len());
             sb.extend_from_slice(&message[..subject_end]);
             let committed = sig_from(c.committer()?);

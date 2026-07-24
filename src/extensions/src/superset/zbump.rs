@@ -72,7 +72,7 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
         let path_str = path.to_string();
 
         if let Some(w) = &wanted {
-            if !w.iter().any(|x| *x == path_str) {
+            if !w.contains(&path_str) {
                 continue;
             }
         }

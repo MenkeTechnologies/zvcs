@@ -857,39 +857,36 @@ fn show_commit(
         if !header_empty {
             out.push(b'\n');
         }
-        match selection {
-            Selection::Blocks { stat, patch, .. } => {
-                let mut wrote = false;
-                if stat {
-                    emit_stat(out, &files, &disp.stat)?;
-                    wrote = true;
-                }
-                if patch {
-                    // Dense combined diff of the merge's tree against every
-                    // parent tree, rendered by the shared `diff --cc` engine.
-                    let result_tree = commit.tree()?;
-                    let mut parent_trees = Vec::with_capacity(parents.len());
-                    for p in &parents {
-                        parent_trees.push(repo.find_commit(p.detach())?.tree()?);
-                    }
-                    let ps: Vec<String> = pathspecs
-                        .iter()
-                        .map(|p| String::from_utf8_lossy(p).into_owned())
-                        .collect();
-                    let cc = super::diff::combined_trees_patch(
-                        repo,
-                        &result_tree,
-                        &parent_trees,
-                        &ps,
-                        3,
-                    )?;
-                    if wrote && !cc.is_empty() {
-                        out.push(b'\n');
-                    }
-                    out.extend_from_slice(&cc);
-                }
+        if let Selection::Blocks { stat, patch, .. } = selection {
+            let mut wrote = false;
+            if stat {
+                emit_stat(out, &files, &disp.stat)?;
+                wrote = true;
             }
-            _ => {}
+            if patch {
+                // Dense combined diff of the merge's tree against every
+                // parent tree, rendered by the shared `diff --cc` engine.
+                let result_tree = commit.tree()?;
+                let mut parent_trees = Vec::with_capacity(parents.len());
+                for p in &parents {
+                    parent_trees.push(repo.find_commit(p.detach())?.tree()?);
+                }
+                let ps: Vec<String> = pathspecs
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect();
+                let cc = super::diff::combined_trees_patch(
+                    repo,
+                    &result_tree,
+                    &parent_trees,
+                    &ps,
+                    3,
+                )?;
+                if wrote && !cc.is_empty() {
+                    out.push(b'\n');
+                }
+                out.extend_from_slice(&cc);
+            }
         }
         return Ok(());
     }
@@ -1353,7 +1350,7 @@ fn scale_linear(it: usize, width: usize, max_change: usize) -> usize {
 /// Shorten an over-long path the way git does: a `...` prefix, cut back to a
 /// directory boundary when one falls inside the retained tail. A name column
 /// narrower than the 3-column `...` prefix keeps only the prefix (git prints "...").
-fn elide_name<'p>(path: &'p [u8], name_width: usize) -> (&'static str, &'p [u8]) {
+fn elide_name(path: &[u8], name_width: usize) -> (&'static str, &[u8]) {
     if display_width(path) <= name_width {
         return ("", path);
     }

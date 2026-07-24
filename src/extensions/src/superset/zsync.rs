@@ -690,7 +690,7 @@ pub fn zsync(args: &[String]) -> Result<ExitCode> {
 
     for (sm, path) in &items {
         // Restrict to the requested set when paths were given.
-        if !requested.is_empty() && !requested.iter().any(|req| *req == path.as_str()) {
+        if !requested.is_empty() && !requested.contains(&path.as_str()) {
             continue;
         }
 

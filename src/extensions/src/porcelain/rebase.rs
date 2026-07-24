@@ -1057,7 +1057,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     } else {
         onto_name.clone().unwrap_or_else(|| upstream_spec.clone())
     };
-    let onto_is_merge_base = onto_spec.contains("...");
+    let _onto_is_merge_base = onto_spec.contains("...");
     let onto_oid = if let Some(p) = onto_spec.find("...") {
         let left = if p == 0 { "HEAD" } else { &onto_spec[..p] };
         let right_raw = &onto_spec[p + 3..];

@@ -1433,7 +1433,7 @@ fn write_path(out: &mut Vec<u8>, path: &BString, nul: bool) {
 fn quote_c_style(name: &[u8]) -> Vec<u8> {
     let needs_quote = name
         .iter()
-        .any(|&b| b < 0x20 || b >= 0x80 || b == b'"' || b == b'\\');
+        .any(|&b| !(0x20..0x80).contains(&b) || b == b'"' || b == b'\\');
     if !needs_quote {
         return name.to_vec();
     }
@@ -1450,7 +1450,7 @@ fn quote_c_style(name: &[u8]) -> Vec<u8> {
             b'\r' => out.extend_from_slice(b"\\r"),
             b'"' => out.extend_from_slice(b"\\\""),
             b'\\' => out.extend_from_slice(b"\\\\"),
-            b if b < 0x20 || b >= 0x80 => {
+            b if !(0x20..0x80).contains(&b) => {
                 out.extend_from_slice(format!("\\{b:03o}").as_bytes());
             }
             b => out.push(b),

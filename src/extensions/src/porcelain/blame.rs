@@ -690,11 +690,10 @@ fn emit_porcelain(
             } else {
                 writeln!(out, "{} {} {}", ci.hex, line.orig_no, line.final_no)?;
             }
-            if i == 0 || opts.line_porcelain {
-                if opts.line_porcelain || shown.insert(first.commit_id) {
+            if (i == 0 || opts.line_porcelain)
+                && (opts.line_porcelain || shown.insert(first.commit_id)) {
                     write_detail(&mut out, ci, previous.as_ref(), path)?;
                 }
-            }
             out.write_all(b"\t")?;
             out.write_all(&line.content)?;
             out.write_all(b"\n")?;
@@ -811,7 +810,7 @@ fn find_previous(
 fn quote_name(name: &[u8]) -> Vec<u8> {
     let needs_quoting = name
         .iter()
-        .any(|&b| b < 0x20 || b >= 0x7f || b == b'"' || b == b'\\');
+        .any(|&b| !(0x20..0x7f).contains(&b) || b == b'"' || b == b'\\');
     if !needs_quoting {
         return name.to_vec();
     }
@@ -828,7 +827,7 @@ fn quote_name(name: &[u8]) -> Vec<u8> {
             0x0b => out.extend_from_slice(b"\\v"),
             b'"' => out.extend_from_slice(b"\\\""),
             b'\\' => out.extend_from_slice(b"\\\\"),
-            b if b < 0x20 || b >= 0x7f => out.extend_from_slice(format!("\\{b:03o}").as_bytes()),
+            b if !(0x20..0x7f).contains(&b) => out.extend_from_slice(format!("\\{b:03o}").as_bytes()),
             b => out.push(b),
         }
     }

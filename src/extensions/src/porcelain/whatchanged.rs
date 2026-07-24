@@ -1769,7 +1769,7 @@ fn run(repo: &gix::Repository, mut parsed: Parsed) -> Result<ExitCode> {
         // and an excluded commit is dropped whether or not it changed anything.
         if apply_grep {
             let message = commit.message_raw()?;
-            let bytes: &[u8] = &message[..];
+            let bytes: &[u8] = message;
             if !parsed.grep.keeps(bytes) {
                 continue;
             }
@@ -1959,9 +1959,9 @@ fn render_commit(
         out.extend_from_slice(format!("commit {}\n", commit.id()).as_bytes());
     }
     out.extend_from_slice(b"Author: ");
-    out.extend_from_slice(&author.name[..]);
+    out.extend_from_slice(author.name);
     out.extend_from_slice(b" <");
-    out.extend_from_slice(&author.email[..]);
+    out.extend_from_slice(author.email);
     out.extend_from_slice(b">\n");
     out.extend_from_slice(
         format!("Date:   {}\n\n", format_git_date(time.seconds, time.offset)).as_bytes(),
@@ -1970,7 +1970,7 @@ fn render_commit(
     // git's `pp_remainder`: leading blank lines are dropped, every remaining line gets a
     // four-space indent, and an all-whitespace line keeps only that indent.
     let raw = commit.message_raw()?;
-    let bytes: &[u8] = &raw[..];
+    let bytes: &[u8] = raw;
     let mut lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
     if lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop(); // the newline terminating the last line, not an extra blank one

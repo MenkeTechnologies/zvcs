@@ -483,7 +483,7 @@ fn switch_create(
     let current_commit = head.try_peel_to_id()?.map(|id| id.detach());
     let already_on = head
         .referent_name()
-        .map(|n| n.shorten().to_string() == branch)
+        .map(|n| n.shorten() == branch)
         .unwrap_or(false);
 
     let start_commit: Option<ObjectId> = match start {
@@ -725,7 +725,7 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
             // matching remotes, DWIM to that one instead of erroring.
             if let Some(def) = repo.config_snapshot().string("checkout.defaultRemote") {
                 let def = def.to_str_lossy().into_owned();
-                if matches.iter().any(|m| *m == def) {
+                if matches.contains(&def) {
                     return Ok(Dwim::One(format!("{def}/{name}")));
                 }
             }

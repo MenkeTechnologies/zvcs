@@ -81,7 +81,7 @@ fn run(exe: &Path, cwd: &Path, args: &[String], env: &[(String, String)], cancel
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return (false, format!("spawn `git {}` failed: {e}\n", args.join(" "))),
     };

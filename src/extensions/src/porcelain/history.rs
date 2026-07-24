@@ -153,7 +153,7 @@ pub fn history(args: &[String]) -> Result<ExitCode> {
 
     // `-h` anywhere in the leading position prints to stdout and still exits 129.
     if first == "-h" || first == "--help" {
-        print!("{USAGE}\n");
+        println!("{USAGE}");
         std::io::stdout().flush()?;
         return Ok(ExitCode::from(EXIT_USAGE));
     }
@@ -276,7 +276,7 @@ fn parse(sub: Sub, args: &[String]) -> Result<Parsed> {
         };
 
         // Pull `--opt <v>` when `--opt=<v>` was not used.
-        let mut take = |i: &mut usize| -> Option<String> {
+        let take = |i: &mut usize| -> Option<String> {
             match value {
                 Some(v) => Some(v.to_string()),
                 None => {
@@ -288,7 +288,7 @@ fn parse(sub: Sub, args: &[String]) -> Result<Parsed> {
 
         match name {
             "-h" | "--help" => {
-                print!("{}\n", sub.usage());
+                println!("{}", sub.usage());
                 std::io::stdout().flush()?;
                 return Ok(Parsed::Exit(ExitCode::from(EXIT_USAGE)));
             }

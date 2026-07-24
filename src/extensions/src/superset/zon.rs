@@ -106,8 +106,8 @@ pub fn spawn_daemon_loop() {
             for e in &events {
                 last = last.max(e.id);
                 for (_sid, kind, repo_like, command) in &subs {
-                    let kind_ok = kind.as_deref().map_or(true, |k| k == e.kind);
-                    let repo_ok = repo_like.as_deref().map_or(true, |p| {
+                    let kind_ok = kind.as_deref().is_none_or(|k| k == e.kind);
+                    let repo_ok = repo_like.as_deref().is_none_or(|p| {
                         e.workdir.as_deref().is_some_and(|w| w.contains(p))
                             || e.git_dir.as_deref().is_some_and(|g| g.contains(p))
                     });

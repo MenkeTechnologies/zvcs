@@ -1595,8 +1595,8 @@ fn read_mark_file(
             continue;
         }
         let corrupt = || anyhow!("corrupt mark line: {line}");
-        let rest = line.strip_prefix(':').ok_or_else(|| corrupt())?;
-        let (mark, hex) = rest.split_once(' ').ok_or_else(|| corrupt())?;
+        let rest = line.strip_prefix(':').ok_or_else(&corrupt)?;
+        let (mark, hex) = rest.split_once(' ').ok_or_else(&corrupt)?;
         let mark: u64 = mark.parse().map_err(|_| corrupt())?;
         let id = ObjectId::from_hex(hex.as_bytes()).map_err(|_| corrupt())?;
         out.push((mark, id));

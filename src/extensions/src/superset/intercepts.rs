@@ -139,7 +139,7 @@ fn save(list: &[Intercept]) -> Result<()> {
     let _ = std::fs::create_dir_all(crate::superset::zdaemon::zvcs_home());
     let mut out = String::new();
     for i in list {
-        let code = i.code.replace('\t', " ").replace('\n', " ");
+        let code = i.code.replace(['\t', '\n'], " ");
         out.push_str(&format!("{}\t{}\t{}\t{}\n", i.id, i.kind.as_str(), i.pattern, code));
     }
     let mut f = std::fs::File::create(&path)?;
@@ -328,7 +328,7 @@ fn list() -> Result<ExitCode> {
         println!("no intercepts registered");
         return Ok(ExitCode::SUCCESS);
     }
-    println!("{:>4}  {:<7}  {:<18}  {}", "ID", "KIND", "PATTERN", "CODE");
+    println!("{:>4}  {:<7}  {:<18}  CODE", "ID", "KIND", "PATTERN");
     for i in &list {
         let preview = if i.code.len() > 44 { format!("{}...", &i.code[..41]) } else { i.code.clone() };
         println!("{:>4}  {:<7}  {:<18}  {}", i.id, i.kind.as_str(), i.pattern, preview);

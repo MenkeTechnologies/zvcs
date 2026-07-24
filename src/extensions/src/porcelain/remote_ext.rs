@@ -97,7 +97,7 @@ fn command_loop(child_cmd: &str) -> Result<ExitCode> {
             print!("*connect\n\n");
             std::io::stdout().flush()?;
         } else if let Some(service) = line.strip_prefix(b"connect ") {
-            print!("\n");
+            println!();
             std::io::stdout().flush()?;
             // The service name is always ASCII on the wire; anything else could
             // not name a program git would run, so a lossy read is faithful.

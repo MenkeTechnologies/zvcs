@@ -1470,7 +1470,7 @@ fn strncasecmp_eq(a: &[u8], b: &[u8], n: usize) -> bool {
     for i in 0..n {
         let ca = a.get(i).copied().unwrap_or(0);
         let cb = b.get(i).copied().unwrap_or(0);
-        if ca.to_ascii_lowercase() != cb.to_ascii_lowercase() {
+        if !ca.eq_ignore_ascii_case(&cb) {
             return false;
         }
         if ca == 0 {

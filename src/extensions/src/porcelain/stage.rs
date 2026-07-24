@@ -455,7 +455,7 @@ fn is_valid_magnitude(s: &str) -> bool {
         (10u32, i)
     };
     let mut j = digits_start;
-    while j < b.len() && (b[j] as char).to_digit(radix).is_some() {
+    while j < b.len() && (b[j] as char).is_digit(radix) {
         j += 1;
     }
     if j == digits_start {
@@ -1258,7 +1258,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // mutating entries so a later commit can't capture a stale subtree.
     index.remove_tree();
     index.write(gix::index::write::Options::default())?;
-    super::add::record_stage_event(&repo, staged.len() + deletions.len());
+    super::add::record_stage_event(repo, staged.len() + deletions.len());
 
     if o.verbose {
         report(&printed);

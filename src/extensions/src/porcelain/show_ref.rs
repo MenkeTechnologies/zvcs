@@ -371,7 +371,7 @@ fn run_exists(repo: &gix::Repository, refs: &[String]) -> Result<ExitCode> {
     let name = refs[0].as_str();
     let present = matches!(
         repo.try_find_reference(name),
-        Ok(Some(r)) if r.name().as_bstr().to_string() == name
+        Ok(Some(r)) if r.name().as_bstr() == name
     );
     if present {
         Ok(ExitCode::SUCCESS)
@@ -484,7 +484,7 @@ fn resolve_exact<'repo>(
     name: &str,
 ) -> Option<(ObjectId, gix::Reference<'repo>)> {
     let mut reference = repo.try_find_reference(name).ok().flatten()?;
-    if reference.name().as_bstr().to_string() != name {
+    if reference.name().as_bstr() != name {
         return None;
     }
     let id = reference.follow_to_object().ok()?.detach();

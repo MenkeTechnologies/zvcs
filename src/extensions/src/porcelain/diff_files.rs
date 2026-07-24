@@ -3702,7 +3702,7 @@ fn sline_interesting(sl: &Sline, all_mask: u64) -> bool {
 
 /// `adjust_hunk_tail()`.
 fn adjust_hunk_tail(sline: &[Sline], all_mask: u64, hunk_begin: usize, i: usize) -> usize {
-    if hunk_begin + 1 <= i && sline[i - 1].flag & all_mask == 0 {
+    if hunk_begin < i && sline[i - 1].flag & all_mask == 0 {
         i - 1
     } else {
         i
@@ -3804,7 +3804,7 @@ fn make_hunks(sline: &mut [Sline], cnt: usize, num_parent: usize, dense: bool, c
                 let mut la = adjust_hunk_tail(sline, all_mask, hunk_begin, j);
                 la = if la + context < cnt + 1 { la + context } else { cnt + 1 };
                 let mut contin = false;
-                while la > 0 && j <= la - 1 {
+                while la > 0 && j < la {
                     la -= 1;
                     if sline[la].flag & mark != 0 {
                         contin = true;

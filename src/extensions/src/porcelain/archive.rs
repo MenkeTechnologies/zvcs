@@ -843,7 +843,7 @@ fn subtree<'r>(
     name: &[u8],
 ) -> Result<Option<gix::Tree<'r>>> {
     for entry in tree.decode()?.entries.iter() {
-        if &entry.filename[..] == name && entry.mode.is_tree() {
+        if entry.filename == name && entry.mode.is_tree() {
             return Ok(Some(repo.find_object(entry.oid.to_owned())?.peel_to_tree()?));
         }
     }
@@ -1343,7 +1343,7 @@ mod gzip {
     const HASH_BITS: usize = 8 + 7;
     const HASH_SIZE: usize = 1 << HASH_BITS;
     const HASH_MASK: usize = HASH_SIZE - 1;
-    const HASH_SHIFT: usize = (HASH_BITS + MIN_MATCH - 1) / MIN_MATCH;
+    const HASH_SHIFT: usize = HASH_BITS.div_ceil(MIN_MATCH);
     const LIT_BUFSIZE: usize = 1 << (8 + 6);
     const PENDING_BUF_SIZE: usize = LIT_BUFSIZE * 4;
     const SYM_END: usize = (LIT_BUFSIZE - 1) * 3;
@@ -2065,7 +2065,7 @@ mod gzip {
         }
 
         fn tr_stored_block(&mut self, buf: Option<usize>, stored_len: usize, last: bool) {
-            self.send_bits(((0) << 1) + i32::from(last), 3);
+            self.send_bits(i32::from(last), 3);
             self.bi_windup();
             self.put_short(stored_len as u16);
             self.put_short(!(stored_len as u16));
@@ -2344,11 +2344,7 @@ mod gzip {
             let scan = self.strstart;
             let mut best_len = self.prev_length;
             let mut nice_match = self.nice_match as usize;
-            let limit = if self.strstart > MAX_DIST {
-                self.strstart - MAX_DIST
-            } else {
-                0
-            };
+            let limit = self.strstart.saturating_sub(MAX_DIST);
 
             let strend = self.strstart + MAX_MATCH;
             let mut scan_end1 = self.window[scan + best_len - 1];

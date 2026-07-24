@@ -142,7 +142,7 @@ pub fn diagnose(args: &[String]) -> Result<ExitCode> {
         while let Some(c) = chars.next() {
             match c {
                 'h' => {
-                    print!("{USAGE}\n");
+                    println!("{USAGE}");
                     return Ok(ExitCode::from(129));
                 }
                 'o' | 's' => {

@@ -78,7 +78,7 @@ pub fn log_invocation(sub: &str, args: &[String]) {
         argv.push(' ');
         argv.push_str(a);
     }
-    let argv = argv.replace('\t', " ").replace('\n', " ");
+    let argv = argv.replace(['\t', '\n'], " ");
     let cwd = cwd.replace('\t', " ");
     let line = format!("{ts}\t{pid}\t{ppid}\t{cwd}\t{argv}\n");
 

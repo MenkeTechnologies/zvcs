@@ -89,7 +89,7 @@ pub fn version(args: &[String]) -> Result<ExitCode> {
             build_options = !negated;
         } else {
             // Short flags, grouped as git allows (`-hh`). Only `-h` exists.
-            for c in a[1..].chars() {
+            if let Some(c) = a[1..].chars().next() {
                 if c != 'h' {
                     return Ok(usage_error(&format!("unknown switch `{c}'")));
                 }

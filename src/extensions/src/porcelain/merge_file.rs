@@ -202,7 +202,7 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
         // Short options, grouped left to right. `-L` consumes the rest of the
         // token as its value, or the next argument if the token ends there.
         let mut chars = arg[1..].char_indices();
-        while let Some((at, c)) = chars.next() {
+        for (at, c) in chars {
             match c {
                 'p' => to_stdout = true,
                 'q' => quiet = true,
@@ -1116,7 +1116,7 @@ fn write_conflict_marker(
     nl: &[u8],
 ) {
     assure_ends_with_nl(out, nl);
-    out.extend(std::iter::repeat(marker).take(marker_size));
+    out.extend(std::iter::repeat_n(marker, marker_size));
     if let Some(label) = label {
         out.push(b' ');
         out.extend_from_slice(label);

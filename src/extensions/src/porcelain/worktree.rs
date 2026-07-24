@@ -1028,7 +1028,7 @@ fn should_prune(admin: &Path, expire: u64) -> PruneCheck {
 /// Port of `prune_worktree()`: announce under `-n`/`-v`, delete unless dry-run.
 fn prune_worktree(wt_dir: &Path, id: &str, reason: &str, show_only: bool, verbose: bool) {
     if show_only || verbose {
-        eprintln!("Removing {}/{}: {}", "worktrees", id, reason);
+        eprintln!("Removing worktrees/{}: {}", id, reason);
     }
     if !show_only {
         delete_git_dir(wt_dir, id);

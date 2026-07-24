@@ -610,7 +610,7 @@ fn diff_touches_path(
     let mut matched = false;
     platform
         .for_each_to_obtain_tree(&new, |change| {
-            if path_matches(&change.location()[..], pathspecs) {
+            if path_matches(change.location(), pathspecs) {
                 matched = true;
                 Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
             } else {

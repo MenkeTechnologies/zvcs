@@ -1758,7 +1758,7 @@ fn update(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 
     for name in &targets {
         eprintln!("Fetching {name}");
-        if super::fetch::fetch(&[name.clone()]).is_err() {
+        if super::fetch::fetch(std::slice::from_ref(name)).is_err() {
             eprintln!("error: Could not fetch {name}");
             return Ok(ExitCode::from(1));
         }

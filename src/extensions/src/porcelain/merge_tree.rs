@@ -62,7 +62,7 @@
 //!     `--quiet`, where no message text is emitted at all.
 
 use anyhow::{bail, Result};
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, Write};
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};

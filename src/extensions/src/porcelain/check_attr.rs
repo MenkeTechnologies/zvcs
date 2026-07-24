@@ -227,7 +227,7 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
     let workdir = repo.workdir().map(gix::path::realpath).transpose()?;
     let prefix: BString = match repo.prefix()? {
         Some(p) if !p.as_os_str().is_empty() => {
-            let mut b = BString::from(gix::path::into_bstr(p).into_owned());
+            let mut b = gix::path::into_bstr(p).into_owned();
             b.push(b'/');
             b
         }

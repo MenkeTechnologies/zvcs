@@ -272,7 +272,7 @@ fn top() -> Result<ExitCode> {
 
         print!("\x1b[2J\x1b[H"); // clear + home
         println!("{BOLD}zvcs trigger monitor{RESET}   {DIM}{} trigger(s) firing · ctrl-c to exit{RESET}", order.len());
-        println!("{BOLD}{:<42} {:>7} {:>7} {:>8}  {}{RESET}", "DIR", "FIRES", "EV", "/SEC", "LAST");
+        println!("{BOLD}{:<42} {:>7} {:>7} {:>8}  LAST{RESET}", "DIR", "FIRES", "EV", "/SEC");
         if order.is_empty() {
             println!("{DIM}(no fires yet — create a file in a watched dir){RESET}");
         }

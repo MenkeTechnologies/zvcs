@@ -983,7 +983,7 @@ fn pad_align(content: &[u8], spec: &AlignSpec) -> Vec<u8> {
     };
     let mut out = vec![b' '; left];
     out.extend_from_slice(content);
-    out.extend(std::iter::repeat(b' ').take(right));
+    out.extend(std::iter::repeat_n(b' ', right));
     out
 }
 

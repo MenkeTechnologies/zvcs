@@ -1568,11 +1568,9 @@ fn prefix_names(p: &mut Patch, root: &str) -> Result<()> {
     if root.is_empty() {
         return Ok(());
     }
-    for name in [&mut p.old_name, &mut p.new_name] {
-        if let Some(n) = name {
-            let joined = format!("{root}/{n}");
-            *n = check_path(joined)?;
-        }
+    for n in [&mut p.old_name, &mut p.new_name].into_iter().flatten() {
+        let joined = format!("{root}/{n}");
+        *n = check_path(joined)?;
     }
     Ok(())
 }

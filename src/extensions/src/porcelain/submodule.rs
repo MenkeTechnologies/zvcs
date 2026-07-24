@@ -989,7 +989,7 @@ fn run_in_submodule(
         proc.arg(&cmd[0]);
     } else {
         proc.arg(format!("{} \"$@\"", cmd[0]));
-        proc.args(&cmd[..]);
+        proc.args(cmd);
     }
     proc.current_dir(sm_dir)
         .env("name", name.to_str_lossy().as_ref())

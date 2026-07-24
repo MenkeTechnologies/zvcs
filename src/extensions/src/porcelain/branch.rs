@@ -692,7 +692,7 @@ fn passes_filters(
     let Some(tip) = id else {
         return Ok(false);
     };
-    if !filters.points_at.is_empty() && !filters.points_at.iter().any(|&o| o == tip) {
+    if !filters.points_at.is_empty() && !filters.points_at.contains(&tip) {
         return Ok(false);
     }
     // `--contains=<c>`: the ref must be a descendant of `<c>`.

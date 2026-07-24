@@ -1580,7 +1580,7 @@ fn quote_c_style(path: &[u8]) -> String {
             b'\r' => s.push_str("\\r"),
             b'\t' => s.push_str("\\t"),
             0x0b => s.push_str("\\v"),
-            _ if b < 0x20 || b >= 0x7f => s.push_str(&format!("\\{b:03o}")),
+            _ if !(0x20..0x7f).contains(&b) => s.push_str(&format!("\\{b:03o}")),
             _ => s.push(b as char),
         }
     }
@@ -1843,11 +1843,7 @@ fn compute_assignment(
         }
     }
 
-    let expected_free = if column_count < row_count {
-        row_count - column_count
-    } else {
-        0
-    };
+    let expected_free = row_count.saturating_sub(column_count);
     if free_count == expected_free {
         return;
     }

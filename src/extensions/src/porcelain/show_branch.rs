@@ -225,7 +225,7 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
                 let mark = if is_head { '*' } else { ' ' };
                 out.extend_from_slice(format!("{mark} [{name}] ").as_bytes());
             } else {
-                out.extend(std::iter::repeat(b' ').take(i));
+                out.extend(std::iter::repeat_n(b' ', i));
                 let mark = if is_head { '*' } else { '!' };
                 out.extend_from_slice(
                     format!(
@@ -250,7 +250,7 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
             }
         }
         if opts.extra >= 0 {
-            out.extend(std::iter::repeat(b'-').take(num_rev));
+            out.extend(std::iter::repeat_n(b'-', num_rev));
             out.push(b'\n');
         }
     }

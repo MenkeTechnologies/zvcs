@@ -468,7 +468,7 @@ fn verify_headers(buf: &[u8], reporter: &mut Reporter) -> bool {
 /// leading zero unless the timestamp is a bare `0`, a value that fits `time_t`,
 /// then a `[+-]HHMM` zone followed immediately by the newline.
 fn fsck_ident(ident: &[u8]) -> Option<(Msg, &'static str)> {
-    const NAME_END: [u8; 3] = [b'<', b'>', b'\n'];
+    const NAME_END: [u8; 3] = *b"<>\n";
 
     if ident.first() == Some(&b'<') {
         return Some((

@@ -143,12 +143,9 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
     // every entry this command writes carry the `CE_VALID` bit.
     let ignore_stat = repo.config_snapshot().boolean("core.ignoreStat") == Some(true);
 
-    let workdir = match repo.workdir() {
-        Some(w) => Some(normalize_lexically(
+    let workdir = repo.workdir().map(|w| normalize_lexically(
             &std::fs::canonicalize(w).unwrap_or_else(|_| w.to_owned()),
-        )),
-        None => None,
-    };
+        ));
     let prefix = match repo.prefix()? {
         Some(p) if !p.as_os_str().is_empty() => {
             let s = p.to_string_lossy().replace('\\', "/");

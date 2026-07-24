@@ -735,12 +735,11 @@ fn credential_read(
                 _ => {}
             },
             "password_expiry_utc" => c.password_expiry_utc = parse_timestamp(value),
-            "url" => {
-                if credential_from_url(c, value).is_err() {
+            "url"
+                if credential_from_url(c, value).is_err() => {
                     eprintln!("fatal: credential url cannot be parsed: {value}");
                     return Err(RequestError::Die(ExitCode::from(128)));
                 }
-            }
             // `wwwauth[]`, `state[]`, `continue`, `quit` and anything else are
             // read by upstream into fields this daemon never consults.
             _ => {}

@@ -56,7 +56,7 @@ pub fn crawl(roots: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
                 let Ok(entry) = result else {
                     return WalkState::Continue; // permission-denied / transient: skip
                 };
-                if !entry.file_type().map_or(false, |t| t.is_dir()) {
+                if !entry.file_type().is_some_and(|t| t.is_dir()) {
                     return WalkState::Continue;
                 }
                 let dir = entry.path();

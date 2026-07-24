@@ -2039,7 +2039,7 @@ fn render_funcctx<W: Write>(
                 let mut c = idx; // 0-based, walking upward
                 while c > 0 {
                     c -= 1;
-                    if c + 1 <= last_shown {
+                    if c < last_shown {
                         break;
                     }
                     if cx.is_func(c) {

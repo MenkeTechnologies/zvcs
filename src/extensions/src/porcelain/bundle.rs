@@ -332,7 +332,7 @@ fn list_heads(args: &[String]) -> Result<ExitCode> {
 /// (an empty filter list keeps everything). git matches ref names exactly.
 fn write_refs(out: &mut Vec<u8>, refs: &[(ObjectId, Vec<u8>)], filters: &[&[u8]]) {
     for (oid, name) in refs {
-        if !filters.is_empty() && !filters.iter().any(|f| *f == name.as_slice()) {
+        if !filters.is_empty() && !filters.contains(&name.as_slice()) {
             continue;
         }
         out.extend_from_slice(oid.to_hex().to_string().as_bytes());

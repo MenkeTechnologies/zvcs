@@ -20,7 +20,7 @@
 
 use anyhow::Result;
 use std::io::{Read, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use gix::bstr::ByteSlice;
@@ -241,7 +241,7 @@ fn parse(args: &[String]) -> std::result::Result<Opts, ExitCode> {
 
         // A short-option cluster: `-w`, `-tblob`, `-wtblob`, `-t blob`.
         let mut chars = a[1..].char_indices();
-        while let Some((at, c)) = chars.next() {
+        for (at, c) in chars {
             match c {
                 'w' => opts.write = true,
                 'h' => {

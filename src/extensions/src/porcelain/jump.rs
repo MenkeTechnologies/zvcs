@@ -286,7 +286,7 @@ fn unmerged_paths(repo: &gix::Repository, args: &[String]) -> Result<BTreeSet<BS
             // than guess which of the two spellings the harness will see.
             if display
                 .iter()
-                .any(|&b| b < 0x20 || b >= 0x7f || b == b'"' || b == b'\\')
+                .any(|&b| !(0x20..0x7f).contains(&b) || b == b'"' || b == b'\\')
             {
                 bail!(
                     "unsupported path {:?}: git ls-files renders it in quoted form and stock \

@@ -714,7 +714,7 @@ fn cone_argument(raw: &str, prefix: &str, skip_checks: bool) -> Result<Result<Op
             eprintln!("fatal: specify directories rather than patterns.  If your directory starts with a '!', pass --skip-checks");
             return Ok(Err(ExitCode::from(128)));
         }
-        if raw.contains(|c| matches!(c, '*' | '?' | '[' | ']' | '\\')) {
+        if raw.contains(['*', '?', '[', ']', '\\']) {
             eprintln!("fatal: specify directories rather than patterns.  If your directory really has any of '*?[]\\' in it, pass --skip-checks");
             return Ok(Err(ExitCode::from(128)));
         }

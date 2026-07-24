@@ -1738,7 +1738,7 @@ fn notes_strategy_config(
         // Subsection names are matched case-sensitively, byte for byte, exactly
         // as git compares the `notes.<name>` subsection.
         match (subsection, header.subsection_name()) {
-            (Some(want), Some(have)) if have.to_string() == want => {}
+            (Some(want), Some(have)) if have == want => {}
             (None, None) => {}
             _ => continue,
         }

@@ -557,7 +557,7 @@ pub fn zbig(args: &[String]) -> Result<ExitCode> {
     let (sel, rest) = Selector::parse(&args);
     let n: usize = rest.iter().find_map(|a| a.parse().ok()).unwrap_or(20);
     let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
-    let per = parallel_map(&repos, |gd, wd| big_files(gd, wd));
+    let per = parallel_map(&repos, big_files);
     let mut all: Vec<(u64, String)> = per.into_iter().flatten().collect();
     all.sort_by(|a, b| b.0.cmp(&a.0));
     all.truncate(n);

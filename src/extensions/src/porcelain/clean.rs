@@ -799,7 +799,7 @@ fn print_columns_row(items: &[String]) -> String {
     if cols == 0 {
         cols = 1;
     }
-    let rows = (items.len() + cols - 1) / cols;
+    let rows = items.len().div_ceil(cols);
     let mut out = String::new();
     for y in 0..rows {
         for x in 0..cols {
@@ -815,7 +815,7 @@ fn print_columns_row(items: &[String]) -> String {
             if newline {
                 out.push('\n');
             } else {
-                out.extend(std::iter::repeat(' ').take(colwidth - lens[i]));
+                out.extend(std::iter::repeat_n(' ', colwidth - lens[i]));
             }
         }
     }
@@ -930,7 +930,7 @@ fn parse_choice(
             || bottom > top
             || (is_single && bottom != top)
         {
-            print!("Huh ({s})?\n");
+            println!("Huh ({s})?");
             continue;
         }
         for i in bottom..=top {
@@ -1020,7 +1020,7 @@ fn list_and_choose_menu(stdin: &mut impl std::io::BufRead) -> Option<usize> {
         "help",
     ];
     loop {
-        print!("*** Commands ***\n");
+        println!("*** Commands ***");
         let disp: Vec<String> = MENU
             .iter()
             .enumerate()
@@ -1118,7 +1118,7 @@ fn ask_each_cmd(
             match read_line_interactively(stdin) {
                 Some(l) => confirm = l,
                 None => {
-                    print!("\n");
+                    println!();
                     eof = true;
                     confirm.clear();
                 }
@@ -1158,7 +1158,7 @@ fn filter_by_patterns_cmd(
         let line = match read_line_interactively(stdin) {
             Some(l) => l,
             None => {
-                print!("\n");
+                println!();
                 String::new()
             }
         };
@@ -1187,7 +1187,7 @@ fn filter_by_patterns_cmd(
             !excluded
         });
         if changed == 0 {
-            print!("WARNING: Cannot find items matched by: {line}\n");
+            println!("WARNING: Cannot find items matched by: {line}");
         }
     }
 }
@@ -1205,9 +1205,9 @@ fn interactive_main_loop(
 
     while !del.is_empty() {
         if del.len() == 1 {
-            print!("Would remove the following item:\n");
+            println!("Would remove the following item:");
         } else {
-            print!("Would remove the following items:\n");
+            println!("Would remove the following items:");
         }
         let shown = shown_paths(&del, prefix_parts);
         print!("{}", print_columns_row(&shown));
@@ -1216,7 +1216,7 @@ fn interactive_main_loop(
             // EOF at the command prompt behaves exactly like `quit`.
             None | Some(4) => {
                 del.clear();
-                print!("Bye.\n");
+                println!("Bye.");
                 break;
             }
             // clean: remove everything still in the list.
@@ -1225,7 +1225,7 @@ fn interactive_main_loop(
             Some(1) => {
                 filter_by_patterns_cmd(repo, &mut del, prefix_parts, &mut stdin);
                 if del.is_empty() {
-                    print!("No more files to clean, exiting.\n");
+                    println!("No more files to clean, exiting.");
                     break;
                 }
             }
@@ -1233,7 +1233,7 @@ fn interactive_main_loop(
             Some(2) => {
                 select_by_numbers_cmd(&mut del, prefix_parts, &mut stdin);
                 if del.is_empty() {
-                    print!("No more files to clean, exiting.\n");
+                    println!("No more files to clean, exiting.");
                     break;
                 }
             }

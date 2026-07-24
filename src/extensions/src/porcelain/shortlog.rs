@@ -1515,7 +1515,7 @@ fn git_date_format(spec: Option<&str>) -> Option<gix::date::time::Format> {
 /// when the field is empty. Returns `None` on a malformed field.
 fn parse_uint<'a>(arg: &mut &'a str, comma: Option<char>, defval: usize) -> Option<usize> {
     // Copy the slice out first so `rest` does not borrow through `arg`.
-    let s: &'a str = *arg;
+    let s: &'a str = arg;
     let digits = s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
     let (num, rest) = s.split_at(digits);
     if rest.chars().next().is_some_and(|c| Some(c) != comma) {
@@ -1865,7 +1865,7 @@ fn diff_touches_path(
     let mut matched = false;
     platform
         .for_each_to_obtain_tree(&new, |change| {
-            if path_matches(&change.location()[..], pathspecs) {
+            if path_matches(change.location(), pathspecs) {
                 matched = true;
                 Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
             } else {

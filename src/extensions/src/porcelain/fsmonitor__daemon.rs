@@ -121,7 +121,7 @@ pub fn fsmonitor__daemon(args: &[String]) -> Result<ExitCode> {
 
     // `if (argc != 1) usage_with_options(...)`.
     if positional.len() != 1 {
-        eprint!("{USAGE}\n");
+        eprintln!("{USAGE}");
         return Ok(ExitCode::from(129));
     }
     if ipc_threads < 1 {

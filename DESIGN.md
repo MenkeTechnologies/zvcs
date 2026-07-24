@@ -67,8 +67,20 @@ Two locks sit underneath, with distinct jobs:
   | Scenario | Behavior |
   |---|---|
   | zvcs peer vs peer | FIFO already serialized them; `index.lock` uncontended when a job writes |
-  | external git holds `index.lock` | zvcs waits/retries (bounded), does not fail |
+  | external git holds `index.lock` | zvcs waits (bounded), then queues the command as a job — never the raw lock error |
   | zvcs holds `index.lock` briefly | external git sees git's normal lock error (git's contract) |
+
+  The bounded wait is `lock::wait_for_foreign_index_lock` (2 s by default,
+  `ZVCS_INDEX_LOCK_WAIT_MS` overrides, `0` disables), run from `dispatch.rs`
+  before any `LOCK_VERBS` command. It exists because the FIFO cannot see a
+  foreign holder and the ported index writer takes the lockfile with
+  `Fail::Immediately` — one attempt, no wait (`gix-index/src/file/write.rs`).
+  If the lock outlasts the budget the command is **not** failed: the dispatcher
+  matches the error by type (`gix::lock::acquire::Error` in the chain) and
+  submits the same argv to the queue, so it runs on the repo's fair lane once
+  the lock clears. A queued job's own re-run carries `ZVCS_QUEUED` and never
+  re-queues, so a permanently stuck lock fails once instead of spawning jobs
+  forever.
 
 ### Layer 2 — `z*` superset verbs + singleton daemon
 
@@ -593,24 +605,39 @@ overlay, sort-by-column, `/` search, and a toast, drawn with htoprs's own
 counterparts (§16 and the events table).
 
 `zppid` (`superset/zppid.rs`) is the per-process commit tally that shares the
-dashboard header. The same dispatcher seam that logs commands also credits
-commits: for a commit-producing verb (`commit`, `commit-tree`, `merge`,
-`cherry-pick`, `revert`, `am`, `rebase`), `dispatch::run` snapshots HEAD before
-the command and, if it advanced to a new tip afterward, upserts one row per
-invoking process into the `ppids` table (keyed by `session_key()` — an exported
-`ZVCS_SESSION` or `pid-<ppid>`; the stored `ppid` is `getppid()`, refreshed each
-commit). Attribution is at command time by the invoking process, which a
-daemon-side HEAD-delta observer could not do; a no-op `commit` or rejected merge
-never advances HEAD, so it counts nothing. `.then` skips the gix HEAD probe for
-every non-commit verb, so the hot path is unchanged. The stored `ppid` is derived
-from the session key (the `N` in `pid-<N>`, or a bare exported `ZVCS_SESSION=$$`),
-not `getppid()` — so a commit routed through the async queue and run by the daemon
-child is still attributed to the submitter rather than collapsing the whole fleet
-onto the daemon's pid. That is why the queue carries `ZVCS_SESSION` in its
-identity env (§ the async queue) alongside the `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
-vars. `git zppid` lists the table (ppid, live/dead via `kill(ppid,0)`, commits,
-last-seen), and the dashboard adds a PROCESSES tile plus a header line with the
-process count and the busiest ppid.
+dashboard. The same dispatcher seam that logs commands also credits commits: for a
+commit-producing verb (`commit`, `commit-tree`, `merge`, `cherry-pick`, `revert`,
+`am`, `rebase`), `dispatch::run` snapshots HEAD before the command and, if it
+advanced to a new tip afterward, upserts one row into the `ppids` table. A no-op
+`commit` or rejected merge never advances HEAD, so it counts nothing, and `.then`
+skips the gix HEAD probe for every non-commit verb, so the hot path is unchanged.
+
+The identity is the **responsible process**, not `getppid()`. `getppid()` is
+useless as an identity here: a `git commit` is run by a throwaway shell (an agent
+spawns a fresh `zsh -c …` per command), so the parent pid differs on every commit —
+keying on it yields a flood of one-commit rows, never a stable "N agents" view.
+`responsible_process()` instead walks up the parent chain, skips transient wrapper
+shells (a shell invoked with `-c`, detected from its `ps` args), and stops at the
+first durable process — a real program (an agent, editor, daemon) or an interactive
+login shell. That pid is stable across every commit one agent makes, so N
+concurrent agents map to N rows. Each row also stores the process's command name and
+cwd (via `ps` and, for the cwd, `/proc/<pid>/cwd` on Linux or `lsof` on macOS) so
+the pid is legible. An explicit `ZVCS_SESSION` still overrides the key. `git zppid`
+lists the table (pid, live/dead via `kill(pid,0)`, commits, last-seen, cmd, cwd),
+and the dashboard adds a PROCESSES tile plus a header line with the process count
+and the busiest pid.
+
+The same durable-process resolution feeds a per-process *command* tally
+(`git zprocs`): the dispatcher records one row per (process, verb) in the
+`proc_verbs` table for every **mutating** verb — `commit`, `push`, `add`, `merge`,
+`rebase`, `reset`, `checkout`, `cherry-pick`, `revert`, `tag`, `stash`, `fetch`,
+`pull`. Only mutating verbs are tracked, deliberately: reads (`rev-parse`,
+`status`, `log`) fire on every prompt and would put the process-walk on the hot
+path, so they are excluded and the walk stays as cheap as the commit tally. The
+resolution runs once per mutating command and is shared between the commit tally
+and the verb tally (`commit` counts in both, on a real HEAD advance). `zprocs`
+joins `proc_verbs` with `ppids` to show each process's pid/cmd/cwd and its verb
+breakdown (`commit:12 push:8 add:5 …`), busiest first.
 
 ## 16. Command logging + AOP interception
 

@@ -208,6 +208,60 @@ impl RepoLock {
     }
 }
 
+/// How long to wait for a FOREIGN `index.lock` to clear before giving up, in
+/// milliseconds. Overridable with `ZVCS_INDEX_LOCK_WAIT_MS` (`0` disables the
+/// wait entirely). Two seconds covers an IDE's or stock git's index write
+/// without making a genuinely stuck lock feel like a hang.
+const FOREIGN_LOCK_WAIT_MS: u64 = 2_000;
+
+/// Wait for `<git_dir>/index.lock` to disappear, returning `true` once the path
+/// is clear and `false` if it is still there when the budget runs out.
+///
+/// The daemon's FIFO only serializes zvcs writers. Anything else touching the
+/// repo — stock git, an IDE, a hook shelling out — takes git's `O_EXCL`
+/// lockfile, which the lane cannot see, and the ported gitoxide index writer
+/// acquires that file with `Fail::Immediately` (one attempt, no wait). Polling
+/// the path here turns the common case (a foreign writer holding it for
+/// milliseconds) into a short wait instead of a hard failure; when the wait is
+/// exhausted the caller queues the command as a job rather than erroring.
+///
+/// Polling, not inotify/kqueue: the wait is short, the file is on local disk,
+/// and a portable poll keeps this identical on macOS and Linux.
+pub fn wait_for_foreign_index_lock(git_dir: &Path) -> bool {
+    let budget = std::env::var("ZVCS_INDEX_LOCK_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(FOREIGN_LOCK_WAIT_MS);
+    let lock = git_dir.join("index.lock");
+    if budget == 0 || !lock.exists() {
+        return !lock.exists();
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget);
+    // Back off 5ms → 100ms: a lock held for one index write clears on an early
+    // cheap poll, while a long hold stops costing wakeups.
+    let mut nap = std::time::Duration::from_millis(5);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(nap);
+        if !lock.exists() {
+            return true;
+        }
+        nap = (nap * 2).min(std::time::Duration::from_millis(100));
+    }
+    !lock.exists()
+}
+
+/// Whether `err`'s chain contains a gitoxide lockfile-acquisition failure — the
+/// `.git/index.lock` (or ref/config lock) a foreign writer is holding.
+///
+/// Matched by TYPE, not message: `gix_index::file::write::Error::AcquireLock`
+/// wraps `gix::lock::acquire::Error` via `#[from]`, so the concrete error is
+/// reachable through `anyhow`'s source chain and stays matched if the wording
+/// changes.
+pub fn is_lock_contention(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<gix::lock::acquire::Error>())
+}
+
 impl Drop for RepoLock {
     fn drop(&mut self) {
         if let Some(stream) = self.stream.as_mut() {

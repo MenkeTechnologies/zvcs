@@ -69,7 +69,7 @@ closes one of them.
 
 | Stock-git failure mode | zvcs answer |
 |------------------------|-------------|
-| **`index.lock` contention.** Git guards index writes with an `O_EXCL` lockfile; a contended writer does not wait, it *fails* (`Unable to create '.git/index.lock'`). Under N agents that is a thundering herd of retries with no fairness. | **`zdaemon`** — one machine-wide daemon with a **per-repo FIFO lane** replaces the flock. A contended writer blocks in arrival order and is answered `GRANTED` only at the head of its repo's lane; first-come-first-served, no starvation, unrelated repos fully parallel. |
+| **`index.lock` contention.** Git guards index writes with an `O_EXCL` lockfile; a contended writer does not wait, it *fails* (`Unable to create '.git/index.lock'`). Under N agents that is a thundering herd of retries with no fairness. | **`zdaemon`** — one machine-wide daemon with a **per-repo FIFO lane** replaces the flock. A contended writer blocks in arrival order and is answered `GRANTED` only at the head of its repo's lane; first-come-first-served, no starvation, unrelated repos fully parallel. A *foreign* holder of git's own lockfile (stock git, an IDE, a hook) is invisible to that lane, so it is waited out (bounded) and then the command is queued as a job — never surfaced as a lock error. |
 | **Detached HEAD by default.** `git submodule update` leaves every submodule on a detached HEAD, so committed work is orphaned unless the caller re-attaches by hand. | **`zsync`** + the daemon's **attach-scan** reconcile each submodule to its tracked mainline (`origin/main`, else `origin/master`) and keep `HEAD` *attached* — even a dirty detached HEAD is rescued in place (no-clobber ref op). Fast-forward only. |
 | **Constant `modified: <sub> (new commits)` markers + stale pointers.** Every submodule commit dirties the parent's gitlink; a blanket `git add` can also move it *backwards*. | **`zbump`** + **autobump** — forward-only gitlink bumps, **committed** (clears the marker), coalesced, done by the daemon on a file-watch so agents never touch the root. Never regresses a pointer. |
 | **Agents colliding on one shared tree.** N agents editing one meta tree collide on files, index, and HEAD. | **`zworktree`** — one command gives each agent a private, object-sharing worktree of the whole submodule tree; complete isolation, no re-clone. |
@@ -129,7 +129,7 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Scheduler | `zsched add <duration> -- <cmd>` `zsched list/rm/clear/run` | daemon-hosted **cron for the tree** — fire any command on an interval (`add 5m -- git zpull --dirty`); the CLI owns the schedule file, the daemon reads it each tick and fires due jobs (add/rm take effect within a tick, no reload) |
 | Coordination | `zwait [<path>]` `zqueue` `zbarrier` | the join side of the async queue — wait for one repo's jobs to drain, list what's queued/running, or block until the whole queue is idle |
 | Profiling | `zstale [<days>]` `zlast` `zbig [<n>]` `zfiles` `zdivergent` `zorphans` | native, fanned in parallel — abandoned repos, most-recently-committed, largest tracked files, file counts, repos diverged from upstream, repos with no remote |
-| Multi-agent view | `zsessions` `zidle` `zdashboard` `zppid` | sessions ranked by repos held; repos free to pick up; an **instant** one-screen health summary aggregated from the status cache + ledger (dirty/ahead/behind/diverged/detached/no-upstream + claims/sessions/queue/procs) — no live walk, so it scales to thousands of repos like `zstatus --all`; and a **per-process commit tally** (`zppid`) — every invoking process (ppid) that ran git, its live/dead state, and how many commits it has landed, credited only when a commit-producing verb advanced HEAD |
+| Multi-agent view | `zsessions` `zidle` `zdashboard` `zppid` `zprocs` | sessions ranked by repos held; repos free to pick up; an **instant** one-screen health summary aggregated from the status cache + ledger (dirty/ahead/behind/diverged/detached/no-upstream + claims/sessions/queue/procs) — no live walk, so it scales to thousands of repos like `zstatus --all`; a **per-process commit tally** (`zppid`) — the **durable process responsible for each commit** (found by walking up past the throwaway per-command shells to the real agent/program/login-shell), with its pid, command, cwd, live/dead state, and commits landed; and a **per-process command breakdown** (`zprocs`) — how many of each mutating verb (commit/push/add/merge/rebase/…) every process has run |
 | Hooks | `zhook set/unset/show/list/test` | manage & test the current repo's ref-change hook (`zvcs.hook`); `zvcs.autohook` fires each repo's own local hook |
 | Triggers | `ztrigger DIR <cmd> [--throttle <dur>]` `ztrigger list/rm/test/tail/top` | watch **any directory** (git repo or not) and run a command on **any file change** under it — command runs with the dir as cwd and `$ZVCS_DIR` set; a leading-edge throttle (default 500ms) collapses the event burst of one file action into a single fire; `tail` streams fires live, `top` is an in-place fire-rate HUD |
 | Watch | `zwatch DIR` `zwatch list/rm` | watch any directory and log each change to the daemon log (a trigger with a built-in logging command) |
@@ -321,6 +321,13 @@ the same repo serialize, first-come-first-served. Clients reach it through
 automatic on drop and on socket EOF, so a crashed holder can't wedge a repo. With
 no daemon the lock degrades to a no-op guard (the op still runs). Index writes
 also go through `index.lock` via `gix-lock` for interop with stock git.
+
+A **foreign** holder of that lockfile — stock git, an IDE, a hook shelling out —
+is invisible to the lane, and the index writer takes the file with one attempt
+and no wait. So an index-writing command first waits out a foreign `index.lock`
+(2 s, `ZVCS_INDEX_LOCK_WAIT_MS` overrides, `0` disables); if it is still held,
+the command is submitted to the queue as a job rather than failing, and runs on
+the repo's fair lane once the lock clears.
 
 Wire protocol — line-based over the unix socket:
 

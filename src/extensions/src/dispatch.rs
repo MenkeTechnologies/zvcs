@@ -25,7 +25,7 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "zfetch", "zgc", "zfsck", "zprune", "zreset", "zabort", "zcheckout", "ztagall", "zcommitall", "zpushall", "zclean",
     "zwait", "zqueue", "zbarrier",
     "zstale", "zlast", "zbig", "zfiles", "zcommits", "zpristine", "zdivergent", "zorphans", "zsessions", "zidle", "zdashboard", "ztop",
-    "zppid",
+    "zppid", "zprocs",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -341,6 +341,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zidle" => "usage: git zidle [selectors] — indexed repos with no active claim (free to pick up)",
         "zdashboard" => "usage: git zdashboard — instant one-screen health summary from the status cache + ledger",
         "zppid" => "usage: git zppid [--json] — per-process commit tally: each invoking process (ppid) and how many commits it has landed",
+        "zprocs" => "usage: git zprocs [--json] — per-process command breakdown: how many of each mutating verb (commit/push/add/merge/…) each process has run",
         "ztop" => "usage: git ztop [selectors] [--interval <secs>] [--once] [--mono] — live htop-style fleet monitor, most churn on top",
         _ => return None,
     })
@@ -437,7 +438,9 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // `-h`/`--help` never writes the index, so a contended repo must not turn a
     // help request into a queued job with empty output.
     let is_help = args.iter().any(|a| a == "-h" || a == "--help");
-    let _queue_guard = if LOCK_VERBS.contains(&sub) && !is_help && std::env::var_os("ZVCS_QUEUED").is_none() {
+    let is_lock_verb = LOCK_VERBS.contains(&sub) && !is_help;
+    let queued_rerun = std::env::var_os("ZVCS_QUEUED").is_some();
+    let _queue_guard = if is_lock_verb && !queued_rerun {
         match gix::discover(".") {
             Ok(repo) => match crate::lock::RepoLock::try_acquire(repo.git_dir()) {
                 crate::lock::TryLock::Held(g) => Some(g),
@@ -450,11 +453,24 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         None
     };
 
+    // The lane above only serializes zvcs writers. A FOREIGN writer (stock git,
+    // an IDE, a hook) holds git's `O_EXCL` `.git/index.lock`, which the daemon
+    // cannot see and the ported index writer refuses to wait on. Give that lock a
+    // short budget to clear before running, so the usual millisecond overlap
+    // becomes a wait rather than the error it used to be. A queued job's re-run
+    // waits too — by then it owns the lane, and only a foreign holder is left.
+    if is_lock_verb {
+        if let Ok(repo) = gix::discover(".") {
+            crate::lock::wait_for_foreign_index_lock(repo.git_dir());
+        }
+    }
+
     // Per-process commit tally: for a commit-producing verb, capture HEAD now so we
     // can credit the running process (by ppid) after the command if HEAD advanced.
     // `.then` skips the gix probe entirely for every non-commit verb, so the hot
     // path pays nothing.
     let commit_head_before = superset::zppid::is_commit_verb(sub).then(superset::zppid::head_commit);
+    let track_mutating = superset::zppid::is_mutating_verb(sub);
 
     let result = match sub {
         // ---- superset (novel) ----
@@ -569,6 +585,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zidle" => superset::zidle(args),
         "zdashboard" => superset::zdashboard(args),
         "zppid" => superset::zppid(args),
+        "zprocs" => superset::zprocs(args),
         "ztop" => superset::ztop(args),
 
         // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----
@@ -763,9 +780,27 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         _ => anyhow::bail!("is not a git command. See 'git --help'."),
     };
 
-    // If a commit-producing verb advanced HEAD, credit the running process's tally.
-    if let Some(before) = commit_head_before {
-        superset::zppid::note_commit(before);
+    // Per-process activity: for a mutating verb, credit the running process (commit
+    // tally on a real HEAD advance, per-verb count otherwise). `commit_head_before`
+    // is Some only for commit verbs, so it drives the effective-commit path.
+    if track_mutating {
+        superset::zppid::note_mutating(sub, commit_head_before.flatten());
     }
-    result
+
+    // Lock contention → queue, the second half of the rule the pre-flight gate
+    // above starts. If the command still failed on a lockfile it could not take
+    // (a foreign holder that outlasted the wait), submit it as a job instead of
+    // reporting gitoxide's "could not be obtained immediately" — the daemon runs
+    // it on the repo's fair FIFO once the lane is free.
+    //
+    // `ZVCS_QUEUED` marks a job's own re-run: it must NOT re-queue itself, or a
+    // permanently stuck lock would spawn jobs forever. There the error stands and
+    // the ledger records the failure.
+    match result {
+        Err(err) if is_lock_verb && !queued_rerun && crate::lock::is_lock_contention(&err) => {
+            eprintln!("zvcs: {sub}: index is locked by another writer — queueing");
+            superset::queue::queue_verb(sub, args)
+        }
+        other => other,
+    }
 }

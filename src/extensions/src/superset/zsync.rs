@@ -389,7 +389,7 @@ fn find_dups(source_git_dir: &Path, url: &str) -> Vec<(std::path::PathBuf, std::
 /// behind ffs; dirty, diverged, or already-current dups are skipped. Returns one
 /// `(workdir, status)` per dup. This is what fans a commit in one clone out to
 /// all its clones on the machine.
-pub fn sync_dups(source: &gix::Repository) -> Vec<(String, String)> {
+pub fn sync_dups(source: &gix::Repository, force: bool) -> Vec<(String, String)> {
     let Ok(src_head) = source.head_id() else {
         return Vec::new();
     };
@@ -403,7 +403,7 @@ pub fn sync_dups(source: &gix::Repository) -> Vec<(String, String)> {
         return Vec::new();
     }
     let statuses = crate::superset::query::parallel_map(&dups, |gd, _wd| {
-        ff_dup(gd, &src_git, src_head).unwrap_or_else(|e| format!("error: {e:#}"))
+        ff_dup(gd, &src_git, src_head, force).unwrap_or_else(|e| format!("error: {e:#}"))
     });
     dups.iter()
         .map(|(_, wd)| wd.display().to_string())
@@ -411,13 +411,15 @@ pub fn sync_dups(source: &gix::Repository) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Fast-forward one dup at `dup_git_dir` to `src_head`, copying the commit's
-/// objects from the source checkout first. Offline; serialized through the repo
-/// lock so it can't race a concurrent writer.
-fn ff_dup(dup_git_dir: &Path, src_git: &Path, src_head: ObjectId) -> Result<String> {
+/// Bring one dup at `dup_git_dir` to `src_head`, copying the commit's objects
+/// from the source checkout first (offline). Without `force`: fast-forward only
+/// (dirty/diverged skipped). With `force`: hard-reset the dup to `src_head` even
+/// if it is diverged or dirty — discarding its own commits and local changes.
+/// Serialized through the repo lock so it can't race a concurrent writer.
+fn ff_dup(dup_git_dir: &Path, src_git: &Path, src_head: ObjectId, force: bool) -> Result<String> {
     let dup = gix::open(dup_git_dir)?;
     let _lock = crate::lock::RepoLock::acquire(dup.git_dir());
-    if dup.is_dirty()? {
+    if !force && dup.is_dirty()? {
         return Ok("dirty, skipped".to_string());
     }
     let mainline = if dup.try_find_reference("refs/remotes/origin/main")?.is_some() {
@@ -427,11 +429,72 @@ fn ff_dup(dup_git_dir: &Path, src_git: &Path, src_head: ObjectId) -> Result<Stri
     } else {
         "main"
     };
-    // Copy the source commit's objects into this dup (offline), then ff to it.
+    // Copy the source commit's objects into this dup (offline), then move to it.
     let src = gix::open(src_git)?;
     copy_commit_graph(&src, &dup, src_head)?;
     let should_interrupt = AtomicBool::new(false);
-    fast_forward_to(&dup, mainline, src_head, &should_interrupt)
+    if force {
+        hard_reset_to(&dup, mainline, src_head, &should_interrupt)
+    } else {
+        fast_forward_to(&dup, mainline, src_head, &should_interrupt)
+    }
+}
+
+/// Hard-reset a repo's `<mainline>` branch and HEAD to `target_id`, checking out
+/// its tree over the worktree — the `--force` path. Unlike [`fast_forward_to`]
+/// there is no ff-safety or clean gate: a diverged or dirty dup is forced to the
+/// target, discarding its own commits and any tracked changes. The target's
+/// objects must already be present locally.
+fn hard_reset_to(
+    repo: &gix::Repository,
+    mainline: &str,
+    target_id: ObjectId,
+    should_interrupt: &AtomicBool,
+) -> Result<String> {
+    let local_id = repo.head().ok().and_then(|mut h| h.try_peel_to_id().ok().flatten()).map(|i| i.detach());
+    if local_id == Some(target_id) {
+        return Ok(format!("already at {}", target_id.to_hex_with_len(12)));
+    }
+    // Move the (clean-or-dirty) worktree + index to the target tree. `old` is the
+    // current HEAD index; update_clean_worktree overwrites tracked files that
+    // differ, which is the reset for a diverged checkout.
+    let old = repo.index_or_load_from_head()?.into_owned();
+    update_clean_worktree(repo, &old, target_id, should_interrupt)?;
+
+    let branch: FullName = format!("refs/heads/{mainline}")
+        .try_into()
+        .map_err(|e| anyhow!("invalid branch name refs/heads/{mainline}: {e}"))?;
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: format!("zsync --force: reset {mainline} to {}", target_id.to_hex_with_len(12)).into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(target_id),
+        },
+        name: branch.clone(),
+        deref: false,
+    })?;
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: format!("zsync --force: attach HEAD to {mainline}").into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Symbolic(branch),
+        },
+        name: "HEAD".try_into().map_err(|e| anyhow!("invalid ref name HEAD: {e}"))?,
+        deref: false,
+    })?;
+    Ok(format!(
+        "forced {mainline} to {}{}",
+        target_id.to_hex_with_len(12),
+        local_id.map(|l| format!(" (was {})", l.to_hex_with_len(12))).unwrap_or_default()
+    ))
 }
 
 /// Move a clean worktree and its index from the state captured in `old` to the
@@ -575,10 +638,13 @@ pub fn zsync(args: &[String]) -> Result<ExitCode> {
     let parent = gix::discover(".")?;
 
     // Fan this repo's HEAD out to all its LOCAL dups — other checkouts of the same
-    // repo (same `origin` URL) indexed on the machine — fast-forwarding each clean
-    // one in parallel, entirely offline (objects copied checkout-to-checkout, no
-    // network). This is "commit in one clone → all its clones fast-forward".
-    let dups = sync_dups(&parent);
+    // repo (same `origin` URL) indexed on the machine — in parallel, entirely
+    // offline (objects copied checkout-to-checkout, no network). This is "commit
+    // in one clone → all its clones update". `--force`/`-f` hard-resets every dup
+    // to this HEAD (diverged and dirty included); otherwise it is fast-forward
+    // only, skipping dirty/diverged dups.
+    let force = args.iter().any(|a| a == "--force" || a == "-f");
+    let dups = sync_dups(&parent, force);
     for (wd, status) in &dups {
         println!("dup {wd}: {status}");
     }

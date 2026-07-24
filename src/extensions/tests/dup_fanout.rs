@@ -73,3 +73,65 @@ fn zsync_fans_a_commit_out_to_all_local_dups() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn zsync_force_resets_diverged_and_dirty_dups() {
+    let root = std::env::temp_dir().join(format!("zvcs-dupf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    git(&src, &["init", "-q", "-b", "main"]);
+    std::fs::write(src.join("x.txt"), "r1\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-q", "-m", "r1"]);
+    git(&root, &["clone", "-q", "--bare", src.to_str().unwrap(), "origin.git"]);
+    let origin = root.join("origin.git");
+    for name in ["a", "b", "c"] {
+        git(&root, &["clone", "-q", origin.to_str().unwrap(), name]);
+    }
+    let (a, b, c) = (root.join("a"), root.join("b"), root.join("c"));
+
+    // a: the source, r2.
+    std::fs::write(a.join("x.txt"), "r2\n").unwrap();
+    git(&a, &["add", "."]);
+    git(&a, &["commit", "-q", "-m", "r2"]);
+    let r2 = head(&a);
+    // b: DIVERGED — its own commit off origin.
+    std::fs::write(b.join("y.txt"), "diverged\n").unwrap();
+    git(&b, &["add", "."]);
+    git(&b, &["commit", "-q", "-m", "diverged"]);
+    // c: DIRTY — uncommitted change.
+    std::fs::write(c.join("x.txt"), "uncommitted\n").unwrap();
+
+    let ok = Command::new(BIN)
+        .args(["zreindex", "--sync", a.to_str().unwrap(), b.to_str().unwrap(), c.to_str().unwrap()])
+        .env("ZVCS_HOME", &home)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+
+    // Non-force leaves the diverged and dirty dups untouched.
+    let _ = Command::new(BIN).args(["zsync"]).current_dir(&a).env("ZVCS_HOME", &home).output().unwrap();
+    assert_ne!(head(&b), r2, "non-force must not move a diverged dup");
+    assert_ne!(head(&c), r2, "non-force must not move a dirty dup");
+
+    // --force resets both to the source HEAD.
+    let out = Command::new(BIN)
+        .args(["zsync", "--force"])
+        .current_dir(&a)
+        .env("ZVCS_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "zsync --force failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    assert_eq!(head(&b), r2, "--force did not reset the diverged dup");
+    assert_eq!(head(&c), r2, "--force did not reset the dirty dup");
+    assert_eq!(std::fs::read_to_string(c.join("x.txt")).unwrap(), "r2\n", "--force did not discard dirty change");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

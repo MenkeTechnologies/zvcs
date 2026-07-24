@@ -225,7 +225,7 @@ pub fn is_verb(sub: &str) -> bool {
 /// that is not a z-verb, so the dispatcher leaves other commands' `-h` alone.
 fn z_usage(sub: &str) -> Option<&'static str> {
     Some(match sub {
-        "zsync" => "usage: git zsync — fetch and fast-forward every submodule to origin/main",
+        "zsync" => "usage: git zsync [--force] — reconcile submodules to origin/main AND fan this checkout's HEAD out to all its local dups (offline); --force hard-resets every dup (diverged/dirty included)",
         "zbump" => "usage: git zbump [<submodule-path>...] — forward-only submodule gitlink bumps",
         "zdaemon" => "usage: git zdaemon <start|stop|restart|status|info|ping|log>",
         "zrepos" => "usage: git zrepos [<pattern>...] — list indexed repos; patterns filter by case-insensitive substring",

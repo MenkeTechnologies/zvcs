@@ -91,6 +91,67 @@ fn parallel_mutations_and_coordination() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn zreset_hard_and_zabort_cleanup() {
+    let root = std::env::temp_dir().join(format!("zvcs-reset-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let home = root.join("home");
+    let sock = root.join("sock");
+
+    // alpha: committed, then a dirty (staged) change zreset --hard will discard.
+    let alpha = work.join("alpha");
+    let beta = work.join("beta");
+    for r in [&alpha, &beta] {
+        std::fs::create_dir_all(r).unwrap();
+        git(r, &["init", "-q", "-b", "main"]);
+        std::fs::write(r.join("f"), "hi\n").unwrap();
+        git(r, &["add", "-A"]);
+        git(r, &["commit", "-qm", "c1"]);
+    }
+    std::fs::write(alpha.join("f"), "hi\nstaged\n").unwrap();
+    git(&alpha, &["add", "-A"]);
+
+    // conf: a conflicting merge left in progress for zabort to clean up.
+    let conf = work.join("conf");
+    std::fs::create_dir_all(&conf).unwrap();
+    git(&conf, &["init", "-q", "-b", "main"]);
+    std::fs::write(conf.join("m"), "base\n").unwrap();
+    git(&conf, &["add", "-A"]);
+    git(&conf, &["commit", "-qm", "base"]);
+    git(&conf, &["checkout", "-q", "-b", "other"]);
+    std::fs::write(conf.join("m"), "other\n").unwrap();
+    git(&conf, &["add", "-A"]);
+    git(&conf, &["commit", "-qm", "other"]);
+    git(&conf, &["checkout", "-q", "main"]);
+    std::fs::write(conf.join("m"), "mainside\n").unwrap();
+    git(&conf, &["add", "-A"]);
+    git(&conf, &["commit", "-qm", "mainc"]);
+    let _ = Command::new("git").args(["merge", "-q", "other"]).current_dir(&conf).status();
+    assert!(conf.join(".git/MERGE_HEAD").exists(), "conf should be mid-merge");
+
+    assert!(zvcs(&home, &sock, &["zreindex", "--sync", work.to_str().unwrap()]).0.contains("indexed 3"));
+
+    // zreset --hard scoped to alpha discards its staged change; conf is untouched.
+    let (reset, rok) = zvcs(&home, &sock, &["zreset", "--repo", "alpha", "--hard"]);
+    assert!(rok && reset.contains("1 ok"), "zreset ran on alpha: {reset}");
+    assert!(status_clean(&alpha), "zreset --hard left alpha clean");
+
+    // zabort aborts conf's merge (1 ok) and skips the two repos not mid-op.
+    let (abort, aok) = zvcs(&home, &sock, &["zabort"]);
+    assert!(aok, "zabort succeeds: {abort}");
+    assert!(abort.contains("1 ok") && abort.contains("2 skipped"), "one aborted, two skipped: {abort}");
+    assert!(!conf.join(".git/MERGE_HEAD").exists(), "zabort cleared conf's merge state");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn status_clean(repo: &Path) -> bool {
+    let out = Command::new("git").args(["status", "--porcelain"]).current_dir(repo).output().unwrap();
+    out.stdout.is_empty()
+}
+
 fn head_branch(repo: &Path) -> String {
     let out = Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(repo).output().unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()

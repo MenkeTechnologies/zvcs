@@ -334,6 +334,67 @@ fn tracked_count(repo: &gix::Repository) -> usize {
     repo.open_index().map(|i| i.entries().len()).unwrap_or(0)
 }
 
+/// `git zpristine [selectors]` — indexed repos that need nothing: no uncommitted
+/// changes, on a branch (not detached), and in sync with upstream (or having none
+/// configured). The green set — the complement of `zdirty`/`zahead`/`zbehind`.
+pub fn zpristine(args: &[String]) -> Result<ExitCode> {
+    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let ok = parallel_map(&repos, |gd, _| probe(gd, is_pristine, |_| false));
+    let mut shown = 0usize;
+    for ((_, wd), p) in repos.iter().zip(&ok) {
+        if *p {
+            println!("{}", wd.display());
+            shown += 1;
+        }
+    }
+    eprintln!("zpristine: {shown} of {} indexed are clean and in sync", repos.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Clean worktree, attached HEAD, and either no upstream or exactly in sync.
+fn is_pristine(repo: &gix::Repository) -> bool {
+    if repo.is_dirty().unwrap_or(true) {
+        return false;
+    }
+    // Detached (or unborn) HEAD is never "pristine" — the meta repo cares.
+    if repo.head_name().ok().flatten().is_none() {
+        return false;
+    }
+    match crate::superset::analytics::ahead_behind(repo) {
+        Some((ahead, behind)) => ahead == 0 && behind == 0,
+        None => true, // no upstream configured — nothing to be out of sync with
+    }
+}
+
+/// `git zcommits [selectors]` — HEAD-history commit count of each indexed repo,
+/// deepest history first.
+pub fn zcommits(args: &[String]) -> Result<ExitCode> {
+    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let counts = parallel_map(&repos, |gd, _| probe(gd, commit_count, |_| 0usize));
+    let mut rows: Vec<(usize, String)> = repos
+        .iter()
+        .zip(&counts)
+        .map(|((_, wd), c)| (*c, wd.display().to_string()))
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let width = rows.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
+    for (c, p) in &rows {
+        println!("{p:<width$}  {c} commit(s)");
+    }
+    let total: usize = counts.iter().sum();
+    eprintln!("zcommits: {total} commits across {} repos", repos.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Commits reachable from HEAD (the repo's history depth), or 0 when unborn.
+fn commit_count(repo: &gix::Repository) -> usize {
+    let Ok(head) = repo.head_id() else { return 0 };
+    repo.rev_walk(Some(head.detach()))
+        .all()
+        .map(|w| w.take_while(Result::is_ok).count())
+        .unwrap_or(0)
+}
+
 /// `git zbig [selectors] [<n>]` — the largest tracked files across every indexed
 /// repo, top `<n>` (default 20).
 pub fn zbig(args: &[String]) -> Result<ExitCode> {

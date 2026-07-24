@@ -443,6 +443,18 @@ pub const DOCS: &[Doc] = &[
         desc: &["Lists the indexed repositories whose upstream has commits they lack, with the count, computed in parallel. Repos with no upstream are omitted."],
     },
     Doc {
+        verb: "zunpushed",
+        summary: "per-repo unpushed commits (the detailed zahead)",
+        synopsis: "git zunpushed [selectors]",
+        desc: &["Lists, per indexed repository, the actual commits HEAD has that its upstream lacks \\(em short id and summary line, grouped under the repo path \\(em computed in parallel. Where `zahead` gives only a count, this shows what is unpushed. The list is capped per repo so a long divergence cannot flood the output; repos with no upstream or nothing unpushed are omitted."],
+    },
+    Doc {
+        verb: "zunpulled",
+        summary: "per-repo commits the upstream has that local lacks",
+        synopsis: "git zunpulled [selectors]",
+        desc: &["Lists, per indexed repository, the commits on the configured upstream that the local branch lacks \\(em short id and summary, grouped per repo. The detailed form of `zbehind`. A `git zfetch` first makes the upstream refs current. Repos with no upstream or nothing unpulled are omitted."],
+    },
+    Doc {
         verb: "zauthors",
         summary: "commit counts by author across indexed repos",
         synopsis: "git zauthors [selectors]",
@@ -483,6 +495,18 @@ pub const DOCS: &[Doc] = &[
         summary: "parallel git prune across indexed repos",
         synopsis: "git zprune [selectors]",
         desc: &["Runs `git prune` in every selected indexed repository concurrently, removing unreachable objects tree-wide."],
+    },
+    Doc {
+        verb: "zreset",
+        summary: "parallel git reset across indexed repos",
+        synopsis: "git zreset [selectors] [--soft|--mixed|--hard] [<ref>]",
+        desc: &["Runs `git reset` in every selected indexed repository concurrently. The mode flag and optional `<ref>` pass straight through to git, so the default (as git's) is `--mixed HEAD`, which unstages. `--hard` discards worktree changes across the whole selection \\(em narrow it with selectors (e.g. `--dirty`) first."],
+    },
+    Doc {
+        verb: "zabort",
+        summary: "abort an in-progress operation across mid-op repos",
+        synopsis: "git zabort [selectors]",
+        desc: &["Aborts an in-progress merge, rebase, cherry-pick, or revert in every selected indexed repository that is mid-operation \\(em running the matching `--abort` \\(em and skips repos with nothing in progress. Cleans up after a fan-out (or a many-agent session) that left repos stuck in a half-finished operation."],
     },
     Doc {
         verb: "zcheckout",
@@ -555,6 +579,18 @@ pub const DOCS: &[Doc] = &[
         summary: "tracked file count per indexed repo",
         synopsis: "git zfiles [selectors]",
         desc: &["Prints the number of tracked files in each indexed repository, largest first, scanned in parallel."],
+    },
+    Doc {
+        verb: "zcommits",
+        summary: "HEAD-history commit count per indexed repo",
+        synopsis: "git zcommits [selectors]",
+        desc: &["Counts the commits reachable from HEAD in each indexed repository \\(em its history depth \\(em and prints them deepest first, walked in parallel."],
+    },
+    Doc {
+        verb: "zpristine",
+        summary: "indexed repos that are clean and in sync",
+        synopsis: "git zpristine [selectors]",
+        desc: &["Lists the indexed repositories that need nothing: no uncommitted changes, on a branch (not detached), and in sync with their upstream (or having none configured). The complement of `zdirty`/`zahead`/`zbehind`/`zconflicts` \\(em the green set \\(em computed in parallel."],
     },
     Doc {
         verb: "zdivergent",

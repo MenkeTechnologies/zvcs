@@ -112,3 +112,58 @@ fn analytics_verbs_aggregate_across_repos() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn unpushed_unpulled_report_commit_details() {
+    let root = std::env::temp_dir().join(format!("zvcs-unsync-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let home = root.join("home");
+    let sock = root.join("sock");
+
+    // A bare origin, seeded from `seed`, then cloned to work/local. Advancing the
+    // upstream (via seed) and committing locally makes local both ahead and behind.
+    let origin = root.join("origin.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "--bare", "-q", "-b", "main"]);
+    let origin_url = origin.to_str().unwrap();
+
+    let seed = root.join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    git(&seed, &["init", "-q", "-b", "main"]);
+    std::fs::write(seed.join("f"), "base\n").unwrap();
+    git(&seed, &["add", "-A"]);
+    commit_as(&seed, "t", "t@e.x", "base");
+    git(&seed, &["remote", "add", "origin", origin_url]);
+    git(&seed, &["push", "-q", "-u", "origin", "main"]);
+
+    let local = work.join("local");
+    git(&root, &["clone", "-q", origin_url, local.to_str().unwrap()]);
+
+    // Upstream advances by one commit the local branch will not have.
+    std::fs::write(seed.join("f"), "base\nupstream\n").unwrap();
+    git(&seed, &["add", "-A"]);
+    commit_as(&seed, "t", "t@e.x", "upstream-new");
+    git(&seed, &["push", "-q", "origin", "main"]);
+
+    // Local commits one of its own (ahead 1), then fetches (behind 1) without merging.
+    std::fs::write(local.join("g"), "local\n").unwrap();
+    git(&local, &["add", "-A"]);
+    commit_as(&local, "t", "t@e.x", "local-new");
+    git(&local, &["fetch", "-q"]);
+
+    assert!(zvcs(&home, &sock, &["zreindex", "--sync", work.to_str().unwrap()]).contains("indexed 1"));
+
+    // zunpushed lists the local-only commit; zunpulled lists the upstream-only one.
+    let unpushed = zvcs(&home, &sock, &["zunpushed"]);
+    assert!(unpushed.contains("local-new"), "zunpushed shows the local commit:\n{unpushed}");
+    assert!(!unpushed.contains("upstream-new"), "zunpushed omits the upstream commit:\n{unpushed}");
+    assert!(unpushed.contains("1 of 1"), "one repo has unpushed work:\n{unpushed}");
+
+    let unpulled = zvcs(&home, &sock, &["zunpulled"]);
+    assert!(unpulled.contains("upstream-new"), "zunpulled shows the upstream commit:\n{unpulled}");
+    assert!(!unpulled.contains("local-new"), "zunpulled omits the local commit:\n{unpulled}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -68,11 +68,17 @@ pub use zstash::{zstash, zstashes, zunstash};
 pub use zup::zup;
 pub use zworktree::zworktree;
 pub use ledger::{zjob, zjobs, zreindex, zrepos};
-pub use analytics::{zahead, zauthors, zbehind, zconflicts, zdashboard, zdivergent, zgrep, zhot, zorphans};
+pub use analytics::{
+    zahead, zauthors, zbehind, zconflicts, zdashboard, zdivergent, zgrep, zhot, zorphans,
+    zunpulled, zunpushed,
+};
 pub use coord::{zbarrier, zqueue, zwait};
-pub use pmutate::{zcheckout, zclean, zcommitall, zfetch, zfsck, zgc, zprune, zpushall, ztagall};
+pub use pmutate::{
+    zabort, zcheckout, zclean, zcommitall, zfetch, zfsck, zgc, zprune, zpushall, zreset, ztagall,
+};
 pub use query::{
-    zage, zbig, zbranches, zdirty, zfiles, zheads, zlast, zpull, zremotes, zsize, zstale, ztags,
+    zage, zbig, zbranches, zcommits, zdirty, zfiles, zheads, zlast, zpristine, zpull, zremotes,
+    zsize, zstale, ztags,
 };
 pub use queue::{zcommit, zpush, zsubmit};
 pub use repl::zrepl;

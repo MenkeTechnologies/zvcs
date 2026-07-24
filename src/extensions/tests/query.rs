@@ -87,5 +87,17 @@ fn parallel_query_verbs_report_repo_state() {
     let size = zvcs(&home, &sock, &["zsize"]);
     assert!(size.contains("total across 2 repos"), "zsize totals both:\n{size}");
 
+    // zpristine: beta is clean, attached, and has no upstream → pristine; alpha is
+    // dirty → excluded.
+    let pristine = zvcs(&home, &sock, &["zpristine"]);
+    assert!(pristine.lines().any(|l| l.ends_with("beta")), "beta is pristine:\n{pristine}");
+    assert!(!pristine.lines().any(|l| l.ends_with("alpha")), "dirty alpha is not pristine:\n{pristine}");
+    assert!(pristine.contains("1 of 2 indexed are clean"), "one pristine of two:\n{pristine}");
+
+    // zcommits: each repo has exactly one commit.
+    let commits = zvcs(&home, &sock, &["zcommits"]);
+    assert_eq!(commits.matches("1 commit(s)").count(), 2, "each has one commit:\n{commits}");
+    assert!(commits.contains("2 commits across 2 repos"), "total commit count:\n{commits}");
+
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -105,9 +105,10 @@ fn ahead_behind_verb(args: &[String], want_ahead: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `(ahead, behind)` commit counts of HEAD vs its configured upstream, or `None`
-/// when there is no upstream. Mirrors `porcelain::status`'s tracking logic.
-pub(crate) fn ahead_behind(repo: &gix::Repository) -> Option<(usize, usize)> {
+/// HEAD's local commit id and its configured upstream's id, or `None` when there
+/// is no upstream. Shared by the ahead/behind counters and the detailed
+/// `zunpushed`/`zunpulled` walks. Mirrors `porcelain::status`'s tracking logic.
+pub(crate) fn upstream_pair(repo: &gix::Repository) -> Option<(gix::ObjectId, gix::ObjectId)> {
     let branch_ref = repo.head_ref().ok().flatten()?;
     let Some(Ok(upstream_name)) = branch_ref.remote_tracking_ref_name(gix::remote::Direction::Fetch)
     else {
@@ -117,7 +118,69 @@ pub(crate) fn ahead_behind(repo: &gix::Repository) -> Option<(usize, usize)> {
     let upstream_ref = repo.try_find_reference(upstream_full.as_str()).ok()??;
     let upstream_id = upstream_ref.into_fully_peeled_id().ok()?.detach();
     let local_id = repo.head_id().ok()?.detach();
+    Some((local_id, upstream_id))
+}
+
+/// `(ahead, behind)` commit counts of HEAD vs its configured upstream, or `None`
+/// when there is no upstream.
+pub(crate) fn ahead_behind(repo: &gix::Repository) -> Option<(usize, usize)> {
+    let (local_id, upstream_id) = upstream_pair(repo)?;
     Some((count_commits(repo, local_id, upstream_id), count_commits(repo, upstream_id, local_id)))
+}
+
+/// `git zunpushed [selectors]` — the commits each indexed repo has that its
+/// upstream lacks (short id + summary), grouped per repo. The detailed form of
+/// `zahead`, which only counts.
+pub fn zunpushed(args: &[String]) -> Result<ExitCode> {
+    unsynced_verb(args, true)
+}
+
+/// `git zunpulled [selectors]` — the commits on each indexed repo's upstream that
+/// the local branch lacks (a `git fetch` first makes this current). The detailed
+/// form of `zbehind`.
+pub fn zunpulled(args: &[String]) -> Result<ExitCode> {
+    unsynced_verb(args, false)
+}
+
+fn unsynced_verb(args: &[String], unpushed: bool) -> Result<ExitCode> {
+    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let per = parallel_map(&repos, |gd, _| probe(gd, |r| unsynced_lines(r, unpushed), |_| Vec::new()));
+    let label = if unpushed { "zunpushed" } else { "zunpulled" };
+    let mut shown = 0usize;
+    for ((_, wd), lines) in repos.iter().zip(&per) {
+        if !lines.is_empty() {
+            println!("== {} ==", wd.display());
+            for l in lines {
+                println!("  {l}");
+            }
+            shown += 1;
+        }
+    }
+    eprintln!("{label}: {shown} of {} indexed", repos.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One repo's unsynced commits (`unpushed` → local\\upstream, else upstream\\local)
+/// as `shortid summary`, capped so a long divergence cannot dominate the output.
+fn unsynced_lines(repo: &gix::Repository, unpushed: bool) -> Vec<String> {
+    let Some((local, upstream)) = upstream_pair(repo) else { return Vec::new() };
+    let (tip, hidden) = if unpushed { (local, upstream) } else { (upstream, local) };
+    let Ok(walk) = repo.rev_walk(Some(tip)).with_hidden(Some(hidden)).all() else { return Vec::new() };
+    let mut out = Vec::new();
+    for info in walk.flatten() {
+        if out.len() >= 50 {
+            out.push("…".into());
+            break;
+        }
+        let id = info.id.to_hex_with_len(8);
+        let summary = repo
+            .find_commit(info.id)
+            .ok()
+            .and_then(|c| c.message().ok().map(|m| m.summary().to_string()))
+            .unwrap_or_default();
+        out.push(format!("{id} {summary}"));
+    }
+    out
 }
 
 /// Commits reachable from `tip` but not `hidden`.

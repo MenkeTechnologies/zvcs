@@ -62,9 +62,10 @@ pub const SELECTOR_FLAGS: &[&str] =
 /// (`selectors_are_real_verbs`, an integration test, guards these are real.)
 pub const SELECTOR_VERBS: &[&str] = &[
     "zforeach", "zheads", "zdirty", "zbranches", "ztags", "zremotes", "zsize",
-    "zage", "zpull", "zgrep", "zahead", "zbehind", "zauthors", "zhot",
-    "zconflicts", "zfetch", "zgc", "zfsck", "zprune", "zcheckout", "ztagall",
-    "zcommitall", "zpushall", "zclean", "zstale", "zlast", "zbig", "zfiles",
+    "zage", "zpull", "zgrep", "zahead", "zbehind", "zunpushed", "zunpulled",
+    "zauthors", "zhot", "zconflicts", "zfetch", "zgc", "zfsck", "zprune",
+    "zreset", "zabort", "zcheckout", "ztagall", "zcommitall", "zpushall",
+    "zclean", "zstale", "zlast", "zbig", "zfiles", "zcommits", "zpristine",
     "zdivergent", "zorphans", "zidle",
 ];
 

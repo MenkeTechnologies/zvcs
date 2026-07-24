@@ -173,6 +173,46 @@ pub fn zpushall(args: &[String]) -> Result<ExitCode> {
     }))
 }
 
+/// `git zreset [selectors] [--soft|--mixed|--hard] [<ref>]` — `git reset` in every
+/// indexed repo. The mode and optional ref pass straight through to git (default,
+/// as git's, is `--mixed HEAD` — unstage); `--hard` discards worktree changes
+/// across the whole selection.
+pub fn zreset(args: &[String]) -> Result<ExitCode> {
+    let (sel, rest) = Selector::parse(args);
+    let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
+    let extra: Vec<&str> = rest.iter().map(String::as_str).collect();
+    let extra = &extra;
+    Ok(fan_out(&repos, "zreset", |_gd, wd| git_in(wd, "reset", extra)))
+}
+
+/// `git zabort [selectors]` — abort an in-progress merge, rebase, cherry-pick, or
+/// revert in every indexed repo that is mid-operation; repos with nothing in
+/// progress are skipped. Cleans up after a fan-out that hit conflicts.
+pub fn zabort(args: &[String]) -> Result<ExitCode> {
+    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    Ok(fan_out(&repos, "zabort", |gd, wd| match in_progress_op(gd) {
+        Some(op) => git_in(wd, op, &["--abort"]),
+        None => Outcome::Skipped("nothing in progress".into()),
+    }))
+}
+
+/// The abortable operation a repo is in the middle of (matching the git subcommand
+/// that aborts it), or `None` when nothing is in progress.
+fn in_progress_op(git_dir: &Path) -> Option<&'static str> {
+    let has = |n: &str| git_dir.join(n).exists();
+    if has("MERGE_HEAD") {
+        Some("merge")
+    } else if has("rebase-merge") || has("rebase-apply") {
+        Some("rebase")
+    } else if has("CHERRY_PICK_HEAD") {
+        Some("cherry-pick")
+    } else if has("REVERT_HEAD") {
+        Some("revert")
+    } else {
+        None
+    }
+}
+
 /// `git zclean -f [selectors]` — remove untracked files and directories
 /// (`git clean -fd`) in every indexed repo. Destructive, so `-f` is required.
 pub fn zclean(args: &[String]) -> Result<ExitCode> {

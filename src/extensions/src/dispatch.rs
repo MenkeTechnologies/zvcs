@@ -18,10 +18,10 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "ztrigger", "zwatch", "zdashed", "zverbs", "zselectors", "zcd", "zpwd", "zls", "zenv", "zunset", "zecho",
     "zdoctor", "zmkdir", "ztouch", "zrm", "zcp", "zmv", "zcat", "zln",
     "zheads", "zdirty", "zbranches", "ztags", "zremotes", "zsize", "zage", "zpull",
-    "zgrep", "zahead", "zbehind", "zauthors", "zhot", "zconflicts",
-    "zfetch", "zgc", "zfsck", "zprune", "zcheckout", "ztagall", "zcommitall", "zpushall", "zclean",
+    "zgrep", "zahead", "zbehind", "zunpushed", "zunpulled", "zauthors", "zhot", "zconflicts",
+    "zfetch", "zgc", "zfsck", "zprune", "zreset", "zabort", "zcheckout", "ztagall", "zcommitall", "zpushall", "zclean",
     "zwait", "zqueue", "zbarrier",
-    "zstale", "zlast", "zbig", "zfiles", "zdivergent", "zorphans", "zsessions", "zidle", "zdashboard",
+    "zstale", "zlast", "zbig", "zfiles", "zcommits", "zpristine", "zdivergent", "zorphans", "zsessions", "zidle", "zdashboard",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -283,6 +283,8 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zgrep" => "usage: git zgrep [selectors] [-i] <pattern> — parallel regex search of tracked content across indexed repos",
         "zahead" => "usage: git zahead [selectors] — indexed repos with commits not yet on their upstream",
         "zbehind" => "usage: git zbehind [selectors] — indexed repos whose upstream is ahead of them",
+        "zunpushed" => "usage: git zunpushed [selectors] — per-repo unpushed commits (id + summary); the detailed zahead",
+        "zunpulled" => "usage: git zunpulled [selectors] — per-repo commits the upstream has that local lacks; the detailed zbehind",
         "zauthors" => "usage: git zauthors [selectors] — commit counts by author across indexed repos, ranked",
         "zhot" => "usage: git zhot [selectors] [<days>] — indexed repos ranked by commits in the last <days> (default 30)",
         "zconflicts" => "usage: git zconflicts [selectors] — indexed repos mid-merge/rebase/cherry-pick/revert/bisect or with conflicts",
@@ -290,6 +292,8 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zgc" => "usage: git zgc [selectors] — parallel git gc across every indexed repo",
         "zfsck" => "usage: git zfsck [selectors] — parallel git fsck across every indexed repo",
         "zprune" => "usage: git zprune [selectors] — parallel git prune across every indexed repo",
+        "zreset" => "usage: git zreset [selectors] [--soft|--mixed|--hard] [<ref>] — parallel git reset across indexed repos",
+        "zabort" => "usage: git zabort [selectors] — abort an in-progress merge/rebase/cherry-pick/revert in every mid-op repo",
         "zcheckout" => "usage: git zcheckout [selectors] <branch> — check out <branch> in every indexed repo that has it",
         "ztagall" => "usage: git ztagall [selectors] <tag> — create <tag> at HEAD in every indexed repo",
         "zcommitall" => "usage: git zcommitall [selectors] -m <msg> — commit tracked changes (commit -a) in every dirty repo",
@@ -302,6 +306,8 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zlast" => "usage: git zlast [selectors] — indexed repos ordered by HEAD commit time, newest first",
         "zbig" => "usage: git zbig [selectors] [<n>] — largest tracked files across indexed repos (top <n>, default 20)",
         "zfiles" => "usage: git zfiles [selectors] — tracked file count of each indexed repo (largest first)",
+        "zcommits" => "usage: git zcommits [selectors] — HEAD-history commit count of each indexed repo (deepest first)",
+        "zpristine" => "usage: git zpristine [selectors] — indexed repos that are clean, attached, and in sync (nothing to do)",
         "zdivergent" => "usage: git zdivergent [selectors] — indexed repos both ahead of and behind their upstream",
         "zorphans" => "usage: git zorphans [selectors] — indexed repos with no remote configured",
         "zsessions" => "usage: git zsessions — active sessions ranked by repos held",
@@ -333,6 +339,10 @@ const LOCK_VERBS: &[&str] = &[
     "mv", "rebase", "reset", "restore", "revert", "rm", "stage", "stash", "switch",
     "read-tree", "update-index", "write-tree", "tag", "branch", "notes", "replace",
     "replay", "rerere", "sparse-checkout", "submodule", "mktag", "mktree",
+    // Superset verbs that stage+commit the parent index. `zbump` (forward-only
+    // submodule gitlink bumps) is THE pointer-bump path — `git add` deliberately
+    // skips gitlinks — so it must queue under meta-root contention like `commit`.
+    "zbump",
 ];
 
 pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
@@ -426,6 +436,8 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zgrep" => superset::zgrep(args),
         "zahead" => superset::zahead(args),
         "zbehind" => superset::zbehind(args),
+        "zunpushed" => superset::zunpushed(args),
+        "zunpulled" => superset::zunpulled(args),
         "zauthors" => superset::zauthors(args),
         "zhot" => superset::zhot(args),
         "zconflicts" => superset::zconflicts(args),
@@ -433,6 +445,8 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zgc" => superset::zgc(args),
         "zfsck" => superset::zfsck(args),
         "zprune" => superset::zprune(args),
+        "zreset" => superset::zreset(args),
+        "zabort" => superset::zabort(args),
         "zcheckout" => superset::zcheckout(args),
         "ztagall" => superset::ztagall(args),
         "zcommitall" => superset::zcommitall(args),
@@ -445,6 +459,8 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zlast" => superset::zlast(args),
         "zbig" => superset::zbig(args),
         "zfiles" => superset::zfiles(args),
+        "zcommits" => superset::zcommits(args),
+        "zpristine" => superset::zpristine(args),
         "zdivergent" => superset::zdivergent(args),
         "zorphans" => superset::zorphans(args),
         "zsessions" => superset::zsessions(args),

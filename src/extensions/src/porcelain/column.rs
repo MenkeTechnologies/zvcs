@@ -778,6 +778,91 @@ fn utf8_len(b: u8) -> usize {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Reusable layout API for the embedding commands (`git tag`/`branch`/`status`).
+//
+// These wrap the same engine `git column` uses, so a `--column[=<opts>]` on tag,
+// branch or status lays its list out byte-identically to piping that list through
+// `git column`. Nothing here changes `git column`'s own output — it only exposes
+// the already-ported `git_column_config`, `parseopt_column_callback`,
+// `finalize_colopts`, `column_active`, `explicitly_enable_column` and
+// `print_columns` primitives under names the porcelain modules can call.
+// ---------------------------------------------------------------------------
+
+/// Column layout parameters for an embedding command, mirroring git's
+/// `struct column_options`; `width == 0` means "ask the terminal".
+pub(crate) struct ColumnOptions {
+    pub width: i64,
+    pub padding: i64,
+    pub indent: Option<String>,
+    pub nl: Option<String>,
+}
+
+/// Port of `git_column_config`: fold `column.ui` and `column.<command>` into
+/// `colopts`. Returns git's config-error text (`error: … \nfatal: …`) on a bad
+/// value, so the caller can print it verbatim and exit 128.
+pub(crate) fn config_colopts(colopts: &mut u32, command: &str) -> Result<(), String> {
+    apply_config(colopts, Some(command))
+}
+
+/// Port of `parseopt_column_callback`: apply one `--column[=<opts>]` / `--no-column`
+/// occurrence. `unset` is the `--no-column` form (git's "never"). A bad `<opts>`
+/// token yields git's `unsupported option '<tok>'` text.
+pub(crate) fn parseopt_column(
+    colopts: &mut u32,
+    arg: Option<&str>,
+    unset: bool,
+) -> Result<(), String> {
+    *colopts |= COL_PARSEOPT;
+    *colopts &= !COL_ENABLE_MASK;
+    if unset {
+        return Ok(());
+    }
+    *colopts |= COL_ENABLED;
+    if let Some(a) = arg {
+        parse_config(colopts, a)?;
+    }
+    Ok(())
+}
+
+/// Port of `finalize_colopts(colopts, -1)`: resolve `auto` against the real
+/// terminal state (see [`finalize_colopts`]).
+pub(crate) fn finalize(colopts: &mut u32) {
+    finalize_colopts(colopts);
+}
+
+/// Port of the inline `column_active`: only an explicit "always" renders a table.
+pub(crate) fn active(colopts: u32) -> bool {
+    colopts & COL_ENABLE_MASK == COL_ENABLED
+}
+
+/// Port of the `explicitly_enable_column` macro: a `--column` on the command line
+/// (`COL_PARSEOPT`) that resolves to active. Used for the `--column` vs `-n` /
+/// `--verbose` conflict, which only dies when the user asked for columns explicitly.
+pub(crate) fn explicitly_enabled(colopts: u32) -> bool {
+    colopts & COL_PARSEOPT != 0 && active(colopts)
+}
+
+/// The value git resets `colopts` to when a conflicting option silently disables
+/// columns (`colopts = 0`).
+pub(crate) const DISABLED: u32 = COL_DISABLED;
+
+/// Lay out `list` per `colopts`/`opts` (git's `print_columns`) and return the
+/// bytes. An empty list yields empty output, matching git's early return.
+pub(crate) fn layout(list: &[Vec<u8>], colopts: u32, opts: &ColumnOptions) -> Vec<u8> {
+    let inner = Options {
+        width: opts.width,
+        padding: opts.padding,
+        indent: opts.indent.clone(),
+        nl: opts.nl.clone(),
+    };
+    let mut out = Vec::new();
+    // print_columns only bails on the all-empty-cells + `--padding=0` corner, which
+    // none of these callers reach (tag padding=2, branch/status padding=1).
+    let _ = print_columns(list, colopts, &inner, &mut out);
+    out
+}
+
 /// git's `term_columns()`, minus the `TIOCGWINSZ` probe (see the module header).
 fn term_columns() -> i64 {
     if let Ok(value) = std::env::var("COLUMNS") {

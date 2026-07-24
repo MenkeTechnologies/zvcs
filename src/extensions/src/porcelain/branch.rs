@@ -154,6 +154,9 @@ struct Opts {
     set_upstream_to: Option<String>,
     unset_upstream: bool,
     color: ColorWhen,
+    /// Column layout state (git's `colopts`), seeded from `column.ui`/`column.branch`
+    /// and refined by `--column[=<opts>]` / `--no-column`.
+    colopts: u32,
     /// `--abbrev=<n>` for `-v`: `None` = configured default, `Some(0)` = full hash.
     abbrev: Option<usize>,
     // Reachability filters (each entry is a raw rev spec, resolved at list time).
@@ -234,7 +237,9 @@ impl Filters {
 /// and `--unset-upstream`, the `--contains`/`--no-contains`/`--merged`/
 /// `--no-merged`/`--points-at` reachability filters, `--abbrev[=<n>]`/
 /// `--no-abbrev`, `-i`/`--ignore-case`, `-q`/`--quiet`, `--color[=<when>]`/
-/// `--no-color`, and `--create-reflog`.
+/// `--no-color`, `--create-reflog`, and `--column[=<opts>]`/`--no-column`
+/// (honoring `column.ui`/`column.branch`, resolving `auto` against the terminal,
+/// and mutually exclusive with `-v`/`--verbose`).
 ///
 /// `--format` supports the `refname`, `refname:short`, `objectname`,
 /// `objectname:short`, and `HEAD` atoms; any other atom is rejected rather than
@@ -263,6 +268,7 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         set_upstream_to: None,
         unset_upstream: false,
         color: ColorWhen::Auto,
+        colopts: super::column::DISABLED,
         abbrev: None,
         contains: Vec::new(),
         no_contains: Vec::new(),
@@ -272,6 +278,13 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         names: Vec::new(),
     };
 
+    // git seeds `colopts` from `column.ui` / `column.branch` while reading config,
+    // before the command line is parsed, so a `--column` flag overrides the config.
+    if let Err(msg) = super::column::config_colopts(&mut o.colopts, "branch") {
+        eprint!("{msg}");
+        return Ok(ExitCode::from(128));
+    }
+
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -279,6 +292,23 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
             "--" => {
                 o.names.extend(args[i + 1..].iter().cloned());
                 break;
+            }
+            // `--column[=<opts>]` / `--no-column`: lay the branch list out in columns
+            // (git's `OPT_COLUMN`). A bad `<opts>` token is a usage error, as in git.
+            "--column" => {
+                if super::column::parseopt_column(&mut o.colopts, None, false).is_err() {
+                    return usage_exit();
+                }
+            }
+            "--no-column" => {
+                let _ = super::column::parseopt_column(&mut o.colopts, None, true);
+            }
+            _ if a.starts_with("--column=") => {
+                if super::column::parseopt_column(&mut o.colopts, Some(&a["--column=".len()..]), false)
+                    .is_err()
+                {
+                    return usage_exit();
+                }
             }
             "--all" => o.mode = ListMode::All,
             "--remotes" => o.mode = ListMode::Remotes,
@@ -443,6 +473,17 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
     // exclusive, so `--list --show-current` is a usage error before any work.
     if o.show_current && (o.explicit_list || o.delete || o.rename || o.copy) {
         return usage_exit();
+    }
+
+    // Resolve `auto` against the terminal (git's `finalize_colopts(&colopts, -1)`),
+    // then apply the `--column` vs `--verbose` incompatibility: an explicit
+    // `--column` is fatal, a config-only "always" is silently downgraded.
+    super::column::finalize(&mut o.colopts);
+    if o.verbose > 0 {
+        if super::column::explicitly_enabled(o.colopts) {
+            return fatal("options '--column' and '--verbose' cannot be used together");
+        }
+        o.colopts = super::column::DISABLED;
     }
 
     let repo = gix::discover(".")?;
@@ -929,6 +970,8 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
     let entries = collect_entries(repo, o, &sort_keys, &filters)?;
 
+    let column_on = super::column::active(o.colopts);
+
     if let Some(fmt) = &o.format {
         // Render every line before printing any, so a bad atom fails the command
         // without having emitted a partial listing.
@@ -942,8 +985,12 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                 render_format(fmt, e)?
             });
         }
-        for line in lines {
-            println!("{line}");
+        if column_on {
+            emit_columns(o.colopts, lines.iter().map(|l| l.as_bytes().to_vec()).collect());
+        } else {
+            for line in lines {
+                println!("{line}");
+            }
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -974,15 +1021,41 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // git formats every entry (marker + optional color + name) into a string_list
+    // and hands it to `print_columns` when columns are active, else writes each
+    // line directly.
+    let mut cells: Vec<Vec<u8>> = Vec::new();
     for e in &entries {
         let marker = if e.current { "* " } else { "  " };
-        if colors.on {
-            println!("{marker}{}{}{RESET}", colors.open(e), e.display);
+        let line = if colors.on {
+            format!("{marker}{}{}{RESET}", colors.open(e), e.display)
         } else {
-            println!("{marker}{}", e.display);
+            format!("{marker}{}", e.display)
+        };
+        if column_on {
+            cells.push(line.into_bytes());
+        } else {
+            println!("{line}");
         }
     }
+    if column_on {
+        emit_columns(o.colopts, cells);
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Lay `cells` out through the shared column engine (git's `print_columns` with
+/// a NULL `column_options`: padding 1, no indent, `\n` newline, terminal width)
+/// and write the result to stdout.
+fn emit_columns(colopts: u32, cells: Vec<Vec<u8>>) {
+    let opts = super::column::ColumnOptions {
+        width: 0,
+        padding: 1,
+        indent: None,
+        nl: None,
+    };
+    let bytes = super::column::layout(&cells, colopts, &opts);
+    let _ = std::io::stdout().write_all(&bytes);
 }
 
 /// Resolve every `--contains`/`--no-contains`/`--merged`/`--no-merged`/

@@ -125,11 +125,19 @@ enum BatchKind {
 /// stream. `--allow-unknown-type` is accepted as a hidden no-op (git only uses
 /// it to read loose objects of an unknown type, which gix cannot decode).
 ///
+/// `--follow-symlinks` (batch modes only) resolves each `<rev>:<path>` request by
+/// walking the tree and following in-tree symlink blobs — a port of git's
+/// `get_tree_entry_follow_symlinks` (tree-walk.c) driving `batch_one_object`
+/// (builtin/cat-file.c): a symlink that escapes the tree (absolute target or `..`
+/// past the root) prints `symlink <len>\n<path>`, a broken one `dangling
+/// <len>\n<name>`, a cycle `loop <len>\n<name>`, and a non-directory prefix
+/// `notdir <len>\n<name>`.
+///
 /// Not ported: `--textconv` (needs the configured external `diff.*.textconv`
 /// program; gix-filter has no textconv driver, standalone or in batch),
-/// `--follow-symlinks`, the `%(objectsize:disk)` / `%(deltabase)` format atoms
-/// (require pack-entry internals gix's header lookup does not expose), and
-/// `--filter` specs beyond `blob:none` / `blob:limit=<n>` / `object:type=<t>`.
+/// the `%(objectsize:disk)` / `%(deltabase)` format atoms (require pack-entry
+/// internals gix's header lookup does not expose), and `--filter` specs beyond
+/// `blob:none` / `blob:limit=<n>` / `object:type=<t>`.
 pub fn cat_file(args: &[String]) -> Result<ExitCode> {
     let mut mode: Option<Mode> = None;
     let mut batch: Option<BatchKind> = None;
@@ -315,6 +323,14 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         return die_usage("'--path=<path|tree-ish>' needs '--filters' or '--textconv'");
     }
 
+    // `--follow-symlinks` only shapes a batch stream (it changes how each
+    // `<rev>:<path>` request is resolved). git's `usage_msg_optf` rejects it
+    // outside batch mode; the check sits right after `--path`, mirroring the
+    // order of git's batch-mode-compatibility guards in `cmd_cat_file`.
+    if follow_symlinks && batch.is_none() {
+        return die_usage("'--follow-symlinks' requires a batch mode");
+    }
+
     if filter.is_some() && batch.is_none() {
         // git prints this bare line (no `fatal:`) and the usage exit code.
         eprintln!("usage: objects filter only supported in batch mode");
@@ -332,13 +348,6 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
 
     if batch.is_some() && !all_objects && !positional.is_empty() {
         return die_usage("batch modes take no arguments");
-    }
-
-    if follow_symlinks {
-        // Not ported: resolving in-tree symlinks during batch requires a full
-        // tree-walk that follows `blob`-as-symlink targets across trees.
-        eprintln!("fatal: git cat-file: --follow-symlinks is not yet ported");
-        return Ok(ExitCode::from(128));
     }
 
     if textconv && batch.is_none() {
@@ -371,6 +380,7 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
             filter.as_deref(),
             use_mailmap,
             filters,
+            follow_symlinks,
         );
     }
 
@@ -729,6 +739,7 @@ fn run_batch(
     filter: Option<&str>,
     use_mailmap: bool,
     filters: bool,
+    follow_symlinks: bool,
 ) -> Result<ExitCode> {
     // `-Z` sets both; `-z` sets only the input delimiter (stdout stays newline).
     let input_delim: u8 = if input_nul { 0 } else { b'\n' };
@@ -849,6 +860,7 @@ fn run_batch(
                     objfilter.as_ref(),
                     mailmap.as_ref(),
                     fpipe.as_mut(),
+                    follow_symlinks,
                 )? {
                     CommandResult::Ok => {}
                     CommandResult::Die(code) => {
@@ -869,6 +881,7 @@ fn run_batch(
                     objfilter.as_ref(),
                     mailmap.as_ref(),
                     fpipe.as_mut(),
+                    follow_symlinks,
                 )? {
                     EmitOutcome::Ok => {
                         if !buffer {
@@ -914,6 +927,7 @@ fn handle_command(
     filter: Option<&ObjFilter>,
     mailmap: Option<&gix::mailmap::Snapshot>,
     filters_pipeline: Option<&mut gix::filter::Pipeline<'_>>,
+    follow_symlinks: bool,
 ) -> Result<CommandResult> {
     // Split the command word from its argument on the first ASCII space.
     let (word, arg) = match line.iter().position(|&b| b == b' ') {
@@ -931,7 +945,7 @@ fn handle_command(
             Ok(CommandResult::Ok)
         }
         b"contents" => {
-            match process_request(out, repo, fmt, arg, true, delim, filter, mailmap, filters_pipeline)? {
+            match process_request(out, repo, fmt, arg, true, delim, filter, mailmap, filters_pipeline, follow_symlinks)? {
                 EmitOutcome::Ok => {
                     if !buffer {
                         out.flush()?;
@@ -942,7 +956,7 @@ fn handle_command(
             }
         }
         b"info" => {
-            match process_request(out, repo, fmt, arg, false, delim, filter, mailmap, filters_pipeline)? {
+            match process_request(out, repo, fmt, arg, false, delim, filter, mailmap, filters_pipeline, follow_symlinks)? {
                 EmitOutcome::Ok => {
                     if !buffer {
                         out.flush()?;
@@ -975,6 +989,7 @@ fn process_request(
     filter: Option<&ObjFilter>,
     mailmap: Option<&gix::mailmap::Snapshot>,
     filters_pipeline: Option<&mut gix::filter::Pipeline<'_>>,
+    follow_symlinks: bool,
 ) -> Result<EmitOutcome> {
     // `%(rest)` in the format splits the line at the first whitespace run: the
     // head is the object name, the tail becomes `%(rest)`. git also forces this
@@ -994,6 +1009,25 @@ fn process_request(
     } else {
         (line, &b""[..])
     };
+
+    // `--follow-symlinks`: git's `batch_one_object` resolves the name through
+    // `get_oid_with_context(GET_OID_FOLLOW_SYMLINKS)`, following in-tree symlinks
+    // during the tree walk. The resolved object (or symlink/dangling/loop/notdir
+    // status line) is emitted here instead of the plain `rev_parse_single` path.
+    if follow_symlinks {
+        return emit_follow(
+            out,
+            repo,
+            fmt,
+            name,
+            rest,
+            want_contents,
+            delim,
+            filter,
+            mailmap,
+            filters_pipeline,
+        );
+    }
 
     // Resolve. A non-UTF-8 or unresolvable name is reported "missing", echoing
     // the name exactly as given.
@@ -1040,6 +1074,292 @@ fn process_request(
         mailmap,
         filters_pipeline,
     )
+}
+
+// ---- `--follow-symlinks` ---------------------------------------------------
+
+/// The outcome of resolving one `<rev>:<path>` request with symlink following,
+/// mirroring git's `get_oid_result` plus the `ctx.mode == 0` symlink-escape case
+/// that `batch_one_object` splits out.
+enum FollowResult {
+    /// An in-tree object was reached (`FOUND`, `mode != 0`).
+    Found(gix::hash::ObjectId),
+    /// A symlink pointed outside the tree — an absolute target or `..` past the
+    /// root (`FOUND`, `mode == 0`); the payload is the escaped path.
+    Symlink(Vec<u8>),
+    /// The path (or `<rev>`) does not resolve (`MISSING_OBJECT`).
+    Missing,
+    /// A followed symlink has no target object (`DANGLING_SYMLINK`).
+    Dangling,
+    /// Symlink following exceeded the 40-hop limit (`SYMLINK_LOOP`).
+    Loop,
+    /// A path component past a non-directory entry (`NOT_DIR`).
+    NotDir,
+}
+
+/// Emit one `--follow-symlinks` batch record: resolve `name`, then either write
+/// the object (info line + optional contents) or the matching status line, byte
+/// for byte as git's `batch_one_object` does. The status lines use a hard `\n`
+/// because git prints them with `printf(..., "\n")`, not the batch delimiter.
+#[allow(clippy::too_many_arguments)]
+fn emit_follow(
+    out: &mut impl Write,
+    repo: &gix::Repository,
+    fmt: &Format,
+    name: &[u8],
+    rest: &[u8],
+    want_contents: bool,
+    delim: u8,
+    filter: Option<&ObjFilter>,
+    mailmap: Option<&gix::mailmap::Snapshot>,
+    filters_pipeline: Option<&mut gix::filter::Pipeline<'_>>,
+) -> Result<EmitOutcome> {
+    match resolve_follow_symlinks(repo, name) {
+        FollowResult::Missing => {
+            out.write_all(name)?;
+            out.write_all(b" missing\n")?;
+            Ok(EmitOutcome::Ok)
+        }
+        FollowResult::Dangling => {
+            writeln!(out, "dangling {}", name.len())?;
+            out.write_all(name)?;
+            out.write_all(b"\n")?;
+            Ok(EmitOutcome::Ok)
+        }
+        FollowResult::Loop => {
+            writeln!(out, "loop {}", name.len())?;
+            out.write_all(name)?;
+            out.write_all(b"\n")?;
+            Ok(EmitOutcome::Ok)
+        }
+        FollowResult::NotDir => {
+            writeln!(out, "notdir {}", name.len())?;
+            out.write_all(name)?;
+            out.write_all(b"\n")?;
+            Ok(EmitOutcome::Ok)
+        }
+        FollowResult::Symlink(path) => {
+            writeln!(out, "symlink {}", path.len())?;
+            out.write_all(&path)?;
+            out.write_all(b"\n")?;
+            Ok(EmitOutcome::Ok)
+        }
+        FollowResult::Found(oid) => {
+            let Ok(header) = repo.find_header(oid) else {
+                out.write_all(name)?;
+                out.write_all(b" missing\n")?;
+                return Ok(EmitOutcome::Ok);
+            };
+            // A filtered-out object reports "excluded" (keyed by its oid), exactly
+            // as the plain-name batch path does.
+            if let Some(f) = filter {
+                if !f.keeps(header.kind(), header.size()) {
+                    out.write_all(oid.to_hex().to_string().as_bytes())?;
+                    out.write_all(b" excluded")?;
+                    out.write_all(&[delim])?;
+                    return Ok(EmitOutcome::Ok);
+                }
+            }
+            emit_object(
+                out,
+                repo,
+                fmt,
+                oid,
+                header.kind(),
+                header.size(),
+                rest,
+                want_contents,
+                delim,
+                mailmap,
+                filters_pipeline,
+            )
+        }
+    }
+}
+
+/// Port of git's `get_oid_with_context_1` symlink-following branch: split `name`
+/// at the first top-level `:` into `<rev>:<path>`, resolve `<rev>` to a tree, and
+/// walk `<path>` following in-tree symlinks. A name without a `:` resolves as an
+/// ordinary object (following makes no difference), matching git.
+fn resolve_follow_symlinks(repo: &gix::Repository, name: &[u8]) -> FollowResult {
+    // Find the `:` that separates `<rev>` from `<path>`, ignoring any inside a
+    // `@{...}` reflog/upstream bracket (git's `bracket_depth` scan).
+    let mut colon = None;
+    let mut depth = 0i32;
+    for (i, &b) in name.iter().enumerate() {
+        match b {
+            b'{' => depth += 1,
+            b'}' if depth > 0 => depth -= 1,
+            b':' if depth == 0 => {
+                colon = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let Some(colon) = colon else {
+        // No `:` — a plain object name. Symlink following is a no-op; resolve as
+        // git's non-`:` path would (any failure is reported "missing").
+        return match std::str::from_utf8(name)
+            .ok()
+            .and_then(|s| repo.rev_parse_single(s).ok())
+        {
+            Some(id) => FollowResult::Found(id.detach()),
+            None => FollowResult::Missing,
+        };
+    };
+
+    // Resolve `<rev>` to a tree (git's `GET_OID_TREEISH` sub-lookup).
+    let tree_id = match std::str::from_utf8(&name[..colon])
+        .ok()
+        .and_then(|s| repo.rev_parse_single(s).ok())
+        .and_then(|id| id.object().ok())
+        .and_then(|o| o.peel_to_kind(Kind::Tree).ok())
+    {
+        Some(tree) => tree.id,
+        None => return FollowResult::Missing,
+    };
+
+    follow_tree(repo, tree_id, name[colon + 1..].to_vec())
+}
+
+/// Port of `get_tree_entry_follow_symlinks` (tree-walk.c): resolve `path` within
+/// the tree `tree_id`, following in-tree symlink blobs up to 40 hops. The `parents`
+/// stack lets a symlink target's `..` ascend toward the root, exactly as git's
+/// `dir_state` array does.
+fn follow_tree(repo: &gix::Repository, tree_id: gix::hash::ObjectId, path: Vec<u8>) -> FollowResult {
+    const MAX_LINKS: i32 = 40;
+    let hash_kind = repo.object_hash();
+
+    // Each parent holds (root oid, tree bytes); the last is the tree currently
+    // being scanned. `t_loaded == false` forces a read at the loop top.
+    let mut parents: Vec<(gix::hash::ObjectId, Vec<u8>)> = Vec::new();
+    let mut namebuf = path;
+    let mut current_tree_oid = tree_id;
+    let mut t_loaded = false;
+    let mut follows_remaining = MAX_LINKS;
+
+    loop {
+        if !t_loaded {
+            let obj = match repo.find_object(current_tree_oid) {
+                Ok(o) => o,
+                Err(_) => return FollowResult::Missing,
+            };
+            let tree = match obj.peel_to_kind(Kind::Tree) {
+                Ok(t) => t,
+                Err(_) => return FollowResult::Missing,
+            };
+            let root = tree.id;
+            let bytes = tree.data.clone();
+            let empty = bytes.is_empty();
+            parents.push((root, bytes));
+            if namebuf.is_empty() {
+                return FollowResult::Found(root);
+            }
+            if empty {
+                return FollowResult::Missing;
+            }
+            t_loaded = true;
+        }
+
+        // Strip leading slashes (a symlink may point at `//a/b`).
+        while namebuf.first() == Some(&b'/') {
+            namebuf.remove(0);
+        }
+
+        // Split off the first path component; `remainder` is present when a `/`
+        // follows it.
+        let first_slash = namebuf.iter().position(|&b| b == b'/');
+        let comp_end = first_slash.unwrap_or(namebuf.len());
+        let component = &namebuf[..comp_end];
+
+        if component == b".." {
+            if parents.len() == 1 {
+                // At the root: the `..` escapes the tree. git restores the split
+                // slash and reports the whole remaining path as the symlink target.
+                return FollowResult::Symlink(namebuf.clone());
+            }
+            parents.pop();
+            // `strbuf_remove(&namebuf, 0, remainder ? 3 : 2)` — drop `../` or `..`.
+            let remove = if first_slash.is_some() { 3 } else { 2 };
+            namebuf.drain(..remove.min(namebuf.len()));
+            // t stays loaded: scan resumes against the now-top parent tree.
+            continue;
+        }
+
+        if namebuf.is_empty() {
+            // Reached via a symlink to `dir/..`: the current tree is the answer.
+            return FollowResult::Found(parents.last().unwrap().0);
+        }
+
+        let Some((entry_oid, kind)) = find_entry(&parents.last().unwrap().1, component, hash_kind)
+        else {
+            return FollowResult::Missing;
+        };
+        current_tree_oid = entry_oid;
+
+        match kind {
+            EntryKind::Tree => {
+                if first_slash.is_none() {
+                    return FollowResult::Found(current_tree_oid);
+                }
+                // Descend: drop `component/` and read the sub-tree next iteration.
+                namebuf.drain(..first_slash.unwrap() + 1);
+                t_loaded = false;
+            }
+            EntryKind::Link => {
+                if follows_remaining == 0 {
+                    return FollowResult::Loop;
+                }
+                follows_remaining -= 1;
+                let contents = match repo.find_object(current_tree_oid) {
+                    Ok(o) => o.data.clone(),
+                    Err(_) => return FollowResult::Dangling,
+                };
+                if contents.first() == Some(&b'/') {
+                    // Absolute target: escapes the tree.
+                    return FollowResult::Symlink(contents);
+                }
+                // Replace the symlink component with its target, keeping any
+                // remainder (git's `strbuf_splice`, then re-inserting the `/`).
+                let len = first_slash.unwrap_or(namebuf.len());
+                let link_len = contents.len();
+                let mut newbuf = contents;
+                newbuf.extend_from_slice(&namebuf[len..]);
+                if first_slash.is_some() && link_len < newbuf.len() {
+                    newbuf[link_len] = b'/';
+                }
+                namebuf = newbuf;
+                // t stays loaded: the target is resolved against the same parent.
+            }
+            // Regular file (or, defensively, a gitlink): a terminal entry.
+            EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Commit => {
+                if first_slash.is_none() {
+                    return FollowResult::Found(current_tree_oid);
+                }
+                return FollowResult::NotDir;
+            }
+        }
+    }
+}
+
+/// Look up a single, slash-free path component in a tree's raw bytes, returning
+/// the entry's object id and kind — git's `find_tree_entry` reduced to the
+/// single-component case the symlink walk always uses.
+fn find_entry(
+    tree_bytes: &[u8],
+    component: &[u8],
+    hash_kind: gix::hash::Kind,
+) -> Option<(gix::hash::ObjectId, EntryKind)> {
+    for entry in TreeRefIter::from_bytes(tree_bytes, hash_kind) {
+        let entry = entry.ok()?;
+        let filename: &[u8] = entry.filename.as_ref();
+        if filename == component {
+            return Some((entry.oid.to_owned(), entry.mode.kind()));
+        }
+    }
+    None
 }
 
 /// Emit a resolved object: the info line, then (for `--batch`/`contents`) the

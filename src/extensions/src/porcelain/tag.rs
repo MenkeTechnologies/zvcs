@@ -30,6 +30,11 @@
 //!                                       `--no-points-at` (drops the points-at filter) and
 //!                                       `--no-sort` (clears every CLI *and* `tag.sort`
 //!                                       config sort key, falling back to refname order).
+//!   * `git tag --column[=<opts>] | --no-column` → lay the tag list out in columns
+//!                                       through the same engine `git column` uses
+//!                                       (padding 2); honors `column.ui`/`column.tag`,
+//!                                       resolves `auto` against the terminal, and is
+//!                                       mutually exclusive with `-n`.
 //!   * `git tag -i|--ignore-case`      → case-insensitive match and sort.
 //!   * `git tag --omit-empty`          → drop refs whose `--format` output is empty.
 //!   * `git tag <name> [<commit>]`     → create a lightweight tag at `<commit>`.
@@ -47,7 +52,7 @@
 //! Genuinely not backed here, and refused rather than faked: cryptographic
 //! signing (`-s`, `-u`) and verification (`-v`), an editor-supplied message (`-a`
 //! with neither `-m` nor `-F`, `-e`), forced ANSI color (`--color`/`--color=always`),
-//! `--column`, custom trailers (`--trailer`), the git gecos identity fallback, and `--format`
+//! custom trailers (`--trailer`), the git gecos identity fallback, and `--format`
 //! atoms outside the set handled by [`render_atom`] (`align`, `describe`,
 //! `upstream`, relative/custom dates, …).
 
@@ -131,6 +136,14 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     let mut omit_empty = false;
     let mut create_reflog = false;
     let mut want_color = false;
+    // Column layout state, seeded from `column.ui` / `column.tag` before the
+    // command line is parsed so a `--column` flag overrides the config (git's
+    // `git_column_config` runs during config, `parseopt_column_callback` after).
+    let mut colopts: u32 = super::column::DISABLED;
+    if let Err(msg) = super::column::config_colopts(&mut colopts, "tag") {
+        eprint!("{msg}");
+        return Ok(ExitCode::from(128));
+    }
     let mut lines: Option<usize> = None;
     let mut sorts: Vec<String> = Vec::new();
     // Set once `--no-sort` is seen: git's `OPT_STRING_LIST` negation clears the
@@ -180,9 +193,14 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             // off is never faking work, so unlike the positive `-s`/`-u`/`-e` these
             // are honored silently.
             "--no-sign" | "--no-local-user" | "--no-edit" => {}
-            // Column display is not ported; the default single-name-per-line output
-            // already matches `--no-column`, so accept it as the no-op it names.
-            "--no-column" => {}
+            // `--column[=<opts>]` / `--no-column`: the list is laid out through the
+            // same engine `git column` uses (see `list_tags`). `--no-column` is git's
+            // "never", which leaves the default one-name-per-line output.
+            "--column" => super::column::parseopt_column(&mut colopts, None, false)
+                .map_err(|m| anyhow!("{m}"))?,
+            "--no-column" => {
+                let _ = super::column::parseopt_column(&mut colopts, None, true);
+            }
             // Clear an accumulated message/file/format/cleanup the way git's
             // OPT_FILENAME / OPT_STRING negations do (each sets its target back to
             // NULL when unset).
@@ -226,6 +244,9 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                     cleanup = Some(rest.to_string());
                 } else if a == "--cleanup" {
                     cleanup = Some(take_value(args, &mut i, "cleanup")?.to_string());
+                } else if let Some(rest) = a.strip_prefix("--column=") {
+                    super::column::parseopt_column(&mut colopts, Some(rest), false)
+                        .map_err(|m| anyhow!("{m}"))?;
                 } else if let Some(rest) = a.strip_prefix("--color=") {
                     match rest {
                         "never" | "auto" => want_color = false,
@@ -349,6 +370,18 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         bail!("forced ANSI color (--color) is not supported")
     }
 
+    // Resolve `auto` against the terminal (git's `finalize_colopts(&colopts, -1)`).
+    // A piped stdout leaves columns off, so the default output is unchanged. `-n`
+    // and columns are mutually exclusive: an explicit `--column` is fatal, a config
+    // -only "always" is silently downgraded (git's `explicitly_enable_column`).
+    super::column::finalize(&mut colopts);
+    if lines.is_some() && super::column::active(colopts) {
+        if super::column::explicitly_enabled(colopts) {
+            return fatal("options '--column' and '-n' cannot be used together");
+        }
+        colopts = super::column::DISABLED;
+    }
+
     let repo = gix::discover(".")?;
 
     if delete {
@@ -389,6 +422,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             &filters,
             ignore_case,
             omit_empty,
+            colopts,
         );
     }
 
@@ -820,6 +854,7 @@ fn list_tags(
     filters: &Filters,
     ignore_case: bool,
     omit_empty: bool,
+    colopts: u32,
 ) -> Result<ExitCode> {
     let match_mode = if ignore_case {
         Mode::IGNORE_CASE
@@ -877,6 +912,11 @@ fn list_tags(
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    // When columns are active every rendered line becomes one table cell (git wraps
+    // list_tags' stdout in a `git column` filter with padding 2); otherwise each
+    // line is written straight out, one per line.
+    let column_on = super::column::active(colopts);
+    let mut cells: Vec<Vec<u8>> = Vec::new();
     for e in &entries {
         let mut line: Vec<u8> = Vec::new();
         if let Some(fmt) = format {
@@ -896,8 +936,23 @@ fn list_tags(
         } else {
             line.extend_from_slice(&e.short);
         }
-        line.push(b'\n');
-        out.write_all(&line)?;
+        if column_on {
+            cells.push(line);
+        } else {
+            line.push(b'\n');
+            out.write_all(&line)?;
+        }
+    }
+    if column_on {
+        // git's `run_column_filter(colopts, &copts)` with `copts.padding = 2`, every
+        // other field zero (indent "", nl "\n", width from the terminal).
+        let opts = super::column::ColumnOptions {
+            width: 0,
+            padding: 2,
+            indent: None,
+            nl: None,
+        };
+        out.write_all(&super::column::layout(&cells, colopts, &opts))?;
     }
     Ok(ExitCode::SUCCESS)
 }

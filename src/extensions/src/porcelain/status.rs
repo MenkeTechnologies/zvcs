@@ -70,6 +70,10 @@ enum Untracked {
 ///     submodule-status ignore level; an invalid `<when>` is fatal (exit 128).
 ///   * `git status --no-short | --no-long | --no-porcelain` — reset to the long
 ///     format and pin it against `status.short`.
+///   * `git status --column[=<opts>] | --no-column` — lay the long-format
+///     untracked and ignored file listings out in columns through the same engine
+///     `git column` uses (padding 1); honors `column.ui`/`column.status` and
+///     resolves `auto` against the terminal.
 ///   * `status.displayCommentPrefix` — prefixes every long-format line with the
 ///     comment string (`core.commentString`/`core.commentChar`, default `#`); the
 ///     trailing summary / stash lines stay unprefixed, matching git.
@@ -134,6 +138,15 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     // `STATUS_FORMAT_LONG`). Only that combination is fatal with `-z`; a
     // `--no-…`-reset (`STATUS_FORMAT_NONE`) instead becomes porcelain v1.
     let mut long_format = false;
+    // Column layout state for the long-format untracked/ignored listings, seeded
+    // from `column.ui` / `column.status` before the command line is parsed so a
+    // `--column` flag overrides the config (git's `git_status_config` runs during
+    // config, `parseopt_column_callback` after).
+    let mut colopts: u32 = super::column::DISABLED;
+    if let Err(msg) = super::column::config_colopts(&mut colopts, "status") {
+        eprint!("{msg}");
+        return Ok(ExitCode::from(128));
+    }
 
     for a in args {
         let s = a.as_str();
@@ -210,6 +223,27 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             "--no-renames" => renames = Some(None),
             "--renames" | "-M" | "--find-renames" => {
                 renames = Some(Some(gix::diff::Rewrites::default()));
+            }
+            // `--column[=<opts>]` / `--no-column`: lay the long-format untracked and
+            // ignored file listings out in columns (git's `OPT_COLUMN`).
+            "--column" => {
+                if let Err(m) = super::column::parseopt_column(&mut colopts, None, false) {
+                    eprintln!("error: {m}");
+                    eprint!("{USAGE}");
+                    return Ok(ExitCode::from(129));
+                }
+            }
+            "--no-column" => {
+                let _ = super::column::parseopt_column(&mut colopts, None, true);
+            }
+            _ if s.starts_with("--column=") => {
+                if let Err(m) =
+                    super::column::parseopt_column(&mut colopts, Some(&s["--column=".len()..]), false)
+                {
+                    eprintln!("error: {m}");
+                    eprint!("{USAGE}");
+                    return Ok(ExitCode::from(129));
+                }
             }
             // git validates the `--porcelain=<version>` value as it parses, dying
             // immediately (exit 128) on anything but v1/v2 — a later valid
@@ -368,6 +402,11 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         ignore_submodules,
         Some(gix::submodule::config::Ignore::All)
     );
+
+    // Resolve `auto` against the terminal (git's `finalize_colopts(&s.colopts, -1)`).
+    // Columns only affect the long-format untracked/ignored listings; a piped
+    // stdout leaves them off, so the default one-per-line output is unchanged.
+    super::column::finalize(&mut colopts);
 
     let repo = gix::discover(".")?;
 
@@ -694,6 +733,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 stash_count,
                 &colors,
                 comment_prefix.as_deref(),
+                colopts,
             )
         );
     }
@@ -1693,8 +1733,15 @@ fn render_long(
     stash_count: usize,
     colors: &StatusColors,
     comment_prefix: Option<&str>,
+    colopts: u32,
 ) -> String {
     let mut out = String::new();
+    // When columns are active, the untracked/ignored path lists are replaced by a
+    // sentinel line, laid out through the shared engine, and spliced back in after
+    // the comment-prefix pass (git bakes the `#` and color into the column indent,
+    // which must not be re-prefixed by `comment_prefix_body`).
+    let column_on = super::column::active(colopts);
+    let mut blocks: Vec<String> = Vec::new();
 
     // git's long-format branch header (wt_longstatus_print): a leading empty
     // `header`-slot write, then the prefix — `header` for a real branch, `nobranch`
@@ -1800,8 +1847,21 @@ fn render_long(
         if !untracked.is_empty() {
             out.push_str("Untracked files:\n");
             out.push_str("  (use \"git add <file>...\" to include in what will be committed)\n");
-            for path in untracked {
-                out.push_str(&format!("\t{}\n", colors.paint(Slot::Untracked, &quote_path(path))));
+            if column_on {
+                out.push_str(&format!("\u{1}{}\u{1}\n", blocks.len()));
+                blocks.push(status_column_block(
+                    colopts,
+                    colors,
+                    comment_prefix.is_some(),
+                    untracked,
+                ));
+            } else {
+                for path in untracked {
+                    out.push_str(&format!(
+                        "\t{}\n",
+                        colors.paint(Slot::Untracked, &quote_path(path))
+                    ));
+                }
             }
             out.push('\n');
         }
@@ -1810,8 +1870,21 @@ fn render_long(
             out.push_str("  (use \"git add -f <file>...\" to include in what will be committed)\n");
             // git colors ignored paths with the untracked slot — there is no
             // separate `color.status.ignored`.
-            for path in ignored {
-                out.push_str(&format!("\t{}\n", colors.paint(Slot::Untracked, &quote_path(path))));
+            if column_on {
+                out.push_str(&format!("\u{1}{}\u{1}\n", blocks.len()));
+                blocks.push(status_column_block(
+                    colopts,
+                    colors,
+                    comment_prefix.is_some(),
+                    ignored,
+                ));
+            } else {
+                for path in ignored {
+                    out.push_str(&format!(
+                        "\t{}\n",
+                        colors.paint(Slot::Untracked, &quote_path(path))
+                    ));
+                }
             }
             out.push('\n');
         }
@@ -1851,14 +1924,65 @@ fn render_long(
 
     // `status.displayCommentPrefix`: prefix each body line with the comment string
     // (git's `status_vprintf`). The trailer keeps its raw, unprefixed form.
-    if let Some(cs) = comment_prefix {
-        let mut prefixed = comment_prefix_body(&out, cs);
-        prefixed.push_str(&trailer);
-        prefixed
-    } else {
-        out.push_str(&trailer);
-        out
+    let mut body = match comment_prefix {
+        Some(cs) => comment_prefix_body(&out, cs),
+        None => out,
+    };
+    // Splice the pre-laid-out column blocks over their sentinels. A sentinel line
+    // does not start with a tab, so `comment_prefix_body` renders it as `<cs> <s>`;
+    // the block itself already carries the correct (possibly `#`/colored) indent.
+    for (idx, block) in blocks.iter().enumerate() {
+        let key = match comment_prefix {
+            Some(cs) => format!("{cs} \u{1}{idx}\u{1}\n"),
+            None => format!("\u{1}{idx}\u{1}\n"),
+        };
+        body = body.replace(&key, block);
     }
+    body.push_str(&trailer);
+    body
+}
+
+/// The leading SGR sequence git's `color()` would emit for `slot`, recovered from
+/// [`StatusColors::paint`] (which wraps text as `<sgr>text<reset>`, or leaves it
+/// unchanged for an uncolored slot).
+fn slot_sgr(colors: &StatusColors, slot: Slot) -> String {
+    match colors.paint(slot, "\u{1}").split_once('\u{1}') {
+        Some((sgr, _)) => sgr.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Build the column-laid-out block for one untracked/ignored listing, byte-for-byte
+/// as git's `wt_status_print_other` does: the paths are C-quoted cells laid out
+/// with padding 1 through the shared engine, the indent is
+/// `<header-sgr>[#]\t<untracked-sgr>` (git bakes the comment `#` and colors into the
+/// indent), and the row terminator carries git's `GIT_COLOR_RESET` when colored.
+fn status_column_block(
+    colopts: u32,
+    colors: &StatusColors,
+    comment: bool,
+    paths: &[BString],
+) -> String {
+    let header_sgr = slot_sgr(colors, Slot::Header);
+    let untracked_sgr = slot_sgr(colors, Slot::Untracked);
+    // git gates the reset-terminated newline on `want_color`; the untracked slot is
+    // the block's color, so a non-empty slot SGR is the reliable "colored" signal.
+    let colored = !untracked_sgr.is_empty();
+    let mut indent = header_sgr;
+    if comment {
+        indent.push('#');
+    }
+    indent.push('\t');
+    indent.push_str(&untracked_sgr);
+    let nl = if colored { "\x1b[m\n" } else { "\n" };
+    let items: Vec<Vec<u8>> = paths.iter().map(|p| quote_path(p).into_bytes()).collect();
+    let opts = super::column::ColumnOptions {
+        width: 0,
+        padding: 1,
+        indent: Some(indent),
+        nl: Some(nl.to_string()),
+    };
+    String::from_utf8_lossy(&super::column::layout(&items, colopts, &opts)).into_owned()
 }
 
 /// Apply git's `status_vprintf` comment-prefix rule to every line of the long-

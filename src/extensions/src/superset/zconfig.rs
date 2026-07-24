@@ -46,6 +46,30 @@ const SETTINGS: &[Setting] = &[
     Setting { key: "interval",      kind: Kind::Count, default: "30",  gated: false, desc: "autonomy debounce, seconds (always on)" },
 ];
 
+/// The setting names `git zconfig <name>` accepts, plus the `all` pseudo-name —
+/// the second-token completion vocabulary for the repl. Sourced from [`SETTINGS`]
+/// so it can never drift from what the verb actually sets.
+pub fn setting_names() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = SETTINGS.iter().map(|s| s.key).collect();
+    v.push("all");
+    v
+}
+
+/// The value vocabulary offered after a `git zconfig <name>` token, for repl
+/// completion: booleans (and the `all` pseudo-name) take on/off, and every named
+/// setting also accepts `default` (revert). A bare count otherwise has no fixed
+/// vocabulary beyond `default`. Empty for an unknown name.
+pub fn value_hints(name: &str) -> &'static [&'static str] {
+    if name == "all" {
+        return &["on", "off"];
+    }
+    match SETTINGS.iter().find(|s| s.key == name) {
+        Some(s) if s.kind == Kind::Bool => &["on", "off", "default"],
+        Some(_) => &["default"], // a count takes a number, or `default` to revert
+        None => &[],
+    }
+}
+
 const USAGE: &str = "\
 usage: git zconfig                       list every setting and its value
        git zconfig <name>                show one setting

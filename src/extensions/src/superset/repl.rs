@@ -9,7 +9,9 @@
 //! [`crate::superset::banner`]) and edits the line with [`reedline`]: real cursor
 //! motion, Tab completion of the command word against every dispatchable verb
 //! (superset + porcelain), of the second word against a verb's subcommands
-//! (`zdaemon <Tab>` → start/stop/…), and of any `-`-prefixed word against that
+//! (`zdaemon <Tab>` → start/stop/…), of `zconfig`'s setting names and their
+//! on/off/default values (`zconfig <Tab>` → autoreconcile/…; `zconfig autoreconcile
+//! <Tab>` → on/off/default), and of any `-`-prefixed word against that
 //! verb's options (`commit -<Tab>` → --amend/…; porcelain options are harvested
 //! at build time from each verb's own parser, so they can't drift). Ctrl-C to
 //! abandon the current line, Ctrl-D to quit,
@@ -112,6 +114,9 @@ include!(concat!(env!("OUT_DIR"), "/porcelain_spec.rs"));
 fn superset_spec(verb: &str) -> Option<(&'static [&'static str], &'static [&'static str])> {
     Some(match verb {
         "zdaemon" => (&["-n", "-f"], &["start", "stop", "restart", "reload", "status", "info", "ping", "log"]),
+        // Setting names and their values complete positionally in `complete`
+        // (sourced from zconfig.rs); only options belong in the static spec.
+        "zconfig" => (&["-h", "--help"], &[]),
         "zstatus" => (&["--all"], &[]),
         "zreindex" => (&["--sync", "--async"], &[]),
         "zunclaim" => (&["--force"], &[]),
@@ -190,6 +195,25 @@ impl Completer for ZreplCompleter {
         // A `-`-prefixed word completes that verb's options, at any position.
         if prefix.starts_with('-') {
             return suggestions(opts.iter().copied(), prefix, span);
+        }
+        // `zconfig` completes positionally, sourced from zconfig.rs: the setting
+        // name (+`all`) at token 2, then that setting's on/off/default values at
+        // token 3. `prior[0]` is the verb, so `prior.len()` is the cursor's arg #.
+        if verb == "zconfig" {
+            let prior: Vec<&str> = before.split_whitespace().collect();
+            return match prior.len() {
+                1 => suggestions(
+                    crate::superset::zconfig::setting_names().into_iter(),
+                    prefix,
+                    span,
+                ),
+                2 => suggestions(
+                    crate::superset::zconfig::value_hints(prior[1]).iter().copied(),
+                    prefix,
+                    span,
+                ),
+                _ => Vec::new(),
+            };
         }
         // The second token completes the verb's subcommands. `before` being just
         // the verb (no interior whitespace) means the cursor word is the second.
@@ -375,6 +399,27 @@ mod tests {
         for sub in ["add", "remove", "rename", "set-url", "show"] {
             assert!(remote.contains(&sub.to_string()), "remote missing `{sub}`: {remote:?}");
         }
+    }
+
+    #[test]
+    fn zconfig_completes_setting_names_then_values() {
+        // Token 2: setting names plus the `all` pseudo-name, prefix-narrowed.
+        let names = values("zconfig ");
+        for n in ["autoreconcile", "autodups", "statusinterval", "watchmru", "interval", "all"] {
+            assert!(names.contains(&n.to_string()), "zconfig missing setting `{n}`: {names:?}");
+        }
+        assert_eq!(
+            values("zconfig auto"),
+            vec!["autobump", "autocrawl", "autodups", "autohook", "autoreconcile", "autostatus"]
+        );
+        // Token 3: a boolean setting offers on/off/default; a count offers only
+        // `default` (its value is a number); `all` offers on/off.
+        assert_eq!(values("zconfig autoreconcile "), vec!["default", "off", "on"]);
+        assert_eq!(values("zconfig statusinterval "), vec!["default"]);
+        assert_eq!(values("zconfig all "), vec!["off", "on"]);
+        // Options still complete; nothing past the value position.
+        assert!(values("zconfig --").contains(&"--help".to_string()));
+        assert!(values("zconfig autoreconcile on ").is_empty());
     }
 
     #[test]

@@ -386,21 +386,25 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- build a tree object from the index ------------------------------
-    let index = repo.open_index()?;
-    let backing = index.path_backing();
+    // A freshly-init'd repo has no index file yet. `open_index` errors on the
+    // missing file, so treat its absence as an empty index — git's root empty
+    // commit (`commit --allow-empty` on a fresh repo) then produces the empty tree
+    // instead of failing with "opening the index: No such file or directory".
+    let index = repo
+        .index_path()
+        .exists()
+        .then(|| repo.open_index())
+        .transpose()?;
 
     // Refuse while conflicts are staged, exactly as git does.
-    for entry in index.entries() {
-        if entry.stage() != gix::index::entry::Stage::Unconflicted {
-            anyhow::bail!("committing is not possible because you have unmerged files");
+    if let Some(index) = &index {
+        for entry in index.entries() {
+            if entry.stage() != gix::index::entry::Stage::Unconflicted {
+                anyhow::bail!("committing is not possible because you have unmerged files");
+            }
         }
     }
 
-    // Feed every index entry into the plumbing tree editor, which builds the
-    // nested trees in canonical (git) order and writes them to the odb. The
-    // high-level `Repository::edit_tree` wrapper is gated behind the
-    // `tree-editor` feature, so the editor is constructed directly over the
-    // public object database handle instead.
     // `pre-commit` runs before the commit is built; a non-zero exit aborts it
     // (the hook prints its own diagnostics, so we exit quietly). `--no-verify`
     // skips it, as it does `commit-msg`.
@@ -408,22 +412,31 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
 
+    // Feed every index entry into the plumbing tree editor, which builds the
+    // nested trees in canonical (git) order and writes them to the odb. The
+    // high-level `Repository::edit_tree` wrapper is gated behind the `tree-editor`
+    // feature, so the editor is constructed directly over the public object
+    // database handle instead. With no index (fresh repo) the editor stays empty
+    // and writes the empty tree.
     let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
     // Snapshot (path, mode, id) per staged file for the summary/short-stat below.
-    let mut new_entries: Vec<(BString, EntryMode, ObjectId)> =
-        Vec::with_capacity(index.entries().len());
-    for entry in index.entries() {
-        let path = entry.path_in(backing);
-        let mode = entry
-            .mode
-            .to_tree_entry_mode()
-            .ok_or_else(|| anyhow::anyhow!("index entry `{path}` has an unrepresentable mode"))?;
-        editor.upsert(
-            path.split(|&b| b == b'/').map(|c| c.as_bstr()),
-            mode.kind(),
-            entry.id,
-        )?;
-        new_entries.push((path.to_owned(), mode, entry.id));
+    let mut new_entries: Vec<(BString, EntryMode, ObjectId)> = Vec::new();
+    if let Some(index) = &index {
+        let backing = index.path_backing();
+        new_entries.reserve(index.entries().len());
+        for entry in index.entries() {
+            let path = entry.path_in(backing);
+            let mode = entry
+                .mode
+                .to_tree_entry_mode()
+                .ok_or_else(|| anyhow::anyhow!("index entry `{path}` has an unrepresentable mode"))?;
+            editor.upsert(
+                path.split(|&b| b == b'/').map(|c| c.as_bstr()),
+                mode.kind(),
+                entry.id,
+            )?;
+            new_entries.push((path.to_owned(), mode, entry.id));
+        }
     }
     let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
 

@@ -364,6 +364,24 @@ pub fn job_finished(
     Ok(())
 }
 
+/// Prune terminal jobs (`done`/`failed`/`stopped`) whose `finished_at` is older
+/// than `retention_secs` ago, so the ledger doesn't grow without bound across
+/// millions of commands. In-flight jobs (`queued`/`running`) and rows with a NULL
+/// `finished_at` are never touched. Returns the number of rows deleted. The daemon
+/// calls this on a slow timer; SQLite reuses the freed pages, so no explicit
+/// `VACUUM` (an exclusive-lock, whole-db rewrite) is run under fleet load.
+pub fn prune_stale_jobs(conn: &Connection, retention_secs: i64) -> Result<usize> {
+    let cutoff = now() - retention_secs;
+    let n = conn.execute(
+        "DELETE FROM jobs
+           WHERE state IN ('done','failed','stopped')
+             AND finished_at IS NOT NULL
+             AND finished_at < ?1",
+        rusqlite::params![cutoff],
+    )?;
+    Ok(n)
+}
+
 /// Record an autonomous-op failure (autobump/reconcile) so the next `git`
 /// invocation can surface it. Upserts the repo, then a `failed` job row.
 pub fn record_failure(git_dir: &Path, kind: &str, reason: &str) -> Result<()> {
@@ -718,7 +736,10 @@ pub fn mark_notified(conn: &Connection, ids: &[i64]) -> Result<()> {
 
 #[cfg(test)]
 mod snapshot_atomic_tests {
-    use super::{load_snapshot, root_mtime_advanced, save_snapshot, upsert_repo, SCHEMA};
+    use super::{
+        insert_job, job_finished, load_snapshot, prune_stale_jobs, root_mtime_advanced,
+        save_snapshot, upsert_repo, SCHEMA,
+    };
     use rusqlite::Connection;
 
     #[test]
@@ -785,6 +806,50 @@ mod snapshot_atomic_tests {
         assert!(root_mtime_advanced(&conn, &gd, &root), "a newer root mtime must re-scan");
         // And once recorded again, it skips.
         assert!(!root_mtime_advanced(&conn, &gd, &root), "must skip after re-recording");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_stale_jobs_deletes_only_old_terminal_rows() {
+        let dir = std::env::temp_dir().join(format!("zvcs-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("t.sqlite")).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+
+        // Three finished (done) jobs + one still queued.
+        let old1 = insert_job(&conn, None, "exec", "{}", None).unwrap();
+        let old2 = insert_job(&conn, None, "exec", "{}", None).unwrap();
+        let recent = insert_job(&conn, None, "exec", "{}", None).unwrap();
+        let queued = insert_job(&conn, None, "exec", "{}", None).unwrap();
+        for id in [old1, old2, recent] {
+            job_finished(&conn, id, "done", 0, "", None).unwrap();
+        }
+
+        // Age two of the finished rows past the 7-day window; leave `recent` fresh.
+        let week = 7 * 24 * 3600i64;
+        conn.execute(
+            "UPDATE jobs SET finished_at = finished_at - ?1 WHERE id IN (?2, ?3)",
+            rusqlite::params![week + 60, old1, old2],
+        )
+        .unwrap();
+
+        let deleted = prune_stale_jobs(&conn, week).unwrap();
+        assert_eq!(deleted, 2, "only the two aged terminal rows may be pruned");
+
+        let survivors: Vec<i64> = conn
+            .prepare("SELECT id FROM jobs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        // The fresh `done` job and the still-`queued` job (never eligible) survive.
+        assert_eq!(survivors, vec![recent, queued], "fresh + in-flight jobs must be kept");
+
+        // A second prune with nothing aged removes nothing.
+        assert_eq!(prune_stale_jobs(&conn, week).unwrap(), 0, "idempotent once nothing is stale");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

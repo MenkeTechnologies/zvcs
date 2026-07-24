@@ -100,6 +100,13 @@ pub(crate) fn log_line(msg: &str) {
     }
 }
 
+/// How often the daemon prunes the job ledger, and how long a finished job is kept
+/// before it is eligible for pruning. Terminal jobs older than the retention window
+/// are deleted; in-flight jobs are never touched. A week is long enough that a bot
+/// can always look up a recent job by number, short enough to bound table growth.
+const JOB_PRUNE_INTERVAL_SECS: u64 = 3600;
+const JOB_RETENTION_SECS: i64 = 7 * 24 * 3600;
+
 /// A unix-domain socket path must fit the platform's `sockaddr_un.sun_path`
 /// array (incl. its NUL terminator): 104 bytes on macOS/BSD, 108 on Linux. Use
 /// the tighter limit so the overflow fallback below triggers identically on
@@ -330,6 +337,18 @@ fn start() -> Result<ExitCode> {
     // `zvcs.statusinterval` (seconds between passes; 0 disables).
     crate::superset::statusd::spawn_if_enabled();
 
+    // Ledger housekeeping: terminal jobs older than the retention window are pruned
+    // on a slow timer so the jobs table stays bounded across millions of commands.
+    thread::spawn(|| loop {
+        thread::sleep(Duration::from_secs(JOB_PRUNE_INTERVAL_SECS));
+        if let Ok(conn) = crate::db::open_rw() {
+            match crate::db::prune_stale_jobs(&conn, JOB_RETENTION_SECS) {
+                Ok(n) if n > 0 => log_line(&format!("[zvcs job] pruned {n} stale job(s)")),
+                _ => {}
+            }
+        }
+    });
+
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(s) => s,
@@ -359,10 +378,15 @@ fn worker_loop(rx: Receiver<Cmd>, sock_path: PathBuf) {
                 }
             }
             Cmd::TryAcquire { repo, id, stream } => {
-                // Non-blocking: grant only if the lane is idle, else answer BUSY and
-                // drop the request — the caller queues its work as a job instead.
+                // Non-blocking: grant only if the lane is idle AND the repo has no
+                // undrained queued/running jobs. Granting while jobs are still
+                // draining would let this fresh op jump ahead of them and break
+                // submission order — "index.lock blocks until the queue is drained."
+                // Otherwise answer BUSY and drop the request; the caller queues its
+                // work as a job, which appends after the jobs already in flight.
+                let pending = crate::jobpool::repo_has_pending(&repo);
                 let lane = lanes.entry(repo.clone()).or_default();
-                if lane.holder.is_none() {
+                if lane.holder.is_none() && !pending {
                     reply(&stream, "GRANTED");
                     lane.holder = Some(id);
                 } else {

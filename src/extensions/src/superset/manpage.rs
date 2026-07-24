@@ -67,7 +67,7 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zrepos",
         summary: "list indexed git repositories",
-        synopsis: "git zrepos [<pattern>...]",
+        synopsis: "git zrepos [<pattern>...] [--json]",
         desc: &[
             "Lists every git repository in the machine-wide index, one path per line (pipe-clean), a drop-in for a shell repo-list.",
             "Patterns filter the output by case-insensitive substring match.",
@@ -85,7 +85,7 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zjobs",
         summary: "list recent async jobs",
-        synopsis: "git zjobs [-n <count>]",
+        synopsis: "git zjobs [-n <count>] [--json]",
         desc: &["Lists recent jobs from the ledger, newest first. -n limits the count."],
     },
     Doc {
@@ -142,13 +142,13 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zwho",
         summary: "list active claims",
-        synopsis: "git zwho",
+        synopsis: "git zwho [--json]",
         desc: &["Lists active claims \\(em which session holds a lease on which repository."],
     },
     Doc {
         verb: "zstatus",
         summary: "working-tree status of indexed repositories",
-        synopsis: "git zstatus [--all]",
+        synopsis: "git zstatus [--all] [--json]",
         desc: &["Reports the current repository's working-tree status live. --all reads every indexed repository's status from the daemon-maintained cache with no filesystem walk."],
     },
     Doc {
@@ -267,7 +267,7 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zverbs",
         summary: "list every zvcs extension verb and its usage",
-        synopsis: "git zverbs",
+        synopsis: "git zverbs [--json]",
         desc: &["Lists every zvcs extension (z*) verb with its one-line usage, sourced from each verb's own -h so the listing can never drift."],
     },
     Doc {
@@ -370,7 +370,7 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zheads",
         summary: "HEAD of every indexed repo, in parallel",
-        synopsis: "git zheads [selectors]",
+        synopsis: "git zheads [selectors] [--json]",
         desc: &[
             "Prints each indexed repository's checked-out branch (or (detached)/(unborn)), short HEAD id, and a * when the worktree has tracked changes \\(em a one-glance view of where every repo in the machine sits.",
             "Selectors are the same as zforeach: bare <pattern>, --repo <p>, --dirty, --ahead, --behind, --claimed, --session <s>. The probe is a native gix read run across all repos on a bounded worker pool.",
@@ -379,37 +379,37 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zdirty",
         summary: "list indexed repos with tracked changes",
-        synopsis: "git zdirty [selectors]",
+        synopsis: "git zdirty [selectors] [--json]",
         desc: &["Lists only the indexed repositories whose worktree has uncommitted tracked changes (the same \"dirty\" gix reports for zstatus; an untracked-only repo counts as clean). Scanned in parallel. Selectors narrow the set as in zforeach."],
     },
     Doc {
         verb: "zbranches",
         summary: "local branches of every indexed repo",
-        synopsis: "git zbranches [selectors]",
+        synopsis: "git zbranches [selectors] [--json]",
         desc: &["Prints each indexed repository's local branch names, grouped by repo, scanned in parallel."],
     },
     Doc {
         verb: "ztags",
         summary: "tag count of every indexed repo",
-        synopsis: "git ztags [selectors]",
+        synopsis: "git ztags [selectors] [--json]",
         desc: &["Prints how many tags each indexed repository has, scanned in parallel."],
     },
     Doc {
         verb: "zremotes",
         summary: "remotes and URLs of every indexed repo",
-        synopsis: "git zremotes [selectors]",
+        synopsis: "git zremotes [selectors] [--json]",
         desc: &["Prints each indexed repository's remotes and their fetch URLs, grouped by repo, scanned in parallel."],
     },
     Doc {
         verb: "zsize",
         summary: "on-disk .git size of every indexed repo",
-        synopsis: "git zsize [selectors]",
+        synopsis: "git zsize [selectors] [--json]",
         desc: &["Prints each indexed repository's on-disk .git size, largest first, with a total, so the heaviest repos in the tree are obvious. Sizes are summed with a native filesystem walk in parallel."],
     },
     Doc {
         verb: "zage",
         summary: "HEAD commit age of every indexed repo",
-        synopsis: "git zage [selectors]",
+        synopsis: "git zage [selectors] [--json]",
         desc: &["Prints how long ago each indexed repository's HEAD commit was made (a relative time like `3 days ago`), scanned in parallel \\(em a quick read of which repos are stale."],
     },
     Doc {
@@ -424,7 +424,7 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zgrep",
         summary: "parallel content search across indexed repos",
-        synopsis: "git zgrep [selectors] [-i] <pattern>",
+        synopsis: "git zgrep [selectors] [-i] <pattern> [--json]",
         desc: &[
             "Searches the tracked file content of every indexed repository for <pattern> (a regular expression) in parallel, printing path:line:text for each match. -i is case-insensitive; binary files are skipped, as git grep does.",
             "Only tracked, non-conflicted worktree files are searched. Selectors narrow the repo set as in zforeach.",
@@ -433,43 +433,43 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zahead",
         summary: "indexed repos ahead of their upstream",
-        synopsis: "git zahead [selectors]",
+        synopsis: "git zahead [selectors] [--json]",
         desc: &["Lists the indexed repositories that have commits not yet on their configured upstream, with the count, computed in parallel. Repos with no upstream are omitted."],
     },
     Doc {
         verb: "zbehind",
         summary: "indexed repos behind their upstream",
-        synopsis: "git zbehind [selectors]",
+        synopsis: "git zbehind [selectors] [--json]",
         desc: &["Lists the indexed repositories whose upstream has commits they lack, with the count, computed in parallel. Repos with no upstream are omitted."],
     },
     Doc {
         verb: "zunpushed",
         summary: "per-repo unpushed commits (the detailed zahead)",
-        synopsis: "git zunpushed [selectors]",
+        synopsis: "git zunpushed [selectors] [--json]",
         desc: &["Lists, per indexed repository, the actual commits HEAD has that its upstream lacks \\(em short id and summary line, grouped under the repo path \\(em computed in parallel. Where `zahead` gives only a count, this shows what is unpushed. The list is capped per repo so a long divergence cannot flood the output; repos with no upstream or nothing unpushed are omitted."],
     },
     Doc {
         verb: "zunpulled",
         summary: "per-repo commits the upstream has that local lacks",
-        synopsis: "git zunpulled [selectors]",
+        synopsis: "git zunpulled [selectors] [--json]",
         desc: &["Lists, per indexed repository, the commits on the configured upstream that the local branch lacks \\(em short id and summary, grouped per repo. The detailed form of `zbehind`. A `git zfetch` first makes the upstream refs current. Repos with no upstream or nothing unpulled are omitted."],
     },
     Doc {
         verb: "zauthors",
         summary: "commit counts by author across indexed repos",
-        synopsis: "git zauthors [selectors]",
+        synopsis: "git zauthors [selectors] [--json]",
         desc: &["Walks every indexed repository's HEAD history in parallel, tallies commits by author `Name <email>`, aggregates across all repos, and prints them ranked by count \\(em a machine-wide contribution summary."],
     },
     Doc {
         verb: "zhot",
         summary: "indexed repos ranked by recent activity",
-        synopsis: "git zhot [selectors] [<days>]",
+        synopsis: "git zhot [selectors] [<days>] [--json]",
         desc: &["Ranks indexed repositories by the number of commits made in the last <days> (default 30), most active first, counted in parallel \\(em a quick read of where work is happening across the tree."],
     },
     Doc {
         verb: "zconflicts",
         summary: "indexed repos mid-operation or conflicted",
-        synopsis: "git zconflicts [selectors]",
+        synopsis: "git zconflicts [selectors] [--json]",
         desc: &["Lists the indexed repositories that are in the middle of a merge, rebase, cherry-pick, revert, or bisect, or that have unmerged (conflicted) index entries, with the operation(s) named \\(em so a stuck repo among many is found at a glance."],
     },
     Doc {
@@ -559,55 +559,55 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zstale",
         summary: "indexed repos not committed to in a while",
-        synopsis: "git zstale [selectors] [<days>]",
+        synopsis: "git zstale [selectors] [<days>] [--json]",
         desc: &["Lists the indexed repositories whose HEAD commit is older than <days> (default 90), with how long ago \\(em surfacing abandoned repos across the tree. Scanned in parallel."],
     },
     Doc {
         verb: "zlast",
         summary: "indexed repos by most recent commit",
-        synopsis: "git zlast [selectors]",
+        synopsis: "git zlast [selectors] [--json]",
         desc: &["Lists indexed repositories ordered by HEAD commit time, most recently committed first, each with its relative age \\(em where work happened most recently."],
     },
     Doc {
         verb: "zbig",
         summary: "largest tracked files across indexed repos",
-        synopsis: "git zbig [selectors] [<n>]",
+        synopsis: "git zbig [selectors] [<n>] [--json]",
         desc: &["Lists the largest tracked files across every indexed repository, top <n> (default 20), by on-disk size \\(em bloat hunting tree-wide. Files are gathered in parallel."],
     },
     Doc {
         verb: "zfiles",
         summary: "tracked file count per indexed repo",
-        synopsis: "git zfiles [selectors]",
+        synopsis: "git zfiles [selectors] [--json]",
         desc: &["Prints the number of tracked files in each indexed repository, largest first, scanned in parallel."],
     },
     Doc {
         verb: "zcommits",
         summary: "HEAD-history commit count per indexed repo",
-        synopsis: "git zcommits [selectors]",
+        synopsis: "git zcommits [selectors] [--json]",
         desc: &["Counts the commits reachable from HEAD in each indexed repository \\(em its history depth \\(em and prints them deepest first, walked in parallel."],
     },
     Doc {
         verb: "zpristine",
         summary: "indexed repos that are clean and in sync",
-        synopsis: "git zpristine [selectors]",
+        synopsis: "git zpristine [selectors] [--json]",
         desc: &["Lists the indexed repositories that need nothing: no uncommitted changes, on a branch (not detached), and in sync with their upstream (or having none configured). The complement of `zdirty`/`zahead`/`zbehind`/`zconflicts` \\(em the green set \\(em computed in parallel."],
     },
     Doc {
         verb: "zdivergent",
         summary: "indexed repos diverged from upstream",
-        synopsis: "git zdivergent [selectors]",
+        synopsis: "git zdivergent [selectors] [--json]",
         desc: &["Lists indexed repositories that are both ahead of and behind their upstream \\(em history has forked, so a merge or rebase is needed. Computed in parallel."],
     },
     Doc {
         verb: "zorphans",
         summary: "indexed repos with no remote",
-        synopsis: "git zorphans [selectors]",
+        synopsis: "git zorphans [selectors] [--json]",
         desc: &["Lists indexed repositories with no remote configured \\(em nothing to fetch from or push to. Scanned in parallel."],
     },
     Doc {
         verb: "zsessions",
         summary: "active sessions ranked by repos held",
-        synopsis: "git zsessions",
+        synopsis: "git zsessions [--json]",
         desc: &["Lists the sessions that currently hold claims, ranked by how many repositories each holds \\(em which agent is working the most of the tree."],
     },
     Doc {
@@ -619,7 +619,7 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zdashboard",
         summary: "instant one-screen health summary of the tree",
-        synopsis: "git zdashboard",
+        synopsis: "git zdashboard [--json]",
         desc: &[
             "Prints a one-screen summary of the indexed tree: how many repositories are dirty, ahead, behind, diverged, detached, or without an upstream, plus the active claim and session counts and the async queue depth.",
             "It aggregates the daemon-maintained status cache and the ledger \\(em a handful of db queries, not a live per-repo walk \\(em so it is instant even across thousands of repos, exactly as `zstatus --all` is. When the cache covers fewer repos than are indexed, a note says so; `git zstatus --all` refreshes it. For fresh, deep reads use the dedicated verbs (zstale, zorphans, zconflicts, zsize).",
@@ -672,7 +672,7 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zpin",
         summary: "freeze a repo from daemon autonomy",
-        synopsis: "git zpin [<path>...|list]",
+        synopsis: "git zpin [<path>...|list] [--json]",
         desc: &[
             "Pins one or more repositories so the daemon's autonomy leaves their pointer alone \\(em a pinned repo is skipped by autobump and reconcile, so its gitlink and HEAD will not move on their own until it is unpinned. Detached-HEAD attach still runs, because re-attaching a detached HEAD heals it without moving the pointer.",
             "With no path it pins the repository at the current directory; with paths it pins each named repository; `git zpin list` prints every pinned repo. The flag lives in the shared index (`repos.pinned`), so it survives daemon restarts and is visible to every session. Unfreeze with `git zunpin`.",
@@ -716,7 +716,7 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zsince",
         summary: "what happened across the tree since a time",
-        synopsis: "git zsince <duration|snapshot> [--kind K] [--repo R]",
+        synopsis: "git zsince <duration|snapshot> [--kind K] [--repo R] [--json]",
         desc: &[
             "Prints every feed event \\(em commits, stages, status changes, reconciles \\(em recorded across the whole indexed tree since a point in time. A duration (90s, 45m, 2d, 1h30m, or a bare number of seconds) counts back from now; any other token is treated as a snapshot name and its creation time is the baseline.",
             "This is the scoped \"what did the fleet do since X\" delta that `git zlog`'s full timeline does not give. --kind and --repo narrow the result to one event kind or to repos matching a substring.",
@@ -725,7 +725,7 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zcontend",
         summary: "live agent-vs-agent contention across the tree",
-        synopsis: "git zcontend",
+        synopsis: "git zcontend [--json]",
         desc: &[
             "Shows who is stepping on whom: the session-attributed claims (advisory leases), the per-repo job backlog (how many jobs are queued or running behind each repository in the daemon's fair queue), and the intersection \\(em repositories that are both claimed and have jobs stacked up, i.e. actively contested.",
             "All three are read from the shared index; nothing is mutated. It is the multi-agent observability view git has no notion of, because git only ever sees one repository and one process.",
@@ -743,7 +743,7 @@ pub const DOCS: &[Doc] = &[
     Doc {
         verb: "zgraph",
         summary: "fleet topology of duplicate checkouts",
-        synopsis: "git zgraph",
+        synopsis: "git zgraph [--json]",
         desc: &[
             "Maps the cross-repository relationship git has no notion of: which local checkouts are the same upstream repository \\(em a dup group, the same origin URL with more than one working tree on the machine. git can never show this, because git only ever sees one repository.",
             "Reads every indexed repository's origin (on demand, so the per-repo config read is acceptable) and lists each dup group with its checkouts, then a summary of repos, distinct origins, dup groups, and repos with no origin.",

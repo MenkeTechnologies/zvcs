@@ -6853,6 +6853,16 @@ _git_commands () {
     zidle:'zvcs: indexed repos with no active claim'
     zdashboard:'zvcs: one-screen health summary of the tree'
     ztop:'zvcs: live htop-style fleet monitor, most churn on top'
+    zpin:'zvcs: freeze a repo from daemon autonomy (no autobump/reconcile)'
+    zunpin:'zvcs: unfreeze pinned repos'
+    zbroadcast:'zvcs: post or read inter-agent messages'
+    zhandoff:'zvcs: hand a repo'\''s claim to another agent session'
+    zon:'zvcs: run a command on a semantic feed event (commit/stage/status/reconcile)'
+    zsince:'zvcs: everything across the tree since a time or snapshot'
+    zcontend:'zvcs: live agent-vs-agent contention (claims, backlog, contested)'
+    zwaitfor:'zvcs: block until a tree-wide state holds (clean/idle/synced)'
+    zgraph:'zvcs: fleet topology of duplicate checkouts (same origin)'
+    zrewind:'zvcs: restore the whole tree to a wall-clock time via reflog reset'
   )
 
   zstyle -a :completion:$curcontext: user-commands user_commands
@@ -9307,6 +9317,59 @@ done
   local -a names=( ${(f)"$(_call_program zvcs-stashes git zstashes 2>/dev/null | cut -f1)"} )
   _describe -t zvcs-stashes stash names
 }
+
+# zvcs coordination + event verbs (subcommands and flags).
+(( $+functions[_git-zpin] )) || _git-zpin () {
+  if (( CURRENT == 2 )); then
+    local -a a=( list:'list pinned repos' )
+    _describe -t zpin-sub subcommand a
+    _files -/
+  fi
+}
+(( $+functions[_git-zunpin] )) || _git-zunpin () {
+  _arguments '--all[unpin every pinned repo]' '*:directory:_files -/'
+}
+(( $+functions[_git-zon] )) || _git-zon () {
+  if (( CURRENT == 2 )); then
+    local -a a=( list:'list subscriptions' rm:'remove a subscription' )
+    _describe -t zon-sub subcommand a
+  fi
+  _arguments '--kind[event kind]:kind:(commit stage status reconcile)' '--repo[repo substring]:pattern:'
+}
+(( $+functions[_git-zsince] )) || _git-zsince () {
+  _arguments '--json[emit NDJSON]' '--kind[event kind]:kind:(commit stage status reconcile)' \
+    '--repo[repo substring]:pattern:' '*:duration or snapshot:'
+}
+(( $+functions[_git-zbroadcast] )) || _git-zbroadcast () {
+  _arguments '--to[address one session]:session:' '*:message:'
+}
+(( $+functions[_git-zhandoff] )) || _git-zhandoff () {
+  _arguments '1:repo path:_files -/' '2:session:'
+}
+(( $+functions[_git-zwaitfor] )) || _git-zwaitfor () {
+  if (( CURRENT == 2 )); then
+    local -a a=( clean:'every repo clean' idle:'no queued/running jobs' synced:'every repo up-to-date' )
+    _describe -t zwaitfor-cond condition a
+  fi
+  _arguments '--timeout[seconds before giving up]:secs:'
+}
+(( $+functions[_git-zrewind] )) || _git-zrewind () {
+  _arguments '--dry-run[show what would move, change nothing]' '*:duration e.g. 2h:'
+}
+(( $+functions[_git-zcontend] )) || _git-zcontend () { _arguments '--json[emit NDJSON]' }
+(( $+functions[_git-zgraph] )) || _git-zgraph () { _arguments '--json[emit NDJSON]' }
+(( $+functions[_git-zstatus] )) || _git-zstatus () {
+  _arguments '(--all -a)'{--all,-a}'[every indexed repo, from the status cache]' '--json[emit NDJSON]'
+}
+
+# Every zvcs read verb takes --json for scripting (NDJSON, one object per line).
+for _zv in zheads zdirty zbranches ztags zremotes zsize zage zstale zlast zfiles \
+           zpristine zcommits zbig zahead zbehind zunpushed zunpulled zauthors \
+           zhot zdivergent zorphans zconflicts zgrep zrepos zjobs zwho zsessions \
+           zdashboard; do
+  (( $+functions[_git-$_zv] )) || functions[_git-$_zv]='_arguments "--json[emit NDJSON for scripting]" "*::selector or pattern:"'
+done
+unset _zv
 
 # Verbs that take a directory path → complete directories.
 for _zv in zsync zbump zup zdashed; do

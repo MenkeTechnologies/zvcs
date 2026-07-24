@@ -611,3 +611,49 @@ function and both a single `stat` when inactive:
   environment. `maybe_intercept` orchestrates before → around/after; an around
   advice runs `"$INTERCEPT_CMD"` to proceed, and a `ZVCS_INTERCEPTED` env guard
   stops re-interception of the wrapped command.
+
+## 17. Coordination, event automation & scripting verbs
+
+Built on the same substrate (daemon, db, watchers, event feed), a further set of
+verbs turns the machine-wide state into things scripts and agents can act on.
+
+**The event feed** (`db.rs` `events` table). Two `AFTER UPDATE` triggers on
+`repo_status` turn a status change into a typed row: a moving `head_sha` →
+`commit` (keyed on the peeled commit id, not the invariant branch name), a
+`dirty`/`sync` flip → `status`. Both the whole-tree poller (statusd) and the
+instant watcher write through `upsert_status`, so both feed it with no per-call
+plumbing; triggers fire on UPDATE only, so a repo's cold-start INSERT never
+floods. `add`/`stage` emit a `stage` event directly on a successful index write;
+the reconcile path emits `reconcile` on a real fast-forward. `zevents`/`ztail`
+tail the feed live; `zsince <duration|snapshot>` is the bounded delta.
+
+**Semantic-event automation** — `zon`. Where `ztrigger` reacts to raw filesystem
+events, `zon` reacts to typed feed events. Subscriptions (`subscriptions` table:
+kind, repo substring, command) are matched by a daemon loop that watches the feed
+and runs each command via the shell with `ZVCS_EVENT`/`ZVCS_REPO`/`ZVCS_DETAIL`/
+`ZVCS_SHA` set.
+
+**Selective autonomy** — `zpin`/`zunpin`. A `repos.pinned` flag; the daemon's
+`react()` refuses autobump and reconcile for a pinned repo (attach still runs —
+re-attaching a detached HEAD doesn't move the pointer). Freeze part of the tree
+from autonomy without turning it off machine-wide.
+
+**Agent coordination.** `zcontend` reads claims + the per-repo job backlog and
+reports the contested set (claimed *and* queued). `zbroadcast`/`zhandoff` are
+inter-agent IPC over the db (`messages` + per-session `message_reads`, so a
+broadcast is delivered once per agent; `zhandoff` reassigns a claim and notifies
+the receiver). `zwaitfor <clean|idle|synced|repo sha>` blocks until a tree-wide
+state holds — a barrier on *state*, where `zwait`/`zbarrier` are job-scoped.
+
+**Topology & time-travel.** `zgraph` groups indexed repos by origin URL into dup
+groups (the same upstream checked out N times — a relationship git has no command
+for). `zrewind <duration>` restores the whole tree (repo + submodules) to the
+HEAD each had at a wall-clock time, from the reflog, reusing the porcelain
+`reset --hard` (dirty repos refused, reflog-expiry-bounded).
+
+**Scripting output** — `--json`. Every read verb (query, analytics, discovery,
+coordination) takes `--json` and emits NDJSON: one object per line, so `jq -c`
+streams and `jq -s` slurps to an array. A shared `json_flag`/`emit_json` helper
+(`query.rs`) strips the flag before selector parsing and prints uniformly; the
+integration test `tests/json_output.rs` runs the real binary and parses every
+verb's `--json` output, so the guarantee can't drift.

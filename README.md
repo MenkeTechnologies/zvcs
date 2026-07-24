@@ -131,6 +131,14 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Health | `zdoctor` | environment health check — git shadow on PATH, daemon, ledger, man pages, MANPATH, dashed forms (OK/WARN/FAIL, exits non-zero on FAIL) |
 | git-compat | every stock subcommand | dispatched natively; depth varies — see the parity report |
 
+**Scripting output.** Every read verb — the query, analytics, discovery, and
+coordination views (`zheads`, `zdirty`, `zrepos`, `ztags`, `zstatus --all`,
+`zjobs`, `zwho`, `zcontend`, `zgraph`, `zsince`, `zdashboard`, …) — takes
+`--json` for NDJSON: one JSON object per line, so `git zdirty --json | jq -r .repo`
+streams and `jq -s` slurps to an array. The live feeds (`zevents`/`ztail`,
+`zcommands`) stream `--json` too. An integration test parses every verb's
+`--json` output so it can't drift.
+
 Every subcommand stock git ships has a dispatch arm, so nothing reaches the
 `not yet ported` path; there is no fallthrough to stock git. Dispatching is not
 the same as agreeing with git, and the two are measured separately — an

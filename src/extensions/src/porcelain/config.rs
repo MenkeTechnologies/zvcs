@@ -35,22 +35,27 @@ impl Mode {
 
 /// Which config file a scoped read/write targets. `Default` keeps git's
 /// implicit behavior (merged read, repository-local write); the rest pin a
-/// single file selected by a `--local`/`--global`/`--system` flag.
-#[derive(PartialEq, Clone, Copy)]
+/// single file — selected by a `--local`/`--global`/`--system` flag, or named
+/// outright by `-f`/`--file`.
+#[derive(PartialEq, Clone)]
 enum Scope {
     Default,
     Local,
     Global,
     System,
+    File(std::path::PathBuf),
 }
 
 /// A resolved write destination: the file to rewrite, its config `Source` (so a
-/// freshly-created file carries the right provenance), and the coordinator lane
-/// key to serialize concurrent zvcs writers on.
+/// freshly-created file carries the right provenance), the coordinator lane key
+/// to serialize concurrent zvcs writers on, and whether a missing parent
+/// directory may be created (git creates one for `--global`, never for
+/// `--file`).
 struct WriteTarget {
     path: std::path::PathBuf,
     source: Source,
     lock_key: std::path::PathBuf,
+    create_parent: bool,
 }
 
 /// Exit 129 — git's usage-error code — after emitting `error: <msg>` on stderr.
@@ -75,6 +80,20 @@ fn is_synthetic(source: Source) -> bool {
     matches!(source, Source::EnvOverride | Source::Api)
 }
 
+/// The bare `strerror` text of an OS error, as git prints it.
+///
+/// Rust's `io::Error` Display appends ` (os error N)`; git's `strerror` does
+/// not, so `No such file or directory (os error 2)` has to become
+/// `No such file or directory` to match messages like
+/// `fatal: unable to read config file 'x': No such file or directory`.
+fn errno_text(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match text.find(" (os error ") {
+        Some(cut) => text[..cut].to_owned(),
+        None => text,
+    }
+}
+
 /// `git config` — get/set/list configuration values, backed by gitoxide.
 ///
 /// Reads resolve through the fully-merged config snapshot (system + global +
@@ -91,11 +110,20 @@ fn is_synthetic(source: Source) -> bool {
 ///     unless only the XDG file exists, created if absent. Never needs a repo.
 ///   * `--system` → `$(prefix)/etc/gitconfig` (honoring `GIT_CONFIG_SYSTEM` /
 ///     `GIT_CONFIG_NOSYSTEM`). Never needs a repo.
+///   * `-f <path>` / `--file <path>` → exactly that file, `include.path`
+///     directives NOT followed (git only honors them here under `--includes`,
+///     which is not implemented). Never needs a repo; created on write, but its
+///     parent directory is not — a missing one is git's
+///     `could not lock config file <path>: <errno>` at exit 255. Reading a
+///     missing file is exit 1 for the get forms and
+///     `fatal: unable to read config file '<path>': <errno>` at exit 128 for
+///     `--list`, exactly as git splits those two paths.
 /// The default (no scope) write still targets the repository-local file and so
 /// still needs a repo — attempting one without one fails with `not in a git
-/// directory`. `--worktree` and `--file` are rejected with a precise error rather
-/// than silently mistargeted. Two scope flags at once → `only one config file at
-/// a time`.
+/// directory`. `--worktree` is rejected with a precise error rather than
+/// silently mistargeted. Two *different* scope flags at once → `only one config
+/// file at a time`; a repeated `--file` just replaces the path, as git's
+/// `given_config_source.file` does.
 ///
 /// Supported forms:
 ///   * `git config <name>` / `--get <name>`   → last value, exit 1 if absent
@@ -136,7 +164,13 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     //   * `git config --get -- --list` still reads the key literally `--list`.
     let mut end_of_options = false;
 
-    for a in args {
+    // Indexed rather than iterated because `-f`/`--file` consumes the argument
+    // after it as its value.
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        i += 1;
+
         if end_of_options {
             positional.push(a.as_str());
             continue;
@@ -197,13 +231,39 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
+        // `-f`/`--file` takes a path, in all four of git's parse-options
+        // spellings: separate (`-f p`, `--file p`), sticky (`-fp`), and
+        // `--file=p`. An empty value is a legal (unreadable) path, not an error.
+        let file_value = match a.as_str() {
+            "-f" | "--file" => match args.get(i) {
+                Some(v) => {
+                    i += 1;
+                    Some(v.clone())
+                }
+                // git's parse-options phrasing differs for the short and long
+                // spellings of the same option.
+                None if a == "-f" => return usage_error("switch `f' requires a value"),
+                None => return usage_error("option `file' requires a value"),
+            },
+            other => other
+                .strip_prefix("--file=")
+                .or_else(|| other.strip_prefix("-f"))
+                .map(ToOwned::to_owned),
+        };
+        if let Some(path) = file_value {
+            // git counts `--file` once no matter how often it is given, so only
+            // a *different* kind of scope flag collides with it.
+            if !matches!(scope, Scope::Default | Scope::File(_)) {
+                return usage_error("only one config file at a time");
+            }
+            scope = Scope::File(path.into());
+            continue;
+        }
+
         match a.as_str() {
             "--name-only" => name_only = true,
             // Per-worktree config needs `extensions.worktreeConfig`; not ported.
             "--worktree" => bail!("--worktree scope is not supported"),
-            "--file" => bail!(
-                "--file is not supported, only the --local, --global and --system scopes"
-            ),
             other if other.starts_with('-') => bail!("unknown option {other}"),
             other => positional.push(other),
         }
@@ -244,10 +304,23 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     //   * Local   → the repository-local file alone (requires a repo).
     //   * Global  → the XDG + `~/.gitconfig` pair, merged (last wins).
     //   * System  → `$(prefix)/etc/gitconfig` alone.
+    //   * File    → the named file alone, includes not followed.
     let snapshot = repo.as_ref().map(gix::Repository::config_snapshot);
     let default_global;
     let scoped;
-    let file: &gix::config::File = match scope {
+    // Set when a `--file` target could not be read. git only makes that fatal
+    // for `--list`; the get forms treat it as "key not found" (exit 1), so the
+    // error is carried to the dispatch below rather than raised here.
+    let mut unreadable: Option<std::io::Error> = None;
+    // A pure write skips the read side entirely: the write path re-reads its
+    // target under the lock, and reading here as well would repeat git's
+    // `warning: unable to access …` diagnostic for an unreadable file.
+    let reads_config = match mode {
+        Mode::List | Mode::Get | Mode::GetAll | Mode::GetRegexp => true,
+        Mode::Auto => positional.len() == 1,
+        Mode::Add | Mode::Unset | Mode::UnsetAll => false,
+    };
+    let file: &gix::config::File = match &scope {
         Scope::Default => match snapshot.as_ref() {
             Some(s) => s.plumbing(),
             None => {
@@ -271,14 +344,43 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             scoped = read_scope(&[Source::System]);
             &scoped
         }
+        // `--file` is git's `CONFIG_SCOPE_COMMAND`, hence `Source::Cli`. Read
+        // through `fs::read` so a missing or unreadable path surfaces as a
+        // plain `io::Error` whose errno git reports verbatim.
+        Scope::File(path) if !reads_config => {
+            scoped = empty_config(path, Source::Cli);
+            &scoped
+        }
+        Scope::File(path) => {
+            scoped = match read_config_bytes(path) {
+                Ok(bytes) => parse_config(&bytes, path, Source::Cli)?,
+                Err(err) => {
+                    unreadable = Some(err);
+                    empty_config(path, Source::Cli)
+                }
+            };
+            &scoped
+        }
     };
 
     // Resolve the write destination for this scope, erroring like git when a
     // repository is required but absent.
-    let write_target = || resolve_write_target(scope, repo.as_ref());
+    let write_target = || resolve_write_target(&scope, repo.as_ref());
 
     match mode {
-        Mode::List => list(file, name_only),
+        // Unlike the get forms, `--list` reports an unreadable `--file` as a
+        // fatal error rather than as an empty result.
+        Mode::List => match (&scope, &unreadable) {
+            (Scope::File(path), Some(err)) => {
+                eprintln!(
+                    "fatal: unable to read config file '{}': {}",
+                    path.display(),
+                    errno_text(err)
+                );
+                Ok(ExitCode::from(128))
+            }
+            _ => list(file, name_only),
+        },
         // `--get <name> <value-pattern>` filters returned values by an ERE — a
         // read-side feature distinct from the value-pattern *set* form below and
         // not yet implemented; the two-argument read is refused rather than faked.
@@ -483,17 +585,62 @@ enum WriteOp {
     UnsetAll,
 }
 
+/// Read a config file, mirroring git's `fopen_or_warn`: every errno except
+/// `ENOENT`/`ENOTDIR` — a directory in the way, a file the user cannot read —
+/// first gets a `warning: unable to access '<path>': <errno>` line, then the
+/// caller decides how fatal the failure is.
+fn read_config_bytes(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read(path).inspect_err(|err| {
+        if !matches!(err.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
+        {
+            eprintln!("warning: unable to access '{}': {}", path.display(), errno_text(err));
+        }
+    })
+}
+
+/// An empty config file carrying `path`/`source` metadata, so entries written
+/// into it later report the right provenance.
+fn empty_config(path: &std::path::Path, source: Source) -> ConfigFile {
+    ConfigFile::new(gix::config::file::Metadata::from(source).at(path))
+}
+
+fn parse_config(bytes: &[u8], path: &std::path::Path, source: Source) -> Result<ConfigFile> {
+    Ok(ConfigFile::from_bytes_no_includes(
+        bytes,
+        gix::config::file::Metadata::from(source).at(path),
+        Default::default(),
+    )?)
+}
+
 /// Load the config file at `path` for `source`, or an empty file carrying that
 /// source/path metadata when it does not exist yet (git creates a fresh
 /// `~/.gitconfig` on first `--global` write). Only a missing file is treated as
 /// empty; a malformed existing file still errors, as git's parser does.
 fn load_or_empty(path: &std::path::Path, source: Source) -> Result<ConfigFile> {
-    if path.exists() {
-        Ok(ConfigFile::from_path_no_includes(path.to_path_buf(), source)?)
-    } else {
-        Ok(gix::config::File::new(
-            gix::config::file::Metadata::from(source).at(path),
-        ))
+    match read_config_bytes(path) {
+        Ok(bytes) => parse_config(&bytes, path, source),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(empty_config(path, source)),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Load a write target's current contents, or an empty file when it does not
+/// exist yet.
+///
+/// `None` means git would refuse the target outright — it exists but cannot be
+/// read at all, e.g. a directory named by `--file` — which is
+/// `error: invalid config file <path>` at exit 3. The diagnostic is emitted
+/// here so both write paths report it identically.
+fn load_for_write(path: &std::path::Path, source: Source) -> Result<Option<ConfigFile>> {
+    match read_config_bytes(path) {
+        Ok(bytes) => parse_config(&bytes, path, source).map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(Some(empty_config(path, source)))
+        }
+        Err(_) => {
+            eprintln!("error: invalid config file {}", path.display());
+            Ok(None)
+        }
     }
 }
 
@@ -517,7 +664,7 @@ fn read_scope(sources: &[Source]) -> ConfigFile {
 
 /// Resolve the single file a scoped write targets, mirroring git's
 /// `given_config_source` resolution.
-fn resolve_write_target(scope: Scope, repo: Option<&gix::Repository>) -> Result<WriteTarget> {
+fn resolve_write_target(scope: &Scope, repo: Option<&gix::Repository>) -> Result<WriteTarget> {
     match scope {
         Scope::Default | Scope::Local => {
             let repo = repo.ok_or_else(|| match scope {
@@ -530,6 +677,7 @@ fn resolve_write_target(scope: Scope, repo: Option<&gix::Repository>) -> Result<
                 path: repo.common_dir().join("config"),
                 source: Source::Local,
                 lock_key: repo.git_dir().to_path_buf(),
+                create_parent: true,
             })
         }
         Scope::Global => {
@@ -547,6 +695,7 @@ fn resolve_write_target(scope: Scope, repo: Option<&gix::Repository>) -> Result<
                 lock_key: path.clone(),
                 path,
                 source,
+                create_parent: true,
             })
         }
         Scope::System => {
@@ -558,8 +707,17 @@ fn resolve_write_target(scope: Scope, repo: Option<&gix::Repository>) -> Result<
                 lock_key: path.clone(),
                 path,
                 source: Source::System,
+                create_parent: true,
             })
         }
+        // `--file` writes exactly the named path, creating the file but never
+        // its directory — git fails to take its lock there instead.
+        Scope::File(path) => Ok(WriteTarget {
+            path: path.clone(),
+            source: Source::Cli,
+            lock_key: path.clone(),
+            create_parent: false,
+        }),
     }
 }
 
@@ -575,11 +733,11 @@ fn write_scoped(target: &WriteTarget, name: &str, value: &str, op: WriteOp) -> R
 
     let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
 
-    if let Some(parent) = target.path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
+    prepare_parent(target);
     let path = &target.path;
-    let mut file = load_or_empty(path, target.source)?;
+    let Some(mut file) = load_for_write(path, target.source)? else {
+        return Ok(ExitCode::from(3));
+    };
 
     match op {
         WriteOp::Set => {
@@ -610,8 +768,7 @@ fn write_scoped(target: &WriteTarget, name: &str, value: &str, op: WriteOp) -> R
         }
     }
 
-    persist(path, &file)?;
-    Ok(ExitCode::SUCCESS)
+    persist_or_lock_error(path, &file)
 }
 
 /// `git config <name> <value> <value-pattern>` — the value-pattern set form.
@@ -654,11 +811,11 @@ fn set_with_value_pattern(
 
     let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
 
-    if let Some(parent) = target.path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
+    prepare_parent(target);
     let path = &target.path;
-    let mut file = load_or_empty(path, target.source)?;
+    let Some(mut file) = load_for_write(path, target.source)? else {
+        return Ok(ExitCode::from(3));
+    };
 
     // Existing values of the key in this file, in order of occurrence. An absent
     // key yields an empty list, which routes to the append branch below.
@@ -697,8 +854,39 @@ fn set_with_value_pattern(
         }
     }
 
-    persist(path, &file)?;
-    Ok(ExitCode::SUCCESS)
+    persist_or_lock_error(path, &file)
+}
+
+/// Create the directory holding a scoped target when git would — a first
+/// `--global` write into a fresh `~/.config/git/`, say. A `--file` target is
+/// left alone: git does not create that directory either, and a missing one has
+/// to fail at the write below with git's lock diagnostic.
+fn prepare_parent(target: &WriteTarget) {
+    if !target.create_parent {
+        return;
+    }
+    if let Some(parent) = target.path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+}
+
+/// Persist `file`, reporting a failure the way git reports being unable to take
+/// the config lock: `error: could not lock config file <path>: <errno>`, exit
+/// 255. That is git's outcome for an unwritable target of any scope — a missing
+/// `--file` directory, a read-only `~/.gitconfig`, a `--system` file owned by
+/// root.
+fn persist_or_lock_error(path: &std::path::Path, file: &ConfigFile) -> Result<ExitCode> {
+    match persist(path, file) {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(err) => {
+            eprintln!(
+                "error: could not lock config file {}: {}",
+                path.display(),
+                errno_text(&err)
+            );
+            Ok(ExitCode::from(255))
+        }
+    }
 }
 
 /// Write `file` to `path` atomically: serialize to a sibling temp file, then
@@ -722,7 +910,7 @@ pub(crate) fn set_branch_upstream(
     Ok(())
 }
 
-fn persist(path: &std::path::Path, file: &ConfigFile) -> Result<()> {
+fn persist(path: &std::path::Path, file: &ConfigFile) -> std::io::Result<()> {
     let bytes = file.to_bstring();
     let tmp = path.with_extension("zvcs-tmp");
     {

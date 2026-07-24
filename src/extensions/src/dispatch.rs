@@ -12,7 +12,7 @@ use std::process::ExitCode;
 /// zvcs-native extension verbs — the superset that stock git does not have.
 pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zconfig", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
-    "zsubmit", "zevents", "ztail", "zcommands",
+    "zsubmit", "zevents", "ztail", "zcommands", "zintercept",
     "zpin", "zunpin", "zbroadcast", "zhandoff", "zon", "zsince", "zcontend", "zwaitfor", "zgraph", "zrewind",
     "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
     "zsnapshots", "zworktree", "zstash", "zunstash", "zstashes", "zup", "zforeach", "zhook",
@@ -241,6 +241,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zrewind" => "usage: git zrewind <duration> [--dry-run] — restore the whole tree (repo + submodules) to the state it had <duration> ago via per-repo reflog reset",
         "ztail" => "usage: git ztail [-n <count>] [--kind commit|stage|status|reconcile] [--repo <substr>] [--json] [--no-follow] — alias of git zevents",
         "zcommands" => "usage: git zcommands [-n <count>] [--repo <substr>] [--json] [--no-follow] [--off] [--clear] — live feed of every git command run across the fleet",
+        "zintercept" => "usage: git zintercept before|after|around <pattern> -- <cmd> | list | remove <id> | clear — AOP hooks that run advice around matching git commands",
         "zdaemon" => "usage: git zdaemon <start|stop|restart|status|info|ping|log>",
         "zconfig" => "usage: git zconfig [<name> [on|off|<count>|default]] — toggle daemon features (see `git help zconfig`)",
         "zrepos" => "usage: git zrepos [<pattern>...] — list indexed repos; patterns filter by case-insensitive substring",
@@ -335,10 +336,16 @@ fn z_usage(sub: &str) -> Option<&'static str> {
 /// `git zverbs` — print every superset (`z*`) verb with its one-line usage. The
 /// text is [`z_usage`] itself, minus the `usage: git ` lead-in, so the listing is
 /// the same source of truth each verb's own `-h` prints and can never drift.
-fn print_verbs() -> Result<ExitCode> {
+fn print_verbs(args: &[String]) -> Result<ExitCode> {
+    let json = args.iter().any(|a| a == "--json");
     for verb in SUPERSET_VERBS {
         if let Some(usage) = z_usage(verb) {
-            println!("{}", usage.strip_prefix("usage: git ").unwrap_or(usage));
+            let u = usage.strip_prefix("usage: git ").unwrap_or(usage);
+            if json {
+                println!("{}", serde_json::json!({"verb": verb, "usage": u}));
+            } else {
+                println!("{u}");
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -366,6 +373,14 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // logging on. A single `stat` (no work) when it is off, so the hot path pays
     // essentially nothing; best-effort, never fails the command.
     superset::zcommands::log_invocation(sub, args);
+
+    // AOP intercepts (ported from zshrs): if before/after/around advice is
+    // registered for this command, orchestrate it. Returns Some when interception
+    // handled the command (around, or before+after wrapping); None otherwise —
+    // including the before-only case, whose advice has already run by then.
+    if let Some(result) = superset::intercepts::maybe_intercept(sub, args) {
+        return result;
+    }
 
     // Every z-verb answers `-h`/`--help` with a one-line usage, uniformly and
     // before dispatch. `z_usage` returns `None` for anything that is not a known
@@ -413,6 +428,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zgraph" => superset::zgraph(args),
         "zrewind" => superset::zrewind(args),
         "zcommands" => superset::zcommands(args),
+        "zintercept" => superset::zintercept(args),
         "zdaemon" => superset::zdaemon(args),
         "zconfig" => superset::zconfig(args),
         "zrepos" => superset::zrepos(args),
@@ -442,7 +458,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zhook" => superset::zhook(args),
         "ztrigger" => superset::ztrigger(args),
         "zwatch" => superset::zwatch(args),
-        "zverbs" => print_verbs(),
+        "zverbs" => print_verbs(args),
         "zselectors" => superset::zselectors(args),
         "zcd" => superset::zcd(args),
         "zpwd" => superset::zpwd(args),

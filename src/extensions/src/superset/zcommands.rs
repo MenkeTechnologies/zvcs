@@ -68,6 +68,8 @@ pub fn log_invocation(sub: &str, args: &[String]) {
     }
     let ts = crate::date::now_seconds();
     let pid = std::process::id();
+    // ppid identifies the invoking process — which agent / shell ran this git.
+    let ppid = unsafe { libc::getppid() };
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
     // argv, space-joined; tabs (our field separator) can't appear in a verb/args
     // git would accept, but strip any defensively.
@@ -78,7 +80,7 @@ pub fn log_invocation(sub: &str, args: &[String]) {
     }
     let argv = argv.replace('\t', " ").replace('\n', " ");
     let cwd = cwd.replace('\t', " ");
-    let line = format!("{ts}\t{pid}\t{cwd}\t{argv}\n");
+    let line = format!("{ts}\t{pid}\t{ppid}\t{cwd}\t{argv}\n");
 
     let path = log_path();
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
@@ -227,17 +229,19 @@ fn read_backlog(path: &Path, limit: usize, repo: Option<&str>) -> Vec<Rec> {
 struct Rec {
     ts: i64,
     pid: u32,
+    ppid: i32,
     cwd: String,
     argv: String,
 }
 
 fn parse_line(line: &str) -> Option<Rec> {
-    let mut it = line.splitn(4, '\t');
+    let mut it = line.splitn(5, '\t');
     let ts = it.next()?.parse().ok()?;
     let pid = it.next()?.parse().ok()?;
+    let ppid = it.next()?.parse().ok()?;
     let cwd = it.next()?.to_string();
     let argv = it.next()?.to_string();
-    Some(Rec { ts, pid, cwd, argv })
+    Some(Rec { ts, pid, ppid, cwd, argv })
 }
 
 fn pass(r: &Rec, o: &Opts) -> bool {
@@ -250,16 +254,19 @@ fn emit(r: &Rec, json: bool) {
         let obj = serde_json::json!({
             "ts": r.ts,
             "pid": r.pid,
+            "ppid": r.ppid,
             "cwd": r.cwd,
             "argv": r.argv,
         });
         println!("{obj}");
         return;
     }
+    // pid←ppid: the git process and the agent/shell that launched it.
     println!(
-        "{DIM}{} {:>7}{RESET}  {CYAN}{:<20}{RESET}  {GREEN}git{RESET} {BOLD}{}{RESET}",
+        "{DIM}{} {:>7}\u{2190}{:<7}{RESET}  {CYAN}{:<20}{RESET}  {GREEN}git{RESET} {BOLD}{}{RESET}",
         hms(r.ts),
         r.pid,
+        r.ppid,
         basename(&r.cwd),
         r.argv,
     );
@@ -289,13 +296,14 @@ mod tests {
 
     #[test]
     fn line_roundtrips_through_parse() {
-        let r = parse_line("1700000000\t4242\t/home/u/repo\tfetch --all").unwrap();
+        let r = parse_line("1700000000\t4242\t900\t/home/u/repo\tfetch --all").unwrap();
         assert_eq!(r.ts, 1700000000);
         assert_eq!(r.pid, 4242);
+        assert_eq!(r.ppid, 900);
         assert_eq!(r.cwd, "/home/u/repo");
         assert_eq!(r.argv, "fetch --all");
-        // argv keeps embedded spaces; only the first 3 tabs split fields.
-        let r2 = parse_line("1\t2\t/p\tcommit -m msg with spaces").unwrap();
+        // argv keeps embedded spaces; only the first 4 tabs split fields.
+        let r2 = parse_line("1\t2\t3\t/p\tcommit -m msg with spaces").unwrap();
         assert_eq!(r2.argv, "commit -m msg with spaces");
         assert!(parse_line("garbage").is_none());
     }
@@ -306,10 +314,10 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("commands.log");
         let body = "\
-1\t10\t/x/alpha\tstatus
-2\t11\t/x/beta\tfetch
-3\t12\t/x/alpha\tcommit -am z
-4\t13\t/x/beta\tpush\n";
+1\t10\t99\t/x/alpha\tstatus
+2\t11\t99\t/x/beta\tfetch
+3\t12\t99\t/x/alpha\tcommit -am z
+4\t13\t99\t/x/beta\tpush\n";
         std::fs::write(&path, body).unwrap();
         let all = read_backlog(&path, 100, None);
         assert_eq!(all.len(), 4);

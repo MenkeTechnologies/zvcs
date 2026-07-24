@@ -58,6 +58,7 @@ mod zrewind;
 mod zsince;
 mod zwaitfor;
 pub mod zcommands;
+pub mod intercepts;
 pub mod ztop;
 mod zsync;
 
@@ -106,5 +107,6 @@ pub use zrewind::zrewind;
 pub use zsince::zsince;
 pub use zwaitfor::zwaitfor;
 pub use zcommands::zcommands;
+pub use intercepts::zintercept;
 pub use ztop::ztop;
 pub use zsync::{reconcile_repo, reconcile_repo_local, sync_dups, zsync};

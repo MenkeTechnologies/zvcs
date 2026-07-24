@@ -651,6 +651,16 @@ pub const DOCS: &[Doc] = &[
         desc: &["An alias for `git zevents` \\(em the single live feed of commits, reconciles, and status-changes across the whole indexed tree. See `git help zevents` for the full description."],
     },
     Doc {
+        verb: "zintercept",
+        summary: "AOP hooks that run advice around matching git commands",
+        synopsis: "git zintercept before|after|around <pattern> -- <cmd> | list | remove <id> | clear",
+        desc: &[
+            "Registers aspect-oriented advice that fires around git commands, ported from zshrs. A before hook runs a shell command before a matching git command; an after hook runs after it (with the command's exit status and timing available); an around hook replaces it, and runs the original itself when it chooses. <pattern> matches the git subcommand \\(em `commit`, `push`, a glob like `commit *`, or `*` / `all` for everything.",
+            "The advice <cmd> is a shell command run via `sh -c`. It sees the intercepted command through the environment: INTERCEPT_NAME (the subcommand), INTERCEPT_ARGS, and INTERCEPT_CMD (the full `git ...` line); after-advice also gets INTERCEPT_STATUS, INTERCEPT_MS, and INTERCEPT_US. An around advice runs \"$INTERCEPT_CMD\" to proceed with the original (that child is not re-intercepted).",
+            "Registrations persist to $ZVCS_HOME/intercepts.tsv and load at dispatch; when none are registered the cost on every git command is a single stat. `list` shows all with their ids, `remove <id>` deletes one, and `clear` removes them all.",
+        ],
+    },
+    Doc {
         verb: "zcommands",
         summary: "live feed of every git command run across the fleet",
         synopsis: "git zcommands [-n <count>] [--repo <substr>] [--json] [--no-follow] [--off] [--clear]",

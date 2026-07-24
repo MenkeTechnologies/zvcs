@@ -216,8 +216,16 @@ fn tag_count(repo: &gix::Repository) -> usize {
 
 /// `git zremotes [selectors]` — each repo's remotes and their fetch URLs.
 pub fn zremotes(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let lists = parallel_map(&repos, |gd, _| probe(gd, remote_lines, |e| e));
+    if json {
+        emit_json(repos.iter().zip(&lists).map(|((_, wd), remotes)| {
+            let rs: Vec<&str> = remotes.lines().filter(|l| !l.is_empty()).collect();
+            serde_json::json!({"repo": wd.to_string_lossy(), "remotes": rs})
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
     for ((_, wd), remotes) in repos.iter().zip(&lists) {
         println!("== {} ==\n{remotes}", wd.display());
     }
@@ -243,7 +251,8 @@ fn remote_lines(repo: &gix::Repository) -> String {
 
 /// `git zsize [selectors]` — each repo's on-disk `.git` size, largest first.
 pub fn zsize(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let sizes = parallel_map(&repos, |gd, _| dir_size(gd));
     let mut rows: Vec<(u64, String)> = repos
         .iter()
@@ -251,6 +260,10 @@ pub fn zsize(args: &[String]) -> Result<ExitCode> {
         .map(|((_, wd), s)| (*s, wd.display().to_string()))
         .collect();
     rows.sort_by(|a, b| b.0.cmp(&a.0));
+    if json {
+        emit_json(rows.iter().map(|(size, path)| serde_json::json!({"repo": path, "bytes": size})));
+        return Ok(ExitCode::SUCCESS);
+    }
     let total: u64 = sizes.iter().sum();
     let width = rows.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
     for (size, path) in &rows {
@@ -280,9 +293,16 @@ pub(crate) fn dir_size(p: &Path) -> u64 {
 
 /// `git zage [selectors]` — how long ago each repo's HEAD commit was made.
 pub fn zage(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let now = crate::date::now_seconds();
     let ages = parallel_map(&repos, |gd, _| probe(gd, |r| head_age(r, now), |e| e));
+    if json {
+        emit_json(repos.iter().zip(&ages).map(|((_, wd), age)| {
+            serde_json::json!({"repo": wd.to_string_lossy(), "age": age})
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
     let width = repos.iter().map(|(_, w)| w.display().to_string().len()).max().unwrap_or(0);
     for ((_, wd), age) in repos.iter().zip(&ages) {
         println!("{:<width$}  {age}", wd.display().to_string());
@@ -332,12 +352,22 @@ fn head_seconds(repo: &gix::Repository) -> Option<i64> {
 /// `git zstale [selectors] [<days>]` — indexed repos whose HEAD commit is older
 /// than `<days>` (default 90), with how long ago \(em find abandoned repos.
 pub fn zstale(args: &[String]) -> Result<ExitCode> {
-    let (sel, rest) = Selector::parse(args);
+    let (json, args) = json_flag(args);
+    let (sel, rest) = Selector::parse(&args);
     let days: i64 = rest.iter().find_map(|a| a.parse().ok()).unwrap_or(90);
     let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     let now = crate::date::now_seconds();
     let cutoff = now - days * 86_400;
     let times = parallel_map(&repos, |gd, _| probe(gd, head_seconds, |_| None));
+    if json {
+        emit_json(repos.iter().zip(&times).filter_map(|((_, wd), t)| {
+            let secs = (*t)?;
+            (secs < cutoff).then(|| {
+                serde_json::json!({"repo": wd.to_string_lossy(), "last": crate::date::show_date_relative(secs, now), "epoch": secs})
+            })
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
     let width = repos.iter().map(|(_, w)| w.display().to_string().len()).max().unwrap_or(0);
     let mut shown = 0usize;
     for ((_, wd), t) in repos.iter().zip(&times) {
@@ -355,7 +385,8 @@ pub fn zstale(args: &[String]) -> Result<ExitCode> {
 /// `git zlast [selectors]` — indexed repos ordered by HEAD commit time, most
 /// recently committed first.
 pub fn zlast(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let now = crate::date::now_seconds();
     let times = parallel_map(&repos, |gd, _| probe(gd, head_seconds, |_| None));
     let mut rows: Vec<(i64, String)> = repos
@@ -364,6 +395,12 @@ pub fn zlast(args: &[String]) -> Result<ExitCode> {
         .filter_map(|((_, wd), t)| t.map(|s| (s, wd.display().to_string())))
         .collect();
     rows.sort_by(|a, b| b.0.cmp(&a.0));
+    if json {
+        emit_json(rows.iter().map(|(secs, path)| {
+            serde_json::json!({"repo": path, "last": crate::date::show_date_relative(*secs, now), "epoch": secs})
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
     let width = rows.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
     for (secs, path) in &rows {
         println!("{path:<width$}  {}", crate::date::show_date_relative(*secs, now));
@@ -374,7 +411,8 @@ pub fn zlast(args: &[String]) -> Result<ExitCode> {
 /// `git zfiles [selectors]` — tracked file count of each indexed repo, largest
 /// first.
 pub fn zfiles(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let counts = parallel_map(&repos, |gd, _| probe(gd, tracked_count, |_| 0usize));
     let mut rows: Vec<(usize, String)> = repos
         .iter()
@@ -382,6 +420,10 @@ pub fn zfiles(args: &[String]) -> Result<ExitCode> {
         .map(|((_, wd), c)| (*c, wd.display().to_string()))
         .collect();
     rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    if json {
+        emit_json(rows.iter().map(|(c, p)| serde_json::json!({"repo": p, "files": c})));
+        return Ok(ExitCode::SUCCESS);
+    }
     let width = rows.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
     for (c, p) in &rows {
         println!("{p:<width$}  {c} file(s)");
@@ -397,8 +439,15 @@ fn tracked_count(repo: &gix::Repository) -> usize {
 /// changes, on a branch (not detached), and in sync with upstream (or having none
 /// configured). The green set — the complement of `zdirty`/`zahead`/`zbehind`.
 pub fn zpristine(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let ok = parallel_map(&repos, |gd, _| probe(gd, is_pristine, |_| false));
+    if json {
+        emit_json(repos.iter().zip(&ok).filter(|(_, p)| **p).map(|((_, wd), _)| {
+            serde_json::json!({"repo": wd.to_string_lossy()})
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
     let mut shown = 0usize;
     for ((_, wd), p) in repos.iter().zip(&ok) {
         if *p {
@@ -428,7 +477,8 @@ fn is_pristine(repo: &gix::Repository) -> bool {
 /// `git zcommits [selectors]` — HEAD-history commit count of each indexed repo,
 /// deepest history first.
 pub fn zcommits(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let counts = parallel_map(&repos, |gd, _| probe(gd, commit_count, |_| 0usize));
     let mut rows: Vec<(usize, String)> = repos
         .iter()
@@ -436,6 +486,10 @@ pub fn zcommits(args: &[String]) -> Result<ExitCode> {
         .map(|((_, wd), c)| (*c, wd.display().to_string()))
         .collect();
     rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    if json {
+        emit_json(rows.iter().map(|(c, p)| serde_json::json!({"repo": p, "commits": c})));
+        return Ok(ExitCode::SUCCESS);
+    }
     let width = rows.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
     for (c, p) in &rows {
         println!("{p:<width$}  {c} commit(s)");
@@ -457,13 +511,18 @@ fn commit_count(repo: &gix::Repository) -> usize {
 /// `git zbig [selectors] [<n>]` — the largest tracked files across every indexed
 /// repo, top `<n>` (default 20).
 pub fn zbig(args: &[String]) -> Result<ExitCode> {
-    let (sel, rest) = Selector::parse(args);
+    let (json, args) = json_flag(args);
+    let (sel, rest) = Selector::parse(&args);
     let n: usize = rest.iter().find_map(|a| a.parse().ok()).unwrap_or(20);
     let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     let per = parallel_map(&repos, |gd, wd| big_files(gd, wd));
     let mut all: Vec<(u64, String)> = per.into_iter().flatten().collect();
     all.sort_by(|a, b| b.0.cmp(&a.0));
     all.truncate(n);
+    if json {
+        emit_json(all.iter().map(|(size, path)| serde_json::json!({"file": path, "bytes": size})));
+        return Ok(ExitCode::SUCCESS);
+    }
     for (size, path) in &all {
         println!("{:>9}  {path}", crate::superset::gitls::human_size(*size));
     }

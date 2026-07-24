@@ -1180,6 +1180,16 @@ fn walk(
     first_parent: bool,
     hidden: &HashSet<ObjectId>,
 ) -> Result<Vec<Node>> {
+    // Shallow commits (from `.git/shallow`, as a `--depth` clone leaves) are grafted
+    // to have no parents: the walk must stop at them, not try to read their absent
+    // parent objects (which is git's `is_repository_shallow` / grafting behaviour).
+    let shallow: HashSet<ObjectId> = repo
+        .shallow_commits()
+        .ok()
+        .flatten()
+        .map(|c| c.iter().copied().collect())
+        .unwrap_or_default();
+
     // Pre-seeding `seen` with the hidden (uninteresting) commits means any tip or
     // parent reachable from a negative range endpoint is never emitted or traversed
     // — git's `..` exclusion, implemented as a boundary the walk cannot cross.
@@ -1200,7 +1210,9 @@ fn walk(
     let mut out: Vec<Node> = Vec::new();
     while !pending.is_empty() {
         let node = pending.remove(0);
-        let parents: &[ObjectId] = if first_parent {
+        let parents: &[ObjectId] = if shallow.contains(&node.id) {
+            &[] // grafted: a shallow commit's parents are outside the clone
+        } else if first_parent {
             &node.parents[..node.parents.len().min(1)]
         } else {
             &node.parents

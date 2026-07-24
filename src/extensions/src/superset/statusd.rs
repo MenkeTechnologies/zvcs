@@ -1,66 +1,121 @@
-//! Background status maintainer — the daemon's worker pool keeps `repo_status`
-//! warm for EVERY indexed repo, so `zdashboard` and `zstatus --all` are instant
-//! *and* accurate without needing `[zvcs] autostatus`.
+//! Background status maintainer — a persistent worker pool that NEVER idles.
 //!
-//! A full working-tree dirtiness scan over the whole index is expensive (seconds
-//! across thousands of repos), so it runs on its own thread: one parallel pass
-//! over all indexed repos, then a pause, repeating forever. The reactive watch
-//! (when configured) still updates actively-changing repos the instant they
-//! change; this thread fills in the cold ones and continually refreshes the rest.
-//! Tunable via `zvcs.statusinterval` (seconds between passes; `0` disables).
+//! `repo_status` must be warm and fresh for `zdashboard` / `zstatus --all` to be
+//! instant *and* accurate, and a live dirtiness scan over thousands of repos is
+//! too slow to do on demand. So the daemon runs a dedicated pool — one worker per
+//! core — that perpetually sweeps the index: each worker pulls the next repo off a
+//! shared rotating cursor, recomputes its status, writes it, and immediately grabs
+//! the next, forever. There is no pause; the pool is always working, so every
+//! repo's status is refreshed every few seconds. The reactive watch still updates
+//! a repo the instant it changes; this keeps the whole index continually fresh.
+//!
+//! The sweep is a single always-running "status maintainer" ledger job whose
+//! output reports live throughput, so `zjobs` / `zjob` show it working. Disable
+//! the whole thing with `zvcs.statusinterval = 0`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// Spawn the maintainer on the daemon, unless `zvcs.statusinterval = 0`.
+/// One repo to keep fresh: its ledger id and git dir.
+struct Target {
+    id: i64,
+    git_dir: PathBuf,
+}
+
+/// Spawn the maintainer pool on the daemon, unless disabled.
 pub fn spawn_if_enabled() {
-    let secs = interval_secs();
-    if secs == 0 {
-        return; // explicitly disabled
+    if interval_secs() == 0 {
+        return; // `zvcs.statusinterval = 0` turns the maintainer off.
     }
-    let pause = Duration::from_secs(secs);
+    let workers = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let updates = Arc::new(AtomicU64::new(0));
+    let snapshot: Arc<RwLock<Arc<Vec<Target>>>> = Arc::new(RwLock::new(Arc::new(load_targets())));
+    let job = create_job();
+
+    // The workers: each owns a db connection and perpetually claims the next repo
+    // off the shared cursor, computes its status, and writes it.
+    for _ in 0..workers {
+        let cursor = Arc::clone(&cursor);
+        let updates = Arc::clone(&updates);
+        let snapshot = Arc::clone(&snapshot);
+        thread::spawn(move || {
+            let mut conn = crate::db::open_rw().ok();
+            loop {
+                if conn.is_none() {
+                    thread::sleep(Duration::from_secs(1));
+                    conn = crate::db::open_rw().ok();
+                    continue;
+                }
+                let repos = { snapshot.read().unwrap().clone() };
+                if repos.is_empty() {
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+                let target = &repos[cursor.fetch_add(1, Ordering::Relaxed) % repos.len()];
+                if let Ok(repo) = gix::open(&target.git_dir) {
+                    let (dirty, detached, sync, head) = crate::superset::status::compute(&repo);
+                    if let Some(c) = &conn {
+                        // A write error (e.g. a dropped connection) → reopen next loop.
+                        if crate::db::upsert_status(c, target.id, dirty, detached, &sync, &head).is_err() {
+                            conn = None;
+                        }
+                    }
+                }
+                updates.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    // The coordinator: refresh the repo snapshot (so newly-indexed repos join and
+    // deleted ones drop out) and publish live throughput to the maintainer job.
     thread::spawn(move || {
-        // One reusable ledger row makes the scan trackable via `zjobs` / `zjob`:
-        // each pass cycles it running -> done with a fresh count, so a glance at
-        // the queue shows whether status is being maintained and how long it takes.
-        let job = create_scan_job();
+        let mut last = 0u64;
         loop {
-            let started = Instant::now();
-            set_state(job, "running", None);
-            let n = refresh_all();
-            let elapsed = started.elapsed().as_secs();
-            let summary = format!("refreshed status for {n} repo(s) in {elapsed}s");
-            set_state(job, "done", Some(&summary));
-            // Daemon stdout is routed to ~/.zvcs/zvcs.log, never the terminal.
-            println!("[zvcs statusd] {summary}");
-            thread::sleep(pause);
+            thread::sleep(Duration::from_secs(5));
+            let fresh = load_targets();
+            let indexed = fresh.len();
+            *snapshot.write().unwrap() = Arc::new(fresh);
+            let total = updates.load(Ordering::Relaxed);
+            let rate = total.saturating_sub(last) / 5;
+            last = total;
+            publish(job, workers, indexed, total, rate);
         }
     });
 }
 
-/// Insert the reusable "status refresh" ledger row (repo-less), returning its id.
-fn create_scan_job() -> Option<i64> {
-    let conn = crate::db::open_rw().ok()?;
-    crate::db::insert_job(&conn, None, "status refresh", "{\"kind\":\"statusscan\"}", None).ok()
+/// Load every indexed repo as a [`Target`].
+fn load_targets() -> Vec<Target> {
+    let Ok(conn) = crate::db::open_ro() else { return Vec::new() };
+    let Ok(repos) = crate::db::list_repos(&conn) else { return Vec::new() };
+    repos.into_iter().map(|r| Target { id: r.id, git_dir: PathBuf::from(r.git_dir) }).collect()
 }
 
-/// Move the scan job to `state`; a `Some(output)` also records the summary.
-fn set_state(job: Option<i64>, state: &str, output: Option<&str>) {
+/// Insert the always-running "status maintainer" ledger row, returning its id.
+fn create_job() -> Option<i64> {
+    let conn = crate::db::open_rw().ok()?;
+    let id = crate::db::insert_job(&conn, None, "status maintainer", "{\"kind\":\"statusd\"}", None).ok()?;
+    let _ = crate::db::job_running(&conn, id);
+    Some(id)
+}
+
+/// Update the maintainer job's live progress line (kept in the `running` state).
+fn publish(job: Option<i64>, workers: usize, indexed: usize, updates: u64, rate: u64) {
     let (Some(id), Ok(conn)) = (job, crate::db::open_rw()) else {
         return;
     };
-    match output {
-        Some(out) => {
-            let _ = crate::db::job_finished(&conn, id, state, 0, out, None);
-        }
-        None => {
-            let _ = crate::db::job_running(&conn, id);
-        }
-    }
+    let out = format!("{workers} workers · {indexed} repos indexed · {updates} status writes · ~{rate}/s");
+    let _ = conn.execute(
+        "UPDATE jobs SET state='running', output=?2 WHERE id=?1",
+        rusqlite::params![id, out],
+    );
 }
 
-/// Seconds between full passes: `zvcs.statusinterval`, default 10.
+/// `zvcs.statusinterval`: any non-zero value (or unset) enables the continuous
+/// maintainer; `0` disables it. Default enabled.
 fn interval_secs() -> u64 {
     gix::discover(".")
         .ok()
@@ -68,45 +123,4 @@ fn interval_secs() -> u64 {
         .filter(|n| *n >= 0)
         .map(|n| n as u64)
         .unwrap_or(10)
-}
-
-/// Recompute and cache status for every indexed repo, in parallel across the
-/// worker pool. Returns how many repos were written. The compute pass takes no
-/// db lock; only the final batched write does, and briefly.
-fn refresh_all() -> usize {
-    let repos = match crate::db::open_ro().and_then(|c| crate::db::list_repos(&c)) {
-        Ok(r) => r,
-        Err(_) => return 0,
-    };
-    if repos.is_empty() {
-        return 0;
-    }
-    let targets: Vec<(PathBuf, PathBuf)> = repos
-        .iter()
-        .map(|r| {
-            let git_dir = PathBuf::from(&r.git_dir);
-            let workdir = r.workdir.clone().map(PathBuf::from).unwrap_or_else(|| git_dir.clone());
-            (git_dir, workdir)
-        })
-        .collect();
-
-    // Parallel, read-only status computation across the machine's cores.
-    let computed = crate::superset::query::parallel_map(&targets, |git_dir, _wd| {
-        gix::open(git_dir).ok().map(|repo| crate::superset::status::compute(&repo))
-    });
-
-    // Write every result in one transaction, keyed by repo id (no side effects on
-    // the repos table the crawler owns).
-    let Ok(conn) = crate::db::open_rw() else { return 0 };
-    let _ = conn.execute_batch("BEGIN");
-    let mut written = 0usize;
-    for (repo, status) in repos.iter().zip(&computed) {
-        if let Some((dirty, detached, sync, head)) = status {
-            if crate::db::upsert_status(&conn, repo.id, *dirty, *detached, sync, head).is_ok() {
-                written += 1;
-            }
-        }
-    }
-    let _ = conn.execute_batch("COMMIT");
-    written
 }

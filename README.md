@@ -286,7 +286,7 @@ the dev environment and nowhere else. Enable it in `~/.gitconfig` or a repo's
     autocrawl     = true            ; background repo-index crawl on daemon start
     crawlroots    = /abs/src /abs/wk ; crawler roots (absolute; default $HOME)
     autostatus    = true            ; reactively update a repo's status on its ref-change
-    statusinterval = 10             ; daemon status maintainer: seconds between full passes (0 disables)
+    statusinterval = 10             ; continuous status maintainer: any non-zero enables the always-on worker pool; 0 disables
     hook          = /abs/on-change  ; run on ref-change in any indexed repo (typed event env)
     autohook      = true            ; fire each repo's own local zvcs.hook (no global hook needed)
     worktreebase  = /abs/worktrees  ; base for zworktree (default ~/.zvcs/worktrees)

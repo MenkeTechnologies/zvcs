@@ -21,7 +21,7 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "zgrep", "zahead", "zbehind", "zunpushed", "zunpulled", "zauthors", "zhot", "zconflicts",
     "zfetch", "zgc", "zfsck", "zprune", "zreset", "zabort", "zcheckout", "ztagall", "zcommitall", "zpushall", "zclean",
     "zwait", "zqueue", "zbarrier",
-    "zstale", "zlast", "zbig", "zfiles", "zcommits", "zpristine", "zdivergent", "zorphans", "zsessions", "zidle", "zdashboard",
+    "zstale", "zlast", "zbig", "zfiles", "zcommits", "zpristine", "zdivergent", "zorphans", "zsessions", "zidle", "zdashboard", "ztop",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -227,7 +227,8 @@ fn z_usage(sub: &str) -> Option<&'static str> {
     Some(match sub {
         "zsync" => "usage: git zsync [--force] — reconcile submodules to origin/main AND fan this checkout's HEAD out to all its local dups (offline); --force hard-resets every dup (diverged/dirty included)",
         "zbump" => "usage: git zbump [<submodule-path>...] — forward-only submodule gitlink bumps",
-        "zevents" | "ztail" => "usage: git zevents [-n <count>] [--kind commit|stage|status|reconcile] [--repo <substr>] [--json] [--no-follow] — one live feed of commits/reconciles/status-changes across the whole tree",
+        "zevents" => "usage: git zevents [-n <count>] [--kind commit|stage|status|reconcile] [--repo <substr>] [--json] [--no-follow] — one live feed of commits/reconciles/status-changes across the whole tree",
+        "ztail" => "usage: git ztail [-n <count>] [--kind commit|stage|status|reconcile] [--repo <substr>] [--json] [--no-follow] — alias of git zevents",
         "zdaemon" => "usage: git zdaemon <start|stop|restart|status|info|ping|log>",
         "zconfig" => "usage: git zconfig [<name> [on|off|<count>|default]] — toggle daemon features (see `git help zconfig`)",
         "zrepos" => "usage: git zrepos [<pattern>...] — list indexed repos; patterns filter by case-insensitive substring",
@@ -314,6 +315,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zsessions" => "usage: git zsessions — active sessions ranked by repos held",
         "zidle" => "usage: git zidle [selectors] — indexed repos with no active claim (free to pick up)",
         "zdashboard" => "usage: git zdashboard — instant one-screen health summary from the status cache + ledger",
+        "ztop" => "usage: git ztop [selectors] [--interval <secs>] [--once] [--mono] — live htop-style fleet monitor, most churn on top",
         _ => return None,
     })
 }
@@ -469,6 +471,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zsessions" => superset::zsessions(args),
         "zidle" => superset::zidle(args),
         "zdashboard" => superset::zdashboard(args),
+        "ztop" => superset::ztop(args),
 
         // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----
         "add" => porcelain::add(args),

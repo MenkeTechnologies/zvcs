@@ -6848,6 +6848,7 @@ _git_commands () {
     zsessions:'zvcs: active sessions ranked by repos held'
     zidle:'zvcs: indexed repos with no active claim'
     zdashboard:'zvcs: one-screen health summary of the tree'
+    ztop:'zvcs: live htop-style fleet monitor, most churn on top'
   )
 
   zstyle -a :completion:$curcontext: user-commands user_commands

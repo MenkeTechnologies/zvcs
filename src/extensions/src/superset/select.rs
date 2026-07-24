@@ -66,7 +66,7 @@ pub const SELECTOR_VERBS: &[&str] = &[
     "zauthors", "zhot", "zconflicts", "zfetch", "zgc", "zfsck", "zprune",
     "zreset", "zabort", "zcheckout", "ztagall", "zcommitall", "zpushall",
     "zclean", "zstale", "zlast", "zbig", "zfiles", "zcommits", "zpristine",
-    "zdivergent", "zorphans", "zidle",
+    "zdivergent", "zorphans", "zidle", "ztop",
 ];
 
 #[derive(Default)]

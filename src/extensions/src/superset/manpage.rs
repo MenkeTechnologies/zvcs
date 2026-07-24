@@ -625,6 +625,31 @@ pub const DOCS: &[Doc] = &[
             "It aggregates the daemon-maintained status cache and the ledger \\(em a handful of db queries, not a live per-repo walk \\(em so it is instant even across thousands of repos, exactly as `zstatus --all` is. When the cache covers fewer repos than are indexed, a note says so; `git zstatus --all` refreshes it. For fresh, deep reads use the dedicated verbs (zstale, zorphans, zconflicts, zsize).",
         ],
     },
+    Doc {
+        verb: "ztop",
+        summary: "live htop-style fleet monitor, most churn on top",
+        synopsis: "git ztop [selectors] [--interval <secs>] [--once] [--mono]",
+        desc: &[
+            "A full-screen, live monitor of the whole indexed tree \\(em an htop for the fleet. A header shows the totals (dirty, ahead, behind, diverged, detached, clean, claims, sessions, queue depth, and whether the daemon is up); a table lists every repo with a churn bar, path, HEAD, state, and how long ago it last changed.",
+            "Repos are sorted with the most churn on top: when a repo's HEAD or dirty flag changes between frames (the daemon rewrote its status row), its churn score bumps and then decays, so whatever is moving right now rises to the top, like an htop CPU column. Press s to cycle the sort (churn / state / name), the arrows / PgUp / PgDn / g / G to scroll, and q (or Esc) to quit.",
+            "Each frame reads the daemon-maintained status cache, not a live per-repo scan, so it stays responsive across thousands of repos \\(em start the daemon (git zdaemon start) so the cache stays warm and churn reflects real activity. Selectors narrow the view to a subset; --interval sets the refresh seconds, --mono (or NO_COLOR) drops color, and --once (or a non-terminal stdout) prints a single plain-text frame for scripts.",
+        ],
+    },
+    Doc {
+        verb: "zevents",
+        summary: "one live feed of commits/reconciles/status-changes across the tree",
+        synopsis: "git zevents [-n <count>] [--kind commit|stage|status|reconcile] [--repo <substr>] [--json] [--no-follow]",
+        desc: &[
+            "Prints a single structured, live feed of what is happening across the whole indexed tree: commits (a HEAD moved), status-changes (a dirty or sync transition), and reconciles (a fetch-free fast-forward the daemon applied). It shows a short backlog, then follows live.",
+            "Events come from the index's append-only events table, written by triggers on the status cache that both the whole-tree poller (statusd) and the instant file-watcher (watch) maintain, so activity anywhere is captured with no per-call plumbing. -n sets the backlog size, --no-follow prints the backlog and exits, --kind filters to one event kind, --repo filters by path substring, and --json emits NDJSON (one event per line) for tooling.",
+        ],
+    },
+    Doc {
+        verb: "ztail",
+        summary: "alias of git zevents",
+        synopsis: "git ztail [-n <count>] [--kind commit|stage|status|reconcile] [--repo <substr>] [--json] [--no-follow]",
+        desc: &["An alias for `git zevents` \\(em the single live feed of commits, reconciles, and status-changes across the whole indexed tree. See `git help zevents` for the full description."],
+    },
 ];
 
 /// The manual for `verb`, or `None` if it is not a superset verb.

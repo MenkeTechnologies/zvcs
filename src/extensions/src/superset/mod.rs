@@ -14,13 +14,16 @@
 //!     pointer only when the new SHA is a descendant of the recorded one.
 
 pub mod attach;
+pub mod banner;
 pub mod claim;
 pub mod dashed;
+pub mod doctor;
 pub mod hooks;
 pub mod ledger;
 pub mod manpage;
 pub mod oplog;
 pub mod select;
+pub mod shell;
 pub mod snapshot;
 pub mod status;
 pub mod trigger;
@@ -40,8 +43,10 @@ mod zsync;
 pub use attach::{ensure_attached, Attached};
 pub use claim::{zclaim, zunclaim, zwho};
 pub use dashed::zdashed;
+pub use doctor::zdoctor;
 pub use oplog::{zlog, zundo};
 pub use snapshot::{zrestore, zsnapshot, zsnapshots};
+pub use shell::{zcd, zecho, zenv, zls, zpwd, zunset};
 pub use status::zstatus;
 pub use trigger::{ztrigger, zwatch};
 pub use zforeach::zforeach;

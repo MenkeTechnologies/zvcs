@@ -99,9 +99,12 @@ pub const DOCS: &[Doc] = &[
     },
     Doc {
         verb: "zrepl",
-        summary: "interactive console over the extension verbs",
+        summary: "interactive console over every zvcs command",
         synopsis: "git zrepl",
-        desc: &["Opens an interactive line console over all the z-verbs."],
+        desc: &[
+            "Opens an interactive line console. Each line is run exactly as `git <line>` would be, so it drives every dispatchable command \\(em the z* superset verbs and every git-compat porcelain command alike (the latter operating on the current repository), doubling as a live daemon/ledger console.",
+            "On a terminal it opens with a stats banner and full line editing: Tab completes the command word against every verb (superset + porcelain), with command history persisted across sessions. Piped stdin falls back to a raw line reader so scripts and heredocs stay usable. Type exit or quit, or press Ctrl-D, to leave.",
+        ],
     },
     Doc {
         verb: "zclaim",
@@ -234,6 +237,57 @@ pub const DOCS: &[Doc] = &[
         summary: "list every zvcs extension verb and its usage",
         synopsis: "git zverbs",
         desc: &["Lists every zvcs extension (z*) verb with its one-line usage, sourced from each verb's own -h so the listing can never drift."],
+    },
+    Doc {
+        verb: "zcd",
+        summary: "change the working directory (for the zrepl console)",
+        synopsis: "git zcd [<dir>|-]",
+        desc: &[
+            "Changes the process working directory: no argument goes to $HOME, `-` goes to the previous directory ($OLDPWD), and a leading ~ expands to $HOME. OLDPWD and PWD are updated so `zcd -` round-trips, exactly as a shell's cd does.",
+            "The zrepl console runs each line in one long-lived process, so a zcd persists across lines \\(em it is what makes the console navigable like a shell. Run standalone it only moves this process's cwd (it cannot change the parent shell's), so it is aimed at the console.",
+        ],
+    },
+    Doc {
+        verb: "zpwd",
+        summary: "print the working directory",
+        synopsis: "git zpwd",
+        desc: &["Prints the current working directory. Paired with zcd for shell-like navigation inside the zrepl console."],
+    },
+    Doc {
+        verb: "zls",
+        summary: "list the working directory",
+        synopsis: "git zls [<ls-args>...]",
+        desc: &["Lists the working directory by delegating to the system ls, so every ls flag (-l, -a, and so on) and its output work as-is. Exits with ls's own status. A shell-like convenience for the zrepl console."],
+    },
+    Doc {
+        verb: "zenv",
+        summary: "print, set, or query environment variables",
+        synopsis: "git zenv [<NAME=VALUE>...|<NAME>...]",
+        desc: &[
+            "With no arguments, prints every environment variable as NAME=VALUE, sorted. A NAME=VALUE argument sets that variable; a bare NAME prints its value (nothing if unset).",
+            "In the zrepl console a variable set with zenv persists for every later `git` line \\(em set GIT_AUTHOR_NAME, ZVCS_SESSION, and the like once and the whole session sees it.",
+        ],
+    },
+    Doc {
+        verb: "zunset",
+        summary: "remove environment variables",
+        synopsis: "git zunset <NAME>...",
+        desc: &["Removes one or more environment variables from the process, the complement of `zenv NAME=VALUE`. In the zrepl console the change persists for later `git` lines."],
+    },
+    Doc {
+        verb: "zecho",
+        summary: "print arguments joined by a space",
+        synopsis: "git zecho [-n] [<arg>...]",
+        desc: &["Prints its arguments joined by a single space. A leading -n suppresses the trailing newline. Arguments are printed literally \\(em there is no shell variable or glob expansion."],
+    },
+    Doc {
+        verb: "zdoctor",
+        summary: "health check of the zvcs environment",
+        synopsis: "git zdoctor",
+        desc: &[
+            "Runs a set of environment checks and prints each as OK, WARN, or FAIL: whether this binary is the git on PATH, whether $ZVCS_HOME exists, whether the coordinator daemon is running, whether a ledger exists, how many man pages are installed, whether ~/.zvcs/man is on MANPATH, and whether the dashed git-<verb> symlinks are installed.",
+            "The process exits non-zero only when a hard FAIL is found, so it is usable in scripts and CI.",
+        ],
     },
 ];
 

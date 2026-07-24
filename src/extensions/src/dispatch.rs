@@ -14,7 +14,8 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
     "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
     "zsnapshots", "zworktree", "zstash", "zunstash", "zstashes", "zup", "zforeach", "zhook",
-    "ztrigger", "zwatch", "zdashed", "zverbs",
+    "ztrigger", "zwatch", "zdashed", "zverbs", "zcd", "zpwd", "zls", "zenv", "zunset", "zecho",
+    "zdoctor",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -228,7 +229,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zjob" => "usage: git zjob <id> | git zjob <stop|restart> <id> — show or control a job",
         "zcommit" => "usage: git zcommit [<path>...] -m <msg> [--push] — queue an atomic staged-commit job",
         "zpush" => "usage: git zpush [<refspec>] — queue an async push job with a network-free ff pre-flight",
-        "zrepl" => "usage: git zrepl — interactive console over the z-verbs",
+        "zrepl" => "usage: git zrepl — interactive console over every zvcs command (z-verbs + git porcelain)",
         "zclaim" => "usage: git zclaim [<path>] — lease a repo for this session",
         "zunclaim" => "usage: git zunclaim [--force] [<path>] — release a lease on a repo",
         "zwho" => "usage: git zwho — list active claims (who is working what)",
@@ -245,9 +246,16 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zup" => "usage: git zup [<path>] — reconcile the tree at cwd (or <path>) to latest",
         "zforeach" => "usage: git zforeach [<pattern>...|--repo <p>|--dirty|--ahead|--behind|--claimed|--session <s>] -- <command>...",
         "zhook" => "usage: git zhook <set <command>|unset|show|list|test>",
-        "ztrigger" => "usage: git ztrigger <DIR> <command>... | git ztrigger <list|rm DIR|test DIR> — run a command on every ref-change in DIR",
+        "ztrigger" => "usage: git ztrigger <DIR> <command>... | git ztrigger <list|rm DIR|test DIR> — run a command on any file change in DIR (worktree + .git)",
         "zwatch" => "usage: git zwatch <DIR> | git zwatch <list|rm DIR> — watch DIR (index + cached status) without a command",
         "zverbs" => "usage: git zverbs — list every zvcs extension verb and its usage",
+        "zcd" => "usage: git zcd [<dir>|-] — change the working directory (for the zrepl console)",
+        "zpwd" => "usage: git zpwd — print the working directory",
+        "zls" => "usage: git zls [<ls-args>...] — list the working directory (delegates to system ls)",
+        "zenv" => "usage: git zenv [<NAME=VALUE>...|<NAME>...] — print, set, or query environment variables",
+        "zunset" => "usage: git zunset <NAME>... — remove environment variables",
+        "zecho" => "usage: git zecho [-n] [<arg>...] — print arguments joined by a space",
+        "zdoctor" => "usage: git zdoctor — health check of the zvcs environment (shadow, daemon, ledger, man pages)",
         _ => return None,
     })
 }
@@ -306,6 +314,13 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "ztrigger" => superset::ztrigger(args),
         "zwatch" => superset::zwatch(args),
         "zverbs" => print_verbs(),
+        "zcd" => superset::zcd(args),
+        "zpwd" => superset::zpwd(args),
+        "zls" => superset::zls(args),
+        "zenv" => superset::zenv(args),
+        "zunset" => superset::zunset(args),
+        "zecho" => superset::zecho(args),
+        "zdoctor" => superset::zdoctor(args),
 
         // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----
         "add" => porcelain::add(args),

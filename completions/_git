@@ -6787,8 +6787,15 @@ _git_commands () {
     zhook:'zvcs: manage ref-change hooks'
     ztrigger:'zvcs: run a command on every ref-change in a DIR'
     zwatch:'zvcs: watch a DIR (index + cached status) without a command'
-    zrepl:'zvcs: interactive console over the verbs'
+    zrepl:'zvcs: interactive console over every command (z-verbs + git porcelain)'
     zverbs:'zvcs: list every extension verb and its usage'
+    zcd:'zvcs: change the working directory (zrepl console)'
+    zpwd:'zvcs: print the working directory'
+    zls:'zvcs: list the working directory (delegates to ls)'
+    zenv:'zvcs: print/set/query environment variables'
+    zunset:'zvcs: remove environment variables'
+    zecho:'zvcs: print arguments joined by a space'
+    zdoctor:'zvcs: health check of the zvcs environment'
   )
 
   zstyle -a :completion:$curcontext: user-commands user_commands

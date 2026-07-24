@@ -1,5 +1,6 @@
 //! Daemon control verbs: ping / info / restart / stop.
 
+use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -73,6 +74,65 @@ fn daemon_control_lifecycle() {
     assert!(wait_for(&sock, false, Duration::from_secs(5)), "socket must be gone after stop");
     assert!(!ctl(&home, &sock, &repo, &["zdaemon", "ping"]).1, "ping after stop must be non-zero");
 
+    let _ = daemon.kill();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A manual `git zdaemon stop` must STAY stopped: with `[zvcs]` autonomy enabled,
+/// every `git` command runs autostart, so without a sticky disable a stop is
+/// undone by the very next command (across up to 16 concurrent instances). The
+/// stop sets a marker autostart honors; `start` clears it. Regression guard.
+#[test]
+fn manual_stop_disables_autostart_until_start() {
+    let root = std::env::temp_dir().join(format!("zvcs-autostart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+    let sock = root.join("sock");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert!(Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&repo).status().unwrap().success());
+    // Enable autonomy directly in the repo config so a bare git command would
+    // normally autostart the daemon. Written to the file to avoid depending on a
+    // `git config` writer.
+    let mut cfg = std::fs::OpenOptions::new().append(true).open(repo.join(".git/config")).unwrap();
+    writeln!(cfg, "[zvcs]\n\tautostatus = true").unwrap();
+    drop(cfg);
+
+    let marker = home.join("zdaemon.disabled");
+
+    // A bare git command autostarts the daemon.
+    let _ = ctl(&home, &sock, &repo, &["rev-parse", "HEAD"]);
+    assert!(wait_for(&sock, true, Duration::from_secs(5)), "autostart should bring the daemon up");
+
+    // stop → daemon down, marker set, status reflects it.
+    let _ = ctl(&home, &sock, &repo, &["zdaemon", "stop"]);
+    assert!(wait_for(&sock, false, Duration::from_secs(5)), "daemon should stop");
+    assert!(marker.exists(), "stop must set the autostart-disable marker");
+    let (st, _) = ctl(&home, &sock, &repo, &["zdaemon", "status"]);
+    assert!(st.contains("autostart disabled"), "status should note disabled: {st}");
+
+    // THE REGRESSION: a git command after stop must NOT resurrect the daemon.
+    let _ = ctl(&home, &sock, &repo, &["rev-parse", "HEAD"]);
+    assert!(
+        !wait_for(&sock, true, Duration::from_secs(2)),
+        "stop must stick — autostart must not respawn the daemon while disabled"
+    );
+
+    // An explicit start clears the marker and brings the daemon back up.
+    let mut daemon: Child = Command::new(BIN)
+        .args(["zdaemon", "start"])
+        .current_dir(&repo)
+        .env("ZVCS_HOME", &home)
+        .env("ZVCS_SOCK", &sock)
+        .spawn()
+        .unwrap();
+    assert!(wait_for(&sock, true, Duration::from_secs(5)), "explicit start should bring the daemon up");
+    assert!(!marker.exists(), "start must clear the disable marker");
+
+    let _ = ctl(&home, &sock, &repo, &["zdaemon", "stop"]);
+    let _ = daemon.wait();
     let _ = daemon.kill();
     let _ = std::fs::remove_dir_all(&root);
 }

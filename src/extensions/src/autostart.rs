@@ -19,6 +19,12 @@ pub fn ensure_if_configured() {
     if !crate::config::ZvcsConfig::load(&repo).should_watch() {
         return;
     }
+    // A manual `git zdaemon stop` disables autostart until an explicit
+    // `start`/`restart`. Without this the daemon would respawn on the very next
+    // `git` command, making a manual stop impossible under the autonomy config.
+    if crate::superset::zdaemon::autostart_disabled() {
+        return;
+    }
 
     let sock = crate::superset::zdaemon::socket_path();
     // Already listening? A successful connect means the singleton daemon is up.

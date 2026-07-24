@@ -145,6 +145,21 @@ fn pid_path() -> PathBuf {
     zvcs_home().join("zvcs.pid")
 }
 
+/// Marker a manual `zdaemon stop` writes to keep the daemon down. Autostart
+/// checks it ([`autostart_disabled`]) and will NOT respawn while it exists;
+/// `start`/`restart` remove it, so an explicit bring-up re-enables autostart.
+/// Without this a manual stop is futile — the next `git` command, across up to 16
+/// concurrent instances, autostarts the daemon straight back up.
+fn autostart_disabled_path() -> PathBuf {
+    zvcs_home().join("zdaemon.disabled")
+}
+
+/// Whether a manual `zdaemon stop` has disabled autostart. Read by
+/// [`crate::autostart::ensure_if_configured`] before it would spawn a daemon.
+pub fn autostart_disabled() -> bool {
+    autostart_disabled_path().exists()
+}
+
 /// Probe whether a live daemon owns the socket.
 fn ping(path: &Path) -> bool {
     match UnixStream::connect(path) {
@@ -214,6 +229,8 @@ fn socket_is_live(path: &Path) -> bool {
 
 fn start() -> Result<ExitCode> {
     let path = socket_path();
+    // An explicit start re-enables autostart, clearing any prior manual stop.
+    let _ = std::fs::remove_file(autostart_disabled_path());
 
     let listener = {
         let _marker = hold_start_lock(&zvcs_home().join("daemon-start"));
@@ -518,14 +535,24 @@ fn handle_restart(id: i64) -> Option<i64> {
 fn status() -> Result<ExitCode> {
     match query(&socket_path(), "STATUS") {
         Some(resp) => println!("{resp}"),
+        None if autostart_disabled() => {
+            println!("not running (autostart disabled — `git zdaemon start` to re-enable)")
+        }
         None => println!("not running"),
     }
     Ok(ExitCode::SUCCESS)
 }
 
 /// `git zdaemon stop` — ask the daemon to exit, then reap the socket + pidfile.
+/// Also sets the autostart-disable marker so the daemon stays down: otherwise the
+/// next `git` command (this instance or any concurrent one) would autostart it
+/// straight back up. `git zdaemon start`/`restart` clears the marker.
 fn stop() -> Result<ExitCode> {
     let path = socket_path();
+    // Disable autostart BEFORE stopping, so a `git` command racing in during the
+    // stop cannot respawn the daemon we are about to kill.
+    let _ = std::fs::create_dir_all(zvcs_home());
+    let _ = std::fs::write(autostart_disabled_path(), b"");
     match query(&path, "STOP") {
         Some(resp) => println!("{resp}"),
         None => println!("not running"),
@@ -539,6 +566,8 @@ fn stop() -> Result<ExitCode> {
 /// it detached (re-reading `[zvcs]` config and rebuilding the watch set).
 fn restart() -> Result<ExitCode> {
     let path = socket_path();
+    // A restart is an explicit bring-up: re-enable autostart (clear a prior stop).
+    let _ = std::fs::remove_file(autostart_disabled_path());
     if ping(&path) {
         let _ = query(&path, "STOP");
     }

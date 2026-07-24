@@ -20,7 +20,7 @@ p{margin:.6rem 0}a{color:var(--accent)}
 </style>
 </head><body>
 <h1>zvcs extension verbs</h1>
-<p class="sub">112 superset (<code>z*</code>) verbs — the coordination layer stock git has no equivalent for. Generated from the same source as the man pages (<code>git help &lt;verb&gt;</code>).</p>
+<p class="sub">113 superset (<code>z*</code>) verbs — the coordination layer stock git has no equivalent for. Generated from the same source as the man pages (<code>git help &lt;verb&gt;</code>).</p>
 <nav class="toc">
 <a href="#zsync"><code>zsync</code></a>
 <a href="#zbump"><code>zbump</code></a>
@@ -111,7 +111,6 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <a href="#zsessions"><code>zsessions</code></a>
 <a href="#zidle"><code>zidle</code></a>
 <a href="#zdashboard"><code>zdashboard</code></a>
-<a href="#zppid"><code>zppid</code></a>
 <a href="#ztop"><code>ztop</code></a>
 <a href="#zevents"><code>zevents</code></a>
 <a href="#ztail"><code>ztail</code></a>
@@ -119,6 +118,7 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <a href="#zcommands"><code>zcommands</code></a>
 <a href="#zaudit"><code>zaudit</code></a>
 <a href="#zscan"><code>zscan</code></a>
+<a href="#zsigs"><code>zsigs</code></a>
 <a href="#zreview"><code>zreview</code></a>
 <a href="#zremote"><code>zremote</code></a>
 <a href="#zrollback"><code>zrollback</code></a>
@@ -607,15 +607,9 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <section id="zdashboard">
 <h2><code>git zdashboard</code> <span class="summary">— live tiled TUI: fleet, events, and commands on one screen</span></h2>
 <pre class="synopsis">git zdashboard [--once] [--json]</pre>
-<p>A live, tiled dashboard of the whole indexed tree on one screen: a header of aggregate totals (dirty, ahead, behind, diverged, detached, clean, claims, sessions, queue, tracked processes and the busiest committing ppid, and whether the daemon is up) over three tiles — a FLEET table (every repo, most recently active first, with the on-screen rows' HEAD state live-refreshed so nothing is stale), an EVENTS feed (commits, reconciles, status changes, as zevents shows), and a COMMANDS feed (every git command run across the machine, with the agent that ran it, as zcommands shows). Press q or Esc to quit.</p>
+<p>A live, tiled dashboard of the whole indexed tree on one screen: a header of aggregate totals (dirty, ahead, behind, diverged, detached, clean, claims, sessions, queue, and whether the daemon is up) over three tiles — a FLEET table (every repo, most recently active first, with the on-screen rows' HEAD state live-refreshed so nothing is stale), an EVENTS feed (commits, reconciles, status changes, as zevents shows), and a COMMANDS feed (every git command run across the machine, with the agent that ran it, as zcommands shows). Press q or Esc to quit.</p>
 <p>Every tile reads the daemon-maintained status cache and ledger, not a live per-repo walk, so the dashboard stays responsive across thousands of repos. The COMMANDS tile is populated once command logging is on (<code>git zcommands</code> enables it).</p>
 <p>For scripting, <code>--once</code> or <code>--json</code> (or a non-terminal stdout) prints the instant text summary instead of the TUI — the same aggregate counts, one screen, no interaction.</p>
-</section>
-<section id="zppid">
-<h2><code>git zppid</code> <span class="summary">— per-process commit tally (each invoking ppid and commits landed)</span></h2>
-<pre class="synopsis">git zppid [--json]</pre>
-<p>Lists every process that has committed through zvcs — any shell, agent, or program that ran git — one row per invoking process, most commits first. Each row shows the session key (an exported <code>ZVCS_SESSION</code> or the <code>pid-&lt;ppid&gt;</code> fallback), the invoking process id (the git process's parent, <code>getppid()</code>), whether that process is still live (<code>kill(ppid, 0)</code>), how many commits it has landed, and when it last committed.</p>
-<p>A commit is credited at command time by the process that ran it: for a commit-producing verb (<code>commit</code>, <code>commit-tree</code>, <code>merge</code>, <code>cherry-pick</code>, <code>revert</code>, <code>am</code>, <code>rebase</code>) the dispatcher snapshots HEAD before the command and, if it advanced to a new tip afterward, increments the running process's tally — so a no-op <code>commit</code> (nothing staged) or a rejected merge counts nothing. The tally persists in the <code>ppids</code> table and also drives the <code>zdashboard</code> header. <code>--json</code> emits one array of objects for scripting.</p>
 </section>
 <section id="ztop">
 <h2><code>git ztop</code> <span class="summary">— live htop-style fleet monitor, most churn on top</span></h2>
@@ -660,6 +654,12 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <pre class="synopsis">git zscan [selectors]</pre>
 <p>Scans the tracked file content of every selected indexed repo, in parallel over the shared worker pool, for common credential patterns — AWS access keys, PEM private keys, GitHub/Slack/Google tokens, JWTs, and high-entropy <code>key = "..."</code> assignments — using the same native, fork-free content walk <code>zgrep</code> does. Each hit prints as path:line:pattern:snippet.</p>
 <p>Binary files are skipped, output is capped per repo so one flooded tree cannot drown the rest, and the whole run exits non-zero when anything is found — so <code>git zscan</code> drops straight into a pre-push hook or CI gate. [selectors] narrows the set the same way every fleet verb does.</p>
+</section>
+<section id="zsigs">
+<h2><code>git zsigs</code> <span class="summary">— fleet commit-signature check (verify-sigs)</span></h2>
+<pre class="synopsis">git zsigs [selectors] [-n &lt;count&gt;]</pre>
+<p>Checks commit signatures across the fleet and flags any that are not a good signature — unsigned (N), bad (B), or unverifiable (E/X/Y/R). By default it checks each selected repo's HEAD; -n walks the top N first-parent commits. Each offender prints as <code>&lt;code&gt; &lt;repo&gt; &lt;sha&gt; &lt;subject&gt;</code> (git's <code>%G?</code> codes), and the run exits non-zero if any are found — so it gates a push or CI under an all-commits-must-be-signed policy.</p>
+<p>Verification is native where it can be and delegated where it must be: the signature and its signed payload are reconstructed from the commit object in-process (the <code>gpgsig</code> header removed and de-folded exactly as git does), then handed to gpg — the same tool git shells to; there is no in-process crypto in git either. A commit with no signature is N without running anything; a present signature that gpg cannot check (no public key, gpg absent) is E, never a fabricated good. SSH-format signatures report E in this pass (verifying them needs an allowed-signers file). The same machinery backs the <code>%G?</code> and <code>%GK</code> pretty-format placeholders in <code>git log</code>.</p>
 </section>
 <section id="zreview">
 <h2><code>git zreview</code> <span class="summary">— aggregate the pending uncommitted change across the fleet</span></h2>

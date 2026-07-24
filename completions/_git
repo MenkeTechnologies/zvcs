@@ -6779,6 +6779,7 @@ _git_commands () {
     zintercept:'zvcs: AOP hooks that run advice around matching git commands'
     zaudit:'zvcs: queryable audit trail over the fleet command log'
     zscan:'zvcs: parallel secret scan of tracked content across the fleet'
+    zsigs:'zvcs: fleet commit-signature check (unsigned/bad/unverifiable)'
     zreview:'zvcs: aggregate pending uncommitted change across the fleet'
     zremote:'zvcs: fleet-wide remote-URL rewrite'
     zrollback:'zvcs: fleet-wide undo of the last mutating op (dry-run unless --apply)'

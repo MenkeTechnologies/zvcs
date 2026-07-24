@@ -12,7 +12,7 @@ use std::process::ExitCode;
 /// zvcs-native extension verbs — the superset that stock git does not have.
 pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zconfig", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
-    "zsubmit", "zevents", "ztail", "zcommands", "zintercept", "zaudit", "zscan", "zreview", "zremote",
+    "zsubmit", "zevents", "ztail", "zcommands", "zintercept", "zaudit", "zscan", "zsigs", "zreview", "zremote",
     "zrollback", "zsched",
     "zpin", "zunpin", "zbroadcast", "zhandoff", "zon", "zsince", "zcontend", "zwaitfor", "zgraph", "zrewind",
     "zguard", "zpolicy",
@@ -248,6 +248,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zintercept" => "usage: git zintercept before|after|around <pattern> -- <cmd> | list | remove <id> | clear — AOP hooks that run advice around matching git commands",
         "zaudit" => "usage: git zaudit [--agent <ppid>] [--repo <substr>] [--cmd <substr>] [--mutating] [--summary] [-n <count>] [--json] — queryable audit trail over the fleet command log",
         "zscan" => "usage: git zscan [selectors] — parallel secret scan of tracked content across indexed repos (exits non-zero if any found)",
+        "zsigs" => "usage: git zsigs [selectors] [-n <count>] — fleet commit-signature check: flag unsigned/bad/unverifiable HEAD commits (gpg/ssh via %G?); exits non-zero if any found",
         "zreview" => "usage: git zreview [selectors] — aggregate the pending uncommitted change (short status + diffstat) of every dirty indexed repo",
         "zremote" => "usage: git zremote set <old> <new> [selectors] [-n|--dry-run] — rewrite remote URLs across the fleet, replacing substring <old> with <new>",
         "zrollback" => "usage: git zrollback [selectors] [--steps <n>] [--apply] [--force] — fleet-wide undo of the last mutating op (reset --hard HEAD@{n}); dry-run unless --apply; skips dirty/mid-op/would-diverge repos unless --force",
@@ -475,6 +476,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zintercept" => superset::zintercept(args),
         "zaudit" => superset::zaudit(args),
         "zscan" => superset::zscan(args),
+        "zsigs" => superset::zsigs(args),
         "zreview" => superset::zreview(args),
         "zremote" => superset::zremote(args),
         "zrollback" => superset::zrollback(args),

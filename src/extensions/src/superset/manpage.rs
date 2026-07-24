@@ -699,6 +699,15 @@ pub const DOCS: &[Doc] = &[
         ],
     },
     Doc {
+        verb: "zsigs",
+        summary: "fleet commit-signature check (verify-sigs)",
+        synopsis: "git zsigs [selectors] [-n <count>]",
+        desc: &[
+            "Checks commit signatures across the fleet and flags any that are not a good signature \\(em unsigned (N), bad (B), or unverifiable (E/X/Y/R). By default it checks each selected repo's HEAD; -n walks the top N first-parent commits. Each offender prints as `<code> <repo> <sha> <subject>` (git's `%G?` codes), and the run exits non-zero if any are found \\(em so it gates a push or CI under an all-commits-must-be-signed policy.",
+            "Verification is native where it can be and delegated where it must be: the signature and its signed payload are reconstructed from the commit object in-process (the `gpgsig` header removed and de-folded exactly as git does), then handed to gpg \\(em the same tool git shells to; there is no in-process crypto in git either. A commit with no signature is N without running anything; a present signature that gpg cannot check (no public key, gpg absent) is E, never a fabricated good. SSH-format signatures report E in this pass (verifying them needs an allowed-signers file). The same machinery backs the `%G?` and `%GK` pretty-format placeholders in `git log`.",
+        ],
+    },
+    Doc {
         verb: "zreview",
         summary: "aggregate the pending uncommitted change across the fleet",
         synopsis: "git zreview [selectors]",

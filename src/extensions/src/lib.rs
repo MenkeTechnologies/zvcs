@@ -15,6 +15,7 @@ pub mod date;
 pub mod db;
 pub mod dispatch;
 pub mod external;
+pub mod gitsig;
 pub mod hooks;
 pub mod index_commit;
 pub mod jobpool;

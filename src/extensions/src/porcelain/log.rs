@@ -1305,6 +1305,12 @@ fn check_format(fmt: &str) -> Result<()> {
                 Some(x) => bail!("unsupported format placeholder %c{x}"),
                 None => bail!("unsupported trailing % in format"),
             },
+            // Signature placeholders: %G? (status char) and %GK (signing key).
+            Some('G') => match it.next() {
+                Some('?' | 'K') => {}
+                Some(x) => bail!("unsupported format placeholder %G{x}"),
+                None => bail!("unsupported trailing % in format"),
+            },
             Some(x) => bail!("unsupported format placeholder %{x}"),
             None => bail!("unsupported trailing % in format"),
         }
@@ -1325,6 +1331,9 @@ fn expand_format(
     // `%C(auto)` latches auto-coloring on for the placeholders that follow it —
     // notably `%d`/`%D`, which stay uncolored until it appears (matching git).
     let mut auto = false;
+    // Signature evaluation (gpg/ssh) is lazy and computed at most once per commit,
+    // shared between %G? and %GK.
+    let mut gsig: Option<(crate::gitsig::GStatus, String)> = None;
     let chars: Vec<char> = fmt.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -1386,6 +1395,16 @@ fn expand_format(
                     Some('I') => expand_date(out, &committer, DateMode::IsoStrict, ctx.now)?,
                     Some('r') => expand_date(out, &committer, DateMode::Relative, ctx.now)?,
                     Some('t') => write!(out, "{}", committer.time()?.seconds)?,
+                    _ => unreachable!("check_format rejected this already"),
+                }
+                i += 1;
+            }
+            'G' => {
+                let (status, key) =
+                    gsig.get_or_insert_with(|| crate::gitsig::evaluate(&commit.data));
+                match chars.get(i).copied() {
+                    Some('?') => out.push(status.code() as u8),
+                    Some('K') => out.extend_from_slice(key.as_bytes()),
                     _ => unreachable!("check_format rejected this already"),
                 }
                 i += 1;

@@ -14,6 +14,41 @@
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::process::ExitCode;
+
+/// `git zselectors` — print the shared selector grammar the parallel verbs accept.
+/// A quick terminal reference; `git help zselectors` opens the fuller man page.
+pub fn zselectors(_args: &[String]) -> Result<ExitCode> {
+    print!(
+        "\
+zvcs selectors — narrow which indexed repos a parallel verb runs over.
+Accepted by the verbs listed under `git zselectors` in the man page (git help
+zselectors), e.g. zforeach, zheads, zpull, zgrep, zdirty, zfetch, …
+
+  (none)             every indexed repo (the default)
+  <pattern>          repos whose workdir PATH contains <pattern>, case-insensitive;
+                     repeatable — ALL patterns must match
+  --repo <pattern>   same as a bare <pattern>
+  --dirty            repos with uncommitted tracked changes
+  --ahead            repos ahead of their upstream
+  --behind           repos behind their upstream
+  --claimed          repos with an active claim (git zclaim)
+  --session <s>      repos claimed by session <s>
+
+Filters COMPOSE with AND — a repo must match every selector given.
+--dirty/--ahead/--behind read the daemon's status cache (kept warm by the status
+maintainer), so they reflect the last scan, not a fresh check.
+
+Examples:
+  git zheads                            HEAD of every indexed repo
+  git zheads cask                       ...only repos whose path contains \"cask\"
+  git zforeach --dirty -- git status    run `git status` in every dirty repo
+  git zpull --behind                    fast-forward only repos behind upstream
+  git zgrep --repo web TODO             search \"TODO\" in repos matching \"web\"
+"
+    );
+    Ok(ExitCode::SUCCESS)
+}
 
 /// The selector flag vocabulary, defined once so the parser, the usage docs, and
 /// the repl's completion cannot drift apart. `--repo`/`--session` take a value;

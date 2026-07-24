@@ -6791,6 +6791,7 @@ _git_commands () {
     zdashed:'zvcs: install git-<verb> symlinks for every verb (dashed forms)'
     zrepl:'zvcs: interactive console over every command (z-verbs + git porcelain)'
     zverbs:'zvcs: list every extension verb and its usage'
+    zselectors:'zvcs: the shared [selectors] grammar the parallel verbs accept'
     zcd:'zvcs: change the working directory (zrepl console)'
     zpwd:'zvcs: print the working directory'
     zls:'zvcs: git-aware directory listing (per-file status like eza --git)'

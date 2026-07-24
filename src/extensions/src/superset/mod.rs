@@ -28,6 +28,7 @@ pub mod lscolors;
 pub mod manpage;
 pub mod oplog;
 pub mod select;
+pub use select::zselectors;
 pub mod shell;
 pub mod snapshot;
 pub mod status;

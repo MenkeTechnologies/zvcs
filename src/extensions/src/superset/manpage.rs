@@ -208,7 +208,18 @@ pub const DOCS: &[Doc] = &[
         synopsis: "git zforeach [<selectors>] -- <command>...",
         desc: &[
             "Runs a command across all indexed repositories, or a subset, in parallel.",
-            "Selectors: a bare <pattern> (substring), --repo <p>, --dirty, --ahead, --behind, --claimed, and --session <s>. Everything after -- is the command to run in each selected repository.",
+            "Selectors: a bare <pattern> (substring), --repo <p>, --dirty, --ahead, --behind, --claimed, and --session <s>. Everything after -- is the command to run in each selected repository. See `git help zselectors` for the full selector grammar.",
+        ],
+    },
+    Doc {
+        verb: "zselectors",
+        summary: "the shared selector grammar the parallel verbs accept",
+        synopsis: "git zselectors",
+        desc: &[
+            "Many superset verbs take an optional leading [selectors] argument that narrows which indexed repositories they act on \\(em zforeach, zheads, zdirty, zpull, zgrep, zfetch, zgc, zcommitall, and the rest. This page documents that shared grammar; `git zselectors` prints a short version to the terminal.",
+            "With no selector a verb acts on EVERY indexed repository. The selectors are: a bare <pattern>, a case-insensitive substring matched against each repo's working-tree path (repeatable \\(em all patterns must match); --repo <pattern>, the same thing spelled out; --dirty, repos with uncommitted tracked changes; --ahead and --behind, repos ahead of or behind their upstream; --claimed, repos with an active lease (git zclaim); and --session <s>, repos leased by session <s>.",
+            "Selectors COMPOSE with AND \\(em a repo must match every selector given (so --ahead --behind is empty, since a repo is never both). --dirty, --ahead, and --behind read the daemon's status cache (kept warm by the status maintainer), so they reflect the last scan rather than a live check.",
+            "Examples: `git zheads` (all repos) vs `git zheads cask` (only repos whose path contains \"cask\"); `git zforeach --dirty -- git status` runs git status in every dirty repo; `git zpull --behind` fast-forwards only the repos behind their upstream; `git zgrep --repo web TODO` searches \"TODO\" in repos matching \"web\".",
         ],
     },
     Doc {

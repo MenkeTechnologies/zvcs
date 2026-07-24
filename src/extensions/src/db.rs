@@ -272,7 +272,7 @@ pub fn list_repos(conn: &Connection) -> Result<Vec<RepoRow>> {
 /// Insert a queued job, returning its id (the number shown to the user).
 pub fn insert_job(
     conn: &Connection,
-    repo_id: i64,
+    repo_id: Option<i64>,
     kind: &str,
     spec: &str,
     session: Option<&str>,

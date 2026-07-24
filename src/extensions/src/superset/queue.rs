@@ -84,9 +84,9 @@ pub fn zpush(args: &[String]) -> Result<ExitCode> {
 /// `git zsubmit [--] <command> [args...]` — ship an arbitrary command to the
 /// daemon's worker pool as an async job. Prints the job id; track it with `git
 /// zjobs` / `git zjob <id>` and cancel it with `git zjob stop <id>`, like any
-/// job. The command runs in the current repo's workdir with no shell (submit
-/// `sh -c "..."` for pipes/redirects). Falls back to running inline when no
-/// daemon is up.
+/// job. The command runs in the current directory (a repo is not required) with
+/// no shell (submit `sh -c "..."` for pipes/redirects). Falls back to running
+/// inline when no daemon is up.
 pub fn zsubmit(args: &[String]) -> Result<ExitCode> {
     let argv: Vec<String> = match args.split_first() {
         Some((first, rest)) if first == "--" => rest.to_vec(),
@@ -95,7 +95,16 @@ pub fn zsubmit(args: &[String]) -> Result<ExitCode> {
     if argv.is_empty() {
         anyhow::bail!("usage: git zsubmit [--] <command> [args...]");
     }
-    let (git_dir, workdir) = here()?;
+    // Runs anywhere: the workdir is the current directory. If that happens to be a
+    // repo, attribute the job to it; otherwise it is a repo-less job.
+    let workdir = std::env::current_dir()?.to_string_lossy().into_owned();
+    let git_dir = gix::discover(".").ok().map(|r| {
+        r.git_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| r.git_dir().to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    });
     // A readable ledger label: `exec: <command>`, char-safely trimmed.
     let cmd = argv.join(" ");
     let label = if cmd.chars().count() > 52 {
@@ -104,15 +113,17 @@ pub fn zsubmit(args: &[String]) -> Result<ExitCode> {
     } else {
         format!("exec: {cmd}")
     };
-    let spec = json!({
+    let mut spec = json!({
         "kind": "exec",
         "label": label,
-        "git_dir": git_dir,
         "workdir": workdir,
         "argv": argv,
         "session": session(),
         "env": carried_env(),
     });
+    if let Some(gd) = git_dir {
+        spec["git_dir"] = json!(gd);
+    }
     submit_or_run(&spec)
 }
 
@@ -319,9 +330,6 @@ fn run_inline(spec: &Value) -> Result<ExitCode> {
 /// Insert a queued ledger row for an inline run; `None` if the ledger is
 /// unavailable (the job still runs, just unrecorded).
 fn record_queued(spec: &Value) -> (Option<i64>, ()) {
-    let Some(gd) = spec.get("git_dir").and_then(Value::as_str) else {
-        return (None, ());
-    };
     // The ledger's displayed kind prefers `label` (a human summary, e.g. the
     // exec command) over the dispatch `kind`; commit/push set no label, so they
     // still show "commit"/"push".
@@ -332,11 +340,17 @@ fn record_queued(spec: &Value) -> (Option<i64>, ()) {
     else {
         return (None, ());
     };
+    // `git_dir` is optional: a `zsubmit` job run outside any repo has none, so it
+    // records with a NULL repo_id (the ledger and `zjobs` LEFT-JOIN handle it).
+    let git_dir = spec.get("git_dir").and_then(Value::as_str);
     let wd = spec.get("workdir").and_then(Value::as_str);
     let session = spec.get("session").and_then(Value::as_str);
     let id = (|| {
         let conn = crate::db::open_rw().ok()?;
-        let repo_id = crate::db::upsert_repo(&conn, std::path::Path::new(gd), wd.map(std::path::Path::new)).ok()?;
+        let repo_id = match git_dir {
+            Some(gd) => Some(crate::db::upsert_repo(&conn, std::path::Path::new(gd), wd.map(std::path::Path::new)).ok()?),
+            None => None,
+        };
         crate::db::insert_job(&conn, repo_id, kind, &spec.to_string(), session).ok()
     })();
     (id, ())

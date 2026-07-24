@@ -61,3 +61,28 @@ fn zsubmit_runs_and_records_the_job() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_file(&sock);
 }
+
+#[test]
+fn zsubmit_runs_outside_any_repo() {
+    let root = std::env::temp_dir().join(format!("zvcs-zsubmit-repoless-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let sock = std::env::temp_dir().join(format!("zsubrl-{}.sock", std::process::id()));
+    std::fs::write(home.join("zdaemon.disabled"), "").unwrap(); // inline, deterministic
+
+    // A plain directory that is NOT a git repo.
+    let dir = root.join("plain");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let submit = zvcs_in(&dir, &home, &sock, &["zsubmit", "--", "sh", "-c", "echo here > proof.txt"]);
+    assert!(submit.contains("job #"), "repo-less submit still records a job: {submit}");
+    assert_eq!(std::fs::read_to_string(dir.join("proof.txt")).unwrap(), "here\n", "ran in the plain dir");
+
+    // It appears in the ledger despite having no repo.
+    let jobs = zvcs_in(&dir, &home, &sock, &["zjobs"]);
+    assert!(jobs.contains("exec: sh -c"), "repo-less job is listed:\n{jobs}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_file(&sock);
+}

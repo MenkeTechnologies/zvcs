@@ -103,7 +103,7 @@ pub const DOCS: &[Doc] = &[
         synopsis: "git zsubmit [--] <command> [args...]",
         desc: &[
             "Ships an arbitrary command to the daemon's worker pool as an async job and prints the job id. Track it with `git zjobs` and `git zjob <id>` (which shows its state and captured output), and cancel it with `git zjob stop <id>` \\(em the same ledger and controls as zcommit/zpush.",
-            "The command runs in the current repository's workdir with no shell, so submit `sh -c \"...\"` when you need pipes, redirects, or globbing. It runs with the submitter's carried git-identity environment; otherwise it inherits the daemon's. With no daemon running, it executes inline.",
+            "The command runs in the current directory (a git repository is not required \\(em a repo-less job simply records with no repo) with no shell, so submit `sh -c \"...\"` when you need pipes, redirects, or globbing. It runs with the submitter's carried git-identity environment; otherwise it inherits the daemon's. With no daemon running, it executes inline.",
         ],
     },
     Doc {

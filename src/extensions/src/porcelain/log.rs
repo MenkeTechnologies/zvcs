@@ -14,6 +14,50 @@ use gix::objs::tree::EntryKind;
 /// The terminal width git assumes for `--stat` when stdout is not a terminal.
 const STAT_TERM_WIDTH: usize = 80;
 
+/// git's ref-decoration style (`--decorate` / `log.decorate`): whether commit
+/// decorations are shown and, when shown, with short (`main`) or full
+/// (`refs/heads/main`) ref names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecorateStyle {
+    /// No decorations on the built-in header/oneline formats.
+    Off,
+    /// `main`, `tag: v1`, `origin/main`.
+    Short,
+    /// `refs/heads/main`, `tag: refs/tags/v1`, `refs/remotes/origin/main`.
+    Full,
+}
+
+/// git's `parse_decoration_style`: a maybe-bool (`true`/`false`/`yes`/`no`/
+/// `on`/`off`/integer), or the words `short`/`full`/`auto`. `auto` resolves to
+/// `Short` when stdout is a terminal and `Off` otherwise, matching git's
+/// `auto_decoration_style`. Returns `None` for a value git rejects — config
+/// treats that as `Off`, while `--decorate=<value>` makes it fatal.
+fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
+    let lower = value.to_ascii_lowercase();
+    match lower.as_str() {
+        "true" | "yes" | "on" | "short" => return Some(DecorateStyle::Short),
+        "false" | "no" | "off" | "" => return Some(DecorateStyle::Off),
+        "full" => return Some(DecorateStyle::Full),
+        "auto" => {
+            return Some(if std::io::stdout().is_terminal() {
+                DecorateStyle::Short
+            } else {
+                DecorateStyle::Off
+            })
+        }
+        _ => {}
+    }
+    // git falls back to integer parsing: a non-zero value is true (Short).
+    if let Ok(n) = lower.parse::<i64>() {
+        return Some(if n != 0 {
+            DecorateStyle::Short
+        } else {
+            DecorateStyle::Off
+        });
+    }
+    None
+}
+
 /// `git log` — commit history reachable from a starting revision (default `HEAD`).
 ///
 /// Ported invocation forms:
@@ -83,9 +127,21 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // Config supplies the defaults; the flags below override them. git reads
     // these in `git_log_config` before parsing args, and validates `log.date`
     // there — an invalid value is fatal even when `--date` later overrides it.
-    let (cfg_abbrev_commit, cfg_date_mode, cfg_show_root) = {
+    let (cfg_abbrev_commit, cfg_date_mode, cfg_show_root, cfg_decorate) = {
         let snap = repo.config_snapshot();
         let abbrev = snap.boolean("log.abbrevCommit").unwrap_or(false);
+        // `log.decorate` sets the default decoration style for the built-in
+        // header/oneline formats. It reuses git's `parse_decoration_style`, so it
+        // accepts a maybe-bool plus `short`/`full`/`auto`; an invalid value is
+        // treated as `Off` (git's `decoration_style = 0`), never fatal. `None`
+        // here means the key is absent, so the built-in default (`auto`) applies.
+        let decorate: Option<DecorateStyle> = match snap.boolean("log.decorate") {
+            Some(true) => Some(DecorateStyle::Short),
+            Some(false) => Some(DecorateStyle::Off),
+            None => snap.string("log.decorate").map(|v| {
+                parse_decoration_style(&v.to_str_lossy()).unwrap_or(DecorateStyle::Off)
+            }),
+        };
         // `log.showRoot` defaults to true: the root commit is shown as a big
         // creation event (a diff against the empty tree). `--root` on the command
         // line forces it on but there is no `--no-root`, so config is the only way
@@ -104,7 +160,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             }
             None => DateMode::Default,
         };
-        (abbrev, date, show_root)
+        (abbrev, date, show_root, decorate)
     };
 
     let mut max_count: Option<usize> = None;
@@ -126,7 +182,15 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // from (`\t<source>` after the hash), for the built-in header formats.
     let mut source_mode = false;
     let mut graph = false;
-    let mut decorate = false;
+    // git's built-in default is `auto` (short refs when interactive, none when
+    // piped); `log.decorate` overrides it, and the `--decorate` flags override
+    // that in turn.
+    let builtin_decorate = if std::io::stdout().is_terminal() {
+        DecorateStyle::Short
+    } else {
+        DecorateStyle::Off
+    };
+    let mut decorate = cfg_decorate.unwrap_or(builtin_decorate);
     let mut all = false;
     let mut reverse = false;
     let mut only_merges = false;
@@ -188,11 +252,17 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 }
             }
         } else if a == "--decorate" {
-            decorate = true;
+            decorate = DecorateStyle::Short;
         } else if let Some(m) = a.strip_prefix("--decorate=") {
-            decorate = m != "no";
+            match parse_decoration_style(m) {
+                Some(s) => decorate = s,
+                None => {
+                    eprintln!("fatal: invalid --decorate option: {m}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         } else if a == "--no-decorate" {
-            decorate = false;
+            decorate = DecorateStyle::Off;
         } else if a == "--oneline" {
             pretty = Pretty::Oneline;
             terminator = true;
@@ -645,7 +715,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     };
     // `%d`/`%D` need a commit→refs map; build it only when the format asks for one
     // so plain formats pay nothing for the ref scan.
-    let decorations = if pretty_uses_decoration(&pretty) || decorate {
+    let decorations = if pretty_uses_decoration(&pretty) || decorate != DecorateStyle::Off {
         Some(build_decorations(&repo)?)
     } else {
         None
@@ -1196,8 +1266,10 @@ fn expand_format(
             'n' => out.push(b'\n'),
             '%' => out.push(b'%'),
             'C' => expand_color(out, &chars, &mut i, ctx.want_color, &mut auto),
-            'd' => expand_decoration(out, commit, ctx, auto, true),
-            'D' => expand_decoration(out, commit, ctx, auto, false),
+            // `%d`/`%D` are always shown (short by default); `log.decorate=full`
+            // / `--decorate=full` switches them to full ref names.
+            'd' => expand_decoration(out, commit, ctx, auto, true, ctx.decorate == DecorateStyle::Full),
+            'D' => expand_decoration(out, commit, ctx, auto, false, ctx.decorate == DecorateStyle::Full),
             'a' => {
                 let author = commit.author()?;
                 match chars.get(i).copied() {
@@ -1457,6 +1529,7 @@ fn expand_decoration(
     ctx: &RenderCtx<'_>,
     auto: bool,
     wrap: bool,
+    full_refs: bool,
 ) {
     let Some(decos) = ctx.decorations else {
         return;
@@ -1489,11 +1562,18 @@ fn expand_decoration(
     if head_here {
         match head_branch {
             Some(b) => {
+                // The branch HEAD points at is a local branch, so its full form
+                // carries the `refs/heads/` prefix.
+                let shown = if full_refs {
+                    format!("refs/heads/{b}")
+                } else {
+                    b.to_string()
+                };
                 entries.push(format!(
                     "{}{}{}",
                     paint("HEAD", "\x1b[1;36m"),
                     punct(" -> "),
-                    paint(b, "\x1b[1;32m")
+                    paint(&shown, "\x1b[1;32m")
                 ));
             }
             None => entries.push(paint("HEAD", "\x1b[1;36m")),
@@ -1519,16 +1599,19 @@ fn expand_decoration(
             .collect();
         ordered.sort_by(|a, b| full(b).cmp(&full(a)));
         for d in ordered {
+            // `--decorate=full` / `log.decorate=full` renders the full ref name
+            // (`refs/heads/main`) in place of the short one (`main`).
+            let shown = if full_refs { full(d) } else { d.name.clone() };
             match d.kind {
-                DecoKind::LocalBranch => entries.push(paint(&d.name, "\x1b[1;32m")),
+                DecoKind::LocalBranch => entries.push(paint(&shown, "\x1b[1;32m")),
                 // git colors the `tag: ` prefix and the tag name as two separate
                 // bold-yellow spans.
                 DecoKind::Tag => entries.push(format!(
                     "{}{}",
                     paint("tag: ", "\x1b[1;33m"),
-                    paint(&d.name, "\x1b[1;33m")
+                    paint(&shown, "\x1b[1;33m")
                 )),
-                DecoKind::RemoteBranch => entries.push(paint(&d.name, "\x1b[1;31m")),
+                DecoKind::RemoteBranch => entries.push(paint(&shown, "\x1b[1;31m")),
             }
         }
     }
@@ -1751,9 +1834,11 @@ struct RenderCtx<'a> {
     /// Commit→refs map plus HEAD info for `%d`/`%D`; `None` when the format has no
     /// decoration placeholder.
     decorations: Option<&'a Decorations>,
-    /// `--decorate`: append ` (refs)` to the oneline/header even when the format
-    /// carries no `%d` placeholder.
-    decorate: bool,
+    /// `--decorate` / `log.decorate`: the decoration style for the oneline/header
+    /// formats. `Off` appends nothing; `Short`/`Full` append ` (refs)` with short
+    /// or full ref names. Also selects short-vs-full for the `%d`/`%D`
+    /// placeholders (which are shown regardless of `Off`, in short form).
+    decorate: DecorateStyle,
     /// `--source`: the ref/argument this commit was reached from, rendered as
     /// `\t<source>` after the hash on the built-in header formats. `None` when
     /// `--source` is off (and for user/`reference` formats, which git leaves bare).
@@ -1781,8 +1866,15 @@ fn render_entry(
             out.extend_from_slice(&ctx.extra);
             write_source(out, ctx);
             // `--decorate`: ` (HEAD -> main, tag: v1)` between the hash and subject.
-            if ctx.decorate {
-                expand_decoration(out, commit, ctx, ctx.want_color, true);
+            if ctx.decorate != DecorateStyle::Off {
+                expand_decoration(
+                    out,
+                    commit,
+                    ctx,
+                    ctx.want_color,
+                    true,
+                    ctx.decorate == DecorateStyle::Full,
+                );
             }
             out.push(b' ');
             out.extend_from_slice(&subject(commit.message_raw()?));
@@ -1828,8 +1920,15 @@ fn render_entry(
             out.extend_from_slice(&ctx.extra);
             write_source(out, ctx);
             // `--decorate`: ` (HEAD -> main, tag: v1)` after the commit id.
-            if ctx.decorate {
-                expand_decoration(out, commit, ctx, ctx.want_color, true);
+            if ctx.decorate != DecorateStyle::Off {
+                expand_decoration(
+                    out,
+                    commit,
+                    ctx,
+                    ctx.want_color,
+                    true,
+                    ctx.decorate == DecorateStyle::Full,
+                );
             }
             out.push(b'\n');
 

@@ -27,6 +27,9 @@ use crate::lock::RepoLock;
 ///   * `git init -b <name>` / `--initial-branch=<name>`   (sets `HEAD` symref)
 ///   * `git init -q` / `--quiet`                          (suppresses the line)
 ///   * `git init --template=<dir>` / `--template <dir>`   (seed from a template)
+///     with git's `copy_templates()` precedence: `--template` > the
+///     `GIT_TEMPLATE_DIR` env var > the `init.templateDir` config (a pathname,
+///     so a leading `~` expands) > gix's built-in default template.
 ///   * `git init --separate-git-dir=<gitdir>`             (real git dir elsewhere + `.git` link file)
 ///   * `git init --shared[=<permissions>]`                (group/world/octal sharing)
 ///   * `git init --object-format=<hash>` / `--object-format <hash>`
@@ -317,10 +320,28 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         None => src_git_dir.clone(),
     };
 
-    // `--template=<dir>`: seed the git dir from the template, replacing gix's
-    // built-in default template so ONLY the requested template's files remain
-    // (matching git, which uses the given template dir instead of the default,
-    // not in addition to it). Structural files stay in place.
+    // Resolve the template directory with git's `copy_templates()` precedence
+    // (`builtin/init-db.c`): the `--template` command-line value wins, else the
+    // `GIT_TEMPLATE_DIR` environment variable, else the `init.templateDir`
+    // config (read as a pathname, so a leading `~` expands, matching git's
+    // `git_config_get_pathname("init.templatedir")`), else gix's already
+    // laid-down built-in default. An explicit (even empty) `--template` or a set
+    // `GIT_TEMPLATE_DIR` short-circuits before the config is consulted, so the
+    // config is a DEFAULT the flag/env override — never the other way around.
+    let template = template
+        .or_else(|| std::env::var("GIT_TEMPLATE_DIR").ok())
+        .or_else(|| {
+            repo.config_snapshot()
+                .trusted_path("init.templateDir")
+                .ok()
+                .flatten()
+                .map(|p| p.to_string_lossy().into_owned())
+        });
+
+    // Seed the git dir from the resolved template, replacing gix's built-in
+    // default template so ONLY the requested template's files remain (matching
+    // git, which uses the given template dir instead of the default, not in
+    // addition to it). Structural files stay in place.
     if let Some(tpl) = template.as_deref().filter(|t| !t.is_empty()) {
         apply_template(tpl, &git_dir)?;
     }

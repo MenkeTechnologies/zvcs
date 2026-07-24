@@ -14,7 +14,7 @@
 //! else `pull.rebase`; `<value>` is `true`/`false`/`merges`/`interactive`
 //! (`preserve` is refused as git refuses it). A rebase forwards its compatible
 //! knobs to `rebase` — `-s`/`--strategy`, `-X`/`--strategy-option`, `--signoff`,
-//! `--autostash` (and `rebase.autoStash`), `--rebase-merges` (from
+//! `--autostash` (and `pull.autoStash`/`rebase.autoStash`), `--rebase-merges` (from
 //! `--rebase=merges`), `--stat`/`--no-stat`/`-n` — and rebases the current branch
 //! onto the fetched upstream.
 //!
@@ -346,11 +346,18 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         if signoff {
             rebase_args.push("--signoff".into());
         }
-        // Autostash: CLI flag wins, else rebase.autoStash. A clean tree makes it
-        // a no-op; a dirty tree is handled by the rebase port's own policy.
+        // Autostash: CLI flag wins, else pull.autoStash — which overrides
+        // rebase.autoStash for pull the way git's config_autostash resolution
+        // does — else rebase.autoStash, else off. A clean tree makes it a no-op;
+        // a dirty tree is handled by the rebase port's own policy.
         let want_autostash = match autostash {
             Some(v) => v,
-            None => repo.config_snapshot().boolean("rebase.autoStash") == Some(true),
+            None => {
+                let snap = repo.config_snapshot();
+                snap.boolean("pull.autoStash")
+                    .or_else(|| snap.boolean("rebase.autoStash"))
+                    == Some(true)
+            }
         };
         if want_autostash {
             rebase_args.push("--autostash".into());

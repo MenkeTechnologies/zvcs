@@ -308,6 +308,15 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     }
     let in_progress = apply_in_progress || merge_in_progress;
 
+    // `rebase_config()` runs before `parse_options`, so `rebase.autoStash`
+    // seeds the default and the `--autostash`/`--no-autostash` option (handled
+    // in the loop below via `autostash = !unset`) overwrites it — git's
+    // `opts->autostash = git_config_bool()` followed by `OPT_AUTOSTASH`, which
+    // is why the explicit flag wins over the config both ways.
+    if repo.config_snapshot().boolean("rebase.autoStash") == Some(true) {
+        autostash = true;
+    }
+
     // --- parse_options ----------------------------------------------------
     let mut i = 0;
     let mut no_more_options = false;

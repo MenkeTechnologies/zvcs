@@ -70,6 +70,9 @@ enum Untracked {
 ///     submodule-status ignore level; an invalid `<when>` is fatal (exit 128).
 ///   * `git status --no-short | --no-long | --no-porcelain` — reset to the long
 ///     format and pin it against `status.short`.
+///   * `status.displayCommentPrefix` — prefixes every long-format line with the
+///     comment string (`core.commentString`/`core.commentChar`, default `#`); the
+///     trailing summary / stash lines stay unprefixed, matching git.
 ///   * unmerged (conflicted) paths, in both long and short form.
 ///   * `git status [--] <pathspec>...` — limits the report to matching paths
 ///     (the gix status iterator is given the patterns), across every format.
@@ -368,6 +371,12 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
 
     let repo = gix::discover(".")?;
 
+    // `status.displayCommentPrefix` (git's `git_status_config`): when true the
+    // long human format prefixes every line with the comment string. Resolved to
+    // the actual comment string here so the borrow of the snapshot ends before the
+    // long renderer runs; `None` leaves the format uncommented (git's default).
+    let mut comment_prefix: Option<String> = None;
+
     // With no format/branch flag on the command line, `status.short` selects the
     // colored short display and `status.branch` adds the `## <branch>` header.
     // A flag (including `--long` / `--no-branch`) always wins over the config.
@@ -413,6 +422,13 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             if let Some(v) = snap.boolean("status.aheadBehind") {
                 ahead_behind = Some(v);
             }
+        }
+        // `status.displayCommentPrefix` only affects the long human format (git
+        // routes every long-format line through `status_printf`, which prepends the
+        // comment string; the short and porcelain renderers never do). Resolve the
+        // comment string now so `render_long` needs no snapshot borrow.
+        if snap.boolean("status.displayCommentPrefix") == Some(true) {
+            comment_prefix = Some(resolve_comment_string(&snap));
         }
     }
 
@@ -677,6 +693,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 show_stash,
                 stash_count,
                 &colors,
+                comment_prefix.as_deref(),
             )
         );
     }
@@ -1675,6 +1692,7 @@ fn render_long(
     show_stash: bool,
     stash_count: usize,
     colors: &StatusColors,
+    comment_prefix: Option<&str>,
 ) -> String {
     let mut out = String::new();
 
@@ -1799,6 +1817,12 @@ fn render_long(
         }
     }
 
+    // Trailing summary + stash line — git emits both with plain `fprintf`, never
+    // through `status_printf`, so they are NOT comment-prefixed even under
+    // `status.displayCommentPrefix`. They are collected into `trailer` and appended
+    // raw after the (optionally prefixed) body below.
+    let mut trailer = String::new();
+
     // Trailing summary — omitted entirely when there is anything staged
     // (git's "committable" state), matching stock output.
     if !committable {
@@ -1814,18 +1838,74 @@ fn render_long(
         } else {
             "nothing to commit, working tree clean"
         };
-        out.push_str(summary);
-        out.push('\n');
+        trailer.push_str(summary);
+        trailer.push('\n');
     }
 
     // `wt_longstatus_print_stash_summary`: an unconditional trailing line after
     // the summary, emitted only when there is at least one stash entry.
     if show_stash && stash_count > 0 {
         let noun = if stash_count == 1 { "entry" } else { "entries" };
-        out.push_str(&format!("Your stash currently has {stash_count} {noun}\n"));
+        trailer.push_str(&format!("Your stash currently has {stash_count} {noun}\n"));
     }
 
+    // `status.displayCommentPrefix`: prefix each body line with the comment string
+    // (git's `status_vprintf`). The trailer keeps its raw, unprefixed form.
+    if let Some(cs) = comment_prefix {
+        let mut prefixed = comment_prefix_body(&out, cs);
+        prefixed.push_str(&trailer);
+        prefixed
+    } else {
+        out.push_str(&trailer);
+        out
+    }
+}
+
+/// Apply git's `status_vprintf` comment-prefix rule to every line of the long-
+/// format body: each line is prefixed with the comment string `cs`, then a single
+/// space *unless* the line's first byte is a tab (git suppresses the space so the
+/// `\t`-indented change entries stay aligned). An empty line becomes the comment
+/// string alone (no trailing space). Only the human long format is prefixed — git
+/// routes it through `status_printf`, while the trailing summary uses raw
+/// `fprintf` and is therefore excluded by the caller.
+fn comment_prefix_body(body: &str, cs: &str) -> String {
+    let mut out = String::with_capacity(body.len() + body.len() / 8 + cs.len());
+    for line in body.split_inclusive('\n') {
+        let (content, nl) = match line.strip_suffix('\n') {
+            Some(c) => (c, "\n"),
+            None => (line, ""),
+        };
+        out.push_str(cs);
+        if !content.is_empty() {
+            if !content.starts_with('\t') {
+                out.push(' ');
+            }
+            out.push_str(content);
+        }
+        out.push_str(nl);
+    }
     out
+}
+
+/// Resolve git's comment string for `status.displayCommentPrefix` output, matching
+/// git's `comment_line_str` precedence: `core.commentString` wins if set, else
+/// `core.commentChar` (a literal `auto` resolves to `#` for status display, as git
+/// does), else the built-in default `#`.
+fn resolve_comment_string(snap: &gix::config::Snapshot) -> String {
+    use gix::bstr::ByteSlice;
+    if let Some(v) = snap.string("core.commentString") {
+        let s = v.to_str_lossy();
+        if !s.is_empty() {
+            return s.into_owned();
+        }
+    }
+    if let Some(v) = snap.string("core.commentChar") {
+        let s = v.to_str_lossy();
+        if !s.is_empty() && s != "auto" {
+            return s.into_owned();
+        }
+    }
+    "#".to_string()
 }
 
 /// Count `refs/stash` reflog entries — git's `count_stash_entries`, which drives

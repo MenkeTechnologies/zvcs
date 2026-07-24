@@ -36,6 +36,10 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     let mut f = Flags::default();
     let mut positionals: Vec<String> = Vec::new();
     let mut end_of_options = false;
+    // Whether `--recurse-submodules`/`--no-recurse-submodules` was given on the
+    // command line; if so it wins over `push.recurseSubmodules` (git reads config
+    // before parse_options, so the flag's assignment lands last).
+    let mut recurse_explicit = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -87,8 +91,14 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "--receive-pack" | "--exec" => {
                 let _ = take_value(inline)?;
             }
-            "--recurse-submodules" => f.recurse = parse_recurse(&take_value(inline)?)?,
-            "--no-recurse-submodules" => f.recurse = Recurse::Off,
+            "--recurse-submodules" => {
+                f.recurse = parse_recurse(&take_value(inline)?)?;
+                recurse_explicit = true;
+            }
+            "--no-recurse-submodules" => {
+                f.recurse = Recurse::Off;
+                recurse_explicit = true;
+            }
             // Rejected: cannot be honored faithfully by the send-pack scope, and
             // silently ignoring them would change the push's meaning.
             "--mirror" => bail!("--mirror is not supported"),
@@ -125,6 +135,47 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     } else {
         positionals.into_iter().skip(1).collect()
     };
+
+    // Honor the `push.*` config defaults for flags not given explicitly. An
+    // explicit command-line flag always wins: git reads config in `git_push_config`
+    // before `parse_options`, so the flag's assignment lands after the config's.
+    {
+        let snap = repo.config_snapshot();
+
+        // `push.recurseSubmodules` — the default for `--recurse-submodules`, parsed
+        // with git's own value parser (`parse_push_recurse_submodules_arg` is
+        // `parse_push_recurse`, which `parse_recurse` ports). The flag overrides it.
+        if !recurse_explicit {
+            if let Some(v) = snap.string("push.recurseSubmodules") {
+                f.recurse = parse_recurse(&v.to_string())?;
+            }
+        }
+
+        // `push.autoSetupRemote` — on a bare default push whose current branch has
+        // no configured upstream, act as if `--set-upstream`. Ported from git's
+        // `setup_default_push_refspecs` (builtin/push.c): the SET_UPSTREAM flag is
+        // added when `(flags & AUTO_UPSTREAM) && branch->merge_nr == 0`, and only
+        // for `push.default` simple/upstream/current — `matching` and `nothing`
+        // return/die before that point. Unlike a plain flag it is not undone by
+        // `--no-set-upstream` (git applies it at push time, after option parsing).
+        let bare_default = specs.is_empty() && !f.all && !f.tags && !f.delete;
+        if bare_default && snap.boolean("push.autoSetupRemote") == Some(true) {
+            let push_default = snap
+                .string("push.default")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "simple".to_string());
+            let default_applies = !matches!(push_default.as_str(), "matching" | "nothing");
+            let has_upstream = repo
+                .head()
+                .ok()
+                .and_then(|h| h.referent_name().map(|n| n.shorten().to_string()))
+                .map(|b| snap.string(&format!("branch.{b}.merge")).is_some())
+                .unwrap_or(false);
+            if default_applies && !has_upstream {
+                f.set_upstream = true;
+            }
+        }
+    }
 
     let remote = match repo.find_remote(remote_name.as_str()) {
         Ok(r) => r,

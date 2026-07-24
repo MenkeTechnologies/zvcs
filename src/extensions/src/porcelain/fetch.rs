@@ -30,6 +30,12 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 ///   * `--shallow-exclude <ref>`      → exclude history reachable from a ref (repeatable)
 ///   * `-v`/`--verbose`, `-q`/`--quiet`, `--dry-run` (and their `--no-…` negations)
 ///
+/// Config-supplied defaults (overridden by the matching flag, git precedence
+/// CLI > config > built-in default):
+///   * `fetch.prune`     → behave as `--prune`
+///   * `fetch.pruneTags` → behave as `--prune-tags`
+///   * `fetch.all`       → behave as `--all` when no remote is named
+///
 /// The per-ref summary is written to stderr in `git fetch` layout (`From <url>`
 /// header plus one aligned line per changed or pruned ref). Options that require
 /// substrate gitoxide's high-level fetch does not expose (`--filter`,
@@ -40,7 +46,10 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
 
     // --- argument parsing -------------------------------------------------
     let mut opts = FetchOpts::default();
-    let mut all = false;
+    // Tri-state so `fetch.all` can supply the default: `Some(true/false)` is an
+    // explicit `--all`/`--no-all`, `None` defers to config (git precedence:
+    // CLI > config > built-in default).
+    let mut all_flag: Option<bool> = None;
     let mut multiple = false;
     let mut positionals: Vec<&str> = Vec::new();
 
@@ -85,23 +94,23 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             "-v" | "--verbose" => opts.verbose = true,
             "-q" | "--quiet" => opts.quiet = true,
             "--dry-run" => opts.dry_run = true,
-            "--all" => all = true,
+            "--all" => all_flag = Some(true),
             "-m" | "--multiple" => multiple = true,
             "-t" | "--tags" => opts.tags = Some(Tags::All),
             // git: `-n` is the short form of `--no-tags`, not `--dry-run`.
             "-n" | "--no-tags" => opts.tags = Some(Tags::None),
-            "-p" | "--prune" => opts.prune = true,
-            "-P" | "--prune-tags" => opts.prune_tags = true,
+            "-p" | "--prune" => opts.prune = Some(true),
+            "-P" | "--prune-tags" => opts.prune_tags = Some(true),
             "-f" | "--force" => opts.force = true,
             // Negations git's parse-options accepts for the `--[no-]…` booleans:
             // resetting each flag to its default (git clears the corresponding bit).
             "--no-verbose" => opts.verbose = false,
             "--no-quiet" => opts.quiet = false,
             "--no-dry-run" => opts.dry_run = false,
-            "--no-all" => all = false,
+            "--no-all" => all_flag = Some(false),
             "--no-multiple" => multiple = false,
-            "--no-prune" => opts.prune = false,
-            "--no-prune-tags" => opts.prune_tags = false,
+            "--no-prune" => opts.prune = Some(false),
+            "--no-prune-tags" => opts.prune_tags = Some(false),
             "--no-force" => opts.force = false,
             "--unshallow" => opts.shallow = Some(Shallow::undo()),
             "--depth" => {
@@ -173,6 +182,33 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         opts.shallow = Some(Shallow::Since { cutoff });
     }
 
+    // --- config-supplied defaults -----------------------------------------
+    // git resolves each of these with CLI > config > built-in default (see
+    // builtin/fetch.c `cmd_fetch`): a bare `git fetch` behaves as if the
+    // corresponding flag were given when the config is set, but an explicit
+    // flag always wins. `-c`/`--config` overrides land here via gix's snapshot
+    // (they are injected as `GIT_CONFIG_*` before the repo is opened).
+    //   * `fetch.prune`     → default for `--prune`
+    //   * `fetch.pruneTags` → default for `--prune-tags`
+    //   * `fetch.all`       → default for `--all` (only with no explicit remote,
+    //                          matching git: a positional remote suppresses it)
+    {
+        let snap = repo.config_snapshot();
+        if opts.prune.is_none() {
+            opts.prune = snap.boolean("fetch.prune");
+        }
+        if opts.prune_tags.is_none() {
+            opts.prune_tags = snap.boolean("fetch.pruneTags");
+        }
+        if all_flag.is_none()
+            && positionals.is_empty()
+            && snap.boolean("fetch.all") == Some(true)
+        {
+            all_flag = Some(true);
+        }
+    }
+    let all = all_flag.unwrap_or(false);
+
     // Serialize ref mutations through the repo coordinator, as the write
     // commands do; a no-op guard if no daemon is running.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
@@ -228,8 +264,11 @@ struct FetchOpts {
     verbose: bool,
     quiet: bool,
     force: bool,
-    prune: bool,
-    prune_tags: bool,
+    // `None` = neither the flag nor the config set it (git's "unspecified");
+    // resolved to a concrete value from `fetch.prune`/`fetch.pruneTags` before
+    // dispatch, so `Some(true)` here means "prune" regardless of origin.
+    prune: Option<bool>,
+    prune_tags: Option<bool>,
     tags: Option<Tags>,
     shallow: Option<Shallow>,
 }
@@ -299,7 +338,7 @@ fn fetch_one(
     // Destination prefixes to prune (glob refspec destinations only), captured
     // before the remote is consumed by `connect`.
     let mut prune_prefixes: Vec<Vec<u8>> = Vec::new();
-    if opts.prune {
+    if opts.prune == Some(true) {
         for s in remote.refspecs(gix::remote::Direction::Fetch) {
             if let Some(dst) = s.to_ref().destination() {
                 let dst: &[u8] = dst.as_ref();
@@ -309,7 +348,7 @@ fn fetch_one(
             }
         }
         // `-P` adds the tags refspec, so its destination joins the prune set.
-        if opts.prune_tags {
+        if opts.prune_tags == Some(true) {
             prune_prefixes.push(b"refs/tags/".to_vec());
         }
         prune_prefixes.sort();
@@ -319,7 +358,7 @@ fn fetch_one(
     // `-P` fetches all tags via an implicit refspec so pruning has the full
     // remote tag set to diff against, without persisting the spec to config.
     let mut extra_refspecs = Vec::new();
-    if opts.prune_tags {
+    if opts.prune_tags == Some(true) {
         extra_refspecs.push(
             gix::refspec::parse(
                 "refs/tags/*:refs/tags/*".into(),

@@ -201,6 +201,15 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `diff.algorithm` default, applied after argument parsing so a `--minimal` /
     // `--histogram` / `--diff-algorithm=` flag always wins (git precedence).
     let mut config_algorithm: Option<ConfigAlgorithm> = None;
+    // `--stat` width limits (`show_stats()`), `0` == unset. Seeded from
+    // `diff.statNameWidth`/`diff.statGraphWidth` below, then overwritten by an
+    // explicit `--stat-name-width=`/`--stat-graph-width=` flag (git precedence;
+    // a `--stat-name-width=0` flag legitimately overrides a positive config).
+    let mut stat_name_width: i64 = 0;
+    let mut stat_graph_width: i64 = 0;
+    // `diff.suppressBlankEmpty`: emit an empty context line as `"\n"` rather than
+    // the default `" \n"` (`fn_out_consume()`); no CLI flag exists for it.
+    let mut suppress_blank_empty = false;
 
     // Revisions and pathspecs are classified in a single left-to-right pass, so an
     // invalid option value, an ambiguous positional, and any "too many operands"
@@ -236,6 +245,23 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         // remembered as unrenderable and only rejected if actually used below.
         if let Some(name) = snap.string("diff.algorithm") {
             config_algorithm = Some(parse_config_algorithm(name.as_ref())?);
+        }
+        // `diff.statNameWidth`/`diff.statGraphWidth` cap the `--stat` name/graph
+        // columns (`git_diff_ui_config()` -> `diff_stat_name_width` /
+        // `diff_stat_graph_width`). Only a positive limit has any effect in
+        // `show_stats()`; a non-positive config leaves the column uncapped.
+        if let Some(n) = snap.integer("diff.statNameWidth") {
+            if n > 0 {
+                stat_name_width = n;
+            }
+        }
+        if let Some(n) = snap.integer("diff.statGraphWidth") {
+            if n > 0 {
+                stat_graph_width = n;
+            }
+        }
+        if snap.boolean("diff.suppressBlankEmpty") == Some(true) {
+            suppress_blank_empty = true;
         }
     }
 
@@ -339,6 +365,29 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     "minimal" => algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal),
                     "histogram" => algorithm = Some(gix::diff::blob::Algorithm::Histogram),
                     other => bail!("diff algorithm {other:?} is not available"),
+                }
+            }
+            // `--stat-name-width=<n>` / `--stat-graph-width=<n>` override the
+            // `diff.statNameWidth`/`diff.statGraphWidth` defaults (`diff_opt_stat()`),
+            // and, like every `--stat*` flag, request the diffstat format.
+            s if s.starts_with("--stat-name-width=") => {
+                fmt |= F_DIFFSTAT;
+                match s["--stat-name-width=".len()..].parse::<i64>() {
+                    Ok(n) => stat_name_width = n,
+                    Err(_) => {
+                        eprintln!("error: stat-name-width expects a numerical value");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            s if s.starts_with("--stat-graph-width=") => {
+                fmt |= F_DIFFSTAT;
+                match s["--stat-graph-width=".len()..].parse::<i64>() {
+                    Ok(n) => stat_graph_width = n,
+                    Err(_) => {
+                        eprintln!("error: stat-graph-width expects a numerical value");
+                        return Ok(ExitCode::from(129));
+                    }
                 }
             }
             s if s.starts_with("--stat=") || s.starts_with("--stat-") => fmt |= F_DIFFSTAT,
@@ -594,7 +643,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 render_numstat(&mut out, &deltas, &analyses);
             }
             if fmt & F_DIFFSTAT != 0 {
-                render_stat(&mut out, &deltas, &analyses, compact_summary);
+                render_stat(
+                    &mut out,
+                    &deltas,
+                    &analyses,
+                    compact_summary,
+                    stat_name_width,
+                    stat_graph_width,
+                );
             }
             if fmt & F_SHORTSTAT != 0 {
                 render_shortstat(&mut out, &deltas, &analyses);
@@ -626,6 +682,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+
+    // `diff.suppressBlankEmpty`: `fn_out_consume()` rewrites any emitted line that
+    // is exactly `" \n"` (an empty context line) to `"\n"` before it is prefixed.
+    let out = apply_suppress_blank_empty(out, suppress_blank_empty);
 
     // `--line-prefix`: `diff_line_prefix()` prepends the string to every emitted
     // line, so a whole-buffer pass over the newline-terminated output reproduces it.
@@ -1714,8 +1774,17 @@ fn stat_display_name(d: &Delta, compact: bool) -> Vec<u8> {
     name
 }
 
-/// `--stat` (`show_stats()`), with git's default 80-column budget.
-fn render_stat(out: &mut Vec<u8>, deltas: &[Delta], analyses: &[Analysis], compact: bool) {
+/// `--stat` (`show_stats()`), with git's default 80-column budget. `stat_name_width`
+/// and `stat_graph_width` (`0` == unset) cap the filename and graph columns, coming
+/// from `--stat-name-width`/`--stat-graph-width` or `diff.statNameWidth`/`diff.statGraphWidth`.
+fn render_stat(
+    out: &mut Vec<u8>,
+    deltas: &[Delta],
+    analyses: &[Analysis],
+    compact: bool,
+    stat_name_width: i64,
+    stat_graph_width: i64,
+) {
     let names: Vec<Vec<u8>> = deltas.iter().map(|d| stat_display_name(d, compact)).collect();
 
     let mut max_change: i64 = 0;
@@ -1750,10 +1819,22 @@ fn render_stat(out: &mut Vec<u8>, deltas: &[Delta], analyses: &[Analysis], compa
     } else {
         bin_width - 4
     };
-    let mut name_width = max_len;
+    // `diff.statGraphWidth`/`--stat-graph-width` caps the graph column.
+    if stat_graph_width > 0 && stat_graph_width < graph_width {
+        graph_width = stat_graph_width;
+    }
+    // `diff.statNameWidth`/`--stat-name-width` caps the filename column.
+    let mut name_width = if stat_name_width > 0 && stat_name_width < max_len {
+        stat_name_width
+    } else {
+        max_len
+    };
     if name_width + number_width + 6 + graph_width > width {
         if graph_width > width * 3 / 8 - number_width - 6 {
             graph_width = (width * 3 / 8 - number_width - 6).max(6);
+        }
+        if stat_graph_width > 0 && graph_width > stat_graph_width {
+            graph_width = stat_graph_width;
         }
         if name_width > width - number_width - 6 - graph_width {
             name_width = width - number_width - 6 - graph_width;
@@ -1939,6 +2020,34 @@ fn emit_file_line(out: &mut Vec<u8>, lead: &[u8], label: &[u8]) {
 
 fn push_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
+}
+
+/// `diff.suppressBlankEmpty`: git's `fn_out_consume()` rewrites any single emitted
+/// line that is exactly `" \n"` — an empty *context* line — to `"\n"` before it is
+/// written (its check is `len == 2 && line[0] == ' ' && line[1] == '\n'`). Blank
+/// added/removed lines (`"+\n"`/`"-\n"`) and a context line whose content is one
+/// space (`"  \n"`, 3 bytes) never match, so a line-oriented pass that drops the
+/// leading space of every standalone `" \n"` line reproduces it byte-for-byte.
+fn apply_suppress_blank_empty(out: Vec<u8>, on: bool) -> Vec<u8> {
+    if !on || out.is_empty() {
+        return out;
+    }
+    let mut res = Vec::with_capacity(out.len());
+    let mut line_start = 0;
+    for i in 0..out.len() {
+        if out[i] == b'\n' {
+            let line = &out[line_start..=i];
+            if line == b" \n" {
+                res.push(b'\n');
+            } else {
+                res.extend_from_slice(line);
+            }
+            line_start = i + 1;
+        }
+    }
+    // A trailing line without a terminator cannot be `" \n"`; copy it verbatim.
+    res.extend_from_slice(&out[line_start..]);
+    res
 }
 
 /// `--line-prefix`: git's `emit_line_0()` writes `diff_line_prefix(o)` before every

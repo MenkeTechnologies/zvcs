@@ -11,7 +11,7 @@ use std::process::ExitCode;
 
 /// zvcs-native extension verbs — the superset that stock git does not have.
 pub const SUPERSET_VERBS: &[&str] = &[
-    "zsync", "zbump", "zdaemon", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
+    "zsync", "zbump", "zdaemon", "zconfig", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
     "zsubmit",
     "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
     "zsnapshots", "zworktree", "zstash", "zunstash", "zstashes", "zup", "zforeach", "zhook",
@@ -228,6 +228,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zsync" => "usage: git zsync [--force] — reconcile submodules to origin/main AND fan this checkout's HEAD out to all its local dups (offline); --force hard-resets every dup (diverged/dirty included)",
         "zbump" => "usage: git zbump [<submodule-path>...] — forward-only submodule gitlink bumps",
         "zdaemon" => "usage: git zdaemon <start|stop|restart|status|info|ping|log>",
+        "zconfig" => "usage: git zconfig [<name> [on|off|<count>|default]] — toggle daemon features (see `git help zconfig`)",
         "zrepos" => "usage: git zrepos [<pattern>...] — list indexed repos; patterns filter by case-insensitive substring",
         "zreindex" => "usage: git zreindex [--sync|--async] [<path>...] — (re)crawl for git repos and refresh the index",
         "zdashed" => "usage: git zdashed [<dir>] — install a git-<verb> symlink for every builtin",
@@ -370,6 +371,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zsync" => superset::zsync(args),
         "zbump" => superset::zbump(args),
         "zdaemon" => superset::zdaemon(args),
+        "zconfig" => superset::zconfig(args),
         "zrepos" => superset::zrepos(args),
         "zreindex" => superset::zreindex(args),
         "zdashed" => superset::zdashed(args),

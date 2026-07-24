@@ -53,6 +53,18 @@ pub const DOCS: &[Doc] = &[
         ],
     },
     Doc {
+        verb: "zconfig",
+        summary: "inspect and toggle the daemon's [zvcs] feature switches",
+        synopsis: "git zconfig [<name> [on|off|<count>|default]]",
+        desc: &[
+            "Turns the daemon's autonomy features on and off from the CLI instead of hand-editing ~/.gitconfig. With no argument it lists every setting, its effective value, and whether it is set in your config (marked *) or showing the built-in default.",
+            "The boolean switches are autoreconcile (auto-sync submodules to origin/main on change), autobump (forward-only gitlink bumps + commit), autocrawl (crawl zvcs.crawlroots into the index on daemon start), autostatus (recompute a repo's status cache when it changes), autohook (fire each repo's zvcs.hook on change), and autodups (fan a commit out to local duplicate checkouts) \\(em all off by default. Set them with `git zconfig <name> on|off`.",
+            "The numeric knobs are statusinterval (status-cache backstop sweep in seconds, default 10, 0 disables), watchmru (file-watch the N most-recently-used repos, default 512, 0 disables), and interval (autonomy debounce in seconds, default 30). Set them with `git zconfig <name> <count>`.",
+            "`git zconfig <name>` shows a single setting; `git zconfig <name> default` reverts it to the built-in default; `git zconfig all on|off` flips every autonomy switch at once (off also zeroes the two background loops so the daemon idles).",
+            "Writes go to the global config (~/.gitconfig), the file the daemon reads. A change reloads a running daemon automatically so it takes effect at once; if no daemon is running the new value applies on its next start (toggling never spawns one).",
+        ],
+    },
+    Doc {
         verb: "zrepos",
         summary: "list indexed git repositories",
         synopsis: "git zrepos [<pattern>...]",

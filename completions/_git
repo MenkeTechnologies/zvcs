@@ -6761,6 +6761,7 @@ _git_commands () {
 
   zvcs_commands=(
     zdaemon:'zvcs: control the coordination daemon'
+    zconfig:'zvcs: inspect and toggle the daemon feature switches'
     zsync:'zvcs: reconcile submodules to origin/main (attached, ff-only)'
     zbump:'zvcs: forward-only submodule pointer bumps (+ commit)'
     zup:'zvcs: bring the whole tree to latest origin/main'

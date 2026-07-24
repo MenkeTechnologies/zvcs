@@ -29,6 +29,8 @@ pub mod manpage;
 pub mod oplog;
 pub mod select;
 pub use select::zselectors;
+pub mod zconfig;
+pub use zconfig::zconfig;
 pub mod shell;
 pub mod snapshot;
 pub mod status;

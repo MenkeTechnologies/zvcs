@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS repos (
     discovered_at INTEGER,
     last_seen     INTEGER,
     hook          TEXT,
-    mtime         INTEGER
+    mtime         INTEGER,
+    pinned        INTEGER
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id            INTEGER PRIMARY KEY,
@@ -114,6 +115,30 @@ CREATE TRIGGER IF NOT EXISTS ev_status AFTER UPDATE ON repo_status
                      ELSE NEW.sync END,
                 NULL, NULL);
     END;
+-- Inter-agent messages (`zbroadcast`/`zhandoff`). `to_session` NULL = broadcast.
+-- Read state is per (message, session) so a broadcast can be marked read once per
+-- agent without a mutable flag on the shared row.
+CREATE TABLE IF NOT EXISTS messages (
+    id           INTEGER PRIMARY KEY,
+    ts           INTEGER NOT NULL,
+    from_session TEXT,
+    to_session   TEXT,
+    body         TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS message_reads (
+    message_id INTEGER NOT NULL,
+    session    TEXT NOT NULL,
+    PRIMARY KEY (message_id, session)
+);
+-- Semantic-event subscriptions (`zon`): the daemon runs `command` when a feed
+-- event matches `kind` (NULL = any) and `repo_like` (NULL = any repo).
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id         INTEGER PRIMARY KEY,
+    kind       TEXT,
+    repo_like  TEXT,
+    command    TEXT NOT NULL,
+    created_at INTEGER
+);
 ";
 
 /// The commit-detection trigger, installed via DROP+CREATE in [`open_rw`] so a
@@ -156,7 +181,7 @@ pub fn open_rw() -> Result<Connection> {
 }
 
 /// Bump when a migration is added below.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// One-time migrations, gated by `PRAGMA user_version` so they run once per db
 /// instead of on every connection. `open_rw` is on the hot path (every client
@@ -174,6 +199,7 @@ fn migrate(conn: &Connection) {
     let _ = conn.execute("ALTER TABLE triggers ADD COLUMN throttle_ms INTEGER NOT NULL DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE repos ADD COLUMN mtime INTEGER", []);
     let _ = conn.execute("ALTER TABLE repo_status ADD COLUMN head_sha TEXT", []);
+    let _ = conn.execute("ALTER TABLE repos ADD COLUMN pinned INTEGER", []); // v2: zpin
     // ev_commit was revised to key on the commit sha (see EV_COMMIT_SQL); DROP+CREATE
     // so an existing db running the old head-keyed trigger is upgraded in place.
     let _ = conn.execute("DROP TRIGGER IF EXISTS ev_commit", []);
@@ -899,6 +925,185 @@ pub fn mark_notified(conn: &Connection, ids: &[i64]) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+// ---- zpin: per-repo autonomy freeze ----------------------------------------
+
+/// Set or clear a repo's pinned flag. A pinned repo is refused by autobump and
+/// reconcile in the daemon — a selective freeze on autonomy.
+pub fn set_pin(conn: &Connection, git_dir: &Path, pinned: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE repos SET pinned=?2 WHERE git_dir=?1",
+        rusqlite::params![git_dir.to_string_lossy(), pinned as i64],
+    )?;
+    Ok(())
+}
+
+/// Whether a repo is pinned. Unknown repo → false.
+pub fn is_pinned(conn: &Connection, git_dir: &Path) -> bool {
+    conn.query_row(
+        "SELECT COALESCE(pinned,0) FROM repos WHERE git_dir=?1",
+        [git_dir.to_string_lossy()],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|v| v != 0)
+    .unwrap_or(false)
+}
+
+/// Every pinned repo's `(git_dir, workdir)`.
+pub fn list_pins(conn: &Connection) -> Result<Vec<(String, Option<String>)>> {
+    let mut stmt = conn.prepare("SELECT git_dir, workdir FROM repos WHERE pinned=1 ORDER BY git_dir")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+// ---- zbroadcast/zhandoff: inter-agent messages -----------------------------
+
+/// Post a message. `to` None = broadcast to every session. Returns the id.
+pub fn post_message(conn: &Connection, from: &str, to: Option<&str>, body: &str) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO messages (ts, from_session, to_session, body) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![now(), from, to, body],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Messages `session` has not read (broadcast or addressed to it, not its own),
+/// oldest first: `(id, from_session, body, ts)`.
+pub fn unread_messages(
+    conn: &Connection,
+    session: &str,
+) -> Result<Vec<(i64, Option<String>, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, from_session, body, ts FROM messages m
+          WHERE (to_session IS NULL OR to_session = ?1)
+            AND from_session IS NOT ?1
+            AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=m.id AND r.session=?1)
+          ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map([session], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Mark messages read by `session` (idempotent).
+pub fn mark_read(conn: &Connection, ids: &[i64], session: &str) -> Result<()> {
+    for id in ids {
+        conn.execute(
+            "INSERT OR IGNORE INTO message_reads (message_id, session) VALUES (?1, ?2)",
+            rusqlite::params![id, session],
+        )?;
+    }
+    Ok(())
+}
+
+/// Reassign a repo's claim to `new_session`. False if the repo isn't claimed.
+pub fn transfer_claim(conn: &Connection, repo_id: i64, new_session: &str) -> Result<bool> {
+    Ok(conn.execute("UPDATE claims SET session=?2 WHERE repo_id=?1", rusqlite::params![repo_id, new_session])? > 0)
+}
+
+// ---- zon: semantic-event subscriptions -------------------------------------
+
+/// Add an event subscription: run `command` when a feed event matches `kind`
+/// (None = any) and `repo_like` (None = any repo). Returns the id.
+pub fn add_subscription(
+    conn: &Connection,
+    kind: Option<&str>,
+    repo_like: Option<&str>,
+    command: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO subscriptions (kind, repo_like, command, created_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![kind, repo_like, command, now()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Every subscription: `(id, kind, repo_like, command)`.
+pub fn list_subscriptions(
+    conn: &Connection,
+) -> Result<Vec<(i64, Option<String>, Option<String>, String)>> {
+    let mut stmt = conn.prepare("SELECT id, kind, repo_like, command FROM subscriptions ORDER BY id")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Remove a subscription by id. False if it didn't exist.
+pub fn remove_subscription(conn: &Connection, id: i64) -> Result<bool> {
+    Ok(conn.execute("DELETE FROM subscriptions WHERE id=?1", [id])? > 0)
+}
+
+/// Feed events at or after epoch `ts`, oldest first, with the same repo-path join
+/// and optional kind/repo filters as the other feed queries. Backs `zsince`.
+pub fn events_after_ts(
+    conn: &Connection,
+    ts: i64,
+    kind: Option<&str>,
+    repo_like: Option<&str>,
+) -> Result<Vec<EventRow>> {
+    let like = repo_like.map(|p| format!("%{p}%"));
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.ts, e.kind, r.git_dir, r.workdir, e.detail, e.sha_before, e.sha_after \
+           FROM events e LEFT JOIN repos r ON r.id = e.repo_id \
+          WHERE e.ts >= ?1 \
+            AND (?2 IS NULL OR e.kind = ?2) \
+            AND (?3 IS NULL OR r.git_dir LIKE ?3 OR r.workdir LIKE ?3) \
+          ORDER BY e.id ASC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![ts, kind, like], row_to_event)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Earliest creation time of a snapshot by `name`, if any (a `zsince` baseline).
+pub fn snapshot_created_at(conn: &Connection, name: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row("SELECT MIN(created_at) FROM snapshots WHERE name=?1", [name], |r| {
+            r.get::<_, Option<i64>>(0)
+        })
+        .optional()?
+        .flatten())
+}
+
+/// Per-repo pending job pressure for `zcontend`: `(repo_path, queued, running)`
+/// for every repo that currently has queued or running jobs, busiest first.
+pub fn contention(conn: &Connection) -> Result<Vec<(String, i64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(r.workdir, r.git_dir),
+                SUM(j.state='queued'), SUM(j.state='running')
+           FROM jobs j JOIN repos r ON r.id = j.repo_id
+          WHERE j.state IN ('queued','running')
+          GROUP BY j.repo_id
+          ORDER BY (SUM(j.state='queued') + SUM(j.state='running')) DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Every indexed repo's `(git_dir, workdir)` — the raw set for `zgraph` topology.
+pub fn all_repos(conn: &Connection) -> Result<Vec<(String, Option<String>)>> {
+    let mut stmt = conn.prepare("SELECT git_dir, workdir FROM repos ORDER BY workdir")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Every repo's cached status for `zwaitfor`/`zcontend`: `(workdir_or_git_dir,
+/// dirty, sync, head_sha)`.
+pub fn all_status(conn: &Connection) -> Result<Vec<(String, bool, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(r.workdir, r.git_dir), COALESCE(s.dirty,0), COALESCE(s.sync,''), COALESCE(s.head_sha,'')
+           FROM repo_status s JOIN repos r ON r.id = s.repo_id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 #[cfg(test)]

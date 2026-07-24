@@ -12,7 +12,8 @@ use std::process::ExitCode;
 /// zvcs-native extension verbs — the superset that stock git does not have.
 pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zconfig", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
-    "zsubmit", "zevents", "ztail",
+    "zsubmit", "zevents", "ztail", "zcommands",
+    "zpin", "zunpin", "zbroadcast", "zhandoff", "zon", "zsince", "zcontend", "zwaitfor", "zgraph", "zrewind",
     "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
     "zsnapshots", "zworktree", "zstash", "zunstash", "zstashes", "zup", "zforeach", "zhook",
     "ztrigger", "zwatch", "zdashed", "zverbs", "zselectors", "zcd", "zpwd", "zls", "zenv", "zunset", "zecho",
@@ -228,7 +229,18 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zsync" => "usage: git zsync [--force] — reconcile submodules to origin/main AND fan this checkout's HEAD out to all its local dups (offline); --force hard-resets every dup (diverged/dirty included)",
         "zbump" => "usage: git zbump [<submodule-path>...] — forward-only submodule gitlink bumps",
         "zevents" => "usage: git zevents [-n <count>] [--kind commit|stage|status|reconcile] [--repo <substr>] [--json] [--no-follow] — one live feed of commits/reconciles/status-changes across the whole tree",
+        "zpin" => "usage: git zpin [<path>...|list] — freeze repos from daemon autonomy (no autobump/reconcile until unpinned)",
+        "zunpin" => "usage: git zunpin [<path>...|--all] — unfreeze pinned repos",
+        "zbroadcast" => "usage: git zbroadcast [--to <session>] [<msg>...] — post an inter-agent message, or (no args) read your unread inbox",
+        "zhandoff" => "usage: git zhandoff <repo-path> <session> — reassign a repo's claim to another agent session and notify it",
+        "zon" => "usage: git zon [--kind commit|stage|status|reconcile] [--repo <substr>] -- <cmd> | git zon list | git zon rm <id> — run a command on a semantic feed event",
+        "zsince" => "usage: git zsince <duration|snapshot> [--kind K] [--repo R] — everything across the tree since a time (90s/45m/2d/1h30m) or snapshot",
+        "zcontend" => "usage: git zcontend — live agent-vs-agent contention: claims, per-repo job backlog, contested repos",
+        "zwaitfor" => "usage: git zwaitfor <clean|idle|synced|<repo> <sha>> [--timeout <secs>] — block until a tree-wide state holds",
+        "zgraph" => "usage: git zgraph — fleet topology: dup groups (same origin, multiple local checkouts)",
+        "zrewind" => "usage: git zrewind <duration> [--dry-run] — restore the whole tree (repo + submodules) to the state it had <duration> ago via per-repo reflog reset",
         "ztail" => "usage: git ztail [-n <count>] [--kind commit|stage|status|reconcile] [--repo <substr>] [--json] [--no-follow] — alias of git zevents",
+        "zcommands" => "usage: git zcommands [-n <count>] [--repo <substr>] [--json] [--no-follow] [--off] [--clear] — live feed of every git command run across the fleet",
         "zdaemon" => "usage: git zdaemon <start|stop|restart|status|info|ping|log>",
         "zconfig" => "usage: git zconfig [<name> [on|off|<count>|default]] — toggle daemon features (see `git help zconfig`)",
         "zrepos" => "usage: git zrepos [<pattern>...] — list indexed repos; patterns filter by case-insensitive substring",
@@ -350,6 +362,11 @@ const LOCK_VERBS: &[&str] = &[
 ];
 
 pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
+    // Fleet command log: record this invocation when `git zcommands` has turned
+    // logging on. A single `stat` (no work) when it is off, so the hot path pays
+    // essentially nothing; best-effort, never fails the command.
+    superset::zcommands::log_invocation(sub, args);
+
     // Every z-verb answers `-h`/`--help` with a one-line usage, uniformly and
     // before dispatch. `z_usage` returns `None` for anything that is not a known
     // z-verb, so this never intercepts a porcelain command's own `-h`.
@@ -385,6 +402,17 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zsync" => superset::zsync(args),
         "zbump" => superset::zbump(args),
         "zevents" | "ztail" => superset::zevents(args),
+        "zpin" => superset::zpin(args),
+        "zunpin" => superset::zunpin(args),
+        "zbroadcast" => superset::zbroadcast(args),
+        "zhandoff" => superset::zhandoff(args),
+        "zon" => superset::zon(args),
+        "zsince" => superset::zsince(args),
+        "zcontend" => superset::zcontend(args),
+        "zwaitfor" => superset::zwaitfor(args),
+        "zgraph" => superset::zgraph(args),
+        "zrewind" => superset::zrewind(args),
+        "zcommands" => superset::zcommands(args),
         "zdaemon" => superset::zdaemon(args),
         "zconfig" => superset::zconfig(args),
         "zrepos" => superset::zrepos(args),

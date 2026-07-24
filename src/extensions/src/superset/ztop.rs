@@ -286,6 +286,7 @@ struct App {
     rows: Vec<Row>,  // the filtered + sorted view actually shown
     filter: String,  // live `/` search query (case-insensitive path substring)
     searching: bool, // true while typing the query
+    full_path: bool, // `p`: show the full repo path vs just its basename
     totals: Totals,
     daemon_up: bool,
 }
@@ -309,6 +310,7 @@ impl App {
             rows: Vec::new(),
             filter: String::new(),
             searching: false,
+            full_path: true,
             totals: Totals::default(),
             daemon_up: false,
         }
@@ -1075,7 +1077,15 @@ fn render(buf: &mut Buffer, app: &App) {
             let (ch, st) = if c < filled { ("█", t.churn) } else { ("·", t.dim) };
             set_cell(buf, lay.churn_x + c, y, ch, st);
         }
-        set_str(buf, lay.repo_x, y, &homify(&row.path), t.row, lay.repo_w);
+        let shown_path = if app.full_path {
+            homify(&row.path)
+        } else {
+            std::path::Path::new(&row.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| homify(&row.path))
+        };
+        set_str(buf, lay.repo_x, y, &shown_path, t.row, lay.repo_w);
         let head = if row.head.is_empty() { "-" } else { &row.head };
         set_str(buf, lay.head_x, y, head, t.dim, lay.head_w);
         let (word, rank) = severity_label(row);
@@ -1204,7 +1214,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
     ("THEME", &[("F2 c", "Theme chooser"), ("~ e", "Theme editor")]),
     ("SEARCH", &[("/", "Search / filter"), ("Esc", "Clear search")]),
     ("SORT", &[("F6 s", "Sort by column"), (">", "Next column"), ("<", "Prev column"), ("I", "Invert order")]),
-    ("NAVIGATE", &[("↑ ↓ k j", "Move up / down"), ("PgUp PgDn", "Page up / down"), ("g G", "Top / bottom")]),
+    ("NAVIGATE", &[("↑ ↓ k j", "Move up / down"), ("PgUp PgDn", "Page up / down"), ("g G", "Top / bottom"), ("p", "Full path / name")]),
     ("ACTIVITY", &[("churn", "recent activity"), ("bar", "brighter = newer"), ("daemon", "run git zdaemon")]),
 ];
 
@@ -1480,6 +1490,10 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> KeyOutcome {
         (KeyCode::Char('/'), _) => {
             app.searching = true;
             app.scroll = 0;
+        }
+        (KeyCode::Char('p'), _) => {
+            app.full_path = !app.full_path;
+            app.set_status(if app.full_path { "full path" } else { "repo name" });
         }
         (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.scroll = app.scroll.saturating_sub(1),
         (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {

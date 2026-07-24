@@ -650,6 +650,15 @@ pub const DOCS: &[Doc] = &[
         synopsis: "git ztail [-n <count>] [--kind commit|stage|status|reconcile] [--repo <substr>] [--json] [--no-follow]",
         desc: &["An alias for `git zevents` \\(em the single live feed of commits, reconciles, and status-changes across the whole indexed tree. See `git help zevents` for the full description."],
     },
+    Doc {
+        verb: "zcommands",
+        summary: "live feed of every git command run across the fleet",
+        synopsis: "git zcommands [-n <count>] [--repo <substr>] [--json] [--no-follow] [--off] [--clear]",
+        desc: &[
+            "Streams every `git` command run anywhere on the machine, in real time. Because the zvcs `git` binary shadows real git on PATH, every invocation flows through one dispatcher; when logging is on, each records a line \\(em time, pid, working directory, and the command \\(em to its own log at $ZVCS_HOME/commands.log (separate from the daemon log). This verb prints a backlog and then follows the log live, so commands from every repo and every concurrent shell scroll past as they run.",
+            "Running it turns logging on (a marker file, so the cost on every other git command is a single stat when it is off) and notes where the log lives. -n sets the backlog size, --no-follow prints the backlog and exits, --repo filters to commands whose directory contains a substring, and --json emits NDJSON for tooling. --off stops logging; --clear truncates the log. The live viewers (zcommands, zevents, ztail, ztop) are excluded so watching does not feed itself.",
+        ],
+    },
 ];
 
 /// The manual for `verb`, or `None` if it is not a superset verb.

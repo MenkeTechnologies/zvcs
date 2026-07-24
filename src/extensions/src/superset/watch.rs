@@ -424,6 +424,19 @@ fn react(cfg: &ZvcsConfig) {
 
     attach_all(&repo);
 
+    // A pinned repo is frozen from pointer autonomy (`git zpin`): no reconcile, no
+    // autobump. Attach still ran above — re-attaching a detached HEAD doesn't move
+    // the pointer, it only heals it.
+    let pinned = crate::db::open_rw()
+        .map(|c| {
+            let gd = repo.git_dir().canonicalize().unwrap_or_else(|_| repo.git_dir().to_path_buf());
+            crate::db::is_pinned(&c, &gd)
+        })
+        .unwrap_or(false);
+    if pinned {
+        return;
+    }
+
     if cfg.autoreconcile {
         // The top-level repo too — `autoreconcile` is documented as "this one +
         // submodules". reconcile_repo_local is ff-only and skips a dirty worktree,

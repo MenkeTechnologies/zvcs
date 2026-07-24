@@ -337,6 +337,10 @@ fn start() -> Result<ExitCode> {
     // `zvcs.statusinterval` (seconds between passes; 0 disables).
     crate::superset::statusd::spawn_if_enabled();
 
+    // Semantic-event automation: run `git zon` subscriptions when matching feed
+    // events fire. No-op-cheap while there are no subscriptions.
+    crate::superset::zon::spawn_daemon_loop();
+
     // Ledger housekeeping: terminal jobs older than the retention window are pruned
     // on a slow timer so the jobs table stays bounded across millions of commands.
     thread::spawn(|| loop {

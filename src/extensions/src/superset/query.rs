@@ -67,6 +67,36 @@ pub(crate) fn select_repos(sel: &Selector) -> Result<Option<Vec<(PathBuf, PathBu
     Ok(Some(repos))
 }
 
+/// Pull `--json` out of the args for scripting output, returning whether it was
+/// present and the remaining args (so the selector parser never sees it). Every
+/// read verb calls this first, then emits NDJSON via [`emit_json`] instead of its
+/// human table when the flag is set.
+pub(crate) fn json_flag(args: &[String]) -> (bool, Vec<String>) {
+    let mut json = false;
+    let kept = args
+        .iter()
+        .filter(|a| {
+            if a.as_str() == "--json" {
+                json = true;
+                false
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
+    (json, kept)
+}
+
+/// Emit one JSON object per line (NDJSON) — the machine format shared by every
+/// `--json` read verb, matching `zevents`/`zcommands`. Stream-friendly: `jq -c`
+/// reads it directly, `jq -s` slurps it to an array.
+pub(crate) fn emit_json(rows: impl IntoIterator<Item = serde_json::Value>) {
+    for r in rows {
+        println!("{r}");
+    }
+}
+
 /// Open a repo by its git dir, mapping the error to a short display string.
 pub(crate) fn probe<T>(git_dir: &Path, f: impl FnOnce(&gix::Repository) -> T, on_err: impl FnOnce(String) -> T) -> T {
     match gix::open(git_dir) {
@@ -78,8 +108,15 @@ pub(crate) fn probe<T>(git_dir: &Path, f: impl FnOnce(&gix::Repository) -> T, on
 /// `git zheads [selectors]` — each repo's checked-out branch (or detached HEAD),
 /// short HEAD id, and a `*` when the worktree is dirty.
 pub fn zheads(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let lines = parallel_map(&repos, |gd, _| probe(gd, head_line, |e| e));
+    if json {
+        emit_json(repos.iter().zip(&lines).map(|((_, wd), line)| {
+            serde_json::json!({"repo": wd.to_string_lossy(), "head": line.trim()})
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
     let width = repos.iter().map(|(_, w)| w.display().to_string().len()).max().unwrap_or(0);
     for ((_, wd), line) in repos.iter().zip(&lines) {
         println!("{:<width$}  {line}", wd.display().to_string());
@@ -104,8 +141,15 @@ fn head_line(repo: &gix::Repository) -> String {
 
 /// `git zdirty [selectors]` — only the repos with uncommitted changes.
 pub fn zdirty(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let dirty = parallel_map(&repos, |gd, _| probe(gd, |r| r.is_dirty().unwrap_or(false), |_| false));
+    if json {
+        emit_json(repos.iter().zip(&dirty).filter(|(_, d)| **d).map(|((_, wd), _)| {
+            serde_json::json!({"repo": wd.to_string_lossy()})
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
     let mut shown = 0usize;
     for ((_, wd), d) in repos.iter().zip(&dirty) {
         if *d {
@@ -119,8 +163,16 @@ pub fn zdirty(args: &[String]) -> Result<ExitCode> {
 
 /// `git zbranches [selectors]` — each repo's local branch names.
 pub fn zbranches(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let lists = parallel_map(&repos, |gd, _| probe(gd, ref_names_branches, |e| e));
+    if json {
+        emit_json(repos.iter().zip(&lists).map(|((_, wd), names)| {
+            let branches: Vec<&str> = names.lines().filter(|l| !l.is_empty()).collect();
+            serde_json::json!({"repo": wd.to_string_lossy(), "branches": branches})
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
     for ((_, wd), names) in repos.iter().zip(&lists) {
         println!("== {} ==\n{names}", wd.display());
     }
@@ -141,8 +193,15 @@ fn ref_names_branches(repo: &gix::Repository) -> String {
 
 /// `git ztags [selectors]` — each repo's tag count.
 pub fn ztags(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let counts = parallel_map(&repos, |gd, _| probe(gd, tag_count, |_| 0usize));
+    if json {
+        emit_json(repos.iter().zip(&counts).map(|((_, wd), n)| {
+            serde_json::json!({"repo": wd.to_string_lossy(), "tags": n})
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
     let width = repos.iter().map(|(_, w)| w.display().to_string().len()).max().unwrap_or(0);
     for ((_, wd), n) in repos.iter().zip(&counts) {
         println!("{:<width$}  {n} tag(s)", wd.display().to_string());

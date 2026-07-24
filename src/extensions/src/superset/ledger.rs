@@ -33,6 +33,7 @@ pub fn zrepos(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
     };
+    let json = args.iter().any(|a| a == "--json");
     let repos = crate::db::list_repos(&conn)?;
     let mut shown = 0usize;
     for r in &repos {
@@ -43,10 +44,14 @@ pub fn zrepos(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
         }
-        println!("{path}");
+        if json {
+            println!("{}", serde_json::json!({"repo": path, "git_dir": r.git_dir}));
+        } else {
+            println!("{path}");
+        }
         shown += 1;
     }
-    if interactive {
+    if interactive && !json {
         eprintln!("{shown} repo(s)");
     }
     Ok(ExitCode::SUCCESS)

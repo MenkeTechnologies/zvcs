@@ -10,10 +10,32 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::process::ExitCode;
 
-pub fn zcontend(_args: &[String]) -> Result<ExitCode> {
+pub fn zcontend(args: &[String]) -> Result<ExitCode> {
+    let json = args.iter().any(|a| a == "--json");
     let conn = crate::db::open_rw()?;
     let claims = crate::db::list_claims(&conn)?;
     let backlog = crate::db::contention(&conn)?;
+
+    // Contested = claimed AND has a backlog: another agent's work is waiting on a
+    // repo someone holds. Both queries key paths on COALESCE(workdir, git_dir), so
+    // they compare directly.
+    let held: HashMap<&str, &str> = claims.iter().map(|(p, s, _)| (p.as_str(), s.as_str())).collect();
+    let contested: Vec<(&String, &&str, i64)> = backlog
+        .iter()
+        .filter_map(|(p, q, r)| held.get(p.as_str()).map(|s| (p, s, q + r)))
+        .collect();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "claims": claims.iter().map(|(p, s, _)| serde_json::json!({"repo": p, "session": s})).collect::<Vec<_>>(),
+                "backlog": backlog.iter().map(|(p, q, r)| serde_json::json!({"repo": p, "queued": q, "running": r})).collect::<Vec<_>>(),
+                "contested": contested.iter().map(|(p, s, n)| serde_json::json!({"repo": p, "holder": s, "waiting": n})).collect::<Vec<_>>(),
+            })
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
 
     println!("claims ({}):", claims.len());
     if claims.is_empty() {
@@ -31,14 +53,6 @@ pub fn zcontend(_args: &[String]) -> Result<ExitCode> {
         println!("  {q:>3} queued  {r:>2} running   {path}");
     }
 
-    // Contested = claimed AND has a backlog: another agent's work is waiting on a
-    // repo someone holds. Both queries key paths on COALESCE(workdir, git_dir), so
-    // they compare directly.
-    let held: HashMap<&str, &str> = claims.iter().map(|(p, s, _)| (p.as_str(), s.as_str())).collect();
-    let contested: Vec<(&String, &&str, i64)> = backlog
-        .iter()
-        .filter_map(|(p, q, r)| held.get(p.as_str()).map(|s| (p, s, q + r)))
-        .collect();
     if !contested.is_empty() {
         println!("\ncontested (claimed + queued):");
         for (path, holder, n) in contested {

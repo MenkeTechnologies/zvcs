@@ -129,6 +129,12 @@ pub fn zjobs(args: &[String]) -> Result<ExitCode> {
         }
     };
     let jobs = crate::db::list_jobs(&conn, limit)?;
+    if args.iter().any(|a| a == "--json") {
+        for j in &jobs {
+            println!("{}", serde_json::json!({"id": j.id, "state": j.state, "kind": j.kind}));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     if jobs.is_empty() {
         println!("no jobs");
         return Ok(ExitCode::SUCCESS);

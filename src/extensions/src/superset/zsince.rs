@@ -11,9 +11,10 @@ use std::path::Path;
 use std::process::ExitCode;
 
 pub fn zsince(args: &[String]) -> Result<ExitCode> {
+    let (json, args) = crate::superset::query::json_flag(args);
     let spec = args
         .first()
-        .ok_or_else(|| anyhow!("usage: git zsince <duration|snapshot> [--kind K] [--repo R]"))?;
+        .ok_or_else(|| anyhow!("usage: git zsince <duration|snapshot> [--kind K] [--repo R] [--json]"))?;
 
     let mut kind = None;
     let mut repo = None;
@@ -40,6 +41,19 @@ pub fn zsince(args: &[String]) -> Result<ExitCode> {
     };
 
     let events = crate::db::events_after_ts(&conn, cutoff, kind.as_deref(), repo.as_deref())?;
+    if json {
+        for e in &events {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "id": e.id, "ts": e.ts, "kind": e.kind,
+                    "repo": e.workdir.clone().or_else(|| e.git_dir.clone()),
+                    "detail": e.detail, "before": e.sha_before, "after": e.sha_after,
+                })
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     if events.is_empty() {
         println!("nothing since {spec}");
         return Ok(ExitCode::SUCCESS);

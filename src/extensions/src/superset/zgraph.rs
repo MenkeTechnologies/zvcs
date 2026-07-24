@@ -9,7 +9,8 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
-pub fn zgraph(_args: &[String]) -> Result<ExitCode> {
+pub fn zgraph(args: &[String]) -> Result<ExitCode> {
+    let json = args.iter().any(|a| a == "--json");
     let conn = crate::db::open_rw()?;
     let repos = crate::db::all_repos(&conn)?;
 
@@ -25,6 +26,13 @@ pub fn zgraph(_args: &[String]) -> Result<ExitCode> {
 
     let mut dups: Vec<(&String, &Vec<String>)> = groups.iter().filter(|(_, v)| v.len() > 1).collect();
     dups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
+
+    if json {
+        for (url, members) in &dups {
+            println!("{}", serde_json::json!({"origin": url, "checkouts": members}));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
 
     if dups.is_empty() {
         println!("no dup groups (every indexed repo has a distinct origin)");

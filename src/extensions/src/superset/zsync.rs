@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
@@ -77,18 +78,32 @@ fn reconcile_repo_inner(repo: &gix::Repository, do_fetch: bool) -> Result<String
         }
     }
 
-    // (d) Fast-forward decision. `local` is the commit HEAD currently resolves to
-    // (the actual clean worktree state); `remote` is the freshly-fetched tip.
+    // (d)+(e) Fast-forward the clean repo to the freshly-updated tracking tip.
+    let remote_id = repo
+        .find_reference(&format!("refs/remotes/origin/{mainline}"))?
+        .into_fully_peeled_id()?
+        .detach();
+    fast_forward_to(repo, mainline, remote_id, &should_interrupt)
+}
+
+/// Fast-forward a CLEAN repo's `<mainline>` branch (and HEAD, re-attaching it) to
+/// `target_id`, moving the worktree to match — writing only the files that
+/// changed. The target's objects must already be present locally (fetched, or
+/// copied from a sibling). Fast-forward only: a local-ahead or diverged branch is
+/// left untouched, and an untracked-file clobber is refused before any ref moves.
+/// Returns a one-line human status; performs no terminal output.
+fn fast_forward_to(
+    repo: &gix::Repository,
+    mainline: &str,
+    remote_id: ObjectId,
+    should_interrupt: &AtomicBool,
+) -> Result<String> {
+    // `local` is the commit HEAD currently resolves to (the clean worktree state).
     let mut head = repo.head()?;
     let local_id = match head.try_peel_to_id()? {
         Some(id) => id.detach(),
         None => return Ok("unborn HEAD, skipped".to_string()),
     };
-    let remote_ref_name = format!("refs/remotes/origin/{mainline}");
-    let remote_id = repo
-        .find_reference(&remote_ref_name)?
-        .into_fully_peeled_id()?
-        .detach();
 
     if local_id == remote_id {
         // Already current — but a detached HEAD (the state `git submodule update`
@@ -180,7 +195,7 @@ fn reconcile_repo_inner(repo: &gix::Repository, do_fetch: bool) -> Result<String
     // old commit — leaving the repo self-consistent (refs match the still-old
     // index; at worst an ordinary dirty worktree) instead of pointing the refs at
     // the new commit over a stale/partial worktree the daemon never repairs.
-    update_clean_worktree(repo, &old, remote_id, &should_interrupt)?;
+    update_clean_worktree(repo, &old, remote_id, should_interrupt)?;
 
     // Advance the local mainline branch to the remote tip, then attach HEAD to that
     // branch so the repository is left on `main`/`master`, not detached.
@@ -252,13 +267,7 @@ fn local_fetch(repo: &gix::Repository, remote_path: &std::path::Path, mainline: 
         .into_fully_peeled_id()?
         .detach();
 
-    let mut seen: HashSet<ObjectId> = HashSet::new();
-    for info in remote.rev_walk([tip]).all()? {
-        let cid = info?.id;
-        copy_object(&remote, repo, cid, &mut seen)?;
-        let tree = remote.find_object(cid)?.try_into_commit()?.tree_id()?.detach();
-        copy_tree(&remote, repo, tree, &mut seen)?;
-    }
+    copy_commit_graph(&remote, repo, tip)?;
 
     // Advance the remote-tracking ref (create or fast-forward), matching a fetch.
     let name = FullName::try_from(BString::from(format!("refs/remotes/origin/{mainline}")))?;
@@ -322,6 +331,107 @@ fn copy_object(
         .write_buf(obj.kind, &obj.data)
         .map_err(|e| anyhow!("write object {id}: {e}"))?;
     Ok(())
+}
+
+/// Copy the whole object graph reachable from commit `tip` (commits, their trees,
+/// blobs) from `src` into `dst` — the offline primitive behind both the local
+/// fetch and the dup fan-out. Nothing is fetched: `src` is a repo already on disk.
+fn copy_commit_graph(src: &gix::Repository, dst: &gix::Repository, tip: ObjectId) -> Result<()> {
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    for info in src.rev_walk([tip]).all()? {
+        let cid = info?.id;
+        copy_object(src, dst, cid, &mut seen)?;
+        let tree = src.find_object(cid)?.try_into_commit()?.tree_id()?.detach();
+        copy_tree(src, dst, tree, &mut seen)?;
+    }
+    Ok(())
+}
+
+/// The `origin` fetch URL of `repo` as a string (any scheme), for identifying
+/// dups — all checkouts of the same repository share it.
+fn origin_url(repo: &gix::Repository) -> Option<String> {
+    let remote = repo.find_remote("origin").ok()?;
+    let url = remote.url(gix::remote::Direction::Fetch)?;
+    Some(url.to_bstring().to_string())
+}
+
+/// Every indexed repo that is a **dup** of `source` — a different checkout with
+/// the same `origin` URL — as `(git_dir, workdir)`. Excludes `source` itself.
+fn find_dups(source_git_dir: &Path, url: &str) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
+    let Ok(conn) = crate::db::open_ro() else {
+        return Vec::new();
+    };
+    let Ok(repos) = crate::db::list_repos(&conn) else {
+        return Vec::new();
+    };
+    let src = source_git_dir.canonicalize().unwrap_or_else(|_| source_git_dir.to_path_buf());
+    repos
+        .into_iter()
+        .filter_map(|r| {
+            let gd = std::path::PathBuf::from(&r.git_dir);
+            if gd.canonicalize().map(|c| c == src).unwrap_or(false) {
+                return None; // skip the source itself
+            }
+            let repo = gix::open(&gd).ok()?;
+            if origin_url(&repo).as_deref() == Some(url) {
+                let wd = r.workdir.map(std::path::PathBuf::from).unwrap_or_else(|| gd.clone());
+                Some((gd, wd))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Fast-forward every LOCAL dup of `source` to source's current HEAD, in
+/// parallel, **entirely offline** — the commit's objects are copied checkout-to-
+/// checkout on disk, never fetched from the network. A dup that is clean and
+/// behind ffs; dirty, diverged, or already-current dups are skipped. Returns one
+/// `(workdir, status)` per dup. This is what fans a commit in one clone out to
+/// all its clones on the machine.
+pub fn sync_dups(source: &gix::Repository) -> Vec<(String, String)> {
+    let Ok(src_head) = source.head_id() else {
+        return Vec::new();
+    };
+    let src_head = src_head.detach();
+    let Some(url) = origin_url(source) else {
+        return Vec::new();
+    };
+    let src_git = source.git_dir().to_path_buf();
+    let dups = find_dups(&src_git, &url);
+    if dups.is_empty() {
+        return Vec::new();
+    }
+    let statuses = crate::superset::query::parallel_map(&dups, |gd, _wd| {
+        ff_dup(gd, &src_git, src_head).unwrap_or_else(|e| format!("error: {e:#}"))
+    });
+    dups.iter()
+        .map(|(_, wd)| wd.display().to_string())
+        .zip(statuses)
+        .collect()
+}
+
+/// Fast-forward one dup at `dup_git_dir` to `src_head`, copying the commit's
+/// objects from the source checkout first. Offline; serialized through the repo
+/// lock so it can't race a concurrent writer.
+fn ff_dup(dup_git_dir: &Path, src_git: &Path, src_head: ObjectId) -> Result<String> {
+    let dup = gix::open(dup_git_dir)?;
+    let _lock = crate::lock::RepoLock::acquire(dup.git_dir());
+    if dup.is_dirty()? {
+        return Ok("dirty, skipped".to_string());
+    }
+    let mainline = if dup.try_find_reference("refs/remotes/origin/main")?.is_some() {
+        "main"
+    } else if dup.try_find_reference("refs/remotes/origin/master")?.is_some() {
+        "master"
+    } else {
+        "main"
+    };
+    // Copy the source commit's objects into this dup (offline), then ff to it.
+    let src = gix::open(src_git)?;
+    copy_commit_graph(&src, &dup, src_head)?;
+    let should_interrupt = AtomicBool::new(false);
+    fast_forward_to(&dup, mainline, src_head, &should_interrupt)
 }
 
 /// Move a clean worktree and its index from the state captured in `old` to the
@@ -464,6 +574,15 @@ fn update_clean_worktree(
 pub fn zsync(args: &[String]) -> Result<ExitCode> {
     let parent = gix::discover(".")?;
 
+    // Fan this repo's HEAD out to all its LOCAL dups — other checkouts of the same
+    // repo (same `origin` URL) indexed on the machine — fast-forwarding each clean
+    // one in parallel, entirely offline (objects copied checkout-to-checkout, no
+    // network). This is "commit in one clone → all its clones fast-forward".
+    let dups = sync_dups(&parent);
+    for (wd, status) in &dups {
+        println!("dup {wd}: {status}");
+    }
+
     // Explicitly requested submodule paths (trailing slashes trimmed).
     // An empty set means "all submodules".
     let requested: Vec<&str> = args
@@ -476,7 +595,11 @@ pub fn zsync(args: &[String]) -> Result<ExitCode> {
         Some(iter) => iter,
         None => {
             if requested.is_empty() {
-                println!("no submodules configured");
+                // Nothing more to do — but only note "no submodules" when there was
+                // also no dup fan-out, so a pure dup-sync isn't mislabeled.
+                if dups.is_empty() {
+                    println!("no submodules configured");
+                }
                 return Ok(ExitCode::SUCCESS);
             }
             bail!("no submodules configured");

@@ -86,6 +86,11 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     let mut overlay = true;
     let mut pathspec_from_file: Option<String> = None;
     let mut pathspec_file_nul = false;
+    // `--recurse-submodules[=<pathspec>]` / `--no-recurse-submodules`. `None` =
+    // fall back to `submodule.recurse` config; `Some(b)` = explicit flag. After a
+    // switch, each initialized submodule's worktree is moved to the gitlink the
+    // superproject now records (git's `submodule_move_head` via the worktree updater).
+    let mut recurse_submodules: Option<bool> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -205,11 +210,20 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             "--ignore-other-worktrees" | "--no-ignore-other-worktrees" => {}
             "--ignore-skip-worktree-bits" | "--no-ignore-skip-worktree-bits" => {}
             "-p" | "--patch" => bail!("interactive patch checkout (-p) needs a TTY"),
+            "--recurse-submodules" => recurse_submodules = Some(true),
+            "--no-recurse-submodules" => recurse_submodules = Some(false),
+            // `--recurse-submodules=<pathspec>` limits which submodules move; this
+            // port recurses into all active ones rather than honoring the pathspec.
+            _ if a.starts_with("--recurse-submodules=") => recurse_submodules = Some(true),
             _ if a.starts_with('-') && a.len() > 1 => bail!("unsupported flag {a:?}"),
             _ => pre.push(a),
         }
         i += 1;
     }
+
+    // Resolve submodule recursion: explicit flag wins, else `submodule.recurse`.
+    let recurse_submodules = recurse_submodules
+        .unwrap_or_else(|| repo.config_snapshot().boolean("submodule.recurse") == Some(true));
 
     // --- Dispatch -----------------------------------------------------------
     // `--pathspec-from-file`: pathspecs come from the file (or stdin for `-`),
@@ -310,11 +324,15 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             .flatten()
             .is_some();
         if is_branch && !detach {
-            return switch_to_branch(&repo, spec, quiet);
+            let code = switch_to_branch(&repo, spec, quiet)?;
+            maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
+            return Ok(code);
         }
         if let Ok(id) = repo.rev_parse_single(spec) {
             let commit = id.object()?.peel_to_commit()?;
-            return detached_checkout(&repo, spec, commit, quiet, detach);
+            let code = detached_checkout(&repo, spec, commit, quiet, detach)?;
+            maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
+            return Ok(code);
         }
         // DWIM (`--guess`, default on via `checkout.guess`): a bare name that is
         // not a local ref and does not resolve as a rev, but names a branch on
@@ -327,7 +345,10 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             if guess {
                 match unique_remote_branch(&repo, spec)? {
                     Dwim::One(remote_short) => {
-                        return create_and_switch(&repo, spec, false, &remote_short, quiet, true);
+                        let code =
+                            create_and_switch(&repo, spec, false, &remote_short, quiet, true)?;
+                        maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
+                        return Ok(code);
                     }
                     Dwim::Many { count, hint_remote } => {
                         if crate::advice::enabled("checkoutAmbiguousRemoteBranchName") {
@@ -352,6 +373,69 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         return restore_from_tree(&repo, pre[0], &pre[1..], overlay, quiet);
     }
     restore_from_index(&repo, &pre, true, quiet)
+}
+
+/// After a switch that changed `HEAD`, move each active, initialized submodule's
+/// worktree to the commit the superproject now records for it — git's
+/// `--recurse-submodules` worktree updater (`submodule_move_head` in submodule.c).
+///
+/// Implemented by re-executing this binary's own `checkout <gitlink>` inside each
+/// submodule, so the move stays faithful (dirty-worktree refusal, nested
+/// recursion) without duplicating checkout logic. Uninitialized submodules (no
+/// repo of their own) are skipped, exactly like git.
+fn maybe_recurse_submodules(repo: &gix::Repository, recurse: bool, quiet: bool) -> Result<()> {
+    if !recurse {
+        return Ok(());
+    }
+    // Re-open the repository so the index reflects the checkout that just ran: the
+    // `repo` handed in was opened before the worktree/index update and its cached
+    // index snapshot still records the OLD submodule gitlinks, which would make
+    // `index_id()` match `head_id()` and skip every move.
+    let repo = gix::open(repo.git_dir())?;
+    let Some(subs) = repo.submodules()? else {
+        return Ok(());
+    };
+    let Some(workdir) = repo.workdir() else {
+        return Ok(());
+    };
+    let exe = std::env::current_exe()?;
+    for sm in subs {
+        if !sm.is_active().unwrap_or(false) {
+            continue;
+        }
+        // The gitlink the just-checked-out superproject index records for this path
+        // (both `index_id` and gix's `head_id` are the *superproject's* view — they
+        // match after a checkout, so they can't tell us whether the submodule needs
+        // moving; the submodule's actual worktree HEAD is what to compare against).
+        let Ok(Some(target)) = sm.index_id() else {
+            continue;
+        };
+        // Only recurse into an initialized submodule (one with its own repo).
+        let Some(sub_repo) = sm.open().ok().flatten() else {
+            continue;
+        };
+        // The submodule's ACTUAL checked-out commit. Already at the recorded gitlink
+        // → nothing to move.
+        let actual = sub_repo.head_id().ok().map(|id| id.detach());
+        if actual == Some(target) {
+            continue;
+        }
+        let Ok(rel) = sm.path() else {
+            continue;
+        };
+        let sub_path = workdir.join(gix::path::from_bstr(rel.as_bstr()));
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("-C")
+            .arg(&sub_path)
+            .arg("checkout")
+            .arg("--recurse-submodules");
+        if quiet {
+            cmd.arg("-q");
+        }
+        cmd.arg(target.to_string());
+        let _ = cmd.status();
+    }
+    Ok(())
 }
 
 /// Switch `HEAD` to an existing local branch `spec`, updating the worktree when

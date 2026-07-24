@@ -9,6 +9,7 @@ enum Mode {
     Auto,
     Get,
     GetAll,
+    GetRegexp,
     List,
     Add,
     Unset,
@@ -23,6 +24,7 @@ impl Mode {
             Mode::Auto => "",
             Mode::Get => "--get",
             Mode::GetAll => "--get-all",
+            Mode::GetRegexp => "--get-regexp",
             Mode::List => "--list",
             Mode::Add => "--add",
             Mode::Unset => "--unset",
@@ -98,6 +100,8 @@ fn is_synthetic(source: Source) -> bool {
 /// Supported forms:
 ///   * `git config <name>` / `--get <name>`   → last value, exit 1 if absent
 ///   * `git config --get-all <name>`          → every value, one per line
+///   * `git config --get-regexp <regex>`      → `key value` for every key the
+///                                              ERE matches, exit 1 if none
 ///   * `git config -l` / `--list`             → all `key=value`, merged scopes
 ///   * `git config <name> <value>`            → set (overwrite last), local
 ///   * `git config <name> <value> <pattern>`  → rewrite values matching the ERE,
@@ -105,7 +109,8 @@ fn is_synthetic(source: Source) -> bool {
 ///   * `git config --add <name> <value>`      → append a multivar entry, local
 ///   * `git config --unset <name>`            → drop the value, exit 5 if absent
 ///   * `git config --unset-all <name>`        → drop every value of the key
-///   * `--name-only`                          → with `--list`, keys without values
+///   * `--name-only`                          → with `--list` or `--get-regexp`,
+///                                              keys without values
 ///
 /// Usage errors (conflicting action flags, a misplaced `--name-only`, a wrong
 /// argument count) report `error: …` on stderr and exit 129, as git's
@@ -153,6 +158,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             "-l" | "--list" => Some(Mode::List),
             "--get" => Some(Mode::Get),
             "--get-all" => Some(Mode::GetAll),
+            "--get-regexp" => Some(Mode::GetRegexp),
             "--add" => Some(Mode::Add),
             "--unset" => Some(Mode::Unset),
             "--unset-all" => Some(Mode::UnsetAll),
@@ -212,14 +218,14 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     if mode == Mode::Auto && !(1..=3).contains(&positional.len()) {
         return usage_error("no action specified");
     }
-    if name_only && mode != Mode::List {
+    if name_only && !matches!(mode, Mode::List | Mode::GetRegexp) {
         return usage_error("--name-only is only applicable to --list or --get-regexp");
     }
     match mode {
         Mode::List if !positional.is_empty() => {
             return usage_error("wrong number of arguments, should be 0");
         }
-        Mode::Get | Mode::GetAll if !(1..=2).contains(&positional.len()) => {
+        Mode::Get | Mode::GetAll | Mode::GetRegexp if !(1..=2).contains(&positional.len()) => {
             return usage_error("wrong number of arguments, should be from 1 to 2");
         }
         _ => {}
@@ -276,11 +282,12 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         // `--get <name> <value-pattern>` filters returned values by an ERE — a
         // read-side feature distinct from the value-pattern *set* form below and
         // not yet implemented; the two-argument read is refused rather than faked.
-        Mode::Get | Mode::GetAll if positional.len() == 2 => {
+        Mode::Get | Mode::GetAll | Mode::GetRegexp if positional.len() == 2 => {
             bail!("value-pattern filtering is not supported")
         }
         Mode::Get => get(file, positional[0], false),
         Mode::GetAll => get(file, positional[0], true),
+        Mode::GetRegexp => get_regexp(file, positional[0], name_only),
         // No action flag: one positional reads, two set the value.
         Mode::Auto if positional.len() == 1 => get(file, positional[0], false),
         Mode::Auto if positional.len() == 2 => {
@@ -375,6 +382,71 @@ fn list(file: &gix::config::File, name_only: bool) -> Result<ExitCode> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
+    for_each_entry(file, |key, value| {
+        out.write_all(key.as_bytes())?;
+        if !name_only {
+            out.write_all(b"=")?;
+            out.write_all(value)?;
+        }
+        out.write_all(b"\n")?;
+        Ok(())
+    })?;
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git config --get-regexp <name-regex>` — every entry whose canonical key
+/// matches the POSIX ERE, one per line.
+///
+/// git separates key and value with a **space** here (not the `=` of `--list`),
+/// and `--name-only` drops the value half. Matching is unanchored against the
+/// git-normalized key (`section[.subsection].name`, section and value names
+/// lower-cased), so `^remote\..*\.url$` behaves as it does under stock git.
+/// Exit 1 with no output when nothing matched. An invalid ERE is git's
+/// `error: invalid key pattern: <pattern>` at exit 6 — note "key pattern" here,
+/// against the plain "pattern" the value-pattern form reports.
+fn get_regexp(file: &gix::config::File, pattern: &str, name_only: bool) -> Result<ExitCode> {
+    let re = match regex::bytes::Regex::new(pattern) {
+        Ok(re) => re,
+        Err(_) => {
+            eprintln!("error: invalid key pattern: {pattern}");
+            return Ok(ExitCode::from(6));
+        }
+    };
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut matched = false;
+
+    for_each_entry(file, |key, value| {
+        if !re.is_match(key.as_bytes()) {
+            return Ok(());
+        }
+        matched = true;
+        out.write_all(key.as_bytes())?;
+        if !name_only {
+            out.write_all(b" ")?;
+            out.write_all(value)?;
+        }
+        out.write_all(b"\n")?;
+        Ok(())
+    })?;
+
+    Ok(if matched { ExitCode::SUCCESS } else { ExitCode::from(1) })
+}
+
+/// Walk every visible entry of `file` in file order, handing `emit` the
+/// git-normalized key and the raw value bytes.
+///
+/// Multivars repeat rather than collapse: `value_names()` walks the section body
+/// in order, naming a multivar once per occurrence, and the nth occurrence pairs
+/// with `values(name)[n]` — so an `a=1 / b=2 / a=3` section yields `a=1`, `b=2`,
+/// `a=3`. Section and value names are lower-cased (git-normalized); subsection
+/// case is preserved.
+fn for_each_entry(
+    file: &gix::config::File,
+    mut emit: impl FnMut(&str, &[u8]) -> Result<()>,
+) -> Result<()> {
     for section in file.sections() {
         if is_synthetic(section.meta().source) {
             continue;
@@ -383,8 +455,6 @@ fn list(file: &gix::config::File, name_only: bool) -> Result<ExitCode> {
         let section_name = header.name().to_string().to_lowercase();
         let subsection = header.subsection_name().map(ToString::to_string);
 
-        // `value_names()` walks the body in order, repeating a multivar's name
-        // once per occurrence; the nth occurrence pairs with `values(name)[n]`.
         let mut occurrence: Vec<(String, usize)> = Vec::new();
         for raw_name in section.value_names() {
             let lname = raw_name.to_lowercase();
@@ -396,19 +466,14 @@ fn list(file: &gix::config::File, name_only: bool) -> Result<ExitCode> {
             let Some(value) = section.values(value_name).into_iter().nth(*nth) else {
                 continue;
             };
-            match &subsection {
-                Some(sub) => write!(out, "{section_name}.{sub}.{value_name}")?,
-                None => write!(out, "{section_name}.{value_name}")?,
-            }
-            if !name_only {
-                out.write_all(b"=")?;
-                out.write_all(&value)?;
-            }
-            out.write_all(b"\n")?;
+            let key = match &subsection {
+                Some(sub) => format!("{section_name}.{sub}.{value_name}"),
+                None => format!("{section_name}.{value_name}"),
+            };
+            emit(&key, &value)?;
         }
     }
-
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
 enum WriteOp {

@@ -1109,9 +1109,10 @@ pub fn all_status(conn: &Connection) -> Result<Vec<(String, bool, String, String
 #[cfg(test)]
 mod snapshot_atomic_tests {
     use super::{
-        events_recent, events_since, insert_job, job_finished, load_snapshot, prune_stale_jobs,
-        record_event, root_mtime_advanced, save_snapshot, upsert_repo, upsert_status, EV_COMMIT_SQL,
-        SCHEMA,
+        add_subscription, claim, events_recent, events_since, insert_job, is_pinned, job_finished,
+        list_claims, list_pins, list_subscriptions, load_snapshot, mark_read, post_message,
+        prune_stale_jobs, record_event, remove_subscription, root_mtime_advanced, save_snapshot,
+        set_pin, transfer_claim, unread_messages, upsert_repo, upsert_status, EV_COMMIT_SQL, SCHEMA,
     };
     use rusqlite::Connection;
     use std::path::Path;
@@ -1180,6 +1181,49 @@ mod snapshot_atomic_tests {
         assert!(root_mtime_advanced(&conn, &gd, &root), "a newer root mtime must re-scan");
         // And once recorded again, it skips.
         assert!(!root_mtime_advanced(&conn, &gd, &root), "must skip after re-recording");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pins_messages_subscriptions_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("zvcs-coord-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("t.sqlite")).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let id = upsert_repo(&conn, Path::new("/x/repo/.git"), Some(Path::new("/x/repo"))).unwrap();
+
+        // zpin
+        assert!(!is_pinned(&conn, Path::new("/x/repo/.git")));
+        set_pin(&conn, Path::new("/x/repo/.git"), true).unwrap();
+        assert!(is_pinned(&conn, Path::new("/x/repo/.git")));
+        assert_eq!(list_pins(&conn).unwrap().len(), 1);
+        set_pin(&conn, Path::new("/x/repo/.git"), false).unwrap();
+        assert!(!is_pinned(&conn, Path::new("/x/repo/.git")));
+
+        // zbroadcast: broadcast reaches everyone but the sender; targeted reaches one.
+        post_message(&conn, "alice", None, "hi all").unwrap();
+        post_message(&conn, "alice", Some("bob"), "hi bob").unwrap();
+        assert_eq!(unread_messages(&conn, "bob").unwrap().len(), 2, "bob: broadcast + targeted");
+        assert_eq!(unread_messages(&conn, "carol").unwrap().len(), 1, "carol: broadcast only");
+        assert_eq!(unread_messages(&conn, "alice").unwrap().len(), 0, "sender never gets own");
+        let ids: Vec<i64> = unread_messages(&conn, "bob").unwrap().iter().map(|(i, ..)| *i).collect();
+        mark_read(&conn, &ids, "bob").unwrap();
+        assert_eq!(unread_messages(&conn, "bob").unwrap().len(), 0, "read is per-session");
+        assert_eq!(unread_messages(&conn, "carol").unwrap().len(), 1, "bob's read doesn't touch carol");
+
+        // zon subscriptions
+        let sid = add_subscription(&conn, Some("commit"), Some("foo"), "echo hi").unwrap();
+        assert_eq!(list_subscriptions(&conn).unwrap().len(), 1);
+        assert!(remove_subscription(&conn, sid).unwrap());
+        assert!(!remove_subscription(&conn, sid).unwrap(), "removing twice is a no-op");
+
+        // zhandoff: transfer a claim to another session.
+        let _ = claim(&conn, id, "alice", Some("/x/repo")).unwrap();
+        assert!(transfer_claim(&conn, id, "bob").unwrap());
+        assert_eq!(list_claims(&conn).unwrap()[0].1, "bob", "claim reassigned");
+        assert!(!transfer_claim(&conn, 999, "bob").unwrap(), "unknown repo → false");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -114,8 +114,8 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Parallel mutations | `zfetch` `zgc` `zfsck` `zprune` `zcheckout <branch>` `ztagall <tag>` `zcommitall -m <msg>` `zpushall` `zclean -f` | run a git operation across every indexed repo in parallel (via this binary's own porcelain + fair lane); mutations that don't apply are skipped, not forced; `zclean` requires `-f` |
 | Coordination | `zwait [<path>]` `zqueue` `zbarrier` | the join side of the async queue — wait for one repo's jobs to drain, list what's queued/running, or block until the whole queue is idle |
 | Hooks | `zhook set/unset/show/list/test` | manage & test the current repo's ref-change hook (`zvcs.hook`); `zvcs.autohook` fires each repo's own local hook |
-| Triggers | `ztrigger DIR <cmd>` `ztrigger list/rm/test` | arm any repo BY PATH to run a command on **any file change** in the directory (worktree + `.git`) — writes DIR's local hook, indexes it, watches the whole dir, auto-flips `zvcs.autohook`, reloads the daemon (no `git config` needed) |
-| Watch | `zwatch DIR` `zwatch list/rm` | watch a repo by path (index + cached status via `zvcs.autostatus`) without attaching a command |
+| Triggers | `ztrigger DIR <cmd>` `ztrigger list/rm/test` | watch **any directory** (git repo or not) and run a command on **any file change** under it — stored in the `triggers` index, fired immediately (no debounce), command runs with the dir as cwd and `$ZVCS_DIR` set |
+| Watch | `zwatch DIR` `zwatch list/rm` | watch any directory and log each change to the daemon log (a trigger with a built-in logging command) |
 | Console | `zrepl` | interactive line console over **every** command — each line runs as `git <line>`, so the `z*` verbs and all git porcelain work alike (startup stats banner + Tab completion of every verb) |
 | Shell | `zcd` `zpwd` `zls` `zenv` `zunset` `zecho` `zmkdir` `ztouch` `zrm` `zcp` `zmv` `zcat` `zln` | shell builtins so `zrepl` drives like a shell — `zcd`/`zenv`/`zunset` mutate the console's cwd/environment and persist across lines; `zls` is a git-aware listing (per-file status like `eza --git`); `zmkdir`/`ztouch`/`zrm`/`zcp`/`zmv`/`zcat`/`zln` are native filesystem commands (`zrm`/`zmv` are on-disk, distinct from `git rm`/`git mv`) |
 | Discovery | `zverbs` | list every extension verb and its one-line usage (sourced from each verb's own `-h`) |
@@ -300,32 +300,31 @@ Hooks get a typed environment: `ZVCS_EVENT` (commit/checkout/merge/pull/rebase/
 reset), `ZVCS_REPO`, `ZVCS_GIT_DIR`, `ZVCS_OLD_SHA`, `ZVCS_NEW_SHA`, `ZVCS_REF` —
 enough for "on commit in X, do Y in repo Z" cross-repo rules.
 
-You never have to touch `[zvcs]` config by hand to wire a trigger — `ztrigger`
-does it all. Arm any repo by path and the command runs on **any file change** in
-that directory (worktree *and* `.git`) — creating a file, editing, committing:
+`ztrigger` watches **any directory** — a git repo or not — and runs a command on
+any file change under it. Triggers live in the `triggers` index (keyed by path),
+so no git config is involved:
 
 ```console
-$ git ztrigger ~/src/api 'make test'   # writes ~/src/api local hook, indexes it,
-                                        # watches the WHOLE dir, flips autohook,
-                                        # reloads the daemon
-$ git ztrigger .        'echo "$ZVCS_EVENT" | notify'   # arm the current repo
-$ git ztrigger list                    # every armed repo (path <tab> command)
-$ git ztrigger test ~/src/api          # fire it once now, without waiting
-$ git ztrigger rm   ~/src/api          # disarm
+$ git ztrigger ~/Desktop  'say 45'           # any dir works — not just repos
+$ git ztrigger ~/src/api  'make test'        # a repo works too (watches worktree + .git)
+$ git ztrigger .          'echo "$ZVCS_DIR changed"'
+$ git ztrigger list                          # every trigger (path <tab> command)
+$ git ztrigger test ~/Desktop                # run its command once now
+$ git ztrigger rm   ~/Desktop                # remove it
 
-$ git zwatch ~/src/api                 # watch (index + cached status), no command
-$ git zwatch list                      # indexed repos, flagged watch|trigger
+$ git zwatch ~/Downloads                      # watch a dir and log each change
+$ git zwatch list / rm ~/Downloads
 ```
 
-An armed repo watches its entire directory, so file changes fire — not only ref
-moves — and there is **no debounce**: the hook runs the instant an event arrives.
-One filesystem event may carry several paths, but a repo fires once per event.
-A hook that writes back into the watched directory will re-fire on its own writes
-— keep trigger commands side-effect-free or point them at another repo.
-
-Only repos you `ztrigger` carry a hook, and the daemon is a no-op for the rest —
-so the set of firing repos is exactly the ones you armed, with no extra list to
-maintain. `zhook` is the same operation scoped to the current repo.
+The command runs the instant an event arrives (**no debounce**), via `sh -c` with
+the watched directory as cwd and `$ZVCS_DIR` set. The daemon watches only the
+directories you triggered, so startup stays instant no matter how many repos are
+indexed. Two caveats: it fires on **every** change under the dir — including a
+repo's `.git` churn (index writes from prompt `git status`, etc.), which can be
+frequent — and a command that writes back into the watched dir re-fires on its own
+writes. Keep commands side-effect-free, point them elsewhere, or watch a quieter
+directory. For a repo's *git* hook (ref-change semantics in `.git/config`), use
+`git zhook` instead.
 
 ## [0x06] LAYOUT
 

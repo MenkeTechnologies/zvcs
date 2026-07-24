@@ -483,27 +483,28 @@ and session attribution. All tested.
   gate keyed on the daemon's config. New `zvcs.autohook` master switch makes the
   watcher cover every indexed repo and fire each repo's *own* hook. Tests:
   `zhook.rs`, `hook_event.rs`.
-- **DIR-addressed triggers** — `ztrigger DIR <cmd>` / `zwatch DIR` are the
-  path-addressed front-end to the same hook core (`superset/hooks.rs` helpers,
-  shared with `zhook`): arm any repo without `cd`-ing into it. `ztrigger` writes
-  DIR's local `zvcs.hook`, indexes DIR (`db::upsert_repo`), auto-flips global
-  `zvcs.autohook`, and reloads the daemon — so no raw `git config` is ever
-  required to wire a trigger. Because the daemon runs each repo's own local hook
-  and no-ops the rest, the firing set is exactly the armed DIRs (no separate
-  watchlist). `zwatch` is the command-less form (index + `zvcs.autostatus`);
-  `zwatch rm`/`ztrigger rm` unwind. `ZVCS_NO_DAEMON` suppresses the reload for
-  scripted bulk runs. Tests: `trigger.rs`.
-  - **Whole-directory watch for armed repos** (`watch.rs`). An armed repo (one
-    with a local `zvcs.hook`) is watched recursively over its *entire* working
-    directory — worktree **and** `.git` — so creating or editing any file fires
-    the hook, not only ref moves; unarmed repos keep the lighter `refs/`+`logs/`
-    watch for autonomy/status. `Target::armed`/`watch_root()` drive registration,
-    event attribution (`collect`), and the fire loop (no reflog-author gate for
-    armed repos — a file event leaves the reflog untouched). There is **no
-    debounce** — the hook fires the instant an event arrives (a coalescing window
-    that waits for global silence never fires on a busy machine with many watched
-    repos and concurrent agents); a hook that writes into the watched dir
-    self-retriggers. Test: `watch.rs::armed_repo_matches_plain_worktree_file_events`.
+- **Directory triggers** — `ztrigger DIR <cmd>` / `zwatch DIR` watch **any**
+  directory (git repo or not) and run a command on any file change under it. They
+  are independent of git: the trigger is stored in a dedicated `triggers` table
+  (`path` PRIMARY KEY, `command`), NOT in `.git/config`, so `git ztrigger
+  ~/Desktop 'say 45'` works on a plain directory. `db::{set_trigger, remove_trigger,
+  list_triggers, has_triggers}` back the verbs; the daemon reads the trigger set
+  directly, watches each path recursively (whole-dir), and runs its command via
+  `hooks::run_command` (cwd = the dir, `$ZVCS_DIR` in env). The daemon starts for
+  triggers even outside a repo (`spawn_if_configured`/`autostart` check
+  `db::has_triggers()`, falling back to `ZvcsConfig::default()`). Repo git-hooks
+  (`zhook`/`autohook`, `zvcs.hook` in config) are a separate mechanism, unchanged.
+  - **No debounce, whole-dir** (`watch.rs`). A trigger fires the instant a
+    `notify` event arrives — a coalescing window that waits for global silence
+    never fires on a busy machine. `Target::{armed, command, watch_root()}` drive
+    registration, event attribution (`collect`, deepest watch-root wins), and the
+    fire loop: a target with a `command` is a directory trigger (always fires); a
+    `command: None` target is a repo hook (fires only when the git-hook config is
+    enabled). Startup is O(triggers + armed repos), not O(indexed repos), so the
+    daemon reaches the watching state instantly regardless of index size.
+    Caveats: fires on **every** change under the dir (including a repo's `.git`
+    churn), and a command that writes into the watched dir self-retriggers. Tests:
+    `trigger.rs`, `watch.rs::armed_repo_matches_plain_worktree_file_events`.
 
 **New `[zvcs]` config keys:** `autostatus` (maintain `zstatus --all`) and
 `autohook` (fire per-repo local hooks), plus the existing

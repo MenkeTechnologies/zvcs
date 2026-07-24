@@ -128,7 +128,7 @@ fn run(cfg: ZvcsConfig) {
         }
     }
     println!(
-        "[zvcs watch] watching {} repo(s) ({watched} tree(s), {armed_n} whole-dir), hooks={}",
+        "[zvcs watch] watching {} path(s) ({watched} tree(s), {armed_n} whole-dir), hooks={}",
         targets.len(),
         cfg.hooks_enabled(),
     );

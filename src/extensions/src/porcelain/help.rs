@@ -1788,6 +1788,25 @@ fn alias_list() -> BTreeMap<String, String> {
 /// `git help <command>|<doc>|<alias>`: an alias prints its expansion, anything
 /// else opens the corresponding man page.
 fn show_help_for(topic: &str) -> Result<ExitCode> {
+    // Superset (`z*`) verbs are real commands here but ship no system man page,
+    // so generate theirs on demand and open it with `man -M`. Done before the
+    // alias check for git's "a real command wins over an alias" precedence.
+    if crate::dispatch::SUPERSET_VERBS.contains(&topic) {
+        reject_unsupported_viewer_config()?;
+        if let Some(root) = crate::superset::manpage::ensure_page(topic)
+            .map_err(|e| anyhow::anyhow!("failed to write man page: {e}"))?
+        {
+            std::io::stdout().flush().ok();
+            let status = Command::new("man")
+                .arg("-M")
+                .arg(&root)
+                .arg(format!("git-{topic}"))
+                .status()
+                .map_err(|e| anyhow::anyhow!("failed to run man: {e}"))?;
+            return Ok(ExitCode::from(exit_status_code(status)));
+        }
+    }
+
     let is_command = command_names().contains(topic) || external_commands().contains(topic);
 
     // git resolves a real command before consulting aliases, so an alias that

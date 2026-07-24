@@ -57,9 +57,15 @@ pub fn zdashed(args: &[String]) -> Result<ExitCode> {
         created += 1;
     }
 
+    // Also materialize the superset man pages so `man git-<verb>` resolves once
+    // `~/.zvcs/man` is on MANPATH; `git help <zverb>` works regardless.
+    let man = crate::superset::manpage::install_all().unwrap_or(0);
+    let man_dir = crate::superset::manpage::man_dir().join("man1");
+
     println!(
-        "installed {created} git-<verb> link(s) in {} ({current} already current, {skipped} skipped)",
-        dir.display()
+        "installed {created} git-<verb> link(s) in {} ({current} already current, {skipped} skipped); {man} man page(s) in {}",
+        dir.display(),
+        man_dir.display()
     );
     Ok(ExitCode::SUCCESS)
 }

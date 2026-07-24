@@ -18,6 +18,7 @@ pub mod claim;
 pub mod dashed;
 pub mod hooks;
 pub mod ledger;
+pub mod manpage;
 pub mod oplog;
 pub mod select;
 pub mod snapshot;

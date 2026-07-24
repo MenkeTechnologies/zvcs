@@ -201,6 +201,19 @@ can't collide with any other — no re-clone. `list` / `remove <name>` manage th
 
 **Console.** `git zrepl` opens an interactive line console over all the verbs.
 
+**Discovery & help.** `git zverbs` lists every extension verb with its one-line
+usage (each verb also answers `-h` with the same line). `git help <zverb>` opens
+a full man page — the pages are generated from a table in
+`src/extensions/src/superset/manpage.rs` (one source of truth, covering every
+verb in `SUPERSET_VERBS`), written on demand under `~/.zvcs/man` and opened with
+`man -M`, so it works with no setup. `git zdashed` writes them all up front, so
+`man git-<verb>` resolves once `~/.zvcs/man` is on `MANPATH`:
+
+```sh
+export MANPATH="$HOME/.zvcs/man:$MANPATH"
+man git-zsync
+```
+
 ## [0x05] THE zdaemon COORDINATOR
 
 `zdaemon` is one machine-wide daemon (state under `~/.zvcs/`, socket

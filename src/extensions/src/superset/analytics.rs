@@ -410,7 +410,14 @@ pub fn zorphans(args: &[String]) -> Result<ExitCode> {
 /// is what `zstatus --all` deliberately avoids, and so does this. The per-repo
 /// live probes remain available as their own verbs (`zstale`, `zorphans`,
 /// `zconflicts`, `zsize`, …) when a fresh, deep read is wanted.
-pub fn zdashboard(_args: &[String]) -> Result<ExitCode> {
+pub fn zdashboard(args: &[String]) -> Result<ExitCode> {
+    // Interactive: the live, tiled TUI (fleet + events + commands). `--once` /
+    // `--json` / a non-terminal stdout keep the instant text summary below.
+    let text_only = args.iter().any(|a| a == "--once" || a == "-1" || a == "--json");
+    if !text_only && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return crate::superset::dashboard::run();
+    }
+    let _args = args;
     let conn = match crate::db::open_ro() {
         Ok(c) => c,
         Err(_) => {

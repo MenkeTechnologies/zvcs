@@ -618,11 +618,12 @@ pub const DOCS: &[Doc] = &[
     },
     Doc {
         verb: "zdashboard",
-        summary: "instant one-screen health summary of the tree",
-        synopsis: "git zdashboard [--json]",
+        summary: "live tiled TUI: fleet, events, and commands on one screen",
+        synopsis: "git zdashboard [--once] [--json]",
         desc: &[
-            "Prints a one-screen summary of the indexed tree: how many repositories are dirty, ahead, behind, diverged, detached, or without an upstream, plus the active claim and session counts and the async queue depth.",
-            "It aggregates the daemon-maintained status cache and the ledger \\(em a handful of db queries, not a live per-repo walk \\(em so it is instant even across thousands of repos, exactly as `zstatus --all` is. When the cache covers fewer repos than are indexed, a note says so; `git zstatus --all` refreshes it. For fresh, deep reads use the dedicated verbs (zstale, zorphans, zconflicts, zsize).",
+            "A live, tiled dashboard of the whole indexed tree on one screen: a header of aggregate totals (dirty, ahead, behind, diverged, detached, clean, claims, sessions, queue, and whether the daemon is up) over three tiles \\(em a FLEET table (every repo, most recently active first, with the on-screen rows' HEAD state live-refreshed so nothing is stale), an EVENTS feed (commits, reconciles, status changes, as zevents shows), and a COMMANDS feed (every git command run across the machine, with the agent that ran it, as zcommands shows). Press q or Esc to quit.",
+            "Every tile reads the daemon-maintained status cache and ledger, not a live per-repo walk, so the dashboard stays responsive across thousands of repos. The COMMANDS tile is populated once command logging is on (`git zcommands` enables it).",
+            "For scripting, `--once` or `--json` (or a non-terminal stdout) prints the instant text summary instead of the TUI \\(em the same aggregate counts, one screen, no interaction.",
         ],
     },
     Doc {

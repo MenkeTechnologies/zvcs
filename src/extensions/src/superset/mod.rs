@@ -16,6 +16,7 @@
 pub mod analytics;
 pub mod attach;
 pub mod banner;
+pub mod dashboard;
 pub mod claim;
 pub mod coord;
 pub mod pmutate;

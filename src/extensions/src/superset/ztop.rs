@@ -898,7 +898,7 @@ fn save_palette(label: &str, pal: Palette) {
 // Rendering primitives — ported from htoprs src/extensions/overlay.rs.
 // ---------------------------------------------------------------------------
 
-fn set_cell(buf: &mut Buffer, x: u16, y: u16, ch: &str, s: Style) {
+pub(crate) fn set_cell(buf: &mut Buffer, x: u16, y: u16, ch: &str, s: Style) {
     let a = buf.area();
     if x < a.x + a.width && y < a.y + a.height {
         let c = &mut buf[(x, y)];
@@ -907,7 +907,7 @@ fn set_cell(buf: &mut Buffer, x: u16, y: u16, ch: &str, s: Style) {
     }
 }
 
-fn set_str(buf: &mut Buffer, x: u16, y: u16, s: &str, st: Style, mw: u16) {
+pub(crate) fn set_str(buf: &mut Buffer, x: u16, y: u16, s: &str, st: Style, mw: u16) {
     let aw = buf.area().x + buf.area().width;
     let ah = buf.area().y + buf.area().height;
     if y >= ah {
@@ -925,7 +925,7 @@ fn set_str(buf: &mut Buffer, x: u16, y: u16, s: &str, st: Style, mw: u16) {
     }
 }
 
-fn fill_row(buf: &mut Buffer, y: u16, st: Style) {
+pub(crate) fn fill_row(buf: &mut Buffer, y: u16, st: Style) {
     let a = buf.area();
     for x in a.x..a.x + a.width {
         set_cell(buf, x, y, " ", st);

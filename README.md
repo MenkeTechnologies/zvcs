@@ -108,10 +108,17 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Snapshots | `zsnapshot` `zrestore` `zsnapshots` | tree-wide restore points across all submodules |
 | Worktrees | `zworktree add/list/remove` | per-agent isolated, object-sharing worktree of the whole tree |
 | Fan-out | `zforeach [selectors] -- <cmd>` | run a command across all/subset of indexed repos, in parallel (selectors: `--repo`/`--dirty`/`--ahead`/`--behind`/`--claimed`/`--session`) |
-| Parallel query | `zheads` `zdirty` `zbranches` `ztags` `zremotes` `zsize` `zage` | native, fork-free reads fanned across every indexed repo — HEAD/branch, dirty set, branches, tag counts, remotes, `.git` sizes, HEAD age; all honor the `zforeach` selectors |
+| Selectors | `zselectors` | the shared `[selectors]` grammar the fleet verbs accept — a bare path pattern, `--dirty`/`--ahead`/`--behind`, `--claimed`/`--session`, ANDed (`git help zselectors`) |
+| Parallel query | `zheads` `zdirty` `zbranches` `ztags` `zremotes` `zsize` `zage` `zcommits` `zpristine` | native, fork-free reads fanned across every indexed repo — HEAD/branch, dirty set, branches, tag counts, remotes, `.git` sizes, HEAD age, commit depth, the clean-and-in-sync set; all honor the `[selectors]` grammar |
 | Parallel pull | `zpull [selectors]` | fetch + fast-forward every indexed repo in parallel (ff-only, same native reconcile as `zsync`; dirty/diverged skipped) |
-| Search & analytics | `zgrep [-i] <pattern>` `zahead` `zbehind` `zauthors` `zhot [<days>]` `zconflicts` | cross-repo, fanned in parallel — regex content search of tracked files; upstream ahead/behind deltas; commit counts by author; repos ranked by recent activity; repos mid-merge/rebase/conflicted |
-| Parallel mutations | `zfetch` `zgc` `zfsck` `zprune` `zcheckout <branch>` `ztagall <tag>` `zcommitall -m <msg>` `zpushall` `zclean -f` | run a git operation across every indexed repo in parallel (via this binary's own porcelain + fair lane); mutations that don't apply are skipped, not forced; `zclean` requires `-f` |
+| Search & analytics | `zgrep [-i] <pattern>` `zahead` `zbehind` `zunpushed` `zunpulled` `zauthors` `zhot [<days>]` `zconflicts` | cross-repo, fanned in parallel — regex content search; upstream ahead/behind counts and the detailed per-repo unpushed/unpulled commit lists; commit counts by author; repos by recent activity; repos mid-merge/rebase/conflicted |
+| Parallel mutations | `zfetch` `zgc` `zfsck` `zprune` `zreset` `zabort` `zcheckout <branch>` `ztagall <tag>` `zcommitall -m <msg>` `zpushall` `zclean -f` | run a git operation across every indexed repo in parallel (via this binary's own porcelain + fair lane); `zreset` parallel-resets, `zabort` aborts an in-progress merge/rebase/cherry-pick/revert in mid-op repos; ops that don't apply are skipped, not forced |
+| Live monitor | `ztop [selectors]` | full-screen htop-style fleet monitor — every indexed repo, sorted by churn, read from the daemon status cache each frame (scales to thousands). 31 htoprs colorschemes with a live picker (`c`) + palette editor (`~`), F1 help, F6 sort-by-column, `/` search, `p` full-path toggle |
+| Command feed | `zcommands` | live feed of **every git command run across the fleet** — time, pid←ppid (which agent), cwd, and argv, appended to its own `$ZVCS_HOME/commands.log`; a single `stat` gates the hot path when off |
+| Event feed | `zevents` `ztail` | one live semantic feed of commits, reconciles, and status changes across the whole tree (from the append-only events table) |
+| AOP | `zintercept before\|after\|around <pattern> -- <cmd>` | aspect-oriented hooks on git commands (ported from zshrs) — run advice before/after/around any matching command, with `INTERCEPT_NAME`/`ARGS`/`CMD` (and `STATUS`/`MS`/`US` for after) in the environment; an around advice runs `"$INTERCEPT_CMD"` to proceed |
+| Autonomy config | `zconfig [<name> on\|off\|<n>]` | toggle the daemon's feature switches from the CLI (`autoreconcile`, `autobump`, `autostatus`, …, `statusinterval`, `watchmru`); `all on\|off` flips them together, reloading a running daemon |
+| Automation | `zpin` `zunpin` `zbroadcast` `zhandoff` `zon` `zsince` `zcontend` `zwaitfor` `zgraph` `zrewind` | freeze repos from autonomy; inter-agent messaging and claim hand-off; run a command on a semantic feed event; a time-window feed; live agent-vs-agent contention; block until a tree-wide state holds; fleet topology (dup groups) |
 | Coordination | `zwait [<path>]` `zqueue` `zbarrier` | the join side of the async queue — wait for one repo's jobs to drain, list what's queued/running, or block until the whole queue is idle |
 | Profiling | `zstale [<days>]` `zlast` `zbig [<n>]` `zfiles` `zdivergent` `zorphans` | native, fanned in parallel — abandoned repos, most-recently-committed, largest tracked files, file counts, repos diverged from upstream, repos with no remote |
 | Multi-agent view | `zsessions` `zidle` `zdashboard` | sessions ranked by repos held; repos free to pick up; and an **instant** one-screen health summary aggregated from the status cache + ledger (dirty/ahead/behind/diverged/detached/no-upstream + claims/sessions/queue) — no live walk, so it scales to thousands of repos like `zstatus --all` |
@@ -151,6 +158,12 @@ It builds fixture repositories with stock git, runs each invocation against both
 binaries, and compares stdout, exit code, and the resulting repository state.
 
 ## [0x04] THE SUPERSET VERBS
+
+Over a hundred superset (`z*`) verbs share the one binary, grouped into a few
+families below. `git zverbs` prints the complete, authoritative list with each
+verb's one-line usage (each verb also answers `-h`), and `git help <zverb>` opens
+its man page — so the live set is always a command away and never drifts from the
+prose here.
 
 **Coordination.** `git zsync [<path>...]` reconciles submodules to their tracked
 mainline (`origin/main`, else `origin/master`), fast-forward only, leaving `HEAD`
@@ -198,6 +211,37 @@ zstatus --all` reads every indexed repo's status from the daemon-maintained
 cache (zero-walk). `git zlog` merges every repo's reflog into one machine-wide
 timeline; `git zundo [<path>]` rewinds a repo one step (`reset --hard` to the
 previous HEAD, refuses on dirty).
+
+**Live monitoring.** `git ztop` is a full-screen, htop-style monitor of the whole
+indexed tree: every repo with a churn bar, HEAD, state, and last-change age,
+sorted so the repos changing right now rise to the top. It reads the
+daemon-maintained status cache each frame — no live walk — so it stays responsive
+across thousands of repos. It ships the 31 htoprs colorschemes with a live picker
+(`c`) and a palette editor (`~`), an F1 help overlay, sort-by-column (F6, `<`/`>`,
+`I`), incremental `/` search, and a `p` full-path toggle; the theme choice
+persists. `git zcommands` is a live feed of **every git command run across the
+fleet** — because the one binary is the sole dispatcher, each invocation logs its
+time, pid←ppid (so you can tell which agent ran it), cwd, and argv to its own
+`$ZVCS_HOME/commands.log`; a single `stat` gates the hot path when logging is off.
+`git zevents` (alias `ztail`) is one live semantic feed of commits, reconciles,
+and status changes across the tree.
+
+**Interception (AOP).** `git zintercept before|after|around <pattern> -- <cmd>`
+registers aspect-oriented advice on git commands, ported from zshrs. A before
+hook runs a shell command before every matching git command, an after hook runs
+after it (with the command's exit status and timing in `INTERCEPT_STATUS`/`_MS`),
+and an around hook replaces it — running `"$INTERCEPT_CMD"` to proceed with the
+original. The advice sees the intercepted command through `INTERCEPT_NAME` /
+`INTERCEPT_ARGS` / `INTERCEPT_CMD`; the pattern matches the git subcommand
+(`commit`, `commit *`, `*`/`all`). Registrations persist to
+`$ZVCS_HOME/intercepts.tsv` and load at dispatch, gated by a single `stat` when
+none are set. `list` / `remove <id>` / `clear` manage them.
+
+**Autonomy config.** `git zconfig` toggles the daemon's feature switches from the
+CLI instead of editing `~/.gitconfig`: with no argument it lists every setting
+and whether it is on; `git zconfig <name> on|off` (or a count) sets one, `git
+zconfig all on|off` flips them together, and a running daemon is reloaded so the
+change takes effect at once.
 
 **Snapshots.** `git zsnapshot <name>` records the HEAD of the repo + every nested
 submodule as one restore point; `git zrestore <name>` resets the whole tree back
@@ -347,14 +391,18 @@ Early and in active development.
 
 The coordination and superset layers are implemented and tested: the singleton
 daemon with per-repo FIFO lanes; reactive file-watcher autonomy (attach,
-autobump-with-commit, fetch-free reconcile); the SQLite ledger + repo index;
-async `zcommit`/`zpush` with job control; multi-agent claims; machine-wide
-`zstatus`; the cross-repo op ledger (`zlog`/`zundo`); tree-wide snapshots; typed
-cross-repo hooks; and per-agent isolated worktrees (`zworktree`). Each is covered
-by an integration test, and zvcs↔stock-git interoperability (round-trip read,
-`git fsck`, submodule pointer bumps, worktrees) is verified by a regression
-suite. See [DESIGN.md](DESIGN.md) for the architecture and the honest list of
-partials.
+autobump-with-commit, fetch-free reconcile) toggled from the CLI (`zconfig`); the
+SQLite ledger + repo index with a daemon-maintained status cache; async
+`zcommit`/`zpush`/`zsubmit` with job control; multi-agent claims and messaging;
+the parallel fleet layer over the indexed set (fork-free queries, analytics,
+mutations, all sharing one `[selectors]` grammar and a bounded worker pool); live
+monitoring (`ztop` htop-style, `zcommands` command feed, `zevents` semantic feed);
+AOP command interception (`zintercept`); machine-wide `zstatus`; the cross-repo op
+ledger (`zlog`/`zundo`); tree-wide snapshots; typed cross-repo hooks; and per-agent
+isolated worktrees (`zworktree`). Each is covered by an integration test, and
+zvcs↔stock-git interoperability (round-trip read, `git fsck`, submodule pointer
+bumps, worktrees) is verified by a regression suite. See [DESIGN.md](DESIGN.md)
+for the architecture and the honest list of partials.
 
 Git compatibility is tracked as two independent numbers, because a subcommand
 that dispatches is not thereby correct:

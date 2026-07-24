@@ -545,3 +545,69 @@ worktree does not move the original; the worktree has no own object store.
 Ergonomics: one command from the meta root replaces `git worktree add` for the
 parent plus one per submodule; the agent is launched in its private tree and
 works normally across submodules with zero cross-agent collisions.
+
+## 14. The parallel fleet layer (`parallel_map` + `[selectors]`)
+
+The many-repo half of the design. Every repo in the machine-wide index
+(§6) is addressable as a fleet, and a family of verbs act on the whole set — or a
+narrowed subset — concurrently.
+
+- **One selection grammar.** `Selector` (`src/extensions/src/superset/select.rs`)
+  is the single `[selectors]` parser every fleet verb shares: a bare path pattern
+  (case-insensitive substring, repeatable, ANDed), `--dirty`/`--ahead`/`--behind`
+  (read from the status cache), and `--claimed`/`--session` (from the claims
+  table). `SELECTOR_FLAGS`/`SELECTOR_VERBS` are consts, test-guarded so the repl
+  completion and the parser cannot drift; `git zselectors` / `git help zselectors`
+  document it as a first-class topic.
+- **One worker pool.** `parallel_map` (`query.rs`) is a scoped-thread pool over
+  `(git_dir, workdir)` pairs, bounded to the machine's cores, work-stealing via a
+  single atomic counter — the same primitive `zforeach` uses. Queries are native
+  gix/filesystem reads (no fork, no ported-porcelain dependency), so they are fast
+  and reliable across thousands of repos.
+- **Three verb shapes over that substrate:** *queries* (`zheads`, `zdirty`,
+  `zsize`, `zcommits`, `zpristine`, …), *analytics* (`zgrep`, `zahead`/`zbehind`
+  and the detailed `zunpushed`/`zunpulled`, `zauthors`, `zhot`, `zconflicts`,
+  `zdivergent`, `zorphans`), and *mutations* (`zfetch`, `zgc`, `zreset`, `zabort`,
+  `zcheckout`, `zcommitall`, `zpushall`, …), which fan a git operation across the
+  selection through this binary's own porcelain and the fair per-repo lane. `--json`
+  emits NDJSON for tooling. Ops that don't apply are skipped, never forced.
+
+## 15. The status cache + live monitoring
+
+`zdashboard` and `ztop` must be instant across thousands of repos, so neither
+walks the fleet live — both read a **daemon-maintained status cache**
+(`repo_status`: dirty, detached, sync ∈ ahead/behind/diverged/up-to-date/
+no-upstream, head, head_sha, updated_at). A producer/consumer maintainer (`statusd`)
+keeps it warm: N read-only compute workers feed one batching writer (WAL is
+single-writer, so this avoids lock thrash), hungry on first run then throttled,
+and mtime-gated so an unchanged repo is skipped. The instant file-watcher (§5)
+updates the most-recently-used repos reactively.
+
+`ztop` (`superset/ztop.rs`) is a ratatui TUI that reads that cache each frame and
+sorts by **churn** — `updated_at` recency plus a live burst when a repo's
+`head_sha` changes while watching — so activity rises to the top and persists.
+Rendering is ported from htoprs: its 31 colorschemes (exact palettes, remapped
+onto the element layout) with a live picker and palette editor, an F1 help
+overlay, sort-by-column, `/` search, and a toast, drawn with htoprs's own
+`Buffer`/`Style` cell primitives. `zcommands` and `zevents` are the streaming
+counterparts (§16 and the events table).
+
+## 16. Command logging + AOP interception
+
+Because the one binary is the sole dispatcher (`dispatch::run`), it is the natural
+seam for two orthogonal cross-cutting features, both hooked at the top of that
+function and both a single `stat` when inactive:
+
+- **`zcommands`** — a fleet command log. When enabled (a marker file), every
+  invocation appends `ts pid ppid cwd argv` to `$ZVCS_HOME/commands.log`
+  (atomic O_APPEND), and the verb tails it live. The `ppid` records which
+  agent/shell ran each command.
+- **`zintercept`** — aspect-oriented interception, ported from zshrs
+  (`src/extensions/intercepts.rs`). `AdviceKind` (before/after/around),
+  `Intercept`, and `intercept_matches` (exact/glob/`all`) are ported faithfully;
+  adapted to zvcs's per-process model, the registry persists to
+  `$ZVCS_HOME/intercepts.tsv` and advice is a shell command run with
+  `INTERCEPT_NAME`/`ARGS`/`CMD` (and `STATUS`/`MS`/`US` for after) in the
+  environment. `maybe_intercept` orchestrates before → around/after; an around
+  advice runs `"$INTERCEPT_CMD"` to proceed, and a `ZVCS_INTERCEPTED` env guard
+  stops re-interception of the wrapped command.

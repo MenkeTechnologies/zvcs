@@ -73,11 +73,13 @@ fn profiling_and_dashboard_reflect_state() {
     let idle = zvcs(&home, &sock, &["zidle"]);
     assert!(idle.contains("2 of 2 indexed unclaimed"), "zidle: {idle}");
 
-    // zdashboard aggregates: 2 repos, 1 dirty, 2 with no remote.
+    // zdashboard is cache-based (instant), so with no daemon the status cache is
+    // cold: it reports the repo count and the coverage note, not live-walked
+    // counts. This is the whole point — it must not walk 3000+ repos live.
     let dash = zvcs(&home, &sock, &["zdashboard"]);
     assert!(dash.contains("2 repos indexed"), "dashboard header: {dash}");
-    assert!(dash.lines().any(|l| l.trim_start().starts_with("dirty") && l.contains('1')), "dashboard dirty=1:\n{dash}");
-    assert!(dash.lines().any(|l| l.contains("no remote") && l.contains('2')), "dashboard no-remote=2:\n{dash}");
+    assert!(dash.lines().any(|l| l.trim_start().starts_with("dirty")), "dashboard has a dirty line:\n{dash}");
+    assert!(dash.contains("status cached for 0/2"), "cold cache note when no daemon:\n{dash}");
 
     let _ = std::fs::remove_dir_all(&root);
 }

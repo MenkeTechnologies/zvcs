@@ -13,8 +13,7 @@ use std::process::ExitCode;
 use anyhow::{bail, Result};
 use gix::bstr::ByteSlice;
 
-use crate::superset::gitls::human_size;
-use crate::superset::query::{dir_size, parallel_map, probe, select_repos, selected};
+use crate::superset::query::{parallel_map, probe, select_repos, selected};
 use crate::superset::select::Selector;
 
 /// `git zgrep [selectors] [-i] <pattern>` — search the tracked file content of
@@ -287,77 +286,51 @@ pub fn zorphans(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// One repo's dashboard facts, gathered in a single probe.
-struct Facts {
-    dirty: bool,
-    ahead: usize,
-    behind: usize,
-    orphan: bool,
-    stale: bool,
-    conflicted: bool,
-    size: u64,
-}
-
-/// `git zdashboard [selectors]` — a one-screen health summary of the indexed
-/// tree: how many repos are dirty, ahead/behind/diverged, conflicted, remote-less,
-/// or stale, plus active claims/sessions, the async queue depth, and total `.git`
-/// size. Each repo is probed once in parallel; ledger state is read once.
-pub fn zdashboard(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
-    let now = crate::date::now_seconds();
-    let stale_cutoff = now - 90 * 86_400;
-
-    let facts = parallel_map(&repos, |gd, _| {
-        let repo = gix::open(gd).ok();
-        let (ahead, behind) = repo.as_ref().and_then(ahead_behind).unwrap_or((0, 0));
-        let head_secs = repo
-            .as_ref()
-            .and_then(|r| r.head_commit().ok().and_then(|c| c.time().ok()).map(|t| t.seconds));
-        Facts {
-            dirty: repo.as_ref().map(|r| r.is_dirty().unwrap_or(false)).unwrap_or(false),
-            ahead,
-            behind,
-            orphan: repo.as_ref().map(|r| r.remote_names().is_empty()).unwrap_or(false),
-            stale: head_secs.map(|s| s < stale_cutoff).unwrap_or(false),
-            conflicted: conflict_state(gd).is_some(),
-            size: dir_size(gd),
+/// `git zdashboard` — an instant one-screen health summary of the indexed tree,
+/// aggregated from the daemon-maintained status cache and the ledger (a handful
+/// of db queries), NOT a live per-repo walk. This is what makes it usable across
+/// thousands of repos: a live scan (is_dirty + rev-walk + .git size over N repos)
+/// is what `zstatus --all` deliberately avoids, and so does this. The per-repo
+/// live probes remain available as their own verbs (`zstale`, `zorphans`,
+/// `zconflicts`, `zsize`, …) when a fresh, deep read is wanted.
+pub fn zdashboard(_args: &[String]) -> Result<ExitCode> {
+    let conn = match crate::db::open_ro() {
+        Ok(c) => c,
+        Err(_) => {
+            println!("zvcs dashboard — no index yet (run `git zreindex`)");
+            return Ok(ExitCode::SUCCESS);
         }
-    });
-
-    let n = repos.len();
-    let count = |pred: &dyn Fn(&Facts) -> bool| facts.iter().filter(|f| pred(f)).count();
-    let dirty = count(&|f| f.dirty);
-    let ahead = count(&|f| f.ahead > 0 && f.behind == 0);
-    let behind = count(&|f| f.behind > 0 && f.ahead == 0);
-    let diverged = count(&|f| f.ahead > 0 && f.behind > 0);
-    let conflicted = count(&|f| f.conflicted);
-    let orphan = count(&|f| f.orphan);
-    let stale = count(&|f| f.stale);
-    let total_size: u64 = facts.iter().map(|f| f.size).sum();
-
-    // Ledger state: claims (+ distinct sessions) and active queue depth.
-    let (claims, sessions) = match crate::db::open_ro() {
-        Ok(conn) => {
-            let list = crate::db::list_claims(&conn).unwrap_or_default();
-            let sessions: std::collections::HashSet<&str> = list.iter().map(|(_, s, _)| s.as_str()).collect();
-            (list.len(), sessions.len())
-        }
-        Err(_) => (0, 0),
     };
-    let queued = crate::db::open_ro()
-        .ok()
-        .and_then(|c| crate::db::list_jobs(&c, 1000).ok())
+    let repos = crate::db::list_repos(&conn)?.len();
+    let status = crate::db::list_status(&conn)?;
+    let with_status = status.len();
+    let count = |pred: &dyn Fn(&crate::db::StatusRow) -> bool| status.iter().filter(|s| pred(s)).count();
+    let dirty = count(&|s| s.dirty);
+    let ahead = count(&|s| s.sync == "ahead");
+    let behind = count(&|s| s.sync == "behind");
+    let diverged = count(&|s| s.sync == "diverged");
+    let detached = count(&|s| s.detached);
+    let no_upstream = count(&|s| s.sync == "no-upstream");
+
+    let claim_list = crate::db::list_claims(&conn).unwrap_or_default();
+    let claims = claim_list.len();
+    let sessions = claim_list
+        .iter()
+        .map(|(_, s, _)| s.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let queue = crate::db::list_jobs(&conn, 1000)
         .map(|j| j.iter().filter(|x| x.state == "queued" || x.state == "running").count())
         .unwrap_or(0);
 
-    println!("zvcs dashboard — {n} repos indexed");
+    println!("zvcs dashboard — {repos} repos indexed");
     println!("  dirty         {dirty:>5}");
     println!("  ahead         {ahead:>5}    behind {behind:>5}    diverged {diverged:>5}");
-    println!("  conflicted    {conflicted:>5}");
-    println!("  no remote     {orphan:>5}");
-    println!("  stale (>90d)  {stale:>5}");
+    println!("  detached      {detached:>5}    no upstream {no_upstream:>5}");
     println!("  claims        {claims:>5}    sessions {sessions:>5}");
-    println!("  queue         {queued:>5} active");
-    println!("  .git total    {:>8}", human_size(total_size));
+    println!("  queue         {queue:>5} active");
+    if with_status < repos {
+        println!("  (status cached for {with_status}/{repos} — `git zstatus --all` refreshes it)");
+    }
     Ok(ExitCode::SUCCESS)
 }

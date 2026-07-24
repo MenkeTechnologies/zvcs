@@ -550,11 +550,11 @@ pub const DOCS: &[Doc] = &[
     },
     Doc {
         verb: "zdashboard",
-        summary: "one-screen health summary of the tree",
-        synopsis: "git zdashboard [selectors]",
+        summary: "instant one-screen health summary of the tree",
+        synopsis: "git zdashboard",
         desc: &[
-            "Prints a one-screen summary of the indexed tree: how many repositories are dirty, ahead, behind, diverged, conflicted, remote-less, or stale, plus the active claim and session counts, the async queue depth, and total .git size.",
-            "Each repository is probed once in parallel and the ledger is read once, so it is a cheap machine-wide overview. Selectors scope which repos are summarized.",
+            "Prints a one-screen summary of the indexed tree: how many repositories are dirty, ahead, behind, diverged, detached, or without an upstream, plus the active claim and session counts and the async queue depth.",
+            "It aggregates the daemon-maintained status cache and the ledger \\(em a handful of db queries, not a live per-repo walk \\(em so it is instant even across thousands of repos, exactly as `zstatus --all` is. When the cache covers fewer repos than are indexed, a note says so; `git zstatus --all` refreshes it. For fresh, deep reads use the dedicated verbs (zstale, zorphans, zconflicts, zsize).",
         ],
     },
 ];

@@ -302,7 +302,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zorphans" => "usage: git zorphans [selectors] — indexed repos with no remote configured",
         "zsessions" => "usage: git zsessions — active sessions ranked by repos held",
         "zidle" => "usage: git zidle [selectors] — indexed repos with no active claim (free to pick up)",
-        "zdashboard" => "usage: git zdashboard [selectors] — one-screen health summary of the indexed tree",
+        "zdashboard" => "usage: git zdashboard — instant one-screen health summary from the status cache + ledger",
         _ => return None,
     })
 }

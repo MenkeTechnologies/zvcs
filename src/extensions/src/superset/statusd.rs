@@ -76,7 +76,16 @@ pub fn spawn_if_enabled() {
                 thread::sleep(Duration::from_millis(500));
                 continue;
             }
-            let target = &repos[cursor.fetch_add(1, Ordering::Relaxed) % repos.len()];
+            let idx = cursor.fetch_add(1, Ordering::Relaxed);
+            // The first full sweep is done once `initial_n` items have been handed
+            // out (computed OR skipped) — flip to warm so the pool throttles.
+            // Keying warm on *writes* (the old logic) never flips when the mtime
+            // filter skips most repos, so the workers would spin at full speed
+            // forever, re-surging on every restart. This is that fix.
+            if idx >= initial_n && !warm.load(Ordering::Relaxed) {
+                warm.store(true, Ordering::Relaxed);
+            }
+            let target = &repos[idx % repos.len()];
             // Cheap mtime gate: if the working-tree root hasn't been touched since
             // the last scan, skip the expensive `is_dirty` compute entirely — the
             // cached status is still valid. This is what keeps the pool from

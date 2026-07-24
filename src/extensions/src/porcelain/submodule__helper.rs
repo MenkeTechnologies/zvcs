@@ -102,6 +102,9 @@ pub fn submodule__helper(args: &[String]) -> Result<ExitCode> {
     };
 
     let mut sub: Option<usize> = None;
+    // Scans args left-to-right to find the subcommand token; the first hit returns,
+    // so clippy sees "loop that never iterates twice" — the scan is intentional.
+    #[allow(clippy::never_loop)]
     for (n, a) in args.iter().enumerate() {
         // `--`/`--end-of-options` stop option scanning; parse_options then has
         // no subcommand to run, which is the "need a subcommand" path.

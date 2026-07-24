@@ -237,6 +237,10 @@ fn worker_loop() -> Result<ExitCode> {
     let stdin = io::stdin();
     let mut input = stdin.lock();
 
+    // Reads the request stream packet-by-packet; the supported flush/EOF path exits
+    // on the first packet, so clippy sees a loop that never re-iterates today — the
+    // loop shape mirrors git's worker protocol and stays for when item packets land.
+    #[allow(clippy::never_loop)]
     loop {
         match read_packet(&mut input) {
             Ok(Pkt::Zero) => break,

@@ -659,6 +659,95 @@ pub const DOCS: &[Doc] = &[
             "Running it turns logging on (a marker file, so the cost on every other git command is a single stat when it is off) and notes where the log lives. -n sets the backlog size, --no-follow prints the backlog and exits, --repo filters to commands whose directory contains a substring, and --json emits NDJSON for tooling. --off stops logging; --clear truncates the log. The live viewers (zcommands, zevents, ztail, ztop) are excluded so watching does not feed itself.",
         ],
     },
+    Doc {
+        verb: "zpin",
+        summary: "freeze a repo from daemon autonomy",
+        synopsis: "git zpin [<path>...|list]",
+        desc: &[
+            "Pins one or more repositories so the daemon's autonomy leaves their pointer alone \\(em a pinned repo is skipped by autobump and reconcile, so its gitlink and HEAD will not move on their own until it is unpinned. Detached-HEAD attach still runs, because re-attaching a detached HEAD heals it without moving the pointer.",
+            "With no path it pins the repository at the current directory; with paths it pins each named repository; `git zpin list` prints every pinned repo. The flag lives in the shared index (`repos.pinned`), so it survives daemon restarts and is visible to every session. Unfreeze with `git zunpin`.",
+        ],
+    },
+    Doc {
+        verb: "zunpin",
+        summary: "unfreeze repos pinned from autonomy",
+        synopsis: "git zunpin [<path>...|--all]",
+        desc: &[
+            "Clears the pin set by `git zpin`, so the daemon resumes autobump and reconcile for the repository. With no path it unpins the repo at the current directory; with paths it unpins each named one; --all unpins every pinned repository at once.",
+        ],
+    },
+    Doc {
+        verb: "zbroadcast",
+        summary: "post and read inter-agent messages",
+        synopsis: "git zbroadcast [--to <session>] [<msg>...]",
+        desc: &[
+            "Sends a message to the other agent sessions working the tree, over the shared index. With a message it broadcasts to every session, or to one with --to <session>; with no arguments it prints this session's unread messages and marks them read.",
+            "Read state is tracked per session, so a broadcast is delivered once to each recipient and a sender never sees its own message. It is a pull inbox \\(em messages are read when you run the verb, adding no cost to any other command. Session identity comes from ZVCS_SESSION.",
+        ],
+    },
+    Doc {
+        verb: "zhandoff",
+        summary: "hand a repo's claim to another agent session",
+        synopsis: "git zhandoff <repo-path> <session>",
+        desc: &[
+            "Reassigns the advisory claim (lease) on a repository from the current holder to another session, and drops that session a message noting the handoff. Fails if the repository is not currently claimed.",
+            "Claims are the session-attributed \"I'm working this repo\" signal set by `git zclaim`; zhandoff transfers one without the receiver having to race for it, so work can be passed cleanly between agents.",
+        ],
+    },
+    Doc {
+        verb: "zon",
+        summary: "run a command on a semantic feed event",
+        synopsis: "git zon [--kind commit|stage|status|reconcile] [--repo <substr>] -- <cmd> | git zon list | git zon rm <id>",
+        desc: &[
+            "Registers a rule that runs a command when a matching event fires on the live feed. Where `git ztrigger` reacts to raw filesystem events under a directory, zon reacts to typed events \\(em commit, stage, status, reconcile \\(em from the same feed `git zevents` shows, optionally filtered to repos whose path contains a substring.",
+            "The command after -- runs via the shell with ZVCS_EVENT, ZVCS_REPO, ZVCS_DETAIL, and ZVCS_SHA set for the triggering event. `git zon list` shows every subscription; `git zon rm <id>` removes one. The daemon watches the feed and runs the matches. Caveat (shared with ztrigger): a command that itself commits or stages can match its own subscription and re-fire \\(em scope it with --kind/--repo.",
+        ],
+    },
+    Doc {
+        verb: "zsince",
+        summary: "what happened across the tree since a time",
+        synopsis: "git zsince <duration|snapshot> [--kind K] [--repo R]",
+        desc: &[
+            "Prints every feed event \\(em commits, stages, status changes, reconciles \\(em recorded across the whole indexed tree since a point in time. A duration (90s, 45m, 2d, 1h30m, or a bare number of seconds) counts back from now; any other token is treated as a snapshot name and its creation time is the baseline.",
+            "This is the scoped \"what did the fleet do since X\" delta that `git zlog`'s full timeline does not give. --kind and --repo narrow the result to one event kind or to repos matching a substring.",
+        ],
+    },
+    Doc {
+        verb: "zcontend",
+        summary: "live agent-vs-agent contention across the tree",
+        synopsis: "git zcontend",
+        desc: &[
+            "Shows who is stepping on whom: the session-attributed claims (advisory leases), the per-repo job backlog (how many jobs are queued or running behind each repository in the daemon's fair queue), and the intersection \\(em repositories that are both claimed and have jobs stacked up, i.e. actively contested.",
+            "All three are read from the shared index; nothing is mutated. It is the multi-agent observability view git has no notion of, because git only ever sees one repository and one process.",
+        ],
+    },
+    Doc {
+        verb: "zwaitfor",
+        summary: "block until a tree-wide state holds",
+        synopsis: "git zwaitfor <clean|idle|synced|<repo> <sha>> [--timeout <secs>]",
+        desc: &[
+            "Blocks until a condition over the whole tree becomes true, then exits 0 (or 1 on timeout) \\(em a cross-repo barrier on state, where `git zbarrier` and `git zwait` are job-scoped. clean waits until every indexed repo is clean; idle until no daemon jobs are queued or running; synced until every repo is up-to-date with its upstream; `<substr> <sha>` until the repo whose path contains the substring is at the given commit (prefix).",
+            "Conditions are read from the daemon's cached status, so the daemon must be maintaining status for the wait to observe changes. --timeout bounds the wait (default 60 seconds).",
+        ],
+    },
+    Doc {
+        verb: "zgraph",
+        summary: "fleet topology of duplicate checkouts",
+        synopsis: "git zgraph",
+        desc: &[
+            "Maps the cross-repository relationship git has no notion of: which local checkouts are the same upstream repository \\(em a dup group, the same origin URL with more than one working tree on the machine. git can never show this, because git only ever sees one repository.",
+            "Reads every indexed repository's origin (on demand, so the per-repo config read is acceptable) and lists each dup group with its checkouts, then a summary of repos, distinct origins, dup groups, and repos with no origin.",
+        ],
+    },
+    Doc {
+        verb: "zrewind",
+        summary: "restore the whole tree to a wall-clock time",
+        synopsis: "git zrewind <duration> [--dry-run]",
+        desc: &[
+            "Rewinds the tree \\(em the repository at the current directory and every nested submodule \\(em to the state it was in a given duration ago (2h, 30m, 1d). For each repository it finds the HEAD the reflog shows it had at that time and resets hard to it, reusing the faithful porcelain reset (itself reflogged, so the rewind is undoable). Where `git zsnapshot` is a manual named restore point, this is any timestamp with no prior setup.",
+            "A dirty repository is refused so uncommitted work is never clobbered, and a repository whose reflog does not reach that far back is reported and skipped (the reflog's default 90-day expiry bounds how far back it can go). --dry-run shows exactly what would move without changing anything.",
+        ],
+    },
 ];
 
 /// The manual for `verb`, or `None` if it is not a superset verb.

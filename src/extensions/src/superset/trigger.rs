@@ -28,7 +28,9 @@ pub fn ztrigger(args: &[String]) -> Result<ExitCode> {
     }
 }
 
-/// `git ztrigger DIR CMD...` — arm DIR so `CMD` runs on every ref-change there.
+/// `git ztrigger DIR CMD...` — arm DIR so `CMD` runs on **any** file change in
+/// the directory (worktree *and* `.git`), not just ref moves: an armed repo is
+/// watched over its whole directory.
 fn set(args: &[String]) -> Result<ExitCode> {
     if args.len() < 2 {
         bail!("usage: git ztrigger <DIR> <command>...");

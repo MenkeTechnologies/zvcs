@@ -109,10 +109,12 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Worktrees | `zworktree add/list/remove` | per-agent isolated, object-sharing worktree of the whole tree |
 | Fan-out | `zforeach [selectors] -- <cmd>` | run a command across all/subset of indexed repos, in parallel (selectors: `--repo`/`--dirty`/`--ahead`/`--behind`/`--claimed`/`--session`) |
 | Hooks | `zhook set/unset/show/list/test` | manage & test the current repo's ref-change hook (`zvcs.hook`); `zvcs.autohook` fires each repo's own local hook |
-| Triggers | `ztrigger DIR <cmd>` `ztrigger list/rm/test` | arm any repo BY PATH to run a command on every ref-change — writes DIR's local hook, indexes it, auto-flips `zvcs.autohook`, reloads the daemon (no `git config` needed) |
+| Triggers | `ztrigger DIR <cmd>` `ztrigger list/rm/test` | arm any repo BY PATH to run a command on **any file change** in the directory (worktree + `.git`) — writes DIR's local hook, indexes it, watches the whole dir, auto-flips `zvcs.autohook`, reloads the daemon (no `git config` needed) |
 | Watch | `zwatch DIR` `zwatch list/rm` | watch a repo by path (index + cached status via `zvcs.autostatus`) without attaching a command |
-| Console | `zrepl` | interactive line console over the verbs |
+| Console | `zrepl` | interactive line console over **every** command — each line runs as `git <line>`, so the `z*` verbs and all git porcelain work alike (startup stats banner + Tab completion of every verb) |
+| Shell | `zcd` `zpwd` `zls` `zenv` `zunset` `zecho` | shell builtins so `zrepl` drives like a shell — `zcd`/`zenv`/`zunset` mutate the console's cwd/environment and persist across lines (later `git` lines see them) |
 | Discovery | `zverbs` | list every extension verb and its one-line usage (sourced from each verb's own `-h`) |
+| Health | `zdoctor` | environment health check — git shadow on PATH, daemon, ledger, man pages, MANPATH, dashed forms (OK/WARN/FAIL, exits non-zero on FAIL) |
 | git-compat | every stock subcommand | dispatched natively; depth varies — see the parity report |
 
 Every subcommand stock git ships has a dispatch arm, so nothing reaches the
@@ -199,7 +201,23 @@ isolated worktree of the repo + all nested submodules (each on a `zwt/<name>`
 branch) at `~/.zvcs/worktrees/<name>/`, so each agent gets a private tree that
 can't collide with any other — no re-clone. `list` / `remove <name>` manage them.
 
-**Console.** `git zrepl` opens an interactive line console over all the verbs.
+**Console.** `git zrepl` opens an interactive line console. Each line is run
+exactly as `git <line>` would be, so it drives **every** dispatchable command —
+the `z*` superset verbs and every git-compat porcelain command alike (the latter
+operating on the current repo) — doubling as a live daemon/ledger console. On a
+tty it opens with a stats banner and edits with Tab-completion of every verb plus
+persistent history; piped stdin falls back to a raw reader so scripts stay
+usable.
+
+**Shell builtins.** Because the console is one long-lived process, a handful of
+shell verbs make it navigable like a shell: `git zcd [<dir>|-]` changes the
+working directory (persisting across lines, `~`/`-` supported), `git zpwd` prints
+it, and `git zls [<ls-args>...]` lists it (delegating to the system `ls`).
+`git zenv [<NAME=VALUE>...]` prints, sets, or queries environment variables —
+anything set persists so every later `git` line sees it — `git zunset <NAME>...`
+clears them, and `git zecho [-n] <arg>...` prints its arguments. The mutating
+verbs (`zcd`/`zenv`/`zunset`) only affect this process, so they are aimed at the
+console.
 
 **Discovery & help.** `git zverbs` lists every extension verb with its one-line
 usage (each verb also answers `-h` with the same line). `git help <zverb>` opens
@@ -270,11 +288,13 @@ reset), `ZVCS_REPO`, `ZVCS_GIT_DIR`, `ZVCS_OLD_SHA`, `ZVCS_NEW_SHA`, `ZVCS_REF` 
 enough for "on commit in X, do Y in repo Z" cross-repo rules.
 
 You never have to touch `[zvcs]` config by hand to wire a trigger — `ztrigger`
-does it all. Arm any repo by path and the command runs on every ref-change there:
+does it all. Arm any repo by path and the command runs on **any file change** in
+that directory (worktree *and* `.git`) — creating a file, editing, committing:
 
 ```console
 $ git ztrigger ~/src/api 'make test'   # writes ~/src/api local hook, indexes it,
-                                        # flips zvcs.autohook on, reloads the daemon
+                                        # watches the WHOLE dir, flips autohook,
+                                        # reloads the daemon
 $ git ztrigger .        'echo "$ZVCS_EVENT" | notify'   # arm the current repo
 $ git ztrigger list                    # every armed repo (path <tab> command)
 $ git ztrigger test ~/src/api          # fire it once now, without waiting
@@ -283,6 +303,12 @@ $ git ztrigger rm   ~/src/api          # disarm
 $ git zwatch ~/src/api                 # watch (index + cached status), no command
 $ git zwatch list                      # indexed repos, flagged watch|trigger
 ```
+
+An armed repo watches its entire directory, so file changes fire — not only ref
+moves. Fires are coalesced over `zvcs.interval` (default 30s); lower it for a
+snappier trigger (`git config --global zvcs.interval 2`). A hook that writes back
+into the watched directory will re-fire on its own writes — keep trigger commands
+side-effect-free or point them at another repo.
 
 Only repos you `ztrigger` carry a hook, and the daemon is a no-op for the rest —
 so the set of firing repos is exactly the ones you armed, with no extra list to

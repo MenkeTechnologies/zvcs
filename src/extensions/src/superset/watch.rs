@@ -1,16 +1,19 @@
-//! Reactive, file-watcher-driven autonomy **and** hooks — triggered by local ref
-//! changes, never by a timer or a remote poll.
+//! Reactive, file-watcher-driven autonomy **and** hooks — triggered by local
+//! filesystem changes, never by a timer or a remote poll.
 //!
-//! A `git commit`/`git pull` rewrites a repo's `logs/HEAD` and `refs/*`;
-//! `notify` fires; the daemon reacts. Two kinds of reaction, both coalesced over
-//! a debounce window:
+//! `notify` fires on changes under each watched path; the daemon reacts. Two
+//! kinds of reaction, both coalesced over a debounce window:
 //!
 //!   * **autonomy** (working tree) — attach detached submodules, fetch-free
-//!     reconcile, and forward-only autobump, when `[zvcs]` autonomy is enabled;
-//!   * **hooks** (any indexed repo) — when `[zvcs] hook` is set, every repo in
-//!     the ledger is watched and its per-repo hook runs on ref-change. Because
-//!     all repos are indexed in the db, this is a filesystem-driven hook system
-//!     with nothing installed in any `.git/hooks`.
+//!     reconcile, and forward-only autobump, when `[zvcs]` autonomy is enabled.
+//!     Keyed off ref moves (`logs/HEAD`, `refs/*`), so these repos watch only the
+//!     `refs/`+`logs/` trees.
+//!   * **hooks** — a repo with a local `zvcs.hook` (armed by `git ztrigger`) is
+//!     **watched over its ENTIRE directory** (worktree *and* `.git`), so creating
+//!     or editing any file fires its hook — not only ref moves. A repo reached
+//!     only through a *global* `zvcs.hook` keeps the lighter ref-change model.
+//!     Because all repos are indexed in the db, this is a filesystem-driven hook
+//!     system with nothing installed in any `.git/hooks`.
 //!
 //! Reconcile here is the fetch-free [`reconcile_repo_local`] fast-forward to
 //! whatever `origin/main` a prior local pull already fetched; the daemon never
@@ -25,15 +28,40 @@ use std::thread;
 
 use crate::config::ZvcsConfig;
 
-/// A watched repository: its git directory (watched) and working directory
-/// (passed to hooks).
+/// A watched repository: its git directory and working directory (passed to
+/// hooks).
 struct Target {
     git_dir: PathBuf,
     workdir: PathBuf,
+    /// The repo carries a local `zvcs.hook` (armed by `git ztrigger`). Armed
+    /// repos are watched over their ENTIRE directory — worktree *and* `.git` —
+    /// so any file create/modify/delete fires the trigger, not just ref moves.
+    /// Unarmed repos are watched only over `refs/`+`logs/` (autonomy/status).
+    armed: bool,
 }
 
-/// Cap on watched repos, so a whole-device index can't exhaust inotify watches.
-const MAX_WATCHED: usize = 1024;
+impl Target {
+    /// The path registered with the OS watcher. Armed repos watch the whole
+    /// working directory (recursively covering `.git`); unarmed repos watch the
+    /// git dir, under which only the `refs`/`logs` subtrees are registered.
+    fn watch_root(&self) -> &PathBuf {
+        if self.armed {
+            &self.workdir
+        } else {
+            &self.git_dir
+        }
+    }
+}
+
+/// Cap on watched repos, so a whole-device index can't exhaust the kernel's
+/// watch budget. macOS FSEvents is effectively unbounded here; the real ceiling
+/// is Linux inotify, where each repo costs ~10 watch descriptors (the subdirs
+/// under `refs/`+`logs/`) against the per-UID `fs.inotify.max_user_watches`.
+/// At 5120 repos that is ~50k descriptors, so a Linux host must have
+/// `max_user_watches` tuned above the old 8192 default (modern systemd distros
+/// already default well above it). Over the cap, later repos are simply not
+/// watched — no crash, `build_targets` logs the cap and stops.
+const MAX_WATCHED: usize = 5120;
 
 /// Spawn the watch loop iff `[zvcs]` autonomy or a hook is configured.
 pub fn spawn_if_configured() {
@@ -76,18 +104,29 @@ fn run(cfg: ZvcsConfig) {
     };
 
     let mut watched = 0usize;
+    let mut armed_n = 0usize;
     for t in &targets {
-        for sub in ["refs", "logs"] {
-            let p = t.git_dir.join(sub);
-            if p.exists() && watcher.watch(&p, RecursiveMode::Recursive).is_ok() {
+        if t.armed {
+            // Whole-directory recursive watch: worktree AND `.git`, so creating
+            // or editing ANY file in the repo fires the trigger — not only ref
+            // moves. This is the directory a `git ztrigger` armed.
+            if watcher.watch(&t.workdir, RecursiveMode::Recursive).is_ok() {
                 watched += 1;
+                armed_n += 1;
+            }
+        } else {
+            for sub in ["refs", "logs"] {
+                let p = t.git_dir.join(sub);
+                if p.exists() && watcher.watch(&p, RecursiveMode::Recursive).is_ok() {
+                    watched += 1;
+                }
             }
         }
     }
     println!(
-        "[zvcs watch] watching {} repo(s) ({watched} ref tree(s)), hooks={}, debounce={:?}",
+        "[zvcs watch] watching {} repo(s) ({watched} tree(s), {armed_n} whole-dir), hooks={}, debounce={:?}",
         targets.len(),
-        cfg.hook.is_some(),
+        cfg.hooks_enabled(),
         cfg.interval
     );
 
@@ -122,12 +161,22 @@ fn run(cfg: ZvcsConfig) {
         }
         if cfg.hooks_enabled() {
             for t in &targets {
-                // Skip the daemon's own bookkeeping (autobump/attach/reconcile) —
-                // fire only on user/agent ref changes. (`zhook test` still fires
-                // manually.) hooks::run reads each repo's own hook (no-op if none).
-                if affected.contains(&t.git_dir)
-                    && !crate::superset::oplog::head_authored_by_zvcs(&t.git_dir)
-                {
+                if !affected.contains(&t.git_dir) {
+                    continue;
+                }
+                if t.armed {
+                    // Whole-dir trigger: fire on ANY change in the directory. No
+                    // reflog-author gate here — that gate distinguishes user vs
+                    // daemon *ref moves*, but a plain file event leaves the reflog
+                    // untouched, so gating on it would wrongly suppress real
+                    // file-change fires whenever the reflog top happens to be a
+                    // prior zvcs commit.
+                    crate::superset::hooks::run(&t.git_dir, &t.workdir);
+                } else if !crate::superset::oplog::head_authored_by_zvcs(&t.git_dir) {
+                    // Unarmed repo reached only via a global `zvcs.hook`: keep the
+                    // ref-change model (refs/logs watch), skipping the daemon's own
+                    // autobump/attach/reconcile bookkeeping. (`zhook test` still
+                    // fires manually.) hooks::run is a no-op if the repo has none.
                     crate::superset::hooks::run(&t.git_dir, &t.workdir);
                 }
             }
@@ -140,15 +189,15 @@ fn run(cfg: ZvcsConfig) {
 fn collect(ev: &notify::Result<Event>, targets: &[Target], affected: &mut HashSet<PathBuf>) {
     let Ok(ev) = ev else { return };
     for path in &ev.paths {
-        // Attribute each event to the SINGLE deepest matching repo. A submodule's
-        // git dir lives under its parent's (`<parent>/.git/modules/<name>`), so a
-        // plain prefix match would also mark the parent — firing the parent's hook
-        // and recomputing its status on a submodule-only ref change. Longest
-        // matching git_dir wins.
+        // Attribute each event to the SINGLE deepest matching repo, keyed on each
+        // target's watch root (whole workdir for armed repos, git dir otherwise).
+        // A submodule's tree lives under its parent's, so a plain prefix match
+        // would also mark the parent — firing the parent's hook on a child-only
+        // change. Longest matching watch root wins.
         if let Some(t) = targets
             .iter()
-            .filter(|t| path.starts_with(&t.git_dir))
-            .max_by_key(|t| t.git_dir.as_os_str().len())
+            .filter(|t| path.starts_with(t.watch_root()))
+            .max_by_key(|t| t.watch_root().as_os_str().len())
         {
             affected.insert(t.git_dir.clone());
         }
@@ -161,6 +210,10 @@ fn collect(ev: &notify::Result<Event>, targets: &[Target], affected: &mut HashSe
 fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut targets: Vec<Target> = Vec::new();
+    // Only probe each repo for a local hook when hooks can actually fire —
+    // otherwise skip the per-repo config read (a whole-device index is thousands
+    // of repos) and treat every target as unarmed (autonomy/status only).
+    let hooks_on = cfg.hooks_enabled();
 
     // Working repo submodules (autonomy is keyed off their HEAD moves).
     if let Ok(repo) = gix::discover(".") {
@@ -168,7 +221,7 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
             for sm in subs {
                 if let Ok(Some(sub)) = sm.open() {
                     if let Some(wd) = sub.workdir() {
-                        add_target(&mut seen, &mut targets, sub.git_dir().to_path_buf(), wd.to_path_buf());
+                        add_target(&mut seen, &mut targets, sub.git_dir().to_path_buf(), wd.to_path_buf(), hooks_on);
                     }
                 }
             }
@@ -184,7 +237,7 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
                         .workdir
                         .map(PathBuf::from)
                         .unwrap_or_else(|| PathBuf::from(&r.git_dir));
-                    add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd);
+                    add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd, hooks_on);
                     if targets.len() >= MAX_WATCHED {
                         println!(
                             "[zvcs watch] capped at {MAX_WATCHED} watched repos; \
@@ -203,11 +256,20 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
 /// Add a repo to the watch set, canonicalizing and deduping by git dir.
 /// Both paths are canonicalized so the daemon's `status::record`/`upsert_repo`
 /// stores the same canonical `workdir` other verbs (claims, selector) key on.
-fn add_target(seen: &mut HashSet<PathBuf>, targets: &mut Vec<Target>, git_dir: PathBuf, workdir: PathBuf) {
+fn add_target(
+    seen: &mut HashSet<PathBuf>,
+    targets: &mut Vec<Target>,
+    git_dir: PathBuf,
+    workdir: PathBuf,
+    hooks_on: bool,
+) {
     let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
     let workdir = workdir.canonicalize().unwrap_or(workdir);
     if seen.insert(git_dir.clone()) {
-        targets.push(Target { git_dir, workdir });
+        // Armed = carries a local `zvcs.hook` (set by `git ztrigger`). Only probed
+        // when hooks can fire, so an autonomy/status-only daemon skips the read.
+        let armed = hooks_on && crate::superset::hooks::hook_for(&workdir).is_some();
+        targets.push(Target { git_dir, workdir, armed });
     }
 }
 
@@ -289,8 +351,8 @@ mod tests {
         let parent = PathBuf::from("/x/.git");
         let sub = PathBuf::from("/x/.git/modules/foo");
         let targets = vec![
-            Target { git_dir: parent.clone(), workdir: PathBuf::from("/x") },
-            Target { git_dir: sub.clone(), workdir: PathBuf::from("/x/foo") },
+            Target { git_dir: parent.clone(), workdir: PathBuf::from("/x"), armed: false },
+            Target { git_dir: sub.clone(), workdir: PathBuf::from("/x/foo"), armed: false },
         ];
 
         // Event under the submodule → only the submodule is marked.
@@ -306,5 +368,23 @@ mod tests {
         collect(&Ok(ev2), &targets, &mut a2);
         assert!(a2.contains(&parent), "parent must be marked for a parent event");
         assert!(!a2.contains(&sub), "submodule must NOT be marked for a parent event");
+    }
+
+    #[test]
+    fn armed_repo_matches_plain_worktree_file_events() {
+        // An armed repo watches its whole workdir, so a plain worktree file event
+        // (NOT under refs/logs, and not even under .git) must be attributed to it —
+        // this is the "fire on any file change" behavior an unarmed (git-dir-only)
+        // target would miss entirely.
+        let git_dir = PathBuf::from("/repo/.git");
+        let workdir = PathBuf::from("/repo");
+        let targets = vec![Target { git_dir: git_dir.clone(), workdir, armed: true }];
+
+        for rel in ["newfile.txt", ".git/index", "src/main.rs"] {
+            let ev = notify::Event::new(notify::EventKind::Any).add_path(PathBuf::from("/repo").join(rel));
+            let mut affected = HashSet::new();
+            collect(&Ok(ev), &targets, &mut affected);
+            assert!(affected.contains(&git_dir), "armed repo must be marked for worktree event {rel}");
+        }
     }
 }

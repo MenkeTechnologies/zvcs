@@ -493,6 +493,15 @@ and session attribution. All tested.
   watchlist). `zwatch` is the command-less form (index + `zvcs.autostatus`);
   `zwatch rm`/`ztrigger rm` unwind. `ZVCS_NO_DAEMON` suppresses the reload for
   scripted bulk runs. Tests: `trigger.rs`.
+  - **Whole-directory watch for armed repos** (`watch.rs`). An armed repo (one
+    with a local `zvcs.hook`) is watched recursively over its *entire* working
+    directory — worktree **and** `.git` — so creating or editing any file fires
+    the hook, not only ref moves; unarmed repos keep the lighter `refs/`+`logs/`
+    watch for autonomy/status. `Target::armed`/`watch_root()` drive registration,
+    event attribution (`collect`), and the fire loop (no reflog-author gate for
+    armed repos — a file event leaves the reflog untouched). Fires coalesce over
+    `zvcs.interval`; a hook that writes into the watched dir self-retriggers.
+    Test: `watch.rs::armed_repo_matches_plain_worktree_file_events`.
 
 **New `[zvcs]` config keys:** `autostatus` (maintain `zstatus --all`) and
 `autohook` (fire per-repo local hooks), plus the existing

@@ -77,11 +77,21 @@ pub fn zls(args: &[String]) -> Result<ExitCode> {
     }
 
     let has_git = !prefix_is_none(&prefix);
+    // Size the size/date columns to their widest value so nothing runs ragged —
+    // relative dates ("5 hours ago" vs "3 years, 2 months ago") vary in width.
+    let (size_w, date_w) = if opts.long {
+        (
+            rows.iter().map(|r| r.size_str.len()).max().unwrap_or(0),
+            rows.iter().map(|r| r.date_str.len()).max().unwrap_or(0),
+        )
+    } else {
+        (0, 0)
+    };
     let out = std::io::stdout();
     let mut w = std::io::BufWriter::new(out.lock());
     use std::io::Write;
     for row in &rows {
-        row.render(&mut w, opts.long, has_git, colored)?;
+        row.render(&mut w, opts.long, has_git, colored, size_w, date_w)?;
     }
     w.flush().ok();
     Ok(ExitCode::SUCCESS)
@@ -227,14 +237,16 @@ fn type_class(mode: gix::index::entry::Mode) -> u8 {
     }
 }
 
-/// A listing entry ready to render.
+/// A listing entry ready to render. The size and date are pre-rendered so the
+/// caller can size their columns to the widest value (no ragged alignment).
 struct Row {
     name: String,
     sort_key: String,
     kind: Kind,
     git: (u8, u8),
     perms: u32,
-    size: u64,
+    size_str: String,
+    date_str: String,
     mtime: i64,
 }
 
@@ -278,14 +290,39 @@ impl Row {
 
         let name = name.to_string_lossy().into_owned();
         let sort_key = name.to_lowercase();
-        Row { name, sort_key, kind, git, perms, size, mtime }
+        Row {
+            name,
+            sort_key,
+            kind,
+            git,
+            perms,
+            size_str: human_size(size),
+            date_str: rel_mtime(mtime),
+            mtime,
+        }
     }
 
     /// eza column order: metadata, then the git field, then the name — the git
-    /// status sits immediately before the name it describes.
-    fn render<W: std::io::Write>(&self, w: &mut W, long: bool, has_git: bool, colored: bool) -> std::io::Result<()> {
+    /// status sits immediately before the name it describes. `size_w`/`date_w`
+    /// are the column widths the caller computed across all rows, so the size and
+    /// (variable-length) relative date align instead of running ragged.
+    fn render<W: std::io::Write>(
+        &self,
+        w: &mut W,
+        long: bool,
+        has_git: bool,
+        colored: bool,
+        size_w: usize,
+        date_w: usize,
+    ) -> std::io::Result<()> {
         if long {
-            write!(w, "{} {:>6} {:>12}  ", perm_string(self.perms), human_size(self.size), rel_mtime(self.mtime))?;
+            write!(
+                w,
+                "{} {:>size_w$} {:>date_w$}  ",
+                perm_string(self.perms),
+                self.size_str,
+                self.date_str
+            )?;
         }
         if has_git {
             write!(w, "{} ", git_field(self.git, colored))?;

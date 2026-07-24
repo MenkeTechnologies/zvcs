@@ -42,14 +42,15 @@ fn runq() -> &'static Mutex<HashMap<PathBuf, RepoLane>> {
     RUNQ.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The repo a job belongs to (canonical `git_dir`), or `None` for a repo-less job.
-/// Canonicalized so it matches the daemon lane key regardless of how the path was
-/// spelled at submit time.
+/// The repo a job belongs to (its `git_dir` string), or `None` for a repo-less
+/// job. The spec's `git_dir` is already canonical (`queue::exec_spec` canonicalizes
+/// it at submit), so we key on the raw string rather than re-`canonicalize()`ing:
+/// canonicalize is existence-dependent, and if the repo were deleted mid-job the
+/// advance step would derive a different key, stranding the lane `running` forever
+/// with queued jobs never popped. A pure-string key is stable regardless.
 fn spec_repo(spec_json: &str) -> Option<PathBuf> {
     let v: Value = serde_json::from_str(spec_json).ok()?;
-    let gd = v.get("git_dir")?.as_str()?;
-    let p = PathBuf::from(gd);
-    Some(p.canonicalize().unwrap_or(p))
+    Some(PathBuf::from(v.get("git_dir")?.as_str()?))
 }
 
 /// True if `repo` has any job still running or queued in its serial lane. The

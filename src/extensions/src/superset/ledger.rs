@@ -105,6 +105,7 @@ pub fn zreindex(args: &[String]) -> Result<ExitCode> {
 
 /// `git zjobs [-n <count>]` — list recent ledger jobs (newest first).
 pub fn zjobs(args: &[String]) -> Result<ExitCode> {
+    let json = args.iter().any(|a| a == "--json");
     let mut limit: i64 = 20;
     let mut i = 0;
     while i < args.len() {
@@ -124,12 +125,14 @@ pub fn zjobs(args: &[String]) -> Result<ExitCode> {
     let conn = match crate::db::open_ro() {
         Ok(c) => c,
         Err(_) => {
-            println!("no jobs yet");
+            if !json {
+                println!("no jobs yet");
+            }
             return Ok(ExitCode::SUCCESS);
         }
     };
     let jobs = crate::db::list_jobs(&conn, limit)?;
-    if args.iter().any(|a| a == "--json") {
+    if json {
         for j in &jobs {
             println!("{}", serde_json::json!({"id": j.id, "state": j.state, "kind": j.kind}));
         }

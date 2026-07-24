@@ -177,16 +177,34 @@ fn message_for(g: &Guard, full: &str) -> String {
     format!("zvcs: {label}: `git {full}`{cond} matches policy `{}` (#{})", g.pattern, g.id)
 }
 
+/// Whether a commit's args alone settle its signing: `Some(true)` = signed
+/// (`-S`, `-S<keyid>` attached, `--gpg-sign`, `--gpg-sign=<keyid>`), `Some(false)`
+/// = explicitly `--no-gpg-sign`, `None` = not on the command line (config decides).
+fn signed_from_args(args: &[String]) -> Option<bool> {
+    if args.iter().any(|a| a == "--no-gpg-sign") {
+        return Some(false);
+    }
+    if args
+        .iter()
+        .any(|a| a.starts_with("-S") || a == "--gpg-sign" || a.starts_with("--gpg-sign="))
+    {
+        return Some(true);
+    }
+    None
+}
+
 /// Evaluate a predicate against the repo at the cwd. Missing repo → false (can't
 /// prove the condition, so never block on it).
 fn predicate_holds(pred: Pred, args: &[String]) -> bool {
     if pred == Pred::Unsigned {
-        // A commit is "signed" if -S/--gpg-sign is passed or commit.gpgsign=true.
-        if args.iter().any(|a| a == "-S" || a.starts_with("--gpg-sign")) {
-            return false;
-        }
-        let Ok(repo) = gix::discover(".") else { return false };
-        return !repo.config_snapshot().boolean("commit.gpgsign").unwrap_or(false);
+        return match signed_from_args(args) {
+            Some(signed) => !signed,
+            // No sign flag on the command line → the config decides.
+            None => {
+                let Ok(repo) = gix::discover(".") else { return false };
+                !repo.config_snapshot().boolean("commit.gpgsign").unwrap_or(false)
+            }
+        };
     }
     let Ok(repo) = gix::discover(".") else { return false };
     match pred {
@@ -343,6 +361,17 @@ mod tests {
         guards.iter().any(|g| {
             g.pred.is_none() && crate::superset::intercepts::intercept_matches(&g.pattern, sub, &full)
         })
+    }
+
+    #[test]
+    fn signed_detection_handles_attached_and_negation() {
+        let a = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(signed_from_args(&a(&["-S"])), Some(true));
+        assert_eq!(signed_from_args(&a(&["-Skeyid"])), Some(true)); // attached form (was a false-positive)
+        assert_eq!(signed_from_args(&a(&["--gpg-sign"])), Some(true));
+        assert_eq!(signed_from_args(&a(&["--gpg-sign=ABC"])), Some(true));
+        assert_eq!(signed_from_args(&a(&["--no-gpg-sign"])), Some(false)); // explicit unsigned
+        assert_eq!(signed_from_args(&a(&["-m", "msg"])), None); // config decides
     }
 
     #[test]

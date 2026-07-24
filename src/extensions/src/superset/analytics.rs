@@ -421,7 +421,9 @@ pub fn zdashboard(args: &[String]) -> Result<ExitCode> {
     let conn = match crate::db::open_ro() {
         Ok(c) => c,
         Err(_) => {
-            println!("zvcs dashboard — no index yet (run `git zreindex`)");
+            if !args.iter().any(|a| a == "--json") {
+                println!("zvcs dashboard — no index yet (run `git zreindex`)");
+            }
             return Ok(ExitCode::SUCCESS);
         }
     };

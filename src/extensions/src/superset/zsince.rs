@@ -33,7 +33,7 @@ pub fn zsince(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let conn = crate::db::open_rw()?;
+    let conn = crate::db::open_ro()?;
     let cutoff = match parse_duration(spec) {
         Some(secs) => now_secs() - secs,
         None => crate::db::snapshot_created_at(&conn, spec)?
@@ -123,7 +123,7 @@ pub(crate) fn parse_duration(s: &str) -> Option<i64> {
                 'd' => 86400,
                 _ => return None,
             };
-            total += num * mult;
+            total = total.checked_add(num.checked_mul(mult)?)?;
             num = 0;
             saw_digit = false;
             saw_unit = true;
@@ -131,11 +131,36 @@ pub(crate) fn parse_duration(s: &str) -> Option<i64> {
     }
     // A trailing bare number (no unit) is seconds; a pure number is seconds too.
     if saw_digit {
-        total += num;
+        total = total.checked_add(num)?;
     } else if !saw_unit {
         return None;
     }
     Some(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_duration;
+
+    #[test]
+    fn parse_duration_units_and_combos() {
+        assert_eq!(parse_duration("90s"), Some(90));
+        assert_eq!(parse_duration("45m"), Some(45 * 60));
+        assert_eq!(parse_duration("2h"), Some(2 * 3600));
+        assert_eq!(parse_duration("1d"), Some(86_400));
+        assert_eq!(parse_duration("1h30m"), Some(3600 + 30 * 60));
+        assert_eq!(parse_duration("120"), Some(120)); // bare number = seconds
+    }
+
+    #[test]
+    fn parse_duration_rejects_non_durations_and_overflow() {
+        assert_eq!(parse_duration("main"), None); // snapshot name, not a duration
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("5x"), None); // unknown unit
+        // A huge magnitude must return None, not panic (debug) or wrap (release).
+        assert_eq!(parse_duration("100000000000000000d"), None);
+        assert_eq!(parse_duration("99999999999999999999"), None); // overflows the digit accumulate
+    }
 }
 
 /// Local-time `HH:MM:SS` for an epoch-seconds timestamp.

@@ -11,7 +11,7 @@ use std::process::ExitCode;
 
 pub fn zgraph(args: &[String]) -> Result<ExitCode> {
     let json = args.iter().any(|a| a == "--json");
-    let conn = crate::db::open_rw()?;
+    let conn = crate::db::open_ro()?;
     let repos = crate::db::all_repos(&conn)?;
 
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();

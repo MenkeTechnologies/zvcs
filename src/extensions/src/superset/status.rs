@@ -11,7 +11,8 @@ use anyhow::Result;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
-/// Compute `(dirty, detached, sync, head)` for an open repo.
+/// Compute `(dirty, detached, sync, head, head_sha)` for an open repo — `head` is
+/// the branch name (or detached/unborn marker), `head_sha` the peeled commit id.
 pub fn compute(repo: &gix::Repository) -> (bool, bool, String, String, String) {
     let detached = repo.head_name().ok().flatten().is_none();
     let dirty = repo.is_dirty().unwrap_or(false);

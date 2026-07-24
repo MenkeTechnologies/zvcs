@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 pub fn zcontend(args: &[String]) -> Result<ExitCode> {
     let json = args.iter().any(|a| a == "--json");
-    let conn = crate::db::open_rw()?;
+    let conn = crate::db::open_ro()?;
     let claims = crate::db::list_claims(&conn)?;
     let backlog = crate::db::contention(&conn)?;
 

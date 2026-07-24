@@ -93,18 +93,25 @@ fn list() -> Result<ExitCode> {
 /// just keeps the cursor at the feed tip).
 pub fn spawn_daemon_loop() {
     std::thread::spawn(|| {
-        let mut last = crate::db::open_rw().map(|c| crate::db::max_event_id(&c)).unwrap_or(0);
+        // `None` until the first successful db open baselines the cursor at the
+        // feed tip. Initializing to 0 on a transient open failure at boot would
+        // replay the entire event history the moment a subscription exists.
+        let mut last: Option<i64> = None;
         loop {
             std::thread::sleep(Duration::from_millis(500));
             let Ok(conn) = crate::db::open_rw() else { continue };
+            let Some(cursor) = last else {
+                last = Some(crate::db::max_event_id(&conn)); // baseline: never replay history
+                continue;
+            };
             let subs = crate::db::list_subscriptions(&conn).unwrap_or_default();
             if subs.is_empty() {
-                last = crate::db::max_event_id(&conn); // don't replay history when a sub is added later
+                last = Some(crate::db::max_event_id(&conn)); // don't replay when a sub is added later
                 continue;
             }
-            let events = crate::db::events_since(&conn, last, None, None).unwrap_or_default();
+            let events = crate::db::events_since(&conn, cursor, None, None).unwrap_or_default();
             for e in &events {
-                last = last.max(e.id);
+                last = Some(cursor.max(e.id).max(last.unwrap_or(0)));
                 for (_sid, kind, repo_like, command) in &subs {
                     let kind_ok = kind.as_deref().is_none_or(|k| k == e.kind);
                     let repo_ok = repo_like.as_deref().is_none_or(|p| {
@@ -123,7 +130,7 @@ pub fn spawn_daemon_loop() {
 fn run_command(command: &str, e: &crate::db::EventRow) {
     let cwd = e.workdir.clone().unwrap_or_else(|| ".".into());
     let repo = e.workdir.as_deref().or(e.git_dir.as_deref()).unwrap_or("");
-    let _ = std::process::Command::new("sh")
+    if let Ok(child) = std::process::Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(&cwd)
@@ -131,5 +138,14 @@ fn run_command(command: &str, e: &crate::db::EventRow) {
         .env("ZVCS_REPO", repo)
         .env("ZVCS_DETAIL", e.detail.as_deref().unwrap_or(""))
         .env("ZVCS_SHA", e.sha_after.as_deref().unwrap_or(""))
-        .spawn();
+        .spawn()
+    {
+        // The daemon is long-lived, so a dropped Child would leak a zombie on
+        // Unix. Reap it on a detached waiter thread (fire-and-forget semantics
+        // preserved — we don't gate the loop on the command finishing).
+        std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        });
+    }
 }

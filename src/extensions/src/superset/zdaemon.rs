@@ -351,6 +351,7 @@ fn start() -> Result<ExitCode> {
                 _ => {}
             }
             let _ = crate::db::prune_stale_events(&conn, JOB_RETENTION_SECS);
+            let _ = crate::db::prune_stale_messages(&conn, JOB_RETENTION_SECS);
         }
     });
 

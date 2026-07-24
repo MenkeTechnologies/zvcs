@@ -139,6 +139,20 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     command    TEXT NOT NULL,
     created_at INTEGER
 );
+-- Per-bot productivity ledger (`zbots`, `zdashboard` header). One row per agent
+-- session (`session_key()`: an exported `ZVCS_SESSION` or `pid-<ppid>`), keyed by
+-- that session string. `pid` is the invoking process (the tmux-pane shell / agent
+-- that ran the git command), refreshed on each commit so it tracks the live PID
+-- even when the session key is a stable `ZVCS_SESSION`. `commits` accumulates every
+-- commit-producing verb that advanced HEAD (see superset::bots). This table is a
+-- pure client-side counter — the daemon never touches it.
+CREATE TABLE IF NOT EXISTS bots (
+    session    TEXT PRIMARY KEY,
+    pid        INTEGER,
+    commits    INTEGER NOT NULL DEFAULT 0,
+    first_seen INTEGER,
+    last_seen  INTEGER
+);
 ";
 
 /// The commit-detection trigger, installed via DROP+CREATE in [`open_rw`] so a
@@ -203,8 +217,12 @@ fn migrate(conn: &Connection) {
     // ev_commit was revised to key on the commit sha (see EV_COMMIT_SQL); DROP+CREATE
     // so an existing db running the old head-keyed trigger is upgraded in place.
     let _ = conn.execute("DROP TRIGGER IF EXISTS ev_commit", []);
-    let _ = conn.execute_batch(EV_COMMIT_SQL);
-    let _ = conn.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), []);
+    // Only advance the schema version once the commit trigger is actually
+    // installed. Bumping it after a failed install would gate the migration out of
+    // every future open, silently disabling `commit` feed events for this db.
+    if conn.execute_batch(EV_COMMIT_SQL).is_ok() {
+        let _ = conn.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), []);
+    }
 }
 
 /// Whether the repo at `root` has changed since its last scan — by the root
@@ -479,6 +497,19 @@ pub fn prune_stale_jobs(conn: &Connection, retention_secs: i64) -> Result<usize>
 pub fn prune_stale_events(conn: &Connection, retention_secs: i64) -> Result<usize> {
     let cutoff = now() - retention_secs;
     let n = conn.execute("DELETE FROM events WHERE ts < ?1", rusqlite::params![cutoff])?;
+    Ok(n)
+}
+
+/// Prune inter-agent messages older than the retention window, and any
+/// `message_reads` rows left orphaned by that delete, so the `messages` tables
+/// stay bounded like the job ledger and the event feed. Returns messages deleted.
+pub fn prune_stale_messages(conn: &Connection, retention_secs: i64) -> Result<usize> {
+    let cutoff = now() - retention_secs;
+    let n = conn.execute("DELETE FROM messages WHERE ts < ?1", rusqlite::params![cutoff])?;
+    let _ = conn.execute(
+        "DELETE FROM message_reads WHERE message_id NOT IN (SELECT id FROM messages)",
+        [],
+    );
     Ok(n)
 }
 
@@ -1106,12 +1137,62 @@ pub fn all_status(conn: &Connection) -> Result<Vec<(String, bool, String, String
     Ok(rows)
 }
 
+// ---- zbots: per-bot commit productivity -----------------------------------
+
+/// One bot's row: an agent session, its live invoking PID, and its accumulated
+/// commit tally with first/last activity timestamps.
+pub struct BotRow {
+    pub session: String,
+    pub pid: i64,
+    pub commits: i64,
+    pub first_seen: i64,
+    pub last_seen: i64,
+}
+
+/// Credit one commit to `session`, upserting the bot row. `pid` (the invoking
+/// process) is refreshed on every commit so a stable `ZVCS_SESSION` key still
+/// tracks the currently-live PID. Called only when a commit-producing verb
+/// advanced HEAD, so the count reflects real commits, not attempts.
+pub fn bot_record_commit(conn: &Connection, session: &str, pid: i64) -> Result<()> {
+    let ts = now();
+    conn.execute(
+        "INSERT INTO bots (session, pid, commits, first_seen, last_seen)
+         VALUES (?1, ?2, 1, ?3, ?3)
+         ON CONFLICT(session) DO UPDATE SET
+             commits = commits + 1, pid = ?2, last_seen = ?3",
+        rusqlite::params![session, pid, ts],
+    )?;
+    Ok(())
+}
+
+/// Every bot, most productive first (ties broken by most-recent activity) — the
+/// full table behind `git zbots` and the dashboard's bot summary.
+pub fn list_bots(conn: &Connection) -> Result<Vec<BotRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT session, COALESCE(pid,0), commits, COALESCE(first_seen,0), COALESCE(last_seen,0)
+           FROM bots ORDER BY commits DESC, last_seen DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(BotRow {
+                session: r.get(0)?,
+                pid: r.get(1)?,
+                commits: r.get(2)?,
+                first_seen: r.get(3)?,
+                last_seen: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod snapshot_atomic_tests {
     use super::{
         add_subscription, claim, events_recent, events_since, insert_job, is_pinned, job_finished,
         list_claims, list_pins, list_subscriptions, load_snapshot, mark_read, post_message,
-        prune_stale_jobs, record_event, remove_subscription, root_mtime_advanced, save_snapshot,
+        prune_stale_jobs, prune_stale_messages, record_event, remove_subscription,
+        root_mtime_advanced, save_snapshot,
         set_pin, transfer_claim, unread_messages, upsert_repo, upsert_status, EV_COMMIT_SQL, SCHEMA,
     };
     use rusqlite::Connection;
@@ -1224,6 +1305,30 @@ mod snapshot_atomic_tests {
         assert!(transfer_claim(&conn, id, "bob").unwrap());
         assert_eq!(list_claims(&conn).unwrap()[0].1, "bob", "claim reassigned");
         assert!(!transfer_claim(&conn, 999, "bob").unwrap(), "unknown repo → false");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_stale_messages_drops_aged_rows_and_orphaned_reads() {
+        let dir = std::env::temp_dir().join(format!("zvcs-msgprune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("t.sqlite")).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+
+        post_message(&conn, "a", None, "old").unwrap(); // id 1
+        post_message(&conn, "a", None, "new").unwrap(); // id 2
+        mark_read(&conn, &[1, 2], "b").unwrap(); // b read both
+
+        let week = 7 * 24 * 3600i64;
+        conn.execute("UPDATE messages SET ts = ts - ?1 WHERE id = 1", [week + 60]).unwrap();
+        assert_eq!(prune_stale_messages(&conn, week).unwrap(), 1, "only the aged message is dropped");
+
+        let msgs: i64 = conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0)).unwrap();
+        assert_eq!(msgs, 1, "the fresh message survives");
+        let reads: i64 = conn.query_row("SELECT count(*) FROM message_reads", [], |r| r.get(0)).unwrap();
+        assert_eq!(reads, 1, "the pruned message's read row is cleaned; the survivor's stays");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

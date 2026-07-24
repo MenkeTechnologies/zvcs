@@ -59,6 +59,11 @@ pub struct ZvcsConfig {
     /// **per-repo (local) hooks** work without also setting a hook on the
     /// daemon's repo. Off by default.
     pub autohook: bool,
+    /// On a commit to any indexed checkout, fast-forward every **local dup** of
+    /// that repo (other checkouts with the same `origin` URL) to it, offline and
+    /// in parallel — the automatic form of `git zsync`'s dup fan-out
+    /// (`zvcs.autodups`). Off by default.
+    pub autodups: bool,
 }
 
 impl Default for ZvcsConfig {
@@ -74,6 +79,7 @@ impl Default for ZvcsConfig {
             hook: None,
             autostatus: false,
             autohook: false,
+            autodups: false,
         }
     }
 }
@@ -109,6 +115,7 @@ impl ZvcsConfig {
                 .filter(|s| !s.trim().is_empty()),
             autostatus: snap.boolean("zvcs.autostatus").unwrap_or(false),
             autohook: snap.boolean("zvcs.autohook").unwrap_or(false),
+            autodups: snap.boolean("zvcs.autodups").unwrap_or(false),
         }
     }
 
@@ -117,16 +124,16 @@ impl ZvcsConfig {
         self.autoreconcile || self.autobump
     }
 
-    /// Whether the daemon should run the watch loop at all — autonomy, hooks, or
-    /// status maintenance.
+    /// Whether the daemon should run the watch loop at all — autonomy, hooks,
+    /// status maintenance, or dup fan-out.
     pub fn should_watch(&self) -> bool {
-        self.any_autonomous() || self.hooks_enabled() || self.autostatus
+        self.any_autonomous() || self.hooks_enabled() || self.autostatus || self.autodups
     }
 
     /// Whether the watcher should cover every indexed repo (not just working
-    /// submodules): needed for machine-wide hooks or status.
+    /// submodules): needed for machine-wide hooks, status, or dup fan-out.
     pub fn watch_all_repos(&self) -> bool {
-        self.hooks_enabled() || self.autostatus
+        self.hooks_enabled() || self.autostatus || self.autodups
     }
 
     /// Whether hooks should fire: a hook set here, or the `autohook` master

@@ -203,6 +203,28 @@ fn run(cfg: ZvcsConfig) {
                 }
             }
         }
+
+        // Auto dup fan-out: on a USER commit to any watched checkout, fast-forward
+        // every local dup of that repo to it — offline, ff-only, the automatic form
+        // of `git zsync`'s fan-out. The `head_authored_by_zvcs` gate skips the
+        // daemon's own ff writes (whose reflog says `zsync:`), so a fan-out
+        // converges across the dups instead of cascading.
+        if cfg.autodups {
+            for t in &targets {
+                if !affected.contains(&t.git_dir)
+                    || crate::superset::oplog::head_authored_by_zvcs(&t.git_dir)
+                {
+                    continue;
+                }
+                if let Ok(repo) = gix::open(&t.git_dir) {
+                    for (wd, status) in crate::superset::sync_dups(&repo, false) {
+                        if status.starts_with("synced") || status.starts_with("forced") {
+                            println!("[zvcs autodups] {wd}: {status}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -301,8 +323,9 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
         }
     }
 
-    // 3. Every indexed repo — only when autostatus maintains per-repo status.
-    if cfg.autostatus {
+    // 3. Every indexed repo — when autostatus maintains per-repo status, or
+    //    autodups needs to see a commit in any checkout to fan it out to its dups.
+    if cfg.autostatus || cfg.autodups {
         if let Ok(conn) = crate::db::open_ro() {
             if let Ok(repos) = crate::db::list_repos(&conn) {
                 for r in repos {

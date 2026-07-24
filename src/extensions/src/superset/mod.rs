@@ -76,4 +76,4 @@ pub use repl::zrepl;
 pub use reconcile::reconcile_tree;
 pub use zbump::{zbump, zbump_run, BumpOutcome};
 pub use zdaemon::zdaemon;
-pub use zsync::{reconcile_repo, reconcile_repo_local, zsync};
+pub use zsync::{reconcile_repo, reconcile_repo_local, sync_dups, zsync};

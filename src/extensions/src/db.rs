@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS repos (
     workdir       TEXT,
     discovered_at INTEGER,
     last_seen     INTEGER,
-    hook          TEXT
+    hook          TEXT,
+    mtime         INTEGER
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id            INTEGER PRIMARY KEY,
@@ -110,7 +111,50 @@ pub fn open_rw() -> Result<Connection> {
     // ALTER explicitly and ignore the "duplicate column" error when it's present.
     let _ = conn.execute("ALTER TABLE repos ADD COLUMN hook TEXT", []);
     let _ = conn.execute("ALTER TABLE triggers ADD COLUMN throttle_ms INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE repos ADD COLUMN mtime INTEGER", []);
     Ok(conn)
+}
+
+/// Whether the repo at `root` has changed since its last scan — by the root
+/// directory's mtime — recording the new mtime when it has. Returns `true`
+/// (rescan) if the root's mtime is newer than what was stored (or nothing was),
+/// `false` (skip) otherwise. This is the cheap filter that lets the daemon skip
+/// stat-walking a repo whose working tree hasn't been touched, instead of
+/// re-checking every indexed repo on every pass.
+pub fn root_mtime_advanced(conn: &Connection, git_dir: &Path, root: &Path) -> bool {
+    let Some(cur) = root_mtime(root) else {
+        return true; // can't stat the root → don't skip, scan to be safe
+    };
+    let stored: Option<i64> = conn
+        .query_row("SELECT mtime FROM repos WHERE git_dir = ?1", [git_dir.to_string_lossy()], |r| r.get(0))
+        .optional()
+        .ok()
+        .flatten();
+    if stored.is_some_and(|s| cur <= s) {
+        return false; // not newer → nothing changed here, skip
+    }
+    let _ = conn.execute(
+        "UPDATE repos SET mtime = ?2 WHERE git_dir = ?1",
+        rusqlite::params![git_dir.to_string_lossy(), cur],
+    );
+    true
+}
+
+/// The mtime (epoch seconds) of `root`'s directory inode, if statable — the cheap,
+/// db-free primitive the statusd compute workers use to decide whether a repo's
+/// root changed before doing the expensive `is_dirty` scan.
+pub fn root_mtime(root: &Path) -> Option<i64> {
+    std::fs::metadata(root)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+}
+
+/// Persist a repo's scanned root mtime by ledger id (the statusd writer path, which
+/// keys on id rather than git-dir).
+pub fn set_repo_mtime_by_id(conn: &Connection, id: i64, mtime: i64) {
+    let _ = conn.execute("UPDATE repos SET mtime = ?2 WHERE id = ?1", rusqlite::params![id, mtime]);
 }
 
 /// Open a read-only connection (client side). Errors if the db does not exist
@@ -674,7 +718,7 @@ pub fn mark_notified(conn: &Connection, ids: &[i64]) -> Result<()> {
 
 #[cfg(test)]
 mod snapshot_atomic_tests {
-    use super::{load_snapshot, save_snapshot, SCHEMA};
+    use super::{load_snapshot, root_mtime_advanced, save_snapshot, upsert_repo, SCHEMA};
     use rusqlite::Connection;
 
     #[test]
@@ -714,6 +758,33 @@ mod snapshot_atomic_tests {
         let after = load_snapshot(&conn, "snap").unwrap();
         assert_eq!(after.len(), 3, "failed save must not destroy the prior snapshot (got {})", after.len());
         assert!(after.iter().any(|(g, _, _)| g == "g1"), "original entries must survive");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn root_mtime_advanced_gates_rescans() {
+        let dir = std::env::temp_dir().join(format!("zvcs-mtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("t.sqlite")).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+
+        let root = dir.join("repo");
+        let gd = root.join(".git");
+        std::fs::create_dir_all(&root).unwrap();
+        upsert_repo(&conn, &gd, Some(&root)).unwrap();
+
+        // First look: never scanned → must scan, and it records the mtime.
+        assert!(root_mtime_advanced(&conn, &gd, &root), "first scan must run");
+        // Immediately again, root untouched → skip.
+        assert!(!root_mtime_advanced(&conn, &gd, &root), "unchanged root must be skipped");
+        // Simulate a newer root mtime by rolling the STORED value back (mtime is
+        // second-granular, so we can't reliably touch-and-advance within a test).
+        conn.execute("UPDATE repos SET mtime = mtime - 10 WHERE git_dir = ?1", [gd.to_string_lossy()]).unwrap();
+        assert!(root_mtime_advanced(&conn, &gd, &root), "a newer root mtime must re-scan");
+        // And once recorded again, it skips.
+        assert!(!root_mtime_advanced(&conn, &gd, &root), "must skip after re-recording");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

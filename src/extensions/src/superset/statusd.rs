@@ -26,10 +26,13 @@ use std::time::{Duration, Instant};
 /// between repos so the pool stops pegging the CPU. Hungry first, gentle after.
 const WARM_THROTTLE: Duration = Duration::from_millis(400);
 
-/// One repo to keep fresh: its ledger id and git dir.
+/// One repo to keep fresh: its ledger id, git dir, working-tree root, and the
+/// root mtime recorded at its last scan (`None` = never scanned).
 struct Target {
     id: i64,
     git_dir: PathBuf,
+    workdir: PathBuf,
+    mtime: Option<i64>,
 }
 
 /// A computed status result headed for the writer.
@@ -39,6 +42,9 @@ struct Update {
     detached: bool,
     sync: String,
     head: String,
+    /// The root mtime observed for this scan, persisted so the next sweep can skip
+    /// this repo while its working tree is untouched.
+    mtime: Option<i64>,
 }
 
 /// Spawn the maintainer pool on the daemon, unless disabled.
@@ -71,10 +77,23 @@ pub fn spawn_if_enabled() {
                 continue;
             }
             let target = &repos[cursor.fetch_add(1, Ordering::Relaxed) % repos.len()];
+            // Cheap mtime gate: if the working-tree root hasn't been touched since
+            // the last scan, skip the expensive `is_dirty` compute entirely — the
+            // cached status is still valid. This is what keeps the pool from
+            // pegging cores re-scanning thousands of untouched repos.
+            let cur = crate::db::root_mtime(&target.workdir);
+            if let (Some(c), Some(m)) = (cur, target.mtime) {
+                if c <= m {
+                    if warm.load(Ordering::Relaxed) {
+                        thread::sleep(WARM_THROTTLE);
+                    }
+                    continue;
+                }
+            }
             if let Ok(repo) = gix::open(&target.git_dir) {
                 let (dirty, detached, sync, head) = crate::superset::status::compute(&repo);
                 // A closed channel means the writer is gone → this pool is done.
-                if tx.send(Update { id: target.id, dirty, detached, sync, head }).is_err() {
+                if tx.send(Update { id: target.id, dirty, detached, sync, head, mtime: cur }).is_err() {
                     return;
                 }
             }
@@ -155,6 +174,11 @@ fn flush(conn: &mut Option<rusqlite::Connection>, batch: &mut Vec<Update>, write
                 ok = false;
                 break;
             }
+            // Record the root mtime we scanned at, so the next sweep skips this repo
+            // until its working tree is touched again.
+            if let Some(mt) = u.mtime {
+                crate::db::set_repo_mtime_by_id(c, u.id, mt);
+            }
         }
         if ok {
             let _ = c.execute_batch("COMMIT");
@@ -167,11 +191,27 @@ fn flush(conn: &mut Option<rusqlite::Connection>, batch: &mut Vec<Update>, write
     batch.clear();
 }
 
-/// Load every indexed repo as a [`Target`].
+/// Load every indexed repo as a [`Target`], including its last-scan root mtime so
+/// the workers can skip untouched repos.
 fn load_targets() -> Vec<Target> {
     let Ok(conn) = crate::db::open_ro() else { return Vec::new() };
-    let Ok(repos) = crate::db::list_repos(&conn) else { return Vec::new() };
-    repos.into_iter().map(|r| Target { id: r.id, git_dir: PathBuf::from(r.git_dir) }).collect()
+    let Ok(mut stmt) = conn.prepare("SELECT id, git_dir, workdir, mtime FROM repos") else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map([], |r| {
+        let git_dir: String = r.get(1)?;
+        let workdir: Option<String> = r.get(2)?;
+        Ok(Target {
+            id: r.get(0)?,
+            workdir: workdir.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&git_dir)),
+            git_dir: PathBuf::from(git_dir),
+            mtime: r.get(3)?,
+        })
+    });
+    match rows {
+        Ok(it) => it.filter_map(Result::ok).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Insert the always-running "status maintainer" ledger row, returning its id.

@@ -57,6 +57,14 @@ pub struct Request {
     /// set, this is sent as the command's old-oid so the server performs a
     /// compare-and-swap, and the local fast-forward check is skipped.
     pub expected: Option<ObjectId>,
+    /// `--follow-tags` semantics: push this ref only when the remote does not
+    /// advertise it at all. git filters followed tags against the advertisement
+    /// ("annotated tags … that are **missing from the remote**"), and only the
+    /// wire layer has that advertisement, so the porcelain marks the request and
+    /// the filtering happens here. Without it a local tag object that differs
+    /// from the remote's would be sent, rejected non-fast-forward, and turn an
+    /// otherwise clean push into a failure.
+    pub only_if_absent: bool,
 }
 
 /// The server's per-ref verdict, from `report-status`.
@@ -172,6 +180,12 @@ pub fn send_pack(
     let mut wire: Vec<Wire> = Vec::new();
     let mut statuses: Vec<RefStatus> = Vec::new();
     for req in requests {
+        // A followed tag (`--follow-tags`) the remote already carries is dropped
+        // outright — not reported, not sent — exactly as git omits it from the
+        // ref list it builds after reading the advertisement.
+        if req.only_if_absent && advertised.contains_key(&req.name) {
+            continue;
+        }
         // The remote's current value of the ref; `--force-with-lease` overrides
         // the old-oid we send with the leased value so the server compare-and-swaps.
         let remote_current = advertised.get(&req.name).copied().unwrap_or(null);

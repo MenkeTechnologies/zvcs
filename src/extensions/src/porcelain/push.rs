@@ -18,7 +18,7 @@ use super::push_proto::{self, Request};
 /// advances the remote-tracking refs, and prints git's `To <url>` status block.
 ///
 /// Implemented flags: `-f/--force`, `--force-with-lease[=…]`, `-n/--dry-run`,
-/// `-d/--delete`, `--all`/`--branches`, `--tags`, `-u/--set-upstream`,
+/// `-d/--delete`, `--all`/`--branches`, `--tags`, `--follow-tags`, `-u/--set-upstream`,
 /// `--repo=<r>`, `--porcelain`, and the refspec forms `src`, `src:dst`, `+src:dst`,
 /// `:dst`. `--recurse-submodules=<check|on-demand|no|only>` is honored: `no` is a
 /// plain push, `check`/`on-demand`/`only` first detect submodules whose pushed
@@ -26,9 +26,11 @@ use super::push_proto::{self, Request};
 /// need pushing these reduce to a plain push; `check` aborts if any do, and
 /// `on-demand`/`only` abort rather than silently skip the recursive submodule push
 /// (that transport recursion is not wired here — skipping it would be data-losing).
+/// `--follow-tags` adds the annotated tags reachable from the refs being pushed
+/// and missing from the remote (see [`append_followed_tags`]).
 /// Flags whose semantics the send-pack scope cannot honor faithfully
 /// (`--mirror`, `--signed=yes|if-asked`, `--atomic`, `-o/--push-option`,
-/// `--prune`, `--follow-tags`) are rejected
+/// `--prune`) are rejected
 /// rather than silently ignored; inert or already-matched flags (`--thin`,
 /// `--receive-pack`, `-4/-6`, `--verify`, …) are accepted.
 pub fn push(args: &[String]) -> Result<ExitCode> {
@@ -74,6 +76,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "--no-all" | "--no-branches" => f.all = false,
             "--tags" => f.tags = true,
             "--no-tags" => f.tags = false,
+            "--follow-tags" => f.follow_tags = true,
             "-u" | "--set-upstream" => f.set_upstream = true,
             "--no-set-upstream" => f.set_upstream = false,
             "--porcelain" => f.porcelain = true,
@@ -85,8 +88,8 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "-q" | "--quiet" | "-v" | "--verbose" | "--progress" | "--no-progress"
             | "--thin" | "--no-thin" | "-4" | "--ipv4" | "-6" | "--ipv6"
             | "--force-if-includes" | "--no-force-if-includes" | "--verify" | "--no-verify"
-            | "--no-signed" | "--no-atomic" | "--no-mirror" | "--no-prune"
-            | "--no-follow-tags" => {}
+            | "--no-signed" | "--no-atomic" | "--no-mirror" | "--no-prune" => {}
+            "--no-follow-tags" => f.follow_tags = false,
             "--receive-pack" | "--exec" => {
                 let _ = take_value(inline)?;
             }
@@ -102,7 +105,6 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             // silently ignoring them would change the push's meaning.
             "--mirror" => bail!("--mirror is not supported"),
             "--prune" => bail!("--prune is not supported"),
-            "--follow-tags" => bail!("--follow-tags is not supported (use --tags)"),
             "--atomic" => bail!("--atomic is not supported"),
             "-o" | "--push-option" => {
                 let _ = take_value(inline)?;
@@ -296,6 +298,7 @@ struct Flags {
     delete: bool,
     all: bool,
     tags: bool,
+    follow_tags: bool,
     set_upstream: bool,
     porcelain: bool,
     repo: Option<String>,
@@ -455,7 +458,7 @@ fn build_requests(
             let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
             if let Some(id) = r.try_id() {
                 let short = short_ref(&name).to_string();
-                requests.push(Request { name: name.clone(), new: id.detach(), force: f.force, expected: None });
+                requests.push(Request { name: name.clone(), new: id.detach(), force: f.force, expected: None, only_if_absent: false });
                 upstreams.push((short, name));
             }
         }
@@ -470,7 +473,7 @@ fn build_requests(
             let mut r = r.map_err(|e| anyhow!("{e}"))?;
             let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
             if let Ok(id) = r.peel_to_id_in_place() {
-                requests.push(Request { name, new: id.detach(), force: f.force, expected: None });
+                requests.push(Request { name, new: id.detach(), force: f.force, expected: None, only_if_absent: false });
             }
         }
         return Ok((requests, upstreams));
@@ -483,6 +486,7 @@ fn build_requests(
                 new: null(repo),
                 force: f.force,
                 expected: None,
+                only_if_absent: false,
             });
         }
         return Ok((requests, upstreams));
@@ -501,7 +505,65 @@ fn build_requests(
             }
         }
     }
+
+    if f.follow_tags {
+        append_followed_tags(repo, &mut requests)?;
+    }
     Ok((requests, upstreams))
+}
+
+/// `--follow-tags` — add the **annotated** tags reachable from the refs already
+/// being pushed (git: "annotated tags in `refs/tags` … pointing at commit-ish
+/// that are reachable from the refs being pushed").
+///
+/// Two filters, both of them git's:
+///   * annotated only — a lightweight tag is a ref straight to a commit and is
+///     never followed; the ref must resolve to a *tag object*.
+///   * reachable only — the tag's peeled commit has to be an ancestor of (or
+///     equal to) one of the tips this push already carries, so tagging an
+///     unrelated branch does not smuggle it along.
+///
+/// Deletions are excluded: `--follow-tags` with `--delete` would be adding refs
+/// to a removal, which git does not do either.
+///
+/// The "missing from the remote" half is enforced one layer down: each followed
+/// tag is marked `only_if_absent`, and `push_proto::send_pack` drops it once the
+/// ref advertisement (which only it has read by then) shows the remote already
+/// carries that tag. Sending them anyway would turn a differing remote tag into
+/// a non-fast-forward rejection and fail an otherwise clean push.
+fn append_followed_tags(repo: &gix::Repository, requests: &mut Vec<Request>) -> Result<()> {
+    let tips: Vec<ObjectId> = requests.iter().filter(|r| !r.new.is_null()).map(|r| r.new).collect();
+    if tips.is_empty() {
+        return Ok(());
+    }
+    let already: std::collections::HashSet<String> =
+        requests.iter().map(|r| r.name.clone()).collect();
+
+    for r in repo.references()?.tags()? {
+        let mut r = r.map_err(|e| anyhow!("{e}"))?;
+        let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
+        if already.contains(&name) {
+            continue;
+        }
+        // Annotated means the ref's own target is a tag object; peeling it yields
+        // the commit the tag names.
+        let target = r.id();
+        let is_annotated = target
+            .object()
+            .map(|o| o.kind == gix::object::Kind::Tag)
+            .unwrap_or(false);
+        if !is_annotated {
+            continue;
+        }
+        let Ok(peeled) = r.peel_to_id_in_place() else { continue };
+        let peeled = peeled.detach();
+        if tips.iter().any(|tip| reachable(repo, peeled, *tip)) {
+            // Never forced: a followed tag is an addition, and git refuses to
+            // clobber a differing remote tag here just as it does for `--tags`.
+            requests.push(Request { name, new: peeled, force: false, expected: None, only_if_absent: true });
+        }
+    }
+    Ok(())
 }
 
 /// Turn one `<refspec>` into a ref update (and its `-u` upstream pair, when the
@@ -560,6 +622,7 @@ fn parse_refspec(
             new,
             force,
             expected: None,
+            only_if_absent: false,
         },
         upstream,
     ))
@@ -585,6 +648,7 @@ fn current_branch_request(repo: &gix::Repository, force: bool) -> Result<(Reques
             new,
             force,
             expected: None,
+            only_if_absent: false,
         },
         (branch, name),
     ))
@@ -939,5 +1003,110 @@ fn reachable(repo: &gix::Repository, commit: ObjectId, tip: ObjectId) -> bool {
     match repo.merge_bases_many(tip, &[commit]) {
         Ok(bases) => bases.iter().any(|b| b.detach() == commit),
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a fixture repo with stock git (the CI image and every dev box has
+    /// one; zvcs cannot create annotated tag objects yet) laid out as:
+    ///
+    ///   main:  c1 ──(v1, annotated)── c2 ──(light, lightweight)
+    ///   side:  c1 ── s1 ──(vside, annotated)
+    ///
+    /// so one tag of each kind sits on `main`'s history and one annotated tag
+    /// sits off it.
+    fn fixture(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("zvcs-followtags-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir fixture");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .output()
+                .expect("run git")
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "c1"]);
+        git(&["tag", "-a", "v1", "-m", "annotated on main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "c2"]);
+        git(&["tag", "light"]);
+        git(&["checkout", "-q", "-b", "side"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "s1"]);
+        git(&["tag", "-a", "vside", "-m", "annotated off main"]);
+        git(&["checkout", "-q", "main"]);
+        dir
+    }
+
+    /// The name of every ref `append_followed_tags` added to a push of `main`.
+    fn followed(dir: &std::path::Path) -> Vec<String> {
+        let repo = gix::open(dir).expect("open fixture");
+        let tip = repo.head_id().expect("head").detach();
+        let mut requests = vec![Request {
+            name: "refs/heads/main".into(),
+            new: tip,
+            force: false,
+            expected: None,
+            only_if_absent: false,
+        }];
+        append_followed_tags(&repo, &mut requests).expect("append");
+        requests.into_iter().skip(1).map(|r| r.name).collect()
+    }
+
+    #[test]
+    fn follows_only_annotated_tags_reachable_from_the_pushed_tip() {
+        let dir = fixture("select");
+        assert_eq!(
+            followed(&dir),
+            vec!["refs/tags/v1".to_string()],
+            "v1 is annotated and on main's history; `light` is lightweight and \
+             `vside` is annotated but only on side"
+        );
+    }
+
+    #[test]
+    fn followed_tags_are_marked_absent_only_and_never_forced() {
+        let dir = fixture("flags");
+        let repo = gix::open(&dir).expect("open fixture");
+        let tip = repo.head_id().expect("head").detach();
+        let mut requests = vec![Request {
+            name: "refs/heads/main".into(),
+            new: tip,
+            // Even under `--force`, a followed tag must not inherit the force bit.
+            force: true,
+            expected: None,
+            only_if_absent: false,
+        }];
+        append_followed_tags(&repo, &mut requests).expect("append");
+
+        let tag = requests.last().expect("a tag was added");
+        assert_eq!(tag.name, "refs/tags/v1");
+        assert!(!tag.force, "a followed tag is an addition, never a clobber");
+        assert!(tag.only_if_absent, "the wire layer drops it when the remote has it");
+    }
+
+    #[test]
+    fn a_deletion_only_push_follows_nothing() {
+        let dir = fixture("delete");
+        let repo = gix::open(&dir).expect("open fixture");
+        let mut requests = vec![Request {
+            name: "refs/heads/gone".into(),
+            new: gix::hash::ObjectId::null(repo.object_hash()),
+            force: false,
+            expected: None,
+            only_if_absent: false,
+        }];
+        append_followed_tags(&repo, &mut requests).expect("append");
+        assert_eq!(requests.len(), 1, "no tips to be reachable from, so no tags");
     }
 }

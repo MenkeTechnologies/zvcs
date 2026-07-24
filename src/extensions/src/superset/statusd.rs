@@ -42,8 +42,9 @@ struct Update {
     detached: bool,
     sync: String,
     head: String,
-    /// The root mtime observed for this scan, persisted so the next sweep can skip
-    /// this repo while its working tree is untouched.
+    head_sha: String,
+    /// The mtime observed for this scan (max of the working tree and `.git`),
+    /// persisted so the next sweep can skip this repo while nothing has changed.
     mtime: Option<i64>,
 }
 
@@ -86,11 +87,14 @@ pub fn spawn_if_enabled() {
                 warm.store(true, Ordering::Relaxed);
             }
             let target = &repos[idx % repos.len()];
-            // Cheap mtime gate: if the working-tree root hasn't been touched since
-            // the last scan, skip the expensive `is_dirty` compute entirely — the
-            // cached status is still valid. This is what keeps the pool from
-            // pegging cores re-scanning thousands of untouched repos.
-            let cur = crate::db::root_mtime(&target.workdir);
+            // Cheap mtime gate: skip the expensive `is_dirty`/compute unless
+            // something changed since the last scan — the cached status is still
+            // valid otherwise. This is what keeps the pool from pegging cores
+            // re-scanning thousands of untouched repos. The gate stats BOTH the
+            // working tree (edits) AND `.git` (commits, ref/index writes) — a
+            // commit doesn't touch the working tree, so a workdir-only gate would
+            // never notice HEAD moving and the event feed would miss commits.
+            let cur = crate::db::root_mtime(&target.workdir).max(crate::db::root_mtime(&target.git_dir));
             if let (Some(c), Some(m)) = (cur, target.mtime) {
                 if c <= m {
                     if warm.load(Ordering::Relaxed) {
@@ -100,9 +104,9 @@ pub fn spawn_if_enabled() {
                 }
             }
             if let Ok(repo) = gix::open(&target.git_dir) {
-                let (dirty, detached, sync, head) = crate::superset::status::compute(&repo);
+                let (dirty, detached, sync, head, head_sha) = crate::superset::status::compute(&repo);
                 // A closed channel means the writer is gone → this pool is done.
-                if tx.send(Update { id: target.id, dirty, detached, sync, head, mtime: cur }).is_err() {
+                if tx.send(Update { id: target.id, dirty, detached, sync, head, head_sha, mtime: cur }).is_err() {
                     return;
                 }
             }
@@ -179,7 +183,7 @@ fn flush(conn: &mut Option<rusqlite::Connection>, batch: &mut Vec<Update>, write
         let mut ok = true;
         let _ = c.execute_batch("BEGIN");
         for u in batch.iter() {
-            if crate::db::upsert_status(c, u.id, u.dirty, u.detached, &u.sync, &u.head).is_err() {
+            if crate::db::upsert_status(c, u.id, u.dirty, u.detached, &u.sync, &u.head, &u.head_sha).is_err() {
                 ok = false;
                 break;
             }

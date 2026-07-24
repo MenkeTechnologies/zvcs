@@ -12,9 +12,19 @@ use std::io::IsTerminal;
 use std::process::ExitCode;
 
 /// Compute `(dirty, detached, sync, head)` for an open repo.
-pub fn compute(repo: &gix::Repository) -> (bool, bool, String, String) {
+pub fn compute(repo: &gix::Repository) -> (bool, bool, String, String, String) {
     let detached = repo.head_name().ok().flatten().is_none();
     let dirty = repo.is_dirty().unwrap_or(false);
+
+    // The peeled commit id. Unlike `head` (the branch name, invariant across
+    // commits) this actually moves on every commit, so the event feed keys commit
+    // detection on it. Empty for an unborn HEAD.
+    let head_sha = repo
+        .head()
+        .ok()
+        .and_then(|mut h| h.try_peel_to_id().ok().flatten())
+        .map(|id| id.to_string())
+        .unwrap_or_default();
 
     let head = match repo.head_name().ok().flatten() {
         Some(name) => name.shorten().to_string(),
@@ -24,7 +34,7 @@ pub fn compute(repo: &gix::Repository) -> (bool, bool, String, String) {
         },
     };
 
-    (dirty, detached, sync_state(repo), head)
+    (dirty, detached, sync_state(repo), head, head_sha)
 }
 
 /// Sync state vs `origin/main` (else `origin/master`), from the merge-base only.
@@ -55,9 +65,9 @@ fn sync_state(repo: &gix::Repository) -> String {
 /// Record `repo`'s status into the db (used by the daemon watcher).
 pub fn record(conn: &rusqlite::Connection, git_dir: &std::path::Path, workdir: &std::path::Path) {
     let Ok(repo) = gix::open(git_dir) else { return };
-    let (dirty, detached, sync, head) = compute(&repo);
+    let (dirty, detached, sync, head, head_sha) = compute(&repo);
     if let Ok(repo_id) = crate::db::upsert_repo(conn, git_dir, Some(workdir)) {
-        let _ = crate::db::upsert_status(conn, repo_id, dirty, detached, &sync, &head);
+        let _ = crate::db::upsert_status(conn, repo_id, dirty, detached, &sync, &head, &head_sha);
     }
 }
 
@@ -69,7 +79,7 @@ pub fn zstatus(args: &[String]) -> Result<ExitCode> {
 
     // Live status for the current repo (and cache it under canonical paths).
     let repo = gix::discover(".")?;
-    let (dirty, detached, sync, head) = compute(&repo);
+    let (dirty, detached, sync, head, head_sha) = compute(&repo);
     let git_dir = repo
         .git_dir()
         .canonicalize()
@@ -79,7 +89,7 @@ pub fn zstatus(args: &[String]) -> Result<ExitCode> {
         .map(|w| w.canonicalize().unwrap_or_else(|_| w.to_path_buf()));
     if let (Ok(conn), Some(wd)) = (crate::db::open_rw(), workdir) {
         if let Ok(id) = crate::db::upsert_repo(&conn, &git_dir, Some(&wd)) {
-            let _ = crate::db::upsert_status(&conn, id, dirty, detached, &sync, &head);
+            let _ = crate::db::upsert_status(&conn, id, dirty, detached, &sync, &head, &head_sha);
         }
     }
     let dirt = if dirty { "dirty" } else { "clean" };

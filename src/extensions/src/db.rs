@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS repo_status (
     detached   INTEGER,
     sync       TEXT,
     head       TEXT,
+    head_sha   TEXT,
     updated_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -95,18 +96,14 @@ CREATE TABLE IF NOT EXISTS events (
     sha_before TEXT,
     sha_after  TEXT
 );
--- The unified live feed behind `git zevents`/`ztail`. Two triggers turn every
+-- The unified live feed behind `git zevents`/`ztail`. Triggers turn every
 -- repo_status change into a typed event, so BOTH the whole-tree poller (statusd)
 -- and the instant notify path (watch) feed it through `upsert_status` with no
 -- caller changes. They fire on UPDATE only — a repo's first (INSERT) status row
 -- never floods the feed at cold start. Reconciles are recorded explicitly by the
 -- daemon's reconcile path (they do not reliably move through upsert_status).
-CREATE TRIGGER IF NOT EXISTS ev_commit AFTER UPDATE ON repo_status
-    WHEN NEW.head IS NOT OLD.head
-    BEGIN
-        INSERT INTO events (ts, kind, repo_id, detail, sha_before, sha_after)
-        VALUES (CAST(strftime('%s','now') AS INTEGER), 'commit', NEW.repo_id, NULL, OLD.head, NEW.head);
-    END;
+-- `ev_commit` is installed from EV_COMMIT_SQL in open_rw (it was revised to key on
+-- the commit SHA, not the invariant branch name, so DROP+CREATE beats IF NOT EXISTS).
 CREATE TRIGGER IF NOT EXISTS ev_status AFTER UPDATE ON repo_status
     WHEN NEW.dirty IS NOT OLD.dirty OR NEW.sync IS NOT OLD.sync
     BEGIN
@@ -116,6 +113,23 @@ CREATE TRIGGER IF NOT EXISTS ev_status AFTER UPDATE ON repo_status
                      THEN (CASE WHEN NEW.dirty THEN 'dirty' ELSE 'clean' END)
                      ELSE NEW.sync END,
                 NULL, NULL);
+    END;
+";
+
+/// The commit-detection trigger, installed via DROP+CREATE in [`open_rw`] so a
+/// definition change reaches existing dbs (`CREATE TRIGGER IF NOT EXISTS` would
+/// keep the stale one). It keys on the peeled commit SHA — the branch name in
+/// `head` is invariant across commits, so the original head-keyed trigger never
+/// fired on a commit. Fires only when BOTH old and new `head_sha` are real commit
+/// ids, so the NULL→sha backfill after an upgrade and unborn HEADs emit nothing.
+const EV_COMMIT_SQL: &str = "
+CREATE TRIGGER ev_commit AFTER UPDATE ON repo_status
+    WHEN NEW.head_sha IS NOT OLD.head_sha
+     AND OLD.head_sha IS NOT NULL AND OLD.head_sha <> ''
+     AND NEW.head_sha IS NOT NULL AND NEW.head_sha <> ''
+    BEGIN
+        INSERT INTO events (ts, kind, repo_id, detail, sha_before, sha_after)
+        VALUES (CAST(strftime('%s','now') AS INTEGER), 'commit', NEW.repo_id, NULL, OLD.head_sha, NEW.head_sha);
     END;
 ";
 
@@ -143,6 +157,11 @@ pub fn open_rw() -> Result<Connection> {
     let _ = conn.execute("ALTER TABLE repos ADD COLUMN hook TEXT", []);
     let _ = conn.execute("ALTER TABLE triggers ADD COLUMN throttle_ms INTEGER NOT NULL DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE repos ADD COLUMN mtime INTEGER", []);
+    let _ = conn.execute("ALTER TABLE repo_status ADD COLUMN head_sha TEXT", []);
+    // Install the current commit-detection trigger (see EV_COMMIT_SQL): DROP+CREATE
+    // so an existing db running the old head-keyed trigger is upgraded in place.
+    let _ = conn.execute("DROP TRIGGER IF EXISTS ev_commit", []);
+    let _ = conn.execute_batch(EV_COMMIT_SQL);
     Ok(conn)
 }
 
@@ -639,13 +658,14 @@ pub fn upsert_status(
     detached: bool,
     sync: &str,
     head: &str,
+    head_sha: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO repo_status (repo_id, dirty, detached, sync, head, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO repo_status (repo_id, dirty, detached, sync, head, head_sha, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(repo_id) DO UPDATE SET
-             dirty=?2, detached=?3, sync=?4, head=?5, updated_at=?6",
-        rusqlite::params![repo_id, dirty as i64, detached as i64, sync, head, now()],
+             dirty=?2, detached=?3, sync=?4, head=?5, head_sha=?6, updated_at=?7",
+        rusqlite::params![repo_id, dirty as i64, detached as i64, sync, head, head_sha, now()],
     )?;
     Ok(())
 }
@@ -869,7 +889,8 @@ pub fn mark_notified(conn: &Connection, ids: &[i64]) -> Result<()> {
 mod snapshot_atomic_tests {
     use super::{
         events_recent, events_since, insert_job, job_finished, load_snapshot, prune_stale_jobs,
-        record_event, root_mtime_advanced, save_snapshot, upsert_repo, upsert_status, SCHEMA,
+        record_event, root_mtime_advanced, save_snapshot, upsert_repo, upsert_status, EV_COMMIT_SQL,
+        SCHEMA,
     };
     use rusqlite::Connection;
     use std::path::Path;
@@ -993,18 +1014,20 @@ mod snapshot_atomic_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let conn = Connection::open(dir.join("t.sqlite")).unwrap();
         conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(EV_COMMIT_SQL).unwrap(); // open_rw installs this; mirror it here
         let id = upsert_repo(&conn, Path::new("/x/repo/.git"), Some(Path::new("/x/repo"))).unwrap();
 
         // First status row is an INSERT — the triggers fire on UPDATE only, so a
         // repo joining the index must NOT flood the feed with a bogus event.
-        upsert_status(&conn, id, false, false, "clean", "aaaaaaaaaa00").unwrap();
+        upsert_status(&conn, id, false, false, "up-to-date", "main", "aaaaaaaaaa00").unwrap();
         assert_eq!(events_recent(&conn, 10, None, None).unwrap().len(), 0, "cold-start INSERT emits nothing");
 
-        // HEAD moves → one `commit` event carrying the sha delta.
-        upsert_status(&conn, id, false, false, "clean", "bbbbbbbbbb11").unwrap();
+        // The commit SHA moves while the branch name (`head`) stays "main" — the
+        // exact case the original head-keyed trigger missed. Must emit one `commit`.
+        upsert_status(&conn, id, false, false, "up-to-date", "main", "bbbbbbbbbb11").unwrap();
         // Goes dirty → one `status` event; sync change → another.
-        upsert_status(&conn, id, true, false, "clean", "bbbbbbbbbb11").unwrap();
-        upsert_status(&conn, id, true, false, "ahead 1", "bbbbbbbbbb11").unwrap();
+        upsert_status(&conn, id, true, false, "up-to-date", "main", "bbbbbbbbbb11").unwrap();
+        upsert_status(&conn, id, true, false, "ahead", "main", "bbbbbbbbbb11").unwrap();
         // A reconcile is recorded directly (triggers can't see it).
         record_event(&conn, "reconcile", Some(id), Some("fast-forwarded"), None, None).unwrap();
 
@@ -1022,6 +1045,28 @@ mod snapshot_atomic_tests {
         assert_eq!(events_recent(&conn, 10, None, Some("nomatch")).unwrap().len(), 0);
         let after_first = events_since(&conn, evs[0].id, None, None).unwrap();
         assert_eq!(after_first.len(), 3, "follow only sees events past the cursor");
+
+        // A migrated row (head_sha starts NULL) must not emit a phantom commit when
+        // first backfilled to a real sha; a later real move still fires.
+        let id2 = upsert_repo(&conn, Path::new("/x/other/.git"), Some(Path::new("/x/other"))).unwrap();
+        conn.execute(
+            "INSERT INTO repo_status(repo_id,dirty,detached,sync,head,head_sha) VALUES(?1,0,0,'up-to-date','main',NULL)",
+            [id2],
+        )
+        .unwrap();
+        let commits = events_recent(&conn, 50, Some("commit"), None).unwrap().len();
+        upsert_status(&conn, id2, false, false, "up-to-date", "main", "dddddddddd33").unwrap();
+        assert_eq!(
+            events_recent(&conn, 50, Some("commit"), None).unwrap().len(),
+            commits,
+            "NULL->sha backfill emits no phantom commit"
+        );
+        upsert_status(&conn, id2, false, false, "up-to-date", "main", "eeeeeeeeee44").unwrap();
+        assert_eq!(
+            events_recent(&conn, 50, Some("commit"), None).unwrap().len(),
+            commits + 1,
+            "a real sha move after backfill fires"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

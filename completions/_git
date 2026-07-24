@@ -6804,6 +6804,14 @@ _git_commands () {
     zmv:'zvcs: move/rename files/directories'
     zcat:'zvcs: print file contents'
     zln:'zvcs: create a hard link or symlink (-s)'
+    zheads:'zvcs: HEAD branch/id (+dirty) of every indexed repo'
+    zdirty:'zvcs: list indexed repos with tracked changes'
+    zbranches:'zvcs: local branches of every indexed repo'
+    ztags:'zvcs: tag count of every indexed repo'
+    zremotes:'zvcs: remotes and URLs of every indexed repo'
+    zsize:'zvcs: on-disk .git size of every indexed repo'
+    zage:'zvcs: HEAD commit age of every indexed repo'
+    zpull:'zvcs: parallel fetch + fast-forward of every indexed repo'
   )
 
   zstyle -a :completion:$curcontext: user-commands user_commands

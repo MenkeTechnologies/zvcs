@@ -444,7 +444,7 @@ fn combine(acc: u8, ch: u8) -> u8 {
 }
 
 /// Human-readable byte size (1024-based, one decimal above K).
-fn human_size(bytes: u64) -> String {
+pub(crate) fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
     if bytes < 1024 {
         return format!("{bytes}B");

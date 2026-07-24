@@ -335,6 +335,60 @@ pub const DOCS: &[Doc] = &[
         synopsis: "git zln [-s] <target> <link>",
         desc: &["Creates <link> pointing at <target>: a hard link by default, or a symbolic link with -s."],
     },
+    Doc {
+        verb: "zheads",
+        summary: "HEAD of every indexed repo, in parallel",
+        synopsis: "git zheads [selectors]",
+        desc: &[
+            "Prints each indexed repository's checked-out branch (or (detached)/(unborn)), short HEAD id, and a * when the worktree has tracked changes \\(em a one-glance view of where every repo in the machine sits.",
+            "Selectors are the same as zforeach: bare <pattern>, --repo <p>, --dirty, --ahead, --behind, --claimed, --session <s>. The probe is a native gix read run across all repos on a bounded worker pool.",
+        ],
+    },
+    Doc {
+        verb: "zdirty",
+        summary: "list indexed repos with tracked changes",
+        synopsis: "git zdirty [selectors]",
+        desc: &["Lists only the indexed repositories whose worktree has uncommitted tracked changes (the same \"dirty\" gix reports for zstatus; an untracked-only repo counts as clean). Scanned in parallel. Selectors narrow the set as in zforeach."],
+    },
+    Doc {
+        verb: "zbranches",
+        summary: "local branches of every indexed repo",
+        synopsis: "git zbranches [selectors]",
+        desc: &["Prints each indexed repository's local branch names, grouped by repo, scanned in parallel."],
+    },
+    Doc {
+        verb: "ztags",
+        summary: "tag count of every indexed repo",
+        synopsis: "git ztags [selectors]",
+        desc: &["Prints how many tags each indexed repository has, scanned in parallel."],
+    },
+    Doc {
+        verb: "zremotes",
+        summary: "remotes and URLs of every indexed repo",
+        synopsis: "git zremotes [selectors]",
+        desc: &["Prints each indexed repository's remotes and their fetch URLs, grouped by repo, scanned in parallel."],
+    },
+    Doc {
+        verb: "zsize",
+        summary: "on-disk .git size of every indexed repo",
+        synopsis: "git zsize [selectors]",
+        desc: &["Prints each indexed repository's on-disk .git size, largest first, with a total, so the heaviest repos in the tree are obvious. Sizes are summed with a native filesystem walk in parallel."],
+    },
+    Doc {
+        verb: "zage",
+        summary: "HEAD commit age of every indexed repo",
+        synopsis: "git zage [selectors]",
+        desc: &["Prints how long ago each indexed repository's HEAD commit was made (a relative time like `3 days ago`), scanned in parallel \\(em a quick read of which repos are stale."],
+    },
+    Doc {
+        verb: "zpull",
+        summary: "parallel fetch + fast-forward of every indexed repo",
+        synopsis: "git zpull [selectors]",
+        desc: &[
+            "Fetches and fast-forwards every selected indexed repository to its tracked mainline, in parallel, using the same native ff-only reconcile as zsync: a dirty or diverged repo is reported and skipped, never forced.",
+            "Where zsync/zup act on the current submodule tree, zpull acts on the machine-wide index, so selectors (--repo, --behind, …) scope which repos are pulled.",
+        ],
+    },
 ];
 
 /// The manual for `verb`, or `None` if it is not a superset verb.

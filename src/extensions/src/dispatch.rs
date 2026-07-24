@@ -16,6 +16,7 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "zsnapshots", "zworktree", "zstash", "zunstash", "zstashes", "zup", "zforeach", "zhook",
     "ztrigger", "zwatch", "zdashed", "zverbs", "zcd", "zpwd", "zls", "zenv", "zunset", "zecho",
     "zdoctor", "zmkdir", "ztouch", "zrm", "zcp", "zmv", "zcat", "zln",
+    "zheads", "zdirty", "zbranches", "ztags", "zremotes", "zsize", "zage", "zpull",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -263,6 +264,14 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zmv" => "usage: git zmv <src>... <dst> — move/rename files/directories",
         "zcat" => "usage: git zcat <file>... — print file contents to stdout",
         "zln" => "usage: git zln [-s] <target> <link> — create a hard link or symlink (-s)",
+        "zheads" => "usage: git zheads [selectors] — HEAD branch/id (+dirty) of each indexed repo, in parallel",
+        "zdirty" => "usage: git zdirty [selectors] — list indexed repos with uncommitted tracked changes, in parallel",
+        "zbranches" => "usage: git zbranches [selectors] — local branches of each indexed repo, in parallel",
+        "ztags" => "usage: git ztags [selectors] — tag count of each indexed repo, in parallel",
+        "zremotes" => "usage: git zremotes [selectors] — remotes and fetch URLs of each indexed repo",
+        "zsize" => "usage: git zsize [selectors] — on-disk .git size of each indexed repo (largest first)",
+        "zage" => "usage: git zage [selectors] — how long ago each indexed repo's HEAD commit was made",
+        "zpull" => "usage: git zpull [selectors] — parallel fetch + fast-forward of every indexed repo (ff-only)",
         _ => return None,
     })
 }
@@ -335,6 +344,14 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zmv" => superset::zmv(args),
         "zcat" => superset::zcat(args),
         "zln" => superset::zln(args),
+        "zheads" => superset::zheads(args),
+        "zdirty" => superset::zdirty(args),
+        "zbranches" => superset::zbranches(args),
+        "ztags" => superset::ztags(args),
+        "zremotes" => superset::zremotes(args),
+        "zsize" => superset::zsize(args),
+        "zage" => superset::zage(args),
+        "zpull" => superset::zpull(args),
 
         // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----
         "add" => porcelain::add(args),

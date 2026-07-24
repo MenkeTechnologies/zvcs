@@ -108,6 +108,8 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Snapshots | `zsnapshot` `zrestore` `zsnapshots` | tree-wide restore points across all submodules |
 | Worktrees | `zworktree add/list/remove` | per-agent isolated, object-sharing worktree of the whole tree |
 | Fan-out | `zforeach [selectors] -- <cmd>` | run a command across all/subset of indexed repos, in parallel (selectors: `--repo`/`--dirty`/`--ahead`/`--behind`/`--claimed`/`--session`) |
+| Parallel query | `zheads` `zdirty` `zbranches` `ztags` `zremotes` `zsize` `zage` | native, fork-free reads fanned across every indexed repo — HEAD/branch, dirty set, branches, tag counts, remotes, `.git` sizes, HEAD age; all honor the `zforeach` selectors |
+| Parallel pull | `zpull [selectors]` | fetch + fast-forward every indexed repo in parallel (ff-only, same native reconcile as `zsync`; dirty/diverged skipped) |
 | Hooks | `zhook set/unset/show/list/test` | manage & test the current repo's ref-change hook (`zvcs.hook`); `zvcs.autohook` fires each repo's own local hook |
 | Triggers | `ztrigger DIR <cmd>` `ztrigger list/rm/test` | arm any repo BY PATH to run a command on **any file change** in the directory (worktree + `.git`) — writes DIR's local hook, indexes it, watches the whole dir, auto-flips `zvcs.autohook`, reloads the daemon (no `git config` needed) |
 | Watch | `zwatch DIR` `zwatch list/rm` | watch a repo by path (index + cached status via `zvcs.autostatus`) without attaching a command |

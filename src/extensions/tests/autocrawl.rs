@@ -43,7 +43,7 @@ fn autocrawl_on_start_indexes_configured_roots() {
     git(&repo, &["config", "zvcs.crawlroots", crawl.to_str().unwrap()]);
 
     let mut daemon: Child = Command::new(BIN)
-        .args(["zdaemon", "start"])
+        .args(["zdaemon", "start", "--foreground"])
         .current_dir(&repo)
         .spawn()
         .unwrap();

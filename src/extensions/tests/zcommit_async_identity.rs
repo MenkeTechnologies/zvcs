@@ -44,7 +44,7 @@ fn async_commit_carries_identity_and_records_sha_on_push_failure() {
     let head0 = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&repo).output().unwrap().stdout).unwrap().trim().to_string();
 
     // Daemon started with NO GIT_AUTHOR/COMMITTER identity in its environment.
-    let mut daemon: Child = Command::new(BIN).args(["zdaemon", "start"]).current_dir(&repo)
+    let mut daemon: Child = Command::new(BIN).args(["zdaemon", "start", "--foreground"]).current_dir(&repo)
         .env("ZVCS_HOME", &home).env("ZVCS_SOCK", &sock)
         .env_remove("GIT_AUTHOR_NAME").env_remove("GIT_COMMITTER_NAME")
         .spawn().unwrap();

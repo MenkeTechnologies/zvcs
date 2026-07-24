@@ -66,7 +66,7 @@ fn hook_fires_on_ref_change_in_watched_repo() {
     let daemon_log = root.join("daemon.log");
     let logf = std::fs::File::create(&daemon_log).unwrap();
     let mut daemon: Child = Command::new(BIN)
-        .args(["zdaemon", "start"])
+        .args(["zdaemon", "start", "--foreground"])
         .current_dir(&repo)
         .stdout(Stdio::from(logf.try_clone().unwrap()))
         .stderr(Stdio::from(logf))

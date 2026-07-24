@@ -59,7 +59,7 @@ fn daemon_converge_fast_forwards_top_level_repo() {
 
     let sock = root.join("zvcs-test.sock");
     std::env::set_var("ZVCS_SOCK", &sock);
-    let mut daemon: Child = Command::new(BIN).args(["zdaemon", "start"]).current_dir(&top).spawn().expect("spawn zdaemon");
+    let mut daemon: Child = Command::new(BIN).args(["zdaemon", "start", "--foreground"]).current_dir(&top).spawn().expect("spawn zdaemon");
 
     // The startup converge (react) must ff the top-level to c1.
     let deadline = Instant::now() + Duration::from_secs(15);

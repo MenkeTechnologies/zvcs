@@ -53,7 +53,7 @@ fn different_repos_lock_concurrently() {
     let a = init_repo(&root, "a");
     let b = init_repo(&root, "b");
 
-    let mut daemon: Child = Command::new(BIN).args(["zdaemon", "start"]).current_dir(&root).spawn().unwrap();
+    let mut daemon: Child = Command::new(BIN).args(["zdaemon", "start", "--foreground"]).current_dir(&root).spawn().unwrap();
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) && !sock.exists() {
         thread::sleep(Duration::from_millis(20));

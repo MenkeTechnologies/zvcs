@@ -44,7 +44,7 @@ fn zjob_restart_and_stop_control() {
     std::fs::write(repo.join("foo.txt"), b"hi\n").unwrap();
 
     let mut daemon: Child = Command::new(BIN)
-        .args(["zdaemon", "start"])
+        .args(["zdaemon", "start", "--foreground"])
         .current_dir(&repo)
         .spawn()
         .unwrap();

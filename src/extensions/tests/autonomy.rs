@@ -78,7 +78,7 @@ fn watcher_autobumps_submodule_pointer_on_commit() {
     let daemon_log = root.join("daemon.log");
     let logf = std::fs::File::create(&daemon_log).unwrap();
     let mut daemon: Child = Command::new(BIN)
-        .args(["zdaemon", "start"])
+        .args(["zdaemon", "start", "--foreground"])
         .current_dir(&parent)
         .stdout(Stdio::from(logf.try_clone().unwrap()))
         .stderr(Stdio::from(logf))

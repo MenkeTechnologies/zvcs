@@ -47,7 +47,7 @@ fn daemon_control_lifecycle() {
 
     // start (detached child), wait for the socket.
     let mut daemon: Child = Command::new(BIN)
-        .args(["zdaemon", "start"])
+        .args(["zdaemon", "start", "--foreground"])
         .current_dir(&repo)
         .env("ZVCS_HOME", &home)
         .env("ZVCS_SOCK", &sock)
@@ -75,6 +75,35 @@ fn daemon_control_lifecycle() {
     assert!(!ctl(&home, &sock, &repo, &["zdaemon", "ping"]).1, "ping after stop must be non-zero");
 
     let _ = daemon.kill();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A bare `git zdaemon start` must daemonize — spawn the worker detached and
+/// RETURN, never holding the terminal. `ctl` uses `Command::output`, which blocks
+/// until the process exits, so if `start` ran the event loop in the foreground
+/// this test would hang forever. It also proves the detached daemon actually came
+/// up and can be stopped (no leak).
+#[test]
+fn bare_start_daemonizes_and_returns() {
+    let root = std::env::temp_dir().join(format!("zvcs-daemonize-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
+    let sock = root.join("sock");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert!(Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&repo).status().unwrap().success());
+
+    // Returns promptly (does not hang), and a daemon is now up.
+    let (_out, ok) = ctl(&home, &sock, &repo, &["zdaemon", "start"]);
+    assert!(ok, "bare `zdaemon start` should return success");
+    assert!(wait_for(&sock, true, Duration::from_secs(5)), "detached daemon should be up");
+    assert!(ctl(&home, &sock, &repo, &["zdaemon", "ping"]).1, "ping the detached daemon");
+
+    // No Child handle (it is detached) — stop it via the socket so it doesn't leak.
+    let _ = ctl(&home, &sock, &repo, &["zdaemon", "stop"]);
+    assert!(wait_for(&sock, false, Duration::from_secs(5)), "detached daemon should stop");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -122,7 +151,7 @@ fn manual_stop_disables_autostart_until_start() {
 
     // An explicit start clears the marker and brings the daemon back up.
     let mut daemon: Child = Command::new(BIN)
-        .args(["zdaemon", "start"])
+        .args(["zdaemon", "start", "--foreground"])
         .current_dir(&repo)
         .env("ZVCS_HOME", &home)
         .env("ZVCS_SOCK", &sock)

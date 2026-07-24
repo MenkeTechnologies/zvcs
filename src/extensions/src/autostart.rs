@@ -55,7 +55,9 @@ pub fn spawn_detached(workdir: &Path) {
         return;
     };
     let mut cmd = Command::new(exe);
-    cmd.args(["zdaemon", "start"])
+    // `--foreground` runs the blocking event loop; the bare `start` form would
+    // re-daemonize and return, so spawn the worker form directly.
+    cmd.args(["zdaemon", "start", "--foreground"])
         .current_dir(workdir)
         .stdin(Stdio::null());
     route_stdio_to_log(&mut cmd);

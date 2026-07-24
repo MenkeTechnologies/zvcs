@@ -34,7 +34,7 @@ fn daemon_populates_zstatus_all() {
     git(&repo, &["config", "zvcs.autostatus", "true"]);
 
     let mut daemon: Child = Command::new(BIN)
-        .args(["zdaemon", "start"])
+        .args(["zdaemon", "start", "--foreground"])
         .current_dir(&repo)
         .spawn()
         .unwrap();

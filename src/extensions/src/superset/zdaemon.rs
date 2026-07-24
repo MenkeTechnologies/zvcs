@@ -128,7 +128,10 @@ const USAGE: &str = "usage: git zdaemon <start|stop|restart|reload|status|info|p
 pub fn zdaemon(args: &[String]) -> Result<ExitCode> {
     let action = args.first().map(String::as_str).unwrap_or("");
     match action {
-        "start" => start(),
+        // `--foreground` runs the blocking event loop; a bare `start` daemonizes
+        // (spawns that detached) and returns at once, so it never holds the prompt.
+        "start" if args.iter().any(|a| a == "--foreground") => start(),
+        "start" => start_detached(),
         "stop" => stop(),
         "restart" | "reload" => restart(),
         "status" => status(),
@@ -225,6 +228,32 @@ fn socket_is_live(path: &Path) -> bool {
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// `git zdaemon start` — daemonize: spawn the `--foreground` event loop detached
+/// and return at once, so it never holds the prompt. Idempotent: if a daemon is
+/// already live it just reports that. Waits briefly for the child to bind, so a
+/// returning prompt means the daemon is actually up.
+fn start_detached() -> Result<ExitCode> {
+    let path = socket_path();
+    if socket_is_live(&path) {
+        eprintln!("zvcs: daemon already running");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let workdir = gix::discover(".")
+        .ok()
+        .and_then(|r| r.workdir().map(|w| w.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    crate::autostart::spawn_detached(&workdir);
+    for _ in 0..75 {
+        if ping(&path) {
+            return Ok(ExitCode::SUCCESS);
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    eprintln!("zvcs: daemon did not come up (see {})", zvcs_home().join("zvcs.log").display());
+    Ok(ExitCode::SUCCESS)
 }
 
 fn start() -> Result<ExitCode> {

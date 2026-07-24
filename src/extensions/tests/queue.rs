@@ -46,7 +46,7 @@ fn zcommit_is_queued_executed_and_recorded() {
 
     // Bring up the daemon (handles SUBMIT regardless of [zvcs] autonomy).
     let mut daemon: Child = Command::new(BIN)
-        .args(["zdaemon", "start"])
+        .args(["zdaemon", "start", "--foreground"])
         .current_dir(&repo)
         .spawn()
         .unwrap();

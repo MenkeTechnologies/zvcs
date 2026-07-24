@@ -48,7 +48,7 @@ fn concurrent_start_on_stale_socket_yields_one_daemon() {
     let mut kids: Vec<Child> = (0..6)
         .map(|_| {
             Command::new(BIN)
-                .args(["zdaemon", "start"])
+                .args(["zdaemon", "start", "--foreground"])
                 .current_dir(&root)
                 .env("ZVCS_HOME", &home)
                 .spawn()

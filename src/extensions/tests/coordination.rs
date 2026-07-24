@@ -56,7 +56,7 @@ fn daemon_serializes_concurrent_writers() {
 
     // Start the coordinator.
     let mut daemon: Child = Command::new(BIN)
-        .args(["zdaemon", "start"])
+        .args(["zdaemon", "start", "--foreground"])
         .current_dir(&tmp)
         .spawn()
         .expect("spawn zdaemon");

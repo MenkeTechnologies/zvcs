@@ -46,7 +46,7 @@ fn daemon_keeps_status_cache_warm() {
     // daemon may also autostart from a global `[zvcs] hook`; either way one runs
     // its statusd — a duplicate start just bails "already running", harmlessly.
     let mut daemon: Child = Command::new(BIN)
-        .args(["zdaemon", "start"])
+        .args(["zdaemon", "start", "--foreground"])
         .env("ZVCS_HOME", &home)
         .env("ZVCS_SOCK", &sock)
         .spawn()

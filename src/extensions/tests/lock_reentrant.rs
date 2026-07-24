@@ -31,7 +31,7 @@ fn nested_acquire_same_repo_same_thread_does_not_deadlock() {
 
     let git_dir = init_repo(&root, "r");
 
-    let mut daemon: Child = Command::new(BIN).args(["zdaemon", "start"]).current_dir(&root).spawn().unwrap();
+    let mut daemon: Child = Command::new(BIN).args(["zdaemon", "start", "--foreground"]).current_dir(&root).spawn().unwrap();
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) && !sock.exists() {
         thread::sleep(Duration::from_millis(20));

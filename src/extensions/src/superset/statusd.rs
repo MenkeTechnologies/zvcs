@@ -16,11 +16,15 @@
 //! show it working. `zvcs.statusinterval = 0` disables it.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Once the cache is warm (first full sweep done), each worker sleeps this long
+/// between repos so the pool stops pegging the CPU. Hungry first, gentle after.
+const WARM_THROTTLE: Duration = Duration::from_millis(400);
 
 /// One repo to keep fresh: its ledger id and git dir.
 struct Target {
@@ -43,8 +47,13 @@ pub fn spawn_if_enabled() {
         return; // `zvcs.statusinterval = 0` turns the maintainer off.
     }
     let workers = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let initial = load_targets();
+    let initial_n = initial.len().max(1);
     let cursor = Arc::new(AtomicUsize::new(0));
-    let snapshot: Arc<RwLock<Arc<Vec<Target>>>> = Arc::new(RwLock::new(Arc::new(load_targets())));
+    let snapshot: Arc<RwLock<Arc<Vec<Target>>>> = Arc::new(RwLock::new(Arc::new(initial)));
+    // `warm` flips true after the first full sweep; workers then throttle so the
+    // daemon is hungry on the cold cache and gentle once it is maintained.
+    let warm = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Update>();
 
     // Read-only compute workers: each perpetually claims the next repo off the
@@ -53,6 +62,7 @@ pub fn spawn_if_enabled() {
     for _ in 0..workers {
         let cursor = Arc::clone(&cursor);
         let snapshot = Arc::clone(&snapshot);
+        let warm = Arc::clone(&warm);
         let tx = tx.clone();
         thread::spawn(move || loop {
             let repos = { snapshot.read().unwrap().clone() };
@@ -68,17 +78,28 @@ pub fn spawn_if_enabled() {
                     return;
                 }
             }
+            // Full speed until warm; then ease off so the pool stops pegging cores.
+            if warm.load(Ordering::Relaxed) {
+                thread::sleep(WARM_THROTTLE);
+            }
         });
     }
     drop(tx); // only the workers hold senders now; the writer stops when all exit.
 
     // The single writer: batches results into the db, refreshes the repo snapshot
-    // (new repos join, deleted drop), and publishes live throughput to the job.
-    thread::spawn(move || writer_loop(rx, snapshot, workers));
+    // (new repos join, deleted drop), flips `warm` after the first sweep, and
+    // publishes live throughput to the job.
+    thread::spawn(move || writer_loop(rx, snapshot, workers, warm, initial_n));
 }
 
 /// Drain computed updates, batch-write them, and keep the snapshot + job current.
-fn writer_loop(rx: mpsc::Receiver<Update>, snapshot: Arc<RwLock<Arc<Vec<Target>>>>, workers: usize) {
+fn writer_loop(
+    rx: mpsc::Receiver<Update>,
+    snapshot: Arc<RwLock<Arc<Vec<Target>>>>,
+    workers: usize,
+    warm: Arc<AtomicBool>,
+    initial_n: usize,
+) {
     let job = create_job();
     let mut conn = crate::db::open_rw().ok();
     let mut batch: Vec<Update> = Vec::new();
@@ -100,6 +121,10 @@ fn writer_loop(rx: mpsc::Receiver<Update>, snapshot: Arc<RwLock<Arc<Vec<Target>>
                 break;
             }
         }
+        // Warm once the first sweep's worth of writes has landed → workers throttle.
+        if !warm.load(Ordering::Relaxed) && writes >= initial_n as u64 {
+            warm.store(true, Ordering::Relaxed);
+        }
         if last_tick.elapsed() >= Duration::from_secs(5) {
             let fresh = load_targets();
             let indexed = fresh.len();
@@ -107,7 +132,8 @@ fn writer_loop(rx: mpsc::Receiver<Update>, snapshot: Arc<RwLock<Arc<Vec<Target>>
             let rate = writes.saturating_sub(last_writes) / 5;
             last_writes = writes;
             last_tick = Instant::now();
-            publish(&conn, job, workers, indexed, writes, rate);
+            let phase = if warm.load(Ordering::Relaxed) { "maintaining" } else { "warming" };
+            publish(&conn, job, workers, indexed, writes, rate, phase);
         }
     }
 }
@@ -157,11 +183,11 @@ fn create_job() -> Option<i64> {
 }
 
 /// Update the maintainer job's live progress line (kept in the `running` state).
-fn publish(conn: &Option<rusqlite::Connection>, job: Option<i64>, workers: usize, indexed: usize, writes: u64, rate: u64) {
+fn publish(conn: &Option<rusqlite::Connection>, job: Option<i64>, workers: usize, indexed: usize, writes: u64, rate: u64, phase: &str) {
     let (Some(id), Some(c)) = (job, conn) else {
         return;
     };
-    let out = format!("{workers} workers · {indexed} repos indexed · {writes} status writes · ~{rate}/s");
+    let out = format!("{phase} · {workers} workers · {indexed} repos indexed · {writes} status writes · ~{rate}/s");
     let _ = c.execute(
         "UPDATE jobs SET state='running', output=?2 WHERE id=?1",
         rusqlite::params![id, out],

@@ -111,23 +111,58 @@ fn responsible_process() -> (i64, String, String) {
     (chosen, cmd, proc_cwd(chosen))
 }
 
-/// Credit the responsible process with one commit iff HEAD advanced from `before` to
-/// a new, non-null tip. Best-effort: swallows every error so it can never fail or
-/// slow the command it follows. Opens the rw db only on an actual advance.
-pub fn note_commit(before: Option<gix::ObjectId>) {
-    let after = head_commit();
-    if after.is_none() || after == before {
-        return; // no new commit landed
-    }
+/// The resolved responsible process for an attributed command: its durable pid,
+/// its session key, and its command name / cwd for display.
+struct Responsible {
+    pid: i64,
+    session: String,
+    cmd: String,
+    cwd: String,
+}
+
+/// Resolve the durable responsible process and its session key — an explicit
+/// `ZVCS_SESSION` when set, else `pid-<responsible-pid>` so one agent is one row.
+fn resolve_responsible() -> Responsible {
     let (pid, cmd, cwd) = responsible_process();
-    // An explicit `ZVCS_SESSION` still overrides the identity; otherwise the durable
-    // responsible-process pid is the key, so one agent is one stable row.
     let session = std::env::var("ZVCS_SESSION")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("pid-{pid}"));
-    if let Ok(conn) = crate::db::open_rw() {
-        let _ = crate::db::ppid_record_commit(&conn, &session, pid, &cmd, &cwd);
+    Responsible { pid, session, cmd, cwd }
+}
+
+/// Mutating verbs whose invocations are tallied per process (`git zprocs`). Chosen
+/// to be state-changing but relatively infrequent, so the durable-process walk stays
+/// off the read hot path (`rev-parse`/`status`/`log` never trigger it).
+const MUTATING_VERBS: &[&str] = &[
+    "commit", "push", "add", "merge", "rebase", "reset",
+    "checkout", "cherry-pick", "revert", "tag", "stash", "fetch", "pull",
+];
+
+/// Whether `sub` is a tracked mutating verb.
+pub fn is_mutating_verb(sub: &str) -> bool {
+    MUTATING_VERBS.contains(&sub)
+}
+
+/// Record one mutating-verb invocation for the responsible process. Resolves the
+/// durable process once and shares it across both tables. For `commit` the effective
+/// commit tally (`ppids.commits`) is bumped only when HEAD actually advanced from
+/// `before_head` — a no-op commit adds nothing — and only then is the verb counted.
+/// Every other mutating verb registers the process and bumps its per-verb count.
+/// Best-effort: swallows every error so it can never fail or slow the command.
+pub fn note_mutating(sub: &str, before_head: Option<gix::ObjectId>) {
+    let who = resolve_responsible();
+    let Ok(conn) = crate::db::open_rw() else { return };
+    if is_commit_verb(sub) {
+        let after = head_commit();
+        if after.is_none() || after == before_head {
+            return; // no new commit landed
+        }
+        let _ = crate::db::ppid_record_commit(&conn, &who.session, who.pid, &who.cmd, &who.cwd);
+        let _ = crate::db::proc_verb_record(&conn, &who.session, "commit");
+    } else {
+        let _ = crate::db::ppid_touch(&conn, &who.session, who.pid, &who.cmd, &who.cwd);
+        let _ = crate::db::proc_verb_record(&conn, &who.session, sub);
     }
 }
 
@@ -212,6 +247,88 @@ pub fn zppid(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `git zprocs [--json]` — per-process breakdown of the mutating commands each
+/// process has run (commit, push, add, merge, …), busiest first. Joins the process
+/// identity (`ppids`) with the per-verb tally (`proc_verbs`).
+pub fn zprocs(args: &[String]) -> Result<ExitCode> {
+    use std::collections::HashMap;
+    let json = args.iter().any(|a| a == "--json");
+
+    let Ok(conn) = crate::db::open_ro() else {
+        if json {
+            println!("[]");
+        } else {
+            println!("no process activity recorded yet");
+        }
+        return Ok(ExitCode::SUCCESS);
+    };
+    let procs = crate::db::list_ppids(&conn)?;
+    let verbs = crate::db::list_proc_verbs(&conn)?;
+    let now = crate::date::now_seconds();
+
+    // session -> [(verb, count)], preserving the count-desc order from the query.
+    let mut by_session: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+    for v in &verbs {
+        by_session.entry(v.session.clone()).or_default().push((v.verb.clone(), v.count));
+    }
+    // Order processes by their total mutating commands, busiest first.
+    let mut rows: Vec<(&crate::db::PpidRow, Vec<(String, i64)>, i64)> = procs
+        .iter()
+        .filter_map(|p| {
+            let vs = by_session.get(&p.session).cloned().unwrap_or_default();
+            if vs.is_empty() {
+                return None; // process with no recorded mutating verbs yet
+            }
+            let total: i64 = vs.iter().map(|(_, c)| c).sum();
+            Some((p, vs, total))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.2.cmp(&a.2));
+
+    if json {
+        let arr: Vec<_> = rows
+            .iter()
+            .map(|(p, vs, total)| {
+                let verbs: serde_json::Map<String, serde_json::Value> =
+                    vs.iter().map(|(v, c)| (v.clone(), serde_json::json!(c))).collect();
+                serde_json::json!({
+                    "pid": p.ppid,
+                    "cmd": p.cmd,
+                    "cwd": p.cwd,
+                    "alive": is_alive(p.ppid),
+                    "total": total,
+                    "verbs": verbs,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!(arr));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if rows.is_empty() {
+        println!("no process activity recorded yet");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let grand: i64 = rows.iter().map(|(_, _, t)| t).sum();
+    println!("{} process(es), {grand} mutating command(s):", rows.len());
+    println!("  {:>7} {:>5} {:>6} {:>5}  {:<12} {}", "PID", "STATE", "TOTAL", "LAST", "CMD", "COMMANDS");
+    for (p, vs, total) in &rows {
+        let state = if is_alive(p.ppid) { "live" } else { "dead" };
+        let breakdown = vs.iter().map(|(v, c)| format!("{v}:{c}")).collect::<Vec<_>>().join(" ");
+        println!(
+            "  {:>7} {:>5} {:>6} {:>5}  {:<12} {}",
+            p.ppid,
+            state,
+            total,
+            ago((now - p.last_seen).max(0)),
+            trunc(&p.cmd, 12),
+            breakdown,
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Compact "time ago" for a fixed-width column: `s`/`m`/`h`/`d`.
 fn ago(secs: i64) -> String {
     let s = secs.max(0);
@@ -245,6 +362,17 @@ mod tests {
         assert!(is_commit_verb("cherry-pick"));
         assert!(!is_commit_verb("status"));
         assert!(!is_commit_verb("push"));
+    }
+
+    #[test]
+    fn mutating_verbs_recognized() {
+        assert!(is_mutating_verb("commit"));
+        assert!(is_mutating_verb("push"));
+        assert!(is_mutating_verb("add"));
+        assert!(is_mutating_verb("rebase"));
+        assert!(!is_mutating_verb("status"));
+        assert!(!is_mutating_verb("rev-parse"));
+        assert!(!is_mutating_verb("log"));
     }
 
     #[test]

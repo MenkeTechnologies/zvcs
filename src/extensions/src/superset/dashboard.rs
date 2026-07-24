@@ -11,6 +11,19 @@
 //! system: `c` opens the 31-scheme chooser, `~`/`e` the palette editor, F1 the
 //! help overlay. The non-interactive path (`--once` / `--json` / a non-tty
 //! stdout) keeps the instant text summary.
+//!
+//! Interactive cursor (mouse ported from iftoprs, plus keyboard). One tile is
+//! focused and its selected row is highlighted with a background — the cursor.
+//! `↑`/`↓` (or `j`/`k`, PageUp/Down, `g`/`G`) move the cursor within the focused
+//! tile; `Tab` cycles tiles and `←`/`→` switch columns. The mouse drives the same
+//! cursor: hovering moves it to the row under the pointer (the highlight follows the
+//! mouse), the wheel steps it, a left-click selects, and a right-click selects and
+//! opens an opaque per-row detail popup. Feeds (events/commands) stay pinned to the
+//! newest row until you scroll up. The focused tile's title shows `▸ … [sel/len]`.
+//! Panes are resizable (ported from zmax): **click and drag a divider** (the border
+//! between panes) to move it under the cursor, or use the keys `H`/`L` (vertical
+//! column divider), `J`/`K` (focused column's horizontal divider), `=` to reset —
+//! each clamped so no pane drops below `MIN_W × MIN_H`.
 
 use std::io::{stdout, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -22,7 +35,10 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -56,6 +72,10 @@ struct Colors {
     green: Style,
     magenta: Style,
     blue: Style,
+    /// Background overlay for the row under the mouse cursor (hover highlight).
+    hl_bg: ratatui::style::Color,
+    /// Solid, opaque background for the right-click detail popup.
+    popup_bg: ratatui::style::Color,
 }
 
 impl Colors {
@@ -82,6 +102,8 @@ impl Colors {
             green: f(2),
             magenta: f(5),
             blue: f(4),
+            hl_bg: c(8), // gray: a subtle selection background under the cursor
+            popup_bg: c(0), // black: an opaque backing for the right-click popup
         }
     }
     fn mono() -> Self {
@@ -104,6 +126,8 @@ impl Colors {
             green: p,
             magenta: p,
             blue: p,
+            hl_bg: ratatui::style::Color::DarkGray,
+            popup_bg: ratatui::style::Color::Black,
         }
     }
 }
@@ -114,6 +138,144 @@ enum Overlay {
     Help,
     Chooser(usize),
     Editor(usize),
+}
+
+/// A rectangle in the terminal grid, for mouse hit-testing the tiles.
+#[derive(Clone, Copy)]
+struct Rect {
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+}
+
+impl Rect {
+    fn contains(&self, col: u16, row: u16) -> bool {
+        col >= self.x && col < self.x + self.w && row >= self.y && row < self.y + self.h
+    }
+
+    /// Inner content area, matching [`tile`]'s border inset (`x+2, y+1, w-4, h-2`).
+    fn inner(&self) -> (u16, u16, u16, u16) {
+        (self.x + 2, self.y + 1, self.w.saturating_sub(4), self.h.saturating_sub(2))
+    }
+}
+
+/// The four tile rectangles, derived from the terminal size the same way [`render`]
+/// lays them out — shared with the mouse handler so a click maps to a tile.
+struct Layout {
+    fleet: Rect,
+    procs: Rect,
+    events: Rect,
+    commands: Rect,
+}
+
+/// Minimum pane width/height a divider may leave on either side — the floor the
+/// resize clamp respects, ported from zmax's `grow_to`/`resize_*` (which never take
+/// a sibling below `min`).
+const MIN_W: u16 = 12;
+const MIN_H: u16 = 3;
+
+/// Adjustable split offsets (in cells) from the default layout, driven by the resize
+/// keys (ported from zmax's `resize_horizontal`/`resize_vertical` delta model).
+/// `col` shifts the vertical column divider; `lrow`/`rrow` shift the left and right
+/// columns' horizontal dividers. Always clamped in [`layout`] so no pane vanishes.
+#[derive(Default, Clone, Copy)]
+struct Splits {
+    col: i16,
+    lrow: i16,
+    rrow: i16,
+}
+
+/// Which divider a mouse drag is moving.
+#[derive(Clone, Copy, PartialEq)]
+enum Divider {
+    Col,      // vertical seam between the left and right columns
+    LeftRow,  // horizontal seam between fleet and procs
+    RightRow, // horizontal seam between events and commands
+}
+
+/// The default (un-resized) width of the left column and heights of the left/right
+/// top panes, for `cols × rows`. The resize deltas are offsets from these.
+fn split_defaults(cols: u16, body_h: u16) -> (u16, u16, u16) {
+    (cols / 2, body_h - body_h / 3, body_h / 2)
+}
+
+/// The divider (and the grab offset from its edge) under the point `(col, row)`, if
+/// any — a press here starts a drag-to-resize (ported from zmax's `split_divider_at`
+/// + `resize_drag`). The seam is the two-cell border between adjacent tiles.
+fn divider_at(l: &Layout, col: u16, row: u16) -> Option<(Divider, i16)> {
+    let top = l.fleet.y;
+    let left_w = l.fleet.w;
+    let body_bottom = l.commands.y + l.commands.h;
+    // Vertical column seam: x in {left_w-1, left_w}, anywhere down the body.
+    if (col == left_w || col + 1 == left_w) && row >= top && row < body_bottom {
+        return Some((Divider::Col, col as i16 - left_w as i16));
+    }
+    // Left column's fleet/procs seam.
+    let ldiv = l.procs.y;
+    if col < left_w && (row == ldiv || row + 1 == ldiv) {
+        return Some((Divider::LeftRow, row as i16 - ldiv as i16));
+    }
+    // Right column's events/commands seam.
+    let rdiv = l.commands.y;
+    if col >= left_w && (row == rdiv || row + 1 == rdiv) {
+        return Some((Divider::RightRow, row as i16 - rdiv as i16));
+    }
+    None
+}
+
+/// Clamp an absolute split position to `[min, max]` and return it as an offset from
+/// `default` (the value stored in [`Splits`]).
+fn set_split_abs(default: u16, target: i32, min: u16, max: u16) -> i16 {
+    (target.clamp(min as i32, max as i32) - default as i32) as i16
+}
+
+/// Compute the tile layout for `cols × rows` with the given resize `splits`, or
+/// `None` when the terminal is too small (matching [`render`]'s minimum). The split
+/// deltas are applied and clamped so every pane keeps at least `MIN_W × MIN_H`.
+fn layout(cols: u16, rows: u16, s: Splits) -> Option<Layout> {
+    if cols < 40 || rows < 12 {
+        return None;
+    }
+    let top = 3u16;
+    let body_h = (rows - 1).saturating_sub(top);
+    let (def_lw, def_fh, def_eh) = split_defaults(cols, body_h);
+    let clampw = |v: i32| v.clamp(MIN_W as i32, (cols - MIN_W) as i32) as u16;
+    let clamph = |v: i32| v.clamp(MIN_H as i32, (body_h - MIN_H) as i32) as u16;
+    let left_w = clampw(def_lw as i32 + s.col as i32);
+    let right_w = cols - left_w;
+    let fleet_h = clamph(def_fh as i32 + s.lrow as i32);
+    let proc_h = body_h - fleet_h;
+    let ev_h = clamph(def_eh as i32 + s.rrow as i32);
+    let cmd_h = body_h - ev_h;
+    Some(Layout {
+        fleet: Rect { x: 0, y: top, w: left_w, h: fleet_h },
+        procs: Rect { x: 0, y: top + fleet_h, w: left_w, h: proc_h },
+        events: Rect { x: left_w, y: top, w: right_w, h: ev_h },
+        commands: Rect { x: left_w, y: top + ev_h, w: right_w, h: cmd_h },
+    })
+}
+
+/// A right-click detail popup: the lines to show and where the click landed.
+struct Tooltip {
+    lines: Vec<String>,
+    col: u16,
+    row: u16,
+}
+
+/// The rectangle of tile index `t`.
+fn tile_rect(l: &Layout, t: usize) -> Rect {
+    match t {
+        FLEET => l.fleet,
+        PROCS => l.procs,
+        EVENTS => l.events,
+        _ => l.commands,
+    }
+}
+
+/// Which tile index (if any) the point `(col, row)` falls in.
+fn tile_at(l: &Layout, col: u16, row: u16) -> Option<usize> {
+    (0..4).find(|&t| tile_rect(l, t).contains(col, row))
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +344,35 @@ struct Dash {
     colors: Colors,
     overlay: Overlay,
     restore: Option<(Palette, String, bool)>,
+    // Interactive cursor. One `TileView` (selected row + scroll top) per tile, plus
+    // which tile is focused. The focused tile's selected row is the highlighted
+    // cursor; arrow keys move it within the focused tile, Tab switches tiles, and the
+    // mouse (hover / scroll / click) drives the same selection.
+    view: [TileView; 4],
+    focus: usize,
+    /// Per-tile "follow the newest row" flag. Feeds (events/commands) start pinned to
+    /// the tail and re-pin whenever the cursor is on the last row; scrolling up
+    /// unpins. Lists (fleet/procs) ignore it.
+    follow: [bool; 4],
+    /// User pane-resize offsets from the default layout.
+    splits: Splits,
+    /// An in-progress divider drag: which divider, and the grab offset from its edge.
+    drag: Option<(Divider, i16)>,
+    tooltip: Option<Tooltip>,
+}
+
+/// Tile indices into [`Dash::view`], and the tile the mouse/keys act on.
+const FLEET: usize = 0;
+const PROCS: usize = 1;
+const EVENTS: usize = 2;
+const COMMANDS: usize = 3;
+
+/// Per-tile view: the selected data row (the cursor) and the first visible row
+/// (scroll top). The visible window is `[top, top + inner_height)`.
+#[derive(Default, Clone, Copy)]
+struct TileView {
+    sel: usize,
+    top: usize,
 }
 
 impl Dash {
@@ -201,6 +392,93 @@ impl Dash {
             colors: Colors::from_theme(pal, mono),
             overlay: Overlay::None,
             restore: None,
+            view: [TileView::default(); 4],
+            focus: FLEET,
+            follow: [true; 4],
+            splits: Splits::default(),
+            drag: None,
+            tooltip: None,
+        }
+    }
+
+    /// Move a divider so its edge follows the mouse absolutely (`cursor − grab
+    /// offset`), clamped so no pane drops below the minimum — zmax's drag model.
+    /// `l` is the current layout (only its invariants — body height, top, defaults —
+    /// are read, so the stale-vs-new split doesn't matter).
+    fn apply_drag(&mut self, l: &Layout, div: Divider, offset: i16, col: u16, row: u16, cols: u16) {
+        let top = l.fleet.y;
+        let body_h = l.fleet.h + l.procs.h;
+        let (def_lw, def_fh, def_eh) = split_defaults(cols, body_h);
+        match div {
+            Divider::Col => {
+                let target = col as i32 - offset as i32;
+                self.splits.col = set_split_abs(def_lw, target, MIN_W, cols - MIN_W);
+            }
+            Divider::LeftRow => {
+                let target = row as i32 - offset as i32 - top as i32; // fleet height
+                self.splits.lrow = set_split_abs(def_fh, target, MIN_H, body_h - MIN_H);
+            }
+            Divider::RightRow => {
+                let target = row as i32 - offset as i32 - top as i32; // events height
+                self.splits.rrow = set_split_abs(def_eh, target, MIN_H, body_h - MIN_H);
+            }
+        }
+    }
+
+    /// The data-row count of tile `t`.
+    fn tile_len(&self, t: usize) -> usize {
+        match t {
+            FLEET => self.fleet.len(),
+            PROCS => self.procs.len(),
+            EVENTS => self.events.len(),
+            _ => self.commands.len(),
+        }
+    }
+
+    /// Keep every tile's selection/scroll in range as the data changes between
+    /// refreshes, and re-pin any following feed to its newest row. Needs the tile
+    /// heights, so it runs from the render loop where the terminal size is known.
+    fn reconcile_views(&mut self, l: &Layout) {
+        for t in 0..4 {
+            let len = self.tile_len(t);
+            let ih = tile_rect(l, t).inner().3 as usize;
+            let v = &mut self.view[t];
+            if len == 0 {
+                *v = TileView::default();
+                continue;
+            }
+            // A pinned feed tracks the newest row.
+            if (t == EVENTS || t == COMMANDS) && self.follow[t] {
+                v.sel = len - 1;
+            }
+            v.sel = v.sel.min(len - 1);
+            // Keep the selection inside the window.
+            if v.sel < v.top {
+                v.top = v.sel;
+            } else if ih > 0 && v.sel >= v.top + ih {
+                v.top = v.sel + 1 - ih;
+            }
+            v.top = v.top.min(len.saturating_sub(ih));
+        }
+    }
+
+    /// Move the focused tile's cursor by `delta` rows, scrolling to keep it visible.
+    fn move_sel(&mut self, delta: i32, ih: usize) {
+        let t = self.focus;
+        let len = self.tile_len(t);
+        if len == 0 {
+            return;
+        }
+        let v = &mut self.view[t];
+        v.sel = (v.sel as i32 + delta).clamp(0, len as i32 - 1) as usize;
+        if v.sel < v.top {
+            v.top = v.sel;
+        } else if ih > 0 && v.sel >= v.top + ih {
+            v.top = v.sel + 1 - ih;
+        }
+        // Feeds re-pin to the tail only when the cursor sits on the last row.
+        if t == EVENTS || t == COMMANDS {
+            self.follow[t] = v.sel + 1 >= len;
         }
     }
 
@@ -319,6 +597,8 @@ impl Dash {
         self.fleet = fleet;
         self.commands = read_commands(FEED);
         self.daemon_up = crate::superset::zdaemon::is_running();
+        // Selection/scroll are reconciled against the new data in the render loop,
+        // where the tile heights are known (see `reconcile_views`).
     }
 }
 
@@ -448,27 +728,18 @@ fn render(buf: &mut Buffer, d: &Dash) {
     };
     set_str(buf, 0, 2, &format!("claims {}  sessions {}  queue {} active  procs {}{}   theme: {}", t.claims, t.sessions, t.queue, t.procs, top_seg, if d.mono { "Monochrome" } else { &d.label }), c.label, cols);
 
-    let top = 3u16;
     let foot = rows - 1;
-    let body_h = foot.saturating_sub(top);
-    let left_w = cols / 2;
-    let right_x = left_w;
-    let right_w = cols - left_w;
-    let ev_h = body_h / 2;
-    let cmd_h = body_h - ev_h;
-    // Left column splits: the fleet on top, the per-process commit tile (`zppid`)
-    // below it. The process tile takes the lower third (clamped so the fleet keeps
-    // the majority and both stay drawable on a short terminal).
-    let proc_h = (body_h / 3).clamp(3, body_h.saturating_sub(4).max(3));
-    let fleet_h = body_h.saturating_sub(proc_h);
-
-    render_fleet(buf, 0, top, left_w, fleet_h, d);
-    render_procs(buf, 0, top + fleet_h, left_w, proc_h, d);
-    render_events(buf, right_x, top, right_w, ev_h, d);
-    render_commands(buf, right_x, top + ev_h, right_w, cmd_h, d);
+    // The tile rectangles come from the shared layout so the mouse handler hit-tests
+    // exactly what is drawn. The fleet sits on top of the per-process tile in the
+    // left column; events over commands on the right.
+    let Some(l) = layout(cols, rows, d.splits) else { return };
+    render_fleet(buf, l.fleet, d);
+    render_procs(buf, l.procs, d);
+    render_events(buf, l.events, d);
+    render_commands(buf, l.commands, d);
 
     fill_row(buf, foot, c.bar);
-    set_str(buf, 0, foot, " q Quit   c Colors   ~ Edit   F1 Help   live — fleet · procs · events · commands ", c.bar, cols);
+    set_str(buf, 0, foot, " q Quit  ↑↓ Move  Tab Tile  drag/HJKL Resize (= reset)  right-click Info  c Colors  F1 Help ", c.bar, cols);
 
     match &d.overlay {
         Overlay::None => {}
@@ -476,24 +747,60 @@ fn render(buf: &mut Buffer, d: &Dash) {
         Overlay::Chooser(cur) => render_theme_chooser(buf, *cur),
         Overlay::Editor(chan) => render_theme_editor(buf, d.pal, *chan),
     }
+    // The right-click detail popup sits above the tiles but below theme overlays.
+    if matches!(d.overlay, Overlay::None) {
+        if let Some(tt) = &d.tooltip {
+            render_tooltip(buf, tt, cols, rows, c);
+        }
+    }
 }
 
-fn render_fleet(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash) {
+/// A tile title with a `▸` marker when it is focused and a `[sel/len]` position, so
+/// the cursor's tile and place in the list are always visible.
+fn tile_title(base: &str, t: usize, d: &Dash) -> String {
+    let mark = if d.focus == t { "▸ " } else { "" };
+    let len = d.tile_len(t);
+    if len == 0 {
+        format!("{mark}{base}")
+    } else {
+        format!("{mark}{base}  [{}/{}]", d.view[t].sel + 1, len)
+    }
+}
+
+/// Paint a solid background across a row's cells, keeping the glyphs/foregrounds
+/// already drawn — the cursor highlight (ported from iftoprs's `select_bg` overlay).
+fn highlight_row(buf: &mut Buffer, x: u16, y: u16, w: u16, bg: ratatui::style::Color) {
+    let a = *buf.area();
+    for cx in x..x + w {
+        if cx < a.x + a.width && y < a.y + a.height {
+            buf[(cx, y)].set_bg(bg);
+        }
+    }
+}
+
+fn render_fleet(buf: &mut Buffer, r: Rect, d: &Dash) {
     let c = &d.colors;
-    let (ix, iy, iw, ih) = tile(buf, x, y, w, h, "FLEET · most active", c);
-    for (i, row) in d.fleet.iter().take(ih as usize).enumerate() {
+    let v = d.view[FLEET];
+    let (ix, iy, iw, ih) = tile(buf, r.x, r.y, r.w, r.h, &tile_title("FLEET · most active", FLEET, d), c);
+    let top = v.top.min(d.fleet.len());
+    let end = (top + ih as usize).min(d.fleet.len());
+    for (i, row) in d.fleet[top..end].iter().enumerate() {
         let cy = iy + i as u16;
         let (word, style) = state_of(row, c);
         let namew = iw.saturating_sub(20);
         set_str(buf, ix, cy, &basename(&row.path), c.row, namew);
         set_str(buf, ix + namew + 1, cy, word, style, 10);
         set_str(buf, ix + namew + 12, cy, &fmt_ago(row.age_secs), c.dim, 6);
+        if d.focus == FLEET && top + i == v.sel {
+            highlight_row(buf, ix, cy, iw, c.hl_bg);
+        }
     }
 }
 
-fn render_procs(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash) {
+fn render_procs(buf: &mut Buffer, r: Rect, d: &Dash) {
     let c = &d.colors;
-    let (ix, iy, iw, ih) = tile(buf, x, y, w, h, "PROCESSES · commits by ppid", c);
+    let v = d.view[PROCS];
+    let (ix, iy, iw, ih) = tile(buf, r.x, r.y, r.w, r.h, &tile_title("PROCESSES · commits by ppid", PROCS, d), c);
     if d.procs.is_empty() {
         set_str(buf, ix, iy, "no commits recorded yet", c.dim, iw);
         return;
@@ -501,7 +808,9 @@ fn render_procs(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash) {
     // pid | cmd | commits | live/dead | age, with the cwd basename filling whatever
     // is left. commits/state/age are anchored from the right edge so they never clip;
     // pid+cmd+cwd share the rest. set_str clips each field to its width.
-    for (i, p) in d.procs.iter().take(ih as usize).enumerate() {
+    let top = v.top.min(d.procs.len());
+    let end = (top + ih as usize).min(d.procs.len());
+    for (i, p) in d.procs[top..end].iter().enumerate() {
         let cy = iy + i as u16;
         let (state, sstyle) = if p.alive { ("live", c.ok) } else { ("dead", c.dim) };
         set_str(buf, ix, cy, &p.ppid.to_string(), c.cyan, 8);
@@ -512,6 +821,9 @@ fn render_procs(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash) {
         set_str(buf, ix + iw.saturating_sub(18), cy, &format!("{}c", p.commits), c.green, 6);
         set_str(buf, ix + iw.saturating_sub(11), cy, state, sstyle, 5);
         set_str(buf, ix + iw.saturating_sub(5), cy, &fmt_ago(p.age_secs), c.dim, 5);
+        if d.focus == PROCS && top + i == v.sel {
+            highlight_row(buf, ix, cy, iw, c.hl_bg);
+        }
     }
 }
 
@@ -531,12 +843,13 @@ fn state_of(row: &FleetRow, c: &Colors) -> (&'static str, Style) {
     }
 }
 
-fn render_events(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash) {
+fn render_events(buf: &mut Buffer, r: Rect, d: &Dash) {
     let c = &d.colors;
-    let (ix, iy, iw, ih) = tile(buf, x, y, w, h, "EVENTS · commits · reconciles · status", c);
-    let take = ih as usize;
-    let start = d.events.len().saturating_sub(take);
-    for (i, e) in d.events[start..].iter().enumerate() {
+    let v = d.view[EVENTS];
+    let (ix, iy, iw, ih) = tile(buf, r.x, r.y, r.w, r.h, &tile_title("EVENTS · commits · reconciles · status", EVENTS, d), c);
+    let top = v.top.min(d.events.len());
+    let end = (top + ih as usize).min(d.events.len());
+    for (i, e) in d.events[top..end].iter().enumerate() {
         let cy = iy + i as u16;
         let (glyph, style) = match e.kind.as_str() {
             "commit" => ("●", c.green),
@@ -549,6 +862,9 @@ fn render_events(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash) {
         set_cell(buf, ix + 9, cy, glyph, style);
         set_str(buf, ix + 11, cy, &event_repo(e), c.cyan, 18);
         set_str(buf, ix + 30, cy, &e.detail.clone().unwrap_or_default(), c.row, iw.saturating_sub(30));
+        if d.focus == EVENTS && top + i == v.sel {
+            highlight_row(buf, ix, cy, iw, c.hl_bg);
+        }
     }
 }
 
@@ -557,22 +873,65 @@ fn event_repo(e: &crate::db::EventRow) -> String {
     basename(&src).trim_end_matches(".git").to_string()
 }
 
-fn render_commands(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash) {
+fn render_commands(buf: &mut Buffer, r: Rect, d: &Dash) {
     let c = &d.colors;
-    let (ix, iy, iw, ih) = tile(buf, x, y, w, h, "COMMANDS · every git across the fleet", c);
+    let v = d.view[COMMANDS];
+    let (ix, iy, iw, ih) = tile(buf, r.x, r.y, r.w, r.h, &tile_title("COMMANDS · every git across the fleet", COMMANDS, d), c);
     if d.commands.is_empty() {
         set_str(buf, ix, iy, "run `git zcommands` once to enable command logging", c.dim, iw);
         return;
     }
-    let take = ih as usize;
-    let start = d.commands.len().saturating_sub(take);
-    for (i, cmd) in d.commands[start..].iter().enumerate() {
+    let top = v.top.min(d.commands.len());
+    let end = (top + ih as usize).min(d.commands.len());
+    for (i, cmd) in d.commands[top..end].iter().enumerate() {
         let cy = iy + i as u16;
         set_str(buf, ix, cy, &hms(cmd.ts), c.dim, 8);
         set_str(buf, ix + 9, cy, &format!("{}\u{2190}{}", cmd.pid, cmd.ppid), c.dim, 13);
         set_str(buf, ix + 23, cy, &basename(&cmd.cwd), c.cyan, 14);
         set_str(buf, ix + 38, cy, "git", c.green, 3);
         set_str(buf, ix + 42, cy, &cmd.argv, c.row, iw.saturating_sub(42));
+        if d.focus == COMMANDS && top + i == v.sel {
+            highlight_row(buf, ix, cy, iw, c.hl_bg);
+        }
+    }
+}
+
+/// Draw the right-click detail popup: a bordered box of `tt.lines` placed near the
+/// click, clamped so it stays fully on screen.
+fn render_tooltip(buf: &mut Buffer, tt: &Tooltip, cols: u16, rows: u16, c: &Colors) {
+    if tt.lines.is_empty() {
+        return;
+    }
+    let inner_w = tt.lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).min(cols as usize - 4) as u16;
+    let bw = inner_w + 2; // + borders
+    let bh = tt.lines.len() as u16 + 2;
+    // Prefer just below-right of the click, clamped into the screen.
+    let bx = tt.col.min(cols.saturating_sub(bw));
+    let by = (tt.row + 1).min(rows.saturating_sub(bh));
+    let (x1, y1) = (bx + bw - 1, by + bh - 1);
+    // Every cell of the popup carries the opaque `popup_bg`, so nothing shows through.
+    let bg = c.popup_bg;
+    let border = c.title.bg(bg);
+    let text = c.cyan.bg(bg);
+    // Fill the whole box solid first (opaque backing).
+    for yy in by..=y1 {
+        for xx in bx..=x1 {
+            set_cell(buf, xx, yy, " ", text);
+        }
+    }
+    set_cell(buf, bx, by, "┌", border);
+    set_cell(buf, x1, by, "┐", border);
+    set_cell(buf, bx, y1, "└", border);
+    set_cell(buf, x1, y1, "┘", border);
+    for cx in bx + 1..x1 {
+        set_cell(buf, cx, by, "─", border);
+        set_cell(buf, cx, y1, "─", border);
+    }
+    for (i, line) in tt.lines.iter().enumerate() {
+        let cy = by + 1 + i as u16;
+        set_cell(buf, bx, cy, "│", border);
+        set_cell(buf, x1, cy, "│", border);
+        set_str(buf, bx + 1, cy, line, text, inner_w);
     }
 }
 
@@ -584,19 +943,23 @@ struct TermGuard;
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen, cursor::Show);
+        let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen, cursor::Show);
     }
 }
 
 pub fn run() -> Result<ExitCode> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, cursor::Hide)?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, cursor::Hide)?;
     let _guard = TermGuard;
     let mut term = Terminal::new(CrosstermBackend::new(stdout()))?;
     let mut dash = Dash::new();
     loop {
-        let visible = ratatui::crossterm::terminal::size().map(|(_, h)| h.saturating_sub(6) as usize).unwrap_or(40);
-        dash.refresh(visible);
+        let (cols, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+        dash.refresh(rows.saturating_sub(6) as usize);
+        // Reconcile the cursor/scroll against the new data (needs the tile heights).
+        if let Some(l) = layout(cols, rows, dash.splits) {
+            dash.reconcile_views(&l);
+        }
         term.draw(|f| render(f.buffer_mut(), &dash))?;
 
         let deadline = Instant::now() + POLL;
@@ -605,16 +968,191 @@ pub fn run() -> Result<ExitCode> {
             if remaining.is_zero() || !event::poll(remaining)? {
                 break;
             }
-            if let Event::Key(k) = event::read()? {
-                if k.kind != KeyEventKind::Press {
-                    continue;
+            match event::read()? {
+                Event::Key(k) => {
+                    if k.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    if handle_key(&mut dash, k.code, k.modifiers) {
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    break; // redraw immediately after a handled key
                 }
-                if handle_key(&mut dash, k.code, k.modifiers) {
-                    return Ok(ExitCode::SUCCESS);
+                Event::Mouse(m) => {
+                    let (cols, rows) =
+                        ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+                    // Only redraw when the event changed something — hover `Moved`
+                    // events flood in and must not trigger a redraw storm.
+                    if handle_mouse(&mut dash, m, cols, rows) {
+                        break;
+                    }
                 }
-                break; // redraw immediately after a handled key
+                _ => {}
             }
         }
+    }
+}
+
+/// Route one mouse event: scroll the tile under the cursor, or (right-click) open a
+/// detail tooltip for the row there. Ported from iftoprs's `handle_mouse` — any
+/// click dismisses an open tooltip; while a theme overlay is up the scroll wheel
+/// cycles it, exactly as the keyboard would. Returns `true` when the view changed
+/// and needs a redraw, so hover `Moved` events (which return `false`) don't churn.
+fn handle_mouse(d: &mut Dash, m: MouseEvent, cols: u16, rows: u16) -> bool {
+    let dismissed = matches!(m.kind, MouseEventKind::Down(_)) && d.tooltip.take().is_some();
+
+    if let Overlay::Chooser(cur) = d.overlay {
+        let n = THEMES.len();
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                let c = (cur + 1) % n;
+                d.overlay = Overlay::Chooser(c);
+                d.set_palette(THEMES[c].palette(), THEMES[c].display_name());
+            }
+            MouseEventKind::ScrollUp => {
+                let c = (cur + n - 1) % n;
+                d.overlay = Overlay::Chooser(c);
+                d.set_palette(THEMES[c].palette(), THEMES[c].display_name());
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                d.overlay = Overlay::None;
+                d.restore = None;
+                save_palette(&d.label, d.pal);
+            }
+            MouseEventKind::Down(_) => {
+                d.overlay = Overlay::None;
+                d.revert_theme();
+            }
+            _ => return false,
+        }
+        return true;
+    }
+    if !matches!(d.overlay, Overlay::None) {
+        return dismissed; // help/editor: keyboard-driven
+    }
+
+    let Some(l) = layout(cols, rows, d.splits) else { return dismissed };
+    let changed = match m.kind {
+        // Wheel moves the cursor in the tile under the pointer (iftoprs select_next/prev).
+        MouseEventKind::ScrollDown => scroll_select(d, &l, m.column, m.row, 1),
+        MouseEventKind::ScrollUp => scroll_select(d, &l, m.column, m.row, -1),
+        // Left press on a divider begins a resize drag; otherwise it moves the cursor.
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(dv) = divider_at(&l, m.column, m.row) {
+                d.drag = Some(dv);
+                false
+            } else {
+                point_select(d, &l, m.column, m.row)
+            }
+        }
+        // A left drag moves the grabbed divider (following the cursor absolutely); with
+        // no divider grabbed it extends the selection to the row under the pointer.
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some((div, off)) = d.drag {
+                d.apply_drag(&l, div, off, m.column, m.row, cols);
+                true
+            } else {
+                point_select(d, &l, m.column, m.row)
+            }
+        }
+        // Releasing ends any divider drag.
+        MouseEventKind::Up(_) => d.drag.take().is_some(),
+        // Hover moves the cursor to the row under the pointer (highlight follows).
+        MouseEventKind::Moved => point_select(d, &l, m.column, m.row),
+        MouseEventKind::Down(MouseButton::Right) => {
+            point_select(d, &l, m.column, m.row);
+            open_tooltip(d, &l, m.column, m.row);
+            true
+        }
+        _ => false,
+    };
+    changed || dismissed
+}
+
+/// Move focus to the tile the pointer is over and set its cursor to the row under
+/// the pointer, keeping it in view. Returns whether focus or selection changed (so a
+/// hover that stays on the same row causes no redraw). Used by left-click and hover.
+fn point_select(d: &mut Dash, l: &Layout, col: u16, row: u16) -> bool {
+    let Some(t) = tile_at(l, col, row) else { return false };
+    let (_, iy, _, ih) = tile_rect(l, t).inner();
+    let len = d.tile_len(t);
+    // Over the border/title, or an empty tile → just focus it.
+    if len == 0 || !(row >= iy && row < iy + ih) {
+        let changed = d.focus != t;
+        d.focus = t;
+        return changed;
+    }
+    let idx = (d.view[t].top + (row - iy) as usize).min(len - 1);
+    let changed = d.focus != t || d.view[t].sel != idx;
+    d.focus = t;
+    d.view[t].sel = idx;
+    if t == EVENTS || t == COMMANDS {
+        d.follow[t] = idx + 1 >= len;
+    }
+    changed
+}
+
+/// Focus the tile under the pointer and move its cursor by `delta` (wheel).
+fn scroll_select(d: &mut Dash, l: &Layout, col: u16, row: u16, delta: i32) -> bool {
+    let Some(t) = tile_at(l, col, row) else { return false };
+    d.focus = t;
+    let ih = tile_rect(l, t).inner().3 as usize;
+    d.move_sel(delta, ih);
+    true
+}
+
+/// Open a detail tooltip for the row the pointer is over, mapping the click back to
+/// the record through the same scroll top the renderer used.
+fn open_tooltip(d: &mut Dash, l: &Layout, col: u16, row: u16) {
+    let Some(t) = tile_at(l, col, row) else { return };
+    let (_, iy, _, ih) = tile_rect(l, t).inner();
+    if !(row >= iy && row < iy + ih) {
+        return;
+    }
+    let idx = d.view[t].top + (row - iy) as usize;
+    let lines = match t {
+        FLEET => d.fleet.get(idx).map(|r| {
+            vec![
+                format!("repo:  {}", crate::superset::zppid::tilde(&r.path)),
+                format!("head:  {}   [{}]", r.head, state_of(r, &d.colors).0),
+                format!("sync:  {}   {} ago", if r.sync.is_empty() { "—" } else { &r.sync }, fmt_ago(r.age_secs)),
+                format!("git:   {}", crate::superset::zppid::tilde(&r.git_dir)),
+            ]
+        }),
+        PROCS => d.procs.get(idx).map(|p| {
+            vec![
+                format!("pid:      {}   [{}]", p.ppid, if p.alive { "live" } else { "dead" }),
+                format!("command:  {}", p.cmd),
+                format!("commits:  {}   {} ago", p.commits, fmt_ago(p.age_secs)),
+                format!("cwd:      {}", crate::superset::zppid::tilde(&p.cwd)),
+            ]
+        }),
+        EVENTS => d.events.get(idx).map(|e| {
+            vec![
+                format!("{}  {}  {}", hms(e.ts), e.kind, event_repo(e)),
+                format!("detail: {}", e.detail.clone().unwrap_or_else(|| "—".into())),
+                format!("{}..{}", short_sha(&e.sha_before), short_sha(&e.sha_after)),
+            ]
+        }),
+        _ => d.commands.get(idx).map(|cmd| {
+            vec![
+                format!("{}  pid {}\u{2190}{}", hms(cmd.ts), cmd.pid, cmd.ppid),
+                format!("cwd:  {}", crate::superset::zppid::tilde(&cmd.cwd)),
+                format!("git {}", cmd.argv),
+            ]
+        }),
+    };
+    if let Some(lines) = lines {
+        d.tooltip = Some(Tooltip { lines, col, row });
+    }
+}
+
+/// Short SHA (12) for tooltips; a placeholder for a null/absent id.
+fn short_sha(s: &Option<String>) -> String {
+    match s {
+        Some(s) if s.len() >= 12 => s[..12].to_string(),
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => "—".into(),
     }
 }
 
@@ -685,9 +1223,10 @@ fn handle_key(d: &mut Dash, code: KeyCode, mods: KeyModifiers) -> bool {
         Overlay::None => {}
     }
 
+    let ih = focus_ih(d);
     match (code, mods) {
         (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => return true,
-        (KeyCode::F(1), _) | (KeyCode::Char('h'), _) | (KeyCode::Char('?'), _) => d.overlay = Overlay::Help,
+        (KeyCode::F(1), _) | (KeyCode::Char('?'), _) => d.overlay = Overlay::Help,
         (KeyCode::F(2), _) | (KeyCode::Char('c'), _) => {
             d.snapshot_theme();
             let cur = ThemeName::from_name(&d.label).map(|t| t.index()).unwrap_or(0);
@@ -697,9 +1236,71 @@ fn handle_key(d: &mut Dash, code: KeyCode, mods: KeyModifiers) -> bool {
             d.snapshot_theme();
             d.overlay = Overlay::Editor(0);
         }
+        // Move the cursor within the focused tile.
+        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => d.move_sel(1, ih),
+        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => d.move_sel(-1, ih),
+        (KeyCode::PageDown, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+            d.move_sel(ih as i32, ih)
+        }
+        (KeyCode::PageUp, _) | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+            d.move_sel(-(ih as i32), ih)
+        }
+        (KeyCode::Home, _) | (KeyCode::Char('g'), _) => d.move_sel(i32::MIN / 2, ih),
+        (KeyCode::End, _) | (KeyCode::Char('G'), _) => d.move_sel(i32::MAX / 2, ih),
+        // Switch which tile the cursor is in.
+        (KeyCode::Tab, _) => d.focus = (d.focus + 1) % 4,
+        (KeyCode::BackTab, _) => d.focus = (d.focus + 3) % 4,
+        (KeyCode::Left, _) | (KeyCode::Right, _) => d.focus ^= 2, // toggle column
+        // Resize panes (Shift+H/J/K/L). H/L move the vertical column divider; J/K
+        // move the focused column's horizontal divider. `=` resets the layout.
+        (KeyCode::Char('L'), _) => resize_panes(d, 2, 0),
+        (KeyCode::Char('H'), _) => resize_panes(d, -2, 0),
+        (KeyCode::Char('J'), _) => resize_panes(d, 0, 1),
+        (KeyCode::Char('K'), _) => resize_panes(d, 0, -1),
+        (KeyCode::Char('='), _) => d.splits = Splits::default(),
         _ => {}
     }
     false
+}
+
+/// Resize the panes by moving a divider, ported from zmax's delta-resize model
+/// (`resize_horizontal`/`resize_vertical`): `dx` shifts the vertical column divider
+/// (+ widens the left column), `dy` shifts the *focused* column's horizontal divider
+/// (+ grows its top pane). Each delta is folded into the stored offset and re-clamped
+/// against the live terminal size so a pane never drops below `MIN_W × MIN_H`.
+fn resize_panes(d: &mut Dash, dx: i16, dy: i16) {
+    let (cols, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+    if cols < 40 || rows < 12 {
+        return;
+    }
+    let body_h = (rows - 1).saturating_sub(3);
+    let (def_lw, def_fh, def_eh) = split_defaults(cols, body_h);
+    if dx != 0 {
+        d.splits.col = clamp_delta(def_lw, d.splits.col, dx, MIN_W, cols - MIN_W);
+    }
+    if dy != 0 {
+        let left = d.focus == FLEET || d.focus == PROCS;
+        let (default, slot) = if left {
+            (def_fh, &mut d.splits.lrow)
+        } else {
+            (def_eh, &mut d.splits.rrow)
+        };
+        *slot = clamp_delta(default, *slot, dy, MIN_H, body_h - MIN_H);
+    }
+}
+
+/// Fold `delta` into `cur_delta` (an offset from `default`) and clamp the resulting
+/// absolute split position to `[min, max]`, returning the new offset.
+fn clamp_delta(default: u16, cur_delta: i16, delta: i16, min: u16, max: u16) -> i16 {
+    let want = default as i32 + cur_delta as i32 + delta as i32;
+    (want.clamp(min as i32, max as i32) - default as i32) as i16
+}
+
+/// The inner (content) height of the currently-focused tile, read from the live
+/// terminal size — the step size for keyboard cursor moves.
+fn focus_ih(d: &Dash) -> usize {
+    let (cols, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+    layout(cols, rows, d.splits).map(|l| tile_rect(&l, d.focus).inner().3 as usize).unwrap_or(10)
 }
 
 #[cfg(test)]
@@ -725,5 +1326,169 @@ mod tests {
         assert_eq!(state_of(&detached, &c).0, "detached");
         let dirty = FleetRow { path: "/y".into(), git_dir: "/y/.git".into(), head: "h".into(), dirty: true, detached: false, sync: "up-to-date".into(), age_secs: 0 };
         assert_eq!(state_of(&dirty, &c).0, "dirty");
+    }
+
+    #[test]
+    fn layout_tiles_cover_the_body_without_overlap() {
+        let l = layout(120, 40, Splits::default()).expect("layout for a normal terminal");
+        // Left column = fleet stacked on procs; right column = events over commands.
+        assert_eq!(l.fleet.x, 0);
+        assert_eq!(l.procs.x, 0);
+        assert_eq!(l.events.x, l.fleet.w);
+        assert_eq!(l.procs.y, l.fleet.y + l.fleet.h); // procs directly below fleet
+        assert_eq!(l.commands.y, l.events.y + l.events.h); // commands below events
+        // Too-small terminal has no layout (matches render's guard).
+        assert!(layout(20, 8, Splits::default()).is_none());
+    }
+
+    #[test]
+    fn rect_contains_is_half_open() {
+        let r = Rect { x: 10, y: 5, w: 4, h: 3 };
+        assert!(r.contains(10, 5)); // top-left corner
+        assert!(r.contains(13, 7)); // bottom-right interior
+        assert!(!r.contains(14, 5)); // one past the right edge
+        assert!(!r.contains(10, 8)); // one past the bottom edge
+    }
+
+    #[test]
+    fn move_sel_scrolls_and_clamps() {
+        let mut d = Dash::new();
+        d.focus = FLEET;
+        // 25 fleet rows, a 10-row tile.
+        d.fleet = (0..25)
+            .map(|i| FleetRow {
+                path: format!("/r{i}"),
+                git_dir: format!("/r{i}/.git"),
+                head: "h".into(),
+                dirty: false,
+                detached: false,
+                sync: String::new(),
+                age_secs: 0,
+            })
+            .collect();
+        d.move_sel(1, 10);
+        assert_eq!(d.view[FLEET].sel, 1);
+        assert_eq!(d.view[FLEET].top, 0); // still in view
+        d.move_sel(20, 10);
+        assert_eq!(d.view[FLEET].sel, 21);
+        assert_eq!(d.view[FLEET].top, 12); // scrolled to keep the cursor visible
+        d.move_sel(100, 10);
+        assert_eq!(d.view[FLEET].sel, 24); // clamped to the last row
+        d.move_sel(-100, 10);
+        assert_eq!(d.view[FLEET].sel, 0); // clamped to the first row
+        assert_eq!(d.view[FLEET].top, 0);
+    }
+
+    #[test]
+    fn render_paints_cursor_highlight_and_opaque_tooltip() {
+        let area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        let l = layout(120, 40, Splits::default()).unwrap();
+
+        // Selected fleet row must carry the highlight background.
+        let mut d = Dash::new();
+        d.fleet = (0..6)
+            .map(|i| FleetRow {
+                path: format!("/repo{i}"),
+                git_dir: format!("/repo{i}/.git"),
+                head: "main".into(),
+                dirty: false,
+                detached: false,
+                sync: "up-to-date".into(),
+                age_secs: 0,
+            })
+            .collect();
+        d.focus = FLEET;
+        d.view[FLEET].sel = 2;
+        d.view[FLEET].top = 0;
+        let mut buf = Buffer::empty(area);
+        render(&mut buf, &d);
+        let (ix, iy, _, _) = l.fleet.inner();
+        let sel_y = iy + 2;
+        assert_eq!(
+            buf[(ix, sel_y)].style().bg,
+            Some(d.colors.hl_bg),
+            "the selected row must be highlighted (cursor)"
+        );
+        assert_ne!(
+            buf[(ix, iy)].style().bg,
+            Some(d.colors.hl_bg),
+            "a non-selected row must not be highlighted"
+        );
+
+        // A tooltip must paint an opaque background — no cell in its box left transparent.
+        let mut d2 = Dash::new();
+        d2.tooltip = Some(Tooltip { lines: vec!["repo: /x/y".into(), "head: main".into()], col: 20, row: 15 });
+        let mut buf2 = Buffer::empty(area);
+        render(&mut buf2, &d2);
+        let opaque = (0..40u16).any(|y| (0..120u16).any(|x| buf2[(x, y)].style().bg == Some(d2.colors.popup_bg)));
+        assert!(opaque, "the right-click tooltip must have a solid (opaque) background");
+    }
+
+    #[test]
+    fn resize_moves_dividers_and_respects_minimums() {
+        let base = layout(120, 40, Splits::default()).unwrap();
+        // A positive col delta widens the left column; the right column shifts right.
+        let wider = layout(120, 40, Splits { col: 10, lrow: 0, rrow: 0 }).unwrap();
+        assert_eq!(wider.fleet.w, base.fleet.w + 10);
+        assert_eq!(wider.events.x, base.events.x + 10);
+        // Extreme deltas clamp so neither side drops below MIN_W.
+        let maxed = layout(120, 40, Splits { col: 10_000, lrow: 0, rrow: 0 }).unwrap();
+        assert_eq!(maxed.fleet.w, 120 - MIN_W);
+        assert_eq!(maxed.events.w, MIN_W);
+        let mined = layout(120, 40, Splits { col: -10_000, lrow: 0, rrow: 0 }).unwrap();
+        assert_eq!(mined.fleet.w, MIN_W);
+        // Row divider: lrow grows the fleet pane and shrinks procs, staying adjacent.
+        let taller = layout(120, 40, Splits { col: 0, lrow: 5, rrow: 0 }).unwrap();
+        assert_eq!(taller.fleet.h, base.fleet.h + 5);
+        assert_eq!(taller.procs.h, base.procs.h - 5);
+        assert_eq!(taller.procs.y, taller.fleet.y + taller.fleet.h);
+    }
+
+    #[test]
+    fn divider_hit_test_and_drag_resize() {
+        let l = layout(120, 40, Splits::default()).unwrap();
+        let left_w = l.fleet.w;
+        let mid = l.fleet.y + 5;
+        // The vertical column seam is grabbable at x in {left_w-1, left_w}.
+        assert!(matches!(divider_at(&l, left_w, mid), Some((Divider::Col, _))));
+        assert!(matches!(divider_at(&l, left_w - 1, mid), Some((Divider::Col, _))));
+        // A cell inside a tile is not a divider; the fleet/procs seam is LeftRow.
+        assert!(divider_at(&l, 5, mid).is_none());
+        assert!(matches!(divider_at(&l, 5, l.procs.y), Some((Divider::LeftRow, _))));
+
+        // Grab the column divider and drag it to x = 40 → left column becomes 40 wide.
+        let mut d = Dash::new();
+        let (div, off) = divider_at(&l, left_w, mid).unwrap();
+        d.apply_drag(&l, div, off, 40, mid, 120);
+        assert_eq!(layout(120, 40, d.splits).unwrap().fleet.w, 40);
+        // Dragging past the edge clamps to the minimum pane width.
+        d.apply_drag(&l, div, off, 500, mid, 120);
+        assert_eq!(layout(120, 40, d.splits).unwrap().fleet.w, 120 - MIN_W);
+    }
+
+    #[test]
+    fn clamp_delta_bounds_the_offset() {
+        assert_eq!(clamp_delta(60, 0, 5, 12, 108), 5);
+        assert_eq!(clamp_delta(60, 0, 1000, 12, 108), 48); // lands on max (108) → offset 48
+        assert_eq!(clamp_delta(60, 0, -1000, 12, 108), -48); // lands on min (12) → offset -48
+    }
+
+    #[test]
+    fn feed_follow_pins_to_the_newest_row() {
+        let mut d = Dash::new();
+        let l = layout(120, 40, Splits::default()).unwrap();
+        d.events = (0..5).map(|i| crate::db::EventRow {
+            id: i, ts: 0, kind: "commit".into(), git_dir: None, workdir: None,
+            detail: None, sha_before: None, sha_after: None,
+        }).collect();
+        d.reconcile_views(&l);
+        assert_eq!(d.view[EVENTS].sel, 4); // pinned to newest
+        // Grow the feed → still pinned to the new newest.
+        d.events.push(crate::db::EventRow {
+            id: 5, ts: 0, kind: "commit".into(), git_dir: None, workdir: None,
+            detail: None, sha_before: None, sha_after: None,
+        });
+        d.reconcile_views(&l);
+        assert_eq!(d.view[EVENTS].sel, 5);
     }
 }

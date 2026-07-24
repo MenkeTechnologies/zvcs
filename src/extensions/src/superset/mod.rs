@@ -106,7 +106,7 @@ pub use queue::{zcommit, zpush, zsubmit};
 pub use repl::zrepl;
 pub use reconcile::reconcile_tree;
 pub use guard::zguard;
-pub use zppid::zppid;
+pub use zppid::{zppid, zprocs};
 pub use zbroadcast::{zbroadcast, zhandoff};
 pub use zbump::{zbump, zbump_run, BumpOutcome};
 pub use zcontend::zcontend;

@@ -6862,6 +6862,7 @@ _git_commands () {
     zdashboard:'zvcs: one-screen health summary of the tree'
     ztop:'zvcs: live htop-style fleet monitor, most churn on top'
     zppid:'zvcs: per-process commit tally (each invoking ppid and commits landed)'
+    zprocs:'zvcs: per-process command breakdown (mutating verbs run by each process)'
     zpin:'zvcs: freeze a repo from daemon autonomy (no autobump/reconcile)'
     zunpin:'zvcs: unfreeze pinned repos'
     zbroadcast:'zvcs: post or read inter-agent messages'
@@ -9386,7 +9387,7 @@ done
 for _zv in zheads zdirty zbranches ztags zremotes zsize zage zstale zlast zfiles \
            zpristine zcommits zbig zahead zbehind zunpushed zunpulled zauthors \
            zhot zdivergent zorphans zconflicts zgrep zrepos zjobs zwho zsessions \
-           zdashboard zppid; do
+           zdashboard zppid zprocs; do
   (( $+functions[_git-$_zv] )) || functions[_git-$_zv]='_arguments "--json[emit NDJSON for scripting]" "*::selector or pattern:"'
 done
 unset _zv

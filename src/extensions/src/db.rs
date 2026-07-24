@@ -156,6 +156,18 @@ CREATE TABLE IF NOT EXISTS ppids (
     first_seen INTEGER,
     last_seen  INTEGER
 );
+-- Per-process command tally (`zprocs`): how many of each mutating verb (commit,
+-- push, add, merge, …) a durable process has run. Keyed by the same session as
+-- `ppids` (join on it for the process's pid/cmd/cwd), one row per (session, verb).
+-- Only mutating verbs are recorded, so the read hot path never writes here.
+CREATE TABLE IF NOT EXISTS proc_verbs (
+    session    TEXT NOT NULL,
+    verb       TEXT NOT NULL,
+    count      INTEGER NOT NULL DEFAULT 0,
+    first_seen INTEGER,
+    last_seen  INTEGER,
+    PRIMARY KEY (session, verb)
+);
 ";
 
 /// The commit-detection trigger, installed via DROP+CREATE in [`open_rw`] so a
@@ -1173,6 +1185,60 @@ pub fn ppid_record_commit(conn: &Connection, session: &str, ppid: i64, cmd: &str
         rusqlite::params![session, ppid, cmd, cwd, ts],
     )?;
     Ok(())
+}
+
+/// Register (or refresh) a process's identity WITHOUT bumping its commit count — the
+/// path for a non-commit mutating verb, so a process that only pushes/adds still
+/// appears in `ppids` (with its pid/cmd/cwd) and can carry a `proc_verbs` breakdown.
+pub fn ppid_touch(conn: &Connection, session: &str, ppid: i64, cmd: &str, cwd: &str) -> Result<()> {
+    let ts = now();
+    conn.execute(
+        "INSERT INTO ppids (session, ppid, cmd, cwd, commits, first_seen, last_seen)
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)
+         ON CONFLICT(session) DO UPDATE SET ppid = ?2, cmd = ?3, cwd = ?4, last_seen = ?5",
+        rusqlite::params![session, ppid, cmd, cwd, ts],
+    )?;
+    Ok(())
+}
+
+/// Increment a process's per-verb command count (`proc_verbs`), upserting the row.
+pub fn proc_verb_record(conn: &Connection, session: &str, verb: &str) -> Result<()> {
+    let ts = now();
+    conn.execute(
+        "INSERT INTO proc_verbs (session, verb, count, first_seen, last_seen)
+         VALUES (?1, ?2, 1, ?3, ?3)
+         ON CONFLICT(session, verb) DO UPDATE SET count = count + 1, last_seen = ?3",
+        rusqlite::params![session, verb, ts],
+    )?;
+    Ok(())
+}
+
+/// One per-verb tally row for `git zprocs`.
+pub struct ProcVerbRow {
+    pub session: String,
+    pub verb: String,
+    pub count: i64,
+    pub last_seen: i64,
+}
+
+/// Every per-verb tally, busiest process/verb first — joined per session against
+/// `ppids` by the caller for the process's pid/cmd/cwd.
+pub fn list_proc_verbs(conn: &Connection) -> Result<Vec<ProcVerbRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT session, verb, count, COALESCE(last_seen,0)
+           FROM proc_verbs ORDER BY count DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(ProcVerbRow {
+                session: r.get(0)?,
+                verb: r.get(1)?,
+                count: r.get(2)?,
+                last_seen: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Every tracked process, most productive first (ties broken by most-recent

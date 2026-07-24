@@ -516,9 +516,9 @@ fn parse_refspec(
         Some(rest) => (rest, true),
         None => (spec, force),
     };
-    let (src, dst) = match spec.split_once(':') {
-        Some((s, d)) => (s, d),
-        None => (spec, spec),
+    let (src, dst_spec) = match spec.split_once(':') {
+        Some((s, d)) => (s, Some(d)),
+        None => (spec, None),
     };
 
     let new = if src.is_empty() {
@@ -528,19 +528,31 @@ fn parse_refspec(
             .map_err(|_| anyhow!("src refspec {src} does not match any"))?
             .detach()
     };
-    let dst = if dst.is_empty() { src } else { dst };
-    let dst_full = full_ref_name(dst);
+
+    // The source's full local ref name, resolved with git's DWIM precedence (tags
+    // before heads), so the destination lands in the right namespace: `git push
+    // origin v0.1.0` on a tag pushes `refs/tags/v0.1.0`, not `refs/heads/v0.1.0`.
+    let src_full = if src.is_empty() { None } else { resolve_src_full(repo, src) };
+
+    let dst_full = match dst_spec {
+        // Bare `src` (or `src:`): push to the source's own full name — git's
+        // `matched_src->name` default. A tag stays a tag, a branch stays a branch.
+        None => src_full.clone().unwrap_or_else(|| full_ref_name(src)),
+        Some(d) if d.is_empty() => src_full.clone().unwrap_or_else(|| full_ref_name(src)),
+        // A fully-qualified destination is used verbatim.
+        Some(d) if d.starts_with("refs/") => d.to_string(),
+        // A short explicit destination is prefixed by the source ref's kind, exactly
+        // as git's `guess_ref` does (tag → refs/tags/, otherwise refs/heads/).
+        Some(d) => match &src_full {
+            Some(sf) if sf.starts_with("refs/tags/") => format!("refs/tags/{d}"),
+            _ => full_ref_name(d),
+        },
+    };
+
     // Record an upstream only when the source is a local branch.
-    let upstream = if !src.is_empty()
-        && repo
-            .find_reference(&full_ref_name(src))
-            .ok()
-            .filter(|_| !src.starts_with("refs/") || src.starts_with("refs/heads/"))
-            .is_some()
-    {
-        Some((src.to_string(), dst_full.clone()))
-    } else {
-        None
+    let upstream = match &src_full {
+        Some(sf) if sf.starts_with("refs/heads/") => Some((src.to_string(), dst_full.clone())),
+        _ => None,
     };
     Ok((
         Request {
@@ -586,6 +598,33 @@ fn full_ref_name(name: &str) -> String {
     } else {
         format!("refs/heads/{name}")
     }
+}
+
+/// Resolve a (possibly short) push source name to its full local ref name, using
+/// git's DWIM precedence — `refs/<name>`, then `refs/tags/<name>`, then
+/// `refs/heads/<name>`, then `refs/remotes/<name>` (git's `ref_rev_parse_rules`
+/// order, tags before heads). So `git push origin v0.1.0` finds the tag
+/// `refs/tags/v0.1.0` before a same-named branch, and the destination mirrors it.
+/// A name already starting with `refs/` is looked up directly. `None` if no local
+/// ref matches (the caller falls back to treating it as a branch). The bare-name
+/// (`HEAD`) rule is intentionally omitted so `push HEAD` keeps its branch fallback.
+fn resolve_src_full(repo: &gix::Repository, name: &str) -> Option<String> {
+    let full = |candidate: &str| {
+        repo.find_reference(candidate)
+            .ok()
+            .and_then(|r| r.name().as_bstr().to_str().ok().map(str::to_string))
+    };
+    if name.starts_with("refs/") {
+        return full(name);
+    }
+    [
+        format!("refs/{name}"),
+        format!("refs/tags/{name}"),
+        format!("refs/heads/{name}"),
+        format!("refs/remotes/{name}"),
+    ]
+    .iter()
+    .find_map(|candidate| full(candidate))
 }
 
 /// Record `branch.<name>.remote`/`.merge` for every branch the remote accepted,

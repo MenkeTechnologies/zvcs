@@ -71,7 +71,7 @@ pub use pmutate::{zcheckout, zclean, zcommitall, zfetch, zfsck, zgc, zprune, zpu
 pub use query::{
     zage, zbig, zbranches, zdirty, zfiles, zheads, zlast, zpull, zremotes, zsize, zstale, ztags,
 };
-pub use queue::{zcommit, zpush};
+pub use queue::{zcommit, zpush, zsubmit};
 pub use repl::zrepl;
 pub use reconcile::reconcile_tree;
 pub use zbump::{zbump, zbump_run, BumpOutcome};

@@ -6771,6 +6771,7 @@ _git_commands () {
     zundo:'zvcs: rewind a repo one step'
     zcommit:'zvcs: async staged commit job'
     zpush:'zvcs: async push job (ls-refs pre-flight)'
+    zsubmit:'zvcs: run an arbitrary command as an async daemon job'
     zjobs:'zvcs: list async jobs'
     zjob:'zvcs: show/stop/restart a job'
     zclaim:'zvcs: lease a repo for this session'

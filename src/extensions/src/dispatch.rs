@@ -12,6 +12,7 @@ use std::process::ExitCode;
 /// zvcs-native extension verbs — the superset that stock git does not have.
 pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
+    "zsubmit",
     "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
     "zsnapshots", "zworktree", "zstash", "zunstash", "zstashes", "zup", "zforeach", "zhook",
     "ztrigger", "zwatch", "zdashed", "zverbs", "zcd", "zpwd", "zls", "zenv", "zunset", "zecho",
@@ -234,6 +235,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zjob" => "usage: git zjob <id> | git zjob <stop|restart> <id> — show or control a job",
         "zcommit" => "usage: git zcommit [<path>...] -m <msg> [--push] — queue an atomic staged-commit job",
         "zpush" => "usage: git zpush [<refspec>] — queue an async push job with a network-free ff pre-flight",
+        "zsubmit" => "usage: git zsubmit [--] <command> [args...] — run an arbitrary command as an async daemon job (track with zjobs/zjob)",
         "zrepl" => "usage: git zrepl — interactive console over every zvcs command (z-verbs + git porcelain)",
         "zclaim" => "usage: git zclaim [<path>] — lease a repo for this session",
         "zunclaim" => "usage: git zunclaim [--force] [<path>] — release a lease on a repo",
@@ -341,6 +343,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zjob" => superset::zjob(args),
         "zcommit" => superset::zcommit(args),
         "zpush" => superset::zpush(args),
+        "zsubmit" => superset::zsubmit(args),
         "zrepl" => superset::zrepl(args),
         "zclaim" => superset::zclaim(args),
         "zunclaim" => superset::zunclaim(args),

@@ -81,6 +81,41 @@ pub fn zpush(args: &[String]) -> Result<ExitCode> {
     submit_or_run(&spec)
 }
 
+/// `git zsubmit [--] <command> [args...]` — ship an arbitrary command to the
+/// daemon's worker pool as an async job. Prints the job id; track it with `git
+/// zjobs` / `git zjob <id>` and cancel it with `git zjob stop <id>`, like any
+/// job. The command runs in the current repo's workdir with no shell (submit
+/// `sh -c "..."` for pipes/redirects). Falls back to running inline when no
+/// daemon is up.
+pub fn zsubmit(args: &[String]) -> Result<ExitCode> {
+    let argv: Vec<String> = match args.split_first() {
+        Some((first, rest)) if first == "--" => rest.to_vec(),
+        _ => args.to_vec(),
+    };
+    if argv.is_empty() {
+        anyhow::bail!("usage: git zsubmit [--] <command> [args...]");
+    }
+    let (git_dir, workdir) = here()?;
+    // A readable ledger label: `exec: <command>`, char-safely trimmed.
+    let cmd = argv.join(" ");
+    let label = if cmd.chars().count() > 52 {
+        let head: String = cmd.chars().take(52).collect();
+        format!("exec: {head}…")
+    } else {
+        format!("exec: {cmd}")
+    };
+    let spec = json!({
+        "kind": "exec",
+        "label": label,
+        "git_dir": git_dir,
+        "workdir": workdir,
+        "argv": argv,
+        "session": session(),
+        "env": carried_env(),
+    });
+    submit_or_run(&spec)
+}
+
 /// Canonical `(git_dir, workdir)` of the repo at cwd.
 fn here() -> Result<(String, String)> {
     let repo = gix::discover(".")?;
@@ -284,10 +319,17 @@ fn run_inline(spec: &Value) -> Result<ExitCode> {
 /// Insert a queued ledger row for an inline run; `None` if the ledger is
 /// unavailable (the job still runs, just unrecorded).
 fn record_queued(spec: &Value) -> (Option<i64>, ()) {
-    let (Some(gd), Some(kind)) = (
-        spec.get("git_dir").and_then(Value::as_str),
-        spec.get("kind").and_then(Value::as_str),
-    ) else {
+    let Some(gd) = spec.get("git_dir").and_then(Value::as_str) else {
+        return (None, ());
+    };
+    // The ledger's displayed kind prefers `label` (a human summary, e.g. the
+    // exec command) over the dispatch `kind`; commit/push set no label, so they
+    // still show "commit"/"push".
+    let Some(kind) = spec
+        .get("label")
+        .and_then(Value::as_str)
+        .or_else(|| spec.get("kind").and_then(Value::as_str))
+    else {
         return (None, ());
     };
     let wd = spec.get("workdir").and_then(Value::as_str);

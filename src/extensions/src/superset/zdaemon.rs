@@ -506,7 +506,11 @@ fn parse(line: &str) -> Req {
 fn handle_submit(json: &str) -> Option<i64> {
     let spec: serde_json::Value = serde_json::from_str(json).ok()?;
     let git_dir = spec.get("git_dir").and_then(|v| v.as_str())?;
-    let kind = spec.get("kind").and_then(|v| v.as_str())?;
+    // Ledger display prefers `label` (e.g. the exec command) over dispatch `kind`.
+    let kind = spec
+        .get("label")
+        .and_then(|v| v.as_str())
+        .or_else(|| spec.get("kind").and_then(|v| v.as_str()))?;
     let workdir = spec.get("workdir").and_then(|v| v.as_str());
     let session = spec.get("session").and_then(|v| v.as_str());
 

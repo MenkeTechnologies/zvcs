@@ -98,6 +98,15 @@ pub const DOCS: &[Doc] = &[
         desc: &["Submits a fire-and-forget push job to the daemon. A network-free / live ls-refs pre-flight refuses a non-fast-forward before the job is enqueued. Falls back to synchronous execution when no daemon is running."],
     },
     Doc {
+        verb: "zsubmit",
+        summary: "run an arbitrary command as an async daemon job",
+        synopsis: "git zsubmit [--] <command> [args...]",
+        desc: &[
+            "Ships an arbitrary command to the daemon's worker pool as an async job and prints the job id. Track it with `git zjobs` and `git zjob <id>` (which shows its state and captured output), and cancel it with `git zjob stop <id>` \\(em the same ledger and controls as zcommit/zpush.",
+            "The command runs in the current repository's workdir with no shell, so submit `sh -c \"...\"` when you need pipes, redirects, or globbing. It runs with the submitter's carried git-identity environment; otherwise it inherits the daemon's. With no daemon running, it executes inline.",
+        ],
+    },
+    Doc {
         verb: "zrepl",
         summary: "interactive console over every zvcs command",
         synopsis: "git zrepl",

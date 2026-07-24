@@ -102,7 +102,7 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Coordination | `zdaemon` `zsync` `zbump` `zup` | singleton daemon; reconcile submodules; forward-only bumps; `zup` brings the whole tree (parent + nested submodules) to latest `origin/main` |
 | Stash | `zstash` `zunstash` `zstashes` | park/restore uncommitted work across the whole submodule tree as one unit |
 | Repo index | `zrepos` `zreindex` | machine-wide index of every git repo (retires a shell repo-list) |
-| Async queue | `zcommit` `zpush` `zjobs` `zjob` | fire-and-forget commit/push jobs + ledger (`zjob stop`/`restart`) |
+| Async queue | `zcommit` `zpush` `zsubmit` `zjobs` `zjob` | fire-and-forget commit/push/**arbitrary-command** jobs on the daemon's worker pool + ledger (`zjob stop`/`restart`); `zsubmit [--] <cmd>` ships any command and returns a job id |
 | Multi-agent | `zclaim` `zunclaim` `zwho` | advisory per-repo leases so agents don't collide |
 | Observability | `zstatus [--all]` `zlog` `zundo` | instant machine-wide status; cross-repo timeline; one-step rewind |
 | Snapshots | `zsnapshot` `zrestore` `zsnapshots` | tree-wide restore points across all submodules |

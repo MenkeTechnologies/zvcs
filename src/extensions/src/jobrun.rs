@@ -198,6 +198,21 @@ fn execute_inner(spec: &Value, cancel: &Cancel) -> Result<JobResult> {
             let (ok, output) = run(&exe, workdir, &args, &env, cancel);
             Ok(JobResult { ok, output, sha_after: None, cancelled: false })
         }
+        "exec" => {
+            // A generic job: run an arbitrary command (argv[0] + args) in the
+            // workdir. No shell is involved — submit `sh -c "..."` for pipes or
+            // redirects. The child is cancellable via `zjob stop` like any job.
+            let argv: Vec<String> = spec
+                .get("argv")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let Some((prog, rest)) = argv.split_first() else {
+                return Ok(JobResult { ok: false, output: "exec job: empty argv\n".into(), sha_after: None, cancelled: false });
+            };
+            let (ok, output) = run(Path::new(prog), workdir, rest, &env, cancel);
+            Ok(JobResult { ok, output, sha_after: None, cancelled: false })
+        }
         other => Err(anyhow!("unknown job kind {other:?}")),
     }
 }

@@ -51,11 +51,17 @@ pub fn set_hook(workdir: &Path, cmd: &str) -> Result<()> {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if ok {
-        Ok(())
-    } else {
+    if !ok {
         bail!("failed to set zvcs.hook in {}", workdir.display());
     }
+    // Mirror the hook into the index so the daemon can build its watch set from
+    // the armed repos directly, without opening every indexed repo's config.
+    if let Ok((git_dir, wd)) = resolve(&workdir.to_string_lossy()) {
+        if let Ok(conn) = crate::db::open_rw() {
+            let _ = crate::db::set_repo_hook(&conn, &git_dir, Some(&wd), Some(cmd));
+        }
+    }
+    Ok(())
 }
 
 /// Remove the local `zvcs.hook` from the repo at `workdir` (idempotent — a
@@ -65,6 +71,12 @@ pub fn unset_hook(workdir: &Path) -> Result<()> {
         .current_dir(workdir)
         .args(["config", "--unset", "zvcs.hook"])
         .status();
+    // Clear the mirrored hook in the index so the daemon stops watching it.
+    if let Ok((git_dir, wd)) = resolve(&workdir.to_string_lossy()) {
+        if let Ok(conn) = crate::db::open_rw() {
+            let _ = crate::db::set_repo_hook(&conn, &git_dir, Some(&wd), None);
+        }
+    }
     Ok(())
 }
 

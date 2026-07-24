@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS repos (
     git_dir       TEXT UNIQUE NOT NULL,
     workdir       TEXT,
     discovered_at INTEGER,
-    last_seen     INTEGER
+    last_seen     INTEGER,
+    hook          TEXT
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id            INTEGER PRIMARY KEY,
@@ -98,6 +99,10 @@ pub fn open_rw() -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.execute_batch(SCHEMA)?;
+    // Migration for pre-existing indexes: add `repos.hook` if the table predates
+    // it. `CREATE TABLE IF NOT EXISTS` won't add a column to an existing table, so
+    // ALTER explicitly and ignore the "duplicate column" error when it's present.
+    let _ = conn.execute("ALTER TABLE repos ADD COLUMN hook TEXT", []);
     Ok(conn)
 }
 
@@ -164,6 +169,30 @@ pub fn remove_repo(conn: &Connection, git_dir: &Path) -> Result<usize> {
         "DELETE FROM repos WHERE git_dir = ?1",
         [git_dir.to_string_lossy()],
     )?)
+}
+
+/// Record (or clear, with `None`) the `zvcs.hook` command for a repo in the
+/// index, so the daemon can find armed repos without opening every repo's config.
+/// Upserts the repo row if it isn't indexed yet (arming implies watching it).
+pub fn set_repo_hook(conn: &Connection, git_dir: &Path, workdir: Option<&Path>, hook: Option<&str>) -> Result<()> {
+    upsert_repo(conn, git_dir, workdir)?;
+    conn.execute(
+        "UPDATE repos SET hook = ?2 WHERE git_dir = ?1",
+        rusqlite::params![git_dir.to_string_lossy(), hook],
+    )?;
+    Ok(())
+}
+
+/// Every indexed repo that carries a hook — the armed set the daemon watches for
+/// triggers. Returns `(git_dir, workdir)`; skips rows with a null/empty hook.
+/// This is an indexed read, so a busy machine's daemon starts in O(armed), not
+/// O(all indexed repos).
+pub fn list_armed(conn: &Connection) -> Result<Vec<(String, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT git_dir, workdir FROM repos WHERE hook IS NOT NULL AND trim(hook) <> ''",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
 /// One row of the repo index.

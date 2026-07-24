@@ -203,32 +203,68 @@ fn collect(ev: &notify::Result<Event>, targets: &[Target], affected: &mut HashSe
     }
 }
 
-/// The repos to watch: the working repo's submodules (for autonomy) plus, when a
-/// hook is configured, every indexed repo (for hooks). Deduped by git dir and
-/// capped at [`MAX_WATCHED`].
+/// The repos to watch, in priority order so startup stays cheap on a big index:
+///   1. **armed** repos (carry a hook) — read straight from the index's `hook`
+///      column, so the trigger set is found in O(armed), NOT by opening every one
+///      of thousands of indexed repos. Watched whole-dir (any file change fires).
+///   2. working-repo **submodules** — only when autonomy is on (keyed off their
+///      HEAD moves).
+///   3. **all** indexed repos — only when `autostatus` needs per-repo status.
+/// Deduped by git dir (armed wins) and capped at [`MAX_WATCHED`].
 fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut targets: Vec<Target> = Vec::new();
-    // Only probe each repo for a local hook when hooks can actually fire —
-    // otherwise skip the per-repo config read (a whole-device index is thousands
-    // of repos) and treat every target as unarmed (autonomy/status only).
-    let hooks_on = cfg.hooks_enabled();
 
-    // Working repo submodules (autonomy is keyed off their HEAD moves).
-    if let Ok(repo) = gix::discover(".") {
-        if let Ok(Some(subs)) = repo.submodules() {
-            for sm in subs {
-                if let Ok(Some(sub)) = sm.open() {
-                    if let Some(wd) = sub.workdir() {
-                        add_target(&mut seen, &mut targets, sub.git_dir().to_path_buf(), wd.to_path_buf(), hooks_on);
+    // 1. Hook repos. Two shapes:
+    //    * a GLOBAL hook (`cfg.hook`, e.g. in ~/.gitconfig) fires in EVERY indexed
+    //      repo, so it must watch them all (ref-change model). Inherently O(all) —
+    //      a global hook opts into machine-wide watching.
+    //    * otherwise (`autohook` only) each repo runs its OWN local hook; watch
+    //      just the ARMED set (repos with a hook), read from the index's `hook`
+    //      column and watched whole-dir. This is what keeps startup O(armed) — a
+    //      watch per armed repo, not per indexed repo — so the daemon reaches the
+    //      watching state fast even on a whole-device index.
+    if cfg.hooks_enabled() {
+        if let Ok(conn) = crate::db::open_ro() {
+            if cfg.hook.is_some() {
+                if let Ok(repos) = crate::db::list_repos(&conn) {
+                    for r in repos {
+                        let wd = r.workdir.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&r.git_dir));
+                        add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd, false);
+                        if targets.len() >= MAX_WATCHED {
+                            break;
+                        }
+                    }
+                }
+            } else if let Ok(armed) = crate::db::list_armed(&conn) {
+                for (git_dir, workdir) in armed {
+                    let wd = workdir.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&git_dir));
+                    add_target(&mut seen, &mut targets, PathBuf::from(git_dir), wd, true);
+                    if targets.len() >= MAX_WATCHED {
+                        break;
                     }
                 }
             }
         }
     }
 
-    // Every indexed repo, for hooks and/or status maintenance.
-    if cfg.watch_all_repos() {
+    // 2. Working-repo submodules — autonomy is keyed off their HEAD moves.
+    if cfg.any_autonomous() {
+        if let Ok(repo) = gix::discover(".") {
+            if let Ok(Some(subs)) = repo.submodules() {
+                for sm in subs {
+                    if let Ok(Some(sub)) = sm.open() {
+                        if let Some(wd) = sub.workdir() {
+                            add_target(&mut seen, &mut targets, sub.git_dir().to_path_buf(), wd.to_path_buf(), false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Every indexed repo — only when autostatus maintains per-repo status.
+    if cfg.autostatus {
         if let Ok(conn) = crate::db::open_ro() {
             if let Ok(repos) = crate::db::list_repos(&conn) {
                 for r in repos {
@@ -236,7 +272,7 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
                         .workdir
                         .map(PathBuf::from)
                         .unwrap_or_else(|| PathBuf::from(&r.git_dir));
-                    add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd, hooks_on);
+                    add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd, false);
                     if targets.len() >= MAX_WATCHED {
                         println!(
                             "[zvcs watch] capped at {MAX_WATCHED} watched repos; \
@@ -252,22 +288,19 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
     targets
 }
 
-/// Add a repo to the watch set, canonicalizing and deduping by git dir.
-/// Both paths are canonicalized so the daemon's `status::record`/`upsert_repo`
-/// stores the same canonical `workdir` other verbs (claims, selector) key on.
+/// Add a repo to the watch set, canonicalizing and deduping by git dir (an armed
+/// repo added first wins over a later status-only pass). Both paths are
+/// canonicalized so the stored `workdir` matches what other verbs key on.
 fn add_target(
     seen: &mut HashSet<PathBuf>,
     targets: &mut Vec<Target>,
     git_dir: PathBuf,
     workdir: PathBuf,
-    hooks_on: bool,
+    armed: bool,
 ) {
     let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
     let workdir = workdir.canonicalize().unwrap_or(workdir);
     if seen.insert(git_dir.clone()) {
-        // Armed = carries a local `zvcs.hook` (set by `git ztrigger`). Only probed
-        // when hooks can fire, so an autonomy/status-only daemon skips the read.
-        let armed = hooks_on && crate::superset::hooks::hook_for(&workdir).is_some();
         targets.push(Target { git_dir, workdir, armed });
     }
 }

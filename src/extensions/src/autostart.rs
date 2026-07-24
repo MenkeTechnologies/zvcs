@@ -13,12 +13,16 @@ use std::process::{Command, Stdio};
 /// Ensure a coordinator is running for the current repo, if `[zvcs]` autonomy is
 /// enabled. Silent no-op when not in a repo, not configured, or already running.
 pub fn ensure_if_configured() {
-    let Ok(repo) = gix::discover(".") else {
-        return;
+    // Directory triggers (`git ztrigger <DIR>`) need the daemon even when the cwd
+    // is not a repo and no `[zvcs]` autonomy/hook/status is set.
+    let watch_wanted = match gix::discover(".") {
+        Ok(repo) => crate::config::ZvcsConfig::load(&repo).should_watch(),
+        Err(_) => false,
     };
-    if !crate::config::ZvcsConfig::load(&repo).should_watch() {
+    if !watch_wanted && !crate::db::has_triggers() {
         return;
     }
+    let repo = gix::discover(".").ok();
     // A manual `git zdaemon stop` disables autostart until an explicit
     // `start`/`restart`. Without this the daemon would respawn on the very next
     // `git` command, making a manual stop impossible under the autonomy config.
@@ -32,10 +36,13 @@ pub fn ensure_if_configured() {
         return;
     }
 
+    // Root the daemon at the repo's workdir when in one, else the current dir
+    // (directory triggers don't need a repo).
     let workdir = repo
-        .workdir()
-        .unwrap_or_else(|| repo.git_dir())
-        .to_path_buf();
+        .as_ref()
+        .map(|r| r.workdir().unwrap_or_else(|| r.git_dir()).to_path_buf())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     spawn_detached(&workdir);
 }
 

@@ -61,6 +61,23 @@ pub struct ZvcsConfig {
     pub autohook: bool,
 }
 
+impl Default for ZvcsConfig {
+    /// Everything off — used when the daemon runs outside a repository but still
+    /// has directory triggers to watch.
+    fn default() -> Self {
+        Self {
+            autoreconcile: false,
+            autobump: false,
+            interval: Duration::from_secs(30),
+            crawlroots: Vec::new(),
+            autocrawl: false,
+            hook: None,
+            autostatus: false,
+            autohook: false,
+        }
+    }
+}
+
 impl ZvcsConfig {
     /// Read `[zvcs]` from the repository's merged config. Absent keys default to
     /// off; `interval` defaults to 30s and ignores non-positive values.

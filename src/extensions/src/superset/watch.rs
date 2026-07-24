@@ -1,19 +1,18 @@
 //! Reactive, file-watcher-driven autonomy **and** hooks — triggered by local
 //! filesystem changes, never by a timer or a remote poll.
 //!
-//! `notify` fires on changes under each watched path; the daemon reacts. Two
-//! kinds of reaction, both coalesced over a debounce window:
+//! `notify` fires on changes under each watched path; the daemon reacts. Three
+//! kinds of reaction, fired the instant an event arrives (no debounce):
 //!
+//!   * **directory triggers** (`git ztrigger <DIR> <cmd>`) — the general case:
+//!     watch ANY directory recursively (repo or not) and run its command on any
+//!     file change. Stored in the `triggers` table, keyed by path.
+//!   * **repo hooks** — a repo with a local `zvcs.hook` is watched whole-dir and
+//!     runs its own hook on any change; a *global* `zvcs.hook` watches every
+//!     indexed repo on the lighter ref-change model.
 //!   * **autonomy** (working tree) — attach detached submodules, fetch-free
-//!     reconcile, and forward-only autobump, when `[zvcs]` autonomy is enabled.
-//!     Keyed off ref moves (`logs/HEAD`, `refs/*`), so these repos watch only the
-//!     `refs/`+`logs/` trees.
-//!   * **hooks** — a repo with a local `zvcs.hook` (armed by `git ztrigger`) is
-//!     **watched over its ENTIRE directory** (worktree *and* `.git`), so creating
-//!     or editing any file fires its hook — not only ref moves. A repo reached
-//!     only through a *global* `zvcs.hook` keeps the lighter ref-change model.
-//!     Because all repos are indexed in the db, this is a filesystem-driven hook
-//!     system with nothing installed in any `.git/hooks`.
+//!     reconcile, forward-only autobump, when `[zvcs]` autonomy is enabled. Keyed
+//!     off ref moves, so those repos watch only the `refs/`+`logs/` trees.
 //!
 //! Reconcile here is the fetch-free [`reconcile_repo_local`] fast-forward to
 //! whatever `origin/main` a prior local pull already fetched; the daemon never
@@ -32,11 +31,15 @@ use crate::config::ZvcsConfig;
 struct Target {
     git_dir: PathBuf,
     workdir: PathBuf,
-    /// The repo carries a local `zvcs.hook` (armed by `git ztrigger`). Armed
-    /// repos are watched over their ENTIRE directory — worktree *and* `.git` —
-    /// so any file create/modify/delete fires the trigger, not just ref moves.
-    /// Unarmed repos are watched only over `refs/`+`logs/` (autonomy/status).
+    /// Watched over its ENTIRE directory (worktree — and `.git` for a repo) so any
+    /// file create/modify/delete fires, not just ref moves. Unarmed repos are
+    /// watched only over `refs/`+`logs/` (autonomy/status).
     armed: bool,
+    /// A directory trigger's command (`git ztrigger <DIR> <cmd>`), run on any
+    /// change under the directory. `None` for a git repo hook (whose command is
+    /// read from the repo's own `zvcs.hook`). Present ⇒ always fires, independent
+    /// of the git-hook config.
+    command: Option<String>,
 }
 
 impl Target {
@@ -62,13 +65,15 @@ impl Target {
 /// watched — no crash, `build_targets` logs the cap and stops.
 const MAX_WATCHED: usize = 5120;
 
-/// Spawn the watch loop iff `[zvcs]` autonomy or a hook is configured.
+/// Spawn the watch loop iff `[zvcs]` autonomy/hook/status is configured OR any
+/// directory trigger exists. Directory triggers don't require the daemon to be
+/// inside a repository.
 pub fn spawn_if_configured() {
-    let Ok(repo) = gix::discover(".") else {
-        return;
+    let cfg = match gix::discover(".") {
+        Ok(repo) => ZvcsConfig::load(&repo),
+        Err(_) => ZvcsConfig::default(),
     };
-    let cfg = ZvcsConfig::load(&repo);
-    if !cfg.should_watch() {
+    if !cfg.should_watch() && !crate::db::has_triggers() {
         return;
     }
     thread::spawn(move || run(cfg));
@@ -158,24 +163,25 @@ fn run(cfg: ZvcsConfig) {
                 }
             }
         }
-        if cfg.hooks_enabled() {
-            for t in &targets {
-                if !affected.contains(&t.git_dir) {
-                    continue;
-                }
+        for t in &targets {
+            if !affected.contains(&t.git_dir) {
+                continue;
+            }
+            if let Some(cmd) = &t.command {
+                // Directory trigger (`git ztrigger`): run the stored command on any
+                // change. Always fires — independent of the git-hook config, and
+                // the directory need not be a repo.
+                crate::superset::hooks::run_command(&t.workdir, cmd);
+            } else if cfg.hooks_enabled() {
                 if t.armed {
-                    // Whole-dir trigger: fire on ANY change in the directory. No
-                    // reflog-author gate here — that gate distinguishes user vs
-                    // daemon *ref moves*, but a plain file event leaves the reflog
-                    // untouched, so gating on it would wrongly suppress real
-                    // file-change fires whenever the reflog top happens to be a
-                    // prior zvcs commit.
+                    // Repo hook, whole-dir: fire on ANY change. No reflog-author
+                    // gate — that distinguishes user vs daemon *ref moves*, but a
+                    // plain file event leaves the reflog untouched, so gating on it
+                    // would wrongly suppress real file-change fires.
                     crate::superset::hooks::run(&t.git_dir, &t.workdir);
                 } else if !crate::superset::oplog::head_authored_by_zvcs(&t.git_dir) {
-                    // Unarmed repo reached only via a global `zvcs.hook`: keep the
-                    // ref-change model (refs/logs watch), skipping the daemon's own
-                    // autobump/attach/reconcile bookkeeping. (`zhook test` still
-                    // fires manually.) hooks::run is a no-op if the repo has none.
+                    // Unarmed repo reached only via a global `zvcs.hook`: ref-change
+                    // model (refs/logs watch), skipping the daemon's own bookkeeping.
                     crate::superset::hooks::run(&t.git_dir, &t.workdir);
                 }
             }
@@ -215,6 +221,21 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut targets: Vec<Target> = Vec::new();
 
+    // 0. Directory triggers (`git ztrigger <DIR> <cmd>`) — watch ANY directory
+    //    whole-dir and run its command on change. Independent of git; always
+    //    active when triggers exist. Read straight from the index.
+    if let Ok(conn) = crate::db::open_ro() {
+        if let Ok(triggers) = crate::db::list_triggers(&conn) {
+            for (path, cmd) in triggers {
+                let p = PathBuf::from(path);
+                add_target(&mut seen, &mut targets, p.clone(), p, true, Some(cmd));
+                if targets.len() >= MAX_WATCHED {
+                    break;
+                }
+            }
+        }
+    }
+
     // 1. Hook repos. Two shapes:
     //    * a GLOBAL hook (`cfg.hook`, e.g. in ~/.gitconfig) fires in EVERY indexed
     //      repo, so it must watch them all (ref-change model). Inherently O(all) —
@@ -230,7 +251,7 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
                 if let Ok(repos) = crate::db::list_repos(&conn) {
                     for r in repos {
                         let wd = r.workdir.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&r.git_dir));
-                        add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd, false);
+                        add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd, false, None);
                         if targets.len() >= MAX_WATCHED {
                             break;
                         }
@@ -239,7 +260,7 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
             } else if let Ok(armed) = crate::db::list_armed(&conn) {
                 for (git_dir, workdir) in armed {
                     let wd = workdir.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&git_dir));
-                    add_target(&mut seen, &mut targets, PathBuf::from(git_dir), wd, true);
+                    add_target(&mut seen, &mut targets, PathBuf::from(git_dir), wd, true, None);
                     if targets.len() >= MAX_WATCHED {
                         break;
                     }
@@ -255,7 +276,7 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
                 for sm in subs {
                     if let Ok(Some(sub)) = sm.open() {
                         if let Some(wd) = sub.workdir() {
-                            add_target(&mut seen, &mut targets, sub.git_dir().to_path_buf(), wd.to_path_buf(), false);
+                            add_target(&mut seen, &mut targets, sub.git_dir().to_path_buf(), wd.to_path_buf(), false, None);
                         }
                     }
                 }
@@ -272,7 +293,7 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
                         .workdir
                         .map(PathBuf::from)
                         .unwrap_or_else(|| PathBuf::from(&r.git_dir));
-                    add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd, false);
+                    add_target(&mut seen, &mut targets, PathBuf::from(r.git_dir), wd, false, None);
                     if targets.len() >= MAX_WATCHED {
                         println!(
                             "[zvcs watch] capped at {MAX_WATCHED} watched repos; \
@@ -297,11 +318,12 @@ fn add_target(
     git_dir: PathBuf,
     workdir: PathBuf,
     armed: bool,
+    command: Option<String>,
 ) {
     let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
     let workdir = workdir.canonicalize().unwrap_or(workdir);
     if seen.insert(git_dir.clone()) {
-        targets.push(Target { git_dir, workdir, armed });
+        targets.push(Target { git_dir, workdir, armed, command });
     }
 }
 
@@ -383,8 +405,8 @@ mod tests {
         let parent = PathBuf::from("/x/.git");
         let sub = PathBuf::from("/x/.git/modules/foo");
         let targets = vec![
-            Target { git_dir: parent.clone(), workdir: PathBuf::from("/x"), armed: false },
-            Target { git_dir: sub.clone(), workdir: PathBuf::from("/x/foo"), armed: false },
+            Target { git_dir: parent.clone(), workdir: PathBuf::from("/x"), armed: false, command: None },
+            Target { git_dir: sub.clone(), workdir: PathBuf::from("/x/foo"), armed: false, command: None },
         ];
 
         // Event under the submodule → only the submodule is marked.
@@ -410,7 +432,7 @@ mod tests {
         // target would miss entirely.
         let git_dir = PathBuf::from("/repo/.git");
         let workdir = PathBuf::from("/repo");
-        let targets = vec![Target { git_dir: git_dir.clone(), workdir, armed: true }];
+        let targets = vec![Target { git_dir: git_dir.clone(), workdir, armed: true, command: None }];
 
         for rel in ["newfile.txt", ".git/index", "src/main.rs"] {
             let ev = notify::Event::new(notify::EventKind::Any).add_path(PathBuf::from("/repo").join(rel));

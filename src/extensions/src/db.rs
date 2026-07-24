@@ -79,6 +79,11 @@ CREATE TABLE IF NOT EXISTS stashes (
     created_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS stashes_name ON stashes(name);
+CREATE TABLE IF NOT EXISTS triggers (
+    path       TEXT PRIMARY KEY,
+    command    TEXT NOT NULL,
+    created_at INTEGER
+);
 ";
 
 /// `~/.zvcs/db.sqlite` (honors `ZVCS_HOME`).
@@ -193,6 +198,42 @@ pub fn list_armed(conn: &Connection) -> Result<Vec<(String, Option<String>)>> {
     )?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
     Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Directory triggers (`git ztrigger <DIR> <command>`) — a general "watch this
+/// directory, run this command on any change" mechanism, independent of git. The
+/// key is the canonical directory path; setting the same path again replaces the
+/// command.
+pub fn set_trigger(conn: &Connection, path: &Path, command: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO triggers (path, command, created_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(path) DO UPDATE SET command = ?2",
+        rusqlite::params![path.to_string_lossy(), command, now()],
+    )?;
+    Ok(())
+}
+
+/// Remove a directory trigger. Returns the number of rows removed (0 if absent).
+pub fn remove_trigger(conn: &Connection, path: &Path) -> Result<usize> {
+    Ok(conn.execute("DELETE FROM triggers WHERE path = ?1", [path.to_string_lossy()])?)
+}
+
+/// Every directory trigger as `(path, command)`. The watch set the daemon builds
+/// for `ztrigger`.
+pub fn list_triggers(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT path, command FROM triggers ORDER BY path")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Whether any directory trigger exists — a cheap check the daemon/autostart use
+/// to decide whether to watch even when no `[zvcs]` autonomy/hook/status is set.
+pub fn has_triggers() -> bool {
+    open_ro()
+        .ok()
+        .and_then(|c| c.query_row("SELECT EXISTS(SELECT 1 FROM triggers)", [], |r| r.get::<_, i64>(0)).ok())
+        .map(|n| n != 0)
+        .unwrap_or(false)
 }
 
 /// One row of the repo index.

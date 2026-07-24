@@ -137,6 +137,34 @@ pub fn list() -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+/// Run a directory trigger's command (`git ztrigger`): `sh -c <cmd>` with the
+/// watched directory as cwd and `ZVCS_DIR` in the environment. Best-effort;
+/// output goes to the daemon log. Independent of git — the directory need not be
+/// a repository.
+pub fn run_command(dir: &Path, cmd: &str) {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(dir)
+        .env("ZVCS_DIR", dir)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            if !s.trim().is_empty() {
+                println!("[zvcs trigger] {}: {}", dir.display(), s.trim());
+            }
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            println!("[zvcs trigger] {}: FAILED: {}", dir.display(), err.trim());
+        }
+        Err(e) => {
+            println!("[zvcs trigger] {}: could not run: {e}", dir.display());
+        }
+    }
+}
+
 /// Read the `zvcs.hook` command for the repo at `workdir`, if configured.
 pub fn hook_for(workdir: &Path) -> Option<String> {
     let repo = gix::discover(workdir).ok()?;

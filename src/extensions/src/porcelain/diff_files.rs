@@ -52,6 +52,9 @@
 //!   * `--dirstat[=<params>]`, `--dirstat-by-file[=<params>]`, `--cumulative`.
 //!   * `--summary`, `--check`.
 //!   * `-w`, `-b`, `--ignore-space-at-eol`, `--ignore-cr-at-eol`.
+//!   * `--diff-algorithm=<myers|minimal|histogram|default>` and the `--minimal` /
+//!     `--histogram` aliases select the xdiff algorithm the content pass runs (an
+//!     explicit flag overrides the `diff.algorithm` config default).
 //!   * `-R`, `--diff-filter=<letters>`, `-S<string>`, `-G<regex>`, `--pickaxe-all`,
 //!     `--pickaxe-regex`, `--find-object=<id>`. `-G`, `-I` and `-S --pickaxe-regex`
 //!     compile with `regex::bytes` (Unicode off, byte semantics) to mirror git's
@@ -81,6 +84,11 @@
 //!     patch. `-I` with raw/stat output is fully supported.
 //!   * `--binary` for content that is actually binary (the `GIT binary patch`
 //!     literal/delta encoding is not produced).
+//!   * `--patience` / `--diff-algorithm=patience` together with a format that consumes
+//!     the line diff (`-p`, `--numstat`/`--stat`/`--shortstat`, `--check`,
+//!     `--dirstat=lines`): imara-diff has no patience variant, so rather than silently
+//!     substituting Myers this bails. `--patience` with a raw/name/summary listing is a
+//!     no-op, since those never diff line content.
 //!   * `-M`/`--find-renames` rename *pairing* (an intent-to-add worktree file matched
 //!     to a staged deletion): accepted as a no-op, so such a pair is still reported as
 //!     a separate `D`+`A` rather than a single `R`.
@@ -368,6 +376,17 @@ struct Opts {
     merges_need_diff: bool,
     /// `--full-index`: the combined header prints full object ids.
     full_index: bool,
+    /// `--diff-algorithm=`/`--minimal`/`--histogram`: the xdiff algorithm the CLI
+    /// selected. `None` leaves gix on the repo's `diff.algorithm` config default
+    /// (git precedence: an explicit CLI flag overrides config). `patience` has no
+    /// imara-diff equivalent, so it is recorded in `patience_spelling` and bailed on
+    /// rather than stored here.
+    algorithm: Option<Algorithm>,
+    /// The spelling of a `patience` request (`--patience` or `--diff-algorithm=patience`).
+    /// imara-diff has no patience variant, so any format that consumes the line diff
+    /// bails with this flag rather than silently substituting Myers. Cleared when a
+    /// later renderable algorithm flag wins, so last-one-on-the-line semantics hold.
+    patience_spelling: Option<String>,
 }
 
 impl Opts {
@@ -611,9 +630,6 @@ const PORTED: &str = "--raw, --name-only, --name-status, -z, --abbrev[=<n>], --n
                       --line-prefix=<s>, --rotate-to=<p>, --skip-to=<p>, --relative[=<p>], \
                       --ignore-submodules[=<when>]";
 
-/// Values git accepts for `--diff-algorithm=`.
-const DIFF_ALGORITHMS: &[&str] = &["myers", "minimal", "patience", "histogram", "default"];
-
 /// Status letters `--diff-filter` understands.
 const FILTER_LETTERS: &[u8] = b"ACDMRTUXB";
 
@@ -693,6 +709,8 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         explicit_stage: false,
         merges_need_diff: false,
         full_index: false,
+        algorithm: None,
+        patience_spelling: None,
     };
     let mut quiet = false;
     let mut paths: Vec<BString> = Vec::new();
@@ -842,6 +860,20 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         }
     }
 
+    // `patience` has no imara-diff equivalent, so any format that consumes the xdiff
+    // line diff — the patch, the line-counting stats, `--check`, and `--dirstat=lines`
+    // — would silently fall back to Myers and print a diff git did not ask for. Bail
+    // for exactly those formats. A raw / name-only / summary / by-file-dirstat listing
+    // never diffs line content, so `--patience` is a harmless no-op there, matching
+    // stock git's exit-0 output for e.g. `git diff-files --patience`.
+    let dirstat_line = if opts.dirstat.by_line { F_DIRSTAT } else { 0 };
+    let line_diff_fmt = F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_PATCH | F_CHECKDIFF | dirstat_line;
+    if opts.fmt & line_diff_fmt != 0 {
+        if let Some(flag) = opts.patience_spelling.take() {
+            return Ok(Parsed::Unsupported(flag));
+        }
+    }
+
     // `-I` suppresses a change group whose every line matches. That is applied to
     // the change *counts* below, but the unified writer renders the whole diff in
     // one pass, so a patch under `-I` could silently keep a hunk git would drop.
@@ -872,9 +904,6 @@ enum Flag {
 const ACCEPTED_NOOP: &[&str] = &[
     "--indent-heuristic",
     "--no-indent-heuristic",
-    "--minimal",
-    "--patience",
-    "--histogram",
     "--submodule",
     "--no-color",
     // Colored *moves* need color to be on, and it never is here: NO_COLOR is
@@ -1027,6 +1056,22 @@ fn classify(s: &str, opts: &mut Opts, quiet: &mut bool) -> Result<Flag, Fatal> {
             opts.unmerged_stage = 3;
             opts.explicit_stage = true;
         }
+        // Diff-algorithm aliases. Each sets the CLI algorithm (which overrides the
+        // `diff.algorithm` config default at the diff site) and clears any pending
+        // patience request, so the last algorithm flag on the line wins. `--patience`
+        // has no imara-diff variant, so it is recorded for the content-format bail.
+        "--minimal" => {
+            opts.algorithm = Some(Algorithm::MyersMinimal);
+            opts.patience_spelling = None;
+        }
+        "--histogram" => {
+            opts.algorithm = Some(Algorithm::Histogram);
+            opts.patience_spelling = None;
+        }
+        "--patience" => {
+            opts.algorithm = None;
+            opts.patience_spelling = Some("--patience".to_owned());
+        }
         "--relative" => opts.relative = Relative::Cwd,
         "--no-relative" => opts.relative = Relative::No,
         "--ignore-submodules" => {
@@ -1125,11 +1170,27 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--diff-algorithm=") {
-        return if DIFF_ALGORITHMS.contains(&v) {
-            Ok(Flag::Handled)
-        } else {
-            Err(Fatal::Usage)
-        };
+        match v {
+            "myers" | "default" => {
+                opts.algorithm = Some(Algorithm::Myers);
+                opts.patience_spelling = None;
+            }
+            "minimal" => {
+                opts.algorithm = Some(Algorithm::MyersMinimal);
+                opts.patience_spelling = None;
+            }
+            "histogram" => {
+                opts.algorithm = Some(Algorithm::Histogram);
+                opts.patience_spelling = None;
+            }
+            // imara-diff has no patience variant: recorded for the content-format bail.
+            "patience" => {
+                opts.algorithm = None;
+                opts.patience_spelling = Some(s.to_owned());
+            }
+            _ => return Err(Fatal::Usage),
+        }
+        return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--unified=") {
         opts.ctx = v.parse().map_err(|_| Fatal::Usage)?;
@@ -2374,7 +2435,10 @@ fn analyze(
             input.update_before(before.iter().map(|l| normalize(l, opts.ws)));
             input.update_after(after.iter().map(|l| normalize(l, opts.ws)));
 
-            let diff = diff_with_slider_heuristics(algorithm, &input);
+            // An explicit `--diff-algorithm=`/`--minimal`/`--histogram` on the command
+            // line overrides the `diff.algorithm` config default gix resolved into
+            // `algorithm` (git precedence: flag beats config).
+            let diff = diff_with_slider_heuristics(opts.algorithm.unwrap_or(algorithm), &input);
             // `xdl_mark_ignorable_regex()`: a change group whose every removed and
             // added line matches an `-I` pattern contributes nothing.
             let (added, deleted) = if opts.ignore_lines.is_empty() {

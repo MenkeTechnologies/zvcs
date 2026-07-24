@@ -60,7 +60,7 @@
 //! e.g. file ↔ symlink), `M`, and `U` for unmerged paths under `--cached`.
 //!
 //! Options that only steer colour or patch/stat *shaping* (`--color` bare,
-//! `--ws-error-highlight=`, `--diff-algorithm=`, `--anchored=`, `--color-moved[=]`,
+//! `--ws-error-highlight=`, `--anchored=`, `--color-moved[=]`,
 //! `--word-diff` bare, `--ignore-submodules` bare, `--ignore-blank-lines`, `-B`,
 //! `-l<n>`, `-a`/`--text`, `-W`, …) are accepted and ignored for the raw, `--name-only`
 //! and `--name-status` listings — stock git's bytes there are identical with and without
@@ -83,6 +83,14 @@
 //!     `error: bad --word-diff argument: <mode>`.
 //!   * `--ignore-submodules=<v>` — only `none|untracked|dirty|all`; else exit 128
 //!     `fatal: bad --ignore-submodules argument: <v>`.
+//!   * `--diff-algorithm[=]<v>` (both the `=<v>` and separated `--diff-algorithm <v>`
+//!     forms, matched case-insensitively) — `myers`/`default` is the Myers renderer this
+//!     module already uses, so it composes with the ported content formats; a missing
+//!     value is exit 129 ``error: option `diff-algorithm' requires a value``; an unknown
+//!     value is exit 129 `error: option diff-algorithm accepts "myers", "minimal",
+//!     "patience" and "histogram"`. `minimal`/`patience`/`histogram` are accepted for the
+//!     raw/name listing (identical bytes) but a *content* format under one of them is
+//!     declined — see the honest-limitations note on unreproducible algorithms below.
 //!   * `--skip-to=<path>` / `--rotate-to=<path>` — git reorders the queued pairs so
 //!     output starts at `<path>` (skip drops the earlier pairs, rotate wraps them to the
 //!     end); a `<path>` naming no queued pair is exit 128
@@ -103,6 +111,15 @@
 //!   payload) are not produced. Both are content-driven in git, so when no pair survives
 //!   the content comparison the correct output is nothing at all and that is what is
 //!   emitted; a run that would have produced real bytes is refused, not approximated.
+//! * The non-default diff algorithms are not reproduced. `--diff-algorithm=minimal`,
+//!   `=histogram`, `=patience` and the `--minimal`/`--histogram`/`--patience` aliases are
+//!   honoured only for the raw and name listings, where git's bytes do not depend on the
+//!   algorithm; a *content* format (patch or a stat) under one of them is declined. git
+//!   drives them through xdiff, but gitoxide's `MyersMinimal` and `Histogram` diverge from
+//!   xdiff on real inputs (verified: both differ from stock git's hunk grouping on
+//!   ordinary files) and it has no patience variant at all, so rendering them would emit
+//!   bytes that do not match git. Only `--diff-algorithm=myers`/`=default` — which is the
+//!   Myers renderer already in use — composes with the content formats.
 //! * Rename/copy detection is off, which is git's default for `diff-index`. `-M`/`-C`
 //!   and friends are accepted for their *observable* side effect on this listing — git
 //!   hashes rename candidates, so an added path gains its real object id — but no rename
@@ -447,14 +464,14 @@ fn render_only_option(a: &str) -> bool {
         "--word-diff",
     ];
     // NB: the value-validated options `--color=`, `--word-diff=`, `--ignore-submodules=`,
-    // `--submodule=`, `--skip-to=` and `--rotate-to=` are handled by dedicated arms in the
-    // parse loop (they can fail), so they deliberately do *not* appear here.
+    // `--submodule=`, `--diff-algorithm=`, `--skip-to=` and `--rotate-to=` are handled by
+    // dedicated arms in the parse loop (they can fail), so they deliberately do *not*
+    // appear here.
     const WITH_VALUE: &[&str] = &[
         "--anchored=",
         "--break-rewrites=",
         "--color-moved=",
         "--color-moved-ws=",
-        "--diff-algorithm=",
         "--diff-merges=",
         "--dst-prefix=",
         "--inter-hunk-context=",
@@ -503,6 +520,37 @@ fn parse_stat_spec(v: &str, stat: &mut StatWidths) {
         if let Ok(v) = c.parse() {
             stat.count = v;
         }
+    }
+}
+
+/// The exact bytes `diff_opt_diff_algorithm()` writes for an unknown `--diff-algorithm`
+/// value (`diff.c`, `error()` → exit 129).
+const DIFF_ALGORITHM_ERR: &[u8] =
+    b"error: option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\"\n";
+
+/// The outcome of validating a `--diff-algorithm=<value>` (`parse_algorithm_value()`,
+/// `diff.c:200`, matched case-insensitively).
+enum AlgoParse {
+    /// `myers`/`default`: git's `xdl_opts` stay at 0, which is the Myers renderer this
+    /// module already uses, so the value composes with the ported content formats.
+    Myers,
+    /// `minimal`/`patience`/`histogram`: git selects an xdiff algorithm gitoxide cannot
+    /// reproduce byte for byte (its `MyersMinimal`/`Histogram` diverge from git's xdiff on
+    /// real inputs, and it has no patience variant at all), so a content format is refused
+    /// rather than rendered with the wrong bytes. The raw and name listings are unaffected.
+    Unreproducible,
+    /// Anything else: git's `parse_algorithm_value()` returns `-1` and the option callback
+    /// dies with [`DIFF_ALGORITHM_ERR`] (exit 129).
+    Bad,
+}
+
+/// `parse_algorithm_value()`: match a `--diff-algorithm` value the way git does, case
+/// insensitively. `default` is git's alias for `myers`.
+fn parse_diff_algorithm(v: &str) -> AlgoParse {
+    match v.to_ascii_lowercase().as_str() {
+        "myers" | "default" => AlgoParse::Myers,
+        "minimal" | "patience" | "histogram" => AlgoParse::Unreproducible,
+        _ => AlgoParse::Bad,
     }
 }
 
@@ -740,6 +788,35 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 opts.patch = true;
                 opts.ctx = parse_context(&s["--unified=".len()..]);
             }
+            // `--diff-algorithm <value>`: the separated form. git's `OPT_CALLBACK_F`
+            // consumes the next argument unconditionally (even one that looks like a
+            // revision) and feeds it to `parse_algorithm_value()`; a truly missing value
+            // is parse-options' `error: option `diff-algorithm' requires a value`
+            // (exit 129). The value is validated exactly as the `--diff-algorithm=` arm
+            // below does.
+            "--diff-algorithm" => {
+                let Some(value) = args.get(i) else {
+                    std::io::stderr()
+                        .lock()
+                        .write_all(b"error: option `diff-algorithm' requires a value\n")?;
+                    return Ok(ExitCode::from(129));
+                };
+                i += 1;
+                match parse_diff_algorithm(value) {
+                    // `myers`/`default` is the Myers renderer already in use.
+                    AlgoParse::Myers => {}
+                    // gitoxide cannot reproduce the other algorithms byte for byte, so a
+                    // content format is refused while the raw/name listing is unaffected.
+                    AlgoParse::Unreproducible => {
+                        content_altering.get_or_insert_with(|| a.to_owned());
+                    }
+                    // Deferred with its argv index so a bad revision earlier in argv still
+                    // wins with git's 128, as git's single left-to-right parse does.
+                    AlgoParse::Bad => {
+                        deferred.get_or_insert((cur, 129, DIFF_ALGORITHM_ERR.to_vec()));
+                    }
+                }
+            }
             s if s.len() > 2 && s.starts_with("-U") => {
                 opts.patch = true;
                 opts.ctx = parse_context(&s[2..]);
@@ -789,6 +866,24 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             }
             s if s.starts_with("--dst-prefix=") => {
                 opts.dst_prefix = s["--dst-prefix=".len()..].to_owned();
+            }
+            s if s.starts_with("--diff-algorithm=") => {
+                // `diff_opt_diff_algorithm()`: `myers`/`default` is the Myers renderer this
+                // module already uses, so it composes with the ported content formats;
+                // `minimal`/`patience`/`histogram` name xdiff algorithms gitoxide cannot
+                // reproduce byte for byte, so a content format is refused rather than
+                // rendered wrong (the raw/name listing is identical either way); an unknown
+                // value is `error: option diff-algorithm accepts …` (exit 129), deferred
+                // with its argv index so a bad revision earlier in argv still wins first.
+                match parse_diff_algorithm(&s["--diff-algorithm=".len()..]) {
+                    AlgoParse::Myers => {}
+                    AlgoParse::Unreproducible => {
+                        content_altering.get_or_insert_with(|| s.to_owned());
+                    }
+                    AlgoParse::Bad => {
+                        deferred.get_or_insert((cur, 129, DIFF_ALGORITHM_ERR.to_vec()));
+                    }
+                }
             }
             "-M" | "-C" | "--find-renames" | "--find-copies" | "--find-copies-harder" => {
                 opts.detect_rename = true;

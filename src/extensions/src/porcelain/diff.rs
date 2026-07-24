@@ -16,9 +16,10 @@
 //!
 //! Beyond the format selectors, these options are honored: `-R` (reverse, for
 //! tree/tree and `--cached` pairs), `-z`, `--full-index`, `--abbrev[=<n>]`,
-//! `--no-prefix`/`--default-prefix`/`--src-prefix=`/`--dst-prefix=`, `--summary`,
-//! `--diff-filter=<...>`, `--patch-with-raw`, `--patch-with-stat`, `--exit-code`,
-//! `--quiet`, `--minimal`/`--diff-algorithm=<myers|minimal|histogram>`, and
+//! `--no-prefix`/`--default-prefix`/`--src-prefix=`/`--dst-prefix=`/`--line-prefix=`,
+//! `--summary`, `--compact-summary`/`--no-compact-summary`, `--diff-filter=<...>`,
+//! `--patch-with-raw`, `--patch-with-stat`, `--exit-code`, `--quiet`,
+//! `--minimal`/`--diff-algorithm=<myers|minimal|histogram>`, and
 //! merge-base ranges `<a>...<b>` (diffed as `merge-base(a,b)` against `b`).
 //! Submodule/gitlink (`160000`) changes render as the short-format
 //! `Subproject commit <oid>` diff for tree/tree and `--cached` pairs.
@@ -33,7 +34,11 @@
 //! * A submodule change against the worktree (`git diff <rev>`) still bails — it needs
 //!   the submodule's own repository to resolve the working HEAD.
 //! * A type change (regular file ↔ symlink) in the worktree bails.
-//! * The `patience` diff algorithm has no imara-diff equivalent and bails.
+//! * The `patience` diff algorithm has no imara-diff equivalent and bails (the
+//!   `--patience` alias and `diff.algorithm=patience` both surface the same error).
+//! * `--line-prefix=<s>` is reproduced by a whole-buffer pass and so only tracks the
+//!   newline-terminated formats; combining it with `-z` (NUL-separated records) is
+//!   not byte-faithful.
 //! * Hunk *section headings* (the text after the second `@@`, i.e. the enclosing function)
 //!   are not emitted — gitoxide's unified-diff writer does not compute them.
 //! * Magic pathspecs (`:(...)`) and glob pathspecs bail; literal path / directory-prefix
@@ -183,6 +188,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut quiet = false;
     let mut src_prefix: Vec<u8> = b"a/".to_vec();
     let mut dst_prefix: Vec<u8> = b"b/".to_vec();
+    // `--line-prefix=<s>`: prepended to every emitted line (`diff_line_prefix()`).
+    let mut line_prefix: Vec<u8> = Vec::new();
+    // `--compact-summary`: annotate `--stat` names with create/delete/mode info.
+    let mut compact_summary = false;
     let mut diff_filter: Option<Vec<u8>> = None;
     let mut algorithm: Option<gix::diff::blob::Algorithm> = None;
     // Default resolved from `core.abbrev` after repo discovery (see below);
@@ -251,6 +260,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             "-p" | "-u" | "--patch" => fmt |= F_PATCH,
             "-s" | "--no-patch" => fmt |= F_NO_OUTPUT,
             "--summary" => fmt |= F_SUMMARY,
+            // `--compact-summary` (`diff_opt_compact_summary()`): sets the
+            // stat-with-summary flag AND turns on `--stat`. `--no-compact-summary`
+            // only clears the flag; it never touches the output format.
+            "--compact-summary" => {
+                compact_summary = true;
+                fmt |= F_DIFFSTAT;
+            }
+            "--no-compact-summary" => compact_summary = false,
             // `--patch-with-raw` / `--patch-with-stat` request two formats at once.
             "--patch-with-raw" => fmt |= F_PATCH | F_RAW,
             "--patch-with-stat" => fmt |= F_PATCH | F_DIFFSTAT,
@@ -279,6 +296,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             "--minimal" => algorithm = Some(gix::diff::blob::Algorithm::MyersMinimal),
             "--myers" => algorithm = Some(gix::diff::blob::Algorithm::Myers),
             "--histogram" => algorithm = Some(gix::diff::blob::Algorithm::Histogram),
+            // `--patience` aliases `--diff-algorithm=patience`; imara-diff has no
+            // patience variant, so it bails identically to that flag.
+            "--patience" => bail!("diff algorithm {:?} is not available", "patience"),
             // Accepted no-ops: these describe behavior zvcs already produces, or
             // (for rename detection) make no difference without renames present.
             "--no-renames" | "--no-color" | "--color=never" | "--ignore-blank-lines"
@@ -309,6 +329,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             }
             s if s.starts_with("--dst-prefix=") => {
                 dst_prefix = s["--dst-prefix=".len()..].as_bytes().to_vec();
+            }
+            s if s.starts_with("--line-prefix=") => {
+                line_prefix = s["--line-prefix=".len()..].as_bytes().to_vec();
             }
             s if s.starts_with("--diff-algorithm=") => {
                 match &s["--diff-algorithm=".len()..] {
@@ -441,7 +464,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // Three or more revisions request a dense combined ("--cc") diff of the first
     // revision against the rest, exactly like `builtin_diff_combined()`.
     if !cached && revs.len() >= 3 {
-        return combined_multi(&repo, &revs, &paths, fmt, ctx);
+        return combined_multi(&repo, &revs, &paths, fmt, ctx, &line_prefix);
     }
 
     // ---- collect the normalized change list -------------------------------
@@ -571,7 +594,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 render_numstat(&mut out, &deltas, &analyses);
             }
             if fmt & F_DIFFSTAT != 0 {
-                render_stat(&mut out, &deltas, &analyses);
+                render_stat(&mut out, &deltas, &analyses, compact_summary);
             }
             if fmt & F_SHORTSTAT != 0 {
                 render_shortstat(&mut out, &deltas, &analyses);
@@ -603,6 +626,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+
+    // `--line-prefix`: `diff_line_prefix()` prepends the string to every emitted
+    // line, so a whole-buffer pass over the newline-terminated output reproduces it.
+    let out = apply_line_prefix(out, &line_prefix);
 
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(&out)?;
@@ -1631,9 +1658,65 @@ fn scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
     1 + (it * (width - 1) / max_change)
 }
 
+/// `get_compact_summary()`: the parenthesized annotation `--compact-summary`
+/// appends to a diffstat name. Mirrors `diff.c`'s status/mode ladder, in order:
+/// creation (`new`/`new +x`/`new +l`), deletion (`gone`), then the symlink and
+/// executable-bit mode transitions. Returns `None` when no annotation applies
+/// (a content-only modification) so the name is printed bare.
+fn compact_comment(d: &Delta) -> Option<&'static str> {
+    // git computes the annotation from `p->one`/`p->two`; an unmerged pair has no
+    // usable filespec modes here, so it carries no comment.
+    if d.unmerged {
+        return None;
+    }
+    let old = d.old.map(|(_, k)| k);
+    let new = d.new_kind();
+    // DIFF_STATUS_ADDED.
+    if old.is_none() {
+        return Some(match new {
+            Some(EntryKind::Link) => "new +l",
+            Some(EntryKind::BlobExecutable) => "new +x",
+            _ => "new",
+        });
+    }
+    // DIFF_STATUS_DELETED.
+    if new.is_none() {
+        return Some("gone");
+    }
+    let (ok, nk) = (old.expect("old present"), new.expect("new present"));
+    let old_link = ok == EntryKind::Link;
+    let new_link = nk == EntryKind::Link;
+    if old_link && !new_link {
+        Some("mode -l")
+    } else if !old_link && new_link {
+        Some("mode +l")
+    } else if ok == EntryKind::Blob && nk == EntryKind::BlobExecutable {
+        Some("mode +x")
+    } else if ok == EntryKind::BlobExecutable && nk == EntryKind::Blob {
+        Some("mode -x")
+    } else {
+        None
+    }
+}
+
+/// The diffstat display name: the C-quoted path, plus the `--compact-summary`
+/// annotation ` (<comment>)` when one applies (`fill_print_name()`).
+fn stat_display_name(d: &Delta, compact: bool) -> Vec<u8> {
+    let mut name = quoted_name(&d.path);
+    if compact {
+        if let Some(c) = compact_comment(d) {
+            name.push(b' ');
+            name.push(b'(');
+            name.extend_from_slice(c.as_bytes());
+            name.push(b')');
+        }
+    }
+    name
+}
+
 /// `--stat` (`show_stats()`), with git's default 80-column budget.
-fn render_stat(out: &mut Vec<u8>, deltas: &[Delta], analyses: &[Analysis]) {
-    let names: Vec<Vec<u8>> = deltas.iter().map(|d| quoted_name(&d.path)).collect();
+fn render_stat(out: &mut Vec<u8>, deltas: &[Delta], analyses: &[Analysis], compact: bool) {
+    let names: Vec<Vec<u8>> = deltas.iter().map(|d| stat_display_name(d, compact)).collect();
 
     let mut max_change: i64 = 0;
     let mut max_len: i64 = 0;
@@ -1856,6 +1939,27 @@ fn emit_file_line(out: &mut Vec<u8>, lead: &[u8], label: &[u8]) {
 
 fn push_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
+}
+
+/// `--line-prefix`: git's `emit_line_0()` writes `diff_line_prefix(o)` before every
+/// emitted line, so prepending `prefix` at the buffer start and after each interior
+/// newline reproduces it byte-for-byte for the newline-terminated formats (patch,
+/// stat, summary, raw/name without `-z`). An empty buffer stays empty (git emits
+/// nothing at all on a clean tree), and a trailing newline is not followed by a
+/// dangling prefixed empty line.
+fn apply_line_prefix(out: Vec<u8>, prefix: &[u8]) -> Vec<u8> {
+    if prefix.is_empty() || out.is_empty() {
+        return out;
+    }
+    let mut res = Vec::with_capacity(out.len() + prefix.len() * 2);
+    res.extend_from_slice(prefix);
+    for (i, &b) in out.iter().enumerate() {
+        res.push(b);
+        if b == b'\n' && i + 1 < out.len() {
+            res.extend_from_slice(prefix);
+        }
+    }
+    res
 }
 
 // ---------------------------------------------------------------------------
@@ -2086,6 +2190,7 @@ fn combined_multi(
     paths: &[String],
     fmt: u32,
     ctx: u32,
+    line_prefix: &[u8],
 ) -> Result<ExitCode> {
     // `-s` / `--no-patch` suppresses all output; the combined patch is the only
     // combined format zvcs renders, so every other format falls back to it.
@@ -2100,6 +2205,7 @@ fn combined_multi(
     }
 
     let out = combined_trees_patch(repo, &result_tree, &parent_trees, paths, ctx)?;
+    let out = apply_line_prefix(out, line_prefix);
 
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(&out)?;

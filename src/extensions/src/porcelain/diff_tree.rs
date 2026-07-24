@@ -16,6 +16,11 @@
 //!   commit id; a root commit prints nothing unless `--root` is given, and a merge
 //!   prints nothing unless `-m` is given
 //! * `-r`, `-t` (implies `-r`), `--root`, `-m`
+//! * `-R` — swap every file pair (git's reverse diff). Applied before
+//!   `--diff-filter`, so a reversed addition filters as a deletion; it swaps the raw
+//!   mode/oid columns and status letter, the `--numstat` add/delete counts, the
+//!   `--shortstat` totals, and turns a `--summary` create line into a delete (and
+//!   vice versa). Paths keep their walk order, matching git.
 //! * `--raw` (the default), `--name-only`, `--name-status`, `-s`/`--no-patch`
 //! * `--numstat`, `--shortstat`, `--summary` — the file-granular stat family, forced
 //!   recursive like git; numstat line counts come from the vendored imara-diff (git's
@@ -89,7 +94,7 @@
 //! * whitespace-insensitive comparison (`-w`, `-b`, `--ignore-*`). These are not
 //!   patch-only: git re-compares blob *content* and drops a pair whose only
 //!   difference is whitespace, so the raw output changes too.
-//! * rename/copy detection (`-M`/`-C`/`-B`), pickaxe (`-S`/`-G`), `-R`, `-O`,
+//! * rename/copy detection (`-M`/`-C`/`-B`), pickaxe (`-S`/`-G`), `-O`,
 //!   `--find-copies-harder`, `--line-prefix`, `--relative`,
 //!   `--submodule`/`--ignore-submodules`.
 //! * magic (`:(...)`) and glob pathspecs.
@@ -208,6 +213,7 @@ struct Opts {
     merges: bool,        // -m: diff a merge against every parent
     no_commit_id: bool,  // --no-commit-id
     always: bool,        // --always: print the commit id even with no changes
+    reverse: bool,       // -R: swap the two sides of every file pair
     exit_code: bool,     // --exit-code/--quiet: exit 1 when anything differs
     abbrev: usize,       // object-id width in the raw output
     filter: u32,         // --diff-filter mask, see `filter_bit`
@@ -259,6 +265,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         merges: false,
         no_commit_id: false,
         always: false,
+        reverse: false,
         exit_code: false,
         abbrev: hash.len_in_hex(),
         filter: ALL_STATUSES,
@@ -298,6 +305,11 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 "-m" => opts.merges = true,
                 "--no-commit-id" => opts.no_commit_id = true,
                 "--always" => opts.always = true,
+                // `-R` (git's `DIFF_OPT_REVERSE_DIFF`): swap the two sides of every
+                // file pair. git applies this in diffcore before `--diff-filter`
+                // classification, so a reversed addition is filtered as a deletion;
+                // the swap therefore runs in [`collect`] before [`apply_filter`].
+                "-R" => opts.reverse = true,
                 // git validates the operand count for `--merge-base` after it has
                 // resolved the revisions (exactly two commits), so the flag is only
                 // recorded here; the count check runs once parsing is complete. The
@@ -817,7 +829,6 @@ fn is_known_unsupported(a: &str) -> bool {
         // pickaxe and ordering
         "--pickaxe-all",
         "--pickaxe-regex",
-        "-R",
         // path rewriting
         "--relative",
         "--no-relative",
@@ -1091,6 +1102,15 @@ fn collect(
 ) -> Result<Vec<Change>> {
     let mut out = Vec::new();
     walk(repo, old, new, BStr::new(""), opts, &mut out)?;
+    // `-R` reverses each pair before `--diff-filter` runs, so a reversed addition is
+    // classified (and filtered) as a deletion, its numstat counts swap, and a
+    // `--summary` create becomes a delete. Paths keep their walk order — git's `-R`
+    // swaps sides in place, it does not re-sort.
+    if opts.reverse {
+        for c in &mut out {
+            std::mem::swap(&mut c.old, &mut c.new);
+        }
+    }
     apply_filter(&mut out, opts.filter);
     Ok(out)
 }

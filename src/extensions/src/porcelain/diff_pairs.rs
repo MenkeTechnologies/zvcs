@@ -38,6 +38,12 @@
 //! * `--relative[=<prefix>]` / `--no-relative`, `--rotate-to=<p>` / `--skip-to=<p>`
 //! * `--output-indicator-new`/`-old`/`-context=<char>` — remap the `+`/`-`/` ` markers on
 //!   body lines (a value longer than one byte errors with exit 129, like `diff_opt_char`)
+//! * `-a`/`--text` — force a textual diff on content gitoxide flags as binary. The patch
+//!   shows hunks instead of `Binary files ... differ`; `--stat`/`--numstat` still report
+//!   the file as binary, matching git's diffstat which ignores the TEXT option.
+//! * `--minimal`, `--histogram`, `--diff-algorithm=<myers|minimal|histogram>` — choose the
+//!   internal blob-diff algorithm (an unknown name errors with exit 129, like git's
+//!   `parse_algorithm`)
 //! * `--exit-code`, `--quiet` (implies `-s` and `--exit-code`)
 //! * `--abbrev[=<n>]` — accepted and ignored, which is what stock git does here.
 //!   `core.abbrev` itself *is* honoured.
@@ -51,11 +57,13 @@
 //!   supported`, exit 128 — this matches stock git's `builtin/diff-pairs.c`, which dies
 //!   with the same message rather than recursing.
 //! * `--color`, `--color-moved`, `--word-diff`, `--check`, `--binary`, `--line-prefix`,
-//!   `--output`, `--inter-hunk-context`, `-a`/`--text`,
-//!   `-W`/`--function-context`, `--dirstat`, `--diff-algorithm`/`--patience`/`--histogram`/
-//!   `--minimal`/`--anchored`, `-O`/`--order`, `--textconv`/`--ext-diff`, `--submodule`,
+//!   `--output`, `--inter-hunk-context`,
+//!   `-W`/`--function-context`, `--dirstat`, `--anchored`, `-O`/`--order`,
+//!   `--textconv`/`--ext-diff`, `--submodule`, `--ignore-blank-lines`,
 //!   and `-I` combined with a *patch* format (git marks the ignorable hunks via
 //!   `xdl_mark_ignorable`, which the vendored differ does not expose).
+//! * `--patience` / `--diff-algorithm=patience`: imara-diff has no patience variant, so
+//!   these bail rather than silently substituting Myers (the same floor `git diff` hits).
 //! * The rename/copy options (`-M`, `-C`, `-B`, `-l`, ...) are meaningless for this command
 //!   — the pairs arrive pre-computed — and are rejected rather than quietly dropped.
 //! * `gitattributes` diff drivers: neither external commands nor custom `funcname`
@@ -433,6 +441,11 @@ struct Opts {
     ind_new: u8,
     ind_old: u8,
     ind_context: u8,
+    // --diff-algorithm / --minimal / --histogram: overrides the algorithm gitoxide would
+    // otherwise pick for the internal blob diff. `None` keeps gitoxide's own default.
+    algo: Option<gix::diff::blob::Algorithm>,
+    // -a / --text: force a textual diff even for content flagged binary.
+    text: bool,
 }
 
 /// One raw-format record: a pre-computed file pair.
@@ -514,6 +527,8 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         ind_new: b'+',
         ind_old: b'-',
         ind_context: b' ',
+        algo: None,
+        text: false,
     };
     let mut nul = false;
     // Deferred until the whole line is read so `--pickaxe-regex`/`--pickaxe-all`, which
@@ -613,6 +628,46 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
             "-b" | "--ignore-space-change" => opts.ws = Whitespace::IgnoreChange,
             "--ignore-space-at-eol" => opts.ws = Whitespace::IgnoreAtEol,
             "--ignore-cr-at-eol" => opts.ws = Whitespace::IgnoreCrAtEol,
+            // -a / --text: force a textual diff for content git would flag as binary.
+            "-a" | "--text" => opts.text = true,
+            "--no-text" => opts.text = false,
+            // Diff-algorithm selection. imara-diff has no `patience` variant, so
+            // `--patience`/`--diff-algorithm=patience` bail rather than silently
+            // substituting Myers, exactly like the sibling `git diff` port.
+            "--minimal" => opts.algo = Some(gix::diff::blob::Algorithm::MyersMinimal),
+            "--histogram" => opts.algo = Some(gix::diff::blob::Algorithm::Histogram),
+            "--patience" => bail!("diff algorithm {:?} is not available", "patience"),
+            "--diff-algorithm" => {
+                let v = want_value!(s.len());
+                match classify_algo(&v) {
+                    AlgoChoice::Use(a) => opts.algo = Some(a),
+                    AlgoChoice::Patience => {
+                        bail!("diff algorithm {:?} is not available", "patience")
+                    }
+                    AlgoChoice::Unknown => {
+                        eprintln!(
+                            "error: option diff-algorithm accepts \"myers\", \"minimal\", \
+                             \"patience\" and \"histogram\""
+                        );
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            _ if s.starts_with("--diff-algorithm=") => {
+                match classify_algo(&s["--diff-algorithm=".len()..]) {
+                    AlgoChoice::Use(a) => opts.algo = Some(a),
+                    AlgoChoice::Patience => {
+                        bail!("diff algorithm {:?} is not available", "patience")
+                    }
+                    AlgoChoice::Unknown => {
+                        eprintln!(
+                            "error: option diff-algorithm accepts \"myers\", \"minimal\", \
+                             \"patience\" and \"histogram\""
+                        );
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
             "-I" | "--ignore-matching-lines" => {
                 let v = want_value!(s.len());
                 let re = compile_regex(v.as_bytes())
@@ -738,6 +793,7 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
                  -I<re>, -S<s>/-G<re>/--find-object=<id>/--pickaxe-regex/--pickaxe-all, \
                  --relative[=<p>]/--no-relative, --rotate-to=<p>/--skip-to=<p>, \
                  --output-indicator-new/-old/-context=<char>, \
+                 -a/--text, --minimal/--histogram/--diff-algorithm=<myers|minimal|histogram>, \
                  --exit-code, --quiet, --abbrev[=<n>], -h)"
             ),
         }
@@ -884,6 +940,28 @@ fn set_indicator(slot: &mut u8, val: &str, name: &str) -> std::result::Result<()
     } else {
         eprintln!("error: {name} expects a character, got '{val}'");
         Err(ExitCode::from(129))
+    }
+}
+
+/// The outcome of resolving a `--diff-algorithm=<name>` value.
+enum AlgoChoice {
+    Use(gix::diff::blob::Algorithm),
+    /// git-valid, but imara-diff has no patience variant.
+    Patience,
+    Unknown,
+}
+
+/// Map a `--diff-algorithm` value to an imara-diff algorithm, matching git's
+/// case-insensitive `parse_algorithm` (which accepts `myers`/`default`, `minimal`,
+/// `histogram` and `patience`).
+fn classify_algo(name: &str) -> AlgoChoice {
+    use gix::diff::blob::Algorithm::{Histogram, Myers, MyersMinimal};
+    match name.to_ascii_lowercase().as_str() {
+        "myers" | "default" => AlgoChoice::Use(Myers),
+        "minimal" => AlgoChoice::Use(MyersMinimal),
+        "histogram" => AlgoChoice::Use(Histogram),
+        "patience" => AlgoChoice::Patience,
+        _ => AlgoChoice::Unknown,
     }
 }
 
@@ -1443,71 +1521,37 @@ fn analyze(
     let new_data = prep.new.data.as_slice().unwrap_or_default().to_vec();
 
     match prep.operation {
-        Operation::SourceOrDestinationIsBinary => Ok(Analysis {
-            add: 0,
-            del: 0,
-            binary: true,
-            old_data,
-            new_data,
-            hunks: Vec::new(),
-        }),
-        Operation::ExternalCommand { .. } => Err(fatal("external diff drivers are not supported")),
-        Operation::InternalDiff { algorithm } => {
-            let before: Vec<&[u8]> = byte_lines(&old_data);
-            let after: Vec<&[u8]> = byte_lines(&new_data);
-            let mut input: InternedInput<Vec<u8>> = InternedInput::default();
-            input.update_before(before.iter().map(|l| normalize(l, opts.ws)));
-            input.update_after(after.iter().map(|l| normalize(l, opts.ws)));
-
-            let diff = diff_with_slider_heuristics(algorithm, &input);
-            // `xdl_mark_ignorable_regex`: a change group whose every removed and added
-            // line matches an `-I` pattern contributes nothing to the counts.
-            let (add, del) = if opts.ignore_lines.is_empty() {
-                (diff.count_additions(), diff.count_removals())
-            } else {
-                let mut a = 0u32;
-                let mut d = 0u32;
-                for hunk in diff.hunks() {
-                    let ignorable = hunk
-                        .before
-                        .clone()
-                        .all(|i| matches_any(&opts.ignore_lines, before[i as usize]))
-                        && hunk
-                            .after
-                            .clone()
-                            .all(|i| matches_any(&opts.ignore_lines, after[i as usize]));
-                    if ignorable {
-                        continue;
-                    }
-                    d += hunk.before.clone().count() as u32;
-                    a += hunk.after.clone().count() as u32;
-                }
-                (a, d)
-            };
-
-            // Hunks render the *original* line bytes, indexed by the cursors the hunk
-            // header establishes, so whitespace-normalized comparison never leaks into
-            // the printed patch. `-I` is rejected alongside a patch format, so the raw
-            // (unmarked) hunks are correct whenever they are actually emitted.
-            let hunks = if diff.hunks().next().is_some() {
-                let sink = PatchSink {
-                    buf: Vec::new(),
-                    before: &before,
-                    after: &after,
-                    func_prev: -1,
-                };
-                match UnifiedDiff::new(&diff, &input, sink, ContextSize::symmetrical(opts.ctx))
-                    .consume()
-                {
-                    Ok(h) => h,
-                    Err(_) => return Err(fatal("unable to diff blob pair")),
-                }
+        Operation::SourceOrDestinationIsBinary => {
+            // `-a`/`--text` forces a textual diff even for content gitoxide flags as
+            // binary. The `binary` flag itself stays set so `--stat`/`--numstat` still
+            // report the file as binary — git's diffstat ignores the TEXT option, so
+            // stock `git diff -a --numstat` prints `-\t-` even though `-a` makes the
+            // patch textual.
+            let hunks = if opts.text {
+                text_analysis(
+                    &old_data,
+                    &new_data,
+                    opts,
+                    opts.algo.unwrap_or(gix::diff::blob::Algorithm::Myers),
+                )?
+                .2
             } else {
                 Vec::new()
             };
-
-            drop(before);
-            drop(after);
+            Ok(Analysis {
+                add: 0,
+                del: 0,
+                binary: true,
+                old_data,
+                new_data,
+                hunks,
+            })
+        }
+        Operation::ExternalCommand { .. } => Err(fatal("external diff drivers are not supported")),
+        Operation::InternalDiff { algorithm } => {
+            // `--diff-algorithm`/`--minimal`/`--histogram` override gitoxide's pick.
+            let (add, del, hunks) =
+                text_analysis(&old_data, &new_data, opts, opts.algo.unwrap_or(algorithm))?;
             Ok(Analysis {
                 add,
                 del,
@@ -1518,6 +1562,69 @@ fn analyze(
             })
         }
     }
+}
+
+/// The text half of [`analyze`]: intern the two blobs (under the active whitespace
+/// rules), diff them with `algorithm`, and return `(additions, removals, rendered
+/// hunks)`. Shared by the normal `InternalDiff` path and the `-a`/`--text` path that
+/// forces a textual diff on content gitoxide classifies as binary.
+fn text_analysis(
+    old_data: &[u8],
+    new_data: &[u8],
+    opts: &Opts,
+    algorithm: gix::diff::blob::Algorithm,
+) -> std::result::Result<(u32, u32, Vec<u8>), ExitCode> {
+    let before: Vec<&[u8]> = byte_lines(old_data);
+    let after: Vec<&[u8]> = byte_lines(new_data);
+    let mut input: InternedInput<Vec<u8>> = InternedInput::default();
+    input.update_before(before.iter().map(|l| normalize(l, opts.ws)));
+    input.update_after(after.iter().map(|l| normalize(l, opts.ws)));
+
+    let diff = diff_with_slider_heuristics(algorithm, &input);
+    // `xdl_mark_ignorable_regex`: a change group whose every removed and added
+    // line matches an `-I` pattern contributes nothing to the counts.
+    let (add, del) = if opts.ignore_lines.is_empty() {
+        (diff.count_additions(), diff.count_removals())
+    } else {
+        let mut a = 0u32;
+        let mut d = 0u32;
+        for hunk in diff.hunks() {
+            let ignorable = hunk
+                .before
+                .clone()
+                .all(|i| matches_any(&opts.ignore_lines, before[i as usize]))
+                && hunk
+                    .after
+                    .clone()
+                    .all(|i| matches_any(&opts.ignore_lines, after[i as usize]));
+            if ignorable {
+                continue;
+            }
+            d += hunk.before.clone().count() as u32;
+            a += hunk.after.clone().count() as u32;
+        }
+        (a, d)
+    };
+
+    // Hunks render the *original* line bytes, indexed by the cursors the hunk
+    // header establishes, so whitespace-normalized comparison never leaks into
+    // the printed patch. `-I` is rejected alongside a patch format, so the raw
+    // (unmarked) hunks are correct whenever they are actually emitted.
+    let hunks = if diff.hunks().next().is_some() {
+        let sink = PatchSink {
+            buf: Vec::new(),
+            before: &before,
+            after: &after,
+            func_prev: -1,
+        };
+        match UnifiedDiff::new(&diff, &input, sink, ContextSize::symmetrical(opts.ctx)).consume() {
+            Ok(h) => h,
+            Err(_) => return Err(fatal("unable to diff blob pair")),
+        }
+    } else {
+        Vec::new()
+    };
+    Ok((add, del, hunks))
 }
 
 /// Split `data` into lines the way `imara_diff::sources::byte_lines` does: the
@@ -2206,7 +2313,7 @@ fn emit_patch(
         b"/dev/null".to_vec()
     };
 
-    if an.binary {
+    if an.binary && !opts.text {
         out.extend_from_slice(b"Binary files ");
         out.extend_from_slice(&old_label);
         out.extend_from_slice(b" and ");

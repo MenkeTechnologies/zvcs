@@ -68,6 +68,7 @@ fn read_verbs_emit_valid_json() {
         &["zorphans", "--json"],
         &["zdivergent", "--json"],
         &["zpin", "list", "--json"],
+        &["zppid", "--json"],
     ];
     for case in cases {
         let out = run(&repo, &home, case);

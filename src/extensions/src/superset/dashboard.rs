@@ -1,12 +1,13 @@
 //! `git zdashboard` — a live, tiled TUI that combines the fleet monitor, the
 //! semantic event feed, and the fleet command feed on one screen.
 //!
-//! Three tiles, refreshed together: a **fleet** table (every indexed repo, most
+//! Four tiles, refreshed together: a **fleet** table (every indexed repo, most
 //! recently active first, read from the daemon status cache with the on-screen
-//! rows' HEAD state live-refreshed so nothing is stale), the **events** feed
-//! (`zevents`: commits / reconciles / status changes), and the **commands** feed
-//! (`zcommands`: every git command run across the machine, with the agent that
-//! ran it). A header row carries the aggregate totals. It shares ztop's theme
+//! rows' HEAD state live-refreshed so nothing is stale), a **processes** tile
+//! (`zppid`: each invoking ppid, its commit tally, live/dead state, and last-commit
+//! age), the **events** feed (`zevents`: commits / reconciles / status changes),
+//! and the **commands** feed (`zcommands`: every git command run across the machine,
+//! with the agent that ran it). A header row carries the aggregate totals. It shares ztop's theme
 //! system: `c` opens the 31-scheme chooser, `~`/`e` the palette editor, F1 the
 //! help overlay. The non-interactive path (`--once` / `--json` / a non-tty
 //! stdout) keeps the instant text summary.
@@ -137,6 +138,18 @@ struct CmdRec {
     argv: String,
 }
 
+/// One row of the per-process commit tile (`zppid`): the responsible process's pid,
+/// command name and cwd, its commit tally, whether it is still live, and how long
+/// since it last committed.
+struct ProcRow {
+    ppid: i64,
+    cmd: String,
+    cwd: String,
+    commits: i64,
+    alive: bool,
+    age_secs: i64,
+}
+
 #[derive(Default)]
 struct Totals {
     repos: usize,
@@ -160,6 +173,7 @@ struct Dash {
     fleet: Vec<FleetRow>,
     events: Vec<crate::db::EventRow>,
     commands: Vec<CmdRec>,
+    procs: Vec<ProcRow>,
     daemon_up: bool,
     // Theme state (shared with ztop).
     pal: Palette,
@@ -179,6 +193,7 @@ impl Dash {
             fleet: Vec::new(),
             events: Vec::new(),
             commands: Vec::new(),
+            procs: Vec::new(),
             daemon_up: false,
             pal,
             label,
@@ -272,6 +287,17 @@ impl Dash {
             let ppids = crate::db::list_ppids(&conn).unwrap_or_default();
             t.procs = ppids.len();
             t.top_ppid = ppids.first().map(|p| (p.ppid, p.commits));
+            self.procs = ppids
+                .into_iter()
+                .map(|p| ProcRow {
+                    alive: crate::superset::zppid::is_alive(p.ppid),
+                    age_secs: (now - p.last_seen).max(0),
+                    ppid: p.ppid,
+                    cmd: p.cmd,
+                    cwd: p.cwd,
+                    commits: p.commits,
+                })
+                .collect();
             self.events = crate::db::events_recent(&conn, FEED, None, None).unwrap_or_default();
         }
 
@@ -416,11 +442,11 @@ fn render(buf: &mut Buffer, d: &Dash) {
         set_str(buf, x, 1, &num, style, cols.saturating_sub(x));
         x += num.len() as u16;
     }
-    let top = match t.top_ppid {
+    let top_seg = match t.top_ppid {
         Some((ppid, n)) if n > 0 => format!("  top ppid {ppid} ({n}c)"),
         _ => String::new(),
     };
-    set_str(buf, 0, 2, &format!("claims {}  sessions {}  queue {} active  procs {}{}   theme: {}", t.claims, t.sessions, t.queue, t.procs, top, if d.mono { "Monochrome" } else { &d.label }), c.label, cols);
+    set_str(buf, 0, 2, &format!("claims {}  sessions {}  queue {} active  procs {}{}   theme: {}", t.claims, t.sessions, t.queue, t.procs, top_seg, if d.mono { "Monochrome" } else { &d.label }), c.label, cols);
 
     let top = 3u16;
     let foot = rows - 1;
@@ -430,13 +456,19 @@ fn render(buf: &mut Buffer, d: &Dash) {
     let right_w = cols - left_w;
     let ev_h = body_h / 2;
     let cmd_h = body_h - ev_h;
+    // Left column splits: the fleet on top, the per-process commit tile (`zppid`)
+    // below it. The process tile takes the lower third (clamped so the fleet keeps
+    // the majority and both stay drawable on a short terminal).
+    let proc_h = (body_h / 3).clamp(3, body_h.saturating_sub(4).max(3));
+    let fleet_h = body_h.saturating_sub(proc_h);
 
-    render_fleet(buf, 0, top, left_w, body_h, d);
+    render_fleet(buf, 0, top, left_w, fleet_h, d);
+    render_procs(buf, 0, top + fleet_h, left_w, proc_h, d);
     render_events(buf, right_x, top, right_w, ev_h, d);
     render_commands(buf, right_x, top + ev_h, right_w, cmd_h, d);
 
     fill_row(buf, foot, c.bar);
-    set_str(buf, 0, foot, " q Quit   c Colors   ~ Edit   F1 Help   live — fleet · events · commands ", c.bar, cols);
+    set_str(buf, 0, foot, " q Quit   c Colors   ~ Edit   F1 Help   live — fleet · procs · events · commands ", c.bar, cols);
 
     match &d.overlay {
         Overlay::None => {}
@@ -456,6 +488,30 @@ fn render_fleet(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash) {
         set_str(buf, ix, cy, &basename(&row.path), c.row, namew);
         set_str(buf, ix + namew + 1, cy, word, style, 10);
         set_str(buf, ix + namew + 12, cy, &fmt_ago(row.age_secs), c.dim, 6);
+    }
+}
+
+fn render_procs(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, d: &Dash) {
+    let c = &d.colors;
+    let (ix, iy, iw, ih) = tile(buf, x, y, w, h, "PROCESSES · commits by ppid", c);
+    if d.procs.is_empty() {
+        set_str(buf, ix, iy, "no commits recorded yet", c.dim, iw);
+        return;
+    }
+    // pid | cmd | commits | live/dead | age, with the cwd basename filling whatever
+    // is left. commits/state/age are anchored from the right edge so they never clip;
+    // pid+cmd+cwd share the rest. set_str clips each field to its width.
+    for (i, p) in d.procs.iter().take(ih as usize).enumerate() {
+        let cy = iy + i as u16;
+        let (state, sstyle) = if p.alive { ("live", c.ok) } else { ("dead", c.dim) };
+        set_str(buf, ix, cy, &p.ppid.to_string(), c.cyan, 8);
+        set_str(buf, ix + 9, cy, &p.cmd, c.magenta, 14);
+        let restx = ix + 24;
+        let restw = iw.saturating_sub(24 + 18);
+        set_str(buf, restx, cy, &basename(&crate::superset::zppid::tilde(&p.cwd)), c.dim, restw);
+        set_str(buf, ix + iw.saturating_sub(18), cy, &format!("{}c", p.commits), c.green, 6);
+        set_str(buf, ix + iw.saturating_sub(11), cy, state, sstyle, 5);
+        set_str(buf, ix + iw.saturating_sub(5), cy, &fmt_ago(p.age_secs), c.dim, 5);
     }
 }
 

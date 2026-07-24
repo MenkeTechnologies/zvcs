@@ -181,6 +181,11 @@ const CARRY_ENV: &[&str] = &[
     "GIT_COMMITTER_NAME",
     "GIT_COMMITTER_EMAIL",
     "GIT_COMMITTER_DATE",
+    // The submitter's bot identity, so a queued/async commit run by the daemon is
+    // attributed to the agent that submitted it (`zppid`), not collapsed to the
+    // daemon's own session. Without this, every fleet commit routed through the
+    // queue folds into one `pid-<daemon>` row.
+    "ZVCS_SESSION",
 ];
 
 /// Snapshot the carried identity env of the submitting process as a JSON object.

@@ -602,9 +602,15 @@ invoking process into the `ppids` table (keyed by `session_key()` — an exporte
 commit). Attribution is at command time by the invoking process, which a
 daemon-side HEAD-delta observer could not do; a no-op `commit` or rejected merge
 never advances HEAD, so it counts nothing. `.then` skips the gix HEAD probe for
-every non-commit verb, so the hot path is unchanged. `git zppid` lists the table
-(ppid, live/dead via `kill(ppid,0)`, commits, last-seen), and the dashboard header
-shows the process count plus the busiest ppid.
+every non-commit verb, so the hot path is unchanged. The stored `ppid` is derived
+from the session key (the `N` in `pid-<N>`, or a bare exported `ZVCS_SESSION=$$`),
+not `getppid()` — so a commit routed through the async queue and run by the daemon
+child is still attributed to the submitter rather than collapsing the whole fleet
+onto the daemon's pid. That is why the queue carries `ZVCS_SESSION` in its
+identity env (§ the async queue) alongside the `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
+vars. `git zppid` lists the table (ppid, live/dead via `kill(ppid,0)`, commits,
+last-seen), and the dashboard adds a PROCESSES tile plus a header line with the
+process count and the busiest ppid.
 
 ## 16. Command logging + AOP interception
 

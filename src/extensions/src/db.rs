@@ -157,6 +157,15 @@ pub fn upsert_repo(conn: &Connection, git_dir: &Path, workdir: Option<&Path>) ->
     Ok(id)
 }
 
+/// Drop a repo from the index by git dir (used by `git zwatch rm`). Returns the
+/// number of rows removed (0 if it was not indexed).
+pub fn remove_repo(conn: &Connection, git_dir: &Path) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM repos WHERE git_dir = ?1",
+        [git_dir.to_string_lossy()],
+    )?)
+}
+
 /// One row of the repo index.
 pub struct RepoRow {
     pub id: i64,

@@ -108,7 +108,9 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Snapshots | `zsnapshot` `zrestore` `zsnapshots` | tree-wide restore points across all submodules |
 | Worktrees | `zworktree add/list/remove` | per-agent isolated, object-sharing worktree of the whole tree |
 | Fan-out | `zforeach [selectors] -- <cmd>` | run a command across all/subset of indexed repos, in parallel (selectors: `--repo`/`--dirty`/`--ahead`/`--behind`/`--claimed`/`--session`) |
-| Hooks | `zhook set/unset/show/list/test` | manage & test ref-change hooks (`zvcs.hook`); `zvcs.autohook` fires each repo's own local hook |
+| Hooks | `zhook set/unset/show/list/test` | manage & test the current repo's ref-change hook (`zvcs.hook`); `zvcs.autohook` fires each repo's own local hook |
+| Triggers | `ztrigger DIR <cmd>` `ztrigger list/rm/test` | arm any repo BY PATH to run a command on every ref-change — writes DIR's local hook, indexes it, auto-flips `zvcs.autohook`, reloads the daemon (no `git config` needed) |
+| Watch | `zwatch DIR` `zwatch list/rm` | watch a repo by path (index + cached status via `zvcs.autostatus`) without attaching a command |
 | Console | `zrepl` | interactive line console over the verbs |
 | Discovery | `zverbs` | list every extension verb and its one-line usage (sourced from each verb's own `-h`) |
 | git-compat | every stock subcommand | dispatched natively; depth varies — see the parity report |
@@ -254,12 +256,31 @@ Hooks get a typed environment: `ZVCS_EVENT` (commit/checkout/merge/pull/rebase/
 reset), `ZVCS_REPO`, `ZVCS_GIT_DIR`, `ZVCS_OLD_SHA`, `ZVCS_NEW_SHA`, `ZVCS_REF` —
 enough for "on commit in X, do Y in repo Z" cross-repo rules.
 
+You never have to touch `[zvcs]` config by hand to wire a trigger — `ztrigger`
+does it all. Arm any repo by path and the command runs on every ref-change there:
+
+```console
+$ git ztrigger ~/src/api 'make test'   # writes ~/src/api local hook, indexes it,
+                                        # flips zvcs.autohook on, reloads the daemon
+$ git ztrigger .        'echo "$ZVCS_EVENT" | notify'   # arm the current repo
+$ git ztrigger list                    # every armed repo (path <tab> command)
+$ git ztrigger test ~/src/api          # fire it once now, without waiting
+$ git ztrigger rm   ~/src/api          # disarm
+
+$ git zwatch ~/src/api                 # watch (index + cached status), no command
+$ git zwatch list                      # indexed repos, flagged watch|trigger
+```
+
+Only repos you `ztrigger` carry a hook, and the daemon is a no-op for the rest —
+so the set of firing repos is exactly the ones you armed, with no extra list to
+maintain. `zhook` is the same operation scoped to the current repo.
+
 ## [0x06] LAYOUT
 
 | Path | Contents |
 |------|----------|
 | `src/ported` | Vendored gitoxide crates (`gix` + the `gix-*` library crates), in-tree. A self-contained workspace, excluded from the root and consumed as a path dependency. The `gix`/`ein` CLI binaries and their `gitoxide-core` backend are removed; `git` is the only binary. |
-| `src/extensions` | The zvcs crate (library + the `git` binary): `main.rs`/`lib.rs` (entry, `session_key`, notify-on-next-command), `dispatch.rs` (routing), `porcelain/` (git-compat), `lock.rs` (daemon client), `config.rs` (`[zvcs]` settings), `autostart.rs` (daemon auto-spawn), `db.rs` (SQLite ledger/index), `crawler.rs` (repo crawl), `jobpool.rs`/`jobrun.rs`/`index_commit.rs` (async jobs), `worktree.rs` (checkout helper), and `superset/` (`zdaemon`, `zsync`, `zbump`, `reconcile`, `attach`, `watch`, `hooks`, `ledger`, `status`, `oplog`, `snapshot`, `claim`, `queue`, `repl`, `zworktree`). |
+| `src/extensions` | The zvcs crate (library + the `git` binary): `main.rs`/`lib.rs` (entry, `session_key`, notify-on-next-command), `dispatch.rs` (routing), `porcelain/` (git-compat), `lock.rs` (daemon client), `config.rs` (`[zvcs]` settings), `autostart.rs` (daemon auto-spawn), `db.rs` (SQLite ledger/index), `crawler.rs` (repo crawl), `jobpool.rs`/`jobrun.rs`/`index_commit.rs` (async jobs), `worktree.rs` (checkout helper), and `superset/` (`zdaemon`, `zsync`, `zbump`, `reconcile`, `attach`, `watch`, `hooks`, `trigger`, `ledger`, `status`, `oplog`, `snapshot`, `claim`, `queue`, `repl`, `zworktree`). |
 
 ## [0x07] STATUS & ROADMAP
 

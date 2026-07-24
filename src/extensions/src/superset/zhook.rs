@@ -7,7 +7,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use std::io::IsTerminal;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 pub fn zhook(args: &[String]) -> Result<ExitCode> {
     match args.first().map(String::as_str) {
@@ -20,39 +20,30 @@ pub fn zhook(args: &[String]) -> Result<ExitCode> {
     }
 }
 
-/// The zvcs `git` binary, to shell `git config` (writes go through porcelain).
-fn exe() -> Result<std::path::PathBuf> {
-    std::env::current_exe().map_err(|e| anyhow!("cannot resolve exe: {e}"))
-}
-
-/// `git zhook set <command>` — set this repo's `zvcs.hook`.
+/// `git zhook set <command>` — set the current repo's `zvcs.hook`. The
+/// DIR-addressed `git ztrigger` is the same operation for an arbitrary path.
 fn set(args: &[String]) -> Result<ExitCode> {
     if args.is_empty() {
         bail!("usage: git zhook set <command>");
     }
     let cmd = args.join(" ");
-    let ok = Command::new(exe()?)
-        .args(["config", "zvcs.hook", &cmd])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if ok {
-        println!("hook set: {cmd}");
-        // Remind if hook-firing isn't enabled anywhere resolvable here.
-        if let Ok(repo) = gix::discover(".") {
-            if !crate::config::ZvcsConfig::load(&repo).hooks_enabled() {
-                eprintln!("note: enable firing with `git config --global zvcs.autohook true` (or set zvcs.hook)");
-            }
+    let (_, workdir) = crate::superset::hooks::resolve(".")?;
+    crate::superset::hooks::set_hook(&workdir, &cmd)?;
+    println!("hook set: {cmd}");
+    // Auto-enable firing so no raw `git config` is ever needed.
+    if let Ok(repo) = gix::discover(".") {
+        if !crate::config::ZvcsConfig::load(&repo).hooks_enabled() {
+            crate::superset::hooks::enable_autohook()?;
+            crate::superset::hooks::reload_daemon();
         }
-        Ok(ExitCode::SUCCESS)
-    } else {
-        bail!("failed to set zvcs.hook");
     }
+    Ok(ExitCode::SUCCESS)
 }
 
-/// `git zhook unset` — remove this repo's `zvcs.hook`.
+/// `git zhook unset` — remove the current repo's `zvcs.hook`.
 fn unset() -> Result<ExitCode> {
-    let _ = Command::new(exe()?).args(["config", "--unset", "zvcs.hook"]).status();
+    let (_, workdir) = crate::superset::hooks::resolve(".")?;
+    crate::superset::hooks::unset_hook(&workdir)?;
     println!("hook unset");
     Ok(ExitCode::SUCCESS)
 }
@@ -71,19 +62,11 @@ fn show() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `git zhook list` — every indexed repo that has a hook (pipe-clean).
+/// `git zhook list` — every indexed repo that has a hook (pipe-clean). Shares
+/// its source with `git ztrigger list`.
 fn list() -> Result<ExitCode> {
-    let conn = match crate::db::open_ro() {
-        Ok(c) => c,
-        Err(_) => return Ok(ExitCode::SUCCESS),
-    };
-    for r in crate::db::list_repos(&conn)? {
-        if let Ok(repo) = gix::open(&r.git_dir) {
-            if let Some(hook) = repo.config_snapshot().string("zvcs.hook") {
-                let path = r.workdir.unwrap_or(r.git_dir);
-                println!("{path}\t{hook}");
-            }
-        }
+    for (path, cmd) in crate::superset::hooks::list()? {
+        println!("{path}\t{cmd}");
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -14,7 +14,7 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
     "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
     "zsnapshots", "zworktree", "zstash", "zunstash", "zstashes", "zup", "zforeach", "zhook",
-    "zdashed", "zverbs",
+    "ztrigger", "zwatch", "zdashed", "zverbs",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -245,6 +245,8 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zup" => "usage: git zup [<path>] — reconcile the tree at cwd (or <path>) to latest",
         "zforeach" => "usage: git zforeach [<pattern>...|--repo <p>|--dirty|--ahead|--behind|--claimed|--session <s>] -- <command>...",
         "zhook" => "usage: git zhook <set <command>|unset|show|list|test>",
+        "ztrigger" => "usage: git ztrigger <DIR> <command>... | git ztrigger <list|rm DIR|test DIR> — run a command on every ref-change in DIR",
+        "zwatch" => "usage: git zwatch <DIR> | git zwatch <list|rm DIR> — watch DIR (index + cached status) without a command",
         "zverbs" => "usage: git zverbs — list every zvcs extension verb and its usage",
         _ => return None,
     })
@@ -301,6 +303,8 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zup" => superset::zup(args),
         "zforeach" => superset::zforeach(args),
         "zhook" => superset::zhook(args),
+        "ztrigger" => superset::ztrigger(args),
+        "zwatch" => superset::zwatch(args),
         "zverbs" => print_verbs(),
 
         // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----

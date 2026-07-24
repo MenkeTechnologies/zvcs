@@ -483,6 +483,16 @@ and session attribution. All tested.
   gate keyed on the daemon's config. New `zvcs.autohook` master switch makes the
   watcher cover every indexed repo and fire each repo's *own* hook. Tests:
   `zhook.rs`, `hook_event.rs`.
+- **DIR-addressed triggers** — `ztrigger DIR <cmd>` / `zwatch DIR` are the
+  path-addressed front-end to the same hook core (`superset/hooks.rs` helpers,
+  shared with `zhook`): arm any repo without `cd`-ing into it. `ztrigger` writes
+  DIR's local `zvcs.hook`, indexes DIR (`db::upsert_repo`), auto-flips global
+  `zvcs.autohook`, and reloads the daemon — so no raw `git config` is ever
+  required to wire a trigger. Because the daemon runs each repo's own local hook
+  and no-ops the rest, the firing set is exactly the armed DIRs (no separate
+  watchlist). `zwatch` is the command-less form (index + `zvcs.autostatus`);
+  `zwatch rm`/`ztrigger rm` unwind. `ZVCS_NO_DAEMON` suppresses the reload for
+  scripted bulk runs. Tests: `trigger.rs`.
 
 **New `[zvcs]` config keys:** `autostatus` (maintain `zstatus --all`) and
 `autohook` (fire per-repo local hooks), plus the existing

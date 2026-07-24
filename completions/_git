@@ -6785,6 +6785,8 @@ _git_commands () {
     zworktree:'zvcs: per-agent isolated worktrees'
     zforeach:'zvcs: run a command across all/subset of repos'
     zhook:'zvcs: manage ref-change hooks'
+    ztrigger:'zvcs: run a command on every ref-change in a DIR'
+    zwatch:'zvcs: watch a DIR (index + cached status) without a command'
     zrepl:'zvcs: interactive console over the verbs'
     zverbs:'zvcs: list every extension verb and its usage'
   )
@@ -9186,6 +9188,28 @@ done
     list:'hooks across repos' test:'fire it once'
   )
   _describe -t zhook-sub subcommand a
+}
+
+(( $+functions[_git-ztrigger] )) || _git-ztrigger () {
+  if (( CURRENT == 2 )); then
+    local -a a=(
+      list:'armed repos' rm:'disarm a DIR' test:'fire a DIR once now'
+    )
+    _describe -t ztrigger-sub 'subcommand or DIR' a
+    _path_files -/
+  elif [[ $words[2] == (rm|test) ]]; then
+    _path_files -/
+  fi
+}
+
+(( $+functions[_git-zwatch] )) || _git-zwatch () {
+  if (( CURRENT == 2 )); then
+    local -a a=( list:'watched repos' rm:'stop watching a DIR' )
+    _describe -t zwatch-sub 'subcommand or DIR' a
+    _path_files -/
+  elif [[ $words[2] == rm ]]; then
+    _path_files -/
+  fi
 }
 
 (( $+functions[_git-zworktree] )) || _git-zworktree () {

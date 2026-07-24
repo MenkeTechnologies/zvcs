@@ -1,11 +1,13 @@
 //! `git receive-pack` — the server side of a push.
-//! **The pack-receiving half is not ported: those paths bail.**
 //!
-//! `receive-pack` is a protocol server. It writes a ref advertisement, then
-//! reads commands, a packfile and (optionally) a push certificate off stdin,
-//! ingests the pack, runs hooks and updates refs. Only the first half is
-//! reproducible on the vendored gitoxide, so only the first half is
-//! implemented. What is ported here is byte-verified against git 2.55.0:
+//! `receive-pack` is a protocol server. It writes a ref advertisement, then reads
+//! commands, a packfile and (optionally) a push certificate off stdin, ingests the
+//! pack, runs hooks and updates refs. The advertisement (below) and the receive path
+//! (`receive`: command list → pack ingest via `gix_pack::Bundle` → ref
+//! compare-and-swap → `report-status`) are both implemented — enough for a local
+//! (`file://`) or ssh push served by this binary. Hooks, the quarantine, push certs,
+//! push-options and atomic pushes are not modelled (see the notes below). The
+//! advertisement is byte-verified against git 2.55.0:
 //!
 //!   * **The ref advertisement** — `<oid> SP <ref>` pkt-lines in refname order,
 //!     with the capability list appended to the first line after a NUL, the
@@ -74,9 +76,12 @@
 //! status reporting on the receive path, which is not reached here, so it has
 //! no observable effect on any implemented path.
 
-use anyhow::{bail, Result};
-use std::io::Read;
+use anyhow::{anyhow, bail, Result};
+use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+use gix::refs::{FullName, Target};
+use std::io::{BufRead, Read, Write};
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
 
 /// The flags this port implements, quoted in every rejection message.
 const PORTED: &str = "ported: -q/--quiet, --http-backend-info-refs/--advertise-refs";
@@ -151,9 +156,9 @@ pub fn receive_pack(args: &[String]) -> Result<ExitCode> {
     if opts.advertise_only {
         return Ok(ExitCode::SUCCESS);
     }
-    let _ = opts.quiet; // only meaningful on the receive path, which bails below.
+    let _ = opts.quiet; // suppresses progress only; the report-status is unaffected.
 
-    read_first_command()
+    receive(&repo)
 }
 
 /// Either a fully parsed command line, or a terminal exit code for the
@@ -380,41 +385,180 @@ fn flush_pkt(out: &mut Vec<u8>) {
     out.extend_from_slice(b"0000");
 }
 
-/// Read the first pkt-line header of the push and decide the session's fate.
-///
-/// Only the two outcomes that never touch a packfile are reproducible: a client
-/// that flushes immediately (exit 0, no output) and a client that goes away
-/// (git's `fatal: the remote end hung up unexpectedly`, exit 128). A malformed
-/// header reproduces git's `bad line length character`. An actual command line
-/// means a real push, which bails.
-fn read_first_command() -> Result<ExitCode> {
-    let mut header = [0u8; 4];
-    let mut read = 0;
+/// One ref-update command a client sent: move `name` from `old` to `new` (a zero
+/// `old` is a create, a zero `new` a delete).
+struct Command {
+    old: gix::ObjectId,
+    new: gix::ObjectId,
+    name: String,
+}
+
+/// Read the command list off stdin, ingest the packfile, apply the ref updates, and
+/// write `report-status` — the receiving half of a push. Faithful to git's
+/// `receive-pack`/`send-pack` wire for the plain (non-side-band) path that zvcs's own
+/// `send-pack` speaks: pkt-line commands, then a flush, then a raw (non-pkt) pack,
+/// then a plain pkt-line `report-status`. An empty command list (immediate flush) is
+/// a no-op success, matching a client that connects and hangs up.
+fn receive(repo: &gix::Repository) -> Result<ExitCode> {
     let mut stdin = std::io::stdin().lock();
-    while read < header.len() {
-        match stdin.read(&mut header[read..]) {
-            Ok(0) => break,
-            Ok(n) => read += n,
-            Err(e) => return Err(e.into()),
+
+    // --- command list (until flush); the first line carries the caps after a NUL.
+    let hash = repo.object_hash();
+    let zero = gix::ObjectId::null(hash);
+    let mut cmds: Vec<Command> = Vec::new();
+    let mut caps: Vec<u8> = Vec::new();
+    while let Some(line) = read_pkt_line(&mut stdin)? {
+        let (body, cap) = match (cmds.is_empty() && caps.is_empty(), line.iter().position(|&b| b == 0)) {
+            (true, Some(n)) => (&line[..n], Some(line[n + 1..].to_vec())),
+            _ => (&line[..], None),
+        };
+        if let Some(c) = cap {
+            caps = c;
         }
+        let text = std::str::from_utf8(body)
+            .map_err(|_| anyhow!("protocol error: non-utf8 command"))?
+            .trim_end();
+        let mut it = text.splitn(3, ' ');
+        let (o, n, name) = match (it.next(), it.next(), it.next()) {
+            (Some(o), Some(n), Some(name)) if !name.is_empty() => (o, n, name),
+            _ => bail!("protocol error: expected old/new/ref, got {text:?}"),
+        };
+        cmds.push(Command {
+            old: gix::ObjectId::from_hex(o.as_bytes()).map_err(|_| anyhow!("protocol error: bad old id"))?,
+            new: gix::ObjectId::from_hex(n.as_bytes()).map_err(|_| anyhow!("protocol error: bad new id"))?,
+            name: name.to_string(),
+        });
     }
-    if read < header.len() {
-        // Includes a truncated header, which git also reports as a hang-up.
-        eprintln!("fatal: the remote end hung up unexpectedly");
-        return Ok(ExitCode::from(128));
-    }
-    if &header == b"0000" {
+    if cmds.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }
-    if !header.iter().all(u8::is_ascii_hexdigit) {
-        eprintln!(
-            "fatal: protocol error: bad line length character: {}",
-            String::from_utf8_lossy(&header)
-        );
-        return Ok(ExitCode::from(128));
+
+    // --- ingest the pack (skipped when every command is a delete) -----------
+    let mut unpack: Result<(), String> = Ok(());
+    if cmds.iter().any(|c| c.new != zero) {
+        if let Err(e) = ingest_pack(repo, &mut stdin) {
+            unpack = Err(e.to_string());
+        }
     }
-    bail!(
-        "receiving a push is not supported (no receive-pack server plumbing, thin-pack \
-         completion, hook runner or quarantine in the vendored gitoxide; {PORTED})"
+
+    // --- apply the ref updates ---------------------------------------------
+    let mut verdicts: Vec<(String, Result<(), String>)> = Vec::with_capacity(cmds.len());
+    for c in &cmds {
+        let v = if unpack.is_err() {
+            Err("unpacker error".to_string())
+        } else {
+            apply_update(repo, &c.name, c.old, c.new, zero)
+        };
+        verdicts.push((c.name.clone(), v));
+    }
+
+    // --- report-status (plain pkt-lines; zvcs's client requests no side-band).
+    if cap_present(&caps, b"report-status") || cap_present(&caps, b"report-status-v2") {
+        let mut out: Vec<u8> = Vec::new();
+        match &unpack {
+            Ok(()) => pkt_line(&mut out, b"unpack ok\n"),
+            Err(e) => pkt_line(&mut out, format!("unpack {e}\n").as_bytes()),
+        }
+        for (name, v) in &verdicts {
+            match v {
+                Ok(()) => pkt_line(&mut out, format!("ok {name}\n").as_bytes()),
+                Err(reason) => pkt_line(&mut out, format!("ng {name} {reason}\n").as_bytes()),
+            }
+        }
+        flush_pkt(&mut out);
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&out)?;
+        stdout.flush()?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Read one pkt-line: `None` on a flush (`0000`), else its payload (header
+/// stripped). A missing/short header or a non-hex length is a protocol error.
+fn read_pkt_line(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
+    let mut hdr = [0u8; 4];
+    read_exact(r, &mut hdr).map_err(|_| anyhow!("the remote end hung up unexpectedly"))?;
+    let len = u16::from_str_radix(
+        std::str::from_utf8(&hdr).map_err(|_| anyhow!("protocol error: bad line length character"))?,
+        16,
     )
+    .map_err(|_| anyhow!("protocol error: bad line length character"))?;
+    match len {
+        0 => Ok(None),                 // flush
+        1..=4 => Ok(Some(Vec::new())), // flush/delim/response-end or empty line
+        _ => {
+            let mut buf = vec![0u8; len as usize - 4];
+            read_exact(r, &mut buf)?;
+            Ok(Some(buf))
+        }
+    }
+}
+
+fn read_exact(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<()> {
+    let mut off = 0;
+    while off < buf.len() {
+        match r.read(&mut buf[off..])? {
+            0 => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof")),
+            n => off += n,
+        }
+    }
+    Ok(())
+}
+
+/// Whether the client advertised capability `want` (a whole space-separated token).
+fn cap_present(caps: &[u8], want: &[u8]) -> bool {
+    caps.split(|&b| b == b' ' || b == b'\n' || b == 0).any(|tok| tok == want)
+}
+
+/// Index the packfile streaming off `input` into `objects/pack`. A thin pack's
+/// external delta bases are resolved from the odb (git's `index-pack --fix-thin`),
+/// so a `send-pack` thin pack lands complete.
+fn ingest_pack(repo: &gix::Repository, input: &mut impl BufRead) -> Result<()> {
+    let pack_dir = repo.objects.store_ref().path().join("pack");
+    std::fs::create_dir_all(&pack_dir)?;
+    let outcome = gix::odb::pack::Bundle::write_to_directory(
+        input,
+        Some(&pack_dir),
+        &mut gix::progress::Discard,
+        &AtomicBool::new(false),
+        Some(repo.objects.clone()),
+        gix::odb::pack::bundle::write::Options {
+            object_hash: gix::hash::Kind::Sha1,
+            ..Default::default()
+        },
+    )?;
+    // `write_to_directory` always drops a `.keep`; a received push keeps none.
+    if let Some(kp) = &outcome.keep_path {
+        let _ = std::fs::remove_file(kp);
+    }
+    Ok(())
+}
+
+/// Apply one ref update as a compare-and-swap against `old` (create when `old` is
+/// zero, delete when `new` is zero), returning the client-facing reason on failure.
+fn apply_update(
+    repo: &gix::Repository,
+    name: &str,
+    old: gix::ObjectId,
+    new: gix::ObjectId,
+    zero: gix::ObjectId,
+) -> Result<(), String> {
+    let full = FullName::try_from(name).map_err(|_| "funny refname".to_string())?;
+    let expected = if old == zero {
+        PreviousValue::MustNotExist
+    } else {
+        PreviousValue::MustExistAndMatch(Target::Object(old))
+    };
+    let change = if new == zero {
+        Change::Delete { expected, log: RefLog::AndReference }
+    } else {
+        Change::Update {
+            log: LogChange { mode: RefLog::AndReference, force_create_reflog: false, message: "push".into() },
+            expected,
+            new: Target::Object(new),
+        }
+    };
+    repo.edit_reference(RefEdit { change, name: full, deref: false })
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }

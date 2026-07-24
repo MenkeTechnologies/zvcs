@@ -112,7 +112,7 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Triggers | `ztrigger DIR <cmd>` `ztrigger list/rm/test` | arm any repo BY PATH to run a command on **any file change** in the directory (worktree + `.git`) — writes DIR's local hook, indexes it, watches the whole dir, auto-flips `zvcs.autohook`, reloads the daemon (no `git config` needed) |
 | Watch | `zwatch DIR` `zwatch list/rm` | watch a repo by path (index + cached status via `zvcs.autostatus`) without attaching a command |
 | Console | `zrepl` | interactive line console over **every** command — each line runs as `git <line>`, so the `z*` verbs and all git porcelain work alike (startup stats banner + Tab completion of every verb) |
-| Shell | `zcd` `zpwd` `zls` `zenv` `zunset` `zecho` | shell builtins so `zrepl` drives like a shell — `zcd`/`zenv`/`zunset` mutate the console's cwd/environment and persist across lines (later `git` lines see them); `zls` is a git-aware listing (per-file status columns like `eza --git`) |
+| Shell | `zcd` `zpwd` `zls` `zenv` `zunset` `zecho` `zmkdir` `ztouch` `zrm` `zcp` `zmv` `zcat` `zln` | shell builtins so `zrepl` drives like a shell — `zcd`/`zenv`/`zunset` mutate the console's cwd/environment and persist across lines; `zls` is a git-aware listing (per-file status like `eza --git`); `zmkdir`/`ztouch`/`zrm`/`zcp`/`zmv`/`zcat`/`zln` are native filesystem commands (`zrm`/`zmv` are on-disk, distinct from `git rm`/`git mv`) |
 | Discovery | `zverbs` | list every extension verb and its one-line usage (sourced from each verb's own `-h`) |
 | Health | `zdoctor` | environment health check — git shadow on PATH, daemon, ledger, man pages, MANPATH, dashed forms (OK/WARN/FAIL, exits non-zero on FAIL) |
 | git-compat | every stock subcommand | dispatched natively; depth varies — see the parity report |
@@ -219,7 +219,11 @@ sets, or queries environment variables —
 anything set persists so every later `git` line sees it — `git zunset <NAME>...`
 clears them, and `git zecho [-n] <arg>...` prints its arguments. The mutating
 verbs (`zcd`/`zenv`/`zunset`) only affect this process, so they are aimed at the
-console.
+console. Rounding out the set are native filesystem commands — `git zmkdir [-p]`,
+`git ztouch`, `git zrm [-r] [-f]`, `git zcp [-r]`, `git zmv`, `git zcat`, and
+`git zln [-s]` — so files can be created, copied, moved, and removed without
+leaving the console. These act on disk (no fork); `zrm`/`zmv` are distinct from
+`git rm`/`git mv`, which stage changes in the index.
 
 **Discovery & help.** `git zverbs` lists every extension verb with its one-line
 usage (each verb also answers `-h` with the same line). `git help <zverb>` opens

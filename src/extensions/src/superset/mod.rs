@@ -48,7 +48,9 @@ pub use doctor::zdoctor;
 pub use oplog::{zlog, zundo};
 pub use snapshot::{zrestore, zsnapshot, zsnapshots};
 pub use gitls::zls;
-pub use shell::{zcd, zecho, zenv, zpwd, zunset};
+pub use shell::{
+    zcat, zcd, zcp, zecho, zenv, zln, zmkdir, zmv, zpwd, zrm, ztouch, zunset,
+};
 pub use status::zstatus;
 pub use trigger::{ztrigger, zwatch};
 pub use zforeach::zforeach;

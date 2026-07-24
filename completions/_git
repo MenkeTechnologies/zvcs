@@ -6796,6 +6796,13 @@ _git_commands () {
     zunset:'zvcs: remove environment variables'
     zecho:'zvcs: print arguments joined by a space'
     zdoctor:'zvcs: health check of the zvcs environment'
+    zmkdir:'zvcs: create directories (-p for parents)'
+    ztouch:'zvcs: create files or bump their mtime'
+    zrm:'zvcs: remove files/directories (filesystem, not git rm)'
+    zcp:'zvcs: copy files/directories (-r recursive)'
+    zmv:'zvcs: move/rename files/directories'
+    zcat:'zvcs: print file contents'
+    zln:'zvcs: create a hard link or symlink (-s)'
   )
 
   zstyle -a :completion:$curcontext: user-commands user_commands

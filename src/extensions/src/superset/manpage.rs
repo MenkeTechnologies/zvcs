@@ -292,6 +292,48 @@ pub const DOCS: &[Doc] = &[
             "The process exits non-zero only when a hard FAIL is found, so it is usable in scripts and CI.",
         ],
     },
+    Doc {
+        verb: "zmkdir",
+        summary: "create directories",
+        synopsis: "git zmkdir [-p] <dir>...",
+        desc: &["Creates each named directory. -p creates any missing parent directories and does not error if the directory already exists. A native filesystem convenience for the zrepl console."],
+    },
+    Doc {
+        verb: "ztouch",
+        summary: "create files or update their mtime",
+        synopsis: "git ztouch <file>...",
+        desc: &["Creates each named file if it does not exist (leaving existing contents intact) and updates its modification time to now, like the shell's touch."],
+    },
+    Doc {
+        verb: "zrm",
+        summary: "remove files and directories",
+        synopsis: "git zrm [-r] [-f] <path>...",
+        desc: &["Removes files from the filesystem \\(em this is not `git rm` (which stages a removal in the index); it deletes on disk. -r removes directories recursively, -f ignores paths that do not exist. Symlinks are removed, never followed."],
+    },
+    Doc {
+        verb: "zcp",
+        summary: "copy files and directories",
+        synopsis: "git zcp [-r] <src>... <dst>",
+        desc: &["Copies files; -r copies directories recursively. With several sources, <dst> must be an existing directory and each source is copied into it under its own name; with one source and a non-directory <dst>, <dst> is the copy's name."],
+    },
+    Doc {
+        verb: "zmv",
+        summary: "move or rename files and directories",
+        synopsis: "git zmv <src>... <dst>",
+        desc: &["Moves or renames paths. With several sources, <dst> must be an existing directory. A rename is used when possible, falling back to copy-then-remove when the move crosses filesystems. This is not `git mv` (which also updates the index); it only moves on disk."],
+    },
+    Doc {
+        verb: "zcat",
+        summary: "print file contents",
+        synopsis: "git zcat <file>...",
+        desc: &["Writes each named file's bytes to stdout, in order, like the shell's cat."],
+    },
+    Doc {
+        verb: "zln",
+        summary: "create a hard link or symlink",
+        synopsis: "git zln [-s] <target> <link>",
+        desc: &["Creates <link> pointing at <target>: a hard link by default, or a symbolic link with -s."],
+    },
 ];
 
 /// The manual for `verb`, or `None` if it is not a superset verb.

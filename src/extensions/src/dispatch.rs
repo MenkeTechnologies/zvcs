@@ -15,7 +15,7 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
     "zsnapshots", "zworktree", "zstash", "zunstash", "zstashes", "zup", "zforeach", "zhook",
     "ztrigger", "zwatch", "zdashed", "zverbs", "zcd", "zpwd", "zls", "zenv", "zunset", "zecho",
-    "zdoctor",
+    "zdoctor", "zmkdir", "ztouch", "zrm", "zcp", "zmv", "zcat", "zln",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -256,6 +256,13 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zunset" => "usage: git zunset <NAME>... — remove environment variables",
         "zecho" => "usage: git zecho [-n] [<arg>...] — print arguments joined by a space",
         "zdoctor" => "usage: git zdoctor — health check of the zvcs environment (shadow, daemon, ledger, man pages)",
+        "zmkdir" => "usage: git zmkdir [-p] <dir>... — create directories",
+        "ztouch" => "usage: git ztouch <file>... — create files or bump their mtime",
+        "zrm" => "usage: git zrm [-r] [-f] <path>... — remove files/directories (filesystem, not git rm)",
+        "zcp" => "usage: git zcp [-r] <src>... <dst> — copy files/directories",
+        "zmv" => "usage: git zmv <src>... <dst> — move/rename files/directories",
+        "zcat" => "usage: git zcat <file>... — print file contents to stdout",
+        "zln" => "usage: git zln [-s] <target> <link> — create a hard link or symlink (-s)",
         _ => return None,
     })
 }
@@ -321,6 +328,13 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zunset" => superset::zunset(args),
         "zecho" => superset::zecho(args),
         "zdoctor" => superset::zdoctor(args),
+        "zmkdir" => superset::zmkdir(args),
+        "ztouch" => superset::ztouch(args),
+        "zrm" => superset::zrm(args),
+        "zcp" => superset::zcp(args),
+        "zmv" => superset::zmv(args),
+        "zcat" => superset::zcat(args),
+        "zln" => superset::zln(args),
 
         // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----
         "add" => porcelain::add(args),

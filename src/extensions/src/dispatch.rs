@@ -17,6 +17,7 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "ztrigger", "zwatch", "zdashed", "zverbs", "zcd", "zpwd", "zls", "zenv", "zunset", "zecho",
     "zdoctor", "zmkdir", "ztouch", "zrm", "zcp", "zmv", "zcat", "zln",
     "zheads", "zdirty", "zbranches", "ztags", "zremotes", "zsize", "zage", "zpull",
+    "zgrep", "zahead", "zbehind", "zauthors", "zhot", "zconflicts",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -272,6 +273,12 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zsize" => "usage: git zsize [selectors] — on-disk .git size of each indexed repo (largest first)",
         "zage" => "usage: git zage [selectors] — how long ago each indexed repo's HEAD commit was made",
         "zpull" => "usage: git zpull [selectors] — parallel fetch + fast-forward of every indexed repo (ff-only)",
+        "zgrep" => "usage: git zgrep [selectors] [-i] <pattern> — parallel regex search of tracked content across indexed repos",
+        "zahead" => "usage: git zahead [selectors] — indexed repos with commits not yet on their upstream",
+        "zbehind" => "usage: git zbehind [selectors] — indexed repos whose upstream is ahead of them",
+        "zauthors" => "usage: git zauthors [selectors] — commit counts by author across indexed repos, ranked",
+        "zhot" => "usage: git zhot [selectors] [<days>] — indexed repos ranked by commits in the last <days> (default 30)",
+        "zconflicts" => "usage: git zconflicts [selectors] — indexed repos mid-merge/rebase/cherry-pick/revert/bisect or with conflicts",
         _ => return None,
     })
 }
@@ -352,6 +359,12 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zsize" => superset::zsize(args),
         "zage" => superset::zage(args),
         "zpull" => superset::zpull(args),
+        "zgrep" => superset::zgrep(args),
+        "zahead" => superset::zahead(args),
+        "zbehind" => superset::zbehind(args),
+        "zauthors" => superset::zauthors(args),
+        "zhot" => superset::zhot(args),
+        "zconflicts" => superset::zconflicts(args),
 
         // ---- BEGIN generated porcelain arms (scripts/wire_dispatch.pl) ----
         "add" => porcelain::add(args),

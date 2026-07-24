@@ -13,6 +13,7 @@
 //!   * [`zbump`]   — forward-only submodule gitlink bumps: stage a submodule
 //!     pointer only when the new SHA is a descendant of the recorded one.
 
+pub mod analytics;
 pub mod attach;
 pub mod banner;
 pub mod claim;
@@ -61,6 +62,7 @@ pub use zstash::{zstash, zstashes, zunstash};
 pub use zup::zup;
 pub use zworktree::zworktree;
 pub use ledger::{zjob, zjobs, zreindex, zrepos};
+pub use analytics::{zahead, zauthors, zbehind, zconflicts, zgrep, zhot};
 pub use query::{zage, zbranches, zdirty, zheads, zpull, zremotes, zsize, ztags};
 pub use queue::{zcommit, zpush};
 pub use repl::zrepl;

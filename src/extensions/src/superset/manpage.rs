@@ -389,6 +389,45 @@ pub const DOCS: &[Doc] = &[
             "Where zsync/zup act on the current submodule tree, zpull acts on the machine-wide index, so selectors (--repo, --behind, …) scope which repos are pulled.",
         ],
     },
+    Doc {
+        verb: "zgrep",
+        summary: "parallel content search across indexed repos",
+        synopsis: "git zgrep [selectors] [-i] <pattern>",
+        desc: &[
+            "Searches the tracked file content of every indexed repository for <pattern> (a regular expression) in parallel, printing path:line:text for each match. -i is case-insensitive; binary files are skipped, as git grep does.",
+            "Only tracked, non-conflicted worktree files are searched. Selectors narrow the repo set as in zforeach.",
+        ],
+    },
+    Doc {
+        verb: "zahead",
+        summary: "indexed repos ahead of their upstream",
+        synopsis: "git zahead [selectors]",
+        desc: &["Lists the indexed repositories that have commits not yet on their configured upstream, with the count, computed in parallel. Repos with no upstream are omitted."],
+    },
+    Doc {
+        verb: "zbehind",
+        summary: "indexed repos behind their upstream",
+        synopsis: "git zbehind [selectors]",
+        desc: &["Lists the indexed repositories whose upstream has commits they lack, with the count, computed in parallel. Repos with no upstream are omitted."],
+    },
+    Doc {
+        verb: "zauthors",
+        summary: "commit counts by author across indexed repos",
+        synopsis: "git zauthors [selectors]",
+        desc: &["Walks every indexed repository's HEAD history in parallel, tallies commits by author `Name <email>`, aggregates across all repos, and prints them ranked by count \\(em a machine-wide contribution summary."],
+    },
+    Doc {
+        verb: "zhot",
+        summary: "indexed repos ranked by recent activity",
+        synopsis: "git zhot [selectors] [<days>]",
+        desc: &["Ranks indexed repositories by the number of commits made in the last <days> (default 30), most active first, counted in parallel \\(em a quick read of where work is happening across the tree."],
+    },
+    Doc {
+        verb: "zconflicts",
+        summary: "indexed repos mid-operation or conflicted",
+        synopsis: "git zconflicts [selectors]",
+        desc: &["Lists the indexed repositories that are in the middle of a merge, rebase, cherry-pick, revert, or bisect, or that have unmerged (conflicted) index entries, with the operation(s) named \\(em so a stuck repo among many is found at a glance."],
+    },
 ];
 
 /// The manual for `verb`, or `None` if it is not a superset verb.

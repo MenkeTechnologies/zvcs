@@ -6812,6 +6812,12 @@ _git_commands () {
     zsize:'zvcs: on-disk .git size of every indexed repo'
     zage:'zvcs: HEAD commit age of every indexed repo'
     zpull:'zvcs: parallel fetch + fast-forward of every indexed repo'
+    zgrep:'zvcs: parallel regex search of tracked content across repos'
+    zahead:'zvcs: indexed repos with commits not on their upstream'
+    zbehind:'zvcs: indexed repos whose upstream is ahead of them'
+    zauthors:'zvcs: commit counts by author across indexed repos'
+    zhot:'zvcs: indexed repos ranked by recent commit activity'
+    zconflicts:'zvcs: indexed repos mid-merge/rebase or conflicted'
   )
 
   zstyle -a :completion:$curcontext: user-commands user_commands

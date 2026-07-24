@@ -22,7 +22,7 @@ use crate::superset::select::Selector;
 /// Map `f` over the selected `(git_dir, workdir)` repos in parallel, returning
 /// results in the same order. A bounded pool (machine cores, capped at 16) work-
 /// steals via one atomic counter, exactly as `zforeach` does.
-fn parallel_map<T, F>(repos: &[(PathBuf, PathBuf)], f: F) -> Vec<T>
+pub(crate) fn parallel_map<T, F>(repos: &[(PathBuf, PathBuf)], f: F) -> Vec<T>
 where
     F: Fn(&Path, &Path) -> T + Sync,
     T: Send,
@@ -49,7 +49,7 @@ where
 
 /// Select repos and print a "no repos matched" note when empty. Returns the
 /// selected repos, or `None` when there is nothing to do.
-fn selected(args: &[String]) -> Result<Option<Vec<(PathBuf, PathBuf)>>> {
+pub(crate) fn selected(args: &[String]) -> Result<Option<Vec<(PathBuf, PathBuf)>>> {
     let (sel, _rest) = Selector::parse(args);
     let repos = sel.select()?;
     if repos.is_empty() {
@@ -60,7 +60,7 @@ fn selected(args: &[String]) -> Result<Option<Vec<(PathBuf, PathBuf)>>> {
 }
 
 /// Open a repo by its git dir, mapping the error to a short display string.
-fn probe<T>(git_dir: &Path, f: impl FnOnce(&gix::Repository) -> T, on_err: impl FnOnce(String) -> T) -> T {
+pub(crate) fn probe<T>(git_dir: &Path, f: impl FnOnce(&gix::Repository) -> T, on_err: impl FnOnce(String) -> T) -> T {
     match gix::open(git_dir) {
         Ok(repo) => f(&repo),
         Err(e) => on_err(format!("(open failed: {e})")),

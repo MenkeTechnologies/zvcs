@@ -13,7 +13,8 @@ use std::process::ExitCode;
 use anyhow::{bail, Result};
 use gix::bstr::ByteSlice;
 
-use crate::superset::query::{parallel_map, probe, select_repos, selected};
+use crate::superset::gitls::human_size;
+use crate::superset::query::{dir_size, parallel_map, probe, select_repos, selected};
 use crate::superset::select::Selector;
 
 /// `git zgrep [selectors] [-i] <pattern>` — search the tracked file content of
@@ -250,4 +251,113 @@ fn conflict_state(git_dir: &Path) -> Option<String> {
         ops.push("conflicts");
     }
     (!ops.is_empty()).then(|| ops.join(", "))
+}
+
+/// `git zdivergent [selectors]` — indexed repos that are both ahead of and behind
+/// their upstream (history has forked; a merge or rebase is needed).
+pub fn zdivergent(args: &[String]) -> Result<ExitCode> {
+    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let ab = parallel_map(&repos, |gd, _| probe(gd, ahead_behind, |_| None));
+    let mut shown = 0usize;
+    for ((_, wd), x) in repos.iter().zip(&ab) {
+        if let Some((ahead, behind)) = x {
+            if *ahead > 0 && *behind > 0 {
+                println!("{}  {ahead} ahead, {behind} behind", wd.display());
+                shown += 1;
+            }
+        }
+    }
+    eprintln!("zdivergent: {shown} of {} indexed diverged from upstream", repos.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git zorphans [selectors]` — indexed repos with no remote configured (nothing
+/// to fetch from or push to).
+pub fn zorphans(args: &[String]) -> Result<ExitCode> {
+    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let no_remote = parallel_map(&repos, |gd, _| probe(gd, |r| r.remote_names().is_empty(), |_| false));
+    let mut shown = 0usize;
+    for ((_, wd), orphan) in repos.iter().zip(&no_remote) {
+        if *orphan {
+            println!("{}", wd.display());
+            shown += 1;
+        }
+    }
+    eprintln!("zorphans: {shown} of {} indexed have no remote", repos.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One repo's dashboard facts, gathered in a single probe.
+struct Facts {
+    dirty: bool,
+    ahead: usize,
+    behind: usize,
+    orphan: bool,
+    stale: bool,
+    conflicted: bool,
+    size: u64,
+}
+
+/// `git zdashboard [selectors]` — a one-screen health summary of the indexed
+/// tree: how many repos are dirty, ahead/behind/diverged, conflicted, remote-less,
+/// or stale, plus active claims/sessions, the async queue depth, and total `.git`
+/// size. Each repo is probed once in parallel; ledger state is read once.
+pub fn zdashboard(args: &[String]) -> Result<ExitCode> {
+    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let now = crate::date::now_seconds();
+    let stale_cutoff = now - 90 * 86_400;
+
+    let facts = parallel_map(&repos, |gd, _| {
+        let repo = gix::open(gd).ok();
+        let (ahead, behind) = repo.as_ref().and_then(ahead_behind).unwrap_or((0, 0));
+        let head_secs = repo
+            .as_ref()
+            .and_then(|r| r.head_commit().ok().and_then(|c| c.time().ok()).map(|t| t.seconds));
+        Facts {
+            dirty: repo.as_ref().map(|r| r.is_dirty().unwrap_or(false)).unwrap_or(false),
+            ahead,
+            behind,
+            orphan: repo.as_ref().map(|r| r.remote_names().is_empty()).unwrap_or(false),
+            stale: head_secs.map(|s| s < stale_cutoff).unwrap_or(false),
+            conflicted: conflict_state(gd).is_some(),
+            size: dir_size(gd),
+        }
+    });
+
+    let n = repos.len();
+    let count = |pred: &dyn Fn(&Facts) -> bool| facts.iter().filter(|f| pred(f)).count();
+    let dirty = count(&|f| f.dirty);
+    let ahead = count(&|f| f.ahead > 0 && f.behind == 0);
+    let behind = count(&|f| f.behind > 0 && f.ahead == 0);
+    let diverged = count(&|f| f.ahead > 0 && f.behind > 0);
+    let conflicted = count(&|f| f.conflicted);
+    let orphan = count(&|f| f.orphan);
+    let stale = count(&|f| f.stale);
+    let total_size: u64 = facts.iter().map(|f| f.size).sum();
+
+    // Ledger state: claims (+ distinct sessions) and active queue depth.
+    let (claims, sessions) = match crate::db::open_ro() {
+        Ok(conn) => {
+            let list = crate::db::list_claims(&conn).unwrap_or_default();
+            let sessions: std::collections::HashSet<&str> = list.iter().map(|(_, s, _)| s.as_str()).collect();
+            (list.len(), sessions.len())
+        }
+        Err(_) => (0, 0),
+    };
+    let queued = crate::db::open_ro()
+        .ok()
+        .and_then(|c| crate::db::list_jobs(&c, 1000).ok())
+        .map(|j| j.iter().filter(|x| x.state == "queued" || x.state == "running").count())
+        .unwrap_or(0);
+
+    println!("zvcs dashboard — {n} repos indexed");
+    println!("  dirty         {dirty:>5}");
+    println!("  ahead         {ahead:>5}    behind {behind:>5}    diverged {diverged:>5}");
+    println!("  conflicted    {conflicted:>5}");
+    println!("  no remote     {orphan:>5}");
+    println!("  stale (>90d)  {stale:>5}");
+    println!("  claims        {claims:>5}    sessions {sessions:>5}");
+    println!("  queue         {queued:>5} active");
+    println!("  .git total    {:>8}", human_size(total_size));
+    Ok(ExitCode::SUCCESS)
 }

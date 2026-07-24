@@ -11,6 +11,7 @@
 //! fast-forward `zsync` performs.
 
 use anyhow::Result;
+use gix::bstr::ByteSlice;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -201,7 +202,7 @@ pub fn zsize(args: &[String]) -> Result<ExitCode> {
 }
 
 /// Recursively sum regular-file sizes under `p`, not following symlinks.
-fn dir_size(p: &Path) -> u64 {
+pub(crate) fn dir_size(p: &Path) -> u64 {
     let mut total = 0;
     let Ok(entries) = std::fs::read_dir(p) else { return 0 };
     for entry in entries.flatten() {
@@ -262,4 +263,112 @@ pub fn zpull(args: &[String]) -> Result<ExitCode> {
     }
     eprintln!("zpull: {ok} ok, {failed} failed ({} repos)", repos.len());
     Ok(if failed > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+}
+
+/// HEAD commit time (unix seconds) of a repo, or `None` when unborn.
+fn head_seconds(repo: &gix::Repository) -> Option<i64> {
+    repo.head_commit().ok().and_then(|c| c.time().ok()).map(|t| t.seconds)
+}
+
+/// `git zstale [selectors] [<days>]` — indexed repos whose HEAD commit is older
+/// than `<days>` (default 90), with how long ago \(em find abandoned repos.
+pub fn zstale(args: &[String]) -> Result<ExitCode> {
+    let (sel, rest) = Selector::parse(args);
+    let days: i64 = rest.iter().find_map(|a| a.parse().ok()).unwrap_or(90);
+    let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
+    let now = crate::date::now_seconds();
+    let cutoff = now - days * 86_400;
+    let times = parallel_map(&repos, |gd, _| probe(gd, head_seconds, |_| None));
+    let width = repos.iter().map(|(_, w)| w.display().to_string().len()).max().unwrap_or(0);
+    let mut shown = 0usize;
+    for ((_, wd), t) in repos.iter().zip(&times) {
+        if let Some(secs) = t {
+            if *secs < cutoff {
+                println!("{:<width$}  {}", wd.display().to_string(), crate::date::show_date_relative(*secs, now));
+                shown += 1;
+            }
+        }
+    }
+    eprintln!("zstale: {shown} of {} indexed older than {days} day(s)", repos.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git zlast [selectors]` — indexed repos ordered by HEAD commit time, most
+/// recently committed first.
+pub fn zlast(args: &[String]) -> Result<ExitCode> {
+    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let now = crate::date::now_seconds();
+    let times = parallel_map(&repos, |gd, _| probe(gd, head_seconds, |_| None));
+    let mut rows: Vec<(i64, String)> = repos
+        .iter()
+        .zip(&times)
+        .filter_map(|((_, wd), t)| t.map(|s| (s, wd.display().to_string())))
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    let width = rows.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
+    for (secs, path) in &rows {
+        println!("{path:<width$}  {}", crate::date::show_date_relative(*secs, now));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git zfiles [selectors]` — tracked file count of each indexed repo, largest
+/// first.
+pub fn zfiles(args: &[String]) -> Result<ExitCode> {
+    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let counts = parallel_map(&repos, |gd, _| probe(gd, tracked_count, |_| 0usize));
+    let mut rows: Vec<(usize, String)> = repos
+        .iter()
+        .zip(&counts)
+        .map(|((_, wd), c)| (*c, wd.display().to_string()))
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let width = rows.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
+    for (c, p) in &rows {
+        println!("{p:<width$}  {c} file(s)");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn tracked_count(repo: &gix::Repository) -> usize {
+    repo.open_index().map(|i| i.entries().len()).unwrap_or(0)
+}
+
+/// `git zbig [selectors] [<n>]` — the largest tracked files across every indexed
+/// repo, top `<n>` (default 20).
+pub fn zbig(args: &[String]) -> Result<ExitCode> {
+    let (sel, rest) = Selector::parse(args);
+    let n: usize = rest.iter().find_map(|a| a.parse().ok()).unwrap_or(20);
+    let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
+    let per = parallel_map(&repos, |gd, wd| big_files(gd, wd));
+    let mut all: Vec<(u64, String)> = per.into_iter().flatten().collect();
+    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.truncate(n);
+    for (size, path) in &all {
+        println!("{:>9}  {path}", crate::superset::gitls::human_size(*size));
+    }
+    eprintln!("zbig: top {} tracked files across {} repos", all.len(), repos.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A repo's tracked regular files as `(size, full-path)`, capped to its own top
+/// 200 so one huge repo cannot dominate memory before the global merge.
+fn big_files(git_dir: &Path, workdir: &Path) -> Vec<(u64, String)> {
+    let Ok(repo) = gix::open(git_dir) else { return Vec::new() };
+    let Ok(index) = repo.open_index() else { return Vec::new() };
+    let mut v: Vec<(u64, String)> = Vec::new();
+    for entry in index.entries() {
+        if entry.stage() != gix::index::entry::Stage::Unconflicted {
+            continue;
+        }
+        let full = workdir.join(entry.path(&index).to_path_lossy());
+        if let Ok(m) = std::fs::symlink_metadata(&full) {
+            if m.is_file() {
+                v.push((m.len(), full.display().to_string()));
+            }
+        }
+    }
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v.truncate(200);
+    v
 }

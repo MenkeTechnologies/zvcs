@@ -47,7 +47,7 @@ pub mod zdaemon;
 mod zsync;
 
 pub use attach::{ensure_attached, Attached};
-pub use claim::{zclaim, zunclaim, zwho};
+pub use claim::{zclaim, zidle, zsessions, zunclaim, zwho};
 pub use dashed::zdashed;
 pub use doctor::zdoctor;
 pub use oplog::{zlog, zundo};
@@ -64,10 +64,12 @@ pub use zstash::{zstash, zstashes, zunstash};
 pub use zup::zup;
 pub use zworktree::zworktree;
 pub use ledger::{zjob, zjobs, zreindex, zrepos};
-pub use analytics::{zahead, zauthors, zbehind, zconflicts, zgrep, zhot};
+pub use analytics::{zahead, zauthors, zbehind, zconflicts, zdashboard, zdivergent, zgrep, zhot, zorphans};
 pub use coord::{zbarrier, zqueue, zwait};
 pub use pmutate::{zcheckout, zclean, zcommitall, zfetch, zfsck, zgc, zprune, zpushall, ztagall};
-pub use query::{zage, zbranches, zdirty, zheads, zpull, zremotes, zsize, ztags};
+pub use query::{
+    zage, zbig, zbranches, zdirty, zfiles, zheads, zlast, zpull, zremotes, zsize, zstale, ztags,
+};
 pub use queue::{zcommit, zpush};
 pub use repl::zrepl;
 pub use reconcile::reconcile_tree;

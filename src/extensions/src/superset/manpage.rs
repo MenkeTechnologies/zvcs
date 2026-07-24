@@ -500,6 +500,63 @@ pub const DOCS: &[Doc] = &[
         synopsis: "git zbarrier",
         desc: &["Blocks until the entire async job queue is idle \\(em every repository's queued and running jobs have drained \\(em the global join after a burst of `zcommit`/`zpush`."],
     },
+    Doc {
+        verb: "zstale",
+        summary: "indexed repos not committed to in a while",
+        synopsis: "git zstale [selectors] [<days>]",
+        desc: &["Lists the indexed repositories whose HEAD commit is older than <days> (default 90), with how long ago \\(em surfacing abandoned repos across the tree. Scanned in parallel."],
+    },
+    Doc {
+        verb: "zlast",
+        summary: "indexed repos by most recent commit",
+        synopsis: "git zlast [selectors]",
+        desc: &["Lists indexed repositories ordered by HEAD commit time, most recently committed first, each with its relative age \\(em where work happened most recently."],
+    },
+    Doc {
+        verb: "zbig",
+        summary: "largest tracked files across indexed repos",
+        synopsis: "git zbig [selectors] [<n>]",
+        desc: &["Lists the largest tracked files across every indexed repository, top <n> (default 20), by on-disk size \\(em bloat hunting tree-wide. Files are gathered in parallel."],
+    },
+    Doc {
+        verb: "zfiles",
+        summary: "tracked file count per indexed repo",
+        synopsis: "git zfiles [selectors]",
+        desc: &["Prints the number of tracked files in each indexed repository, largest first, scanned in parallel."],
+    },
+    Doc {
+        verb: "zdivergent",
+        summary: "indexed repos diverged from upstream",
+        synopsis: "git zdivergent [selectors]",
+        desc: &["Lists indexed repositories that are both ahead of and behind their upstream \\(em history has forked, so a merge or rebase is needed. Computed in parallel."],
+    },
+    Doc {
+        verb: "zorphans",
+        summary: "indexed repos with no remote",
+        synopsis: "git zorphans [selectors]",
+        desc: &["Lists indexed repositories with no remote configured \\(em nothing to fetch from or push to. Scanned in parallel."],
+    },
+    Doc {
+        verb: "zsessions",
+        summary: "active sessions ranked by repos held",
+        synopsis: "git zsessions",
+        desc: &["Lists the sessions that currently hold claims, ranked by how many repositories each holds \\(em which agent is working the most of the tree."],
+    },
+    Doc {
+        verb: "zidle",
+        summary: "indexed repos with no active claim",
+        synopsis: "git zidle [selectors]",
+        desc: &["Lists indexed repositories that no session has claimed \\(em the ones free for an agent to pick up. Selectors narrow the candidate set as in zforeach."],
+    },
+    Doc {
+        verb: "zdashboard",
+        summary: "one-screen health summary of the tree",
+        synopsis: "git zdashboard [selectors]",
+        desc: &[
+            "Prints a one-screen summary of the indexed tree: how many repositories are dirty, ahead, behind, diverged, conflicted, remote-less, or stale, plus the active claim and session counts, the async queue depth, and total .git size.",
+            "Each repository is probed once in parallel and the ledger is read once, so it is a cheap machine-wide overview. Selectors scope which repos are summarized.",
+        ],
+    },
 ];
 
 /// The manual for `verb`, or `None` if it is not a superset verb.

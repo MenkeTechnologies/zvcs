@@ -6830,6 +6830,15 @@ _git_commands () {
     zwait:'zvcs: block until a repo'\''s async jobs drain'
     zqueue:'zvcs: list queued/running async jobs'
     zbarrier:'zvcs: block until the async queue is idle'
+    zstale:'zvcs: indexed repos not committed to in a while'
+    zlast:'zvcs: indexed repos by most recent commit'
+    zbig:'zvcs: largest tracked files across indexed repos'
+    zfiles:'zvcs: tracked file count per indexed repo'
+    zdivergent:'zvcs: indexed repos diverged from upstream'
+    zorphans:'zvcs: indexed repos with no remote'
+    zsessions:'zvcs: active sessions ranked by repos held'
+    zidle:'zvcs: indexed repos with no active claim'
+    zdashboard:'zvcs: one-screen health summary of the tree'
   )
 
   zstyle -a :completion:$curcontext: user-commands user_commands

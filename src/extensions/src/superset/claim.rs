@@ -86,3 +86,55 @@ pub fn zwho(_args: &[String]) -> Result<ExitCode> {
     }
     Ok(ExitCode::SUCCESS)
 }
+
+/// `git zsessions` — active sessions ranked by how many repos each holds, so it
+/// is clear which agent is working the most of the tree.
+pub fn zsessions(_args: &[String]) -> Result<ExitCode> {
+    let conn = match crate::db::open_ro() {
+        Ok(c) => c,
+        Err(_) => {
+            println!("no active claims");
+            return Ok(ExitCode::SUCCESS);
+        }
+    };
+    let claims = crate::db::list_claims(&conn)?;
+    if claims.is_empty() {
+        println!("no active claims");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut by_session: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (_, session, _) in claims {
+        *by_session.entry(session).or_default() += 1;
+    }
+    let mut rows: Vec<(usize, String)> = by_session.into_iter().map(|(s, n)| (n, s)).collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    for (n, session) in &rows {
+        println!("{n:>4}  {session}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git zidle [selectors]` — indexed repos with no active claim: the ones free
+/// for an agent to pick up. Selectors narrow the candidate set as in `zforeach`.
+pub fn zidle(args: &[String]) -> Result<ExitCode> {
+    let (sel, _rest) = crate::superset::select::Selector::parse(args);
+    let repos = sel.select()?;
+    if repos.is_empty() {
+        println!("no repos matched");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let claimed: std::collections::HashSet<String> = match crate::db::open_ro() {
+        Ok(conn) => crate::db::list_claims(&conn)?.into_iter().map(|(p, _, _)| p).collect(),
+        Err(_) => std::collections::HashSet::new(),
+    };
+    let mut shown = 0usize;
+    for (_, workdir) in &repos {
+        let path = workdir.display().to_string();
+        if !claimed.contains(&path) {
+            println!("{path}");
+            shown += 1;
+        }
+    }
+    eprintln!("zidle: {shown} of {} indexed unclaimed", repos.len());
+    Ok(ExitCode::SUCCESS)
+}

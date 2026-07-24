@@ -95,9 +95,18 @@ pub fn zsubmit(args: &[String]) -> Result<ExitCode> {
     if argv.is_empty() {
         anyhow::bail!("usage: git zsubmit [--] <command> [args...]");
     }
+    submit_or_run(&exec_spec(argv))
+}
+
+/// Build an `exec` job spec for `argv` (argv[0] is the program). Attributes the
+/// job to the cwd repo when there is one; carries the session + environment.
+/// Shared by `zsubmit` and the lock-contention auto-queue.
+fn exec_spec(argv: Vec<String>) -> Value {
     // Runs anywhere: the workdir is the current directory. If that happens to be a
     // repo, attribute the job to it; otherwise it is a repo-less job.
-    let workdir = std::env::current_dir()?.to_string_lossy().into_owned();
+    let workdir = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let git_dir = gix::discover(".").ok().map(|r| {
         r.git_dir()
             .canonicalize()
@@ -124,6 +133,19 @@ pub fn zsubmit(args: &[String]) -> Result<ExitCode> {
     if let Some(gd) = git_dir {
         spec["git_dir"] = json!(gd);
     }
+    spec
+}
+
+/// Queue a git command that could not take its repo lock (contention). The job
+/// re-runs the command through this binary with `ZVCS_QUEUED=1` set, so when the
+/// daemon's jobpool runs it, it BLOCKS on the repo's fair lane rather than
+/// re-queueing (loop guard). Prints the job number; runs inline if no daemon.
+pub fn queue_verb(sub: &str, args: &[String]) -> Result<ExitCode> {
+    let exe = std::env::current_exe().map_err(|e| anyhow!("cannot resolve zvcs binary: {e}"))?;
+    let mut argv = vec![exe.to_string_lossy().into_owned(), sub.to_string()];
+    argv.extend(args.iter().cloned());
+    let mut spec = exec_spec(argv);
+    spec["env"]["ZVCS_QUEUED"] = json!("1");
     submit_or_run(&spec)
 }
 

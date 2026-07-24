@@ -51,6 +51,14 @@ enum Cmd {
         id: String,
         stream: UnixStream,
     },
+    /// Non-blocking acquire: `GRANTED` if the lane is free (caller becomes holder),
+    /// else `BUSY` immediately — never enqueues. Backs the "queue on contention"
+    /// path: a caller that gets `BUSY` submits its work as a job instead of waiting.
+    TryAcquire {
+        repo: PathBuf,
+        id: String,
+        stream: UnixStream,
+    },
     Release {
         repo: PathBuf,
         id: String,
@@ -332,6 +340,21 @@ fn worker_loop(rx: Receiver<Cmd>, sock_path: PathBuf) {
                     lane.queue.push_back((id, stream));
                 }
             }
+            Cmd::TryAcquire { repo, id, stream } => {
+                // Non-blocking: grant only if the lane is idle, else answer BUSY and
+                // drop the request — the caller queues its work as a job instead.
+                let lane = lanes.entry(repo.clone()).or_default();
+                if lane.holder.is_none() {
+                    reply(&stream, "GRANTED");
+                    lane.holder = Some(id);
+                } else {
+                    reply(&stream, "BUSY");
+                    // Don't leave an empty lane behind for a repo we didn't take.
+                    if lane.holder.is_none() && lane.queue.is_empty() {
+                        lanes.remove(&repo);
+                    }
+                }
+            }
             Cmd::Release { repo, id } => {
                 if let Some(lane) = lanes.get_mut(&repo) {
                     if lane.holder.as_deref() == Some(id.as_str()) {
@@ -414,6 +437,18 @@ fn conn_loop(stream: &UnixStream, tx: &Sender<Cmd>, held: &mut Vec<(PathBuf, Str
                     return;
                 }
             }
+            Req::TryAcquire { id, repo } => {
+                let s = match stream.try_clone() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                // Track it as held: if it turns out BUSY the worker never becomes
+                // holder, so the EOF-release for this (repo,id) is a harmless no-op.
+                held.push((repo.clone(), id.clone()));
+                if tx.send(Cmd::TryAcquire { repo, id, stream: s }).is_err() {
+                    return;
+                }
+            }
             Req::Release { id: wire_id } => {
                 // Release the (repo, id) this connection actually acquired — not
                 // blindly the id echoed on the wire — so an explicit RELEASE
@@ -472,6 +507,7 @@ fn conn_loop(stream: &UnixStream, tx: &Sender<Cmd>, held: &mut Vec<(PathBuf, Str
 
 enum Req {
     Acquire { id: String, repo: PathBuf },
+    TryAcquire { id: String, repo: PathBuf },
     Release { id: String },
     Submit(String),
     JobStop(i64),
@@ -488,12 +524,14 @@ fn parse(line: &str) -> Req {
     let verb = it.next().unwrap_or("");
     let rest = it.next().unwrap_or("").trim();
     match verb {
-        "ACQUIRE" => {
+        "ACQUIRE" | "TRYACQUIRE" => {
             let mut p = rest.splitn(2, char::is_whitespace);
             let id = p.next().unwrap_or("").trim();
             let repo = p.next().unwrap_or("").trim();
             if id.is_empty() || repo.is_empty() {
-                Req::Err("ACQUIRE needs <client-id> <git-dir>".into())
+                Req::Err(format!("{verb} needs <client-id> <git-dir>"))
+            } else if verb == "TRYACQUIRE" {
+                Req::TryAcquire { id: id.to_string(), repo: PathBuf::from(repo) }
             } else {
                 Req::Acquire {
                     id: id.to_string(),

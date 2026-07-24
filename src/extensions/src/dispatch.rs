@@ -321,6 +321,18 @@ fn print_verbs() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Index-mutating verbs whose primary operation takes the repo write lock. On
+/// lane contention these auto-queue as a job instead of blocking (see [`run`]).
+/// Deliberately excludes verbs that only lock conditionally or are not index
+/// writers (`config` reads, `fetch`/`fetch-pack`/`http-fetch`, `remote`, `init`),
+/// so those never get deferred.
+const LOCK_VERBS: &[&str] = &[
+    "add", "am", "apply", "checkout", "cherry-pick", "commit", "commit-tree", "merge",
+    "mv", "rebase", "reset", "restore", "revert", "rm", "stage", "stash", "switch",
+    "read-tree", "update-index", "write-tree", "tag", "branch", "notes", "replace",
+    "replay", "rerere", "sparse-checkout", "submodule", "mktag", "mktree",
+];
+
 pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // Every z-verb answers `-h`/`--help` with a one-line usage, uniformly and
     // before dispatch. `z_usage` returns `None` for anything that is not a known
@@ -331,6 +343,27 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
     }
+
+    // Lock-contention → queue. For an index-mutating verb, try to take the repo's
+    // write lane WITHOUT blocking: if it is already held, submit this command as a
+    // job (it will run on the daemon's fair FIFO) and return its number instead of
+    // waiting. If the lane is free we hold it here for the whole command (the
+    // command's own inner `acquire` is a reentrant no-op). `ZVCS_QUEUED` marks a
+    // job's own re-run so it BLOCKS on the lock rather than re-queueing (loop guard);
+    // no daemon → run inline exactly as before.
+    let _queue_guard = if LOCK_VERBS.contains(&sub) && std::env::var_os("ZVCS_QUEUED").is_none() {
+        match gix::discover(".") {
+            Ok(repo) => match crate::lock::RepoLock::try_acquire(repo.git_dir()) {
+                crate::lock::TryLock::Held(g) => Some(g),
+                crate::lock::TryLock::Busy => return crate::superset::queue::queue_verb(sub, args),
+                crate::lock::TryLock::NoDaemon => None,
+            },
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     match sub {
         // ---- superset (novel) ----
         "zsync" => superset::zsync(args),

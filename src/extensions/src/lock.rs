@@ -56,6 +56,17 @@ pub struct RepoLock {
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
+/// Outcome of [`RepoLock::try_acquire`] — the non-blocking lock.
+pub enum TryLock {
+    /// The lock was taken; hold the guard for the critical section.
+    Held(RepoLock),
+    /// The lane is contended (another writer holds it); the caller should queue
+    /// its work as a job rather than block.
+    Busy,
+    /// No daemon reachable — proceed unserialized, exactly as [`RepoLock::acquire`].
+    NoDaemon,
+}
+
 impl RepoLock {
     /// Acquire the repo-wide index lock via the daemon at `<git_dir>/zvcs.sock`.
     ///
@@ -129,6 +140,59 @@ impl RepoLock {
                 _not_send: std::marker::PhantomData,
             },
             _ => Self::unlocked(id, repo),
+        }
+    }
+
+    /// Non-blocking acquire. Unlike [`acquire`], never waits: if the repo's lane is
+    /// already held, returns [`TryLock::Busy`] at once so the caller can queue its
+    /// work as a job instead of blocking. `TryLock::Held` is the lock (proceed
+    /// inline); `TryLock::NoDaemon` means no daemon is reachable (proceed
+    /// unserialized, exactly as `acquire` does in that case).
+    pub fn try_acquire(git_dir: &Path) -> TryLock {
+        let id = format!("{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
+        let sock = crate::superset::zdaemon::socket_path();
+        let repo = git_dir.canonicalize().unwrap_or_else(|_| {
+            if git_dir.is_absolute() {
+                git_dir.to_path_buf()
+            } else {
+                std::env::current_dir().map(|c| c.join(git_dir)).unwrap_or_else(|_| git_dir.to_path_buf())
+            }
+        });
+
+        // Reentrant: this thread already holds it — hand back a no-op held guard.
+        if HELD.with(|h| h.borrow().contains(&repo)) {
+            return TryLock::Held(Self { stream: None, id, held_key: None, _not_send: std::marker::PhantomData });
+        }
+
+        let mut stream = match UnixStream::connect(&sock) {
+            Ok(s) => s,
+            Err(_) => return TryLock::NoDaemon,
+        };
+        if stream.write_all(format!("TRYACQUIRE {id} {}\n", repo.display()).as_bytes()).is_err()
+            || stream.flush().is_err()
+        {
+            return TryLock::NoDaemon;
+        }
+        let reader_half = match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => return TryLock::NoDaemon,
+        };
+        let mut reader = BufReader::new(reader_half);
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(n) if n > 0 && line.trim() == "GRANTED" => {
+                HELD.with(|h| {
+                    h.borrow_mut().insert(repo.clone());
+                });
+                TryLock::Held(Self {
+                    stream: Some(stream),
+                    id,
+                    held_key: Some(repo),
+                    _not_send: std::marker::PhantomData,
+                })
+            }
+            Ok(n) if n > 0 && line.trim() == "BUSY" => TryLock::Busy,
+            _ => TryLock::NoDaemon,
         }
     }
 

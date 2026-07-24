@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Spawn the maintainer on the daemon, unless `zvcs.statusinterval = 0`.
 pub fn spawn_if_enabled() {
@@ -20,12 +20,44 @@ pub fn spawn_if_enabled() {
         return; // explicitly disabled
     }
     let pause = Duration::from_secs(secs);
-    thread::spawn(move || loop {
-        let n = refresh_all();
-        // Daemon stdout is routed to ~/.zvcs/zvcs.log, never the terminal.
-        println!("[zvcs statusd] refreshed status for {n} repo(s)");
-        thread::sleep(pause);
+    thread::spawn(move || {
+        // One reusable ledger row makes the scan trackable via `zjobs` / `zjob`:
+        // each pass cycles it running -> done with a fresh count, so a glance at
+        // the queue shows whether status is being maintained and how long it takes.
+        let job = create_scan_job();
+        loop {
+            let started = Instant::now();
+            set_state(job, "running", None);
+            let n = refresh_all();
+            let elapsed = started.elapsed().as_secs();
+            let summary = format!("refreshed status for {n} repo(s) in {elapsed}s");
+            set_state(job, "done", Some(&summary));
+            // Daemon stdout is routed to ~/.zvcs/zvcs.log, never the terminal.
+            println!("[zvcs statusd] {summary}");
+            thread::sleep(pause);
+        }
     });
+}
+
+/// Insert the reusable "status refresh" ledger row (repo-less), returning its id.
+fn create_scan_job() -> Option<i64> {
+    let conn = crate::db::open_rw().ok()?;
+    crate::db::insert_job(&conn, None, "status refresh", "{\"kind\":\"statusscan\"}", None).ok()
+}
+
+/// Move the scan job to `state`; a `Some(output)` also records the summary.
+fn set_state(job: Option<i64>, state: &str, output: Option<&str>) {
+    let (Some(id), Ok(conn)) = (job, crate::db::open_rw()) else {
+        return;
+    };
+    match output {
+        Some(out) => {
+            let _ = crate::db::job_finished(&conn, id, state, 0, out, None);
+        }
+        None => {
+            let _ = crate::db::job_running(&conn, id);
+        }
+    }
 }
 
 /// Seconds between full passes: `zvcs.statusinterval`, default 10.

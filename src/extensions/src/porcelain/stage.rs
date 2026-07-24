@@ -1258,6 +1258,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // mutating entries so a later commit can't capture a stale subtree.
     index.remove_tree();
     index.write(gix::index::write::Options::default())?;
+    super::add::record_stage_event(&repo, staged.len() + deletions.len());
 
     if o.verbose {
         report(&printed);

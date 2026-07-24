@@ -29,6 +29,7 @@ const CYAN: &str = "\x1b[36m";
 const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const MAGENTA: &str = "\x1b[35m";
+const BLUE: &str = "\x1b[34m";
 
 /// How often the live follow polls for new events.
 const POLL: Duration = Duration::from_millis(400);
@@ -114,6 +115,7 @@ fn emit(e: &EventRow, json: bool) {
         "commit" => (format!("{GREEN}●{RESET}"), format!("{GREEN}commit  {RESET}")),
         "reconcile" => (format!("{MAGENTA}↻{RESET}"), format!("{MAGENTA}reconcile{RESET}")),
         "status" => (format!("{YELLOW}◑{RESET}"), format!("{YELLOW}status  {RESET}")),
+        "stage" => (format!("{BLUE}+{RESET}"), format!("{BLUE}stage   {RESET}")),
         other => ("•".to_string(), format!("{other:<9}")),
     };
     println!(

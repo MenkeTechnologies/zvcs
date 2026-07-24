@@ -151,18 +151,34 @@ pub fn open_rw() -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.execute_batch(SCHEMA)?;
-    // Migration for pre-existing indexes: add `repos.hook` if the table predates
-    // it. `CREATE TABLE IF NOT EXISTS` won't add a column to an existing table, so
-    // ALTER explicitly and ignore the "duplicate column" error when it's present.
+    migrate(&conn);
+    Ok(conn)
+}
+
+/// Bump when a migration is added below.
+const SCHEMA_VERSION: i64 = 1;
+
+/// One-time migrations, gated by `PRAGMA user_version` so they run once per db
+/// instead of on every connection. `open_rw` is on the hot path (every client
+/// command that records anything), so the `ev_commit` DROP+CREATE especially must
+/// not churn — it would rewrite the trigger, and briefly drop it, on each open.
+fn migrate(conn: &Connection) {
+    let ver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
+    if ver >= SCHEMA_VERSION {
+        return;
+    }
+    // Columns added after the original schema. `CREATE TABLE IF NOT EXISTS` won't
+    // add a column to an existing table, so ALTER explicitly; the "duplicate
+    // column" error when it is already present is ignored.
     let _ = conn.execute("ALTER TABLE repos ADD COLUMN hook TEXT", []);
     let _ = conn.execute("ALTER TABLE triggers ADD COLUMN throttle_ms INTEGER NOT NULL DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE repos ADD COLUMN mtime INTEGER", []);
     let _ = conn.execute("ALTER TABLE repo_status ADD COLUMN head_sha TEXT", []);
-    // Install the current commit-detection trigger (see EV_COMMIT_SQL): DROP+CREATE
+    // ev_commit was revised to key on the commit sha (see EV_COMMIT_SQL); DROP+CREATE
     // so an existing db running the old head-keyed trigger is upgraded in place.
     let _ = conn.execute("DROP TRIGGER IF EXISTS ev_commit", []);
     let _ = conn.execute_batch(EV_COMMIT_SQL);
-    Ok(conn)
+    let _ = conn.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), []);
 }
 
 /// Whether the repo at `root` has changed since its last scan — by the root

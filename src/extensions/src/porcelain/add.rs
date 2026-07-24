@@ -661,6 +661,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         index.sort_entries();
         index.remove_tree();
         index.write(gix::index::write::Options::default())?;
+        record_stage_event(&repo, staged.len() + deletions.len());
 
         if verbose {
             for line in &report {
@@ -689,6 +690,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // mutating entries so a later commit can't capture a stale subtree.
     index.remove_tree();
     index.write(gix::index::write::Options::default())?;
+    record_stage_event(&repo, staged.len() + deletions.len());
 
     if verbose {
         for line in &report {
@@ -697,6 +699,25 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     }
 
     Ok(finish_code(&read_errors, ignore_errors, dry_run))
+}
+
+/// Record a `stage` event in the live feed (`git zevents`/`ztail`) after a
+/// successful index write, so `git add` shows in the tree-wide activity feed
+/// alongside commits, reconciles, and status changes. Best-effort: no daemon/db
+/// just means no feed entry, never a failed add. Shared with the `stage` verb.
+pub(crate) fn record_stage_event(repo: &gix::Repository, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let Some(workdir) = repo.workdir() else { return };
+    let git_dir = repo.git_dir().canonicalize().unwrap_or_else(|_| repo.git_dir().to_path_buf());
+    let workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
+    if let Ok(conn) = crate::db::open_rw() {
+        if let Ok(repo_id) = crate::db::upsert_repo(&conn, &git_dir, Some(&workdir)) {
+            let detail = format!("staged {count} path(s)");
+            let _ = crate::db::record_event(&conn, "stage", Some(repo_id), Some(&detail), None, None);
+        }
+    }
 }
 
 /// The overall exit code: git returns 1 from a real add when `--ignore-errors`

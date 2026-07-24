@@ -20,7 +20,8 @@ use crate::superset::select::Selector;
 /// every indexed repo for `<pattern>` (a regular expression), in parallel, and
 /// print `path:line:text` for each match. `-i` is case-insensitive.
 pub fn zgrep(args: &[String]) -> Result<ExitCode> {
-    let (sel, rest) = Selector::parse(args);
+    let (json, args) = json_flag(args);
+    let (sel, rest) = Selector::parse(&args);
     let mut icase = false;
     let mut pattern: Option<&str> = None;
     for a in &rest {
@@ -41,6 +42,10 @@ pub fn zgrep(args: &[String]) -> Result<ExitCode> {
     let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     let re = &re;
     let results = parallel_map(&repos, |gd, wd| grep_repo(gd, wd, re));
+    if json {
+        emit_json(results.iter().flatten().map(|line| serde_json::json!({"match": line})));
+        return Ok(ExitCode::SUCCESS);
+    }
     let mut total = 0usize;
     for lines in &results {
         for line in lines {
@@ -298,8 +303,15 @@ fn recent_commits(repo: &gix::Repository, cutoff: i64) -> usize {
 /// `git zconflicts [selectors]` — indexed repos in the middle of a merge, rebase,
 /// cherry-pick, revert, or bisect, or with unmerged (conflicted) index entries.
 pub fn zconflicts(args: &[String]) -> Result<ExitCode> {
-    let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
+    let (json, args) = json_flag(args);
+    let Some(repos) = selected(&args)? else { return Ok(ExitCode::SUCCESS) };
     let states = parallel_map(&repos, |gd, _| conflict_state(gd));
+    if json {
+        emit_json(repos.iter().zip(&states).filter_map(|((_, wd), state)| {
+            state.as_ref().map(|s| serde_json::json!({"repo": wd.to_string_lossy(), "state": s}))
+        }));
+        return Ok(ExitCode::SUCCESS);
+    }
     let mut shown = 0usize;
     for ((_, wd), state) in repos.iter().zip(&states) {
         if let Some(s) = state {
@@ -428,6 +440,18 @@ pub fn zdashboard(_args: &[String]) -> Result<ExitCode> {
         .map(|j| j.iter().filter(|x| x.state == "queued" || x.state == "running").count())
         .unwrap_or(0);
 
+    if _args.iter().any(|a| a == "--json") {
+        println!(
+            "{}",
+            serde_json::json!({
+                "repos": repos, "with_status": with_status, "dirty": dirty,
+                "ahead": ahead, "behind": behind, "diverged": diverged,
+                "detached": detached, "no_upstream": no_upstream,
+                "claims": claims, "sessions": sessions, "queue_active": queue,
+            })
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
     println!("zvcs dashboard — {repos} repos indexed");
     println!("  dirty         {dirty:>5}");
     println!("  ahead         {ahead:>5}    behind {behind:>5}    diverged {diverged:>5}");

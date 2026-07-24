@@ -28,12 +28,18 @@ fn discover(path: &str) -> Result<(PathBuf, Option<PathBuf>)> {
 pub fn zpin(args: &[String]) -> Result<ExitCode> {
     let conn = crate::db::open_rw()?;
     if args.first().map(|s| s.as_str()) == Some("list") {
+        let json = args.iter().any(|a| a == "--json");
         let pins = crate::db::list_pins(&conn)?;
-        if pins.is_empty() {
+        if pins.is_empty() && !json {
             println!("no pinned repos");
         }
         for (gd, wd) in pins {
-            println!("{}", wd.unwrap_or(gd));
+            let path = wd.unwrap_or(gd);
+            if json {
+                println!("{}", serde_json::json!({"repo": path}));
+            } else {
+                println!("{path}");
+            }
         }
         return Ok(ExitCode::SUCCESS);
     }

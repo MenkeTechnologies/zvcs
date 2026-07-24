@@ -74,7 +74,7 @@ pub fn record(conn: &rusqlite::Connection, git_dir: &std::path::Path, workdir: &
 /// `git zstatus [--all]`.
 pub fn zstatus(args: &[String]) -> Result<ExitCode> {
     if args.iter().any(|a| a == "--all" || a == "-a") {
-        return zstatus_all();
+        return zstatus_all(args);
     }
 
     // Live status for the current repo (and cache it under canonical paths).
@@ -100,18 +100,28 @@ pub fn zstatus(args: &[String]) -> Result<ExitCode> {
 
 /// `git zstatus --all` — every indexed repo's cached status. Pipe-clean:
 /// `<sync>\t<clean|dirty>\t<head>\t<path>` per line; hints to stderr if a tty.
-fn zstatus_all() -> Result<ExitCode> {
+fn zstatus_all(args: &[String]) -> Result<ExitCode> {
+    let json = args.iter().any(|a| a == "--json");
     let interactive = std::io::stdout().is_terminal();
     let conn = match crate::db::open_ro() {
         Ok(c) => c,
         Err(_) => {
-            if interactive {
+            if interactive && !json {
                 eprintln!("zvcs: no status index yet (needs the daemon or `git zstatus`)");
             }
             return Ok(ExitCode::SUCCESS);
         }
     };
     let rows = crate::db::list_status(&conn)?;
+    if json {
+        for s in &rows {
+            println!(
+                "{}",
+                serde_json::json!({"repo": s.path, "sync": s.sync, "dirty": s.dirty, "detached": s.detached, "head": s.head})
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     for s in &rows {
         let dirt = if s.dirty { "dirty" } else { "clean" };
         let det = if s.detached { "+detached" } else { "" };

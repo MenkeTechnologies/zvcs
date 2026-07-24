@@ -76,30 +76,40 @@ pub fn zunclaim(args: &[String]) -> Result<ExitCode> {
 }
 
 /// `git zwho` — list active claims (who is working what).
-pub fn zwho(_args: &[String]) -> Result<ExitCode> {
+pub fn zwho(args: &[String]) -> Result<ExitCode> {
+    let json = args.iter().any(|a| a == "--json");
     let conn = match crate::db::open_ro() {
         Ok(c) => c,
         Err(_) => return Ok(ExitCode::SUCCESS), // no ledger → no claims
     };
     for (path, session, _ts) in crate::db::list_claims(&conn)? {
-        println!("{session}\t{path}");
+        if json {
+            println!("{}", serde_json::json!({"session": session, "repo": path}));
+        } else {
+            println!("{session}\t{path}");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
 
 /// `git zsessions` — active sessions ranked by how many repos each holds, so it
 /// is clear which agent is working the most of the tree.
-pub fn zsessions(_args: &[String]) -> Result<ExitCode> {
+pub fn zsessions(args: &[String]) -> Result<ExitCode> {
+    let json = args.iter().any(|a| a == "--json");
     let conn = match crate::db::open_ro() {
         Ok(c) => c,
         Err(_) => {
-            println!("no active claims");
+            if !json {
+                println!("no active claims");
+            }
             return Ok(ExitCode::SUCCESS);
         }
     };
     let claims = crate::db::list_claims(&conn)?;
     if claims.is_empty() {
-        println!("no active claims");
+        if !json {
+            println!("no active claims");
+        }
         return Ok(ExitCode::SUCCESS);
     }
     let mut by_session: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -109,7 +119,11 @@ pub fn zsessions(_args: &[String]) -> Result<ExitCode> {
     let mut rows: Vec<(usize, String)> = by_session.into_iter().map(|(s, n)| (n, s)).collect();
     rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     for (n, session) in &rows {
-        println!("{n:>4}  {session}");
+        if json {
+            println!("{}", serde_json::json!({"session": session, "claims": n}));
+        } else {
+            println!("{n:>4}  {session}");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

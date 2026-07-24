@@ -427,8 +427,9 @@ fn is_fast_forward(repo: &gix::Repository, old: ObjectId, new: ObjectId) -> Opti
 
 /// The objects to pack: reachable from `wants` but not from `haves` — git's
 /// `pack-objects --revs <wants> --not <haves>`. Computed as the set difference of
-/// the two reachability closures (correct, though not bitmap-optimized).
-fn objects_to_send(repo: &gix::Repository, wants: &[ObjectId], haves: &[ObjectId]) -> Vec<ObjectId> {
+/// the two reachability closures (correct, though not bitmap-optimized). Shared with
+/// `upload-pack`, whose server side needs the same closure for a negotiated fetch.
+pub(crate) fn objects_to_send(repo: &gix::Repository, wants: &[ObjectId], haves: &[ObjectId]) -> Vec<ObjectId> {
     let want_closure = reachable_objects(repo, wants);
     if haves.is_empty() {
         return want_closure.into_iter().collect();

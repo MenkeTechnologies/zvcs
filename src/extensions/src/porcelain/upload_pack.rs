@@ -1,11 +1,16 @@
 //! `git upload-pack` — the *server* half of `git fetch`.
-//! **The protocol itself is not ported: every serving path bails.**
 //!
-//! `upload-pack` is invoked by `git fetch-pack` over a transport. It writes a
-//! ref advertisement, reads `want`/`have` negotiation from stdin, and streams a
-//! generated pack back. What is ported here is the surface that is byte-
-//! verifiable *without* speaking the protocol — argument parsing and repository
-//! resolution (all checked against git 2.55.0 on Darwin):
+//! `upload-pack` is invoked by `git fetch-pack` over a transport. It writes a ref
+//! advertisement, reads `want`/`have` negotiation from stdin, and streams a
+//! generated pack back. The serving path (`serve`) is implemented for the
+//! bidirectional v0 protocol: a `multi_ack_detailed` advertisement with the
+//! `symref=HEAD:<target>` hint, the want/have loop, and a side-band-64k pack built
+//! from the negotiated closure (`push_proto::objects_to_send` +
+//! `pack_objects::pack_bytes_for`). Enough for a local (`file://`) or ssh
+//! clone/fetch served by this binary. Shallow/deepen and object filters are not
+//! negotiated (ignored); stateless-RPC (smart-HTTP) beyond `--advertise-refs` is
+//! not modelled. Argument parsing and repository resolution are checked against git
+//! 2.55.0 on Darwin:
 //!
 //!   * `-h` → the 368-byte usage block on **stdout**, exit 129, before any
 //!     repository is touched (so it works outside a repository).
@@ -62,6 +67,8 @@
 //! compares exit codes.
 
 use anyhow::{bail, Result};
+use gix::ObjectId;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -281,24 +288,252 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
     // `open_path_as_is` keeps gix from silently appending `/.git` itself, which
     // would make `--strict` accept a worktree root that git rejects.
     let options = gix::open::Options::default().open_path_as_is(true);
-    let found = candidates
+    let repo = candidates
         .into_iter()
-        .any(|c| gix::open_opts(c, options.clone()).is_ok());
+        .find_map(|c| gix::open_opts(c, options.clone()).ok());
 
-    if !found {
+    let Some(repo) = repo else {
         eprintln!("fatal: '{directory}' does not appear to be a git repository");
         return Ok(ExitCode::from(128));
+    };
+
+    // `--advertise-refs`/`--http-backend-info-refs` write the advertisement and exit
+    // (the smart-HTTP info/refs half); the bidirectional local/ssh path negotiates.
+    let advertise_only = args
+        .iter()
+        .any(|a| a == "--advertise-refs" || a == "--http-backend-info-refs");
+    serve(&repo, advertise_only)
+}
+
+// ---------------------------------------------------------------------------
+// Serving half: advertise refs, negotiate want/have, stream the pack.
+// ---------------------------------------------------------------------------
+
+/// Serve a fetch/clone: write the ref advertisement, run the `want`/`have` v0
+/// negotiation, then build and stream the pack of everything the client wants and
+/// does not already have. Enough for a local (`file://`) or ssh clone/fetch served
+/// by this binary. `advertise_only` (smart-HTTP info/refs) writes the advertisement
+/// and stops. Shallow/deepen and object filters are not negotiated (ignored).
+fn serve(repo: &gix::Repository, advertise_only: bool) -> Result<ExitCode> {
+    {
+        let adv = advertisement(repo)?;
+        let mut out = std::io::stdout().lock();
+        out.write_all(&adv)?;
+        out.flush()?;
+    }
+    if advertise_only {
+        return Ok(ExitCode::SUCCESS);
     }
 
-    bail!(
-        "upload-pack is not ported: serving a fetch needs the want/have/ACK state machine, \
-         shallow handling and side-band pack streaming from the server side, and the vendored \
-         gix-protocol is client-only (handshake/fetch/ls_refs behind blocking-client) with no \
-         server module; the advertisement is also unreproducible because every line carries \
-         `agent=git/<version>-<platform>` of the git binary plus config-dependent capabilities \
-         (ported: -h, the usage and option diagnostics, --timeout validation, and the \
-         not-a-git-repository failure)"
+    let mut stdin = std::io::stdin().lock();
+
+    // --- wants (until flush); the first `want` carries the client's caps ---------
+    let mut wants: Vec<ObjectId> = Vec::new();
+    let mut want_caps: Vec<u8> = Vec::new();
+    while let Some(line) = read_pkt(&mut stdin)? {
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim_end();
+        if let Some(rest) = text.strip_prefix("want ") {
+            let mut it = rest.splitn(2, ' ');
+            if let Some(hex) = it.next() {
+                if let Ok(id) = ObjectId::from_hex(hex.as_bytes()) {
+                    wants.push(id);
+                }
+            }
+            if want_caps.is_empty() {
+                if let Some(caps) = it.next() {
+                    want_caps = caps.as_bytes().to_vec();
+                }
+            }
+        }
+        // `shallow`/`deepen*`/`filter` lines are ignored (not negotiated).
+    }
+    if wants.is_empty() {
+        return Ok(ExitCode::SUCCESS); // client hung up after the advertisement (ls-remote)
+    }
+
+    // --- haves until `done`, ACK/NAK per round -----------------------------------
+    let mut common: Vec<ObjectId> = Vec::new();
+    let mut out = std::io::stdout().lock();
+    loop {
+        match read_pkt(&mut stdin)? {
+            // A flush ends a have batch without `done`: with no multi-ack advertised,
+            // git answers a single NAK and the client sends more haves or `done`.
+            None => {
+                write_pkt(&mut out, b"NAK\n")?;
+                out.flush()?;
+            }
+            Some(line) => {
+                let text = String::from_utf8_lossy(&line);
+                let text = text.trim_end();
+                if text == "done" {
+                    break;
+                }
+                if let Some(hex) = text.strip_prefix("have ") {
+                    if let Ok(id) = ObjectId::from_hex(hex.as_bytes()) {
+                        if repo.find_object(id).is_ok() {
+                            common.push(id);
+                            // multi_ack_detailed: acknowledge each object we have in common
+                            // as it arrives.
+                            write_pkt(&mut out, format!("ACK {} common\n", id.to_hex()).as_bytes())?;
+                            out.flush()?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Final acknowledgement: the last common object, or NAK when there is none.
+    match common.last() {
+        Some(id) => write_pkt(&mut out, format!("ACK {}\n", id.to_hex()).as_bytes())?,
+        None => write_pkt(&mut out, b"NAK\n")?,
+    }
+    out.flush()?;
+
+    // --- build + stream the pack -------------------------------------------------
+    let objects = crate::porcelain::push_proto::objects_to_send(repo, &wants, &common);
+    let pack = crate::porcelain::pack_objects::pack_bytes_for(repo, &objects)?;
+    if cap_present(&want_caps, b"side-band-64k") || cap_present(&want_caps, b"side-band") {
+        // Multiplex the pack on band 1 (≤ 65515 payload bytes per pkt-line), then a
+        // flush closes the side-band stream.
+        for chunk in pack.chunks(65515) {
+            let mut framed = Vec::with_capacity(chunk.len() + 1);
+            framed.push(1);
+            framed.extend_from_slice(chunk);
+            write_pkt(&mut out, &framed)?;
+        }
+        out.write_all(b"0000")?;
+    } else {
+        out.write_all(&pack)?; // raw, self-delimiting
+    }
+    out.flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The fetch ref advertisement: `HEAD` first (carrying the caps and the
+/// `symref=HEAD:<target>` so the client checks out the right branch), then every
+/// ref in name order, each annotated tag followed by its peeled `^{}` line, then a
+/// flush. Mirrors git's `send_ref`/`upload-pack` advertisement shape.
+fn advertisement(repo: &gix::Repository) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let head_target = repo
+        .head_ref()
+        .ok()
+        .flatten()
+        .map(|r| r.name().as_bstr().to_string());
+    let caps = capabilities(head_target.as_deref());
+    let mut sent_caps = false;
+
+    // HEAD first, when it resolves to an object.
+    if let Ok(mut head) = repo.head() {
+        if let Ok(Some(id)) = head.try_peel_to_id() {
+            pkt_line(&mut out, format!("{} HEAD\0{caps}\n", id.detach().to_hex()).as_bytes());
+            sent_caps = true;
+        }
+    }
+
+    for reference in repo.references()?.all()? {
+        let Ok(mut reference) = reference else { continue };
+        let name = reference.name().as_bstr().to_string();
+        let Ok(id) = reference.follow_to_object() else { continue };
+        let oid = id.detach();
+        let line = if sent_caps {
+            format!("{} {name}\n", oid.to_hex())
+        } else {
+            sent_caps = true;
+            format!("{} {name}\0{caps}\n", oid.to_hex())
+        };
+        pkt_line(&mut out, line.as_bytes());
+        // An annotated tag advertises its peeled target on a `^{}` line.
+        if let Ok(obj) = repo.find_object(oid) {
+            if let Ok(peeled) = obj.peel_to_kind(gix::objs::Kind::Commit) {
+                if peeled.id != oid {
+                    pkt_line(&mut out, format!("{} {name}^{{}}\n", peeled.id.to_hex()).as_bytes());
+                }
+            }
+        }
+    }
+
+    if !sent_caps {
+        // Empty repository: advertise the capabilities on the synthetic line.
+        let null = repo.object_hash().null();
+        pkt_line(&mut out, format!("{} capabilities^{{}}\0{caps}\n", null.to_hex()).as_bytes());
+    }
+
+    if let Ok(Some(commits)) = repo.shallow_commits() {
+        for id in commits.iter() {
+            pkt_line(&mut out, format!("shallow {}\n", id.to_hex()).as_bytes());
+        }
+    }
+    flush_pkt(&mut out);
+    Ok(out)
+}
+
+/// The upload-pack capability list. `symref=HEAD:<target>` tells the client which
+/// branch HEAD follows so a clone checks it out.
+fn capabilities(head_target: Option<&str>) -> String {
+    let mut caps =
+        String::from("multi_ack_detailed side-band-64k thin-pack ofs-delta no-progress include-tag");
+    if let Some(t) = head_target {
+        caps.push_str(&format!(" symref=HEAD:{t}"));
+    }
+    caps.push_str(" object-format=sha1 agent=git/2.55.0-zvcs");
+    caps
+}
+
+/// Whether the client advertised capability `want` (a whole space-separated token).
+fn cap_present(caps: &[u8], want: &[u8]) -> bool {
+    caps.split(|&b| b == b' ' || b == b'\n' || b == 0).any(|tok| tok == want)
+}
+
+/// Append a pkt-line (four-hex length header covering itself, then the payload).
+fn pkt_line(out: &mut Vec<u8>, payload: &[u8]) {
+    out.extend_from_slice(format!("{:04x}", payload.len() + 4).as_bytes());
+    out.extend_from_slice(payload);
+}
+
+/// Append a flush packet.
+fn flush_pkt(out: &mut Vec<u8>) {
+    out.extend_from_slice(b"0000");
+}
+
+/// Write one pkt-line to a stream.
+fn write_pkt(out: &mut impl Write, payload: &[u8]) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(payload.len() + 4);
+    pkt_line(&mut buf, payload);
+    out.write_all(&buf)
+}
+
+/// Read one pkt-line: `None` on flush (`0000`), else its payload with the header
+/// stripped. A missing/short header or a non-hex length is a protocol error.
+fn read_pkt(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
+    let mut hdr = [0u8; 4];
+    read_exact(r, &mut hdr).map_err(|_| anyhow::anyhow!("the remote end hung up unexpectedly"))?;
+    let len = u16::from_str_radix(
+        std::str::from_utf8(&hdr).map_err(|_| anyhow::anyhow!("protocol error: bad line length character"))?,
+        16,
     )
+    .map_err(|_| anyhow::anyhow!("protocol error: bad line length character"))?;
+    match len {
+        0 => Ok(None),
+        1..=4 => Ok(Some(Vec::new())),
+        _ => {
+            let mut buf = vec![0u8; len as usize - 4];
+            read_exact(r, &mut buf)?;
+            Ok(Some(buf))
+        }
+    }
+}
+
+fn read_exact(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<()> {
+    let mut off = 0;
+    while off < buf.len() {
+        match r.read(&mut buf[off..])? {
+            0 => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof")),
+            n => off += n,
+        }
+    }
+    Ok(())
 }
 
 /// Why a long option could not be resolved to a single table entry.

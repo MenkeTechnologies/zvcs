@@ -107,6 +107,18 @@ pub fn run() -> ExitCode {
                 std::env::set_var("GIT_NAMESPACE", &s["--namespace=".len()..]);
                 idx += 1;
             }
+            // `git --exec-path` (no value) prints the core-programs directory and
+            // exits, ignoring any following command — git's `handle_options`. For the
+            // shadow that is where its `git-*` helpers live (`~/.zvcs/bin`), or
+            // `$GIT_EXEC_PATH` when set. The `=<path>` form sets the prefix instead.
+            "--exec-path" => {
+                println!("{}", exec_path());
+                return ExitCode::SUCCESS;
+            }
+            s if s.starts_with("--exec-path=") => {
+                std::env::set_var("GIT_EXEC_PATH", &s["--exec-path=".len()..]);
+                idx += 1;
+            }
             _ => break,
         }
     }
@@ -219,6 +231,22 @@ fn dashed_subcommand(arg0: &str) -> Option<String> {
     let base = std::path::Path::new(arg0).file_name()?.to_str()?;
     let verb = base.strip_prefix("git-")?;
     (!verb.is_empty()).then(|| verb.to_string())
+}
+
+/// The exec-path `git --exec-path` reports: `$GIT_EXEC_PATH` when set, else the zvcs
+/// bin directory where the shadow's `git-*` helper symlinks live (`$HOME/.zvcs/bin`).
+/// Unlike stock git's `libexec/git-core`, the shadow serves every `git-*` helper from
+/// one binary, so that install dir is the honest answer.
+fn exec_path() -> String {
+    if let Ok(p) = std::env::var("GIT_EXEC_PATH") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => format!("{h}/.zvcs/bin"),
+        _ => ".zvcs/bin".to_string(),
+    }
 }
 
 /// Translate `git -c <name>=<value>` overrides into the `GIT_CONFIG_COUNT` /

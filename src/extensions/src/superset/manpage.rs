@@ -255,9 +255,12 @@ pub const DOCS: &[Doc] = &[
     },
     Doc {
         verb: "zls",
-        summary: "list the working directory",
-        synopsis: "git zls [<ls-args>...]",
-        desc: &["Lists the working directory by delegating to the system ls, so every ls flag (-l, -a, and so on) and its output work as-is. Exits with ls's own status. A shell-like convenience for the zrepl console."],
+        summary: "git-aware directory listing",
+        synopsis: "git zls [-alrt] [<path>]",
+        desc: &[
+            "Lists a directory with a two-column git status field per entry, like `eza --git`: the first column is the staged status (index vs HEAD), the second the unstaged status (worktree vs index). Letters follow eza: N new, M modified, D deleted, R renamed, C copied, T type-change, U conflicted, I ignored, and - unchanged. A directory folds the status of the paths under it, so a subtree with any change is flagged. Outside a git repository the column is omitted.",
+            "Flags: -a includes dotfiles, -l is a long listing (permissions, size, relative mtime), -t sorts by modification time (newest first), and -r reverses. Names are colored by type on a terminal. The per-path status is the same walk `git status` performs.",
+        ],
     },
     Doc {
         verb: "zenv",

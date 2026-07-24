@@ -1,17 +1,18 @@
-//! Shell-convenience verbs for the `zrepl` console — `zcd`, `zpwd`, `zls`,
-//! `zenv`, `zunset`, `zecho`.
+//! Shell-convenience verbs for the `zrepl` console — `zcd`, `zpwd`, `zenv`,
+//! `zunset`, `zecho`. (`zls`, the git-aware listing, lives in
+//! [`crate::superset::gitls`].)
 //!
 //! `zrepl` runs each line as `git <line>` in one long-lived process, so a verb
 //! that mutates process state persists across lines: `zcd` navigates like a
 //! shell's cd, `zenv NAME=VALUE` sets a variable every later `git` line sees, and
-//! `zunset` clears one. `zpwd`, `zls`, and `zecho` round out the basics. Outside
-//! the console these still run, but the mutating ones (`zcd`, `zenv`, `zunset`)
-//! only affect this process (they cannot change the parent shell), so they are
-//! aimed at the interactive console.
+//! `zunset` clears one. `zpwd` and `zecho` round out the basics. Outside the
+//! console these still run, but the mutating ones (`zcd`, `zenv`, `zunset`) only
+//! affect this process (they cannot change the parent shell), so they are aimed
+//! at the interactive console.
 
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 /// `git zcd [<dir>]` — change the working directory. No argument goes to `$HOME`;
 /// `-` goes to `$OLDPWD` (the previous directory). A leading `~` is expanded to
@@ -46,16 +47,6 @@ pub fn zpwd(_args: &[String]) -> Result<ExitCode> {
     let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("cannot read cwd: {e}"))?;
     println!("{}", cwd.display());
     Ok(ExitCode::SUCCESS)
-}
-
-/// `git zls [<args>...]` — list the working directory by delegating to the system
-/// `ls`, so every `ls` flag (`-l`, `-a`, …) and its output work as-is. Exits with
-/// `ls`'s own status; 127 if `ls` is not on `PATH`.
-pub fn zls(args: &[String]) -> Result<ExitCode> {
-    match Command::new("ls").args(args).status() {
-        Ok(status) => Ok(ExitCode::from(status.code().unwrap_or(1) as u8)),
-        Err(e) => bail!("ls: {e}"),
-    }
 }
 
 /// `git zenv [NAME=VALUE...|NAME...]` — with no arguments, print every

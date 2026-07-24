@@ -112,7 +112,7 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Triggers | `ztrigger DIR <cmd>` `ztrigger list/rm/test` | arm any repo BY PATH to run a command on **any file change** in the directory (worktree + `.git`) — writes DIR's local hook, indexes it, watches the whole dir, auto-flips `zvcs.autohook`, reloads the daemon (no `git config` needed) |
 | Watch | `zwatch DIR` `zwatch list/rm` | watch a repo by path (index + cached status via `zvcs.autostatus`) without attaching a command |
 | Console | `zrepl` | interactive line console over **every** command — each line runs as `git <line>`, so the `z*` verbs and all git porcelain work alike (startup stats banner + Tab completion of every verb) |
-| Shell | `zcd` `zpwd` `zls` `zenv` `zunset` `zecho` | shell builtins so `zrepl` drives like a shell — `zcd`/`zenv`/`zunset` mutate the console's cwd/environment and persist across lines (later `git` lines see them) |
+| Shell | `zcd` `zpwd` `zls` `zenv` `zunset` `zecho` | shell builtins so `zrepl` drives like a shell — `zcd`/`zenv`/`zunset` mutate the console's cwd/environment and persist across lines (later `git` lines see them); `zls` is a git-aware listing (per-file status columns like `eza --git`) |
 | Discovery | `zverbs` | list every extension verb and its one-line usage (sourced from each verb's own `-h`) |
 | Health | `zdoctor` | environment health check — git shadow on PATH, daemon, ledger, man pages, MANPATH, dashed forms (OK/WARN/FAIL, exits non-zero on FAIL) |
 | git-compat | every stock subcommand | dispatched natively; depth varies — see the parity report |
@@ -212,8 +212,10 @@ usable.
 **Shell builtins.** Because the console is one long-lived process, a handful of
 shell verbs make it navigable like a shell: `git zcd [<dir>|-]` changes the
 working directory (persisting across lines, `~`/`-` supported), `git zpwd` prints
-it, and `git zls [<ls-args>...]` lists it (delegating to the system `ls`).
-`git zenv [<NAME=VALUE>...]` prints, sets, or queries environment variables —
+it, and `git zls [-alrt] [<path>]` is a git-aware listing — each entry carries a
+two-column git status field (staged, then unstaged) like `eza --git`, a directory
+folding the status of the paths under it. `git zenv [<NAME=VALUE>...]` prints,
+sets, or queries environment variables —
 anything set persists so every later `git` line sees it — `git zunset <NAME>...`
 clears them, and `git zecho [-n] <arg>...` prints its arguments. The mutating
 verbs (`zcd`/`zenv`/`zunset`) only affect this process, so they are aimed at the

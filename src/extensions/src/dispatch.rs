@@ -251,7 +251,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zverbs" => "usage: git zverbs — list every zvcs extension verb and its usage",
         "zcd" => "usage: git zcd [<dir>|-] — change the working directory (for the zrepl console)",
         "zpwd" => "usage: git zpwd — print the working directory",
-        "zls" => "usage: git zls [<ls-args>...] — list the working directory (delegates to system ls)",
+        "zls" => "usage: git zls [-alrt] [<path>] — git-aware directory listing (per-file status like eza --git)",
         "zenv" => "usage: git zenv [<NAME=VALUE>...|<NAME>...] — print, set, or query environment variables",
         "zunset" => "usage: git zunset <NAME>... — remove environment variables",
         "zecho" => "usage: git zecho [-n] [<arg>...] — print arguments joined by a space",

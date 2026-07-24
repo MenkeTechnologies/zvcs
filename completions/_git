@@ -6791,7 +6791,7 @@ _git_commands () {
     zverbs:'zvcs: list every extension verb and its usage'
     zcd:'zvcs: change the working directory (zrepl console)'
     zpwd:'zvcs: print the working directory'
-    zls:'zvcs: list the working directory (delegates to ls)'
+    zls:'zvcs: git-aware directory listing (per-file status like eza --git)'
     zenv:'zvcs: print/set/query environment variables'
     zunset:'zvcs: remove environment variables'
     zecho:'zvcs: print arguments joined by a space'

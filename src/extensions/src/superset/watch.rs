@@ -78,7 +78,9 @@ pub fn spawn_if_configured() {
         Ok(repo) => ZvcsConfig::load(&repo),
         Err(_) => ZvcsConfig::default(),
     };
-    if !cfg.should_watch() && !crate::db::has_triggers() {
+    // Also run when the MRU status-watch is enabled (default), so an active repo's
+    // status updates the instant it changes even without hooks/autostatus.
+    if !cfg.should_watch() && !crate::db::has_triggers() && watch_mru_count() == 0 {
         return;
     }
     thread::spawn(move || run(cfg));
@@ -158,12 +160,13 @@ fn run(cfg: ZvcsConfig) {
         if cfg.any_autonomous() {
             react(&cfg);
         }
-        if cfg.autostatus {
-            if let Ok(conn) = crate::db::open_rw() {
-                for t in &targets {
-                    if affected.contains(&t.git_dir) {
-                        crate::superset::status::record(&conn, &t.git_dir, &t.workdir);
-                    }
+        // Refresh cached status for every changed repo the instant it changes —
+        // this is what makes `zdashboard` / `zstatus --all` react immediately for
+        // watched (recently-used) repos, no `autostatus` needed.
+        if let Ok(conn) = crate::db::open_rw() {
+            for t in &targets {
+                if affected.contains(&t.git_dir) {
+                    crate::superset::status::record(&conn, &t.git_dir, &t.workdir);
                 }
             }
         }
@@ -346,7 +349,51 @@ fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
         }
     }
 
+    // 4. The most-recently-used repos — watched for status so an active repo's
+    //    status updates the instant it changes, without `autostatus` and without
+    //    watching the whole index. Ranked by git-dir mtime (recent ref activity =
+    //    active), bounded by `zvcs.watchmru` (default 512). Deduped against the
+    //    categories above; the continuous `statusd` sweep covers the cold tail.
+    let mru = watch_mru_count();
+    if mru > 0 && targets.len() < MAX_WATCHED {
+        for (git_dir, workdir) in most_recently_used(mru) {
+            let wd = workdir.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&git_dir));
+            add_target(&mut seen, &mut targets, PathBuf::from(git_dir), wd, false, None, 0);
+            if targets.len() >= MAX_WATCHED {
+                break;
+            }
+        }
+    }
+
     targets
+}
+
+/// How many most-recently-used repos to watch for status: `zvcs.watchmru`,
+/// default 512, `0` disables the MRU watch (the `statusd` sweep still covers all).
+fn watch_mru_count() -> usize {
+    gix::discover(".")
+        .ok()
+        .and_then(|r| r.config_snapshot().integer("zvcs.watchmru"))
+        .filter(|n| *n >= 0)
+        .map(|n| n as usize)
+        .unwrap_or(512)
+}
+
+/// The `n` indexed repos whose git dir changed most recently (a cheap MRU proxy:
+/// `.git` mtime moves on commit/checkout/fetch). Returns `(git_dir, workdir)`.
+fn most_recently_used(n: usize) -> Vec<(String, Option<String>)> {
+    let Ok(conn) = crate::db::open_ro() else { return Vec::new() };
+    let Ok(repos) = crate::db::list_repos(&conn) else { return Vec::new() };
+    let mut scored: Vec<(std::time::SystemTime, String, Option<String>)> = repos
+        .into_iter()
+        .filter_map(|r| {
+            let mtime = std::fs::metadata(&r.git_dir).and_then(|m| m.modified()).ok()?;
+            Some((mtime, r.git_dir, r.workdir))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0)); // most recent first
+    scored.truncate(n);
+    scored.into_iter().map(|(_, gd, wd)| (gd, wd)).collect()
 }
 
 /// Add a repo to the watch set, canonicalizing and deduping by git dir (an armed

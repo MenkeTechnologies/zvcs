@@ -176,8 +176,9 @@ fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///     over the 80-column / uncapped default).
 ///   * Pathspec limiting compares each commit to its first parent only, so merge
 ///     simplification (TREESAME across multiple parents) is not modelled.
-///   * `--grep`/`--author` filters, `--since`/`--until` date filters, revision
-///     ranges (`A..B`), and every flag not listed above are rejected explicitly.
+///   * Revision ranges are supported: `A..B` (`^A B`), `A...B` (symmetric
+///     difference, excluding the merge-base), and a leading `^A` exclusion.
+///   * `--grep`/`--author` filters and every flag not listed above are rejected.
 pub fn log(args: &[String]) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
@@ -622,7 +623,50 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // reached from (a rev argument, a full refname for `--all`, or `HEAD`). A commit
     // inherits the source of the tip that first reaches it during the walk.
     let mut tip_sources: Vec<String> = Vec::new();
+    // Split each revision arg into positive tips and negative (excluded) tips to
+    // support git's range forms: `A..B` (= `^A B`), `A...B` (symmetric difference —
+    // exclude the merge-base), and a leading `^A`. An empty endpoint means `HEAD`
+    // (`A..`, `..B`). Anything without `..`/`^` is a single positive tip, as before.
+    let mut pos_specs: Vec<String> = Vec::new();
+    let mut neg_ids: Vec<ObjectId> = Vec::new();
     for spec in &revs {
+        if let Some(rest) = spec.strip_prefix('^') {
+            match resolve_rev(&repo, rest) {
+                Ok(id) => neg_ids.push(id),
+                Err(_) => {
+                    let hex_len = repo.object_hash().len_in_hex();
+                    eprint!("{}", bad_revision_message(rest, hex_len));
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        } else if let Some((a, b)) = spec.split_once("...") {
+            let a = if a.is_empty() { "HEAD" } else { a };
+            let b = if b.is_empty() { "HEAD" } else { b };
+            pos_specs.push(a.to_string());
+            pos_specs.push(b.to_string());
+            // `A...B` hides what both endpoints can reach: their merge-base.
+            if let (Ok(ia), Ok(ib)) = (resolve_rev(&repo, a), resolve_rev(&repo, b)) {
+                if let Ok(base) = repo.merge_base(ia, ib) {
+                    neg_ids.push(base.detach());
+                }
+            }
+        } else if let Some((a, b)) = spec.split_once("..") {
+            let a = if a.is_empty() { "HEAD" } else { a };
+            let b = if b.is_empty() { "HEAD" } else { b };
+            match resolve_rev(&repo, a) {
+                Ok(id) => neg_ids.push(id),
+                Err(_) => {
+                    let hex_len = repo.object_hash().len_in_hex();
+                    eprint!("{}", bad_revision_message(a, hex_len));
+                    return Ok(ExitCode::from(128));
+                }
+            }
+            pos_specs.push(b.to_string());
+        } else {
+            pos_specs.push(spec.clone());
+        }
+    }
+    for spec in &pos_specs {
         match repo.rev_parse_single(spec.as_str()) {
             Ok(id) => {
                 tips.push(id.detach());
@@ -689,7 +733,14 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // Walk in git's default commit-date order, then re-sort if a topological
     // order was asked for. `--graph` implies `--topo-order` unless `--date-order`
     // was given explicitly.
-    let mut nodes = walk(&repo, &tips, &tip_sources, first_parent)?;
+    // Commits reachable from the negative tips are hidden from the walk (the `..`
+    // range exclusion). Empty when no `A..B`/`^A` was given.
+    let hidden = if neg_ids.is_empty() {
+        HashSet::new()
+    } else {
+        ancestor_closure(&repo, &neg_ids)?
+    };
+    let mut nodes = walk(&repo, &tips, &tip_sources, first_parent, &hidden)?;
     let effective_order = match (order, graph) {
         (Order::Default, true) => Order::Topo,
         (o, _) => o,
@@ -1069,6 +1120,35 @@ struct Node {
     source: String,
 }
 
+/// Resolve a single revision to its object id (a range endpoint), `Err(())` if it
+/// doesn't name anything — the caller turns that into git's bad-revision error.
+fn resolve_rev(repo: &gix::Repository, spec: &str) -> Result<ObjectId, ()> {
+    repo.rev_parse_single(spec).map(|id| id.detach()).map_err(|_| ())
+}
+
+/// Every commit reachable from `roots` (inclusive) — the "uninteresting" set for a
+/// `..` exclusion, gathered by a plain ancestor DFS.
+fn ancestor_closure(repo: &gix::Repository, roots: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+    let mut set: HashSet<ObjectId> = HashSet::new();
+    let mut stack: Vec<ObjectId> = Vec::new();
+    for &r in roots {
+        if set.insert(r) {
+            stack.push(r);
+        }
+    }
+    while let Some(id) = stack.pop() {
+        let Ok(obj) = repo.find_object(id) else { continue };
+        let Ok(commit) = obj.try_into_commit() else { continue };
+        for p in commit.parent_ids() {
+            let pid = p.detach();
+            if set.insert(pid) {
+                stack.push(pid);
+            }
+        }
+    }
+    Ok(set)
+}
+
 fn read_node(repo: &gix::Repository, id: ObjectId) -> Result<Node> {
     let commit = repo.find_object(id)?.try_into_commit()?;
     Ok(Node {
@@ -1098,8 +1178,12 @@ fn walk(
     tips: &[ObjectId],
     tip_sources: &[String],
     first_parent: bool,
+    hidden: &HashSet<ObjectId>,
 ) -> Result<Vec<Node>> {
-    let mut seen: HashSet<ObjectId> = HashSet::new();
+    // Pre-seeding `seen` with the hidden (uninteresting) commits means any tip or
+    // parent reachable from a negative range endpoint is never emitted or traversed
+    // — git's `..` exclusion, implemented as a boundary the walk cannot cross.
+    let mut seen: HashSet<ObjectId> = hidden.clone();
     let mut pending: Vec<Node> = Vec::new();
     for (idx, tip) in tips.iter().enumerate() {
         if seen.insert(*tip) {

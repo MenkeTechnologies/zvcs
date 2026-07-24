@@ -14,11 +14,12 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "zsync", "zbump", "zdaemon", "zconfig", "zrepos", "zreindex", "zjobs", "zjob", "zcommit", "zpush",
     "zsubmit", "zevents", "ztail", "zcommands", "zintercept",
     "zpin", "zunpin", "zbroadcast", "zhandoff", "zon", "zsince", "zcontend", "zwaitfor", "zgraph", "zrewind",
+    "zguard", "zpolicy",
     "zrepl", "zclaim", "zunclaim", "zwho", "zstatus", "zlog", "zundo", "zsnapshot", "zrestore",
     "zsnapshots", "zworktree", "zstash", "zunstash", "zstashes", "zup", "zforeach", "zhook",
     "ztrigger", "zwatch", "zdashed", "zverbs", "zselectors", "zcd", "zpwd", "zls", "zenv", "zunset", "zecho",
     "zdoctor", "zmkdir", "ztouch", "zrm", "zcp", "zmv", "zcat", "zln",
-    "zheads", "zdirty", "zbranches", "ztags", "zremotes", "zsize", "zage", "zpull",
+    "zheads", "zdirty", "zbranches", "ztags", "zremotes", "zsize", "zage", "zpull", "zattach",
     "zgrep", "zahead", "zbehind", "zunpushed", "zunpulled", "zauthors", "zhot", "zconflicts",
     "zfetch", "zgc", "zfsck", "zprune", "zreset", "zabort", "zcheckout", "ztagall", "zcommitall", "zpushall", "zclean",
     "zwait", "zqueue", "zbarrier",
@@ -239,6 +240,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zwaitfor" => "usage: git zwaitfor <clean|idle|synced|<repo> <sha>> [--timeout <secs>] — block until a tree-wide state holds",
         "zgraph" => "usage: git zgraph — fleet topology: dup groups (same origin, multiple local checkouts)",
         "zrewind" => "usage: git zrewind <duration> [--dry-run] — restore the whole tree (repo + submodules) to the state it had <duration> ago via per-repo reflog reset",
+        "zguard" | "zpolicy" => "usage: git zguard deny|warn <pattern> [--when detached|dirty|protected|unsigned] [-m <msg>] | list | rm <id> | clear | test <cmd>... — fleet-wide command policy that refuses/warns on matching git commands",
         "ztail" => "usage: git ztail [-n <count>] [--kind commit|stage|status|reconcile] [--repo <substr>] [--json] [--no-follow] — alias of git zevents",
         "zcommands" => "usage: git zcommands [-n <count>] [--repo <substr>] [--json] [--no-follow] [--off] [--clear] — live feed of every git command run across the fleet",
         "zintercept" => "usage: git zintercept before|after|around <pattern> -- <cmd> | list | remove <id> | clear — AOP hooks that run advice around matching git commands",
@@ -378,6 +380,24 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // essentially nothing; best-effort, never fails the command.
     superset::zcommands::log_invocation(sub, args);
 
+    // Fleet-wide command policy (`git zguard`): refuse or warn on a matching
+    // command before it runs. A single `stat` when no rule is set. The policy
+    // management verbs are exempt so a bad rule can never lock you out of fixing it.
+    if sub != "zguard" && sub != "zpolicy" && superset::guard::active() {
+        match superset::guard::check(sub, args) {
+            superset::guard::Verdict::Deny(msg) => {
+                eprintln!("{msg}");
+                return Ok(ExitCode::from(1));
+            }
+            superset::guard::Verdict::Warn(msgs) => {
+                for m in &msgs {
+                    eprintln!("{m}");
+                }
+            }
+            superset::guard::Verdict::Allow => {}
+        }
+    }
+
     // AOP intercepts (ported from zshrs): if before/after/around advice is
     // registered for this command, orchestrate it. Returns Some when interception
     // handled the command (around, or before+after wrapping); None otherwise —
@@ -431,6 +451,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zwaitfor" => superset::zwaitfor(args),
         "zgraph" => superset::zgraph(args),
         "zrewind" => superset::zrewind(args),
+        "zguard" | "zpolicy" => superset::guard::zguard(args),
         "zcommands" => superset::zcommands(args),
         "zintercept" => superset::zintercept(args),
         "zdaemon" => superset::zdaemon(args),

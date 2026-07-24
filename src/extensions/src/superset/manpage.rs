@@ -759,6 +759,23 @@ pub const DOCS: &[Doc] = &[
             "A dirty repository is refused so uncommitted work is never clobbered, and a repository whose reflog does not reach that far back is reported and skipped (the reflog's default 90-day expiry bounds how far back it can go). --dry-run shows exactly what would move without changing anything.",
         ],
     },
+    Doc {
+        verb: "zguard",
+        summary: "declarative fleet-wide command policy (refuse or warn)",
+        synopsis: "git zguard deny|warn <pattern> [--when <predicate>] [-m <msg>] | list | rm <id> | clear | test <cmd>...",
+        desc: &[
+            "Registers rules that refuse or warn on a git command before it runs \\(em a pattern-based command policy applied at the shadow binary, so it covers every invocation through it. The veto evolution of `zintercept`'s around-advice, promoted to a first-class policy layer no VCS has natively.",
+            "A rule is an action (deny or warn), a glob pattern matched against the whole command line (`*` and `?`, same matcher as `zintercept`), an optional repo-state predicate, and an optional message. `git zguard deny 'push*--force*'` refuses a force-push; `git zguard warn 'rm*-rf*'` warns but allows.",
+            "The `--when <predicate>` conditions a rule on the current repository: detached (HEAD is detached), dirty (uncommitted changes), protected (HEAD is main or master), unsigned (a commit with no -S/--gpg-sign and commit.gpgsign unset). So `git zguard deny 'commit*' --when detached` blocks commits on a detached HEAD, and `--when unsigned` requires signed commits.",
+            "list shows the rules; rm <id> removes one; clear removes all; test <cmd>... reports the verdict (DENY/WARN/allow) for a command without running it. Rules are stored in $ZVCS_HOME/guards.tsv (machine-wide); the dispatch hot path is a single stat when no rule is set. The zguard/zpolicy verbs are exempt from their own rules, so a bad rule can never lock you out.",
+        ],
+    },
+    Doc {
+        verb: "zpolicy",
+        summary: "alias of git zguard (command policy)",
+        synopsis: "git zpolicy deny|warn <pattern> [--when <predicate>] [-m <msg>] | list | rm <id> | clear | test <cmd>...",
+        desc: &["An alias for `git zguard` \\(em declarative fleet-wide command policy. See `git help zguard` for the full description."],
+    },
 ];
 
 /// The manual for `verb`, or `None` if it is not a superset verb.

@@ -6863,6 +6863,8 @@ _git_commands () {
     zwaitfor:'zvcs: block until a tree-wide state holds (clean/idle/synced)'
     zgraph:'zvcs: fleet topology of duplicate checkouts (same origin)'
     zrewind:'zvcs: restore the whole tree to a wall-clock time via reflog reset'
+    zguard:'zvcs: declarative fleet-wide command policy (deny/warn matching git commands)'
+    zpolicy:'zvcs: alias of zguard — command policy'
   )
 
   zstyle -a :completion:$curcontext: user-commands user_commands
@@ -9358,6 +9360,15 @@ done
 }
 (( $+functions[_git-zcontend] )) || _git-zcontend () { _arguments '--json[emit NDJSON]' }
 (( $+functions[_git-zgraph] )) || _git-zgraph () { _arguments '--json[emit NDJSON]' }
+(( $+functions[_git-zguard] )) || _git-zguard () {
+  if (( CURRENT == 2 )); then
+    local -a a=( deny:'refuse matching commands' warn:'warn on matching commands' list:'show rules' rm:'remove a rule' clear:'remove all rules' test:'dry-run a command against the rules' )
+    _describe -t zguard-sub subcommand a
+  else
+    _arguments '--when[condition on the repo state]:predicate:(detached dirty protected unsigned)' '-m[custom message]:message:'
+  fi
+}
+(( $+functions[_git-zpolicy] )) || _git-zpolicy () { _git-zguard }
 (( $+functions[_git-zstatus] )) || _git-zstatus () {
   _arguments '(--all -a)'{--all,-a}'[every indexed repo, from the status cache]' '--json[emit NDJSON]'
 }

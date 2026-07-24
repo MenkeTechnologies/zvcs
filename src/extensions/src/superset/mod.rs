@@ -59,6 +59,7 @@ mod zrewind;
 mod zsince;
 mod zwaitfor;
 pub mod zcommands;
+pub mod guard;
 pub mod intercepts;
 pub mod ztop;
 mod zsync;
@@ -90,12 +91,13 @@ pub use pmutate::{
     zabort, zcheckout, zclean, zcommitall, zfetch, zfsck, zgc, zprune, zpushall, zreset, ztagall,
 };
 pub use query::{
-    zage, zbig, zbranches, zcommits, zdirty, zfiles, zheads, zlast, zpristine, zpull, zremotes,
-    zsize, zstale, ztags,
+    zage, zattach, zbig, zbranches, zcommits, zdirty, zfiles, zheads, zlast, zpristine, zpull,
+    zremotes, zsize, zstale, ztags,
 };
 pub use queue::{zcommit, zpush, zsubmit};
 pub use repl::zrepl;
 pub use reconcile::reconcile_tree;
+pub use guard::zguard;
 pub use zbroadcast::{zbroadcast, zhandoff};
 pub use zbump::{zbump, zbump_run, BumpOutcome};
 pub use zcontend::zcontend;

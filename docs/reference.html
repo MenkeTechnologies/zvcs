@@ -20,7 +20,7 @@ p{margin:.6rem 0}a{color:var(--accent)}
 </style>
 </head><body>
 <h1>zvcs extension verbs</h1>
-<p class="sub">103 superset (<code>z*</code>) verbs — the coordination layer stock git has no equivalent for. Generated from the same source as the man pages (<code>git help &lt;verb&gt;</code>).</p>
+<p class="sub">105 superset (<code>z*</code>) verbs — the coordination layer stock git has no equivalent for. Generated from the same source as the man pages (<code>git help &lt;verb&gt;</code>).</p>
 <nav class="toc">
 <a href="#zsync"><code>zsync</code></a>
 <a href="#zbump"><code>zbump</code></a>
@@ -125,6 +125,8 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <a href="#zwaitfor"><code>zwaitfor</code></a>
 <a href="#zgraph"><code>zgraph</code></a>
 <a href="#zrewind"><code>zrewind</code></a>
+<a href="#zguard"><code>zguard</code></a>
+<a href="#zpolicy"><code>zpolicy</code></a>
 </nav>
 <section id="zsync">
 <h2><code>git zsync</code> <span class="summary">— reconcile every submodule to its tracked mainline, attached</span></h2>
@@ -589,10 +591,11 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <p>Lists indexed repositories that no session has claimed — the ones free for an agent to pick up. Selectors narrow the candidate set as in zforeach.</p>
 </section>
 <section id="zdashboard">
-<h2><code>git zdashboard</code> <span class="summary">— instant one-screen health summary of the tree</span></h2>
-<pre class="synopsis">git zdashboard [--json]</pre>
-<p>Prints a one-screen summary of the indexed tree: how many repositories are dirty, ahead, behind, diverged, detached, or without an upstream, plus the active claim and session counts and the async queue depth.</p>
-<p>It aggregates the daemon-maintained status cache and the ledger — a handful of db queries, not a live per-repo walk — so it is instant even across thousands of repos, exactly as <code>zstatus --all</code> is. When the cache covers fewer repos than are indexed, a note says so; <code>git zstatus --all</code> refreshes it. For fresh, deep reads use the dedicated verbs (zstale, zorphans, zconflicts, zsize).</p>
+<h2><code>git zdashboard</code> <span class="summary">— live tiled TUI: fleet, events, and commands on one screen</span></h2>
+<pre class="synopsis">git zdashboard [--once] [--json]</pre>
+<p>A live, tiled dashboard of the whole indexed tree on one screen: a header of aggregate totals (dirty, ahead, behind, diverged, detached, clean, claims, sessions, queue, and whether the daemon is up) over three tiles — a FLEET table (every repo, most recently active first, with the on-screen rows' HEAD state live-refreshed so nothing is stale), an EVENTS feed (commits, reconciles, status changes, as zevents shows), and a COMMANDS feed (every git command run across the machine, with the agent that ran it, as zcommands shows). Press q or Esc to quit.</p>
+<p>Every tile reads the daemon-maintained status cache and ledger, not a live per-repo walk, so the dashboard stays responsive across thousands of repos. The COMMANDS tile is populated once command logging is on (<code>git zcommands</code> enables it).</p>
+<p>For scripting, <code>--once</code> or <code>--json</code> (or a non-terminal stdout) prints the instant text summary instead of the TUI — the same aggregate counts, one screen, no interaction.</p>
 </section>
 <section id="ztop">
 <h2><code>git ztop</code> <span class="summary">— live htop-style fleet monitor, most churn on top</span></h2>
@@ -683,5 +686,18 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <pre class="synopsis">git zrewind &lt;duration&gt; [--dry-run]</pre>
 <p>Rewinds the tree — the repository at the current directory and every nested submodule — to the state it was in a given duration ago (2h, 30m, 1d). For each repository it finds the HEAD the reflog shows it had at that time and resets hard to it, reusing the faithful porcelain reset (itself reflogged, so the rewind is undoable). Where <code>git zsnapshot</code> is a manual named restore point, this is any timestamp with no prior setup.</p>
 <p>A dirty repository is refused so uncommitted work is never clobbered, and a repository whose reflog does not reach that far back is reported and skipped (the reflog's default 90-day expiry bounds how far back it can go). --dry-run shows exactly what would move without changing anything.</p>
+</section>
+<section id="zguard">
+<h2><code>git zguard</code> <span class="summary">— declarative fleet-wide command policy (refuse or warn)</span></h2>
+<pre class="synopsis">git zguard deny|warn &lt;pattern&gt; [--when &lt;predicate&gt;] [-m &lt;msg&gt;] | list | rm &lt;id&gt; | clear | test &lt;cmd&gt;...</pre>
+<p>Registers rules that refuse or warn on a git command before it runs — a pattern-based command policy applied at the shadow binary, so it covers every invocation through it. The veto evolution of <code>zintercept</code>'s around-advice, promoted to a first-class policy layer no VCS has natively.</p>
+<p>A rule is an action (deny or warn), a glob pattern matched against the whole command line (<code>*</code> and <code>?</code>, same matcher as <code>zintercept</code>), an optional repo-state predicate, and an optional message. <code>git zguard deny 'push*--force*'</code> refuses a force-push; <code>git zguard warn 'rm*-rf*'</code> warns but allows.</p>
+<p>The <code>--when &lt;predicate&gt;</code> conditions a rule on the current repository: detached (HEAD is detached), dirty (uncommitted changes), protected (HEAD is main or master), unsigned (a commit with no -S/--gpg-sign and commit.gpgsign unset). So <code>git zguard deny 'commit*' --when detached</code> blocks commits on a detached HEAD, and <code>--when unsigned</code> requires signed commits.</p>
+<p>list shows the rules; rm &lt;id&gt; removes one; clear removes all; test &lt;cmd&gt;... reports the verdict (DENY/WARN/allow) for a command without running it. Rules are stored in $ZVCS_HOME/guards.tsv (machine-wide); the dispatch hot path is a single stat when no rule is set. The zguard/zpolicy verbs are exempt from their own rules, so a bad rule can never lock you out.</p>
+</section>
+<section id="zpolicy">
+<h2><code>git zpolicy</code> <span class="summary">— alias of git zguard (command policy)</span></h2>
+<pre class="synopsis">git zpolicy deny|warn &lt;pattern&gt; [--when &lt;predicate&gt;] [-m &lt;msg&gt;] | list | rm &lt;id&gt; | clear | test &lt;cmd&gt;...</pre>
+<p>An alias for <code>git zguard</code> — declarative fleet-wide command policy. See <code>git help zguard</code> for the full description.</p>
 </section>
 </body></html>

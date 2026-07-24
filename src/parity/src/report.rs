@@ -708,7 +708,7 @@ fn probe_supported(bin: &Path, home: &Path, cmd: &str, flag: &str, dir: &Path) -
         if matches!(child.try_wait(), Ok(Some(_))) {
             break false;
         }
-        if start.elapsed() >= Duration::from_secs(5) {
+        if start.elapsed() >= Duration::from_millis(1500) {
             let _ = child.kill();
             let _ = child.wait();
             break true;

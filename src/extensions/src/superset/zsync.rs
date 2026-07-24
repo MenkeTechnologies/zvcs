@@ -59,13 +59,22 @@ fn reconcile_repo_inner(repo: &gix::Repository, do_fetch: bool) -> Result<String
     // already updated the remote-tracking ref, and the daemon must never poll.
     let should_interrupt = AtomicBool::new(false);
     if do_fetch {
-        let remote = repo
-            .find_remote("origin")
-            .context("a configured `origin` remote is required to fetch")?;
-        remote
-            .connect(gix::remote::Direction::Fetch)?
-            .prepare_fetch(gix::progress::Discard, gix::remote::ref_map::Options::default())?
-            .receive(gix::progress::Discard, &should_interrupt)?;
+        // A LOCAL origin (a path, `file://…`) would drive gix's file transport,
+        // which spawns `git-upload-pack` — a subprocess zvcs does not serve. Fetch
+        // it NATIVELY instead: copy the reachable object graph straight from the
+        // local repo's object store and advance the remote-tracking ref. No
+        // subprocess, no network. Real remotes keep the compiled-in http transport.
+        if let Some(path) = origin_local_path(repo)? {
+            local_fetch(repo, &path, mainline)?;
+        } else {
+            let remote = repo
+                .find_remote("origin")
+                .context("a configured `origin` remote is required to fetch")?;
+            remote
+                .connect(gix::remote::Direction::Fetch)?
+                .prepare_fetch(gix::progress::Discard, gix::remote::ref_map::Options::default())?
+                .receive(gix::progress::Discard, &should_interrupt)?;
+        }
     }
 
     // (d) Fast-forward decision. `local` is the commit HEAD currently resolves to
@@ -212,6 +221,107 @@ fn reconcile_repo_inner(repo: &gix::Repository, do_fetch: bool) -> Result<String
         local_id.to_hex_with_len(12),
         remote_id.to_hex_with_len(12)
     ))
+}
+
+/// The filesystem path of `origin` iff it is a LOCAL repository (a bare path or a
+/// `file://` URL). `None` for http/ssh/git remotes, which fetch over the network.
+fn origin_local_path(repo: &gix::Repository) -> Result<Option<std::path::PathBuf>> {
+    let Ok(remote) = repo.find_remote("origin") else {
+        return Ok(None);
+    };
+    let Some(url) = remote.url(gix::remote::Direction::Fetch) else {
+        return Ok(None);
+    };
+    if url.scheme == gix::url::Scheme::File {
+        let path: &gix::bstr::BStr = url.path.as_ref();
+        Ok(Some(gix::path::from_bstr(path).into_owned()))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Native fetch from a LOCAL origin: copy the object graph reachable from the
+/// remote's `<mainline>` branch into this repo's object store, then advance the
+/// `refs/remotes/origin/<mainline>` tracking ref. No subprocess, no network — the
+/// observable result of a real fetch, done by reading the sibling repo directly.
+fn local_fetch(repo: &gix::Repository, remote_path: &std::path::Path, mainline: &str) -> Result<()> {
+    let remote = gix::open(remote_path)
+        .with_context(|| format!("open local origin {}", remote_path.display()))?;
+    let tip = remote
+        .find_reference(&format!("refs/heads/{mainline}"))?
+        .into_fully_peeled_id()?
+        .detach();
+
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    for info in remote.rev_walk([tip]).all()? {
+        let cid = info?.id;
+        copy_object(&remote, repo, cid, &mut seen)?;
+        let tree = remote.find_object(cid)?.try_into_commit()?.tree_id()?.detach();
+        copy_tree(&remote, repo, tree, &mut seen)?;
+    }
+
+    // Advance the remote-tracking ref (create or fast-forward), matching a fetch.
+    let name = FullName::try_from(BString::from(format!("refs/remotes/origin/{mainline}")))?;
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: BString::from("fetch: zvcs native local fetch"),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(tip),
+        },
+        name,
+        deref: false,
+    })?;
+    Ok(())
+}
+
+/// Copy a tree object and everything it references (subtrees, blobs) from
+/// `remote` into `local`. Gitlink (submodule) entries are refs to another repo,
+/// not objects here, so they are skipped. `seen` dedups shared subtrees/blobs.
+fn copy_tree(
+    remote: &gix::Repository,
+    local: &gix::Repository,
+    id: ObjectId,
+    seen: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    copy_object(remote, local, id, seen)?;
+    let tree = remote.find_object(id)?.try_into_tree()?;
+    for entry in tree.iter() {
+        let entry = entry?;
+        let oid = entry.oid().to_owned();
+        use gix::objs::tree::EntryKind;
+        match entry.mode().kind() {
+            EntryKind::Tree => copy_tree(remote, local, oid, seen)?,
+            EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
+                copy_object(remote, local, oid, seen)?
+            }
+            EntryKind::Commit => {} // gitlink — lives in another repo, not here
+        }
+    }
+    Ok(())
+}
+
+/// Copy one object's raw bytes from `remote` to `local` (idempotent by hash).
+/// Skips objects already present locally or already copied this pass.
+fn copy_object(
+    remote: &gix::Repository,
+    local: &gix::Repository,
+    id: ObjectId,
+    seen: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    if !seen.insert(id) || local.has_object(id) {
+        return Ok(());
+    }
+    let obj = remote.find_object(id)?;
+    use gix::objs::Write;
+    local
+        .objects
+        .write_buf(obj.kind, &obj.data)
+        .map_err(|e| anyhow!("write object {id}: {e}"))?;
+    Ok(())
 }
 
 /// Move a clean worktree and its index from the state captured in `old` to the

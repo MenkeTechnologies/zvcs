@@ -299,6 +299,131 @@ pub fn blame_store(
     )?;
     Ok(())
 }
+// ---------------------------------------------------------------------------
+// off-thread cache writes
+// ---------------------------------------------------------------------------
+
+/// A row a read-only verb computed and wants remembered.
+///
+/// Filling a cache must never be something the user waits for. The value is
+/// already in hand — the command can print it and go — so the write belongs off
+/// the critical path entirely.
+pub enum CacheWrite {
+    /// A tree pair's change list, with or without the per-file line counts.
+    TreeDiff { old_tree: String, new_tree: String, counts: bool, files: String },
+    /// Abbreviations computed at one `core.abbrev` length.
+    Abbrev { hex_len: usize, rows: Vec<(String, String)> },
+    /// One `(commit, path)` blame, run-length encoded.
+    Blame { commit: String, path: String, algo: String, blob: String, runs: String },
+}
+
+/// The writer thread and the channel feeding it, started on first use.
+static WRITER: std::sync::Mutex<
+    Option<(std::sync::mpsc::Sender<CacheWrite>, std::thread::JoinHandle<()>)>,
+> = std::sync::Mutex::new(None);
+
+/// Queue a cache row and return immediately.
+///
+/// Every caller here is a read-only verb whose answer is already computed, so
+/// the write is pure bookkeeping. Doing it inline cost a fresh connection, a
+/// schema check and a transaction PER ROW — which made the first (cold) run of
+/// `log --stat` measurably slower than plain git, exactly the run where the user
+/// has the least patience for it. Now the rows go to a single writer thread that
+/// batches them into one transaction, and [`cache_flush`] waits for it once, at
+/// the very end of the command, after the output is already on its way.
+pub fn cache_write(job: CacheWrite) {
+    let mut guard = match WRITER.lock() {
+        Ok(g) => g,
+        // A poisoned lock means a previous writer panicked; losing cache rows is
+        // not worth failing a user's command over.
+        Err(_) => return,
+    };
+    if guard.is_none() {
+        let (tx, rx) = std::sync::mpsc::channel::<CacheWrite>();
+        let handle = std::thread::spawn(move || writer_loop(rx));
+        *guard = Some((tx, handle));
+    }
+    if let Some((tx, _)) = guard.as_ref() {
+        let _ = tx.send(job);
+    }
+}
+
+/// Wait for queued cache rows to land. Call once, as late as possible.
+///
+/// A detached thread does not outlive the process, so the queue does have to be
+/// drained before exit — but by then the command has done all of its real work,
+/// so what is waited on is only whatever the writer has not already absorbed
+/// while the command was running.
+pub fn cache_flush() {
+    let taken = match WRITER.lock() {
+        Ok(mut g) => g.take(),
+        Err(_) => return,
+    };
+    if let Some((tx, handle)) = taken {
+        // Dropping the sender ends the writer's loop once the queue is empty.
+        drop(tx);
+        let _ = handle.join();
+    }
+}
+
+/// Drain the queue into batched transactions until the sender is dropped.
+fn writer_loop(rx: std::sync::mpsc::Receiver<CacheWrite>) {
+    let mut conn = match open_rw() {
+        Ok(conn) => conn,
+        // No ledger (read-only home, missing directory): the caches are an
+        // optimization, so a command that cannot record them still works.
+        Err(_) => {
+            while rx.recv().is_ok() {}
+            return;
+        }
+    };
+    // Batch cap: bounds how much a single transaction holds when a long walk
+    // produces rows faster than they can be committed.
+    const BATCH: usize = 512;
+    while let Ok(first) = rx.recv() {
+        let mut batch = vec![first];
+        while batch.len() < BATCH {
+            match rx.try_recv() {
+                Ok(job) => batch.push(job),
+                Err(_) => break,
+            }
+        }
+        let Ok(tx) = conn.transaction() else { continue };
+        for job in batch {
+            let _ = match job {
+                CacheWrite::TreeDiff { old_tree, new_tree, counts, files } => {
+                    treediff_store(&tx, &old_tree, &new_tree, counts, &files)
+                }
+                CacheWrite::Abbrev { hex_len, rows } => abbrev_store_tx(&tx, hex_len, &rows),
+                CacheWrite::Blame { commit, path, algo, blob, runs } => {
+                    blame_store(&tx, &commit, &path, &algo, &blob, &runs)
+                }
+            };
+        }
+        let _ = tx.commit();
+    }
+}
+
+/// A thread's cached read-only connection, or `None` if the ledger cannot be
+/// read from this thread.
+///
+/// Opening a connection per lookup is the read-side twin of the write-side bug:
+/// a walk that consults the cache once per commit paid an open, a pragma and a
+/// file-handle for each one.
+pub fn with_ro<T>(f: impl FnOnce(&Connection) -> T) -> Option<T> {
+    thread_local! {
+        static RO: std::cell::RefCell<Option<Option<Connection>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    RO.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        // `None` = not tried yet; `Some(None)` = tried and unavailable, which is
+        // remembered so a missing ledger is not re-opened once per lookup.
+        let conn = slot.get_or_insert_with(|| open_ro().ok());
+        conn.as_ref().map(f)
+    })
+}
+
 /// Load every cached abbreviation computed at `hex_len`.
 ///
 /// Object ids are content addresses, so an abbreviation is valid for any repo
@@ -315,14 +440,19 @@ pub fn abbrev_load(conn: &Connection, hex_len: usize) -> Result<HashMap<String, 
 /// Record abbreviations computed this run, in one transaction.
 pub fn abbrev_store(conn: &mut Connection, hex_len: usize, pairs: &[(String, String)]) -> Result<()> {
     let tx = conn.transaction()?;
-    {
-        let mut stmt =
-            tx.prepare("INSERT OR IGNORE INTO abbrev (oid, hex_len, short) VALUES (?1, ?2, ?3)")?;
-        for (oid, short) in pairs {
-            stmt.execute(rusqlite::params![oid, hex_len as i64, short])?;
-        }
-    }
+    abbrev_store_tx(&tx, hex_len, pairs)?;
     tx.commit()?;
+    Ok(())
+}
+
+/// The abbreviation rows themselves, inside a transaction the caller owns — the
+/// writer thread batches several kinds of row into one commit.
+fn abbrev_store_tx(conn: &Connection, hex_len: usize, pairs: &[(String, String)]) -> Result<()> {
+    let mut stmt =
+        conn.prepare("INSERT OR IGNORE INTO abbrev (oid, hex_len, short) VALUES (?1, ?2, ?3)")?;
+    for (oid, short) in pairs {
+        stmt.execute(rusqlite::params![oid, hex_len as i64, short])?;
+    }
     Ok(())
 }
 /// Open the read-write connection (daemon side): WAL, busy-timeout, schema.

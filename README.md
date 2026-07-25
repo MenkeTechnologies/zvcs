@@ -466,31 +466,31 @@ interleaved run so load moves them together. Regenerate with:
 cargo build --release && scripts/bench.sh /path/to/some/repo
 ```
 
-Repository: zshrs (6,376 commits) · stock git 2.50.1 · 18 cores · 10 runs after
-3 warmups · release build · the machine was busy, which compresses zvcs's lead
-rather than git's.
+Repository: zshrs (6,376 commits) · stock git 2.50.1 · 18 cores · 12 runs after
+3 warmups · release build · the machine was busy (load ~20), which compresses
+zvcs's lead rather than git's.
 
 | Command | zvcs | git | |
 |---|---:|---:|---:|
-| `git status` | 15.1 ms | 156.8 ms | **10.38x** |
-| `git log --stat -n 30` | 13.2 ms | 112.4 ms | **8.52x** |
-| `git blame README.md` | 6.8 ms | 30.9 ms | **4.54x** |
-| `git log -S return --format=%H` | 1.569 s | 6.805 s | **4.34x** |
-| `git log --oneline` | 17.3 ms | 49.7 ms | **2.87x** |
-| `git log` | 20.6 ms | 58.9 ms | **2.86x** |
-| `git log --format=%s` | 17.7 ms | 44.8 ms | **2.53x** |
-| `git log -p -n 20` | 29.6 ms | 72.8 ms | **2.46x** |
-| `git log --format=%h` | 9.3 ms | 17.2 ms | **1.85x** |
-| `git cat-file -p HEAD` | 8.0 ms | 13.4 ms | **1.68x** |
-| `git diff --name-only HEAD~5` | 14.8 ms | 20.8 ms | **1.41x** |
-| `git for-each-ref` | 9.4 ms | 13.2 ms | **1.40x** |
-| `git describe` | 9.7 ms | 13.4 ms | **1.38x** |
-| `git show HEAD` | 10.0 ms | 13.6 ms | **1.36x** |
-| `git shortlog -s` | 7.6 ms | 10.2 ms | **1.34x** |
-| `git rev-list --count HEAD` | 10.0 ms | 12.8 ms | **1.28x** |
-| `git diff --stat HEAD~5` | 29.7 ms | 36.9 ms | **1.24x** |
-| `git ls-files` | 9.4 ms | 11.0 ms | **1.17x** |
-| `git tag -l` | 11.5 ms | 12.0 ms | **1.04x** |
+| `git log --stat -n 30` | 15.9 ms | 168.6 ms | **10.60x** |
+| `git status` | 32.2 ms | 315.3 ms | **9.79x** |
+| `git blame README.md` | 11.8 ms | 48.3 ms | **4.09x** |
+| `git log -S return --format=%H` | 2.673 s | 7.209 s | **2.70x** |
+| `git log --oneline` | 31.8 ms | 78.4 ms | **2.47x** |
+| `git log` | 44.1 ms | 95.7 ms | **2.17x** |
+| `git log --format=%s` | 32.1 ms | 66.8 ms | **2.08x** |
+| `git log --format=%h` | 14.9 ms | 29.5 ms | **1.98x** |
+| `git log -p -n 20` | 45.3 ms | 73.2 ms | **1.62x** |
+| `git shortlog -s` | 6.8 ms | 10.7 ms | **1.57x** |
+| `git describe` | 8.9 ms | 13.2 ms | **1.48x** |
+| `git cat-file -p HEAD` | 7.2 ms | 10.4 ms | **1.44x** |
+| `git rev-list --count HEAD` | 9.2 ms | 12.4 ms | **1.35x** |
+| `git show HEAD` | 8.9 ms | 12.0 ms | **1.35x** |
+| `git diff --name-only HEAD~5` | 13.6 ms | 17.9 ms | **1.32x** |
+| `git for-each-ref` | 8.3 ms | 10.9 ms | **1.31x** |
+| `git tag -l` | 8.5 ms | 10.8 ms | **1.27x** |
+| `git ls-files` | 8.5 ms | 10.1 ms | **1.19x** |
+| `git diff --stat HEAD~5` | 27.7 ms | 30.6 ms | **1.10x** |
 
 Three things produce the difference, and only the first is ordinary optimization:
 
@@ -512,20 +512,27 @@ Three things produce the difference, and only the first is ordinary optimization
 
 ### Cold versus warm
 
-The table above is steady state — a repository the daemon has seen. On first
-touch of a repository with an empty ledger, the cache-backed commands are around
-git's own speed, because they compute the same answers *and* write them down:
+The table above is steady state — a repository the daemon has seen. The cold
+column below is the opposite extreme: a repository with no ledger at all, where
+the cache-backed commands compute every answer from the object store *and* write
+it down for next time.
 
 | Command | zvcs cold | zvcs warm | git |
 |---|---:|---:|---:|
-| `git log --stat -n 30` | 137.4 ms | 16.2 ms | 118.9 ms |
-| `git log --stat -n 150` | 831.4 ms | 64.0 ms | 624.6 ms |
-| `git blame README.md` | 169.5 ms | 9.4 ms | 107.4 ms |
+| `git log --stat -n 30` | 100.4 ms | 9.5 ms | 119.0 ms |
+| `git log --stat -n 150` | 402.1 ms | 10.7 ms | 531.8 ms |
+| `git blame README.md` | 73.8 ms | 8.6 ms | 94.4 ms |
 
-Cold is measured with the ledger deleted before every single run, which is the
-worst case and not one a running daemon leaves you in — it warms the newest
-commits on every ref change, and `git zprecache` does the same pass on demand
-(150 commits in 0.63 s).
+Cold stays ahead of git because filling a cache is not something the caller waits
+for: the rows are queued to a writer thread and the command returns, with one
+wait at the very end for whatever the writer has not already absorbed. The rows
+still land — a detached thread would be killed at exit, and a cache that never
+persists is just a slower uncached path.
+
+Cold here means the ledger is deleted before every single run, which is the worst
+case and not one a running daemon leaves you in: it warms the newest commits on
+every ref change, and `git zprecache` does the same pass on demand (150 commits
+in 0.63 s).
 
 ## [0x09] DOCUMENTATION
 

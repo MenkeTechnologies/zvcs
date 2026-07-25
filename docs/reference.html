@@ -20,7 +20,7 @@ p{margin:.6rem 0}a{color:var(--accent)}
 </style>
 </head><body>
 <h1>zvcs extension verbs</h1>
-<p class="sub">113 superset (<code>z*</code>) verbs — the coordination layer stock git has no equivalent for. Generated from the same source as the man pages (<code>git help &lt;verb&gt;</code>).</p>
+<p class="sub">116 superset (<code>z*</code>) verbs — the coordination layer stock git has no equivalent for. Generated from the same source as the man pages (<code>git help &lt;verb&gt;</code>).</p>
 <nav class="toc">
 <a href="#zsync"><code>zsync</code></a>
 <a href="#zbump"><code>zbump</code></a>
@@ -111,8 +111,6 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <a href="#zsessions"><code>zsessions</code></a>
 <a href="#zidle"><code>zidle</code></a>
 <a href="#zdashboard"><code>zdashboard</code></a>
-<a href="#zppid"><code>zppid</code></a>
-<a href="#zprocs"><code>zprocs</code></a>
 <a href="#ztop"><code>ztop</code></a>
 <a href="#zevents"><code>zevents</code></a>
 <a href="#ztail"><code>ztail</code></a>
@@ -137,6 +135,9 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <a href="#zrewind"><code>zrewind</code></a>
 <a href="#zguard"><code>zguard</code></a>
 <a href="#zpolicy"><code>zpolicy</code></a>
+<a href="#zppid"><code>zppid</code></a>
+<a href="#zprocs"><code>zprocs</code></a>
+<a href="#zprecache"><code>zprecache</code></a>
 </nav>
 <section id="zsync">
 <h2><code>git zsync</code> <span class="summary">— reconcile every submodule to its tracked mainline, attached</span></h2>
@@ -609,21 +610,9 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <section id="zdashboard">
 <h2><code>git zdashboard</code> <span class="summary">— live tiled TUI: fleet, events, and commands on one screen</span></h2>
 <pre class="synopsis">git zdashboard [--once] [--json]</pre>
-<p>A live, tiled dashboard of the whole indexed tree on one screen: a header of aggregate totals (dirty, ahead, behind, diverged, detached, clean, claims, sessions, queue, tracked processes and the busiest committing pid, and whether the daemon is up) over four tiles — a FLEET table (every repo, most recently active first, with the on-screen rows' HEAD state live-refreshed so nothing is stale), a PROCESSES tile (each responsible process with its command, cwd, commit tally, live/dead state, and last-commit age, as zppid shows), an EVENTS feed (commits, reconciles, status changes, as zevents shows), and a COMMANDS feed (every git command run across the machine, with the agent that ran it, as zcommands shows). It is interactive: one tile is focused and its selected row is highlighted (the cursor). Arrow keys (or <code>j</code>/<code>k</code>, PageUp/Down, <code>g</code>/<code>G</code>) move the cursor within the focused tile, <code>Tab</code> cycles tiles and <code>←</code>/<code>→</code> switch columns. The mouse drives the same cursor — hovering moves it to the row under the pointer, the wheel steps it, and a right-click opens an opaque per-row detail popup (full repo path / process cwd / event SHAs / command line). The feeds stay pinned to the newest row until you scroll up; the focused tile's title shows <code>▸ … [sel/len]</code>. Panes are resizable — <strong>drag a divider</strong> (the border between panes) with the mouse, or use <code>H</code>/<code>L</code> (vertical column divider), <code>J</code>/<code>K</code> (focused column's horizontal divider), and <code>=</code> to reset — each clamped so no pane vanishes. Press q or Esc to quit.</p>
+<p>A live, tiled dashboard of the whole indexed tree on one screen: a header of aggregate totals (dirty, ahead, behind, diverged, detached, clean, claims, sessions, queue, and whether the daemon is up) over three tiles — a FLEET table (every repo, most recently active first, with the on-screen rows' HEAD state live-refreshed so nothing is stale), an EVENTS feed (commits, reconciles, status changes, as zevents shows), and a COMMANDS feed (every git command run across the machine, with the agent that ran it, as zcommands shows). Press q or Esc to quit.</p>
 <p>Every tile reads the daemon-maintained status cache and ledger, not a live per-repo walk, so the dashboard stays responsive across thousands of repos. The COMMANDS tile is populated once command logging is on (<code>git zcommands</code> enables it).</p>
 <p>For scripting, <code>--once</code> or <code>--json</code> (or a non-terminal stdout) prints the instant text summary instead of the TUI — the same aggregate counts, one screen, no interaction.</p>
-</section>
-<section id="zppid">
-<h2><code>git zppid</code> <span class="summary">— per-process commit tally (each responsible process, its command, cwd, and commits)</span></h2>
-<pre class="synopsis">git zppid [--json]</pre>
-<p>Lists every process that has committed through zvcs, most commits first — one row per <em>responsible</em> process. The responsible process is <strong>not</strong> the git command's immediate parent: a <code>git commit</code> is run by a throwaway shell (an agent spawns a fresh <code>zsh -c …</code> per command), so <code>getppid()</code> is different on every commit and useless as an identity. Instead zvcs walks up the parent chain, skips transient wrapper shells (a shell invoked with <code>-c</code>), and stops at the first durable process — a real program (an agent, editor, daemon) or an interactive login shell. That pid is stable across every commit one agent makes, so N concurrent agents show as N rows. Each row carries the pid, whether it is still live (<code>kill(pid, 0)</code>), its commit count, when it last committed, and the process's command name and working directory so the pid is legible.</p>
-<p>A commit is credited at command time, only when HEAD actually advanced: for a commit-producing verb (<code>commit</code>, <code>commit-tree</code>, <code>merge</code>, <code>cherry-pick</code>, <code>revert</code>, <code>am</code>, <code>rebase</code>) the dispatcher snapshots HEAD before the command and increments the responsible process's tally if it moved to a new tip afterward — so a no-op <code>commit</code> (nothing staged) or a rejected merge counts nothing. An explicit <code>ZVCS_SESSION</code> overrides the identity key. The tally persists in the <code>ppids</code> table and also drives the <code>zdashboard</code> PROCESSES tile and header. <code>--json</code> emits one array of objects for scripting.</p>
-</section>
-<section id="zprocs">
-<h2><code>git zprocs</code> <span class="summary">— per-process command breakdown (mutating verbs run by each process)</span></h2>
-<pre class="synopsis">git zprocs [--json]</pre>
-<p>Shows, for each durable process (resolved the same way as <a href="#zppid"><code>zppid</code></a> — walking past throwaway per-command shells to the real agent/program), how many of each <em>mutating</em> git verb it has run, busiest first: <code>commit</code>, <code>push</code>, <code>add</code>, <code>merge</code>, <code>rebase</code>, <code>reset</code>, <code>checkout</code>, <code>cherry-pick</code>, <code>revert</code>, <code>tag</code>, <code>stash</code>, <code>fetch</code>, <code>pull</code>. Each row lists the process's pid, live/dead state, total mutating commands, last activity, command name, and the per-verb breakdown (<code>commit:12 push:8 add:5 …</code>).</p>
-<p>Only mutating verbs are counted — read verbs (<code>rev-parse</code>, <code>status</code>, <code>log</code>) fire on every shell prompt, so tracking them would put the process-resolution walk on the hot path and slow the shell. The counts persist in the <code>proc_verbs</code> table, keyed by the same process identity as <code>zppid</code> (so the two join), and are recorded off the read path. <code>--json</code> emits one object per process with a <code>verbs</code> map.</p>
 </section>
 <section id="ztop">
 <h2><code>git ztop</code> <span class="summary">— live htop-style fleet monitor, most churn on top</span></h2>
@@ -771,5 +760,23 @@ p{margin:.6rem 0}a{color:var(--accent)}
 <h2><code>git zpolicy</code> <span class="summary">— alias of git zguard (command policy)</span></h2>
 <pre class="synopsis">git zpolicy deny|warn &lt;pattern&gt; [--when &lt;predicate&gt;] [-m &lt;msg&gt;] | list | rm &lt;id&gt; | clear | test &lt;cmd&gt;...</pre>
 <p>An alias for <code>git zguard</code> — declarative fleet-wide command policy. See <code>git help zguard</code> for the full description.</p>
+</section>
+<section id="zppid">
+<h2><code>git zppid</code> <span class="summary">— per-process commit tally, attributed to the durable process</span></h2>
+<pre class="synopsis">git zppid</pre>
+<p>Reports which process is responsible for each recorded commit, found by walking up past the throwaway per-command shells to the durable agent, program, or login shell that drove them.</p>
+<p>Each row carries the pid, its command and working directory, whether it is still alive, and how many commits it landed.</p>
+</section>
+<section id="zprocs">
+<h2><code>git zprocs</code> <span class="summary">— per-process breakdown of mutating commands</span></h2>
+<pre class="synopsis">git zprocs</pre>
+<p>Reports how many of each mutating verb — commit, push, add, merge, rebase and the rest — every recorded process has run, attributed the same way as <code>git zppid</code>.</p>
+</section>
+<section id="zprecache">
+<h2><code>git zprecache</code> <span class="summary">— precompute the log caches for recent commits</span></h2>
+<pre class="synopsis">git zprecache [-n &lt;commits&gt;] [-q]</pre>
+<p>Fills the ledger's log caches — commit abbreviations and the per-file line tallies that --stat, --numstat, --shortstat and --name-status need — for the newest commits, so those formats read the ledger instead of the object store.</p>
+<p>Everything it stores is a pure function of immutable objects, so an entry never expires. -n sets how many commits to walk (default 200); -q suppresses the count.</p>
+<p>The daemon does this on its own whenever a watched repository's refs move (zvcs.precache, on by default); this verb is the same pass on demand, for a fresh clone or a fetch that landed while the daemon was down.</p>
 </section>
 </body></html>

@@ -1542,9 +1542,9 @@ impl AbbrevCache {
             .integer("core.abbrev")
             .and_then(|v| usize::try_from(v).ok())
             .unwrap_or(0);
-        let known: std::collections::HashMap<ObjectId, String> = crate::db::open_ro()
-            .ok()
-            .and_then(|c| crate::db::abbrev_load(&c, hex_len).ok())
+        let known: std::collections::HashMap<ObjectId, String> =
+            crate::db::with_ro(|c| crate::db::abbrev_load(c, hex_len).ok())
+            .flatten()
             .unwrap_or_default()
             .into_iter()
             // A row whose id is not parseable hex is from a different hash
@@ -1589,20 +1589,20 @@ impl AbbrevCache {
         short
     }
 
-    /// Write what this run computed, in one transaction.
+    /// Hand what this run computed to the ledger's writer thread.
     ///
-    /// Synchronous on purpose: a detached thread does not survive the process
-    /// exiting a few microseconds later, and a cache that never persists is just
-    /// a slower uncached path. The write happens once per set of unseen commits
-    /// — every later run in any clone reads them back — and a failure is silent
-    /// because losing the batch only costs a recomputation.
+    /// The rows are queued rather than written here: the command has its
+    /// abbreviations already, and `run()` waits for the queue once, after the
+    /// output is on its way. Losing a batch would only cost a recomputation, so
+    /// nothing here reports an error.
     fn flush(self) {
         if self.fresh.is_empty() {
             return;
         }
-        if let Ok(mut conn) = crate::db::open_rw() {
-            let _ = crate::db::abbrev_store(&mut conn, self.hex_len, &self.fresh);
-        }
+        crate::db::cache_write(crate::db::CacheWrite::Abbrev {
+            hex_len: self.hex_len,
+            rows: self.fresh,
+        });
     }
 }
 
@@ -3167,8 +3167,10 @@ fn collect_changes(
     // sidesteps the work instead of racing it.
     let old_key = old_tree.as_ref().map(|t| t.id.to_string()).unwrap_or_default();
     let new_key = new_tree.id.to_string();
-    if let Some(text) =
-        crate::db::open_ro().ok().and_then(|c| crate::db::treediff_load(&c, &old_key, &new_key, with_counts))
+    if let Some(text) = crate::db::with_ro(|c| {
+        crate::db::treediff_load(c, &old_key, &new_key, with_counts)
+    })
+    .flatten()
     {
         if let Some(files) = decode_changes(&text) {
             return Ok(files);
@@ -3188,9 +3190,14 @@ fn collect_changes(
             out.push(f);
         }
     }
-    if let Ok(conn) = crate::db::open_rw() {
-        let _ = crate::db::treediff_store(&conn, &old_key, &new_key, with_counts, &encode_changes(&out));
-    }
+    // Off-thread: the answer is already in `out`, so the row is bookkeeping and
+    // the caller must not wait for a transaction to reach the disk.
+    crate::db::cache_write(crate::db::CacheWrite::TreeDiff {
+        old_tree: old_key,
+        new_tree: new_key,
+        counts: with_counts,
+        files: encode_changes(&out),
+    });
     Ok(out)
 }
 

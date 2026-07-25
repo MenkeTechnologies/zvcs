@@ -870,6 +870,32 @@ fn list_tags(
         .flatten()
         .map(|r| BString::from(r.name().as_bstr().to_vec()));
 
+    // A plain `git tag -l` prints refnames and sorts by refname, so nothing about
+    // the objects those refs point at is ever consulted. Reading them anyway cost
+    // an object decode per tag — and a second one per annotated tag, to peel it —
+    // which is the whole cost of the command on a repository with many tags.
+    // Anything that DOES look at the object (a --format, `-n`, a filter, or a
+    // sort key other than the default refname order) takes the full path below.
+    let names_only = format.is_none() && lines.is_none() && !filters.any() && sort_keys.is_empty();
+    if names_only {
+        let mut names: Vec<(BString, BString)> = Vec::new();
+        for r in repo.references()?.tags()? {
+            let r = r.map_err(|e| anyhow!("failed to read a tag reference: {e}"))?;
+            let short = BString::from(r.name().shorten().to_vec());
+            if !patterns.is_empty()
+                && !patterns
+                    .iter()
+                    .any(|p| wildmatch(p.as_bytes().as_bstr(), short.as_bstr(), match_mode))
+            {
+                continue;
+            }
+            names.push((BString::from(r.name().as_bstr().to_vec()), short));
+        }
+        // git's implicit key: ascending full refname.
+        names.sort_by(|a, b| a.0.cmp(&b.0));
+        return write_lines(names.into_iter().map(|(_, short)| short.into()).collect(), colopts);
+    }
+
     let mut entries: Vec<Facts> = Vec::new();
     for r in repo.references()?.tags()? {
         let r = r.map_err(|e| anyhow!("failed to read a tag reference: {e}"))?;
@@ -946,17 +972,36 @@ fn list_tags(
         }
     }
     if column_on {
-        // git's `run_column_filter(colopts, &copts)` with `copts.padding = 2`, every
-        // other field zero (indent "", nl "\n", width from the terminal).
-        let opts = super::column::ColumnOptions {
-            width: 0,
-            padding: 2,
-            indent: None,
-            nl: None,
-        };
-        out.write_all(&super::column::layout(&cells, colopts, &opts))?;
+        write_cells(&mut out, &cells, colopts)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Write already-rendered lines, through the column filter when it is active.
+fn write_lines(lines: Vec<Vec<u8>>, colopts: u32) -> Result<ExitCode> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if super::column::active(colopts) {
+        write_cells(&mut out, &lines, colopts)?;
+    } else {
+        for mut line in lines {
+            line.push(b'\n');
+            out.write_all(&line)?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// git's `run_column_filter(colopts, &copts)` with `copts.padding = 2`, every
+/// other field zero (indent "", nl "\n", width from the terminal).
+fn write_cells(out: &mut impl std::io::Write, cells: &[Vec<u8>], colopts: u32) -> std::io::Result<()> {
+    let opts = super::column::ColumnOptions {
+        width: 0,
+        padding: 2,
+        indent: None,
+        nl: None,
+    };
+    out.write_all(&super::column::layout(cells, colopts, &opts))
 }
 
 /// The commit a tag ultimately names, if any (its peel for an annotated tag, or

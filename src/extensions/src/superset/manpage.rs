@@ -850,6 +850,31 @@ pub const DOCS: &[Doc] = &[
         synopsis: "git zpolicy deny|warn <pattern> [--when <predicate>] [-m <msg>] | list | rm <id> | clear | test <cmd>...",
         desc: &["An alias for `git zguard` \\(em declarative fleet-wide command policy. See `git help zguard` for the full description."],
     },
+    Doc {
+        verb: "zppid",
+        summary: "per-process commit tally, attributed to the durable process",
+        synopsis: "git zppid",
+        desc: &[
+            "Reports which process is responsible for each recorded commit, found by walking up past the throwaway per-command shells to the durable agent, program, or login shell that drove them.",
+            "Each row carries the pid, its command and working directory, whether it is still alive, and how many commits it landed.",
+        ],
+    },
+    Doc {
+        verb: "zprocs",
+        summary: "per-process breakdown of mutating commands",
+        synopsis: "git zprocs",
+        desc: &["Reports how many of each mutating verb \\(em commit, push, add, merge, rebase and the rest \\(em every recorded process has run, attributed the same way as `git zppid`."],
+    },
+    Doc {
+        verb: "zprecache",
+        summary: "precompute the log caches for recent commits",
+        synopsis: "git zprecache [-n <commits>] [-q]",
+        desc: &[
+            "Fills the ledger's log caches \\(em commit abbreviations and the per-file line tallies that --stat, --numstat, --shortstat and --name-status need \\(em for the newest commits, so those formats read the ledger instead of the object store.",
+            "Everything it stores is a pure function of immutable objects, so an entry never expires. -n sets how many commits to walk (default 200); -q suppresses the count.",
+            "The daemon does this on its own whenever a watched repository's refs move (zvcs.precache, on by default); this verb is the same pass on demand, for a fresh clone or a fetch that landed while the daemon was down.",
+        ],
+    },
 ];
 
 /// The manual for `verb`, or `None` if it is not a superset verb.

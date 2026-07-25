@@ -221,6 +221,12 @@ pub fn run() -> ExitCode {
         }
     };
     pager::finish();
+    // Cache rows queued during the command are written by a background thread
+    // (see `db::cache_write`); this is the one place that waits for it, after the
+    // output is out and the pager has been torn down. A detached thread would not
+    // outlive the process, so the wait has to happen — but by now the writer has
+    // had the whole command, and usually the whole pager session, to get ahead.
+    db::cache_flush();
     code
 }
 

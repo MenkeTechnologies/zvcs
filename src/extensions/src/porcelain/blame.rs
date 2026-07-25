@@ -227,8 +227,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         .ok()
         .map(|id| id.detach());
     let cached = cache_key.as_ref().zip(blamed_blob).and_then(|((c, p, a), blob)| {
-        let conn = crate::db::open_ro().ok()?;
-        let (blob_hex, runs) = crate::db::blame_load(&conn, c, p, a)?;
+        let (blob_hex, runs) = crate::db::with_ro(|conn| crate::db::blame_load(conn, c, p, a)).flatten()?;
         if blob_hex != blob.to_string() {
             return None; // the path holds different content at this commit
         }
@@ -245,16 +244,15 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
                 .map_err(|e| anyhow!("{e}"))?;
             let lines = materialize_lines(&outcome);
             if let (Some((c, p, a)), Some(blob)) = (&cache_key, blamed_blob) {
-                if let Ok(conn) = crate::db::open_rw() {
-                    let _ = crate::db::blame_store(
-                        &conn,
-                        c,
-                        p,
-                        a,
-                        &blob.to_string(),
-                        &encode_runs(&lines),
-                    );
-                }
+                // Queued, not written here: the blame is already computed and
+                // about to be printed.
+                crate::db::cache_write(crate::db::CacheWrite::Blame {
+                    commit: c.clone(),
+                    path: p.clone(),
+                    algo: a.clone(),
+                    blob: blob.to_string(),
+                    runs: encode_runs(&lines),
+                });
             }
             (lines, outcome.blob.clone())
         }

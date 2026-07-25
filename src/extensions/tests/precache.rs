@@ -95,6 +95,34 @@ fn warmed_caches_render_exactly_what_the_cold_path_does() {
     }
 }
 
+/// Cache rows are written off the command's critical path, which is only safe
+/// if the process still waits for them before exiting — a detached writer would
+/// be killed at exit and the cache would never fill, turning every run into a
+/// cold one while looking fine.
+///
+/// So: one cold run, then assert the rows are on disk when the process is gone.
+#[test]
+fn a_single_run_leaves_its_cache_rows_on_disk() {
+    let (repo, home) = fixture("async", 6);
+    let db = home.join("db.sqlite");
+    let _ = std::fs::remove_file(&db);
+
+    let out = zvcs(&repo, &home, &["log", "--stat"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(db.exists(), "the run created the ledger");
+
+    // Read the rows with a fresh process, so nothing of the writer is still
+    // around to make this pass.
+    let counted = zvcs(&repo, &home, &["zprecache", "-n", "0"]);
+    assert!(counted.status.success());
+    let size = std::fs::metadata(&db).expect("ledger metadata").len();
+    assert!(size > 0, "the ledger holds what the run computed");
+
+    // The second run must render exactly what the first did, now from the cache.
+    let again = zvcs(&repo, &home, &["log", "--stat"]);
+    assert_eq!(stdout_of(&again), stdout_of(&out), "cached output must match the computed output");
+}
+
 /// `-n` bounds the walk. A repository with more commits than the limit warms
 /// only the newest ones — the recent end is what gets read.
 #[test]

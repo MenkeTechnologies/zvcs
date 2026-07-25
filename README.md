@@ -493,7 +493,7 @@ zvcs's lead rather than git's.
 | `git diff --stat HEAD~5` | 27.7 ms | 30.6 ms | **1.10x** |
 
 Three things produce the difference, and only the first is ordinary optimization.
-The [performance architecture page](https://menketechnologies.github.io/zvcs/performance.html)
+The [performance architecture page](https://menketechnologies.github.io/zvcs/#performance)
 diagrams these and the two supporting levers — doing less work, and keeping cache
 writes off the caller's critical path:
 
@@ -542,7 +542,7 @@ in 0.63 s).
 - **Docs hub** — <https://menketechnologies.github.io/zvcs/>
 - **Design document** — [DESIGN.md](DESIGN.md) — daemon architecture, concurrency model, autonomous behaviors, ledger/queue
 - **zsh completion** — [completions/_git](completions/_git) — the stock zsh `_git` forked with the `z*` verbs; put the dir first on `fpath` to shadow the system `_git`
-- **Performance architecture** — <https://menketechnologies.github.io/zvcs/performance.html> — diagrams of how the speedup is achieved: the worker pool over work git does single-threaded, the pickaxe rewrite, the ledger of never-stale values, daemon precompute, and the off-critical-path write queue
+- **Performance architecture** — <https://menketechnologies.github.io/zvcs/#performance> — diagrams of how the speedup is achieved: the worker pool over work git does single-threaded, the pickaxe rewrite, the ledger of never-stale values, daemon precompute, and the off-critical-path write queue
 - **Engineering report** — <https://menketechnologies.github.io/zvcs/report.html>
 - **gitoxide** — <https://github.com/GitoxideLabs/gitoxide> (the ported library)
 - **Source** — <https://github.com/MenkeTechnologies/zvcs>

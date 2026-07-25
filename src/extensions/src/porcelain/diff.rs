@@ -594,21 +594,26 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `--quiet`/`-s` produce no output, so the patch bodies are never needed.
     let workdir = repo.workdir().map(|p| p.to_owned());
     let want_patch = fmt & F_PATCH != 0 && !quiet;
-    let mut analyses: Vec<Analysis> = Vec::with_capacity(deltas.len());
-    if !quiet {
-        for delta in &deltas {
-            analyses.push(analyze(
-                &mut cache,
-                &repo.objects,
-                delta,
-                ctx,
-                ws,
-                hash_kind,
-                workdir.as_deref(),
-                want_patch,
-                algorithm,
-            )?);
-        }
+    // Analysis reads both sides of every changed file, so it runs only for the
+    // formats that consume it: the counts (`--numstat`/`--stat`/`--shortstat`)
+    // and the patch body. `--name-only`, `--name-status`, `--raw` and `--summary`
+    // render from the change list alone, and paying for blob reads there is pure
+    // waste — the same reason `--quiet` skips it.
+    let want_analysis = fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_PATCH) != 0;
+    let mut analyses: Vec<Analysis> = Vec::new();
+    if !quiet && want_analysis {
+        analyses = analyze_all(
+            &repo,
+            &mut cache,
+            &deltas,
+            ctx,
+            ws,
+            hash_kind,
+            workdir.as_deref(),
+            want_patch,
+            algorithm,
+            worktree_mode,
+        )?;
     }
 
     // With no explicit `--abbrev`, the `index` line honors `core.abbrev`
@@ -1253,6 +1258,113 @@ pub(crate) fn commit_patch(
     parent: Option<ObjectId>,
     ctx: u32,
 ) -> Result<Vec<u8>> {
+    let mut cache = repo.diff_resource_cache_for_tree_diff()?;
+    let r = patch_render(repo);
+    commit_patch_with(repo, &mut cache, &r, commit.id, parent, ctx)
+}
+
+/// The render settings `log -p`/`show` use for a patch body. Resolved once per
+/// worker rather than per commit: `core.abbrev` cannot change mid-command, and
+/// reading it is a config lookup.
+fn patch_render(repo: &gix::Repository) -> Render {
+    let hash_kind = repo.object_hash();
+    Render {
+        // `git log -p`/`git show` honor core.abbrev on the index line, same as
+        // `git diff` — resolved once here rather than hardcoded.
+        abbrev: crate::abbrev::configured_abbrev(repo, hash_kind.len_in_hex()),
+        full_index: false,
+        z: false,
+        src_prefix: b"a/".to_vec(),
+        dst_prefix: b"b/".to_vec(),
+        hash_kind,
+    }
+}
+
+/// The patch bodies for a batch of commits, one per job, in the caller's order.
+///
+/// Every entry is an independent tree-to-tree diff over immutable objects, so the
+/// batch is embarrassingly parallel — and git renders `log -p` on a single core
+/// no matter how many are idle, because its diff machinery has no threading at
+/// all. Workers pull from a shared cursor rather than taking a fixed slice, since
+/// one commit that rewrites a large file costs more than a hundred that touch a
+/// line each; a static split would leave every worker but that one idle.
+///
+/// Neither `gix::Repository` nor the blob platform is `Sync`, so a worker owns a
+/// clone of each. The clone shares the underlying object store, so it costs a
+/// handle rather than a re-open.
+pub(crate) fn commit_patches(
+    repo: &gix::Repository,
+    jobs: &[(ObjectId, Option<ObjectId>)],
+    ctx: u32,
+) -> Result<Vec<Vec<u8>>> {
+    // Four commits per worker: below that the handle clones cost more than the
+    // split saves, and a short `log -p -n 3` should not spawn anything.
+    let workers = crate::threads::count(jobs.len(), 4);
+    if workers <= 1 {
+        let mut cache = repo.diff_resource_cache_for_tree_diff()?;
+        let r = patch_render(repo);
+        return jobs
+            .iter()
+            .map(|(id, parent)| commit_patch_with(repo, &mut cache, &r, *id, *parent, ctx))
+            .collect();
+    }
+
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let mut done: Vec<(usize, Vec<u8>)> = Vec::with_capacity(jobs.len());
+    let mut failure: Option<anyhow::Error> = None;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let proto = repo.clone();
+            let cursor = &cursor;
+            handles.push(scope.spawn(move || -> Result<Vec<(usize, Vec<u8>)>> {
+                let repo = proto;
+                let mut cache = repo.diff_resource_cache_for_tree_diff()?;
+                let r = patch_render(&repo);
+                let mut mine = Vec::new();
+                loop {
+                    let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((id, parent)) = jobs.get(i) else { break };
+                    mine.push((i, commit_patch_with(&repo, &mut cache, &r, *id, *parent, ctx)?));
+                }
+                Ok(mine)
+            }));
+        }
+        for h in handles {
+            match h.join() {
+                Ok(Ok(mine)) => done.extend(mine),
+                Ok(Err(e)) => {
+                    failure.get_or_insert(e);
+                }
+                // A panicked worker is a bug in the diff pipeline, not a user
+                // error; surface it as one rather than silently dropping patches.
+                Err(_) => {
+                    failure.get_or_insert_with(|| anyhow::anyhow!("diff worker panicked"));
+                }
+            }
+        }
+    });
+    if let Some(e) = failure {
+        return Err(e);
+    }
+
+    let mut out: Vec<Vec<u8>> = vec![Vec::new(); jobs.len()];
+    for (i, patch) in done {
+        out[i] = patch;
+    }
+    Ok(out)
+}
+
+/// One commit's patch, reusing a caller-owned blob platform and render settings.
+fn commit_patch_with(
+    repo: &gix::Repository,
+    cache: &mut gix::diff::blob::Platform,
+    r: &Render,
+    commit_id: ObjectId,
+    parent: Option<ObjectId>,
+    ctx: u32,
+) -> Result<Vec<u8>> {
+    let commit = repo.find_object(commit_id)?.try_into_commit()?;
     let new_tree = commit.tree()?;
     let old_tree = match parent {
         Some(pid) => Some(repo.find_object(pid)?.try_into_commit()?.tree()?),
@@ -1273,23 +1385,11 @@ pub(crate) fn commit_patch(
     deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
 
     let hash_kind = repo.object_hash();
-    let mut cache = repo.diff_resource_cache_for_tree_diff()?;
-    let r = Render {
-        // `git log -p`/`git show` honor core.abbrev on the index line, same as
-        // `git diff` — resolved once here rather than hardcoded.
-        abbrev: crate::abbrev::configured_abbrev(repo, hash_kind.len_in_hex()),
-        full_index: false,
-        z: false,
-        src_prefix: b"a/".to_vec(),
-        dst_prefix: b"b/".to_vec(),
-        hash_kind,
-    };
-
     let mut out: Vec<u8> = Vec::new();
     for delta in &deltas {
         // A worktree side never arises for a tree diff, so `workdir` is `None`.
         let an = analyze(
-            &mut cache,
+            cache,
             &repo.objects,
             delta,
             ctx,
@@ -1299,7 +1399,7 @@ pub(crate) fn commit_patch(
             true,
             None,
         )?;
-        render_patch(&mut out, repo, delta, &an, ctx, &r)?;
+        render_patch(&mut out, repo, delta, &an, ctx, r)?;
     }
     Ok(out)
 }
@@ -1322,6 +1422,106 @@ fn path_matches(path: &BString, pat: &str) -> bool {
 // ---------------------------------------------------------------------------
 // blob analysis
 // ---------------------------------------------------------------------------
+
+/// Analyze every delta, across the thread pool when the change set is large
+/// enough to pay for it.
+///
+/// This is the one path that a cache cannot serve: `git diff` against the
+/// WORKING TREE reads files whose contents are not content-addressed, so there is
+/// no stable key to memoize on. What it does have is independence — each delta
+/// reads its own pair of sides and diffs them with no reference to the others —
+/// and git leaves that on the table, diffing every file on one core.
+///
+/// Each worker clones the repository handle and builds its own blob platform;
+/// neither type is `Sync`, and the platform additionally carries per-diff scratch
+/// state that must not be shared. The caller's `cache` is used as-is on the
+/// sequential path so a small diff allocates nothing extra.
+#[allow(clippy::too_many_arguments)]
+fn analyze_all(
+    repo: &gix::Repository,
+    cache: &mut gix::diff::blob::Platform,
+    deltas: &[Delta],
+    ctx: u32,
+    ws: Whitespace,
+    hash_kind: gix::hash::Kind,
+    workdir: Option<&std::path::Path>,
+    want_patch: bool,
+    algorithm: Option<gix::diff::blob::Algorithm>,
+    worktree_mode: bool,
+) -> Result<Vec<Analysis>> {
+    // Two files per worker. A handle clone plus a fresh blob platform is real
+    // setup, but analyzing one file means reading and diffing both its sides —
+    // enough work that even the five-file diff of a few commits' worth of change
+    // measures faster split than sequential.
+    let workers = crate::threads::count(deltas.len(), 2);
+    if workers <= 1 {
+        return deltas
+            .iter()
+            .map(|d| {
+                analyze(cache, &repo.objects, d, ctx, ws, hash_kind, workdir, want_patch, algorithm)
+            })
+            .collect();
+    }
+
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let mut done: Vec<(usize, Analysis)> = Vec::with_capacity(deltas.len());
+    let mut failure: Option<anyhow::Error> = None;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let proto = repo.clone();
+            let cursor = &cursor;
+            handles.push(scope.spawn(move || -> Result<Vec<(usize, Analysis)>> {
+                let repo = proto;
+                // The worker's platform must resolve the same sides the caller's
+                // does: a worktree diff reads its "new" side off disk through
+                // `WorktreeRoots`, and a tree pair reads both sides from the odb.
+                let mut cache = match (worktree_mode, workdir) {
+                    (true, Some(root)) => repo.diff_resource_cache(
+                        Mode::ToGit,
+                        WorktreeRoots { old_root: None, new_root: Some(root.to_owned()) },
+                    )?,
+                    _ => repo.diff_resource_cache_for_tree_diff()?,
+                };
+                let mut mine = Vec::new();
+                loop {
+                    let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(delta) = deltas.get(i) else { break };
+                    let an = analyze(
+                        &mut cache,
+                        &repo.objects,
+                        delta,
+                        ctx,
+                        ws,
+                        hash_kind,
+                        workdir,
+                        want_patch,
+                        algorithm,
+                    )?;
+                    mine.push((i, an));
+                }
+                Ok(mine)
+            }));
+        }
+        for h in handles {
+            match h.join() {
+                Ok(Ok(mine)) => done.extend(mine),
+                Ok(Err(e)) => {
+                    failure.get_or_insert(e);
+                }
+                Err(_) => {
+                    failure.get_or_insert_with(|| anyhow::anyhow!("diff worker panicked"));
+                }
+            }
+        }
+    });
+    if let Some(e) = failure {
+        return Err(e);
+    }
+
+    done.sort_by_key(|(i, _)| *i);
+    Ok(done.into_iter().map(|(_, a)| a).collect())
+}
 
 #[allow(clippy::too_many_arguments)]
 fn analyze(
@@ -1428,6 +1628,9 @@ fn analyze(
                     buf: Vec::new(),
                     before: &before,
                     after: &after,
+                    // No hunk has been emitted yet, so nothing bounds the first search.
+                    func_prev: -1,
+                    func_text: Vec::new(),
                 };
                 Some(
                     UnifiedDiff::new(&diff, &input, sink, ContextSize::symmetrical(ctx))
@@ -1481,6 +1684,9 @@ fn analyze_gitlink(
             buf: Vec::new(),
             before: &before_r,
             after: &after_r,
+            // No hunk has been emitted yet, so nothing bounds the first search.
+            func_prev: -1,
+            func_text: Vec::new(),
         };
         Some(UnifiedDiff::new(&diff, &input, sink, ContextSize::symmetrical(ctx)).consume()?)
     } else {
@@ -2791,17 +2997,91 @@ struct PatchSink<'a> {
     buf: Vec<u8>,
     before: &'a [&'a [u8]],
     after: &'a [&'a [u8]],
+    /// git's `funclineprev`: the line the previous hunk's search started from, and
+    /// the limit for the next one, so a heading is never scanned for twice.
+    func_prev: i64,
+    /// git's `func_line`, which lives across the whole file rather than one hunk.
+    /// A search that finds nothing leaves it alone, so a hunk deep inside a long
+    /// function keeps the heading found for the hunk above it — the search window
+    /// stops at the previous hunk precisely because that answer is still good.
+    func_text: Vec<u8>,
+}
+
+/// git's `def_ff` (xdiff/xemit.c): the default answer to "does this line begin a
+/// section?" when no `diff=<driver>` attribute supplies a `funcname` pattern.
+///
+/// A line qualifies when its first byte is an ASCII letter, `_`, or `$` — the
+/// column-zero convention that C, shell, Rust and most other languages follow for
+/// top-level definitions. The text is clipped to `sz` FIRST and only then stripped
+/// of trailing whitespace, which is the order git uses; doing it the other way
+/// around would keep a different byte count for a long line.
+fn def_ff(rec: &[u8], sz: usize) -> Option<&[u8]> {
+    let first = *rec.first()?;
+    if !(first.is_ascii_alphabetic() || first == b'_' || first == b'$') {
+        return None;
+    }
+    let mut len = rec.len().min(sz);
+    // C's `isspace` in the default locale, which includes the vertical tab that
+    // Rust's `is_ascii_whitespace` leaves out.
+    while len > 0 && matches!(rec[len - 1], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        len -= 1;
+    }
+    Some(&rec[..len])
+}
+
+/// The longest section heading git will keep: `struct func_line { char buf[80]; }`.
+const FUNC_LINE_MAX: usize = 80;
+/// git formats a hunk header into a 128-byte buffer and clips the heading to
+/// whatever is left in it, so a long line number range shortens the heading.
+const HUNK_HDR_MAX: usize = 128;
+
+impl PatchSink<'_> {
+    /// git's `get_func_line`: walk the pre-image from `start` toward `limit`
+    /// looking for a line that reads as a section heading. The direction follows
+    /// the endpoints — backward for the normal case where the previous hunk sits
+    /// above this one — and `limit` itself is never examined.
+    fn func_line(&self, start: i64, limit: i64) -> Option<&[u8]> {
+        let step: i64 = if start > limit { -1 } else { 1 };
+        let mut l = start;
+        while l != limit && l >= 0 && (l as usize) < self.before.len() {
+            if let Some(text) = def_ff(self.before[l as usize], FUNC_LINE_MAX) {
+                return Some(text);
+            }
+            l += step;
+        }
+        None
+    }
 }
 
 impl ConsumeHunk for PatchSink<'_> {
     type Out = Vec<u8>;
 
     fn consume_hunk(&mut self, header: HunkHeader, lines: &[(DiffLineKind, &[u8])]) -> std::io::Result<()> {
-        self.buf.extend_from_slice(b"@@ -");
-        self.buf.extend_from_slice(fmt_range(header.before_hunk_start, header.before_hunk_len).as_bytes());
-        self.buf.extend_from_slice(b" +");
-        self.buf.extend_from_slice(fmt_range(header.after_hunk_start, header.after_hunk_len).as_bytes());
-        self.buf.extend_from_slice(b" @@\n");
+        let mut hdr: Vec<u8> = Vec::with_capacity(HUNK_HDR_MAX);
+        hdr.extend_from_slice(b"@@ -");
+        hdr.extend_from_slice(fmt_range(header.before_hunk_start, header.before_hunk_len).as_bytes());
+        hdr.extend_from_slice(b" +");
+        hdr.extend_from_slice(fmt_range(header.after_hunk_start, header.after_hunk_len).as_bytes());
+        hdr.extend_from_slice(b" @@");
+
+        // The section heading: the nearest qualifying line at or above the hunk's
+        // first pre-image line, searched no further back than the previous hunk's
+        // own starting point. `before_hunk_start` is 1-based and git's `s1` is the
+        // 0-based index of that same line.
+        let s1 = header.before_hunk_start as i64 - 1;
+        if let Some(func) = self.func_line(s1 - 1, self.func_prev) {
+            self.func_text = func.to_vec();
+        }
+        self.func_prev = s1 - 1;
+        if !self.func_text.is_empty() {
+            // git clips the heading to what remains of its 128-byte header
+            // buffer, reserving one byte for the newline.
+            let room = HUNK_HDR_MAX.saturating_sub(hdr.len() + 2);
+            hdr.push(b' ');
+            hdr.extend_from_slice(&self.func_text[..self.func_text.len().min(room)]);
+        }
+        hdr.push(b'\n');
+        self.buf.extend_from_slice(&hdr);
 
         let mut bi = header.before_hunk_start.saturating_sub(1) as usize;
         let mut ai = header.after_hunk_start.saturating_sub(1) as usize;

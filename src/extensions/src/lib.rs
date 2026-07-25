@@ -26,6 +26,7 @@ pub mod pager;
 pub mod porcelain;
 pub mod revfilter;
 pub mod superset;
+pub mod threads;
 pub mod worktree;
 
 use std::process::ExitCode;

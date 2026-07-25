@@ -45,6 +45,9 @@ prodash = { version = "31.0.0", features = [
     "unit-human",
 ] }
 anyhow = "1"
+# Vectorized substring search for the `-S` pickaxe count (git uses a kwset for
+# the same reason). Already in the tree via gitoxide.
+memchr = "2"
 # POSIX-ERE value-pattern matching for `git config <name> <value> <value-pattern>`.
 # Foundational, vendorable crate; byte-oriented `regex::bytes` mirrors git's regexec.
 regex = "1"

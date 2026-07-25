@@ -863,14 +863,35 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             if !commit_filter.matches(&commit)? {
                 continue;
             }
-            // Pickaxe: diff against the first parent and test the change text.
-            if has_pickaxe {
-                let patch = super::diff::commit_patch(&repo, &commit, node.parents.first().copied(), 0)?;
-                if !pickaxe_hit(&patch, pickaxe_s.as_deref(), pickaxe_g_re.as_ref()) {
-                    continue;
-                }
-            }
             kept.push(node);
+        }
+        // Pickaxe: test each surviving commit's changes against `-S`/`-G`. Both
+        // scans run across the thread pool — the commits are independent, and git
+        // walks the same candidates one at a time on one core.
+        if has_pickaxe {
+            // A merge produces no diff without `-m`/`-c`/`--cc`, and the pickaxe
+            // tests a diff — so git never reports a merge for `-S`/`-G` no matter
+            // what its parents contain. Dropping them here also keeps the scan
+            // from reading blobs for the largest commits in the history.
+            kept.retain(|n| n.parents.len() < 2);
+            kept = match (&pickaxe_s, &pickaxe_g_re) {
+                // `-S` alone never needs patch text. git's `has_changes` counts
+                // the needle in each side's whole blob and keeps the file when the
+                // two counts differ, so the scan reads blobs and never diffs them.
+                (Some(needle), None) => pickaxe_by_count(&repo, kept, needle.as_bytes())?,
+                _ => {
+                    let jobs: Vec<(ObjectId, Option<ObjectId>)> =
+                        kept.iter().map(|n| (n.id, n.parents.first().copied())).collect();
+                    let patches = super::diff::commit_patches(&repo, &jobs, 0)?;
+                    kept.into_iter()
+                        .zip(patches)
+                        .filter(|(_, patch)| {
+                            pickaxe_hit(patch, pickaxe_s.as_deref(), pickaxe_g_re.as_ref())
+                        })
+                        .map(|(node, _)| node)
+                        .collect()
+                }
+            };
         }
         nodes = kept;
     }
@@ -942,7 +963,13 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         Pretty::User(f) => !want_names && !emit_patch && format_is_walk_only(f),
         _ => false,
     };
-    for node in &nodes {
+    // `-p` renders each commit's patch from an immutable tree pair, so the patch
+    // for a commit ten rows down the output does not depend on anything the rows
+    // above it do. The window computes a batch of them across the thread pool
+    // while the loop below stays a plain in-order stream — git computes them one
+    // at a time on one core.
+    let mut patches = PatchWindow::new(emit_patch, show_root);
+    for (ni, node) in nodes.iter().enumerate() {
         if walk_only {
             let Pretty::User(fmt) = &pretty else { unreachable!() };
             let mut block: Vec<u8> = Vec::new();
@@ -1054,12 +1081,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 // The full patch, rendered by the same pipeline as `git diff` so
                 // the two agree byte-for-byte. git separates a preceding count
                 // format from the patch with a blank line.
-                let p = super::diff::commit_patch(
-                    &repo,
-                    &commit,
-                    node.parents.first().copied(),
-                    3,
-                )?;
+                let p = patches.get(&repo, &nodes, ni, 3)?;
                 if !p.is_empty() {
                     if !diff.is_empty() {
                         diff.push(b'\n');
@@ -1231,6 +1253,76 @@ enum Order {
 }
 
 /// What the walk needs to know about a commit, read once up front.
+/// A look-ahead buffer of rendered `-p` patch bodies.
+///
+/// The output is a stream, but the work behind it is not sequential: a commit's
+/// patch is a pure function of its tree and its first parent's, both immutable.
+/// So instead of computing one patch, printing it, and leaving the rest of the
+/// machine idle — which is all git can do — the window computes the next
+/// `SPAN` commits' patches at once across the thread pool and hands them out in
+/// order. Memory stays bounded by the span rather than by the length of the
+/// history, so `log -p` over ten thousand commits still streams.
+///
+/// Commits the caller will not show a diff for (merges, and root commits under
+/// `log.showRoot=false`) get an empty slot rather than a wasted diff.
+struct PatchWindow {
+    active: bool,
+    show_root: bool,
+    /// Index of `slots[0]` within the caller's node list.
+    start: usize,
+    slots: Vec<Vec<u8>>,
+}
+
+impl PatchWindow {
+    /// Commits computed per refill. Large enough to keep every core busy on a
+    /// wide box, small enough that the buffered patches stay a few megabytes.
+    const SPAN: usize = 64;
+
+    fn new(active: bool, show_root: bool) -> Self {
+        PatchWindow { active, show_root, start: 0, slots: Vec::new() }
+    }
+
+    /// `true` when git renders a diff for this commit at all: merges are shown
+    /// only with `-m`/`-c`/`--cc`, and a root commit's diff obeys `log.showRoot`.
+    fn diffable(&self, node: &Node) -> bool {
+        node.parents.len() < 2 && (self.show_root || !node.parents.is_empty())
+    }
+
+    /// The patch body for `nodes[i]`, refilling the window when `i` runs past it.
+    fn get<'a>(
+        &'a mut self,
+        repo: &gix::Repository,
+        nodes: &[Node],
+        i: usize,
+        ctx: u32,
+    ) -> Result<&'a [u8]> {
+        if !self.active {
+            return Ok(&[]);
+        }
+        if i < self.start || i >= self.start + self.slots.len() {
+            let end = (i + Self::SPAN).min(nodes.len());
+            let span = &nodes[i..end];
+            // Only diffable commits become jobs; `at[k]` is the slot that job
+            // `k`'s result belongs in, so the batch carries no wasted diffs.
+            let mut jobs: Vec<(ObjectId, Option<ObjectId>)> = Vec::with_capacity(span.len());
+            let mut at: Vec<usize> = Vec::with_capacity(span.len());
+            for (k, n) in span.iter().enumerate() {
+                if self.diffable(n) {
+                    jobs.push((n.id, n.parents.first().copied()));
+                    at.push(k);
+                }
+            }
+            let computed = super::diff::commit_patches(repo, &jobs, ctx)?;
+            self.slots = vec![Vec::new(); span.len()];
+            for (slot, patch) in at.into_iter().zip(computed) {
+                self.slots[slot] = patch;
+            }
+            self.start = i;
+        }
+        Ok(&self.slots[i - self.start])
+    }
+}
+
 struct Node {
     id: ObjectId,
     parents: Vec<ObjectId>,
@@ -2174,6 +2266,167 @@ fn now_secs() -> i64 {
     crate::date::now_seconds()
 }
 
+/// `-S<string>` over a set of commits, keeping those whose first-parent diff
+/// changes the number of occurrences of `needle`.
+///
+/// This is git's `has_changes` (diffcore-pickaxe.c): for each changed path,
+/// count the needle in the whole old blob and the whole new blob, and keep the
+/// commit as soon as one pair's counts differ. No patch is built and no line
+/// diff is run — the needle's position is irrelevant, only how many times it
+/// appears, and a blob whose id is unchanged cannot change its own count.
+///
+/// The commits are independent, so the scan runs across the thread pool. Each
+/// worker owns a repository handle, which is not `Sync`.
+fn pickaxe_by_count(repo: &gix::Repository, nodes: Vec<Node>, needle: &[u8]) -> Result<Vec<Node>> {
+    if needle.is_empty() || nodes.is_empty() {
+        return Ok(nodes);
+    }
+    // Two commits per worker: a single commit's scan can read many blobs, so
+    // there is real work in each unit.
+    let workers = crate::threads::count(nodes.len(), 2);
+    if workers <= 1 {
+        let mut kept = Vec::new();
+        for node in nodes {
+            if commit_changes_count(repo, &node, needle)? {
+                kept.push(node);
+            }
+        }
+        return Ok(kept);
+    }
+
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let mut hits: Vec<usize> = Vec::new();
+    let mut failure: Option<anyhow::Error> = None;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        let nodes = &nodes;
+        for _ in 0..workers {
+            let proto = repo.clone();
+            let cursor = &cursor;
+            handles.push(scope.spawn(move || -> Result<Vec<usize>> {
+                let repo = proto;
+                let mut mine = Vec::new();
+                loop {
+                    let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(node) = nodes.get(i) else { break };
+                    if commit_changes_count(&repo, node, needle)? {
+                        mine.push(i);
+                    }
+                }
+                Ok(mine)
+            }));
+        }
+        for h in handles {
+            match h.join() {
+                Ok(Ok(mine)) => hits.extend(mine),
+                Ok(Err(e)) => {
+                    failure.get_or_insert(e);
+                }
+                Err(_) => {
+                    failure.get_or_insert_with(|| anyhow::anyhow!("pickaxe worker panicked"));
+                }
+            }
+        }
+    });
+    if let Some(e) = failure {
+        return Err(e);
+    }
+
+    hits.sort_unstable();
+    let mut keep = vec![false; nodes.len()];
+    for i in hits {
+        keep[i] = true;
+    }
+    Ok(nodes.into_iter().zip(keep).filter(|(_, k)| *k).map(|(n, _)| n).collect())
+}
+
+/// `true` when this commit's first-parent diff changes how many times `needle`
+/// occurs in any one file.
+fn commit_changes_count(repo: &gix::Repository, node: &Node, needle: &[u8]) -> Result<bool> {
+    let new_tree = repo.find_object(node.id)?.try_into_commit()?.tree()?;
+    let old_tree = match node.parents.first() {
+        Some(pid) => Some(repo.find_object(*pid)?.try_into_commit()?.tree()?),
+        None => None,
+    };
+    // Counting a blob means reading it, so the count is memoized per blob id
+    // within the commit: a file that appears on both sides of several changes
+    // (or a tree that reuses a blob) is read once.
+    let mut counted: std::collections::HashMap<ObjectId, i64> = std::collections::HashMap::new();
+    let mut count_of = |repo: &gix::Repository, id: Option<ObjectId>| -> Result<i64> {
+        let Some(id) = id else { return Ok(0) };
+        if let Some(n) = counted.get(&id) {
+            return Ok(*n);
+        }
+        // A gitlink or a missing object counts as absent, exactly as git's
+        // pickaxe treats a side it cannot read as an empty buffer.
+        let n = match repo.find_object(id) {
+            Ok(obj) if obj.kind == gix::object::Kind::Blob => {
+                count_occurrences(&obj.data, needle)
+            }
+            _ => 0,
+        };
+        counted.insert(id, n);
+        Ok(n)
+    };
+
+    // Two passes, because rename detection is expensive and almost never
+    // changes the answer.
+    //
+    // git runs diffcore's rename pass BEFORE the pickaxe, so content moved from
+    // one path to another arrives as a single pair whose two sides hold the
+    // needle the same number of times — no change, no match. Pairing can only
+    // ever CANCEL a difference, never create one: an unpaired deletion and
+    // addition compare against nothing, and joining them can only bring the two
+    // counts closer. So a first pass with no rename tracking is a strict
+    // over-approximation, and only a commit it flags needs the second, exact
+    // pass. Most commits are not flagged, and the history's renames are paid for
+    // only where they might matter.
+    if !any_count_changed(repo, old_tree.as_ref(), &new_tree, &mut count_of, false)? {
+        return Ok(false);
+    }
+    any_count_changed(repo, old_tree.as_ref(), &new_tree, &mut count_of, true)
+}
+
+/// Whether any changed pair between the two trees holds the needle a different
+/// number of times, with git's rename tracking (50% similarity, no copies)
+/// either on or off.
+fn any_count_changed(
+    repo: &gix::Repository,
+    old_tree: Option<&gix::Tree<'_>>,
+    new_tree: &gix::Tree<'_>,
+    count_of: &mut impl FnMut(&gix::Repository, Option<ObjectId>) -> Result<i64>,
+    rename_tracking: bool,
+) -> Result<bool> {
+    let mut options = gix::diff::Options::default();
+    if rename_tracking {
+        options.track_rewrites(Some(Default::default()));
+    }
+    let changes = repo.diff_tree_to_tree(old_tree, Some(new_tree), Some(options))?;
+    for change in changes {
+        let (old_id, new_id) = change_blob_ids(&change);
+        // An unchanged blob id on both sides cannot change its own count.
+        if old_id == new_id {
+            continue;
+        }
+        if count_of(repo, old_id)? != count_of(repo, new_id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The old and new blob ids of a tree change, or `None` for a side that does not
+/// exist (an addition has no old side, a deletion no new one).
+fn change_blob_ids(change: &gix::object::tree::diff::ChangeDetached) -> (Option<ObjectId>, Option<ObjectId>) {
+    use gix::object::tree::diff::ChangeDetached as C;
+    match change {
+        C::Addition { id, .. } => (None, Some(*id)),
+        C::Deletion { id, .. } => (Some(*id), None),
+        C::Modification { previous_id, id, .. } => (Some(*previous_id), Some(*id)),
+        C::Rewrite { source_id, id, .. } => (Some(*source_id), Some(*id)),
+    }
+}
+
 /// Whether a commit's patch satisfies the pickaxe filter, scanning only the
 /// added/removed content lines (git's `-S`/`-G` operate on the change text).
 ///
@@ -2214,17 +2467,17 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> i64 {
     if needle.is_empty() || needle.len() > hay.len() {
         return 0;
     }
-    let mut n = 0i64;
-    let mut i = 0;
-    while i + needle.len() <= hay.len() {
-        if &hay[i..i + needle.len()] == needle {
-            n += 1;
-            i += needle.len();
+    // Non-overlapping, like git's kwset walk: a match advances past the whole
+    // needle. The substring search is vectorized (git uses the same idea through
+    // its kwset); a byte-at-a-time loop reads a multi-megabyte blob far slower.
+    memchr::memmem::find_iter(hay, needle).fold((0i64, 0usize), |(n, next), at| {
+        if at >= next {
+            (n + 1, at + needle.len())
         } else {
-            i += 1;
+            (n, next)
         }
-    }
-    n
+    })
+    .0
 }
 
 /// git's approxidate for `--since`/`--until`: parse an absolute or relative date

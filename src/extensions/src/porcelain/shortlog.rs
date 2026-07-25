@@ -815,30 +815,12 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             .skip(filters.skip)
             .take(filters.max_count.unwrap_or(usize::MAX));
 
-        for id in selected {
-            let commit = repo.find_commit(id)?;
-            let idents = group_keys(repo, &commit, &mailmap, &opts)?;
-
-            // git computes the record text once and substitutes `<none>` when
-            // it comes out empty.
-            let oneline = if opts.summary {
-                BString::default()
-            } else {
-                let text = match &opts.user_format {
-                    Some(fmt) => {
-                        expand_format(repo, &commit, &mailmap, fmt, opts.date_format.as_deref())?
-                    }
-                    None => {
-                        let message = commit.message()?;
-                        message.summary().into_owned()
-                    }
-                };
-                if text.is_empty() {
-                    BString::from("<none>")
-                } else {
-                    text
-                }
-            };
+        let selected: Vec<ObjectId> = selected.collect();
+        // Reading each commit, applying the mailmap and expanding its record are
+        // per-commit work with no shared state, so they run across the thread
+        // pool; only the tally itself is sequential, and it must stay in walk
+        // order because that is the order records appear under each author.
+        for (idents, oneline) in commit_records(repo, &selected, &mailmap, &opts)? {
             for ident in idents {
                 insert_one_record(&mut groups, &opts, ident, oneline.as_bstr());
             }
@@ -1245,6 +1227,92 @@ fn message_matches(commit: &gix::Commit<'_>, filters: &Filters) -> Result<bool> 
 /// dedups identical strings — so a commit whose author equals its committer is
 /// counted once under both `--group=author --group=committer`. A trailer field
 /// can contribute zero keys (no such trailer) or several (repeated trailers).
+/// The group keys and record text for each commit, in the given order.
+///
+/// One commit's record does not depend on any other's, so the batch runs across
+/// the thread pool with each worker owning a repository handle (not `Sync`). The
+/// caller's order is preserved because a group's records are printed in walk
+/// order.
+fn commit_records(
+    repo: &gix::Repository,
+    ids: &[ObjectId],
+    mailmap: &gix::mailmap::Snapshot,
+    opts: &Opts,
+) -> Result<Vec<(Vec<BString>, BString)>> {
+    // Sixteen commits per worker: one record is a single object read plus a
+    // format expansion, so the batch has to be sizeable to repay a thread.
+    let workers = crate::threads::count(ids.len(), 16);
+    if workers <= 1 {
+        return ids.iter().map(|id| one_record(repo, *id, mailmap, opts)).collect();
+    }
+
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let mut done: Vec<(usize, (Vec<BString>, BString))> = Vec::with_capacity(ids.len());
+    let mut failure: Option<anyhow::Error> = None;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let proto = repo.clone();
+            let cursor = &cursor;
+            handles.push(scope.spawn(move || -> Result<Vec<(usize, (Vec<BString>, BString))>> {
+                let repo = proto;
+                let mut mine = Vec::new();
+                loop {
+                    let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(id) = ids.get(i) else { break };
+                    mine.push((i, one_record(&repo, *id, mailmap, opts)?));
+                }
+                Ok(mine)
+            }));
+        }
+        for h in handles {
+            match h.join() {
+                Ok(Ok(mine)) => done.extend(mine),
+                Ok(Err(e)) => {
+                    failure.get_or_insert(e);
+                }
+                Err(_) => {
+                    failure.get_or_insert_with(|| anyhow::anyhow!("shortlog worker panicked"));
+                }
+            }
+        }
+    });
+    if let Some(e) = failure {
+        return Err(e);
+    }
+
+    done.sort_by_key(|(i, _)| *i);
+    Ok(done.into_iter().map(|(_, rec)| rec).collect())
+}
+
+/// One commit's group keys and its record text.
+fn one_record(
+    repo: &gix::Repository,
+    id: ObjectId,
+    mailmap: &gix::mailmap::Snapshot,
+    opts: &Opts,
+) -> Result<(Vec<BString>, BString)> {
+    let commit = repo.find_commit(id)?;
+    let idents = group_keys(repo, &commit, mailmap, opts)?;
+
+    // git computes the record text once and substitutes `<none>` when it comes
+    // out empty.
+    let oneline = if opts.summary {
+        BString::default()
+    } else {
+        let text = match &opts.user_format {
+            Some(fmt) => expand_format(repo, &commit, mailmap, fmt, opts.date_format.as_deref())?,
+            None => commit.message()?.summary().into_owned(),
+        };
+        if text.is_empty() {
+            BString::from("<none>")
+        } else {
+            text
+        }
+    };
+    Ok((idents, oneline))
+}
+
 fn group_keys(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,

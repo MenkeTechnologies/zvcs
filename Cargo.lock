@@ -4039,6 +4039,7 @@ dependencies = [
  "gix",
  "ignore",
  "libc",
+ "memchr",
  "notify",
  "prodash",
  "ratatui",

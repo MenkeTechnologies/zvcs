@@ -161,33 +161,11 @@ CREATE TABLE IF NOT EXISTS ppids (
 -- push, add, merge, …) a durable process has run. Keyed by the same session as
 -- `ppids` (join on it for the process's pid/cmd/cwd), one row per (session, verb).
 -- Only mutating verbs are recorded, so the read hot path never writes here.
-CREATE TABLE IF NOT EXISTS treediff (
-    old_tree TEXT NOT NULL,
-    new_tree TEXT NOT NULL,
-    counts   INTEGER NOT NULL,
-    files    TEXT NOT NULL,
-    PRIMARY KEY (old_tree, new_tree, counts)
-) WITHOUT ROWID;
-
-CREATE TABLE IF NOT EXISTS blame (
-    -- `commit` is a SQLite keyword: naming the column that made the whole SCHEMA
-    -- batch fail to parse, which silently disabled every ledger write, not just
-    -- this table.
-    commit_oid TEXT NOT NULL,
-    path   TEXT NOT NULL,
-    algo   TEXT NOT NULL,
-    blob   TEXT NOT NULL,
-    runs   TEXT NOT NULL,
-    PRIMARY KEY (commit_oid, path, algo)
-) WITHOUT ROWID;
-
-CREATE TABLE IF NOT EXISTS abbrev (
-    oid     TEXT NOT NULL,
-    hex_len INTEGER NOT NULL,
-    short   TEXT NOT NULL,
-    PRIMARY KEY (oid, hex_len)
-) WITHOUT ROWID;
-
+--
+-- The tree-diff, blame and abbreviation caches used to sit here too. They are
+-- derived answers over immutable objects — no concurrent mutation, no triggers,
+-- nothing to query — so they moved to the zero-copy images in `crate::rcache`,
+-- and `migrate` drops the tables after importing what they held.
 CREATE TABLE IF NOT EXISTS proc_verbs (
     session    TEXT NOT NULL,
     verb       TEXT NOT NULL,
@@ -227,234 +205,6 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
-/// The cached file-change list between two trees.
-///
-/// A tree-to-tree diff is a pure function of two immutable trees, so like the
-/// blame cache this never expires and is shared by every clone holding them.
-/// `counts` is part of the key because the added/deleted line tallies require
-/// reading each blob — a caller that does not need them stores a cheaper row.
-pub fn treediff_load(
-    conn: &Connection,
-    old_tree: &str,
-    new_tree: &str,
-    counts: bool,
-) -> Option<String> {
-    conn.query_row(
-        "SELECT files FROM treediff WHERE old_tree = ?1 AND new_tree = ?2 AND counts = ?3",
-        rusqlite::params![old_tree, new_tree, i64::from(counts)],
-        |r| r.get(0),
-    )
-    .optional()
-    .ok()
-    .flatten()
-}
-
-pub fn treediff_store(
-    conn: &Connection,
-    old_tree: &str,
-    new_tree: &str,
-    counts: bool,
-    files: &str,
-) -> Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO treediff (old_tree, new_tree, counts, files) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![old_tree, new_tree, i64::from(counts), files],
-    )?;
-    Ok(())
-}
-/// The cached blame of one path at one commit: the blob that was blamed and a
-/// run-length encoding of the attribution.
-///
-/// Blaming `(commit, path)` is deterministic over immutable objects, so the
-/// answer never expires — and because commits are content addresses, an entry is
-/// valid in every clone that holds them. `algo` is part of the key because the
-/// diff algorithm changes the attribution.
-pub fn blame_load(
-    conn: &Connection,
-    commit: &str,
-    path: &str,
-    algo: &str,
-) -> Option<(String, String)> {
-    conn.query_row(
-        "SELECT blob, runs FROM blame WHERE commit_oid = ?1 AND path = ?2 AND algo = ?3",
-        rusqlite::params![commit, path, algo],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
-    .optional()
-    .ok()
-    .flatten()
-}
-
-pub fn blame_store(
-    conn: &Connection,
-    commit: &str,
-    path: &str,
-    algo: &str,
-    blob: &str,
-    runs: &str,
-) -> Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO blame (commit_oid, path, algo, blob, runs) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![commit, path, algo, blob, runs],
-    )?;
-    Ok(())
-}
-// ---------------------------------------------------------------------------
-// off-thread cache writes
-// ---------------------------------------------------------------------------
-
-/// A row a read-only verb computed and wants remembered.
-///
-/// Filling a cache must never be something the user waits for. The value is
-/// already in hand — the command can print it and go — so the write belongs off
-/// the critical path entirely.
-pub enum CacheWrite {
-    /// A tree pair's change list, with or without the per-file line counts.
-    TreeDiff { old_tree: String, new_tree: String, counts: bool, files: String },
-    /// Abbreviations computed at one `core.abbrev` length.
-    Abbrev { hex_len: usize, rows: Vec<(String, String)> },
-    /// One `(commit, path)` blame, run-length encoded.
-    Blame { commit: String, path: String, algo: String, blob: String, runs: String },
-}
-
-/// The writer thread and the channel feeding it, started on first use.
-static WRITER: std::sync::Mutex<
-    Option<(std::sync::mpsc::Sender<CacheWrite>, std::thread::JoinHandle<()>)>,
-> = std::sync::Mutex::new(None);
-
-/// Queue a cache row and return immediately.
-///
-/// Every caller here is a read-only verb whose answer is already computed, so
-/// the write is pure bookkeeping. Doing it inline cost a fresh connection, a
-/// schema check and a transaction PER ROW — which made the first (cold) run of
-/// `log --stat` measurably slower than plain git, exactly the run where the user
-/// has the least patience for it. Now the rows go to a single writer thread that
-/// batches them into one transaction, and [`cache_flush`] waits for it once, at
-/// the very end of the command, after the output is already on its way.
-pub fn cache_write(job: CacheWrite) {
-    let mut guard = match WRITER.lock() {
-        Ok(g) => g,
-        // A poisoned lock means a previous writer panicked; losing cache rows is
-        // not worth failing a user's command over.
-        Err(_) => return,
-    };
-    if guard.is_none() {
-        let (tx, rx) = std::sync::mpsc::channel::<CacheWrite>();
-        let handle = std::thread::spawn(move || writer_loop(rx));
-        *guard = Some((tx, handle));
-    }
-    if let Some((tx, _)) = guard.as_ref() {
-        let _ = tx.send(job);
-    }
-}
-
-/// Wait for queued cache rows to land. Call once, as late as possible.
-///
-/// A detached thread does not outlive the process, so the queue does have to be
-/// drained before exit — but by then the command has done all of its real work,
-/// so what is waited on is only whatever the writer has not already absorbed
-/// while the command was running.
-pub fn cache_flush() {
-    let taken = match WRITER.lock() {
-        Ok(mut g) => g.take(),
-        Err(_) => return,
-    };
-    if let Some((tx, handle)) = taken {
-        // Dropping the sender ends the writer's loop once the queue is empty.
-        drop(tx);
-        let _ = handle.join();
-    }
-}
-
-/// Drain the queue into batched transactions until the sender is dropped.
-fn writer_loop(rx: std::sync::mpsc::Receiver<CacheWrite>) {
-    let mut conn = match open_rw() {
-        Ok(conn) => conn,
-        // No ledger (read-only home, missing directory): the caches are an
-        // optimization, so a command that cannot record them still works.
-        Err(_) => {
-            while rx.recv().is_ok() {}
-            return;
-        }
-    };
-    // Batch cap: bounds how much a single transaction holds when a long walk
-    // produces rows faster than they can be committed.
-    const BATCH: usize = 512;
-    while let Ok(first) = rx.recv() {
-        let mut batch = vec![first];
-        while batch.len() < BATCH {
-            match rx.try_recv() {
-                Ok(job) => batch.push(job),
-                Err(_) => break,
-            }
-        }
-        let Ok(tx) = conn.transaction() else { continue };
-        for job in batch {
-            let _ = match job {
-                CacheWrite::TreeDiff { old_tree, new_tree, counts, files } => {
-                    treediff_store(&tx, &old_tree, &new_tree, counts, &files)
-                }
-                CacheWrite::Abbrev { hex_len, rows } => abbrev_store_tx(&tx, hex_len, &rows),
-                CacheWrite::Blame { commit, path, algo, blob, runs } => {
-                    blame_store(&tx, &commit, &path, &algo, &blob, &runs)
-                }
-            };
-        }
-        let _ = tx.commit();
-    }
-}
-
-/// A thread's cached read-only connection, or `None` if the ledger cannot be
-/// read from this thread.
-///
-/// Opening a connection per lookup is the read-side twin of the write-side bug:
-/// a walk that consults the cache once per commit paid an open, a pragma and a
-/// file-handle for each one.
-pub fn with_ro<T>(f: impl FnOnce(&Connection) -> T) -> Option<T> {
-    thread_local! {
-        static RO: std::cell::RefCell<Option<Option<Connection>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-    RO.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        // `None` = not tried yet; `Some(None)` = tried and unavailable, which is
-        // remembered so a missing ledger is not re-opened once per lookup.
-        let conn = slot.get_or_insert_with(|| open_ro().ok());
-        conn.as_ref().map(f)
-    })
-}
-
-/// Load every cached abbreviation computed at `hex_len`.
-///
-/// Object ids are content addresses, so an abbreviation is valid for any repo
-/// that holds the object — the cache is machine-wide and shared across clones.
-/// `hex_len` is part of the key because the correct abbreviation grows with the
-/// repository: an entry computed when 7 hex digits were unique must not be
-/// served once the repo needs 8.
-pub fn abbrev_load(conn: &Connection, hex_len: usize) -> Result<HashMap<String, String>> {
-    let mut stmt = conn.prepare("SELECT oid, short FROM abbrev WHERE hex_len = ?1")?;
-    let rows = stmt.query_map([hex_len as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
-}
-
-/// Record abbreviations computed this run, in one transaction.
-pub fn abbrev_store(conn: &mut Connection, hex_len: usize, pairs: &[(String, String)]) -> Result<()> {
-    let tx = conn.transaction()?;
-    abbrev_store_tx(&tx, hex_len, pairs)?;
-    tx.commit()?;
-    Ok(())
-}
-
-/// The abbreviation rows themselves, inside a transaction the caller owns — the
-/// writer thread batches several kinds of row into one commit.
-fn abbrev_store_tx(conn: &Connection, hex_len: usize, pairs: &[(String, String)]) -> Result<()> {
-    let mut stmt =
-        conn.prepare("INSERT OR IGNORE INTO abbrev (oid, hex_len, short) VALUES (?1, ?2, ?3)")?;
-    for (oid, short) in pairs {
-        stmt.execute(rusqlite::params![oid, hex_len as i64, short])?;
-    }
-    Ok(())
-}
 /// Open the read-write connection (daemon side): WAL, busy-timeout, schema.
 pub fn open_rw() -> Result<Connection> {
     let conn = Connection::open(db_path()).context("open db (rw)")?;
@@ -462,6 +212,12 @@ pub fn open_rw() -> Result<Connection> {
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.execute_batch(SCHEMA)?;
     migrate(&conn);
+    // Deliberately not gated on the schema version. During an upgrade an older
+    // binary still running (a daemon, another shell) recreates these tables from
+    // its own `SCHEMA` and writes to them, so a once-per-db import would strand
+    // whatever landed after it ran. Draining on every read-write open costs three
+    // prepares that fail immediately once the tables are gone for good.
+    export_caches_to_rcache(&conn);
     Ok(conn)
 }
 
@@ -499,6 +255,100 @@ fn migrate(conn: &Connection) {
     if conn.execute_batch(EV_COMMIT_SQL).is_ok() {
         let _ = conn.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), []);
     }
+}
+
+/// Move whatever the ledger's cache tables still hold into [`crate::rcache`] and
+/// drop them.
+///
+/// These rows cost real work to produce — a tree diff reads a blob per changed
+/// file — so the move folds them into the new images rather than throwing them
+/// away and making the next walk recompute everything. Tables that are already
+/// gone yield no rows and drop silently, which is the steady state.
+///
+/// The tables are dropped only after the import returns, so a crash in between
+/// leaves them to be drained again rather than losing the rows.
+fn export_caches_to_rcache(conn: &Connection) {
+    let jobs = collect_cache_rows(conn);
+    if !jobs.is_empty() {
+        crate::rcache::import(jobs);
+    }
+    for table in ["treediff", "blame", "abbrev"] {
+        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {table}"), []);
+    }
+}
+
+/// Read the cache tables into the writes that reproduce them, or an empty vec if
+/// the tables are already gone.
+///
+/// Split from the import so the part that can be wrong — the SQL, the hex decode
+/// and the grouping by hex length — is testable without a cache directory.
+fn collect_cache_rows(conn: &Connection) -> Vec<crate::rcache::CacheWrite> {
+    let mut jobs: Vec<crate::rcache::CacheWrite> = Vec::new();
+
+    if let Ok(mut stmt) = conn.prepare("SELECT old_tree, new_tree, counts, files FROM treediff") {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok(crate::rcache::CacheWrite::TreeDiff {
+                old_tree: r.get(0)?,
+                new_tree: r.get(1)?,
+                counts: r.get::<_, i64>(2)? != 0,
+                files: r.get(3)?,
+            })
+        }) {
+            jobs.extend(rows.filter_map(|r| r.ok()));
+        }
+    }
+
+    if let Ok(mut stmt) = conn.prepare("SELECT commit_oid, path, algo, blob, runs FROM blame") {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok(crate::rcache::CacheWrite::Blame {
+                commit: r.get(0)?,
+                path: r.get(1)?,
+                algo: r.get(2)?,
+                blob: r.get(3)?,
+                runs: r.get(4)?,
+            })
+        }) {
+            jobs.extend(rows.filter_map(|r| r.ok()));
+        }
+    }
+
+    // The ledger stored ids as hex text; the image keys them by their raw bytes,
+    // so `log` can look one up without formatting a string per commit. A row that
+    // is not parseable hex came from a different hash format and is dropped.
+    if let Ok(mut stmt) = conn.prepare("SELECT hex_len, oid, short FROM abbrev") {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        }) {
+            let mut by_len: HashMap<usize, Vec<(Vec<u8>, String)>> = HashMap::new();
+            for (hex_len, oid, short) in rows.filter_map(|r| r.ok()) {
+                let Ok(hex_len) = usize::try_from(hex_len) else { continue };
+                let Some(raw) = unhex(&oid) else { continue };
+                by_len.entry(hex_len).or_default().push((raw, short));
+            }
+            jobs.extend(
+                by_len
+                    .into_iter()
+                    .map(|(hex_len, rows)| crate::rcache::CacheWrite::Abbrev { hex_len, rows }),
+            );
+        }
+    }
+
+    jobs
+}
+
+/// Decode a lowercase-or-uppercase hex string into bytes, or `None` if it is not
+/// an even-length run of hex digits.
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    text.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let nibble = |b: u8| (b as char).to_digit(16).map(|v| v as u8);
+            Some((nibble(pair[0])? << 4) | nibble(pair[1])?)
+        })
+        .collect()
 }
 
 /// Whether the repo at `root` has changed since its last scan — by the root
@@ -1777,5 +1627,128 @@ mod snapshot_atomic_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod cache_migration_tests {
+    use super::{collect_cache_rows, export_caches_to_rcache, unhex};
+    use crate::rcache::CacheWrite;
+    use rusqlite::Connection;
+
+    /// The cache tables as they stood before the caches moved to `rcache`. A db
+    /// created since then never has them, so the migration has to build them here
+    /// to have anything to migrate.
+    const OLD_CACHE_SCHEMA: &str = "
+    CREATE TABLE treediff (old_tree TEXT NOT NULL, new_tree TEXT NOT NULL,
+                           counts INTEGER NOT NULL, files TEXT NOT NULL,
+                           PRIMARY KEY (old_tree, new_tree, counts)) WITHOUT ROWID;
+    CREATE TABLE blame (commit_oid TEXT NOT NULL, path TEXT NOT NULL, algo TEXT NOT NULL,
+                        blob TEXT NOT NULL, runs TEXT NOT NULL,
+                        PRIMARY KEY (commit_oid, path, algo)) WITHOUT ROWID;
+    CREATE TABLE abbrev (oid TEXT NOT NULL, hex_len INTEGER NOT NULL, short TEXT NOT NULL,
+                         PRIMARY KEY (oid, hex_len)) WITHOUT ROWID;
+    ";
+
+    fn old_db(name: &str) -> Connection {
+        let dir = std::env::temp_dir().join(format!("zvcs-cachemig-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("t.sqlite")).unwrap();
+        conn.execute_batch(OLD_CACHE_SCHEMA).unwrap();
+        conn
+    }
+
+    #[test]
+    fn every_cached_row_survives_the_move_off_sqlite() {
+        // These rows cost blob reads and history walks to produce, so an upgrade
+        // has to carry them over rather than make the next walk recompute them.
+        let conn = old_db("rows");
+        conn.execute(
+            "INSERT INTO treediff (old_tree, new_tree, counts, files) VALUES ('aa', 'bb', 1, 'M,1,2,0,3,4,x.rs')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blame (commit_oid, path, algo, blob, runs) VALUES ('cc', 'src/a.rs', 'Histogram|w=false', 'dd', 'r1\nr2')",
+            [],
+        )
+        .unwrap();
+        // Two hex lengths, plus a row whose id is not hex at all.
+        conn.execute("INSERT INTO abbrev (oid, hex_len, short) VALUES ('aabb', 7, 'aab')", []).unwrap();
+        conn.execute("INSERT INTO abbrev (oid, hex_len, short) VALUES ('ccdd', 8, 'ccdd')", []).unwrap();
+        conn.execute("INSERT INTO abbrev (oid, hex_len, short) VALUES ('zzzz', 7, 'zzz')", []).unwrap();
+
+        let jobs = collect_cache_rows(&conn);
+
+        let mut treediffs = 0;
+        let mut blames = 0;
+        let mut abbrevs: Vec<(usize, usize)> = Vec::new(); // (hex_len, row count)
+        for job in &jobs {
+            match job {
+                CacheWrite::TreeDiff { old_tree, new_tree, counts, files } => {
+                    assert_eq!((old_tree.as_str(), new_tree.as_str(), *counts), ("aa", "bb", true));
+                    assert_eq!(files, "M,1,2,0,3,4,x.rs");
+                    treediffs += 1;
+                }
+                CacheWrite::Blame { commit, path, algo, blob, runs } => {
+                    assert_eq!(commit, "cc");
+                    assert_eq!(path, "src/a.rs");
+                    assert_eq!(algo, "Histogram|w=false");
+                    assert_eq!(blob, "dd");
+                    assert_eq!(runs, "r1\nr2");
+                    blames += 1;
+                }
+                CacheWrite::Abbrev { hex_len, rows } => {
+                    // The id must arrive as raw bytes: the image keys it that way
+                    // so `log` never formats a string to look one up.
+                    for (oid, _) in rows {
+                        assert_eq!(oid.len(), 2, "hex must be decoded, not carried as text");
+                    }
+                    abbrevs.push((*hex_len, rows.len()));
+                }
+            }
+        }
+        assert_eq!(treediffs, 1);
+        assert_eq!(blames, 1);
+        abbrevs.sort_unstable();
+        assert_eq!(abbrevs, vec![(7, 1), (8, 1)], "one row per length, the non-hex row dropped");
+    }
+
+    #[test]
+    fn the_tables_are_gone_once_they_have_been_read() {
+        // Empty tables import nothing, so this exercises the drop on its own.
+        let conn = old_db("drop");
+        export_caches_to_rcache(&conn);
+        for table in ["treediff", "blame", "abbrev"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} must be dropped after the migration");
+        }
+    }
+
+    #[test]
+    fn a_db_without_the_old_tables_migrates_to_nothing() {
+        // Every `open_rw` on a fresh db runs this path once; it must not error or
+        // invent rows when there is nothing to carry over.
+        let dir = std::env::temp_dir().join(format!("zvcs-cachemig-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("t.sqlite")).unwrap();
+        assert!(collect_cache_rows(&conn).is_empty());
+        export_caches_to_rcache(&conn);
+    }
+
+    #[test]
+    fn unhex_rejects_what_is_not_an_object_id() {
+        assert_eq!(unhex("00ff"), Some(vec![0x00, 0xff]));
+        assert_eq!(unhex("AABB"), Some(vec![0xaa, 0xbb]));
+        assert_eq!(unhex("abc"), None, "odd length is not a byte string");
+        assert_eq!(unhex("zz"), None, "non-hex digits are not an object id");
     }
 }

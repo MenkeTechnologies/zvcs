@@ -230,11 +230,11 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         .ok()
         .map(|id| id.detach());
     let cached = cache_key.as_ref().zip(blamed_blob).and_then(|((c, p, a), blob)| {
-        let (blob_hex, runs) = crate::db::with_ro(|conn| crate::db::blame_load(conn, c, p, a)).flatten()?;
+        let (blob_hex, runs) = crate::rcache::blame_load(c, p, a)?;
         if blob_hex != blob.to_string() {
             return None; // the path holds different content at this commit
         }
-        lines_from_cache(&repo, blob, &runs)
+        lines_from_cache(&repo, blob, runs)
     });
 
     // `(lines, blob content)` — the overlay path needs the blamed blob's bytes,
@@ -249,7 +249,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
             if let (Some((c, p, a)), Some(blob)) = (&cache_key, blamed_blob) {
                 // Queued, not written here: the blame is already computed and
                 // about to be printed.
-                crate::db::cache_write(crate::db::CacheWrite::Blame {
+                crate::rcache::cache_write(crate::rcache::CacheWrite::Blame {
                     commit: c.clone(),
                     path: p.clone(),
                     algo: a.clone(),

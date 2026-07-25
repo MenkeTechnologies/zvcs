@@ -317,6 +317,10 @@ writer**; clients ship records over the socket. Client *read* verbs
 (`zjobs`/`zjob`/`zrepos`) open the db read-only (WAL concurrent read) and work
 even when the daemon is down.
 
+The ledger holds *mutable, coordinated* state only — jobs, events, claims,
+messages, repo status. The derived-answer caches are **not** here; they are
+zero-copy rkyv images under `~/.zvcs/cache/` (§6a).
+
 ```
 repos(
   id INTEGER PK, git_dir TEXT UNIQUE, workdir TEXT,
@@ -344,6 +348,50 @@ jobs(
   forces a rescan.
 - **`jobs`** is the ledger of every async job (§7) and the record behind
   notify-on-next-command (§5.4).
+
+## 6a. Derived-answer caches (`~/.zvcs/cache/`, `rcache.rs`)
+
+Tree diffs, blames and object abbreviations are pure functions of immutable
+objects: there is no event that can make one wrong. That earns none of what
+SQLite provides — no concurrent mutation, no triggers, no queries — while
+costing a query planner, row decoding and an allocation per column to hand back
+bytes already sitting on disk. They live in **rkyv** images instead, read in
+place out of an mmap.
+
+```
+~/.zvcs/cache/<name>.rkyv   base image: header + sorted index + byte heap
+~/.zvcs/cache/<name>.log    append journal: [u32 klen][u32 vlen][key][val]
+~/.zvcs/cache/<name>.lock   flock target, writers only
+```
+
+- **Layout.** One archive holding a dense index of pointer-free records
+  (`hash: u64`, four `u32` offsets) over a byte heap. A lookup binary-searches on
+  the key hash, then compares the full key bytes out of the heap — a collision
+  costs one extra compare and can never serve a wrong answer. Nothing is
+  decoded, allocated or copied on a hit; the returned slice points into the
+  mapping. Keeping the index pointer-free is also what makes
+  `rkyv::check_archived_root` cheap enough to run on every command: validating
+  it is a bounds check plus a scan of plain integers.
+- **Portability.** `archive_le` + `size_32`, and the header pins the writing
+  build's pointer width, so an image written on macOS aarch64 is readable on
+  Linux x86_64/aarch64. No crate version is pinned: entries are keyed by
+  content, so they stay correct across releases, and pinning would discard the
+  whole warm cache on every bump.
+- **Writes.** Rewriting a multi-megabyte image per put would be slower than the
+  SQLite insert it replaces, so writers append to a journal and fold it into the
+  base once it crosses 1 MiB. Readers merge the two; the threshold is what bounds
+  the journal scan a reader pays.
+- **Concurrency.** Readers take no lock. Writers hold `flock(LOCK_EX)` across an
+  append and across a compaction, and a compaction lands by atomic rename, so a
+  reader maps either the whole old image or the whole new one. Every remaining
+  race (stale base, truncated journal, torn tail record) degrades to a cache
+  miss — a recomputation the command would have done anyway — which is what lets
+  the read path stay lock-free.
+- **Migration.** `db.rs` drains the old `treediff`/`blame`/`abbrev` tables into
+  these images and drops them on every read-write ledger open. It is deliberately
+  not version-gated: during an upgrade an older binary still running recreates
+  those tables from its own schema, and a once-per-db import would strand
+  whatever landed after it ran.
 
 ## 7. Async queue & `z` write-verbs
 
@@ -421,6 +469,7 @@ commits/pushes that should not block.
 | Reactive reconcile on remote-tracking change (`reconcile_repo_local`) | built |
 | Failure log + notify-on-next-command (`db.rs`, `lib.rs`) | built |
 | SQLite `jobs` + `repos` (rusqlite bundled, WAL) (`db.rs`) | built |
+| Zero-copy rkyv caches for tree diffs / blames / abbreviations (`rcache.rs`) | built |
 | Crawler + `zreindex`/`zrepos` (pipe-clean, prunes deleted) (`crawler.rs`, `ledger.rs`) | built |
 | Filesystem hooks across all indexed repos (`hooks.rs`, `watch.rs`, `zvcs.hook`) | built |
 | `zcommit`/`zpush` async via daemon `SUBMIT` (`queue.rs`, `jobrun.rs`) | built |

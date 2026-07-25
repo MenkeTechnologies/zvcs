@@ -59,7 +59,16 @@ regex = "1"
 notify = "6"
 # Job ledger + repo index. Bundled SQLite for cross-arch reproducibility
 # (macOS aarch64 / Linux x86_64+aarch64); WAL, single daemon writer thread.
+# The derived-answer caches do NOT live here — see `rcache`.
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Zero-copy caches for derived answers (`rcache`): tree diffs, blames and object
+# abbreviations are pure functions of immutable objects, so they are read in place
+# out of an mmap'd archive instead of being decoded row by row out of SQLite.
+# `archive_le` fixes the byte order so one image is readable on macOS aarch64 and
+# Linux x86_64/aarch64 alike; `size_32` keeps relative pointers four bytes wide.
+rkyv = { version = "0.7", features = ["validation", "archive_le", "size_32"] }
+# The mapping behind those images. Already in the tree via gitoxide.
+memmap2 = "0.9"
 # Fast parallel filesystem walk for the repo crawler (whole-device `.git` scan).
 ignore = "0.4"
 # Job spec encoding over the daemon socket (async z-verbs).

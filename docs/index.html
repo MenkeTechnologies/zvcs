@@ -233,7 +233,7 @@ git zworktree add agent3 # private isolated tree for an agent</pre>
       <section class="tutorial-section" id="performance">
         <h2>Performance — how the read path beats stock git</h2>
         <p>
-          Every read command measured against stock git is ahead, from 1.10x to 10.60x. The
+          Every read command measured against stock git is ahead, from 1.19x to 16.05x. The
           diagrams below are the whole explanation: what the time is actually spent on, the five
           levers that move it, and the three things this does <em>not</em> fix. Numbers come from
           <code>scripts/bench.sh</code> on zshrs (6,376 commits) against Apple git 2.50.1, 18 cores,
@@ -317,7 +317,7 @@ git zworktree add agent3 # private isolated tree for an agent</pre>
         <div class="lever-grid">
           <div class="lever-card"><h4>A · every core</h4><p>Patches, per-file analysis, pickaxe scans and record rendering are fanned across a worker pool. git's diff and log machinery is single-threaded.</p></div>
           <div class="lever-card"><h4>B · less work</h4><p><code>-S</code> counts a needle in blobs instead of rendering patches; name-only formats stop reading blobs they never print.</p></div>
-          <div class="lever-card"><h4>C · a ledger</h4><p>Values that are pure functions of immutable objects are stored in SQLite and never recomputed — machine-wide, shared across clones.</p></div>
+          <div class="lever-card"><h4>C · a cache</h4><p>Values that are pure functions of immutable objects are stored in memory-mapped rkyv images and never recomputed — machine-wide, shared across clones. A hit is a binary search and a slice into the mapping: nothing decoded, nothing allocated.</p></div>
           <div class="lever-card only-us"><h4>D · a daemon</h4><p>Those values are computed when a repo's refs move, before anyone asks. <strong>Structurally impossible for git.</strong></p></div>
           <div class="lever-card"><h4>E · off the critical path</h4><p>Filling a cache is bookkeeping. The rows are queued to a writer thread; the command returns without waiting on a transaction.</p></div>
         </div>
@@ -511,7 +511,7 @@ git zworktree add agent3 # private isolated tree for an agent</pre>
       <hr class="section-rule">
 
       <section class="tutorial-section">
-        <h3>Lever C — a ledger for values that cannot go stale</h3>
+        <h3>Lever C — a zero-copy cache for values that cannot go stale</h3>
         <p>
           Git objects are content addresses. That makes certain answers permanent, not merely
           cacheable-with-invalidation: there is no event that can make them wrong.
@@ -519,7 +519,7 @@ git zworktree add agent3 # private isolated tree for an agent</pre>
 
         <figure class="fig">
           <svg class="dg" viewBox="0 0 960 250" role="img" aria-label="What the ledger stores and why each entry never expires">
-            <text class="t-title" x="0" y="16">THE LEDGER — ~/.zvcs/db.sqlite (WAL)</text>
+            <text class="t-title" x="0" y="16">THE CACHE — ~/.zvcs/cache/*.rkyv (mmap'd, zero-copy)</text>
 
             <rect class="box-cyan" x="0" y="34" width="300" height="92" rx="2"></rect>
             <text class="t-cyan" x="16" y="56">treediff</text>
@@ -548,9 +548,12 @@ git zworktree add agent3 # private isolated tree for an agent</pre>
             <text class="t-accent" x="16" y="243">content-addressed, so there is no stable key — that path is served by lever A instead.</text>
           </svg>
           <figcaption>
-            One cache serves several formats: the tree-diff row feeds <code>--stat</code>,
+            One cache serves several formats: the tree-diff entry feeds <code>--stat</code>,
             <code>--numstat</code>, <code>--shortstat</code>, <code>--name-only</code>,
             <code>--name-status</code> and the path-limited traversal predicate.
+            Writers append to a journal and fold it into the image once it grows;
+            readers take no lock, and every race degrades to a miss, never to a
+            wrong answer.
           </figcaption>
         </figure>
       </section>
@@ -606,9 +609,9 @@ git zworktree add agent3 # private isolated tree for an agent</pre>
             <text class="t-sub" x="16" y="256">zvcs.precache (on by default) warms the newest 200 commits off the watcher thread · `git zprecache [-n]` does the same pass on demand</text>
           </svg>
           <figcaption>
-            Measured on a fresh clone with an empty ledger: <code>log --stat -n 150</code> takes
-            402 ms cold, 10.7 ms warm, and <code>git zprecache -n 150</code> — the work the daemon
-            does on its own — takes 0.63 s once.
+            Measured with an empty cache: <code>log --stat -n 150</code> takes 432 ms cold,
+            12.0 ms warm, and <code>git zprecache -n 150</code> — the work the daemon does on its
+            own — takes 0.52 s once.
           </figcaption>
         </figure>
       </section>
@@ -686,35 +689,37 @@ git zworktree add agent3 # private isolated tree for an agent</pre>
             <text class="t-title" x="0" y="16">SPEEDUP OVER STOCK GIT — HIGHER IS BETTER</text>
             <line class="rule" x1="250" y1="28" x2="250" y2="392"></line>
             <text class="t-sub" x="250" y="410">1x</text>
-            <line class="rule" x1="320" y1="28" x2="320" y2="392" stroke-dasharray="3 5"></line>
-            <text class="t-sub" x="320" y="410">2x</text>
-            <line class="rule" x1="460" y1="28" x2="460" y2="392" stroke-dasharray="3 5"></line>
-            <text class="t-sub" x="460" y="410">4x</text>
-            <line class="rule" x1="740" y1="28" x2="740" y2="392" stroke-dasharray="3 5"></line>
-            <text class="t-sub" x="740" y="410">8x</text>
+            <line class="rule" x1="292" y1="28" x2="292" y2="392" stroke-dasharray="3 5"></line>
+            <text class="t-sub" x="292" y="410">2x</text>
+            <line class="rule" x1="376" y1="28" x2="376" y2="392" stroke-dasharray="3 5"></line>
+            <text class="t-sub" x="376" y="410">4x</text>
+            <line class="rule" x1="544" y1="28" x2="544" y2="392" stroke-dasharray="3 5"></line>
+            <text class="t-sub" x="544" y="410">8x</text>
+            <line class="rule" x1="880" y1="28" x2="880" y2="392" stroke-dasharray="3 5"></line>
+            <text class="t-sub" x="880" y="410">16x</text>
 
             <g>
-              <text x="0" y="46">log --stat -n 30</text><rect class="bar-z" x="250" y="34" width="672" height="15"></rect><text class="t-green" x="928" y="46">10.60x</text>
-              <text x="0" y="70">status</text><rect class="bar-z" x="250" y="58" width="616" height="15"></rect><text class="t-green" x="872" y="70">9.79x</text>
-              <text x="0" y="94">blame README.md</text><rect class="bar-z" x="250" y="82" width="216" height="15"></rect><text class="t-green" x="472" y="94">4.09x</text>
-              <text x="0" y="118">log -S return</text><rect class="bar-z" x="250" y="106" width="119" height="15"></rect><text class="t-green" x="375" y="118">2.70x</text>
-              <text x="0" y="142">log --oneline</text><rect class="bar-z" x="250" y="130" width="103" height="15"></rect><text class="t-green" x="359" y="142">2.47x</text>
-              <text x="0" y="166">log (default format)</text><rect class="bar-z" x="250" y="154" width="82" height="15"></rect><text class="t-green" x="338" y="166">2.17x</text>
-              <text x="0" y="190">log --format=%s</text><rect class="bar-z" x="250" y="178" width="76" height="15"></rect><text class="t-green" x="332" y="190">2.08x</text>
-              <text x="0" y="214">log --format=%h</text><rect class="bar-z" x="250" y="202" width="69" height="15"></rect><text class="t-green" x="325" y="214">1.98x</text>
-              <text x="0" y="238">log -p -n 20</text><rect class="bar-z" x="250" y="226" width="43" height="15"></rect><text class="t-green" x="299" y="238">1.62x</text>
-              <text x="0" y="262">shortlog -s</text><rect class="bar-z" x="250" y="250" width="40" height="15"></rect><text class="t-green" x="296" y="262">1.57x</text>
-              <text x="0" y="286">describe</text><rect class="bar-z" x="250" y="274" width="34" height="15"></rect><text class="t-green" x="290" y="286">1.48x</text>
-              <text x="0" y="310">cat-file -p HEAD</text><rect class="bar-z" x="250" y="298" width="31" height="15"></rect><text class="t-green" x="287" y="310">1.44x</text>
-              <text x="0" y="334">show HEAD</text><rect class="bar-z" x="250" y="322" width="25" height="15"></rect><text class="t-green" x="281" y="334">1.35x</text>
-              <text x="0" y="358">tag -l</text><rect class="bar-z" x="250" y="346" width="19" height="15"></rect><text class="t-green" x="275" y="358">1.27x</text>
-              <text x="0" y="382">diff --stat HEAD~5</text><rect class="bar-z" x="250" y="370" width="7" height="15"></rect><text class="t-green" x="263" y="382">1.10x</text>
+              <text x="0" y="46">log --stat -n 30</text><rect class="bar-z" x="250" y="34" width="632" height="15"></rect><text class="t-green" x="888" y="46">16.05x</text>
+              <text x="0" y="70">status</text><rect class="bar-z" x="250" y="58" width="393" height="15"></rect><text class="t-green" x="649" y="70">10.37x</text>
+              <text x="0" y="94">blame README.md</text><rect class="bar-z" x="250" y="82" width="149" height="15"></rect><text class="t-green" x="405" y="94">4.55x</text>
+              <text x="0" y="118">log -S return</text><rect class="bar-z" x="250" y="106" width="109" height="15"></rect><text class="t-green" x="365" y="118">3.59x</text>
+              <text x="0" y="142">log (default format)</text><rect class="bar-z" x="250" y="130" width="97" height="15"></rect><text class="t-green" x="353" y="142">3.31x</text>
+              <text x="0" y="166">log --oneline</text><rect class="bar-z" x="250" y="154" width="93" height="15"></rect><text class="t-green" x="349" y="166">3.21x</text>
+              <text x="0" y="190">log --format=%s</text><rect class="bar-z" x="250" y="178" width="80" height="15"></rect><text class="t-green" x="336" y="190">2.90x</text>
+              <text x="0" y="214">log --format=%h</text><rect class="bar-z" x="250" y="202" width="54" height="15"></rect><text class="t-green" x="310" y="214">2.29x</text>
+              <text x="0" y="238">log -p -n 20</text><rect class="bar-z" x="250" y="226" width="36" height="15"></rect><text class="t-green" x="292" y="238">1.86x</text>
+              <text x="0" y="262">cat-file -p HEAD</text><rect class="bar-z" x="250" y="250" width="24" height="15"></rect><text class="t-green" x="280" y="262">1.56x</text>
+              <text x="0" y="286">shortlog -s</text><rect class="bar-z" x="250" y="274" width="21" height="15"></rect><text class="t-green" x="277" y="286">1.50x</text>
+              <text x="0" y="310">describe</text><rect class="bar-z" x="250" y="298" width="17" height="15"></rect><text class="t-green" x="273" y="310">1.40x</text>
+              <text x="0" y="334">show HEAD</text><rect class="bar-z" x="250" y="322" width="13" height="15"></rect><text class="t-green" x="269" y="334">1.30x</text>
+              <text x="0" y="358">tag -l</text><rect class="bar-z" x="250" y="346" width="10" height="15"></rect><text class="t-green" x="266" y="358">1.24x</text>
+              <text x="0" y="382">diff --stat HEAD~5</text><rect class="bar-z" x="250" y="370" width="8" height="15"></rect><text class="t-green" x="264" y="382">1.19x</text>
             </g>
           </svg>
           <figcaption>
-            Also measured and ahead, omitted from the chart for space: <code>rev-list --count</code>
-            1.35x, <code>diff --name-only HEAD~5</code> 1.32x, <code>for-each-ref</code> 1.31x,
-            <code>ls-files</code> 1.19x.
+            Also measured and ahead, omitted from the chart for space: <code>for-each-ref</code>
+            1.35x, <code>ls-files</code> 1.35x, <code>rev-list --count</code> 1.34x,
+            <code>diff --name-only HEAD~5</code> 1.20x.
           </figcaption>
         </figure>
 
@@ -739,14 +744,16 @@ git zworktree add agent3 # private isolated tree for an agent</pre>
         <table class="bench-table">
           <thead><tr><th>Command</th><th>zvcs cold</th><th>zvcs warm</th><th>git</th></tr></thead>
           <tbody>
-            <tr><td>log --stat -n 30</td><td class="num">100.4 ms</td><td class="num">9.5 ms</td><td class="num">119.0 ms</td></tr>
-            <tr><td>log --stat -n 150</td><td class="num">402.1 ms</td><td class="num">10.7 ms</td><td class="num">531.8 ms</td></tr>
-            <tr><td>blame README.md</td><td class="num">73.8 ms</td><td class="num">8.6 ms</td><td class="num">94.4 ms</td></tr>
+            <tr><td>log --stat -n 30</td><td class="num">121.6 ms</td><td class="num">8.2 ms</td><td class="num">142.0 ms</td></tr>
+            <tr><td>log --stat -n 150</td><td class="num">432.2 ms</td><td class="num">12.0 ms</td><td class="num">544.0 ms</td></tr>
+            <tr><td>blame README.md</td><td class="num">72.1 ms</td><td class="num">10.4 ms</td><td class="num">43.7 ms</td></tr>
           </tbody>
         </table>
         <p>
-          Cold means the ledger is deleted before <em>every single run</em> — the worst case, and not
-          one a running daemon leaves behind.
+          Cold means the cache is deleted before <em>every single run</em> — the worst case, and not
+          one a running daemon leaves behind. Cold <code>blame</code> is the one row that loses to
+          git, and it is reported as measured: gix's blame walk is slower than git's, so the first
+          blame of a file costs ~1.7x git. The cache is what turns it around on the second.
         </p>
       </section>
 
@@ -799,6 +806,7 @@ git zworktree add agent3 # private isolated tree for an agent</pre>
             <tr><td>Singleton daemon + per-repo FIFO lanes</td><td><span class="status-pill status-implemented">Implemented</span></td><td><code>~/.zvcs/</code>; parallel across repos; socket-EOF auto-release; reactive file-watch, no polling.</td></tr>
             <tr><td>Coordination — <code>zsync</code> / <code>zbump</code> / attach</td><td><span class="status-pill status-implemented">Implemented</span></td><td>ff-only reconcile; forward-only bump + commit; detached-HEAD attach-scan (dirty-safe).</td></tr>
             <tr><td>SQLite ledger + repo index + crawler</td><td><span class="status-pill status-implemented">Implemented</span></td><td><code>zrepos</code>/<code>zreindex</code> (pipe-clean, prunes deleted); WAL ledger; notify-on-next-command.</td></tr>
+            <tr><td>Zero-copy derived-answer cache (<code>~/.zvcs/cache/*.rkyv</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>mmap'd rkyv images for tree diffs, blames and abbreviations; lock-free reads, journal + flock'd compaction for writes.</td></tr>
             <tr><td>Async queue — <code>zcommit</code>/<code>zpush</code>/<code>zjob(s)</code></td><td><span class="status-pill status-implemented">Implemented</span></td><td>Bounded job pool; ls-refs push pre-flight; <code>zjob stop</code>/<code>restart</code>; sync fallback.</td></tr>
             <tr><td>Multi-agent, status, timeline, snapshots</td><td><span class="status-pill status-implemented">Implemented</span></td><td><code>zclaim</code>/<code>zwho</code>; <code>zstatus --all</code>; <code>zlog</code>/<code>zundo</code>; <code>zsnapshot</code>/<code>zrestore</code>; typed hooks.</td></tr>
             <tr><td>Per-agent isolated worktrees (<code>zworktree</code>)</td><td><span class="status-pill status-implemented">Implemented</span></td><td>Object-sharing linked worktrees of the whole submodule tree; stock-git interop verified.</td></tr>

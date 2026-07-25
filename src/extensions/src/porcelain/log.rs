@@ -1504,7 +1504,7 @@ impl PartialEq for Node {
 }
 impl Eq for Node {}
 
-/// Abbreviated object ids, memoised in the ledger.
+/// Abbreviated object ids, memoised in the zero-copy cache.
 ///
 /// `gix`'s `shorten_or_id()` disambiguates a prefix against the whole object
 /// database on EVERY call, which measures ~60-90us per id here regardless of
@@ -1518,21 +1518,18 @@ impl Eq for Node {}
 /// object; the hex length is part of the key because the correct abbreviation
 /// grows as a repository does, and a stale, now-ambiguous prefix must never be
 /// served.
+///
+/// Nothing is loaded up front. The store is an mmap'd image searched per id
+/// (`crate::rcache`), so a `log -5` touches a handful of pages instead of
+/// decoding every abbreviation the machine has ever computed — which is what
+/// reading them out of the SQLite ledger cost, hex-parsing each id on the way in.
 struct AbbrevCache {
     hex_len: usize,
-    /// What the ledger already knew, shared as-is with every worker that forks
-    /// this cache — it is read-only for the life of the command.
-    ///
-    /// Keyed by the id itself rather than its hex text: a lookup per commit
-    /// otherwise formats a 40-byte string and allocates it just to hash it, and
-    /// on a deep history that allocation is most of what `--oneline` costs
-    /// beyond reading the objects.
-    known: std::sync::Arc<std::collections::HashMap<ObjectId, String>>,
-    /// Abbreviations computed by THIS cache, kept apart from `known` so a fork
-    /// can be merged back without rebuilding the shared map.
+    /// Abbreviations computed by THIS cache. Anything else is one lookup away in
+    /// the shared image, so only what the image lacks is held here.
     local: std::collections::HashMap<ObjectId, String>,
-    /// New rows for the ledger, in its own hex-keyed form.
-    fresh: Vec<(String, String)>,
+    /// New rows for the cache, keyed by the id's raw bytes as the image keys them.
+    fresh: Vec<(Vec<u8>, String)>,
 }
 
 impl AbbrevCache {
@@ -1543,37 +1540,19 @@ impl AbbrevCache {
             .integer("core.abbrev")
             .and_then(|v| usize::try_from(v).ok())
             .unwrap_or(0);
-        let known: std::collections::HashMap<ObjectId, String> =
-            crate::db::with_ro(|c| crate::db::abbrev_load(c, hex_len).ok())
-            .flatten()
-            .unwrap_or_default()
-            .into_iter()
-            // A row whose id is not parseable hex is from a different hash
-            // format and cannot match anything this command asks for.
-            .filter_map(|(full, short)| Some((ObjectId::from_hex(full.as_bytes()).ok()?, short)))
-            .collect();
-        AbbrevCache {
-            hex_len,
-            known: std::sync::Arc::new(known),
-            local: Default::default(),
-            fresh: Vec::new(),
-        }
+        AbbrevCache { hex_len, local: Default::default(), fresh: Vec::new() }
     }
 
-    /// A cache for a worker thread: the ledger's map is shared, and anything the
-    /// worker computes stays private until [`absorb`](Self::absorb) takes it.
+    /// A cache for a worker thread: the shared image needs no handing over, and
+    /// anything the worker computes stays private until
+    /// [`absorb`](Self::absorb) takes it.
     fn fork(&self) -> Self {
-        AbbrevCache {
-            hex_len: self.hex_len,
-            known: std::sync::Arc::clone(&self.known),
-            local: Default::default(),
-            fresh: Vec::new(),
-        }
+        AbbrevCache { hex_len: self.hex_len, local: Default::default(), fresh: Vec::new() }
     }
 
     /// Take what a forked cache computed. Two workers may have shortened the same
-    /// id, which is harmless — the ledger write is keyed by id, so a duplicate
-    /// row overwrites itself with the same value.
+    /// id, which is harmless — the cache write is keyed by id, so a duplicate row
+    /// overwrites itself with the same value.
     fn absorb(&mut self, other: Self) {
         self.local.extend(other.local);
         self.fresh.extend(other.fresh);
@@ -1581,16 +1560,19 @@ impl AbbrevCache {
 
     fn get(&mut self, id: gix::Id<'_>) -> String {
         let oid = id.detach();
-        if let Some(short) = self.local.get(&oid).or_else(|| self.known.get(&oid)) {
+        if let Some(short) = self.local.get(&oid) {
             return short.clone();
         }
+        if let Some(short) = crate::rcache::abbrev_load(oid.as_slice(), self.hex_len) {
+            return short.to_string();
+        }
         let short = id.shorten_or_id().to_string();
-        self.fresh.push((oid.to_string(), short.clone()));
+        self.fresh.push((oid.as_slice().to_vec(), short.clone()));
         self.local.insert(oid, short.clone());
         short
     }
 
-    /// Hand what this run computed to the ledger's writer thread.
+    /// Hand what this run computed to the cache's writer thread.
     ///
     /// The rows are queued rather than written here: the command has its
     /// abbreviations already, and `run()` waits for the queue once, after the
@@ -1600,7 +1582,7 @@ impl AbbrevCache {
         if self.fresh.is_empty() {
             return;
         }
-        crate::db::cache_write(crate::db::CacheWrite::Abbrev {
+        crate::rcache::cache_write(crate::rcache::CacheWrite::Abbrev {
             hex_len: self.hex_len,
             rows: self.fresh,
         });
@@ -3179,17 +3161,13 @@ fn collect_changes(
 
     // A tree-to-tree diff is a pure function of two immutable trees, so the file
     // list — and the per-file line tallies, which cost a blob read each — are
-    // memoised in the ledger exactly as blame is. `--stat` over a range re-diffs
-    // the same parent/child pairs on every invocation; git does too, but this
-    // sidesteps the work instead of racing it.
+    // memoised exactly as blame is. `--stat` over a range re-diffs the same
+    // parent/child pairs on every invocation; git does too, but this sidesteps
+    // the work instead of racing it.
     let old_key = old_tree.as_ref().map(|t| t.id.to_string()).unwrap_or_default();
     let new_key = new_tree.id.to_string();
-    if let Some(text) = crate::db::with_ro(|c| {
-        crate::db::treediff_load(c, &old_key, &new_key, with_counts)
-    })
-    .flatten()
-    {
-        if let Some(files) = decode_changes(&text) {
+    if let Some(text) = crate::rcache::treediff_load(&old_key, &new_key, with_counts) {
+        if let Some(files) = decode_changes(text) {
             return Ok(files);
         }
     }
@@ -3209,7 +3187,7 @@ fn collect_changes(
     }
     // Off-thread: the answer is already in `out`, so the row is bookkeeping and
     // the caller must not wait for a transaction to reach the disk.
-    crate::db::cache_write(crate::db::CacheWrite::TreeDiff {
+    crate::rcache::cache_write(crate::rcache::CacheWrite::TreeDiff {
         old_tree: old_key,
         new_tree: new_key,
         counts: with_counts,

@@ -1,5 +1,5 @@
 //! Precomputed log caches must be an optimization and nothing else: whatever a
-//! warmed ledger makes fast, it has to render exactly what the cold path would.
+//! warmed cache makes fast, it has to render exactly what the cold path would.
 //!
 //! The daemon fills these caches on ref-change and `git zprecache` fills them on
 //! demand, so a wrong entry would be served silently to every later command —
@@ -100,27 +100,58 @@ fn warmed_caches_render_exactly_what_the_cold_path_does() {
 /// be killed at exit and the cache would never fill, turning every run into a
 /// cold one while looking fine.
 ///
-/// So: one cold run, then assert the rows are on disk when the process is gone.
+/// So: one cold run, then assert the entries are on disk when the process is
+/// gone.
 #[test]
-fn a_single_run_leaves_its_cache_rows_on_disk() {
+fn a_single_run_leaves_its_cache_entries_on_disk() {
     let (repo, home) = fixture("async", 6);
-    let db = home.join("db.sqlite");
-    let _ = std::fs::remove_file(&db);
+    let cache = home.join("cache");
+    let _ = std::fs::remove_dir_all(&cache);
 
     let out = zvcs(&repo, &home, &["log", "--stat"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(db.exists(), "the run created the ledger");
 
-    // Read the rows with a fresh process, so nothing of the writer is still
+    // Either half of the store counts: a batch this small stays in the journal,
+    // and a larger one would have been folded into the base image.
+    let written = |name: &str| {
+        ["rkyv", "log"]
+            .iter()
+            .filter_map(|ext| std::fs::metadata(cache.join(format!("{name}.{ext}"))).ok())
+            .map(|m| m.len())
+            .sum::<u64>()
+    };
+    assert!(written("treediff") > 0, "the run left its tree diffs on disk");
+    // The default format prints full ids, so nothing abbreviates until a format
+    // asks for a short one — that path has its own cache and its own writer.
+    assert_eq!(written("abbrev"), 0, "no format asked for a short id yet");
+    let short = zvcs(&repo, &home, &["log", "--oneline"]);
+    assert!(short.status.success(), "{}", String::from_utf8_lossy(&short.stderr));
+    assert!(written("abbrev") > 0, "the run left its abbreviations on disk");
+
+    // Read them back with a fresh process, so nothing of the writer is still
     // around to make this pass.
     let counted = zvcs(&repo, &home, &["zprecache", "-n", "0"]);
     assert!(counted.status.success());
-    let size = std::fs::metadata(&db).expect("ledger metadata").len();
-    assert!(size > 0, "the ledger holds what the run computed");
 
     // The second run must render exactly what the first did, now from the cache.
     let again = zvcs(&repo, &home, &["log", "--stat"]);
     assert_eq!(stdout_of(&again), stdout_of(&out), "cached output must match the computed output");
+}
+
+/// A read-only verb must not create the ledger. The caches moved out of SQLite
+/// precisely so `log` never opens it — if that regressed, every read command
+/// would be paying for a database it has no reason to touch.
+#[test]
+fn a_read_only_run_never_opens_the_ledger() {
+    let (repo, home) = fixture("noledger", 4);
+    let db = home.join("db.sqlite");
+    let _ = std::fs::remove_file(&db);
+
+    for args in [&["log", "--stat"][..], &["log", "--oneline"][..], &["blame", "keep.txt"][..]] {
+        let out = zvcs(&repo, &home, args);
+        assert!(out.status.success(), "`{}`: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
+        assert!(!db.exists(), "`{}` created the ledger", args.join(" "));
+    }
 }
 
 /// `-n` bounds the walk. A repository with more commits than the limit warms

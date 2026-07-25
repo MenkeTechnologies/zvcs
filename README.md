@@ -144,7 +144,7 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Coordination | `zwait [<path>]` `zqueue` `zbarrier` | the join side of the async queue — wait for one repo's jobs to drain, list what's queued/running, or block until the whole queue is idle |
 | Profiling | `zstale [<days>]` `zlast` `zbig [<n>]` `zfiles` `zdivergent` `zorphans` | native, fanned in parallel — abandoned repos, most-recently-committed, largest tracked files, file counts, repos diverged from upstream, repos with no remote |
 | Multi-agent view | `zsessions` `zidle` `zdashboard` `zppid` `zprocs` | sessions ranked by repos held; repos free to pick up; an **instant** one-screen health summary aggregated from the status cache + ledger (dirty/ahead/behind/diverged/detached/no-upstream + claims/sessions/queue/procs) — no live walk, so it scales to thousands of repos like `zstatus --all`; a **per-process commit tally** (`zppid`) — the **durable process responsible for each commit** (found by walking up past the throwaway per-command shells to the real agent/program/login-shell), with its pid, command, cwd, live/dead state, and commits landed; and a **per-process command breakdown** (`zprocs`) — how many of each mutating verb (commit/push/add/merge/rebase/…) every process has run |
-| Precompute | `zprecache [-n <commits>] [-q]` | fill the log caches — abbreviations and the per-file line tallies `--stat`/`--numstat`/`--shortstat`/`--name-status` need — for the newest commits, so those formats read the ledger instead of the object store. All of it is a pure function of immutable objects, so an entry is correct forever. The daemon does this on its own whenever a watched repo's refs move (`zvcs.precache`, on by default); this verb is the same pass on demand, e.g. after a clone or a fetch that landed while the daemon was down. **git cannot do this at all** — no part of git runs between two commands, so its first `log --stat` after a fetch always pays in full |
+| Precompute | `zprecache [-n <commits>] [-q]` | fill the log caches — abbreviations and the per-file line tallies `--stat`/`--numstat`/`--shortstat`/`--name-status` need — for the newest commits, so those formats read a memory-mapped image instead of the object store. All of it is a pure function of immutable objects, so an entry is correct forever. The daemon does this on its own whenever a watched repo's refs move (`zvcs.precache`, on by default); this verb is the same pass on demand, e.g. after a clone or a fetch that landed while the daemon was down. **git cannot do this at all** — no part of git runs between two commands, so its first `log --stat` after a fetch always pays in full |
 | Hooks | `zhook set/unset/show/list/test` | manage & test the current repo's ref-change hook (`zvcs.hook`); `zvcs.autohook` fires each repo's own local hook |
 | Triggers | `ztrigger DIR <cmd> [--throttle <dur>]` `ztrigger list/rm/test/tail/top` | watch **any directory** (git repo or not) and run a command on **any file change** under it — command runs with the dir as cwd and `$ZVCS_DIR` set; a leading-edge throttle (default 500ms) collapses the event burst of one file action into a single fire; `tail` streams fires live, `top` is an in-place fire-rate HUD |
 | Watch | `zwatch DIR` `zwatch list/rm` | watch any directory and log each change to the daemon log (a trigger with a built-in logging command) |
@@ -437,7 +437,7 @@ own writes. For a repo's *git* hook (ref-change semantics in `.git/config`), use
 | Path | Contents |
 |------|----------|
 | `src/ported` | Vendored gitoxide crates (`gix` + the `gix-*` library crates), in-tree. A self-contained workspace, excluded from the root and consumed as a path dependency. The `gix`/`ein` CLI binaries and their `gitoxide-core` backend are removed; `git` is the only binary. |
-| `src/extensions` | The zvcs crate (library + the `git` binary): `main.rs`/`lib.rs` (entry, `session_key`, notify-on-next-command), `dispatch.rs` (routing), `porcelain/` (git-compat), `lock.rs` (daemon client), `config.rs` (`[zvcs]` settings), `autostart.rs` (daemon auto-spawn), `db.rs` (SQLite ledger/index), `crawler.rs` (repo crawl), `jobpool.rs`/`jobrun.rs`/`index_commit.rs` (async jobs), `worktree.rs` (checkout helper), and `superset/` (`zdaemon`, `zsync`, `zbump`, `reconcile`, `attach`, `watch`, `hooks`, `trigger`, `ledger`, `status`, `oplog`, `snapshot`, `claim`, `queue`, `repl`, `zworktree`). |
+| `src/extensions` | The zvcs crate (library + the `git` binary): `main.rs`/`lib.rs` (entry, `session_key`, notify-on-next-command), `dispatch.rs` (routing), `porcelain/` (git-compat), `lock.rs` (daemon client), `config.rs` (`[zvcs]` settings), `autostart.rs` (daemon auto-spawn), `db.rs` (SQLite ledger/index), `rcache.rs` (zero-copy rkyv caches for tree diffs/blames/abbreviations), `crawler.rs` (repo crawl), `jobpool.rs`/`jobrun.rs`/`index_commit.rs` (async jobs), `worktree.rs` (checkout helper), and `superset/` (`zdaemon`, `zsync`, `zbump`, `reconcile`, `attach`, `watch`, `hooks`, `trigger`, `ledger`, `status`, `oplog`, `snapshot`, `claim`, `queue`, `repl`, `zworktree`). |
 
 ## [0x07] STATUS & ROADMAP
 
@@ -487,30 +487,30 @@ cargo build --release && scripts/bench.sh /path/to/some/repo
 ```
 
 Repository: zshrs (6,376 commits) · stock git 2.50.1 · 18 cores · 12 runs after
-3 warmups · release build · the machine was busy (load ~20), which compresses
+3 warmups · release build · the machine was busy (load ~17-20), which compresses
 zvcs's lead rather than git's.
 
 | Command | zvcs | git | |
 |---|---:|---:|---:|
-| `git log --stat -n 30` | 15.9 ms | 168.6 ms | **10.60x** |
-| `git status` | 32.2 ms | 315.3 ms | **9.79x** |
-| `git blame README.md` | 11.8 ms | 48.3 ms | **4.09x** |
-| `git log -S return --format=%H` | 2.673 s | 7.209 s | **2.70x** |
-| `git log --oneline` | 31.8 ms | 78.4 ms | **2.47x** |
-| `git log` | 44.1 ms | 95.7 ms | **2.17x** |
-| `git log --format=%s` | 32.1 ms | 66.8 ms | **2.08x** |
-| `git log --format=%h` | 14.9 ms | 29.5 ms | **1.98x** |
-| `git log -p -n 20` | 45.3 ms | 73.2 ms | **1.62x** |
-| `git shortlog -s` | 6.8 ms | 10.7 ms | **1.57x** |
-| `git describe` | 8.9 ms | 13.2 ms | **1.48x** |
-| `git cat-file -p HEAD` | 7.2 ms | 10.4 ms | **1.44x** |
-| `git rev-list --count HEAD` | 9.2 ms | 12.4 ms | **1.35x** |
-| `git show HEAD` | 8.9 ms | 12.0 ms | **1.35x** |
-| `git diff --name-only HEAD~5` | 13.6 ms | 17.9 ms | **1.32x** |
-| `git for-each-ref` | 8.3 ms | 10.9 ms | **1.31x** |
-| `git tag -l` | 8.5 ms | 10.8 ms | **1.27x** |
-| `git ls-files` | 8.5 ms | 10.1 ms | **1.19x** |
-| `git diff --stat HEAD~5` | 27.7 ms | 30.6 ms | **1.10x** |
+| `git log --stat -n 30` | 8.3 ms | 133.2 ms | **16.05x** |
+| `git status` | 20.0 ms | 207.4 ms | **10.37x** |
+| `git blame README.md` | 8.4 ms | 38.2 ms | **4.55x** |
+| `git log -S return --format=%H` | 1.858 s | 6.679 s | **3.59x** |
+| `git log` | 22.3 ms | 73.9 ms | **3.31x** |
+| `git log --oneline` | 20.5 ms | 65.8 ms | **3.21x** |
+| `git log --format=%s` | 19.0 ms | 55.1 ms | **2.90x** |
+| `git log --format=%h` | 11.5 ms | 26.3 ms | **2.29x** |
+| `git log -p -n 20` | 35.7 ms | 66.4 ms | **1.86x** |
+| `git cat-file -p HEAD` | 8.0 ms | 12.5 ms | **1.56x** |
+| `git shortlog -s` | 7.2 ms | 10.8 ms | **1.50x** |
+| `git describe` | 10.3 ms | 14.4 ms | **1.40x** |
+| `git for-each-ref` | 9.4 ms | 12.7 ms | **1.35x** |
+| `git ls-files` | 8.3 ms | 11.2 ms | **1.35x** |
+| `git rev-list --count HEAD` | 9.9 ms | 13.3 ms | **1.34x** |
+| `git show HEAD` | 10.2 ms | 13.3 ms | **1.30x** |
+| `git tag -l` | 10.5 ms | 13.0 ms | **1.24x** |
+| `git diff --name-only HEAD~5` | 15.2 ms | 18.2 ms | **1.20x** |
+| `git diff --stat HEAD~5` | 28.4 ms | 33.9 ms | **1.19x** |
 
 Three things produce the difference, and only the first is ordinary optimization.
 The [performance architecture page](https://menketechnologies.github.io/zvcs/#performance)
@@ -524,11 +524,14 @@ writes off the caller's critical path:
   than a fixed slice, because one commit that rewrites a large file outweighs a
   hundred that touch a line each. `ZVCS_THREADS=1` forces the sequential path and
   produces byte-identical output.
-- **A ledger that remembers.** An abbreviation is fixed once the object exists,
+- **A cache that remembers.** An abbreviation is fixed once the object exists,
   and a tree pair's change list and per-file line tallies are a pure function of
   two immutable trees. None of it can go stale, so it is computed once and read
-  back from SQLite forever after — which is what `log --stat` and `blame` are
-  reading instead of the object store.
+  back forever after — which is what `log --stat` and `blame` are reading instead
+  of the object store. The answers live in memory-mapped rkyv images under
+  `~/.zvcs/cache/`, so a hit is a binary search and a slice into the mapping:
+  nothing is decoded, allocated or copied, and a short command pays for the
+  entries it touches rather than for every one on the machine.
 - **A daemon that computes it early.** `zvcs.precache` warms those caches when a
   watched repo's refs move, so the work is done before anyone asks. **git cannot
   do this at all**: no part of git runs between two commands.
@@ -536,26 +539,31 @@ writes off the caller's critical path:
 ### Cold versus warm
 
 The table above is steady state — a repository the daemon has seen. The cold
-column below is the opposite extreme: a repository with no ledger at all, where
+column below is the opposite extreme: a repository with no cache at all, where
 the cache-backed commands compute every answer from the object store *and* write
 it down for next time.
 
 | Command | zvcs cold | zvcs warm | git |
 |---|---:|---:|---:|
-| `git log --stat -n 30` | 100.4 ms | 9.5 ms | 119.0 ms |
-| `git log --stat -n 150` | 402.1 ms | 10.7 ms | 531.8 ms |
-| `git blame README.md` | 73.8 ms | 8.6 ms | 94.4 ms |
+| `git log --stat -n 30` | 121.6 ms | 8.2 ms | 142.0 ms |
+| `git log --stat -n 150` | 432.2 ms | 12.0 ms | 544.0 ms |
+| `git blame README.md` | 72.1 ms | 10.4 ms | 43.7 ms |
 
-Cold stays ahead of git because filling a cache is not something the caller waits
-for: the rows are queued to a writer thread and the command returns, with one
-wait at the very end for whatever the writer has not already absorbed. The rows
-still land — a detached thread would be killed at exit, and a cache that never
-persists is just a slower uncached path.
+Cold `--stat` stays ahead of git because filling a cache is not something the
+caller waits for: the entries are queued to a writer thread and the command
+returns, with one wait at the very end for whatever the writer has not already
+absorbed. They still land — a detached thread would be killed at exit, and a
+cache that never persists is just a slower uncached path.
 
-Cold here means the ledger is deleted before every single run, which is the worst
+Cold `blame` is the exception and is reported as measured: gix's blame walk is
+slower than git's, so the first blame of a file loses to git by ~1.7x. The cache
+is what turns that around — the second one is 4.2x faster than git, and the entry
+is valid in every clone holding those commits.
+
+Cold here means the cache is deleted before every single run, which is the worst
 case and not one a running daemon leaves you in: it warms the newest commits on
 every ref change, and `git zprecache` does the same pass on demand (150 commits
-in 0.63 s).
+in 0.52 s).
 
 ## [0x09] DOCUMENTATION
 

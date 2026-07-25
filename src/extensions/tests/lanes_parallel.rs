@@ -48,6 +48,10 @@ fn different_repos_lock_concurrently() {
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
     let sock = root.join("sock");
+    // ZVCS_HOME as well as the socket: with the shared home, `zdaemon start`
+    // sees the machine daemon and exits "already running", so the socket this
+    // test waits for never appears.
+    std::env::set_var("ZVCS_HOME", root.join("zvcs-home"));
     std::env::set_var("ZVCS_SOCK", &sock);
 
     let a = init_repo(&root, "a");

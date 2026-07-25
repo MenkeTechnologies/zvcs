@@ -52,6 +52,11 @@ fn daemon_serializes_concurrent_writers() {
     // Both this process's RepoLock and the spawned daemon read the same override
     // (the child inherits the env).
     let sock = tmp.join("zvcs-test.sock");
+    // ZVCS_HOME too, not just the socket: `zdaemon start` refuses with "daemon
+    // already running" when the SHARED home shows a live daemon, so a developer
+    // box running the real coordinator failed this test while CI passed. Both the
+    // spawned daemon and this process inherit the override.
+    std::env::set_var("ZVCS_HOME", tmp.join("zvcs-home"));
     std::env::set_var("ZVCS_SOCK", &sock);
 
     // Start the coordinator.

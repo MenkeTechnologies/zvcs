@@ -130,6 +130,9 @@ fn errno_text(err: &std::io::Error) -> String {
 ///   * `git config --get-all <name>`          → every value, one per line
 ///   * `git config --get-regexp <regex>`      → `key value` for every key the
 ///                                              ERE matches, exit 1 if none
+///   * `--get`/`--get-all`/`--get-regexp` also take an optional trailing
+///     `<value-pattern>` — an ERE (`!` inverts) that filters which VALUES count;
+///     `--get` then reports the last survivor, exit 1 when none survive
 ///   * `git config -l` / `--list`             → all `key=value`, merged scopes
 ///   * `git config <name> <value>`            → set (overwrite last), local
 ///   * `git config <name> <value> <pattern>`  → rewrite values matching the ERE,
@@ -381,17 +384,15 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             }
             _ => list(file, name_only),
         },
-        // `--get <name> <value-pattern>` filters returned values by an ERE — a
-        // read-side feature distinct from the value-pattern *set* form below and
-        // not yet implemented; the two-argument read is refused rather than faked.
-        Mode::Get | Mode::GetAll | Mode::GetRegexp if positional.len() == 2 => {
-            bail!("value-pattern filtering is not supported")
+        // `--get`/`--get-all`/`--get-regexp <name> <value-pattern>`: the optional
+        // second operand filters the returned values by an ERE (`!` inverts).
+        Mode::Get => get(file, positional[0], false, positional.get(1).copied()),
+        Mode::GetAll => get(file, positional[0], true, positional.get(1).copied()),
+        Mode::GetRegexp => {
+            get_regexp(file, positional[0], name_only, positional.get(1).copied())
         }
-        Mode::Get => get(file, positional[0], false),
-        Mode::GetAll => get(file, positional[0], true),
-        Mode::GetRegexp => get_regexp(file, positional[0], name_only),
         // No action flag: one positional reads, two set the value.
-        Mode::Auto if positional.len() == 1 => get(file, positional[0], false),
+        Mode::Auto if positional.len() == 1 => get(file, positional[0], false, None),
         Mode::Auto if positional.len() == 2 => {
             write_scoped(&write_target()?, positional[0], positional[1], WriteOp::Set)
         }
@@ -438,38 +439,87 @@ fn parse_key(name: &str) -> Result<KeyRef<'_>> {
         .ok_or_else(|| anyhow::anyhow!("key does not contain a section: {name}"))
 }
 
+/// A compiled `<value-pattern>`: the optional second operand of a read, an
+/// unanchored POSIX ERE matched against the value bytes, inverted by a leading
+/// `!` — the same grammar the value-pattern *set* form uses.
+struct ValueFilter {
+    re: regex::bytes::Regex,
+    invert: bool,
+}
+
+impl ValueFilter {
+    /// Compile `pattern`, or report git's `error: invalid pattern: <p>` at exit 6.
+    fn parse(pattern: &str) -> Result<Self, ExitCode> {
+        let (invert, pat) = match pattern.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, pattern),
+        };
+        match regex::bytes::Regex::new(pat) {
+            Ok(re) => Ok(Self { re, invert }),
+            Err(_) => {
+                eprintln!("error: invalid pattern: {pat}");
+                Err(ExitCode::from(6))
+            }
+        }
+    }
+
+    fn matches(&self, value: &[u8]) -> bool {
+        self.re.is_match(value) != self.invert
+    }
+}
+
 /// `git config <name>` / `--get` / `--get-all` — read from the merged snapshot.
 ///
+/// With a `<value-pattern>` only the values it selects are considered, so
+/// `--get` reports the LAST matching value and `--get-all` every matching one,
+/// in file order. A pattern that selects nothing is exit 1 with no output, the
+/// same as an absent key — git does not distinguish the two.
+///
 /// Exit code 1 (no output) when the key is absent, matching stock git.
-fn get(file: &gix::config::File, name: &str, all: bool) -> Result<ExitCode> {
+fn get(
+    file: &gix::config::File,
+    name: &str,
+    all: bool,
+    value_pattern: Option<&str>,
+) -> Result<ExitCode> {
     let key = parse_key(name)?;
+    let filter = match value_pattern.map(ValueFilter::parse) {
+        Some(Err(code)) => return Ok(code),
+        Some(Ok(f)) => Some(f),
+        None => None,
+    };
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
     let visible = |meta: &gix::config::file::Metadata| !is_synthetic(meta.source);
 
-    if all {
-        match file.raw_values_filter_by(key.section_name, key.subsection_name, key.value_name, visible) {
-            Ok(values) => {
-                for v in values {
-                    out.write_all(&v)?;
-                    out.write_all(b"\n")?;
-                }
-                Ok(ExitCode::SUCCESS)
-            }
-            Err(_) => Ok(ExitCode::from(1)),
-        }
-    } else {
-        match file.raw_value_filter_by(key.section_name, key.subsection_name, key.value_name, visible) {
-            Ok(v) => {
-                out.write_all(&v)?;
-                out.write_all(b"\n")?;
-                Ok(ExitCode::SUCCESS)
-            }
-            Err(_) => Ok(ExitCode::from(1)),
-        }
+    // One code path for both forms: collect the visible values, filter, then take
+    // all of them or just the last. `raw_values_filter_by` preserves file order,
+    // and git's `--get` is defined as the last value that survives the filter.
+    let values = match file.raw_values_filter_by(
+        key.section_name,
+        key.subsection_name,
+        key.value_name,
+        visible,
+    ) {
+        Ok(values) => values,
+        Err(_) => return Ok(ExitCode::from(1)),
+    };
+    let selected: Vec<_> = values
+        .into_iter()
+        .filter(|v| filter.as_ref().is_none_or(|f| f.matches(v)))
+        .collect();
+    if selected.is_empty() {
+        return Ok(ExitCode::from(1));
     }
+
+    let emit: &[_] = if all { &selected } else { &selected[selected.len() - 1..] };
+    for v in emit {
+        out.write_all(v)?;
+        out.write_all(b"\n")?;
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `git config -l` — emit every `key=value` from the merged snapshot, in file
@@ -507,13 +557,24 @@ fn list(file: &gix::config::File, name_only: bool) -> Result<ExitCode> {
 /// Exit 1 with no output when nothing matched. An invalid ERE is git's
 /// `error: invalid key pattern: <pattern>` at exit 6 — note "key pattern" here,
 /// against the plain "pattern" the value-pattern form reports.
-fn get_regexp(file: &gix::config::File, pattern: &str, name_only: bool) -> Result<ExitCode> {
+fn get_regexp(
+    file: &gix::config::File,
+    pattern: &str,
+    name_only: bool,
+    value_pattern: Option<&str>,
+) -> Result<ExitCode> {
     let re = match regex::bytes::Regex::new(pattern) {
         Ok(re) => re,
         Err(_) => {
             eprintln!("error: invalid key pattern: {pattern}");
             return Ok(ExitCode::from(6));
         }
+    };
+    // The optional second operand narrows by VALUE, on top of the key match.
+    let filter = match value_pattern.map(ValueFilter::parse) {
+        Some(Err(code)) => return Ok(code),
+        Some(Ok(f)) => Some(f),
+        None => None,
     };
 
     let stdout = std::io::stdout();
@@ -522,6 +583,9 @@ fn get_regexp(file: &gix::config::File, pattern: &str, name_only: bool) -> Resul
 
     for_each_entry(file, |key, value| {
         if !re.is_match(key.as_bytes()) {
+            return Ok(());
+        }
+        if filter.as_ref().is_some_and(|f| !f.matches(value)) {
             return Ok(());
         }
         matched = true;

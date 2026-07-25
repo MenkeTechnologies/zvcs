@@ -126,3 +126,60 @@ fn invalid_key_pattern_is_exit_6() {
     assert_eq!(String::from_utf8_lossy(&out.stderr), "error: invalid key pattern: [\n");
     assert!(stdout_of(&out).is_empty());
 }
+
+/// A repo whose local config carries one multivar with three values, for the
+/// `<value-pattern>` reads.
+fn multivar_repo(tag: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("zvcs-cfgvp-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).expect("mkdir fixture");
+    assert!(zvcs(&p, &["init", "-q", "-b", "main"]).status.success(), "init failed");
+    for v in ["one", "two", "three"] {
+        assert!(zvcs(&p, &["config", "--add", "a.b", v]).status.success(), "add {v}");
+    }
+    p
+}
+
+#[test]
+fn value_pattern_selects_which_values_are_read() {
+    let dir = multivar_repo("select");
+
+    // `--get` reports the LAST value that survives the filter, not the first.
+    let last = zvcs(&dir, &["config", "--local", "--get", "a.b", "t"]);
+    assert!(last.status.success());
+    assert_eq!(stdout_of(&last), "three\n");
+
+    // `--get-all` reports every survivor, in file order.
+    let all = zvcs(&dir, &["config", "--local", "--get-all", "a.b", "t"]);
+    assert_eq!(stdout_of(&all), "two\nthree\n");
+
+    // A leading `!` inverts the match.
+    let inverted = zvcs(&dir, &["config", "--local", "--get", "a.b", "!t"]);
+    assert_eq!(stdout_of(&inverted), "one\n");
+
+    // Selecting nothing is exit 1 with no output — git does not distinguish it
+    // from an absent key.
+    let none = zvcs(&dir, &["config", "--local", "--get", "a.b", "zz"]);
+    assert_eq!(none.status.code(), Some(1));
+    assert!(stdout_of(&none).is_empty());
+}
+
+#[test]
+fn get_regexp_narrows_by_value_too() {
+    let dir = multivar_repo("regexp");
+
+    let out = zvcs(&dir, &["config", "--local", "--get-regexp", r"^a\.", "tw"]);
+
+    assert!(out.status.success());
+    assert_eq!(stdout_of(&out), "a.b two\n", "key pattern AND value pattern both apply");
+}
+
+#[test]
+fn an_invalid_value_pattern_is_exit_6() {
+    let dir = multivar_repo("badvalue");
+
+    let out = zvcs(&dir, &["config", "--local", "--get", "a.b", "["]);
+
+    assert_eq!(out.status.code(), Some(6));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "error: invalid pattern: [\n");
+}

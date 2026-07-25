@@ -1253,6 +1253,19 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
 /// the help-key color, descriptions in white; two columns. Ported style from
 /// htoprs `overlay::draw_help`.
 pub(crate) fn render_help(buf: &mut Buffer) {
+    render_help_for(buf, "ZTOP", "live fleet monitor", HELP_SECTIONS);
+}
+
+/// The same help box for any tool that shares this theme layer, titled with the
+/// tool it actually belongs to and listing ITS keys. zdashboard renders its own
+/// section list through here — a help screen that names another program and
+/// advertises bindings the running one does not have is worse than no help.
+pub(crate) fn render_help_for(
+    buf: &mut Buffer,
+    tool: &str,
+    subtitle: &str,
+    sections: &[(&str, &[(&str, &str)])],
+) {
     let bg = Style::default().fg(Color::White).bg(HELP_BG);
     let border = Style::default().fg(HELP_TITLE).bg(HELP_BG).add_modifier(Modifier::BOLD);
     let section_s = Style::default().fg(HELP_SECTION).bg(HELP_BG).add_modifier(Modifier::BOLD);
@@ -1263,7 +1276,7 @@ pub(crate) fn render_help(buf: &mut Buffer) {
     // Distribute sections across two columns, balancing height.
     let mut cols: [Vec<&(&str, &[(&str, &str)])>; 2] = [Vec::new(), Vec::new()];
     let mut heights = [0usize; 2];
-    for s in HELP_SECTIONS {
+    for s in sections {
         let h = s.1.len() + 2; // header + rows + a blank
         let c = if heights[0] <= heights[1] { 0 } else { 1 };
         cols[c].push(s);
@@ -1275,8 +1288,8 @@ pub(crate) fn render_help(buf: &mut Buffer) {
     let bh = (content_h + 6).min(buf.area().height);
     let (ix, iy) = draw_box(buf, bw, bh, bg, border);
 
-    set_str(buf, ix, iy, "⌨  ZTOP — KEYBOARD SHORTCUTS", border, bw - 3);
-    set_str(buf, ix, iy + 1, "live fleet monitor", hint_s, bw - 3);
+    set_str(buf, ix, iy, &format!("⌨  {tool} — KEYBOARD SHORTCUTS"), border, bw - 3);
+    set_str(buf, ix, iy + 1, subtitle, hint_s, bw - 3);
     for (ci, col) in cols.iter().enumerate() {
         let cx = ix + ci as u16 * (col_w + 1);
         let mut y = iy + 3;

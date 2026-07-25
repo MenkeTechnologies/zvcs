@@ -46,7 +46,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::Terminal;
 
 use crate::superset::ztop::{
-    cn_themed, fill_row, load_palette, render_help, render_theme_chooser, render_theme_editor,
+    cn_themed, fill_row, load_palette, render_help_for, render_theme_chooser, render_theme_editor,
     save_palette, set_cell, set_str, Palette, ThemeName, THEMES,
 };
 
@@ -777,7 +777,7 @@ fn render(buf: &mut Buffer, d: &Dash) {
 
     match &d.overlay {
         Overlay::None => {}
-        Overlay::Help => render_help(buf),
+        Overlay::Help => render_help_for(buf, "ZDASHBOARD", "fleet · processes · events · commands", DASH_HELP),
         Overlay::Chooser(cur) => render_theme_chooser(buf, *cur),
         Overlay::Editor(chan) => render_theme_editor(buf, d.pal, *chan),
     }
@@ -1191,6 +1191,19 @@ fn short_sha(s: &Option<String>) -> String {
         _ => "—".into(),
     }
 }
+
+/// zdashboard's OWN keymap, listed in its own help box. Every entry below is a
+/// binding this file actually implements — checked against `handle_key` — and
+/// nothing ztop has but this does not appears here.
+const DASH_HELP: &[(&str, &[(&str, &str)])] = &[
+    ("GENERAL", &[("F1 h ?", "This help"), ("q", "Quit"), ("^C", "Quit")]),
+    ("THEME", &[("F2 c", "Theme chooser"), ("~ e", "Theme editor")]),
+    ("FILTER", &[("/", "Filter every tile"), ("Enter", "Keep the filter"), ("Esc", "Clear the filter")]),
+    ("NAVIGATE", &[("↑ ↓ k j", "Move the cursor"), ("PgUp PgDn", "Page up / down"), ("^U ^D", "Half page"), ("g G", "Top / bottom")]),
+    ("TILES", &[("Tab", "Next tile"), ("Shift-Tab", "Previous tile"), ("← →", "Other column")]),
+    ("LAYOUT", &[("H L", "Move column divider"), ("J K", "Move row divider"), ("=", "Reset layout"), ("drag", "Drag a divider")]),
+    ("MOUSE", &[("wheel", "Scroll a tile"), ("click", "Select a row"), ("right-click", "Row details")]),
+];
 
 /// Handle one key. Returns true to quit. Theme overlays (chooser/editor/help)
 /// mirror ztop's controls so the two feel identical.

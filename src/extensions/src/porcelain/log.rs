@@ -666,13 +666,27 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             pos_specs.push(spec.clone());
         }
     }
+    // git resolves each positional token as a revision; the first that is *not* a
+    // revision but names an existing path switches to pathspec mode — that token and
+    // every one after it become pathspecs, exactly as if a `--` had preceded them
+    // (so `git log .` == `git log -- .`). A token that is neither a revision nor a
+    // path is the "ambiguous argument" fatal.
+    let mut in_paths = false;
     for spec in &pos_specs {
+        if in_paths {
+            pathspecs.push(spec.clone());
+            continue;
+        }
         match repo.rev_parse_single(spec.as_str()) {
             Ok(id) => {
                 tips.push(id.detach());
                 if source_mode {
                     tip_sources.push(spec.clone());
                 }
+            }
+            Err(_) if spec_is_path(&repo, spec) => {
+                in_paths = true;
+                pathspecs.push(spec.clone());
             }
             Err(_) => {
                 let hex_len = repo.object_hash().len_in_hex();
@@ -681,6 +695,10 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+    // Whether the args named any *positive* revision tip. When they didn't — no revs,
+    // only `^exclude`s, or every token turned out to be a pathspec (`git log .`) —
+    // git defaults the positive side to `HEAD`, just as for a bare `git log`.
+    let positive_from_args = !tips.is_empty();
     if all {
         // Materialise the names first: the iterator holds the packed-refs buffer,
         // which would block the per-ref object lookups below.
@@ -712,7 +730,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
-    if revs.is_empty() || all {
+    if !positive_from_args || all {
         let head = repo.head()?;
         if head.is_unborn() && !all {
             let branch = head
@@ -1080,6 +1098,30 @@ fn parse_int(value: &str) -> Option<i64> {
     }
     let n: i64 = digits.parse().ok()?;
     Some(if neg { -n } else { n })
+}
+
+/// Whether `spec` names a path, so git treats an unresolvable revision token as a
+/// pathspec instead of erroring (`git checkout`-style disambiguation, git's
+/// `verify_filename`). True when the path is present in the working tree, or is
+/// tracked in the index — the latter covers `git log <file>` for a path that was
+/// deleted from the worktree but still has history.
+fn spec_is_path(repo: &gix::Repository, spec: &str) -> bool {
+    if std::path::Path::new(spec).exists() {
+        return true;
+    }
+    let needle = spec.strip_suffix('/').unwrap_or(spec);
+    if needle.is_empty() {
+        return false;
+    }
+    let Ok(index) = repo.open_index() else {
+        return false;
+    };
+    let n = needle.as_bytes();
+    index.entries().iter().any(|e| {
+        let p: &[u8] = e.path(&index).as_ref();
+        // Exact file, or a directory prefix (`p` lies under `needle/`).
+        p == n || (p.len() > n.len() && p.starts_with(n) && p[n.len()] == b'/')
+    })
 }
 
 /// git distinguishes a well-formed but absent object id from an unresolvable name:

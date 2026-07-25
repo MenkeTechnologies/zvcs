@@ -77,6 +77,19 @@ closes one of them.
 
 ## [0x02] BUILD
 
+Homebrew installs the binary as `zvcs`, so it never clobbers the git formula —
+shadowing is opt-in, and `zvcs zshadow` is the whole opt-in:
+
+```sh
+brew install menketechnologies/menketech/zvcs
+zvcs zshadow                  # install ~/.zvcs/{bin,man,completions}, print the shell lines
+eval "$(zvcs zshadow)"        # …apply them here, or paste them into ~/.zshrc
+git zdoctor                   # in a new shell, `git` is zvcs
+```
+
+Re-run `zvcs zshadow` after a `brew upgrade` so the `~/.zvcs/bin/git` symlink
+follows the new build. From source:
+
 ```sh
 git clone https://github.com/MenkeTechnologies/zvcs
 cd zvcs

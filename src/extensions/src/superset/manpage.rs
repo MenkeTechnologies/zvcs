@@ -264,6 +264,7 @@ pub const DOCS: &[Doc] = &[
             "stdout carries shell code only \\(em the export PATH line for the bin directory, the export MANPATH line for the man directory, and the fpath line for the completion directory \\(em so `eval \"$(git zshadow)\"` sets the current shell up and the same lines paste into ~/.zshrc. The install summary goes to stderr, where an eval leaves it alone.",
             "A PATH or MANPATH line the environment already satisfies is printed commented out, so re-evaluating never duplicates an entry and the line is still visible to uncomment when pasting into an rc file; --all prints every line uncommented. fpath is a zsh variable rather than an exported one, so it cannot be inspected from here and its line is always live \\(em put it before compinit, and `typeset -U fpath` keeps repeats harmless.",
             "-n (--print) prints the lines without installing anything. Paths under $HOME are written as $HOME/... so the lines are portable across machines.",
+            "Homebrew installs this binary as `zvcs` rather than `git`, so the bootstrap there is `zvcs zshadow` \\(em the same command under its other name. Once the printed PATH line is in effect, `git` is this binary and `git zshadow` is the way to re-run it, which a brew upgrade calls for: the shim points at the binary that installed it.",
             "Idempotent: a correct symlink is left alone, a stale one is repointed, a real file of the same name is never clobbered, and the completion is rewritten only when its content differs.",
         ],
     },

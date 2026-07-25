@@ -95,7 +95,14 @@ const NOT_COMMITTED_MAIL: &[u8] = b"not.committed.yet";
 /// regex/function `-L` forms, `--date=human`, the `-local` date variants, …)
 /// are rejected with a terse message rather than emitting wrong output.
 pub fn blame(args: &[String]) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let mut repo = gix::discover(".")?;
+    // Object-heavy path: give gix the caches it does not enable by default —
+    // a decoded-object cache and a git-sized delta-base cache (gix ships a
+    // 64-entry linked list; git's core.deltaBaseCacheLimit default is 96MB).
+    repo.object_cache_size_if_unset(16 * 1024 * 1024);
+    repo.objects.set_pack_cache(|| {
+        Box::new(gix::odb::pack::cache::lru::MemoryCappedHashmap::new(96 * 1024 * 1024))
+    });
 
     // git reads blame.showEmail as the default for `-e`/`--show-email`, still
     // overridable on the command line (including `--no-show-email`).

@@ -215,7 +215,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // invalid option value, an ambiguous positional, and any "too many operands"
     // error surface in git's own argument order — `setup_revisions()` is one pass,
     // and the earliest failing token is the one whose exit code git reports.
-    let repo = gix::discover(".")?;
+    let mut repo = gix::discover(".")?;
+    // Object-heavy path: give gix the caches it does not enable by default —
+    // a decoded-object cache and a git-sized delta-base cache (gix ships a
+    // 64-entry linked list; git's core.deltaBaseCacheLimit default is 96MB).
+    repo.object_cache_size_if_unset(16 * 1024 * 1024);
+    repo.objects.set_pack_cache(|| {
+        Box::new(gix::odb::pack::cache::lru::MemoryCappedHashmap::new(96 * 1024 * 1024))
+    });
 
     // Config-provided defaults, overridden by the CLI flags parsed below (git's
     // precedence: diff.context < -U, diff.srcPrefix/dstPrefix/noPrefix < the

@@ -552,10 +552,13 @@ fn build_requests(
         return Ok((requests, upstreams));
     }
 
+    // `--tags` ADDS every tag to whatever was asked for: git documents it as "all
+    // refs under refs/tags are pushed, in addition to refspecs explicitly listed
+    // on the command line". Refusing the combination broke the ordinary release
+    // command, `git push origin main --tags`, which stock git accepts. (`--all`
+    // above is different: git really does reject it alongside a refspec.)
+    let mut tag_requests: Vec<Request> = Vec::new();
     if f.tags {
-        if !specs.is_empty() {
-            bail!("--tags can't be combined with refspecs");
-        }
         for r in repo.references()?.tags()? {
             let r = r.map_err(|e| anyhow!("{e}"))?;
             let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
@@ -566,10 +569,15 @@ fn build_requests(
             // fetch reporting "would clobber existing tag" because the two sides
             // now name different objects.
             if let Some(id) = r.try_id() {
-                requests.push(Request { name, new: id.detach(), force: f.force, expected: None, only_if_absent: false });
+                tag_requests.push(Request { name, new: id.detach(), force: f.force, expected: None, only_if_absent: false });
             }
         }
-        return Ok((requests, upstreams));
+        // Only `--tags` on its own is complete here; with refspecs alongside, the
+        // named refs still have to be resolved below and pushed with the tags.
+        if specs.is_empty() {
+            requests.append(&mut tag_requests);
+            return Ok((requests, upstreams));
+        }
     }
 
     if f.delete {
@@ -611,6 +619,7 @@ fn build_requests(
     if f.follow_tags {
         append_followed_tags(repo, &mut requests)?;
     }
+    requests.append(&mut tag_requests);
     Ok((requests, upstreams))
 }
 

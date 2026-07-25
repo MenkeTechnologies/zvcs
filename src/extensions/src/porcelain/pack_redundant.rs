@@ -321,7 +321,7 @@ fn percent_encode(s: &str) -> String {
 /// at its own root, absolute otherwise.
 fn object_dir_display(repo: &gix::Repository) -> String {
     let common = repo.common_dir();
-    if let Some(work_dir) = repo.work_dir() {
+    if let Some(work_dir) = repo.workdir() {
         if let Ok(rel) = common.strip_prefix(work_dir) {
             return format!("{}/objects", rel.display());
         }

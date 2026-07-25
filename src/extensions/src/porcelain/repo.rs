@@ -30,7 +30,7 @@
 //! `fatal: not a git repository` / exit 128, matching every other module here.
 
 use anyhow::Result;
-use gix::bstr::{BString, ByteSlice};
+use gix::bstr::BString;
 use gix::odb::pack::Find as _;
 use gix::ObjectId;
 use std::collections::HashSet;

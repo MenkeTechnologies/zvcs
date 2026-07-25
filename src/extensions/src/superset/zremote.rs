@@ -105,7 +105,6 @@ pub fn zremote(args: &[String]) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn substring_rewrite_semantics() {

@@ -1740,7 +1740,6 @@ fn custom_has_field_date(fmt: &str) -> bool {
 
 /// Expand a validated `--format` string for one entry.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn expand_format(
     repo: &gix::Repository,
     fmt: &str,

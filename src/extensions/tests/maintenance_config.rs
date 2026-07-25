@@ -138,7 +138,7 @@ fn task_enabled_false_suppresses_default_pack_refs() {
     let (rz, hz) = fixture("packoff-z", &cfg);
     let (rg, hg) = fixture("packoff-g", &cfg);
     let z = run(BIN, &rz, &hz, &[]);
-    let g = run("git", &rg, &hg, &[]);
+    let _g = run("git", &rg, &hg, &[]);
     assert_eq!(z.status.code(), Some(0));
     assert!(!packed_refs(&rz), "pack-refs.enabled=false leaves refs loose");
     assert!(rz.join(".git/refs/heads/b1").exists(), "loose ref remains present");
@@ -222,7 +222,7 @@ fn strategy_incremental_runs_gc_and_enabled_gates_it() {
     let (rz, hz) = fixture("strat-off-z", &cfg);
     let (rg, hg) = fixture("strat-off-g", &cfg);
     let z = run(BIN, &rz, &hz, &[]);
-    let g = run("git", &rg, &hg, &[]);
+    let _g = run("git", &rg, &hg, &[]);
     assert_eq!(z.status.code(), Some(0));
     assert!(!packed_refs(&rz), "gc.enabled=false empties the strategy set");
     assert_eq!(packed_refs(&rz), packed_refs(&rg), "must match git");

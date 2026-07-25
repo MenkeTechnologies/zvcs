@@ -70,7 +70,7 @@ mod tests {
     #[test]
     fn worker_count_is_bounded_by_the_work() {
         let n = count(100, 4);
-        assert!(n >= 1 && n <= 25, "expected at most 25 workers for 100 items at 4 each, got {n}");
+        assert!((1..=25).contains(&n), "expected at most 25 workers for 100 items at 4 each, got {n}");
     }
 
     /// `min_per_thread` of 0 must not divide by zero.

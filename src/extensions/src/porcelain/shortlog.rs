@@ -1254,6 +1254,7 @@ fn commit_records(
         for _ in 0..workers {
             let proto = repo.clone();
             let cursor = &cursor;
+            #[allow(clippy::type_complexity)] // per-worker (index, (authors, key)) result rows
             handles.push(scope.spawn(move || -> Result<Vec<(usize, (Vec<BString>, BString))>> {
                 let repo = proto;
                 let mut mine = Vec::new();

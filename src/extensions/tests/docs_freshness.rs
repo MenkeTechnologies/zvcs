@@ -57,25 +57,26 @@ fn quoted_verb_counts_match_the_dispatch_tables() {
     let superset = SUPERSET_VERBS.len();
     let porcelain = PORCELAIN_VERBS.len();
 
+    // Compile the scan patterns once, not once per page (clippy::regex_creation_in_loops).
+    let z_re = regex::Regex::new(r"z\*, (\d+)\)").expect("z* pattern");
+    let porcelain_re = regex::Regex::new(r"porcelain \((\d+)\)").expect("porcelain pattern");
+    let stat_re = regex::Regex::new(r#"stat-val">(\d+)</div><div class="stat-label">([^<]+)<"#)
+        .expect("stat pattern");
+
     for name in PAGES {
         let html = page(name);
         // "superset verbs (z*, N)" in the dispatch diagrams.
-        for cap in regex::Regex::new(r"z\*, (\d+)\)").expect("z* pattern").captures_iter(&html) {
+        for cap in z_re.captures_iter(&html) {
             let claimed: usize = cap[1].parse().expect("count is a number");
             assert_eq!(claimed, superset, "{name} says {claimed} superset verbs, there are {superset}");
         }
         // "porcelain (N)" in the same diagrams.
-        for cap in
-            regex::Regex::new(r"porcelain \((\d+)\)").expect("porcelain pattern").captures_iter(&html)
-        {
+        for cap in porcelain_re.captures_iter(&html) {
             let claimed: usize = cap[1].parse().expect("count is a number");
             assert_eq!(claimed, porcelain, "{name} says {claimed} git-compat verbs, there are {porcelain}");
         }
         // The report's headline stat cards.
-        for cap in regex::Regex::new(r#"stat-val">(\d+)</div><div class="stat-label">([^<]+)<"#)
-            .expect("stat pattern")
-            .captures_iter(&html)
-        {
+        for cap in stat_re.captures_iter(&html) {
             let claimed: usize = cap[1].parse().expect("count is a number");
             let label = &cap[2];
             let expected = match label {

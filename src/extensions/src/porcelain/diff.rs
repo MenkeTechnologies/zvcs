@@ -1252,6 +1252,7 @@ fn collect_tree_change(
 /// abbreviation, `a/`/`b/` prefixes, and hunk formatting). Merge commits are the
 /// caller's concern: git shows no diff for them without `-m`/`-c`/`--cc`, so `log`
 /// only invokes this for commits with a single parent (or none).
+#[allow(dead_code)] // shared single-parent patch renderer; kept for `log -p`/`diff` parity.
 pub(crate) fn commit_patch(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,

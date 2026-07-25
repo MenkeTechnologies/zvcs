@@ -1067,7 +1067,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                     if !diff.is_empty() {
                         diff.push(b'\n');
                     }
-                    diff.extend_from_slice(&p);
+                    diff.extend_from_slice(p);
                 }
             }
             if !diff.is_empty() {
@@ -1319,6 +1319,7 @@ impl<'a> EntryWindow<'a> {
                 let mine_abbrev = std::cell::RefCell::new(abbrev.borrow().fork());
                 let cursor = &cursor;
                 let params = &self.params;
+                #[allow(clippy::type_complexity)] // per-worker (rows, abbrev-cache) result
                 handles.push(scope.spawn(move || -> Result<(Vec<(usize, Vec<u8>)>, AbbrevCache)> {
                     let repo = proto;
                     let mut mine = Vec::new();
@@ -1767,6 +1768,7 @@ impl NodeReader {
 /// git's `commit_list_insert_by_date`: keep the list newest-first, and place a
 /// commit *after* every commit with the same date so equal timestamps come out
 /// in insertion order — the tie-break git's priority queue also uses.
+#[allow(dead_code)] // faithful port of git's commit_list_insert_by_date; kept for the walk.
 fn insert_by_date(list: &mut Vec<Node>, node: Node) {
     let pos = list
         .iter()

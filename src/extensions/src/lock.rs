@@ -314,6 +314,24 @@ pub fn is_ref_race(err: &anyhow::Error) -> bool {
     })
 }
 
+impl Drop for RepoLock {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.as_mut() {
+            let _ = stream.write_all(format!("RELEASE {}\n", self.id).as_bytes());
+            let _ = stream.flush();
+            // Closing the socket (on drop, right after this) also triggers the
+            // daemon's EOF auto-release, so the next waiter is promoted either way.
+        }
+        // Clear the thread-local reentrancy key (only the guard that registered it
+        // carries `held_key`; reentrant no-op guards carry `None` and skip this).
+        if let Some(key) = self.held_key.take() {
+            HELD.with(|h| {
+                h.borrow_mut().remove(&key);
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use gix::refs::file::transaction::prepare::Error as PrepareError;
@@ -408,23 +426,5 @@ mod tests {
             expected: gix::refs::Target::Object(gix::ObjectId::empty_blob(gix::hash::Kind::Sha1)),
         });
         assert!(!super::is_ref_race(&err));
-    }
-}
-
-impl Drop for RepoLock {
-    fn drop(&mut self) {
-        if let Some(stream) = self.stream.as_mut() {
-            let _ = stream.write_all(format!("RELEASE {}\n", self.id).as_bytes());
-            let _ = stream.flush();
-            // Closing the socket (on drop, right after this) also triggers the
-            // daemon's EOF auto-release, so the next waiter is promoted either way.
-        }
-        // Clear the thread-local reentrancy key (only the guard that registered it
-        // carries `held_key`; reentrant no-op guards carry `None` and skip this).
-        if let Some(key) = self.held_key.take() {
-            HELD.with(|h| {
-                h.borrow_mut().remove(&key);
-            });
-        }
     }
 }

@@ -18,6 +18,7 @@ pub struct RequestWriter<'a> {
 impl io::Write for RequestWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.trace {
+            #[allow(unused_imports)]
             use bstr::ByteSlice;
             gix_features::trace::trace!(">> {}", buf.as_bstr());
         }
@@ -78,6 +79,7 @@ impl<'a> RequestWriter<'a> {
             }
             MessageKind::Text(t) => {
                 if self.trace {
+                    #[allow(unused_imports)]
                     use bstr::ByteSlice;
                     gix_features::trace::trace!(">> {}", t.as_bstr());
                 }

@@ -46,7 +46,8 @@ same binary that answers `rev-parse`.
 - [\[0x05\] The zdaemon Coordinator](#0x05-the-zdaemon-coordinator)
 - [\[0x06\] Layout](#0x06-layout)
 - [\[0x07\] Status & Roadmap](#0x07-status--roadmap)
-- [\[0x08\] Documentation](#0x08-documentation)
+- [\[0x08\] Benchmarks](#0x08-benchmarks)
+- [\[0x09\] Documentation](#0x09-documentation)
 - [\[0xFF\] License](#0xff-license)
 
 ---
@@ -456,7 +457,77 @@ Mutating subcommands are currently excluded from generated fuzz cases, so their
 parity rests on curated cases only. Treat their scores as less well covered than
 the read-only ones rather than as evidence of correctness.
 
-## [0x08] DOCUMENTATION
+## [0x08] BENCHMARKS
+
+Same repository, same commands, same machine, both binaries measured in one
+interleaved run so load moves them together. Regenerate with:
+
+```sh
+cargo build --release && scripts/bench.sh /path/to/some/repo
+```
+
+Repository: zshrs (6,376 commits) · stock git 2.50.1 · 18 cores · 10 runs after
+3 warmups · release build · the machine was busy, which compresses zvcs's lead
+rather than git's.
+
+| Command | zvcs | git | |
+|---|---:|---:|---:|
+| `git status` | 15.1 ms | 156.8 ms | **10.38x** |
+| `git log --stat -n 30` | 13.2 ms | 112.4 ms | **8.52x** |
+| `git blame README.md` | 6.8 ms | 30.9 ms | **4.54x** |
+| `git log -S return --format=%H` | 1.569 s | 6.805 s | **4.34x** |
+| `git log --oneline` | 17.3 ms | 49.7 ms | **2.87x** |
+| `git log` | 20.6 ms | 58.9 ms | **2.86x** |
+| `git log --format=%s` | 17.7 ms | 44.8 ms | **2.53x** |
+| `git log -p -n 20` | 29.6 ms | 72.8 ms | **2.46x** |
+| `git log --format=%h` | 9.3 ms | 17.2 ms | **1.85x** |
+| `git cat-file -p HEAD` | 8.0 ms | 13.4 ms | **1.68x** |
+| `git diff --name-only HEAD~5` | 14.8 ms | 20.8 ms | **1.41x** |
+| `git for-each-ref` | 9.4 ms | 13.2 ms | **1.40x** |
+| `git describe` | 9.7 ms | 13.4 ms | **1.38x** |
+| `git show HEAD` | 10.0 ms | 13.6 ms | **1.36x** |
+| `git shortlog -s` | 7.6 ms | 10.2 ms | **1.34x** |
+| `git rev-list --count HEAD` | 10.0 ms | 12.8 ms | **1.28x** |
+| `git diff --stat HEAD~5` | 29.7 ms | 36.9 ms | **1.24x** |
+| `git ls-files` | 9.4 ms | 11.0 ms | **1.17x** |
+| `git tag -l` | 11.5 ms | 12.0 ms | **1.04x** |
+
+Three things produce the difference, and only the first is ordinary optimization:
+
+- **Every core, not one.** git's diff and log machinery is single-threaded. A
+  blob pair is diffed in isolation and the object store cannot change while a
+  read-only verb runs, so patches, per-file analysis, pickaxe scans and record
+  rendering are fanned across the pool. Workers pull from a shared cursor rather
+  than a fixed slice, because one commit that rewrites a large file outweighs a
+  hundred that touch a line each. `ZVCS_THREADS=1` forces the sequential path and
+  produces byte-identical output.
+- **A ledger that remembers.** An abbreviation is fixed once the object exists,
+  and a tree pair's change list and per-file line tallies are a pure function of
+  two immutable trees. None of it can go stale, so it is computed once and read
+  back from SQLite forever after — which is what `log --stat` and `blame` are
+  reading instead of the object store.
+- **A daemon that computes it early.** `zvcs.precache` warms those caches when a
+  watched repo's refs move, so the work is done before anyone asks. **git cannot
+  do this at all**: no part of git runs between two commands.
+
+### Cold versus warm
+
+The table above is steady state — a repository the daemon has seen. On first
+touch of a repository with an empty ledger, the cache-backed commands are around
+git's own speed, because they compute the same answers *and* write them down:
+
+| Command | zvcs cold | zvcs warm | git |
+|---|---:|---:|---:|
+| `git log --stat -n 30` | 137.4 ms | 16.2 ms | 118.9 ms |
+| `git log --stat -n 150` | 831.4 ms | 64.0 ms | 624.6 ms |
+| `git blame README.md` | 169.5 ms | 9.4 ms | 107.4 ms |
+
+Cold is measured with the ledger deleted before every single run, which is the
+worst case and not one a running daemon leaves you in — it warms the newest
+commits on every ref change, and `git zprecache` does the same pass on demand
+(150 commits in 0.63 s).
+
+## [0x09] DOCUMENTATION
 
 - **Docs hub** — <https://menketechnologies.github.io/zvcs/>
 - **Design document** — [DESIGN.md](DESIGN.md) — daemon architecture, concurrency model, autonomous behaviors, ledger/queue

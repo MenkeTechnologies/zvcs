@@ -364,6 +364,24 @@ fn start() -> Result<ExitCode> {
     // Record our pid for `zdaemon info`.
     let _ = std::fs::write(pid_path(), std::process::id().to_string());
 
+    // Self-terminate if our socket file disappears. A test tears down its temp
+    // `ZVCS_HOME`/socket when it finishes; without this, any daemon it spawned —
+    // especially one *autostarted* (detached, own process group) by a `git` command
+    // rather than the explicit `zdaemon start` the test tracks and kills — would
+    // outlive the run and pile up. Tie every daemon's life to the socket it serves:
+    // once that path is gone, no one can reach it, so it exits. Normal operation
+    // never removes the socket (only `zdaemon stop` does, which also exits), so this
+    // only ever fires on an abandoned daemon.
+    {
+        let sock = path.clone();
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(2));
+            if !sock.exists() {
+                std::process::exit(0);
+            }
+        });
+    }
+
     let (tx, rx): (Sender<Cmd>, Receiver<Cmd>) = mpsc::channel();
 
     let worker_path = path.clone();

@@ -2620,6 +2620,21 @@ fn collect_changes(
         None => None,
     };
 
+    // A tree-to-tree diff is a pure function of two immutable trees, so the file
+    // list — and the per-file line tallies, which cost a blob read each — are
+    // memoised in the ledger exactly as blame is. `--stat` over a range re-diffs
+    // the same parent/child pairs on every invocation; git does too, but this
+    // sidesteps the work instead of racing it.
+    let old_key = old_tree.as_ref().map(|t| t.id.to_string()).unwrap_or_default();
+    let new_key = new_tree.id.to_string();
+    if let Some(text) =
+        crate::db::open_ro().ok().and_then(|c| crate::db::treediff_load(&c, &old_key, &new_key, with_counts))
+    {
+        if let Some(files) = decode_changes(&text) {
+            return Ok(files);
+        }
+    }
+
     let mut changes = repo.diff_tree_to_tree(
         old_tree.as_ref(),
         Some(&new_tree),
@@ -2633,7 +2648,53 @@ fn collect_changes(
             out.push(f);
         }
     }
+    if let Ok(conn) = crate::db::open_rw() {
+        let _ = crate::db::treediff_store(&conn, &old_key, &new_key, with_counts, &encode_changes(&out));
+    }
     Ok(out)
+}
+
+/// Encode a change list for the ledger: one record per file,
+/// `status,added,deleted,binary,old_size,new_size,path`, NUL-separated so a path
+/// containing any printable byte survives the round trip.
+fn encode_changes(files: &[FileChange]) -> String {
+    files
+        .iter()
+        .map(|f| {
+            format!(
+                "{},{},{},{},{},{},{}",
+                f.status as char,
+                f.added,
+                f.deleted,
+                u8::from(f.is_binary),
+                f.old_size,
+                f.new_size,
+                String::from_utf8_lossy(&f.path)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\0")
+}
+
+/// Decode what [`encode_changes`] wrote. `None` for a malformed record, so a
+/// damaged row falls back to a real diff rather than a wrong answer.
+fn decode_changes(text: &str) -> Option<Vec<FileChange>> {
+    if text.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    for rec in text.split('\0') {
+        let mut f = rec.splitn(7, ',');
+        let status = f.next()?.bytes().next()?;
+        let added: usize = f.next()?.parse().ok()?;
+        let deleted: usize = f.next()?.parse().ok()?;
+        let is_binary = f.next()? == "1";
+        let old_size: usize = f.next()?.parse().ok()?;
+        let new_size: usize = f.next()?.parse().ok()?;
+        let path = f.next()?.as_bytes().to_vec();
+        out.push(FileChange { path, status, added, deleted, is_binary, old_size, new_size });
+    }
+    Some(out)
 }
 
 /// Whether `node`'s commit touched any path matching `pathspecs`, diffed against

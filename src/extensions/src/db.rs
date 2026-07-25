@@ -161,6 +161,14 @@ CREATE TABLE IF NOT EXISTS ppids (
 -- push, add, merge, …) a durable process has run. Keyed by the same session as
 -- `ppids` (join on it for the process's pid/cmd/cwd), one row per (session, verb).
 -- Only mutating verbs are recorded, so the read hot path never writes here.
+CREATE TABLE IF NOT EXISTS treediff (
+    old_tree TEXT NOT NULL,
+    new_tree TEXT NOT NULL,
+    counts   INTEGER NOT NULL,
+    files    TEXT NOT NULL,
+    PRIMARY KEY (old_tree, new_tree, counts)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS blame (
     -- `commit` is a SQLite keyword: naming the column that made the whole SCHEMA
     -- batch fail to parse, which silently disabled every ledger write, not just
@@ -219,6 +227,41 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// The cached file-change list between two trees.
+///
+/// A tree-to-tree diff is a pure function of two immutable trees, so like the
+/// blame cache this never expires and is shared by every clone holding them.
+/// `counts` is part of the key because the added/deleted line tallies require
+/// reading each blob — a caller that does not need them stores a cheaper row.
+pub fn treediff_load(
+    conn: &Connection,
+    old_tree: &str,
+    new_tree: &str,
+    counts: bool,
+) -> Option<String> {
+    conn.query_row(
+        "SELECT files FROM treediff WHERE old_tree = ?1 AND new_tree = ?2 AND counts = ?3",
+        rusqlite::params![old_tree, new_tree, i64::from(counts)],
+        |r| r.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+pub fn treediff_store(
+    conn: &Connection,
+    old_tree: &str,
+    new_tree: &str,
+    counts: bool,
+    files: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO treediff (old_tree, new_tree, counts, files) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![old_tree, new_tree, i64::from(counts), files],
+    )?;
+    Ok(())
+}
 /// The cached blame of one path at one commit: the blob that was blamed and a
 /// run-length encoding of the attribution.
 ///

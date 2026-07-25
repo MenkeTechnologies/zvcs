@@ -320,6 +320,7 @@ pub fn file(
                         file_path,
                         file_path,
                         options.diff_algorithm,
+                        options.ignore_whitespace,
                         &mut stats,
                     )?;
                     hunks_to_blame = process_changes(hunks_to_blame, changes.clone(), suspect, *parent_id);
@@ -352,6 +353,7 @@ pub fn file(
                         file_path,
                         source_location.as_ref(),
                         options.diff_algorithm,
+                        options.ignore_whitespace,
                         &mut stats,
                     )?;
                     hunks_to_blame = process_changes(hunks_to_blame, changes, suspect, *parent_id);
@@ -755,6 +757,7 @@ fn blob_changes(
     file_path: &BStr,
     previous_file_path: &BStr,
     diff_algorithm: gix_diff::blob::Algorithm,
+    ignore_whitespace: bool,
     stats: &mut Statistics,
 ) -> Result<Vec<Change>, Error> {
     use gix_diff::blob::Hunk;
@@ -775,10 +778,19 @@ fn blob_changes(
     )?;
 
     let outcome = resource_cache.prepare_diff()?;
-    let input = gix_diff::blob::InternedInput::new(
-        outcome.old.data.as_slice().unwrap_or_default(),
-        outcome.new.data.as_slice().unwrap_or_default(),
-    );
+    let old_data = outcome.old.data.as_slice().unwrap_or_default();
+    let new_data = outcome.new.data.as_slice().unwrap_or_default();
+    // `git blame -w` (XDF_IGNORE_WHITESPACE): compare lines with all whitespace removed,
+    // so a whitespace-only change is not a change. Normalizing per line preserves the
+    // line count, so the resulting hunk line-indices still map to the original lines.
+    let (old_norm, new_norm);
+    let input = if ignore_whitespace {
+        old_norm = strip_whitespace_per_line(old_data);
+        new_norm = strip_whitespace_per_line(new_data);
+        gix_diff::blob::InternedInput::new(old_norm.as_slice(), new_norm.as_slice())
+    } else {
+        gix_diff::blob::InternedInput::new(old_data, new_data)
+    };
 
     let mut diff = gix_diff::blob::Diff::compute(diff_algorithm, &input);
     diff.postprocess_lines(&input);
@@ -877,4 +889,15 @@ fn collect_parents(
 /// to unify them so the later access shows the right thing.
 pub(crate) fn tokens_for_diffing(data: &[u8]) -> impl TokenSource<Token = &[u8]> {
     gix_diff::blob::sources::byte_lines(data)
+}
+
+/// Remove all in-line whitespace (space, tab, CR, form-feed, vertical-tab) while keeping every
+/// `\n`, so `git blame -w` (`XDF_IGNORE_WHITESPACE`) treats a whitespace-only line change as no
+/// change. Keeping every `\n` preserves the line count, so a diff of the stripped data yields
+/// hunk line-indices that still map one-to-one onto the original lines.
+fn strip_whitespace_per_line(data: &[u8]) -> Vec<u8> {
+    data.iter()
+        .copied()
+        .filter(|&b| b == b'\n' || !matches!(b, b' ' | b'\t' | b'\r' | 0x0c | 0x0b))
+        .collect()
 }

@@ -102,6 +102,8 @@ pub mod blame_file {
         pub since: Option<gix_date::Time>,
         /// Determine if rename tracking should be performed, and how.
         pub rewrites: Option<gix_diff::Rewrites>,
+        /// Ignore whitespace differences when diffing revisions (`git blame -w`).
+        pub ignore_whitespace: bool,
     }
 
     /// The error returned by [Repository::blame_file()](crate::Repository::blame_file()).

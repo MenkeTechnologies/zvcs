@@ -246,6 +246,7 @@ pub fn annotate(args: &[String]) -> Result<ExitCode> {
         ranges,
         since: None,
         rewrites: Some(gix::diff::Rewrites::default()),
+        ignore_whitespace: opts.ignore_whitespace,
     };
 
     let outcome = match repo.blame_file(rel_path.as_bytes().as_bstr(), suspect, blame_options) {
@@ -479,11 +480,6 @@ impl Options {
         }
         if self.revs_file.is_some() {
             return Some("-S <revs-file>");
-        }
-        if self.ignore_whitespace {
-            // xdiff's XDF_IGNORE_WHITESPACE has no counterpart in imara-diff,
-            // which is the tokenizer `gix-blame` diffs through.
-            return Some("-w");
         }
         if self.find_moves {
             return Some("-M line-move detection");

@@ -164,6 +164,9 @@ pub struct Options {
     /// Collect debug information whenever there's a diff or rename that affects the outcome of a
     /// blame.
     pub debug_track_path: bool,
+    /// Ignore whitespace when diffing revisions (`git blame -w`): a line that changed only in
+    /// whitespace is attributed to the earlier commit, not the whitespace-only change.
+    pub ignore_whitespace: bool,
 }
 
 /// Represents a change during history traversal for blame. It is supposed to capture enough

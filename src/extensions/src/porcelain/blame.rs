@@ -209,6 +209,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         ranges,
         since: None,
         rewrites: Some(gix::diff::Rewrites::default()),
+        ignore_whitespace: opts.ignore_whitespace,
     };
 
     // A blame of (commit, path) is a pure function of immutable objects, so the
@@ -219,7 +220,9 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     //
     // Only a full-file blame is cached: `-L` narrows the walk, so its outcome is
     // not the whole file's attribution.
-    let algo_key = format!("{:?}", opts.diff_algorithm);
+    // The key must separate `-w` from a plain blame: they diff differently, so their
+    // attributions differ and must not share a cache entry.
+    let algo_key = format!("{:?}|w={}", opts.diff_algorithm, opts.ignore_whitespace);
     let cache_key = opts.ranges.is_empty().then(|| (suspect.to_string(), rel_path.clone(), algo_key));
     // The blamed blob identifies the file content the attribution belongs to.
     let blamed_blob = repo
@@ -1335,6 +1338,8 @@ struct Options {
     raw_timestamp: bool,
     /// `-c`: git-annotate-compatible output format.
     annotate_compat: bool,
+    /// `-w`: ignore whitespace differences when diffing revisions.
+    ignore_whitespace: bool,
     /// `--diff-algorithm=<algo>`; `None` falls back to `diff.algorithm`.
     diff_algorithm: Option<gix::diff::blob::Algorithm>,
     /// `--contents <file>`: use `<file>`'s contents (or stdin for `-`) as the
@@ -1367,6 +1372,7 @@ impl Options {
         let mut show_root = show_root_default;
         let mut raw_timestamp = false;
         let mut annotate_compat = false;
+        let mut ignore_whitespace = false;
         let mut diff_algorithm: Option<gix::diff::blob::Algorithm> = None;
         let mut contents: Option<String> = None;
         // Raw `--date` value (last one wins); resolved against the repo in `blame`.
@@ -1408,7 +1414,7 @@ impl Options {
                 "-t" => raw_timestamp = true,
                 // `-c` selects git-annotate-compatible output.
                 "-c" => annotate_compat = true,
-                "-w" => bail!("unsupported option: -w (ignore whitespace is not implemented)"),
+                "-w" => ignore_whitespace = true,
                 // git's `--porcelain` and `--line-porcelain` are bit flags on one
                 // field, so `--line-porcelain` wins no matter the order.
                 "-p" | "--porcelain" => porcelain = true,
@@ -1532,6 +1538,7 @@ impl Options {
             show_root,
             raw_timestamp,
             annotate_compat,
+            ignore_whitespace,
             diff_algorithm,
             contents,
             date_arg,

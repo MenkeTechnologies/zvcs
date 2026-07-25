@@ -23,6 +23,7 @@ impl Repository {
             ranges,
             since,
             rewrites,
+            ignore_whitespace,
         } = options;
         let diff_algorithm = match diff_algorithm {
             Some(diff_algorithm) => diff_algorithm,
@@ -35,6 +36,7 @@ impl Repository {
             since,
             rewrites,
             debug_track_path: false,
+            ignore_whitespace,
         };
 
         let outcome = gix_blame::file(

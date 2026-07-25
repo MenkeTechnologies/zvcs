@@ -22,9 +22,20 @@ use std::process::{Command, Output};
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// Run the zvcs binary in `dir` with an isolated `ZVCS_HOME` plus any extra env.
+///
+/// The git config is pinned to `/dev/null` as well, not just the home. Autostart
+/// spawns a daemon when the config asks for autonomy/hooks/status, and that config
+/// is read from the DEVELOPER's `~/.gitconfig` — so on a box with `[zvcs] autohook`
+/// set, every one of these processes started a daemon in its temp home that
+/// nothing ever stopped (four orphans per suite run), and the tests silently
+/// exercised the daemon path instead of the no-daemon path they document.
 fn zvcs(dir: &Path, home: &Path, env: &[(&str, &str)], args: &[&str]) -> Output {
     let mut cmd = Command::new(BIN);
-    cmd.args(args).current_dir(dir).env("ZVCS_HOME", home);
+    cmd.args(args)
+        .current_dir(dir)
+        .env("ZVCS_HOME", home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null");
     for (k, v) in env {
         cmd.env(k, v);
     }

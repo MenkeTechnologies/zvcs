@@ -1,782 +1,969 @@
-<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>zvcs — extension verb reference</title>
-<style>
-:root{--bg:#0d1117;--fg:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--code:#1f2430;--line:#21262d}
-@media(prefers-color-scheme:light){:root{--bg:#fff;--fg:#1f2328;--dim:#57606a;--accent:#0969da;--code:#f2f4f8;--line:#d0d7de}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;max-width:60rem;margin:0 auto;padding:2rem 1.25rem}
-h1{font-size:1.9rem;margin:0 0 .25rem}.sub{color:var(--dim);margin:0 0 1.5rem}
-code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-code{background:var(--code);padding:.1em .35em;border-radius:4px;font-size:.9em}
-.toc{display:flex;flex-wrap:wrap;gap:.4rem .6rem;padding:1rem;background:var(--code);border-radius:8px;margin-bottom:2rem}
-.toc a{text-decoration:none;color:var(--accent)}.toc a code{background:transparent;padding:0}
-section{border-top:1px solid var(--line);padding-top:1.25rem;margin-top:1.25rem}
-h2{font-size:1.15rem;margin:0 0 .5rem;scroll-margin-top:1rem}h2 code{background:transparent;padding:0;color:var(--accent)}
-.summary{color:var(--dim);font-weight:400;font-size:.95rem}
-pre.synopsis{background:var(--code);padding:.6rem .8rem;border-radius:6px;overflow-x:auto;font-size:.9em;margin:.5rem 0 1rem}
-p{margin:.6rem 0}a{color:var(--accent)}
-</style>
-</head><body>
-<h1>zvcs extension verbs</h1>
-<p class="sub">116 superset (<code>z*</code>) verbs — the coordination layer stock git has no equivalent for. Generated from the same source as the man pages (<code>git help &lt;verb&gt;</code>).</p>
-<nav class="toc">
-<a href="#zsync"><code>zsync</code></a>
-<a href="#zbump"><code>zbump</code></a>
-<a href="#zdaemon"><code>zdaemon</code></a>
-<a href="#zconfig"><code>zconfig</code></a>
-<a href="#zrepos"><code>zrepos</code></a>
-<a href="#zreindex"><code>zreindex</code></a>
-<a href="#zjobs"><code>zjobs</code></a>
-<a href="#zjob"><code>zjob</code></a>
-<a href="#zcommit"><code>zcommit</code></a>
-<a href="#zpush"><code>zpush</code></a>
-<a href="#zsubmit"><code>zsubmit</code></a>
-<a href="#zrepl"><code>zrepl</code></a>
-<a href="#zclaim"><code>zclaim</code></a>
-<a href="#zunclaim"><code>zunclaim</code></a>
-<a href="#zwho"><code>zwho</code></a>
-<a href="#zstatus"><code>zstatus</code></a>
-<a href="#zlog"><code>zlog</code></a>
-<a href="#zundo"><code>zundo</code></a>
-<a href="#zsnapshot"><code>zsnapshot</code></a>
-<a href="#zrestore"><code>zrestore</code></a>
-<a href="#zsnapshots"><code>zsnapshots</code></a>
-<a href="#zworktree"><code>zworktree</code></a>
-<a href="#zstash"><code>zstash</code></a>
-<a href="#zunstash"><code>zunstash</code></a>
-<a href="#zstashes"><code>zstashes</code></a>
-<a href="#zup"><code>zup</code></a>
-<a href="#zforeach"><code>zforeach</code></a>
-<a href="#zselectors"><code>zselectors</code></a>
-<a href="#zhook"><code>zhook</code></a>
-<a href="#ztrigger"><code>ztrigger</code></a>
-<a href="#zwatch"><code>zwatch</code></a>
-<a href="#zdashed"><code>zdashed</code></a>
-<a href="#zverbs"><code>zverbs</code></a>
-<a href="#zcd"><code>zcd</code></a>
-<a href="#zpwd"><code>zpwd</code></a>
-<a href="#zls"><code>zls</code></a>
-<a href="#zenv"><code>zenv</code></a>
-<a href="#zunset"><code>zunset</code></a>
-<a href="#zecho"><code>zecho</code></a>
-<a href="#zdoctor"><code>zdoctor</code></a>
-<a href="#zmkdir"><code>zmkdir</code></a>
-<a href="#ztouch"><code>ztouch</code></a>
-<a href="#zrm"><code>zrm</code></a>
-<a href="#zcp"><code>zcp</code></a>
-<a href="#zmv"><code>zmv</code></a>
-<a href="#zcat"><code>zcat</code></a>
-<a href="#zln"><code>zln</code></a>
-<a href="#zheads"><code>zheads</code></a>
-<a href="#zdirty"><code>zdirty</code></a>
-<a href="#zbranches"><code>zbranches</code></a>
-<a href="#ztags"><code>ztags</code></a>
-<a href="#zremotes"><code>zremotes</code></a>
-<a href="#zsize"><code>zsize</code></a>
-<a href="#zage"><code>zage</code></a>
-<a href="#zpull"><code>zpull</code></a>
-<a href="#zattach"><code>zattach</code></a>
-<a href="#zgrep"><code>zgrep</code></a>
-<a href="#zahead"><code>zahead</code></a>
-<a href="#zbehind"><code>zbehind</code></a>
-<a href="#zunpushed"><code>zunpushed</code></a>
-<a href="#zunpulled"><code>zunpulled</code></a>
-<a href="#zauthors"><code>zauthors</code></a>
-<a href="#zhot"><code>zhot</code></a>
-<a href="#zconflicts"><code>zconflicts</code></a>
-<a href="#zfetch"><code>zfetch</code></a>
-<a href="#zgc"><code>zgc</code></a>
-<a href="#zfsck"><code>zfsck</code></a>
-<a href="#zprune"><code>zprune</code></a>
-<a href="#zreset"><code>zreset</code></a>
-<a href="#zabort"><code>zabort</code></a>
-<a href="#zcheckout"><code>zcheckout</code></a>
-<a href="#ztagall"><code>ztagall</code></a>
-<a href="#zcommitall"><code>zcommitall</code></a>
-<a href="#zpushall"><code>zpushall</code></a>
-<a href="#zclean"><code>zclean</code></a>
-<a href="#zwait"><code>zwait</code></a>
-<a href="#zqueue"><code>zqueue</code></a>
-<a href="#zbarrier"><code>zbarrier</code></a>
-<a href="#zstale"><code>zstale</code></a>
-<a href="#zlast"><code>zlast</code></a>
-<a href="#zbig"><code>zbig</code></a>
-<a href="#zfiles"><code>zfiles</code></a>
-<a href="#zcommits"><code>zcommits</code></a>
-<a href="#zpristine"><code>zpristine</code></a>
-<a href="#zdivergent"><code>zdivergent</code></a>
-<a href="#zorphans"><code>zorphans</code></a>
-<a href="#zsessions"><code>zsessions</code></a>
-<a href="#zidle"><code>zidle</code></a>
-<a href="#zdashboard"><code>zdashboard</code></a>
-<a href="#ztop"><code>ztop</code></a>
-<a href="#zevents"><code>zevents</code></a>
-<a href="#ztail"><code>ztail</code></a>
-<a href="#zintercept"><code>zintercept</code></a>
-<a href="#zcommands"><code>zcommands</code></a>
-<a href="#zaudit"><code>zaudit</code></a>
-<a href="#zscan"><code>zscan</code></a>
-<a href="#zsigs"><code>zsigs</code></a>
-<a href="#zreview"><code>zreview</code></a>
-<a href="#zremote"><code>zremote</code></a>
-<a href="#zrollback"><code>zrollback</code></a>
-<a href="#zsched"><code>zsched</code></a>
-<a href="#zpin"><code>zpin</code></a>
-<a href="#zunpin"><code>zunpin</code></a>
-<a href="#zbroadcast"><code>zbroadcast</code></a>
-<a href="#zhandoff"><code>zhandoff</code></a>
-<a href="#zon"><code>zon</code></a>
-<a href="#zsince"><code>zsince</code></a>
-<a href="#zcontend"><code>zcontend</code></a>
-<a href="#zwaitfor"><code>zwaitfor</code></a>
-<a href="#zgraph"><code>zgraph</code></a>
-<a href="#zrewind"><code>zrewind</code></a>
-<a href="#zguard"><code>zguard</code></a>
-<a href="#zpolicy"><code>zpolicy</code></a>
-<a href="#zppid"><code>zppid</code></a>
-<a href="#zprocs"><code>zprocs</code></a>
-<a href="#zprecache"><code>zprecache</code></a>
-</nav>
-<section id="zsync">
-<h2><code>git zsync</code> <span class="summary">— reconcile every submodule to its tracked mainline, attached</span></h2>
-<pre class="synopsis">git zsync [&lt;path&gt;...]</pre>
-<p>Fetches and fast-forwards every submodule to its tracked mainline (origin/main, else origin/master), leaving HEAD attached to that branch — detached HEAD never happens.</p>
-<p>Fast-forward only; a submodule whose worktree is dirty or whose history has diverged is skipped rather than forced. Optional paths limit the operation to the named submodules.</p>
-</section>
-<section id="zbump">
-<h2><code>git zbump</code> <span class="summary">— forward-only submodule gitlink bumps, then commit them</span></h2>
-<pre class="synopsis">git zbump [&lt;submodule-path&gt;...]</pre>
-<p>Advances the parent repository's recorded gitlink for each submodule to that submodule's current HEAD, but only when the new commit is a descendant of the recorded one — a forward-only bump that can never regress a pointer.</p>
-<p>The coalesced bumps are then committed, clearing git's "(new commits)" status marker. Paths limit the set of submodules considered.</p>
-</section>
-<section id="zdaemon">
-<h2><code>git zdaemon</code> <span class="summary">— control the singleton machine-wide coordinator</span></h2>
-<pre class="synopsis">git zdaemon &lt;start|stop|restart|reload|status|info|ping|log&gt;</pre>
-<p>Controls the one machine-wide daemon (state under ~/.zvcs, socket ~/.zvcs/zvcs.sock) that replaces git's index.lock with a fair per-repo queue and hosts the async job queue, the SQLite ledger, and reactive autonomy.</p>
-<p>start/stop bring it up and down; restart and reload respawn it, re-reading config; status and info report liveness and pid/socket/paths/config; ping is a scriptable liveness check; log [-n N] [-f] shows or tails ~/.zvcs/zvcs.log.</p>
-</section>
-<section id="zconfig">
-<h2><code>git zconfig</code> <span class="summary">— inspect and toggle the daemon's [zvcs] feature switches</span></h2>
-<pre class="synopsis">git zconfig [&lt;name&gt; [on|off|&lt;count&gt;|default]]</pre>
-<p>Turns the daemon's autonomy features on and off from the CLI instead of hand-editing ~/.gitconfig. With no argument it lists every setting, its effective value, and whether it is set in your config (marked *) or showing the built-in default.</p>
-<p>The boolean switches are autoreconcile (auto-sync submodules to origin/main on change), autobump (forward-only gitlink bumps + commit), autocrawl (crawl zvcs.crawlroots into the index on daemon start), autostatus (recompute a repo's status cache when it changes), autohook (fire each repo's zvcs.hook on change), and autodups (fan a commit out to local duplicate checkouts) — all off by default. Set them with <code>git zconfig &lt;name&gt; on|off</code>.</p>
-<p>The numeric knobs are statusinterval (status-cache backstop sweep in seconds, default 10, 0 disables), watchmru (file-watch the N most-recently-used repos, default 512, 0 disables), and interval (autonomy debounce in seconds, default 30). Set them with <code>git zconfig &lt;name&gt; &lt;count&gt;</code>.</p>
-<p><code>git zconfig &lt;name&gt;</code> shows a single setting; <code>git zconfig &lt;name&gt; default</code> reverts it to the built-in default; <code>git zconfig all on|off</code> flips every autonomy switch at once (off also zeroes the two background loops so the daemon idles).</p>
-<p>Writes go to the global config (~/.gitconfig), the file the daemon reads. A change reloads a running daemon automatically so it takes effect at once; if no daemon is running the new value applies on its next start (toggling never spawns one).</p>
-</section>
-<section id="zrepos">
-<h2><code>git zrepos</code> <span class="summary">— list indexed git repositories</span></h2>
-<pre class="synopsis">git zrepos [&lt;pattern&gt;...] [--json]</pre>
-<p>Lists every git repository in the machine-wide index, one path per line (pipe-clean), a drop-in for a shell repo-list.</p>
-<p>Patterns filter the output by case-insensitive substring match.</p>
-</section>
-<section id="zreindex">
-<h2><code>git zreindex</code> <span class="summary">— (re)crawl for git repositories and refresh the index</span></h2>
-<pre class="synopsis">git zreindex [--sync|--async] [&lt;path&gt;...]</pre>
-<p>Crawls for git repositories and records them in the ledger, pruning ones deleted from disk. The walk is parallel and skips mounts that would hang a whole-device scan (kernel pseudo-filesystems, network volumes, the macOS data-volume firmlink).</p>
-<p>At a terminal it runs async by default — the crawl detaches and results go to zvcs.log; piped or scripted it runs inline so "indexed N, pruned M" stays on stdout. --sync and --async override the default.</p>
-</section>
-<section id="zjobs">
-<h2><code>git zjobs</code> <span class="summary">— list recent async jobs</span></h2>
-<pre class="synopsis">git zjobs [-n &lt;count&gt;] [--json]</pre>
-<p>Lists recent jobs from the ledger, newest first. -n limits the count.</p>
-</section>
-<section id="zjob">
-<h2><code>git zjob</code> <span class="summary">— show or control an async job</span></h2>
-<pre class="synopsis">git zjob &lt;id&gt; | git zjob &lt;stop|restart&gt; &lt;id&gt;</pre>
-<p>Shows one job's ledger record, or stops (cancels) / restarts (re-enqueues) a running or queued job by id.</p>
-</section>
-<section id="zcommit">
-<h2><code>git zcommit</code> <span class="summary">— queue an atomic staged-commit job</span></h2>
-<pre class="synopsis">git zcommit [&lt;path&gt;...] -m &lt;msg&gt; [--push]</pre>
-<p>Submits a fire-and-forget staged-commit job to the daemon and returns a job number; --push chains a push after the commit.</p>
-<p>Falls back to synchronous execution when no daemon is running.</p>
-</section>
-<section id="zpush">
-<h2><code>git zpush</code> <span class="summary">— queue an async push job with a fast-forward pre-flight</span></h2>
-<pre class="synopsis">git zpush [&lt;refspec&gt;]</pre>
-<p>Submits a fire-and-forget push job to the daemon. A network-free / live ls-refs pre-flight refuses a non-fast-forward before the job is enqueued. Falls back to synchronous execution when no daemon is running.</p>
-</section>
-<section id="zsubmit">
-<h2><code>git zsubmit</code> <span class="summary">— run an arbitrary command as an async daemon job</span></h2>
-<pre class="synopsis">git zsubmit [--] &lt;command&gt; [args...]</pre>
-<p>Ships an arbitrary command to the daemon's worker pool as an async job and prints the job id. Track it with <code>git zjobs</code> and <code>git zjob &lt;id&gt;</code> (which shows its state and captured output), and cancel it with <code>git zjob stop &lt;id&gt;</code> — the same ledger and controls as zcommit/zpush.</p>
-<p>The command runs in the current directory (a git repository is not required — a repo-less job simply records with no repo) with no shell, so submit <code>sh -c "..."</code> when you need pipes, redirects, or globbing. It runs with the submitter's carried git-identity environment; otherwise it inherits the daemon's. With no daemon running, it executes inline.</p>
-</section>
-<section id="zrepl">
-<h2><code>git zrepl</code> <span class="summary">— interactive console over every zvcs command</span></h2>
-<pre class="synopsis">git zrepl</pre>
-<p>Opens an interactive line console. Each line is run exactly as <code>git &lt;line&gt;</code> would be, so it drives every dispatchable command — the z* superset verbs and every git-compat porcelain command alike (the latter operating on the current repository), doubling as a live daemon/ledger console.</p>
-<p>On a terminal it opens with a stats banner and full line editing: Tab completes the command word against every verb (superset + porcelain), with command history persisted across sessions. Piped stdin falls back to a raw line reader so scripts and heredocs stay usable. Type exit or quit, or press Ctrl-D, to leave.</p>
-</section>
-<section id="zclaim">
-<h2><code>git zclaim</code> <span class="summary">— lease a repository for this session</span></h2>
-<pre class="synopsis">git zclaim [&lt;path&gt;]</pre>
-<p>Takes an advisory per-repo lease for the current session (ZVCS_SESSION), refusing if another agent already holds it, so concurrent agents do not collide on the same repository.</p>
-</section>
-<section id="zunclaim">
-<h2><code>git zunclaim</code> <span class="summary">— release a repository lease</span></h2>
-<pre class="synopsis">git zunclaim [--force] [&lt;path&gt;]</pre>
-<p>Releases a lease held on a repository. --force releases a lease held by another session.</p>
-</section>
-<section id="zwho">
-<h2><code>git zwho</code> <span class="summary">— list active claims</span></h2>
-<pre class="synopsis">git zwho [--json]</pre>
-<p>Lists active claims — which session holds a lease on which repository.</p>
-</section>
-<section id="zstatus">
-<h2><code>git zstatus</code> <span class="summary">— working-tree status of indexed repositories</span></h2>
-<pre class="synopsis">git zstatus [--all] [--json]</pre>
-<p>Reports the current repository's working-tree status live. --all reads every indexed repository's status from the daemon-maintained cache with no filesystem walk.</p>
-</section>
-<section id="zlog">
-<h2><code>git zlog</code> <span class="summary">— machine-wide reflog timeline across indexed repositories</span></h2>
-<pre class="synopsis">git zlog [-n &lt;count&gt;]</pre>
-<p>Merges every indexed repository's reflog into one machine-wide timeline, newest first. -n limits the count.</p>
-</section>
-<section id="zundo">
-<h2><code>git zundo</code> <span class="summary">— rewind a repository one reflog step</span></h2>
-<pre class="synopsis">git zundo [&lt;path&gt;]</pre>
-<p>Rewinds a repository one reflog step — a reset --hard to the previous HEAD. Refuses on a dirty worktree.</p>
-</section>
-<section id="zsnapshot">
-<h2><code>git zsnapshot</code> <span class="summary">— record the tree's HEADs as a restore point</span></h2>
-<pre class="synopsis">git zsnapshot &lt;name&gt;</pre>
-<p>Records the HEAD of the repository and every nested submodule as one named restore point.</p>
-</section>
-<section id="zrestore">
-<h2><code>git zrestore</code> <span class="summary">— reset the whole tree back to a snapshot</span></h2>
-<pre class="synopsis">git zrestore &lt;name&gt;</pre>
-<p>Resets the whole tree — the repository and every nested submodule — back to a named snapshot.</p>
-</section>
-<section id="zsnapshots">
-<h2><code>git zsnapshots</code> <span class="summary">— list snapshots</span></h2>
-<pre class="synopsis">git zsnapshots</pre>
-<p>Lists snapshot names and their repository counts.</p>
-</section>
-<section id="zworktree">
-<h2><code>git zworktree</code> <span class="summary">— tree-wide private worktrees</span></h2>
-<pre class="synopsis">git zworktree &lt;add &lt;name&gt;|list|remove &lt;name&gt;&gt;</pre>
-<p>add &lt;name&gt; provisions a complete, object-sharing, isolated worktree of the repository plus all nested submodules (each on a zwt/&lt;name&gt; branch) at ~/.zvcs/worktrees/&lt;name&gt;/, so each agent gets a private tree that cannot collide with any other — no re-clone.</p>
-<p>list and remove &lt;name&gt; manage them.</p>
-</section>
-<section id="zstash">
-<h2><code>git zstash</code> <span class="summary">— stash every dirty repo in the tree as one unit</span></h2>
-<pre class="synopsis">git zstash [&lt;name&gt;]</pre>
-<p>Parks uncommitted work across every dirty repository in the tree as one named unit.</p>
-</section>
-<section id="zunstash">
-<h2><code>git zunstash</code> <span class="summary">— pop the tree-wide stash back</span></h2>
-<pre class="synopsis">git zunstash [&lt;name&gt;]</pre>
-<p>Restores (pops) a tree-wide stash, last-in-first-out, applying onto the same commits it was stashed on. A repository whose HEAD has since moved is reported and its stash kept intact.</p>
-</section>
-<section id="zstashes">
-<h2><code>git zstashes</code> <span class="summary">— list tree-wide stashes</span></h2>
-<pre class="synopsis">git zstashes</pre>
-<p>Lists tree-wide stashes and their repository counts.</p>
-</section>
-<section id="zup">
-<h2><code>git zup</code> <span class="summary">— reconcile the tree at cwd to latest origin/main</span></h2>
-<pre class="synopsis">git zup [&lt;path&gt;]</pre>
-<p>Brings the whole tree — the top-level repository and every nested submodule — to latest origin/main (fetch, then fast-forward, staying attached). A dirty or diverged repository is skipped.</p>
-</section>
-<section id="zforeach">
-<h2><code>git zforeach</code> <span class="summary">— run a command across all or a subset of indexed repos</span></h2>
-<pre class="synopsis">git zforeach [&lt;selectors&gt;] -- &lt;command&gt;...</pre>
-<p>Runs a command across all indexed repositories, or a subset, in parallel.</p>
-<p>Selectors: a bare &lt;pattern&gt; (substring), --repo &lt;p&gt;, --dirty, --ahead, --behind, --claimed, and --session &lt;s&gt;. Everything after -- is the command to run in each selected repository. See <code>git help zselectors</code> for the full selector grammar.</p>
-</section>
-<section id="zselectors">
-<h2><code>git zselectors</code> <span class="summary">— the shared selector grammar the parallel verbs accept</span></h2>
-<pre class="synopsis">git zselectors</pre>
-<p>Many superset verbs take an optional leading [selectors] argument that narrows which indexed repositories they act on — zforeach, zheads, zdirty, zpull, zgrep, zfetch, zgc, zcommitall, and the rest. This page documents that shared grammar; <code>git zselectors</code> prints a short version to the terminal.</p>
-<p>With no selector a verb acts on EVERY indexed repository. The selectors are: a bare &lt;pattern&gt;, a case-insensitive substring matched against each repo's working-tree path (repeatable — all patterns must match); --repo &lt;pattern&gt;, the same thing spelled out; --dirty, repos with uncommitted tracked changes; --ahead and --behind, repos ahead of or behind their upstream; --claimed, repos with an active lease (git zclaim); and --session &lt;s&gt;, repos leased by session &lt;s&gt;.</p>
-<p>Selectors COMPOSE with AND — a repo must match every selector given (so --ahead --behind is empty, since a repo is never both). --dirty, --ahead, and --behind read the daemon's status cache (kept warm by the status maintainer), so they reflect the last scan rather than a live check.</p>
-<p>Examples: <code>git zheads</code> (all repos) vs <code>git zheads cask</code> (only repos whose path contains "cask"); <code>git zforeach --dirty -- git status</code> runs git status in every dirty repo; <code>git zpull --behind</code> fast-forwards only the repos behind their upstream; <code>git zgrep --repo web TODO</code> searches "TODO" in repos matching "web".</p>
-</section>
-<section id="zhook">
-<h2><code>git zhook</code> <span class="summary">— manage the current repo's ref-change hook</span></h2>
-<pre class="synopsis">git zhook &lt;set &lt;command&gt;|unset|show|list|test&gt;</pre>
-<p>Manages and tests the current repository's ref-change hook (zvcs.hook), which the daemon runs on every ref-change when zvcs.autohook is enabled. set installs a command, unset removes it, show/list display it, and test runs it once.</p>
-</section>
-<section id="ztrigger">
-<h2><code>git ztrigger</code> <span class="summary">— arm any directory to run a command on every ref-change</span></h2>
-<pre class="synopsis">git ztrigger &lt;DIR&gt; &lt;command&gt;... | git ztrigger &lt;list|rm DIR|test DIR&gt;</pre>
-<p>The directory-addressed front-end to the hook system: unlike zhook (current repo only) it takes an explicit path, so any repository on the machine can be wired without cd-ing into it, and it flips the master switches itself — no raw git config needed.</p>
-<p>git ztrigger DIR CMD writes DIR's local zvcs.hook, indexes DIR, turns on the global zvcs.autohook switch, and reloads the daemon, so CMD runs on every ref-change in DIR. list, rm DIR, and test DIR manage armed triggers.</p>
-</section>
-<section id="zwatch">
-<h2><code>git zwatch</code> <span class="summary">— watch a directory's status without running a command</span></h2>
-<pre class="synopsis">git zwatch &lt;DIR&gt; | git zwatch &lt;list|rm DIR&gt;</pre>
-<p>The command-less form of ztrigger: it indexes DIR and turns on zvcs.autostatus so the daemon maintains DIR's cached status on every ref-change, without running any command. list and rm DIR manage watches.</p>
-</section>
-<section id="zdashed">
-<h2><code>git zdashed</code> <span class="summary">— install git-&lt;verb&gt; symlinks and man pages</span></h2>
-<pre class="synopsis">git zdashed [&lt;dir&gt;]</pre>
-<p>Installs a git-&lt;verb&gt; symlink for every builtin and superset verb into &lt;dir&gt; (default ~/.zvcs/bin), so the dashed external forms resolve to this binary once stock git is removed.</p>
-<p>It also writes every extension man page under ~/.zvcs/man, so <code>man git-&lt;verb&gt;</code> resolves when that directory is on MANPATH.</p>
-</section>
-<section id="zverbs">
-<h2><code>git zverbs</code> <span class="summary">— list every zvcs extension verb and its usage</span></h2>
-<pre class="synopsis">git zverbs [--json]</pre>
-<p>Lists every zvcs extension (z*) verb with its one-line usage, sourced from each verb's own -h so the listing can never drift.</p>
-</section>
-<section id="zcd">
-<h2><code>git zcd</code> <span class="summary">— change the working directory (for the zrepl console)</span></h2>
-<pre class="synopsis">git zcd [&lt;dir&gt;|-]</pre>
-<p>Changes the process working directory: no argument goes to $HOME, <code>-</code> goes to the previous directory ($OLDPWD), and a leading ~ expands to $HOME. OLDPWD and PWD are updated so <code>zcd -</code> round-trips, exactly as a shell's cd does.</p>
-<p>The zrepl console runs each line in one long-lived process, so a zcd persists across lines — it is what makes the console navigable like a shell. Run standalone it only moves this process's cwd (it cannot change the parent shell's), so it is aimed at the console.</p>
-</section>
-<section id="zpwd">
-<h2><code>git zpwd</code> <span class="summary">— print the working directory</span></h2>
-<pre class="synopsis">git zpwd</pre>
-<p>Prints the current working directory. Paired with zcd for shell-like navigation inside the zrepl console.</p>
-</section>
-<section id="zls">
-<h2><code>git zls</code> <span class="summary">— git-aware directory listing</span></h2>
-<pre class="synopsis">git zls [-alrt] [&lt;path&gt;]</pre>
-<p>Lists a directory with a two-column git status field per entry, like <code>eza --git</code>: the first column is the staged status (index vs HEAD), the second the unstaged status (worktree vs index). Letters follow eza: N new, M modified, D deleted, R renamed, C copied, T type-change, U conflicted, I ignored, and - unchanged. A directory folds the status of the paths under it, so a subtree with any change is flagged. Outside a git repository the column is omitted.</p>
-<p>Flags: -a includes dotfiles, -l is a long listing (permissions, size, relative mtime), -t sorts by modification time (newest first), and -r reverses. The per-path status is the same walk <code>git status</code> performs.</p>
-<p>On a terminal the output is colored from the same palette eza uses: LS_COLORS for file kinds and *.ext extensions, then EXA_COLORS/EZA_COLORS for the permission bits, size, date, git columns, and punctuation — so it matches the user's eza. NO_COLOR disables color.</p>
-</section>
-<section id="zenv">
-<h2><code>git zenv</code> <span class="summary">— print, set, or query environment variables</span></h2>
-<pre class="synopsis">git zenv [&lt;NAME=VALUE&gt;...|&lt;NAME&gt;...]</pre>
-<p>With no arguments, prints every environment variable as NAME=VALUE, sorted. A NAME=VALUE argument sets that variable; a bare NAME prints its value (nothing if unset).</p>
-<p>In the zrepl console a variable set with zenv persists for every later <code>git</code> line — set GIT_AUTHOR_NAME, ZVCS_SESSION, and the like once and the whole session sees it.</p>
-</section>
-<section id="zunset">
-<h2><code>git zunset</code> <span class="summary">— remove environment variables</span></h2>
-<pre class="synopsis">git zunset &lt;NAME&gt;...</pre>
-<p>Removes one or more environment variables from the process, the complement of <code>zenv NAME=VALUE</code>. In the zrepl console the change persists for later <code>git</code> lines.</p>
-</section>
-<section id="zecho">
-<h2><code>git zecho</code> <span class="summary">— print arguments joined by a space</span></h2>
-<pre class="synopsis">git zecho [-n] [&lt;arg&gt;...]</pre>
-<p>Prints its arguments joined by a single space. A leading -n suppresses the trailing newline. Arguments are printed literally — there is no shell variable or glob expansion.</p>
-</section>
-<section id="zdoctor">
-<h2><code>git zdoctor</code> <span class="summary">— health check of the zvcs environment</span></h2>
-<pre class="synopsis">git zdoctor</pre>
-<p>Runs a set of environment checks and prints each as OK, WARN, or FAIL: whether this binary is the git on PATH, whether $ZVCS_HOME exists, whether the coordinator daemon is running, whether a ledger exists, how many man pages are installed, whether ~/.zvcs/man is on MANPATH, and whether the dashed git-&lt;verb&gt; symlinks are installed.</p>
-<p>The process exits non-zero only when a hard FAIL is found, so it is usable in scripts and CI.</p>
-</section>
-<section id="zmkdir">
-<h2><code>git zmkdir</code> <span class="summary">— create directories</span></h2>
-<pre class="synopsis">git zmkdir [-p] &lt;dir&gt;...</pre>
-<p>Creates each named directory. -p creates any missing parent directories and does not error if the directory already exists. A native filesystem convenience for the zrepl console.</p>
-</section>
-<section id="ztouch">
-<h2><code>git ztouch</code> <span class="summary">— create files or update their mtime</span></h2>
-<pre class="synopsis">git ztouch &lt;file&gt;...</pre>
-<p>Creates each named file if it does not exist (leaving existing contents intact) and updates its modification time to now, like the shell's touch.</p>
-</section>
-<section id="zrm">
-<h2><code>git zrm</code> <span class="summary">— remove files and directories</span></h2>
-<pre class="synopsis">git zrm [-r] [-f] &lt;path&gt;...</pre>
-<p>Removes files from the filesystem — this is not <code>git rm</code> (which stages a removal in the index); it deletes on disk. -r removes directories recursively, -f ignores paths that do not exist. Symlinks are removed, never followed.</p>
-</section>
-<section id="zcp">
-<h2><code>git zcp</code> <span class="summary">— copy files and directories</span></h2>
-<pre class="synopsis">git zcp [-r] &lt;src&gt;... &lt;dst&gt;</pre>
-<p>Copies files; -r copies directories recursively. With several sources, &lt;dst&gt; must be an existing directory and each source is copied into it under its own name; with one source and a non-directory &lt;dst&gt;, &lt;dst&gt; is the copy's name.</p>
-</section>
-<section id="zmv">
-<h2><code>git zmv</code> <span class="summary">— move or rename files and directories</span></h2>
-<pre class="synopsis">git zmv &lt;src&gt;... &lt;dst&gt;</pre>
-<p>Moves or renames paths. With several sources, &lt;dst&gt; must be an existing directory. A rename is used when possible, falling back to copy-then-remove when the move crosses filesystems. This is not <code>git mv</code> (which also updates the index); it only moves on disk.</p>
-</section>
-<section id="zcat">
-<h2><code>git zcat</code> <span class="summary">— print file contents</span></h2>
-<pre class="synopsis">git zcat &lt;file&gt;...</pre>
-<p>Writes each named file's bytes to stdout, in order, like the shell's cat.</p>
-</section>
-<section id="zln">
-<h2><code>git zln</code> <span class="summary">— create a hard link or symlink</span></h2>
-<pre class="synopsis">git zln [-s] &lt;target&gt; &lt;link&gt;</pre>
-<p>Creates &lt;link&gt; pointing at &lt;target&gt;: a hard link by default, or a symbolic link with -s.</p>
-</section>
-<section id="zheads">
-<h2><code>git zheads</code> <span class="summary">— HEAD of every indexed repo, in parallel</span></h2>
-<pre class="synopsis">git zheads [selectors] [--json]</pre>
-<p>Prints each indexed repository's checked-out branch (or (detached)/(unborn)), short HEAD id, and a * when the worktree has tracked changes — a one-glance view of where every repo in the machine sits.</p>
-<p>Selectors are the same as zforeach: bare &lt;pattern&gt;, --repo &lt;p&gt;, --dirty, --ahead, --behind, --claimed, --session &lt;s&gt;. The probe is a native gix read run across all repos on a bounded worker pool.</p>
-</section>
-<section id="zdirty">
-<h2><code>git zdirty</code> <span class="summary">— list indexed repos with tracked changes</span></h2>
-<pre class="synopsis">git zdirty [selectors] [--json]</pre>
-<p>Lists only the indexed repositories whose worktree has uncommitted tracked changes (the same "dirty" gix reports for zstatus; an untracked-only repo counts as clean). Scanned in parallel. Selectors narrow the set as in zforeach.</p>
-</section>
-<section id="zbranches">
-<h2><code>git zbranches</code> <span class="summary">— local branches of every indexed repo</span></h2>
-<pre class="synopsis">git zbranches [selectors] [--json]</pre>
-<p>Prints each indexed repository's local branch names, grouped by repo, scanned in parallel.</p>
-</section>
-<section id="ztags">
-<h2><code>git ztags</code> <span class="summary">— tag count of every indexed repo</span></h2>
-<pre class="synopsis">git ztags [selectors] [--json]</pre>
-<p>Prints how many tags each indexed repository has, scanned in parallel.</p>
-</section>
-<section id="zremotes">
-<h2><code>git zremotes</code> <span class="summary">— remotes and URLs of every indexed repo</span></h2>
-<pre class="synopsis">git zremotes [selectors] [--json]</pre>
-<p>Prints each indexed repository's remotes and their fetch URLs, grouped by repo, scanned in parallel.</p>
-</section>
-<section id="zsize">
-<h2><code>git zsize</code> <span class="summary">— on-disk .git size of every indexed repo</span></h2>
-<pre class="synopsis">git zsize [selectors] [--json]</pre>
-<p>Prints each indexed repository's on-disk .git size, largest first, with a total, so the heaviest repos in the tree are obvious. Sizes are summed with a native filesystem walk in parallel.</p>
-</section>
-<section id="zage">
-<h2><code>git zage</code> <span class="summary">— HEAD commit age of every indexed repo</span></h2>
-<pre class="synopsis">git zage [selectors] [--json]</pre>
-<p>Prints how long ago each indexed repository's HEAD commit was made (a relative time like <code>3 days ago</code>), scanned in parallel — a quick read of which repos are stale.</p>
-</section>
-<section id="zpull">
-<h2><code>git zpull</code> <span class="summary">— parallel fetch + fast-forward of every indexed repo</span></h2>
-<pre class="synopsis">git zpull [selectors]</pre>
-<p>Fetches and fast-forwards every selected indexed repository to its tracked mainline, in parallel, using the same native ff-only reconcile as zsync: a dirty or diverged repo is reported and skipped, never forced.</p>
-<p>Where zsync/zup act on the current submodule tree, zpull acts on the machine-wide index, so selectors (--repo, --behind, …) scope which repos are pulled.</p>
-</section>
-<section id="zattach">
-<h2><code>git zattach</code> <span class="summary">— re-attach every detached-HEAD indexed repo to its mainline</span></h2>
-<pre class="synopsis">git zattach [selectors]</pre>
-<p>Re-attaches every selected indexed repository that is on a detached HEAD to its mainline branch (main, else master), fleet-wide — the kill-switch for the detached HEADs <code>git submodule update</code> leaves behind across the whole index.</p>
-<p>It uses the same local, no-clobber attach zsync applies to submodules: it never contacts a remote, never moves the checked-out commit, and never touches the worktree or index — it only creates or fast-forwards the local mainline branch to the commit HEAD is already at and makes HEAD symbolic to it, so it is safe even on a dirty repo. A repo whose local mainline is ahead of or diverged from HEAD is refused rather than clobbered (catching the worktree up is zpull/zsync's clean-only job); a repo with no main or master anywhere is skipped. It reports how many were attached, already on a branch, had no mainline, or were refused.</p>
-</section>
-<section id="zgrep">
-<h2><code>git zgrep</code> <span class="summary">— parallel content search across indexed repos</span></h2>
-<pre class="synopsis">git zgrep [selectors] [-i] &lt;pattern&gt; [--json]</pre>
-<p>Searches the tracked file content of every indexed repository for &lt;pattern&gt; (a regular expression) in parallel, printing path:line:text for each match. -i is case-insensitive; binary files are skipped, as git grep does.</p>
-<p>Only tracked, non-conflicted worktree files are searched. Selectors narrow the repo set as in zforeach.</p>
-</section>
-<section id="zahead">
-<h2><code>git zahead</code> <span class="summary">— indexed repos ahead of their upstream</span></h2>
-<pre class="synopsis">git zahead [selectors] [--json]</pre>
-<p>Lists the indexed repositories that have commits not yet on their configured upstream, with the count, computed in parallel. Repos with no upstream are omitted.</p>
-</section>
-<section id="zbehind">
-<h2><code>git zbehind</code> <span class="summary">— indexed repos behind their upstream</span></h2>
-<pre class="synopsis">git zbehind [selectors] [--json]</pre>
-<p>Lists the indexed repositories whose upstream has commits they lack, with the count, computed in parallel. Repos with no upstream are omitted.</p>
-</section>
-<section id="zunpushed">
-<h2><code>git zunpushed</code> <span class="summary">— per-repo unpushed commits (the detailed zahead)</span></h2>
-<pre class="synopsis">git zunpushed [selectors] [--json]</pre>
-<p>Lists, per indexed repository, the actual commits HEAD has that its upstream lacks — short id and summary line, grouped under the repo path — computed in parallel. Where <code>zahead</code> gives only a count, this shows what is unpushed. The list is capped per repo so a long divergence cannot flood the output; repos with no upstream or nothing unpushed are omitted.</p>
-</section>
-<section id="zunpulled">
-<h2><code>git zunpulled</code> <span class="summary">— per-repo commits the upstream has that local lacks</span></h2>
-<pre class="synopsis">git zunpulled [selectors] [--json]</pre>
-<p>Lists, per indexed repository, the commits on the configured upstream that the local branch lacks — short id and summary, grouped per repo. The detailed form of <code>zbehind</code>. A <code>git zfetch</code> first makes the upstream refs current. Repos with no upstream or nothing unpulled are omitted.</p>
-</section>
-<section id="zauthors">
-<h2><code>git zauthors</code> <span class="summary">— commit counts by author across indexed repos</span></h2>
-<pre class="synopsis">git zauthors [selectors] [--json]</pre>
-<p>Walks every indexed repository's HEAD history in parallel, tallies commits by author <code>Name &lt;email&gt;</code>, aggregates across all repos, and prints them ranked by count — a machine-wide contribution summary.</p>
-</section>
-<section id="zhot">
-<h2><code>git zhot</code> <span class="summary">— indexed repos ranked by recent activity</span></h2>
-<pre class="synopsis">git zhot [selectors] [&lt;days&gt;] [--json]</pre>
-<p>Ranks indexed repositories by the number of commits made in the last &lt;days&gt; (default 30), most active first, counted in parallel — a quick read of where work is happening across the tree.</p>
-</section>
-<section id="zconflicts">
-<h2><code>git zconflicts</code> <span class="summary">— indexed repos mid-operation or conflicted</span></h2>
-<pre class="synopsis">git zconflicts [selectors] [--json]</pre>
-<p>Lists the indexed repositories that are in the middle of a merge, rebase, cherry-pick, revert, or bisect, or that have unmerged (conflicted) index entries, with the operation(s) named — so a stuck repo among many is found at a glance.</p>
-</section>
-<section id="zfetch">
-<h2><code>git zfetch</code> <span class="summary">— parallel git fetch across indexed repos</span></h2>
-<pre class="synopsis">git zfetch [selectors]</pre>
-<p>Runs <code>git fetch</code> in every selected indexed repository concurrently, through this binary's own porcelain and fair per-repo lane. Output is grouped per repo and failures are recorded in the ledger.</p>
-</section>
-<section id="zgc">
-<h2><code>git zgc</code> <span class="summary">— parallel git gc across indexed repos</span></h2>
-<pre class="synopsis">git zgc [selectors]</pre>
-<p>Runs <code>git gc</code> in every selected indexed repository concurrently — machine-wide maintenance in one command.</p>
-</section>
-<section id="zfsck">
-<h2><code>git zfsck</code> <span class="summary">— parallel git fsck across indexed repos</span></h2>
-<pre class="synopsis">git zfsck [selectors]</pre>
-<p>Runs <code>git fsck</code> in every selected indexed repository concurrently, to check object integrity across the whole tree at once.</p>
-</section>
-<section id="zprune">
-<h2><code>git zprune</code> <span class="summary">— parallel git prune across indexed repos</span></h2>
-<pre class="synopsis">git zprune [selectors]</pre>
-<p>Runs <code>git prune</code> in every selected indexed repository concurrently, removing unreachable objects tree-wide.</p>
-</section>
-<section id="zreset">
-<h2><code>git zreset</code> <span class="summary">— parallel git reset across indexed repos</span></h2>
-<pre class="synopsis">git zreset [selectors] [--soft|--mixed|--hard] [&lt;ref&gt;]</pre>
-<p>Runs <code>git reset</code> in every selected indexed repository concurrently. The mode flag and optional <code>&lt;ref&gt;</code> pass straight through to git, so the default (as git's) is <code>--mixed HEAD</code>, which unstages. <code>--hard</code> discards worktree changes across the whole selection — narrow it with selectors (e.g. <code>--dirty</code>) first.</p>
-</section>
-<section id="zabort">
-<h2><code>git zabort</code> <span class="summary">— abort an in-progress operation across mid-op repos</span></h2>
-<pre class="synopsis">git zabort [selectors]</pre>
-<p>Aborts an in-progress merge, rebase, cherry-pick, or revert in every selected indexed repository that is mid-operation — running the matching <code>--abort</code> — and skips repos with nothing in progress. Cleans up after a fan-out (or a many-agent session) that left repos stuck in a half-finished operation.</p>
-</section>
-<section id="zcheckout">
-<h2><code>git zcheckout</code> <span class="summary">— check out a branch in every repo that has it</span></h2>
-<pre class="synopsis">git zcheckout [selectors] &lt;branch&gt;</pre>
-<p>Checks out <code>&lt;branch&gt;</code> in every selected indexed repository that already has it, in parallel. A repo without the branch is skipped — the branch is never created — so this is a safe way to move a whole tree onto a shared branch name.</p>
-</section>
-<section id="ztagall">
-<h2><code>git ztagall</code> <span class="summary">— create a tag at HEAD in every indexed repo</span></h2>
-<pre class="synopsis">git ztagall [selectors] &lt;tag&gt;</pre>
-<p>Creates tag <code>&lt;tag&gt;</code> at HEAD in every selected indexed repository, in parallel. A repo that already has the tag reports the failure rather than moving it.</p>
-</section>
-<section id="zcommitall">
-<h2><code>git zcommitall</code> <span class="summary">— commit tracked changes across every dirty repo</span></h2>
-<pre class="synopsis">git zcommitall [selectors] -m &lt;msg&gt;</pre>
-<p>Commits tracked changes (<code>git commit -a</code>) with message <code>&lt;msg&gt;</code> in every selected indexed repository whose worktree is dirty, in parallel. Clean repos are skipped. Untracked files are not staged (as with <code>commit -a</code>).</p>
-</section>
-<section id="zpushall">
-<h2><code>git zpushall</code> <span class="summary">— push every indexed repo that is ahead</span></h2>
-<pre class="synopsis">git zpushall [selectors]</pre>
-<p>Runs <code>git push</code> in every selected indexed repository that is ahead of its upstream, in parallel. Repos that are not ahead (or have no upstream) are skipped, so no needless network calls are made.</p>
-</section>
-<section id="zclean">
-<h2><code>git zclean</code> <span class="summary">— remove untracked files across indexed repos</span></h2>
-<pre class="synopsis">git zclean -f [selectors]</pre>
-<p>Runs <code>git clean -fd</code> — remove untracked files and directories — in every selected indexed repository, in parallel. Because it deletes, the <code>-f</code> flag is required; ignored files are left (as <code>git clean</code> does without <code>-x</code>).</p>
-</section>
-<section id="zwait">
-<h2><code>git zwait</code> <span class="summary">— block until a repo's async jobs drain</span></h2>
-<pre class="synopsis">git zwait [&lt;path&gt;]</pre>
-<p>Blocks until the repository at <code>&lt;path&gt;</code> (or the current directory) has no queued or running async jobs (<code>zcommit</code>/<code>zpush</code>) left in the ledger — the join for that repo's fire-and-forget work. With no daemon there are no jobs, so it returns at once.</p>
-</section>
-<section id="zqueue">
-<h2><code>git zqueue</code> <span class="summary">— list queued and running async jobs</span></h2>
-<pre class="synopsis">git zqueue</pre>
-<p>Lists the async jobs currently queued or running in the ledger (id, state, kind, repo) — what the daemon is working through right now.</p>
-</section>
-<section id="zbarrier">
-<h2><code>git zbarrier</code> <span class="summary">— block until the async queue is idle</span></h2>
-<pre class="synopsis">git zbarrier</pre>
-<p>Blocks until the entire async job queue is idle — every repository's queued and running jobs have drained — the global join after a burst of <code>zcommit</code>/<code>zpush</code>.</p>
-</section>
-<section id="zstale">
-<h2><code>git zstale</code> <span class="summary">— indexed repos not committed to in a while</span></h2>
-<pre class="synopsis">git zstale [selectors] [&lt;days&gt;] [--json]</pre>
-<p>Lists the indexed repositories whose HEAD commit is older than &lt;days&gt; (default 90), with how long ago — surfacing abandoned repos across the tree. Scanned in parallel.</p>
-</section>
-<section id="zlast">
-<h2><code>git zlast</code> <span class="summary">— indexed repos by most recent commit</span></h2>
-<pre class="synopsis">git zlast [selectors] [--json]</pre>
-<p>Lists indexed repositories ordered by HEAD commit time, most recently committed first, each with its relative age — where work happened most recently.</p>
-</section>
-<section id="zbig">
-<h2><code>git zbig</code> <span class="summary">— largest tracked files across indexed repos</span></h2>
-<pre class="synopsis">git zbig [selectors] [&lt;n&gt;] [--json]</pre>
-<p>Lists the largest tracked files across every indexed repository, top &lt;n&gt; (default 20), by on-disk size — bloat hunting tree-wide. Files are gathered in parallel.</p>
-</section>
-<section id="zfiles">
-<h2><code>git zfiles</code> <span class="summary">— tracked file count per indexed repo</span></h2>
-<pre class="synopsis">git zfiles [selectors] [--json]</pre>
-<p>Prints the number of tracked files in each indexed repository, largest first, scanned in parallel.</p>
-</section>
-<section id="zcommits">
-<h2><code>git zcommits</code> <span class="summary">— HEAD-history commit count per indexed repo</span></h2>
-<pre class="synopsis">git zcommits [selectors] [--json]</pre>
-<p>Counts the commits reachable from HEAD in each indexed repository — its history depth — and prints them deepest first, walked in parallel.</p>
-</section>
-<section id="zpristine">
-<h2><code>git zpristine</code> <span class="summary">— indexed repos that are clean and in sync</span></h2>
-<pre class="synopsis">git zpristine [selectors] [--json]</pre>
-<p>Lists the indexed repositories that need nothing: no uncommitted changes, on a branch (not detached), and in sync with their upstream (or having none configured). The complement of <code>zdirty</code>/<code>zahead</code>/<code>zbehind</code>/<code>zconflicts</code> — the green set — computed in parallel.</p>
-</section>
-<section id="zdivergent">
-<h2><code>git zdivergent</code> <span class="summary">— indexed repos diverged from upstream</span></h2>
-<pre class="synopsis">git zdivergent [selectors] [--json]</pre>
-<p>Lists indexed repositories that are both ahead of and behind their upstream — history has forked, so a merge or rebase is needed. Computed in parallel.</p>
-</section>
-<section id="zorphans">
-<h2><code>git zorphans</code> <span class="summary">— indexed repos with no remote</span></h2>
-<pre class="synopsis">git zorphans [selectors] [--json]</pre>
-<p>Lists indexed repositories with no remote configured — nothing to fetch from or push to. Scanned in parallel.</p>
-</section>
-<section id="zsessions">
-<h2><code>git zsessions</code> <span class="summary">— active sessions ranked by repos held</span></h2>
-<pre class="synopsis">git zsessions [--json]</pre>
-<p>Lists the sessions that currently hold claims, ranked by how many repositories each holds — which agent is working the most of the tree.</p>
-</section>
-<section id="zidle">
-<h2><code>git zidle</code> <span class="summary">— indexed repos with no active claim</span></h2>
-<pre class="synopsis">git zidle [selectors]</pre>
-<p>Lists indexed repositories that no session has claimed — the ones free for an agent to pick up. Selectors narrow the candidate set as in zforeach.</p>
-</section>
-<section id="zdashboard">
-<h2><code>git zdashboard</code> <span class="summary">— live tiled TUI: fleet, events, and commands on one screen</span></h2>
-<pre class="synopsis">git zdashboard [--once] [--json]</pre>
-<p>A live, tiled dashboard of the whole indexed tree on one screen: a header of aggregate totals (dirty, ahead, behind, diverged, detached, clean, claims, sessions, queue, and whether the daemon is up) over three tiles — a FLEET table (every repo, most recently active first, with the on-screen rows' HEAD state live-refreshed so nothing is stale), an EVENTS feed (commits, reconciles, status changes, as zevents shows), and a COMMANDS feed (every git command run across the machine, with the agent that ran it, as zcommands shows). Press q or Esc to quit.</p>
-<p>Every tile reads the daemon-maintained status cache and ledger, not a live per-repo walk, so the dashboard stays responsive across thousands of repos. The COMMANDS tile is populated once command logging is on (<code>git zcommands</code> enables it).</p>
-<p>For scripting, <code>--once</code> or <code>--json</code> (or a non-terminal stdout) prints the instant text summary instead of the TUI — the same aggregate counts, one screen, no interaction.</p>
-</section>
-<section id="ztop">
-<h2><code>git ztop</code> <span class="summary">— live htop-style fleet monitor, most churn on top</span></h2>
-<pre class="synopsis">git ztop [selectors] [--interval &lt;secs&gt;] [--once] [--mono]</pre>
-<p>A full-screen, live monitor of the whole indexed tree — an htop for the fleet. A header shows the totals (dirty, ahead, behind, diverged, detached, clean, claims, sessions, queue depth, and whether the daemon is up); a table lists every repo with a churn bar, path, HEAD, state, and how long ago it last changed.</p>
-<p>Repos are sorted with the most churn on top: when a repo's HEAD or dirty flag changes between frames (the daemon rewrote its status row), its churn score bumps and then decays, so whatever is moving right now rises to the top, like an htop CPU column. Press s to cycle the sort (churn / state / name), the arrows / PgUp / PgDn / g / G to scroll, and q (or Esc) to quit.</p>
-<p>Each frame reads the daemon-maintained status cache, not a live per-repo scan, so it stays responsive across thousands of repos — start the daemon (git zdaemon start) so the cache stays warm and churn reflects real activity. Selectors narrow the view to a subset; --interval sets the refresh seconds, --mono (or NO_COLOR) drops color, and --once (or a non-terminal stdout) prints a single plain-text frame for scripts.</p>
-</section>
-<section id="zevents">
-<h2><code>git zevents</code> <span class="summary">— one live feed of commits/reconciles/status-changes across the tree</span></h2>
-<pre class="synopsis">git zevents [-n &lt;count&gt;] [--kind commit|stage|status|reconcile] [--repo &lt;substr&gt;] [--json] [--no-follow]</pre>
-<p>Prints a single structured, live feed of what is happening across the whole indexed tree: commits (a HEAD moved), status-changes (a dirty or sync transition), and reconciles (a fetch-free fast-forward the daemon applied). It shows a short backlog, then follows live.</p>
-<p>Events come from the index's append-only events table, written by triggers on the status cache that both the whole-tree poller (statusd) and the instant file-watcher (watch) maintain, so activity anywhere is captured with no per-call plumbing. -n sets the backlog size, --no-follow prints the backlog and exits, --kind filters to one event kind, --repo filters by path substring, and --json emits NDJSON (one event per line) for tooling.</p>
-</section>
-<section id="ztail">
-<h2><code>git ztail</code> <span class="summary">— alias of git zevents</span></h2>
-<pre class="synopsis">git ztail [-n &lt;count&gt;] [--kind commit|stage|status|reconcile] [--repo &lt;substr&gt;] [--json] [--no-follow]</pre>
-<p>An alias for <code>git zevents</code> — the single live feed of commits, reconciles, and status-changes across the whole indexed tree. See <code>git help zevents</code> for the full description.</p>
-</section>
-<section id="zintercept">
-<h2><code>git zintercept</code> <span class="summary">— AOP hooks that run advice around matching git commands</span></h2>
-<pre class="synopsis">git zintercept before|after|around &lt;pattern&gt; -- &lt;cmd&gt; | list | remove &lt;id&gt; | clear</pre>
-<p>Registers aspect-oriented advice that fires around git commands, ported from zshrs. A before hook runs a shell command before a matching git command; an after hook runs after it (with the command's exit status and timing available); an around hook replaces it, and runs the original itself when it chooses. &lt;pattern&gt; matches the git subcommand — <code>commit</code>, <code>push</code>, a glob like <code>commit *</code>, or <code>*</code> / <code>all</code> for everything.</p>
-<p>The advice &lt;cmd&gt; is a shell command run via <code>sh -c</code>. It sees the intercepted command through the environment: INTERCEPT_NAME (the subcommand), INTERCEPT_ARGS, and INTERCEPT_CMD (the full <code>git ...</code> line); after-advice also gets INTERCEPT_STATUS, INTERCEPT_MS, and INTERCEPT_US. An around advice runs "$INTERCEPT_CMD" to proceed with the original (that child is not re-intercepted).</p>
-<p>Registrations persist to $ZVCS_HOME/intercepts.tsv and load at dispatch; when none are registered the cost on every git command is a single stat. <code>list</code> shows all with their ids, <code>remove &lt;id&gt;</code> deletes one, and <code>clear</code> removes them all.</p>
-</section>
-<section id="zcommands">
-<h2><code>git zcommands</code> <span class="summary">— live feed of every git command run across the fleet</span></h2>
-<pre class="synopsis">git zcommands [-n &lt;count&gt;] [--repo &lt;substr&gt;] [--json] [--no-follow] [--off] [--clear]</pre>
-<p>Streams every <code>git</code> command run anywhere on the machine, in real time. Because the zvcs <code>git</code> binary shadows real git on PATH, every invocation flows through one dispatcher; when logging is on, each records a line — time, pid, working directory, and the command — to its own log at $ZVCS_HOME/commands.log (separate from the daemon log). This verb prints a backlog and then follows the log live, so commands from every repo and every concurrent shell scroll past as they run.</p>
-<p>Running it turns logging on (a marker file, so the cost on every other git command is a single stat when it is off) and notes where the log lives. -n sets the backlog size, --no-follow prints the backlog and exits, --repo filters to commands whose directory contains a substring, and --json emits NDJSON for tooling. --off stops logging; --clear truncates the log. The live viewers (zcommands, zevents, ztail, ztop) are excluded so watching does not feed itself.</p>
-</section>
-<section id="zaudit">
-<h2><code>git zaudit</code> <span class="summary">— queryable audit trail over the fleet command log</span></h2>
-<pre class="synopsis">git zaudit [--agent &lt;ppid&gt;] [--repo &lt;substr&gt;] [--cmd &lt;substr&gt;] [--mutating] [--summary] [-n &lt;count&gt;] [--json]</pre>
-<p>The historical, accountable side of the same command log <code>zcommands</code> feeds — $ZVCS_HOME/commands.log. Where zcommands follows the live stream, zaudit queries the record: it answers "which agent ran which command against which repo, and when" across a fleet of concurrent agents. Each logged line carries the time, the command's pid, its parent pid (the agent that launched it), the working directory, and the git argv.</p>
-<p>Filters compose: --agent &lt;ppid&gt; restricts to one agent, --repo &lt;substr&gt; to repos whose directory contains a substring, --cmd &lt;substr&gt; to commands whose argv contains a substring, and --mutating to state-changing subcommands only (commit, push, reset, rebase, merge, checkout, and the mutating z-verbs). -n limits how many matching records print (newest last); --json emits NDJSON.</p>
-<p>--summary replaces the record list with tallies: how many commands each agent ran, and how many of each subcommand, ranked by count — an at-a-glance accountability view of who did what across the tree.</p>
-</section>
-<section id="zscan">
-<h2><code>git zscan</code> <span class="summary">— parallel secret scan of tracked content across the fleet</span></h2>
-<pre class="synopsis">git zscan [selectors]</pre>
-<p>Scans the tracked file content of every selected indexed repo, in parallel over the shared worker pool, for common credential patterns — AWS access keys, PEM private keys, GitHub/Slack/Google tokens, JWTs, and high-entropy <code>key = "..."</code> assignments — using the same native, fork-free content walk <code>zgrep</code> does. Each hit prints as path:line:pattern:snippet.</p>
-<p>Binary files are skipped, output is capped per repo so one flooded tree cannot drown the rest, and the whole run exits non-zero when anything is found — so <code>git zscan</code> drops straight into a pre-push hook or CI gate. [selectors] narrows the set the same way every fleet verb does.</p>
-</section>
-<section id="zsigs">
-<h2><code>git zsigs</code> <span class="summary">— fleet commit-signature check (verify-sigs)</span></h2>
-<pre class="synopsis">git zsigs [selectors] [-n &lt;count&gt;]</pre>
-<p>Checks commit signatures across the fleet and flags any that are not a good signature — unsigned (N), bad (B), or unverifiable (E/X/Y/R). By default it checks each selected repo's HEAD; -n walks the top N first-parent commits. Each offender prints as <code>&lt;code&gt; &lt;repo&gt; &lt;sha&gt; &lt;subject&gt;</code> (git's <code>%G?</code> codes), and the run exits non-zero if any are found — so it gates a push or CI under an all-commits-must-be-signed policy.</p>
-<p>Verification is native where it can be and delegated where it must be: the signature and its signed payload are reconstructed from the commit object in-process (the <code>gpgsig</code> header removed and de-folded exactly as git does), then handed to gpg — the same tool git shells to; there is no in-process crypto in git either. A commit with no signature is N without running anything; a present signature that gpg cannot check (no public key, gpg absent) is E, never a fabricated good. SSH-format signatures report E in this pass (verifying them needs an allowed-signers file). The same machinery backs the <code>%G?</code> and <code>%GK</code> pretty-format placeholders in <code>git log</code>.</p>
-</section>
-<section id="zreview">
-<h2><code>git zreview</code> <span class="summary">— aggregate the pending uncommitted change across the fleet</span></h2>
-<pre class="synopsis">git zreview [selectors]</pre>
-<p>The read-side companion to <code>zcommitall</code>: for every selected repo with uncommitted work, it prints the repo's <code>git status --short</code> block grouped under its path, plus the summary line of its diffstat against HEAD, so you can review everything about to be committed across a whole tree of submodules on one screen.</p>
-<p>Clean repos are omitted; a trailing line reports how many repos have pending change and how many total entries. The status probe runs through this binary over the shared worker pool, so it is fleet-parallel and reads consistently with every other z-verb.</p>
-</section>
-<section id="zremote">
-<h2><code>git zremote</code> <span class="summary">— fleet-wide remote-URL rewrite</span></h2>
-<pre class="synopsis">git zremote set &lt;old&gt; &lt;new&gt; [selectors] [-n|--dry-run]</pre>
-<p>Rewrites remote URLs across the fleet in one command: in every selected repo, any remote whose URL contains the substring &lt;old&gt; is rewritten with &lt;old&gt; replaced by &lt;new&gt;. This is the one-shot answer to moving an org, changing a host, or switching ssh\(&lt;-&gt;https across a tree of submodules.</p>
-<p>Each change prints as <code>set &lt;repo&gt;::&lt;remote&gt;  &lt;from&gt; → &lt;to&gt;</code>; -n / --dry-run previews every change as <code>would set</code> without touching anything. Writes go through this binary's own <code>remote set-url</code> porcelain over the shared worker pool; the run exits non-zero if any set-url fails.</p>
-</section>
-<section id="zrollback">
-<h2><code>git zrollback</code> <span class="summary">— fleet-wide undo of the last mutating operation</span></h2>
-<pre class="synopsis">git zrollback [selectors] [--steps &lt;n&gt;] [--apply] [--force]</pre>
-<p>The multi-repo evolution of <code>zundo</code>: across every selected repo it resolves <code>HEAD@{n}</code> from the reflog (n = --steps, default 1) and rewinds to it with <code>reset --hard</code>, undoing the last commit / merge / rebase / reset. The reset is itself reflogged, so a rollback is undoable.</p>
-<p>It is **dry-run by default** — with no --apply it prints what each repo *would* do (<code>&lt;current&gt; → &lt;target&gt;</code>) and changes nothing. --apply executes the rollback on the repos that pass the guards.</p>
-<p>The guards refuse to lose work: a repo is skipped, not rolled back, when its worktree is dirty, when it is mid-operation (merge/rebase/cherry-pick/revert), or when rolling back would diverge from its remote — the discarded commits are already pushed (sync is up-to-date, behind, or diverged). Rollback is allowed by default only when the commits are local-only (ahead or no-upstream). --force overrides every guard.</p>
-</section>
-<section id="zsched">
-<h2><code>git zsched</code> <span class="summary">— daemon-hosted scheduled fleet commands (a built-in cron)</span></h2>
-<pre class="synopsis">git zsched add &lt;duration&gt; -- &lt;cmd&gt; | list | rm &lt;id&gt; | clear | run &lt;id&gt;</pre>
-<p>Schedules a command to run on an interval, hosted by the daemon — a built-in cron for the whole tree. <code>git zsched add 5m -- git zpull --dirty</code> fast-forwards every dirty repo every five minutes; durations are 30s / 5m / 1h / 1h30m style. <code>list</code> shows every schedule with its id and interval, <code>rm &lt;id&gt;</code> removes one, <code>clear</code> removes them all, and <code>run &lt;id&gt;</code> fires one now (synchronously) for testing.</p>
-<p>Schedules persist to $ZVCS_HOME/schedule.tsv as <code>id\tinterval\tcommand</code>. The CLI owns every write to that file; the daemon's scheduler thread only reads it (re-reading each tick, so add/rm take effect within one tick with no reload) and tracks each schedule's last-fire time in memory — so the CLI and daemon never contend on the file. A schedule fires one full interval after the daemon first sees it, not on daemon start.</p>
-</section>
-<section id="zpin">
-<h2><code>git zpin</code> <span class="summary">— freeze a repo from daemon autonomy</span></h2>
-<pre class="synopsis">git zpin [&lt;path&gt;...|list] [--json]</pre>
-<p>Pins one or more repositories so the daemon's autonomy leaves their pointer alone — a pinned repo is skipped by autobump and reconcile, so its gitlink and HEAD will not move on their own until it is unpinned. Detached-HEAD attach still runs, because re-attaching a detached HEAD heals it without moving the pointer.</p>
-<p>With no path it pins the repository at the current directory; with paths it pins each named repository; <code>git zpin list</code> prints every pinned repo. The flag lives in the shared index (<code>repos.pinned</code>), so it survives daemon restarts and is visible to every session. Unfreeze with <code>git zunpin</code>.</p>
-</section>
-<section id="zunpin">
-<h2><code>git zunpin</code> <span class="summary">— unfreeze repos pinned from autonomy</span></h2>
-<pre class="synopsis">git zunpin [&lt;path&gt;...|--all]</pre>
-<p>Clears the pin set by <code>git zpin</code>, so the daemon resumes autobump and reconcile for the repository. With no path it unpins the repo at the current directory; with paths it unpins each named one; --all unpins every pinned repository at once.</p>
-</section>
-<section id="zbroadcast">
-<h2><code>git zbroadcast</code> <span class="summary">— post and read inter-agent messages</span></h2>
-<pre class="synopsis">git zbroadcast [--to &lt;session&gt;] [&lt;msg&gt;...]</pre>
-<p>Sends a message to the other agent sessions working the tree, over the shared index. With a message it broadcasts to every session, or to one with --to &lt;session&gt;; with no arguments it prints this session's unread messages and marks them read.</p>
-<p>Read state is tracked per session, so a broadcast is delivered once to each recipient and a sender never sees its own message. It is a pull inbox — messages are read when you run the verb, adding no cost to any other command. Session identity comes from ZVCS_SESSION.</p>
-</section>
-<section id="zhandoff">
-<h2><code>git zhandoff</code> <span class="summary">— hand a repo's claim to another agent session</span></h2>
-<pre class="synopsis">git zhandoff &lt;repo-path&gt; &lt;session&gt;</pre>
-<p>Reassigns the advisory claim (lease) on a repository from the current holder to another session, and drops that session a message noting the handoff. Fails if the repository is not currently claimed.</p>
-<p>Claims are the session-attributed "I'm working this repo" signal set by <code>git zclaim</code>; zhandoff transfers one without the receiver having to race for it, so work can be passed cleanly between agents.</p>
-</section>
-<section id="zon">
-<h2><code>git zon</code> <span class="summary">— run a command on a semantic feed event</span></h2>
-<pre class="synopsis">git zon [--kind commit|stage|status|reconcile] [--repo &lt;substr&gt;] -- &lt;cmd&gt; | git zon list | git zon rm &lt;id&gt;</pre>
-<p>Registers a rule that runs a command when a matching event fires on the live feed. Where <code>git ztrigger</code> reacts to raw filesystem events under a directory, zon reacts to typed events — commit, stage, status, reconcile — from the same feed <code>git zevents</code> shows, optionally filtered to repos whose path contains a substring.</p>
-<p>The command after -- runs via the shell with ZVCS_EVENT, ZVCS_REPO, ZVCS_DETAIL, and ZVCS_SHA set for the triggering event. <code>git zon list</code> shows every subscription; <code>git zon rm &lt;id&gt;</code> removes one. The daemon watches the feed and runs the matches. Caveat (shared with ztrigger): a command that itself commits or stages can match its own subscription and re-fire — scope it with --kind/--repo.</p>
-</section>
-<section id="zsince">
-<h2><code>git zsince</code> <span class="summary">— what happened across the tree since a time</span></h2>
-<pre class="synopsis">git zsince &lt;duration|snapshot&gt; [--kind K] [--repo R] [--json]</pre>
-<p>Prints every feed event — commits, stages, status changes, reconciles — recorded across the whole indexed tree since a point in time. A duration (90s, 45m, 2d, 1h30m, or a bare number of seconds) counts back from now; any other token is treated as a snapshot name and its creation time is the baseline.</p>
-<p>This is the scoped "what did the fleet do since X" delta that <code>git zlog</code>'s full timeline does not give. --kind and --repo narrow the result to one event kind or to repos matching a substring.</p>
-</section>
-<section id="zcontend">
-<h2><code>git zcontend</code> <span class="summary">— live agent-vs-agent contention across the tree</span></h2>
-<pre class="synopsis">git zcontend [--json]</pre>
-<p>Shows who is stepping on whom: the session-attributed claims (advisory leases), the per-repo job backlog (how many jobs are queued or running behind each repository in the daemon's fair queue), and the intersection — repositories that are both claimed and have jobs stacked up, i.e. actively contested.</p>
-<p>All three are read from the shared index; nothing is mutated. It is the multi-agent observability view git has no notion of, because git only ever sees one repository and one process.</p>
-</section>
-<section id="zwaitfor">
-<h2><code>git zwaitfor</code> <span class="summary">— block until a tree-wide state holds</span></h2>
-<pre class="synopsis">git zwaitfor &lt;clean|idle|synced|&lt;repo&gt; &lt;sha&gt;&gt; [--timeout &lt;secs&gt;]</pre>
-<p>Blocks until a condition over the whole tree becomes true, then exits 0 (or 1 on timeout) — a cross-repo barrier on state, where <code>git zbarrier</code> and <code>git zwait</code> are job-scoped. clean waits until every indexed repo is clean; idle until no daemon jobs are queued or running; synced until every repo is up-to-date with its upstream; <code>&lt;substr&gt; &lt;sha&gt;</code> until the repo whose path contains the substring is at the given commit (prefix).</p>
-<p>Conditions are read from the daemon's cached status, so the daemon must be maintaining status for the wait to observe changes. --timeout bounds the wait (default 60 seconds).</p>
-</section>
-<section id="zgraph">
-<h2><code>git zgraph</code> <span class="summary">— fleet topology of duplicate checkouts</span></h2>
-<pre class="synopsis">git zgraph [--json]</pre>
-<p>Maps the cross-repository relationship git has no notion of: which local checkouts are the same upstream repository — a dup group, the same origin URL with more than one working tree on the machine. git can never show this, because git only ever sees one repository.</p>
-<p>Reads every indexed repository's origin (on demand, so the per-repo config read is acceptable) and lists each dup group with its checkouts, then a summary of repos, distinct origins, dup groups, and repos with no origin.</p>
-</section>
-<section id="zrewind">
-<h2><code>git zrewind</code> <span class="summary">— restore the whole tree to a wall-clock time</span></h2>
-<pre class="synopsis">git zrewind &lt;duration&gt; [--dry-run]</pre>
-<p>Rewinds the tree — the repository at the current directory and every nested submodule — to the state it was in a given duration ago (2h, 30m, 1d). For each repository it finds the HEAD the reflog shows it had at that time and resets hard to it, reusing the faithful porcelain reset (itself reflogged, so the rewind is undoable). Where <code>git zsnapshot</code> is a manual named restore point, this is any timestamp with no prior setup.</p>
-<p>A dirty repository is refused so uncommitted work is never clobbered, and a repository whose reflog does not reach that far back is reported and skipped (the reflog's default 90-day expiry bounds how far back it can go). --dry-run shows exactly what would move without changing anything.</p>
-</section>
-<section id="zguard">
-<h2><code>git zguard</code> <span class="summary">— declarative fleet-wide command policy (refuse or warn)</span></h2>
-<pre class="synopsis">git zguard deny|warn &lt;pattern&gt; [--when &lt;predicate&gt;] [-m &lt;msg&gt;] | list | rm &lt;id&gt; | clear | test &lt;cmd&gt;...</pre>
-<p>Registers rules that refuse or warn on a git command before it runs — a pattern-based command policy applied at the shadow binary, so it covers every invocation through it. The veto evolution of <code>zintercept</code>'s around-advice, promoted to a first-class policy layer no VCS has natively.</p>
-<p>A rule is an action (deny or warn), a glob pattern matched against the whole command line (<code>*</code> and <code>?</code>, same matcher as <code>zintercept</code>), an optional repo-state predicate, and an optional message. <code>git zguard deny 'push*--force*'</code> refuses a force-push; <code>git zguard warn 'rm*-rf*'</code> warns but allows.</p>
-<p>The <code>--when &lt;predicate&gt;</code> conditions a rule on the current repository: detached (HEAD is detached), dirty (uncommitted changes), protected (HEAD is main or master), unsigned (a commit with no -S/--gpg-sign and commit.gpgsign unset). So <code>git zguard deny 'commit*' --when detached</code> blocks commits on a detached HEAD, and <code>--when unsigned</code> requires signed commits.</p>
-<p>list shows the rules; rm &lt;id&gt; removes one; clear removes all; test &lt;cmd&gt;... reports the verdict (DENY/WARN/allow) for a command without running it. Rules are stored in $ZVCS_HOME/guards.tsv (machine-wide); the dispatch hot path is a single stat when no rule is set. The zguard/zpolicy verbs are exempt from their own rules, so a bad rule can never lock you out.</p>
-</section>
-<section id="zpolicy">
-<h2><code>git zpolicy</code> <span class="summary">— alias of git zguard (command policy)</span></h2>
-<pre class="synopsis">git zpolicy deny|warn &lt;pattern&gt; [--when &lt;predicate&gt;] [-m &lt;msg&gt;] | list | rm &lt;id&gt; | clear | test &lt;cmd&gt;...</pre>
-<p>An alias for <code>git zguard</code> — declarative fleet-wide command policy. See <code>git help zguard</code> for the full description.</p>
-</section>
-<section id="zppid">
-<h2><code>git zppid</code> <span class="summary">— per-process commit tally, attributed to the durable process</span></h2>
-<pre class="synopsis">git zppid</pre>
-<p>Reports which process is responsible for each recorded commit, found by walking up past the throwaway per-command shells to the durable agent, program, or login shell that drove them.</p>
-<p>Each row carries the pid, its command and working directory, whether it is still alive, and how many commits it landed.</p>
-</section>
-<section id="zprocs">
-<h2><code>git zprocs</code> <span class="summary">— per-process breakdown of mutating commands</span></h2>
-<pre class="synopsis">git zprocs</pre>
-<p>Reports how many of each mutating verb — commit, push, add, merge, rebase and the rest — every recorded process has run, attributed the same way as <code>git zppid</code>.</p>
-</section>
-<section id="zprecache">
-<h2><code>git zprecache</code> <span class="summary">— precompute the log caches for recent commits</span></h2>
-<pre class="synopsis">git zprecache [-n &lt;commits&gt;] [-q]</pre>
-<p>Fills the ledger's log caches — commit abbreviations and the per-file line tallies that --stat, --numstat, --shortstat and --name-status need — for the newest commits, so those formats read the ledger instead of the object store.</p>
-<p>Everything it stores is a pure function of immutable objects, so an entry never expires. -n sets how many commits to walk (default 200); -q suppresses the count.</p>
-<p>The daemon does this on its own whenever a watched repository's refs move (zvcs.precache, on by default); this verb is the same pass on demand, for a fresh clone or a fetch that landed while the daemon was down.</p>
-</section>
-</body></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="zvcs superset verb reference — every z* verb with its synopsis and manual text, generated from the same table git help &lt;verb&gt; renders.">
+  <title>zvcs — Verb Reference</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="hud-static.css">
+  <link rel="stylesheet" href="tutorial.css">
+  <style>
+    .tutorial-main { max-width: 72rem; }
+    .docs-build-line { margin: 0.35rem 0 0; font-family: 'Share Tech Mono', ui-monospace, monospace; font-size: 11px; color: var(--text-dim); letter-spacing: 0.03em; max-width: 48rem; opacity: 0.75; }
+    .hub-scheme-strip { border-bottom: 1px dashed var(--border); background: color-mix(in srgb, var(--bg-secondary) 85%, transparent); padding: 0.55rem 1.5rem 0.65rem; position: relative; }
+    .hub-scheme-strip-inner { max-width: 72rem; margin: 0 auto; display: flex; align-items: center; gap: 0.85rem; }
+    .hub-scheme-strip .hud-scheme-label { flex: 0 0 auto; font-family: 'Orbitron', sans-serif; font-size: 9px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; color: var(--accent); }
+    .hub-scheme-strip .scheme-grid { flex: 1 1 auto; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
+    @media (max-width: 720px) { .hub-scheme-strip-inner { flex-direction: column; align-items: stretch; } .hub-scheme-strip .scheme-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+    .verb-index { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(21rem, 1fr)); gap: 0.3rem; }
+    .verb-index li { border: 1px solid var(--border); border-left: 2px solid var(--cyan); padding: 0.4rem 0.65rem; border-radius: 2px; background: color-mix(in srgb, var(--bg-card) 92%, transparent); }
+    .verb-index a { font-family: 'Share Tech Mono', ui-monospace, monospace; font-size: 13px; color: var(--cyan); text-decoration: none; }
+    .verb-index a:hover { color: var(--accent-light); }
+    .verb-summary { display: block; font-size: 11px; color: var(--text-muted); line-height: 1.45; margin-top: 0.15rem; }
+
+    .doc-entry { border: 1px solid var(--border); border-left: 2px solid var(--magenta); border-radius: 2px; background: color-mix(in srgb, var(--bg-card) 92%, transparent); padding: 0.85rem 1.1rem; margin: 0 0 0.6rem; scroll-margin-top: 1rem; }
+    .doc-entry h3 { margin: 0 0 0.5rem; font-family: 'Orbitron', sans-serif; font-size: 13px; font-weight: 700; letter-spacing: 1.2px; color: var(--magenta); }
+    .doc-sigil { color: var(--text-muted); font-weight: 400; }
+    .doc-summary { display: block; margin-top: 0.25rem; font-family: 'Share Tech Mono', ui-monospace, monospace; font-size: 11.5px; font-weight: 400; letter-spacing: 0; text-transform: none; color: var(--text-dim); }
+    .doc-synopsis { font-family: 'Share Tech Mono', ui-monospace, monospace; font-size: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 2px; padding: 0.55rem 0.8rem; overflow-x: auto; margin: 0 0 0.6rem; box-shadow: inset 0 0 18px rgba(0, 0, 0, 0.35); }
+    .doc-synopsis code { color: var(--cyan); background: transparent; border: none; padding: 0; white-space: pre; }
+    [data-theme="light"] .doc-synopsis { box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.05); }
+    .doc-entry p { margin: 0 0 0.45rem; font-size: 12.5px; color: var(--text-dim); line-height: 1.65; }
+    .doc-entry p code { font-family: 'Share Tech Mono', ui-monospace, monospace; font-size: 11.5px; color: var(--accent-light); }
+    .doc-top { font-family: 'Share Tech Mono', ui-monospace, monospace; font-size: 10px; color: var(--text-muted); text-decoration: none; }
+    .doc-top:hover { color: var(--cyan); }
+  </style>
+</head>
+<body>
+  <div class="app tutorial-app" id="docsApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand">// ZVCS — VERB REFERENCE</h1>
+          <nav class="tutorial-crumbs" aria-label="Breadcrumb">
+            <a href="index.html">Docs</a>
+            <span class="sep">/</span>
+            <span class="current">Verb Reference</span>
+            <span class="sep">/</span>
+            <a href="report.html">Engineering Report</a>
+            <span class="sep">/</span>
+            <a href="https://github.com/MenkeTechnologies/zvcs" target="_blank" rel="noopener noreferrer">GitHub</a>
+          </nav>
+          <p class="docs-build-line">zvcs v0.9.1 · 116 superset verbs · generated from <code>src/extensions/src/superset/manpage.rs</code>, the same table <code>git help &lt;verb&gt;</code> renders</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+          <a class="btn btn-secondary" href="index.html">Hub</a>
+          <a class="btn btn-secondary" href="report.html">Report</a>
+          <a class="btn btn-secondary" href="https://github.com/MenkeTechnologies/zvcs" target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="hub-scheme-strip">
+      <div class="hub-scheme-strip-inner">
+        <span class="hud-scheme-label">// Color scheme</span>
+        <div class="scheme-grid" id="hudSchemeGrid"></div>
+      </div>
+    </div>
+
+    <main class="tutorial-main">
+      <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>SUPERSET VERBS</h2>
+      <p class="tutorial-subtitle">The 116 <code>z*</code> verbs — the coordination layer stock git has no equivalent for. Every entry is the verb's man page: <code>git help &lt;verb&gt;</code> shows the same text in a terminal.</p>
+
+      <section class="tutorial-section" id="verb-index">
+        <h2>Index</h2>
+        <ul class="verb-index">
+        <li><a href="#zsync">zsync</a> <span class="verb-summary">reconcile every submodule to its tracked mainline, attached</span></li>
+        <li><a href="#zbump">zbump</a> <span class="verb-summary">forward-only submodule gitlink bumps, then commit them</span></li>
+        <li><a href="#zdaemon">zdaemon</a> <span class="verb-summary">control the singleton machine-wide coordinator</span></li>
+        <li><a href="#zconfig">zconfig</a> <span class="verb-summary">inspect and toggle the daemon's [zvcs] feature switches</span></li>
+        <li><a href="#zrepos">zrepos</a> <span class="verb-summary">list indexed git repositories</span></li>
+        <li><a href="#zreindex">zreindex</a> <span class="verb-summary">(re)crawl for git repositories and refresh the index</span></li>
+        <li><a href="#zjobs">zjobs</a> <span class="verb-summary">list recent async jobs</span></li>
+        <li><a href="#zjob">zjob</a> <span class="verb-summary">show or control an async job</span></li>
+        <li><a href="#zcommit">zcommit</a> <span class="verb-summary">queue an atomic staged-commit job</span></li>
+        <li><a href="#zpush">zpush</a> <span class="verb-summary">queue an async push job with a fast-forward pre-flight</span></li>
+        <li><a href="#zsubmit">zsubmit</a> <span class="verb-summary">run an arbitrary command as an async daemon job</span></li>
+        <li><a href="#zrepl">zrepl</a> <span class="verb-summary">interactive console over every zvcs command</span></li>
+        <li><a href="#zclaim">zclaim</a> <span class="verb-summary">lease a repository for this session</span></li>
+        <li><a href="#zunclaim">zunclaim</a> <span class="verb-summary">release a repository lease</span></li>
+        <li><a href="#zwho">zwho</a> <span class="verb-summary">list active claims</span></li>
+        <li><a href="#zstatus">zstatus</a> <span class="verb-summary">working-tree status of indexed repositories</span></li>
+        <li><a href="#zlog">zlog</a> <span class="verb-summary">machine-wide reflog timeline across indexed repositories</span></li>
+        <li><a href="#zundo">zundo</a> <span class="verb-summary">rewind a repository one reflog step</span></li>
+        <li><a href="#zsnapshot">zsnapshot</a> <span class="verb-summary">record the tree's HEADs as a restore point</span></li>
+        <li><a href="#zrestore">zrestore</a> <span class="verb-summary">reset the whole tree back to a snapshot</span></li>
+        <li><a href="#zsnapshots">zsnapshots</a> <span class="verb-summary">list snapshots</span></li>
+        <li><a href="#zworktree">zworktree</a> <span class="verb-summary">tree-wide private worktrees</span></li>
+        <li><a href="#zstash">zstash</a> <span class="verb-summary">stash every dirty repo in the tree as one unit</span></li>
+        <li><a href="#zunstash">zunstash</a> <span class="verb-summary">pop the tree-wide stash back</span></li>
+        <li><a href="#zstashes">zstashes</a> <span class="verb-summary">list tree-wide stashes</span></li>
+        <li><a href="#zup">zup</a> <span class="verb-summary">reconcile the tree at cwd to latest origin/main</span></li>
+        <li><a href="#zforeach">zforeach</a> <span class="verb-summary">run a command across all or a subset of indexed repos</span></li>
+        <li><a href="#zselectors">zselectors</a> <span class="verb-summary">the shared selector grammar the parallel verbs accept</span></li>
+        <li><a href="#zhook">zhook</a> <span class="verb-summary">manage the current repo's ref-change hook</span></li>
+        <li><a href="#ztrigger">ztrigger</a> <span class="verb-summary">arm any directory to run a command on every ref-change</span></li>
+        <li><a href="#zwatch">zwatch</a> <span class="verb-summary">watch a directory's status without running a command</span></li>
+        <li><a href="#zdashed">zdashed</a> <span class="verb-summary">install git-&lt;verb&gt; symlinks and man pages</span></li>
+        <li><a href="#zverbs">zverbs</a> <span class="verb-summary">list every zvcs extension verb and its usage</span></li>
+        <li><a href="#zcd">zcd</a> <span class="verb-summary">change the working directory (for the zrepl console)</span></li>
+        <li><a href="#zpwd">zpwd</a> <span class="verb-summary">print the working directory</span></li>
+        <li><a href="#zls">zls</a> <span class="verb-summary">git-aware directory listing</span></li>
+        <li><a href="#zenv">zenv</a> <span class="verb-summary">print, set, or query environment variables</span></li>
+        <li><a href="#zunset">zunset</a> <span class="verb-summary">remove environment variables</span></li>
+        <li><a href="#zecho">zecho</a> <span class="verb-summary">print arguments joined by a space</span></li>
+        <li><a href="#zdoctor">zdoctor</a> <span class="verb-summary">health check of the zvcs environment</span></li>
+        <li><a href="#zmkdir">zmkdir</a> <span class="verb-summary">create directories</span></li>
+        <li><a href="#ztouch">ztouch</a> <span class="verb-summary">create files or update their mtime</span></li>
+        <li><a href="#zrm">zrm</a> <span class="verb-summary">remove files and directories</span></li>
+        <li><a href="#zcp">zcp</a> <span class="verb-summary">copy files and directories</span></li>
+        <li><a href="#zmv">zmv</a> <span class="verb-summary">move or rename files and directories</span></li>
+        <li><a href="#zcat">zcat</a> <span class="verb-summary">print file contents</span></li>
+        <li><a href="#zln">zln</a> <span class="verb-summary">create a hard link or symlink</span></li>
+        <li><a href="#zheads">zheads</a> <span class="verb-summary">HEAD of every indexed repo, in parallel</span></li>
+        <li><a href="#zdirty">zdirty</a> <span class="verb-summary">list indexed repos with tracked changes</span></li>
+        <li><a href="#zbranches">zbranches</a> <span class="verb-summary">local branches of every indexed repo</span></li>
+        <li><a href="#ztags">ztags</a> <span class="verb-summary">tag count of every indexed repo</span></li>
+        <li><a href="#zremotes">zremotes</a> <span class="verb-summary">remotes and URLs of every indexed repo</span></li>
+        <li><a href="#zsize">zsize</a> <span class="verb-summary">on-disk .git size of every indexed repo</span></li>
+        <li><a href="#zage">zage</a> <span class="verb-summary">HEAD commit age of every indexed repo</span></li>
+        <li><a href="#zpull">zpull</a> <span class="verb-summary">parallel fetch + fast-forward of every indexed repo</span></li>
+        <li><a href="#zattach">zattach</a> <span class="verb-summary">re-attach every detached-HEAD indexed repo to its mainline</span></li>
+        <li><a href="#zgrep">zgrep</a> <span class="verb-summary">parallel content search across indexed repos</span></li>
+        <li><a href="#zahead">zahead</a> <span class="verb-summary">indexed repos ahead of their upstream</span></li>
+        <li><a href="#zbehind">zbehind</a> <span class="verb-summary">indexed repos behind their upstream</span></li>
+        <li><a href="#zunpushed">zunpushed</a> <span class="verb-summary">per-repo unpushed commits (the detailed zahead)</span></li>
+        <li><a href="#zunpulled">zunpulled</a> <span class="verb-summary">per-repo commits the upstream has that local lacks</span></li>
+        <li><a href="#zauthors">zauthors</a> <span class="verb-summary">commit counts by author across indexed repos</span></li>
+        <li><a href="#zhot">zhot</a> <span class="verb-summary">indexed repos ranked by recent activity</span></li>
+        <li><a href="#zconflicts">zconflicts</a> <span class="verb-summary">indexed repos mid-operation or conflicted</span></li>
+        <li><a href="#zfetch">zfetch</a> <span class="verb-summary">parallel git fetch across indexed repos</span></li>
+        <li><a href="#zgc">zgc</a> <span class="verb-summary">parallel git gc across indexed repos</span></li>
+        <li><a href="#zfsck">zfsck</a> <span class="verb-summary">parallel git fsck across indexed repos</span></li>
+        <li><a href="#zprune">zprune</a> <span class="verb-summary">parallel git prune across indexed repos</span></li>
+        <li><a href="#zreset">zreset</a> <span class="verb-summary">parallel git reset across indexed repos</span></li>
+        <li><a href="#zabort">zabort</a> <span class="verb-summary">abort an in-progress operation across mid-op repos</span></li>
+        <li><a href="#zcheckout">zcheckout</a> <span class="verb-summary">check out a branch in every repo that has it</span></li>
+        <li><a href="#ztagall">ztagall</a> <span class="verb-summary">create a tag at HEAD in every indexed repo</span></li>
+        <li><a href="#zcommitall">zcommitall</a> <span class="verb-summary">commit tracked changes across every dirty repo</span></li>
+        <li><a href="#zpushall">zpushall</a> <span class="verb-summary">push every indexed repo that is ahead</span></li>
+        <li><a href="#zclean">zclean</a> <span class="verb-summary">remove untracked files across indexed repos</span></li>
+        <li><a href="#zwait">zwait</a> <span class="verb-summary">block until a repo's async jobs drain</span></li>
+        <li><a href="#zqueue">zqueue</a> <span class="verb-summary">list queued and running async jobs</span></li>
+        <li><a href="#zbarrier">zbarrier</a> <span class="verb-summary">block until the async queue is idle</span></li>
+        <li><a href="#zstale">zstale</a> <span class="verb-summary">indexed repos not committed to in a while</span></li>
+        <li><a href="#zlast">zlast</a> <span class="verb-summary">indexed repos by most recent commit</span></li>
+        <li><a href="#zbig">zbig</a> <span class="verb-summary">largest tracked files across indexed repos</span></li>
+        <li><a href="#zfiles">zfiles</a> <span class="verb-summary">tracked file count per indexed repo</span></li>
+        <li><a href="#zcommits">zcommits</a> <span class="verb-summary">HEAD-history commit count per indexed repo</span></li>
+        <li><a href="#zpristine">zpristine</a> <span class="verb-summary">indexed repos that are clean and in sync</span></li>
+        <li><a href="#zdivergent">zdivergent</a> <span class="verb-summary">indexed repos diverged from upstream</span></li>
+        <li><a href="#zorphans">zorphans</a> <span class="verb-summary">indexed repos with no remote</span></li>
+        <li><a href="#zsessions">zsessions</a> <span class="verb-summary">active sessions ranked by repos held</span></li>
+        <li><a href="#zidle">zidle</a> <span class="verb-summary">indexed repos with no active claim</span></li>
+        <li><a href="#zdashboard">zdashboard</a> <span class="verb-summary">live tiled TUI: fleet, events, and commands on one screen</span></li>
+        <li><a href="#ztop">ztop</a> <span class="verb-summary">live htop-style fleet monitor, most churn on top</span></li>
+        <li><a href="#zevents">zevents</a> <span class="verb-summary">one live feed of commits/reconciles/status-changes across the tree</span></li>
+        <li><a href="#ztail">ztail</a> <span class="verb-summary">alias of git zevents</span></li>
+        <li><a href="#zintercept">zintercept</a> <span class="verb-summary">AOP hooks that run advice around matching git commands</span></li>
+        <li><a href="#zcommands">zcommands</a> <span class="verb-summary">live feed of every git command run across the fleet</span></li>
+        <li><a href="#zaudit">zaudit</a> <span class="verb-summary">queryable audit trail over the fleet command log</span></li>
+        <li><a href="#zscan">zscan</a> <span class="verb-summary">parallel secret scan of tracked content across the fleet</span></li>
+        <li><a href="#zsigs">zsigs</a> <span class="verb-summary">fleet commit-signature check (verify-sigs)</span></li>
+        <li><a href="#zreview">zreview</a> <span class="verb-summary">aggregate the pending uncommitted change across the fleet</span></li>
+        <li><a href="#zremote">zremote</a> <span class="verb-summary">fleet-wide remote-URL rewrite</span></li>
+        <li><a href="#zrollback">zrollback</a> <span class="verb-summary">fleet-wide undo of the last mutating operation</span></li>
+        <li><a href="#zsched">zsched</a> <span class="verb-summary">daemon-hosted scheduled fleet commands (a built-in cron)</span></li>
+        <li><a href="#zpin">zpin</a> <span class="verb-summary">freeze a repo from daemon autonomy</span></li>
+        <li><a href="#zunpin">zunpin</a> <span class="verb-summary">unfreeze repos pinned from autonomy</span></li>
+        <li><a href="#zbroadcast">zbroadcast</a> <span class="verb-summary">post and read inter-agent messages</span></li>
+        <li><a href="#zhandoff">zhandoff</a> <span class="verb-summary">hand a repo's claim to another agent session</span></li>
+        <li><a href="#zon">zon</a> <span class="verb-summary">run a command on a semantic feed event</span></li>
+        <li><a href="#zsince">zsince</a> <span class="verb-summary">what happened across the tree since a time</span></li>
+        <li><a href="#zcontend">zcontend</a> <span class="verb-summary">live agent-vs-agent contention across the tree</span></li>
+        <li><a href="#zwaitfor">zwaitfor</a> <span class="verb-summary">block until a tree-wide state holds</span></li>
+        <li><a href="#zgraph">zgraph</a> <span class="verb-summary">fleet topology of duplicate checkouts</span></li>
+        <li><a href="#zrewind">zrewind</a> <span class="verb-summary">restore the whole tree to a wall-clock time</span></li>
+        <li><a href="#zguard">zguard</a> <span class="verb-summary">declarative fleet-wide command policy (refuse or warn)</span></li>
+        <li><a href="#zpolicy">zpolicy</a> <span class="verb-summary">alias of git zguard (command policy)</span></li>
+        <li><a href="#zppid">zppid</a> <span class="verb-summary">per-process commit tally, attributed to the durable process</span></li>
+        <li><a href="#zprocs">zprocs</a> <span class="verb-summary">per-process breakdown of mutating commands</span></li>
+        <li><a href="#zprecache">zprecache</a> <span class="verb-summary">precompute the log caches for recent commits</span></li>
+        </ul>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Manual</h2>
+      <article class="doc-entry" id="zsync">
+        <h3><span class="doc-sigil">git</span> zsync <span class="doc-summary">reconcile every submodule to its tracked mainline, attached</span></h3>
+        <pre class="doc-synopsis"><code>git zsync [&lt;path&gt;...]</code></pre>
+        <p>Fetches and fast-forwards every submodule to its tracked mainline (origin/main, else origin/master), leaving HEAD attached to that branch — detached HEAD never happens.</p>
+        <p>Fast-forward only; a submodule whose worktree is dirty or whose history has diverged is skipped rather than forced. Optional paths limit the operation to the named submodules.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zbump">
+        <h3><span class="doc-sigil">git</span> zbump <span class="doc-summary">forward-only submodule gitlink bumps, then commit them</span></h3>
+        <pre class="doc-synopsis"><code>git zbump [&lt;submodule-path&gt;...]</code></pre>
+        <p>Advances the parent repository's recorded gitlink for each submodule to that submodule's current HEAD, but only when the new commit is a descendant of the recorded one — a forward-only bump that can never regress a pointer.</p>
+        <p>The coalesced bumps are then committed, clearing git's "(new commits)" status marker. Paths limit the set of submodules considered.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zdaemon">
+        <h3><span class="doc-sigil">git</span> zdaemon <span class="doc-summary">control the singleton machine-wide coordinator</span></h3>
+        <pre class="doc-synopsis"><code>git zdaemon &lt;start|stop|restart|reload|status|info|ping|log&gt;</code></pre>
+        <p>Controls the one machine-wide daemon (state under ~/.zvcs, socket ~/.zvcs/zvcs.sock) that replaces git's index.lock with a fair per-repo queue and hosts the async job queue, the SQLite ledger, and reactive autonomy.</p>
+        <p>start/stop bring it up and down; restart and reload respawn it, re-reading config; status and info report liveness and pid/socket/paths/config; ping is a scriptable liveness check; log [-n N] [-f] shows or tails ~/.zvcs/zvcs.log.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zconfig">
+        <h3><span class="doc-sigil">git</span> zconfig <span class="doc-summary">inspect and toggle the daemon's [zvcs] feature switches</span></h3>
+        <pre class="doc-synopsis"><code>git zconfig [&lt;name&gt; [on|off|&lt;count&gt;|default]]</code></pre>
+        <p>Turns the daemon's autonomy features on and off from the CLI instead of hand-editing ~/.gitconfig. With no argument it lists every setting, its effective value, and whether it is set in your config (marked *) or showing the built-in default.</p>
+        <p>The boolean switches are autoreconcile (auto-sync submodules to origin/main on change), autobump (forward-only gitlink bumps + commit), autocrawl (crawl zvcs.crawlroots into the index on daemon start), autostatus (recompute a repo's status cache when it changes), autohook (fire each repo's zvcs.hook on change), and autodups (fan a commit out to local duplicate checkouts) — all off by default. Set them with <code>git zconfig &lt;name&gt; on|off</code>.</p>
+        <p>The numeric knobs are statusinterval (status-cache backstop sweep in seconds, default 10, 0 disables), watchmru (file-watch the N most-recently-used repos, default 512, 0 disables), and interval (autonomy debounce in seconds, default 30). Set them with <code>git zconfig &lt;name&gt; &lt;count&gt;</code>.</p>
+        <p><code>git zconfig &lt;name&gt;</code> shows a single setting; <code>git zconfig &lt;name&gt; default</code> reverts it to the built-in default; <code>git zconfig all on|off</code> flips every autonomy switch at once (off also zeroes the two background loops so the daemon idles).</p>
+        <p>Writes go to the global config (~/.gitconfig), the file the daemon reads. A change reloads a running daemon automatically so it takes effect at once; if no daemon is running the new value applies on its next start (toggling never spawns one).</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zrepos">
+        <h3><span class="doc-sigil">git</span> zrepos <span class="doc-summary">list indexed git repositories</span></h3>
+        <pre class="doc-synopsis"><code>git zrepos [&lt;pattern&gt;...] [--json]</code></pre>
+        <p>Lists every git repository in the machine-wide index, one path per line (pipe-clean), a drop-in for a shell repo-list.</p>
+        <p>Patterns filter the output by case-insensitive substring match.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zreindex">
+        <h3><span class="doc-sigil">git</span> zreindex <span class="doc-summary">(re)crawl for git repositories and refresh the index</span></h3>
+        <pre class="doc-synopsis"><code>git zreindex [--sync|--async] [&lt;path&gt;...]</code></pre>
+        <p>Crawls for git repositories and records them in the ledger, pruning ones deleted from disk. The walk is parallel and skips mounts that would hang a whole-device scan (kernel pseudo-filesystems, network volumes, the macOS data-volume firmlink).</p>
+        <p>At a terminal it runs async by default — the crawl detaches and results go to zvcs.log; piped or scripted it runs inline so "indexed N, pruned M" stays on stdout. --sync and --async override the default.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zjobs">
+        <h3><span class="doc-sigil">git</span> zjobs <span class="doc-summary">list recent async jobs</span></h3>
+        <pre class="doc-synopsis"><code>git zjobs [-n &lt;count&gt;] [--json]</code></pre>
+        <p>Lists recent jobs from the ledger, newest first. -n limits the count.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zjob">
+        <h3><span class="doc-sigil">git</span> zjob <span class="doc-summary">show or control an async job</span></h3>
+        <pre class="doc-synopsis"><code>git zjob &lt;id&gt; | git zjob &lt;stop|restart&gt; &lt;id&gt;</code></pre>
+        <p>Shows one job's ledger record, or stops (cancels) / restarts (re-enqueues) a running or queued job by id.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zcommit">
+        <h3><span class="doc-sigil">git</span> zcommit <span class="doc-summary">queue an atomic staged-commit job</span></h3>
+        <pre class="doc-synopsis"><code>git zcommit [&lt;path&gt;...] -m &lt;msg&gt; [--push]</code></pre>
+        <p>Submits a fire-and-forget staged-commit job to the daemon and returns a job number; --push chains a push after the commit.</p>
+        <p>Falls back to synchronous execution when no daemon is running.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zpush">
+        <h3><span class="doc-sigil">git</span> zpush <span class="doc-summary">queue an async push job with a fast-forward pre-flight</span></h3>
+        <pre class="doc-synopsis"><code>git zpush [&lt;refspec&gt;]</code></pre>
+        <p>Submits a fire-and-forget push job to the daemon. A network-free / live ls-refs pre-flight refuses a non-fast-forward before the job is enqueued. Falls back to synchronous execution when no daemon is running.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zsubmit">
+        <h3><span class="doc-sigil">git</span> zsubmit <span class="doc-summary">run an arbitrary command as an async daemon job</span></h3>
+        <pre class="doc-synopsis"><code>git zsubmit [--] &lt;command&gt; [args...]</code></pre>
+        <p>Ships an arbitrary command to the daemon's worker pool as an async job and prints the job id. Track it with <code>git zjobs</code> and <code>git zjob &lt;id&gt;</code> (which shows its state and captured output), and cancel it with <code>git zjob stop &lt;id&gt;</code> — the same ledger and controls as zcommit/zpush.</p>
+        <p>The command runs in the current directory (a git repository is not required — a repo-less job simply records with no repo) with no shell, so submit <code>sh -c "..."</code> when you need pipes, redirects, or globbing. It runs with the submitter's carried git-identity environment; otherwise it inherits the daemon's. With no daemon running, it executes inline.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zrepl">
+        <h3><span class="doc-sigil">git</span> zrepl <span class="doc-summary">interactive console over every zvcs command</span></h3>
+        <pre class="doc-synopsis"><code>git zrepl</code></pre>
+        <p>Opens an interactive line console. Each line is run exactly as <code>git &lt;line&gt;</code> would be, so it drives every dispatchable command — the z* superset verbs and every git-compat porcelain command alike (the latter operating on the current repository), doubling as a live daemon/ledger console.</p>
+        <p>On a terminal it opens with a stats banner and full line editing: Tab completes the command word against every verb (superset + porcelain), with command history persisted across sessions. Piped stdin falls back to a raw line reader so scripts and heredocs stay usable. Type exit or quit, or press Ctrl-D, to leave.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zclaim">
+        <h3><span class="doc-sigil">git</span> zclaim <span class="doc-summary">lease a repository for this session</span></h3>
+        <pre class="doc-synopsis"><code>git zclaim [&lt;path&gt;]</code></pre>
+        <p>Takes an advisory per-repo lease for the current session (ZVCS_SESSION), refusing if another agent already holds it, so concurrent agents do not collide on the same repository.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zunclaim">
+        <h3><span class="doc-sigil">git</span> zunclaim <span class="doc-summary">release a repository lease</span></h3>
+        <pre class="doc-synopsis"><code>git zunclaim [--force] [&lt;path&gt;]</code></pre>
+        <p>Releases a lease held on a repository. --force releases a lease held by another session.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zwho">
+        <h3><span class="doc-sigil">git</span> zwho <span class="doc-summary">list active claims</span></h3>
+        <pre class="doc-synopsis"><code>git zwho [--json]</code></pre>
+        <p>Lists active claims — which session holds a lease on which repository.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zstatus">
+        <h3><span class="doc-sigil">git</span> zstatus <span class="doc-summary">working-tree status of indexed repositories</span></h3>
+        <pre class="doc-synopsis"><code>git zstatus [--all] [--json]</code></pre>
+        <p>Reports the current repository's working-tree status live. --all reads every indexed repository's status from the daemon-maintained cache with no filesystem walk.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zlog">
+        <h3><span class="doc-sigil">git</span> zlog <span class="doc-summary">machine-wide reflog timeline across indexed repositories</span></h3>
+        <pre class="doc-synopsis"><code>git zlog [-n &lt;count&gt;]</code></pre>
+        <p>Merges every indexed repository's reflog into one machine-wide timeline, newest first. -n limits the count.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zundo">
+        <h3><span class="doc-sigil">git</span> zundo <span class="doc-summary">rewind a repository one reflog step</span></h3>
+        <pre class="doc-synopsis"><code>git zundo [&lt;path&gt;]</code></pre>
+        <p>Rewinds a repository one reflog step — a reset --hard to the previous HEAD. Refuses on a dirty worktree.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zsnapshot">
+        <h3><span class="doc-sigil">git</span> zsnapshot <span class="doc-summary">record the tree's HEADs as a restore point</span></h3>
+        <pre class="doc-synopsis"><code>git zsnapshot &lt;name&gt;</code></pre>
+        <p>Records the HEAD of the repository and every nested submodule as one named restore point.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zrestore">
+        <h3><span class="doc-sigil">git</span> zrestore <span class="doc-summary">reset the whole tree back to a snapshot</span></h3>
+        <pre class="doc-synopsis"><code>git zrestore &lt;name&gt;</code></pre>
+        <p>Resets the whole tree — the repository and every nested submodule — back to a named snapshot.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zsnapshots">
+        <h3><span class="doc-sigil">git</span> zsnapshots <span class="doc-summary">list snapshots</span></h3>
+        <pre class="doc-synopsis"><code>git zsnapshots</code></pre>
+        <p>Lists snapshot names and their repository counts.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zworktree">
+        <h3><span class="doc-sigil">git</span> zworktree <span class="doc-summary">tree-wide private worktrees</span></h3>
+        <pre class="doc-synopsis"><code>git zworktree &lt;add &lt;name&gt;|list|remove &lt;name&gt;&gt;</code></pre>
+        <p>add &lt;name&gt; provisions a complete, object-sharing, isolated worktree of the repository plus all nested submodules (each on a zwt/&lt;name&gt; branch) at ~/.zvcs/worktrees/&lt;name&gt;/, so each agent gets a private tree that cannot collide with any other — no re-clone.</p>
+        <p>list and remove &lt;name&gt; manage them.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zstash">
+        <h3><span class="doc-sigil">git</span> zstash <span class="doc-summary">stash every dirty repo in the tree as one unit</span></h3>
+        <pre class="doc-synopsis"><code>git zstash [&lt;name&gt;]</code></pre>
+        <p>Parks uncommitted work across every dirty repository in the tree as one named unit.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zunstash">
+        <h3><span class="doc-sigil">git</span> zunstash <span class="doc-summary">pop the tree-wide stash back</span></h3>
+        <pre class="doc-synopsis"><code>git zunstash [&lt;name&gt;]</code></pre>
+        <p>Restores (pops) a tree-wide stash, last-in-first-out, applying onto the same commits it was stashed on. A repository whose HEAD has since moved is reported and its stash kept intact.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zstashes">
+        <h3><span class="doc-sigil">git</span> zstashes <span class="doc-summary">list tree-wide stashes</span></h3>
+        <pre class="doc-synopsis"><code>git zstashes</code></pre>
+        <p>Lists tree-wide stashes and their repository counts.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zup">
+        <h3><span class="doc-sigil">git</span> zup <span class="doc-summary">reconcile the tree at cwd to latest origin/main</span></h3>
+        <pre class="doc-synopsis"><code>git zup [&lt;path&gt;]</code></pre>
+        <p>Brings the whole tree — the top-level repository and every nested submodule — to latest origin/main (fetch, then fast-forward, staying attached). A dirty or diverged repository is skipped.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zforeach">
+        <h3><span class="doc-sigil">git</span> zforeach <span class="doc-summary">run a command across all or a subset of indexed repos</span></h3>
+        <pre class="doc-synopsis"><code>git zforeach [&lt;selectors&gt;] -- &lt;command&gt;...</code></pre>
+        <p>Runs a command across all indexed repositories, or a subset, in parallel.</p>
+        <p>Selectors: a bare &lt;pattern&gt; (substring), --repo &lt;p&gt;, --dirty, --ahead, --behind, --claimed, and --session &lt;s&gt;. Everything after -- is the command to run in each selected repository. See <code>git help zselectors</code> for the full selector grammar.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zselectors">
+        <h3><span class="doc-sigil">git</span> zselectors <span class="doc-summary">the shared selector grammar the parallel verbs accept</span></h3>
+        <pre class="doc-synopsis"><code>git zselectors</code></pre>
+        <p>Many superset verbs take an optional leading [selectors] argument that narrows which indexed repositories they act on — zforeach, zheads, zdirty, zpull, zgrep, zfetch, zgc, zcommitall, and the rest. This page documents that shared grammar; <code>git zselectors</code> prints a short version to the terminal.</p>
+        <p>With no selector a verb acts on EVERY indexed repository. The selectors are: a bare &lt;pattern&gt;, a case-insensitive substring matched against each repo's working-tree path (repeatable — all patterns must match); --repo &lt;pattern&gt;, the same thing spelled out; --dirty, repos with uncommitted tracked changes; --ahead and --behind, repos ahead of or behind their upstream; --claimed, repos with an active lease (git zclaim); and --session &lt;s&gt;, repos leased by session &lt;s&gt;.</p>
+        <p>Selectors COMPOSE with AND — a repo must match every selector given (so --ahead --behind is empty, since a repo is never both). --dirty, --ahead, and --behind read the daemon's status cache (kept warm by the status maintainer), so they reflect the last scan rather than a live check.</p>
+        <p>Examples: <code>git zheads</code> (all repos) vs <code>git zheads cask</code> (only repos whose path contains "cask"); <code>git zforeach --dirty -- git status</code> runs git status in every dirty repo; <code>git zpull --behind</code> fast-forwards only the repos behind their upstream; <code>git zgrep --repo web TODO</code> searches "TODO" in repos matching "web".</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zhook">
+        <h3><span class="doc-sigil">git</span> zhook <span class="doc-summary">manage the current repo's ref-change hook</span></h3>
+        <pre class="doc-synopsis"><code>git zhook &lt;set &lt;command&gt;|unset|show|list|test&gt;</code></pre>
+        <p>Manages and tests the current repository's ref-change hook (zvcs.hook), which the daemon runs on every ref-change when zvcs.autohook is enabled. set installs a command, unset removes it, show/list display it, and test runs it once.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="ztrigger">
+        <h3><span class="doc-sigil">git</span> ztrigger <span class="doc-summary">arm any directory to run a command on every ref-change</span></h3>
+        <pre class="doc-synopsis"><code>git ztrigger &lt;DIR&gt; &lt;command&gt;... | git ztrigger &lt;list|rm DIR|test DIR&gt;</code></pre>
+        <p>The directory-addressed front-end to the hook system: unlike zhook (current repo only) it takes an explicit path, so any repository on the machine can be wired without cd-ing into it, and it flips the master switches itself — no raw git config needed.</p>
+        <p>git ztrigger DIR CMD writes DIR's local zvcs.hook, indexes DIR, turns on the global zvcs.autohook switch, and reloads the daemon, so CMD runs on every ref-change in DIR. list, rm DIR, and test DIR manage armed triggers.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zwatch">
+        <h3><span class="doc-sigil">git</span> zwatch <span class="doc-summary">watch a directory's status without running a command</span></h3>
+        <pre class="doc-synopsis"><code>git zwatch &lt;DIR&gt; | git zwatch &lt;list|rm DIR&gt;</code></pre>
+        <p>The command-less form of ztrigger: it indexes DIR and turns on zvcs.autostatus so the daemon maintains DIR's cached status on every ref-change, without running any command. list and rm DIR manage watches.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zdashed">
+        <h3><span class="doc-sigil">git</span> zdashed <span class="doc-summary">install git-&lt;verb&gt; symlinks and man pages</span></h3>
+        <pre class="doc-synopsis"><code>git zdashed [&lt;dir&gt;]</code></pre>
+        <p>Installs a git-&lt;verb&gt; symlink for every builtin and superset verb into &lt;dir&gt; (default ~/.zvcs/bin), so the dashed external forms resolve to this binary once stock git is removed.</p>
+        <p>It also writes every extension man page under ~/.zvcs/man, so <code>man git-&lt;verb&gt;</code> resolves when that directory is on MANPATH.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zverbs">
+        <h3><span class="doc-sigil">git</span> zverbs <span class="doc-summary">list every zvcs extension verb and its usage</span></h3>
+        <pre class="doc-synopsis"><code>git zverbs [--json]</code></pre>
+        <p>Lists every zvcs extension (z*) verb with its one-line usage, sourced from each verb's own -h so the listing can never drift.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zcd">
+        <h3><span class="doc-sigil">git</span> zcd <span class="doc-summary">change the working directory (for the zrepl console)</span></h3>
+        <pre class="doc-synopsis"><code>git zcd [&lt;dir&gt;|-]</code></pre>
+        <p>Changes the process working directory: no argument goes to $HOME, <code>-</code> goes to the previous directory ($OLDPWD), and a leading ~ expands to $HOME. OLDPWD and PWD are updated so <code>zcd -</code> round-trips, exactly as a shell's cd does.</p>
+        <p>The zrepl console runs each line in one long-lived process, so a zcd persists across lines — it is what makes the console navigable like a shell. Run standalone it only moves this process's cwd (it cannot change the parent shell's), so it is aimed at the console.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zpwd">
+        <h3><span class="doc-sigil">git</span> zpwd <span class="doc-summary">print the working directory</span></h3>
+        <pre class="doc-synopsis"><code>git zpwd</code></pre>
+        <p>Prints the current working directory. Paired with zcd for shell-like navigation inside the zrepl console.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zls">
+        <h3><span class="doc-sigil">git</span> zls <span class="doc-summary">git-aware directory listing</span></h3>
+        <pre class="doc-synopsis"><code>git zls [-alrt] [&lt;path&gt;]</code></pre>
+        <p>Lists a directory with a two-column git status field per entry, like <code>eza --git</code>: the first column is the staged status (index vs HEAD), the second the unstaged status (worktree vs index). Letters follow eza: N new, M modified, D deleted, R renamed, C copied, T type-change, U conflicted, I ignored, and - unchanged. A directory folds the status of the paths under it, so a subtree with any change is flagged. Outside a git repository the column is omitted.</p>
+        <p>Flags: -a includes dotfiles, -l is a long listing (permissions, size, relative mtime), -t sorts by modification time (newest first), and -r reverses. The per-path status is the same walk <code>git status</code> performs.</p>
+        <p>On a terminal the output is colored from the same palette eza uses: LS_COLORS for file kinds and *.ext extensions, then EXA_COLORS/EZA_COLORS for the permission bits, size, date, git columns, and punctuation — so it matches the user's eza. NO_COLOR disables color.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zenv">
+        <h3><span class="doc-sigil">git</span> zenv <span class="doc-summary">print, set, or query environment variables</span></h3>
+        <pre class="doc-synopsis"><code>git zenv [&lt;NAME=VALUE&gt;...|&lt;NAME&gt;...]</code></pre>
+        <p>With no arguments, prints every environment variable as NAME=VALUE, sorted. A NAME=VALUE argument sets that variable; a bare NAME prints its value (nothing if unset).</p>
+        <p>In the zrepl console a variable set with zenv persists for every later <code>git</code> line — set GIT_AUTHOR_NAME, ZVCS_SESSION, and the like once and the whole session sees it.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zunset">
+        <h3><span class="doc-sigil">git</span> zunset <span class="doc-summary">remove environment variables</span></h3>
+        <pre class="doc-synopsis"><code>git zunset &lt;NAME&gt;...</code></pre>
+        <p>Removes one or more environment variables from the process, the complement of <code>zenv NAME=VALUE</code>. In the zrepl console the change persists for later <code>git</code> lines.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zecho">
+        <h3><span class="doc-sigil">git</span> zecho <span class="doc-summary">print arguments joined by a space</span></h3>
+        <pre class="doc-synopsis"><code>git zecho [-n] [&lt;arg&gt;...]</code></pre>
+        <p>Prints its arguments joined by a single space. A leading -n suppresses the trailing newline. Arguments are printed literally — there is no shell variable or glob expansion.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zdoctor">
+        <h3><span class="doc-sigil">git</span> zdoctor <span class="doc-summary">health check of the zvcs environment</span></h3>
+        <pre class="doc-synopsis"><code>git zdoctor</code></pre>
+        <p>Runs a set of environment checks and prints each as OK, WARN, or FAIL: whether this binary is the git on PATH, whether $ZVCS_HOME exists, whether the coordinator daemon is running, whether a ledger exists, how many man pages are installed, whether ~/.zvcs/man is on MANPATH, and whether the dashed git-&lt;verb&gt; symlinks are installed.</p>
+        <p>The process exits non-zero only when a hard FAIL is found, so it is usable in scripts and CI.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zmkdir">
+        <h3><span class="doc-sigil">git</span> zmkdir <span class="doc-summary">create directories</span></h3>
+        <pre class="doc-synopsis"><code>git zmkdir [-p] &lt;dir&gt;...</code></pre>
+        <p>Creates each named directory. -p creates any missing parent directories and does not error if the directory already exists. A native filesystem convenience for the zrepl console.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="ztouch">
+        <h3><span class="doc-sigil">git</span> ztouch <span class="doc-summary">create files or update their mtime</span></h3>
+        <pre class="doc-synopsis"><code>git ztouch &lt;file&gt;...</code></pre>
+        <p>Creates each named file if it does not exist (leaving existing contents intact) and updates its modification time to now, like the shell's touch.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zrm">
+        <h3><span class="doc-sigil">git</span> zrm <span class="doc-summary">remove files and directories</span></h3>
+        <pre class="doc-synopsis"><code>git zrm [-r] [-f] &lt;path&gt;...</code></pre>
+        <p>Removes files from the filesystem — this is not <code>git rm</code> (which stages a removal in the index); it deletes on disk. -r removes directories recursively, -f ignores paths that do not exist. Symlinks are removed, never followed.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zcp">
+        <h3><span class="doc-sigil">git</span> zcp <span class="doc-summary">copy files and directories</span></h3>
+        <pre class="doc-synopsis"><code>git zcp [-r] &lt;src&gt;... &lt;dst&gt;</code></pre>
+        <p>Copies files; -r copies directories recursively. With several sources, &lt;dst&gt; must be an existing directory and each source is copied into it under its own name; with one source and a non-directory &lt;dst&gt;, &lt;dst&gt; is the copy's name.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zmv">
+        <h3><span class="doc-sigil">git</span> zmv <span class="doc-summary">move or rename files and directories</span></h3>
+        <pre class="doc-synopsis"><code>git zmv &lt;src&gt;... &lt;dst&gt;</code></pre>
+        <p>Moves or renames paths. With several sources, &lt;dst&gt; must be an existing directory. A rename is used when possible, falling back to copy-then-remove when the move crosses filesystems. This is not <code>git mv</code> (which also updates the index); it only moves on disk.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zcat">
+        <h3><span class="doc-sigil">git</span> zcat <span class="doc-summary">print file contents</span></h3>
+        <pre class="doc-synopsis"><code>git zcat &lt;file&gt;...</code></pre>
+        <p>Writes each named file's bytes to stdout, in order, like the shell's cat.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zln">
+        <h3><span class="doc-sigil">git</span> zln <span class="doc-summary">create a hard link or symlink</span></h3>
+        <pre class="doc-synopsis"><code>git zln [-s] &lt;target&gt; &lt;link&gt;</code></pre>
+        <p>Creates &lt;link&gt; pointing at &lt;target&gt;: a hard link by default, or a symbolic link with -s.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zheads">
+        <h3><span class="doc-sigil">git</span> zheads <span class="doc-summary">HEAD of every indexed repo, in parallel</span></h3>
+        <pre class="doc-synopsis"><code>git zheads [selectors] [--json]</code></pre>
+        <p>Prints each indexed repository's checked-out branch (or (detached)/(unborn)), short HEAD id, and a * when the worktree has tracked changes — a one-glance view of where every repo in the machine sits.</p>
+        <p>Selectors are the same as zforeach: bare &lt;pattern&gt;, --repo &lt;p&gt;, --dirty, --ahead, --behind, --claimed, --session &lt;s&gt;. The probe is a native gix read run across all repos on a bounded worker pool.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zdirty">
+        <h3><span class="doc-sigil">git</span> zdirty <span class="doc-summary">list indexed repos with tracked changes</span></h3>
+        <pre class="doc-synopsis"><code>git zdirty [selectors] [--json]</code></pre>
+        <p>Lists only the indexed repositories whose worktree has uncommitted tracked changes (the same "dirty" gix reports for zstatus; an untracked-only repo counts as clean). Scanned in parallel. Selectors narrow the set as in zforeach.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zbranches">
+        <h3><span class="doc-sigil">git</span> zbranches <span class="doc-summary">local branches of every indexed repo</span></h3>
+        <pre class="doc-synopsis"><code>git zbranches [selectors] [--json]</code></pre>
+        <p>Prints each indexed repository's local branch names, grouped by repo, scanned in parallel.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="ztags">
+        <h3><span class="doc-sigil">git</span> ztags <span class="doc-summary">tag count of every indexed repo</span></h3>
+        <pre class="doc-synopsis"><code>git ztags [selectors] [--json]</code></pre>
+        <p>Prints how many tags each indexed repository has, scanned in parallel.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zremotes">
+        <h3><span class="doc-sigil">git</span> zremotes <span class="doc-summary">remotes and URLs of every indexed repo</span></h3>
+        <pre class="doc-synopsis"><code>git zremotes [selectors] [--json]</code></pre>
+        <p>Prints each indexed repository's remotes and their fetch URLs, grouped by repo, scanned in parallel.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zsize">
+        <h3><span class="doc-sigil">git</span> zsize <span class="doc-summary">on-disk .git size of every indexed repo</span></h3>
+        <pre class="doc-synopsis"><code>git zsize [selectors] [--json]</code></pre>
+        <p>Prints each indexed repository's on-disk .git size, largest first, with a total, so the heaviest repos in the tree are obvious. Sizes are summed with a native filesystem walk in parallel.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zage">
+        <h3><span class="doc-sigil">git</span> zage <span class="doc-summary">HEAD commit age of every indexed repo</span></h3>
+        <pre class="doc-synopsis"><code>git zage [selectors] [--json]</code></pre>
+        <p>Prints how long ago each indexed repository's HEAD commit was made (a relative time like <code>3 days ago</code>), scanned in parallel — a quick read of which repos are stale.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zpull">
+        <h3><span class="doc-sigil">git</span> zpull <span class="doc-summary">parallel fetch + fast-forward of every indexed repo</span></h3>
+        <pre class="doc-synopsis"><code>git zpull [selectors]</code></pre>
+        <p>Fetches and fast-forwards every selected indexed repository to its tracked mainline, in parallel, using the same native ff-only reconcile as zsync: a dirty or diverged repo is reported and skipped, never forced.</p>
+        <p>Where zsync/zup act on the current submodule tree, zpull acts on the machine-wide index, so selectors (--repo, --behind, …) scope which repos are pulled.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zattach">
+        <h3><span class="doc-sigil">git</span> zattach <span class="doc-summary">re-attach every detached-HEAD indexed repo to its mainline</span></h3>
+        <pre class="doc-synopsis"><code>git zattach [selectors]</code></pre>
+        <p>Re-attaches every selected indexed repository that is on a detached HEAD to its mainline branch (main, else master), fleet-wide — the kill-switch for the detached HEADs <code>git submodule update</code> leaves behind across the whole index.</p>
+        <p>It uses the same local, no-clobber attach zsync applies to submodules: it never contacts a remote, never moves the checked-out commit, and never touches the worktree or index — it only creates or fast-forwards the local mainline branch to the commit HEAD is already at and makes HEAD symbolic to it, so it is safe even on a dirty repo. A repo whose local mainline is ahead of or diverged from HEAD is refused rather than clobbered (catching the worktree up is zpull/zsync's clean-only job); a repo with no main or master anywhere is skipped. It reports how many were attached, already on a branch, had no mainline, or were refused.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zgrep">
+        <h3><span class="doc-sigil">git</span> zgrep <span class="doc-summary">parallel content search across indexed repos</span></h3>
+        <pre class="doc-synopsis"><code>git zgrep [selectors] [-i] &lt;pattern&gt; [--json]</code></pre>
+        <p>Searches the tracked file content of every indexed repository for &lt;pattern&gt; (a regular expression) in parallel, printing path:line:text for each match. -i is case-insensitive; binary files are skipped, as git grep does.</p>
+        <p>Only tracked, non-conflicted worktree files are searched. Selectors narrow the repo set as in zforeach.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zahead">
+        <h3><span class="doc-sigil">git</span> zahead <span class="doc-summary">indexed repos ahead of their upstream</span></h3>
+        <pre class="doc-synopsis"><code>git zahead [selectors] [--json]</code></pre>
+        <p>Lists the indexed repositories that have commits not yet on their configured upstream, with the count, computed in parallel. Repos with no upstream are omitted.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zbehind">
+        <h3><span class="doc-sigil">git</span> zbehind <span class="doc-summary">indexed repos behind their upstream</span></h3>
+        <pre class="doc-synopsis"><code>git zbehind [selectors] [--json]</code></pre>
+        <p>Lists the indexed repositories whose upstream has commits they lack, with the count, computed in parallel. Repos with no upstream are omitted.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zunpushed">
+        <h3><span class="doc-sigil">git</span> zunpushed <span class="doc-summary">per-repo unpushed commits (the detailed zahead)</span></h3>
+        <pre class="doc-synopsis"><code>git zunpushed [selectors] [--json]</code></pre>
+        <p>Lists, per indexed repository, the actual commits HEAD has that its upstream lacks — short id and summary line, grouped under the repo path — computed in parallel. Where <code>zahead</code> gives only a count, this shows what is unpushed. The list is capped per repo so a long divergence cannot flood the output; repos with no upstream or nothing unpushed are omitted.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zunpulled">
+        <h3><span class="doc-sigil">git</span> zunpulled <span class="doc-summary">per-repo commits the upstream has that local lacks</span></h3>
+        <pre class="doc-synopsis"><code>git zunpulled [selectors] [--json]</code></pre>
+        <p>Lists, per indexed repository, the commits on the configured upstream that the local branch lacks — short id and summary, grouped per repo. The detailed form of <code>zbehind</code>. A <code>git zfetch</code> first makes the upstream refs current. Repos with no upstream or nothing unpulled are omitted.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zauthors">
+        <h3><span class="doc-sigil">git</span> zauthors <span class="doc-summary">commit counts by author across indexed repos</span></h3>
+        <pre class="doc-synopsis"><code>git zauthors [selectors] [--json]</code></pre>
+        <p>Walks every indexed repository's HEAD history in parallel, tallies commits by author <code>Name &lt;email&gt;</code>, aggregates across all repos, and prints them ranked by count — a machine-wide contribution summary.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zhot">
+        <h3><span class="doc-sigil">git</span> zhot <span class="doc-summary">indexed repos ranked by recent activity</span></h3>
+        <pre class="doc-synopsis"><code>git zhot [selectors] [&lt;days&gt;] [--json]</code></pre>
+        <p>Ranks indexed repositories by the number of commits made in the last &lt;days&gt; (default 30), most active first, counted in parallel — a quick read of where work is happening across the tree.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zconflicts">
+        <h3><span class="doc-sigil">git</span> zconflicts <span class="doc-summary">indexed repos mid-operation or conflicted</span></h3>
+        <pre class="doc-synopsis"><code>git zconflicts [selectors] [--json]</code></pre>
+        <p>Lists the indexed repositories that are in the middle of a merge, rebase, cherry-pick, revert, or bisect, or that have unmerged (conflicted) index entries, with the operation(s) named — so a stuck repo among many is found at a glance.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zfetch">
+        <h3><span class="doc-sigil">git</span> zfetch <span class="doc-summary">parallel git fetch across indexed repos</span></h3>
+        <pre class="doc-synopsis"><code>git zfetch [selectors]</code></pre>
+        <p>Runs <code>git fetch</code> in every selected indexed repository concurrently, through this binary's own porcelain and fair per-repo lane. Output is grouped per repo and failures are recorded in the ledger.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zgc">
+        <h3><span class="doc-sigil">git</span> zgc <span class="doc-summary">parallel git gc across indexed repos</span></h3>
+        <pre class="doc-synopsis"><code>git zgc [selectors]</code></pre>
+        <p>Runs <code>git gc</code> in every selected indexed repository concurrently — machine-wide maintenance in one command.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zfsck">
+        <h3><span class="doc-sigil">git</span> zfsck <span class="doc-summary">parallel git fsck across indexed repos</span></h3>
+        <pre class="doc-synopsis"><code>git zfsck [selectors]</code></pre>
+        <p>Runs <code>git fsck</code> in every selected indexed repository concurrently, to check object integrity across the whole tree at once.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zprune">
+        <h3><span class="doc-sigil">git</span> zprune <span class="doc-summary">parallel git prune across indexed repos</span></h3>
+        <pre class="doc-synopsis"><code>git zprune [selectors]</code></pre>
+        <p>Runs <code>git prune</code> in every selected indexed repository concurrently, removing unreachable objects tree-wide.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zreset">
+        <h3><span class="doc-sigil">git</span> zreset <span class="doc-summary">parallel git reset across indexed repos</span></h3>
+        <pre class="doc-synopsis"><code>git zreset [selectors] [--soft|--mixed|--hard] [&lt;ref&gt;]</code></pre>
+        <p>Runs <code>git reset</code> in every selected indexed repository concurrently. The mode flag and optional <code>&lt;ref&gt;</code> pass straight through to git, so the default (as git's) is <code>--mixed HEAD</code>, which unstages. <code>--hard</code> discards worktree changes across the whole selection — narrow it with selectors (e.g. <code>--dirty</code>) first.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zabort">
+        <h3><span class="doc-sigil">git</span> zabort <span class="doc-summary">abort an in-progress operation across mid-op repos</span></h3>
+        <pre class="doc-synopsis"><code>git zabort [selectors]</code></pre>
+        <p>Aborts an in-progress merge, rebase, cherry-pick, or revert in every selected indexed repository that is mid-operation — running the matching <code>--abort</code> — and skips repos with nothing in progress. Cleans up after a fan-out (or a many-agent session) that left repos stuck in a half-finished operation.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zcheckout">
+        <h3><span class="doc-sigil">git</span> zcheckout <span class="doc-summary">check out a branch in every repo that has it</span></h3>
+        <pre class="doc-synopsis"><code>git zcheckout [selectors] &lt;branch&gt;</code></pre>
+        <p>Checks out <code>&lt;branch&gt;</code> in every selected indexed repository that already has it, in parallel. A repo without the branch is skipped — the branch is never created — so this is a safe way to move a whole tree onto a shared branch name.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="ztagall">
+        <h3><span class="doc-sigil">git</span> ztagall <span class="doc-summary">create a tag at HEAD in every indexed repo</span></h3>
+        <pre class="doc-synopsis"><code>git ztagall [selectors] &lt;tag&gt;</code></pre>
+        <p>Creates tag <code>&lt;tag&gt;</code> at HEAD in every selected indexed repository, in parallel. A repo that already has the tag reports the failure rather than moving it.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zcommitall">
+        <h3><span class="doc-sigil">git</span> zcommitall <span class="doc-summary">commit tracked changes across every dirty repo</span></h3>
+        <pre class="doc-synopsis"><code>git zcommitall [selectors] -m &lt;msg&gt;</code></pre>
+        <p>Commits tracked changes (<code>git commit -a</code>) with message <code>&lt;msg&gt;</code> in every selected indexed repository whose worktree is dirty, in parallel. Clean repos are skipped. Untracked files are not staged (as with <code>commit -a</code>).</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zpushall">
+        <h3><span class="doc-sigil">git</span> zpushall <span class="doc-summary">push every indexed repo that is ahead</span></h3>
+        <pre class="doc-synopsis"><code>git zpushall [selectors]</code></pre>
+        <p>Runs <code>git push</code> in every selected indexed repository that is ahead of its upstream, in parallel. Repos that are not ahead (or have no upstream) are skipped, so no needless network calls are made.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zclean">
+        <h3><span class="doc-sigil">git</span> zclean <span class="doc-summary">remove untracked files across indexed repos</span></h3>
+        <pre class="doc-synopsis"><code>git zclean -f [selectors]</code></pre>
+        <p>Runs <code>git clean -fd</code> — remove untracked files and directories — in every selected indexed repository, in parallel. Because it deletes, the <code>-f</code> flag is required; ignored files are left (as <code>git clean</code> does without <code>-x</code>).</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zwait">
+        <h3><span class="doc-sigil">git</span> zwait <span class="doc-summary">block until a repo's async jobs drain</span></h3>
+        <pre class="doc-synopsis"><code>git zwait [&lt;path&gt;]</code></pre>
+        <p>Blocks until the repository at <code>&lt;path&gt;</code> (or the current directory) has no queued or running async jobs (<code>zcommit</code>/<code>zpush</code>) left in the ledger — the join for that repo's fire-and-forget work. With no daemon there are no jobs, so it returns at once.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zqueue">
+        <h3><span class="doc-sigil">git</span> zqueue <span class="doc-summary">list queued and running async jobs</span></h3>
+        <pre class="doc-synopsis"><code>git zqueue</code></pre>
+        <p>Lists the async jobs currently queued or running in the ledger (id, state, kind, repo) — what the daemon is working through right now.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zbarrier">
+        <h3><span class="doc-sigil">git</span> zbarrier <span class="doc-summary">block until the async queue is idle</span></h3>
+        <pre class="doc-synopsis"><code>git zbarrier</code></pre>
+        <p>Blocks until the entire async job queue is idle — every repository's queued and running jobs have drained — the global join after a burst of <code>zcommit</code>/<code>zpush</code>.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zstale">
+        <h3><span class="doc-sigil">git</span> zstale <span class="doc-summary">indexed repos not committed to in a while</span></h3>
+        <pre class="doc-synopsis"><code>git zstale [selectors] [&lt;days&gt;] [--json]</code></pre>
+        <p>Lists the indexed repositories whose HEAD commit is older than &lt;days&gt; (default 90), with how long ago — surfacing abandoned repos across the tree. Scanned in parallel.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zlast">
+        <h3><span class="doc-sigil">git</span> zlast <span class="doc-summary">indexed repos by most recent commit</span></h3>
+        <pre class="doc-synopsis"><code>git zlast [selectors] [--json]</code></pre>
+        <p>Lists indexed repositories ordered by HEAD commit time, most recently committed first, each with its relative age — where work happened most recently.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zbig">
+        <h3><span class="doc-sigil">git</span> zbig <span class="doc-summary">largest tracked files across indexed repos</span></h3>
+        <pre class="doc-synopsis"><code>git zbig [selectors] [&lt;n&gt;] [--json]</code></pre>
+        <p>Lists the largest tracked files across every indexed repository, top &lt;n&gt; (default 20), by on-disk size — bloat hunting tree-wide. Files are gathered in parallel.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zfiles">
+        <h3><span class="doc-sigil">git</span> zfiles <span class="doc-summary">tracked file count per indexed repo</span></h3>
+        <pre class="doc-synopsis"><code>git zfiles [selectors] [--json]</code></pre>
+        <p>Prints the number of tracked files in each indexed repository, largest first, scanned in parallel.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zcommits">
+        <h3><span class="doc-sigil">git</span> zcommits <span class="doc-summary">HEAD-history commit count per indexed repo</span></h3>
+        <pre class="doc-synopsis"><code>git zcommits [selectors] [--json]</code></pre>
+        <p>Counts the commits reachable from HEAD in each indexed repository — its history depth — and prints them deepest first, walked in parallel.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zpristine">
+        <h3><span class="doc-sigil">git</span> zpristine <span class="doc-summary">indexed repos that are clean and in sync</span></h3>
+        <pre class="doc-synopsis"><code>git zpristine [selectors] [--json]</code></pre>
+        <p>Lists the indexed repositories that need nothing: no uncommitted changes, on a branch (not detached), and in sync with their upstream (or having none configured). The complement of <code>zdirty</code>/<code>zahead</code>/<code>zbehind</code>/<code>zconflicts</code> — the green set — computed in parallel.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zdivergent">
+        <h3><span class="doc-sigil">git</span> zdivergent <span class="doc-summary">indexed repos diverged from upstream</span></h3>
+        <pre class="doc-synopsis"><code>git zdivergent [selectors] [--json]</code></pre>
+        <p>Lists indexed repositories that are both ahead of and behind their upstream — history has forked, so a merge or rebase is needed. Computed in parallel.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zorphans">
+        <h3><span class="doc-sigil">git</span> zorphans <span class="doc-summary">indexed repos with no remote</span></h3>
+        <pre class="doc-synopsis"><code>git zorphans [selectors] [--json]</code></pre>
+        <p>Lists indexed repositories with no remote configured — nothing to fetch from or push to. Scanned in parallel.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zsessions">
+        <h3><span class="doc-sigil">git</span> zsessions <span class="doc-summary">active sessions ranked by repos held</span></h3>
+        <pre class="doc-synopsis"><code>git zsessions [--json]</code></pre>
+        <p>Lists the sessions that currently hold claims, ranked by how many repositories each holds — which agent is working the most of the tree.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zidle">
+        <h3><span class="doc-sigil">git</span> zidle <span class="doc-summary">indexed repos with no active claim</span></h3>
+        <pre class="doc-synopsis"><code>git zidle [selectors]</code></pre>
+        <p>Lists indexed repositories that no session has claimed — the ones free for an agent to pick up. Selectors narrow the candidate set as in zforeach.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zdashboard">
+        <h3><span class="doc-sigil">git</span> zdashboard <span class="doc-summary">live tiled TUI: fleet, events, and commands on one screen</span></h3>
+        <pre class="doc-synopsis"><code>git zdashboard [--once] [--json]</code></pre>
+        <p>A live, tiled dashboard of the whole indexed tree on one screen: a header of aggregate totals (dirty, ahead, behind, diverged, detached, clean, claims, sessions, queue, and whether the daemon is up) over three tiles — a FLEET table (every repo, most recently active first, with the on-screen rows' HEAD state live-refreshed so nothing is stale), an EVENTS feed (commits, reconciles, status changes, as zevents shows), and a COMMANDS feed (every git command run across the machine, with the agent that ran it, as zcommands shows). Press q or Esc to quit.</p>
+        <p>Every tile reads the daemon-maintained status cache and ledger, not a live per-repo walk, so the dashboard stays responsive across thousands of repos. The COMMANDS tile is populated once command logging is on (<code>git zcommands</code> enables it).</p>
+        <p>For scripting, <code>--once</code> or <code>--json</code> (or a non-terminal stdout) prints the instant text summary instead of the TUI — the same aggregate counts, one screen, no interaction.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="ztop">
+        <h3><span class="doc-sigil">git</span> ztop <span class="doc-summary">live htop-style fleet monitor, most churn on top</span></h3>
+        <pre class="doc-synopsis"><code>git ztop [selectors] [--interval &lt;secs&gt;] [--once] [--mono]</code></pre>
+        <p>A full-screen, live monitor of the whole indexed tree — an htop for the fleet. A header shows the totals (dirty, ahead, behind, diverged, detached, clean, claims, sessions, queue depth, and whether the daemon is up); a table lists every repo with a churn bar, path, HEAD, state, and how long ago it last changed.</p>
+        <p>Repos are sorted with the most churn on top: when a repo's HEAD or dirty flag changes between frames (the daemon rewrote its status row), its churn score bumps and then decays, so whatever is moving right now rises to the top, like an htop CPU column. Press s to cycle the sort (churn / state / name), the arrows / PgUp / PgDn / g / G to scroll, and q (or Esc) to quit.</p>
+        <p>Each frame reads the daemon-maintained status cache, not a live per-repo scan, so it stays responsive across thousands of repos — start the daemon (git zdaemon start) so the cache stays warm and churn reflects real activity. Selectors narrow the view to a subset; --interval sets the refresh seconds, --mono (or NO_COLOR) drops color, and --once (or a non-terminal stdout) prints a single plain-text frame for scripts.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zevents">
+        <h3><span class="doc-sigil">git</span> zevents <span class="doc-summary">one live feed of commits/reconciles/status-changes across the tree</span></h3>
+        <pre class="doc-synopsis"><code>git zevents [-n &lt;count&gt;] [--kind commit|stage|status|reconcile] [--repo &lt;substr&gt;] [--json] [--no-follow]</code></pre>
+        <p>Prints a single structured, live feed of what is happening across the whole indexed tree: commits (a HEAD moved), status-changes (a dirty or sync transition), and reconciles (a fetch-free fast-forward the daemon applied). It shows a short backlog, then follows live.</p>
+        <p>Events come from the index's append-only events table, written by triggers on the status cache that both the whole-tree poller (statusd) and the instant file-watcher (watch) maintain, so activity anywhere is captured with no per-call plumbing. -n sets the backlog size, --no-follow prints the backlog and exits, --kind filters to one event kind, --repo filters by path substring, and --json emits NDJSON (one event per line) for tooling.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="ztail">
+        <h3><span class="doc-sigil">git</span> ztail <span class="doc-summary">alias of git zevents</span></h3>
+        <pre class="doc-synopsis"><code>git ztail [-n &lt;count&gt;] [--kind commit|stage|status|reconcile] [--repo &lt;substr&gt;] [--json] [--no-follow]</code></pre>
+        <p>An alias for <code>git zevents</code> — the single live feed of commits, reconciles, and status-changes across the whole indexed tree. See <code>git help zevents</code> for the full description.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zintercept">
+        <h3><span class="doc-sigil">git</span> zintercept <span class="doc-summary">AOP hooks that run advice around matching git commands</span></h3>
+        <pre class="doc-synopsis"><code>git zintercept before|after|around &lt;pattern&gt; -- &lt;cmd&gt; | list | remove &lt;id&gt; | clear</code></pre>
+        <p>Registers aspect-oriented advice that fires around git commands, ported from zshrs. A before hook runs a shell command before a matching git command; an after hook runs after it (with the command's exit status and timing available); an around hook replaces it, and runs the original itself when it chooses. &lt;pattern&gt; matches the git subcommand — <code>commit</code>, <code>push</code>, a glob like <code>commit *</code>, or <code>*</code> / <code>all</code> for everything.</p>
+        <p>The advice &lt;cmd&gt; is a shell command run via <code>sh -c</code>. It sees the intercepted command through the environment: INTERCEPT_NAME (the subcommand), INTERCEPT_ARGS, and INTERCEPT_CMD (the full <code>git ...</code> line); after-advice also gets INTERCEPT_STATUS, INTERCEPT_MS, and INTERCEPT_US. An around advice runs "$INTERCEPT_CMD" to proceed with the original (that child is not re-intercepted).</p>
+        <p>Registrations persist to $ZVCS_HOME/intercepts.tsv and load at dispatch; when none are registered the cost on every git command is a single stat. <code>list</code> shows all with their ids, <code>remove &lt;id&gt;</code> deletes one, and <code>clear</code> removes them all.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zcommands">
+        <h3><span class="doc-sigil">git</span> zcommands <span class="doc-summary">live feed of every git command run across the fleet</span></h3>
+        <pre class="doc-synopsis"><code>git zcommands [-n &lt;count&gt;] [--repo &lt;substr&gt;] [--json] [--no-follow] [--off] [--clear]</code></pre>
+        <p>Streams every <code>git</code> command run anywhere on the machine, in real time. Because the zvcs <code>git</code> binary shadows real git on PATH, every invocation flows through one dispatcher; when logging is on, each records a line — time, pid, working directory, and the command — to its own log at $ZVCS_HOME/commands.log (separate from the daemon log). This verb prints a backlog and then follows the log live, so commands from every repo and every concurrent shell scroll past as they run.</p>
+        <p>Running it turns logging on (a marker file, so the cost on every other git command is a single stat when it is off) and notes where the log lives. -n sets the backlog size, --no-follow prints the backlog and exits, --repo filters to commands whose directory contains a substring, and --json emits NDJSON for tooling. --off stops logging; --clear truncates the log. The live viewers (zcommands, zevents, ztail, ztop) are excluded so watching does not feed itself.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zaudit">
+        <h3><span class="doc-sigil">git</span> zaudit <span class="doc-summary">queryable audit trail over the fleet command log</span></h3>
+        <pre class="doc-synopsis"><code>git zaudit [--agent &lt;ppid&gt;] [--repo &lt;substr&gt;] [--cmd &lt;substr&gt;] [--mutating] [--summary] [-n &lt;count&gt;] [--json]</code></pre>
+        <p>The historical, accountable side of the same command log <code>zcommands</code> feeds — $ZVCS_HOME/commands.log. Where zcommands follows the live stream, zaudit queries the record: it answers "which agent ran which command against which repo, and when" across a fleet of concurrent agents. Each logged line carries the time, the command's pid, its parent pid (the agent that launched it), the working directory, and the git argv.</p>
+        <p>Filters compose: --agent &lt;ppid&gt; restricts to one agent, --repo &lt;substr&gt; to repos whose directory contains a substring, --cmd &lt;substr&gt; to commands whose argv contains a substring, and --mutating to state-changing subcommands only (commit, push, reset, rebase, merge, checkout, and the mutating z-verbs). -n limits how many matching records print (newest last); --json emits NDJSON.</p>
+        <p>--summary replaces the record list with tallies: how many commands each agent ran, and how many of each subcommand, ranked by count — an at-a-glance accountability view of who did what across the tree.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zscan">
+        <h3><span class="doc-sigil">git</span> zscan <span class="doc-summary">parallel secret scan of tracked content across the fleet</span></h3>
+        <pre class="doc-synopsis"><code>git zscan [selectors]</code></pre>
+        <p>Scans the tracked file content of every selected indexed repo, in parallel over the shared worker pool, for common credential patterns — AWS access keys, PEM private keys, GitHub/Slack/Google tokens, JWTs, and high-entropy <code>key = "..."</code> assignments — using the same native, fork-free content walk <code>zgrep</code> does. Each hit prints as path:line:pattern:snippet.</p>
+        <p>Binary files are skipped, output is capped per repo so one flooded tree cannot drown the rest, and the whole run exits non-zero when anything is found — so <code>git zscan</code> drops straight into a pre-push hook or CI gate. [selectors] narrows the set the same way every fleet verb does.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zsigs">
+        <h3><span class="doc-sigil">git</span> zsigs <span class="doc-summary">fleet commit-signature check (verify-sigs)</span></h3>
+        <pre class="doc-synopsis"><code>git zsigs [selectors] [-n &lt;count&gt;]</code></pre>
+        <p>Checks commit signatures across the fleet and flags any that are not a good signature — unsigned (N), bad (B), or unverifiable (E/X/Y/R). By default it checks each selected repo's HEAD; -n walks the top N first-parent commits. Each offender prints as <code>&lt;code&gt; &lt;repo&gt; &lt;sha&gt; &lt;subject&gt;</code> (git's <code>%G?</code> codes), and the run exits non-zero if any are found — so it gates a push or CI under an all-commits-must-be-signed policy.</p>
+        <p>Verification is native where it can be and delegated where it must be: the signature and its signed payload are reconstructed from the commit object in-process (the <code>gpgsig</code> header removed and de-folded exactly as git does), then handed to gpg — the same tool git shells to; there is no in-process crypto in git either. A commit with no signature is N without running anything; a present signature that gpg cannot check (no public key, gpg absent) is E, never a fabricated good. SSH-format signatures report E in this pass (verifying them needs an allowed-signers file). The same machinery backs the <code>%G?</code> and <code>%GK</code> pretty-format placeholders in <code>git log</code>.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zreview">
+        <h3><span class="doc-sigil">git</span> zreview <span class="doc-summary">aggregate the pending uncommitted change across the fleet</span></h3>
+        <pre class="doc-synopsis"><code>git zreview [selectors]</code></pre>
+        <p>The read-side companion to <code>zcommitall</code>: for every selected repo with uncommitted work, it prints the repo's <code>git status --short</code> block grouped under its path, plus the summary line of its diffstat against HEAD, so you can review everything about to be committed across a whole tree of submodules on one screen.</p>
+        <p>Clean repos are omitted; a trailing line reports how many repos have pending change and how many total entries. The status probe runs through this binary over the shared worker pool, so it is fleet-parallel and reads consistently with every other z-verb.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zremote">
+        <h3><span class="doc-sigil">git</span> zremote <span class="doc-summary">fleet-wide remote-URL rewrite</span></h3>
+        <pre class="doc-synopsis"><code>git zremote set &lt;old&gt; &lt;new&gt; [selectors] [-n|--dry-run]</code></pre>
+        <p>Rewrites remote URLs across the fleet in one command: in every selected repo, any remote whose URL contains the substring &lt;old&gt; is rewritten with &lt;old&gt; replaced by &lt;new&gt;. This is the one-shot answer to moving an org, changing a host, or switching ssh↔https across a tree of submodules.</p>
+        <p>Each change prints as <code>set &lt;repo&gt;::&lt;remote&gt;  &lt;from&gt; → &lt;to&gt;</code>; -n / --dry-run previews every change as <code>would set</code> without touching anything. Writes go through this binary's own <code>remote set-url</code> porcelain over the shared worker pool; the run exits non-zero if any set-url fails.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zrollback">
+        <h3><span class="doc-sigil">git</span> zrollback <span class="doc-summary">fleet-wide undo of the last mutating operation</span></h3>
+        <pre class="doc-synopsis"><code>git zrollback [selectors] [--steps &lt;n&gt;] [--apply] [--force]</code></pre>
+        <p>The multi-repo evolution of <code>zundo</code>: across every selected repo it resolves <code>HEAD@{n}</code> from the reflog (n = --steps, default 1) and rewinds to it with <code>reset --hard</code>, undoing the last commit / merge / rebase / reset. The reset is itself reflogged, so a rollback is undoable.</p>
+        <p>It is **dry-run by default** — with no --apply it prints what each repo *would* do (<code>&lt;current&gt; → &lt;target&gt;</code>) and changes nothing. --apply executes the rollback on the repos that pass the guards.</p>
+        <p>The guards refuse to lose work: a repo is skipped, not rolled back, when its worktree is dirty, when it is mid-operation (merge/rebase/cherry-pick/revert), or when rolling back would diverge from its remote — the discarded commits are already pushed (sync is up-to-date, behind, or diverged). Rollback is allowed by default only when the commits are local-only (ahead or no-upstream). --force overrides every guard.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zsched">
+        <h3><span class="doc-sigil">git</span> zsched <span class="doc-summary">daemon-hosted scheduled fleet commands (a built-in cron)</span></h3>
+        <pre class="doc-synopsis"><code>git zsched add &lt;duration&gt; -- &lt;cmd&gt; | list | rm &lt;id&gt; | clear | run &lt;id&gt;</code></pre>
+        <p>Schedules a command to run on an interval, hosted by the daemon — a built-in cron for the whole tree. <code>git zsched add 5m -- git zpull --dirty</code> fast-forwards every dirty repo every five minutes; durations are 30s / 5m / 1h / 1h30m style. <code>list</code> shows every schedule with its id and interval, <code>rm &lt;id&gt;</code> removes one, <code>clear</code> removes them all, and <code>run &lt;id&gt;</code> fires one now (synchronously) for testing.</p>
+        <p>Schedules persist to $ZVCS_HOME/schedule.tsv as <code>id\tinterval\tcommand</code>. The CLI owns every write to that file; the daemon's scheduler thread only reads it (re-reading each tick, so add/rm take effect within one tick with no reload) and tracks each schedule's last-fire time in memory — so the CLI and daemon never contend on the file. A schedule fires one full interval after the daemon first sees it, not on daemon start.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zpin">
+        <h3><span class="doc-sigil">git</span> zpin <span class="doc-summary">freeze a repo from daemon autonomy</span></h3>
+        <pre class="doc-synopsis"><code>git zpin [&lt;path&gt;...|list] [--json]</code></pre>
+        <p>Pins one or more repositories so the daemon's autonomy leaves their pointer alone — a pinned repo is skipped by autobump and reconcile, so its gitlink and HEAD will not move on their own until it is unpinned. Detached-HEAD attach still runs, because re-attaching a detached HEAD heals it without moving the pointer.</p>
+        <p>With no path it pins the repository at the current directory; with paths it pins each named repository; <code>git zpin list</code> prints every pinned repo. The flag lives in the shared index (<code>repos.pinned</code>), so it survives daemon restarts and is visible to every session. Unfreeze with <code>git zunpin</code>.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zunpin">
+        <h3><span class="doc-sigil">git</span> zunpin <span class="doc-summary">unfreeze repos pinned from autonomy</span></h3>
+        <pre class="doc-synopsis"><code>git zunpin [&lt;path&gt;...|--all]</code></pre>
+        <p>Clears the pin set by <code>git zpin</code>, so the daemon resumes autobump and reconcile for the repository. With no path it unpins the repo at the current directory; with paths it unpins each named one; --all unpins every pinned repository at once.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zbroadcast">
+        <h3><span class="doc-sigil">git</span> zbroadcast <span class="doc-summary">post and read inter-agent messages</span></h3>
+        <pre class="doc-synopsis"><code>git zbroadcast [--to &lt;session&gt;] [&lt;msg&gt;...]</code></pre>
+        <p>Sends a message to the other agent sessions working the tree, over the shared index. With a message it broadcasts to every session, or to one with --to &lt;session&gt;; with no arguments it prints this session's unread messages and marks them read.</p>
+        <p>Read state is tracked per session, so a broadcast is delivered once to each recipient and a sender never sees its own message. It is a pull inbox — messages are read when you run the verb, adding no cost to any other command. Session identity comes from ZVCS_SESSION.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zhandoff">
+        <h3><span class="doc-sigil">git</span> zhandoff <span class="doc-summary">hand a repo's claim to another agent session</span></h3>
+        <pre class="doc-synopsis"><code>git zhandoff &lt;repo-path&gt; &lt;session&gt;</code></pre>
+        <p>Reassigns the advisory claim (lease) on a repository from the current holder to another session, and drops that session a message noting the handoff. Fails if the repository is not currently claimed.</p>
+        <p>Claims are the session-attributed "I'm working this repo" signal set by <code>git zclaim</code>; zhandoff transfers one without the receiver having to race for it, so work can be passed cleanly between agents.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zon">
+        <h3><span class="doc-sigil">git</span> zon <span class="doc-summary">run a command on a semantic feed event</span></h3>
+        <pre class="doc-synopsis"><code>git zon [--kind commit|stage|status|reconcile] [--repo &lt;substr&gt;] -- &lt;cmd&gt; | git zon list | git zon rm &lt;id&gt;</code></pre>
+        <p>Registers a rule that runs a command when a matching event fires on the live feed. Where <code>git ztrigger</code> reacts to raw filesystem events under a directory, zon reacts to typed events — commit, stage, status, reconcile — from the same feed <code>git zevents</code> shows, optionally filtered to repos whose path contains a substring.</p>
+        <p>The command after -- runs via the shell with ZVCS_EVENT, ZVCS_REPO, ZVCS_DETAIL, and ZVCS_SHA set for the triggering event. <code>git zon list</code> shows every subscription; <code>git zon rm &lt;id&gt;</code> removes one. The daemon watches the feed and runs the matches. Caveat (shared with ztrigger): a command that itself commits or stages can match its own subscription and re-fire — scope it with --kind/--repo.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zsince">
+        <h3><span class="doc-sigil">git</span> zsince <span class="doc-summary">what happened across the tree since a time</span></h3>
+        <pre class="doc-synopsis"><code>git zsince &lt;duration|snapshot&gt; [--kind K] [--repo R] [--json]</code></pre>
+        <p>Prints every feed event — commits, stages, status changes, reconciles — recorded across the whole indexed tree since a point in time. A duration (90s, 45m, 2d, 1h30m, or a bare number of seconds) counts back from now; any other token is treated as a snapshot name and its creation time is the baseline.</p>
+        <p>This is the scoped "what did the fleet do since X" delta that <code>git zlog</code>'s full timeline does not give. --kind and --repo narrow the result to one event kind or to repos matching a substring.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zcontend">
+        <h3><span class="doc-sigil">git</span> zcontend <span class="doc-summary">live agent-vs-agent contention across the tree</span></h3>
+        <pre class="doc-synopsis"><code>git zcontend [--json]</code></pre>
+        <p>Shows who is stepping on whom: the session-attributed claims (advisory leases), the per-repo job backlog (how many jobs are queued or running behind each repository in the daemon's fair queue), and the intersection — repositories that are both claimed and have jobs stacked up, i.e. actively contested.</p>
+        <p>All three are read from the shared index; nothing is mutated. It is the multi-agent observability view git has no notion of, because git only ever sees one repository and one process.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zwaitfor">
+        <h3><span class="doc-sigil">git</span> zwaitfor <span class="doc-summary">block until a tree-wide state holds</span></h3>
+        <pre class="doc-synopsis"><code>git zwaitfor &lt;clean|idle|synced|&lt;repo&gt; &lt;sha&gt;&gt; [--timeout &lt;secs&gt;]</code></pre>
+        <p>Blocks until a condition over the whole tree becomes true, then exits 0 (or 1 on timeout) — a cross-repo barrier on state, where <code>git zbarrier</code> and <code>git zwait</code> are job-scoped. clean waits until every indexed repo is clean; idle until no daemon jobs are queued or running; synced until every repo is up-to-date with its upstream; <code>&lt;substr&gt; &lt;sha&gt;</code> until the repo whose path contains the substring is at the given commit (prefix).</p>
+        <p>Conditions are read from the daemon's cached status, so the daemon must be maintaining status for the wait to observe changes. --timeout bounds the wait (default 60 seconds).</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zgraph">
+        <h3><span class="doc-sigil">git</span> zgraph <span class="doc-summary">fleet topology of duplicate checkouts</span></h3>
+        <pre class="doc-synopsis"><code>git zgraph [--json]</code></pre>
+        <p>Maps the cross-repository relationship git has no notion of: which local checkouts are the same upstream repository — a dup group, the same origin URL with more than one working tree on the machine. git can never show this, because git only ever sees one repository.</p>
+        <p>Reads every indexed repository's origin (on demand, so the per-repo config read is acceptable) and lists each dup group with its checkouts, then a summary of repos, distinct origins, dup groups, and repos with no origin.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zrewind">
+        <h3><span class="doc-sigil">git</span> zrewind <span class="doc-summary">restore the whole tree to a wall-clock time</span></h3>
+        <pre class="doc-synopsis"><code>git zrewind &lt;duration&gt; [--dry-run]</code></pre>
+        <p>Rewinds the tree — the repository at the current directory and every nested submodule — to the state it was in a given duration ago (2h, 30m, 1d). For each repository it finds the HEAD the reflog shows it had at that time and resets hard to it, reusing the faithful porcelain reset (itself reflogged, so the rewind is undoable). Where <code>git zsnapshot</code> is a manual named restore point, this is any timestamp with no prior setup.</p>
+        <p>A dirty repository is refused so uncommitted work is never clobbered, and a repository whose reflog does not reach that far back is reported and skipped (the reflog's default 90-day expiry bounds how far back it can go). --dry-run shows exactly what would move without changing anything.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zguard">
+        <h3><span class="doc-sigil">git</span> zguard <span class="doc-summary">declarative fleet-wide command policy (refuse or warn)</span></h3>
+        <pre class="doc-synopsis"><code>git zguard deny|warn &lt;pattern&gt; [--when &lt;predicate&gt;] [-m &lt;msg&gt;] | list | rm &lt;id&gt; | clear | test &lt;cmd&gt;...</code></pre>
+        <p>Registers rules that refuse or warn on a git command before it runs — a pattern-based command policy applied at the shadow binary, so it covers every invocation through it. The veto evolution of <code>zintercept</code>'s around-advice, promoted to a first-class policy layer no VCS has natively.</p>
+        <p>A rule is an action (deny or warn), a glob pattern matched against the whole command line (<code>*</code> and <code>?</code>, same matcher as <code>zintercept</code>), an optional repo-state predicate, and an optional message. <code>git zguard deny 'push*--force*'</code> refuses a force-push; <code>git zguard warn 'rm*-rf*'</code> warns but allows.</p>
+        <p>The <code>--when &lt;predicate&gt;</code> conditions a rule on the current repository: detached (HEAD is detached), dirty (uncommitted changes), protected (HEAD is main or master), unsigned (a commit with no -S/--gpg-sign and commit.gpgsign unset). So <code>git zguard deny 'commit*' --when detached</code> blocks commits on a detached HEAD, and <code>--when unsigned</code> requires signed commits.</p>
+        <p>list shows the rules; rm &lt;id&gt; removes one; clear removes all; test &lt;cmd&gt;... reports the verdict (DENY/WARN/allow) for a command without running it. Rules are stored in $ZVCS_HOME/guards.tsv (machine-wide); the dispatch hot path is a single stat when no rule is set. The zguard/zpolicy verbs are exempt from their own rules, so a bad rule can never lock you out.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zpolicy">
+        <h3><span class="doc-sigil">git</span> zpolicy <span class="doc-summary">alias of git zguard (command policy)</span></h3>
+        <pre class="doc-synopsis"><code>git zpolicy deny|warn &lt;pattern&gt; [--when &lt;predicate&gt;] [-m &lt;msg&gt;] | list | rm &lt;id&gt; | clear | test &lt;cmd&gt;...</code></pre>
+        <p>An alias for <code>git zguard</code> — declarative fleet-wide command policy. See <code>git help zguard</code> for the full description.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zppid">
+        <h3><span class="doc-sigil">git</span> zppid <span class="doc-summary">per-process commit tally, attributed to the durable process</span></h3>
+        <pre class="doc-synopsis"><code>git zppid</code></pre>
+        <p>Reports which process is responsible for each recorded commit, found by walking up past the throwaway per-command shells to the durable agent, program, or login shell that drove them.</p>
+        <p>Each row carries the pid, its command and working directory, whether it is still alive, and how many commits it landed.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zprocs">
+        <h3><span class="doc-sigil">git</span> zprocs <span class="doc-summary">per-process breakdown of mutating commands</span></h3>
+        <pre class="doc-synopsis"><code>git zprocs</code></pre>
+        <p>Reports how many of each mutating verb — commit, push, add, merge, rebase and the rest — every recorded process has run, attributed the same way as <code>git zppid</code>.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zprecache">
+        <h3><span class="doc-sigil">git</span> zprecache <span class="doc-summary">precompute the log caches for recent commits</span></h3>
+        <pre class="doc-synopsis"><code>git zprecache [-n &lt;commits&gt;] [-q]</code></pre>
+        <p>Fills the ledger's log caches — commit abbreviations and the per-file line tallies that --stat, --numstat, --shortstat and --name-status need — for the newest commits, so those formats read the ledger instead of the object store.</p>
+        <p>Everything it stores is a pure function of immutable objects, so an entry never expires. -n sets how many commits to walk (default 200); -q suppresses the count.</p>
+        <p>The daemon does this on its own whenever a watched repository's refs move (zvcs.precache, on by default); this verb is the same pass on demand, for a fresh clone or a fetch that landed while the daemon was down.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      </section>
+    </main>
+  </div>
+  <script src="hud-theme.js"></script>
+</body>
+</html>

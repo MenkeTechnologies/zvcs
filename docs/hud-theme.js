@@ -1,17 +1,17 @@
 /**
- * vimlrs docs — theme / CRT / neon / color-scheme toggles.
+ * zvcs docs — theme / CRT / neon / color-scheme toggles.
  * Vendored and simplified from audio_haxor/docs/hud-theme.js.
- * Storage keys live under the `vimlrs-hud-*` namespace so the two projects
+ * Storage keys live under the `zvcs-hud-*` namespace so the two projects
  * can't clobber each other if ever opened from the same origin.
  */
 (function () {
   'use strict';
 
   var STORAGE = {
-    theme: 'vimlrs-hud-theme',
-    crt: 'vimlrs-hud-crt',
-    neon: 'vimlrs-hud-neon',
-    scheme: 'vimlrs-hud-scheme',
+    theme: 'zvcs-hud-theme',
+    crt: 'zvcs-hud-crt',
+    neon: 'zvcs-hud-neon',
+    scheme: 'zvcs-hud-scheme',
   };
 
   var SCHEME_VAR_KEYS = [

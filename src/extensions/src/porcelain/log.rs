@@ -694,7 +694,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         }
         match repo.rev_parse_single(spec.as_str()) {
             Ok(id) => {
-                tips.push(id.detach());
+                tips.push(peel_to_commit(&repo, id.detach()));
                 if source_mode {
                     tip_sources.push(spec.clone());
                 }
@@ -1690,7 +1690,22 @@ fn expand_walk_only(
 /// Resolve a single revision to its object id (a range endpoint), `Err(())` if it
 /// doesn't name anything — the caller turns that into git's bad-revision error.
 fn resolve_rev(repo: &gix::Repository, spec: &str) -> Result<ObjectId, ()> {
-    repo.rev_parse_single(spec).map(|id| id.detach()).map_err(|_| ())
+    repo.rev_parse_single(spec).map(|id| peel_to_commit(repo, id.detach())).map_err(|_| ())
+}
+
+/// The commit a revision names, following annotated tags.
+///
+/// `git log v1.0` walks from the COMMIT the tag points at; the tag object itself
+/// is not a walkable node. Without this, every release tag — the most natural
+/// thing to `git log` — failed with "was supposed to be of kind commit, but was
+/// kind tag". A spec that names something with no commit behind it (a tree, a
+/// blob) is left as-is so the walk reports it the way git does.
+fn peel_to_commit(repo: &gix::Repository, id: ObjectId) -> ObjectId {
+    repo.find_object(id)
+        .ok()
+        .and_then(|obj| obj.peel_tags_to_end().ok())
+        .filter(|obj| obj.kind == gix::object::Kind::Commit)
+        .map_or(id, |obj| obj.id)
 }
 
 /// Every commit reachable from `roots` (inclusive) — the "uninteresting" set for a

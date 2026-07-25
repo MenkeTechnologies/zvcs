@@ -43,8 +43,12 @@ fn zjobs_negative_n_is_clamped_not_unlimited() {
         .args(["zforeach", "--", "git", "rev-parse", "--verify", "--quiet", "no-such-ref"])
         .current_dir(&root).env("ZVCS_HOME", &home).output().unwrap();
 
-    // Sanity: the ledger really has 2 jobs (default limit shows both).
-    assert_eq!(job_lines(&zjobs(&home, &root, &[])), 2, "precondition: 2 failed jobs recorded");
+    // Sanity: the ledger holds more than one job, which is all the clamp test
+    // needs. Not "exactly 2": the daemon keeps a long-lived status-maintainer job
+    // of its own, so pinning the total would tie this test to daemon internals it
+    // is not about.
+    let total = job_lines(&zjobs(&home, &root, &[]));
+    assert!(total >= 2, "precondition: the failing foreach recorded a job per repo, saw {total}");
 
     // The bug: a negative/zero -n would dump ALL jobs. Clamped to >=1 → exactly 1.
     assert_eq!(job_lines(&zjobs(&home, &root, &["-n", "-1"])), 1, "`-n -1` must clamp to 1, not dump the ledger");

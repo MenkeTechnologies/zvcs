@@ -21,9 +21,22 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
-fn zjob1(home: &Path, sock: &Path, cwd: &Path) -> String {
+/// The id `zcommit` reported for its submission. The daemon queues jobs of its
+/// own (the status maintainer is one), so the first id in the ledger is not
+/// necessarily the one this test submitted.
+fn reported_job_id(submitted: &str) -> String {
+    submitted
+        .split("queued job #")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .filter(|s| !s.is_empty())
+        .expect("zcommit reported a job id")
+        .to_string()
+}
+
+fn zjob1(home: &Path, sock: &Path, cwd: &Path, id: &str) -> String {
     String::from_utf8_lossy(
-        &Command::new(BIN).args(["zjob", "1"]).current_dir(cwd)
+        &Command::new(BIN).args(["zjob", id]).current_dir(cwd)
             .env("ZVCS_HOME", home).env("ZVCS_SOCK", sock).output().unwrap().stdout,
     ).into_owned()
 }
@@ -70,7 +83,7 @@ fn async_commit_carries_identity_and_records_sha_on_push_failure() {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut job = String::new();
     while Instant::now() < deadline {
-        job = zjob1(&home, &sock, &repo);
+        job = zjob1(&home, &sock, &repo, &reported_job_id(&submitted));
         if job.contains("state:  done") || job.contains("state:  failed") {
             break;
         }

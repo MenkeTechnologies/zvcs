@@ -183,3 +183,121 @@ fn an_invalid_value_pattern_is_exit_6() {
     assert_eq!(out.status.code(), Some(6));
     assert_eq!(String::from_utf8_lossy(&out.stderr), "error: invalid pattern: [\n");
 }
+
+/// A repo with one multivar, one boolean, one number and one path, for the
+/// display-flag and type-conversion reads.
+fn typed_repo(tag: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("zvcs-cfgtype-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).expect("mkdir fixture");
+    assert!(zvcs(&p, &["init", "-q", "-b", "main"]).status.success(), "init failed");
+    let seeds: [&[&str]; 4] = [
+        &["config", "--local", "a.b", "one"],
+        &["config", "--local", "--add", "a.b", "two"],
+        &["config", "--local", "sec.flag", "yes"],
+        &["config", "--local", "num.n", "1k"],
+    ];
+    for args in seeds {
+        assert!(zvcs(&p, args).status.success(), "seed {args:?}");
+    }
+    p
+}
+
+#[test]
+fn type_canonicalizes_and_rejects() {
+    let dir = typed_repo("type");
+
+    // git's boolean grammar: `yes` prints as `true`.
+    let b = zvcs(&dir, &["config", "--local", "--type=bool", "sec.flag"]);
+    assert_eq!(stdout_of(&b), "true\n");
+    // The legacy spelling is the same flag.
+    let legacy = zvcs(&dir, &["config", "--local", "--bool", "sec.flag"]);
+    assert_eq!(stdout_of(&legacy), "true\n");
+    // `1k` is 1024 under git's integer grammar.
+    let n = zvcs(&dir, &["config", "--local", "--type=int", "num.n"]);
+    assert_eq!(stdout_of(&n), "1024\n");
+
+    // A value that is not of the requested type is fatal, and the message names
+    // the FIRST offending value even though `--get` would return the last.
+    let bad = zvcs(&dir, &["config", "--local", "--get", "--type=bool", "a.b"]);
+    assert_eq!(bad.status.code(), Some(128));
+    assert_eq!(
+        String::from_utf8_lossy(&bad.stderr),
+        "fatal: bad boolean config value 'one' for 'a.b'\n"
+    );
+}
+
+#[test]
+fn show_origin_and_scope_prefix_the_output() {
+    let dir = typed_repo("origin");
+
+    let list = zvcs(&dir, &["config", "--local", "--list", "--show-scope"]);
+    assert!(
+        stdout_of(&list).lines().all(|l| l.starts_with("local\t")),
+        "every line of a --local list is in the local scope: {:?}",
+        stdout_of(&list)
+    );
+
+    // A get prints the VALUE only — the prefix is added, the key is not.
+    let get = zvcs(&dir, &["config", "--local", "--get", "--show-origin", "a.b"]);
+    assert_eq!(stdout_of(&get), "file:.git/config\ttwo\n");
+}
+
+#[test]
+fn null_separates_records_with_nul() {
+    let dir = typed_repo("null");
+
+    let out = zvcs(&dir, &["config", "--local", "--list", "--null"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    assert!(text.contains("a.b\none\0"), "key NL value NUL: {text:?}");
+    assert!(!text.contains("a.b=one"), "the `=` form is not used under --null");
+}
+
+#[test]
+fn replace_all_collapses_matching_values() {
+    let dir = typed_repo("replace");
+
+    assert!(zvcs(&dir, &["config", "--local", "--replace-all", "a.b", "ZZ"]).status.success());
+    let all = zvcs(&dir, &["config", "--local", "--get-all", "a.b"]);
+    assert_eq!(stdout_of(&all), "ZZ\n", "both values collapse into one");
+
+    // With a pattern, only the values it selects are replaced.
+    assert!(zvcs(&dir, &["config", "--local", "--add", "a.b", "keepme"]).status.success());
+    assert!(zvcs(&dir, &["config", "--local", "--replace-all", "a.b", "QQ", "keep"]).status.success());
+    let after = zvcs(&dir, &["config", "--local", "--get-all", "a.b"]);
+    assert_eq!(stdout_of(&after), "ZZ\nQQ\n");
+}
+
+#[test]
+fn sections_rename_and_remove() {
+    let dir = typed_repo("sections");
+
+    assert!(zvcs(&dir, &["config", "--local", "--rename-section", "sec", "newsec"]).status.success());
+    let moved = zvcs(&dir, &["config", "--local", "--get", "newsec.flag"]);
+    assert_eq!(stdout_of(&moved), "yes\n", "values survive the rename verbatim");
+
+    assert!(zvcs(&dir, &["config", "--local", "--remove-section", "newsec"]).status.success());
+    let gone = zvcs(&dir, &["config", "--local", "--get", "newsec.flag"]);
+    assert_eq!(gone.status.code(), Some(1));
+
+    let missing = zvcs(&dir, &["config", "--local", "--remove-section", "nosuch"]);
+    assert_eq!(missing.status.code(), Some(128));
+    assert_eq!(String::from_utf8_lossy(&missing.stderr), "fatal: no such section: nosuch\n");
+}
+
+#[test]
+fn get_colorbool_answers_through_the_exit_code() {
+    let dir = typed_repo("colorbool");
+
+    // With the tty-ness stated, git PRINTS the answer and exits 0 either way.
+    let stated = zvcs(&dir, &["config", "--local", "--get-colorbool", "color.ui", "true"]);
+    assert!(stated.status.success());
+    assert_eq!(stdout_of(&stated), "true\n");
+
+    // With it omitted and stdout captured (not a terminal), the answer is the
+    // exit code alone — no output.
+    let probed = zvcs(&dir, &["config", "--local", "--get-colorbool", "color.ui"]);
+    assert_eq!(probed.status.code(), Some(1));
+    assert!(stdout_of(&probed).is_empty());
+}

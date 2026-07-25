@@ -10,10 +10,15 @@ enum Mode {
     Get,
     GetAll,
     GetRegexp,
+    GetUrlMatch,
+    GetColorBool,
     List,
     Add,
+    ReplaceAll,
     Unset,
     UnsetAll,
+    RenameSection,
+    RemoveSection,
 }
 
 impl Mode {
@@ -25,6 +30,11 @@ impl Mode {
             Mode::Get => "--get",
             Mode::GetAll => "--get-all",
             Mode::GetRegexp => "--get-regexp",
+            Mode::GetUrlMatch => "--get-urlmatch",
+            Mode::GetColorBool => "--get-colorbool",
+            Mode::ReplaceAll => "--replace-all",
+            Mode::RenameSection => "--rename-section",
+            Mode::RemoveSection => "--remove-section",
             Mode::List => "--list",
             Mode::Add => "--add",
             Mode::Unset => "--unset",
@@ -65,6 +75,112 @@ struct WriteTarget {
 fn usage_error(msg: &str) -> Result<ExitCode> {
     eprintln!("error: {msg}");
     Ok(ExitCode::from(129))
+}
+
+/// How a read prints each `(key, value)` pair: git's `--show-origin` /
+/// `--show-scope` prefixes, the `--null` record separator, and the `--type`
+/// canonicalization applied to the value.
+#[derive(Default, Clone, Copy)]
+struct Display {
+    show_origin: bool,
+    show_scope: bool,
+    null: bool,
+    name_only: bool,
+    ty: Option<ValueType>,
+}
+
+/// `--type=<t>` and its legacy spellings (`--bool`, `--int`, `--bool-or-int`,
+/// `--path`). git canonicalizes the value on the way out; an unparsable value is
+/// `fatal: bad <t> config value '<v>' for '<key>'` at exit 128.
+#[derive(Clone, Copy, PartialEq)]
+enum ValueType {
+    Bool,
+    Int,
+    BoolOrInt,
+    Path,
+}
+
+impl ValueType {
+    fn parse(name: &str) -> Option<ValueType> {
+        match name {
+            "bool" => Some(ValueType::Bool),
+            "int" => Some(ValueType::Int),
+            "bool-or-int" => Some(ValueType::BoolOrInt),
+            "path" => Some(ValueType::Path),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ValueType::Bool => "boolean",
+            ValueType::Int => "numerical",
+            ValueType::BoolOrInt => "numerical",
+            ValueType::Path => "path",
+        }
+    }
+
+    /// Canonicalize `value` the way git prints it under this type, or `None`
+    /// when the value does not parse as the type.
+    fn canonicalize(self, value: &[u8]) -> Option<Vec<u8>> {
+        let text = String::from_utf8_lossy(value).trim().to_string();
+        match self {
+            ValueType::Bool => canonical_bool(&text).map(|b| b.to_string().into_bytes()),
+            ValueType::Int => canonical_int(&text).map(|n| n.to_string().into_bytes()),
+            // git tries integer first, then boolean, and prints 1/0 for a bool.
+            ValueType::BoolOrInt => canonical_int(&text)
+                .map(|n| n.to_string().into_bytes())
+                .or_else(|| canonical_bool(&text).map(|b| u8::from(b).to_string().into_bytes())),
+            ValueType::Path => Some(expand_config_path(&text).into_bytes()),
+        }
+    }
+}
+
+/// git's boolean grammar: the empty value is true, and the words are matched
+/// case-insensitively (`git_parse_maybe_bool`).
+fn canonical_bool(text: &str) -> Option<bool> {
+    match text.to_ascii_lowercase().as_str() {
+        "" | "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// git's integer grammar: an optional `k`/`m`/`g` suffix scales the number
+/// (`git_parse_int`), so `1k` reads as 1024.
+fn canonical_int(text: &str) -> Option<i64> {
+    let (digits, scale) = match text.chars().last() {
+        Some('k') | Some('K') => (&text[..text.len() - 1], 1024i64),
+        Some('m') | Some('M') => (&text[..text.len() - 1], 1024 * 1024),
+        Some('g') | Some('G') => (&text[..text.len() - 1], 1024 * 1024 * 1024),
+        _ => (text, 1),
+    };
+    digits.trim().parse::<i64>().ok().and_then(|n| n.checked_mul(scale))
+}
+
+/// `--type=path`: expand a leading `~` / `~user` the way git's
+/// `expand_user_path` does. `~user` needs a passwd lookup that is not vendored,
+/// so it is left verbatim rather than guessed at.
+fn expand_config_path(text: &str) -> String {
+    match text.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => format!("{}/{}", home.to_string_lossy().trim_end_matches('/'), rest),
+            None => text.to_string(),
+        },
+        None => text.to_string(),
+    }
+}
+
+/// The `--show-scope` word for a config source, matching git's scope names.
+fn scope_word(source: Source) -> &'static str {
+    match source {
+        Source::System => "system",
+        Source::Git | Source::User => "global",
+        Source::Local | Source::Worktree => "local",
+        Source::Cli => "command",
+        Source::Env | Source::EnvOverride => "command",
+        _ => "unknown",
+    }
 }
 
 /// Config that stock git would never surface.
@@ -155,6 +271,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     let mut mode = Mode::Auto;
     let mut scope = Scope::Default;
     let mut name_only = false;
+    let mut d = Display::default();
     let mut positional: Vec<&str> = Vec::new();
     // git config parses options with `PARSE_OPT_STOP_AT_NON_OPTION`: option
     // scanning ends at the FIRST argument that is not an option, and that token
@@ -200,6 +317,11 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             "--get" => Some(Mode::Get),
             "--get-all" => Some(Mode::GetAll),
             "--get-regexp" => Some(Mode::GetRegexp),
+            "--get-urlmatch" => Some(Mode::GetUrlMatch),
+            "--get-colorbool" => Some(Mode::GetColorBool),
+            "--replace-all" => Some(Mode::ReplaceAll),
+            "--rename-section" => Some(Mode::RenameSection),
+            "--remove-section" => Some(Mode::RemoveSection),
             "--add" => Some(Mode::Add),
             "--unset" => Some(Mode::Unset),
             "--unset-all" => Some(Mode::UnsetAll),
@@ -267,7 +389,34 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
+        // `--type=<t>` and its legacy spellings canonicalize the value on the way
+        // out; an unknown type is git's usage error.
+        if let Some(t) = a.strip_prefix("--type=") {
+            match ValueType::parse(t) {
+                Some(ty) => {
+                    d.ty = Some(ty);
+                    continue;
+                }
+                None => return usage_error(&format!("unrecognized --type argument, {t}")),
+            }
+        }
+
         match a.as_str() {
+            "--show-origin" => d.show_origin = true,
+            "--show-scope" => d.show_scope = true,
+            "-z" | "--null" => d.null = true,
+            "--bool" => d.ty = Some(ValueType::Bool),
+            "--int" => d.ty = Some(ValueType::Int),
+            "--bool-or-int" => d.ty = Some(ValueType::BoolOrInt),
+            "--path" => d.ty = Some(ValueType::Path),
+            "--type" => {
+                let v = args.get(i).cloned().unwrap_or_default();
+                i += 1;
+                match ValueType::parse(&v) {
+                    Some(ty) => d.ty = Some(ty),
+                    None => return usage_error(&format!("unrecognized --type argument, {v}")),
+                }
+            }
             "--name-only" => name_only = true,
             // Per-worktree config needs `extensions.worktreeConfig`; not ported.
             "--worktree" => bail!("--worktree scope is not supported"),
@@ -285,6 +434,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     if mode == Mode::Auto && !(1..=3).contains(&positional.len()) {
         return usage_error("no action specified");
     }
+    d.name_only = name_only;
     if name_only && !matches!(mode, Mode::List | Mode::GetRegexp) {
         return usage_error("--name-only is only applicable to --list or --get-regexp");
     }
@@ -323,9 +473,19 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     // target under the lock, and reading here as well would repeat git's
     // `warning: unable to access …` diagnostic for an unreadable file.
     let reads_config = match mode {
-        Mode::List | Mode::Get | Mode::GetAll | Mode::GetRegexp => true,
+        Mode::List
+        | Mode::Get
+        | Mode::GetAll
+        | Mode::GetRegexp
+        | Mode::GetUrlMatch
+        | Mode::GetColorBool => true,
         Mode::Auto => positional.len() == 1,
-        Mode::Add | Mode::Unset | Mode::UnsetAll => false,
+        Mode::Add
+        | Mode::ReplaceAll
+        | Mode::Unset
+        | Mode::UnsetAll
+        | Mode::RenameSection
+        | Mode::RemoveSection => false,
     };
     let file: &gix::config::File = match &scope {
         Scope::Default => match snapshot.as_ref() {
@@ -386,17 +546,29 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 );
                 Ok(ExitCode::from(128))
             }
-            _ => list(file, name_only),
+            _ => list(file, &d),
         },
         // `--get`/`--get-all`/`--get-regexp <name> <value-pattern>`: the optional
         // second operand filters the returned values by an ERE (`!` inverts).
-        Mode::Get => get(file, positional[0], false, positional.get(1).copied()),
-        Mode::GetAll => get(file, positional[0], true, positional.get(1).copied()),
+        Mode::Get => get(file, positional[0], false, positional.get(1).copied(), &d),
+        Mode::GetAll => get(file, positional[0], true, positional.get(1).copied(), &d),
         Mode::GetRegexp => {
-            get_regexp(file, positional[0], name_only, positional.get(1).copied())
+            get_regexp(file, positional[0], positional.get(1).copied(), &d)
+        }
+        // `--get-urlmatch <section[.var]> <url>` needs git's URL matcher
+        // (host/port/path/user specificity ranking); not ported, and guessing a
+        // ranking would silently return the wrong value.
+        Mode::GetUrlMatch => bail!("--get-urlmatch is not supported"),
+        Mode::GetColorBool => get_colorbool(file, &positional),
+        Mode::RenameSection => rename_section(&write_target()?, &positional),
+        Mode::RemoveSection => remove_section(&write_target()?, &positional),
+        Mode::ReplaceAll => {
+            let name = positional.first().copied().unwrap_or_default();
+            let value = positional.get(1).copied().unwrap_or_default();
+            replace_all(&write_target()?, name, value, positional.get(2).copied())
         }
         // No action flag: one positional reads, two set the value.
-        Mode::Auto if positional.len() == 1 => get(file, positional[0], false, None),
+        Mode::Auto if positional.len() == 1 => get(file, positional[0], false, None, &d),
         Mode::Auto if positional.len() == 2 => {
             write_scoped(&write_target()?, positional[0], positional[1], WriteOp::Set)
         }
@@ -485,6 +657,7 @@ fn get(
     name: &str,
     all: bool,
     value_pattern: Option<&str>,
+    d: &Display,
 ) -> Result<ExitCode> {
     let key = parse_key(name)?;
     let filter = match value_pattern.map(ValueFilter::parse) {
@@ -496,34 +669,125 @@ fn get(
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
-    let visible = |meta: &gix::config::file::Metadata| !is_synthetic(meta.source);
-
-    // One code path for both forms: collect the visible values, filter, then take
-    // all of them or just the last. `raw_values_filter_by` preserves file order,
-    // and git's `--get` is defined as the last value that survives the filter.
-    let values = match file.raw_values_filter_by(
-        key.section_name,
-        key.subsection_name,
-        key.value_name,
-        visible,
-    ) {
-        Ok(values) => values,
-        Err(_) => return Ok(ExitCode::from(1)),
-    };
-    let selected: Vec<_> = values
-        .into_iter()
-        .filter(|v| filter.as_ref().is_none_or(|f| f.matches(v)))
-        .collect();
+    // Walked through `for_each_entry` rather than `raw_values_*` so each value
+    // arrives with the metadata `--show-origin`/`--show-scope` need; the walk is
+    // in file order, and git's `--get` is the LAST value that survives the
+    // filter.
+    let wanted = key_of(&key);
+    let mut selected: Vec<(Vec<u8>, gix::config::file::Metadata)> = Vec::new();
+    for_each_entry(file, |k, value, meta| {
+        if k == wanted && filter.as_ref().is_none_or(|f| f.matches(value)) {
+            selected.push((value.to_vec(), meta.clone()));
+        }
+        Ok(())
+    })?;
     if selected.is_empty() {
         return Ok(ExitCode::from(1));
     }
 
-    let emit: &[_] = if all { &selected } else { &selected[selected.len() - 1..] };
-    for v in emit {
-        out.write_all(v)?;
-        out.write_all(b"\n")?;
+    // git canonicalizes in file order and dies on the first value that does not
+    // parse as the requested type — even when `--get` would have returned a
+    // later one, so the error names the same value stock git names.
+    let mut canonical: Vec<(Vec<u8>, gix::config::file::Metadata)> = Vec::new();
+    for (v, meta) in &selected {
+        match typed(d, name, v) {
+            Ok(v) => canonical.push((v, meta.clone())),
+            Err(code) => return Ok(code),
+        }
+    }
+
+    let emit: &[_] = if all { &canonical } else { &canonical[canonical.len() - 1..] };
+    for (v, meta) in emit {
+        emit_kv(&mut out, d, name, v, meta, b'\n', false)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The git-normalized `section[.subsection].name` spelling of a parsed key, so a
+/// lookup can be compared against what [`for_each_entry`] yields.
+fn key_of(key: &KeyRef<'_>) -> String {
+    let section = key.section_name.to_lowercase();
+    let value = key.value_name.to_lowercase();
+    match key.subsection_name {
+        Some(sub) => format!("{section}.{sub}.{value}"),
+        None => format!("{section}.{value}"),
+    }
+}
+
+/// Print one `key`/`value` pair the way the active display flags ask for it:
+/// the `--show-scope` word and `--show-origin` `file:<path>` prefix (each
+/// TAB-separated, scope first, exactly as git orders them), then the key, then
+/// the value under `sep` unless `--name-only` dropped it. `--null` ends the
+/// record with a NUL and separates key from value with a newline, which is what
+/// makes the output unambiguous for values containing newlines.
+///
+/// Returns `Err` only on I/O; a value that fails `--type` conversion is git's
+/// fatal, reported by the caller.
+fn emit_kv(
+    out: &mut impl Write,
+    d: &Display,
+    key: &str,
+    value: &[u8],
+    meta: &gix::config::file::Metadata,
+    sep: u8,
+    with_key: bool,
+) -> Result<()> {
+    if d.show_scope {
+        out.write_all(scope_word(meta.source).as_bytes())?;
+        out.write_all(b"\t")?;
+    }
+    if d.show_origin {
+        match &meta.path {
+            Some(path) => {
+                // git prints the path as it resolved it, without the `./` a
+                // relative discovery leaves on the front.
+                let text = path.to_string_lossy();
+                let text = text.strip_prefix("./").unwrap_or(&text);
+                out.write_all(b"file:")?;
+                out.write_all(text.as_bytes())?;
+            }
+            None => out.write_all(origin_word(meta.source).as_bytes())?,
+        }
+        out.write_all(b"\t")?;
+    }
+    if with_key {
+        out.write_all(key.as_bytes())?;
+    }
+    if !d.name_only && !(with_key && d.name_only) {
+        if with_key {
+            let sep_buf = [sep];
+            out.write_all(if d.null { b"\n".as_slice() } else { sep_buf.as_slice() })?;
+        }
+        out.write_all(value)?;
+    }
+    out.write_all(if d.null { b"\0" } else { b"\n" })?;
+    Ok(())
+}
+
+/// git's `--show-origin` word for a source with no file behind it.
+fn origin_word(source: Source) -> &'static str {
+    match source {
+        Source::Cli => "command line:",
+        Source::Env | Source::EnvOverride => "environment:",
+        _ => "blob:",
+    }
+}
+
+/// Apply `--type` to a value, reporting git's fatal and exit 128 when the value
+/// does not parse as that type.
+fn typed(d: &Display, key: &str, value: &[u8]) -> std::result::Result<Vec<u8>, ExitCode> {
+    match d.ty {
+        None => Ok(value.to_vec()),
+        Some(t) => t.canonicalize(value).ok_or_else(|| {
+            eprintln!(
+                "fatal: bad {} config value '{}' for '{}'",
+                t.label(),
+                String::from_utf8_lossy(value),
+                key
+            );
+            ExitCode::from(128)
+        }),
+    }
 }
 
 /// `git config -l` — emit every `key=value` from the merged snapshot, in file
@@ -534,21 +798,23 @@ fn get(
 /// Entries are emitted in the order they appear in their file, multivars
 /// included: an `a=1 / b=2 / a=3` section lists as `a=1`, `b=2`, `a=3`, not with
 /// the two `a`s collapsed together.
-fn list(file: &gix::config::File, name_only: bool) -> Result<ExitCode> {
+fn list(file: &gix::config::File, d: &Display) -> Result<ExitCode> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let mut failed: Option<ExitCode> = None;
 
-    for_each_entry(file, |key, value| {
-        out.write_all(key.as_bytes())?;
-        if !name_only {
-            out.write_all(b"=")?;
-            out.write_all(value)?;
+    for_each_entry(file, |key, value, meta| {
+        if failed.is_some() {
+            return Ok(());
         }
-        out.write_all(b"\n")?;
+        match typed(d, key, value) {
+            Ok(v) => emit_kv(&mut out, d, key, &v, meta, b'=', true)?,
+            Err(code) => failed = Some(code),
+        }
         Ok(())
     })?;
 
-    Ok(ExitCode::SUCCESS)
+    Ok(failed.unwrap_or(ExitCode::SUCCESS))
 }
 
 /// `git config --get-regexp <name-regex>` — every entry whose canonical key
@@ -564,8 +830,8 @@ fn list(file: &gix::config::File, name_only: bool) -> Result<ExitCode> {
 fn get_regexp(
     file: &gix::config::File,
     pattern: &str,
-    name_only: bool,
     value_pattern: Option<&str>,
+    d: &Display,
 ) -> Result<ExitCode> {
     let re = match regex::bytes::Regex::new(pattern) {
         Ok(re) => re,
@@ -585,22 +851,24 @@ fn get_regexp(
     let mut out = stdout.lock();
     let mut matched = false;
 
-    for_each_entry(file, |key, value| {
-        if !re.is_match(key.as_bytes()) {
+    let mut failed: Option<ExitCode> = None;
+    for_each_entry(file, |key, value, meta| {
+        if failed.is_some() || !re.is_match(key.as_bytes()) {
             return Ok(());
         }
         if filter.as_ref().is_some_and(|f| !f.matches(value)) {
             return Ok(());
         }
         matched = true;
-        out.write_all(key.as_bytes())?;
-        if !name_only {
-            out.write_all(b" ")?;
-            out.write_all(value)?;
+        match typed(d, key, value) {
+            Ok(v) => emit_kv(&mut out, d, key, &v, meta, b' ', true)?,
+            Err(code) => failed = Some(code),
         }
-        out.write_all(b"\n")?;
         Ok(())
     })?;
+    if let Some(code) = failed {
+        return Ok(code);
+    }
 
     Ok(if matched { ExitCode::SUCCESS } else { ExitCode::from(1) })
 }
@@ -615,7 +883,7 @@ fn get_regexp(
 /// case is preserved.
 fn for_each_entry(
     file: &gix::config::File,
-    mut emit: impl FnMut(&str, &[u8]) -> Result<()>,
+    mut emit: impl FnMut(&str, &[u8], &gix::config::file::Metadata) -> Result<()>,
 ) -> Result<()> {
     for section in file.sections() {
         if is_synthetic(section.meta().source) {
@@ -640,10 +908,174 @@ fn for_each_entry(
                 Some(sub) => format!("{section_name}.{sub}.{value_name}"),
                 None => format!("{section_name}.{value_name}"),
             };
-            emit(&key, &value)?;
+            emit(&key, &value, section.meta())?;
         }
     }
     Ok(())
+}
+
+
+/// `git config --get-colorbool <name> [<stdout-is-tty>]` — resolve a color
+/// setting to `true`/`false`, printing it and exiting 0 when color is on, 1 when
+/// off (git inverts the usual convention here so shell `if` reads naturally).
+///
+/// `auto` (and an unset key) depend on whether stdout is a terminal: the caller
+/// may state that as the optional second operand, otherwise it is probed.
+fn get_colorbool(file: &gix::config::File, positional: &[&str]) -> Result<ExitCode> {
+    let Some(name) = positional.first() else {
+        return usage_error("wrong number of arguments, should be from 1 to 2");
+    };
+    // git prints the resolved value only when the caller SAYS whether stdout is
+    // a tty; with the argument omitted it answers through the exit code alone.
+    let stated = positional.get(1);
+    let tty = match stated {
+        Some(v) => canonical_bool(v).unwrap_or(false),
+        None => std::io::IsTerminal::is_terminal(&std::io::stdout()),
+    };
+
+    let key = parse_key(name)?;
+    let raw = file
+        .raw_value_filter_by(key.section_name, key.subsection_name, key.value_name, |m| {
+            !is_synthetic(m.source)
+        })
+        .ok()
+        .map(|v| String::from_utf8_lossy(&v).trim().to_string());
+
+    // git: an explicit boolean wins; `auto` and "unset" both defer to the tty.
+    let on = match raw.as_deref() {
+        Some("auto") | None => tty,
+        Some(v) => canonical_bool(v).unwrap_or(true), // a color NAME means "on"
+    };
+    if stated.is_some() {
+        println!("{on}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    Ok(if on { ExitCode::SUCCESS } else { ExitCode::from(1) })
+}
+
+/// `git config --rename-section <old> <new>` — rewrite the section header in
+/// place, keeping every value. Missing section is git's
+/// `fatal: no such section: <old>` at exit 128.
+fn rename_section(target: &WriteTarget, positional: &[&str]) -> Result<ExitCode> {
+    let (old, new) = match positional {
+        [old, new] => (*old, *new),
+        _ => return usage_error("wrong number of arguments, should be 2"),
+    };
+    let (old_name, old_sub) = split_section(old);
+    let (new_name, new_sub) = split_section(new);
+
+    let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
+    let mut file = load_or_empty(&target.path, target.source)?;
+
+    // gix exposes no public "rewrite this header", so the rename is a move: read
+    // the old section's entries in order, drop it, and push them into a section
+    // with the new name. Values keep their order and their multivar repeats.
+    let Ok(section) = file.section(&old_name, old_sub.as_deref().map(gix::bstr::BStr::new)) else {
+        eprintln!("fatal: no such section: {old}");
+        return Ok(ExitCode::from(128));
+    };
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    for raw in section.value_names() {
+        let name = raw.to_lowercase();
+        let nth = seen.iter().filter(|(n, _)| *n == name).count();
+        seen.push((name.clone(), nth));
+        if let Some(v) = section.values(&name).into_iter().nth(nth) {
+            entries.push((name, v.to_vec()));
+        }
+    }
+    file.remove_section(&old_name, old_sub.as_deref().map(gix::bstr::BStr::new));
+
+    let mut dest = file.section_mut_or_create_new(
+        &new_name,
+        new_sub.as_deref().map(gix::bstr::BStr::new),
+    )?;
+    for (name, value) in &entries {
+        dest.push(name.as_str(), Some(value.as_slice().into()))?;
+    }
+    persist(&target.path, &file)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git config --remove-section <name>` — drop the section and everything in it.
+fn remove_section(target: &WriteTarget, positional: &[&str]) -> Result<ExitCode> {
+    let Some(name) = positional.first() else {
+        return usage_error("wrong number of arguments, should be 1");
+    };
+    let (section, sub) = split_section(name);
+
+    let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
+    let mut file = load_or_empty(&target.path, target.source)?;
+    let mut removed = false;
+    while file
+        .remove_section(&section, sub.as_deref().map(gix::bstr::BStr::new))
+        .is_some()
+    {
+        removed = true;
+    }
+    if !removed {
+        eprintln!("fatal: no such section: {name}");
+        return Ok(ExitCode::from(128));
+    }
+    persist(&target.path, &file)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git config --replace-all <name> <value> [<value-pattern>]` — collapse every
+/// matching value of the key to a single `<value>`. Without a pattern that is
+/// every value of the key; with one, only the values the ERE selects (and a key
+/// whose values none match gains `<value>` as a new entry, as git's
+/// `--replace-all` does).
+fn replace_all(
+    target: &WriteTarget,
+    name: &str,
+    value: &str,
+    value_pattern: Option<&str>,
+) -> Result<ExitCode> {
+    let key = parse_key(name)?;
+    let section_lc = key.section_name.to_lowercase();
+    let value_lc = key.value_name.to_lowercase();
+    let filter = match value_pattern.map(ValueFilter::parse) {
+        Some(Err(code)) => return Ok(code),
+        Some(Ok(f)) => Some(f),
+        None => None,
+    };
+
+    let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
+    let mut file = load_or_empty(&target.path, target.source)?;
+
+    // Drop every value the filter selects, then push the replacement once — the
+    // "collapse to one" half of git's semantics.
+    let keep: Vec<Vec<u8>> = file
+        .raw_values_by(&section_lc, key.subsection_name, &value_lc)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|v| filter.as_ref().is_some_and(|f| !f.matches(v)))
+        .map(|v| v.to_vec())
+        .collect();
+
+    if let Ok(mut section) = file.section_mut(&section_lc, key.subsection_name) {
+        while section.remove(&value_lc).is_some() {}
+        for v in &keep {
+            section.push(value_lc.as_str(), Some(v.as_slice().into()))?;
+        }
+        section.push(value_lc.as_str(), Some(value.into()))?;
+    } else {
+        file.section_mut_or_create_new(&section_lc, key.subsection_name)?
+            .push(value_lc.as_str(), Some(value.into()))?;
+    }
+    persist(&target.path, &file)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Split a `--rename-section`/`--remove-section` operand into its section and
+/// optional subsection halves: `remote.origin` is the subsection `origin` of
+/// `remote`, while `core` has none.
+fn split_section(spec: &str) -> (String, Option<String>) {
+    match spec.split_once('.') {
+        Some((name, sub)) => (name.to_lowercase(), Some(sub.to_string())),
+        None => (spec.to_lowercase(), None),
+    }
 }
 
 enum WriteOp {

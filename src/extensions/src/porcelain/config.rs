@@ -19,6 +19,7 @@ enum Mode {
     UnsetAll,
     RenameSection,
     RemoveSection,
+    Edit,
 }
 
 impl Mode {
@@ -35,6 +36,7 @@ impl Mode {
             Mode::ReplaceAll => "--replace-all",
             Mode::RenameSection => "--rename-section",
             Mode::RemoveSection => "--remove-section",
+            Mode::Edit => "--edit",
             Mode::List => "--list",
             Mode::Add => "--add",
             Mode::Unset => "--unset",
@@ -272,6 +274,9 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     let mut scope = Scope::Default;
     let mut name_only = false;
     let mut d = Display::default();
+    // `include.path` / `includeIf` following. git resolves includes for the
+    // implicit scopes and, for an explicitly named file, only when asked.
+    let mut includes = false;
     let mut positional: Vec<&str> = Vec::new();
     // git config parses options with `PARSE_OPT_STOP_AT_NON_OPTION`: option
     // scanning ends at the FIRST argument that is not an option, and that token
@@ -322,6 +327,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             "--replace-all" => Some(Mode::ReplaceAll),
             "--rename-section" => Some(Mode::RenameSection),
             "--remove-section" => Some(Mode::RemoveSection),
+            "-e" | "--edit" => Some(Mode::Edit),
             "--add" => Some(Mode::Add),
             "--unset" => Some(Mode::Unset),
             "--unset-all" => Some(Mode::UnsetAll),
@@ -402,6 +408,8 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         }
 
         match a.as_str() {
+            "--includes" => includes = true,
+            "--no-includes" => includes = false,
             "--show-origin" => d.show_origin = true,
             "--show-scope" => d.show_scope = true,
             "-z" | "--null" => d.null = true,
@@ -485,7 +493,8 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         | Mode::Unset
         | Mode::UnsetAll
         | Mode::RenameSection
-        | Mode::RemoveSection => false,
+        | Mode::RemoveSection
+        | Mode::Edit => false,
     };
     let file: &gix::config::File = match &scope {
         Scope::Default => match snapshot.as_ref() {
@@ -520,7 +529,30 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         }
         Scope::File(path) => {
             scoped = match read_config_bytes(path) {
-                Ok(bytes) => parse_config(&bytes, path, Source::Cli)?,
+                Ok(bytes) => {
+                    let mut f = parse_config(&bytes, path, Source::Cli)?;
+                    if includes {
+                        // Follow `include.path` / `includeIf` from the named file,
+                        // which git does here only under `--includes`. The
+                        // DEFAULT include options are "do not follow", so the
+                        // follow-mode options have to be passed explicitly, with
+                        // the gitdir context the conditional forms need.
+                        let git_dir = repo.as_ref().map(|r| r.git_dir().to_owned());
+                        let conditional = gix::config::file::includes::conditional::Context {
+                            git_dir: git_dir.as_deref(),
+                            branch_name: None,
+                        };
+                        let opts = gix::config::file::init::Options {
+                            includes: gix::config::file::includes::Options::follow(
+                                Default::default(),
+                                conditional,
+                            ),
+                            ..Default::default()
+                        };
+                        f.resolve_includes(opts)?;
+                    }
+                    f
+                }
                 Err(err) => {
                     unreadable = Some(err);
                     empty_config(path, Source::Cli)
@@ -555,11 +587,9 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         Mode::GetRegexp => {
             get_regexp(file, positional[0], positional.get(1).copied(), &d)
         }
-        // `--get-urlmatch <section[.var]> <url>` needs git's URL matcher
-        // (host/port/path/user specificity ranking); not ported, and guessing a
-        // ranking would silently return the wrong value.
-        Mode::GetUrlMatch => bail!("--get-urlmatch is not supported"),
+        Mode::GetUrlMatch => get_urlmatch(file, &positional, &d),
         Mode::GetColorBool => get_colorbool(file, &positional),
+        Mode::Edit => edit_config(&write_target()?),
         Mode::RenameSection => rename_section(&write_target()?, &positional),
         Mode::RemoveSection => remove_section(&write_target()?, &positional),
         Mode::ReplaceAll => {
@@ -914,6 +944,186 @@ fn for_each_entry(
     Ok(())
 }
 
+
+/// `git config --get-urlmatch <section[.key]> <url>` — the URL-specific lookup
+/// that `http.<url>.*` config is built on.
+///
+/// Ported from git's `urlmatch.c`: every `<section> "<pattern-url>"` subsection
+/// whose URL is a prefix-match for `<url>` is a candidate, and the most specific
+/// candidate wins per key. Specificity is git's tuple, compared in this order:
+///
+///   1. a pattern that names a user beats one that does not,
+///   2. a longer matched host wins,
+///   3. a longer matched path wins.
+///
+/// A bare `<section>` prints `key value` for every key the winning candidates
+/// define (git lower-cases the key here); `<section>.<key>` prints just that
+/// key's value. The plain, subsection-less section is the fallback candidate, so
+/// a URL that matches no pattern still gets the generic setting.
+fn get_urlmatch(file: &gix::config::File, positional: &[&str], d: &Display) -> Result<ExitCode> {
+    let (spec, url) = match positional {
+        [spec, url] => (*spec, *url),
+        _ => return usage_error("wrong number of arguments, should be 2"),
+    };
+    let (section, key) = match spec.split_once('.') {
+        Some((s, k)) => (s.to_lowercase(), Some(k.to_lowercase())),
+        None => (spec.to_lowercase(), None),
+    };
+    let Some(want) = UrlParts::parse(url) else {
+        eprintln!("fatal: bad URL: {url}");
+        return Ok(ExitCode::from(128));
+    };
+
+    // key -> (score, value): the winner for each key seen so far.
+    let mut best: std::collections::BTreeMap<String, (UrlScore, Vec<u8>)> =
+        std::collections::BTreeMap::new();
+
+    for sec in file.sections() {
+        if is_synthetic(sec.meta().source) || sec.header().name() != section.as_str() {
+            continue;
+        }
+        let score = match sec.header().subsection_name() {
+            // The generic section matches every URL, at the lowest specificity.
+            None => UrlScore::default(),
+            Some(pattern) => {
+                let text = pattern.to_string();
+                match UrlParts::parse(&text).and_then(|p| p.score_against(&want)) {
+                    Some(score) => score,
+                    None => continue,
+                }
+            }
+        };
+        for name in sec.value_names() {
+            let lname = name.to_lowercase();
+            if key.as_ref().is_some_and(|k| *k != lname) {
+                continue;
+            }
+            let Some(value) = sec.value(&lname) else { continue };
+            let entry = best.entry(lname).or_insert_with(|| (UrlScore::default(), Vec::new()));
+            if entry.1.is_empty() || score >= entry.0 {
+                *entry = (score, value.to_vec());
+            }
+        }
+    }
+
+    if best.is_empty() {
+        return Ok(ExitCode::from(1));
+    }
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let meta = gix::config::file::Metadata::from(Source::Cli);
+    for (name, (_, value)) in &best {
+        // A single-key query prints the value alone; a whole-section query
+        // prints `section.key value`, as git does.
+        match &key {
+            Some(_) => emit_kv(&mut out, d, name, value, &meta, b' ', false)?,
+            None => emit_kv(&mut out, d, &format!("{section}.{name}"), value, &meta, b' ', true)?,
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// How specifically a config URL pattern matched the queried URL. Ordered the
+/// way git ranks candidates: user first, then host length, then path length.
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct UrlScore {
+    user: bool,
+    host_len: usize,
+    path_len: usize,
+}
+
+/// The pieces of a URL git compares: scheme, optional user, host (with port),
+/// and path. Deliberately hand-split rather than parsed by a URL crate, because
+/// the comparison is textual and git's is too.
+struct UrlParts {
+    scheme: String,
+    user: Option<String>,
+    host: String,
+    path: String,
+}
+
+impl UrlParts {
+    fn parse(url: &str) -> Option<UrlParts> {
+        let (scheme, rest) = url.split_once("://")?;
+        let (authority, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, ""),
+        };
+        let (user, host) = match authority.rsplit_once('@') {
+            Some((u, h)) => (Some(u.to_string()), h),
+            None => (None, authority),
+        };
+        Some(UrlParts {
+            scheme: scheme.to_lowercase(),
+            user,
+            host: host.to_lowercase(),
+            path: path.trim_end_matches('/').to_string(),
+        })
+    }
+
+    /// Score this PATTERN against `url`, or `None` when it does not match.
+    fn score_against(&self, url: &UrlParts) -> Option<UrlScore> {
+        if self.scheme != url.scheme || self.host != url.host {
+            return None;
+        }
+        // A pattern that names a user matches only that user's URLs.
+        if self.user.is_some() && self.user != url.user {
+            return None;
+        }
+        // The pattern's path must be a prefix of the URL's, at a `/` boundary.
+        let path = self.path.trim_end_matches('/');
+        if !path.is_empty() {
+            let rest = url.path.strip_prefix(path)?;
+            if !(rest.is_empty() || rest.starts_with('/')) {
+                return None;
+            }
+        }
+        Some(UrlScore {
+            user: self.user.is_some(),
+            host_len: self.host.len(),
+            path_len: path.len(),
+        })
+    }
+}
+
+/// `git config -e|--edit` — open the target config in the user's editor.
+///
+/// Editor precedence is git's `GIT_EDITOR` → `core.editor` → `VISUAL` →
+/// `EDITOR` → `vi`, and the command is run through the shell exactly as git
+/// does, so a configured editor with arguments (`code --wait`) works.
+fn edit_config(target: &WriteTarget) -> Result<ExitCode> {
+    let editor = std::env::var("GIT_EDITOR")
+        .ok()
+        .or_else(|| {
+            gix::discover(".")
+                .ok()
+                .and_then(|r| r.config_snapshot().string("core.editor").map(|v| v.to_string()))
+        })
+        .or_else(|| std::env::var("VISUAL").ok())
+        .or_else(|| std::env::var("EDITOR").ok())
+        .unwrap_or_else(|| "vi".to_string());
+
+    if target.create_parent {
+        if let Some(parent) = target.path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+    }
+    // git creates the file first so the editor always opens something.
+    if !target.path.exists() {
+        std::fs::File::create(&target.path)?;
+    }
+
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$@\"", editor = editor))
+        .arg(editor)
+        .arg(&target.path)
+        .status()?;
+    Ok(match status.code() {
+        Some(0) | None => ExitCode::SUCCESS,
+        Some(code) => ExitCode::from(code as u8),
+    })
+}
 
 /// `git config --get-colorbool <name> [<stdout-is-tty>]` — resolve a color
 /// setting to `true`/`false`, printing it and exiting 0 when color is on, 1 when

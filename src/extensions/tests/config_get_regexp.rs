@@ -301,3 +301,84 @@ fn get_colorbool_answers_through_the_exit_code() {
     assert_eq!(probed.status.code(), Some(1));
     assert!(stdout_of(&probed).is_empty());
 }
+
+/// A standalone config file with URL-specific `http` subsections, plus an
+/// included file, for `--get-urlmatch` and `--includes`.
+fn url_config(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("zvcs-cfgurl-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir fixture");
+    std::fs::write(dir.join("sub.cfg"), "[inc]\n\tfrom = included\n").expect("sub");
+    std::fs::write(
+        dir.join("main.cfg"),
+        format!(
+            "[include]\n\tpath = {}/sub.cfg\n\
+             [http]\n\tsslVerify = true\n\tcookieFile = /tmp/generic\n\
+             [http \"https://example.com\"]\n\tsslVerify = false\n\
+             [http \"https://example.com/path\"]\n\tcookieFile = /tmp/path\n\
+             [http \"https://user@example.com/path\"]\n\tcookieFile = /tmp/user\n",
+            dir.display()
+        ),
+    )
+    .expect("main");
+    dir
+}
+
+#[test]
+fn urlmatch_picks_the_most_specific_subsection() {
+    let dir = url_config("urlmatch");
+    let cfg = "main.cfg";
+
+    // A longer matching path beats the generic entry.
+    let path = zvcs(&dir, &["config", "-f", cfg, "--get-urlmatch", "http.cookieFile", "https://example.com/path/deeper"]);
+    assert_eq!(stdout_of(&path), "/tmp/path\n");
+
+    // A pattern naming a user beats one that does not, for the same path.
+    let user = zvcs(&dir, &["config", "-f", cfg, "--get-urlmatch", "http.cookieFile", "https://user@example.com/path"]);
+    assert_eq!(stdout_of(&user), "/tmp/user\n");
+
+    // A URL matching no pattern still gets the section's generic value.
+    let generic = zvcs(&dir, &["config", "-f", cfg, "--get-urlmatch", "http.cookieFile", "https://other.example.org"]);
+    assert_eq!(stdout_of(&generic), "/tmp/generic\n");
+
+    // A whole-section query prints `section.key value` for every key.
+    let section = zvcs(&dir, &["config", "-f", cfg, "--get-urlmatch", "http", "https://example.com"]);
+    assert_eq!(stdout_of(&section), "http.cookiefile /tmp/generic\nhttp.sslverify false\n");
+
+    // A key no candidate defines is exit 1.
+    let missing = zvcs(&dir, &["config", "-f", cfg, "--get-urlmatch", "http.nosuch", "https://example.com"]);
+    assert_eq!(missing.status.code(), Some(1));
+}
+
+#[test]
+fn includes_are_followed_only_when_asked() {
+    let dir = url_config("includes");
+
+    let off = zvcs(&dir, &["config", "-f", "main.cfg", "--get", "inc.from"]);
+    assert_eq!(off.status.code(), Some(1), "include.path is not followed by default here");
+
+    let on = zvcs(&dir, &["config", "-f", "main.cfg", "--includes", "--get", "inc.from"]);
+    assert!(on.status.success());
+    assert_eq!(stdout_of(&on), "included\n");
+}
+
+#[test]
+fn edit_runs_the_configured_editor_on_the_target_file() {
+    let dir = std::env::temp_dir().join(format!("zvcs-cfgedit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    assert!(zvcs(&dir, &["init", "-q", "-b", "main"]).status.success());
+
+    // A scripted "editor" that appends a section, so the effect is observable
+    // without a terminal.
+    let out = Command::new(BIN)
+        .args(["config", "--local", "--edit"])
+        .current_dir(&dir)
+        .env("GIT_EDITOR", r#"printf '[edited]\n\tby = zvcs\n' >>"#)
+        .output()
+        .expect("run zvcs git");
+
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let read_back = zvcs(&dir, &["config", "--local", "--get", "edited.by"]);
+    assert_eq!(stdout_of(&read_back), "zvcs\n", "the editor's write landed in the target file");
+}

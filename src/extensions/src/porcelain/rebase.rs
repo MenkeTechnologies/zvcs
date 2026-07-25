@@ -1638,6 +1638,7 @@ fn peel_to_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 }
 
 /// True when `name` names a hook git would actually run.
+#[allow(dead_code)] // port helper retained for the hook-dispatch path
 fn hook_is_runnable(repo: &gix::Repository, name: &str) -> bool {
     let path = repo.common_dir().join("hooks").join(name);
     #[cfg(unix)]

@@ -477,7 +477,6 @@ fn ensure_no_filters(
             )));
         }
     }
-    drop(snapshot);
 
     let info = repo.git_dir().join("info").join("attributes");
     if info.exists() {

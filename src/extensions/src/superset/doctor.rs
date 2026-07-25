@@ -20,6 +20,8 @@ use crate::superset::{manpage, zdaemon};
 enum Level {
     Ok,
     Warn,
+    // No check currently emits FAIL, but marker()/any_fail handle it as a real severity.
+    #[allow(dead_code)]
     Fail,
 }
 

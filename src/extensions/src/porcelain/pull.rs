@@ -190,6 +190,9 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
                 bail!("--edit is not supported (editing the merge message needs a TTY editor loop)")
             }
             "--cleanup" => {
+                // `i` bump inside take_value! is dead here because we bail immediately;
+                // the value is still consumed so a missing one errors identically to git.
+                #[allow(unused_assignments)]
                 let _ = take_value!("cleanup");
                 bail!("--cleanup is not supported (the merge port does not run message cleanup)")
             }

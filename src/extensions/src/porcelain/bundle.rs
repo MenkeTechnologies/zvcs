@@ -224,7 +224,7 @@ fn read_header(path: &str) -> Result<Header, HeaderError> {
     };
     let mut hexsz = 40usize;
 
-    let mut pending: Option<Vec<u8>> = None;
+    let mut pending: Option<Vec<u8>>;
     // Capabilities (v3 only) come first, each on its own `@key[=value]` line.
     loop {
         let Some(line) = read_line(&mut *input)? else {

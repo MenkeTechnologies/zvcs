@@ -75,6 +75,7 @@ use gix::merge::tree::{Conflict, FileFavor, Resolution, ResolutionFailure, Treat
 /// The outcome of one real (`--write-tree`) merge, ready for framing by the
 /// caller. `Fatal` carries the exit code git would `die()`/`exit()` with; it
 /// aborts the whole process, including a `--stdin` batch mid-stream.
+#[allow(dead_code)] // deliberate port surface; wired by the merge framing path
 enum Merged {
     Fatal(ExitCode),
     Done { clean: bool, body: Vec<u8> },

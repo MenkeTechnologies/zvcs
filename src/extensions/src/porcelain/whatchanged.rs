@@ -890,10 +890,12 @@ fn parse_args(
     quiet: bool,
     cfg: &LogConfig,
 ) -> Result<Parsed, Fatal> {
-    let mut p = Parsed::default();
     // Config supplies the defaults; the flags parsed below override them.
-    p.abbrev_commit = cfg.abbrev_commit;
-    p.show_root = cfg.show_root;
+    let mut p = Parsed {
+        abbrev_commit: cfg.abbrev_commit,
+        show_root: cfg.show_root,
+        ..Parsed::default()
+    };
     let mut st = OptState::default();
     if quiet {
         st.out_bits = OUT_NO_OUTPUT;

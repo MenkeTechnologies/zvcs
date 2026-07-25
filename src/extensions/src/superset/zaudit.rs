@@ -139,7 +139,7 @@ fn summary(recs: &[Rec], json: bool) -> Result<ExitCode> {
 /// Entries ranked by count, most first.
 fn rank<K: Clone>(m: &BTreeMap<K, usize>) -> Vec<(K, usize)> {
     let mut v: Vec<(K, usize)> = m.iter().map(|(k, n)| (k.clone(), *n)).collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
     v
 }
 

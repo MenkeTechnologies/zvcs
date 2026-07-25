@@ -257,6 +257,7 @@ fn acquire_singleton_lock() -> Option<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(false)
         .open(zvcs_home().join("zvcsd.lock"))
         .ok()?;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -913,11 +914,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("zvcsd.lock");
 
-        let a = std::fs::OpenOptions::new().create(true).write(true).open(&path).unwrap();
+        let a = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&path).unwrap();
         assert!(try_lock(&a), "first holder must acquire");
 
         // A distinct open fd for the same file — the second "daemon" — is refused.
-        let b = std::fs::OpenOptions::new().create(true).write(true).open(&path).unwrap();
+        let b = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&path).unwrap();
         assert!(!try_lock(&b), "second holder must be refused while the first lives");
 
         // First "daemon" exits → its fd closes → the lock frees → the next acquires.

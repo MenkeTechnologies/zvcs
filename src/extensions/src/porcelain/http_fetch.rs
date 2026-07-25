@@ -372,11 +372,11 @@ impl Walker {
         };
         let text = String::from_utf8_lossy(&body);
         let text = text.trim_end();
-        if text.starts_with("ref: ") {
+        if let Some(rest) = text.strip_prefix("ref: ") {
             bail!(
                 "target {target:?} resolved to the symbolic ref {:?}; git records the symref and \
                  then walks a null object id, which this port refuses to imitate ({PORTED})",
-                text["ref: ".len()..].trim()
+                rest.trim()
             );
         }
         Ok(ObjectId::from_hex(text.as_bytes()).ok())

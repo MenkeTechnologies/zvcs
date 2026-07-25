@@ -1822,6 +1822,8 @@ fn compute_assignment(
     // upstream reuses the one allocation.
     let mut free_row = vec![0usize; row_count];
     let mut free_count = 0usize;
+    // `i` is stored into free_row and used to mutate row2column[i]; not a plain slice read.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..row_count {
         let j1 = row2column[i];
         if j1 == -1 {
@@ -1834,6 +1836,8 @@ fn compute_assignment(
             // C's `!j1`: column 1 when j1 is 0, column 0 otherwise.
             let other = usize::from(j1 == 0);
             let mut min = at(other, i) - v[other];
+            // `j` is passed to at(j, i) and compared to j1; not a plain index.
+            #[allow(clippy::needless_range_loop)]
             for j in 1..column_count {
                 if j != j1 && min > at(j, i) - v[j] {
                     min = at(j, i) - v[j];
@@ -1861,6 +1865,8 @@ fn compute_assignment(
             let mut u1 = at(j1, i) - v[j1];
             let mut j2: i64 = -1;
             let mut u2 = i64::MAX;
+            // `j` is passed to at(j, i) and stored into j1/j2; not a plain index.
+            #[allow(clippy::needless_range_loop)]
             for j in 1..column_count {
                 let c = at(j, i) - v[j];
                 if u2 > c {
@@ -1907,12 +1913,11 @@ fn compute_assignment(
     let mut d = vec![0i64; column_count];
     let mut pred = vec![0usize; column_count];
     let mut col: Vec<usize> = vec![0; column_count];
-    for f in 0..saved_free_count {
-        let i1 = free_row[f];
+    for &i1 in &free_row[..saved_free_count] {
         let mut low = 0usize;
         let mut up = 0usize;
-        let mut last = 0usize;
-        let mut min = 0i64;
+        let mut last;
+        let mut min;
         let mut j: i64 = -1;
 
         for jj in 0..column_count {
@@ -1926,6 +1931,9 @@ fn compute_assignment(
             last = low;
             min = d[col[up]];
             up += 1;
+            // `up` is deliberately advanced inside the scan; the range is snapshotted
+            // once, mirroring the C `for (k = up; ...)` bookkeeping.
+            #[allow(clippy::mut_range_bound)]
             for k in up..column_count {
                 j = col[k] as i64;
                 let c = d[j as usize];
@@ -1952,6 +1960,9 @@ fn compute_assignment(
                 low += 1;
                 let i = column2row[j1] as usize;
                 let u1 = at(j1, i) - v[j1] - min;
+                // `up` is deliberately advanced inside the scan; the range is snapshotted
+                // once, mirroring the C `for (k = up; ...)` bookkeeping.
+                #[allow(clippy::mut_range_bound)]
                 for k in up..column_count {
                     j = col[k] as i64;
                     let c = at(j as usize, i) - v[j as usize] - u1;
@@ -1979,8 +1990,7 @@ fn compute_assignment(
         }
 
         // Updating of the column pieces.
-        for k in 0..last {
-            let j1 = col[k];
+        for &j1 in &col[..last] {
             v[j1] += d[j1] - min;
         }
 

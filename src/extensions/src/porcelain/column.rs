@@ -628,8 +628,8 @@ impl Table<'_> {
 
             let widths = self.width.as_ref().expect("just computed");
             let mut total_width = indent_len;
-            for x in 0..self.cols as usize {
-                total_width += self.len[widths[x]];
+            for &w in widths.iter().take(self.cols as usize) {
+                total_width += self.len[w];
                 total_width += padding;
             }
             if total_width > total {

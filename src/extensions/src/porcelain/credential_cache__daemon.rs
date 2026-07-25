@@ -97,6 +97,7 @@ const TIME_MAX: u64 = u64::MAX;
 const USAGE: &str = "usage: git credential-cache--daemon [--debug] <socket-path>\n\n    \
                      --[no-]debug          print debugging messages to stderr\n\n";
 
+#[allow(non_snake_case)] // maps to git's `credential-cache--daemon` subcommand; name is deliberate
 pub fn credential_cache__daemon(args: &[String]) -> Result<ExitCode> {
     // `args[0]` is the subcommand itself when dispatched; tolerate its absence.
     let rest = match args.first() {

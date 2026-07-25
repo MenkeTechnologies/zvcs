@@ -208,7 +208,6 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
         };
         (!is_utf8).then_some(v)
     });
-    drop(snapshot);
 
     // Serialize the object write through the repo coordinator, as the other
     // writing porcelain does, so concurrent zvcs writers queue instead of racing.

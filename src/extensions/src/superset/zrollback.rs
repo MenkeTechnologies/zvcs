@@ -206,7 +206,7 @@ mod tests {
         let b = "b".repeat(40);
         let c = "c".repeat(40);
         // oldest→newest: z→a (initial), a→b (commit), b→c (commit). HEAD=c.
-        let lines = vec![entry(&z, &a, "commit: init"), entry(&a, &b, "commit: two"), entry(&b, &c, "commit: three")];
+        let lines = [entry(&z, &a, "commit: init"), entry(&a, &b, "commit: two"), entry(&b, &c, "commit: three")];
         let entries: Vec<Entry> = lines.iter().filter_map(|l| parse_line(l)).collect();
         // HEAD@{1} = old of newest = b; HEAD@{2} = old of second-newest = a.
         assert_eq!(target(&entries, 1).unwrap().0, b);

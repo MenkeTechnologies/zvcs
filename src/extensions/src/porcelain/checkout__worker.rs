@@ -79,6 +79,7 @@ const USAGE: &str = "usage: git checkout--worker [<options>]\n\n    \
 /// or above it is rejected by `packet_read_with_status`.
 const LARGE_PACKET_MAX: usize = 65520;
 
+#[allow(non_snake_case)] // maps to `git checkout--worker`; name is deliberate.
 pub fn checkout__worker(args: &[String]) -> Result<ExitCode> {
     // `args[0]` is the subcommand itself when dispatched; tolerate its absence.
     let rest = match args.first() {

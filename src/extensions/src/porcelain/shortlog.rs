@@ -1669,7 +1669,7 @@ fn render(groups: &BTreeMap<BString, Group>, opts: &Opts, out: &mut Vec<u8>) {
     // it stably by descending count, so ties keep the alphabetic order.
     let mut entries: Vec<(&BString, &Group)> = groups.iter().collect();
     if opts.numbered {
-        entries.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+        entries.sort_by_key(|x| std::cmp::Reverse(x.1.count));
     }
 
     for (ident, group) in entries {

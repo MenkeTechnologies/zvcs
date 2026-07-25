@@ -195,6 +195,9 @@ fn parse_gpg_status(status: &[u8]) -> (GStatus, String) {
             _ => {}
         }
     }
+    // ERRSIG and the fallthrough both map to CannotCheck in git; keeping the
+    // separate branch keeps `errsig` a live read and documents the mapping.
+    #[allow(clippy::if_same_then_else)]
     let status = if bad {
         GStatus::Bad
     } else if revkey {

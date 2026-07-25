@@ -390,6 +390,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // missing file, so treat its absence as an empty index — git's root empty
     // commit (`commit --allow-empty` on a fresh repo) then produces the empty tree
     // instead of failing with "opening the index: No such file or directory".
+    // `open_index`'s Err variant is large; boxing it would churn every call site.
+    #[allow(clippy::result_large_err)]
     let index = repo
         .index_path()
         .exists()
@@ -1203,6 +1205,9 @@ fn append_signoff(msg: &mut String, ident: &str) {
     };
     if has_footer == 0 {
         // Leave a blank line between a message body and the sob.
+        // Distinct cases mirror git C source; the `cut == 1` arm also guards the
+        // `cut - 2` index below from underflowing, so keep them separate.
+        #[allow(clippy::if_same_then_else)]
         let append = if cut == 0 {
             Some("\n\n")
         } else if cut == 1 {
@@ -1311,6 +1316,8 @@ fn find_trailer_start(buf: &[u8]) -> usize {
                 continue;
             }
             non_trailer_lines += possible_continuation_lines;
+            // Distinct conditions mirror git C source; merging obscures the port.
+            #[allow(clippy::if_same_then_else)]
             if recognized_prefix && trailer_lines * 3 >= non_trailer_lines {
                 return next_line_off(buf, bol);
             } else if trailer_lines > 0 && non_trailer_lines == 0 {

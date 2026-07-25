@@ -581,7 +581,7 @@ fn mktemp_dir() -> Result<PathBuf> {
 /// `touch "$file"`: create it if absent and set its mtime to now, so a later
 /// `test -nt` sees a tool-modified `MERGED` as newer.
 fn touch(file: &Path) -> Result<()> {
-    let f = std::fs::OpenOptions::new().create(true).write(true).open(file)?;
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(file)?;
     f.set_modified(std::time::SystemTime::now())?;
     Ok(())
 }

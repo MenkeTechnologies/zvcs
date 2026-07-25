@@ -415,6 +415,9 @@ fn show_pack_info(
     if baseobjects != 0 {
         println!("non delta: {baseobjects} {}", objects(baseobjects));
     }
+    // `cnt` is both the histogram index and the printed chain length, and the
+    // range starts at 1 (index 0 is reported separately), so enumerate is a poor fit.
+    #[allow(clippy::needless_range_loop)]
     for cnt in 1..=MAX_CHAIN as usize {
         let n = histogram[cnt];
         if n != 0 {

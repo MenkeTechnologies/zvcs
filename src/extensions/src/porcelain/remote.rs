@@ -786,7 +786,7 @@ fn remove(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     {}
 
     for branch in branch_subsections(&file) {
-        let mut now_empty = false;
+        let now_empty;
         {
             let Ok(mut section) = file.section_mut("branch", Some(branch.as_bstr())) else {
                 continue;

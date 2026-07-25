@@ -199,6 +199,9 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
 
     // `seen` was built by prepending; restore that order, then stable-sort by date.
     seen.reverse();
+    // Reverse comparator: sort_by_key + reverse() would flip equal-date elements too,
+    // breaking the stable descending order restored just above.
+    #[allow(clippy::unnecessary_sort_by)]
     seen.sort_by(|a, b| g.date(*b).cmp(&g.date(*a)));
 
     let mut out: Vec<u8> = Vec::new();
@@ -869,8 +872,7 @@ fn name_first_parent_chain(
     mut c: ObjectId,
 ) -> usize {
     let mut i = 0;
-    loop {
-        let Some(cn) = names.get(&c).cloned() else { break };
+    while let Some(cn) = names.get(&c).cloned() {
         let Some(&p) = g.parents(c).first() else { break };
         if names.contains_key(&p) {
             break;

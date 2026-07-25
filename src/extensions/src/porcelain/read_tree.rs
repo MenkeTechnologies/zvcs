@@ -564,13 +564,18 @@ fn worktree_dirty(repo: &gix::Repository) -> Result<HashSet<BString>> {
 
     let mut dirty = HashSet::new();
     for item in iter {
-        if let Item::Modification { rela_path, status, .. } = item? {
-            if let EntryStatus::Change(
-                Change::Modification { .. } | Change::Type { .. } | Change::SubmoduleModification(_),
-            ) = status
-            {
-                dirty.insert(rela_path);
-            }
+        if let Item::Modification {
+            rela_path,
+            status:
+                EntryStatus::Change(
+                    Change::Modification { .. }
+                    | Change::Type { .. }
+                    | Change::SubmoduleModification(_),
+                ),
+            ..
+        } = item?
+        {
+            dirty.insert(rela_path);
         }
     }
     Ok(dirty)

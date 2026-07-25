@@ -658,6 +658,7 @@ pub fn diff_files(args: &[String]) -> Result<ExitCode> {
 
 /// The outcome of argument parsing: either a runnable request, or the first
 /// real-git flag we have not ported.
+#[allow(clippy::large_enum_variant)] // Boxing would churn every construct/match site.
 enum Parsed {
     Run { opts: Opts, paths: Vec<BString> },
     Unsupported(String),
@@ -3591,19 +3592,19 @@ fn combine_diff_parent(
     // Assign this parent's line numbers, coalescing its lost lines into the
     // accumulated set as it goes.
     let mut p_lno = 1u64;
-    for lno in 0..=cnt {
-        sline[lno].p_lno[n] = p_lno;
-        if !sline[lno].plost.is_empty() {
-            let plost = std::mem::take(&mut sline[lno].plost);
-            let base = std::mem::take(&mut sline[lno].lost);
-            sline[lno].lost = coalesce_lines(base, plost, n, ws);
+    for (lno, s) in sline.iter_mut().enumerate().take(cnt + 1) {
+        s.p_lno[n] = p_lno;
+        if !s.plost.is_empty() {
+            let plost = std::mem::take(&mut s.plost);
+            let base = std::mem::take(&mut s.lost);
+            s.lost = coalesce_lines(base, plost, n, ws);
         }
-        for ll in &sline[lno].lost {
+        for ll in &s.lost {
             if ll.parent_map & nmask != 0 {
                 p_lno += 1;
             }
         }
-        if lno < cnt && sline[lno].flag & nmask == 0 {
+        if lno < cnt && s.flag & nmask == 0 {
             p_lno += 1;
         }
     }
@@ -3614,15 +3615,15 @@ fn combine_diff_parent(
 fn reuse_combine_diff(sline: &mut [Sline], cnt: usize, i: usize, j: usize) {
     let imask = 1u64 << i;
     let jmask = 1u64 << j;
-    for lno in 0..=cnt {
-        sline[lno].p_lno[i] = sline[lno].p_lno[j];
-        for ll in &mut sline[lno].lost {
+    for s in sline.iter_mut().take(cnt + 1) {
+        s.p_lno[i] = s.p_lno[j];
+        for ll in &mut s.lost {
             if ll.parent_map & jmask != 0 {
                 ll.parent_map |= imask;
             }
         }
-        if sline[lno].flag & jmask != 0 {
-            sline[lno].flag |= imask;
+        if s.flag & jmask != 0 {
+            s.flag |= imask;
         }
     }
     sline[cnt + 1].p_lno[i] = sline[cnt + 1].p_lno[j];
@@ -3648,8 +3649,8 @@ fn coalesce_lines(base: Vec<Lline>, newlines: Vec<Lline>, parent: usize, ws: Whi
     let k = newlines.len();
     let mut lcs = vec![vec![0i32; k + 1]; m + 1];
     let mut dir = vec![vec![Coalesce::Base; k + 1]; m + 1];
-    for j in 1..=k {
-        dir[0][j] = Coalesce::New;
+    for cell in dir[0][1..=k].iter_mut() {
+        *cell = Coalesce::New;
     }
     for i in 1..=m {
         for j in 1..=k {
@@ -3778,11 +3779,11 @@ fn make_hunks(sline: &mut [Sline], cnt: usize, num_parent: usize, dense: bool, c
     let all_mask = (1u64 << num_parent) - 1;
     let mark = 1u64 << num_parent;
 
-    for i in 0..=cnt {
-        if sline_interesting(&sline[i], all_mask) {
-            sline[i].flag |= mark;
+    for s in sline.iter_mut().take(cnt + 1) {
+        if sline_interesting(s, all_mask) {
+            s.flag |= mark;
         } else {
-            sline[i].flag &= !mark;
+            s.flag &= !mark;
         }
     }
     if !dense {
@@ -3850,8 +3851,8 @@ fn make_hunks(sline: &mut [Sline], cnt: usize, num_parent: usize, dense: bool, c
         }
 
         if !has_interesting && same_diff != all_mask {
-            for j in hunk_begin..hunk_end {
-                sline[j].flag &= !mark;
+            for s in &mut sline[hunk_begin..hunk_end] {
+                s.flag &= !mark;
             }
         }
         i = hunk_end;
@@ -3878,6 +3879,7 @@ fn hunk_comment_line(sl: &Sline, result: &[u8]) -> bool {
 
 /// `dump_sline()`: render every combined hunk. `ind_*` carry the
 /// `--output-indicator-*` overrides that the two-way writer also honors.
+#[allow(clippy::too_many_arguments)]
 fn dump_sline(
     out: &mut Vec<u8>,
     sline: &[Sline],
@@ -3920,8 +3922,8 @@ fn dump_sline(
 
         let mut null_context = 0u64;
         if context == 0 {
-            for j in lno..hunk_end {
-                if sline[j].flag & (mark - 1) == 0 {
+            for s in &sline[lno..hunk_end] {
+                if s.flag & (mark - 1) == 0 {
                     null_context += 1;
                 }
             }
@@ -4159,6 +4161,9 @@ fn render_combined_patch(
         }
     }
 
+    // `n` indexes both `c.parents` and `parents`, bounds the inner `0..n`, and is
+    // passed by value to the combine helpers — not a plain single-slice index.
+    #[allow(clippy::needless_range_loop)]
     for n in 0..NUM_PARENT {
         let mut reused = false;
         for j in 0..n {

@@ -805,7 +805,7 @@ fn print_summary(
                 }
             }
             // `git log` walks in reverse chronological order across both sides.
-            lines.sort_by(|a, b| b.0.cmp(&a.0));
+            lines.sort_by_key(|x| std::cmp::Reverse(x.0));
             let take = if limit > 0 {
                 lines.len().min(limit as usize)
             } else {
@@ -2265,71 +2265,6 @@ fn display_path(path: &BStr, prefix: Option<&BString>) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cls(args: &[&str]) -> SetBranch {
-        classify_set_branch(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-    }
-
-    fn apply(branch: Option<&str>, path: &str) -> SetBranch {
-        SetBranch::Apply {
-            branch: branch.map(str::to_string),
-            path: path.to_string(),
-        }
-    }
-
-    /// Every case below is the observed behavior of stock `git submodule
-    /// set-branch` (git 2.55.0); the enum variant maps 1:1 to git's exit code
-    /// (UsageTop=1, UsageSub=129, Required/Both=128, Apply=0/1).
-    #[test]
-    fn set_branch_parse_matches_git() {
-        // Well-formed writes.
-        assert_eq!(cls(&["-b", "feature", "sub/foo"]), apply(Some("feature"), "sub/foo"));
-        assert_eq!(cls(&["--branch", "feat", "sub/foo"]), apply(Some("feat"), "sub/foo"));
-        assert_eq!(cls(&["--branch=feat", "sub/foo"]), apply(Some("feat"), "sub/foo"));
-        assert_eq!(cls(&["--branch=", "sub/foo"]), apply(Some(""), "sub/foo"));
-        assert_eq!(cls(&["-q", "-b", "feature", "sub/foo"]), apply(Some("feature"), "sub/foo"));
-        assert_eq!(cls(&["-b", "feature", "--", "sub/foo"]), apply(Some("feature"), "sub/foo"));
-        // `--default` removes the key (branch == None).
-        assert_eq!(cls(&["-d", "sub/foo"]), apply(None, "sub/foo"));
-        assert_eq!(cls(&["--default", "sub/foo"]), apply(None, "sub/foo"));
-
-        // Neither flag -> `--branch or --default required` (128). A leading
-        // operand stops option parsing, so trailing `-b feature` is an operand.
-        assert_eq!(cls(&["sub/foo"]), SetBranch::Required);
-        assert_eq!(cls(&["sub/foo", "-b", "feature"]), SetBranch::Required);
-
-        // Both flags -> cannot be used together (128).
-        assert_eq!(cls(&["-b", "x", "-d", "sub/foo"]), SetBranch::Both);
-
-        // Wrong operand count -> subcommand usage (129). `--branch sub/foo`
-        // consumes the path as the value, leaving zero operands.
-        assert_eq!(cls(&["-b", "feature", "sub/foo", "extra"]), SetBranch::UsageSub);
-        assert_eq!(cls(&["--branch", "sub/foo"]), SetBranch::UsageSub);
-        assert_eq!(cls(&["-d"]), SetBranch::UsageSub);
-
-        // Malformed/unknown option -> top-level usage (exit 1).
-        assert_eq!(cls(&["-b", ""]), SetBranch::UsageTop);
-        assert_eq!(cls(&["-b", "", "sub/foo"]), SetBranch::UsageTop);
-        assert_eq!(cls(&["--branch"]), SetBranch::UsageTop);
-        assert_eq!(cls(&["--bogus", "sub/foo"]), SetBranch::UsageTop);
-        assert_eq!(cls(&["-db", "sub/foo"]), SetBranch::UsageTop);
-        assert_eq!(cls(&["--def", "sub/foo"]), SetBranch::UsageTop);
-    }
-
-    /// Pins the 129 usage block to the exact bytes git emits (see the const's
-    /// provenance note): the two `usage:`/`or:` lines and the trailing blank line.
-    #[test]
-    fn set_branch_usage_bytes_match_git() {
-        assert!(SET_BRANCH_USAGE.starts_with(
-            "usage: git submodule set-branch [-q|--quiet] (-d|--default) <path>\n   or: git submodule set-branch [-q|--quiet] (-b|--branch) <branch> <path>\n\n"
-        ));
-        assert!(SET_BRANCH_USAGE.ends_with("set the default tracking branch\n\n"));
-    }
-}
-
 /// `git submodule add [-b <branch>] [-f] [--name <name>] [--] <repository> [<path>]`
 /// — clone `<repository>` into `<path>`, register it in `.gitmodules` and the
 /// local config, and stage both the file and the new gitlink.
@@ -2483,4 +2418,69 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
         println!("Adding existing repo at '{path}' to the index");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cls(args: &[&str]) -> SetBranch {
+        classify_set_branch(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    fn apply(branch: Option<&str>, path: &str) -> SetBranch {
+        SetBranch::Apply {
+            branch: branch.map(str::to_string),
+            path: path.to_string(),
+        }
+    }
+
+    /// Every case below is the observed behavior of stock `git submodule
+    /// set-branch` (git 2.55.0); the enum variant maps 1:1 to git's exit code
+    /// (UsageTop=1, UsageSub=129, Required/Both=128, Apply=0/1).
+    #[test]
+    fn set_branch_parse_matches_git() {
+        // Well-formed writes.
+        assert_eq!(cls(&["-b", "feature", "sub/foo"]), apply(Some("feature"), "sub/foo"));
+        assert_eq!(cls(&["--branch", "feat", "sub/foo"]), apply(Some("feat"), "sub/foo"));
+        assert_eq!(cls(&["--branch=feat", "sub/foo"]), apply(Some("feat"), "sub/foo"));
+        assert_eq!(cls(&["--branch=", "sub/foo"]), apply(Some(""), "sub/foo"));
+        assert_eq!(cls(&["-q", "-b", "feature", "sub/foo"]), apply(Some("feature"), "sub/foo"));
+        assert_eq!(cls(&["-b", "feature", "--", "sub/foo"]), apply(Some("feature"), "sub/foo"));
+        // `--default` removes the key (branch == None).
+        assert_eq!(cls(&["-d", "sub/foo"]), apply(None, "sub/foo"));
+        assert_eq!(cls(&["--default", "sub/foo"]), apply(None, "sub/foo"));
+
+        // Neither flag -> `--branch or --default required` (128). A leading
+        // operand stops option parsing, so trailing `-b feature` is an operand.
+        assert_eq!(cls(&["sub/foo"]), SetBranch::Required);
+        assert_eq!(cls(&["sub/foo", "-b", "feature"]), SetBranch::Required);
+
+        // Both flags -> cannot be used together (128).
+        assert_eq!(cls(&["-b", "x", "-d", "sub/foo"]), SetBranch::Both);
+
+        // Wrong operand count -> subcommand usage (129). `--branch sub/foo`
+        // consumes the path as the value, leaving zero operands.
+        assert_eq!(cls(&["-b", "feature", "sub/foo", "extra"]), SetBranch::UsageSub);
+        assert_eq!(cls(&["--branch", "sub/foo"]), SetBranch::UsageSub);
+        assert_eq!(cls(&["-d"]), SetBranch::UsageSub);
+
+        // Malformed/unknown option -> top-level usage (exit 1).
+        assert_eq!(cls(&["-b", ""]), SetBranch::UsageTop);
+        assert_eq!(cls(&["-b", "", "sub/foo"]), SetBranch::UsageTop);
+        assert_eq!(cls(&["--branch"]), SetBranch::UsageTop);
+        assert_eq!(cls(&["--bogus", "sub/foo"]), SetBranch::UsageTop);
+        assert_eq!(cls(&["-db", "sub/foo"]), SetBranch::UsageTop);
+        assert_eq!(cls(&["--def", "sub/foo"]), SetBranch::UsageTop);
+    }
+
+    /// Pins the 129 usage block to the exact bytes git emits (see the const's
+    /// provenance note): the two `usage:`/`or:` lines and the trailing blank line.
+    #[test]
+    fn set_branch_usage_bytes_match_git() {
+        assert!(SET_BRANCH_USAGE.starts_with(
+            "usage: git submodule set-branch [-q|--quiet] (-d|--default) <path>\n   or: git submodule set-branch [-q|--quiet] (-b|--branch) <branch> <path>\n\n"
+        ));
+        assert!(SET_BRANCH_USAGE.ends_with("set the default tracking branch\n\n"));
+    }
 }

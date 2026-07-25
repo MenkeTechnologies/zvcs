@@ -41,6 +41,9 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 /// substrate gitoxide's high-level fetch does not expose (`--filter`,
 /// `--append`/FETCH_HEAD, `--set-upstream`, `--refmap`) are rejected with a
 /// precise message rather than silently ignored.
+// The final `take_value!` expansion bumps the `i` cursor that no later arm reads;
+// the write is needed by every other expansion, so it can't be removed.
+#[allow(unused_assignments)]
 pub fn fetch(args: &[String]) -> Result<ExitCode> {
     let mut repo = gix::discover(".")?;
 

@@ -53,6 +53,8 @@ const IPC_SOCKET: &str = "fsmonitor--daemon.ipc";
 ///
 /// `start` and `run` are rejected: the daemon side needs a filesystem-event
 /// backend and a simple-IPC server, neither of which is available here.
+// Name maps to git's `fsmonitor--daemon` subcommand; the double underscore is deliberate.
+#[allow(non_snake_case)]
 pub fn fsmonitor__daemon(args: &[String]) -> Result<ExitCode> {
     // `args[0]` is the subcommand itself when dispatched; tolerate its absence.
     let rest = match args.first() {

@@ -1260,6 +1260,7 @@ pub(crate) fn render_help(buf: &mut Buffer) {
 /// tool it actually belongs to and listing ITS keys. zdashboard renders its own
 /// section list through here — a help screen that names another program and
 /// advertises bindings the running one does not have is worse than no help.
+#[allow(clippy::type_complexity)] // sections table shape; a lifetime alias would over-constrain
 pub(crate) fn render_help_for(
     buf: &mut Buffer,
     tool: &str,

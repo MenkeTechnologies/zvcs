@@ -808,14 +808,14 @@ fn record_person(people: &mut Vec<(BString, usize)>, name: &BStr) {
 /// git's `add_people_info()` plus `credit_people()`.
 fn add_people_info(
     repo: &Repository,
-    authors: &mut Vec<(BString, usize)>,
-    committers: &mut Vec<(BString, usize)>,
+    authors: &mut [(BString, usize)],
+    committers: &mut [(BString, usize)],
     comment: &BStr,
     out: &mut Vec<u8>,
 ) {
     // The lists arrive sorted by name; git then sorts by descending count.
-    authors.sort_by(|a, b| b.1.cmp(&a.1));
-    committers.sort_by(|a, b| b.1.cmp(&a.1));
+    authors.sort_by_key(|a| std::cmp::Reverse(a.1));
+    committers.sort_by_key(|c| std::cmp::Reverse(c.1));
 
     let me_author = identity(repo.author());
     let me_committer = identity(repo.committer());

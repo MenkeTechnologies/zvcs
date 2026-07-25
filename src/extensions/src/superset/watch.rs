@@ -394,7 +394,7 @@ fn most_recently_used(n: usize) -> Vec<(String, Option<String>)> {
             Some((mtime, r.git_dir, r.workdir))
         })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0)); // most recent first
+    scored.sort_by_key(|t| std::cmp::Reverse(t.0)); // most recent first
     scored.truncate(n);
     scored.into_iter().map(|(_, gd, wd)| (gd, wd)).collect()
 }

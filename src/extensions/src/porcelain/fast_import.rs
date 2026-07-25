@@ -790,8 +790,7 @@ impl Importer {
         }
 
         // File changes run until a blank line, EOF, or a line we do not own.
-        loop {
-            let Some(cmd) = line.clone() else { break };
+        while let Some(cmd) = line.clone() {
             if cmd.is_empty() {
                 break;
             }

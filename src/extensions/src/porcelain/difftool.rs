@@ -481,8 +481,7 @@ struct RawRecord {
 fn parse_raw(buf: &[u8]) -> Result<Vec<RawRecord>> {
     let mut fields = buf.split(|&b| b == 0);
     let mut out = Vec::new();
-    loop {
-        let Some(header) = fields.next() else { break };
+    while let Some(header) = fields.next() {
         if header.is_empty() {
             // Trailing empty field after the final NUL.
             break;

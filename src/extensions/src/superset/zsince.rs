@@ -138,6 +138,16 @@ pub(crate) fn parse_duration(s: &str) -> Option<i64> {
     Some(total)
 }
 
+/// Local-time `HH:MM:SS` for an epoch-seconds timestamp.
+fn hms(ts: i64) -> String {
+    let t = ts as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return "--:--:--".to_string();
+    }
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_duration;
@@ -161,14 +171,4 @@ mod tests {
         assert_eq!(parse_duration("100000000000000000d"), None);
         assert_eq!(parse_duration("99999999999999999999"), None); // overflows the digit accumulate
     }
-}
-
-/// Local-time `HH:MM:SS` for an epoch-seconds timestamp.
-fn hms(ts: i64) -> String {
-    let t = ts as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
-        return "--:--:--".to_string();
-    }
-    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }

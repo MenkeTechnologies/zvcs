@@ -1336,8 +1336,8 @@ fn topo_sort(nodes: Vec<Node>, by_date: bool) -> Vec<Node> {
     for &i in &out {
         placed[i] = true;
     }
-    for i in 0..nodes.len() {
-        if !placed[i] {
+    for (i, &is_placed) in placed.iter().enumerate() {
+        if !is_placed {
             out.push(i);
         }
     }
@@ -1846,7 +1846,7 @@ fn expand_decoration(
             .iter()
             .filter(|d| !(d.kind == DecoKind::LocalBranch && Some(d.name.as_str()) == head_branch))
             .collect();
-        ordered.sort_by(|a, b| full(b).cmp(&full(a)));
+        ordered.sort_by_key(|d| std::cmp::Reverse(full(d)));
         for d in ordered {
             // `--decorate=full` / `log.decorate=full` renders the full ref name
             // (`refs/heads/main`) in place of the short one (`main`).
@@ -3294,9 +3294,7 @@ impl Graph {
             if col_commit == self.commit {
                 seen_this = true;
                 line.push(b'|');
-                for _ in 1..self.num_parents {
-                    line.push(b'\\');
-                }
+                line.extend((1..self.num_parents).map(|_| b'\\'));
             } else if seen_this {
                 line.extend_from_slice(b"\\ ");
             } else {

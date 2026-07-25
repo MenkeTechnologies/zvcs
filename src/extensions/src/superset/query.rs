@@ -259,7 +259,7 @@ pub fn zsize(args: &[String]) -> Result<ExitCode> {
         .zip(&sizes)
         .map(|((_, wd), s)| (*s, wd.display().to_string()))
         .collect();
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
     if json {
         emit_json(rows.iter().map(|(size, path)| serde_json::json!({"repo": path, "bytes": size})));
         return Ok(ExitCode::SUCCESS);
@@ -436,7 +436,7 @@ pub fn zlast(args: &[String]) -> Result<ExitCode> {
         .zip(&times)
         .filter_map(|((_, wd), t)| t.map(|s| (s, wd.display().to_string())))
         .collect();
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
     if json {
         emit_json(rows.iter().map(|(secs, path)| {
             serde_json::json!({"repo": path, "last": crate::date::show_date_relative(*secs, now), "epoch": secs})
@@ -559,7 +559,7 @@ pub fn zbig(args: &[String]) -> Result<ExitCode> {
     let Some(repos) = select_repos(&sel)? else { return Ok(ExitCode::SUCCESS) };
     let per = parallel_map(&repos, big_files);
     let mut all: Vec<(u64, String)> = per.into_iter().flatten().collect();
-    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.sort_by_key(|a| std::cmp::Reverse(a.0));
     all.truncate(n);
     if json {
         emit_json(all.iter().map(|(size, path)| serde_json::json!({"file": path, "bytes": size})));
@@ -589,7 +589,7 @@ fn big_files(git_dir: &Path, workdir: &Path) -> Vec<(u64, String)> {
             }
         }
     }
-    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v.sort_by_key(|a| std::cmp::Reverse(a.0));
     v.truncate(200);
     v
 }

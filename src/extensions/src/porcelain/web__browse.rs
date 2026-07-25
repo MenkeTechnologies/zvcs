@@ -87,6 +87,7 @@ const KNOWN_TOOLS: &[&str] = &[
     "xdg-open",
 ];
 
+#[allow(non_snake_case)] // maps to git's `web--browse` subcommand
 pub fn web__browse(args: &[String]) -> Result<ExitCode> {
     // `git-sh-setup` inspects `$1` alone, echoes LONG_USAGE (which is just the
     // usage line, as this script sets no LONG_USAGE) to stdout, and exits 0.

@@ -662,7 +662,8 @@ fn emit_porcelain(
     // git prints a commit's detail block once per output (`--porcelain`) or once
     // per line (`--line-porcelain`).
     let mut shown: HashSet<ObjectId> = HashSet::new();
-    let mut previous_cache: HashMap<(ObjectId, Vec<u8>), Option<(String, Vec<u8>)>> = HashMap::new();
+    type PreviousCache = HashMap<(ObjectId, Vec<u8>), Option<(String, Vec<u8>)>>;
+    let mut previous_cache: PreviousCache = HashMap::new();
 
     for group in group_lines(lines) {
         let first = &lines[group.start];
@@ -1461,7 +1462,7 @@ fn parse_line_range(spec: &str, ranges: &mut Vec<RangeInclusive<u32>>) -> Result
 
     let end: u32 = match end_part {
         None => u32::MAX,
-        Some(e) if e.is_empty() => u32::MAX,
+        Some("") => u32::MAX,
         Some(e) if e.starts_with('+') => {
             let count: u32 = e[1..]
                 .parse()

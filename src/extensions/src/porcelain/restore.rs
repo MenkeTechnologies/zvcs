@@ -72,7 +72,7 @@ fn resolve_spec(prefix: &[String], wd: &Path, raw: &str) -> Result<Option<String
             return Ok(None);
         }
         return match raw.strip_prefix(&*wds).and_then(|r| r.strip_prefix('/')) {
-            Some(rest) if rest.is_empty() => Ok(None),
+            Some("") => Ok(None),
             Some(rest) => Ok(Some(rest.trim_end_matches('/').to_string())),
             None => Err(()),
         };

@@ -272,6 +272,7 @@ pub fn zprocs(args: &[String]) -> Result<ExitCode> {
         by_session.entry(v.session.clone()).or_default().push((v.verb.clone(), v.count));
     }
     // Order processes by their total mutating commands, busiest first.
+    #[allow(clippy::type_complexity)] // borrowed PpidRow makes a lifetime-parameterized alias awkward
     let mut rows: Vec<(&crate::db::PpidRow, Vec<(String, i64)>, i64)> = procs
         .iter()
         .filter_map(|p| {
@@ -283,7 +284,7 @@ pub fn zprocs(args: &[String]) -> Result<ExitCode> {
             Some((p, vs, total))
         })
         .collect();
-    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    rows.sort_by_key(|x| std::cmp::Reverse(x.2));
 
     if json {
         let arr: Vec<_> = rows

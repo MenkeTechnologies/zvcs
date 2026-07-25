@@ -1774,8 +1774,8 @@ fn collect(
     // blob diff declined because a side is binary — the ids whose sizes git
     // reports instead. Sizes are looked up after the walk so the callback stays
     // infallible.
-    let mut raw: Vec<(BString, String, Option<(u64, u64)>, Option<ObjectId>, Option<ObjectId>)> =
-        Vec::new();
+    type RawRow = (BString, String, Option<(u64, u64)>, Option<ObjectId>, Option<ObjectId>);
+    let mut raw: Vec<RawRow> = Vec::new();
     let mut summary: Vec<(BString, String)> = Vec::new();
 
     let mut platform = old.changes()?;

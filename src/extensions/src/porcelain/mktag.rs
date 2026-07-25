@@ -277,7 +277,6 @@ impl Reporter {
             };
             overrides.push((msg.id(), severity));
         }
-        drop(snapshot);
 
         Ok(Reporter {
             strict,

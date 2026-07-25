@@ -22,6 +22,7 @@ mod check_ignore;
 mod check_mailmap;
 mod check_ref_format;
 mod checkout;
+#[allow(non_snake_case)] // maps to git's `checkout--worker` subcommand
 mod checkout__worker;
 mod checkout_index;
 mod cherry;
@@ -37,6 +38,7 @@ mod config;
 mod count_objects;
 mod credential;
 mod credential_cache;
+#[allow(non_snake_case)] // maps to git's `credential-cache--daemon` subcommand
 mod credential_cache__daemon;
 mod credential_netrc;
 mod credential_osxkeychain;
@@ -53,6 +55,7 @@ mod diff_index;
 mod diff_pairs;
 mod diff_tree;
 mod difftool;
+#[allow(non_snake_case)] // maps to git's `difftool--helper` subcommand
 mod difftool__helper;
 mod fast_export;
 mod fast_import;
@@ -66,6 +69,7 @@ mod format_patch;
 mod format_rev;
 mod fsck;
 mod fsck_objects;
+#[allow(non_snake_case)] // maps to git's `fsmonitor--daemon` subcommand
 mod fsmonitor__daemon;
 mod gc;
 mod get_tar_commit_id;
@@ -151,6 +155,7 @@ mod revert;
 mod rm;
 mod send_email;
 mod send_pack;
+#[allow(non_snake_case)] // maps to git's `sh-i18n--envsubst` subcommand
 mod sh_i18n__envsubst;
 mod shell;
 mod shortlog;
@@ -164,6 +169,7 @@ mod stash;
 mod status;
 mod stripspace;
 mod submodule;
+#[allow(non_snake_case)] // maps to git's `submodule--helper` subcommand
 mod submodule__helper;
 mod subtree;
 mod switch;
@@ -175,6 +181,7 @@ mod update_index;
 mod update_ref;
 mod update_server_info;
 mod upload_archive;
+#[allow(non_snake_case)] // maps to git's `upload-archive--writer` subcommand
 mod upload_archive__writer;
 mod upload_pack;
 mod url_parse;
@@ -183,6 +190,7 @@ mod verify_commit;
 mod verify_pack;
 mod verify_tag;
 mod version;
+#[allow(non_snake_case)] // maps to git's `web--browse` subcommand
 mod web__browse;
 mod whatchanged;
 mod worktree;

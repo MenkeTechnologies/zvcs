@@ -469,7 +469,7 @@ fn push_if(stack: &mut Vec<Frame>, cmp_status: CmpStatus, str: Option<Vec<u8>>) 
 
 /// `%(then)`: decide the condition from the text collected since `%(if)`, then
 /// reset the frame so it collects the then-branch.
-fn then_atom(stack: &mut Vec<Frame>) -> Result<()> {
+fn then_atom(stack: &mut [Frame]) -> Result<()> {
     let cur = stack.last_mut().expect("base frame");
     let (cmp_status, needle) = match &mut cur.cond {
         Some(c) => {

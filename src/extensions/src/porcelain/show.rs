@@ -644,6 +644,7 @@ impl Pickaxe {
 
 /// Render the object `id` (named `spec` on the command line), peeling annotated
 /// tags to their target after printing the tag header.
+#[allow(clippy::too_many_arguments)]
 fn show_one(
     repo: &gix::Repository,
     out: &mut Vec<u8>,
@@ -736,6 +737,7 @@ fn show_tag(out: &mut Vec<u8>, obj: &gix::Object<'_>, date_mode: DateMode) -> Re
 
 /// The commit header in the selected pretty format, then the separator, then the
 /// selected diff output against the first parent.
+#[allow(clippy::too_many_arguments)]
 fn show_commit(
     repo: &gix::Repository,
     out: &mut Vec<u8>,

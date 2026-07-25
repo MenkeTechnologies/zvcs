@@ -93,6 +93,7 @@ const USAGE: &str = "usage: git submodule--helper <command>\n\n";
 /// Reproduces `parse_options`' `PARSE_OPT_SUBCOMMAND` behaviour exactly (this
 /// builtin declares no options of its own), then routes to the four ported
 /// subcommands; every other registered subcommand bails.
+#[allow(non_snake_case)] // maps to git's `submodule--helper` subcommand
 pub fn submodule__helper(args: &[String]) -> Result<ExitCode> {
     // Dispatch hands us the tail; tolerate the subcommand name at index 0 so
     // either calling convention behaves the same.

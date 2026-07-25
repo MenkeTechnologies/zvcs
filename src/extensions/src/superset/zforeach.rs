@@ -54,7 +54,8 @@ pub fn zforeach(args: &[String]) -> Result<ExitCode> {
     let repos = Arc::new(repos);
     let cmd = Arc::new(cmd);
     let next = Arc::new(AtomicUsize::new(0));
-    let results: Arc<Mutex<Vec<Option<(bool, String)>>>> = Arc::new(Mutex::new(vec![None; n]));
+    type Results = Arc<Mutex<Vec<Option<(bool, String)>>>>;
+    let results: Results = Arc::new(Mutex::new(vec![None; n]));
 
     let workers = thread::available_parallelism().map(|c| c.get().min(16)).unwrap_or(4);
     let handles: Vec<_> = (0..workers)

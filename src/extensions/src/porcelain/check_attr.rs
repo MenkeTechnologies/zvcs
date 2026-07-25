@@ -39,6 +39,7 @@ usage: git check-attr [--source <tree-ish>] [-a | --all | <attr>...] [--] <pathn
 
 /// The index the attribute stack derives its in-tree `.gitattributes` mapping
 /// from: the worktree index, or one materialised from `--source`'s tree.
+#[allow(clippy::large_enum_variant)] // Boxing would churn every construct/match site.
 enum AttrIndex {
     Worktree(gix::worktree::Index),
     FromTree(gix::index::File),
@@ -303,7 +304,7 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
         // then does the metadata collection know every attribute name — so the
         // outcome has to be sized against it afterwards. The second descent is
         // a cache hit on the same stack.
-        stack.at_entry(rel.as_bstr(), mode)?;
+        let _ = stack.at_entry(rel.as_bstr(), mode)?;
         if all {
             outcome.initialize(stack.attributes_collection());
         } else {

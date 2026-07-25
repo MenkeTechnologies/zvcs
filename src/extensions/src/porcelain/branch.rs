@@ -1453,7 +1453,6 @@ fn unset_upstream(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     if !has_upstream {
         return fatal(format!("branch '{branch_name}' has no upstream information"));
     }
-    drop(snap);
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let path = repo.common_dir().join("config");

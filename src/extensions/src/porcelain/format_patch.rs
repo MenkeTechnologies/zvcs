@@ -3332,8 +3332,7 @@ fn emit_hunks_with_ignorable(
             lines.push((DiffLineKind::Context, after_lines[l as usize]));
         }
         let (mut c1, mut c2) = (i64::from(f.i1), i64::from(f.i2));
-        for k in first..=last {
-            let ch = &changes[k];
+        for ch in &changes[first..=last] {
             // Context bridging this change and the previous one in the hunk.
             while c1 < i64::from(ch.i1) && c2 < i64::from(ch.i2) {
                 lines.push((DiffLineKind::Context, after_lines[c2 as usize]));

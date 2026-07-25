@@ -376,11 +376,13 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
 // ---------------------------------------------------------------------------
 
 fn parse(args: &[String], defaults: &AmDefaults) -> Result<Opts, Usage> {
-    let mut o = Opts::default();
     // `am_state_init` sets these from `git_am_config` before `parse_options`
     // runs; a later `--3way`/`--no-3way`/`-m`/`--no-message-id` overrides them.
-    o.threeway = defaults.threeway;
-    o.message_id = defaults.message_id;
+    let mut o = Opts {
+        threeway: defaults.threeway,
+        message_id: defaults.message_id,
+        ..Opts::default()
+    };
     let mut end_of_opts = false;
     let mut i = 0;
 

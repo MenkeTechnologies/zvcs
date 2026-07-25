@@ -760,6 +760,7 @@ fn commit_info(
 /// name-rev's `name_rev()`: walk `start`'s ancestry (first-parent-priority DFS via a
 /// LIFO stack) propagating `tip_name` to every commit it beats, honoring the date
 /// cutoff. `deref` marks a name reached by peeling a tag (adds a `^0` handle).
+#[allow(clippy::too_many_arguments)]
 fn name_rev(
     names: &mut std::collections::HashMap<ObjectId, RevName>,
     cache: &mut std::collections::HashMap<ObjectId, CommitInfo>,

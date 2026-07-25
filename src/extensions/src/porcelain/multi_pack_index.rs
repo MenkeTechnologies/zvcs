@@ -1101,6 +1101,7 @@ fn reject_chain(pack_dir: &Path) -> Result<()> {
 
 /// Outcome of trying to interpret `a` as one of the two options every
 /// sub-command shares with the top level.
+#[allow(clippy::enum_variant_names)] // Consumed/MissingValue/NotCommon are the intended names
 enum Common {
     /// Recognised and fully handled, including any separate value argument.
     Consumed,

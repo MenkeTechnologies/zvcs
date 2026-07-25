@@ -317,8 +317,8 @@ fn scan_pack_dir(objdir: &Path, hash: gix::hash::Kind, garbage: &mut Garbage) ->
             j += 1;
         }
         if seen != (FILE_PACK | FILE_IDX) {
-            for k in i..j {
-                garbage.report(seen, &deferred[k]);
+            for entry in &deferred[i..j] {
+                garbage.report(seen, entry);
             }
         }
         i = j;

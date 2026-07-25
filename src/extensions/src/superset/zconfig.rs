@@ -262,11 +262,7 @@ mod tests {
         // The listed default must be a value the setting actually accepts —
         // guards the table against a default that `normalize` would reject.
         for s in SETTINGS {
-            let input = match s.default {
-                "on" => "on",
-                "off" => "off",
-                other => other,
-            };
+            let input = s.default;
             assert!(normalize(s, input).is_ok(), "{} rejects its own default", s.key);
         }
     }

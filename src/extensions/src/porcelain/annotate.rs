@@ -789,7 +789,7 @@ fn resolve_line_spec(
         // A bare `-L<n>` is `-L<n>,` — to the end of the file (verified: on a
         // 5-line file both `-L2` and `-L2,` print lines 2 through 5).
         None => file_lines,
-        Some(e) if e.is_empty() => file_lines,
+        Some("") => file_lines,
         Some(e) if e.starts_with('+') => {
             let count: u32 = e[1..]
                 .parse()

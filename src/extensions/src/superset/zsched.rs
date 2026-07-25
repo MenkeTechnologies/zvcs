@@ -85,7 +85,7 @@ pub fn spawn_scheduler() {
                     Some(&t) => now.duration_since(t) >= Duration::from_secs(s.interval),
                     None => false, // first sight: arm it, fire next interval
                 };
-                if last.get(&s.id).is_none() || due {
+                if !last.contains_key(&s.id) || due {
                     if due {
                         fire(s);
                     }

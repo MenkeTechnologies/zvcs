@@ -87,6 +87,7 @@ struct Rejected {
     output: bool,
 }
 
+#[allow(non_snake_case)] // maps to git's `upload-archive--writer` subcommand
 pub fn upload_archive__writer(args: &[String]) -> Result<ExitCode> {
     // `-h` alone prints to stdout; every other bad argument count to stderr.
     if args.len() == 1 && args[0] == "-h" {

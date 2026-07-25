@@ -65,6 +65,7 @@ const GROUP: usize = 7;
 ///
 /// See the module documentation for the invocations that are reproduced
 /// byte-for-byte and for the tool database the rest would need.
+#[allow(non_snake_case)] // maps to git's `difftool--helper` subcommand
 pub fn difftool__helper(args: &[String]) -> Result<ExitCode> {
     // Dispatch includes the verb at index 0. The helper's positionals are paths,
     // so strip exactly one leading literal verb.

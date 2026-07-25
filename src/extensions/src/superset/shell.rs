@@ -171,6 +171,7 @@ pub fn ztouch(args: &[String]) -> Result<ExitCode> {
         let handle = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(f)
             .map_err(|e| anyhow::anyhow!("{f}: {e}"))?;
         handle

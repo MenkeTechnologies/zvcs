@@ -27,6 +27,7 @@ use std::sync::atomic::AtomicBool;
 /// A no-op checkout is exactly what an empty subset means, so skipping is both
 /// correct and what avoids the panic. Every call site routes through here so
 /// the invariant holds in one place instead of thirteen.
+#[allow(clippy::result_large_err)] // checkout::Error is large; boxing would churn all call sites
 pub fn checkout_subset<Find>(
     index: &mut gix::index::State,
     dir: impl Into<PathBuf>,

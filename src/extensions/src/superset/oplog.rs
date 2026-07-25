@@ -90,47 +90,6 @@ fn short(sha: &str) -> &str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::head_authored_by_zvcs;
-
-    /// Write a `logs/HEAD` whose last entry carries `msg`, then classify it.
-    fn classify(msg: &str) -> bool {
-        let dir = std::env::temp_dir().join(format!("zvcs-oplog-{}-{}", std::process::id(), msg.len()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("logs")).unwrap();
-        let z = "0000000000000000000000000000000000000000";
-        let o = "1111111111111111111111111111111111111111";
-        // Two entries so we also prove only the LAST is consulted.
-        let body = format!(
-            "{z} {o} T <t@e.x> 1700000000 +0000\tcommit: earlier work\n\
-             {o} {o} T <t@e.x> 1700000001 +0000\t{msg}\n"
-        );
-        std::fs::write(dir.join("logs/HEAD"), &body).unwrap();
-        let r = head_authored_by_zvcs(&dir);
-        let _ = std::fs::remove_dir_all(&dir);
-        r
-    }
-
-    #[test]
-    fn zvcs_own_writes_are_recognized() {
-        assert!(classify("zsync: fast-forward main to origin/main"));
-        assert!(classify("zsync: attach HEAD to main"));
-        assert!(classify("zvcs attach: point main at HEAD"));
-        assert!(classify("zvcs attach: HEAD -> main"));
-        assert!(classify("commit: zvcs: autobump 2 submodule pointers"));
-    }
-
-    #[test]
-    fn user_commits_mentioning_zvcs_are_not_suppressed() {
-        // The exact class the bare-substring guard broke: this repo's own history.
-        assert!(!classify("commit: zvcs: async z-verbs (zcommit/zpush)"));
-        assert!(!classify("commit: zvcs: SQLite ledger + repo index"));
-        assert!(!classify("commit: zsync should be faster"));
-        assert!(!classify("commit: ordinary user work"));
-    }
-}
-
 /// `git zlog [-n N]` — machine-wide reflog timeline across all indexed repos
 /// (newest first). Pipe-clean: `<unixtime>\t<repo>\t<old>..<new>\t<message>`.
 pub fn zlog(args: &[String]) -> Result<ExitCode> {
@@ -165,7 +124,7 @@ pub fn zlog(args: &[String]) -> Result<ExitCode> {
             all.push((label.clone(), e));
         }
     }
-    all.sort_by(|a, b| b.1.time.cmp(&a.1.time));
+    all.sort_by_key(|x| std::cmp::Reverse(x.1.time));
     for (repo, e) in all.iter().take(n) {
         println!("{}\t{}\t{}..{}\t{}", e.time, repo, short(&e.old), short(&e.new), e.msg);
     }
@@ -223,4 +182,45 @@ pub fn zundo(args: &[String]) -> Result<ExitCode> {
     }
     println!("undid \"{}\" — now at {}", msg, short(&prev));
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::head_authored_by_zvcs;
+
+    /// Write a `logs/HEAD` whose last entry carries `msg`, then classify it.
+    fn classify(msg: &str) -> bool {
+        let dir = std::env::temp_dir().join(format!("zvcs-oplog-{}-{}", std::process::id(), msg.len()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let z = "0000000000000000000000000000000000000000";
+        let o = "1111111111111111111111111111111111111111";
+        // Two entries so we also prove only the LAST is consulted.
+        let body = format!(
+            "{z} {o} T <t@e.x> 1700000000 +0000\tcommit: earlier work\n\
+             {o} {o} T <t@e.x> 1700000001 +0000\t{msg}\n"
+        );
+        std::fs::write(dir.join("logs/HEAD"), &body).unwrap();
+        let r = head_authored_by_zvcs(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    }
+
+    #[test]
+    fn zvcs_own_writes_are_recognized() {
+        assert!(classify("zsync: fast-forward main to origin/main"));
+        assert!(classify("zsync: attach HEAD to main"));
+        assert!(classify("zvcs attach: point main at HEAD"));
+        assert!(classify("zvcs attach: HEAD -> main"));
+        assert!(classify("commit: zvcs: autobump 2 submodule pointers"));
+    }
+
+    #[test]
+    fn user_commits_mentioning_zvcs_are_not_suppressed() {
+        // The exact class the bare-substring guard broke: this repo's own history.
+        assert!(!classify("commit: zvcs: async z-verbs (zcommit/zpush)"));
+        assert!(!classify("commit: zvcs: SQLite ledger + repo index"));
+        assert!(!classify("commit: zsync should be faster"));
+        assert!(!classify("commit: ordinary user work"));
+    }
 }

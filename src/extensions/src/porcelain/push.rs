@@ -698,7 +698,7 @@ fn parse_refspec(
         // Bare `src` (or `src:`): push to the source's own full name — git's
         // `matched_src->name` default. A tag stays a tag, a branch stays a branch.
         None => src_full.clone().unwrap_or_else(|| full_ref_name(src)),
-        Some(d) if d.is_empty() => src_full.clone().unwrap_or_else(|| full_ref_name(src)),
+        Some("") => src_full.clone().unwrap_or_else(|| full_ref_name(src)),
         // A fully-qualified destination is used verbatim.
         Some(d) if d.starts_with("refs/") => d.to_string(),
         // A short explicit destination is prefixed by the source ref's kind, exactly
@@ -1126,6 +1126,65 @@ fn reachable(repo: &gix::Repository, commit: ObjectId, tip: ObjectId) -> bool {
     }
 }
 
+/// Expand a pattern refspec — `[+]<src-prefix>*<src-suffix>:<dst-prefix>*<dst-suffix>`
+/// — into one [`Request`] per matching local ref.
+///
+/// Ports the glob half of git's `match_push_refs`: exactly one `*` on each side,
+/// the text it matched on the source carried into the destination, and a missing
+/// destination meaning "same name over there". The refs are walked once, in name
+/// order, so the pushed set is deterministic.
+///
+/// Only refs are matched, never revisions: `refs/heads/*` cannot select a commit,
+/// which is why this is separate from [`parse_refspec`]'s `rev_parse_single`.
+fn expand_pattern_refspec(
+    repo: &gix::Repository,
+    spec: &str,
+    force: bool,
+) -> Result<Vec<Request>> {
+    let (spec, force) = match spec.strip_prefix('+') {
+        Some(rest) => (rest, true),
+        None => (spec, force),
+    };
+    let (src, dst) = match spec.split_once(':') {
+        Some((s, d)) => (s, d),
+        None => (spec, spec),
+    };
+    if src.matches('*').count() != 1 || dst.matches('*').count() != 1 {
+        bail!("invalid refspec '{spec}': a pattern needs exactly one '*' on each side");
+    }
+    let (src_prefix, src_suffix) = src.split_once('*').expect("checked above");
+    let (dst_prefix, dst_suffix) = dst.split_once('*').expect("checked above");
+    let src_prefix = full_ref_name(src_prefix);
+    let dst_prefix = full_ref_name(dst_prefix);
+
+    let mut out = Vec::new();
+    let mut names: Vec<(String, ObjectId)> = Vec::new();
+    for r in repo.references()?.all()? {
+        let r = r.map_err(|e| anyhow!("{e}"))?;
+        let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
+        if let Some(id) = r.try_id() {
+            names.push((name, id.detach()));
+        }
+    }
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (name, id) in names {
+        let Some(rest) = name.strip_prefix(src_prefix.as_str()) else { continue };
+        let Some(matched) = rest.strip_suffix(src_suffix) else { continue };
+        if matched.is_empty() {
+            continue;
+        }
+        out.push(Request {
+            name: format!("{dst_prefix}{matched}{dst_suffix}"),
+            new: id,
+            force,
+            expected: None,
+            only_if_absent: false,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1292,63 +1351,4 @@ mod tests {
         append_followed_tags(&repo, &mut requests).expect("append");
         assert_eq!(requests.len(), 1, "no tips to be reachable from, so no tags");
     }
-}
-
-/// Expand a pattern refspec — `[+]<src-prefix>*<src-suffix>:<dst-prefix>*<dst-suffix>`
-/// — into one [`Request`] per matching local ref.
-///
-/// Ports the glob half of git's `match_push_refs`: exactly one `*` on each side,
-/// the text it matched on the source carried into the destination, and a missing
-/// destination meaning "same name over there". The refs are walked once, in name
-/// order, so the pushed set is deterministic.
-///
-/// Only refs are matched, never revisions: `refs/heads/*` cannot select a commit,
-/// which is why this is separate from [`parse_refspec`]'s `rev_parse_single`.
-fn expand_pattern_refspec(
-    repo: &gix::Repository,
-    spec: &str,
-    force: bool,
-) -> Result<Vec<Request>> {
-    let (spec, force) = match spec.strip_prefix('+') {
-        Some(rest) => (rest, true),
-        None => (spec, force),
-    };
-    let (src, dst) = match spec.split_once(':') {
-        Some((s, d)) => (s, d),
-        None => (spec, spec),
-    };
-    if src.matches('*').count() != 1 || dst.matches('*').count() != 1 {
-        bail!("invalid refspec '{spec}': a pattern needs exactly one '*' on each side");
-    }
-    let (src_prefix, src_suffix) = src.split_once('*').expect("checked above");
-    let (dst_prefix, dst_suffix) = dst.split_once('*').expect("checked above");
-    let src_prefix = full_ref_name(src_prefix);
-    let dst_prefix = full_ref_name(dst_prefix);
-
-    let mut out = Vec::new();
-    let mut names: Vec<(String, ObjectId)> = Vec::new();
-    for r in repo.references()?.all()? {
-        let r = r.map_err(|e| anyhow!("{e}"))?;
-        let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
-        if let Some(id) = r.try_id() {
-            names.push((name, id.detach()));
-        }
-    }
-    names.sort_by(|a, b| a.0.cmp(&b.0));
-
-    for (name, id) in names {
-        let Some(rest) = name.strip_prefix(src_prefix.as_str()) else { continue };
-        let Some(matched) = rest.strip_suffix(src_suffix) else { continue };
-        if matched.is_empty() {
-            continue;
-        }
-        out.push(Request {
-            name: format!("{dst_prefix}{matched}{dst_suffix}"),
-            new: id,
-            force,
-            expected: None,
-            only_if_absent: false,
-        });
-    }
-    Ok(out)
 }

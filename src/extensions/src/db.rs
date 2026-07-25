@@ -724,6 +724,7 @@ pub fn stop_if_queued(conn: &Connection, id: i64) -> Result<bool> {
 /// Clone a job into a new `queued` row linked by `parent_job_id`, for restart.
 /// Returns `(new_id, spec_json)` to enqueue, or `None` if the job is unknown.
 pub fn restart_job(conn: &Connection, id: i64) -> Result<Option<(i64, String)>> {
+    #[allow(clippy::type_complexity)] // one-off row tuple; a named alias adds no clarity
     let row: Option<(Option<i64>, String, Option<String>, Option<String>)> = conn
         .query_row(
             "SELECT repo_id, kind, spec, session_key FROM jobs WHERE id=?1",
@@ -1021,6 +1022,7 @@ pub fn post_message(conn: &Connection, from: &str, to: Option<&str>, body: &str)
 
 /// Messages `session` has not read (broadcast or addressed to it, not its own),
 /// oldest first: `(id, from_session, body, ts)`.
+#[allow(clippy::type_complexity)] // one-off row tuple return; a named alias adds no clarity
 pub fn unread_messages(
     conn: &Connection,
     session: &str,
@@ -1072,6 +1074,7 @@ pub fn add_subscription(
 }
 
 /// Every subscription: `(id, kind, repo_like, command)`.
+#[allow(clippy::type_complexity)] // one-off row tuple return; a named alias adds no clarity
 pub fn list_subscriptions(
     conn: &Connection,
 ) -> Result<Vec<(i64, Option<String>, Option<String>, String)>> {

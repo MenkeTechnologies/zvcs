@@ -526,11 +526,7 @@ impl Mailinfo {
         }
 
         let mut continuation = Vec::new();
-        loop {
-            match self.input.peek() {
-                Some(b' ') | Some(b'\t') => {}
-                _ => break,
-            }
+        while let Some(b' ') | Some(b'\t') = self.input.peek() {
             if !self.input.getline_lf(&mut continuation) {
                 break;
             }
@@ -547,6 +543,8 @@ impl Mailinfo {
     /// `check_header()`: store a recognised header, returning whether the line
     /// was one. `primary` selects `p_hdr_data` over `s_hdr_data`.
     fn check_header(&mut self, line: &[u8], primary: bool, overwrite: bool) -> Result<bool> {
+        // `i` cross-indexes HEADER, p_hdr and s_hdr in lockstep; not a single slice.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..HEADER.len() {
             let taken = if primary {
                 self.p_hdr[i].is_some()
@@ -609,10 +607,7 @@ impl Mailinfo {
         let mut out: Vec<u8> = Vec::new();
         let mut cursor = 0usize;
 
-        loop {
-            let Some(rel) = find(&v[cursor..], b"=?") else {
-                break;
-            };
+        while let Some(rel) = find(&v[cursor..], b"=?") {
             let word = cursor + rel;
 
             if cursor != word {
@@ -750,8 +745,8 @@ impl Mailinfo {
 
                     let mut parts = split_keep(line, b'\n');
                     let last = parts.len().saturating_sub(1);
-                    for idx in 0..parts.len() {
-                        let mut part = std::mem::take(&mut parts[idx]);
+                    for (idx, slot) in parts.iter_mut().enumerate() {
+                        let mut part = std::mem::take(slot);
                         if idx == last && part.last() != Some(&b'\n') {
                             prev = part;
                             break;
@@ -1087,6 +1082,8 @@ impl Mailinfo {
     fn handle_info(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
 
+        // `i` cross-indexes HEADER, s_hdr and p_hdr in lockstep; not a single slice.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..HEADER.len() {
             // In-body headers only win once a patch was actually produced.
             let mut hdr = if self.patch_lines != 0 && self.s_hdr[i].is_some() {

@@ -683,8 +683,8 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     // message; the first path is diagnosed as a possibly-misspelt revision when
     // revisions were allowed at that position.
     if !seen_dashdash {
-        for j in path_start..rest.len() {
-            if let Some(code) = verify_filename(&rest[j], j == path_start && allow_revs) {
+        for (j, item) in rest.iter().enumerate().skip(path_start) {
+            if let Some(code) = verify_filename(item, j == path_start && allow_revs) {
                 return Ok(code);
             }
         }
@@ -1635,13 +1635,16 @@ impl TokParser<'_> {
         let x = self.and_expr()?;
         // git ORs two adjacent expressions with no explicit operator between them,
         // stopping at a closing paren or the end of the token stream.
-        if x.is_some() && self.peek().is_some() && !matches!(self.peek(), Some(Tok::Close)) {
-            return match self.or_expr()? {
-                Some(y) => Ok(Some(Expr::Or(Box::new(x.unwrap()), Box::new(y)))),
-                None => Err("not a pattern expression".into()),
-            };
+        if let Some(xv) = x {
+            if self.peek().is_some() && !matches!(self.peek(), Some(Tok::Close)) {
+                return match self.or_expr()? {
+                    Some(y) => Ok(Some(Expr::Or(Box::new(xv), Box::new(y)))),
+                    None => Err("not a pattern expression".into()),
+                };
+            }
+            return Ok(Some(xv));
         }
-        Ok(x)
+        Ok(None)
     }
 }
 
@@ -1715,7 +1718,7 @@ impl<'r> DiffAttrs<'r> {
         let mode = Some(gix::index::entry::Mode::FILE);
         // The first descent loads the `.gitattributes` along the path so the
         // collection knows every attribute name before the outcome is sized.
-        self.stack.at_entry(rela, mode)?;
+        let _ = self.stack.at_entry(rela, mode)?;
         self.outcome
             .initialize_with_selection(self.stack.attributes_collection(), ["diff"]);
         let platform = self.stack.at_entry(rela, mode)?;
@@ -2029,9 +2032,9 @@ fn render_funcctx<W: Write>(
     let mut last_hit: usize = 0; // 1-based line of the last match printed
     let mut show_function = false; // funcbody: currently inside a body to emit
 
-    for idx in 0..n {
+    for (idx, matched) in is_match.iter().enumerate() {
         let lno = idx + 1;
-        if is_match[idx] {
+        if *matched {
             if pre > 0 || opts.funcbody {
                 fc_show_pre(out, &cx, idx, &mut last_shown)?;
             } else if opts.show_function {
@@ -2146,8 +2149,8 @@ fn render_context(
     // Every match drags its pre/post neighbours into the shown set; overlapping
     // windows merge, which is what makes adjacent matches share one hunk.
     let mut show = vec![false; n];
-    for idx in 0..n {
-        if !is_match[idx] {
+    for (idx, matched) in is_match.iter().enumerate() {
+        if !*matched {
             continue;
         }
         let lo = idx.saturating_sub(pre);
@@ -2260,7 +2263,7 @@ fn search_file(
     let mut hit = false;
     // Once a binary file is known to match, git prints a single notice in place
     // of the matching lines and moves on; the counting modes are unaffected.
-    let mut binary_notice_pending = binary;
+    let binary_notice_pending = binary;
     // Whether this file's `--break`/`--heading` prelude has been emitted yet.
     let mut fired = false;
 
@@ -2282,7 +2285,6 @@ fn search_file(
             continue;
         }
         if binary_notice_pending {
-            binary_notice_pending = false;
             open_group(out, name, opts, emitted_any, &mut fired)?;
             out.write_all(b"Binary file ")?;
             out.write_all(name)?;
@@ -2576,6 +2578,7 @@ fn next_match(line: &[u8], matcher: &Matcher, at: usize) -> Option<(usize, usize
 /// Find `needle` in `hay` at or after `from`, honouring `-i` and `-w`.
 /// An empty needle matches at `from` with length zero (git: "an empty string as
 /// search expression matches all lines").
+#[allow(dead_code)] // faithful port of git's literal find; retained alongside next_match
 fn find_from(hay: &[u8], needle: &[u8], from: usize, opts: &Opts) -> Option<(usize, usize)> {
     if from > hay.len() {
         return None;
@@ -2621,6 +2624,7 @@ fn is_binary(content: &[u8]) -> bool {
 /// free of that dialect's metacharacters are literal, and those are the only
 /// ones this port can execute — there is no regex engine among the vendored
 /// gitoxide crates to hand the rest to.
+#[allow(dead_code)] // port helper for literal-pattern extraction; kept for the regex-refusal path
 fn literal_of(pattern: &str, dialect: Dialect) -> Result<Vec<u8>> {
     let meta: &[char] = match dialect {
         Dialect::Fixed => &[],

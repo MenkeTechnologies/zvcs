@@ -731,6 +731,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
 ///     with no on-disk ignore files consulted (git's behaviour without
 ///     `--exclude-standard`).
 ///   * [`Excludes::None`] — nothing configured; nothing is ever excluded.
+#[allow(clippy::large_enum_variant)] // boxing would churn every construct/match site
 enum Excludes<'repo> {
     None,
     Overrides {

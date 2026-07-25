@@ -298,7 +298,7 @@ fn cmd_gc(repo: &gix::Repository) -> Result<ExitCode> {
         let id_dir = ent.path();
         let mut status = scan_rerere_dir(&id_dir);
 
-        for variant in 0..status.len() {
+        for (variant, slot) in status.iter_mut().enumerate() {
             // `prune_one()`: a postimage dates the resolution, a preimage alone
             // dates an unresolved conflict; neither means nothing to prune.
             let post = variant_path(&id_dir, variant as u32, "postimage");
@@ -312,7 +312,7 @@ fn cmd_gc(repo: &gix::Repository) -> Result<ExitCode> {
             };
             if then < cutoff {
                 unlink_rr_item(&id_dir, variant as u32);
-                status[variant] = 0;
+                *slot = 0;
             }
         }
 

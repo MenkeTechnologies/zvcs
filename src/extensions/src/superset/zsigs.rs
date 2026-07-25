@@ -118,9 +118,9 @@ mod tests {
     #[test]
     fn offender_flagging_uses_is_good() {
         // Only non-good statuses are offenders.
-        assert!(!GStatus::Good.is_good() == false);
-        assert!(GStatus::NoSignature.is_good() == false);
-        assert!(GStatus::Bad.is_good() == false);
+        assert!(GStatus::Good.is_good());
+        assert!(!GStatus::NoSignature.is_good());
+        assert!(!GStatus::Bad.is_good());
         assert!(GStatus::GoodUnknown.is_good());
     }
 }

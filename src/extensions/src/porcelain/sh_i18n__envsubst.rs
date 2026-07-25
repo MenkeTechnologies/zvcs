@@ -261,6 +261,7 @@ fn read_stdin() -> Vec<u8> {
 }
 
 /// `git sh-i18n--envsubst` — see the module docs for the full contract.
+#[allow(non_snake_case)] // maps to git's `sh-i18n--envsubst` subcommand
 pub fn sh_i18n__envsubst(args: &[String]) -> Result<ExitCode> {
     if args.len() == 1 && args[0] == "--help" {
         bail!("--help (man page display) is not supported; this command takes no options");

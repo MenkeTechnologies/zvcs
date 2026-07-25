@@ -1512,6 +1512,9 @@ fn header_path(rest: &str, strip: usize) -> Result<Option<String>> {
 /// that matters here — a header with no `---`/`+++` pair is a pure mode change,
 /// where both sides name the same file.
 fn git_header_names(rest: &str, strip: usize) -> Result<Option<(String, String)>> {
+    // `rest` is reindexed at original offsets (`rest[..=end]`, `rest[end + 2..]`),
+    // so rebasing onto a stripped slice would not be behavior-identical.
+    #[allow(clippy::manual_strip)]
     if rest.starts_with('"') {
         if let Some(end) = rest[1..].find('"').map(|i| i + 1) {
             let a = strip_path(&unquote(&rest[..=end])?, strip)?;

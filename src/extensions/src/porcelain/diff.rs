@@ -2223,6 +2223,9 @@ fn build_combined_sline(result: &[u8], parents: &[Vec<u8>], ctx: u32) -> (Vec<SL
 
         // Assign per-parent line numbers, coalescing this parent's lost lines in.
         let mut p_lno: u32 = 1;
+        // `lno` is compared against `cnt` and the range is narrower than `sline`;
+        // faithful port of combine-diff.c, not a plain slice iteration.
+        #[allow(clippy::needless_range_loop)]
         for lno in 0..=cnt {
             sline[lno].p_lno[n] = p_lno;
             let fresh = std::mem::take(&mut sline[lno].plost);
@@ -2477,8 +2480,8 @@ fn coalesce_lines(base: &mut Vec<LostLine>, fresh: Vec<Vec<u8>>, parent: u32) {
     for d in dir.iter_mut() {
         d[0] = 0;
     }
-    for j in 1..=m {
-        dir[0][j] = 1;
+    for cell in dir[0].iter_mut().skip(1) {
+        *cell = 1;
     }
     for i in 1..=n {
         for j in 1..=m {

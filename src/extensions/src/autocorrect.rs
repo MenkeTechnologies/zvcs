@@ -243,8 +243,8 @@ fn levenshtein(s1: &str, s2: &str, w: i32, s: i32, a: i32, d: i32) -> i32 {
     let mut row1 = vec![0i32; len2 + 1];
     let mut row2 = vec![0i32; len2 + 1];
 
-    for j in 0..=len2 {
-        row1[j] = j as i32 * a;
+    for (j, slot) in row1.iter_mut().enumerate() {
+        *slot = j as i32 * a;
     }
     for i in 0..len1 {
         row2[0] = (i as i32 + 1) * d;

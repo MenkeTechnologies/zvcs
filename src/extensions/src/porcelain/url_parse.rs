@@ -523,6 +523,10 @@ fn url_normalize(url: &[u8]) -> Result<UrlInfo, &'static str> {
             pos -= 1;
         }
         let width = slash_ptr - pos;
+        // Empty accept-branches for the default/:80/:443 ports are distinct
+        // intentional cases mirroring url.c; collapsing them would obscure the
+        // port-normalization structure.
+        #[allow(clippy::if_same_then_else)]
         if pos == slash_ptr {
             // `:` with no number is the same as the default.
         } else if width == 2 && norm.starts_with(b"http:") && &url[pos..pos + 2] == b"80" {

@@ -1271,6 +1271,7 @@ fn expire_one_reflog(
 }
 
 /// `should_expire_reflog_ent()` with `gc`'s flags (no `stalefix`, no `recno`).
+#[allow(clippy::too_many_arguments)]
 fn should_expire_entry(
     repo: &gix::Repository,
     old: ObjectId,

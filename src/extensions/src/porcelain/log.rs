@@ -1521,10 +1521,16 @@ struct AbbrevCache {
     hex_len: usize,
     /// What the ledger already knew, shared as-is with every worker that forks
     /// this cache — it is read-only for the life of the command.
-    known: std::sync::Arc<std::collections::HashMap<String, String>>,
+    ///
+    /// Keyed by the id itself rather than its hex text: a lookup per commit
+    /// otherwise formats a 40-byte string and allocates it just to hash it, and
+    /// on a deep history that allocation is most of what `--oneline` costs
+    /// beyond reading the objects.
+    known: std::sync::Arc<std::collections::HashMap<ObjectId, String>>,
     /// Abbreviations computed by THIS cache, kept apart from `known` so a fork
     /// can be merged back without rebuilding the shared map.
-    local: std::collections::HashMap<String, String>,
+    local: std::collections::HashMap<ObjectId, String>,
+    /// New rows for the ledger, in its own hex-keyed form.
     fresh: Vec<(String, String)>,
 }
 
@@ -1536,10 +1542,15 @@ impl AbbrevCache {
             .integer("core.abbrev")
             .and_then(|v| usize::try_from(v).ok())
             .unwrap_or(0);
-        let known = crate::db::open_ro()
+        let known: std::collections::HashMap<ObjectId, String> = crate::db::open_ro()
             .ok()
             .and_then(|c| crate::db::abbrev_load(&c, hex_len).ok())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            // A row whose id is not parseable hex is from a different hash
+            // format and cannot match anything this command asks for.
+            .filter_map(|(full, short)| Some((ObjectId::from_hex(full.as_bytes()).ok()?, short)))
+            .collect();
         AbbrevCache {
             hex_len,
             known: std::sync::Arc::new(known),
@@ -1568,13 +1579,13 @@ impl AbbrevCache {
     }
 
     fn get(&mut self, id: gix::Id<'_>) -> String {
-        let full = id.to_string();
-        if let Some(short) = self.local.get(&full).or_else(|| self.known.get(&full)) {
+        let oid = id.detach();
+        if let Some(short) = self.local.get(&oid).or_else(|| self.known.get(&oid)) {
             return short.clone();
         }
         let short = id.shorten_or_id().to_string();
-        self.fresh.push((full.clone(), short.clone()));
-        self.local.insert(full, short.clone());
+        self.fresh.push((oid.to_string(), short.clone()));
+        self.local.insert(oid, short.clone());
         short
     }
 
@@ -3098,6 +3109,45 @@ struct FileChange {
 /// dropping the directory entries gix reports alongside the files it recurses into.
 /// Blob contents are only read when `with_counts` is set, which is the only case
 /// that needs them.
+/// Fill the ledger's log caches for the newest `limit` commits reachable from
+/// `HEAD`, and report how many commits were covered.
+///
+/// This is what the daemon calls after a watched repo's refs move. Everything it
+/// computes is a pure function of immutable objects — an abbreviation is fixed
+/// once the object exists, and a tree pair's change list and line tallies never
+/// expire — so the work is valid forever and can be done before anyone asks for
+/// it. That is the part git has no way to do: it has no process alive between
+/// commands, so the first `log --stat` after a pull always pays full price.
+///
+/// Bounded by `limit` because only the recent end of a history is ever read
+/// interactively, and each pass is a fresh walk from the new tip. Failures are
+/// silent by design: a warmed cache is an optimization, and the verb that missed
+/// it simply computes the value itself.
+pub fn warm_caches(repo: &gix::Repository, limit: usize) -> usize {
+    let Ok(head) = repo.head_commit() else { return 0 };
+    let mut abbrev = AbbrevCache::new(repo);
+    let mut warmed = 0usize;
+    let Ok(walk) = repo.rev_walk([head.id]).all() else { return 0 };
+    for info in walk.take(limit).flatten() {
+        let Ok(commit) = repo.find_commit(info.id) else { continue };
+        abbrev.get(commit.id());
+        let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
+        for parent in &parents {
+            abbrev.get(parent.attach(repo));
+        }
+        // git shows no diff for a merge, so nothing would ever read its tallies.
+        if parents.len() < 2 {
+            // Stores into the tree-diff cache as a side effect (see
+            // `collect_changes`), with the counts every `--stat`-style format
+            // needs — the expensive half, one blob read per changed file.
+            let _ = collect_changes(repo, &commit, parents.first().copied(), true);
+        }
+        warmed += 1;
+    }
+    abbrev.flush();
+    warmed
+}
+
 fn collect_changes(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,

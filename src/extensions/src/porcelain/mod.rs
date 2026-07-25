@@ -277,6 +277,8 @@ pub use interpret_trailers::interpret_trailers;
 pub use jump::jump;
 pub use last_modified::last_modified;
 pub use log::log;
+/// Ledger warming for the daemon: the log caches for a repo's newest commits.
+pub use log::warm_caches as warm_log_caches;
 pub use ls_files::ls_files;
 pub use ls_remote::ls_remote;
 pub use ls_tree::ls_tree;

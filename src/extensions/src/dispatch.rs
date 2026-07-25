@@ -25,7 +25,7 @@ pub const SUPERSET_VERBS: &[&str] = &[
     "zfetch", "zgc", "zfsck", "zprune", "zreset", "zabort", "zcheckout", "ztagall", "zcommitall", "zpushall", "zclean",
     "zwait", "zqueue", "zbarrier",
     "zstale", "zlast", "zbig", "zfiles", "zcommits", "zpristine", "zdivergent", "zorphans", "zsessions", "zidle", "zdashboard", "ztop",
-    "zppid", "zprocs",
+    "zppid", "zprocs", "zprecache",
 ];
 
 /// Every git-compat porcelain verb this dispatch table serves, generated from
@@ -242,7 +242,10 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zwaitfor" => "usage: git zwaitfor <clean|idle|synced|<repo> <sha>> [--timeout <secs>] — block until a tree-wide state holds",
         "zgraph" => "usage: git zgraph — fleet topology: dup groups (same origin, multiple local checkouts)",
         "zrewind" => "usage: git zrewind <duration> [--dry-run] — restore the whole tree (repo + submodules) to the state it had <duration> ago via per-repo reflog reset",
-        "zguard" | "zpolicy" => "usage: git zguard deny|warn <pattern> [--when detached|dirty|protected|unsigned] [-m <msg>] | list | rm <id> | clear | test <cmd>... — fleet-wide command policy that refuses/warns on matching git commands",
+        "zguard" => "usage: git zguard deny|warn <pattern> [--when detached|dirty|protected|unsigned] [-m <msg>] | list | rm <id> | clear | test <cmd>... — fleet-wide command policy that refuses/warns on matching git commands",
+        // The alias needs its own line: `git zverbs` prints one usage per verb,
+        // and a shared string would list `zguard` twice and `zpolicy` never.
+        "zpolicy" => "usage: git zpolicy <deny|warn|list|rm|clear|test> ... — alias of `git zguard`",
         "ztail" => "usage: git ztail [-n <count>] [--kind commit|stage|status|reconcile] [--repo <substr>] [--json] [--no-follow] — alias of git zevents",
         "zcommands" => "usage: git zcommands [-n <count>] [--repo <substr>] [--json] [--no-follow] [--off] [--clear] — live feed of every git command run across the fleet",
         "zintercept" => "usage: git zintercept before|after|around <pattern> -- <cmd> | list | remove <id> | clear — AOP hooks that run advice around matching git commands",
@@ -268,6 +271,7 @@ fn z_usage(sub: &str) -> Option<&'static str> {
         "zunclaim" => "usage: git zunclaim [--force] [<path>] — release a lease on a repo",
         "zwho" => "usage: git zwho — list active claims (who is working what)",
         "zstatus" => "usage: git zstatus [--all] — cached working-tree status of indexed repos",
+        "zprecache" => "usage: git zprecache [-n <commits>] [-q] — precompute the log caches (abbreviations, --stat tallies) for recent commits",
         "zlog" => "usage: git zlog [-n <count>] — machine-wide reflog timeline across all indexed repos",
         "zundo" => "usage: git zundo [<path>] — rewind a repo one reflog step (reset --hard to previous HEAD)",
         "zsnapshot" => "usage: git zsnapshot <name> — record the tree's HEADs as a restore point",
@@ -515,6 +519,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         "zunclaim" => superset::zunclaim(args),
         "zwho" => superset::zwho(args),
         "zstatus" => superset::zstatus(args),
+        "zprecache" => superset::zprecache(args),
         "zlog" => superset::zlog(args),
         "zundo" => superset::zundo(args),
         "zsnapshot" => superset::zsnapshot(args),

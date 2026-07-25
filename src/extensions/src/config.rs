@@ -64,6 +64,16 @@ pub struct ZvcsConfig {
     /// in parallel — the automatic form of `git zsync`'s dup fan-out
     /// (`zvcs.autodups`). Off by default.
     pub autodups: bool,
+    /// On ref-change in any watched repo, precompute the log caches for the
+    /// commits that just arrived (`zvcs.precache`, on by default).
+    ///
+    /// Abbreviations and tree-diff tallies are pure functions of immutable
+    /// objects, so they can be computed the moment a commit exists rather than
+    /// the moment someone runs `log --stat`. The daemon is already awake and
+    /// already knows the refs moved; doing it there is free from the user's
+    /// point of view. git cannot do this at all — nothing of git is running
+    /// between two commands.
+    pub precache: bool,
 }
 
 impl Default for ZvcsConfig {
@@ -80,6 +90,9 @@ impl Default for ZvcsConfig {
             autostatus: false,
             autohook: false,
             autodups: false,
+            // Nothing is watched in the default config, so there is nothing to
+            // warm; the switch matters only once a watch set exists.
+            precache: false,
         }
     }
 }
@@ -116,6 +129,7 @@ impl ZvcsConfig {
             autostatus: snap.boolean("zvcs.autostatus").unwrap_or(false),
             autohook: snap.boolean("zvcs.autohook").unwrap_or(false),
             autodups: snap.boolean("zvcs.autodups").unwrap_or(false),
+            precache: snap.boolean("zvcs.precache").unwrap_or(true),
         }
     }
 

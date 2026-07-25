@@ -209,6 +209,29 @@ fn run(cfg: ZvcsConfig) {
             }
         }
 
+        // Precompute the log caches for whatever just arrived. Abbreviations and
+        // tree-diff tallies are pure functions of immutable objects, so a commit
+        // that exists can be measured before anyone asks — and the daemon is
+        // already awake with the news that the refs moved. Nothing of git is
+        // alive between two commands, so git's first `log --stat` after a pull
+        // always pays in full; this one is already paid.
+        //
+        // Off the watcher thread: warming reads blobs, and the loop must stay
+        // free to coalesce the next burst of events.
+        if cfg.precache {
+            let warm: Vec<PathBuf> = affected.iter().cloned().collect();
+            std::thread::spawn(move || {
+                for git_dir in warm {
+                    if let Ok(repo) = gix::open(&git_dir) {
+                        // The recent end of a history is the only part read
+                        // interactively, and each ref move starts a fresh walk
+                        // from the new tip.
+                        crate::porcelain::warm_log_caches(&repo, 200);
+                    }
+                }
+            });
+        }
+
         // Auto dup fan-out: on a USER commit to any watched checkout, fast-forward
         // every local dup of that repo to it — offline, ff-only, the automatic form
         // of `git zsync`'s fan-out. The `head_authored_by_zvcs` gate skips the

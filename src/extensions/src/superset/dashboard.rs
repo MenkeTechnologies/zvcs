@@ -1057,8 +1057,10 @@ fn handle_mouse(d: &mut Dash, m: MouseEvent, cols: u16, rows: u16) -> bool {
         }
         // Releasing ends any divider drag.
         MouseEventKind::Up(_) => d.drag.take().is_some(),
-        // Hover moves the cursor to the row under the pointer (highlight follows).
-        MouseEventKind::Moved => point_select(d, &l, m.column, m.row),
+        // Bare hover must NOT move the cursor (matches iftoprs, which only tracks a
+        // hover position and never disturbs the selection). It just dismisses an open
+        // tooltip — redraw only if one was actually up, so idle hover doesn't churn.
+        MouseEventKind::Moved => d.tooltip.take().is_some(),
         MouseEventKind::Down(MouseButton::Right) => {
             point_select(d, &l, m.column, m.row);
             open_tooltip(d, &l, m.column, m.row);
@@ -1071,7 +1073,7 @@ fn handle_mouse(d: &mut Dash, m: MouseEvent, cols: u16, rows: u16) -> bool {
 
 /// Move focus to the tile the pointer is over and set its cursor to the row under
 /// the pointer, keeping it in view. Returns whether focus or selection changed (so a
-/// hover that stays on the same row causes no redraw). Used by left-click and hover.
+/// click on the current row causes no redraw). Used by left-click and right-click.
 fn point_select(d: &mut Dash, l: &Layout, col: u16, row: u16) -> bool {
     let Some(t) = tile_at(l, col, row) else { return false };
     let (_, iy, _, ih) = tile_rect(l, t).inner();

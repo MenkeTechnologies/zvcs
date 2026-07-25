@@ -63,7 +63,11 @@ fn daemon_converge_fast_forwards_top_level_repo() {
     std::fs::create_dir_all(&sb.home).unwrap();
 
     let bare = root.join("remote.git");
-    git(&sb, &root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    // `-b main` explicitly: the sandbox pins an empty global config, so there is
+    // no `init.defaultBranch` to inherit and the bare repo's HEAD would point at
+    // `refs/heads/master` — a ref this test never creates, which makes the later
+    // fetch fail to resolve the remote HEAD.
+    git(&sb, &root, &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
     git(&sb, &root, &["clone", "-q", bare.to_str().unwrap(), "top"]);
     let top = root.join("top");
     git(&sb, &top, &["checkout", "-q", "-B", "main"]);

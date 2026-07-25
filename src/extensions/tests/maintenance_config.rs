@@ -55,6 +55,29 @@ fn stock_git() -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The oldest git whose bare `maintenance run` selects the task set this port
+/// reproduces. Earlier gits run `gc` alone (see git-maintenance(1) for 2.50:
+/// "by default, only maintenance.gc.enabled is true"), so they are the wrong
+/// oracle for the `<task>.enabled` gates — the task under test is not even in
+/// their default set. The port itself was read off git 2.55.0 traces.
+const ORACLE_MIN: (u32, u32) = (2, 55);
+
+/// A stock git recent enough to compare against, or `None` — in which case the
+/// test still pins OUR behavior and skips only the equality check.
+fn oracle_git() -> Option<String> {
+    let git = stock_git()?;
+    let out = std::process::Command::new(&git).arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let nums: Vec<u32> = text
+        .split_whitespace()
+        .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))?
+        .split('.')
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    let (major, minor) = (*nums.first()?, *nums.get(1)?);
+    ((major, minor) >= ORACLE_MIN).then_some(git)
+}
+
 /// A zeroed 40-char object id, used to build a syntactically valid reflog line.
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
@@ -147,22 +170,26 @@ fn task_enabled_false_suppresses_default_pack_refs() {
     let (rz, hz) = fixture("packon-z", &[]);
     let (rg, hg) = fixture("packon-g", &[]);
     let z = run(BIN, &rz, &hz, &[]);
-    let g = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &rg, &hg, &[]);
     assert_eq!(z.status.code(), Some(0), "run must succeed");
-    assert_eq!(g.status.code(), Some(0), "sanity: git succeeds");
     assert!(packed_refs(&rz), "default run packs refs");
-    assert_eq!(packed_refs(&rz), packed_refs(&rg), "must match git");
+    if let Some(git) = oracle_git() {
+        let g = run(&git, &rg, &hg, &[]);
+        assert_eq!(g.status.code(), Some(0), "sanity: git succeeds");
+        assert_eq!(packed_refs(&rz), packed_refs(&rg), "must match git");
+    }
 
     // Disabled: pack-refs is dropped from the set, so refs stay loose.
     let cfg = [("maintenance.pack-refs.enabled", "false")];
     let (rz, hz) = fixture("packoff-z", &cfg);
     let (rg, hg) = fixture("packoff-g", &cfg);
     let z = run(BIN, &rz, &hz, &[]);
-    let _g = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &rg, &hg, &[]);
     assert_eq!(z.status.code(), Some(0));
     assert!(!packed_refs(&rz), "pack-refs.enabled=false leaves refs loose");
     assert!(rz.join(".git/refs/heads/b1").exists(), "loose ref remains present");
-    assert_eq!(packed_refs(&rz), packed_refs(&rg), "must match git");
+    if let Some(git) = oracle_git() {
+        let _g = run(&git, &rg, &hg, &[]);
+        assert_eq!(packed_refs(&rz), packed_refs(&rg), "must match git");
+    }
 
     cleanup(&[&rz, &rg]);
 }
@@ -195,11 +222,13 @@ fn reflog_expire_task_enabled_gate() {
     inject_ancient_reflog(&rz);
     inject_ancient_reflog(&rg);
     let z = run(BIN, &rz, &hz, &[]);
-    let g = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &rg, &hg, &[]);
     assert_eq!(z.status.code(), Some(0));
-    assert_eq!(g.status.code(), Some(0), "sanity: git succeeds");
     assert!(!reflog_has_ancient(&rz), "reflog-expire drops the ancient entry");
-    assert_eq!(reflog_has_ancient(&rz), reflog_has_ancient(&rg), "must match git");
+    if let Some(git) = oracle_git() {
+        let g = run(&git, &rg, &hg, &[]);
+        assert_eq!(g.status.code(), Some(0), "sanity: git succeeds");
+        assert_eq!(reflog_has_ancient(&rz), reflog_has_ancient(&rg), "must match git");
+    }
 
     // Disabled: the task is removed, so the ancient entry survives.
     let cfg = [("maintenance.reflog-expire.enabled", "false")];
@@ -208,11 +237,13 @@ fn reflog_expire_task_enabled_gate() {
     inject_ancient_reflog(&rz);
     inject_ancient_reflog(&rg);
     let z = run(BIN, &rz, &hz, &[]);
-    let g = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &rg, &hg, &[]);
     assert_eq!(z.status.code(), Some(0));
-    assert_eq!(g.status.code(), Some(0), "sanity: git succeeds");
     assert!(reflog_has_ancient(&rz), "disabled reflog-expire keeps the entry");
-    assert_eq!(reflog_has_ancient(&rz), reflog_has_ancient(&rg), "must match git");
+    if let Some(git) = oracle_git() {
+        let g = run(&git, &rg, &hg, &[]);
+        assert_eq!(g.status.code(), Some(0), "sanity: git succeeds");
+        assert_eq!(reflog_has_ancient(&rz), reflog_has_ancient(&rg), "must match git");
+    }
 
     cleanup(&[&rz, &rg]);
 }

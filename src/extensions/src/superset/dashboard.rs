@@ -359,6 +359,9 @@ struct Dash {
     /// An in-progress divider drag: which divider, and the grab offset from its edge.
     drag: Option<(Divider, i16)>,
     tooltip: Option<Tooltip>,
+    /// `/` incremental filter: the query, and whether it is being typed.
+    filter: String,
+    searching: bool,
 }
 
 /// Tile indices into [`Dash::view`], and the tile the mouse/keys act on.
@@ -383,6 +386,8 @@ impl Dash {
             totals: Totals::default(),
             fleet: Vec::new(),
             events: Vec::new(),
+            filter: String::new(),
+            searching: false,
             commands: Vec::new(),
             procs: Vec::new(),
             daemon_up: false,
@@ -463,6 +468,26 @@ impl Dash {
     }
 
     /// Move the focused tile's cursor by `delta` rows, scrolling to keep it visible.
+    /// Drop every row of every tile that does not contain the `/` query
+    /// (case-insensitive), so the tiles, their row counts and the cursor all see
+    /// the same filtered set. Called at the end of each refresh and whenever the
+    /// query changes; an empty query is a no-op.
+    fn apply_filter(&mut self) {
+        if self.filter.is_empty() {
+            return;
+        }
+        let q = self.filter.to_lowercase();
+        let hit = |s: &str| s.to_lowercase().contains(&q);
+        self.fleet.retain(|r| hit(&r.path) || hit(&r.head) || hit(&r.sync));
+        self.procs.retain(|p| hit(&p.cmd) || hit(&p.cwd));
+        self.commands.retain(|c| hit(&c.argv) || hit(&c.cwd));
+        self.events.retain(|e| {
+            hit(&e.kind)
+                || e.workdir.as_deref().is_some_and(hit)
+                || e.detail.as_deref().is_some_and(hit)
+        });
+    }
+
     fn move_sel(&mut self, delta: i32, ih: usize) {
         let t = self.focus;
         let len = self.tile_len(t);
@@ -596,6 +621,7 @@ impl Dash {
         self.totals = t;
         self.fleet = fleet;
         self.commands = read_commands(FEED);
+        self.apply_filter();
         self.daemon_up = crate::superset::zdaemon::is_running();
         // Selection/scroll are reconciled against the new data in the render loop,
         // where the tile heights are known (see `reconcile_views`).
@@ -739,7 +765,15 @@ fn render(buf: &mut Buffer, d: &Dash) {
     render_commands(buf, l.commands, d);
 
     fill_row(buf, foot, c.bar);
-    set_str(buf, 0, foot, " q Quit  ↑↓ Move  Tab Tile  drag/HJKL Resize (= reset)  right-click Info  c Colors  F1 Help ", c.bar, cols);
+    // While `/` is being typed the footer becomes the query line — that is the
+    // only on-screen feedback that the keystrokes are going somewhere.
+    if d.searching {
+        set_str(buf, 0, foot, &format!(" /{}_  (Enter keep · Esc clear)", d.filter), c.bar, cols);
+    } else if d.filter.is_empty() {
+        set_str(buf, 0, foot, " q Quit  ↑↓ Move  Tab Tile  drag/HJKL Resize (= reset)  right-click Info  / Filter  c Colors  F1/h Help ", c.bar, cols);
+    } else {
+        set_str(buf, 0, foot, &format!(" filter: {}  ·  / edit  Esc clear  ·  q Quit  Tab Tile  F1/h Help ", d.filter), c.bar, cols);
+    }
 
     match &d.overlay {
         Overlay::None => {}
@@ -1164,6 +1198,38 @@ fn handle_key(d: &mut Dash, code: KeyCode, mods: KeyModifiers) -> bool {
     if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
         return true;
     }
+
+    // `/` incremental filter input takes precedence over every other binding, so
+    // the query can contain the same letters the commands use.
+    if d.searching {
+        match code {
+            KeyCode::Esc => {
+                d.searching = false;
+                d.filter.clear();
+            }
+            KeyCode::Enter => d.searching = false,
+            KeyCode::Backspace => {
+                d.filter.pop();
+            }
+            // Only unmodified text types. A terminal encodes Alt+<c> — and Esc
+            // immediately followed by <c> — as ONE alt-modified key; appending it
+            // would strand the user in the filter with a stray character.
+            KeyCode::Char(c) if !mods.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+                d.filter.push(c)
+            }
+            KeyCode::Char(_) => {
+                d.searching = false;
+                d.filter.clear();
+                return handle_key(d, code, mods - KeyModifiers::ALT);
+            }
+            _ => return false,
+        }
+        // The cursor may now point past the end of a shrunken tile; the render
+        // loop reconciles it against the filtered data on the next frame.
+        d.view = [TileView::default(); 4];
+        return false;
+    }
+
     match d.overlay {
         Overlay::Help => {
             d.overlay = Overlay::None;
@@ -1227,8 +1293,21 @@ fn handle_key(d: &mut Dash, code: KeyCode, mods: KeyModifiers) -> bool {
 
     let ih = focus_ih(d);
     match (code, mods) {
+        // With a filter applied, Esc clears it rather than quitting — the footer
+        // says so, and quitting out of a filtered view by reflex loses the whole
+        // screen.
+        (KeyCode::Esc, _) if !d.filter.is_empty() => {
+            d.filter.clear();
+            d.view = [TileView::default(); 4];
+        }
         (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => return true,
-        (KeyCode::F(1), _) | (KeyCode::Char('?'), _) => d.overlay = Overlay::Help,
+        (KeyCode::F(1), _) | (KeyCode::Char('h'), _) | (KeyCode::Char('?'), _) => {
+            d.overlay = Overlay::Help
+        }
+        (KeyCode::Char('/'), _) => {
+            d.searching = true;
+            d.filter.clear();
+        }
         (KeyCode::F(2), _) | (KeyCode::Char('c'), _) => {
             d.snapshot_theme();
             let cur = ThemeName::from_name(&d.label).map(|t| t.index()).unwrap_or(0);

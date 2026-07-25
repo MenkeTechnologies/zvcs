@@ -78,7 +78,10 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
     let work = root.join("work");
     std::fs::create_dir_all(&work).expect("mkdir work");
 
-    ok(&root, &shim_dir, &["init", "-q", "--bare", "remote.git"]);
+    // `-b main` explicitly: a runner has no `init.defaultBranch`, so the bare
+    // repo would init to `master` and every later `main` reference — the
+    // clone's branch, a checkout, a refspec — would miss.
+    ok(&root, &shim_dir, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
     ok(&work, &shim_dir, &["init", "-q", "-b", "main"]);
     ok(&work, &shim_dir, &["commit", "-q", "--allow-empty", "-m", "c1"]);
     ok(&work, &shim_dir, &["branch", "topic"]);

@@ -43,7 +43,10 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
     // the URL the push targets.
     for r in ["origin", "backup", "other"] {
         let bare = root.join(format!("{r}.git"));
-        git(&root, &home, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    // `-b main` explicitly: a runner has no `init.defaultBranch`, so the bare
+    // repo would init to `master` and every later `main` reference — the
+    // clone's branch, a checkout, a refspec — would miss.
+        git(&root, &home, &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
     }
 
     git(&repo, &home, &["init", "-q", "-b", "main"]);

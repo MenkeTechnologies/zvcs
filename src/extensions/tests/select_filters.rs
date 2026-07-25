@@ -107,7 +107,10 @@ fn status_filters_intersect_with_and() {
 
     // "both": ahead of origin/main AND dirty.
     let bare = root.join("both.git");
-    git(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    // `-b main` explicitly: a runner has no `init.defaultBranch`, so the bare
+    // repo would init to `master` and every later `main` reference — the
+    // clone's branch, a checkout, a refspec — would miss.
+    git(&root, &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
     git(&root, &["clone", "-q", bare.to_str().unwrap(), "both"]);
     let both = root.join("both");
     git(&both, &["checkout", "-q", "-B", "main"]);

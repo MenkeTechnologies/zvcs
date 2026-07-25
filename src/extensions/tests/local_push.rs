@@ -42,7 +42,10 @@ fn push_to_local_bare_remote() {
         std::os::unix::fs::symlink(BIN, bindir.join(name)).unwrap();
     }
 
-    run(&work, &home, &bindir, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    // `-b main` explicitly: a runner has no `init.defaultBranch`, so the bare
+    // repo would init to `master` and every later `main` reference — the
+    // clone's branch, a checkout, a refspec — would miss.
+    run(&work, &home, &bindir, &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
     run(&work, &home, &bindir, &["init", "-q", "-b", "main", "."]);
     run(&work, &home, &bindir, &["config", "user.email", "t@e.co"]);
     run(&work, &home, &bindir, &["config", "user.name", "t"]);

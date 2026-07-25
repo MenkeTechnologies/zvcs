@@ -36,7 +36,10 @@ fn zup_ff_applies_add_modify_delete_and_leaves_clean_index() {
     let home = root.join("home");
 
     let bare = root.join("remote.git");
-    git(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    // `-b main` explicitly: a runner has no `init.defaultBranch`, so the bare
+    // repo would init to `master` and every later `main` reference — the
+    // clone's branch, a checkout, a refspec — would miss.
+    git(&root, &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
 
     // work: c0 with a.txt and b.txt, push.
     git(&root, &["clone", "-q", bare.to_str().unwrap(), "work"]);
@@ -85,7 +88,7 @@ fn zup_skips_dirty_worktree_without_clobbering() {
     let home = root.join("home");
 
     let bare = root.join("remote.git");
-    git(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    git(&root, &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
     git(&root, &["clone", "-q", bare.to_str().unwrap(), "work"]);
     let work = root.join("work");
     git(&work, &["checkout", "-q", "-B", "main"]);
@@ -127,7 +130,7 @@ fn zup_refuses_to_overwrite_untracked_file() {
     let home = root.join("home");
 
     let bare = root.join("remote.git");
-    git(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    git(&root, &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
     git(&root, &["clone", "-q", bare.to_str().unwrap(), "work"]);
     let work = root.join("work");
     git(&work, &["checkout", "-q", "-B", "main"]);
@@ -173,7 +176,7 @@ fn zup_skips_dir_to_file_change_without_moving_refs() {
     let home = root.join("home");
 
     let bare = root.join("remote.git");
-    git(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    git(&root, &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
     git(&root, &["clone", "-q", bare.to_str().unwrap(), "work"]);
     let work = root.join("work");
     git(&work, &["checkout", "-q", "-B", "main"]);

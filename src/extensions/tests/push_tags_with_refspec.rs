@@ -48,7 +48,10 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
     std::fs::create_dir_all(&root).expect("mkdir root");
 
     assert!(
-        zvcs(&root, &home, &["init", "-q", "--bare", bare.to_str().expect("utf-8")]).status.success(),
+    // `-b main` explicitly: a runner has no `init.defaultBranch`, so the bare
+    // repo would init to `master` and every later `main` reference — the
+    // clone's branch, a checkout, a refspec — would miss.
+        zvcs(&root, &home, &["init", "-q", "--bare", "-b", "main", bare.to_str().expect("utf-8")]).status.success(),
         "init bare"
     );
     assert!(

@@ -64,7 +64,10 @@ fn zpush_refuses_via_live_lsrefs_when_remote_moved() {
     let root = root.canonicalize().unwrap();
 
     let bare = root.join("remote.git");
-    git(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    // `-b main` explicitly: a runner has no `init.defaultBranch`, so the bare
+    // repo would init to `master` and every later `main` reference — the
+    // clone's branch, a checkout, a refspec — would miss.
+    git(&root, &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
 
     // Clone A: create c0, push.
     git(&root, &["clone", "-q", bare.to_str().unwrap(), "work"]);

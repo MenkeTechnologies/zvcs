@@ -33,7 +33,10 @@ fn bare_tag_source_resolves_to_refs_tags_not_heads() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&repo).unwrap();
 
-    run(&repo, &home, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    // `-b main` explicitly: a runner has no `init.defaultBranch`, so the bare
+    // repo would init to `master` and every later `main` reference — the
+    // clone's branch, a checkout, a refspec — would miss.
+    run(&repo, &home, &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
     run(&repo, &home, &["init", "-q", "-b", "main", "."]);
     run(&repo, &home, &["config", "user.email", "t@e.co"]);
     run(&repo, &home, &["config", "user.name", "t"]);

@@ -55,19 +55,18 @@ fn ztrigger_arms_dir_and_fires() {
 
     // Arm the repo BY PATH from an unrelated cwd (the point of ztrigger vs zhook).
     let (_o, ok) = zvcs(&root, &root, &[
-        "ztrigger", repo_s, "echo", "$ZVCS_EVENT", ">", marker.to_str().unwrap(),
+        "ztrigger", repo_s, "echo", "$ZVCS_DIR", ">", marker.to_str().unwrap(),
     ]);
     assert!(ok, "ztrigger set failed");
 
-    // Effect 1: the repo's LOCAL zvcs.hook was written.
-    let (hook, _) = zvcs(&root, &repo, &["config", "zvcs.hook"]);
-    assert!(hook.contains("ZVCS_EVENT") && hook.contains("fired"), "local hook not set:\n{hook}");
+    // Effect 1: the command is recorded against the DIRECTORY, not as a repo
+    // hook. Triggers moved to their own table so they work on any directory,
+    // repository or not — a repo-local `zvcs.hook` cannot express that.
+    let (listed, _) = zvcs(&root, &root, &["ztrigger", "list"]);
+    let row = listed.lines().find(|l| l.starts_with(repo_s)).unwrap_or_default();
+    assert!(row.contains("ZVCS_DIR") && row.contains("fired"), "trigger not recorded:\n{listed}");
 
-    // Effect 2: the master switch was auto-flipped in the sandboxed global config.
-    let (auto, _) = zvcs(&root, &root, &["config", "--global", "zvcs.autohook"]);
-    assert_eq!(auto.trim(), "true", "autohook not auto-enabled");
-
-    // Effect 3: the repo is indexed, so `ztrigger list` shows it.
+    // Effect 2: the repo is indexed, so `ztrigger list` shows it.
     let (list, _) = zvcs(&root, &root, &["ztrigger", "list"]);
     assert!(list.contains("repo"), "ztrigger list missing repo:\n{list}");
 
@@ -75,7 +74,7 @@ fn ztrigger_arms_dir_and_fires() {
     let (_t, tok) = zvcs(&root, &repo, &["ztrigger", "test", repo_s]);
     assert!(tok, "ztrigger test failed");
     let fired = std::fs::read_to_string(&marker).unwrap_or_default();
-    assert!(!fired.trim().is_empty(), "trigger command did not run");
+    assert!(fired.contains(repo_s), "trigger command did not run with ZVCS_DIR set: {fired:?}");
 
     // rm disarms: the local hook is gone and the repo drops off the armed list.
     let (_r, rok) = zvcs(&root, &root, &["ztrigger", "rm", repo_s]);
@@ -107,9 +106,12 @@ fn zwatch_indexes_without_a_command() {
     let (auto, _) = zvcs(&root, &root, &["config", "--global", "zvcs.autostatus"]);
     assert_eq!(auto.trim(), "true", "autostatus not enabled");
 
-    // No hook was set — it must not appear as armed.
+    // A watch IS a trigger with a built-in logging command — the two verbs share
+    // one table — so it shows up there too, with the command the user did not
+    // have to write.
     let (tlist, _) = zvcs(&root, &root, &["ztrigger", "list"]);
-    assert!(!tlist.contains("repo"), "unexpected trigger on a plain watch:\n{tlist}");
+    let row = tlist.lines().find(|l| l.starts_with(repo_s)).unwrap_or_default();
+    assert!(row.contains("[zwatch]"), "a watch should list as the built-in logging trigger:\n{tlist}");
 
     // rm removes it from the index.
     let (_r, rok) = zvcs(&root, &root, &["zwatch", "rm", repo_s]);

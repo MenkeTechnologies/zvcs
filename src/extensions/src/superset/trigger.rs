@@ -158,8 +158,15 @@ pub fn zwatch(args: &[String]) -> Result<ExitCode> {
         Some("list") => list(),
         Some("rm") | Some("remove") => rm(args.get(1).map(String::as_str)),
         _ => {
+            // The command-less form: watch DIR and keep its cached status warm.
+            // That is what `zvcs.autostatus` gates, so turn it on — a watch that
+            // does not update the status cache is a watch that does nothing the
+            // user can see. (`git help zwatch` documents this; the call was lost
+            // when triggers moved to their own table.)
             let a = [args[0].clone(), "echo \"[zwatch] $ZVCS_DIR changed\"".to_string()];
-            set(&a)
+            let code = set(&a)?;
+            crate::superset::hooks::enable_autostatus()?;
+            Ok(code)
         }
     }
 }

@@ -93,7 +93,7 @@ fn scenario(bin: &str, tag: &str, config: &[(&str, &str)], args: &[&str]) -> Res
     merge_args.extend_from_slice(args);
     let out = env_cmd(bin, &repo, &home).args(&merge_args).output().unwrap();
     let show = env_cmd("git", &repo, &home)
-        .args(&["notes", "--ref=commits", "show", "HEAD"])
+        .args(["notes", "--ref=commits", "show", "HEAD"])
         .output()
         .unwrap();
     let note = String::from_utf8_lossy(&show.stdout).into_owned();

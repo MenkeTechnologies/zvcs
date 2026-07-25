@@ -3,6 +3,7 @@
 //! on PATH see the same `.git`, index, and worktree.
 //!
 //! Supported invocations (the common forms):
+//! ```text
 //!   * `git checkout <branch>`                 → switch to an existing local branch
 //!   * `git checkout <commit-ish>`             → detach `HEAD` at a commit
 //!   * `git checkout -d|--detach <rev>`        → detach even when `<rev>` is a branch
@@ -21,6 +22,7 @@
 //!                                                pathspecs from `<file>` (or stdin
 //!                                                for `-`) instead of the argv.
 //!   * `-q`/`--quiet` suppress the transition messages
+//! ```
 //!
 //! Every transition message (`Switched to …`, `Already on …`, `Reset branch …`,
 //! `HEAD is now at …`, `Previous HEAD position was …`, `Updated N path(s) …`,
@@ -28,6 +30,7 @@
 //! `git checkout` writes nothing to stdout on success.
 //!
 //! Deviations (honest, conservative — never corrupting):
+//! ```text
 //!   * A branch/commit switch that changes the working tree requires a clean
 //!     tracked worktree. Stock git also permits a switch when the dirty files do
 //!     not collide with the diff between trees; that non-conflicting case is
@@ -48,6 +51,7 @@
 //!     the deferred dirty-merge rendering, so on the clean-switch path honored
 //!     here it is a no-op (the 3-way carry is refused by the same clean-check as
 //!     every other switch).
+//! ```
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -269,6 +273,32 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             bail!("too many start-points given for branch creation");
         }
         let start = pre.first().copied().unwrap_or("HEAD");
+        // On an UNBORN HEAD (a fresh `git init`, or a clone of an empty repo)
+        // there is no commit for the default start-point to resolve to, and git
+        // still succeeds: `-b`/`-B` with no explicit start just re-points the
+        // unborn HEAD at the new name. Resolving "HEAD" here instead would fail
+        // with a rev-spec parse error and make `checkout -B main` unusable in an
+        // empty repository.
+        if pre.is_empty() && repo.head()?.is_unborn() {
+            let full: gix::refs::FullName = format!("refs/heads/{name}").try_into()?;
+            repo.edit_reference(RefEdit {
+                change: Change::Update {
+                    log: LogChange {
+                        mode: RefLog::AndReference,
+                        force_create_reflog: false,
+                        message: format!("checkout: moving to {name}").into(),
+                    },
+                    expected: PreviousValue::Any,
+                    new: Target::Symbolic(full),
+                },
+                name: "HEAD".try_into()?,
+                deref: false,
+            })?;
+            if !quiet {
+                eprintln!("Switched to a new branch '{name}'");
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
         return create_and_switch(&repo, &name, reset, start, quiet, track);
     }
 

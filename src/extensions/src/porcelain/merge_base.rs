@@ -5,6 +5,7 @@
 //! (`gix_revision::merge_base`), so the selected bases are the same commits git
 //! picks, printed one full hex id per line:
 //!
+//! ```text
 //!   * `merge-base <commit> <commit>...`   — bases of the first commit against
 //!                                           the rest taken together
 //!   * `merge-base --octopus <commit>...`  — best common ancestors of all
@@ -13,6 +14,7 @@
 //!   * `merge-base --is-ancestor <a> <b>`  — no output, exit 0 (yes) / 1 (no)
 //!   * `merge-base --fork-point <ref> [<commit>]` — walks the reflog of `<ref>`
 //!   * `-a`/`--all`/`--no-all`
+//! ```
 //!
 //! Exit codes follow git: 1 when no merge base exists (or `--is-ancestor` is
 //! false), 128 for a bad object name or a mode/`--all` conflict, 129 for a

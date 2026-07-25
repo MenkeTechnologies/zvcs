@@ -103,6 +103,7 @@ fn errno_text(err: &std::io::Error) -> String {
 /// never require a repo).
 ///
 /// A scope flag narrows both reads and writes to a single file, like git:
+/// ```text
 ///   * `--local`  → the repository-local config (`<common_dir>/config`); requires
 ///     a repo, else `--local can only be used inside a git repository`.
 ///   * `--global` → the per-user config: `$XDG_CONFIG_HOME/git/config` and
@@ -118,6 +119,7 @@ fn errno_text(err: &std::io::Error) -> String {
 ///     missing file is exit 1 for the get forms and
 ///     `fatal: unable to read config file '<path>': <errno>` at exit 128 for
 ///     `--list`, exactly as git splits those two paths.
+/// ```
 /// The default (no scope) write still targets the repository-local file and so
 /// still needs a repo — attempting one without one fails with `not in a git
 /// directory`. `--worktree` is rejected with a precise error rather than
@@ -126,6 +128,7 @@ fn errno_text(err: &std::io::Error) -> String {
 /// `given_config_source.file` does.
 ///
 /// Supported forms:
+/// ```text
 ///   * `git config <name>` / `--get <name>`   → last value, exit 1 if absent
 ///   * `git config --get-all <name>`          → every value, one per line
 ///   * `git config --get-regexp <regex>`      → `key value` for every key the
@@ -142,6 +145,7 @@ fn errno_text(err: &std::io::Error) -> String {
 ///   * `git config --unset-all <name>`        → drop every value of the key
 ///   * `--name-only`                          → with `--list` or `--get-regexp`,
 ///                                              keys without values
+/// ```
 ///
 /// Usage errors (conflicting action flags, a misplaced `--name-only`, a wrong
 /// argument count) report `error: …` on stderr and exit 129, as git's

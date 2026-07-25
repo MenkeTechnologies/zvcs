@@ -197,6 +197,7 @@ fn parse(args: &[String]) -> std::result::Result<Parsed, u8> {
 ///
 /// Supported invocations (stdout, exit code and resulting worktree state match
 /// stock `git clean`):
+/// ```text
 ///   * `-n`/`--dry-run`   — list as `Would remove <path>` without touching disk.
 ///   * `-f`/`--force`     — actually delete; `-ff` also deletes nested
 ///                          repositories, which a single `-f` refuses to touch.
@@ -219,6 +220,7 @@ fn parse(args: &[String]) -> std::result::Result<Parsed, u8> {
 ///   * `--` and `<pathspec>...` — as with git, any pathspec implies `-d`, and
 ///     options may be given after pathspecs.
 ///   * grouped short flags (`-ndx`, `-ffd`, …).
+/// ```
 ///
 /// Diagnostics follow git: an unknown option or a missing option value exits
 /// 129, while a pathspec with invalid magic (`:(bogusmagic)…`), a pathspec that

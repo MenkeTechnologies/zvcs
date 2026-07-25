@@ -2,6 +2,7 @@
 //! protocol, backed by the vendored `gix-credentials` cascade.
 //!
 //! Supported actions, with stdout byte-identical to stock git:
+//! ```text
 //!   * `git credential fill`       — read a credential description on stdin,
 //!                                    consult the configured helpers (and, if
 //!                                    they come up short, prompt), then print
@@ -9,6 +10,7 @@
 //!   * `git credential approve`    — send `store` to every configured helper.
 //!   * `git credential reject`     — send `erase` to every configured helper.
 //!   * `git credential capability` — print the fixed capability announcement.
+//! ```
 //!
 //! Helper discovery, `credential.<url>.*` subsection matching, `credential.
 //! username`, `credential.useHttpPath`, `credential.protectProtocol` and the
@@ -32,6 +34,7 @@
 //! rather than a silently degraded credential.
 //!
 //! Known divergences from stock git:
+//! ```text
 //!   * Helper *stdin* is written by `gix-credentials`, which leads with a
 //!     `url=` line and orders the remaining keys differently than git. Helpers
 //!     that parse `key=value` see the same credential; a helper that echoes its
@@ -47,6 +50,7 @@
 //!     fatal and exit 128.
 //!   * `git credential` outside of a repository is not supported — the
 //!     credential config engine is reached through a `gix::Repository`.
+//! ```
 
 use anyhow::Result;
 use std::io::{Read, Write};

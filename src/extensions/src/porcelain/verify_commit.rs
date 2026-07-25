@@ -4,6 +4,7 @@
 //! `--raw`, their `--no-` forms, `-h`, `--`), the usage block and its exit code
 //! 129, and every verdict that can be reached *without* running a signature
 //! checker:
+//! ```text
 //!   * an unresolvable spec        → `error: commit '<name>' not found.`
 //!   * an oid with no object       → `error: <name>: unable to read file.`
 //!   * a non-commit object         → `error: <name>: cannot verify a non-commit
@@ -11,6 +12,7 @@
 //!   * a commit carrying no `gpgsig` header → no output at all, exit 1
 //!     (git's `check_commit_signature` fails before it ever spawns gpg, so `-v`
 //!     prints nothing on this path either — verified against git 2.55.0)
+//! ```
 //! Like git, each `<commit>` is processed in order, errors do not stop the loop,
 //! and the process exits 1 if any of them failed.
 //!

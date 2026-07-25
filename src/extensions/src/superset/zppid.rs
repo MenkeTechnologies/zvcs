@@ -231,7 +231,7 @@ pub fn zppid(args: &[String]) -> Result<ExitCode> {
     let total: i64 = procs.iter().map(|p| p.commits).sum();
     let live = procs.iter().filter(|p| is_alive(p.ppid)).count();
     println!("{} process(es), {live} live, {total} commit(s):", procs.len());
-    println!("  {:>7} {:>5} {:>7} {:>5}  {:<16} {}", "PID", "STATE", "COMMITS", "LAST", "CMD", "CWD");
+    println!("  {:>7} {:>5} {:>7} {:>5}  {:<16} CWD", "PID", "STATE", "COMMITS", "LAST", "CMD");
     for p in &procs {
         let state = if is_alive(p.ppid) { "live" } else { "dead" };
         println!(
@@ -312,7 +312,7 @@ pub fn zprocs(args: &[String]) -> Result<ExitCode> {
 
     let grand: i64 = rows.iter().map(|(_, _, t)| t).sum();
     println!("{} process(es), {grand} mutating command(s):", rows.len());
-    println!("  {:>7} {:>5} {:>6} {:>5}  {:<12} {}", "PID", "STATE", "TOTAL", "LAST", "CMD", "COMMANDS");
+    println!("  {:>7} {:>5} {:>6} {:>5}  {:<12} COMMANDS", "PID", "STATE", "TOTAL", "LAST", "CMD");
     for (p, vs, total) in &rows {
         let state = if is_alive(p.ppid) { "live" } else { "dead" };
         let breakdown = vs.iter().map(|(v, c)| format!("{v}:{c}")).collect::<Vec<_>>().join(" ");

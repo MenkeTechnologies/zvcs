@@ -40,6 +40,7 @@ const ERROR_PACK: u8 = 4;
 /// 6. the connectivity report is printed in `obj_hash` slot order.
 ///
 /// Ported flags:
+/// ```text
 ///   * `<object>...`                  — resolved with gix's rev-parse, the stand-in
 ///                                       for `repo_get_oid()`.
 ///   * `--unreachable`                — list every unreachable object instead of
@@ -77,6 +78,7 @@ const ERROR_PACK: u8 = 4;
 ///                                       id. This is the one flag that mutates the
 ///                                       repository.
 ///   * `-h` / `--help`                 — prints the usage block to stdout, exit 129.
+/// ```
 ///
 /// Unknown, ambiguous, and abbreviated long options are resolved by a faithful
 /// port of `parse-options.c::parse_long_opt` (unambiguous prefixes apply, e.g.

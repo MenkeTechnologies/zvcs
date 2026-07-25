@@ -14,7 +14,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 
-use crate::gitsig::{evaluate, GStatus};
+use crate::gitsig::evaluate;
 use crate::superset::query::{parallel_map, selected};
 
 /// One commit that failed the signature check in a repo.

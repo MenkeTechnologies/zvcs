@@ -102,6 +102,7 @@ enum Order {
 /// `git rev-list` — list commit ids reachable from the given revisions.
 ///
 /// Supported invocation forms:
+/// ```text
 ///   * `rev-list <rev>...`            — commits reachable from each `<rev>`
 ///   * `rev-list ^<rev>`              — exclude commits reachable from `<rev>`
 ///   * `rev-list <a>..<b>`            — reachable from `<b>` but not `<a>` (empty
@@ -121,6 +122,7 @@ enum Order {
 ///                                       from the listed commits
 ///   * `-- <path>...`                 — path-limited: keep only commits whose diff
 ///                                       against a parent touched a matching path
+/// ```
 ///
 /// Genuinely unsupported forms are rejected: symmetric-difference ranges
 /// (`<a>...<b>`) and magic pathspecs (`:(glob)`, `:!exclude`, …).

@@ -761,11 +761,13 @@ const FSCK_FATAL_IDS: &[&str] = &["nulinheader", "unterminatedheader"];
 ///
 /// git splits the value on space, comma or pipe, skips empty tokens, lowercases
 /// the id (the part before the first `=`), and for each token in order:
+/// ```text
 ///   * no `=`                       → `Missing '=': '<id>'`
 ///   * unknown id                   → `Unhandled message id: <id>`
 ///   * severity not error/warn/ignore (case-sensitive) → `Unknown fsck message
 ///     type: '<severity>'`
 ///   * a `FSCK_FATAL` id set below `error` → `Cannot demote <id> to <severity>`
+/// ```
 /// A fully valid list returns `Ok`; the flag is still rejected later as
 /// unported, but only after every check git performs first has passed.
 fn validate_fsck_msg_types(values: &str) -> std::result::Result<(), ExitCode> {

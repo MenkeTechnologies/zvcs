@@ -17,11 +17,14 @@ use crate::lock::RepoLock;
 /// default `master`. (gix's own fallback is `main`; this port overrides it to
 /// git's `master` so the no-config case matches stock git byte-for-byte.)
 /// Output mirrors stock git:
+/// ```text
 ///   * fresh repo:    `Initialized empty Git repository in <gitdir>/`
 ///   * existing repo: `Reinitialized existing Git repository in <gitdir>/`
 ///   * with `--shared`: the word `shared ` is inserted before `Git repository`.
+/// ```
 ///
 /// Supported invocation forms:
+/// ```text
 ///   * `git init [<directory>]`
 ///   * `git init --bare [<directory>]`                    (also into a non-empty dir)
 ///   * `git init -b <name>` / `--initial-branch=<name>`   (sets `HEAD` symref)
@@ -40,6 +43,7 @@ use crate::lock::RepoLock;
 ///     `--no-initial-branch` / `--no-object-format` / `--no-ref-format`
 ///                                                        (git's auto-generated negations; reset to default, last-wins)
 ///   * `--` to terminate option parsing
+/// ```
 ///
 /// Ported from git's `builtin/init-db.c` + `setup.c` (`create_default_files`,
 /// `copy_templates_1`, `separate_git_dir`) and `path.c`
@@ -48,6 +52,7 @@ use crate::lock::RepoLock;
 /// template merge semantics, and the `gitdir:` link file all match stock git.
 ///
 /// # Deviations (surfaced honestly, never faked)
+/// ```text
 ///   * Reinitialization prints the git message and succeeds but applies no new
 ///     options: `--template`, `--shared`, and `--separate-git-dir` migration are
 ///     only honored on a *fresh* init. gix exposes no reinit path, so an
@@ -62,6 +67,7 @@ use crate::lock::RepoLock;
 ///     no-ops that match the repository gix already writes — and an otherwise
 ///     unrecognized value reproduces git's exact error text (`unknown hash
 ///     algorithm '<v>'` / `unknown ref storage format '<v>'`).
+/// ```
 pub fn init(args: &[String]) -> Result<ExitCode> {
     let mut bare = false;
     let mut quiet = false;

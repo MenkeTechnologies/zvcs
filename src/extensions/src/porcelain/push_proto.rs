@@ -67,6 +67,35 @@ pub struct Request {
     pub only_if_absent: bool,
 }
 
+/// Which advertised refs a push may DELETE beyond the caller's explicit
+/// requests — the `--mirror` / `--prune` half of the protocol, which can only be
+/// computed here because it needs the ref advertisement.
+pub enum DeleteScope {
+    /// `--mirror`: every advertised ref the local repository no longer has.
+    All,
+    /// `--prune`: only advertised refs under these destination prefixes (the
+    /// namespaces this push writes to), so an unrelated remote ref is never
+    /// touched.
+    Prefixes(Vec<String>),
+}
+
+/// Wire-level options that change the request itself rather than the ref list.
+#[derive(Default)]
+pub struct SendOptions {
+    /// `--atomic`: ask the server to apply every update or none. Requires the
+    /// `atomic` capability; git errors rather than silently pushing
+    /// non-atomically, and so does this.
+    pub atomic: bool,
+    /// `-o/--push-option` values, sent as their own pkt-line section between the
+    /// command list and the pack. Requires the `push-options` capability.
+    pub push_options: Vec<String>,
+    /// Extra deletions to synthesize from the advertisement.
+    pub delete_scope: Option<DeleteScope>,
+    /// Ref names the caller is pushing, used with `delete_scope` to decide which
+    /// advertised refs have no local counterpart.
+    pub local_refs: HashSet<String>,
+}
+
 /// The server's per-ref verdict, from `report-status`.
 pub struct RefStatus {
     pub name: String,
@@ -101,6 +130,7 @@ pub fn send_pack(
     remote: &gix::Remote<'_>,
     requests: &[Request],
     dry_run: bool,
+    opts: &SendOptions,
 ) -> Result<Outcome> {
     let null = ObjectId::null(repo.object_hash());
     let url = remote
@@ -165,6 +195,21 @@ pub fn send_pack(
     }
     if object_format_supported {
         cap_buf.push_str(&format!(" object-format={}", repo.object_hash()));
+    }
+    // `--atomic` and `-o` are refused rather than downgraded: git errors when the
+    // receiving end lacks the capability, because pushing non-atomically (or
+    // dropping the options) would silently do something other than what was asked.
+    if opts.atomic {
+        if !caps.contains("atomic") {
+            bail!("the receiving end does not support --atomic push");
+        }
+        cap_buf.push_str(" atomic");
+    }
+    if !opts.push_options.is_empty() {
+        if !caps.contains("push-options") {
+            bail!("the receiving end does not support push options");
+        }
+        cap_buf.push_str(" push-options");
     }
     cap_buf.push_str(&format!(" agent={}", agent()));
 
@@ -270,6 +315,50 @@ pub fn send_pack(
         });
     }
 
+    // `--mirror` / `--prune`: an advertised ref with no local counterpart is
+    // deleted. This has to happen here rather than in the porcelain because only
+    // the handshake knows what the remote actually has. `delete-refs` is required
+    // for the same reason git requires it — without it the deletion cannot be
+    // expressed on the wire at all.
+    if let Some(scope) = &opts.delete_scope {
+        let requested: HashSet<&str> = wire.iter().map(|w| w.name.as_str()).collect();
+        let mut doomed: Vec<(&String, &ObjectId)> = advertised
+            .iter()
+            .filter(|(name, _)| !opts.local_refs.contains(name.as_str()))
+            .filter(|(name, _)| !requested.contains(name.as_str()))
+            .filter(|(name, _)| match scope {
+                DeleteScope::All => true,
+                DeleteScope::Prefixes(prefixes) => {
+                    prefixes.iter().any(|p| name.starts_with(p.as_str()))
+                }
+            })
+            .collect();
+        // Deterministic order so the status block reads the same run to run.
+        doomed.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, old) in doomed {
+            if !allow_deleting_refs {
+                statuses.push(RefStatus {
+                    name: name.clone(),
+                    old: *old,
+                    new: null,
+                    result: Err("remote does not support deleting refs".to_owned()),
+                    forced: false,
+                    up_to_date: false,
+                });
+                continue;
+            }
+            // Only the wire entry: the per-ref status is produced from the
+            // server report alongside every other command, so pushing one here
+            // too would report the deletion twice.
+            wire.push(Wire {
+                name: name.clone(),
+                old: *old,
+                new: null,
+                forced: true,
+            });
+        }
+    }
+
     // Nothing survived the checks: no request to send. Report what we have.
     if wire.is_empty() {
         return Ok(Outcome {
@@ -291,6 +380,16 @@ pub fn send_pack(
         encode::data_to_write(line.as_bytes(), &mut req_buf)?;
     }
     encode::write_packet_line(&PacketLineRef::Flush, &mut req_buf)?;
+
+    // Push options ride in their own pkt-line section between the command list's
+    // flush and the pack, one option per line, terminated by a flush (git's
+    // `send_pack()` after `advertise_push_options`).
+    if !opts.push_options.is_empty() {
+        for opt in &opts.push_options {
+            encode::data_to_write(opt.as_bytes(), &mut req_buf)?;
+        }
+        encode::write_packet_line(&PacketLineRef::Flush, &mut req_buf)?;
+    }
 
     // Build the pack of objects the remote lacks: everything reachable from the
     // new tips, minus everything reachable from the advertised/old tips it already

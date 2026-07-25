@@ -3,6 +3,7 @@
 //! Served natively via the vendored gitoxide crates so tools on PATH observe
 //! the same ref store. Implemented forms (matching stock `git tag`):
 //!
+//! ```text
 //!   * `git tag`                       → list every tag, one short name per line,
 //!                                       sorted ascending by refname.
 //!   * `git tag -l|--list [<pattern>…]`→ list, keeping tags whose *short* name
@@ -45,6 +46,7 @@
 //!   * `git tag --create-reflog …`     → force-create the tag's reflog, writing git's
 //!                                       `tag: tagging <abbrev> (<subject>, <date>)` line.
 //!   * `git tag -d <name>…`            → delete each tag.
+//! ```
 //!
 //! Exit codes follow git: fatal errors exit 128, a bad object name for a filter
 //! exits 129, and a failed delete exits 1.

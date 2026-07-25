@@ -2,6 +2,7 @@
 //! ref store and worktree-state checkout.
 //!
 //! Supported invocations, reproduced from git 2.55.0 rather than inferred:
+//! ```text
 //!   * `git switch <branch>`                    → attach `HEAD` to an existing
 //!                                                local branch and update the
 //!                                                worktree/index to its tip.
@@ -21,6 +22,7 @@
 //!                                                resolved from the `HEAD` reflog.
 //!   * `-t`/`--track[=(direct|inherit)]` / `--no-track`, `--guess`/`--no-guess`,
 //!     `-f`/`--force`/`--discard-changes`, `-q`/`--quiet`.
+//! ```
 //!
 //! Stream and exit-code conventions: the informational messages (`Switched to
 //! branch '<b>'`, `Switched to a new branch '<b>'`, `Switched to and reset branch
@@ -36,6 +38,7 @@
 //! `--conflict` (only meaningful with `--merge`).
 //!
 //! Known divergences from git that are *not* fixable from this file:
+//! ```text
 //!   * No `.git/logs/HEAD` reflog line is written for the symbolic `HEAD` move —
 //!     see [`attach_head`].
 //!   * A switch that must rewrite tracked files requires a clean worktree unless
@@ -46,6 +49,7 @@
 //!   * The "you are leaving N commit behind" orphaned-commit warning printed when
 //!     abandoning a detached HEAD with unreachable commits is not reproduced
 //!     (consistent with `checkout.rs`).
+//! ```
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};

@@ -85,10 +85,14 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "--force-with-lease" => f.lease = parse_lease(inline)?,
             "--no-force-with-lease" => f.lease = Lease::None,
             // Accepted, but inert here or already matched by the engine's behavior.
-            "-q" | "--quiet" | "-v" | "--verbose" | "--progress" | "--no-progress"
+            "-v" | "--verbose" => f.verbose = true,
+            "-q" | "--quiet" | "--progress" | "--no-progress"
             | "--thin" | "--no-thin" | "-4" | "--ipv4" | "-6" | "--ipv6"
             | "--force-if-includes" | "--no-force-if-includes" | "--verify" | "--no-verify"
-            | "--no-signed" | "--no-atomic" | "--no-mirror" | "--no-prune" => {}
+            | "--no-signed" => {}
+            "--no-atomic" => f.atomic = false,
+            "--no-mirror" => f.mirror = false,
+            "--no-prune" => f.prune = false,
             "--no-follow-tags" => f.follow_tags = false,
             "--receive-pack" | "--exec" => {
                 let _ = take_value(inline)?;
@@ -101,14 +105,15 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
                 f.recurse = Recurse::Off;
                 recurse_explicit = true;
             }
-            // Rejected: cannot be honored faithfully by the send-pack scope, and
-            // silently ignoring them would change the push's meaning.
-            "--mirror" => bail!("--mirror is not supported"),
-            "--prune" => bail!("--prune is not supported"),
-            "--atomic" => bail!("--atomic is not supported"),
+            // `--mirror`/`--prune` synthesize deletions from the ref
+            // advertisement; `--atomic` and `-o` are negotiated capabilities.
+            // All four are refused by the wire layer when the server lacks the
+            // capability rather than being silently downgraded.
+            "--mirror" => f.mirror = true,
+            "--prune" => f.prune = true,
+            "--atomic" => f.atomic = true,
             "-o" | "--push-option" => {
-                let _ = take_value(inline)?;
-                bail!("--push-option is not supported");
+                f.push_options.push(take_value(inline)?);
             }
             "--signed" => match inline.as_deref() {
                 None | Some("no") | Some("false") => {}
@@ -272,7 +277,45 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let outcome = push_proto::send_pack(&repo, &remote, &requests, f.dry_run)?;
+    // Every ref this repository still has, for the `--mirror`/`--prune` deletion
+    // decision: an advertised ref absent from this set has no local counterpart.
+    let local_refs: std::collections::HashSet<String> = repo
+        .references()?
+        .all()?
+        .filter_map(|r| r.ok())
+        .filter_map(|r| r.name().as_bstr().to_str().ok().map(str::to_owned))
+        .collect();
+    let delete_scope = if f.mirror {
+        Some(push_proto::DeleteScope::All)
+    } else if f.prune {
+        // git prunes only within the namespaces the push's refspecs actually
+        // COVER — a pattern refspec (`refs/heads/*:refs/heads/*`, which is what
+        // `--all` and the configured default expand to). An explicit single-ref
+        // push like `git push --prune origin main` covers exactly that one ref,
+        // so it prunes nothing; deleting the rest of the namespace there would
+        // destroy remote branches stock git leaves alone.
+        let mut prefixes: Vec<String> = specs
+            .iter()
+            .filter(|s| s.contains('*'))
+            .filter_map(|s| {
+                let dst = s.rsplit_once(':').map(|(_, d)| d).unwrap_or(s.as_str());
+                dst.split_once('*').map(|(prefix, _)| full_ref_name(prefix))
+            })
+            .collect();
+        if f.all {
+            prefixes.push("refs/heads/".to_string());
+        }
+        if prefixes.is_empty() { None } else { Some(push_proto::DeleteScope::Prefixes(prefixes)) }
+    } else {
+        None
+    };
+    let send_opts = push_proto::SendOptions {
+        atomic: f.atomic,
+        push_options: f.push_options.clone(),
+        delete_scope,
+        local_refs,
+    };
+    let outcome = push_proto::send_pack(&repo, &remote, &requests, f.dry_run, &send_opts)?;
 
     // A dry run performs no local writes; a real push advances the tracking refs
     // and (for `-u`) records the upstream, but only for refs the remote accepted.
@@ -286,7 +329,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     if f.porcelain {
         report_porcelain(&outcome)
     } else {
-        report(&outcome)
+        report(&outcome, f.verbose)
     }
 }
 
@@ -298,6 +341,11 @@ struct Flags {
     delete: bool,
     all: bool,
     tags: bool,
+    mirror: bool,
+    verbose: bool,
+    prune: bool,
+    atomic: bool,
+    push_options: Vec<String>,
     follow_tags: bool,
     set_upstream: bool,
     porcelain: bool,
@@ -449,6 +497,35 @@ fn build_requests(
     let mut requests = Vec::new();
     let mut upstreams = Vec::new();
 
+    // `--mirror` pushes EVERY ref under `refs/` — branches, tags, remote-tracking
+    // refs, notes — each forced, each to its own name. The deletion half (remote
+    // refs this repository no longer has) is synthesized in the wire layer, which
+    // is the only place the advertisement exists.
+    if f.mirror {
+        if !specs.is_empty() {
+            bail!("--mirror can't be combined with refspecs");
+        }
+        for r in repo.references()?.all()? {
+            let r = r.map_err(|e| anyhow!("{e}"))?;
+            let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
+            // Only real refs under refs/ travel: HEAD and other root refs are not
+            // part of the mirror set.
+            if !name.starts_with("refs/") {
+                continue;
+            }
+            if let Some(id) = r.try_id() {
+                requests.push(Request {
+                    name,
+                    new: id.detach(),
+                    force: true,
+                    expected: None,
+                    only_if_absent: false,
+                });
+            }
+        }
+        return Ok((requests, upstreams));
+    }
+
     if f.all {
         if !specs.is_empty() {
             bail!("--all can't be combined with refspecs");
@@ -504,6 +581,15 @@ fn build_requests(
         upstreams.push(up);
     } else {
         for spec in specs {
+            // A PATTERN refspec (`refs/heads/*:refs/heads/*`) expands to one
+            // update per matching local ref, with the matched tail substituted
+            // into the destination — git's `match_push_refs` glob handling. This
+            // is also the shape `--prune` needs to be meaningful, since only a
+            // pattern covers a whole namespace.
+            if spec.contains('*') {
+                requests.extend(expand_pattern_refspec(repo, spec, f.force)?);
+                continue;
+            }
             let (req, up) = parse_refspec(repo, spec, f.force)?;
             requests.push(req);
             if let Some(up) = up {
@@ -790,7 +876,7 @@ fn tracking_ref_for(remote: &gix::Remote<'_>, pushed: &str) -> Option<String> {
 
 /// Print the human `To <url>` status block (git prints it on stderr) and return
 /// the exit code: failure if the unpack failed or any ref was rejected.
-fn report(outcome: &push_proto::Outcome) -> Result<ExitCode> {
+fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
     let mut any_failed = outcome.unpack.is_err();
     if let Err(reason) = &outcome.unpack {
         eprintln!("error: unpack failed: {reason}");
@@ -800,7 +886,12 @@ fn report(outcome: &push_proto::Outcome) -> Result<ExitCode> {
         .statuses
         .iter()
         .any(|s| !s.up_to_date && s.result.is_ok());
-    if !did_update && !any_failed && outcome.statuses.iter().all(|s| s.result.is_ok()) {
+    let nothing_moved =
+        !did_update && !any_failed && outcome.statuses.iter().all(|s| s.result.is_ok());
+    // Under `-v` git still prints the `To <url>` block listing each unchanged
+    // ref, and only THEN the summary line; the default output is the summary
+    // alone.
+    if nothing_moved && !verbose {
         eprintln!("Everything up-to-date");
         return Ok(ExitCode::SUCCESS);
     }
@@ -810,14 +901,25 @@ fn report(outcome: &push_proto::Outcome) -> Result<ExitCode> {
         let short = |oid: &ObjectId| oid.to_hex_with_len(7).to_string();
         let src_dst = format!("{} -> {}", short_ref(&s.name), short_ref(&s.name));
         match &s.result {
-            Ok(()) if s.up_to_date => eprintln!(" = [up to date]      {src_dst}"),
+            // git lists an unchanged ref only under `-v`; the default block shows
+            // just what moved.
+            Ok(()) if s.up_to_date => {
+                if verbose {
+                    eprintln!(" = [up to date]      {src_dst}");
+                }
+            }
             Ok(()) if s.old.is_null() => {
+                // git names the created ref by its namespace: a branch, a tag, or
+                // — for anything else, notes and remote-tracking refs included,
+                // which `--mirror` pushes — the generic "new reference".
                 let kind = if s.name.starts_with("refs/tags/") {
-                    "[new tag]   "
+                    "[new tag]     "
+                } else if s.name.starts_with("refs/heads/") {
+                    "[new branch]  "
                 } else {
-                    "[new branch]"
+                    "[new reference]"
                 };
-                eprintln!(" * {kind}      {src_dst}");
+                eprintln!(" * {kind}    {src_dst}");
             }
             Ok(()) if s.new.is_null() => {
                 eprintln!(" - [deleted]         {}", short_ref(&s.name));
@@ -832,6 +934,9 @@ fn report(outcome: &push_proto::Outcome) -> Result<ExitCode> {
                 eprintln!(" ! [rejected]        {src_dst} ({reason})");
             }
         }
+    }
+    if nothing_moved {
+        eprintln!("Everything up-to-date");
     }
 
     if any_failed {
@@ -880,8 +985,11 @@ fn report_porcelain(outcome: &push_proto::Outcome) -> Result<ExitCode> {
 
 /// Shorten a full ref name for display (`refs/heads/main` → `main`).
 fn short_ref(name: &str) -> &str {
+    // git's `prettify_refname`: the three well-known namespaces are stripped,
+    // anything else (notes, replace, a custom hierarchy) prints in full.
     name.strip_prefix("refs/heads/")
         .or_else(|| name.strip_prefix("refs/tags/"))
+        .or_else(|| name.strip_prefix("refs/remotes/"))
         .unwrap_or(name)
 }
 
@@ -1184,4 +1292,63 @@ mod tests {
         append_followed_tags(&repo, &mut requests).expect("append");
         assert_eq!(requests.len(), 1, "no tips to be reachable from, so no tags");
     }
+}
+
+/// Expand a pattern refspec — `[+]<src-prefix>*<src-suffix>:<dst-prefix>*<dst-suffix>`
+/// — into one [`Request`] per matching local ref.
+///
+/// Ports the glob half of git's `match_push_refs`: exactly one `*` on each side,
+/// the text it matched on the source carried into the destination, and a missing
+/// destination meaning "same name over there". The refs are walked once, in name
+/// order, so the pushed set is deterministic.
+///
+/// Only refs are matched, never revisions: `refs/heads/*` cannot select a commit,
+/// which is why this is separate from [`parse_refspec`]'s `rev_parse_single`.
+fn expand_pattern_refspec(
+    repo: &gix::Repository,
+    spec: &str,
+    force: bool,
+) -> Result<Vec<Request>> {
+    let (spec, force) = match spec.strip_prefix('+') {
+        Some(rest) => (rest, true),
+        None => (spec, force),
+    };
+    let (src, dst) = match spec.split_once(':') {
+        Some((s, d)) => (s, d),
+        None => (spec, spec),
+    };
+    if src.matches('*').count() != 1 || dst.matches('*').count() != 1 {
+        bail!("invalid refspec '{spec}': a pattern needs exactly one '*' on each side");
+    }
+    let (src_prefix, src_suffix) = src.split_once('*').expect("checked above");
+    let (dst_prefix, dst_suffix) = dst.split_once('*').expect("checked above");
+    let src_prefix = full_ref_name(src_prefix);
+    let dst_prefix = full_ref_name(dst_prefix);
+
+    let mut out = Vec::new();
+    let mut names: Vec<(String, ObjectId)> = Vec::new();
+    for r in repo.references()?.all()? {
+        let r = r.map_err(|e| anyhow!("{e}"))?;
+        let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
+        if let Some(id) = r.try_id() {
+            names.push((name, id.detach()));
+        }
+    }
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (name, id) in names {
+        let Some(rest) = name.strip_prefix(src_prefix.as_str()) else { continue };
+        let Some(matched) = rest.strip_suffix(src_suffix) else { continue };
+        if matched.is_empty() {
+            continue;
+        }
+        out.push(Request {
+            name: format!("{dst_prefix}{matched}{dst_suffix}"),
+            new: id,
+            force,
+            expected: None,
+            only_if_absent: false,
+        });
+    }
+    Ok(out)
 }

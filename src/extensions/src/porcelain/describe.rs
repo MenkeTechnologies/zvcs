@@ -16,6 +16,7 @@ use std::process::ExitCode;
 /// `<tag>-<depth>-g<shorthash>`, with an optional `-dirty` suffix.
 ///
 /// Supported forms:
+/// ```text
 ///   * `git describe [<commit-ish>...]`  — default target is `HEAD`
 ///   * `--tags`                          — consider lightweight tags too
 ///   * `--all`                           — consider every ref (incl. branches),

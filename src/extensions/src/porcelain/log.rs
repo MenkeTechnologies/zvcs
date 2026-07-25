@@ -180,7 +180,22 @@ fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///     difference, excluding the merge-base), and a leading `^A` exclusion.
 ///   * `--grep`/`--author` filters and every flag not listed above are rejected.
 pub fn log(args: &[String]) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    // Repeated object reads (one per rendered commit) re-inflate from the pack
+    // without a cache; gix ships one and simply does not enable it by default.
+    // A few MB turns `log` on a deep history from thousands of decompressions
+    // into a warm-cache walk.
+    let mut repo = gix::discover(".")?;
+    // Rendering re-reads every walked commit for its message; without gix's
+    // object cache each read re-inflates from the pack. Enabling it is the
+    // difference between one decompression per commit and one per cache miss.
+    repo.object_cache_size_if_unset(8 * 1024 * 1024);
+    // gix's DEFAULT pack cache is a 64-entry linked list; git ships a 96MB
+    // delta-base cache (core.deltaBaseCacheLimit). On a deep history every
+    // rendered commit re-resolves its delta chain against those 64 slots, which
+    // is where `log` spent its time. Size it like git.
+    repo.objects.set_pack_cache(|| {
+        Box::new(gix::odb::pack::cache::lru::MemoryCappedHashmap::new(96 * 1024 * 1024))
+    });
 
     // Config supplies the defaults; the flags below override them. git reads
     // these in `git_log_config` before parsing args, and validates `log.date`
@@ -758,7 +773,28 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     } else {
         ancestor_closure(&repo, &neg_ids)?
     };
-    let mut nodes = walk(&repo, &tips, &tip_sources, first_parent, &hidden)?;
+    // The walk may stop early only when every commit it yields is guaranteed to
+    // be shown: no pathspec, parent-count, date, grep or pickaxe filter can drop
+    // one, no topological re-sort needs the whole set, and `--reverse` does not
+    // need the tail. Anything else walks the full history as before.
+    let unfiltered = pathspecs.is_empty()
+        && !only_merges
+        && !no_merges
+        && min_parents.is_none()
+        && max_parents.is_none()
+        && since.is_none()
+        && until.is_none()
+        && author_pats.is_empty()
+        && committer_pats.is_empty()
+        && grep_pats.is_empty()
+        && pickaxe_s.is_none()
+        && pickaxe_g.is_none()
+        && !reverse
+        && !graph
+        && order == Order::Default;
+    let budget = (unfiltered && max_count.is_some())
+        .then(|| skip.saturating_add(max_count.unwrap_or(0)));
+    let mut nodes = walk(&repo, &tips, &tip_sources, first_parent, &hidden, budget)?;
     let effective_order = match (order, graph) {
         (Order::Default, true) => Order::Topo,
         (o, _) => o,
@@ -892,7 +928,12 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // `--graph` needs every commit's block up front to lay out the columns, so it
     // buffers; every other format streams commit-by-commit (see the write below).
     let mut blocks: Vec<Vec<u8>> = Vec::new();
-    let mut stdout = std::io::stdout().lock();
+    // BLOCK-buffered, not line-buffered: Rust's stdout is a LineWriter, so writing
+    // one terminated record per commit meant one write(2) per commit — 6375
+    // syscalls for a full `log` on a deep history, which showed up as ~400ms of
+    // system time against git's 8ms. git buffers and so does this now; the tail
+    // is flushed below, and a closed pipe still surfaces as BrokenPipe.
+    let mut stdout = std::io::BufWriter::with_capacity(64 * 1024, std::io::stdout().lock());
     let mut first = true;
     for node in &nodes {
         let commit = repo.find_object(node.id)?.try_into_commit()?;
@@ -1162,6 +1203,26 @@ struct Node {
     source: String,
 }
 
+/// Heap order for the walk's frontier: newest commit-date first, ties broken by
+/// object id so the ordering is total (a `BinaryHeap` needs `Ord`, and equal
+/// dates are common in imported or scripted history).
+impl Ord for Node {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.time.cmp(&other.time).then_with(|| other.id.cmp(&self.id))
+    }
+}
+impl PartialOrd for Node {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for Node {
+    fn eq(&self, other: &Self) -> bool {
+        self.time == other.time && self.id == other.id
+    }
+}
+impl Eq for Node {}
+
 /// Resolve a single revision to its object id (a range endpoint), `Err(())` if it
 /// doesn't name anything — the caller turns that into git's bad-revision error.
 fn resolve_rev(repo: &gix::Repository, spec: &str) -> Result<ObjectId, ()> {
@@ -1201,6 +1262,45 @@ fn read_node(repo: &gix::Repository, id: ObjectId) -> Result<Node> {
     })
 }
 
+/// The walk needs exactly three things per commit — id, parents, commit time —
+/// and all three live in the **commit-graph** when the repository has one, which
+/// is why git can walk a 6000-commit history without touching the object
+/// database. `read_node` decodes a full commit object (zlib inflate, header
+/// parse) for the same three fields.
+///
+/// This reader prefers the graph and falls back to the object for any commit the
+/// graph does not carry (a graph written before the newest commits, or none at
+/// all), so the walk is always correct and merely faster when the graph is
+/// current.
+struct NodeReader {
+    graph: Option<gix::commitgraph::Graph>,
+}
+
+impl NodeReader {
+    fn new(repo: &gix::Repository) -> Self {
+        NodeReader { graph: repo.commit_graph().ok() }
+    }
+
+    fn read(&self, repo: &gix::Repository, id: ObjectId) -> Result<Node> {
+        if let Some(graph) = &self.graph {
+            if let Some(commit) = graph.commit_by_id(id) {
+                let parents: Vec<ObjectId> = commit
+                    .iter_parents()
+                    .filter_map(|p| p.ok())
+                    .map(|pos| graph.commit_at(pos).id().to_owned())
+                    .collect();
+                return Ok(Node {
+                    id,
+                    parents,
+                    time: commit.committer_timestamp() as i64,
+                    source: String::new(),
+                });
+            }
+        }
+        read_node(repo, id)
+    }
+}
+
 /// git's `commit_list_insert_by_date`: keep the list newest-first, and place a
 /// commit *after* every commit with the same date so equal timestamps come out
 /// in insertion order — the tie-break git's priority queue also uses.
@@ -1221,6 +1321,7 @@ fn walk(
     tip_sources: &[String],
     first_parent: bool,
     hidden: &HashSet<ObjectId>,
+    budget: Option<usize>,
 ) -> Result<Vec<Node>> {
     // Shallow commits (from `.git/shallow`, as a `--depth` clone leaves) are grafted
     // to have no parents: the walk must stop at them, not try to read their absent
@@ -1235,23 +1336,33 @@ fn walk(
     // Pre-seeding `seen` with the hidden (uninteresting) commits means any tip or
     // parent reachable from a negative range endpoint is never emitted or traversed
     // — git's `..` exclusion, implemented as a boundary the walk cannot cross.
+    let reader = NodeReader::new(repo);
     let mut seen: HashSet<ObjectId> = hidden.clone();
-    let mut pending: Vec<Node> = Vec::new();
+    // A binary heap, not a date-sorted Vec: the frontier is popped newest-first,
+    // and both the push and the pop are logarithmic. The previous sorted-insert
+    // plus `remove(0)` made a full walk quadratic in the number of commits.
+    let mut pending: std::collections::BinaryHeap<Node> = std::collections::BinaryHeap::new();
     for (idx, tip) in tips.iter().enumerate() {
         if seen.insert(*tip) {
-            let mut node = read_node(repo, *tip)?;
+            let mut node = reader.read(repo, *tip)?;
             // `--source` names each tip; without it `tip_sources` is empty and the
             // source stays blank (never rendered). Parents inherit below.
             if let Some(src) = tip_sources.get(idx) {
                 node.source = src.clone();
             }
-            insert_by_date(&mut pending, node);
+            pending.push(node);
         }
     }
 
     let mut out: Vec<Node> = Vec::new();
-    while !pending.is_empty() {
-        let node = pending.remove(0);
+    while let Some(node) = pending.pop() {
+        // `budget` is `skip + max-count` when the caller has established that
+        // nothing downstream can drop a commit (no pathspec, no parent/date/grep
+        // filter, default order). Stopping there turns `log -n 100` on a
+        // 6000-commit history from a full-history read into 100 object reads.
+        if budget.is_some_and(|b| out.len() >= b) {
+            break;
+        }
         let parents: &[ObjectId] = if shallow.contains(&node.id) {
             &[] // grafted: a shallow commit's parents are outside the clone
         } else if first_parent {
@@ -1261,11 +1372,11 @@ fn walk(
         };
         for parent in parents {
             if seen.insert(*parent) {
-                let mut pnode = read_node(repo, *parent)?;
+                let mut pnode = reader.read(repo, *parent)?;
                 // git's `add_parents_to_list`: a parent inherits the source of the
                 // commit that first reaches it (an empty-string clone when off).
                 pnode.source = node.source.clone();
-                insert_by_date(&mut pending, pnode);
+                pending.push(pnode);
             }
         }
         out.push(node);

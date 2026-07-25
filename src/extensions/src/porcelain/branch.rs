@@ -1547,7 +1547,7 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     if old_full != new_full && repo.try_find_reference(new_full.as_str())?.is_some() && !o.force {
         return fatal(format!("a branch named '{new}' already exists"));
     }
-    let target = old_ref.peel_to_id_in_place()?.detach();
+    let target = old_ref.peel_to_id()?.detach();
 
     let old_name: FullName = old_full
         .as_str()
@@ -1661,7 +1661,7 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     if old_full != new_full && repo.try_find_reference(new_full.as_str())?.is_some() && !o.force {
         return fatal(format!("a branch named '{new}' already exists"));
     }
-    let target = old_ref.peel_to_id_in_place()?.detach();
+    let target = old_ref.peel_to_id()?.detach();
 
     let new_name: FullName = new_full
         .as_str()
@@ -1805,7 +1805,7 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             None => return error_exit(format!("branch '{name}' not found")),
         };
 
-        let tip_id = reference.peel_to_id_in_place()?;
+        let tip_id = reference.peel_to_id()?;
         let abbrev = tip_id.shorten_or_id();
         let tip = tip_id.detach();
 

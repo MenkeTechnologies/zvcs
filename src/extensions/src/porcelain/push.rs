@@ -653,7 +653,7 @@ fn append_followed_tags(repo: &gix::Repository, requests: &mut Vec<Request>) -> 
         if !is_annotated {
             continue;
         }
-        let Ok(peeled) = r.peel_to_id_in_place() else { continue };
+        let Ok(peeled) = r.peel_to_id() else { continue };
         let peeled = peeled.detach();
         if tips.iter().any(|tip| reachable(repo, peeled, *tip)) {
             // Never forced: a followed tag is an addition, and git refuses to
@@ -1073,7 +1073,7 @@ fn unpushed_submodules(repo: &gix::Repository, requests: &[Request]) -> Result<V
             Ok(platform) => match platform.remote_branches() {
                 Ok(iter) => iter
                     .filter_map(|r| r.ok())
-                    .filter_map(|mut r| r.peel_to_id_in_place().ok().map(|id| id.detach()))
+                    .filter_map(|mut r| r.peel_to_id().ok().map(|id| id.detach()))
                     .collect(),
                 Err(_) => continue,
             },

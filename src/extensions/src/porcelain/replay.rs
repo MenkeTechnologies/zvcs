@@ -326,7 +326,7 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
             return error(&format!("'{r}' is not a valid refname"));
         }
         if let Ok(Some(mut existing)) = repo.try_find_reference(r.as_str()) {
-            if let Ok(id) = existing.peel_to_id_in_place() {
+            if let Ok(id) = existing.peel_to_id() {
                 single_old = id.detach();
             }
         }
@@ -636,7 +636,7 @@ fn load_branch_decorations(
         let Ok(mut reference) = repo.find_reference(name.as_str()) else {
             continue;
         };
-        let Ok(id) = reference.peel_to_id_in_place() else {
+        let Ok(id) = reference.peel_to_id() else {
             continue;
         };
         map.entry(id.detach()).or_default().insert(0, name);

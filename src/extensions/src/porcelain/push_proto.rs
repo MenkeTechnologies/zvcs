@@ -23,10 +23,11 @@
 //! Faithful to the common `git push over https` path: create, fast-forward and
 //! forced ref updates, deletes, and `report-status` / `report-status-v2`. Not
 //! ported (git only sends these when explicitly asked, and each needs substrate
-//! that does not exist in the vendored crates): push certificates (`--signed`),
-//! `--atomic`, `push-options`, shallow grafts, and the `side-band-64k` progress
-//! demultiplexer — none is requested, so the server replies with a plain
-//! `report-status` stream. The pack is complete but undeltified (see
+//! that does not exist in the vendored crates): shallow grafts and the
+//! `side-band-64k` progress demultiplexer — neither is requested, so the server
+//! replies with a plain `report-status` stream. Push certificates (`--signed`),
+//! `--atomic` and `push-options` ARE negotiated here, each refused when the
+//! server does not advertise the capability rather than silently downgraded. The pack is complete but undeltified (see
 //! [`super::pack_objects`]); a non-thin pack is valid for receive-pack, `--thin`
 //! is only a size optimization.
 
@@ -94,6 +95,21 @@ pub struct SendOptions {
     /// Ref names the caller is pushing, used with `delete_scope` to decide which
     /// advertised refs have no local counterpart.
     pub local_refs: HashSet<String>,
+    /// `--signed`: send a push certificate signed with gpg.
+    pub signed: Signed,
+}
+
+/// `--signed=<mode>` — git's `SEND_PACK_PUSH_CERT_*`.
+#[derive(Default, Clone, Copy, PartialEq)]
+pub enum Signed {
+    /// `--signed=false` (the default): never send a certificate.
+    #[default]
+    Never,
+    /// `--signed=if-asked`: send one only when the server advertises a nonce.
+    IfAsked,
+    /// `--signed` / `--signed=true`: send one, and fail if the server cannot
+    /// take it.
+    Always,
 }
 
 /// The server's per-ref verdict, from `report-status`.
@@ -117,6 +133,83 @@ pub struct Outcome {
     pub statuses: Vec<RefStatus>,
     /// `unpack ok`, or the server's failure reason.
     pub unpack: Result<(), String>,
+}
+
+
+/// The certificate's signed payload — split out from the signing so the exact
+/// bytes can be asserted without a gpg key in the loop.
+fn push_cert_payload(
+    pusher: &str,
+    url: &str,
+    nonce: &str,
+    commands: &[(ObjectId, ObjectId, String)],
+    push_options: &[String],
+) -> String {
+    let mut cert = String::new();
+    cert.push_str("certificate version 0.1\n");
+    cert.push_str(&format!("pusher {pusher}\n"));
+    cert.push_str(&format!("pushee {url}\n"));
+    cert.push_str(&format!("nonce {nonce}\n"));
+    for opt in push_options {
+        cert.push_str(&format!("push-option {opt}\n"));
+    }
+    cert.push('\n');
+    for (old, new, name) in commands {
+        cert.push_str(&format!("{old} {new} {name}\n"));
+    }
+    cert
+}
+
+/// Build a signed push certificate over `wire`, ported from git's
+/// `generate_push_cert` (send-pack.c).
+///
+/// The signed payload is exactly:
+///
+/// ```text
+/// certificate version 0.1
+/// pusher <ident> <timestamp> <tz>
+/// pushee <url>
+/// nonce <nonce>
+/// [push-option <opt>]…
+///
+/// <old> <new> <ref>…
+/// ```
+///
+/// followed by the armored detached signature. The blank line is part of the
+/// signed bytes, and so is the trailing newline of every command — a certificate
+/// the server cannot verify byte-for-byte is worse than no certificate, so
+/// nothing here is reformatted on the way out.
+fn build_push_cert(
+    repo: &gix::Repository,
+    url: &str,
+    nonce: &str,
+    commands: &[(ObjectId, ObjectId, String)],
+    push_options: &[String],
+) -> Result<Vec<u8>> {
+    let committer = repo
+        .committer()
+        .transpose()?
+        .ok_or_else(|| anyhow!("cannot sign a push without a committer identity"))?;
+    let cert = push_cert_payload(
+        &format!("{} <{}> {}", committer.name, committer.email, committer.time),
+        url,
+        nonce,
+        commands,
+        push_options,
+    );
+
+    let snap = repo.config_snapshot();
+    let program = snap
+        .string("gpg.program")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "gpg".to_string());
+    let key = snap.string("user.signingKey").map(|v| v.to_string());
+    let signature = crate::gitsig::sign(cert.as_bytes(), &program, key.as_deref())
+        .map_err(|e| anyhow!("gpg failed to sign the push certificate: {e}"))?;
+
+    let mut out = cert.into_bytes();
+    out.extend_from_slice(&signature);
+    Ok(out)
 }
 
 /// Push `requests` to `remote` over receive-pack, returning each ref's verdict.
@@ -210,6 +303,27 @@ pub fn send_pack(
             bail!("the receiving end does not support push options");
         }
         cap_buf.push_str(" push-options");
+    }
+    // `push-cert=<nonce>`: the server hands out a nonce that the certificate has
+    // to quote back, which is what stops a captured certificate from being
+    // replayed against a different push.
+    let nonce = caps
+        .capability("push-cert")
+        .and_then(|c| c.value())
+        .map(|v| v.to_string())
+        .filter(|v| !v.is_empty());
+    let sign_cert = match opts.signed {
+        Signed::Never => false,
+        Signed::IfAsked => nonce.is_some(),
+        Signed::Always => {
+            if nonce.is_none() {
+                bail!("the receiving end does not support --signed push");
+            }
+            true
+        }
+    };
+    if sign_cert {
+        cap_buf.push_str(" push-cert");
     }
     cap_buf.push_str(&format!(" agent={}", agent()));
 
@@ -371,13 +485,36 @@ pub fn send_pack(
     // Build the command list. The first command carries the capability string
     // after a NUL; the rest are bare (send-pack.c `packet_buf_write`).
     let mut req_buf: Vec<u8> = Vec::new();
-    for (i, w) in wire.iter().enumerate() {
-        let line = if i == 0 {
-            format!("{} {} {}\0{}", w.old, w.new, w.name, cap_buf)
-        } else {
-            format!("{} {} {}", w.old, w.new, w.name)
-        };
-        encode::data_to_write(line.as_bytes(), &mut req_buf)?;
+    if sign_cert {
+        // git's `generate_push_cert`: a header block (version, pusher, pushee,
+        // nonce, then any push options), a blank line, the same `<old> <new>
+        // <ref>` command lines the unsigned form would send, and a gpg
+        // signature over exactly those bytes. The whole thing rides between
+        // `push-cert` and `push-cert-end` pkt-lines, with the capability string
+        // attached to the OPENING line rather than to a command.
+        let commands: Vec<(ObjectId, ObjectId, String)> =
+            wire.iter().map(|w| (w.old, w.new, w.name.clone())).collect();
+        let cert = build_push_cert(
+            repo,
+            &url,
+            nonce.as_deref().unwrap_or_default(),
+            &commands,
+            &opts.push_options,
+        )?;
+        encode::data_to_write(format!("push-cert\0{cap_buf}").as_bytes(), &mut req_buf)?;
+        for line in cert.split_inclusive(|b| *b == b'\n') {
+            encode::data_to_write(line, &mut req_buf)?;
+        }
+        encode::data_to_write(b"push-cert-end\n", &mut req_buf)?;
+    } else {
+        for (i, w) in wire.iter().enumerate() {
+            let line = if i == 0 {
+                format!("{} {} {}\0{}", w.old, w.new, w.name, cap_buf)
+            } else {
+                format!("{} {} {}", w.old, w.new, w.name)
+            };
+            encode::data_to_write(line.as_bytes(), &mut req_buf)?;
+        }
     }
     encode::write_packet_line(&PacketLineRef::Flush, &mut req_buf)?;
 
@@ -585,4 +722,59 @@ fn reachable_objects(repo: &gix::Repository, tips: &[ObjectId]) -> HashSet<Objec
 /// The `agent=` capability value git advertises, as `git/<version>`.
 fn agent() -> String {
     format!("git/{}", env!("CARGO_PKG_VERSION"))
+}
+
+
+#[cfg(test)]
+mod push_cert_tests {
+    use super::*;
+
+    fn oid(hex: &str) -> ObjectId {
+        ObjectId::from_hex(hex.as_bytes()).expect("oid")
+    }
+
+    /// The payload git signs, byte for byte: header block, a blank line, then one
+    /// line per ref update. A server verifies this text against the signature, so
+    /// any reformatting here would produce certificates that fail remotely while
+    /// looking fine locally.
+    #[test]
+    fn payload_has_gits_exact_shape() {
+        let a = oid("1111111111111111111111111111111111111111");
+        let b = oid("2222222222222222222222222222222222222222");
+        let payload = push_cert_payload(
+            "A U Thor <author@example.com> 1700000000 +0000",
+            "https://example.com/repo.git",
+            "1700000000-abcdef",
+            &[(a, b, "refs/heads/main".to_string())],
+            &[],
+        );
+
+        assert_eq!(
+            payload,
+            "certificate version 0.1\n\
+             pusher A U Thor <author@example.com> 1700000000 +0000\n\
+             pushee https://example.com/repo.git\n\
+             nonce 1700000000-abcdef\n\
+             \n\
+             1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 refs/heads/main\n"
+        );
+    }
+
+    /// Push options are part of the SIGNED text, in the header block — a server
+    /// that receives options not covered by the signature must reject the push.
+    #[test]
+    fn push_options_are_inside_the_signed_header() {
+        let a = oid("1111111111111111111111111111111111111111");
+        let payload = push_cert_payload(
+            "P <p@e> 1 +0000",
+            "u",
+            "n",
+            &[(a, a, "refs/heads/x".to_string())],
+            &["ci.skip".to_string(), "deploy=staging".to_string()],
+        );
+
+        let header = payload.split("\n\n").next().expect("header block");
+        assert!(header.contains("push-option ci.skip"));
+        assert!(header.contains("push-option deploy=staging"));
+    }
 }

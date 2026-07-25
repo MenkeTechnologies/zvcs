@@ -89,7 +89,8 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "-q" | "--quiet" | "--progress" | "--no-progress"
             | "--thin" | "--no-thin" | "-4" | "--ipv4" | "-6" | "--ipv6"
             | "--force-if-includes" | "--no-force-if-includes" | "--verify" | "--no-verify"
-            | "--no-signed" => {}
+            => {}
+            "--no-signed" => f.signed = push_proto::Signed::Never,
             "--no-atomic" => f.atomic = false,
             "--no-mirror" => f.mirror = false,
             "--no-prune" => f.prune = false,
@@ -115,10 +116,17 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "-o" | "--push-option" => {
                 f.push_options.push(take_value(inline)?);
             }
-            "--signed" => match inline.as_deref() {
-                None | Some("no") | Some("false") => {}
-                Some(v) => bail!("--signed={v} is not supported"),
-            },
+            // `--signed[=<mode>]`: send a gpg-signed push certificate. The
+            // modes are git's — `if-asked` only signs when the server offers a
+            // nonce, plain/`true` insists on one.
+            "--signed" => {
+                f.signed = match inline.as_deref() {
+                    None | Some("true") | Some("yes") => push_proto::Signed::Always,
+                    Some("false") | Some("no") => push_proto::Signed::Never,
+                    Some("if-asked") => push_proto::Signed::IfAsked,
+                    Some(v) => bail!("bad signed argument: {v}"),
+                };
+            }
             other => bail!("unsupported option {other:?}"),
         }
         i += 1;
@@ -311,6 +319,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     };
     let send_opts = push_proto::SendOptions {
         atomic: f.atomic,
+        signed: f.signed,
         push_options: f.push_options.clone(),
         delete_scope,
         local_refs,
@@ -345,6 +354,7 @@ struct Flags {
     verbose: bool,
     prune: bool,
     atomic: bool,
+    signed: push_proto::Signed,
     push_options: Vec<String>,
     follow_tags: bool,
     set_upstream: bool,

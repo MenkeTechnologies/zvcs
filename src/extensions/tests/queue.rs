@@ -13,6 +13,12 @@ fn git(dir: &Path, args: &[&str]) {
         .args(["-c", "user.email=t@example.com", "-c", "user.name=zvcs-test"])
         .args(args)
         .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "zvcs-test")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "zvcs-test")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
         .status()
         .unwrap()
         .success();
@@ -20,7 +26,20 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn zvcs(cwd: &Path, args: &[&str]) -> (String, String) {
-    let out = Command::new(BIN).args(args).current_dir(cwd).output().unwrap();
+    // Pinned global config: the developer's own `[zvcs]` switches would autostart
+    // a SECOND daemon beside the one this test starts on purpose, and the two
+    // then race for the same socket.
+    let out = Command::new(BIN)
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "zvcs-test")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "zvcs-test")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .output()
+        .unwrap();
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -48,6 +67,12 @@ fn zcommit_is_queued_executed_and_recorded() {
     let mut daemon: Child = Command::new(BIN)
         .args(["zdaemon", "start", "--foreground"])
         .current_dir(&repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "zvcs-test")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "zvcs-test")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
         .spawn()
         .unwrap();
     wait_for(&root.join("sock"), Duration::from_secs(5));
@@ -73,8 +98,17 @@ fn zcommit_is_queued_executed_and_recorded() {
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    // The ledger records job #1 as done.
-    let job = zvcs(&repo, &["zjob", "1"]).0;
+    // The ledger records THIS job as done. The id comes from what `zcommit`
+    // reported, not a hardcoded #1: the daemon queues jobs of its own (the status
+    // maintainer is a long-lived one), so the first id is not necessarily ours.
+    let id = err
+        .split("queued job #")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .filter(|s| !s.is_empty())
+        .expect("zcommit reported a job id")
+        .to_string();
+    let job = zvcs(&repo, &["zjob", &id]).0;
 
     let _ = Command::new(BIN)
         .args(["zdaemon", "stop"])
@@ -89,7 +123,7 @@ fn zcommit_is_queued_executed_and_recorded() {
     assert!(committed, "zcommit job never landed; log:\n{final_log}");
     assert!(
         job.contains("done"),
-        "ledger did not record job #1 as done; zjob 1:\n{job}"
+        "ledger did not record job #{id} as done; zjob {id}:\n{job}"
     );
 }
 

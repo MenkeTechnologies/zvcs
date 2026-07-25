@@ -94,7 +94,7 @@ fn run(cfg: ZvcsConfig) {
         react(&cfg);
     }
 
-    let targets = build_targets(&cfg);
+    let mut targets = build_targets(&cfg);
 
     // Populate status for every watched repo on start (instant `zstatus --all`).
     if cfg.autostatus {
@@ -116,26 +116,8 @@ fn run(cfg: ZvcsConfig) {
         }
     };
 
-    let mut watched = 0usize;
-    let mut armed_n = 0usize;
-    for t in &targets {
-        if t.armed {
-            // Whole-directory recursive watch: worktree AND `.git`, so creating
-            // or editing ANY file in the repo fires the trigger — not only ref
-            // moves. This is the directory a `git ztrigger` armed.
-            if watcher.watch(&t.workdir, RecursiveMode::Recursive).is_ok() {
-                watched += 1;
-                armed_n += 1;
-            }
-        } else {
-            for sub in ["refs", "logs"] {
-                let p = t.git_dir.join(sub);
-                if p.exists() && watcher.watch(&p, RecursiveMode::Recursive).is_ok() {
-                    watched += 1;
-                }
-            }
-        }
-    }
+    let mut registered: HashSet<PathBuf> = HashSet::new();
+    let (watched, armed_n) = register(&mut watcher, &targets, &mut registered);
     println!(
         "[zvcs watch] watching {} path(s) ({watched} tree(s), {armed_n} whole-dir), hooks={}",
         targets.len(),
@@ -147,11 +129,25 @@ fn run(cfg: ZvcsConfig) {
     // burst immediately, then suppress for `throttle_ms` so one file action (which
     // emits several fs events) fires once, not N times.
     let mut last_fired: HashMap<PathBuf, (Option<Instant>, u32)> = HashMap::new();
+    // The watch set is not fixed for the life of the daemon: the crawler indexes
+    // repos in the background, `zreindex` adds them at any moment, and a repo can
+    // be cloned an hour after startup. Building the set once meant every one of
+    // those was invisible until the daemon was restarted — a hook on a repo
+    // indexed a second too late simply never fired, silently and forever.
+    let mut last_rescan = Instant::now();
     loop {
-        let ev = match rx.recv() {
+        let ev = match rx.recv_timeout(RESCAN_EVERY) {
             Ok(ev) => ev,
-            Err(_) => return,
+            // A quiet period is the cheapest moment to look for new repos.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                rescan(&cfg, &mut watcher, &mut targets, &mut registered, &mut last_rescan);
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
+        if last_rescan.elapsed() >= RESCAN_EVERY {
+            rescan(&cfg, &mut watcher, &mut targets, &mut registered, &mut last_rescan);
+        }
         let mut affected: HashSet<PathBuf> = HashSet::new();
         collect(&ev, &targets, &mut affected);
         if affected.is_empty() {
@@ -253,6 +249,82 @@ fn run(cfg: ZvcsConfig) {
                 }
             }
         }
+    }
+}
+
+/// How often the watch set is rebuilt from the repo index. Short enough that a
+/// freshly cloned or freshly indexed repo starts firing its hooks within a few
+/// seconds; long enough that the ledger read is nothing next to the idle cost of
+/// a daemon that is otherwise asleep on a channel.
+const RESCAN_EVERY: Duration = Duration::from_secs(5);
+
+/// Register OS watches for every target that does not have one yet, returning
+/// `(paths watched, whole-dir targets)` for the ones added by this call.
+///
+/// `registered` is keyed by the path handed to the watcher, so a target already
+/// being watched is skipped rather than re-registered — `notify` would otherwise
+/// deliver the same event twice per duplicate watch.
+fn register(
+    watcher: &mut impl Watcher,
+    targets: &[Target],
+    registered: &mut HashSet<PathBuf>,
+) -> (usize, usize) {
+    let (mut watched, mut armed_n) = (0usize, 0usize);
+    for t in targets {
+        if t.armed {
+            // Whole-directory recursive watch: worktree AND `.git`, so creating
+            // or editing ANY file in the repo fires the trigger — not only ref
+            // moves. This is the directory a `git ztrigger` armed.
+            if registered.contains(&t.workdir) {
+                continue;
+            }
+            if watcher.watch(&t.workdir, RecursiveMode::Recursive).is_ok() {
+                registered.insert(t.workdir.clone());
+                watched += 1;
+                armed_n += 1;
+            }
+        } else {
+            for sub in ["refs", "logs"] {
+                let p = t.git_dir.join(sub);
+                if registered.contains(&p) {
+                    continue;
+                }
+                if p.exists() && watcher.watch(&p, RecursiveMode::Recursive).is_ok() {
+                    registered.insert(p);
+                    watched += 1;
+                }
+            }
+        }
+    }
+    (watched, armed_n)
+}
+
+/// Rebuild the watch set and register whatever is new.
+///
+/// Only additions are acted on. A repo that disappeared keeps a dead watch until
+/// the daemon restarts, which costs one descriptor and no correctness: events
+/// cannot arrive for a path that no longer exists, and dropping the watch would
+/// race a repo that is merely being rewritten (a `git clone` into an existing
+/// path, a checkout that recreates `refs/`).
+fn rescan(
+    cfg: &ZvcsConfig,
+    watcher: &mut impl Watcher,
+    targets: &mut Vec<Target>,
+    registered: &mut HashSet<PathBuf>,
+    last_rescan: &mut Instant,
+) {
+    *last_rescan = Instant::now();
+    let rebuilt = build_targets(cfg);
+    if rebuilt.len() == targets.len() {
+        return;
+    }
+    *targets = rebuilt;
+    let (added, armed) = register(watcher, targets, registered);
+    if added > 0 {
+        println!(
+            "[zvcs watch] picked up {added} new path(s) ({armed} whole-dir); now watching {} repo(s)",
+            targets.len()
+        );
     }
 }
 

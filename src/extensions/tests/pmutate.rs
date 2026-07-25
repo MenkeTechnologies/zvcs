@@ -24,7 +24,26 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn zvcs(home: &Path, sock: &Path, args: &[&str]) -> (String, bool) {
-    let out = Command::new(BIN).args(args).env("ZVCS_HOME", home).env("ZVCS_SOCK", sock).output().unwrap();
+    // The git config is pinned as well as the home: autostart spawns a daemon
+    // when `[zvcs]` autonomy/hooks are configured, and that config is read from
+    // the DEVELOPER's ~/.gitconfig. On a box with `[zvcs] autohook` set, these
+    // processes each started a daemon in the temp home that nothing ever
+    // stopped, and the "with no daemon" assertions below then ran against a
+    // daemon. Pinning makes the test describe the world it actually runs in —
+    // and since it also removes the developer's user.name/user.email, the
+    // identity the committing verbs need is supplied here rather than borrowed.
+    let out = Command::new(BIN)
+        .args(args)
+        .env("ZVCS_HOME", home)
+        .env("ZVCS_SOCK", sock)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "zvcs-test")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "zvcs-test")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .output()
+        .unwrap();
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
     (s, out.status.success())

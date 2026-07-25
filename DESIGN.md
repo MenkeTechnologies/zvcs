@@ -127,6 +127,14 @@ Wire protocol (line-framed) extends the current
 (`ACQUIRE <git-dir> <client-id>`), plus `SUBMIT`/`JOB`, `JOBSTOP`,
 `JOBRESTART`, `REINDEX`, and a `REPL` upgrade.
 
+**Watch set:** rebuilt from the repo index every 5s, not only at startup. Repos
+arrive at any time — the background crawler finds them, `zreindex` adds them, a
+clone appears mid-session — and a set fixed at startup left every one of them
+unwatched until the daemon was restarted, with its hooks silently never firing.
+New paths are registered; a path already watched is skipped rather than watched
+twice, and a repo that disappeared keeps its (harmless) watch until restart
+rather than racing a repo that is merely being rewritten.
+
 **Control surface:** `git zdaemon <start|stop|restart|reload|status|info|ping|log>`.
 `restart`/`reload` STOP the running daemon and respawn it detached (re-reading
 `[zvcs]` config, rebuilding the watch set); `ping` is a scriptable liveness check

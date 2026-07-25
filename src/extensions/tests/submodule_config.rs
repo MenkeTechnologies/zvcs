@@ -271,6 +271,24 @@ fn status_submodule_active_pathspec_marks_inactive() {
 }
 
 #[test]
+fn status_submodule_active_dot_pathspec_marks_active() {
+    // `submodule.active = .` is the tree-wide spec: git normalizes `.` at the
+    // repo root to an empty match string, so it matches every submodule path and
+    // status prints the active line with a rev-name. Deregister first so the
+    // pathspec is what decides, not the `submodule.sm.active=true` that
+    // `submodule add` writes.
+    let cfg = &[("submodule.active", ".")];
+    let z = scenario(BIN, "st-dot", true, cfg, &["status"]);
+    let g = scenario("git", "st-dot-g", true, cfg, &["status"]);
+    let so = stdout(&z.out);
+    assert!(
+        !so.starts_with('-') && so.contains(" ("),
+        "submodule.active=. must match every submodule and print a rev-name: {so:?}"
+    );
+    assert_output_matches(&z, &g, "status submodule.active=.");
+}
+
+#[test]
 fn status_per_name_active_false_marks_inactive() {
     // `submodule.sm.active=false` overrides to inactive even without a
     // `submodule.active` pathspec — the per-name half of is_submodule_active.

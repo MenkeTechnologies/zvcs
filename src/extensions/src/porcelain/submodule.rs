@@ -322,7 +322,7 @@ fn status_repo(
             Some(wd) => gix::open(wd.join(&*gix::path::from_bstr(entry.path.as_bstr()))).ok(),
             None => None,
         };
-        let active = sub.is_active()?;
+        let active = is_submodule_active(repo, &index, sub, &entry.path)?;
         let (Some(sub_repo), true) = (sub_repo, active) else {
             print_status(out, quiet, '-', &entry.oid, &display, None)?;
             continue;
@@ -443,7 +443,7 @@ fn init_repo(repo: &gix::Repository, patterns: &[BString], quiet: bool) -> Resul
         let mut kept = Vec::new();
         for entry in entries {
             let active = match find_submodule(&submodules, &entry.path) {
-                Some(sub) => sub.is_active()?,
+                Some(sub) => is_submodule_active(repo, &index, sub, &entry.path)?,
                 None => false,
             };
             if active {
@@ -477,7 +477,7 @@ fn init_repo(repo: &gix::Repository, patterns: &[BString], quiet: bool) -> Resul
         let sub_name = sub_name.as_bstr();
 
         // Mark it active first — that is the order git writes the two keys in.
-        if !sub.is_active()? {
+        if !is_submodule_active(repo, &index, sub, &entry.path)? {
             config.set_raw_value_by("submodule", Some(sub_name), "active", "true")?;
             dirty = true;
         }
@@ -1078,7 +1078,7 @@ fn sync_repo(
             continue;
         };
         // `sync_submodule` returns immediately for an inactive submodule.
-        if !sub.is_active()? {
+        if !is_submodule_active(repo, &index, sub, &entry.path)? {
             continue;
         }
         let sub_name = sub.name().to_owned();
@@ -1358,7 +1358,7 @@ fn update_repo(
             continue;
         }
 
-        if !sub.is_active()? {
+        if !is_submodule_active(&repo, &index, sub, &entry.path)? {
             warn_missing(warn, &display);
             continue;
         }
@@ -2012,6 +2012,49 @@ fn find_submodule<'a, 'repo>(
     submodules
         .iter()
         .find(|s| s.path().map(|p| &p == path).unwrap_or(false))
+}
+
+/// git's `is_submodule_active` (submodule.c): `submodule.<name>.active` decides
+/// on its own, otherwise the `submodule.active` pathspecs are matched against
+/// the submodule's **path**, otherwise the submodule is active exactly when
+/// `submodule.<name>.url` is set.
+///
+/// `gix::Submodule::is_active` is not used for the middle rule. It runs the
+/// pathspecs against the submodule's *name* using a matcher of its own that
+/// never sees the index, so a tree-wide `submodule.active = .` matches nothing
+/// and every submodule comes back inactive: `status` then prints `-` for a
+/// fully checked-out submodule and `--recursive` silently refuses to descend
+/// into it. git matches the path through the index pathspec machinery, which is
+/// what `repo.pathspec` reproduces here (`match_pathspec(..., is_dir = 1)`).
+fn is_submodule_active(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+    sub: &gix::Submodule<'_>,
+    path: &BString,
+) -> Result<bool> {
+    let name = sub.name();
+    let snapshot = repo.config_snapshot();
+
+    if let Some(active) = snapshot.boolean(key(name, "active")) {
+        return Ok(active);
+    }
+
+    let specs: Vec<BString> = snapshot
+        .plumbing()
+        .strings("submodule.active")
+        .unwrap_or_default();
+    if !specs.is_empty() {
+        let mut ps = repo.pathspec(
+            false,
+            &specs,
+            false,
+            index,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+        )?;
+        return Ok(ps.is_included(path.as_bstr(), Some(true)));
+    }
+
+    Ok(snapshot.string(key(name, "url")).is_some())
 }
 
 // ----------------------------------------------------------- module list ----

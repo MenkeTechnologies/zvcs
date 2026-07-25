@@ -54,7 +54,15 @@ fn common_prefix_len(patterns: &[gix_glob::search::pattern::Mapping<Spec>]) -> u
         .filter(|p| !p.value.pattern.is_excluded())
         .map(|p| {
             count += 1;
-            if p.value.pattern.signature.contains(MagicSignature::ICASE) {
+            if p.value.pattern.always_matches() {
+                // git's `common_prefix()` reads `item.match`, and `parse_pathspec`
+                // leaves that empty for `.` (and for the nil spec `:`), so such a
+                // spec constrains no prefix at all. `normalize()` keeps the literal
+                // `.` as the glob text here, which would otherwise be taken as a
+                // one-byte common prefix and reject every path not starting with a
+                // dot — turning a match-everything spec into a match-nothing one.
+                0
+            } else if p.value.pattern.signature.contains(MagicSignature::ICASE) {
                 p.value.pattern.prefix_len
             } else {
                 p.pattern.first_wildcard_pos.unwrap_or(p.pattern.text.len())

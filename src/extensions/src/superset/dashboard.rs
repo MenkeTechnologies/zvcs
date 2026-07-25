@@ -5,7 +5,7 @@
 //! recently active first, read from the daemon status cache with the on-screen
 //! rows' HEAD state live-refreshed so nothing is stale), a **processes** tile
 //! (`zppid`: each invoking ppid, its commit tally, live/dead state, and last-commit
-//! age), the **events** feed (`zevents`: commits / reconciles / status changes),
+//! age — live processes first, then most commits), the **events** feed (`zevents`: commits / reconciles / status changes),
 //! and the **commands** feed (`zcommands`: every git command run across the machine,
 //! with the agent that ran it). A header row carries the aggregate totals. It shares ztop's theme
 //! system: `c` opens the 31-scheme chooser, `~`/`e` the palette editor, F1 the
@@ -312,6 +312,17 @@ struct ProcRow {
     age_secs: i64,
 }
 
+/// Row order for the processes tile: live processes first — a dead ppid with a big
+/// tally is history, a live one is what you can still act on — then most commits,
+/// then most recently active, then ppid so the order is stable across refreshes.
+fn proc_order(a: &ProcRow, b: &ProcRow) -> std::cmp::Ordering {
+    b.alive
+        .cmp(&a.alive)
+        .then(b.commits.cmp(&a.commits))
+        .then(a.age_secs.cmp(&b.age_secs))
+        .then(a.ppid.cmp(&b.ppid))
+}
+
 #[derive(Default)]
 struct Totals {
     repos: usize,
@@ -601,6 +612,7 @@ impl Dash {
                     commits: p.commits,
                 })
                 .collect();
+            self.procs.sort_by(proc_order);
             self.events = crate::db::events_recent(&conn, FEED, None, None).unwrap_or_default();
         }
 
@@ -1400,6 +1412,27 @@ fn focus_ih(d: &Dash) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn procs_put_live_processes_above_dead_ones() {
+        let row = |ppid, commits, alive, age_secs| ProcRow {
+            ppid,
+            cmd: "zsh".into(),
+            cwd: "/x".into(),
+            commits,
+            alive,
+            age_secs,
+        };
+        // A dead process with a huge tally must not outrank a live one-commit process.
+        let mut v = vec![row(1, 99, false, 10), row(2, 1, true, 900), row(3, 40, true, 20), row(4, 5, false, 5)];
+        v.sort_by(proc_order);
+        assert_eq!(v.iter().map(|p| p.ppid).collect::<Vec<_>>(), vec![3, 2, 1, 4]);
+
+        // Equal liveness and tally: most recently active first, then ppid.
+        let mut t = vec![row(9, 3, true, 100), row(7, 3, true, 5), row(5, 3, true, 5)];
+        t.sort_by(proc_order);
+        assert_eq!(t.iter().map(|p| p.ppid).collect::<Vec<_>>(), vec![5, 7, 9]);
+    }
 
     #[test]
     fn command_line_parses_five_fields() {

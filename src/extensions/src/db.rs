@@ -15,6 +15,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -160,6 +161,13 @@ CREATE TABLE IF NOT EXISTS ppids (
 -- push, add, merge, …) a durable process has run. Keyed by the same session as
 -- `ppids` (join on it for the process's pid/cmd/cwd), one row per (session, verb).
 -- Only mutating verbs are recorded, so the read hot path never writes here.
+CREATE TABLE IF NOT EXISTS abbrev (
+    oid     TEXT NOT NULL,
+    hex_len INTEGER NOT NULL,
+    short   TEXT NOT NULL,
+    PRIMARY KEY (oid, hex_len)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS proc_verbs (
     session    TEXT NOT NULL,
     verb       TEXT NOT NULL,
@@ -199,6 +207,32 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Load every cached abbreviation computed at `hex_len`.
+///
+/// Object ids are content addresses, so an abbreviation is valid for any repo
+/// that holds the object — the cache is machine-wide and shared across clones.
+/// `hex_len` is part of the key because the correct abbreviation grows with the
+/// repository: an entry computed when 7 hex digits were unique must not be
+/// served once the repo needs 8.
+pub fn abbrev_load(conn: &Connection, hex_len: usize) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT oid, short FROM abbrev WHERE hex_len = ?1")?;
+    let rows = stmt.query_map([hex_len as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Record abbreviations computed this run, in one transaction.
+pub fn abbrev_store(conn: &mut Connection, hex_len: usize, pairs: &[(String, String)]) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt =
+            tx.prepare("INSERT OR IGNORE INTO abbrev (oid, hex_len, short) VALUES (?1, ?2, ?3)")?;
+        for (oid, short) in pairs {
+            stmt.execute(rusqlite::params![oid, hex_len as i64, short])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
 /// Open the read-write connection (daemon side): WAL, busy-timeout, schema.
 pub fn open_rw() -> Result<Connection> {
     let conn = Connection::open(db_path()).context("open db (rw)")?;

@@ -48,6 +48,9 @@ anyhow = "1"
 # Vectorized substring search for the `-S` pickaxe count (git uses a kwset for
 # the same reason). Already in the tree via gitoxide.
 memchr = "2"
+# Display width for git's log tab expansion (its `utf8_width`): a tab stop is
+# a column, and a wide character takes two. Already in the tree via ratatui.
+unicode-width = "0.2"
 # POSIX-ERE value-pattern matching for `git config <name> <value> <value-pattern>`.
 # Foundational, vendorable crate; byte-oriented `regex::bytes` mirrors git's regexec.
 regex = "1"

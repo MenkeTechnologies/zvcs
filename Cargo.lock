@@ -4048,6 +4048,7 @@ dependencies = [
  "rusqlite",
  "security-framework-sys",
  "serde_json",
+ "unicode-width",
 ]
 
 [[package]]

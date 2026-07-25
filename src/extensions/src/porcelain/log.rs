@@ -969,6 +969,23 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // while the loop below stays a plain in-order stream — git computes them one
     // at a time on one core.
     let mut patches = PatchWindow::new(emit_patch, show_root);
+    // Each record's text comes out of its own commit object, and reading 6000 of
+    // them is the whole cost of a format like `--oneline` or `%s`. The window
+    // renders a batch of records at a time across the thread pool; the loop below
+    // still writes them one after another, in walk order.
+    let mut entries = EntryWindow::new(EntryParams {
+        abbrev_commit,
+        show_parents,
+        date_mode,
+        want_color,
+        now,
+        decorations: decorations.as_ref(),
+        decorate,
+        source_mode,
+        terminator,
+        empty_user_format,
+        pretty: &pretty,
+    });
     for (ni, node) in nodes.iter().enumerate() {
         if walk_only {
             let Pretty::User(fmt) = &pretty else { unreachable!() };
@@ -995,46 +1012,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             }
             continue;
         }
-        let commit = repo.find_object(node.id)?.try_into_commit()?;
-        // `--parents` decorates the header with the commit's own parent ids.
-        let extra = if show_parents {
-            let mut e = Vec::new();
-            for p in &node.parents {
-                e.push(b' ');
-                let pid = p.attach(&repo);
-                if abbrev_commit {
-                    e.extend_from_slice(abbrev_cache.borrow_mut().get(pid).as_bytes());
-                } else {
-                    e.extend_from_slice(pid.to_string().as_bytes());
-                }
-            }
-            e
-        } else {
-            Vec::new()
-        };
-        let ctx = RenderCtx {
-            abbrev_commit,
-            abbrev: &abbrev_cache,
-            date_mode,
-            extra,
-            want_color,
-            now,
-            decorations: decorations.as_ref(),
-            decorate,
-            source: if source_mode {
-                Some(node.source.as_bytes())
-            } else {
-                None
-            },
-        };
-        let mut block: Vec<u8> = Vec::new();
-        render_entry(&mut block, &commit, &pretty, &ctx)?;
-        // A `tformat:` record is terminated by a newline. git still terminates a
-        // record whose expansion happened to be empty (so `%d` prints one line per
-        // commit); only the genuinely empty user format emits no terminator.
-        if terminator && !empty_user_format {
-            block.push(b'\n');
-        }
+        let mut block = entries.get(&repo, &nodes, ni, &abbrev_cache)?;
 
         // A root commit's diff (against the empty tree) is only shown when
         // `show_root` is set — git's `log.showRoot` (default true), forced on by
@@ -1049,6 +1027,9 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 // present; git suppresses the count formats in that case, so the
                 // blob reads they need are skipped too.
                 let count_formats = (stat || numstat || shortstat) && !name_only && !name_status;
+                // The record was rendered by a worker, which kept nothing; the
+                // count formats need the commit itself for its tree.
+                let commit = repo.find_object(node.id)?.try_into_commit()?;
                 let files =
                     collect_changes(&repo, &commit, node.parents.first().copied(), count_formats)?;
                 if name_status {
@@ -1253,6 +1234,176 @@ enum Order {
 }
 
 /// What the walk needs to know about a commit, read once up front.
+/// Everything a commit's record needs beyond the commit itself: the flags and
+/// lookup tables that are fixed for the whole command.
+struct EntryParams<'a> {
+    abbrev_commit: bool,
+    show_parents: bool,
+    date_mode: DateMode,
+    want_color: bool,
+    now: i64,
+    decorations: Option<&'a Decorations>,
+    decorate: DecorateStyle,
+    source_mode: bool,
+    terminator: bool,
+    empty_user_format: bool,
+    pretty: &'a Pretty,
+}
+
+/// A look-ahead buffer of rendered commit records.
+///
+/// Reading a commit object and expanding its format is per-commit work with no
+/// shared state, and on a deep history it is the entire cost of `--oneline`,
+/// `%s` or the default format — the walk itself is already cheap. The window
+/// renders `SPAN` records at a time across the thread pool and hands them out in
+/// order, so the caller stays a simple in-order loop and memory is bounded by
+/// the span, not the history.
+struct EntryWindow<'a> {
+    params: EntryParams<'a>,
+    /// Index of `slots[0]` within the caller's node list.
+    start: usize,
+    slots: Vec<Vec<u8>>,
+}
+
+impl<'a> EntryWindow<'a> {
+    /// Records rendered per refill. Records are small (a line for `--oneline`,
+    /// a paragraph for the default format), so the span can be wide.
+    const SPAN: usize = 256;
+    /// Records per worker. An object read plus a format expansion is small work,
+    /// so a batch must be sizeable before threads repay their setup.
+    const PER_WORKER: usize = 32;
+
+    fn new(params: EntryParams<'a>) -> Self {
+        EntryWindow { params, start: 0, slots: Vec::new() }
+    }
+
+    /// The rendered record for `nodes[i]`, refilling the window when `i` runs
+    /// past it. The record is moved out: the caller appends its diff to it.
+    fn get(
+        &mut self,
+        repo: &gix::Repository,
+        nodes: &[Node],
+        i: usize,
+        abbrev: &std::cell::RefCell<AbbrevCache>,
+    ) -> Result<Vec<u8>> {
+        if i < self.start || i >= self.start + self.slots.len() {
+            let end = (i + Self::SPAN).min(nodes.len());
+            self.slots = self.render_span(repo, &nodes[i..end], abbrev)?;
+            self.start = i;
+        }
+        Ok(std::mem::take(&mut self.slots[i - self.start]))
+    }
+
+    fn render_span(
+        &self,
+        repo: &gix::Repository,
+        span: &[Node],
+        abbrev: &std::cell::RefCell<AbbrevCache>,
+    ) -> Result<Vec<Vec<u8>>> {
+        let workers = crate::threads::count(span.len(), Self::PER_WORKER);
+        if workers <= 1 {
+            return span.iter().map(|n| entry_block(repo, n, &self.params, abbrev)).collect();
+        }
+
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let mut done: Vec<(usize, Vec<u8>)> = Vec::with_capacity(span.len());
+        let mut caches: Vec<AbbrevCache> = Vec::with_capacity(workers);
+        let mut failure: Option<anyhow::Error> = None;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let proto = repo.clone();
+                // A worker abbreviates ids of its own, so it takes a fork of the
+                // cache — the ledger's half is shared, the new half is private
+                // until it is merged back below.
+                let mine_abbrev = std::cell::RefCell::new(abbrev.borrow().fork());
+                let cursor = &cursor;
+                let params = &self.params;
+                handles.push(scope.spawn(move || -> Result<(Vec<(usize, Vec<u8>)>, AbbrevCache)> {
+                    let repo = proto;
+                    let mut mine = Vec::new();
+                    loop {
+                        let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(node) = span.get(i) else { break };
+                        mine.push((i, entry_block(&repo, node, params, &mine_abbrev)?));
+                    }
+                    Ok((mine, mine_abbrev.into_inner()))
+                }));
+            }
+            for h in handles {
+                match h.join() {
+                    Ok(Ok((mine, cache))) => {
+                        done.extend(mine);
+                        caches.push(cache);
+                    }
+                    Ok(Err(e)) => {
+                        failure.get_or_insert(e);
+                    }
+                    Err(_) => {
+                        failure.get_or_insert_with(|| anyhow::anyhow!("log worker panicked"));
+                    }
+                }
+            }
+        });
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        for cache in caches {
+            abbrev.borrow_mut().absorb(cache);
+        }
+
+        done.sort_by_key(|(i, _)| *i);
+        Ok(done.into_iter().map(|(_, block)| block).collect())
+    }
+}
+
+/// One commit's rendered record: its header/message block plus the record
+/// terminator, with no diff attached.
+fn entry_block(
+    repo: &gix::Repository,
+    node: &Node,
+    p: &EntryParams<'_>,
+    abbrev: &std::cell::RefCell<AbbrevCache>,
+) -> Result<Vec<u8>> {
+    let commit = repo.find_object(node.id)?.try_into_commit()?;
+    // `--parents` decorates the header with the commit's own parent ids.
+    let extra = if p.show_parents {
+        let mut e = Vec::new();
+        for parent in &node.parents {
+            e.push(b' ');
+            let pid = parent.attach(repo);
+            if p.abbrev_commit {
+                e.extend_from_slice(abbrev.borrow_mut().get(pid).as_bytes());
+            } else {
+                e.extend_from_slice(pid.to_string().as_bytes());
+            }
+        }
+        e
+    } else {
+        Vec::new()
+    };
+    let ctx = RenderCtx {
+        abbrev_commit: p.abbrev_commit,
+        abbrev,
+        date_mode: p.date_mode,
+        extra,
+        want_color: p.want_color,
+        now: p.now,
+        decorations: p.decorations,
+        decorate: p.decorate,
+        source: if p.source_mode { Some(node.source.as_bytes()) } else { None },
+    };
+    let mut block: Vec<u8> = Vec::new();
+    render_entry(&mut block, &commit, p.pretty, &ctx)?;
+    // A `tformat:` record is terminated by a newline. git still terminates a
+    // record whose expansion happened to be empty (so `%d` prints one line per
+    // commit); only the genuinely empty user format emits no terminator.
+    if p.terminator && !p.empty_user_format {
+        block.push(b'\n');
+    }
+    Ok(block)
+}
+
 /// A look-ahead buffer of rendered `-p` patch bodies.
 ///
 /// The output is a stream, but the work behind it is not sequential: a commit's
@@ -1368,7 +1519,12 @@ impl Eq for Node {}
 /// served.
 struct AbbrevCache {
     hex_len: usize,
-    known: std::collections::HashMap<String, String>,
+    /// What the ledger already knew, shared as-is with every worker that forks
+    /// this cache — it is read-only for the life of the command.
+    known: std::sync::Arc<std::collections::HashMap<String, String>>,
+    /// Abbreviations computed by THIS cache, kept apart from `known` so a fork
+    /// can be merged back without rebuilding the shared map.
+    local: std::collections::HashMap<String, String>,
     fresh: Vec<(String, String)>,
 }
 
@@ -1384,17 +1540,41 @@ impl AbbrevCache {
             .ok()
             .and_then(|c| crate::db::abbrev_load(&c, hex_len).ok())
             .unwrap_or_default();
-        AbbrevCache { hex_len, known, fresh: Vec::new() }
+        AbbrevCache {
+            hex_len,
+            known: std::sync::Arc::new(known),
+            local: Default::default(),
+            fresh: Vec::new(),
+        }
+    }
+
+    /// A cache for a worker thread: the ledger's map is shared, and anything the
+    /// worker computes stays private until [`absorb`](Self::absorb) takes it.
+    fn fork(&self) -> Self {
+        AbbrevCache {
+            hex_len: self.hex_len,
+            known: std::sync::Arc::clone(&self.known),
+            local: Default::default(),
+            fresh: Vec::new(),
+        }
+    }
+
+    /// Take what a forked cache computed. Two workers may have shortened the same
+    /// id, which is harmless — the ledger write is keyed by id, so a duplicate
+    /// row overwrites itself with the same value.
+    fn absorb(&mut self, other: Self) {
+        self.local.extend(other.local);
+        self.fresh.extend(other.fresh);
     }
 
     fn get(&mut self, id: gix::Id<'_>) -> String {
         let full = id.to_string();
-        if let Some(short) = self.known.get(&full) {
+        if let Some(short) = self.local.get(&full).or_else(|| self.known.get(&full)) {
             return short.clone();
         }
         let short = id.shorten_or_id().to_string();
         self.fresh.push((full.clone(), short.clone()));
-        self.known.insert(full, short.clone());
+        self.local.insert(full, short.clone());
         short
     }
 
@@ -1413,6 +1593,13 @@ impl AbbrevCache {
             let _ = crate::db::abbrev_store(&mut conn, self.hex_len, &self.fresh);
         }
     }
+}
+
+/// The byte two hex digits name, or `None` if either is not a hex digit. Upper
+/// and lower case both count, as in git.
+fn hex_byte(hi: Option<char>, lo: Option<char>) -> Option<u8> {
+    let nibble = |c: Option<char>| c?.to_digit(16).map(|v| v as u8);
+    Some((nibble(hi)? << 4) | nibble(lo)?)
 }
 
 /// Whether a user format can be rendered from the WALK alone — the ids and
@@ -1825,6 +2012,10 @@ fn check_format(fmt: &str) -> Result<()> {
                 Some(x) => bail!("unsupported format placeholder %G{x}"),
                 None => bail!("unsupported trailing % in format"),
             },
+            // `%xNN` is always accepted: two hex digits emit that byte, and
+            // anything else prints literally rather than failing, so there is
+            // nothing here to reject.
+            Some('x') => {}
             Some(x) => bail!("unsupported format placeholder %{x}"),
             None => bail!("unsupported trailing % in format"),
         }
@@ -1880,6 +2071,17 @@ fn expand_format(
             'f' => out.extend_from_slice(&sanitized_subject(&subject(commit.message_raw()?))),
             'n' => out.push(b'\n'),
             '%' => out.push(b'%'),
+            // `%xNN`: the byte with that hex code, which is how a format asks for
+            // a literal tab, NUL or any byte the shell would eat. Two hex digits
+            // are required; anything else is not a placeholder at all and git
+            // prints the text as typed.
+            'x' => match hex_byte(chars.get(i).copied(), chars.get(i + 1).copied()) {
+                Some(byte) => {
+                    out.push(byte);
+                    i += 2;
+                }
+                None => out.extend_from_slice(b"%x"),
+            },
             'C' => expand_color(out, &chars, &mut i, ctx.want_color, &mut auto),
             // `%d`/`%D` are always shown (short by default); `log.decorate=full`
             // / `--decorate=full` switches them to full ref names.
@@ -2705,7 +2907,8 @@ fn render_entry(
             write_raw_ident(out, b"author", &author)?;
             write_raw_ident(out, b"committer", &committer)?;
             out.push(b'\n');
-            indent_message(out, commit.message_raw()?);
+            // `raw` prints the message as stored: its table entry has no tab width.
+            indent_message(out, commit.message_raw()?, 0);
         }
         Pretty::Medium | Pretty::Short | Pretty::Full | Pretty::Fuller => {
             let author = commit.author()?;
@@ -2781,7 +2984,7 @@ fn render_entry(
                 out.extend_from_slice(&subject(commit.message_raw()?));
                 out.push(b'\n');
             } else {
-                indent_message(out, commit.message_raw()?);
+                indent_message(out, commit.message_raw()?, 8);
             }
         }
     }
@@ -2830,16 +3033,50 @@ fn write_raw_ident(out: &mut Vec<u8>, role: &[u8], sig: &gix::actor::SignatureRe
 /// Indent a commit message four spaces per line, exactly as git's `pp_remainder`:
 /// every line — blank ones included — is prefixed, and trailing blank lines are
 /// dropped.
-fn indent_message(out: &mut Vec<u8>, msg: &[u8]) {
+///
+/// `tab_width` is git's `expand_tabs_in_log`, which its format table sets to 8
+/// for the formats that indent (`medium`, `full`, `fuller`) and 0 for `raw`. A
+/// tab inside a commit message was written against the message's own left edge,
+/// so a four-space indent would shift every tab stop and misalign whatever the
+/// author lined up; git expands the tabs instead, and the columns survive.
+fn indent_message(out: &mut Vec<u8>, msg: &[u8], tab_width: usize) {
     let mut lines: Vec<&[u8]> = msg.split(|&b| b == b'\n').collect();
     while lines.last() == Some(&&b""[..]) {
         lines.pop();
     }
     for line in lines {
         out.extend_from_slice(b"    ");
-        out.extend_from_slice(line);
+        if tab_width == 0 {
+            out.extend_from_slice(line);
+        } else {
+            expand_tabs(out, line, tab_width);
+        }
         out.push(b'\n');
     }
+}
+
+/// git's `strbuf_add_tabexpand`: replace each tab with spaces up to the next tab
+/// stop, measuring columns from the START OF THE LINE — the indent the caller
+/// already wrote does not count, which is what keeps a message's internal
+/// alignment intact.
+///
+/// Width is display width, so a wide character occupies two columns. A segment
+/// that is not valid UTF-8 cannot be measured, and git stops expanding that line
+/// and copies the rest verbatim rather than guessing.
+fn expand_tabs(out: &mut Vec<u8>, line: &[u8], tab_width: usize) {
+    let mut rest = line;
+    let mut column = 0usize;
+    while let Some(at) = memchr::memchr(b'\t', rest) {
+        let Ok(text) = std::str::from_utf8(&rest[..at]) else {
+            break;
+        };
+        column += unicode_width::UnicodeWidthStr::width(text);
+        out.extend_from_slice(&rest[..at]);
+        out.extend(std::iter::repeat_n(b' ', tab_width - (column % tab_width)));
+        column += tab_width - (column % tab_width);
+        rest = &rest[at + 1..];
+    }
+    out.extend_from_slice(rest);
 }
 
 // ---------------------------------------------------------------------------

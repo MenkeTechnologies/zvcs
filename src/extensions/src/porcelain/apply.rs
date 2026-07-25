@@ -1522,8 +1522,8 @@ fn git_header_names(rest: &str, strip: usize) -> Result<Option<(String, String)>
     }
     for (idx, _) in rest.match_indices(' ') {
         let (Ok(a), Ok(b)) = (
-            strip_path(rest[..idx].as_bytes(), strip),
-            strip_path(rest[idx + 1..].as_bytes(), strip),
+            strip_path(&rest.as_bytes()[..idx], strip),
+            strip_path(&rest.as_bytes()[idx + 1..], strip),
         ) else {
             continue;
         };

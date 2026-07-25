@@ -334,7 +334,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             | "--no-textconv" | "--ita-invisible-in-index" | "--ita-visible-in-index" => {}
             s if s == "--ignore-submodules" || s.starts_with("--ignore-submodules=") => {}
             s if s.starts_with("--diff-filter=") => {
-                diff_filter = Some(s["--diff-filter=".len()..].as_bytes().to_vec());
+                diff_filter = Some(s.as_bytes()["--diff-filter=".len()..].to_vec());
             }
             s if s.starts_with("--abbrev=") => {
                 let raw = &s["--abbrev=".len()..];
@@ -351,13 +351,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 }
             }
             s if s.starts_with("--src-prefix=") => {
-                src_prefix = s["--src-prefix=".len()..].as_bytes().to_vec();
+                src_prefix = s.as_bytes()["--src-prefix=".len()..].to_vec();
             }
             s if s.starts_with("--dst-prefix=") => {
-                dst_prefix = s["--dst-prefix=".len()..].as_bytes().to_vec();
+                dst_prefix = s.as_bytes()["--dst-prefix=".len()..].to_vec();
             }
             s if s.starts_with("--line-prefix=") => {
-                line_prefix = s["--line-prefix=".len()..].as_bytes().to_vec();
+                line_prefix = s.as_bytes()["--line-prefix=".len()..].to_vec();
             }
             s if s.starts_with("--diff-algorithm=") => {
                 match &s["--diff-algorithm=".len()..] {

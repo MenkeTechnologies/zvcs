@@ -915,10 +915,10 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 opts.relative = Some(trim_slashes(&s["--relative=".len()..]));
             }
             s if s.starts_with("--line-prefix=") => {
-                opts.line_prefix = s["--line-prefix=".len()..].as_bytes().to_vec();
+                opts.line_prefix = s.as_bytes()["--line-prefix=".len()..].to_vec();
             }
             s if s.starts_with("--ignore-matching-lines=") => {
-                ignore_arg = Some((cur, s["--ignore-matching-lines=".len()..].as_bytes().to_vec()));
+                ignore_arg = Some((cur, s.as_bytes()["--ignore-matching-lines=".len()..].to_vec()));
             }
             s if s.starts_with("--diff-filter=") => {
                 // `diff_opt_diff_filter()` rejects an unknown letter inline during the
@@ -1018,10 +1018,10 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 opts.skip_or_rotate = Some((false, s["--rotate-to=".len()..].into()));
             }
             s if s.len() > 2 && s.starts_with("-I") => {
-                ignore_arg = Some((cur, s[2..].as_bytes().to_vec()));
+                ignore_arg = Some((cur, s.as_bytes()[2..].to_vec()));
             }
             s if s.len() > 2 && (s.starts_with("-S") || s.starts_with("-G")) => {
-                pickaxe_arg = Some((s.as_bytes()[1], s[2..].as_bytes().to_vec()));
+                pickaxe_arg = Some((s.as_bytes()[1], s.as_bytes()[2..].to_vec()));
             }
             s if s.len() > 2 && (s.starts_with("-M") || s.starts_with("-C")) => {
                 opts.detect_rename = true;

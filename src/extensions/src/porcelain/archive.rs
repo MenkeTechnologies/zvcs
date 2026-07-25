@@ -710,8 +710,8 @@ fn resolve_virtual_file(value: &str) -> std::result::Result<Added, String> {
         None => Err(format!("missing colon: '{value}'")),
         Some(0) => Err(format!("empty file name: '{value}'")),
         Some(idx) => Ok(Added::Virtual {
-            name: value[..idx].as_bytes().to_vec(),
-            content: value[idx + 1..].as_bytes().to_vec(),
+            name: value.as_bytes()[..idx].to_vec(),
+            content: value.as_bytes()[idx + 1..].to_vec(),
         }),
     }
 }

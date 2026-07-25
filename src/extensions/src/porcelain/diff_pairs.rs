@@ -675,12 +675,12 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
                 opts.ignore_lines.push(Needle::Regex(re));
             }
             _ if s.starts_with("-I") => {
-                let re = compile_regex(s[2..].as_bytes())
+                let re = compile_regex(&s.as_bytes()[2..])
                     .map_err(|e| anyhow::anyhow!("invalid regex given to -I: {e}"))?;
                 opts.ignore_lines.push(Needle::Regex(re));
             }
             _ if s.starts_with("--ignore-matching-lines=") => {
-                let re = compile_regex(s["--ignore-matching-lines=".len()..].as_bytes())
+                let re = compile_regex(&s.as_bytes()["--ignore-matching-lines=".len()..])
                     .map_err(|e| anyhow::anyhow!("invalid regex given to -I: {e}"))?;
                 opts.ignore_lines.push(Needle::Regex(re));
             }
@@ -694,9 +694,9 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
             }
             // Pickaxe.
             "-S" => pickaxe_pending = Some((b'S', want_value!(s.len()).into_bytes())),
-            _ if s.starts_with("-S") => pickaxe_pending = Some((b'S', s[2..].as_bytes().to_vec())),
+            _ if s.starts_with("-S") => pickaxe_pending = Some((b'S', s.as_bytes()[2..].to_vec())),
             "-G" => pickaxe_pending = Some((b'G', want_value!(s.len()).into_bytes())),
-            _ if s.starts_with("-G") => pickaxe_pending = Some((b'G', s[2..].as_bytes().to_vec())),
+            _ if s.starts_with("-G") => pickaxe_pending = Some((b'G', s.as_bytes()[2..].to_vec())),
             "--pickaxe-all" => pickaxe_all = true,
             "--pickaxe-regex" => pickaxe_regex = true,
             "--find-object" => find_object_args.push(want_value!(s.len())),
@@ -707,19 +707,19 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
             "--relative" => opts.relative = Relative::Cwd,
             "--no-relative" => opts.relative = Relative::No,
             _ if s.starts_with("--relative=") => {
-                opts.relative = Relative::Path(BString::from(s["--relative=".len()..].as_bytes()));
+                opts.relative = Relative::Path(BString::from(&s.as_bytes()["--relative=".len()..]));
             }
             // --rotate-to / --skip-to
             "--rotate-to" => opts.anchor = Some(Anchor::Rotate(want_value!(s.len()).into())),
             _ if s.starts_with("--rotate-to=") => {
                 opts.anchor = Some(Anchor::Rotate(BString::from(
-                    s["--rotate-to=".len()..].as_bytes(),
+                    &s.as_bytes()["--rotate-to=".len()..],
                 )));
             }
             "--skip-to" => opts.anchor = Some(Anchor::Skip(want_value!(s.len()).into())),
             _ if s.starts_with("--skip-to=") => {
                 opts.anchor = Some(Anchor::Skip(BString::from(
-                    s["--skip-to=".len()..].as_bytes(),
+                    &s.as_bytes()["--skip-to=".len()..],
                 )));
             }
             // Accepted and ignored, matching stock git: `--abbrev=<n>` has no effect on
@@ -779,10 +779,10 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
                 }
             }
             _ if s.starts_with("--src-prefix=") => {
-                opts.src_prefix = BString::from(s["--src-prefix=".len()..].as_bytes());
+                opts.src_prefix = BString::from(&s.as_bytes()["--src-prefix=".len()..]);
             }
             _ if s.starts_with("--dst-prefix=") => {
-                opts.dst_prefix = BString::from(s["--dst-prefix=".len()..].as_bytes());
+                opts.dst_prefix = BString::from(&s.as_bytes()["--dst-prefix=".len()..]);
             }
             _ => bail!(
                 "unsupported flag {s:?} (ported: -z, -p/-u/--patch, -s/--no-patch, --raw, \

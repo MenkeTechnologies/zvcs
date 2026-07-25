@@ -624,7 +624,7 @@ fn parse_msg_opts(
                 o.separator = Some(a["--separator=".len()..].to_string())
             }
             _ if a.starts_with("--message=") => o.msgs.push(Msg {
-                bytes: a["--message=".len()..].as_bytes().to_vec(),
+                bytes: a.as_bytes()["--message=".len()..].to_vec(),
                 strip: true,
             }),
             _ if a.starts_with("--file=") => match read_file(&a["--file=".len()..]) {
@@ -638,7 +638,7 @@ fn parse_msg_opts(
                 }
             }
             _ if a.starts_with("-m") => o.msgs.push(Msg {
-                bytes: a[2..].as_bytes().to_vec(),
+                bytes: a.as_bytes()[2..].to_vec(),
                 strip: true,
             }),
             _ if a.starts_with("-F") => match read_file(&a[2..]) {

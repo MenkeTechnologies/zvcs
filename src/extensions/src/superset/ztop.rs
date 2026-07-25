@@ -1401,10 +1401,22 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> KeyOutcome {
                 app.scroll = 0;
                 app.reproject();
             }
-            KeyCode::Char(c) => {
+            // Only unmodified text enters the query. A terminal encodes Alt+<c>
+            // as ESC followed by <c>, and crossterm delivers that as one
+            // ALT-modified key — so treating every Char as literal input turns a
+            // quick `Esc` then `h` into the character `h` appended to the filter,
+            // leaving the user stuck in search with no way out that they can see.
+            // Alt/Ctrl chords leave search first, then act.
+            KeyCode::Char(c) if !mods.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
                 app.filter.push(c);
                 app.scroll = 0;
                 app.reproject();
+            }
+            KeyCode::Char(_) => {
+                app.searching = false;
+                app.filter.clear();
+                app.reproject();
+                return handle_key(app, code, mods - KeyModifiers::ALT);
             }
             _ => return KeyOutcome::Ignore,
         }
@@ -1634,5 +1646,53 @@ mod tests {
         assert!(!m.expired());
         let old = StatusMsg { text: "x".into(), since: Instant::now() - Duration::from_secs(4) };
         assert!(old.expired());
+    }
+}
+
+#[cfg(test)]
+mod search_key_tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(ThemeName::NeonSprawl.palette(), "Neon Sprawl".into(), true, Duration::from_secs(2))
+    }
+
+    #[test]
+    fn plain_characters_type_into_the_query() {
+        let mut a = app();
+        handle_key(&mut a, KeyCode::Char('/'), KeyModifiers::NONE);
+        assert!(a.searching, "'/' opens the incremental search");
+        for c in "zdb".chars() {
+            handle_key(&mut a, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(a.filter, "zdb");
+        assert!(a.searching, "typing stays in search");
+    }
+
+    /// A terminal encodes `Alt+h` — and an `Esc` immediately followed by `h` —
+    /// as one ALT-modified key. Appending that to the query left the user stuck
+    /// in search with an unexplained `h` in it, which is what "the h key doesn't
+    /// work" looks like from the outside.
+    #[test]
+    fn an_alt_chord_leaves_search_and_acts() {
+        let mut a = app();
+        handle_key(&mut a, KeyCode::Char('/'), KeyModifiers::NONE);
+        handle_key(&mut a, KeyCode::Char('h'), KeyModifiers::ALT);
+
+        assert!(!a.searching, "the chord ends search");
+        assert!(a.filter.is_empty(), "and does not leave a stray character behind");
+        assert!(matches!(a.overlay, Overlay::Help), "then does what the key means");
+    }
+
+    #[test]
+    fn escape_still_cancels_the_search() {
+        let mut a = app();
+        handle_key(&mut a, KeyCode::Char('/'), KeyModifiers::NONE);
+        handle_key(&mut a, KeyCode::Char('x'), KeyModifiers::NONE);
+        handle_key(&mut a, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(!a.searching);
+        assert!(a.filter.is_empty());
+        assert!(matches!(a.overlay, Overlay::None));
     }
 }

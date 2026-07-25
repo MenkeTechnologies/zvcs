@@ -233,6 +233,44 @@ fn dashed_subcommand(arg0: &str) -> Option<String> {
     (!verb.is_empty()).then(|| verb.to_string())
 }
 
+/// Ensure a committer identity exists for reflog writes on paths that update refs
+/// without making a commit — `fetch`/`pull` (remote-tracking reflogs) and
+/// `receive-pack` (the pushed ref reflogs). For a *commit* git errors when
+/// `user.name`/`user.email` are unset ("Please tell me who you are"), but for a
+/// *reflog* it synthesizes a default from the system user and hostname and proceeds;
+/// gix errors in both cases (its personas are cached at open, so an env override set
+/// this late is never seen). Fill the reflog gap by injecting a synthesized
+/// `user.name`/`user.email` into the repo's *in-memory* config — which `committer()`
+/// falls back to — when nothing is configured. Nothing is written to disk, and a real
+/// identity is left untouched, so `commit`'s own "who are you" behaviour is unchanged.
+pub fn ensure_reflog_identity(repo: &mut gix::Repository) {
+    // A configured identity (env or `user.*`, valid or not) is left as-is.
+    if repo.committer().is_some() {
+        return;
+    }
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let email = format!("{user}@{}", hostname().unwrap_or_else(|| "localhost".to_string()));
+    let mut cfg = repo.config_snapshot_mut();
+    let _ = cfg.set_value(&gix::config::tree::User::NAME, user.as_str());
+    let _ = cfg.set_value(&gix::config::tree::User::EMAIL, email.as_str());
+    // Rebuilds the cached personas so the injected identity takes effect.
+    let _ = cfg.commit();
+}
+
+/// The machine's hostname (`gethostname`), for the synthesized reflog identity.
+fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..end]).ok().filter(|s| !s.is_empty()).map(str::to_string)
+}
+
 /// The exec-path `git --exec-path` reports: `$GIT_EXEC_PATH` when set, else the zvcs
 /// bin directory where the shadow's `git-*` helper symlinks live (`$HOME/.zvcs/bin`).
 /// Unlike stock git's `libexec/git-core`, the shadow serves every `git-*` helper from

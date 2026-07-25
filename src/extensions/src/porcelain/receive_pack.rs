@@ -135,7 +135,7 @@ pub fn receive_pack(args: &[String]) -> Result<ExitCode> {
         Parsed::Exit(code) => return Ok(code),
     };
 
-    let Some(repo) = open_repo(&opts.dir) else {
+    let Some(mut repo) = open_repo(&opts.dir) else {
         eprintln!(
             "fatal: '{}' does not appear to be a git repository",
             opts.dir
@@ -158,7 +158,7 @@ pub fn receive_pack(args: &[String]) -> Result<ExitCode> {
     }
     let _ = opts.quiet; // suppresses progress only; the report-status is unaffected.
 
-    receive(&repo)
+    receive(&mut repo)
 }
 
 /// Either a fully parsed command line, or a terminal exit code for the
@@ -399,7 +399,12 @@ struct Command {
 /// `send-pack` speaks: pkt-line commands, then a flush, then a raw (non-pkt) pack,
 /// then a plain pkt-line `report-status`. An empty command list (immediate flush) is
 /// a no-op success, matching a client that connects and hangs up.
-fn receive(repo: &gix::Repository) -> Result<ExitCode> {
+fn receive(repo: &mut gix::Repository) -> Result<ExitCode> {
+    // Each accepted ref update writes a reflog; a bare remote often has no configured
+    // identity, so seed a synthesized system default (as git does) to keep the reflog
+    // write from failing the push.
+    crate::ensure_reflog_identity(repo);
+
     let mut stdin = std::io::stdin().lock();
 
     // --- command list (until flush); the first line carries the caps after a NUL.

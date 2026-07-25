@@ -42,7 +42,11 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 /// `--append`/FETCH_HEAD, `--set-upstream`, `--refmap`) are rejected with a
 /// precise message rather than silently ignored.
 pub fn fetch(args: &[String]) -> Result<ExitCode> {
-    let repo = gix::discover(".")?;
+    let mut repo = gix::discover(".")?;
+
+    // Remote-tracking ref updates write reflogs; without a configured identity, seed
+    // a synthesized system default so the reflog write can't fail (git does the same).
+    crate::ensure_reflog_identity(&mut repo);
 
     // --- argument parsing -------------------------------------------------
     let mut opts = FetchOpts::default();

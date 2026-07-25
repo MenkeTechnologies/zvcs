@@ -64,12 +64,10 @@ fn clone_and_fetch_from_local_remote() {
     assert_eq!(stdout(&dst, &home, &bindir, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
     assert!(dst.join("f").exists(), "worktree was not checked out");
 
-    // A committer identity for the fetch's remote-tracking reflog updates.
-    run(&dst, &home, &bindir, &["config", "user.email", "t@e.co"]);
-    run(&dst, &home, &bindir, &["config", "user.name", "t"]);
-
-    // Incremental fetch: add a commit upstream, fetch, and confirm only-new transfer
-    // landed the new tip.
+    // Incremental fetch, deliberately with NO committer identity configured in the
+    // clone target: fetch's remote-tracking reflog must fall back to a synthesized
+    // system identity (as git does) rather than erroring. Add a commit upstream,
+    // fetch, and confirm the only-new transfer landed the new tip.
     std::fs::write(src.join("f"), "c3\n").unwrap();
     run(&src, &home, &bindir, &["add", "f"]);
     run(&src, &home, &bindir, &["commit", "-q", "-m", "c3"]);

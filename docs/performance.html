@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="zvcs performance architecture — how a git-shadowing VCS in Rust beats stock git on every measured read command: fanning single-threaded diff and log work across the machine, replacing patch rendering with blob counting in the pickaxe, memoizing pure functions of immutable objects in a SQLite ledger, precomputing them in a daemon before they are asked for, and keeping cache writes off the caller's critical path. Diagrams and measurements.">
+  <title>zvcs &mdash; Performance Architecture</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&amp;family=Share+Tech+Mono&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="hud-static.css">
+  <link rel="stylesheet" href="tutorial.css">
+  <style>
+    .tutorial-main { max-width: 76rem; }
+    .docs-build-line { margin: 0.35rem 0 0; font-family: 'Share Tech Mono', ui-monospace, monospace; font-size: 11px; color: var(--text-dim); letter-spacing: 0.03em; max-width: 52rem; opacity: 0.8; }
+
+    /* diagrams ------------------------------------------------------------ */
+    .dg { width: 100%; height: auto; display: block; margin: 1rem 0 0.4rem; }
+    .dg text { font-family: 'Share Tech Mono', ui-monospace, monospace; font-size: 13px; fill: var(--text-dim); }
+    .dg .t-title { font-family: 'Orbitron', sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 1.4px; fill: var(--cyan); }
+    .dg .t-sub { font-size: 11.5px; fill: var(--text-muted); }
+    .dg .t-cyan { fill: var(--cyan); }
+    .dg .t-accent { fill: var(--accent-light); }
+    .dg .t-green { fill: var(--green); }
+    .dg .t-mag { fill: var(--magenta); }
+    .dg .box { fill: var(--bg-card); stroke: var(--border); stroke-width: 1; }
+    .dg .box-cyan { fill: var(--bg-card); stroke: var(--cyan); stroke-width: 1.4; }
+    .dg .box-accent { fill: var(--bg-card); stroke: var(--accent); stroke-width: 1.4; }
+    .dg .box-green { fill: var(--bg-card); stroke: var(--green); stroke-width: 1.4; }
+    .dg .box-mag { fill: var(--bg-card); stroke: var(--magenta); stroke-width: 1.4; }
+    .dg .box-dash { fill: none; stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 4 4; }
+    .dg .wire { stroke: var(--text-muted); stroke-width: 1.4; fill: none; }
+    .dg .wire-cyan { stroke: var(--cyan); stroke-width: 1.4; fill: none; }
+    .dg .wire-accent { stroke: var(--accent); stroke-width: 1.4; fill: none; }
+    .dg .bar-z { fill: var(--cyan); }
+    .dg .bar-g { fill: var(--accent); }
+    .dg .bar-idle { fill: var(--bg-secondary); stroke: var(--border); stroke-width: 1; }
+    .dg .bar-warm { fill: var(--green); }
+    .dg .rule { stroke: var(--border); stroke-width: 1; }
+
+    .fig { margin: 1.4rem 0 1.8rem; }
+    .fig figcaption { font-size: 11.5px; color: var(--text-muted); line-height: 1.6; border-left: 2px solid var(--border); padding-left: 0.7rem; margin-top: 0.2rem; }
+    .lever-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr)); gap: 0.65rem; margin: 0.9rem 0; }
+    .lever-card { border: 1px solid var(--border); border-left: 3px solid var(--cyan); background: var(--bg-card); padding: 0.75rem 1rem; border-radius: 2px; }
+    .lever-card.only-us { border-left-color: var(--magenta); }
+    .lever-card h4 { font-family: 'Orbitron', sans-serif; font-size: 10px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: var(--cyan); margin: 0 0 0.35rem; }
+    .lever-card.only-us h4 { color: var(--magenta); }
+    .lever-card p { margin: 0; font-size: 11.5px; color: var(--text-dim); line-height: 1.6; }
+    .bench-table { width: 100%; border-collapse: collapse; margin: 0.7rem 0; font-size: 12px; }
+    .bench-table th { background: var(--bg-secondary); color: var(--cyan); font-family: 'Orbitron', sans-serif; font-size: 10px; font-weight: 700; letter-spacing: 1.2px; text-transform: uppercase; text-align: left; padding: 7px 10px; border: 1px solid var(--border); }
+    .bench-table td { padding: 6px 10px; border: 1px solid var(--border); color: var(--text-dim); }
+    .bench-table td:first-child { font-family: 'Share Tech Mono', monospace; color: var(--accent-light); white-space: nowrap; }
+    .bench-table td.num { text-align: right; font-family: 'Share Tech Mono', monospace; }
+    .bench-table td.win { text-align: right; font-family: 'Orbitron', sans-serif; font-size: 11px; font-weight: 700; color: var(--green); }
+    .caveat { border: 1px solid var(--border); border-left: 3px solid var(--accent); background: color-mix(in srgb, var(--bg-card) 92%, transparent); padding: 0.8rem 1rem; border-radius: 2px; margin: 0.9rem 0; }
+    .caveat h4 { font-family: 'Orbitron', sans-serif; font-size: 10px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: var(--accent); margin: 0 0 0.4rem; }
+    .caveat p { margin: 0 0 0.5rem; font-size: 11.5px; color: var(--text-dim); line-height: 1.6; }
+    .caveat p:last-child { margin-bottom: 0; }
+  </style>
+</head>
+<body>
+  <div class="app tutorial-app" id="docsApp">
+    <div class="crt-scanline" id="crtH" aria-hidden="true"></div>
+    <div class="crt-scanline-v" id="crtV" aria-hidden="true"></div>
+
+    <header class="tutorial-header">
+      <div class="tutorial-header-inner">
+        <div>
+          <h1 class="tutorial-brand">// ZVCS — PERFORMANCE ARCHITECTURE</h1>
+          <nav class="tutorial-crumbs" aria-label="Breadcrumb">
+            <a href="index.html">Docs</a>
+            <span class="sep">/</span>
+            <span class="current">Performance</span>
+            <span class="sep">/</span>
+            <a href="report.html">Engineering Report</a>
+            <span class="sep">/</span>
+            <a href="reference.html">Verb Reference</a>
+            <span class="sep">/</span>
+            <a href="https://github.com/MenkeTechnologies/zvcs" target="_blank" rel="noopener noreferrer">GitHub</a>
+          </nav>
+          <p class="docs-build-line">How every measured read command ends up ahead of stock git — five levers, what each one changes, and what it does not fix. Measured on zshrs (6,376 commits) against Apple git 2.50.1, 18 cores, release build.</p>
+        </div>
+        <div class="tutorial-toolbar">
+          <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
+          <button type="button" class="btn btn-secondary active" id="btnCrt" title="CRT scanline overlay">CRT</button>
+          <button type="button" class="btn btn-secondary active" id="btnNeon" title="Neon border pulse">Neon</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- one shared arrowhead for every diagram on the page -->
+    <svg width="0" height="0" aria-hidden="true" style="position:absolute">
+      <defs>
+        <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"></path>
+        </marker>
+      </defs>
+    </svg>
+
+    <main class="tutorial-main">
+
+      <section class="tutorial-section">
+        <h2>The shape of the problem</h2>
+        <p>
+          A read-only git command spends almost none of its time on git. It spends it on
+          <em>per-item work</em>: decode this commit, diff that tree pair, count lines in this blob,
+          abbreviate that id. The items are independent, the objects are immutable while the command
+          runs, and most of the answers are the same every time they are asked for.
+        </p>
+        <p>
+          Stock git does that work on one core, from scratch, on every invocation, with nothing of
+          itself alive between two commands. Those three properties are what the five levers below
+          attack — and only the first of them is ordinary optimization.
+        </p>
+
+        <figure class="fig">
+          <svg class="dg" viewBox="0 0 960 300" role="img" aria-label="Pipeline of a read-only command showing where the levers apply">
+            <text class="t-title" x="0" y="16">WHERE A READ COMMAND SPENDS ITS TIME</text>
+
+            <!-- pipeline boxes -->
+            <rect class="box" x="0" y="40" width="120" height="52" rx="2"></rect>
+            <text x="60" y="62" text-anchor="middle">parse</text>
+            <text class="t-sub" x="60" y="79" text-anchor="middle">argv, config</text>
+
+            <rect class="box" x="150" y="40" width="140" height="52" rx="2"></rect>
+            <text x="220" y="62" text-anchor="middle">walk</text>
+            <text class="t-sub" x="220" y="79" text-anchor="middle">commit-graph</text>
+
+            <rect class="box-cyan" x="320" y="40" width="320" height="52" rx="2"></rect>
+            <text class="t-cyan" x="480" y="62" text-anchor="middle">per-item work — the whole cost</text>
+            <text class="t-sub" x="480" y="79" text-anchor="middle">decode commit · diff trees · count blob lines · abbreviate</text>
+
+            <rect class="box" x="670" y="40" width="130" height="52" rx="2"></rect>
+            <text x="735" y="62" text-anchor="middle">render</text>
+            <text class="t-sub" x="735" y="79" text-anchor="middle">in walk order</text>
+
+            <rect class="box" x="830" y="40" width="130" height="52" rx="2"></rect>
+            <text x="895" y="62" text-anchor="middle">write out</text>
+            <text class="t-sub" x="895" y="79" text-anchor="middle">block-buffered</text>
+
+            <g color="var(--text-muted)">
+              <path class="wire" d="M120 66 H150" marker-end="url(#ah)"></path>
+              <path class="wire" d="M290 66 H320" marker-end="url(#ah)"></path>
+              <path class="wire" d="M640 66 H670" marker-end="url(#ah)"></path>
+              <path class="wire" d="M800 66 H830" marker-end="url(#ah)"></path>
+            </g>
+
+            <!-- three properties -->
+            <text class="t-title" x="0" y="140">THREE PROPERTIES OF THAT WORK</text>
+
+            <rect class="box-green" x="0" y="158" width="300" height="62" rx="2"></rect>
+            <text class="t-green" x="16" y="180">1 · the items are independent</text>
+            <text class="t-sub" x="16" y="200">a blob pair is diffed in isolation</text>
+            <text class="t-sub" x="16" y="214">→ lever A: use every core</text>
+
+            <rect class="box-green" x="330" y="158" width="300" height="62" rx="2"></rect>
+            <text class="t-green" x="346" y="180">2 · the inputs are immutable</text>
+            <text class="t-sub" x="346" y="200">objects are content addresses</text>
+            <text class="t-sub" x="346" y="214">→ lever C: memoize, forever</text>
+
+            <rect class="box-green" x="660" y="158" width="300" height="62" rx="2"></rect>
+            <text class="t-green" x="676" y="180">3 · the answer predates the question</text>
+            <text class="t-sub" x="676" y="200">a commit exists before it is read</text>
+            <text class="t-sub" x="676" y="214">→ lever D: compute it early</text>
+
+            <!-- git's constraints -->
+            <rect class="box-dash" x="0" y="242" width="960" height="48" rx="2"></rect>
+            <text class="t-accent" x="16" y="264">git cannot take 1 (single-threaded diff), takes 2 only for its own caches, and cannot take 3 at all —</text>
+            <text class="t-accent" x="16" y="281">no part of git is running between two commands.</text>
+          </svg>
+          <figcaption>
+            The levers are not tricks layered on a slow core; each one follows from a property the
+            work already has. Lever B (do less work) and lever E (do not block on bookkeeping) appear
+            in their own sections below.
+          </figcaption>
+        </figure>
+
+        <div class="lever-grid">
+          <div class="lever-card"><h4>A · every core</h4><p>Patches, per-file analysis, pickaxe scans and record rendering are fanned across a worker pool. git's diff and log machinery is single-threaded.</p></div>
+          <div class="lever-card"><h4>B · less work</h4><p><code>-S</code> counts a needle in blobs instead of rendering patches; name-only formats stop reading blobs they never print.</p></div>
+          <div class="lever-card"><h4>C · a ledger</h4><p>Values that are pure functions of immutable objects are stored in SQLite and never recomputed — machine-wide, shared across clones.</p></div>
+          <div class="lever-card only-us"><h4>D · a daemon</h4><p>Those values are computed when a repo's refs move, before anyone asks. <strong>Structurally impossible for git.</strong></p></div>
+          <div class="lever-card"><h4>E · off the critical path</h4><p>Filling a cache is bookkeeping. The rows are queued to a writer thread; the command returns without waiting on a transaction.</p></div>
+        </div>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Lever A — fan the work across the machine</h2>
+        <p>
+          The object store cannot change while a read-only verb runs, so nothing forces the per-item
+          work to be sequential. Four paths use the pool: <code>log -p</code> patches,
+          <code>diff</code> per-file analysis, <code>log -S</code>/<code>-G</code> scans, and
+          <code>shortlog</code> record extraction.
+        </p>
+        <p>
+          <strong>Workers pull from a shared cursor rather than taking a fixed slice.</strong> One
+          commit that rewrites a large file outweighs a hundred that touch a line each, so a static
+          split leaves every worker but one idle:
+        </p>
+
+        <figure class="fig">
+          <svg class="dg" viewBox="0 0 960 250" role="img" aria-label="Fixed slice versus shared cursor work distribution">
+            <text class="t-title" x="0" y="16">FIXED SLICE (what a static split gives you)</text>
+            <text class="t-sub" x="640" y="16">wall clock →</text>
+
+            <g>
+              <text x="0" y="44">w0</text>
+              <rect class="bar-z" x="34" y="32" width="80" height="14"></rect>
+              <rect class="bar-idle" x="114" y="32" width="446" height="14"></rect>
+              <text x="0" y="68">w1</text>
+              <rect class="bar-z" x="34" y="56" width="120" height="14"></rect>
+              <rect class="bar-idle" x="154" y="56" width="406" height="14"></rect>
+              <text x="0" y="92">w2</text>
+              <rect class="bar-z" x="34" y="80" width="540" height="14"></rect>
+              <text class="t-accent" x="584" y="92">one huge commit</text>
+              <text x="0" y="116">w3</text>
+              <rect class="bar-z" x="34" y="104" width="60" height="14"></rect>
+              <rect class="bar-idle" x="94" y="104" width="466" height="14"></rect>
+            </g>
+            <path class="wire-accent" d="M574 26 V128" color="var(--accent)"></path>
+            <text class="t-accent" x="584" y="122">finish = the slowest slice</text>
+
+            <text class="t-title" x="0" y="164">SHARED CURSOR (what zvcs does)</text>
+            <g>
+              <text x="0" y="192">w0</text>
+              <rect class="bar-z" x="34" y="180" width="300" height="14"></rect>
+              <rect class="bar-idle" x="334" y="180" width="20" height="14"></rect>
+              <text x="0" y="216">w1</text>
+              <rect class="bar-z" x="34" y="204" width="316" height="14"></rect>
+              <text x="0" y="240">w2</text>
+              <rect class="bar-z" x="34" y="228" width="320" height="14"></rect>
+            </g>
+            <path class="wire-cyan" d="M354 174 V246" color="var(--cyan)"></path>
+            <text class="t-cyan" x="368" y="216">finish = total ÷ workers</text>
+            <text class="t-sub" x="368" y="234">each worker takes the next index the moment it is free</text>
+          </svg>
+          <figcaption>
+            Each worker owns a repository handle and a blob platform — neither type is <code>Sync</code>,
+            and a handle clone shares the underlying object store rather than re-opening it.
+            <code>ZVCS_THREADS</code> pins the count; <code>ZVCS_THREADS=1</code> forces the sequential
+            path and produces byte-identical output, which is asserted by test.
+          </figcaption>
+        </figure>
+
+        <p>
+          Output stays a stream. <code>log -p</code> renders a window of commits ahead of the writer
+          and hands them out in walk order, so memory is bounded by the window rather than by the
+          length of the history:
+        </p>
+
+        <figure class="fig">
+          <svg class="dg" viewBox="0 0 960 230" role="img" aria-label="Look-ahead window feeding an in-order output stream">
+            <text class="t-title" x="0" y="16">LOOK-AHEAD WINDOW — PARALLEL INSIDE, ORDERED OUTSIDE</text>
+
+            <rect class="box" x="0" y="34" width="150" height="46" rx="2"></rect>
+            <text x="75" y="54" text-anchor="middle">walk</text>
+            <text class="t-sub" x="75" y="71" text-anchor="middle">node list</text>
+
+            <rect class="box-cyan" x="190" y="26" width="250" height="150" rx="2"></rect>
+            <text class="t-cyan" x="315" y="48" text-anchor="middle">window: next N commits</text>
+            <text class="t-sub" x="315" y="66" text-anchor="middle">64 patches · 256 records</text>
+            <rect class="box" x="210" y="80" width="94" height="26" rx="2"></rect><text x="257" y="98" text-anchor="middle">worker</text>
+            <rect class="box" x="326" y="80" width="94" height="26" rx="2"></rect><text x="373" y="98" text-anchor="middle">worker</text>
+            <rect class="box" x="210" y="116" width="94" height="26" rx="2"></rect><text x="257" y="134" text-anchor="middle">worker</text>
+            <rect class="box" x="326" y="116" width="94" height="26" rx="2"></rect><text x="373" y="134" text-anchor="middle">worker</text>
+            <text class="t-sub" x="315" y="164" text-anchor="middle">shared cursor over the window</text>
+
+            <rect class="box-green" x="490" y="34" width="170" height="46" rx="2"></rect>
+            <text class="t-green" x="575" y="54" text-anchor="middle">slots, by index</text>
+            <text class="t-sub" x="575" y="71" text-anchor="middle">results land in order</text>
+
+            <rect class="box" x="710" y="34" width="120" height="46" rx="2"></rect>
+            <text x="770" y="54" text-anchor="middle">emit</text>
+            <text class="t-sub" x="770" y="71" text-anchor="middle">one record</text>
+
+            <rect class="box" x="860" y="34" width="100" height="46" rx="2"></rect>
+            <text x="910" y="54" text-anchor="middle">stdout</text>
+            <text class="t-sub" x="910" y="71" text-anchor="middle">64 KiB buf</text>
+
+            <g color="var(--text-muted)">
+              <path class="wire" d="M150 57 H190" marker-end="url(#ah)"></path>
+              <path class="wire" d="M440 57 H490" marker-end="url(#ah)"></path>
+              <path class="wire" d="M660 57 H710" marker-end="url(#ah)"></path>
+              <path class="wire" d="M830 57 H860" marker-end="url(#ah)"></path>
+            </g>
+
+            <path class="wire" d="M770 80 V196 H315 V176" color="var(--text-muted)" marker-end="url(#ah)" stroke-dasharray="4 4"></path>
+            <text class="t-sub" x="480" y="214" text-anchor="middle">window refills only when the reader runs past it — memory is O(window), not O(history)</text>
+          </svg>
+          <figcaption>
+            The same shape covers commit records (<code>--oneline</code>, <code>%s</code>, the default
+            format): reading 6,000 commit objects is the entire cost of those formats, and none of
+            those reads depends on another.
+          </figcaption>
+        </figure>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Lever B — stop doing work nobody asked for</h2>
+        <p>
+          Two cases mattered more than the threading. The pickaxe was building a full patch for every
+          candidate commit and then counting occurrences in the <code>+</code>/<code>-</code> lines.
+          git never does that: <code>has_changes</code> counts the needle in each side's whole blob
+          and keeps the file when the two counts differ — the needle's <em>position</em> is
+          irrelevant.
+        </p>
+
+        <figure class="fig">
+          <svg class="dg" viewBox="0 0 960 310" role="img" aria-label="Pickaxe before and after: patch rendering versus blob counting">
+            <text class="t-title" x="0" y="16">git log -S &lt;needle&gt; — BEFORE</text>
+            <rect class="box" x="0" y="30" width="130" height="44" rx="2"></rect><text x="65" y="57" text-anchor="middle">commit</text>
+            <rect class="box" x="160" y="30" width="150" height="44" rx="2"></rect><text x="235" y="50" text-anchor="middle">tree diff</text><text class="t-sub" x="235" y="66" text-anchor="middle">changed files</text>
+            <rect class="box-accent" x="340" y="30" width="200" height="44" rx="2"></rect><text class="t-accent" x="440" y="50" text-anchor="middle">render full patch</text><text class="t-sub" x="440" y="66" text-anchor="middle">Myers + hunks + text</text>
+            <rect class="box" x="570" y="30" width="180" height="44" rx="2"></rect><text x="660" y="50" text-anchor="middle">count in ± lines</text>
+            <rect class="box" x="780" y="30" width="180" height="44" rx="2"></rect><text x="870" y="57" text-anchor="middle">keep / drop</text>
+            <g color="var(--text-muted)">
+              <path class="wire" d="M130 52 H160" marker-end="url(#ah)"></path>
+              <path class="wire" d="M310 52 H340" marker-end="url(#ah)"></path>
+              <path class="wire" d="M540 52 H570" marker-end="url(#ah)"></path>
+              <path class="wire" d="M750 52 H780" marker-end="url(#ah)"></path>
+            </g>
+
+            <text class="t-title" x="0" y="116">git log -S &lt;needle&gt; — AFTER</text>
+            <rect class="box" x="0" y="130" width="130" height="44" rx="2"></rect><text x="65" y="157" text-anchor="middle">commit</text>
+            <rect class="box" x="160" y="130" width="150" height="44" rx="2"></rect><text x="235" y="150" text-anchor="middle">tree diff</text><text class="t-sub" x="235" y="166" text-anchor="middle">no renames yet</text>
+            <rect class="box-cyan" x="340" y="130" width="200" height="44" rx="2"></rect><text class="t-cyan" x="440" y="150" text-anchor="middle">count in both blobs</text><text class="t-sub" x="440" y="166" text-anchor="middle">vectorized substring scan</text>
+            <rect class="box" x="570" y="130" width="180" height="44" rx="2"></rect><text x="660" y="150" text-anchor="middle">counts differ?</text><text class="t-sub" x="660" y="166" text-anchor="middle">cheap over-approximation</text>
+            <rect class="box" x="780" y="130" width="180" height="44" rx="2"></rect><text x="870" y="157" text-anchor="middle">keep / drop</text>
+            <g color="var(--text-muted)">
+              <path class="wire" d="M130 152 H160" marker-end="url(#ah)"></path>
+              <path class="wire" d="M310 152 H340" marker-end="url(#ah)"></path>
+              <path class="wire" d="M540 152 H570" marker-end="url(#ah)"></path>
+              <path class="wire" d="M750 152 H780" marker-end="url(#ah)"></path>
+            </g>
+
+            <!-- the rename gate -->
+            <rect class="box-mag" x="570" y="196" width="390" height="102" rx="2"></rect>
+            <text class="t-mag" x="586" y="214">only if the cheap pass said &quot;maybe&quot;:</text>
+            <text class="t-sub" x="586" y="232">re-diff WITH rename detection</text>
+            <text class="t-sub" x="586" y="246">(50% similarity, git&#39;s default)</text>
+            <text class="t-sub" x="586" y="262">moved content holds the needle</text>
+            <text class="t-sub" x="586" y="276">equally on both sides — pairing</text>
+            <text class="t-sub" x="586" y="290">only CANCELS, never creates</text>
+            <path class="wire" d="M660 174 V196" color="var(--text-muted)" marker-end="url(#ah)"></path>
+
+            <text class="t-sub" x="0" y="216">Merges are dropped outright:</text>
+            <text class="t-sub" x="0" y="234">git renders no diff for a merge</text>
+            <text class="t-sub" x="0" y="252">without -m/-c/--cc, so a merge can</text>
+            <text class="t-sub" x="0" y="270">never match — and merges are the</text>
+            <text class="t-sub" x="0" y="288">largest diffs in the history.</text>
+          </svg>
+          <figcaption>
+            Rename detection is expensive and almost never changes the answer, so it runs only for a
+            commit the cheap pass already flagged. Result: <code>log -S return</code> over 6,376
+            commits — <strong>2.673 s against git's 7.209 s</strong>, byte-identical hit sets across
+            six needles including one with 5,320 hits.
+          </figcaption>
+        </figure>
+
+        <p>
+          The second case: <code>--name-only</code>, <code>--name-status</code>, <code>--raw</code>
+          and <code>--summary</code> were analyzing blobs to produce line counts that those formats
+          never print. Skipping the analysis took <code>diff --name-only HEAD~5</code> from
+          26.7 ms to 9.5 ms in isolation — the change list was already in hand.
+        </p>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Lever C — a ledger for values that cannot go stale</h2>
+        <p>
+          Git objects are content addresses. That makes certain answers permanent, not merely
+          cacheable-with-invalidation: there is no event that can make them wrong.
+        </p>
+
+        <figure class="fig">
+          <svg class="dg" viewBox="0 0 960 250" role="img" aria-label="What the ledger stores and why each entry never expires">
+            <text class="t-title" x="0" y="16">THE LEDGER — ~/.zvcs/db.sqlite (WAL)</text>
+
+            <rect class="box-cyan" x="0" y="34" width="300" height="92" rx="2"></rect>
+            <text class="t-cyan" x="16" y="56">treediff</text>
+            <text class="t-sub" x="16" y="76">key: (old_tree, new_tree, counts)</text>
+            <text class="t-sub" x="16" y="93">value: status + ± tallies per file</text>
+            <text class="t-sub" x="16" y="110">the tallies cost one blob read each</text>
+
+            <rect class="box-cyan" x="330" y="34" width="300" height="92" rx="2"></rect>
+            <text class="t-cyan" x="346" y="56">abbrev</text>
+            <text class="t-sub" x="346" y="76">key: (object id, hex_len)</text>
+            <text class="t-sub" x="346" y="93">value: the unique short form</text>
+            <text class="t-sub" x="346" y="110">hex_len is in the key: the repo grows</text>
+
+            <rect class="box-cyan" x="660" y="34" width="300" height="92" rx="2"></rect>
+            <text class="t-cyan" x="676" y="56">blame</text>
+            <text class="t-sub" x="676" y="76">key: (commit, path, algo)</text>
+            <text class="t-sub" x="676" y="93">value: run-length attribution</text>
+            <text class="t-sub" x="676" y="110">algo is in the key: it changes the answer</text>
+
+            <rect class="box-green" x="0" y="146" width="960" height="44" rx="2"></rect>
+            <text class="t-green" x="16" y="166">Every key is made of content addresses, so an entry is valid in EVERY clone that holds those objects —</text>
+            <text class="t-green" x="16" y="183">the cache is machine-wide, not per-repository, and a fresh clone inherits everything already computed.</text>
+
+            <rect class="box-dash" x="0" y="206" width="960" height="44" rx="2"></rect>
+            <text class="t-accent" x="16" y="226">Not cacheable, and not pretended to be: a worktree diff. Working-tree bytes are not</text>
+            <text class="t-accent" x="16" y="243">content-addressed, so there is no stable key — that path is served by lever A instead.</text>
+          </svg>
+          <figcaption>
+            One cache serves several formats: the tree-diff row feeds <code>--stat</code>,
+            <code>--numstat</code>, <code>--shortstat</code>, <code>--name-only</code>,
+            <code>--name-status</code> and the path-limited traversal predicate.
+          </figcaption>
+        </figure>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Lever D — compute it before it is asked for</h2>
+        <p>
+          This is the one advantage that is structural rather than algorithmic. The daemon is already
+          awake and already learns that a watched repository's refs moved; the values above can be
+          computed at that moment instead of when someone runs <code>log --stat</code>.
+        </p>
+
+        <figure class="fig">
+          <svg class="dg" viewBox="0 0 960 300" role="img" aria-label="Timeline comparing git, zvcs cold, zvcs warm and daemon-precached">
+            <text class="t-title" x="0" y="16">WHEN THE WORK HAPPENS</text>
+
+            <!-- axis -->
+            <line class="rule" x1="150" y1="34" x2="150" y2="270"></line>
+            <text class="t-sub" x="150" y="288">fetch / commit lands</text>
+            <line class="rule" x1="560" y1="34" x2="560" y2="270"></line>
+            <text class="t-sub" x="560" y="288">user runs `git log --stat`</text>
+
+            <!-- git -->
+            <text class="t-accent" x="0" y="62">stock git</text>
+            <rect class="bar-idle" x="150" y="50" width="410" height="18"></rect>
+            <text class="t-sub" x="200" y="64">nothing of git is running</text>
+            <rect class="bar-g" x="560" y="50" width="330" height="18"></rect>
+            <text class="t-sub" x="890" y="64" text-anchor="end">full cost, every time</text>
+
+            <!-- zvcs cold -->
+            <text class="t-cyan" x="0" y="112">zvcs, no ledger</text>
+            <rect class="bar-idle" x="150" y="100" width="410" height="18"></rect>
+            <rect class="bar-z" x="560" y="100" width="270" height="18"></rect>
+            <text class="t-sub" x="822" y="114" text-anchor="end">computes + records</text>
+
+            <!-- zvcs warm -->
+            <text class="t-cyan" x="0" y="162">zvcs, warm</text>
+            <rect class="bar-idle" x="150" y="150" width="410" height="18"></rect>
+            <rect class="bar-warm" x="560" y="150" width="40" height="18"></rect>
+            <text class="t-sub" x="612" y="164">reads the ledger</text>
+
+            <!-- daemon -->
+            <text class="t-mag" x="0" y="212">zvcs + daemon</text>
+            <rect class="box-mag" x="150" y="196" width="200" height="26" rx="2"></rect>
+            <text class="t-mag" x="250" y="214" text-anchor="middle">precache on ref-change</text>
+            <rect class="bar-idle" x="350" y="200" width="210" height="18"></rect>
+            <rect class="bar-warm" x="560" y="200" width="40" height="18"></rect>
+            <text class="t-sub" x="612" y="214">already paid, off the user&#39;s clock</text>
+
+            <rect class="box-dash" x="0" y="238" width="960" height="26" rx="2"></rect>
+            <text class="t-sub" x="16" y="256">zvcs.precache (on by default) warms the newest 200 commits off the watcher thread · `git zprecache [-n]` does the same pass on demand</text>
+          </svg>
+          <figcaption>
+            Measured on a fresh clone with an empty ledger: <code>log --stat -n 150</code> takes
+            402 ms cold, 10.7 ms warm, and <code>git zprecache -n 150</code> — the work the daemon
+            does on its own — takes 0.63 s once.
+          </figcaption>
+        </figure>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Lever E — never make the caller wait on bookkeeping</h2>
+        <p>
+          A cache row is written only because the answer was already computed. Making the user wait
+          for it is backwards — and the first version did worse than wait: it opened a connection and
+          re-ran the schema batch <em>per row</em>, in the middle of the walk. The cold run, the one
+          the cache cannot help yet, was carrying the entire cost of building it.
+        </p>
+
+        <figure class="fig">
+          <svg class="dg" viewBox="0 0 960 280" role="img" aria-label="Cache write path before and after">
+            <text class="t-title" x="0" y="16">BEFORE — INLINE, PER ROW</text>
+            <g>
+              <rect class="box" x="0" y="32" width="110" height="40" rx="2"></rect><text x="55" y="57" text-anchor="middle">commit N</text>
+              <rect class="box-accent" x="130" y="32" width="120" height="40" rx="2"></rect><text class="t-accent" x="190" y="50" text-anchor="middle">open_rw</text><text class="t-sub" x="190" y="65" text-anchor="middle">+ schema</text>
+              <rect class="box-accent" x="270" y="32" width="120" height="40" rx="2"></rect><text class="t-accent" x="330" y="50" text-anchor="middle">txn</text><text class="t-sub" x="330" y="65" text-anchor="middle">1 row</text>
+              <rect class="box" x="410" y="32" width="110" height="40" rx="2"></rect><text x="465" y="57" text-anchor="middle">commit N+1</text>
+              <rect class="box-accent" x="540" y="32" width="120" height="40" rx="2"></rect><text class="t-accent" x="600" y="50" text-anchor="middle">open_rw</text><text class="t-sub" x="600" y="65" text-anchor="middle">+ schema</text>
+              <rect class="box-accent" x="680" y="32" width="120" height="40" rx="2"></rect><text class="t-accent" x="740" y="50" text-anchor="middle">txn</text><text class="t-sub" x="740" y="65" text-anchor="middle">1 row</text>
+              <text class="t-sub" x="830" y="57">… × every commit</text>
+            </g>
+            <text class="t-accent" x="0" y="94">the walk stalls on the disk once per commit — and the read side reopened the ledger per lookup too</text>
+
+            <text class="t-title" x="0" y="134">AFTER — QUEUED, BATCHED, WAITED ON ONCE</text>
+            <g>
+              <rect class="box" x="0" y="150" width="110" height="40" rx="2"></rect><text x="55" y="175" text-anchor="middle">commit N</text>
+              <rect class="box" x="130" y="150" width="110" height="40" rx="2"></rect><text x="185" y="175" text-anchor="middle">commit N+1</text>
+              <rect class="box" x="260" y="150" width="110" height="40" rx="2"></rect><text x="315" y="175" text-anchor="middle">commit N+2</text>
+              <text class="t-sub" x="390" y="175">… walk never touches the disk</text>
+
+              <rect class="box-green" x="600" y="150" width="170" height="40" rx="2"></rect>
+              <text class="t-green" x="685" y="168" text-anchor="middle">render + write out</text>
+              <text class="t-sub" x="685" y="184" text-anchor="middle">user has the answer</text>
+
+              <rect class="box-cyan" x="800" y="150" width="160" height="40" rx="2"></rect>
+              <text class="t-cyan" x="880" y="168" text-anchor="middle">flush (join)</text>
+              <text class="t-sub" x="880" y="184" text-anchor="middle">whatever is left</text>
+            </g>
+
+            <path class="wire-cyan" d="M55 190 V222" color="var(--cyan)" marker-end="url(#ah)"></path>
+            <path class="wire-cyan" d="M185 190 V222" color="var(--cyan)" marker-end="url(#ah)"></path>
+            <path class="wire-cyan" d="M315 190 V222" color="var(--cyan)" marker-end="url(#ah)"></path>
+            <rect class="box-cyan" x="0" y="222" width="560" height="46" rx="2"></rect>
+            <text class="t-cyan" x="16" y="242">writer thread — one connection, one transaction per drain</text>
+            <text class="t-sub" x="16" y="259">runs concurrently with the walk, the render and the pager</text>
+            <path class="wire" d="M560 245 H880 V190" color="var(--text-muted)" marker-end="url(#ah)" stroke-dasharray="4 4"></path>
+          </svg>
+          <figcaption>
+            The wait at the end has to exist — a detached thread does not outlive the process, and a
+            cache that never persists is just a slower uncached path. But by then the writer has had
+            the whole command, and usually the whole pager session, to get ahead. Cold
+            <code>log --stat -n 150</code>: <strong>831 ms → 402 ms</strong>, against git's 532 ms.
+          </figcaption>
+        </figure>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Results</h2>
+        <p>
+          zshrs (6,376 commits) · stock git 2.50.1 · 18 cores · 12 runs after 3 warmups · release
+          build · both binaries measured in one interleaved <code>hyperfine</code> run so machine
+          load moves them together. Regenerate with <code>scripts/bench.sh &lt;repo&gt;</code>.
+        </p>
+
+        <figure class="fig">
+          <svg class="dg" viewBox="0 0 960 420" role="img" aria-label="Bar chart of zvcs speedup over git per command">
+            <text class="t-title" x="0" y="16">SPEEDUP OVER STOCK GIT — HIGHER IS BETTER</text>
+            <line class="rule" x1="250" y1="28" x2="250" y2="392"></line>
+            <text class="t-sub" x="250" y="410">1x</text>
+            <line class="rule" x1="320" y1="28" x2="320" y2="392" stroke-dasharray="3 5"></line>
+            <text class="t-sub" x="320" y="410">2x</text>
+            <line class="rule" x1="460" y1="28" x2="460" y2="392" stroke-dasharray="3 5"></line>
+            <text class="t-sub" x="460" y="410">4x</text>
+            <line class="rule" x1="740" y1="28" x2="740" y2="392" stroke-dasharray="3 5"></line>
+            <text class="t-sub" x="740" y="410">8x</text>
+
+            <g>
+              <text x="0" y="46">log --stat -n 30</text><rect class="bar-z" x="250" y="34" width="672" height="15"></rect><text class="t-green" x="928" y="46">10.60x</text>
+              <text x="0" y="70">status</text><rect class="bar-z" x="250" y="58" width="616" height="15"></rect><text class="t-green" x="872" y="70">9.79x</text>
+              <text x="0" y="94">blame README.md</text><rect class="bar-z" x="250" y="82" width="216" height="15"></rect><text class="t-green" x="472" y="94">4.09x</text>
+              <text x="0" y="118">log -S return</text><rect class="bar-z" x="250" y="106" width="119" height="15"></rect><text class="t-green" x="375" y="118">2.70x</text>
+              <text x="0" y="142">log --oneline</text><rect class="bar-z" x="250" y="130" width="103" height="15"></rect><text class="t-green" x="359" y="142">2.47x</text>
+              <text x="0" y="166">log (default format)</text><rect class="bar-z" x="250" y="154" width="82" height="15"></rect><text class="t-green" x="338" y="166">2.17x</text>
+              <text x="0" y="190">log --format=%s</text><rect class="bar-z" x="250" y="178" width="76" height="15"></rect><text class="t-green" x="332" y="190">2.08x</text>
+              <text x="0" y="214">log --format=%h</text><rect class="bar-z" x="250" y="202" width="69" height="15"></rect><text class="t-green" x="325" y="214">1.98x</text>
+              <text x="0" y="238">log -p -n 20</text><rect class="bar-z" x="250" y="226" width="43" height="15"></rect><text class="t-green" x="299" y="238">1.62x</text>
+              <text x="0" y="262">shortlog -s</text><rect class="bar-z" x="250" y="250" width="40" height="15"></rect><text class="t-green" x="296" y="262">1.57x</text>
+              <text x="0" y="286">describe</text><rect class="bar-z" x="250" y="274" width="34" height="15"></rect><text class="t-green" x="290" y="286">1.48x</text>
+              <text x="0" y="310">cat-file -p HEAD</text><rect class="bar-z" x="250" y="298" width="31" height="15"></rect><text class="t-green" x="287" y="310">1.44x</text>
+              <text x="0" y="334">show HEAD</text><rect class="bar-z" x="250" y="322" width="25" height="15"></rect><text class="t-green" x="281" y="334">1.35x</text>
+              <text x="0" y="358">tag -l</text><rect class="bar-z" x="250" y="346" width="19" height="15"></rect><text class="t-green" x="275" y="358">1.27x</text>
+              <text x="0" y="382">diff --stat HEAD~5</text><rect class="bar-z" x="250" y="370" width="7" height="15"></rect><text class="t-green" x="263" y="382">1.10x</text>
+            </g>
+          </svg>
+          <figcaption>
+            Also measured and ahead, omitted from the chart for space: <code>rev-list --count</code>
+            1.35x, <code>diff --name-only HEAD~5</code> 1.32x, <code>for-each-ref</code> 1.31x,
+            <code>ls-files</code> 1.19x.
+          </figcaption>
+        </figure>
+
+        <h3>Which lever moved which command</h3>
+        <table class="bench-table">
+          <thead><tr><th>Command</th><th>Levers</th><th>What actually changed</th></tr></thead>
+          <tbody>
+            <tr><td>log --stat</td><td>C, D, E</td><td>tree-pair tallies memoized; daemon warms them; writes no longer stall the walk</td></tr>
+            <tr><td>status</td><td>—</td><td>already ahead: gitoxide's index + worktree scan, no per-file fork</td></tr>
+            <tr><td>blame</td><td>C, D, E</td><td>run-length attribution memoized per (commit, path, algo)</td></tr>
+            <tr><td>log -S / -G</td><td>A, B</td><td>blob counting instead of patch rendering; rename gate; merges dropped; scan fanned out</td></tr>
+            <tr><td>log --oneline, %s, default</td><td>A</td><td>commit records rendered 256 at a time across the pool</td></tr>
+            <tr><td>log -p</td><td>A</td><td>64-patch look-ahead window, emitted in walk order</td></tr>
+            <tr><td>diff --stat (worktree)</td><td>A</td><td>per-file analysis fanned out — no cacheable key exists for a worktree side</td></tr>
+            <tr><td>diff --name-only, --raw</td><td>B</td><td>stopped reading blobs for counts those formats never print</td></tr>
+            <tr><td>tag -l</td><td>B</td><td>names-only path: a plain listing no longer decodes and peels every tag object</td></tr>
+            <tr><td>shortlog</td><td>A</td><td>per-commit record extraction fanned out</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Cold versus warm</h3>
+        <table class="bench-table">
+          <thead><tr><th>Command</th><th>zvcs cold</th><th>zvcs warm</th><th>git</th></tr></thead>
+          <tbody>
+            <tr><td>log --stat -n 30</td><td class="num">100.4 ms</td><td class="num">9.5 ms</td><td class="num">119.0 ms</td></tr>
+            <tr><td>log --stat -n 150</td><td class="num">402.1 ms</td><td class="num">10.7 ms</td><td class="num">531.8 ms</td></tr>
+            <tr><td>blame README.md</td><td class="num">73.8 ms</td><td class="num">8.6 ms</td><td class="num">94.4 ms</td></tr>
+          </tbody>
+        </table>
+        <p>
+          Cold means the ledger is deleted before <em>every single run</em> — the worst case, and not
+          one a running daemon leaves behind.
+        </p>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>What this does not fix</h2>
+
+        <div class="caveat">
+          <h4>Hunk boundary placement still differs from git</h4>
+          <p>
+            On 31 of 400 sampled commits, a patch places an ambiguous hunk boundary differently than
+            git does — same content, same file list, a valid diff, but not byte-identical, and it
+            shifts <code>--stat</code> counts by a line or two on those commits. The vendored
+            imara-diff slides a group to a different position than git's
+            <code>xdl_change_compact</code>. It is not the indent heuristic: disabling that in git
+            does not reproduce our placement either. Porting the compaction is the fix.
+          </p>
+        </div>
+
+        <div class="caveat">
+          <h4>Nothing here speeds up writes</h4>
+          <p>
+            Every measurement on this page is a read-only command. Mutating verbs are excluded from
+            the benchmark set on purpose — a benchmark has to be repeatable, and a mutating verb
+            changes the repository under its own measurement.
+          </p>
+        </div>
+
+        <div class="caveat">
+          <h4>Parallelism is not free under load</h4>
+          <p>
+            zvcs deliberately uses every core, so a busy machine compresses its lead rather than
+            git's. The figures above were taken at load ~20 on an 18-core box; on an idle machine the
+            ratios are larger, not smaller. <code>ZVCS_THREADS</code> pins the worker count when that
+            trade is not wanted.
+          </p>
+        </div>
+      </section>
+
+      <hr class="section-rule">
+
+      <section class="tutorial-section">
+        <h2>Links</h2>
+        <ul>
+          <li><strong>Docs</strong> — <a href="index.html">index.html</a></li>
+          <li><strong>Engineering report</strong> — <a href="report.html">report.html</a></li>
+          <li><strong>Verb reference</strong> — <a href="reference.html">reference.html</a> (includes <code>zprecache</code>)</li>
+          <li><strong>Benchmark script</strong> — <a href="https://github.com/MenkeTechnologies/zvcs/blob/main/scripts/bench.sh">scripts/bench.sh</a></li>
+          <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/zvcs">github.com/MenkeTechnologies/zvcs</a></li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <script src="hud-theme.js"></script>
+</body>
+</html>

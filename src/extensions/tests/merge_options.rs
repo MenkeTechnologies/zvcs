@@ -10,8 +10,19 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
+/// Identity env vars git honors ABOVE `user.name`/`user.email` config. This test
+/// asserts on the author line SQUASH_MSG carries, so an inherited identity would
+/// rewrite what it is checking: CI exports `GIT_AUTHOR_NAME` for the whole job
+/// (a fresh runner has none) and every commit here came out authored by that.
+const IDENTITY_ENV: [&str; 4] =
+    ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"];
+
 fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new(BIN)
+    let mut cmd = Command::new(BIN);
+    for var in IDENTITY_ENV {
+        cmd.env_remove(var);
+    }
+    let ok = cmd
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -23,7 +34,11 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn git_out(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new(BIN)
+    let mut cmd = Command::new(BIN);
+    for var in IDENTITY_ENV {
+        cmd.env_remove(var);
+    }
+    let out = cmd
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")

@@ -89,8 +89,8 @@ enum Untracked {
 ///     forced color, which is not a real workflow).
 /// ```
 ///
-/// Faithfully unsupported cases `bail!` with a precise reason rather than
-/// emitting wrong output: intent-to-add entries.
+/// Intent-to-add entries (`git add -N`) render as git does: a new file in the
+/// worktree column (` A`), absent from HEAD and index in porcelain v2.
 pub fn status(args: &[String]) -> Result<ExitCode> {
     let mut short = false;
     let mut porcelain_v2 = false;
@@ -633,9 +633,10 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                             };
                             unmerged.push((mask, rela_path));
                         }
-                        EntryStatus::IntentToAdd => {
-                            anyhow::bail!("intent-to-add entries (git add -N) are not supported")
-                        }
+                        // `git add -N` records a placeholder so the path can be
+                        // diffed, but nothing is staged: git lists it under
+                        // "Changes not staged for commit" as a new file, ` A`.
+                        EntryStatus::IntentToAdd => unstaged.push((WorkKind::Added, rela_path)),
                         EntryStatus::NeedsUpdate(_) => {}
                         EntryStatus::Change(change) => match change {
                             Change::Removed => unstaged.push((WorkKind::Deleted, rela_path)),
@@ -964,6 +965,10 @@ enum WorkKind {
     Modified,
     Deleted,
     TypeChange,
+    /// `git add -N`: the index holds a placeholder, so the path is a NEW FILE
+    /// that is not staged. git reports it in the worktree column (` A`), never
+    /// as a staged addition.
+    Added,
 }
 
 /// Shorten a `HEAD` referent name (`refs/heads/main` → `main`), or fall back.
@@ -988,6 +993,10 @@ struct V2Rec {
     h_i: gix::hash::ObjectId,
     /// Whether a tree↔index change set the HEAD/index fields (else fill from index).
     staged: bool,
+    /// `git add -N`: the index entry is a placeholder, so git reports mode
+    /// `000000` and a null oid for BOTH the HEAD and index columns rather than
+    /// the placeholder's own values.
+    ita: bool,
     /// `(R|C, similarity, source-path)` for a rename/copy — renders a `2` line.
     rename: Option<(u8, u32, BString)>,
 }
@@ -1104,6 +1113,7 @@ fn porcelain_v2_output(
         h_h: zero,
         h_i: zero,
         staged: false,
+        ita: false,
         rename: None,
     };
 
@@ -1241,7 +1251,9 @@ fn porcelain_v2_output(
                             unmerged.push((mask, rela_path));
                         }
                         EntryStatus::IntentToAdd => {
-                            anyhow::bail!("intent-to-add entries (git add -N) are not supported")
+                            let r = recs.entry(rela_path).or_insert_with(new_rec);
+                            r.y = b'A';
+                            r.ita = true;
                         }
                         EntryStatus::NeedsUpdate(_) => {}
                         EntryStatus::Change(change) => {
@@ -1268,9 +1280,10 @@ fn porcelain_v2_output(
     // --------------------------------------- fill from index & worktree stat
     let index = repo.index_or_empty()?;
     for (path, r) in recs.iter_mut() {
-        if !r.staged {
+        if !r.staged && !r.ita {
             // No staged change: HEAD == index for this path, so pull both from
-            // the stage-0 index entry.
+            // the stage-0 index entry. An intent-to-add placeholder is skipped:
+            // git reports it as absent from HEAD and index alike.
             if let Ok(idx) = index.entry_index_by_path(path.as_bstr()) {
                 let e = &index.entries()[idx];
                 r.m_i = e.mode.bits();
@@ -2335,6 +2348,7 @@ fn work_label(kind: WorkKind) -> &'static str {
         WorkKind::Modified => "modified:",
         WorkKind::Deleted => "deleted:",
         WorkKind::TypeChange => "typechange:",
+        WorkKind::Added => "new file:",
     }
 }
 
@@ -2354,5 +2368,6 @@ fn work_char(kind: WorkKind) -> u8 {
         WorkKind::Modified => b'M',
         WorkKind::Deleted => b'D',
         WorkKind::TypeChange => b'T',
+        WorkKind::Added => b'A',
     }
 }

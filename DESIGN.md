@@ -127,6 +127,18 @@ Wire protocol (line-framed) extends the current
 (`ACQUIRE <git-dir> <client-id>`), plus `SUBMIT`/`JOB`, `JOBSTOP`,
 `JOBRESTART`, `REINDEX`, and a `REPL` upgrade.
 
+**Lifetime:** a daemon exits when the socket it serves or its own pid file
+disappears — the pid file rather than the home directory, because `zvcs_home()`
+recreates the directory as a side effect of every log line, so a directory check
+could never fire. It matters for the deep-`ZVCS_HOME` case: such a home's socket
+falls back to a short `/tmp` path that survives the home's teardown, and without
+the pid-file check the daemon outlived the sandbox that created it. A daemon
+whose home is explicitly set AND lives under the OS temp dir — the shape every
+test harness uses, never a real installation — additionally exits after 5
+minutes with no client, so an interrupted test run cannot leave daemons behind
+for the rest of the session. The daily-driver daemon in `~/.zvcs` is never
+idle-reaped.
+
 **Watch set:** rebuilt from the repo index every 5s, not only at startup. Repos
 arrive at any time — the background crawler finds them, `zreindex` adds them, a
 clone appears mid-session — and a set fixed at startup left every one of them

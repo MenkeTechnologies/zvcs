@@ -131,6 +131,63 @@ pub fn socket_path() -> PathBuf {
     short_fallback_socket(&home)
 }
 
+/// How often a sandboxed daemon checks whether it has gone idle.
+const IDLE_CHECK_EVERY: Duration = Duration::from_secs(30);
+/// How long a sandboxed daemon may sit without a single client before exiting.
+/// Well past any test's runtime, short enough that an interrupted run does not
+/// leave daemons behind for the rest of the session.
+const SANDBOX_IDLE_LIMIT: Duration = Duration::from_secs(300);
+
+/// Monotonic mark of the last client connection, as seconds since the daemon's
+/// own start — `Instant` cannot live in a static, and a static start point plus
+/// an elapsed-seconds counter reproduces it exactly.
+static LAST_CONTACT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The daemon's start instant, set on the first call.
+fn started_at() -> Instant {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *START.get_or_init(Instant::now)
+}
+
+/// Record that a client just connected.
+fn note_contact() {
+    LAST_CONTACT_SECS
+        .store(started_at().elapsed().as_secs(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long ago the last client connected (or the daemon started).
+fn last_contact() -> Instant {
+    let secs = LAST_CONTACT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    started_at() + Duration::from_secs(secs)
+}
+
+/// Whether this daemon is running in a throwaway home: `ZVCS_HOME` set
+/// explicitly, and pointing inside the OS temp directory. That is exactly the
+/// shape every test harness uses and never the shape of a real installation,
+/// which lives at `~/.zvcs`.
+fn is_sandboxed_home() -> bool {
+    let home = std::env::var_os("ZVCS_HOME").map(PathBuf::from);
+    is_sandboxed(home.as_deref(), &std::env::temp_dir())
+}
+
+/// The rule itself, taking its inputs rather than reading the environment, so it
+/// can be tested without racing every other test in the process for `set_var`.
+fn is_sandboxed(home: Option<&Path>, tmp: &Path) -> bool {
+    let Some(home) = home else {
+        return false; // the default `~/.zvcs` installation is never reaped
+    };
+    // Both spellings of both paths, because macOS reports the temp dir as
+    // `/var/folders/...` while its canonical form is `/private/var/folders/...`,
+    // and `canonicalize` cannot resolve a home that has already been torn down.
+    // A match in any pairing means the home is inside the temp dir.
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let (home_raw, home_canon) = (home.to_path_buf(), canon(home));
+    let (tmp_raw, tmp_canon) = (tmp.to_path_buf(), canon(tmp));
+    [&home_raw, &home_canon]
+        .iter()
+        .any(|h| h.starts_with(&tmp_raw) || h.starts_with(&tmp_canon))
+}
+
 /// A short `/tmp` socket path derived from `home`, for when the default under
 /// `ZVCS_HOME` is too long to bind. Deterministic (same binary → same digest via
 /// the fixed-seed `DefaultHasher`), so the daemon and every client compute the
@@ -372,11 +429,43 @@ fn start() -> Result<ExitCode> {
     // once that path is gone, no one can reach it, so it exits. Normal operation
     // never removes the socket (only `zdaemon stop` does, which also exits), so this
     // only ever fires on an abandoned daemon.
+    //
+    // The PID FILE is checked too, not just the socket. A deep `ZVCS_HOME` (every
+    // test's temp dir is one) overflows `SUN_PATH_MAX`, so its socket falls back
+    // to a short `/tmp` path — which lives OUTSIDE the home and therefore
+    // survives the teardown that was supposed to end the daemon.
+    //
+    // The pid file rather than the home directory itself: `zvcs_home()` CREATES
+    // the directory as a side effect, and the daemon calls it constantly (every
+    // log line, every ledger open), so a removed home reappears within
+    // milliseconds and a directory check never fires. A file is not recreated.
     {
         let sock = path.clone();
+        let pidfile = pid_path();
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(2));
-            if !sock.exists() {
+            if !sock.exists() || !pidfile.exists() {
+                std::process::exit(0);
+            }
+        });
+    }
+
+    // A sandboxed daemon also exits once nothing has talked to it for a while.
+    //
+    // The teardown check above covers a test that finishes; it does not cover a
+    // test RUN that is killed — an interrupted `cargo test` leaves its temp homes
+    // on disk, so every daemon it started (and autostart starts them detached, in
+    // their own process group, outliving the harness by design) stays alive
+    // forever. They accumulate across runs and hold sockets nothing will ever
+    // dial again.
+    //
+    // Only sandboxed daemons are subject to this: the home has to have been set
+    // explicitly AND live under the OS temp dir. The daily-driver daemon in
+    // `~/.zvcs` is never idle-reaped, however long it sits waiting.
+    if is_sandboxed_home() {
+        thread::spawn(|| loop {
+            thread::sleep(IDLE_CHECK_EVERY);
+            if last_contact().elapsed() >= SANDBOX_IDLE_LIMIT {
                 std::process::exit(0);
             }
         });
@@ -434,6 +523,7 @@ fn start() -> Result<ExitCode> {
             Ok(s) => s,
             Err(_) => continue,
         };
+        note_contact();
         let tx = tx.clone();
         thread::spawn(move || handle_conn(stream, tx));
     }
@@ -952,5 +1042,35 @@ mod tests {
 
         drop(b);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod reaper_tests {
+    use super::is_sandboxed;
+    use std::path::{Path, PathBuf};
+
+    /// A daemon in the real installation must never be idle-reaped, however long
+    /// it waits — that is the daily driver sitting on an empty socket.
+    #[test]
+    fn the_default_home_is_never_sandboxed() {
+        assert!(!is_sandboxed(None, &std::env::temp_dir()));
+        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
+            .join(".zvcs");
+        assert!(!is_sandboxed(Some(&home), &std::env::temp_dir()));
+    }
+
+    /// A home under the OS temp dir is a throwaway: every test harness builds one
+    /// there, and nothing else does.
+    #[test]
+    fn a_home_under_the_temp_dir_is_sandboxed() {
+        let tmp = std::env::temp_dir();
+        assert!(is_sandboxed(Some(&tmp.join("zvcs-suite-1234").join("home")), &tmp));
+    }
+
+    /// A path that merely starts with the same characters is not inside it.
+    #[test]
+    fn a_sibling_of_the_temp_dir_is_not_sandboxed() {
+        assert!(!is_sandboxed(Some(Path::new("/tmpfoo/home")), Path::new("/tmp")));
     }
 }

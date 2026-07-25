@@ -225,6 +225,44 @@ fn write_temp(tag: &str, data: &[u8]) -> Option<std::path::PathBuf> {
     std::fs::write(&path, data).ok().map(|_| path)
 }
 
+/// Sign `payload` with gpg, returning the ASCII-armored detached signature.
+///
+/// Ports git's `sign_buffer` for the gpg backend: the program is `gpg.program`
+/// (falling back to `gpg`), the key comes from `user.signingKey` when set — git
+/// passes `-u <key>`, otherwise gpg picks the default key — and the signature is
+/// armored and detached (`-bsa`), which is the form both commit `gpgsig` headers
+/// and push certificates carry.
+///
+/// `Err` carries gpg's own stderr, so a missing key or a locked agent reaches
+/// the user verbatim instead of as a generic failure.
+pub fn sign(payload: &[u8], program: &str, key: Option<&str>) -> Result<Vec<u8>, String> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let mut cmd = Command::new(program);
+    cmd.args(["--batch", "--no-tty", "--status-fd=2", "-bsa"]);
+    if let Some(k) = key {
+        cmd.arg("-u").arg(k);
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run {program}: {e}"))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "gpg stdin unavailable".to_string())?
+        .write_all(payload)
+        .map_err(|e| format!("writing to {program}: {e}"))?;
+    let out = child.wait_with_output().map_err(|e| format!("{program}: {e}"))?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(out.stdout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,42 +346,4 @@ mod tests {
         // Nothing conclusive → E.
         assert_eq!(parse_gpg_status(b"[GNUPG:] NODATA 1\n").0, GStatus::CannotCheck);
     }
-}
-
-/// Sign `payload` with gpg, returning the ASCII-armored detached signature.
-///
-/// Ports git's `sign_buffer` for the gpg backend: the program is `gpg.program`
-/// (falling back to `gpg`), the key comes from `user.signingKey` when set — git
-/// passes `-u <key>`, otherwise gpg picks the default key — and the signature is
-/// armored and detached (`-bsa`), which is the form both commit `gpgsig` headers
-/// and push certificates carry.
-///
-/// `Err` carries gpg's own stderr, so a missing key or a locked agent reaches
-/// the user verbatim instead of as a generic failure.
-pub fn sign(payload: &[u8], program: &str, key: Option<&str>) -> Result<Vec<u8>, String> {
-    use std::io::Write as _;
-    use std::process::Stdio;
-
-    let mut cmd = Command::new(program);
-    cmd.args(["--batch", "--no-tty", "--status-fd=2", "-bsa"]);
-    if let Some(k) = key {
-        cmd.arg("-u").arg(k);
-    }
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not run {program}: {e}"))?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| "gpg stdin unavailable".to_string())?
-        .write_all(payload)
-        .map_err(|e| format!("writing to {program}: {e}"))?;
-    let out = child.wait_with_output().map_err(|e| format!("{program}: {e}"))?;
-    if !out.status.success() || out.stdout.is_empty() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-    }
-    Ok(out.stdout)
 }

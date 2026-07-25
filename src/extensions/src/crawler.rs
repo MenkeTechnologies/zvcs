@@ -170,12 +170,17 @@ pub fn spawn_if_configured() {
     let git_dir = repo.git_dir();
     let git_dir = git_dir.canonicalize().unwrap_or_else(|_| git_dir.to_path_buf());
 
-    // Initial crawl from the config as it stands at daemon start.
+    // Initial crawl from the config as it stands at daemon start. The daemon's
+    // autocrawl only ever crawls EXPLICIT `[zvcs] crawlroots` — never the `$HOME`
+    // default. An automatic whole-`$HOME` scan on every daemon start is far too
+    // aggressive: on a machine with a large home it pegs the box, and a daemon that
+    // comes up mid-configuration (crawlroots not yet written) would scan all of
+    // `$HOME` for nothing. `git zreindex` keeps the `$HOME` default for the explicit,
+    // opt-in case.
     let cfg = crate::config::ZvcsConfig::load(&repo);
-    let initial = cfg.autocrawl.then(|| {
-        let roots = roots_from_config(&cfg);
-        spawn_crawl(roots.clone(), "indexed");
-        roots
+    let initial = (cfg.autocrawl && !cfg.crawlroots.is_empty()).then(|| {
+        spawn_crawl(cfg.crawlroots.clone(), "indexed");
+        cfg.crawlroots.clone()
     });
 
     std::thread::spawn(move || watch_config_and_recrawl(git_dir, initial));
@@ -217,31 +222,41 @@ fn watch_config_and_recrawl(git_dir: PathBuf, initial_roots: Option<Vec<PathBuf>
         return;
     }
     let mut last_roots = initial_roots;
+    // Reconcile once right after the watch is active: a `crawlroots` write that
+    // landed between the daemon's initial config read and the watch becoming live
+    // would otherwise be missed. Any write from here on is delivered as an event.
+    recrawl_if_changed(&git_dir, &mut last_roots);
     while let Ok(res) = rx.recv() {
         let Ok(event) = res else { continue };
-        if !event
+        if event
             .paths
             .iter()
             .any(|p| p.file_name() == Some(std::ffi::OsStr::new("config")))
         {
-            continue;
+            recrawl_if_changed(&git_dir, &mut last_roots);
         }
-        // Re-open by the captured git dir (cwd-independent) and re-read config.
-        let Ok(repo) = gix::open(&git_dir) else { continue };
-        let cfg = crate::config::ZvcsConfig::load(&repo);
-        if !cfg.autocrawl {
-            last_roots = None;
-            continue;
-        }
-        let roots = roots_from_config(&cfg);
-        if last_roots.as_ref() == Some(&roots) {
-            continue; // roots unchanged — an unrelated config edit
-        }
-        last_roots = Some(roots.clone());
-        match crawl_into_db(&roots) {
-            Ok(n) => log_line(&format!("[zvcs crawl] reindexed {n} repo(s) after config change")),
-            Err(e) => log_line(&format!("[zvcs crawl] error: {e:#}")),
-        }
+    }
+}
+
+/// Re-read the repo config by its (cwd-independent) git dir and, if the resolved
+/// autocrawl roots changed since the last crawl, crawl them now. `last_roots` is
+/// the roots most recently crawled (`None` once autocrawl is off), updated in place.
+fn recrawl_if_changed(git_dir: &Path, last_roots: &mut Option<Vec<PathBuf>>) {
+    let Ok(repo) = gix::open(git_dir) else { return };
+    let cfg = crate::config::ZvcsConfig::load(&repo);
+    // Only explicit crawlroots (see `spawn_if_configured`); empty → nothing to crawl.
+    if !cfg.autocrawl || cfg.crawlroots.is_empty() {
+        *last_roots = None;
+        return;
+    }
+    let roots = cfg.crawlroots.clone();
+    if last_roots.as_ref() == Some(&roots) {
+        return; // roots unchanged — an unrelated config edit
+    }
+    *last_roots = Some(roots.clone());
+    match crawl_into_db(&roots) {
+        Ok(n) => log_line(&format!("[zvcs crawl] reindexed {n} repo(s) after config change")),
+        Err(e) => log_line(&format!("[zvcs crawl] error: {e:#}")),
     }
 }
 

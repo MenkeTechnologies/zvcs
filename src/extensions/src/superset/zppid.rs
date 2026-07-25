@@ -53,42 +53,171 @@ fn cmd_name(argv0: &str) -> String {
     argv0.rsplit('/').next().unwrap_or(argv0).trim_start_matches('-').to_string()
 }
 
-/// `(ppid, argv0, is_wrapper)` for `pid` via one `ps`. `is_wrapper` is true for a
-/// shell invoked with `-c` — a transient per-command wrapper to climb past. `None`
-/// when the pid is gone or unreadable.
+/// `(ppid, argv0, is_wrapper)` for `pid`, read straight from the kernel — no
+/// `ps`, no fork. `is_wrapper` is true for a shell invoked with `-c`, a
+/// transient per-command wrapper to climb past. `None` when the pid is gone.
+///
+/// Forking here was the single most expensive thing zvcs did: every mutating
+/// verb spawned `ps` per ancestor hop and then `lsof` for the cwd, and `lsof`
+/// alone measures ~52ms on macOS — a flat ~57ms tax on `add`/`commit`/`push`
+/// regardless of repository size, which made `git add` 6x slower than stock git
+/// for reasons that had nothing to do with git.
 fn proc_row(pid: i64) -> Option<(i64, String, bool)> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "ppid=,args=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let line = String::from_utf8_lossy(&out.stdout);
-    let mut it = line.split_whitespace();
-    let ppid: i64 = it.next()?.parse().ok()?;
-    let argv0 = it.next()?.to_string();
-    let is_wrapper = is_shell(&argv0) && it.any(|a| a == "-c");
+    let (ppid, argv) = proc_parent_and_argv(pid)?;
+    let argv0 = argv.first()?.clone();
+    let is_wrapper = is_shell(&argv0) && argv.iter().any(|a| a == "-c");
     Some((ppid, argv0, is_wrapper))
 }
 
-/// A process's current working directory. Linux reads `/proc/<pid>/cwd` directly (no
-/// fork); macOS/BSD fall back to `lsof`'s cwd fd. Empty when it can't be read.
-fn proc_cwd(pid: i64) -> String {
-    if let Ok(p) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
-        return p.to_string_lossy().into_owned();
+/// Parent pid and argv of `pid` through the platform's process-info syscall.
+#[cfg(target_os = "linux")]
+fn proc_parent_and_argv(pid: i64) -> Option<(i64, Vec<String>)> {
+    // `/proc/<pid>/stat`: field 4 is the ppid, but the comm field (2) may itself
+    // contain spaces and parentheses, so the scan starts after its closing `)`.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let ppid: i64 = rest.split_whitespace().nth(1)?.parse().ok()?;
+    // `/proc/<pid>/cmdline` is NUL-separated argv.
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    let argv: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    Some((ppid, argv))
+}
+
+/// macOS/BSD: `sysctl(KERN_PROC_PID)` for the parent, `KERN_PROCARGS2` for argv.
+/// Both are plain syscalls; neither allocates a process.
+#[cfg(not(target_os = "linux"))]
+fn proc_parent_and_argv(pid: i64) -> Option<(i64, Vec<String>)> {
+    // `proc_pidinfo(PROC_PIDTBSDINFO)` carries the parent pid at a fixed offset
+    // in `proc_bsdinfo` (pbi_ppid, the 4th u32). Read as raw bytes rather than
+    // transcribing the whole struct — libc does not export it on this target,
+    // and the offset is part of the stable ABI `lsof` itself relies on.
+    const PROC_PIDTBSDINFO: libc::c_int = 3;
+    const PBI_PPID_OFFSET: usize = 12;
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
     }
-    let Ok(out) = std::process::Command::new("lsof")
-        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-        .output()
-    else {
-        return String::new();
+    let mut buf = [0u8; 256];
+    let rc = unsafe {
+        proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDTBSDINFO,
+            0,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len() as libc::c_int,
+        )
     };
-    // -Fn: newline-separated fields, the cwd path on an `n`-prefixed line.
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .find_map(|l| l.strip_prefix('n').map(|s| s.to_string()))
-        .unwrap_or_default()
+    if rc <= 0 {
+        return None;
+    }
+    let ppid = u32::from_ne_bytes([
+        buf[PBI_PPID_OFFSET],
+        buf[PBI_PPID_OFFSET + 1],
+        buf[PBI_PPID_OFFSET + 2],
+        buf[PBI_PPID_OFFSET + 3],
+    ]) as i64;
+    Some((ppid, proc_argv(pid)))
+}
+
+/// argv of `pid` via `sysctl(KERN_PROCARGS2)`, whose buffer is
+/// `argc`, the executable path, then NUL-separated argv (with padding NULs
+/// between the path and argv[0] that have to be skipped).
+#[cfg(not(target_os = "linux"))]
+fn proc_argv(pid: i64) -> Vec<String> {
+    const KERN_PROCARGS2: libc::c_int = 49;
+    unsafe {
+        let mut size: usize = 4096;
+        let mut buf = vec![0u8; size];
+        let mut mib = [libc::CTL_KERN, KERN_PROCARGS2, pid as libc::c_int];
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return Vec::new();
+        }
+        buf.truncate(size);
+        if buf.len() < 4 {
+            return Vec::new();
+        }
+        let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]).max(0) as usize;
+        let mut parts = buf[4..].split(|b| *b == 0);
+        // The first entry is the executable path; the padding NULs after it are
+        // empty splits, so argv starts at the first non-empty entry beyond it.
+        let _exec_path = parts.next();
+        parts
+            .filter(|p| !p.is_empty())
+            .take(argc)
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect()
+    }
+}
+
+/// A process's current working directory, without spawning anything: Linux reads
+/// the `/proc/<pid>/cwd` symlink, macOS asks `proc_pidinfo` for the vnode path
+/// info — the same call `lsof` itself makes, minus the process.
+fn proc_cwd(pid: i64) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        proc_cwd_darwin(pid).unwrap_or_default()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_cwd_darwin(pid: i64) -> Option<String> {
+    // `PROC_PIDVNODEPATHINFO` returns two `vnode_info_path` structs (cwd first,
+    // then the root dir); each ends with a `MAXPATHLEN` C string. Only the cwd
+    // path is read here, so the struct is modelled as raw bytes rather than
+    // transcribed field by field.
+    const PROC_PIDVNODEPATHINFO: libc::c_int = 9;
+    const MAXPATHLEN: usize = 1024;
+    // vnode_info (152 bytes) + path buffer, twice.
+    const VNODE_INFO_PATH: usize = 152 + MAXPATHLEN;
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
+    }
+    let mut buf = vec![0u8; VNODE_INFO_PATH * 2];
+    let rc = unsafe {
+        proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDVNODEPATHINFO,
+            0,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len() as libc::c_int,
+        )
+    };
+    if rc <= 0 {
+        return None;
+    }
+    let path = &buf[152..VNODE_INFO_PATH];
+    let end = path.iter().position(|b| *b == 0).unwrap_or(path.len());
+    let text = String::from_utf8_lossy(&path[..end]).into_owned();
+    (!text.is_empty()).then_some(text)
 }
 
 /// The durable process responsible for this git command: `(pid, cmd, cwd)`. Walks
@@ -113,11 +242,21 @@ fn responsible_process() -> (i64, String, String) {
 
 /// The resolved responsible process for an attributed command: its durable pid,
 /// its session key, and its command name / cwd for display.
-struct Responsible {
+pub struct Responsible {
     pid: i64,
     session: String,
     cmd: String,
     cwd: String,
+}
+
+/// Start resolving the responsible process on a BACKGROUND thread, so the
+/// process-info syscalls overlap the git command instead of being paid after it.
+///
+/// The caller kicks this off before running the verb and collects it afterwards;
+/// by then the answer is almost always already there, and the ledger write is
+/// all that remains on the critical path.
+pub fn spawn_resolve() -> std::thread::JoinHandle<Responsible> {
+    std::thread::spawn(resolve_responsible)
 }
 
 /// Resolve the durable responsible process and its session key — an explicit
@@ -150,8 +289,20 @@ pub fn is_mutating_verb(sub: &str) -> bool {
 /// `before_head` — a no-op commit adds nothing — and only then is the verb counted.
 /// Every other mutating verb registers the process and bumps its per-verb count.
 /// Best-effort: swallows every error so it can never fail or slow the command.
-pub fn note_mutating(sub: &str, before_head: Option<gix::ObjectId>) {
-    let who = resolve_responsible();
+pub fn note_mutating(
+    sub: &str,
+    before_head: Option<gix::ObjectId>,
+    resolver: Option<std::thread::JoinHandle<Responsible>>,
+) {
+    // The identity was resolved on a background thread while the command ran;
+    // fall back to resolving inline only if no thread was started.
+    let who = match resolver {
+        Some(handle) => match handle.join() {
+            Ok(who) => who,
+            Err(_) => return,
+        },
+        None => resolve_responsible(),
+    };
     let Ok(conn) = crate::db::open_rw() else { return };
     if is_commit_verb(sub) {
         let after = head_commit();

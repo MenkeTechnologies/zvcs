@@ -308,15 +308,11 @@ fn git_exec_path() -> Option<PathBuf> {
             return Some(PathBuf::from(p));
         }
     }
-    let out = Command::new("git").arg("--exec-path").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?;
-    let text = text.trim_end_matches(['\n', '\r']);
-    if text.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(text))
-    }
+    // Never ask another `git` where the helpers live — this binary IS git, and
+    // shelling out to a foreign one both forks and takes the answer from a
+    // different installation. The helper directory is the one holding this
+    // executable, which is where zvcs's own `git-*` programs sit.
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(PathBuf::from))
 }

@@ -471,6 +471,9 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // path pays nothing.
     let commit_head_before = superset::zppid::is_commit_verb(sub).then(superset::zppid::head_commit);
     let track_mutating = superset::zppid::is_mutating_verb(sub);
+    // Resolving WHO ran this command costs a few process-info syscalls; start
+    // them now so they run alongside the command rather than after it.
+    let attribution = track_mutating.then(superset::zppid::spawn_resolve);
 
     let result = match sub {
         // ---- superset (novel) ----
@@ -784,7 +787,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // tally on a real HEAD advance, per-verb count otherwise). `commit_head_before`
     // is Some only for commit verbs, so it drives the effective-commit path.
     if track_mutating {
-        superset::zppid::note_mutating(sub, commit_head_before.flatten());
+        superset::zppid::note_mutating(sub, commit_head_before.flatten(), attribution);
     }
 
     // Lock contention → queue, the second half of the rule the pre-flight gate

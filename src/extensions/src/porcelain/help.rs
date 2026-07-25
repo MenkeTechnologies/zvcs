@@ -1740,13 +1740,11 @@ fn git_exec_path() -> Option<PathBuf> {
             return Some(PathBuf::from(p));
         }
     }
-    let out = Command::new("git").arg("--exec-path").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?;
-    let text = text.trim_end_matches(['\n', '\r']);
-    (!text.is_empty()).then(|| PathBuf::from(text))
+    // This binary IS git: the helper directory is the one holding this
+    // executable, never whatever a foreign `git --exec-path` would report.
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(PathBuf::from))
 }
 
 /// Every `alias.<name>` in the effective configuration, sorted by name, the

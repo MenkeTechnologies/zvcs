@@ -39,7 +39,12 @@ impl Cancel {
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::SeqCst);
         if let Some(pid) = *self.child.lock().unwrap() {
-            let _ = Command::new("kill").arg("-KILL").arg(pid.to_string()).status();
+            // SIGKILL through libc, never a `kill` process: forking to cancel a
+            // job is both slower and a dependency on a binary that may not be on
+            // PATH inside a hook or a stripped container.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
         }
     }
     fn set_child(&self, pid: u32) {

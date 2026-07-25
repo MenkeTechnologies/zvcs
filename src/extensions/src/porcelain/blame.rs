@@ -211,14 +211,57 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         rewrites: Some(gix::diff::Rewrites::default()),
     };
 
-    let outcome = repo
-        .blame_file(rel_path.as_bytes().as_bstr(), suspect, blame_options)
-        .map_err(|e| anyhow!("{e}"))?;
+    // A blame of (commit, path) is a pure function of immutable objects, so the
+    // result is memoised in the ledger. gix re-runs the whole history walk and
+    // per-step diff on every invocation; git does too, but roughly twice as
+    // fast — caching sidesteps the race entirely, and the entry is valid in any
+    // clone holding those commits.
+    //
+    // Only a full-file blame is cached: `-L` narrows the walk, so its outcome is
+    // not the whole file's attribution.
+    let algo_key = format!("{:?}", opts.diff_algorithm);
+    let cache_key = opts.ranges.is_empty().then(|| (suspect.to_string(), rel_path.clone(), algo_key));
+    // The blamed blob identifies the file content the attribution belongs to.
+    let blamed_blob = repo
+        .rev_parse_single(format!("{suspect}:{rel_path}").as_str())
+        .ok()
+        .map(|id| id.detach());
+    let cached = cache_key.as_ref().zip(blamed_blob).and_then(|((c, p, a), blob)| {
+        let conn = crate::db::open_ro().ok()?;
+        let (blob_hex, runs) = crate::db::blame_load(&conn, c, p, a)?;
+        if blob_hex != blob.to_string() {
+            return None; // the path holds different content at this commit
+        }
+        lines_from_cache(&repo, blob, &runs)
+    });
 
-    let mut lines = materialize_lines(&outcome);
+    // `(lines, blob content)` — the overlay path needs the blamed blob's bytes,
+    // which come from the outcome on a miss and from the object on a hit.
+    let (mut lines, blamed_bytes) = match cached {
+        Some((lines, bytes)) => (lines, bytes),
+        None => {
+            let outcome = repo
+                .blame_file(rel_path.as_bytes().as_bstr(), suspect, blame_options)
+                .map_err(|e| anyhow!("{e}"))?;
+            let lines = materialize_lines(&outcome);
+            if let (Some((c, p, a)), Some(blob)) = (&cache_key, blamed_blob) {
+                if let Ok(conn) = crate::db::open_rw() {
+                    let _ = crate::db::blame_store(
+                        &conn,
+                        c,
+                        p,
+                        a,
+                        &blob.to_string(),
+                        &encode_runs(&lines),
+                    );
+                }
+            }
+            (lines, outcome.blob.clone())
+        }
+    };
 
     if let Some(content) = &worktree_content {
-        lines = overlay_worktree(&repo, lines, &outcome.blob, content, opts.diff_algorithm)?;
+        lines = overlay_worktree(&repo, lines, &blamed_bytes, content, opts.diff_algorithm)?;
         if !opts.ranges.is_empty() {
             let keep = |n: u32| opts.ranges.iter().any(|r| r.contains(&n));
             lines.retain(|l| keep(l.final_no));
@@ -237,6 +280,81 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     } else {
         emit_human(&repo, &lines, &info, &rel_path, &opts)
     }
+}
+
+/// Run-length encode an attribution: consecutive lines from the same commit,
+/// advancing together in both files, collapse to one record
+/// `final_start,orig_start,count,commit[,source_name]`.
+fn encode_runs(lines: &[Line]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let start = &lines[i];
+        let mut n = 1;
+        while i + n < lines.len() {
+            let l = &lines[i + n];
+            let contiguous = l.commit_id == start.commit_id
+                && l.final_no == start.final_no + n as u32
+                && l.orig_no == start.orig_no + n as u32
+                && l.source_name == start.source_name;
+            if !contiguous {
+                break;
+            }
+            n += 1;
+        }
+        let name = start
+            .source_name
+            .as_ref()
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .unwrap_or_default();
+        out.push(format!(
+            "{},{},{},{},{}",
+            start.final_no, start.orig_no, n, start.commit_id, name
+        ));
+        i += n;
+    }
+    out.join(";")
+}
+
+/// Rebuild the attribution from a cached encoding, taking line CONTENT from the
+/// blamed blob. Returns `None` when the record does not parse or the blob is
+/// gone, so a damaged entry falls back to a real blame rather than lying.
+fn lines_from_cache(
+    repo: &gix::Repository,
+    blob: ObjectId,
+    runs: &str,
+) -> Option<(Vec<Line>, Vec<u8>)> {
+    let data = repo.find_object(blob).ok()?.detach().data;
+    let mut content: Vec<Vec<u8>> = Vec::new();
+    for chunk in data.split_inclusive(|b| *b == b'\n') {
+        let mut c = chunk.to_vec();
+        if c.last() == Some(&b'\n') {
+            c.pop();
+        }
+        content.push(c);
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    for rec in runs.split(';').filter(|r| !r.is_empty()) {
+        let mut f = rec.splitn(5, ',');
+        let final_no: u32 = f.next()?.parse().ok()?;
+        let orig_no: u32 = f.next()?.parse().ok()?;
+        let count: u32 = f.next()?.parse().ok()?;
+        let commit_id = ObjectId::from_hex(f.next()?.as_bytes()).ok()?;
+        let name = f.next().unwrap_or("");
+        let source_name = (!name.is_empty()).then(|| name.as_bytes().to_vec());
+        for k in 0..count {
+            let idx = (final_no + k) as usize - 1;
+            lines.push(Line {
+                commit_id,
+                final_no: final_no + k,
+                orig_no: orig_no + k,
+                source_name: source_name.clone(),
+                content: content.get(idx)?.clone(),
+            });
+        }
+    }
+    (!lines.is_empty()).then_some((lines, data))
 }
 
 /// One output line: which commit it came from and where it sits in both files.

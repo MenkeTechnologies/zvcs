@@ -161,6 +161,18 @@ CREATE TABLE IF NOT EXISTS ppids (
 -- push, add, merge, …) a durable process has run. Keyed by the same session as
 -- `ppids` (join on it for the process's pid/cmd/cwd), one row per (session, verb).
 -- Only mutating verbs are recorded, so the read hot path never writes here.
+CREATE TABLE IF NOT EXISTS blame (
+    -- `commit` is a SQLite keyword: naming the column that made the whole SCHEMA
+    -- batch fail to parse, which silently disabled every ledger write, not just
+    -- this table.
+    commit_oid TEXT NOT NULL,
+    path   TEXT NOT NULL,
+    algo   TEXT NOT NULL,
+    blob   TEXT NOT NULL,
+    runs   TEXT NOT NULL,
+    PRIMARY KEY (commit_oid, path, algo)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS abbrev (
     oid     TEXT NOT NULL,
     hex_len INTEGER NOT NULL,
@@ -207,6 +219,43 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// The cached blame of one path at one commit: the blob that was blamed and a
+/// run-length encoding of the attribution.
+///
+/// Blaming `(commit, path)` is deterministic over immutable objects, so the
+/// answer never expires — and because commits are content addresses, an entry is
+/// valid in every clone that holds them. `algo` is part of the key because the
+/// diff algorithm changes the attribution.
+pub fn blame_load(
+    conn: &Connection,
+    commit: &str,
+    path: &str,
+    algo: &str,
+) -> Option<(String, String)> {
+    conn.query_row(
+        "SELECT blob, runs FROM blame WHERE commit_oid = ?1 AND path = ?2 AND algo = ?3",
+        rusqlite::params![commit, path, algo],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+pub fn blame_store(
+    conn: &Connection,
+    commit: &str,
+    path: &str,
+    algo: &str,
+    blob: &str,
+    runs: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO blame (commit_oid, path, algo, blob, runs) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![commit, path, algo, blob, runs],
+    )?;
+    Ok(())
+}
 /// Load every cached abbreviation computed at `hex_len`.
 ///
 /// Object ids are content addresses, so an abbreviation is valid for any repo

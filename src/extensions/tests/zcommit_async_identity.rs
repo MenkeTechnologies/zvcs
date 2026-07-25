@@ -14,7 +14,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["-c", "user.email=repo@e.x", "-c", "user.name=repoDefault"])
             .args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
@@ -41,7 +41,7 @@ fn async_commit_carries_identity_and_records_sha_on_push_failure() {
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
     git(&repo, &["commit", "--allow-empty", "-q", "-m", "c0"]);
-    let head0 = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&repo).output().unwrap().stdout).unwrap().trim().to_string();
+    let head0 = String::from_utf8(Command::new(BIN).args(["rev-parse", "HEAD"]).current_dir(&repo).output().unwrap().stdout).unwrap().trim().to_string();
 
     // Daemon started with NO GIT_AUTHOR/COMMITTER identity in its environment.
     let mut daemon: Child = Command::new(BIN).args(["zdaemon", "start", "--foreground"]).current_dir(&repo)
@@ -77,8 +77,8 @@ fn async_commit_carries_identity_and_records_sha_on_push_failure() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    let head_now = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&repo).output().unwrap().stdout).unwrap().trim().to_string();
-    let author = String::from_utf8(Command::new("git").args(["log", "-1", "--format=%an"]).current_dir(&repo).output().unwrap().stdout).unwrap().trim().to_string();
+    let head_now = String::from_utf8(Command::new(BIN).args(["rev-parse", "HEAD"]).current_dir(&repo).output().unwrap().stdout).unwrap().trim().to_string();
+    let author = String::from_utf8(Command::new(BIN).args(["log", "-1", "--format=%an"]).current_dir(&repo).output().unwrap().stdout).unwrap().trim().to_string();
 
     let _ = Command::new(BIN).args(["zdaemon", "stop"]).current_dir(&repo).env("ZVCS_HOME", &home).env("ZVCS_SOCK", &sock).status();
     let _ = daemon.kill();

@@ -11,7 +11,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -51,7 +51,7 @@ fn checkout(repo: &Path, home: &Path, args: &[&str]) -> Output {
 }
 
 fn tracked(repo: &Path, path: &str) -> bool {
-    Command::new("git")
+    Command::new(BIN)
         .args(["ls-files", "--error-unmatch", path])
         .current_dir(repo)
         .output()

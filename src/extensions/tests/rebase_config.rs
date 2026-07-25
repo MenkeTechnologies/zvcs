@@ -46,7 +46,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 /// the fixture and to write `.git/config`, never as behavior under test.
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -86,7 +86,7 @@ fn reset(repo: &Path) {
     git(repo, &["reset", "-q", "--hard", "main"]);
     for key in ["rebase.stat", "rebase.autosquash", "rebase.autostash", "rebase.forkpoint"] {
         // `--unset-all` on an absent key exits 5; ignore it.
-        let _ = Command::new("git")
+        let _ = Command::new(BIN)
             .args(["config", "--unset-all", key])
             .current_dir(repo)
             .status();

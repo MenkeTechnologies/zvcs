@@ -10,7 +10,7 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
+    let ok = Command::new(BIN)
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "t")
@@ -128,7 +128,7 @@ fn zreset_hard_and_zabort_cleanup() {
     std::fs::write(conf.join("m"), "mainside\n").unwrap();
     git(&conf, &["add", "-A"]);
     git(&conf, &["commit", "-qm", "mainc"]);
-    let _ = Command::new("git").args(["merge", "-q", "other"]).current_dir(&conf).status();
+    let _ = Command::new(BIN).args(["merge", "-q", "other"]).current_dir(&conf).status();
     assert!(conf.join(".git/MERGE_HEAD").exists(), "conf should be mid-merge");
 
     assert!(zvcs(&home, &sock, &["zreindex", "--sync", work.to_str().unwrap()]).0.contains("indexed 3"));
@@ -176,16 +176,16 @@ fn zattach_reattaches_detached_head() {
 }
 
 fn status_clean(repo: &Path) -> bool {
-    let out = Command::new("git").args(["status", "--porcelain"]).current_dir(repo).output().unwrap();
+    let out = Command::new(BIN).args(["status", "--porcelain"]).current_dir(repo).output().unwrap();
     out.stdout.is_empty()
 }
 
 fn head_branch(repo: &Path) -> String {
-    let out = Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(repo).output().unwrap();
+    let out = Command::new(BIN).args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(repo).output().unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn has_tag(repo: &Path, tag: &str) -> bool {
-    let out = Command::new("git").args(["tag", "--list", tag]).current_dir(repo).output().unwrap();
+    let out = Command::new(BIN).args(["tag", "--list", tag]).current_dir(repo).output().unwrap();
     String::from_utf8_lossy(&out.stdout).trim() == tag
 }

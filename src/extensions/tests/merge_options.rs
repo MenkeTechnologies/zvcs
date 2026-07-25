@@ -11,7 +11,7 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
+    let ok = Command::new(BIN)
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -23,7 +23,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn git_out(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")

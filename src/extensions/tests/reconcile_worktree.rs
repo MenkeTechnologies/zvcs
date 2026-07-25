@@ -10,7 +10,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["-c", "user.email=t@e.x", "-c", "user.name=t"])
             .args(args)
             .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
@@ -24,7 +24,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn porcelain(dir: &Path) -> String {
-    String::from_utf8(Command::new("git").args(["status", "--porcelain"]).current_dir(dir).output().unwrap().stdout).unwrap()
+    String::from_utf8(Command::new(BIN).args(["status", "--porcelain"]).current_dir(dir).output().unwrap().stdout).unwrap()
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn zup_skips_dirty_worktree_without_clobbering() {
     git(&work, &["add", "a.txt"]);
     git(&work, &["commit", "-q", "-m", "c0"]);
     git(&work, &["push", "-q", "origin", "main"]);
-    let c0 = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
+    let c0 = String::from_utf8(Command::new(BIN).args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
 
     // Advance origin to c1 from a second clone.
     git(&root, &["clone", "-q", bare.to_str().unwrap(), "work2"]);
@@ -109,7 +109,7 @@ fn zup_skips_dirty_worktree_without_clobbering() {
     assert!(report.contains("dirty"), "zup should report the dirty skip:\n{report}");
 
     assert_eq!(std::fs::read_to_string(work.join("a.txt")).unwrap(), "IN FLIGHT\n", "in-flight change must be preserved");
-    let head_now = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
+    let head_now = String::from_utf8(Command::new(BIN).args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
     assert_eq!(head_now, c0, "HEAD must not move on a dirty repo");
 
     let _ = std::fs::remove_dir_all(&root);
@@ -135,7 +135,7 @@ fn zup_refuses_to_overwrite_untracked_file() {
     git(&work, &["add", "a.txt"]);
     git(&work, &["commit", "-q", "-m", "c0"]);
     git(&work, &["push", "-q", "origin", "main"]);
-    let c0 = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
+    let c0 = String::from_utf8(Command::new(BIN).args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
 
     // Remote adds a tracked file `new.txt`.
     git(&root, &["clone", "-q", bare.to_str().unwrap(), "work2"]);
@@ -155,7 +155,7 @@ fn zup_refuses_to_overwrite_untracked_file() {
 
     // The untracked file must be intact and HEAD must not have moved.
     assert_eq!(std::fs::read_to_string(work.join("new.txt")).unwrap(), "MY UNTRACKED WORK\n", "untracked file was clobbered!");
-    let head_now = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
+    let head_now = String::from_utf8(Command::new(BIN).args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
     assert_eq!(head_now, c0, "HEAD must not move when the ff is refused");
 
     let _ = std::fs::remove_dir_all(&root);
@@ -182,7 +182,7 @@ fn zup_skips_dir_to_file_change_without_moving_refs() {
     git(&work, &["add", "d/a.txt"]);
     git(&work, &["commit", "-q", "-m", "c0"]);
     git(&work, &["push", "-q", "origin", "main"]);
-    let c0 = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
+    let c0 = String::from_utf8(Command::new(BIN).args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
 
     // Remote: turn `d/` into a file `d`.
     git(&root, &["clone", "-q", bare.to_str().unwrap(), "work2"]);
@@ -200,7 +200,7 @@ fn zup_skips_dir_to_file_change_without_moving_refs() {
     assert!(!report.contains("untracked"), "must not mislabel a tracked directory as untracked:\n{report}");
 
     // Refs must not have moved, and the tracked directory must be intact.
-    let head_now = String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
+    let head_now = String::from_utf8(Command::new(BIN).args(["rev-parse", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap().trim().to_string();
     assert_eq!(head_now, c0, "HEAD must stay at the old commit when the ff is skipped");
     assert_eq!(std::fs::read_to_string(work.join("d/a.txt")).unwrap(), "inside\n", "tracked directory content must be preserved");
 

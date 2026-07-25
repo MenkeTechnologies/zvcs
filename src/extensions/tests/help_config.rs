@@ -22,7 +22,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -70,7 +70,7 @@ fn alias_expansion_precedes_format_gate() {
 
     // Byte-for-byte against the installed git: it resolves the alias ahead of the
     // viewer selection too.
-    let real = Command::new("git")
+    let real = Command::new(BIN)
         .args(["-c", "help.format=html", "help", "co"])
         .current_dir(&repo)
         .env("HOME", &home)

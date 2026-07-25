@@ -9,7 +9,7 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) -> std::process::Output {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(["-c", "user.email=t@e.x", "-c", "user.name=t", "-c", "protocol.file.allow=always"])
         .args(args)
         .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")

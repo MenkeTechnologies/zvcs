@@ -8,7 +8,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["-c", "user.email=t@e.x", "-c", "user.name=t", "-c", "protocol.file.allow=always"])
             .args(args)
             .current_dir(dir)
@@ -25,7 +25,7 @@ fn zvcs(home: &Path, cwd: &Path, args: &[&str]) -> bool {
 
 /// `git rev-parse --verify <ref>` succeeds?
 fn ref_exists(dir: &Path, r: &str) -> bool {
-    Command::new("git").args(["rev-parse", "--verify", "--quiet", r]).current_dir(dir).output().unwrap().status.success()
+    Command::new(BIN).args(["rev-parse", "--verify", "--quiet", r]).current_dir(dir).output().unwrap().status.success()
 }
 
 #[test]

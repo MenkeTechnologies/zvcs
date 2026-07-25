@@ -9,7 +9,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["-c", "user.email=t@e.x", "-c", "user.name=t"])
             .args(args)
             .current_dir(dir)

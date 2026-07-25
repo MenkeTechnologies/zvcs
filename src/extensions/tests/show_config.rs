@@ -19,7 +19,7 @@ const DATE: &str = "1136214245 +0000";
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -69,7 +69,7 @@ fn show(repo: &Path, home: &Path, extra: &[&str]) -> Output {
 fn real(repo: &Path, home: &Path, extra: &[&str]) -> Output {
     let mut args = vec!["show"];
     args.extend_from_slice(extra);
-    Command::new("git")
+    Command::new(BIN)
         .args(&args)
         .current_dir(repo)
         .env("HOME", home)
@@ -96,7 +96,7 @@ fn assert_matches_git(repo: &Path, home: &Path, extra: &[&str]) {
 }
 
 fn rev(repo: &Path, spec: &str) -> String {
-    let out = Command::new("git").args(["rev-parse", spec]).current_dir(repo).output().unwrap();
+    let out = Command::new(BIN).args(["rev-parse", spec]).current_dir(repo).output().unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
@@ -209,7 +209,7 @@ fn show_tag_honors_log_date() {
     // GIT_COMMITTER_DATE), so its `Date:` line is deterministic and subject to
     // log.date just like a commit's.
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["tag", "-a", "v1", "-m", "release"])
             .current_dir(&repo)
             .env("GIT_COMMITTER_DATE", DATE)

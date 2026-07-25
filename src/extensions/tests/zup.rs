@@ -7,7 +7,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["-c", "user.email=t@e.x", "-c", "user.name=t"])
             .args(args)
             .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
@@ -21,7 +21,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn head(dir: &Path) -> String {
-    String::from_utf8(Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap().stdout).unwrap().trim().to_string()
+    String::from_utf8(Command::new(BIN).args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap().stdout).unwrap().trim().to_string()
 }
 
 #[test]
@@ -58,7 +58,7 @@ fn zup_fast_forwards_to_latest() {
 
     assert_eq!(head(&work), c1, "zup must fast-forward work to origin/main;\n{report}");
     // Attached to main, not detached.
-    let branch = String::from_utf8(Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap();
+    let branch = String::from_utf8(Command::new(BIN).args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(&work).output().unwrap().stdout).unwrap();
     assert_eq!(branch.trim(), "main", "HEAD must stay attached to main");
 
     let _ = std::fs::remove_dir_all(&root);

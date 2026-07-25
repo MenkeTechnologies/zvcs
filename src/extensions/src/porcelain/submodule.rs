@@ -199,7 +199,7 @@ pub fn submodule(args: &[String]) -> Result<ExitCode> {
         "init" => init(tail, quiet),
         "summary" => summary(tail, cached),
         "foreach" => foreach(tail, quiet),
-        "add" => bail!("`submodule add` needs a clone of the new submodule; not ported"),
+        "add" => add(tail, quiet),
         "update" => update(tail, quiet),
         "deinit" => bail!("`submodule deinit` removes submodule worktrees; not ported"),
         "sync" => sync(tail, quiet),
@@ -2328,4 +2328,159 @@ mod tests {
         ));
         assert!(SET_BRANCH_USAGE.ends_with("set the default tracking branch\n\n"));
     }
+}
+
+/// `git submodule add [-b <branch>] [-f] [--name <name>] [--] <repository> [<path>]`
+/// — clone `<repository>` into `<path>`, register it in `.gitmodules` and the
+/// local config, and stage both the file and the new gitlink.
+///
+/// Ported behaviourally from git's `cmd_add`/`module_add` (builtin/submodule.c
+/// plus git-submodule.sh's `add` in older versions): resolve the path, refuse a
+/// path that is already occupied or already in the index, clone, write
+/// `submodule.<name>.path` / `.url` into `.gitmodules`, mirror the url into the
+/// repository config (git's `git config submodule.<name>.url`), then stage
+/// `.gitmodules` and a mode-160000 entry at the clone's HEAD.
+///
+/// Built entirely out of already-ported pieces — the clone runs through this
+/// binary's own `clone`, the gitlink through its own `update-index --cacheinfo`
+/// — so there is no second implementation of either to drift.
+///
+/// Deliberate scope: `--reference`, `--depth`, `--ref-format` and the
+/// `--branch`-tracking extras of newer git are not accepted; a relative
+/// `<repository>` url is taken verbatim rather than resolved against the default
+/// remote, the same restriction the rest of this port already documents.
+fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
+    let mut force = false;
+    let mut name: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut end_of_options = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if end_of_options || !a.starts_with('-') {
+            rest.push(a.to_string());
+            i += 1;
+            continue;
+        }
+        let (opt, inline) = match a.split_once('=') {
+            Some((o, v)) => (o, Some(v.to_string())),
+            None => (a, None),
+        };
+        let mut value = |inline: Option<String>| -> Result<String> {
+            match inline {
+                Some(v) => Ok(v),
+                None => {
+                    i += 1;
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("option `{opt}' requires a value"))
+                }
+            }
+        };
+        match opt {
+            "--" => end_of_options = true,
+            "-f" | "--force" => force = true,
+            "-q" | "--quiet" => {}
+            "--name" => name = Some(value(inline)?),
+            "-b" | "--branch" => branch = Some(value(inline)?),
+            other => bail!("`submodule add {other}` is not ported"),
+        }
+        i += 1;
+    }
+
+    let url = match rest.first() {
+        Some(u) => u.clone(),
+        None => return usage_exit(),
+    };
+    // git defaults the path to the url's last component with a trailing `.git`
+    // and any trailing slashes removed.
+    let path = match rest.get(1) {
+        Some(p) => p.trim_end_matches('/').to_string(),
+        None => {
+            let base = url.trim_end_matches('/').rsplit('/').next().unwrap_or(&url);
+            base.strip_suffix(".git").unwrap_or(base).to_string()
+        }
+    };
+    if path.is_empty() {
+        bail!("'{url}' does not name a submodule path");
+    }
+    let name = name.unwrap_or_else(|| path.clone());
+
+    let repo = gix::discover(".")?;
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("a working tree is required"))?
+        .to_path_buf();
+
+    // An occupied path is git's refusal, not something to clone over.
+    let abs = workdir.join(&path);
+    let occupied = std::fs::read_dir(&abs).map(|mut d| d.next().is_some()).unwrap_or(false);
+    if occupied && !force {
+        bail!("'{path}' already exists and is not an empty directory");
+    }
+    if !force && repo.index_or_empty()?.entry_by_path(BStr::new(path.as_bytes())).is_some() {
+        bail!("'{path}' already exists in the index");
+    }
+
+    // ---- clone, through this binary's own porcelain -------------------------
+    let mut clone_args = vec!["--".to_string(), url.clone(), path.clone()];
+    if let Some(b) = &branch {
+        clone_args.splice(0..0, ["--branch".to_string(), b.clone()]);
+    }
+    if quiet {
+        clone_args.insert(0, "--quiet".to_string());
+    }
+    let code = super::clone(&clone_args)?;
+    if code != ExitCode::SUCCESS {
+        return Ok(code);
+    }
+
+    // ---- register in .gitmodules and in the repository config ---------------
+    let gitmodules = workdir.join(".gitmodules");
+    let mut file = if gitmodules.exists() {
+        ConfigFile::from_path_no_includes(gitmodules.clone(), Source::Worktree)?
+    } else {
+        ConfigFile::new(gix::config::file::Metadata::from(Source::Worktree).at(&gitmodules))
+    };
+    {
+        let mut section = file.section_mut_or_create_new("submodule", Some(name.as_str().into()))?;
+        section.push("path", Some(BStr::new(path.as_bytes())))?;
+        section.push("url", Some(BStr::new(url.as_bytes())))?;
+        if let Some(b) = &branch {
+            section.push("branch", Some(BStr::new(b.as_bytes())))?;
+        }
+    }
+    std::fs::write(&gitmodules, file.to_bstring())?;
+
+    // git mirrors the url into the repository config so the submodule is
+    // initialized in place, the same effect as a following `submodule init`.
+    let local_config = repo.common_dir().join("config");
+    let mut cfg = ConfigFile::from_path_no_includes(local_config.clone(), Source::Local)?;
+    cfg.set_raw_value_by("submodule", Some(name.as_str().into()), "url", url.as_str())?;
+    std::fs::write(&local_config, cfg.to_bstring())?;
+
+    // ---- stage .gitmodules and the gitlink ---------------------------------
+    let head = gix::open(&abs)?
+        .head_id()
+        .map_err(|_| anyhow::anyhow!("the cloned submodule has an unborn HEAD"))?
+        .detach();
+    let cacheinfo = format!("160000,{},{}", head.to_hex(), path);
+    let staged = crate::dispatch::run(
+        "update-index",
+        &["--add".to_string(), "--cacheinfo".to_string(), cacheinfo],
+    )?;
+    if staged != ExitCode::SUCCESS {
+        return Ok(staged);
+    }
+    let staged = crate::dispatch::run("add", &["--".to_string(), ".gitmodules".to_string()])?;
+    if staged != ExitCode::SUCCESS {
+        return Ok(staged);
+    }
+
+    if !quiet {
+        println!("Adding existing repo at '{path}' to the index");
+    }
+    Ok(ExitCode::SUCCESS)
 }

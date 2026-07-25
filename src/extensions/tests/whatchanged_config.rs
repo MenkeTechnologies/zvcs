@@ -17,7 +17,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -49,7 +49,7 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
 }
 
 fn commit(repo: &Path, msg: &str) {
-    assert!(Command::new("git")
+    assert!(Command::new(BIN)
         .args(["commit", "-q", "-m", msg])
         .current_dir(repo)
         .env("GIT_AUTHOR_DATE", "1136214245 +0000")
@@ -64,7 +64,7 @@ fn config(repo: &Path, key: &str, val: &str) {
 }
 fn unset(repo: &Path, key: &str) {
     // `--unset` fails if the key is absent; tolerate that so tests can share a fixture.
-    let _ = Command::new("git")
+    let _ = Command::new(BIN)
         .args(["config", "--unset", key])
         .current_dir(repo)
         .status();
@@ -127,7 +127,7 @@ fn log_abbrev_commit_config_and_override() {
     let (repo, home) = fixture("abbrev");
     let full = {
         let out =
-            Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&repo).output().unwrap();
+            Command::new(BIN).args(["rev-parse", "HEAD"]).current_dir(&repo).output().unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
     };
 

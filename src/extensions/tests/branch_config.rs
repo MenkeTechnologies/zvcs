@@ -13,7 +13,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 /// Run the system git in `dir`, asserting success (used only for fixture setup).
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -28,7 +28,7 @@ fn git(dir: &Path, args: &[&str]) {
 /// date is deterministic across machines and runs.
 fn commit_at(repo: &Path, msg: &str, date: &str) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["commit", "-q", "--allow-empty", "-m", msg])
             .current_dir(repo)
             .env("GIT_CONFIG_NOSYSTEM", "1")

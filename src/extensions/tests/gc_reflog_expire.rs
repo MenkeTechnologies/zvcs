@@ -22,14 +22,14 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed in {}",
         dir.display()
     );
 }
 
 fn rev(dir: &Path, spec: &str) -> String {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(["rev-parse", spec])
         .current_dir(dir)
         .output()

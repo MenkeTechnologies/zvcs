@@ -11,7 +11,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -50,7 +50,7 @@ fn commit_with_editor(repo: &Path, home: &Path, editor: &str, extra: &[&str]) ->
 }
 
 fn subject(repo: &Path) -> String {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(["log", "-1", "--format=%s"])
         .current_dir(repo)
         .output()
@@ -155,7 +155,7 @@ fn core_comment_string_multibyte_prefix() {
     );
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(subject(&repo), "kept subject");
-    let body = Command::new("git")
+    let body = Command::new(BIN)
         .args(["log", "-1", "--format=%b"])
         .current_dir(&repo)
         .output()

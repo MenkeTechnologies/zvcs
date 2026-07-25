@@ -8,7 +8,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["-c", "user.email=t@e.x", "-c", "user.name=t", "-c", "protocol.file.allow=always"])
             .args(args)
             .env("GIT_AUTHOR_NAME", "t")
@@ -24,7 +24,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn out(dir: &Path, args: &[&str]) -> String {
-    String::from_utf8(Command::new("git").args(args).current_dir(dir).output().unwrap().stdout)
+    String::from_utf8(Command::new(BIN).args(args).current_dir(dir).output().unwrap().stdout)
         .unwrap()
         .trim()
         .to_string()

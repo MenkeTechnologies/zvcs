@@ -28,7 +28,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -37,7 +37,7 @@ fn git(dir: &Path, args: &[&str]) {
 /// commit objects (hence identical graph input) across runs.
 fn commit(repo: &Path, msg: &str, when: &str) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["commit", "-q", "-m", msg])
             .current_dir(repo)
             .env("GIT_COMMITTER_DATE", when)
@@ -79,7 +79,7 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
 
     git(&repo, &["checkout", "-q", "main"]);
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["merge", "-q", "--no-edit", "b1", "b2", "b3"])
             .current_dir(&repo)
             .env("GIT_COMMITTER_DATE", "@1700000200 +0000")
@@ -99,7 +99,7 @@ fn set_generation_version(repo: &Path, value: Option<&str>) {
         Some(v) => git(repo, &["config", "commitGraph.generationVersion", v]),
         None => {
             // `--unset` fails when the key is absent; ignore that.
-            let _ = Command::new("git")
+            let _ = Command::new(BIN)
                 .args(["config", "--unset", "commitGraph.generationVersion"])
                 .current_dir(repo)
                 .status();
@@ -148,7 +148,7 @@ fn chunk_ids(bytes: &[u8]) -> Vec<String> {
 
 /// Real git accepts the file this port wrote (self-consistent chunks + trailer).
 fn real_git_verifies(repo: &Path, home: &Path) {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(["commit-graph", "verify"])
         .current_dir(repo)
         .env("HOME", home)

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) -> std::process::Output {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(["-c", "user.email=t@e.x", "-c", "user.name=t", "-c", "protocol.file.allow=always"])
         .args(args)
         .current_dir(dir)

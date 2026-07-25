@@ -22,7 +22,7 @@ const MSG: &[u8] = b"subject line\n\nBody paragraph here.\n\nAcked-by: A <a@x.y>
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "setup: git {args:?} failed"
     );
 }

@@ -12,7 +12,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 const DATE: &str = "1136214245 +0000";
 
 fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
+    let ok = Command::new(BIN)
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_DATE", DATE)

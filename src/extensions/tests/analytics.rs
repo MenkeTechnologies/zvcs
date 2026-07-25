@@ -9,7 +9,7 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
+    let ok = Command::new(BIN)
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "t")
@@ -24,7 +24,7 @@ fn git(dir: &Path, args: &[&str]) {
 
 /// Commit staged changes as a specific author.
 fn commit_as(dir: &Path, name: &str, email: &str, msg: &str) {
-    let ok = Command::new("git")
+    let ok = Command::new(BIN)
         .args(["commit", "-qm", msg])
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", name)
@@ -80,7 +80,7 @@ fn analytics_verbs_aggregate_across_repos() {
     git(&conf, &["add", "-A"]);
     commit_as(&conf, "alice", "alice@x.com", "mainc");
     // This merge conflicts and is left unresolved.
-    let _ = Command::new("git").args(["merge", "-q", "other"]).current_dir(&conf).status();
+    let _ = Command::new(BIN).args(["merge", "-q", "other"]).current_dir(&conf).status();
 
     assert!(zvcs(&home, &sock, &["zreindex", "--sync", work.to_str().unwrap()]).contains("indexed 2"));
 

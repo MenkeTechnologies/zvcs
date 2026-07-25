@@ -25,7 +25,7 @@ const WARNING: &str = "warning: minimum pack size limit is 1 MiB";
 /// the fixture and to write `.git/config`, never as the behavior under test.
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }

@@ -39,7 +39,7 @@ fn daemon_control_lifecycle() {
     let sock = root.join("sock");
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
-    assert!(Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&repo).status().unwrap().success());
+    assert!(Command::new(BIN).args(["init", "-q", "-b", "main"]).current_dir(&repo).status().unwrap().success());
 
     // ping before start → not running (non-zero).
     let (out, ok) = ctl(&home, &sock, &repo, &["zdaemon", "ping"]);
@@ -93,7 +93,7 @@ fn bare_start_daemonizes_and_returns() {
     let sock = root.join("sock");
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
-    assert!(Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&repo).status().unwrap().success());
+    assert!(Command::new(BIN).args(["init", "-q", "-b", "main"]).current_dir(&repo).status().unwrap().success());
 
     // Returns promptly (does not hang), and a daemon is now up.
     let (_out, ok) = ctl(&home, &sock, &repo, &["zdaemon", "start"]);
@@ -121,7 +121,7 @@ fn manual_stop_disables_autostart_until_start() {
     let sock = root.join("sock");
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
-    assert!(Command::new("git").args(["init", "-q", "-b", "main"]).current_dir(&repo).status().unwrap().success());
+    assert!(Command::new(BIN).args(["init", "-q", "-b", "main"]).current_dir(&repo).status().unwrap().success());
     // Enable autonomy directly in the repo config so a bare git command would
     // normally autostart the daemon. Written to the file to avoid depending on a
     // `git config` writer.

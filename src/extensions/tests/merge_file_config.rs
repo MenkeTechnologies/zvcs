@@ -21,7 +21,7 @@ fn setup(tag: &str) -> (PathBuf, PathBuf) {
     let repo = repo.canonicalize().unwrap();
     let home = home.canonicalize().unwrap();
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["init", "-q", "."])
             .current_dir(&repo)
             .status()
@@ -38,7 +38,7 @@ fn setup(tag: &str) -> (PathBuf, PathBuf) {
 /// Set a repo-local config value with real git.
 fn config(repo: &Path, key: &str, value: &str) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["config", key, value])
             .current_dir(repo)
             .status()
@@ -208,7 +208,7 @@ fn unknown_value_is_fatal_even_with_flag_override() {
 /// Append a repo-local multivar entry with real git.
 fn config_add(repo: &Path, key: &str, value: &str) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["config", "--add", key, value])
             .current_dir(repo)
             .status()

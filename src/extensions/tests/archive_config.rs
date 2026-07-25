@@ -24,7 +24,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -52,7 +52,7 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
     }
     git(&repo, &["add", "f.txt"]);
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["commit", "-q", "-m", "c"])
             .current_dir(&repo)
             .env("GIT_COMMITTER_DATE", "@1700000000 +0000")

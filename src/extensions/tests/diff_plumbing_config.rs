@@ -39,7 +39,7 @@ const PATCH_KEYS: &[(&str, &str)] = &[
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -230,7 +230,7 @@ fn diff_index_content_formats_match_git() {
         &["diff-index", "--summary", "--cached", "HEAD~"][..],
     ] {
         let ours = stdout_of(&run(&repo, &home, args));
-        let theirs = Command::new("git")
+        let theirs = Command::new(BIN)
             .args(args)
             .current_dir(&repo)
             .env("HOME", &home)

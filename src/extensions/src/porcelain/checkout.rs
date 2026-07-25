@@ -308,6 +308,20 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
 
     // No `--`, no -b/-B.
     if pre.is_empty() {
+        // `git checkout --detach` with no revision detaches at the CURRENT HEAD:
+        // git resolves the missing argument to HEAD rather than erroring
+        // (builtin/checkout.c, `opts->force_detach && !argc`). The worktree is
+        // already at that commit, so this is a ref-only move.
+        if detach {
+            let head = repo
+                .head_id()
+                .map_err(|_| anyhow::anyhow!("you are on a branch yet to be born"))?
+                .detach();
+            let commit = head.attach(&repo).object()?.peel_to_commit()?;
+            let code = detached_checkout(&repo, "HEAD", commit, quiet, true)?;
+            maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
+            return Ok(code);
+        }
         bail!("nothing to checkout: specify a branch, commit, or path(s)");
     }
 

@@ -20,7 +20,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -45,7 +45,7 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
         git(&repo, &["add", "f"]);
         // Pin the committer date too, so both `%cd` and the reflog entry timestamp
         // (which drives a `--date=` selector) are deterministic.
-        let ok = Command::new("git")
+        let ok = Command::new(BIN)
             .args(["-c", "commit.gpgsign=false", "commit", "-q", "-m", n, "--date=1136214245 +0000"])
             .current_dir(&repo)
             .env("GIT_AUTHOR_DATE", "1136214245 +0000")

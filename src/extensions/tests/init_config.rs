@@ -116,7 +116,7 @@ fn run_init(bin: &str, dir: &Path, home: &Path, extra: &[&str]) {
 /// Read a single config value from the repo at/inside `dir` using stock git
 /// (ground truth for both zvcs- and git-created repos). `None` when unset.
 fn git_config_get(dir: &Path, key: &str) -> Option<String> {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .arg("-C")
         .arg(dir)
         .args(["config", "--get", key])

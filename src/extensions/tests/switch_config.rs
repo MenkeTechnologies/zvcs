@@ -9,7 +9,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -55,7 +55,7 @@ fn switch(repo: &Path, home: &Path, args: &[&str]) -> Output {
 }
 
 fn current_branch(repo: &Path) -> String {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(["branch", "--show-current"])
         .current_dir(repo)
         .output()
@@ -64,7 +64,7 @@ fn current_branch(repo: &Path) -> String {
 }
 
 fn remote_url(repo: &Path, name: &str) -> String {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(["remote", "get-url", name])
         .current_dir(repo)
         .output()
@@ -101,7 +101,7 @@ fn checkout_default_remote_disambiguates() {
 }
 
 fn config_get(repo: &Path, key: &str) -> String {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(["config", "--get", key])
         .current_dir(repo)
         .output()

@@ -9,7 +9,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -46,7 +46,7 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
 
 /// Subject line (`%s`) of `HEAD`'s commit.
 fn subject(repo: &Path) -> String {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(["log", "-1", "--format=%s"])
         .current_dir(repo)
         .output()
@@ -67,7 +67,7 @@ fn run(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
 
 /// Number of parents of HEAD (2 = a merge commit, 1 = fast-forward tip).
 fn head_parents(repo: &Path) -> usize {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(["rev-list", "--parents", "-n", "1", "HEAD"])
         .current_dir(repo)
         .output()

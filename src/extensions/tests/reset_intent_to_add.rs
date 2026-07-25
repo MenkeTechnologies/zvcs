@@ -9,7 +9,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 
 fn git(dir: &Path, args: &[&str]) -> Output {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(["-c", "user.email=t@e.x", "-c", "user.name=t"])
         .args(args)
         .current_dir(dir)

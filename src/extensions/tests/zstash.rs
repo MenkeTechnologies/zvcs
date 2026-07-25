@@ -7,7 +7,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(["-c", "user.email=t@e.x", "-c", "user.name=t"]).args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(["-c", "user.email=t@e.x", "-c", "user.name=t"]).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -18,7 +18,7 @@ fn zvcs(home: &Path, cwd: &Path, args: &[&str]) -> (String, bool) {
 }
 
 fn porcelain(dir: &Path) -> String {
-    String::from_utf8(Command::new("git").args(["status", "--porcelain"]).current_dir(dir).output().unwrap().stdout).unwrap()
+    String::from_utf8(Command::new(BIN).args(["status", "--porcelain"]).current_dir(dir).output().unwrap().stdout).unwrap()
 }
 
 #[test]

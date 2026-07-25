@@ -23,7 +23,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -51,7 +51,7 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
 
     // An empty commit format-patches to a message with a subject and no diff.
     git(&repo, &["commit", "-q", "--allow-empty", "-m", "empty subject line"]);
-    let mbox = Command::new("git")
+    let mbox = Command::new(BIN)
         .args(["format-patch", "-1", "--stdout"])
         .current_dir(&repo)
         .output()

@@ -10,13 +10,13 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
 
 fn git_out(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+    let out = Command::new(BIN).args(args).current_dir(dir).output().unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 

@@ -25,7 +25,7 @@ fn git_env(cmd: &mut Command, dir: &Path, home: &Path) {
 
 /// Run stock `git <args>` in the fixture, asserting success (fixture setup).
 fn git(dir: &Path, home: &Path, args: &[&str]) {
-    let mut c = Command::new("git");
+    let mut c = Command::new(BIN);
     git_env(&mut c, dir, home);
     assert!(c.args(args).status().unwrap().success(), "git {args:?}");
 }

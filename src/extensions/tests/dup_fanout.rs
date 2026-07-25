@@ -9,7 +9,7 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
+    let ok = Command::new(BIN)
         .args(["-c", "user.email=t@e.x", "-c", "user.name=t"])
         .args(args)
         .current_dir(dir)
@@ -20,7 +20,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn head(dir: &Path) -> String {
-    let out = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap();
+    let out = Command::new(BIN).args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 

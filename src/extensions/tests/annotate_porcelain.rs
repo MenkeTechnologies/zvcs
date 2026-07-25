@@ -22,7 +22,7 @@ fn git_env<'a>(cmd: &'a mut Command, home: &Path) -> &'a mut Command {
 }
 
 fn git(dir: &Path, home: &Path, args: &[&str]) {
-    let ok = git_env(Command::new("git").args(args).current_dir(dir), home)
+    let ok = git_env(Command::new(BIN).args(args).current_dir(dir), home)
         .status()
         .unwrap()
         .success();
@@ -31,7 +31,7 @@ fn git(dir: &Path, home: &Path, args: &[&str]) {
 
 fn commit(repo: &Path, home: &Path, msg: &str, date: &str) {
     let ok = git_env(
-        Command::new("git").args(["commit", "-q", "-m", msg]).current_dir(repo),
+        Command::new(BIN).args(["commit", "-q", "-m", msg]).current_dir(repo),
         home,
     )
     .env("GIT_AUTHOR_DATE", date)

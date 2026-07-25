@@ -21,7 +21,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -103,7 +103,7 @@ fn run_add(bin: &str, repo: &Path, home: &Path, extra: &[&str]) -> (Output, Vec<
         .output()
         .unwrap();
     let staged = String::from_utf8(
-        Command::new("git")
+        Command::new(BIN)
             .args(["ls-files"])
             .current_dir(repo)
             .output()

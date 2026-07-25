@@ -40,7 +40,7 @@ const HELPER_PW_ONLY: &str = "!f() { echo password=p; }; f";
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(args)
             .current_dir(dir)
             // Pin every write to the temp repo. `GIT_CEILING_DIRECTORIES` stops

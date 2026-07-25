@@ -7,7 +7,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["-c", "user.email=t@e.x", "-c", "user.name=t"])
             .args(args)
             .current_dir(dir)
@@ -25,7 +25,7 @@ fn zvcs(home: &Path, cwd: &Path, args: &[&str]) -> (String, bool) {
 
 fn head(dir: &Path) -> String {
     String::from_utf8(
-        Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap().stdout,
+        Command::new(BIN).args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap().stdout,
     )
     .unwrap()
     .trim()

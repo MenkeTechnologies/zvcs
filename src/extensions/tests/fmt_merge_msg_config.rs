@@ -14,7 +14,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -45,7 +45,7 @@ fn fixture(tag: &str, commits: usize) -> (PathBuf, PathBuf, String) {
         git(&repo, &["commit", "-q", "-m", &format!("side commit {i}")]);
     }
     git(&repo, &["checkout", "-q", "main"]);
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(["rev-parse", "side"])
         .current_dir(&repo)
         .output()

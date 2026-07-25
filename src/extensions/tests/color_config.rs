@@ -18,7 +18,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 /// Run system git in `dir` for fixture setup, asserting success.
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")

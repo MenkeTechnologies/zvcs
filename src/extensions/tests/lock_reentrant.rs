@@ -16,7 +16,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 fn init_repo(root: &Path, name: &str) -> PathBuf {
     let r = root.join(name);
     std::fs::create_dir_all(&r).unwrap();
-    assert!(Command::new("git").args(["init", "-q"]).current_dir(&r).status().unwrap().success());
+    assert!(Command::new(BIN).args(["init", "-q"]).current_dir(&r).status().unwrap().success());
     r.join(".git").canonicalize().unwrap()
 }
 

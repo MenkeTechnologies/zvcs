@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
-    assert!(Command::new("git").args(args).current_dir(dir).status().unwrap().success(), "git {args:?}");
+    assert!(Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(), "git {args:?}");
 }
 
 fn zvcs(home: &Path, sock: &Path, args: &[&str]) -> String {

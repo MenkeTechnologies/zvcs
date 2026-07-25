@@ -10,11 +10,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const BIN: &str = env!("CARGO_BIN_EXE_git");
+
 use zvcs::superset::{ensure_attached, Attached};
 
 /// Run `git <args>` in `dir` with a deterministic identity; panic on failure.
 fn git(dir: &Path, args: &[&str]) -> std::process::Output {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(["-c", "user.email=test@example.com", "-c", "user.name=zvcs-test"])
         .args(args)
         .current_dir(dir)

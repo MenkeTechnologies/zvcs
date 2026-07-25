@@ -18,7 +18,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 /// decision back to the config this test is about.
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(args)
             .current_dir(dir)
             .env_remove("GIT_AUTHOR_NAME")
@@ -113,7 +113,7 @@ fn dated_fixture(tag: &str, date: &str) -> (PathBuf, PathBuf) {
     std::fs::write(repo.join("f"), "hello\n").unwrap();
     git(&repo, &["add", "f"]);
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["commit", "-q", "-m", "c0"])
             .current_dir(&repo)
             .env("GIT_AUTHOR_DATE", date)

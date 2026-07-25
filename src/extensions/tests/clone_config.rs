@@ -11,7 +11,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Command::new("git").args(args).current_dir(dir).status().unwrap().success(),
+        Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
         "git {args:?} failed"
     );
 }
@@ -45,7 +45,7 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
 fn set_global(home: &Path, key: &str, val: &str) {
     let path = home.join(".gitconfig");
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["config", "--file"])
             .arg(&path)
             .args([key, val])
@@ -71,7 +71,7 @@ fn clone_with(bin: &str, cwd: &Path, home: &Path, up: &Path, dst: &str) -> Outpu
 
 /// Read a single key from a cloned repo's `.git/config`.
 fn cfg_get(repo: &Path, key: &str) -> String {
-    let out = Command::new("git")
+    let out = Command::new(BIN)
         .args(["config", "--file"])
         .arg(repo.join(".git/config"))
         .args(["--get", key])
@@ -82,7 +82,7 @@ fn cfg_get(repo: &Path, key: &str) -> String {
 
 /// True iff `refs/remotes/<remote>/<branch>` exists in the cloned repo.
 fn remote_ref_exists(repo: &Path, remote: &str, branch: &str) -> bool {
-    Command::new("git")
+    Command::new(BIN)
         .args(["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{remote}/{branch}")])
         .current_dir(repo)
         .status()

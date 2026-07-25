@@ -37,7 +37,7 @@ fn daemon_serializes_concurrent_writers() {
     std::fs::create_dir_all(&tmp).expect("mkdir tmp");
     let tmp = tmp.canonicalize().expect("canonicalize tmp");
     assert!(
-        Command::new("git")
+        Command::new(BIN)
             .args(["init", "-q"])
             .current_dir(&tmp)
             .status()

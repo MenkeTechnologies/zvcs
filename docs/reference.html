@@ -57,7 +57,7 @@
             <span class="sep">/</span>
             <a href="https://github.com/MenkeTechnologies/zvcs" target="_blank" rel="noopener noreferrer">GitHub</a>
           </nav>
-          <p class="docs-build-line">zvcs v0.9.2 · 116 superset verbs · generated from <code>src/extensions/src/superset/manpage.rs</code>, the same table <code>git help &lt;verb&gt;</code> renders</p>
+          <p class="docs-build-line">zvcs v0.9.2 · 117 superset verbs · generated from <code>src/extensions/src/superset/manpage.rs</code>, the same table <code>git help &lt;verb&gt;</code> renders</p>
         </div>
         <div class="tutorial-toolbar">
           <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
@@ -79,7 +79,7 @@
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>SUPERSET VERBS</h2>
-      <p class="tutorial-subtitle">The 116 <code>z*</code> verbs — the coordination layer stock git has no equivalent for. Every entry is the verb's man page: <code>git help &lt;verb&gt;</code> shows the same text in a terminal.</p>
+      <p class="tutorial-subtitle">The 117 <code>z*</code> verbs — the coordination layer stock git has no equivalent for. Every entry is the verb's man page: <code>git help &lt;verb&gt;</code> shows the same text in a terminal.</p>
 
       <section class="tutorial-section" id="verb-index">
         <h2>Index</h2>
@@ -115,6 +115,7 @@
         <li><a href="#zhook">zhook</a> <span class="verb-summary">manage the current repo's ref-change hook</span></li>
         <li><a href="#ztrigger">ztrigger</a> <span class="verb-summary">arm any directory to run a command on every ref-change</span></li>
         <li><a href="#zwatch">zwatch</a> <span class="verb-summary">watch a directory's status without running a command</span></li>
+        <li><a href="#zshadow">zshadow</a> <span class="verb-summary">install the ~/.zvcs shadow and print the shell lines for it</span></li>
         <li><a href="#zdashed">zdashed</a> <span class="verb-summary">install git-&lt;verb&gt; symlinks and man pages</span></li>
         <li><a href="#zverbs">zverbs</a> <span class="verb-summary">list every zvcs extension verb and its usage</span></li>
         <li><a href="#zcd">zcd</a> <span class="verb-summary">change the working directory (for the zrepl console)</span></li>
@@ -407,6 +408,16 @@
         <h3><span class="doc-sigil">git</span> zwatch <span class="doc-summary">watch a directory's status without running a command</span></h3>
         <pre class="doc-synopsis"><code>git zwatch &lt;DIR&gt; | git zwatch &lt;list|rm DIR&gt;</code></pre>
         <p>The command-less form of ztrigger: it indexes DIR and turns on zvcs.autostatus so the daemon maintains DIR's cached status on every ref-change, without running any command. list and rm DIR manage watches.</p>
+        <a class="doc-top" href="#verb-index">↑ index</a>
+      </article>
+      <article class="doc-entry" id="zshadow">
+        <h3><span class="doc-sigil">git</span> zshadow <span class="doc-summary">install the ~/.zvcs shadow and print the shell lines for it</span></h3>
+        <pre class="doc-synopsis"><code>git zshadow [&lt;dir&gt;] [-n|--print] [--all]</code></pre>
+        <p>Sets up the whole shadow install in one command: a <code>git</code> symlink to this binary in &lt;dir&gt; (default ~/.zvcs/bin), a git-&lt;verb&gt; dashed link beside it for every verb the dispatcher serves, every superset man page under ~/.zvcs/man, and the zvcs-forked zsh completion as ~/.zvcs/completions/_git. The completion is compiled into the binary, so nothing is needed from the source tree.</p>
+        <p>stdout carries shell code only — the export PATH line for the bin directory, the export MANPATH line for the man directory, and the fpath line for the completion directory — so <code>eval "$(git zshadow)"</code> sets the current shell up and the same lines paste into ~/.zshrc. The install summary goes to stderr, where an eval leaves it alone.</p>
+        <p>A PATH or MANPATH line the environment already satisfies is printed commented out, so re-evaluating never duplicates an entry and the line is still visible to uncomment when pasting into an rc file; --all prints every line uncommented. fpath is a zsh variable rather than an exported one, so it cannot be inspected from here and its line is always live — put it before compinit, and <code>typeset -U fpath</code> keeps repeats harmless.</p>
+        <p>-n (--print) prints the lines without installing anything. Paths under $HOME are written as $HOME/... so the lines are portable across machines.</p>
+        <p>Idempotent: a correct symlink is left alone, a stale one is repointed, a real file of the same name is never clobbered, and the completion is rewritten only when its content differs.</p>
         <a class="doc-top" href="#verb-index">↑ index</a>
       </article>
       <article class="doc-entry" id="zdashed">

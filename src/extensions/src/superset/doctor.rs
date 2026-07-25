@@ -91,7 +91,7 @@ pub fn zdoctor(_args: &[String]) -> Result<ExitCode> {
         report(
             Level::Warn,
             "man pages",
-            format!("{installed}/{total} installed — run `git zdashed` (git help <zverb> installs on demand)"),
+            format!("{installed}/{total} installed — run `git zshadow` (git help <zverb> installs on demand)"),
         );
     }
 
@@ -112,7 +112,17 @@ pub fn zdoctor(_args: &[String]) -> Result<ExitCode> {
     if bin.join("git-status").exists() {
         report(Level::Ok, "dashed forms", format!("installed in {}", bin.display()));
     } else {
-        report(Level::Warn, "dashed forms", "not installed — run `git zdashed` (needed once stock git is removed)".to_string());
+        report(Level::Warn, "dashed forms", "not installed — run `git zshadow` (needed once stock git is removed)".to_string());
+    }
+
+    // zsh completion: installed by `git zshadow`, active only once its directory
+    // is on `fpath` — which this process cannot see (fpath is not exported), so
+    // only the file itself is checked.
+    let comp = home.join("completions").join("_git");
+    if comp.exists() {
+        report(Level::Ok, "completion", format!("{} (needs its dir on fpath)", comp.display()));
+    } else {
+        report(Level::Warn, "completion", "no _git installed — run `git zshadow`".to_string());
     }
 
     Ok(if any_fail { ExitCode::FAILURE } else { ExitCode::SUCCESS })
@@ -145,8 +155,10 @@ fn canon(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Whether the `$<var>` PATH-style list contains `dir`.
-fn path_list_contains(var: &str, dir: &Path) -> bool {
+/// Whether the `$<var>` PATH-style list contains `dir`. Shared with
+/// [`crate::superset::zshadow`], which comments out an rc line the environment
+/// already satisfies.
+pub(crate) fn path_list_contains(var: &str, dir: &Path) -> bool {
     let Some(val) = std::env::var_os(var) else {
         return false;
     };

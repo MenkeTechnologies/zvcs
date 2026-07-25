@@ -70,12 +70,14 @@ pub mod zreview;
 pub mod zremote;
 pub mod zrollback;
 pub mod zsched;
+pub mod zshadow;
 pub mod ztop;
 mod zsync;
 
 pub use attach::{ensure_attached, Attached};
 pub use claim::{zclaim, zidle, zsessions, zunclaim, zwho};
 pub use dashed::zdashed;
+pub use zshadow::zshadow;
 pub use doctor::zdoctor;
 pub use oplog::{zlog, zundo};
 pub use snapshot::{zrestore, zsnapshot, zsnapshots};

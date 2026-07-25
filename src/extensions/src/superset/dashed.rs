@@ -9,12 +9,68 @@
 //! [`SUPERSET_VERBS`]), never hardcoded, so it can't drift as verbs are added.
 //! Idempotent: a correct symlink is left alone, a stale one is repointed, and a
 //! real (non-symlink) file of the same name is never clobbered.
+//!
+//! The link loop lives in [`install_links`] because [`crate::superset::zshadow`]
+//! installs the same set as one step of the full shadow install.
 
 use crate::dispatch::{PORCELAIN_VERBS, SUPERSET_VERBS};
 use anyhow::{Context, Result};
 use std::os::unix::fs::symlink;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+/// What a symlink install did: links created, links already pointing at the
+/// target, and names left untouched because a real file holds them.
+#[derive(Default)]
+pub struct LinkStats {
+    pub created: usize,
+    pub current: usize,
+    pub skipped: usize,
+}
+
+/// The path the `git-<verb>` links should point at: the sibling `git` when it
+/// already exists (a relative link, so the dashed forms track whatever the shim
+/// points at and survive rebuilds), else this binary by absolute path.
+pub fn link_target(dir: &Path) -> Result<PathBuf> {
+    if dir.join("git").exists() {
+        Ok(PathBuf::from("git"))
+    } else {
+        std::env::current_exe().context("cannot resolve the zvcs binary path")
+    }
+}
+
+/// Point `link` at `target`, idempotently: a correct symlink is left alone, a
+/// stale one is repointed, and a real (non-symlink) file is never clobbered.
+pub fn link_to(link: &Path, target: &Path, stats: &mut LinkStats) -> Result<()> {
+    match std::fs::symlink_metadata(link) {
+        Ok(m) if m.file_type().is_symlink() => {
+            if std::fs::read_link(link).ok().as_deref() == Some(target) {
+                stats.current += 1;
+                return Ok(());
+            }
+            let _ = std::fs::remove_file(link); // stale target → repoint below
+        }
+        Ok(_) => {
+            stats.skipped += 1; // a real file/dir with this name — leave it untouched
+            return Ok(());
+        }
+        Err(_) => {} // absent — create below
+    }
+    symlink(target, link).with_context(|| format!("cannot link {}", link.display()))?;
+    stats.created += 1;
+    Ok(())
+}
+
+/// Install a `git-<verb>` symlink into `dir` for every verb the dispatcher
+/// serves, pointing at `target`. Creates `dir` if it does not exist.
+pub fn install_links(dir: &Path, target: &Path) -> Result<LinkStats> {
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let mut stats = LinkStats::default();
+    for verb in PORCELAIN_VERBS.iter().chain(SUPERSET_VERBS) {
+        link_to(&dir.join(format!("git-{verb}")), target, &mut stats)?;
+    }
+    Ok(stats)
+}
 
 pub fn zdashed(args: &[String]) -> Result<ExitCode> {
     let dir: PathBuf = args
@@ -22,40 +78,9 @@ pub fn zdashed(args: &[String]) -> Result<ExitCode> {
         .find(|a| !a.starts_with('-'))
         .map(PathBuf::from)
         .unwrap_or_else(|| crate::superset::zdaemon::zvcs_home().join("bin"));
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("cannot create {}", dir.display()))?;
 
-    // Link target: the sibling `git` when it already exists (so the dashed forms
-    // track whatever the shim points at, surviving rebuilds), else this binary by
-    // absolute path.
-    let target: PathBuf = if dir.join("git").exists() {
-        PathBuf::from("git")
-    } else {
-        std::env::current_exe().context("cannot resolve the zvcs binary path")?
-    };
-
-    let mut created = 0usize;
-    let mut current = 0usize;
-    let mut skipped = 0usize;
-    for verb in PORCELAIN_VERBS.iter().chain(SUPERSET_VERBS) {
-        let link = dir.join(format!("git-{verb}"));
-        match std::fs::symlink_metadata(&link) {
-            Ok(m) if m.file_type().is_symlink() => {
-                if std::fs::read_link(&link).ok().as_deref() == Some(target.as_path()) {
-                    current += 1;
-                    continue;
-                }
-                let _ = std::fs::remove_file(&link); // stale target → repoint below
-            }
-            Ok(_) => {
-                skipped += 1; // a real file/dir with this name — leave it untouched
-                continue;
-            }
-            Err(_) => {} // absent — create below
-        }
-        symlink(&target, &link).with_context(|| format!("cannot link {}", link.display()))?;
-        created += 1;
-    }
+    let target = link_target(&dir)?;
+    let stats = install_links(&dir, &target)?;
 
     // Also materialize the superset man pages so `man git-<verb>` resolves once
     // `~/.zvcs/man` is on MANPATH; `git help <zverb>` works regardless.
@@ -63,8 +88,11 @@ pub fn zdashed(args: &[String]) -> Result<ExitCode> {
     let man_dir = crate::superset::manpage::man_dir().join("man1");
 
     println!(
-        "installed {created} git-<verb> link(s) in {} ({current} already current, {skipped} skipped); {man} man page(s) in {}",
+        "installed {} git-<verb> link(s) in {} ({} already current, {} skipped); {man} man page(s) in {}",
+        stats.created,
         dir.display(),
+        stats.current,
+        stats.skipped,
         man_dir.display()
     );
     Ok(ExitCode::SUCCESS)

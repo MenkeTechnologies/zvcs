@@ -81,7 +81,7 @@
 
       <div class="stat-grid">
         <div class="stat-card"><div class="stat-val accent">git</div><div class="stat-label">the one binary, shadowed</div></div>
-        <div class="stat-card"><div class="stat-val">116</div><div class="stat-label">superset verbs</div></div>
+        <div class="stat-card"><div class="stat-val">117</div><div class="stat-label">superset verbs</div></div>
         <div class="stat-card"><div class="stat-val">181</div><div class="stat-label">git-compat verbs dispatched</div></div>
         <div class="stat-card"><div class="stat-val">v0.9.2</div><div class="stat-label">version</div></div>
         <div class="stat-card"><div class="stat-val">MIT</div><div class="stat-label">license · free / OSS</div></div>
@@ -99,7 +99,7 @@
       <section class="tutorial-section">
         <h2>Architecture</h2>
         <p>One dispatch table routes two namespaces; the execution path never leaves the process:</p>
-<pre>git &lt;subcommand&gt;  →  dispatch::run  ┬─  superset verbs (z*, 116)  →  daemon · queue · ledger · fleet
+<pre>git &lt;subcommand&gt;  →  dispatch::run  ┬─  superset verbs (z*, 117)  →  daemon · queue · ledger · fleet
                                     └─  git-compat porcelain (181) →  gitoxide (gix) library</pre>
         <div class="feature-grid">
           <div class="feature-card"><h4>No fork/exec</h4><p>Every subcommand runs in-process against the vendored <code>gix</code> crates. Unported subcommands error terse (zsh-style <code>zvcs: &lt;cmd&gt;: &lt;reason&gt;</code> on stderr) rather than falling through to stock git — this is a from-scratch engine, not a shim (<code>src/dispatch.rs</code>).</p></div>

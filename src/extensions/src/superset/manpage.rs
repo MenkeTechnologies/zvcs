@@ -256,6 +256,18 @@ pub const DOCS: &[Doc] = &[
         desc: &["The command-less form of ztrigger: it indexes DIR and turns on zvcs.autostatus so the daemon maintains DIR's cached status on every ref-change, without running any command. list and rm DIR manage watches."],
     },
     Doc {
+        verb: "zshadow",
+        summary: "install the ~/.zvcs shadow and print the shell lines for it",
+        synopsis: "git zshadow [<dir>] [-n|--print] [--all]",
+        desc: &[
+            "Sets up the whole shadow install in one command: a `git` symlink to this binary in <dir> (default ~/.zvcs/bin), a git-<verb> dashed link beside it for every verb the dispatcher serves, every superset man page under ~/.zvcs/man, and the zvcs-forked zsh completion as ~/.zvcs/completions/_git. The completion is compiled into the binary, so nothing is needed from the source tree.",
+            "stdout carries shell code only \\(em the export PATH line for the bin directory, the export MANPATH line for the man directory, and the fpath line for the completion directory \\(em so `eval \"$(git zshadow)\"` sets the current shell up and the same lines paste into ~/.zshrc. The install summary goes to stderr, where an eval leaves it alone.",
+            "A PATH or MANPATH line the environment already satisfies is printed commented out, so re-evaluating never duplicates an entry and the line is still visible to uncomment when pasting into an rc file; --all prints every line uncommented. fpath is a zsh variable rather than an exported one, so it cannot be inspected from here and its line is always live \\(em put it before compinit, and `typeset -U fpath` keeps repeats harmless.",
+            "-n (--print) prints the lines without installing anything. Paths under $HOME are written as $HOME/... so the lines are portable across machines.",
+            "Idempotent: a correct symlink is left alone, a stale one is repointed, a real file of the same name is never clobbered, and the completion is rewritten only when its content differs.",
+        ],
+    },
+    Doc {
         verb: "zdashed",
         summary: "install git-<verb> symlinks and man pages",
         synopsis: "git zdashed [<dir>]",

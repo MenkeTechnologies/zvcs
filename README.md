@@ -86,6 +86,17 @@ export PATH="$PWD/target/debug:$PATH"
 git rev-parse HEAD
 ```
 
+`git zshadow` then installs the permanent shadow — a `git` symlink and the
+`git-<verb>` dashed links in `~/.zvcs/bin`, every man page in `~/.zvcs/man`, and
+the forked zsh `_git` in `~/.zvcs/completions` — and prints the three shell lines
+that activate them (stdout is shell code only; the summary goes to stderr):
+
+```sh
+git zshadow                 # install, then print the lines
+eval "$(git zshadow)"       # …and apply them to this shell
+git zshadow --print --all   # print without installing (to paste into ~/.zshrc)
+```
+
 The workspace has two members-by-convention: `src/ported` (the vendored gitoxide
 crates, a self-contained workspace excluded from the root) is consumed by
 `src/extensions` (the zvcs crate) as a path dependency. `gix` is built with the
@@ -140,7 +151,8 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Console | `zrepl` | interactive line console over **every** command — each line runs as `git <line>`, so the `z*` verbs and all git porcelain work alike (startup stats banner + Tab completion of every verb) |
 | Shell | `zcd` `zpwd` `zls` `zenv` `zunset` `zecho` `zmkdir` `ztouch` `zrm` `zcp` `zmv` `zcat` `zln` | shell builtins so `zrepl` drives like a shell — `zcd`/`zenv`/`zunset` mutate the console's cwd/environment and persist across lines; `zls` is a git-aware listing (per-file status like `eza --git`); `zmkdir`/`ztouch`/`zrm`/`zcp`/`zmv`/`zcat`/`zln` are native filesystem commands (`zrm`/`zmv` are on-disk, distinct from `git rm`/`git mv`) |
 | Discovery | `zverbs` | list every extension verb and its one-line usage (sourced from each verb's own `-h`) |
-| Health | `zdoctor` | environment health check — git shadow on PATH, daemon, ledger, man pages, MANPATH, dashed forms (OK/WARN/FAIL, exits non-zero on FAIL) |
+| Setup | `zshadow [<dir>] [-n\|--print] [--all]` | install the whole `~/.zvcs` shadow — `git` shim + `git-<verb>` dashed links in `~/.zvcs/bin`, man pages in `~/.zvcs/man`, the forked zsh `_git` in `~/.zvcs/completions` — then print the `PATH`, `MANPATH`, and `fpath` lines on stdout (shell code only, so `eval "$(git zshadow)"` works; a line the environment already satisfies is printed commented out) |
+| Health | `zdoctor` | environment health check — git shadow on PATH, daemon, ledger, man pages, MANPATH, dashed forms, installed completion (OK/WARN/FAIL, exits non-zero on FAIL) |
 | git-compat | every stock subcommand | dispatched natively; depth varies — see the parity report |
 
 **Scripting output.** Every read verb — the query, analytics, discovery, and
@@ -165,7 +177,8 @@ through `git fuzzy helper` on every keystroke). The binary also honors dashed
 invocation: run as `git-<verb>` it strips the prefix from argv[0] and dispatches
 `<verb>`. `git zdashed [<dir>]` installs a `git-<verb>` symlink for every verb
 into `<dir>` (default `~/.zvcs/bin`), so the dashed forms exist once stock git is
-removed. Verbs come from the dispatch tables, so the set never drifts.
+removed (`git zshadow` does the same as one step of the full install). Verbs come
+from the dispatch tables, so the set never drifts.
 
 Run the harness to see current depth per subcommand:
 
@@ -303,8 +316,9 @@ usage (each verb also answers `-h` with the same line). `git help <zverb>` opens
 a full man page — the pages are generated from a table in
 `src/extensions/src/superset/manpage.rs` (one source of truth, covering every
 verb in `SUPERSET_VERBS`), written on demand under `~/.zvcs/man` and opened with
-`man -M`, so it works with no setup. `git zdashed` writes them all up front, so
-`man git-<verb>` resolves once `~/.zvcs/man` is on `MANPATH`:
+`man -M`, so it works with no setup. `git zshadow` (or `git zdashed`) writes them
+all up front, so `man git-<verb>` resolves once `~/.zvcs/man` is on `MANPATH` —
+the line `zshadow` prints:
 
 ```sh
 export MANPATH="$HOME/.zvcs/man:$MANPATH"
@@ -547,7 +561,7 @@ in 0.63 s).
 
 - **Docs hub** — <https://menketechnologies.github.io/zvcs/>
 - **Design document** — [DESIGN.md](DESIGN.md) — daemon architecture, concurrency model, autonomous behaviors, ledger/queue
-- **zsh completion** — [completions/_git](completions/_git) — the stock zsh `_git` forked with the `z*` verbs; put the dir first on `fpath` to shadow the system `_git`
+- **zsh completion** — [completions/_git](completions/_git) — the stock zsh `_git` forked with the `z*` verbs; put the dir first on `fpath` to shadow the system `_git`. It is compiled into the binary, so `git zshadow` installs it as `~/.zvcs/completions/_git` and prints the `fpath` line for it (put that line before `compinit`)
 - **Performance architecture** — <https://menketechnologies.github.io/zvcs/#performance> — diagrams of how the speedup is achieved: the worker pool over work git does single-threaded, the pickaxe rewrite, the ledger of never-stale values, daemon precompute, and the off-critical-path write queue
 - **Verb reference** — <https://menketechnologies.github.io/zvcs/reference.html> — every superset (`z*`) verb with its synopsis and manual text; the same content `git help <verb>` opens in a terminal. Generated by `perl scripts/gen_reference.pl` from `src/extensions/src/superset/manpage.rs`, so the page can never drift from the man pages; `--check` fails if it is stale.
 - **Engineering report** — <https://menketechnologies.github.io/zvcs/report.html>

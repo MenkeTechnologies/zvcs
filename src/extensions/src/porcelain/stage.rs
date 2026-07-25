@@ -6,6 +6,7 @@
 //! git-add(1)"), so the semantics below are `git add`'s semantics.
 //!
 //! Supported forms:
+//! ```text
 //!   * `git stage <pathspec>...`   — stage files/dirs (recurses, honors `.gitignore`)
 //!   * `-A`/`--all`/`--no-ignore-removal`   — adds, modifications *and* deletions
 //!   * `--no-all`/`--ignore-removal`        — adds and modifications, no deletions
@@ -20,8 +21,10 @@
 //!   * `-n/--dry-run`, `-v/--verbose`, `-f/--force`, `--sparse/--no-sparse`, `--`
 //!   * `--warn-embedded-repo`/`--no-warn-embedded-repo` — accepted no-op: the
 //!     embedded-repo warning is moot since gitlinks are never staged here
+//! ```
 //!
 //! Deviations (bailed or noted, never faked):
+//! ```text
 //!   * `.gitattributes` content filters (autocrlf, `clean`/`smudge`) are NOT
 //!     applied — the blob is the verbatim worktree bytes. `--renormalize` exists
 //!     only to re-run those filters, so it is rejected outright whenever the repo
@@ -39,6 +42,7 @@
 //!     normally; only `--no-auto-advance` triggers the fatal.
 //!   * pathspecs are resolved relative to the repository root, not to the current
 //!     working directory's prefix.
+//! ```
 //!
 //! NOTE: this module currently duplicates the staging engine that [`add`](super::add)
 //! also carries. The two should be hoisted into one shared engine that both verbs
@@ -404,9 +408,11 @@ fn unquote_c_style(line: &[u8]) -> Option<String> {
 /// `option `<name>'` wording; `value` is `None` when the option carried no argument.
 ///
 /// git's own error text differs by failure kind (verified against git 2.55.0):
+/// ```text
 ///   * no argument             -> `<label> requires a value`
 ///   * present but empty        -> `<label> expects a numerical value`
 ///   * non-empty, not a number  -> `<label> expects an integer value with an optional k/m/g suffix`
+/// ```
 /// A value error is printed alone — it carries no usage block.
 fn check_magnitude(value: Option<&str>, short: bool, name: &str) -> std::result::Result<(), ExitCode> {
     let label = if short {

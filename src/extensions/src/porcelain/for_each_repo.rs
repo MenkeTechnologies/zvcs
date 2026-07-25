@@ -6,21 +6,25 @@
 //! the work is config lookup plus a subprocess per repository.
 //!
 //! Ported flags — the complete option table:
+//! ```text
 //!   * `--config=<key>` / `--config <key>` — the multi-valued config variable
 //!     holding the repository paths. `--no-config` clears it again.
 //!   * `--keep-going` / `--no-keep-going` — keep iterating after a failing
 //!     repository; the overall exit code is then 1, never the child's code.
 //!   * `--` — stop option parsing.
 //!   * `-h` — the usage block on stdout, exit 129.
+//! ```
 //!
 //! Option parsing reproduces `parse_options` with `PARSE_OPT_STOP_AT_NON_OPTION`:
 //! the first non-option argument ends option parsing, so everything from there on
 //! (including things that look like flags) is handed to the child untouched.
 //! Unique-prefix abbreviations (`--conf=x`, `--keep`) are accepted as git accepts
 //! them, and the diagnostics match byte-for-byte:
+//! ```text
 //!   * `error: unknown option \`bogus'` / `error: unknown switch \`x'`
 //!   * `error: option \`config' requires a value`
 //!   * `error: option \`keep-going' takes no value`
+//! ```
 //!   all followed by the usage block on stderr, exit 129.
 //!
 //! Config handling mirrors `repo_config_get_string_multi`:

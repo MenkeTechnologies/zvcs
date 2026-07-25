@@ -5,8 +5,8 @@
 //! which are left behind whenever the run stops — here on an empty patch
 //! (`Patch is empty.`, exit 128) — and are therefore directly observable.
 //!
-//! These tests pin zvcs to stock git byte-for-byte (stdout + stderr + exit code
-//! + the two state files + whether a session directory survives) across the
+//! These tests pin zvcs to stock git byte-for-byte (stdout, stderr, exit code,
+//! the two state files, and whether a session directory survives) across the
 //! config default, a CLI override of that default, a CLI-only value, and a
 //! malformed boolean (git's exact `git_config_bool` fatal at config-read time,
 //! before any session is created).

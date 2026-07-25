@@ -2,6 +2,7 @@
 //! vendored gitoxide crates so tools on PATH see the same staged index.
 //!
 //! Supported forms (the dominant `git add` invocations):
+//! ```text
 //!   * `git add <pathspec>...`  — stage files/dirs (recurses, honors `.gitignore`)
 //!   * `git add .`              — stage everything under the current prefix
 //!   * `git add -A|--all`       — stage the whole worktree (adds, mods, deletes)
@@ -22,6 +23,7 @@
 //!     `--warn-embedded-repo`/`--no-warn-embedded-repo` (accepted no-op: the
 //!     embedded-repo warning is moot since untracked embedded repos are never
 //!     staged here — only *tracked* submodule gitlinks are updated)
+//! ```
 //!
 //! For each matched worktree file the blob is hashed into the object database and
 //! its index entry is (re)written with the current mode and filesystem stat.
@@ -30,6 +32,7 @@
 //! are collapsed to the freshly-staged stage-0 entry.
 //!
 //! Deviations (bailed or noted, never faked):
+//! ```text
 //!   * `.gitattributes` content filters (autocrlf, `clean`/`smudge`) are NOT
 //!     applied — the blob is the verbatim worktree bytes. `--renormalize` therefore
 //!     re-stages current bytes without re-running EOL filters.
@@ -43,6 +46,7 @@
 //!     never entered here — git's `fatal: the option '<x>' requires
 //!     '--interactive/--patch'` (exit 128) is reproduced. A bare `--auto-advance`
 //!     is the default and stages normally; only `--no-auto-advance` triggers it.
+//! ```
 
 use anyhow::{bail, Result};
 use std::collections::HashSet;
@@ -803,9 +807,11 @@ fn os_err_message(e: &std::io::Error) -> String {
 /// wording. `value` is `None` when the option was given with no argument at all.
 ///
 /// git's own error text differs by failure kind (verified against git 2.55.0):
+/// ```text
 ///   * no argument            -> `<label> requires a value`
 ///   * present but empty       -> `<label> expects a numerical value`
 ///   * non-empty, not a number -> `<label> expects an integer value with an optional k/m/g suffix`
+/// ```
 /// These lines are printed alone — a value error carries no usage block.
 fn check_magnitude(value: Option<&str>, short: bool, name: &str) -> std::result::Result<(), ExitCode> {
     let label = if short {

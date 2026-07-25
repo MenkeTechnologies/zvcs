@@ -4,6 +4,7 @@
 //! `notify` fires on changes under each watched path; the daemon reacts. Three
 //! kinds of reaction, fired the instant an event arrives (no debounce):
 //!
+//! ```text
 //!   * **directory triggers** (`git ztrigger <DIR> <cmd>`) — the general case:
 //!     watch ANY directory recursively (repo or not) and run its command on any
 //!     file change. Stored in the `triggers` table, keyed by path.
@@ -13,6 +14,7 @@
 //!   * **autonomy** (working tree) — attach detached submodules, fetch-free
 //!     reconcile, forward-only autobump, when `[zvcs]` autonomy is enabled. Keyed
 //!     off ref moves, so those repos watch only the `refs/`+`logs/` trees.
+//! ```
 //!
 //! Reconcile here is the fetch-free [`reconcile_repo_local`] fast-forward to
 //! whatever `origin/main` a prior local pull already fetched; the daemon never
@@ -258,6 +260,7 @@ fn collect(ev: &notify::Result<Event>, targets: &[Target], affected: &mut HashSe
 ///   2. working-repo **submodules** — only when autonomy is on (keyed off their
 ///      HEAD moves).
 ///   3. **all** indexed repos — only when `autostatus` needs per-repo status.
+///
 /// Deduped by git dir (armed wins) and capped at [`MAX_WATCHED`].
 fn build_targets(cfg: &ZvcsConfig) -> Vec<Target> {
     let mut seen: HashSet<PathBuf> = HashSet::new();

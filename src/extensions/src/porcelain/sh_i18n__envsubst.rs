@@ -10,6 +10,7 @@
 //!
 //! Interface (there are no options; every argument is data):
 //!
+//! ```text
 //!   * no arguments        → `error: we won't substitute all variables on stdin
 //!                           for you`, stdin is *not* read, nothing is written
 //!                           to stdout. Upstream's `all_variables` path is
@@ -25,6 +26,7 @@
 //!                           first argument must be --variables when two are
 //!                           given` — that non-fatal fall-through is preserved.
 //!   * three or more       → `error: too many arguments`, no other output.
+//! ```
 //!
 //! Every one of those paths exits 0: upstream calls git's `error()`, which
 //! returns rather than exiting, and `cmd_main` ends in `return EXIT_SUCCESS`.

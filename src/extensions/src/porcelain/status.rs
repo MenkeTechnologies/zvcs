@@ -52,6 +52,7 @@ enum Untracked {
 /// into a single iterator. From those items we reconstruct git's own output.
 ///
 /// Supported invocations (output byte-for-byte matches stock `git status`):
+/// ```text
 ///   * `git status`                      — default long format.
 ///   * `git status -s|--short`           — short format.
 ///   * `git status --porcelain[=v1]`     — porcelain v1.
@@ -86,6 +87,7 @@ enum Untracked {
 ///     porcelain / v2 keeps its format) and turns off the deferred `status.*`
 ///     config inheritance. Output is uncolored (git only colors `-z` under a
 ///     forced color, which is not a real workflow).
+/// ```
 ///
 /// Faithfully unsupported cases `bail!` with a precise reason rather than
 /// emitting wrong output: intent-to-add entries.

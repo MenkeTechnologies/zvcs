@@ -4,6 +4,7 @@
 //! What *is* covered is the part of stock `http-push` that runs before it opens
 //! a connection, and only because those paths are byte-verifiable without a
 //! server:
+//! ```text
 //!   * the argument scanner from `http-push.c`'s `main` loop, including its two
 //!     quirks — an *unrecognised* `-…` argument is not an error but falls
 //!     through to become the `<remote>` URL, and option scanning stops at the
@@ -12,6 +13,7 @@
 //!     line, on **stderr**, exit 129
 //!   * the `-d`/`-D` arity check → `fatal: You must specify only one branch name
 //!     when deleting a remote branch`, exit 128
+//! ```
 //! (all checked against git 2.55.0 by running the stock binary.)
 //!
 //! Everything else bails, naming the substrate that is missing. It is

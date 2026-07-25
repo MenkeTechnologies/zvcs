@@ -3,6 +3,7 @@
 //!
 //! What *is* covered is the complete argument surface, and only because those
 //! paths are byte-verifiable without opening a connection:
+//! ```text
 //!   * `-h` → git's 1472-byte usage block on stdout, exit 129
 //!   * git's parse-options behaviour for every option in the table, including
 //!     unambiguous long-option abbreviation (`--sign` → `--signed`), `--no-`
@@ -19,6 +20,7 @@
 //!   * the two post-parse usage checks: a missing `<directory>`, and git's
 //!     rule that `--all` and `--mirror` are mutually exclusive and that neither
 //!     may be combined with explicit `<ref>` arguments
+//! ```
 //! (all checked against git 2.55.0.)
 //!
 //! Everything else — i.e. `send-pack` actually pushing — bails, naming the

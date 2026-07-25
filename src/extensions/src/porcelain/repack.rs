@@ -28,6 +28,7 @@
 //!
 //! Covered because these paths are byte-verifiable without touching the object
 //! database:
+//! ```text
 //!   * `-h` → git's 2699-byte usage block on stdout, exit 129
 //!   * git's parse-options behaviour for every option in the table, including
 //!     unambiguous long-option abbreviation (`--qui` → `--quiet`), `--no-`
@@ -48,10 +49,12 @@
 //!     vs. `-a`/`-A`, incremental-with-bitmaps, `--filter-to` without
 //!     `--filter`, and — last of the five — `invalid --name-hash-version
 //!     option: <n>` for any version above 2
+//! ```
 //! (all checked against git 2.55.0.)
 //!
 //! # What repacking does here
 //!
+//! ```text
 //!   * **The object set** is git's `--all --reflog --indexed-objects`: the
 //!     closure over every ref, `HEAD`, every reflog entry, and the index (its
 //!     blobs at every stage plus the cache-tree), which is exactly the seed
@@ -82,9 +85,11 @@
 //!     traversal, which the index objects are then unioned back into — the model
 //!     git's own output confirms (on the `branched` fixture, `blob:none` yields
 //!     11 of 13 objects: 13 less 4 blobs, plus the 2 blobs the index holds).
+//! ```
 //!
 //! # Deliberate gaps, so this doc claims no more than the code does
 //!
+//! ```text
 //!   * **`-b`/`--write-bitmap-index`** writes no `.bitmap`: that needs an EWAH
 //!     bitmap writer, and `gix-bitmap` is a read-only decoder. The flag is
 //!     accepted and its pre-flight conflict check still fires.
@@ -122,6 +127,7 @@
 //!     128) while this reports the integer (exit 129). The mechanism behind
 //!     that inversion was not identified, and the ordering is otherwise
 //!     positional, so the positional behaviour is what is implemented.
+//! ```
 
 use anyhow::{bail, Result};
 use std::convert::Infallible;

@@ -37,6 +37,7 @@ use std::process::ExitCode;
 ///                                         suffixed with `:<path>`
 ///   * `--broken[=<mark>]`               — accepted; the mark is only appended when the
 ///                                         worktree diff itself fails, which cannot happen here
+/// ```
 ///
 /// `--match`/`--exclude` are ports of `builtin/describe.c:get_name()`: the candidate
 /// `name_by_oid` map is built here from the repo's refs filtered by `wildmatch`, then
@@ -1059,6 +1060,7 @@ fn prefixed_name(repo: &gix::Repository, short: &BStr) -> Option<BString> {
 /// 32-bit `int`.
 ///
 /// Faithful to `parse_opt_abbrev_cb` in git's `parse-options-cb.c`:
+/// ```text
 ///   * optional leading whitespace, then an optional `+`/`-`, then decimal digits;
 ///   * `None` (git's `error: … expects a numerical value`, exit 129) is returned
 ///     only when no digit is consumed or non-digit bytes trail the number
@@ -1069,6 +1071,7 @@ fn prefixed_name(repo: &gix::Repository, short: &BStr) -> Option<BString> {
 ///     low 32 bits (`i64 as i32`), so `99…9` -> -1, `2^32` -> 0, `2^32+4` -> 4 —
 ///     matching git bit-for-bit. The caller stores this and lets `hex_len` apply
 ///     git's later `MINIMUM_ABBREV`/`hexsz` clamp.
+/// ```
 fn parse_c_int(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     let mut i = 0;

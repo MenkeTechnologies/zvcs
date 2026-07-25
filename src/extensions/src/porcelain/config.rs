@@ -846,12 +846,14 @@ fn write_scoped(target: &WriteTarget, name: &str, value: &str, op: WriteOp) -> R
 /// inverts the match, matching against the value text as bytes, unanchored —
 /// git's `regexec`). The outcomes mirror stock git exactly:
 ///
+/// ```text
 ///   * no value matches   → append `<value>` as a new line (exit 0)
 ///   * exactly one matches → rewrite that value in place (exit 0)
 ///   * more than one       → without `--replace-all` git refuses: it prints
 ///                           `warning: <key> has multiple values` on stderr,
 ///                           leaves the file untouched, and exits 5
 ///   * invalid ERE         → `error: invalid pattern: <pattern>`, exit 6
+/// ```
 fn set_with_value_pattern(
     target: &WriteTarget,
     name: &str,

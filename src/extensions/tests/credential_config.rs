@@ -3,6 +3,7 @@
 //! a direct read of `credential.protectProtocol`. These tests pin the keys that
 //! actually drive a code path in `credential.rs` to stock git byte-for-byte:
 //!
+//! ```text
 //!   * `credential.useHttpPath`        — whether an http(s) path stays part of
 //!                                        the credential context (and so whether
 //!                                        `fill` echoes it back).
@@ -15,6 +16,7 @@
 //!   * `credential.protectProtocol`    — on by default, so a carriage return in a
 //!                                        credential value is a fatal protocol
 //!                                        smuggling attempt.
+//! ```
 //!
 //! Every case is exercised with a fake inline helper (`credential.helper='!f() {
 //! echo username=u; echo password=p; }; f'`) so nothing touches the network or an

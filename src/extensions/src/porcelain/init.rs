@@ -429,7 +429,7 @@ fn relocate_git_dir(src: &Path, target: &Path, real: &str) -> Result<PathBuf> {
 }
 
 /// Seed `git_dir` from the template at `template`. Ports git's `copy_templates`
-/// + `copy_templates_1`: entries whose name starts with `.` are skipped,
+/// and `copy_templates_1`: entries whose name starts with `.` are skipped,
 /// directories are merged, existing files are left untouched, symlinks are
 /// recreated, and regular files are copied preserving their source mode.
 ///

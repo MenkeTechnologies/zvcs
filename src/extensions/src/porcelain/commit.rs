@@ -44,10 +44,15 @@ use gix::ObjectId;
 /// and `--fixup <commit>` (including `--fixup=amend:<commit>`) build git's
 /// autosquash-formatted message from the referenced commit.
 ///
+/// `git commit [--only|-o] <paths>` (the default when paths are given) records a
+/// pathspec-limited commit: the tree is HEAD's tree with only the listed paths
+/// taken from the worktree, other paths' staged changes disregarded, and the same
+/// paths are then staged into the real index. `-a` together with paths is refused,
+/// and `--amend` with paths is allowed.
+///
 /// Options still not backed (`-p`/`--patch`, `-S`/`--gpg-sign`, `--fixup=reword:`,
-/// `-e`/`--edit`, `-t`/`--template`, `--cleanup`, `--dry-run`, `--porcelain`,
-/// pathspec-limited commits, …) fail with a precise message rather than silently
-/// doing the wrong thing.
+/// `-e`/`--edit`, `-t`/`--template`, `--cleanup`, `--dry-run`, `--porcelain`, …)
+/// fail with a precise message rather than silently doing the wrong thing.
 pub fn commit(args: &[String]) -> Result<ExitCode> {
     // --- argument parsing ------------------------------------------------
     let mut messages: Vec<String> = Vec::new();
@@ -72,10 +77,20 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut signoff = false;
     let mut squash_arg: Option<String> = None;
     let mut fixup_arg: Option<String> = None;
+    // Pathspec-limited (git's default `--only`/`-o`) mode: the trailing `<paths>`
+    // (bare positionals and everything after `--`). When any are given, the commit
+    // tree is HEAD's tree with only these paths replaced by their worktree content.
+    let mut pathspecs: Vec<String> = Vec::new();
+    let mut positional_only = false;
 
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
+        if positional_only {
+            pathspecs.push(args[i].clone());
+            i += 1;
+            continue;
+        }
         match a {
             "-m" | "--message" => {
                 i += 1;
@@ -156,11 +171,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             // `-v`/`--verbose` shows the diff in the commit-message editor; the
             // recorded commit is identical, so it is accepted (a no-op for `-m`).
             "-v" | "--verbose" => {}
-            "--" => {
-                if i + 1 < args.len() {
-                    anyhow::bail!("pathspec-limited commits are not supported");
-                }
-            }
+            // Everything after `--` is a pathspec, even if it looks like a flag.
+            "--" => positional_only = true,
             "--amend" => amend = true,
             "--no-edit" => no_edit = true,
             "--reset-author" => reset_author = true,
@@ -220,10 +232,19 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-            _ => anyhow::bail!("pathspec-limited commits are not supported"),
+            // A bare positional argument is a pathspec (git's `--only` mode).
+            _ => pathspecs.push(args[i].clone()),
         }
         i += 1;
     }
+
+    // `git commit -a <paths>` is rejected outright, exactly as git does.
+    if all && !pathspecs.is_empty() {
+        anyhow::bail!("paths '{} ...' with -a does not make sense", pathspecs[0]);
+    }
+    // Pathspec-limited ("only") mode: build the commit tree from HEAD's tree with
+    // only the listed paths taken from the worktree.
+    let only_mode = !pathspecs.is_empty();
 
     // `-F <file>` (repeatable) supplies the message from a file, joined with any
     // `-m` blocks in the order given; `-` reads stdin. Read here so it feeds the
@@ -420,27 +441,35 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // feature, so the editor is constructed directly over the public object
     // database handle instead. With no index (fresh repo) the editor stays empty
     // and writes the empty tree.
-    let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
-    // Snapshot (path, mode, id) per staged file for the summary/short-stat below.
-    let mut new_entries: Vec<(BString, EntryMode, ObjectId)> = Vec::new();
-    if let Some(index) = &index {
-        let backing = index.path_backing();
-        new_entries.reserve(index.entries().len());
-        for entry in index.entries() {
-            let path = entry.path_in(backing);
-            let mode = entry
-                .mode
-                .to_tree_entry_mode()
-                .ok_or_else(|| anyhow::anyhow!("index entry `{path}` has an unrepresentable mode"))?;
-            editor.upsert(
-                path.split(|&b| b == b'/').map(|c| c.as_bstr()),
-                mode.kind(),
-                entry.id,
-            )?;
-            new_entries.push((path.to_owned(), mode, entry.id));
+    //
+    // In pathspec-limited ("only") mode the tree comes from HEAD's tree with only
+    // the listed paths swapped for their worktree content instead — see
+    // `build_only_mode_tree`, which also stages those paths into the real index.
+    let (tree_id, new_entries): (ObjectId, Vec<(BString, EntryMode, ObjectId)>) = if only_mode {
+        build_only_mode_tree(&repo, &pathspecs)?
+    } else {
+        let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
+        // Snapshot (path, mode, id) per staged file for the summary/short-stat below.
+        let mut new_entries: Vec<(BString, EntryMode, ObjectId)> = Vec::new();
+        if let Some(index) = &index {
+            let backing = index.path_backing();
+            new_entries.reserve(index.entries().len());
+            for entry in index.entries() {
+                let path = entry.path_in(backing);
+                let mode = entry.mode.to_tree_entry_mode().ok_or_else(|| {
+                    anyhow::anyhow!("index entry `{path}` has an unrepresentable mode")
+                })?;
+                editor.upsert(
+                    path.split(|&b| b == b'/').map(|c| c.as_bstr()),
+                    mode.kind(),
+                    entry.id,
+                )?;
+                new_entries.push((path.to_owned(), mode, entry.id));
+            }
         }
-    }
-    let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
+        let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
+        (tree_id, new_entries)
+    };
 
     // --- parents ---------------------------------------------------------
     // `--amend` replaces HEAD: the new commit takes HEAD's *parents*, and the
@@ -780,6 +809,217 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// `git commit <pathspec>...` — git's default `--only`/`-o` mode.
+///
+/// The commit tree is HEAD's tree with only the matched pathspec paths replaced
+/// by their WORKING-TREE content: a present file is added/modified, a tracked
+/// path whose worktree file is gone is deleted, and every other path keeps its
+/// HEAD version — so any staged (index) changes to *other* paths are disregarded.
+/// After the tree is built the same matched paths are staged into the real
+/// on-disk index (leaving unrelated index entries untouched) so later commits see
+/// them. Returns `(tree_id, new_entries)` for the caller's summary/short-stat.
+///
+/// A pathspec matches a path when the path equals it or lives under `<spec>/`;
+/// literal files and directory prefixes are supported, as are the worktree globs
+/// the dirwalk resolves. Blob hashing and mode detection mirror `git add`.
+/// A staged-entry snapshot for the commit summary: (repo-relative path, mode, id).
+type StagedEntry = (BString, EntryMode, ObjectId);
+
+fn build_only_mode_tree(
+    repo: &gix::Repository,
+    pathspecs: &[String],
+) -> Result<(ObjectId, Vec<StagedEntry>)> {
+    if repo.workdir().is_none() {
+        anyhow::bail!("this operation must be run in a work tree");
+    }
+
+    // HEAD's tree — a pathspec-limited commit needs a prior commit to build upon.
+    let head_commit = repo
+        .head()?
+        .try_peel_to_id()?
+        .ok_or_else(|| {
+            anyhow::anyhow!("cannot do a pathspec-limited commit on an unborn branch (no HEAD)")
+        })?
+        .detach();
+    let head_tree_id = repo.find_commit(head_commit)?.tree_id()?.detach();
+
+    // Temp index seeded from HEAD's tree: the base the commit tree is built from,
+    // so unrelated staged changes in the real index are disregarded.
+    let mut temp = repo.index_from_tree(&head_tree_id)?;
+
+    // HEAD-tracked paths (path -> (id, mode)) for modification/deletion decisions.
+    let tracked: HashMap<BString, (ObjectId, Mode)> = {
+        let backing = temp.path_backing();
+        temp.entries()
+            .iter()
+            .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode)))
+            .collect()
+    };
+
+    // Walk the worktree for files matching the pathspecs (mirrors `git add`).
+    let patterns: Vec<BString> = pathspecs
+        .iter()
+        .map(|s| BString::from(s.clone().into_bytes()))
+        .collect();
+    let options = repo
+        .dirwalk_options()?
+        .emit_tracked(true)
+        .emit_ignored(Some(gix::dir::walk::EmissionMode::Matching));
+    let dirwalk_index = repo.index_or_load_from_head_or_empty()?;
+    let mut iter = repo.dirwalk_iter(dirwalk_index, patterns, Default::default(), options)?;
+
+    struct Staged {
+        path: BString,
+        id: ObjectId,
+        mode: Mode,
+        stat: Stat,
+    }
+    let mut staged: Vec<Staged> = Vec::new();
+    let mut staged_set: HashSet<BString> = HashSet::new();
+
+    for item in iter.by_ref() {
+        let entry = item?.entry;
+        // Only regular files and symlinks carry stageable content.
+        match entry.disk_kind {
+            Some(gix::dir::entry::Kind::File) | Some(gix::dir::entry::Kind::Symlink) => {}
+            _ => continue,
+        }
+        let path = entry.rela_path;
+        let already_tracked = tracked.contains_key(&path);
+        // An ignored, untracked path is not committed (a tracked-but-ignored path
+        // is still restaged); no `-f` exists on `git commit`.
+        if matches!(entry.status, gix::dir::entry::Status::Ignored(_)) && !already_tracked {
+            continue;
+        }
+        let Some(abs) = repo.workdir_path(&path) else {
+            continue;
+        };
+        let md = gix::index::fs::Metadata::from_path_no_follow(&abs)?;
+        // A tracked path replaced by a directory is not stageable content.
+        if md.is_dir() {
+            continue;
+        }
+        let (bytes, mode) = if md.is_symlink() {
+            let target = std::fs::read_link(&abs)?;
+            #[cfg(unix)]
+            let bytes = {
+                use std::os::unix::ffi::OsStrExt;
+                target.as_os_str().as_bytes().to_vec()
+            };
+            #[cfg(not(unix))]
+            let bytes = target.to_string_lossy().into_owned().into_bytes();
+            (bytes, Mode::SYMLINK)
+        } else {
+            let bytes = std::fs::read(&abs)?;
+            let mode = if md.is_executable() {
+                Mode::FILE_EXECUTABLE
+            } else {
+                Mode::FILE
+            };
+            (bytes, mode)
+        };
+        let id = repo.write_blob(&bytes)?.detach();
+        staged_set.insert(path.clone());
+        staged.push(Staged { path, id, mode, stat: Stat::from_fs(&md)? });
+    }
+
+    // Recover the pathspec matcher (used to decide deletions) from the walk.
+    let mut pathspec = match iter.into_outcome() {
+        Some(outcome) => outcome.pathspec,
+        None => anyhow::bail!("directory walk did not complete"),
+    };
+
+    // Deletions: tracked paths matched by the pathspec whose worktree file is gone.
+    let mut deletions: Vec<BString> = Vec::new();
+    for path in tracked.keys() {
+        if staged_set.contains(path) || !pathspec.is_included(path.as_bstr(), Some(false)) {
+            continue;
+        }
+        let gone = match repo.workdir_path(path.as_bstr()) {
+            Some(p) => std::fs::symlink_metadata(p).is_err(),
+            None => true,
+        };
+        if gone {
+            deletions.push(path.clone());
+        }
+    }
+
+    // Each explicit (non-magic, non-glob) pathspec must match something, exactly
+    // as git's `pathspec '<x>' did not match any files`. A tracked path that is
+    // present but unchanged still counts as a match (its tree entry is untouched).
+    for p in pathspecs {
+        if p == "." || p.starts_with(':') || p.contains(['*', '?', '[']) {
+            continue;
+        }
+        let pb = p.as_bytes();
+        let mut prefix = pb.to_vec();
+        prefix.push(b'/');
+        let matched = staged_set
+            .iter()
+            .chain(deletions.iter())
+            .chain(tracked.keys())
+            .any(|x| x.as_slice() == pb || x.as_slice().starts_with(&prefix));
+        if !matched {
+            anyhow::bail!("pathspec '{p}' did not match any files");
+        }
+    }
+
+    // Apply the staged/deleted paths to both the temp index (→ commit tree) and
+    // the real on-disk index (→ visible to later commits). The tree-cache is
+    // dropped from each so a stale subtree cannot be captured.
+    let remove: HashSet<BString> = staged
+        .iter()
+        .map(|s| s.path.clone())
+        .chain(deletions.iter().cloned())
+        .collect();
+
+    temp.remove_entries(|_, path, _| remove.contains(&path.to_owned()));
+    for s in &staged {
+        temp.dangerously_push_entry(s.stat, s.id, Flags::empty(), s.mode, s.path.as_ref());
+    }
+    temp.sort_entries();
+    temp.remove_tree();
+
+    // Build the commit tree from the temp index.
+    let hash = repo.object_hash();
+    let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
+    let mut new_entries: Vec<(BString, EntryMode, ObjectId)> = Vec::new();
+    {
+        let backing = temp.path_backing();
+        new_entries.reserve(temp.entries().len());
+        for entry in temp.entries() {
+            let path = entry.path_in(backing);
+            let mode = entry
+                .mode
+                .to_tree_entry_mode()
+                .ok_or_else(|| anyhow::anyhow!("index entry `{path}` has an unrepresentable mode"))?;
+            editor.upsert(
+                path.split(|&b| b == b'/').map(|c| c.as_bstr()),
+                mode.kind(),
+                entry.id,
+            )?;
+            new_entries.push((path.to_owned(), mode, entry.id));
+        }
+    }
+    let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
+
+    // Stage the same paths into the REAL on-disk index, leaving all other entries.
+    let mut real = if repo.index_path().exists() {
+        repo.open_index()?
+    } else {
+        gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path())
+    };
+    real.remove_entries(|_, path, _| remove.contains(&path.to_owned()));
+    for s in &staged {
+        real.dangerously_push_entry(s.stat, s.id, Flags::empty(), s.mode, s.path.as_ref());
+    }
+    real.sort_entries();
+    real.remove_tree();
+    real.write(gix::index::write::Options::default())?;
+
+    Ok((tree_id, new_entries))
 }
 
 /// Stage every *tracked* path whose worktree state diverges from the index —

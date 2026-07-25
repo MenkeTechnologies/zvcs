@@ -28,6 +28,9 @@ fn nested_acquire_same_repo_same_thread_does_not_deadlock() {
     let root = root.canonicalize().unwrap();
     let sock = root.join("sock");
     std::env::set_var("ZVCS_SOCK", &sock);
+    // Isolate the ledger/singleton state (like every other daemon test) so the
+    // test daemon uses its own lock, not the global one a real daemon already holds.
+    std::env::set_var("ZVCS_HOME", root.join("home"));
 
     let git_dir = init_repo(&root, "r");
 

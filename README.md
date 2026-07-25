@@ -81,7 +81,9 @@ closes one of them.
 git clone https://github.com/MenkeTechnologies/zvcs
 cd zvcs
 cargo build
-./target/debug/git rev-parse HEAD
+# the binary is named `git` and shadows stock git — put it first on PATH
+export PATH="$PWD/target/debug:$PATH"
+git rev-parse HEAD
 ```
 
 The workspace has two members-by-convention: `src/ported` (the vendored gitoxide
@@ -369,7 +371,11 @@ the dev environment and nowhere else. Enable it in `~/.gitconfig` or a repo's
     autohook      = true            ; fire each repo's own local zvcs.hook (no global hook needed)
     worktreebase  = /abs/worktrees  ; base for zworktree (default ~/.zvcs/worktrees)
     precache      = false           ; stop precomputing log caches on ref-change (default on)
+    replvimode    = true            ; vi keybindings in the `git zrepl` console (default emacs)
 ```
+
+`git ztop` writes its own `topscheme` / `toppalette` keys when you pick a colour
+scheme in its UI; nothing else reads them.
 
 When anything is enabled, a `git` invocation auto-spawns the daemon (detached,
 output to `~/.zvcs/zvcs.log`); it watches indexed repos and reacts by attaching

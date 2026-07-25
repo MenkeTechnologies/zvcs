@@ -97,7 +97,7 @@
             <span class="sep">/</span>
             <a href="https://github.com/MenkeTechnologies/zvcs" target="_blank" rel="noopener noreferrer">GitHub</a>
           </nav>
-          <p class="docs-build-line">zvcs v0.1.0 · one Rust binary named <code>git</code> · shadows stock git on PATH, no fork/exec · git-compat served via vendored gitoxide · superset: singleton per-repo-lane daemon, reactive autonomy, SQLite ledger + async queue, machine-wide status, cross-repo timeline/undo, tree snapshots, per-agent isolated worktrees · MIT · in active development</p>
+          <p class="docs-build-line">zvcs v0.8.0 · one Rust binary named <code>git</code> · shadows stock git on PATH, no fork/exec · git-compat served via vendored gitoxide · superset: singleton per-repo-lane daemon, reactive autonomy, SQLite ledger + async queue, machine-wide status, cross-repo timeline/undo, tree snapshots, per-agent isolated worktrees · MIT · in active development</p>
         </div>
         <div class="tutorial-toolbar">
           <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
@@ -152,12 +152,13 @@
       <section class="tutorial-section">
         <h2>Architecture</h2>
         <p>Two namespaces share one dispatch table (<code>src/extensions/src/dispatch.rs</code>):</p>
-        <pre>git &lt;subcommand&gt;  →  dispatch  ┬─  superset verbs (z*)      →  coordination · queue · ledger
+        <pre>git &lt;subcommand&gt;  →  dispatch  ┬─  superset verbs (z*, 116)  →  coordination · queue · ledger
                                │                              (zdaemon zsync zbump zcommit zpush
                                │                               zjobs zjob zrepos zreindex zstatus
                                │                               zlog zundo zclaim zwho zsnapshot
-                               │                               zrestore zworktree zrepl …)
-                               └─  git-compat porcelain     →  gitoxide (gix) library</pre>
+                               │                               zrestore zworktree zrepl zguard
+                               │                               zprecache zppid zprocs …)
+                               └─  git-compat porcelain (181) →  gitoxide (gix) library</pre>
         <div class="cat-grid">
           <div class="cat-card"><h4>Vendored gitoxide</h4><p><code>src/ported</code> holds the <code>gix</code> + <code>gix-*</code> crates in-tree as a self-contained workspace, excluded from the root and consumed as a path dependency. The <code>gix</code>/<code>ein</code> CLIs and <code>gitoxide-core</code> are removed; <code>git</code> is the only binary.</p></div>
           <div class="cat-card"><h4>The shadow binary</h4><p><code>src/extensions</code> is the zvcs crate whose one binary is named <code>git</code>. It shadows stock git on <code>PATH</code> and routes every subcommand through <code>dispatch::run</code>.</p></div>
@@ -179,52 +180,54 @@
             <tr><td><code>STATUS</code> / <code>STOP</code></td><td>client → daemon</td><td>Snapshot / shut the daemon down.</td></tr>
           </tbody>
         </table>
-        <p>All autonomy is gated by <code>[zvcs]</code> gitconfig and defaults off: <code>autoreconcile</code>, <code>autobump</code>, <code>autocrawl</code>, <code>autostatus</code>, <code>hook</code>, plus <code>interval</code> (debounce), <code>crawlroots</code>, and <code>worktreebase</code>. Headless failures are recorded in the ledger and surfaced on your next <code>git</code> command.</p>
+        <p>Autonomy is gated by <code>[zvcs]</code> gitconfig. Off unless set: <code>autoreconcile</code>, <code>autobump</code>, <code>autocrawl</code>, <code>autostatus</code>, <code>autohook</code>, <code>autodups</code>, <code>hook</code>. On by default: <code>precache</code> (precompute the log caches when a watched repo's refs move — see <a href="#performance">Performance</a>). Tunables: <code>interval</code> (debounce), <code>statusinterval</code>, <code>watchmru</code>, <code>crawlroots</code>, <code>worktreebase</code>. UI, not daemon behaviour: <code>replvimode</code> (vi keys in <code>git zrepl</code>), <code>topscheme</code> and <code>toppalette</code> (<code>git ztop</code> colours, written by its own scheme picker). Headless failures are recorded in the ledger and surfaced on your next <code>git</code> command.</p>
       </section>
 
       <section class="tutorial-section">
         <h2>Usage</h2>
-<pre># build (produces target/debug/git)
+<pre># build, then put the shadow binary first on PATH — from here on,
+# `git` IS zvcs (that is the whole point: it shadows stock git)
 cargo build
+export PATH="$PWD/target/debug:$PATH"
 
 # git-compat: resolve HEAD against the on-disk .git via gitoxide
-./target/debug/git rev-parse HEAD
-./target/debug/git rev-parse --abbrev-ref HEAD
+git rev-parse HEAD
+git rev-parse --abbrev-ref HEAD
 
 # superset: the singleton fair-lock coordinator (full control surface)
-./target/debug/git zdaemon start
-./target/debug/git zdaemon status       # holder / lane snapshot
-./target/debug/git zdaemon info         # pid, socket, paths, config
-./target/debug/git zdaemon ping         # exit 0 if live (scriptable)
-./target/debug/git zdaemon restart      # respawn, re-reading config
-./target/debug/git zdaemon log -f       # tail ~/.zvcs/zvcs.log
-./target/debug/git zdaemon stop
+git zdaemon start
+git zdaemon status       # holder / lane snapshot
+git zdaemon info         # pid, socket, paths, config
+git zdaemon ping         # exit 0 if live (scriptable)
+git zdaemon restart      # respawn, re-reading config
+git zdaemon log -f       # tail ~/.zvcs/zvcs.log
+git zdaemon stop
 
 # coordination: reconcile submodules to mainline (attached, ff-only) + bump pointers
-./target/debug/git zsync                # reconcile submodules
-./target/debug/git zbump                # forward-only gitlink bumps (+ commit)
-./target/debug/git zup                  # bring the whole tree to latest origin/main
+git zsync                # reconcile submodules
+git zbump                # forward-only gitlink bumps (+ commit)
+git zup                  # bring the whole tree to latest origin/main
 
 # repo index + machine-wide status
-./target/debug/git zreindex             # crawl for git repos
-./target/debug/git zrepos               # list them (pipe-clean)
-./target/debug/git zstatus --all        # instant status across every indexed repo
+git zreindex             # crawl for git repos
+git zrepos               # list them (pipe-clean)
+git zstatus --all        # instant status across every indexed repo
 
 # async queue + ledger
-./target/debug/git zcommit file.rs -m "msg" --push
-./target/debug/git zjobs                # recent jobs
-./target/debug/git zjob 42              # one job (zjob stop|restart 42)
+git zcommit file.rs -m "msg" --push
+git zjobs                # recent jobs
+git zjob 42              # one job (zjob stop|restart 42)
 
 # multi-agent, timeline, snapshots, isolated worktrees
-./target/debug/git zclaim               # lease this repo for $ZVCS_SESSION
-./target/debug/git zwho                 # who holds what
-./target/debug/git zlog                 # cross-repo reflog timeline
-./target/debug/git zundo                # rewind this repo one step
-./target/debug/git zsnapshot before     # tree-wide restore point (committed HEADs)
-./target/debug/git zrestore before      # restore the whole tree
-./target/debug/git zstash               # park uncommitted work across the tree
-./target/debug/git zunstash             # restore it (LIFO)
-./target/debug/git zworktree add agent3 # private isolated tree for an agent</pre>
+git zclaim               # lease this repo for $ZVCS_SESSION
+git zwho                 # who holds what
+git zlog                 # cross-repo reflog timeline
+git zundo                # rewind this repo one step
+git zsnapshot before     # tree-wide restore point (committed HEADs)
+git zrestore before      # restore the whole tree
+git zstash               # park uncommitted work across the tree
+git zunstash             # restore it (LIFO)
+git zworktree add agent3 # private isolated tree for an agent</pre>
       </section>
 
       <section class="tutorial-section" id="performance">
@@ -811,11 +814,12 @@ cargo build
 git clone https://github.com/MenkeTechnologies/zvcs
 cd zvcs
 
-# build (produces target/debug/git)
+# build and shadow stock git on PATH
 cargo build
+export PATH="$PWD/target/debug:$PATH"
 
 # smoke-test git-compat against this repo's own .git
-./target/debug/git rev-parse HEAD</pre>
+git rev-parse HEAD</pre>
         <p><code>src/ported</code> is a self-contained workspace excluded from the root and consumed by <code>src/extensions</code> as a path dependency. <code>gix</code> is built with the <code>blocking-http-transport-reqwest-rust-tls</code> feature so <code>zsync</code> can fetch over HTTPS with a pure-Rust TLS stack.</p>
       </section>
 

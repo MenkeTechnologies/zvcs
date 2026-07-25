@@ -18,6 +18,26 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
+/// A STOCK git to compare against, or `None` when the machine has no foreign git
+/// installed.
+///
+/// These are differential tests: their whole point is to diff zvcs against
+/// another implementation, so they are the one place a foreign binary is
+/// legitimate. It is resolved EXPLICITLY (`ZVCS_STOCK_GIT`, else the system
+/// path) rather than through `PATH`, because on a machine where zvcs shadows
+/// git — the machine this is developed on — `PATH` resolution silently makes the
+/// oracle the thing under test, and the comparison proves nothing. When no stock
+/// git exists the oracle half is skipped and the zvcs-side assertions still run.
+fn stock_git() -> Option<String> {
+    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
+        return std::path::Path::new(&p).exists().then_some(p);
+    }
+    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(str::to_owned)
+}
+
 fn git(dir: &Path, args: &[&str]) {
     assert!(
         Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
@@ -272,7 +292,7 @@ fn reflog_decoration_and_relative_date_placeholders() {
         &["show", "--pretty=%ct"][..],
     ] {
         assert_eq!(
-            run("git", extra),
+            run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), extra),
             run(BIN, extra),
             "reflog {extra:?} must match real git byte-for-byte"
         );

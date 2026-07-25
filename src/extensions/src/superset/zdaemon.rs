@@ -266,8 +266,15 @@ fn acquire_singleton_lock() -> Option<std::fs::File> {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Some(file);
         }
+        // The lock is held. If the socket ANSWERS, the holder is a live daemon
+        // and no amount of waiting will free it — bail now. Retrying here made
+        // every loser of a start race (and every autostart that lost) sit for
+        // five seconds before reporting "already running".
+        if socket_is_live(&socket_path()) {
+            return None;
+        }
         if Instant::now() >= deadline {
-            return None; // another daemon held it the whole window → it is live
+            return None; // held the whole window without answering → give up
         }
         thread::sleep(Duration::from_millis(100));
     }

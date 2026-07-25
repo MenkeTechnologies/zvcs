@@ -75,6 +75,10 @@ fn watcher_autobumps_submodule_pointer_on_commit() {
     // watches exist and be missed entirely).
     let sock = root.join("zvcs-test.sock");
     std::env::set_var("ZVCS_SOCK", &sock);
+    // ZVCS_HOME as well: `zdaemon start` refuses with "daemon already running"
+    // when the SHARED home shows a live coordinator, so on a box actually
+    // running zvcs the socket this test waits for never appears.
+    std::env::set_var("ZVCS_HOME", root.join("zvcs-home"));
     let daemon_log = root.join("daemon.log");
     let logf = std::fs::File::create(&daemon_log).unwrap();
     let mut daemon: Child = Command::new(BIN)

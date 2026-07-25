@@ -16,6 +16,26 @@ use std::process::{Command, Output, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
+/// A STOCK git to compare against, or `None` when the machine has no foreign git
+/// installed.
+///
+/// These are differential tests: their whole point is to diff zvcs against
+/// another implementation, so they are the one place a foreign binary is
+/// legitimate. It is resolved EXPLICITLY (`ZVCS_STOCK_GIT`, else the system
+/// path) rather than through `PATH`, because on a machine where zvcs shadows
+/// git — the machine this is developed on — `PATH` resolution silently makes the
+/// oracle the thing under test, and the comparison proves nothing. When no stock
+/// git exists the oracle half is skipped and the zvcs-side assertions still run.
+fn stock_git() -> Option<String> {
+    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
+        return std::path::Path::new(&p).exists().then_some(p);
+    }
+    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(str::to_owned)
+}
+
 /// A commit-message-shaped input with an existing trailer block, so both the
 /// if-exists and if-missing paths have something to act on.
 const MSG: &[u8] = b"subject line\n\nBody paragraph here.\n\nAcked-by: A <a@x.y>\nReviewed-by: B <b@x.y>\n";
@@ -64,7 +84,7 @@ fn run(bin: &str, repo: &Path, home: &Path, args: &[&str]) -> Output {
 /// Assert the zvcs binary matches stock git byte-for-byte for the same repo
 /// config and the same arguments.
 fn assert_matches(repo: &Path, home: &Path, args: &[&str]) {
-    let real = run("git", repo, home, args);
+    let real = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), repo, home, args);
     let ours = run(BIN, repo, home, args);
     assert_eq!(
         real.stdout, ours.stdout,

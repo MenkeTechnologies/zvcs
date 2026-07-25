@@ -9,6 +9,26 @@ use std::process::{Command, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
+/// A STOCK git to compare against, or `None` when the machine has no foreign git
+/// installed.
+///
+/// These are differential tests: their whole point is to diff zvcs against
+/// another implementation, so they are the one place a foreign binary is
+/// legitimate. It is resolved EXPLICITLY (`ZVCS_STOCK_GIT`, else the system
+/// path) rather than through `PATH`, because on a machine where zvcs shadows
+/// git — the machine this is developed on — `PATH` resolution silently makes the
+/// oracle the thing under test, and the comparison proves nothing. When no stock
+/// git exists the oracle half is skipped and the zvcs-side assertions still run.
+fn stock_git() -> Option<String> {
+    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
+        return std::path::Path::new(&p).exists().then_some(p);
+    }
+    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(str::to_owned)
+}
+
 fn git(dir: &Path, args: &[&str]) {
     assert!(
         Command::new(BIN)
@@ -78,7 +98,7 @@ fn version_sort_matches_git() {
         "--format=%(refname:short)",
         "refs/tags/",
     ];
-    let want = run("git", &root, &args, None);
+    let want = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &root, &args, None);
     let got = run(BIN, &root, &args, None);
     assert_eq!(got, want, "version:refname sort mismatch");
     let _ = std::fs::remove_dir_all(&root);
@@ -94,7 +114,7 @@ fn version_sort_short_prefix_and_descending_match_git() {
         "--format=%(refname:short)",
         "refs/tags/",
     ];
-    let want = run("git", &root, &args, None);
+    let want = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &root, &args, None);
     let got = run(BIN, &root, &args, None);
     assert_eq!(got, want, "-v:refname sort mismatch");
     let _ = std::fs::remove_dir_all(&root);
@@ -106,7 +126,7 @@ fn stdin_patterns_match_git() {
     let args = ["for-each-ref", "--stdin", "--format=%(refname)"];
     // Two explicit patterns plus a trailing CRLF line git's strbuf_getline trims.
     let input = "refs/tags/v1.0\nrefs/tags/v2.0\r\n";
-    let want = run("git", &root, &args, Some(input));
+    let want = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &root, &args, Some(input));
     let got = run(BIN, &root, &args, Some(input));
     assert_eq!(got, want, "--stdin pattern reading mismatch");
     assert!(

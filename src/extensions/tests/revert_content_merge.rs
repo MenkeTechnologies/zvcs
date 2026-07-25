@@ -13,6 +13,26 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
+/// A STOCK git to compare against, or `None` when the machine has no foreign git
+/// installed.
+///
+/// These are differential tests: their whole point is to diff zvcs against
+/// another implementation, so they are the one place a foreign binary is
+/// legitimate. It is resolved EXPLICITLY (`ZVCS_STOCK_GIT`, else the system
+/// path) rather than through `PATH`, because on a machine where zvcs shadows
+/// git — the machine this is developed on — `PATH` resolution silently makes the
+/// oracle the thing under test, and the comparison proves nothing. When no stock
+/// git exists the oracle half is skipped and the zvcs-side assertions still run.
+fn stock_git() -> Option<String> {
+    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
+        return std::path::Path::new(&p).exists().then_some(p);
+    }
+    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(str::to_owned)
+}
+
 const DATE: &str = "1112911993 +0000"; // 2005-04-07 in UTC
 
 fn run(bin: &str, repo: &Path, home: &Path, args: &[&str]) -> Output {
@@ -37,15 +57,15 @@ fn run(bin: &str, repo: &Path, home: &Path, args: &[&str]) -> Output {
 }
 
 fn init(repo: &Path, home: &Path) {
-    run("git", repo, home, &["init", "-q", "-b", "main"]);
-    run("git", repo, home, &["config", "user.name", "A U Thor"]);
-    run("git", repo, home, &["config", "user.email", "author@example.com"]);
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), repo, home, &["init", "-q", "-b", "main"]);
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), repo, home, &["config", "user.name", "A U Thor"]);
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), repo, home, &["config", "user.email", "author@example.com"]);
 }
 
 fn commit(repo: &Path, home: &Path, body: &str, msg: &str) {
     std::fs::write(repo.join("file.txt"), body).unwrap();
-    run("git", repo, home, &["add", "file.txt"]);
-    run("git", repo, home, &["commit", "-q", "-m", msg]);
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), repo, home, &["add", "file.txt"]);
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), repo, home, &["commit", "-q", "-m", msg]);
 }
 
 /// Build a fresh work area with `home` and `repo` directories.
@@ -75,7 +95,7 @@ fn build_content_merge_fixture(tag: &str) -> (PathBuf, PathBuf, String) {
     commit(&repo, &home, "a\nB\nc\nd\ne\nf\nG\nh\n", "cap g"); // C3, HEAD
     // The revert target is C2 (HEAD~1); resolve its full id so both binaries
     // name the same commit.
-    let o = run("git", &repo, &home, &["rev-parse", "HEAD~1"]);
+    let o = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &repo, &home, &["rev-parse", "HEAD~1"]);
     let target = String::from_utf8_lossy(&o.stdout).trim().to_string();
     (repo, home, target)
 }
@@ -89,7 +109,7 @@ fn content_level_revert_matches_git() {
     assert_eq!(ztarget, gtarget, "fixtures must name the identical target commit");
 
     let zo = run(BIN, &zrepo, &zhome, &["revert", "--no-edit", &ztarget]);
-    let go = run("git", &grepo, &ghome, &["revert", "--no-edit", &gtarget]);
+    let go = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &grepo, &ghome, &["revert", "--no-edit", &gtarget]);
 
     assert!(
         zo.status.success(),
@@ -116,8 +136,8 @@ fn content_level_revert_matches_git() {
         "content merge must revert the top and keep the bottom"
     );
 
-    let zmsg = run("git", &zrepo, &zhome, &["log", "-1", "--format=%B"]);
-    let gmsg = run("git", &grepo, &ghome, &["log", "-1", "--format=%B"]);
+    let zmsg = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &zrepo, &zhome, &["log", "-1", "--format=%B"]);
+    let gmsg = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &grepo, &ghome, &["log", "-1", "--format=%B"]);
     assert_eq!(
         String::from_utf8_lossy(&gmsg.stdout),
         String::from_utf8_lossy(&zmsg.stdout),
@@ -139,7 +159,7 @@ fn conflicting_revert_stops_like_git() {
     commit(&repo, &home, "a\nx\nc\n", "base");
     commit(&repo, &home, "a\ny\nc\n", "to y"); // C2 (target)
     commit(&repo, &home, "a\nz\nc\n", "to z"); // C3, HEAD
-    let o = run("git", &repo, &home, &["rev-parse", "HEAD~1"]);
+    let o = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &repo, &home, &["rev-parse", "HEAD~1"]);
     let target = String::from_utf8_lossy(&o.stdout).trim().to_string();
 
     // git's exit status for the same conflicting revert, in a parallel repo.
@@ -148,7 +168,7 @@ fn conflicting_revert_stops_like_git() {
     commit(&grepo, &ghome, "a\nx\nc\n", "base");
     commit(&grepo, &ghome, "a\ny\nc\n", "to y");
     commit(&grepo, &ghome, "a\nz\nc\n", "to z");
-    let go = run("git", &grepo, &ghome, &["revert", "--no-edit", &target]);
+    let go = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &grepo, &ghome, &["revert", "--no-edit", &target]);
 
     let zo = run(BIN, &repo, &home, &["revert", "--no-edit", &target]);
 

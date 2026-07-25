@@ -2265,6 +2265,27 @@ fn display_path(path: &BStr, prefix: Option<&BString>) -> String {
     }
 }
 
+
+/// A relative path from `from` to `to`, both absolute — enough for the
+/// `gitdir:`/`core.worktree` pair git writes when it absorbs a submodule's git
+/// directory. Falls back to the absolute target when the two share no prefix.
+fn pathdiff_relative(from: &std::path::Path, to: &std::path::Path) -> String {
+    let from: Vec<_> = from.components().collect();
+    let to: Vec<_> = to.components().collect();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    if common == 0 {
+        return to.iter().collect::<std::path::PathBuf>().to_string_lossy().into_owned();
+    }
+    let mut out = std::path::PathBuf::new();
+    for _ in common..from.len() {
+        out.push("..");
+    }
+    for c in &to[common..] {
+        out.push(c);
+    }
+    out.to_string_lossy().into_owned()
+}
+
 /// `git submodule add [-b <branch>] [-f] [--name <name>] [--] <repository> [<path>]`
 /// — clone `<repository>` into `<path>`, register it in `.gitmodules` and the
 /// local config, and stage both the file and the new gitlink.
@@ -2370,6 +2391,31 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
     let code = super::clone(&clone_args)?;
     if code != ExitCode::SUCCESS {
         return Ok(code);
+    }
+
+    // ---- absorb the clone's git dir, as git does ----------------------------
+    // `git submodule add` does not leave a standalone repository in the worktree:
+    // the git dir moves to `<parent>/.git/modules/<name>` and the worktree gets a
+    // `.git` FILE pointing at it, so the superproject owns the submodule's
+    // objects and refs. Without this the tree looks right but every tool that
+    // expects a gitfile (including this port's own crawler) sees a nested
+    // independent repo.
+    let modules_dir = repo.common_dir().join("modules").join(&name);
+    if let Some(parent) = modules_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let cloned_git = abs.join(".git");
+    if cloned_git.is_dir() && !modules_dir.exists() {
+        std::fs::rename(&cloned_git, &modules_dir)?;
+        // The gitfile is relative so the pair survives moving the checkout.
+        let rel_to_modules = pathdiff_relative(&abs, &modules_dir);
+        std::fs::write(&cloned_git, format!("gitdir: {rel_to_modules}\n"))?;
+        // The moved git dir needs to know where its worktree went.
+        let cfg_path = modules_dir.join("config");
+        let mut cfg = ConfigFile::from_path_no_includes(cfg_path.clone(), Source::Local)?;
+        let rel_to_worktree = pathdiff_relative(&modules_dir, &abs);
+        cfg.set_raw_value_by("core", None, "worktree", rel_to_worktree.as_str())?;
+        std::fs::write(&cfg_path, cfg.to_bstring())?;
     }
 
     // ---- register in .gitmodules and in the repository config ---------------

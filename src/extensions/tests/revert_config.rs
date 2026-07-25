@@ -10,6 +10,26 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
+/// A STOCK git to compare against, or `None` when the machine has no foreign git
+/// installed.
+///
+/// These are differential tests: their whole point is to diff zvcs against
+/// another implementation, so they are the one place a foreign binary is
+/// legitimate. It is resolved EXPLICITLY (`ZVCS_STOCK_GIT`, else the system
+/// path) rather than through `PATH`, because on a machine where zvcs shadows
+/// git — the machine this is developed on — `PATH` resolution silently makes the
+/// oracle the thing under test, and the comparison proves nothing. When no stock
+/// git exists the oracle half is skipped and the zvcs-side assertions still run.
+fn stock_git() -> Option<String> {
+    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
+        return std::path::Path::new(&p).exists().then_some(p);
+    }
+    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(str::to_owned)
+}
+
 /// A fixed, deterministic identity + date so both the reverted commit's short
 /// date (SHORT format, `YYYY-MM-DD`) and the abbreviated hash are stable across
 /// machines and runs.
@@ -52,28 +72,28 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
 
     // Use the system git only to construct the fixture, under the same fixed
     // env so the reverted commit's hash and date are identical for both binaries.
-    run("git", &repo, &home, &["init", "-q", "-b", "main"]);
-    run("git", &repo, &home, &["config", "user.name", "A U Thor"]);
-    run("git", &repo, &home, &["config", "user.email", "author@example.com"]);
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &repo, &home, &["init", "-q", "-b", "main"]);
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &repo, &home, &["config", "user.name", "A U Thor"]);
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &repo, &home, &["config", "user.email", "author@example.com"]);
     std::fs::write(repo.join("file.txt"), "line1\nline2\n").unwrap();
-    run("git", &repo, &home, &["add", "file.txt"]);
-    run("git", &repo, &home, &["commit", "-q", "-m", "add file with two lines"]);
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &repo, &home, &["add", "file.txt"]);
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &repo, &home, &["commit", "-q", "-m", "add file with two lines"]);
     std::fs::write(repo.join("file.txt"), "line1\nline2\nline3\n").unwrap();
-    run("git", &repo, &home, &["add", "file.txt"]);
-    run("git", &repo, &home, &["commit", "-q", "-m", "append line3"]);
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &repo, &home, &["add", "file.txt"]);
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &repo, &home, &["commit", "-q", "-m", "append line3"]);
     (repo, home)
 }
 
 /// The reverted commit is reset back to the tip before each measured run so the
 /// two binaries revert the identical commit into the identical starting state.
 fn reset_to_tip(repo: &Path, home: &Path) {
-    run("git", repo, home, &["reset", "--hard", "-q", "HEAD"]);
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), repo, home, &["reset", "--hard", "-q", "HEAD"]);
     // Drop any revert commit a prior run left on the branch.
-    run("git", repo, home, &["checkout", "-q", "-B", "main", "HEAD"]);
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), repo, home, &["checkout", "-q", "-B", "main", "HEAD"]);
 }
 
 fn head_message(repo: &Path, home: &Path) -> String {
-    let o = run("git", repo, home, &["log", "-1", "--format=%B"]);
+    let o = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), repo, home, &["log", "-1", "--format=%B"]);
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
@@ -83,7 +103,7 @@ fn head_message(repo: &Path, home: &Path) -> String {
 fn revert_message(bin: &str, tag: &str, config: Option<bool>, extra: &[&str]) -> String {
     let (repo, home) = fixture(tag);
     if let Some(v) = config {
-        run("git", &repo, &home, &["config", "revert.reference", if v { "true" } else { "false" }]);
+        run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &repo, &home, &["config", "revert.reference", if v { "true" } else { "false" }]);
     }
     reset_to_tip(&repo, &home);
     let mut args = vec!["revert"];

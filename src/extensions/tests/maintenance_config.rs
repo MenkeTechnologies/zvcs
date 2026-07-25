@@ -35,6 +35,26 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
+/// A STOCK git to compare against, or `None` when the machine has no foreign git
+/// installed.
+///
+/// These are differential tests: their whole point is to diff zvcs against
+/// another implementation, so they are the one place a foreign binary is
+/// legitimate. It is resolved EXPLICITLY (`ZVCS_STOCK_GIT`, else the system
+/// path) rather than through `PATH`, because on a machine where zvcs shadows
+/// git — the machine this is developed on — `PATH` resolution silently makes the
+/// oracle the thing under test, and the comparison proves nothing. When no stock
+/// git exists the oracle half is skipped and the zvcs-side assertions still run.
+fn stock_git() -> Option<String> {
+    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
+        return std::path::Path::new(&p).exists().then_some(p);
+    }
+    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(str::to_owned)
+}
+
 /// A zeroed 40-char object id, used to build a syntactically valid reflog line.
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
@@ -127,7 +147,7 @@ fn task_enabled_false_suppresses_default_pack_refs() {
     let (rz, hz) = fixture("packon-z", &[]);
     let (rg, hg) = fixture("packon-g", &[]);
     let z = run(BIN, &rz, &hz, &[]);
-    let g = run("git", &rg, &hg, &[]);
+    let g = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &rg, &hg, &[]);
     assert_eq!(z.status.code(), Some(0), "run must succeed");
     assert_eq!(g.status.code(), Some(0), "sanity: git succeeds");
     assert!(packed_refs(&rz), "default run packs refs");
@@ -138,7 +158,7 @@ fn task_enabled_false_suppresses_default_pack_refs() {
     let (rz, hz) = fixture("packoff-z", &cfg);
     let (rg, hg) = fixture("packoff-g", &cfg);
     let z = run(BIN, &rz, &hz, &[]);
-    let _g = run("git", &rg, &hg, &[]);
+    let _g = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &rg, &hg, &[]);
     assert_eq!(z.status.code(), Some(0));
     assert!(!packed_refs(&rz), "pack-refs.enabled=false leaves refs loose");
     assert!(rz.join(".git/refs/heads/b1").exists(), "loose ref remains present");
@@ -155,7 +175,7 @@ fn cli_task_selection_overrides_enabled_false() {
     let (rz, hz) = fixture("override-z", &cfg);
     let (rg, hg) = fixture("override-g", &cfg);
     let z = run(BIN, &rz, &hz, &["--task=pack-refs"]);
-    let g = run("git", &rg, &hg, &["--task=pack-refs"]);
+    let g = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &rg, &hg, &["--task=pack-refs"]);
     assert_eq!(z.status.code(), Some(0));
     assert_eq!(g.status.code(), Some(0));
     assert!(packed_refs(&rz), "--task=pack-refs runs despite enabled=false");
@@ -175,7 +195,7 @@ fn reflog_expire_task_enabled_gate() {
     inject_ancient_reflog(&rz);
     inject_ancient_reflog(&rg);
     let z = run(BIN, &rz, &hz, &[]);
-    let g = run("git", &rg, &hg, &[]);
+    let g = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &rg, &hg, &[]);
     assert_eq!(z.status.code(), Some(0));
     assert_eq!(g.status.code(), Some(0), "sanity: git succeeds");
     assert!(!reflog_has_ancient(&rz), "reflog-expire drops the ancient entry");
@@ -188,7 +208,7 @@ fn reflog_expire_task_enabled_gate() {
     inject_ancient_reflog(&rz);
     inject_ancient_reflog(&rg);
     let z = run(BIN, &rz, &hz, &[]);
-    let g = run("git", &rg, &hg, &[]);
+    let g = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &rg, &hg, &[]);
     assert_eq!(z.status.code(), Some(0));
     assert_eq!(g.status.code(), Some(0), "sanity: git succeeds");
     assert!(reflog_has_ancient(&rz), "disabled reflog-expire keeps the entry");
@@ -208,7 +228,7 @@ fn strategy_incremental_runs_gc_and_enabled_gates_it() {
     let (rz, hz) = fixture("strat-on-z", &cfg);
     let (rg, hg) = fixture("strat-on-g", &cfg);
     let z = run(BIN, &rz, &hz, &[]);
-    let g = run("git", &rg, &hg, &[]);
+    let g = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &rg, &hg, &[]);
     assert_eq!(z.status.code(), Some(0));
     assert_eq!(g.status.code(), Some(0));
     assert!(packed_refs(&rz), "strategy=incremental runs gc, which packs refs");
@@ -222,7 +242,7 @@ fn strategy_incremental_runs_gc_and_enabled_gates_it() {
     let (rz, hz) = fixture("strat-off-z", &cfg);
     let (rg, hg) = fixture("strat-off-g", &cfg);
     let z = run(BIN, &rz, &hz, &[]);
-    let _g = run("git", &rg, &hg, &[]);
+    let _g = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &rg, &hg, &[]);
     assert_eq!(z.status.code(), Some(0));
     assert!(!packed_refs(&rz), "gc.enabled=false empties the strategy set");
     assert_eq!(packed_refs(&rz), packed_refs(&rg), "must match git");

@@ -11,6 +11,26 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
+/// A STOCK git to compare against, or `None` when the machine has no foreign git
+/// installed.
+///
+/// These are differential tests: their whole point is to diff zvcs against
+/// another implementation, so they are the one place a foreign binary is
+/// legitimate. It is resolved EXPLICITLY (`ZVCS_STOCK_GIT`, else the system
+/// path) rather than through `PATH`, because on a machine where zvcs shadows
+/// git — the machine this is developed on — `PATH` resolution silently makes the
+/// oracle the thing under test, and the comparison proves nothing. When no stock
+/// git exists the oracle half is skipped and the zvcs-side assertions still run.
+fn stock_git() -> Option<String> {
+    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
+        return std::path::Path::new(&p).exists().then_some(p);
+    }
+    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(str::to_owned)
+}
+
 fn git(dir: &Path, args: &[&str]) {
     assert!(
         Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
@@ -68,7 +88,7 @@ fn run(bin: &str, cwd: &Path, home: &Path, args: &[&str]) -> (Vec<u8>, Option<i3
 
 /// Assert stock git and the port agree on stdout and exit code for `args`.
 fn parity(repo: &Path, home: &Path, args: &[&str]) {
-    let (g_out, g_code) = run("git", repo, home, args);
+    let (g_out, g_code) = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), repo, home, args);
     let (z_out, z_code) = run(BIN, repo, home, args);
     assert_eq!(
         g_code, z_code,
@@ -109,7 +129,7 @@ fn boolean_grammar_matches_git() {
 fn boolean_grammar_errors_match_git() {
     let (repo, home) = fixture("boolerr");
     // A dangling operator is a fatal (exit 128) in both.
-    let (_, g) = run("git", &repo, &home, &["-e", "alpha", "--and", "--", "words.txt"]);
+    let (_, g) = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &repo, &home, &["-e", "alpha", "--and", "--", "words.txt"]);
     let (_, z) = run(BIN, &repo, &home, &["-e", "alpha", "--and", "--", "words.txt"]);
     assert_eq!(g, Some(128));
     assert_eq!(z, Some(128));

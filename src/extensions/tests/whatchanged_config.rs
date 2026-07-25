@@ -15,6 +15,26 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
+/// A STOCK git to compare against, or `None` when the machine has no foreign git
+/// installed.
+///
+/// These are differential tests: their whole point is to diff zvcs against
+/// another implementation, so they are the one place a foreign binary is
+/// legitimate. It is resolved EXPLICITLY (`ZVCS_STOCK_GIT`, else the system
+/// path) rather than through `PATH`, because on a machine where zvcs shadows
+/// git — the machine this is developed on — `PATH` resolution silently makes the
+/// oracle the thing under test, and the comparison proves nothing. When no stock
+/// git exists the oracle half is skipped and the zvcs-side assertions still run.
+fn stock_git() -> Option<String> {
+    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
+        return std::path::Path::new(&p).exists().then_some(p);
+    }
+    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(str::to_owned)
+}
+
 fn git(dir: &Path, args: &[&str]) {
     assert!(
         Command::new(BIN).args(args).current_dir(dir).status().unwrap().success(),
@@ -89,12 +109,25 @@ fn run(bin: &str, repo: &Path, home: &Path, extra: &[&str]) -> Output {
 fn zvcs(repo: &Path, home: &Path, extra: &[&str]) -> Output {
     run(BIN, repo, home, extra)
 }
+/// Whether the stock git found on this machine can even run the invocation these
+/// tests diff against. `whatchanged` requires `--i-still-use-this` on the gits
+/// that deprecated it and REJECTS the flag on older ones (Apple git 2.50.1 does),
+/// so on such a machine the oracle half is skipped rather than reported as a zvcs
+/// divergence — the comparison would be measuring the oracle's age.
+fn oracle_usable(repo: &Path, home: &Path) -> bool {
+    let out = real(repo, home, &[]);
+    !String::from_utf8_lossy(&out.stderr).contains("unrecognized argument")
+}
+
 fn real(repo: &Path, home: &Path, extra: &[&str]) -> Output {
-    run("git", repo, home, extra)
+    run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), repo, home, extra)
 }
 
 /// zvcs stdout and exit code must equal real git's for the same invocation.
 fn assert_stdout_matches(repo: &Path, home: &Path, extra: &[&str]) {
+    if !oracle_usable(repo, home) {
+        return;
+    }
     let r = real(repo, home, extra);
     let z = zvcs(repo, home, extra);
     assert_eq!(
@@ -279,8 +312,11 @@ fn log_date_valid_nondefault_bails_but_empty_walk_exits_zero() {
         "bail names the unported config: {}",
         String::from_utf8_lossy(&z.stderr)
     );
-    // Real git happily renders the short date here — this is the one documented divergence.
-    assert!(String::from_utf8_lossy(&real(&repo, &home, &[]).stdout).contains("Date:   2006-01-02"));
+    // Real git happily renders the short date here — this is the one documented
+    // divergence, and it can only be checked where the oracle runs at all.
+    if oracle_usable(&repo, &home) {
+        assert!(String::from_utf8_lossy(&real(&repo, &home, &[]).stdout).contains("Date:   2006-01-02"));
+    }
 
     // But when a filter empties the walk, the unported option is never applied, so both
     // git and zvcs exit 0 with empty output — the deferred bail must not fire early.

@@ -9,6 +9,26 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
+/// A STOCK git to compare against, or `None` when the machine has no foreign git
+/// installed.
+///
+/// These are differential tests: their whole point is to diff zvcs against
+/// another implementation, so they are the one place a foreign binary is
+/// legitimate. It is resolved EXPLICITLY (`ZVCS_STOCK_GIT`, else the system
+/// path) rather than through `PATH`, because on a machine where zvcs shadows
+/// git — the machine this is developed on — `PATH` resolution silently makes the
+/// oracle the thing under test, and the comparison proves nothing. When no stock
+/// git exists the oracle half is skipped and the zvcs-side assertions still run.
+fn stock_git() -> Option<String> {
+    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
+        return std::path::Path::new(&p).exists().then_some(p);
+    }
+    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(str::to_owned)
+}
+
 /// A repo with three files whose middle line conflicts three ways, plus an
 /// isolated HOME so only the repo's `.git/config` is consulted.
 fn setup(tag: &str) -> (PathBuf, PathBuf) {
@@ -66,7 +86,7 @@ fn run(bin: &str, repo: &Path, home: &Path, args: &[&str]) -> Output {
 /// same `merge-file` invocation — the byte-for-byte marker-output guarantee.
 fn assert_matches_git(repo: &Path, home: &Path, args: &[&str]) -> Output {
     let ours = run(BIN, repo, home, args);
-    let theirs = run("git", repo, home, args);
+    let theirs = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), repo, home, args);
     assert_eq!(
         ours.stdout, theirs.stdout,
         "stdout differs for args {args:?}\nzvcs: {:?}\ngit:  {:?}",
@@ -166,7 +186,7 @@ fn unknown_value_is_fatal() {
     let (repo, home) = setup("badval");
     config(&repo, "merge.conflictStyle", "bogus");
     let ours = run(BIN, &repo, &home, &["-p", "cur", "base", "oth"]);
-    let theirs = run("git", &repo, &home, &["-p", "cur", "base", "oth"]);
+    let theirs = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &repo, &home, &["-p", "cur", "base", "oth"]);
     assert_eq!(ours.status.code(), Some(128), "unknown style must exit 128");
     assert_eq!(theirs.status.code(), Some(128), "git also exits 128");
     let our_err = String::from_utf8_lossy(&ours.stderr);
@@ -195,7 +215,7 @@ fn unknown_value_is_fatal_even_with_flag_override() {
     let (repo, home) = setup("badflag");
     config(&repo, "merge.conflictStyle", "Diff3"); // case-sensitive: rejected
     let ours = run(BIN, &repo, &home, &["-p", "--diff3", "cur", "base", "oth"]);
-    let theirs = run("git", &repo, &home, &["-p", "--diff3", "cur", "base", "oth"]);
+    let theirs = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &repo, &home, &["-p", "--diff3", "cur", "base", "oth"]);
     assert_eq!(ours.status.code(), Some(128), "bad config is fatal despite --diff3");
     assert_eq!(theirs.status.code(), Some(128), "git agrees");
     let our_first = String::from_utf8_lossy(&ours.stderr).lines().next().unwrap_or_default().to_string();
@@ -239,7 +259,7 @@ fn earlier_invalid_value_is_fatal() {
     config_add(&repo, "merge.conflictStyle", "bogus");
     config_add(&repo, "merge.conflictStyle", "diff3");
     let ours = run(BIN, &repo, &home, &["-p", "cur", "base", "oth"]);
-    let theirs = run("git", &repo, &home, &["-p", "cur", "base", "oth"]);
+    let theirs = run(&stock_git().unwrap_or_else(|| "/usr/bin/git".into()), &repo, &home, &["-p", "cur", "base", "oth"]);
     assert_eq!(ours.status.code(), Some(128), "earlier bad value is fatal");
     assert_eq!(theirs.status.code(), Some(128), "git agrees");
     let our_first = String::from_utf8_lossy(&ours.stderr).lines().next().unwrap_or_default().to_string();

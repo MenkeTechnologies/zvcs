@@ -107,6 +107,7 @@ pub fn zsigs(args: &[String]) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gitsig::GStatus;
 
     #[test]
     fn subject_is_first_message_line() {

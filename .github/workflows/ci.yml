@@ -27,8 +27,13 @@ jobs:
       # fresh runner has no git identity. Export the identity via git's
       # GIT_AUTHOR_*/GIT_COMMITTER_* env vars — they apply to every git
       # invocation (including fixture repos in temp dirs) without mutating
-      # runner-persistent global config. Tests that set their own `-c user.*`
-      # still override these.
+      # runner-persistent global config.
+      #
+      # NOTE: these env vars OUTRANK `user.name`/`user.email` config, including
+      # `-c user.name=...`. A test that attributes commits to particular authors
+      # through config must clear them (`Command::env_remove`) or it silently
+      # gets this identity instead — which is exactly how
+      # blame_ignore_whitespace came to pass locally and fail on every runner.
       - name: Configure git identity
         run: |
           {

@@ -936,7 +936,38 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // is flushed below, and a closed pipe still surfaces as BrokenPipe.
     let mut stdout = std::io::BufWriter::with_capacity(64 * 1024, std::io::stdout().lock());
     let mut first = true;
+    // Formats that need only what the walk produced skip the object read
+    // entirely — the dominant cost of `--pretty=format:%H` on a deep history.
+    let walk_only = match &pretty {
+        Pretty::User(f) => !want_names && !emit_patch && format_is_walk_only(f),
+        _ => false,
+    };
     for node in &nodes {
+        if walk_only {
+            let Pretty::User(fmt) = &pretty else { unreachable!() };
+            let mut block: Vec<u8> = Vec::new();
+            expand_walk_only(&mut block, fmt, node, abbrev_commit, &abbrev_cache, &repo);
+            if terminator && !empty_user_format {
+                block.push(b'\n');
+            }
+            if graph {
+                blocks.push(block);
+                continue;
+            }
+            let mut piece: Vec<u8> = Vec::new();
+            if !terminator && !first {
+                piece.push(b'\n');
+            }
+            piece.extend_from_slice(&block);
+            first = false;
+            if let Err(e) = stdout.write_all(&piece) {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    return Ok(ExitCode::SUCCESS);
+                }
+                return Err(e.into());
+            }
+            continue;
+        }
         let commit = repo.find_object(node.id)?.try_into_commit()?;
         // `--parents` decorates the header with the commit's own parent ids.
         let extra = if show_parents {
@@ -1289,6 +1320,79 @@ impl AbbrevCache {
         if let Ok(mut conn) = crate::db::open_rw() {
             let _ = crate::db::abbrev_store(&mut conn, self.hex_len, &self.fresh);
         }
+    }
+}
+
+/// Whether a user format can be rendered from the WALK alone — the ids and
+/// parents already in hand — without reading each commit object.
+///
+/// git's `%H`/`%h`/`%P`/`%p` need nothing the walk did not already produce, and
+/// on a deep history the object read is the whole cost: rendering `%H` for 6375
+/// commits spent ~40ms opening objects for data it never used, which is why
+/// zvcs's `%H` was slower than its own `--oneline`.
+///
+/// Anything else — a date, an author, a message, a decoration, a colour — still
+/// takes the object, so the check is a deliberate whitelist: an unknown
+/// placeholder answers `false` and keeps the faithful path.
+fn format_is_walk_only(fmt: &str) -> bool {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            i += 1;
+            continue;
+        }
+        let Some(&p) = chars.get(i + 1) else { return false };
+        match p {
+            'H' | 'h' | 'P' | 'p' | 'n' | '%' => i += 2,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Expand a walk-only format for one node. Mirrors the placeholder handling in
+/// [`expand_format`] for exactly the subset [`format_is_walk_only`] admits.
+fn expand_walk_only(
+    out: &mut Vec<u8>,
+    fmt: &str,
+    node: &Node,
+    abbrev_commit: bool,
+    cache: &std::cell::RefCell<AbbrevCache>,
+    repo: &gix::Repository,
+) {
+    let short = |id: ObjectId| -> String {
+        if abbrev_commit || true {
+            cache.borrow_mut().get(id.attach(repo))
+        } else {
+            id.to_string()
+        }
+    };
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(chars[i].encode_utf8(&mut buf).as_bytes());
+            i += 1;
+            continue;
+        }
+        match chars.get(i + 1) {
+            Some('H') => out.extend_from_slice(node.id.to_string().as_bytes()),
+            Some('h') => out.extend_from_slice(short(node.id).as_bytes()),
+            Some('P') => {
+                let text: Vec<String> = node.parents.iter().map(ToString::to_string).collect();
+                out.extend_from_slice(text.join(" ").as_bytes());
+            }
+            Some('p') => {
+                let text: Vec<String> = node.parents.iter().map(|p| short(*p)).collect();
+                out.extend_from_slice(text.join(" ").as_bytes());
+            }
+            Some('n') => out.push(b'\n'),
+            Some('%') => out.push(b'%'),
+            _ => {}
+        }
+        i += 2;
     }
 }
 

@@ -262,6 +262,155 @@ pub fn is_lock_contention(err: &anyhow::Error) -> bool {
     err.chain().any(|e| e.is::<gix::lock::acquire::Error>())
 }
 
+/// Whether `err`'s chain is a REF RACE: the compare-and-swap on a reference was
+/// rejected because a concurrent writer moved it between our read and our write
+/// (`The reference "refs/heads/main" should have content <a>, actual content was
+/// <b>`).
+///
+/// This is contention with a different shape than [`is_lock_contention`]. No
+/// lockfile is involved — both writers took `.git/index` and the ref lock
+/// cleanly, one simply lost the race on the ref's expected value. Under a
+/// N-agent fanout with no daemon (the unserialized fallback), this is the
+/// dominant loss mode: a 32-way `commit` fanout produced 12 of these, each one a
+/// hard exit-1 that dropped the commit, versus 2 lockfile errors.
+///
+/// Re-running the command once the winner has landed is exactly what resolves
+/// it, so the caller queues it like a lock conflict instead of failing.
+///
+/// Matched by TYPE and VARIANT, at every wrapper level the porcelain can hand
+/// us. The wrappers are `#[error(transparent)]`, and transparent forwards
+/// `source()` to the INNER error's source — so the inner
+/// `prepare::Error` is NOT a link in `anyhow`'s chain, it is the payload of the
+/// link that is there. Downcasting to it alone silently matches nothing (which
+/// is how this shipped un-caught). Hence one arm per reachable carrier:
+/// `commit`/`commit_as` yield `gix::commit::Error`, `--amend` and the branch/tag
+/// verbs yield `gix::reference::edit::Error`, and a bare transaction yields the
+/// `prepare::Error` itself.
+///
+/// Only `ReferenceOutOfDate` counts — the other variants (a malformed name, an
+/// IO failure) are real errors that a re-run would hit again.
+pub fn is_ref_race(err: &anyhow::Error) -> bool {
+    /// The one variant that means "someone else won the race".
+    fn lost_cas(e: &gix::refs::file::transaction::prepare::Error) -> bool {
+        matches!(e, gix::refs::file::transaction::prepare::Error::ReferenceOutOfDate { .. })
+    }
+
+    err.chain().any(|e| {
+        if let Some(p) = e.downcast_ref::<gix::refs::file::transaction::prepare::Error>() {
+            return lost_cas(p);
+        }
+        if let Some(gix::reference::edit::Error::FileTransactionPrepare(p)) =
+            e.downcast_ref::<gix::reference::edit::Error>()
+        {
+            return lost_cas(p);
+        }
+        if let Some(gix::commit::Error::ReferenceEdit(
+            gix::reference::edit::Error::FileTransactionPrepare(p),
+        )) = e.downcast_ref::<gix::commit::Error>()
+        {
+            return lost_cas(p);
+        }
+        false
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use gix::refs::file::transaction::prepare::Error as PrepareError;
+
+    /// A `ReferenceOutOfDate` as the ref store raises it when a concurrent writer
+    /// moved `refs/heads/main` between our read and our compare-and-swap, wrapped
+    /// the way a porcelain command surfaces it (`anyhow` with context on top).
+    fn lost_ref_race() -> anyhow::Error {
+        let err = PrepareError::ReferenceOutOfDate {
+            full_name: "refs/heads/main".into(),
+            expected: gix::refs::Target::Object(gix::ObjectId::empty_blob(gix::hash::Kind::Sha1)),
+            actual: gix::refs::Target::Object(gix::ObjectId::empty_tree(gix::hash::Kind::Sha1)),
+        };
+        anyhow::Error::new(err).context("commit")
+    }
+
+    /// The two contention shapes must not be conflated: a ref race takes no
+    /// lockfile, so the lockfile predicate has to stay `false` for it. Before the
+    /// ref-race arm existed, that `false` is exactly what dropped the commit
+    /// instead of queueing it.
+    #[test]
+    fn a_ref_race_is_contention_but_not_lock_contention() {
+        let err = lost_ref_race();
+        assert!(super::is_ref_race(&err), "the CAS rejection is a ref race");
+        assert!(
+            !super::is_lock_contention(&err),
+            "no lockfile was involved — this must not read as lock contention"
+        );
+    }
+
+    /// The same rejection as the porcelain actually produces it: through `gix`'s
+    /// `edit_reference`, so the wrapper chain (`reference::edit::Error` →
+    /// `prepare::Error`) is the real one and not a hand-built stand-in. A
+    /// constructed variant alone would still pass if the wrapper stopped
+    /// forwarding `source()`.
+    #[test]
+    fn the_real_edit_reference_rejection_is_recognized() {
+        let dir = std::env::temp_dir().join(format!("zvcs-refrace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = gix::init(&dir).expect("init repo");
+
+        // A ref whose value we then claim to know — the CAS is rejected because the
+        // value we pass as `expected` is not what is on disk.
+        let stale = gix::ObjectId::empty_blob(gix::hash::Kind::Sha1);
+        let actual = repo.write_blob(b"on disk").expect("write blob").detach();
+        let name: gix::refs::FullName = "refs/heads/race".try_into().expect("ref name");
+        repo.edit_reference(gix::refs::transaction::RefEdit {
+            change: gix::refs::transaction::Change::Update {
+                log: gix::refs::transaction::LogChange::default(),
+                expected: gix::refs::transaction::PreviousValue::Any,
+                new: gix::refs::Target::Object(actual),
+            },
+            name: name.clone(),
+            deref: false,
+        })
+        .expect("create ref");
+
+        // Claim a value the ref does not have: the store rejects the swap.
+        let lose_the_race = || {
+            repo.edit_reference(gix::refs::transaction::RefEdit {
+                change: gix::refs::transaction::Change::Update {
+                    log: gix::refs::transaction::LogChange::default(),
+                    expected: gix::refs::transaction::PreviousValue::MustExistAndMatch(
+                        gix::refs::Target::Object(stale),
+                    ),
+                    new: gix::refs::Target::Object(actual),
+                },
+                name: name.clone(),
+                deref: false,
+            })
+            .expect_err("the stale expectation must be rejected")
+        };
+
+        // `--amend` and the branch/tag verbs surface exactly this.
+        let as_edit = anyhow::Error::new(lose_the_race());
+        assert!(super::is_ref_race(&as_edit), "unrecognized as edit error: {as_edit:#}");
+
+        // `git commit` goes through `Repository::commit`, one wrapper further out.
+        let as_commit = anyhow::Error::new(gix::commit::Error::ReferenceEdit(lose_the_race()));
+        assert!(super::is_ref_race(&as_commit), "unrecognized as commit error: {as_commit:#}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only the CAS rejection queues. A malformed ref name is a real error a
+    /// re-run would hit identically, so classifying it as contention would spin
+    /// the queue on a command that can never succeed.
+    #[test]
+    fn other_prepare_failures_are_not_races() {
+        let err = anyhow::Error::new(PrepareError::MustExist {
+            full_name: "refs/heads/main".into(),
+            expected: gix::refs::Target::Object(gix::ObjectId::empty_blob(gix::hash::Kind::Sha1)),
+        });
+        assert!(!super::is_ref_race(&err));
+    }
+}
+
 impl Drop for RepoLock {
     fn drop(&mut self) {
         if let Some(stream) = self.stream.as_mut() {

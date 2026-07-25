@@ -804,6 +804,14 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
             eprintln!("zvcs: {sub}: index is locked by another writer — queueing");
             superset::queue::queue_verb(sub, args)
         }
+        // A ref race takes no lockfile at all: both writers wrote cleanly and this
+        // one lost the compare-and-swap on the ref's expected value. Re-running
+        // after the winner lands is what fixes it, so it queues like a lock
+        // conflict rather than dropping the command.
+        Err(err) if is_lock_verb && !queued_rerun && crate::lock::is_ref_race(&err) => {
+            eprintln!("zvcs: {sub}: ref moved under another writer — queueing");
+            superset::queue::queue_verb(sub, args)
+        }
         other => other,
     }
 }

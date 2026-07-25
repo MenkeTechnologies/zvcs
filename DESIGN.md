@@ -82,6 +82,18 @@ Two locks sit underneath, with distinct jobs:
   re-queues, so a permanently stuck lock fails once instead of spawning jobs
   forever.
 
+- **Ref races (lockfile-free contention).** Two writers can each take and release
+  every lock cleanly and still collide: the loser's compare-and-swap on
+  `refs/heads/<branch>` is rejected (`ReferenceOutOfDate`) because the winner
+  moved the ref between its read and its write. No lockfile is involved, so
+  `is_lock_contention` does not see it; `lock::is_ref_race` matches that variant
+  through whichever `gix` wrapper carries it (`commit::Error`,
+  `reference::edit::Error`, or the bare `prepare::Error` — the wrappers are
+  `#[error(transparent)]`, so the inner error is a payload, never a `source()`
+  link) and the dispatcher queues the command instead of dropping it. Measured on
+  a 32-way `commit` fanout with no daemon: 11–12 of these per run, each formerly a
+  hard exit-1 that lost the commit.
+
 ### Layer 2 — `z*` superset verbs + singleton daemon
 
 The novel coordination layer stock git cannot have. Verbs live under a `z`

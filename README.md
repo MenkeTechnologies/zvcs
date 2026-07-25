@@ -329,6 +329,14 @@ and no wait. So an index-writing command first waits out a foreign `index.lock`
 the command is submitted to the queue as a job rather than failing, and runs on
 the repo's fair lane once the lock clears.
 
+The second contention shape takes no lockfile at all: a **ref race**, where two
+writers each committed cleanly and the loser's compare-and-swap on
+`refs/heads/<branch>` is rejected because the winner moved it first. That is
+routed to the queue too (`ref moved under another writer — queueing`), since a
+re-run once the winner has landed is exactly what resolves it. A job's own re-run
+never re-queues itself, so a conflict that keeps losing reports the failure
+instead of spawning jobs forever.
+
 Wire protocol — line-based over the unix socket:
 
 | Line | Direction | Meaning |

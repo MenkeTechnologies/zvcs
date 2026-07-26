@@ -33,6 +33,8 @@ use gix::remote::fetch::{Shallow, Tags};
 ///   * `--shallow-since <time>`      → shallow boundary at a cutoff date
 ///   * `--shallow-exclude <ref>`     → exclude history reachable from a ref (repeatable)
 ///   * `--no-tags`                   → do not fetch tags
+///   * `-u`/`--upload-pack <path>`   → run `<path>` instead of `git-upload-pack` on the other end
+///   * `--server-option <opt>`       → protocol-v2 `server-option=<opt>` line (repeatable)
 ///   * `--reject-shallow`            → refuse to clone from a shallow remote
 ///   * `--template <dir>`            → seed the new git dir from a template directory
 ///   * `--separate-git-dir <dir>`    → real git dir elsewhere + a `gitdir:` link file
@@ -125,6 +127,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `--reject-shallow` (`true`) / `--no-reject-shallow` (`false`); `None` leaves
     // it unspecified so the `clone.rejectShallow` config value, if any, decides.
     let mut reject_shallow: Option<bool> = None;
+    // `-u`/`--upload-pack <path>` and the repeatable `--server-option`, both handed to the transport.
+    let mut upload_pack: Option<String> = None;
+    let mut server_options: Vec<gix::bstr::BString> = Vec::new();
     // `--single-branch` (`true`) / `--no-single-branch` (`false`); `None` leaves the
     // choice to gitoxide, which single-branches a shallow clone like git does.
     let mut single_branch: Option<bool> = None;
@@ -219,6 +224,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--no-tags" => tags = Some(Tags::None),
             // `--tags` resets to git's default (all tags fetched).
             "--tags" => tags = None,
+            // `-u`/`--upload-pack <path>`: the program to run in place of `git-upload-pack`.
+            "-u" | "--upload-pack" => upload_pack = Some(take_value!("--upload-pack")),
+            "--no-upload-pack" => upload_pack = None,
+            // Protocol-v2 server options, repeatable. `-o` is `--origin` for clone, so only the long form.
+            "--server-option" => server_options.push(take_value!("--server-option").into()),
+            "--no-server-option" => server_options.clear(),
             "--reject-shallow" => reject_shallow = Some(true),
             "--no-reject-shallow" => reject_shallow = Some(false),
             "--single-branch" => single_branch = Some(true),
@@ -517,6 +528,17 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // everything and lets gitoxide match locally — which is what `--mirror` wants
     // anyway. Only the mirror refspec needs this; every other plan has a literal
     // prefix (`refs/heads/`) that the filter handles correctly.
+    // The transport-level knobs. `remote.<name>.uploadpack`/`serverOption` cannot apply here: the remote is
+    // being created by this very clone, so only the command line can supply them.
+    if upload_pack.is_some() {
+        prepare = prepare.with_connect_options(gix::remote::connect::Options {
+            upload_pack: upload_pack.as_deref().map(Into::into),
+        });
+    }
+    if !server_options.is_empty() {
+        prepare = prepare.with_server_options(server_options.clone());
+    }
+
     if matches!(plan, Some(Refspecs::Mirror)) {
         prepare = prepare.with_fetch_options(gix::remote::ref_map::Options {
             prefix_from_spec_as_filter_on_remote: false,
@@ -529,6 +551,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         let url_for_remote = url.clone();
         let explicit_origin = origin.clone();
         let single_outcome = single_outcome.clone();
+        let probe_connect = gix::remote::connect::Options {
+            upload_pack: upload_pack.as_deref().map(Into::into),
+        };
+        let probe_server_options = server_options.clone();
         prepare = prepare.configure_remote(move |r| {
             let Some(plan) = plan.as_ref() else {
                 // Only the tag mode changes; keep the refspec gitoxide chose,
@@ -540,7 +566,14 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             };
             let repo = r.repo;
             let remote_name = resolve_remote_name(repo, explicit_origin.as_deref());
-            let specs = plan.refspecs(repo, &url_for_remote, &remote_name, &single_outcome)?;
+            let specs = plan.refspecs(
+                repo,
+                &url_for_remote,
+                &remote_name,
+                &single_outcome,
+                &probe_connect,
+                &probe_server_options,
+            )?;
             // Build a fresh remote rather than adding to `r`: `with_refspecs` only
             // appends, so replacing gitoxide's wildcard spec is impossible in place.
             let mut remote = repo.remote_at(url_for_remote.clone())?;
@@ -771,13 +804,16 @@ impl Refspecs {
         url: &gix::Url,
         remote_name: &str,
         outcome: &SingleOutcome,
+        connect_options: &gix::remote::connect::Options,
+        server_options: &[gix::bstr::BString],
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(match self {
             Refspecs::Mirror => vec!["+refs/*:refs/*".to_string()],
             Refspecs::Bare => vec!["+refs/heads/*:refs/heads/*".to_string()],
             Refspecs::Wildcard => vec![format!("+refs/heads/*:refs/remotes/{remote_name}/*")],
             Refspecs::Single { branch, bare } => {
-                let (fetched, head_target) = resolve_single_ref(repo, url, branch.as_deref())?;
+                let (fetched, head_target) =
+                    resolve_single_ref(repo, url, branch.as_deref(), connect_options, server_options)?;
                 *outcome.lock().expect("clone is single-threaded here") =
                     Some((fetched.clone(), head_target));
                 match fetched {
@@ -813,9 +849,13 @@ fn resolve_single_ref(
     repo: &gix::Repository,
     url: &gix::Url,
     branch: Option<&str>,
+    connect_options: &gix::remote::connect::Options,
+    server_options: &[gix::bstr::BString],
 ) -> Result<(Option<String>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
     let remote = repo.remote_at(url.clone())?;
-    let connection = remote.connect(gix::remote::Direction::Fetch)?;
+    let connection = remote
+        .connect_with_options(gix::remote::Direction::Fetch, connect_options.clone())?
+        .with_server_options(server_options.to_vec());
     // The probe remote carries no refspecs, so the server must advertise
     // everything rather than only what a refspec prefix would allow.
     let (map, _handshake) = connection.ref_map(

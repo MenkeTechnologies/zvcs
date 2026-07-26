@@ -5,24 +5,22 @@
 //! prunes the loose objects it just packed (`-d`) and refreshes
 //! `objects/info/packs` (unless `-n` or `repack.updateServerInfo` is false).
 //!
-//! # Pack bytes differ from git's by design
+//! # Pack bytes differ from git's, but the compression does not
 //!
-//! `gix-pack` has no delta compression — its only output mode is
-//! `Mode::PackCopyAndBaseObjects`, documented as "Copy base objects and deltas
-//! from packs, while non-packed objects will be treated as base objects (i.e.
-//! without trying to delta compress them)"
-//! (`gix-pack/src/data/output/entry/iter_from_counts.rs:362`). Every object this
-//! module writes is therefore stored undeltified, so the pack is larger than
-//! git's and shares none of its bytes; since a pack's filename embeds its
-//! checksum, the name differs too.
+//! The pack is built by `pack-objects`' writer, so it is delta-compressed by
+//! git's own machinery ported into [`gix_pack::data::output::delta`], honouring
+//! `pack.window`, `pack.depth`, `pack.windowMemory`, `pack.deltaCacheSize`,
+//! `pack.deltaCacheLimit`, `pack.threads` and `pack.compression`.
+//! `repack.useDeltaBaseOffset` (default true, as in git) decides whether a delta
+//! names its base by pack offset or by object id.
 //!
-//! That is a deliberate, bounded divergence, not an approximation of the work:
-//! the pack written here is a *valid* pack containing the *correct* object set,
-//! with a correct `.idx` and `.rev` beside it. What it is not is byte-identical,
-//! which no delta-free writer can be. Consequently `-f` and `-F`, which exist
-//! only to control delta *reuse*, have nothing to control and are accepted as
-//! no-ops, and `--window`/`--depth`/`--window-memory`/`--threads`, which tune
-//! the delta search, are likewise accepted and ignored.
+//! The bytes still differ from git's: objects are enumerated in this module's
+//! own order rather than git's `compute_write_order()`, and no delta is ever
+//! reused from an existing pack. Since a pack's filename embeds its checksum,
+//! the name differs too. What the pack *is* is valid, complete and comparable in
+//! size, with a correct `.idx` and `.rev` beside it. `-f` and `-F`, which exist
+//! only to control delta *reuse*, therefore still have nothing to control and
+//! are accepted as no-ops.
 //!
 //! # Argument surface
 //!
@@ -70,9 +68,10 @@
 //!     wording, stream and exit code, including the way `-q`/`--quiet`
 //!     suppresses just that notice. With `-a` the whole set is repacked
 //!     regardless.
-//!   * **`.rev`** is written next to every pack via
-//!     [`gix::odb::pack::index::write_reverse_index`], added to the vendored
-//!     `gix-pack` for this command, unless `pack.writeReverseIndex` is false.
+//!   * **`.idx` and `.rev`** are written straight from the pack writer's own
+//!     record of where each object landed, the `.rev` unless
+//!     `pack.writeReverseIndex` is false. The pack is named after its trailing
+//!     checksum, as git names it.
 //!   * **`-d`** removes the packs the new one supersedes and then prunes the
 //!     loose objects now present in a pack, delegating to the real
 //!     [`super::prune_packed::prune_packed`] port. A pack with a `.keep`, and
@@ -109,18 +108,20 @@
 //!     reduce to a rule the observed output confirms, and guessing one would put
 //!     the wrong object set in the pack. Observable only under `--filter=tree:*`
 //!     *together with* `-d`, where a loose object git prunes may survive.
-//!   * **`-f`/`-F`/`--window*`/`--depth`/`--threads`/`--path-walk`/
-//!     `--delta-islands`/`--name-hash-version`** tune a delta search that does
-//!     not happen, and are accepted as no-ops.
+//!   * **`--window`/`--window-memory`/`--depth`/`--threads`** are forwarded to
+//!     the delta search, shadowing the `pack.*` keys of the same name.
+//!     **`-f`/`-F`/`--path-walk`/`--delta-islands`/`--name-hash-version`** tune
+//!     parts of git's search that have no counterpart here, and stay no-ops.
 //!   * `repack.writeBitmaps` / `pack.writeBitmaps` are not read, so the
 //!     incremental-with-bitmaps `fatal:` fires only when `-b` is given
 //!     explicitly.
-//!   * `repack.useDeltaBaseOffset`, `repack.packKeptObjects` and
-//!     `repack.cruftWindow` / `repack.cruftDepth` / `repack.cruftThreads` are not
-//!     read either: they tune a delta search, a kept-object exclusion and a cruft
-//!     pack that this delta-free, cruft-free writer never performs, so honouring
-//!     them would change nothing. `repack.updateServerInfo` *is* honoured, since
-//!     the closing `update-server-info` it gates is real; see [`execute`].
+//!   * `repack.useDeltaBaseOffset` *is* read, and picks `OBJ_OFS_DELTA` over
+//!     `OBJ_REF_DELTA`. `repack.packKeptObjects` and `repack.cruftWindow` /
+//!     `repack.cruftDepth` / `repack.cruftThreads` are not: they tune a
+//!     kept-object exclusion and a cruft pack this writer never produces, so
+//!     honouring them would change nothing. `repack.updateServerInfo` *is*
+//!     honoured, since the closing `update-server-info` it gates is real; see
+//!     [`execute`].
 //!   * `--filter=sparse:oid=<rev>` is accepted on syntax alone — git's rejection
 //!     of it depends on resolving and parsing the named blob;
 //!   * `combine:` sub-specs are not percent-decoded;
@@ -132,14 +133,11 @@
 //! ```
 
 use anyhow::{bail, Result};
-use std::convert::Infallible;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
 
 use gix::hash::ObjectId;
-use gix::odb::pack;
 
 /// Stock git's `repack` usage block, byte-for-byte (2699 bytes, git 2.55.0),
 /// including the trailing blank line. Printed on `-h` (stdout) and after the
@@ -458,85 +456,56 @@ fn execute(st: &State) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Encode `ids` as a pack and let `gix-pack` index it into `pack_dir`, then
-/// write the `.rev` beside the result.
+/// Encode `ids` as a pack, install it in `pack_dir` as `pack-<checksum>.pack`,
+/// and write its `.idx` (and optionally its `.rev`) beside it.
 ///
-/// The pack is built in memory and handed to
-/// [`pack::Bundle::write_to_directory`] rather than written directly, so the
-/// `.idx` comes from the vendored writer that `index-pack` already relies on
-/// and the naming follows the same rule.
+/// The index is built here rather than by re-reading the pack, because the
+/// writer already knows where every object landed and what its CRC is — and
+/// because `gix-pack`'s bundle writer refuses a pack containing `OBJ_REF_DELTA`
+/// entries, which is precisely what `repack.useDeltaBaseOffset=false` asks for.
+/// The naming rule is unchanged: a pack is named after its own trailing
+/// checksum, which is what git does and what `gc` does here.
 fn write_pack(
     repo: &gix::Repository,
     ids: &[ObjectId],
     pack_dir: &Path,
     write_rev: bool,
 ) -> Result<PathBuf> {
-    let bytes = encode_pack(repo, ids)?;
-    let outcome = pack::Bundle::write_to_directory(
-        &mut &bytes[..],
-        Some(pack_dir),
-        &mut gix::progress::Discard,
-        &AtomicBool::new(false),
-        None::<gix::odb::Handle>,
-        pack::bundle::write::Options {
-            object_hash: repo.object_hash(),
-            ..Default::default()
+    let allow_ofs_delta = repo
+        .config_snapshot()
+        .boolean("repack.useDeltaBaseOffset")
+        .unwrap_or(true);
+    let packed = super::pack_objects::packed_for(
+        repo,
+        ids,
+        super::pack_objects::WriteOptions {
+            allow_ofs_delta,
+            ..super::pack_objects::WriteOptions::default()
         },
     )?;
-
-    let Some(index_path) = outcome.index_path.clone() else {
+    if packed.entries.is_empty() {
         bail!("pack writer produced no files for {} objects", ids.len());
-    };
-    // `write_to_directory` always drops a `.keep` next to a freshly written
-    // pack; `repack` never leaves one behind.
-    if let Some(keep) = &outcome.keep_path {
-        let _ = fs::remove_file(keep);
     }
 
+    let kind = repo.object_hash();
+    let base = pack_dir.join(format!("pack-{}", packed.id));
+    fs::write(base.with_extension("pack"), &packed.bytes)?;
+
+    // Both companions index into the pack in object-id order.
+    let mut by_oid = packed.entries.clone();
+    by_oid.sort_unstable_by_key(|entry| entry.id);
+    let index_path = base.with_extension("idx");
+    fs::write(
+        &index_path,
+        super::pack_objects::index_file(kind, 2, &packed.id, &by_oid)?,
+    )?;
     if write_rev {
-        let index = pack::index::File::at(&index_path, repo.object_hash())?;
-        let mut rev = Vec::new();
-        pack::index::write_reverse_index(&index, &mut rev)?;
-        fs::write(index_path.with_extension("rev"), rev)?;
+        fs::write(
+            base.with_extension("rev"),
+            super::pack_objects::reverse_index_file(kind, &packed.id, &by_oid)?,
+        )?;
     }
     Ok(index_path)
-}
-
-/// Serialise `ids` into pack bytes, every object stored as a base entry.
-///
-/// No delta search happens — see the module docs — so each object is simply
-/// deflated behind its own entry header, and the resulting pack is valid but
-/// larger than the one git would write for the same objects.
-fn encode_pack(repo: &gix::Repository, ids: &[ObjectId]) -> Result<Vec<u8>> {
-    let compression = gix::zlib::Compression::default();
-    let object_hash = repo.object_hash();
-
-    let mut entries = Vec::with_capacity(ids.len());
-    for id in ids {
-        let object = repo.find_object(*id)?;
-        let data = gix::objs::Data {
-            kind: object.kind,
-            object_hash,
-            data: &object.data,
-        };
-        let count = pack::data::output::Count::from_data(*id, None);
-        entries.push(pack::data::output::Entry::from_data(&count, &data, compression)?);
-    }
-
-    let mut out = Vec::new();
-    let num_entries = entries.len() as u32;
-    let mut writer = pack::data::output::bytes::FromEntriesIter::new(
-        std::iter::once(Ok::<_, Infallible>(entries)),
-        &mut out,
-        num_entries,
-        pack::data::Version::V2,
-        object_hash,
-    );
-    for step in writer.by_ref() {
-        step?;
-    }
-    drop(writer);
-    Ok(out)
 }
 
 /// Write the empty pack, its index and its reverse index into `dir`.
@@ -1110,9 +1079,10 @@ fn short_opts(cluster: &str, args: &[String], i: &mut usize, st: &mut State) -> 
             'd' => st.delete_redundant = true,
             'n' => st.no_server_info = true,
             'q' => st.quiet = true,
-            // `-f`/`-F` control delta reuse, `-l` scopes the search to local
-            // packs and `-i` enables delta islands: all no-ops for a delta-free
-            // writer.
+            // `-f`/`-F` control delta *reuse* and `-l` scopes the search to
+            // local packs; nothing here reuses a pack entry, so both describe a
+            // behaviour this writer already has. `-i` enables delta islands,
+            // which are not modelled.
             'f' | 'F' | 'l' | 'i' => {}
             'g' => {
                 // The remainder of the cluster is the value, else the next argv.

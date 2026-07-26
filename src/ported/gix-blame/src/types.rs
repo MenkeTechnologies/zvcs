@@ -167,6 +167,12 @@ pub struct Options {
     /// Ignore whitespace when diffing revisions (`git blame -w`): a line that changed only in
     /// whitespace is attributed to the earlier commit, not the whitespace-only change.
     pub ignore_whitespace: bool,
+    /// Commits whose changes should not be attributed to them (`git blame --ignore-rev`).
+    ///
+    /// After the usual diff has passed everything it can to the parents, the lines that are left
+    /// over for an ignored commit are matched against the parent's lines by similarity, and the
+    /// ones that find a match are passed on to the parent as well. This is git's `sb->ignore_list`.
+    pub ignore_revs: std::collections::HashSet<ObjectId>,
 }
 
 /// Represents a change during history traversal for blame. It is supposed to capture enough
@@ -328,6 +334,13 @@ pub struct BlameEntry {
     /// The *Source File*'s name, in case it differs from *Blamed File*'s name.
     /// This happens when the file was renamed.
     pub source_file_name: Option<BString>,
+    /// The lines were passed to this commit by the `--ignore-rev` re-attribution rather than by a
+    /// diff, so they only *resemble* the lines of the ignored commit. git's `blame_entry::ignored`.
+    pub ignored: bool,
+    /// The lines belong to an ignored commit but no similar line was found in any parent, so no
+    /// better origin than the ignored commit itself could be determined. git's
+    /// `blame_entry::unblamable`.
+    pub unblamable: bool,
 }
 
 impl BlameEntry {
@@ -354,6 +367,8 @@ impl BlameEntry {
             len: NonZeroU32::new(range_in_blamed_file.len() as u32).expect("BUG: hunks are never empty"),
             commit_id,
             source_file_name,
+            ignored: false,
+            unblamable: false,
         }
     }
 }
@@ -392,6 +407,11 @@ pub struct UnblamedHunk {
     pub suspects: SmallVec<[(ObjectId, Range<u32>); 1]>,
     /// The *Source File*'s name, in case it differs from *Blamed File*'s name.
     pub source_file_name: Option<BString>,
+    /// See [`BlameEntry::ignored`]. Sticky: it survives every later split of this hunk, as it does
+    /// in git where `split_blame_at()` copies it onto the new entry.
+    pub ignored: bool,
+    /// See [`BlameEntry::unblamable`]. Sticky, like [`Self::ignored`].
+    pub unblamable: bool,
 }
 
 impl UnblamedHunk {
@@ -403,6 +423,8 @@ impl UnblamedHunk {
             range_in_blamed_file: range_start..range_end,
             suspects: [(suspect, range_start..range_end)].into(),
             source_file_name: None,
+            ignored: false,
+            unblamable: false,
         }
     }
 

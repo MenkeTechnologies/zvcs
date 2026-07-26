@@ -179,7 +179,7 @@ fn globally_enabled() -> bool {
 /// `hint:` for an empty one (no trailing space), all on stderr. Each whole line —
 /// the `hint:` prefix included — is painted with `color.advice.hint` (default
 /// yellow) when `color.advice` allows it; git closes the span before the newline.
-fn print_hint(body: &str) {
+pub(crate) fn print_hint(body: &str) {
     let color = hint_color();
     let reset = if color.is_empty() { "" } else { "\x1b[m" };
     for line in body.split('\n') {

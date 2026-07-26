@@ -1542,6 +1542,12 @@ fn prune_one(repo: &gix::Repository, name: &str, dry_run: bool) -> Result<bool> 
         }
     };
 
+    // git's `prune_remote` returns before printing anything when the remote has
+    // nothing stale, so a no-op prune is silent.
+    if stale.is_empty() {
+        return Ok(true);
+    }
+
     println!("Pruning {name}");
     println!(
         "URL: {}",
@@ -1566,9 +1572,24 @@ fn prune_one(repo: &gix::Repository, name: &str, dry_run: bool) -> Result<bool> 
 /// Connect to `<name>` (fetch direction) and run the ref-advertisement
 /// handshake, returning the resulting ref map. Contacting the remote is the
 /// only way to learn what it advertises, so this fails when it is unreachable.
+///
+/// `remote.<name>.uploadpack` names the program run in place of
+/// `git-upload-pack` on the other end, exactly as git's `transport_get()`
+/// copies `remote->uploadpack` into `smart_options.uploadpack`. Only the
+/// transports that spawn the service themselves (a local path and ssh) can
+/// honour it, which is where git applies it too — so a bogus value makes
+/// `remote show` and `remote prune` fail to reach a local remote, as it does
+/// under stock git.
 fn query_ref_map(repo: &gix::Repository, name: &str) -> Result<gix::remote::fetch::RefMap> {
     let remote = repo.find_remote(name)?;
-    let connection = remote.connect(gix::remote::Direction::Fetch)?;
+    let upload_pack = repo
+        .config_snapshot()
+        .plumbing()
+        .string_by("remote", Some(BStr::new(name)), "uploadpack");
+    let connection = remote.connect_with_options(
+        gix::remote::Direction::Fetch,
+        gix::remote::connect::Options { upload_pack },
+    )?;
     let (map, _handshake) = connection.ref_map(
         gix::progress::Discard,
         gix::remote::ref_map::Options::default(),
@@ -1709,6 +1730,21 @@ fn stale_tracking_refs(repo: &gix::Repository, name: &str) -> Result<Vec<String>
 
 /// `git remote update [-p] [<group>|<remote>]…` — fetch from every named
 /// remote (all of them by default), then optionally prune.
+///
+/// Port of git's `update()`, which builds a `git fetch --multiple <args>`
+/// command line: with no operand it asks for the `default` group, and when the
+/// last operand is `default` while `remotes.default` is configured nowhere it
+/// swaps that operand for `--all`. Those two branches behave differently, and
+/// the difference is where `remote.<name>.skipFetchAll` lives:
+///
+///   * the `--all` branch enumerates the configured remotes and drops the ones
+///     `skipFetchAll` (or its deprecated synonym `skipDefaultUpdate`) marks, and
+///     when exactly one survives git fetches it directly — `cmd_fetch` refuses
+///     to "do fetch_multiple() of one", so no `Fetching <name>` line is printed;
+///   * a named group or remote is fetched whatever the skip flags say, and is
+///     always announced.
+///
+/// The announcement goes to stdout, as git's `printf` in `fetch_multiple` does.
 fn update(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut do_prune = false;
     let mut pos: Vec<&str> = Vec::new();
@@ -1730,34 +1766,61 @@ fn update(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         .map(|n| n.to_str_lossy().into_owned())
         .collect();
 
+    // git appends the literal `default` when no operand was given, then rewrites
+    // a trailing `default` to `--all` unless `remotes.default` exists.
+    let cfg = repo.config_snapshot();
+    let mut wanted: Vec<&str> = pos.clone();
+    if wanted.is_empty() {
+        wanted.push("default");
+    }
+    let default_group_defined = cfg
+        .plumbing()
+        .strings_by("remotes", None::<&BStr>, "default")
+        .is_some();
+    let all = wanted.last() == Some(&"default") && !default_group_defined;
+    if all {
+        wanted.pop();
+        // The rewrite leaves `git fetch --multiple <rest> --all`, and `--all`
+        // refuses to share the command line with an operand.
+        if !wanted.is_empty() {
+            eprintln!("fatal: fetch --all does not take a repository argument");
+            return Ok(ExitCode::from(1));
+        }
+    }
+
     let mut targets: Vec<String> = Vec::new();
-    if pos.is_empty() {
-        targets = known;
-    } else {
-        let cfg = repo.config_snapshot();
-        for want in pos {
-            if known.iter().any(|n| n.as_str() == want) {
-                targets.push(want.to_string());
-                continue;
-            }
-            let group = cfg
-                .plumbing()
-                .strings_by("remotes", None::<&BStr>, want)
-                .unwrap_or_default();
-            if group.is_empty() {
-                eprintln!("fatal: no such remote or remote group: {want}");
-                return Ok(ExitCode::from(1));
-            }
-            for entry in group {
-                for member in entry.to_str_lossy().split_whitespace() {
-                    targets.push(member.to_string());
-                }
+    for want in wanted {
+        if known.iter().any(|n| n.as_str() == want) {
+            targets.push(want.to_string());
+            continue;
+        }
+        let group = cfg
+            .plumbing()
+            .strings_by("remotes", None::<&BStr>, want)
+            .unwrap_or_default();
+        if group.is_empty() {
+            eprintln!("fatal: no such remote or remote group: {want}");
+            return Ok(ExitCode::from(1));
+        }
+        for entry in group {
+            for member in entry.to_str_lossy().split_whitespace() {
+                targets.push(member.to_string());
             }
         }
     }
 
+    // Only the `--all` branch consults the skip flags, and only it collapses a
+    // one-remote run into a silent single fetch.
+    let mut announce = true;
+    if all {
+        targets.extend(known.iter().filter(|n| !skip_fetch_all(repo, n)).cloned());
+        announce = targets.len() > 1;
+    }
+
     for name in &targets {
-        eprintln!("Fetching {name}");
+        if announce {
+            println!("Fetching {name}");
+        }
         if super::fetch::fetch(std::slice::from_ref(name)).is_err() {
             eprintln!("error: Could not fetch {name}");
             return Ok(ExitCode::from(1));
@@ -1767,4 +1830,69 @@ fn update(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// git's `remote->skip_default_update` for `<name>`: the effective value of
+/// `remote.<name>.skipFetchAll`, whose deprecated synonym
+/// `remote.<name>.skipDefaultUpdate` is parsed into the very same field. Because
+/// both names write one slot as the config is read in order, the *last*
+/// occurrence of either wins — `skipFetchAll = true` followed by
+/// `skipDefaultUpdate = false` leaves the remote unskipped.
+///
+/// The ordered walk is what makes that rule expressible: the merged config file
+/// is visited section by section (system, then global, then local, matching
+/// git's parse order) and, inside each, value name by value name. A key written
+/// without `=` counts as `true`, as `git_config_bool` treats a `NULL` value, and
+/// an unparseable value leaves the previous verdict alone.
+fn skip_fetch_all(repo: &gix::Repository, name: &str) -> bool {
+    /// git's `git_parse_maybe_bool`, which is deliberately narrower than a
+    /// number parse: anything else is a config error, which git reports and this
+    /// caller ignores in favour of the value already decided.
+    fn parse_bool(value: &BStr) -> Option<bool> {
+        match value.to_str_lossy().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" | "1" => Some(true),
+            "false" | "no" | "off" | "0" | "" => Some(false),
+            _ => None,
+        }
+    }
+
+    let cfg = repo.config_snapshot();
+    let Some(sections) = cfg.plumbing().sections_by_name("remote") else {
+        return false;
+    };
+
+    let mut skip = false;
+    for section in sections {
+        if section.header().subsection_name() != Some(BStr::new(name)) {
+            continue;
+        }
+        let body = section.body();
+
+        // The last of the two synonyms in this section, as (config name, which
+        // occurrence of that name it is).
+        let mut last: Option<(&str, usize)> = None;
+        let (mut fetch_all, mut default_update) = (0usize, 0usize);
+        for value_name in body.value_names() {
+            match value_name.to_ascii_lowercase().as_str() {
+                "skipfetchall" => {
+                    last = Some(("skipFetchAll", fetch_all));
+                    fetch_all += 1;
+                }
+                "skipdefaultupdate" => {
+                    last = Some(("skipDefaultUpdate", default_update));
+                    default_update += 1;
+                }
+                _ => {}
+            }
+        }
+
+        if let Some((key, nth)) = last {
+            skip = match body.values(key).get(nth) {
+                Some(value) => parse_bool(value.as_bstr()).unwrap_or(skip),
+                // The name was there but carried no `= value`.
+                None => true,
+            };
+        }
+    }
+    skip
 }

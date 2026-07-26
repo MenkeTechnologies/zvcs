@@ -133,6 +133,7 @@ where
             transport: &mut con.transport.inner,
             user_agent: repo.config.user_agent_tuple(),
             trace_packetlines: con.trace,
+            server_options: con.server_options.clone(),
         };
 
         let negotiator = repo

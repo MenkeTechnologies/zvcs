@@ -9,7 +9,7 @@ use gix_object::{
 use gix_traverse::commit::find as find_commit;
 use smallvec::SmallVec;
 
-use super::{Change, UnblamedHunk, process_changes};
+use super::{Change, UnblamedHunk, process_changes, process_ignored_changes};
 use crate::{BlameEntry, Error, Options, Outcome, Statistics, types::BlamePathEntry};
 
 /// Produce a list of consecutive [`BlameEntry`] instances to indicate in which commits the ranges of the file
@@ -201,9 +201,20 @@ pub fn file(
 
         // This block asserts that, for every `UnblamedHunk`, all lines in the *Blamed File* are
         // identical to the corresponding lines in the *Source File*.
+        //
+        // Under `-w` the walk diffs whitespace-normalized text (see `blob_changes`), so a hunk may
+        // legitimately survive a commit that only re-indented it. The invariant then holds modulo
+        // the very normalization the diff used, which is what is compared here.
         #[cfg(debug_assertions)]
         {
             let source_blob = odb.find_blob(&entry_id, &mut buf)?.data.to_vec();
+            let normalize = |token: &[u8]| -> BString {
+                if options.ignore_whitespace {
+                    BString::new(strip_whitespace_per_line(token))
+                } else {
+                    BString::new(token.into())
+                }
+            };
             let mut source_interner = gix_diff::blob::Interner::new(source_blob.len() / 100);
             let source_lines_as_tokens: Vec<_> = tokens_for_diffing(&source_blob)
                 .tokenize()
@@ -217,16 +228,21 @@ pub fn file(
                 .collect();
 
             for hunk in hunks_to_blame.iter() {
+                // A hunk that the `--ignore-rev` re-attribution moved to a fuzzily matched line in
+                // the parent is, by construction, only *similar* to the blamed lines.
+                if hunk.ignored || hunk.unblamable {
+                    continue;
+                }
                 if let Some(range_in_suspect) = hunk.get_range(&suspect) {
                     let range_in_blamed_file = hunk.range_in_blamed_file.clone();
 
                     let source_lines = range_in_suspect
                         .clone()
-                        .map(|i| BString::new(source_interner[source_lines_as_tokens[i as usize]].into()))
+                        .map(|i| normalize(source_interner[source_lines_as_tokens[i as usize]]))
                         .collect::<Vec<_>>();
                     let blamed_lines = range_in_blamed_file
                         .clone()
-                        .map(|i| BString::new(blamed_interner[blamed_lines_as_tokens[i as usize]].into()))
+                        .map(|i| normalize(blamed_interner[blamed_lines_as_tokens[i as usize]]))
                         .collect::<Vec<_>>();
 
                     assert_eq!(source_lines, blamed_lines);
@@ -255,6 +271,14 @@ pub fn file(
                 }
             }
         }
+
+        // git's `pass_blame()` runs the ordinary diff against every parent first, and only then, for
+        // an ignored commit, re-runs it against every parent with `ignore_diffs` set. What each of
+        // those second passes needs is recorded here as the first pass goes.
+        let suspect_is_ignored = options.ignore_revs.contains(&suspect);
+        // `(parent, changes, parent blob, target blob, source path if the parent renamed the file)`
+        type IgnoredPass = (ObjectId, Vec<Change>, Vec<u8>, Vec<u8>, Option<BString>);
+        let mut ignored_passes: Vec<IgnoredPass> = Vec::new();
 
         let more_than_one_parent = parent_ids.len() > 1;
         for (index, (parent_id, parent_commit_time)) in parent_ids.iter().enumerate() {
@@ -312,7 +336,7 @@ pub fn file(
                     unreachable!("We already found file_path in suspect^{{tree}}, so it can't be deleted")
                 }
                 TreeDiffChange::Modification { previous_id, id } => {
-                    let changes = blob_changes(
+                    let (changes, data) = blob_changes(
                         &odb,
                         resource_cache,
                         id,
@@ -322,8 +346,12 @@ pub fn file(
                         options.diff_algorithm,
                         options.ignore_whitespace,
                         &mut stats,
+                        suspect_is_ignored,
                     )?;
                     hunks_to_blame = process_changes(hunks_to_blame, changes.clone(), suspect, *parent_id);
+                    if let Some((old_data, new_data)) = data {
+                        ignored_passes.push((*parent_id, changes.clone(), old_data, new_data, None));
+                    }
                     if let Some(ref mut blame_path) = blame_path {
                         let has_blame_been_passed = hunks_to_blame.iter().any(|hunk| hunk.has_suspect(parent_id));
 
@@ -345,7 +373,7 @@ pub fn file(
                     source_id,
                     id,
                 } => {
-                    let changes = blob_changes(
+                    let (changes, data) = blob_changes(
                         &odb,
                         resource_cache,
                         id,
@@ -355,8 +383,18 @@ pub fn file(
                         options.diff_algorithm,
                         options.ignore_whitespace,
                         &mut stats,
+                        suspect_is_ignored,
                     )?;
-                    hunks_to_blame = process_changes(hunks_to_blame, changes, suspect, *parent_id);
+                    hunks_to_blame = process_changes(hunks_to_blame, changes.clone(), suspect, *parent_id);
+                    if let Some((old_data, new_data)) = data {
+                        ignored_passes.push((
+                            *parent_id,
+                            changes,
+                            old_data,
+                            new_data,
+                            Some(source_location.clone()),
+                        ));
+                    }
 
                     let mut has_blame_been_passed = false;
 
@@ -383,6 +421,22 @@ pub fn file(
                     }
                 }
             }
+        }
+
+        // "Pass remaining suspects for ignored commits to their parents." (`blame.c`, `pass_blame`)
+        for (parent_id, changes, parent_blob, target_blob, source_file_name) in &ignored_passes {
+            if !hunks_to_blame.iter().any(|hunk| hunk.has_suspect(&suspect)) {
+                break;
+            }
+            hunks_to_blame = process_ignored_changes(
+                hunks_to_blame,
+                changes,
+                suspect,
+                *parent_id,
+                parent_blob,
+                target_blob,
+                source_file_name.as_ref(),
+            );
         }
 
         hunks_to_blame.retain_mut(|unblamed_hunk| {
@@ -471,6 +525,10 @@ fn coalesce_blame_entries(lines_blamed: Vec<BlameEntry>) -> Vec<BlameEntry> {
                     && previous_blamed_range.end == current_blamed_range.start
                     // As of 2024-09-19, the check below only is in `git`, but not in `libgit2`.
                     && previous_source_range.end == current_source_range.start
+                    // `blame_coalesce()` refuses to merge entries that differ in these, so that the
+                    // `--ignore-rev` markers stay attached to exactly the lines they describe.
+                    && previous_entry.ignored == entry.ignored
+                    && previous_entry.unblamable == entry.unblamable
                 {
                     let coalesced_entry = BlameEntry {
                         start_in_blamed_file: previous_blamed_range.start as u32,
@@ -479,6 +537,8 @@ fn coalesce_blame_entries(lines_blamed: Vec<BlameEntry>) -> Vec<BlameEntry> {
                             .expect("BUG: hunks are never zero-sized"),
                         commit_id: previous_entry.commit_id,
                         source_file_name: previous_entry.source_file_name.clone(),
+                        ignored: previous_entry.ignored,
+                        unblamable: previous_entry.unblamable,
                     };
 
                     acc.pop();
@@ -748,6 +808,10 @@ fn tree_diff_with_rewrites_at_file_path(
     }
 }
 
+/// What [`blob_changes`] returns: the diff as [`Change`]s, plus — when the caller asked for it —
+/// the exact `(old, new)` bytes that were diffed, for the `--ignore-rev` fingerprints.
+type BlobChanges = (Vec<Change>, Option<(Vec<u8>, Vec<u8>)>);
+
 #[expect(clippy::too_many_arguments)]
 fn blob_changes(
     odb: impl gix_object::Find + gix_object::FindHeader,
@@ -759,7 +823,8 @@ fn blob_changes(
     diff_algorithm: gix_diff::blob::Algorithm,
     ignore_whitespace: bool,
     stats: &mut Statistics,
-) -> Result<Vec<Change>, Error> {
+    collect_data: bool,
+) -> Result<BlobChanges, Error> {
     use gix_diff::blob::Hunk;
 
     resource_cache.set_resource(
@@ -780,6 +845,9 @@ fn blob_changes(
     let outcome = resource_cache.prepare_diff()?;
     let old_data = outcome.old.data.as_slice().unwrap_or_default();
     let new_data = outcome.new.data.as_slice().unwrap_or_default();
+    // The `--ignore-rev` re-attribution fingerprints exactly the bytes that were diffed here, as
+    // git does by reusing `blame_origin::file` for both.
+    let data = collect_data.then(|| (old_data.to_vec(), new_data.to_vec()));
     // `git blame -w` (XDF_IGNORE_WHITESPACE): compare lines with all whitespace removed,
     // so a whitespace-only change is not a change. Normalizing per line preserves the
     // line count, so the resulting hunk line-indices still map to the original lines.
@@ -828,7 +896,7 @@ fn blob_changes(
     }
 
     stats.blobs_diffed += 1;
-    Ok(changes)
+    Ok((changes, data))
 }
 
 fn find_path_entry_in_commit(

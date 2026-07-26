@@ -916,6 +916,13 @@ fn parse_push_options(args: &[String]) -> Result<(Option<String>, bool)> {
                 bail!("--include-untracked is not ported")
             }
             "-a" | "--all" => bail!("--all is not ported"),
+            // `stash -p` runs the hunk selector against a SCRATCH index
+            // (`.git/stash-index`, seeded from HEAD and pointed at with
+            // `GIT_INDEX_FILE`), then turns that index into the stash tree.
+            // This port ignores `GIT_INDEX_FILE` everywhere, so the selector
+            // would stage into the REAL index instead — silently corrupting the
+            // user's staged state. Refused until the scratch-index plumbing
+            // exists; the selector itself is ready (`super::add_patch`).
             "-p" | "--patch" => bail!("--patch is not ported"),
             "-k" | "--keep-index" | "--no-keep-index" => bail!("--keep-index is not ported"),
             "-S" | "--staged" => bail!("--staged is not ported"),
@@ -949,6 +956,13 @@ fn parse_save_message(args: &[String]) -> Result<Option<String>> {
             "-q" | "--quiet" => {}
             "-u" | "--include-untracked" => bail!("--include-untracked is not ported"),
             "-a" | "--all" => bail!("--all is not ported"),
+            // `stash -p` runs the hunk selector against a SCRATCH index
+            // (`.git/stash-index`, seeded from HEAD and pointed at with
+            // `GIT_INDEX_FILE`), then turns that index into the stash tree.
+            // This port ignores `GIT_INDEX_FILE` everywhere, so the selector
+            // would stage into the REAL index instead — silently corrupting the
+            // user's staged state. Refused until the scratch-index plumbing
+            // exists; the selector itself is ready (`super::add_patch`).
             "-p" | "--patch" => bail!("--patch is not ported"),
             "-k" | "--keep-index" | "--no-keep-index" => bail!("--keep-index is not ported"),
             other if other.starts_with('-') => bail!("unsupported stash option '{other}'"),
@@ -1017,6 +1031,13 @@ fn parse_apply_options(repo: &gix::Repository, args: &[String]) -> Result<ApplyO
             "--no-index" => restore_index = false,
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
+            // `stash -p` runs the hunk selector against a SCRATCH index
+            // (`.git/stash-index`, seeded from HEAD and pointed at with
+            // `GIT_INDEX_FILE`), then turns that index into the stash tree.
+            // This port ignores `GIT_INDEX_FILE` everywhere, so the selector
+            // would stage into the REAL index instead — silently corrupting the
+            // user's staged state. Refused until the scratch-index plumbing
+            // exists; the selector itself is ready (`super::add_patch`).
             "-p" | "--patch" => bail!("--patch is not ported"),
             other if other.starts_with('-') && other != "-" => {
                 bail!("unsupported stash option '{other}'")

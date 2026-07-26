@@ -93,30 +93,32 @@ const ERROR_PACK: u8 = 4;
 ///
 /// ### Known divergences from stock git — read before trusting a clean result
 ///
-/// 1. **The fsck message layer covers 28 of git's 76 message ids.** git lints
+/// 1. **The fsck message layer does not cover every message id.** git lints
 ///    object *contents* on top of the connectivity walk and exits 1 when an
 ///    error-severity message fires; that layer is ported below (see [`MSGS`]),
-///    including `fsck.<msg-id>` severities, `--strict` promotion and
-///    `fsck.skipList`. What is *not* covered is listed id by id in
-///    [`UNPORTED_MSG_IDS`]: the reference-database ids (`git refs verify` has no
-///    equivalent here), the `.gitmodules`/`.gitattributes` blob ids, and the ids
-///    git only reaches by linting a buffer its own object parser already
-///    rejected. A repository whose only defect is one of those is reported clean
-///    here while stock git reports it.
-///    `--full` verifies pack *integrity* (checksums, per-object hash/CRC) via the
-///    gix pack verifier; the message layer runs over packed objects too, since
-///    the object-directory scan below iterates the whole odb rather than only
-///    its loose half.
+///    including `fsck.<msg-id>` severities, `--strict` promotion,
+///    `fsck.skipList`, the `.gitmodules`/`.gitattributes` blob lint and
+///    `fsck_finish()`'s sweep over the paths the trees named. What is *not*
+///    covered is listed id by id in [`UNPORTED_MSG_IDS`], and a repository whose
+///    only defect is one of those is reported clean here while stock git reports
+///    it. `--full` verifies pack *integrity* (checksums, per-object hash/CRC)
+///    via the gix pack verifier; the message layer runs over packed objects too,
+///    since the object-directory scan below iterates the whole odb rather than
+///    only its loose half.
 /// 2. **No `git refs verify`.** git checks the reference database by default
 ///    (`--references`) by running `git refs verify`; there is no equivalent in the
 ///    vendored crates. Both spellings of the flag are accepted because the check
 ///    is skipped either way — only its `--progress` block differs.
 /// 3. **No re-hashing.** git recomputes each object's hash to catch a silent
 ///    `hash mismatch`; this port trusts the odb's own integrity checking.
-/// 4. **Corruption exit code is coarse.** An object the odb cannot read is
-///    reported `fatal:` with exit 128, which matches git's loose-object
-///    corruption path; git distinguishes an unreadable object (128) from a
-///    decodable-but-malformed one (2) and this port reports 128 for both.
+/// 4. **An object the odb cannot open at all still aborts.** git treats an
+///    unreadable loose object as `error: <oid>: object corrupt or missing:
+///    <path>`, sets `ERROR_OBJECT` and keeps going; this port reports `fatal:`
+///    and exits 128 for that case. The neighbouring case — an object that reads
+///    fine but that `parse_object_buffer()` rejects — *is* ported: the
+///    `error: <oid>: object could not be parsed: <path>` line, the `error:`
+///    diagnostic `parse_commit_buffer()`/`parse_tag_buffer()` prints ahead of
+///    it, `ERROR_OBJECT`, and carrying on with the rest of the odb.
 /// 5. **Gitlink entries are not walked**, matching `gix-fsck` and git: a
 ///    submodule commit that happens to live in this odb is not marked reachable
 ///    by the tree or index entry that names it.
@@ -302,7 +304,17 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // this pass has to cover unreachable objects too.
     let mut scan_lines: Vec<(ObjectId, String)> = Vec::new();
     // `fsck_object()`'s own findings, which go to stderr rather than stdout.
-    let mut msg_lines: Vec<(ObjectId, String)> = Vec::new();
+    let mut msg_lines: Vec<(Slot, ObjectId, String)> = Vec::new();
+    // `fsck_options`' two oidsets, mapped to the first byte of the earliest
+    // tree that named the blob — which is what decides whether the blob's own
+    // scan slot sees the set already populated. See [`Slot`].
+    let mut gitmodules_found: HashMap<ObjectId, u8> = HashMap::new();
+    let mut gitattributes_found: HashMap<ObjectId, u8> = HashMap::new();
+    // Objects `parse_object_buffer()` rejected. `fsck_loose()` returns before
+    // setting `HAS_OBJ`, so git treats them exactly as absent from here on: no
+    // `unreachable`/`dangling` line, no lost-found file, and a `missing` line if
+    // something reachable names them.
+    let mut unparseable: HashMap<ObjectId, Kind> = HashMap::new();
     // `fsck_source()` announces the directory once per odb source before walking
     // it; `--connectivity-only` skips `fsck_source()` altogether.
     if opt.verbose && !opt.connectivity_only {
@@ -313,24 +325,39 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             Ok(h) => h.kind(),
             Err(e) => return Ok(fatal_corrupt(id, &e)),
         };
+        // `fsck_loose()` parses before it does anything else, and skips
+        // `fsck_obj()` — the verbose line included — when the parse fails.
+        let decoded = match decode(&repo, id)? {
+            Ok(d) => d,
+            Err(failed) => {
+                let slot = Slot::Scan(id.as_bytes()[0]);
+                if let Some(line) = failed.diagnostic {
+                    msg_lines.push((slot, id, line));
+                }
+                let path = loose_object_label(&repo, id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{id} is a packed object git cannot parse: git reports those through \
+                         verify_pack()'s `object corrupt or missing` line, which this port does \
+                         not reach"
+                    )
+                })?;
+                msg_lines.push((slot, id, format!("error: {id}: object could not be parsed: {path}")));
+                errors |= ERROR_OBJECT;
+                unparseable.insert(id, kind);
+                continue;
+            }
+        };
         // `fsck_obj()`'s own line, which covers blobs too.
         if opt.verbose && !opt.connectivity_only {
             eprintln!("Checking {kind} {id}");
         }
-        if kind == Kind::Blob {
-            continue;
-        }
-        let decoded = match decode(&repo, id) {
-            Ok(d) => d,
-            Err(e) => return Ok(fatal_corrupt(id, &e)),
-        };
-        for (child, _) in decoded.children {
+        for (child, _) in &decoded.children {
             // Absent children are `note`d all the same: `fsck_walk()` creates
             // them, so they occupy an `obj_hash` slot. They are not *reported*
             // here — `check_unreachable_object()` never prints `missing`, so an
             // object that only an unreachable object names stays quiet.
-            state.note(child);
-            state.used.insert(child);
+            state.note(*child);
+            state.used.insert(*child);
         }
         // `--root` and `--tags` lines are emitted by `fsck_obj()`, which
         // `--connectivity-only` skips entirely.
@@ -338,20 +365,47 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
-        // `fsck_obj()` runs `fsck_object()` next, and returns early when it
-        // reported an error — so an object that fails the message layer
-        // contributes no `root`/`tagged` line.
+        // `fsck_obj()` runs `fsck_walk()` before `fsck_object()`, and turns a
+        // walk that failed outright into `objerror(… "broken links")`.
+        if let Some((line, broken)) = decoded.walk_error {
+            msg_lines.push((Slot::Scan(id.as_bytes()[0]), id, line));
+            if broken {
+                msg_lines.push((
+                    Slot::Scan(id.as_bytes()[0]),
+                    id,
+                    format!("error in {kind} {id}: broken links"),
+                ));
+                errors |= ERROR_OBJECT;
+            }
+        }
+
+        // `fsck_object()` next; `fsck_obj()` skips the `root`/`tagged` line when
+        // it reported an error.
         let object = repo.find_object(id)?;
+        let checked = check_object(kind, &object.data, opt.strict);
+        for line in checked.raw {
+            msg_lines.push((Slot::Scan(id.as_bytes()[0]), id, line));
+        }
+        for blob in checked.gitmodules {
+            let entry = gitmodules_found.entry(blob).or_insert(u8::MAX);
+            *entry = (*entry).min(id.as_bytes()[0]);
+        }
+        for blob in checked.gitattributes {
+            let entry = gitattributes_found.entry(blob).or_insert(u8::MAX);
+            *entry = (*entry).min(id.as_bytes()[0]);
+        }
         let mut failed = false;
-        for finding in check_object(kind, &object.data) {
+        for finding in checked.findings {
             match msg_config.severity(&finding, &id) {
                 Severity::Ignore => {}
                 Severity::Info | Severity::Warn => msg_lines.push((
+                    Slot::Scan(id.as_bytes()[0]),
                     id,
                     format!("warning in {kind} {id}: {}: {}", finding.msg.id, finding.text),
                 )),
                 Severity::Error | Severity::Fatal => {
                     msg_lines.push((
+                        Slot::Scan(id.as_bytes()[0]),
                         id,
                         format!("error in {kind} {id}: {}: {}", finding.msg.id, finding.text),
                     ));
@@ -365,7 +419,6 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                         ERROR_PACK
                     };
                     failed = true;
-                    break;
                 }
             }
         }
@@ -381,6 +434,22 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 scan_lines.push((id, format!("tagged {target_kind} {target} ({name}) in {id}")));
             }
         }
+    }
+
+    // ---- 3a. the blob-content lint ------------------------------------------
+    //
+    // `fsck_blob()` for every blob a tree named `.gitmodules`/`.gitattributes`,
+    // plus `fsck_finish()`'s report for one that is absent or is not a blob.
+    // `--connectivity-only` skips both, since it skips `fsck_source()` and
+    // `fsck_finish()` alike.
+    if !opt.connectivity_only {
+        errors |= lint_special_blobs(
+            &repo,
+            &msg_config,
+            &gitmodules_found,
+            &gitattributes_found,
+            &mut msg_lines,
+        );
     }
     // `for_each_loose_file_in_source()` walks the 256 subdirectories in numeric
     // order and only the entries *within* one of them in raw `readdir()` order
@@ -405,15 +474,18 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         scan_lines.sort_by_key(|(id, _)| id.as_bytes()[0]);
     }
 
-    // The message layer's lines are emitted from the same scan, so they are
-    // ordered — and refused when ambiguous — by the same rule.
+    // The message layer's lines come from the same scan plus `fsck_finish()`,
+    // so they are ordered — and refused when ambiguous — by the same rule, with
+    // the two finish sweeps landing after every scan line. See [`Slot`].
     if msg_lines.len() > 1 {
-        let mut by_subdir: HashSet<u8> = HashSet::new();
-        let distinct: Vec<ObjectId> = {
-            let mut seen = HashSet::new();
-            msg_lines.iter().map(|(id, _)| *id).filter(|id| seen.insert(*id)).collect()
-        };
-        let collides = distinct.iter().any(|id| !by_subdir.insert(id.as_bytes()[0]));
+        let mut by_slot: HashMap<Slot, HashSet<ObjectId>> = HashMap::new();
+        for &(slot, id, _) in &msg_lines {
+            by_slot.entry(slot).or_default().insert(id);
+        }
+        // Within one `.git/objects/??` subdirectory the walk is raw `readdir()`
+        // order; within one `fsck_finish()` sweep it is git's khash order.
+        // Either way, two distinct ids in the same slot are unorderable.
+        let collides = by_slot.values().any(|ids| ids.len() > 1);
         if collides || has_packs(&repo) {
             bail!(
                 "refusing to guess the output order: git emits these {} object-content messages \
@@ -422,9 +494,9 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 msg_lines.len()
             );
         }
-        msg_lines.sort_by_key(|(id, _)| id.as_bytes()[0]);
+        msg_lines.sort_by_key(|&(slot, _, _)| slot);
     }
-    for (_, line) in &msg_lines {
+    for (_, _, line) in &msg_lines {
         eprintln!("{line}");
     }
     if show_progress && !opt.connectivity_only {
@@ -492,10 +564,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         if kind == Kind::Blob {
             continue;
         }
-        let decoded = match decode(&repo, id) {
-            Ok(d) => d,
-            Err(e) => return Ok(fatal_corrupt(id, &e)),
-        };
+        // An object `parse_object_buffer()` rejected has no links to follow:
+        // `fsck_walk_commit()`/`fsck_walk_tag()` read fields the failed parse
+        // never filled in. The scan above already reported it.
+        let Ok(decoded) = decode(&repo, id)? else { continue };
         for (child, child_kind) in decoded.children {
             if !repo.has_object(child) {
                 state.missing.insert(child, child_kind);
@@ -508,6 +580,14 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     }
 
     // ---- 7. the connectivity report ----------------------------------------
+    //
+    // `check_reachable_object()` prints `missing` for anything reachable that
+    // lacks `HAS_OBJ`, which an object the scan failed to parse does.
+    for (&id, &kind) in &unparseable {
+        if state.reachable.contains(&id) {
+            state.missing.insert(id, kind);
+        }
+    }
     if opt.name_objects && !state.missing.is_empty() {
         bail!(
             "--name-objects is not ported for a repository with missing objects: git decorates a \
@@ -524,7 +604,9 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     }
     if opt.show_unreachable || opt.show_dangling || opt.write_lost_and_found {
         for &id in &all {
-            if state.reachable.contains(&id) {
+            // `check_unreachable_object()` returns immediately without
+            // `HAS_OBJ`, so an object the scan could not parse is silent here.
+            if state.reachable.contains(&id) || unparseable.contains_key(&id) {
                 continue;
             }
             // `check_unreachable_object()`: a shown-unreachable object returns
@@ -871,6 +953,30 @@ impl State {
     }
 }
 
+/// Where in `git fsck`'s stderr a message-layer line lands.
+///
+/// `cmd_fsck` runs `fsck_source()` over every odb source and only then
+/// `fsck_finish()`, so every finish line follows every scan line. Within the
+/// scan, `for_each_loose_file_in_source()` walks the 256 subdirectories in
+/// numeric order, which is the first byte of the id. Within `fsck_finish()` the
+/// `.gitmodules` sweep runs before the `.gitattributes` one.
+///
+/// A blob a tree named `.gitmodules` is linted twice over in git — once by
+/// `fsck_blob()` if the scan reaches the blob after the naming tree, once by
+/// `fsck_finish()` otherwise — and `gitmodules_done` keeps it to one. Which of
+/// the two happens is decided by comparing the two first bytes, so the slot is
+/// derivable; a blob and its naming tree in the *same* subdirectory is the
+/// unorderable case the caller refuses.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+enum Slot {
+    /// `fsck_source()`, keyed by the `.git/objects/??` subdirectory.
+    Scan(u8),
+    /// `fsck_finish()`'s `gitmodules_found` sweep.
+    FinishGitmodules,
+    /// `fsck_finish()`'s `gitattributes_found` sweep.
+    FinishGitattributes,
+}
+
 /// What one decoded object contributes.
 struct Decoded {
     /// The objects it refers to, paired with the type expected at each site —
@@ -880,52 +986,80 @@ struct Decoded {
     is_root_commit: bool,
     /// `(target kind, target id, tag name)`, which `--tags` reports.
     tag: Option<(Kind, ObjectId, String)>,
+    /// The message `fsck_walk_tree()`'s tree-entry decoder printed, and whether
+    /// it was the `init_tree_desc_gently()` failure that makes `fsck_walk()`
+    /// return `-1` — which is what `fsck_obj()` turns into `broken links`.
+    walk_error: Option<(String, bool)>,
 }
 
-/// Decode `id`. Gitlink tree entries are skipped: they name commits of a
-/// different repository, which is also what git's `fsck_walk_tree()` does.
-fn decode(repo: &gix::Repository, id: ObjectId) -> Result<Decoded> {
-    use gix::objs::tree::EntryKind;
+/// Why `parse_object_buffer()` returned NULL. git prints its own diagnostic
+/// first for some failures and stays quiet for the rest, then `fsck_loose()`
+/// adds the `object could not be parsed` line either way.
+struct ParseFailed {
+    /// The `error:` line `parse_commit_buffer()`/`parse_tag_buffer()` printed
+    /// before giving up, if it printed one.
+    diagnostic: Option<String>,
+}
 
+/// `object.c::parse_object_buffer` for the four types, reduced to what
+/// `builtin/fsck.c` uses of the result: the links `fsck_walk()` follows and the
+/// two fields `--root`/`--tags` print. Blobs and trees always parse — a tree's
+/// entries are only decoded later, by the walk — so only a commit or a tag can
+/// fail here.
+///
+/// Gitlink tree entries are skipped: they name commits of a different
+/// repository, which is also what git's `fsck_walk_tree()` does.
+fn decode(repo: &gix::Repository, id: ObjectId) -> Result<Result<Decoded, ParseFailed>> {
     let object = repo.find_object(id)?;
+    Ok(parse_object_buffer(id, object.kind, &object.data))
+}
+
+/// The buffer half of [`decode`], so `receive-pack` can reuse it.
+fn parse_object_buffer(id: ObjectId, kind: Kind, data: &[u8]) -> Result<Decoded, ParseFailed> {
     let mut children = Vec::new();
     let mut is_root_commit = false;
     let mut tag = None;
-    match object.kind {
+    let mut walk_error = None;
+    match kind {
         Kind::Commit => {
-            // gix validates the whole header; `parse_commit_buffer()` only reads
-            // the `tree` and `parent` lines, and leaves everything else to the
-            // message layer. Fall back to those two fields so a commit git
-            // parses — one with a broken ident line, say — is linted rather
-            // than declared corrupt.
-            let (tree, parents) = match gix::objs::CommitRef::from_bytes(&object.data, repo.object_hash()) {
-                Ok(commit) => (commit.tree(), commit.parents().collect::<Vec<_>>()),
-                Err(e) => commit_links(&object.data).ok_or(e)?,
-            };
+            let (tree, parents) = parse_commit_buffer(id, data)?;
             children.push((tree, Kind::Tree));
             is_root_commit = parents.is_empty();
             children.extend(parents.into_iter().map(|p| (p, Kind::Commit)));
         }
         Kind::Tree => {
-            let tree = gix::objs::TreeRef::from_bytes(&object.data, repo.object_hash())?;
-            for entry in &tree.entries {
-                let kind = match entry.mode.kind() {
-                    EntryKind::Tree => Kind::Tree,
-                    EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => Kind::Blob,
-                    EntryKind::Commit => continue,
+            // `parse_tree_buffer()` only hands the buffer to the tree object;
+            // a malformed entry is not noticed until `fsck_walk_tree()` decodes
+            // it, which is what the rest of this arm is.
+            let (entries, stop) = tree_entries(data);
+            for entry in &entries {
+                // `fsck_walk_tree()` canonicalizes the mode (its `tree_desc`
+                // has no `TREE_DESC_RAW_MODES`) and skips gitlinks.
+                let kind = match entry.mode & 0o170000 {
+                    0o040000 => Kind::Tree,
+                    0o120000 | 0o100000 => Kind::Blob,
+                    _ => continue,
                 };
-                children.push((entry.oid.to_owned(), kind));
+                children.push((ObjectId::from_bytes_or_panic(entry.oid), kind));
             }
+            walk_error = match stop {
+                TreeStop::End => None,
+                TreeStop::AtInit(msg) => {
+                    // `init_tree_desc_gently()` failed, so not one entry was
+                    // walked and `fsck_walk()` reports the whole tree broken.
+                    children.clear();
+                    Some((format!("error: {msg}"), true))
+                }
+                TreeStop::AtUpdate(msg) => {
+                    // `tree_entry_gently()` reports end-of-tree, so the entry
+                    // the advance failed on is never handed to the walker.
+                    children.pop();
+                    Some((format!("error: {msg}"), false))
+                }
+            };
         }
         Kind::Tag => {
-            // Same as for commits: `parse_tag_buffer()` reads only `object`,
-            // `type` and `tag`, so an extra header or a missing tagger is a
-            // message-layer matter, not a parse failure.
-            let (target, target_kind, name) =
-                match gix::objs::TagRef::from_bytes(&object.data, repo.object_hash()) {
-                    Ok(parsed) => (parsed.target(), parsed.target_kind, parsed.name.to_string()),
-                    Err(e) => tag_links(&object.data).ok_or(e)?,
-                };
+            let (target, target_kind, name) = parse_tag_buffer(id, data)?;
             children.push((target, target_kind));
             tag = Some((target_kind, target, name));
         }
@@ -935,42 +1069,79 @@ fn decode(repo: &gix::Repository, id: ObjectId) -> Result<Decoded> {
         children,
         is_root_commit,
         tag,
+        walk_error,
     })
 }
 
-/// `commit.c::parse_commit_buffer` reduced to what `fsck_walk_commit()` needs:
-/// the `tree` line and every `parent` line, both of which must be well formed
-/// or git itself reports the object as unparseable.
-fn commit_links(data: &[u8]) -> Option<(ObjectId, Vec<ObjectId>)> {
-    let rest = data.strip_prefix(b"tree ")?;
-    let (tree, mut rest) = take_oid_line(rest)?;
-    let mut parents = Vec::new();
-    while let Some(after) = rest.strip_prefix(b"parent ") {
-        let (parent, tail) = take_oid_line(after)?;
-        parents.push(parent);
-        rest = tail;
+/// The length of a `tree <hex>` line without its newline (`the_hash_algo->hexsz
+/// + 5`), and of a `parent <hex>` line (`+ 7`).
+const TREE_ENTRY_LEN: usize = 45;
+/// See [`TREE_ENTRY_LEN`].
+const PARENT_ENTRY_LEN: usize = 47;
+
+/// `commit.c::parse_commit_buffer`, which reads only the `tree` line and the
+/// `parent` lines and leaves every other header to the message layer. Its two
+/// `lookup_*` failures are not modelled: they need an id already known to this
+/// process under a conflicting type.
+fn parse_commit_buffer(id: ObjectId, data: &[u8]) -> Result<(ObjectId, Vec<ObjectId>), ParseFailed> {
+    let bogus = || ParseFailed { diagnostic: Some(format!("error: bogus commit object {id}")) };
+    if data.len() <= TREE_ENTRY_LEN + 1
+        || !data.starts_with(b"tree ")
+        || data[TREE_ENTRY_LEN] != b'\n'
+    {
+        return Err(bogus());
     }
-    Some((tree, parents))
+    let tree = ObjectId::from_hex(&data[5..TREE_ENTRY_LEN]).map_err(|_| ParseFailed {
+        diagnostic: Some(format!("error: bad tree pointer in commit {id}")),
+    })?;
+
+    let mut at = TREE_ENTRY_LEN + 1;
+    let mut parents = Vec::new();
+    while at + PARENT_ENTRY_LEN < data.len() && data[at..].starts_with(b"parent ") {
+        let bad = || ParseFailed { diagnostic: Some(format!("error: bad parents in commit {id}")) };
+        if data.len() <= at + PARENT_ENTRY_LEN + 1 || data[at + PARENT_ENTRY_LEN] != b'\n' {
+            return Err(bad());
+        }
+        parents.push(ObjectId::from_hex(&data[at + 7..at + PARENT_ENTRY_LEN]).map_err(|_| bad())?);
+        at += PARENT_ENTRY_LEN + 1;
+    }
+    Ok((tree, parents))
 }
 
-/// `tag.c::parse_tag_buffer` reduced to the three headers `fsck_walk_tag()`
-/// needs: the target id, its type and the tag name.
-fn tag_links(data: &[u8]) -> Option<(ObjectId, Kind, String)> {
-    let rest = data.strip_prefix(b"object ")?;
-    let (target, rest) = take_oid_line(rest)?;
-    let rest = rest.strip_prefix(b"type ")?;
-    let eol = rest.iter().position(|&b| b == b'\n')?;
-    let kind = Kind::from_bytes(&rest[..eol]).ok()?;
-    let rest = rest[eol + 1..].strip_prefix(b"tag ")?;
-    let eol = rest.iter().position(|&b| b == b'\n')?;
-    Some((target, kind, String::from_utf8_lossy(&rest[..eol]).into_owned()))
-}
+/// `tag.c::parse_tag_buffer`, which reads only the `object`, `type` and `tag`
+/// headers. Every failure but the unknown type is silent — it returns `-1`
+/// without printing.
+fn parse_tag_buffer(id: ObjectId, data: &[u8]) -> Result<(ObjectId, Kind, String), ParseFailed> {
+    let silent = || ParseFailed { diagnostic: None };
+    // `hexsz + 24`: the shortest buffer that could hold all three headers.
+    if data.len() < 64 || !data.starts_with(b"object ") {
+        return Err(silent());
+    }
+    let target = ObjectId::from_hex(&data[7..47]).map_err(|_| silent())?;
+    if data[47] != b'\n' || !data[48..].starts_with(b"type ") {
+        return Err(silent());
+    }
+    let after_type = &data[53..];
+    let nl = after_type.iter().position(|&b| b == b'\n').ok_or_else(silent)?;
+    // `char type[20]`, so a type name of 19 characters is the longest that fits.
+    if nl >= 20 {
+        return Err(silent());
+    }
+    let target_kind = Kind::from_bytes(&after_type[..nl]).map_err(|_| ParseFailed {
+        diagnostic: Some(format!(
+            "error: unknown tag type '{}' in {id}",
+            String::from_utf8_lossy(&after_type[..nl])
+        )),
+    })?;
 
-/// One hex object id followed by a newline, and the rest of the buffer.
-fn take_oid_line(data: &[u8]) -> Option<(ObjectId, &[u8])> {
-    let eol = data.iter().position(|&b| b == b'\n')?;
-    let id = ObjectId::from_hex(&data[..eol]).ok()?;
-    Some((id, &data[eol + 1..]))
+    let rest = &after_type[nl + 1..];
+    // `bufptr + 4 < tail`: a `tag ` header needs at least one more byte.
+    if rest.len() <= 4 || !rest.starts_with(b"tag ") {
+        return Err(silent());
+    }
+    let name = &rest[4..];
+    let nl = name.iter().position(|&b| b == b'\n').ok_or_else(silent)?;
+    Ok((target, target_kind, String::from_utf8_lossy(&name[..nl]).into_owned()))
 }
 
 /// git's default head set minus reflogs and the index: every reference plus
@@ -1249,6 +1420,141 @@ fn is_loose(repo: &gix::Repository, id: ObjectId) -> bool {
     odb_sources(repo)
         .into_iter()
         .any(|objdir| objdir.join(&hex[..2]).join(&hex[2..]).is_file())
+}
+
+/// The path `fsck_loose()` names in its diagnostics: the loose object file, as
+/// spelled by the odb source that holds it. `None` when the object is not loose
+/// — git reaches those through `verify_pack()`, which reports differently.
+///
+/// git chdirs to the top of the worktree during setup, so its object directory
+/// is `.git/objects` for an ordinary repository; the workdir prefix is stripped
+/// here to reproduce that spelling from an absolute path.
+fn loose_object_label(repo: &gix::Repository, id: ObjectId) -> Option<String> {
+    let hex = id.to_hex().to_string();
+    let full = odb_sources(repo)
+        .into_iter()
+        .map(|objdir| objdir.join(&hex[..2]).join(&hex[2..]))
+        .find(|p| p.is_file())?;
+    let rela = repo
+        .workdir()
+        .and_then(|work| full.strip_prefix(work).ok())
+        .unwrap_or(full.as_path());
+    Some(rela.display().to_string())
+}
+
+/// `fsck.c::fsck_blob` for every blob some tree named `.gitmodules` or
+/// `.gitattributes`, plus `fsck_finish()`'s two `fsck_blobs()` sweeps for the
+/// ones that are absent or are not blobs at all. Appends every reported line to
+/// `msg_lines` in the slot git would print it from, and returns the error bits.
+fn lint_special_blobs(
+    repo: &gix::Repository,
+    msg_config: &MsgConfig,
+    gitmodules_found: &HashMap<ObjectId, u8>,
+    gitattributes_found: &HashMap<ObjectId, u8>,
+    msg_lines: &mut Vec<(Slot, ObjectId, String)>,
+) -> u8 {
+    let mut errors = 0u8;
+    let mut candidates: Vec<ObjectId> =
+        gitmodules_found.keys().chain(gitattributes_found.keys()).copied().collect();
+    candidates.sort();
+    candidates.dedup();
+
+    for id in candidates {
+        let as_modules = gitmodules_found.contains_key(&id);
+        let as_attrs = gitattributes_found.contains_key(&id);
+        // The sweep that would reach this id first, for the ids `fsck_blobs()`
+        // reports itself.
+        let finish_slot = if as_modules { Slot::FinishGitmodules } else { Slot::FinishGitattributes };
+
+        let (kind, data) = match repo.find_object(id) {
+            Ok(object) => (object.kind, object.data.clone()),
+            Err(_) => {
+                // `fsck_blobs()`: unreadable, and reported once per sweep.
+                for (present, slot, msg, label) in [
+                    (as_modules, Slot::FinishGitmodules, &GITMODULES_MISSING, ".gitmodules"),
+                    (as_attrs, Slot::FinishGitattributes, &GITATTRIBUTES_MISSING, ".gitattributes"),
+                ] {
+                    if !present {
+                        continue;
+                    }
+                    let finding = Finding {
+                        msg,
+                        text: format!("unable to read {label} blob"),
+                    };
+                    errors |= emit_blob_finding(msg_config, &finding, id, Kind::Blob, slot, msg_lines);
+                }
+                continue;
+            }
+        };
+        if kind != Kind::Blob {
+            for (present, slot, msg, label) in [
+                (as_modules, Slot::FinishGitmodules, &GITMODULES_BLOB, ".gitmodules"),
+                (as_attrs, Slot::FinishGitattributes, &GITATTRIBUTES_BLOB, ".gitattributes"),
+            ] {
+                if !present {
+                    continue;
+                }
+                let finding = Finding {
+                    msg,
+                    text: format!("non-blob found at {label}"),
+                };
+                errors |= emit_blob_finding(msg_config, &finding, id, kind, slot, msg_lines);
+            }
+            continue;
+        }
+
+        // Which slot `fsck_blob()` itself runs in: the blob's own scan slot when
+        // the naming tree came first, `fsck_finish()`'s otherwise.
+        let earliest_tree = [
+            as_modules.then(|| gitmodules_found[&id]),
+            as_attrs.then(|| gitattributes_found[&id]),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(u8::MAX);
+        let slot = match earliest_tree.cmp(&id.as_bytes()[0]) {
+            std::cmp::Ordering::Less => Slot::Scan(id.as_bytes()[0]),
+            _ => finish_slot,
+        };
+        for finding in check_blob(&data, as_modules, as_attrs) {
+            errors |= emit_blob_finding(msg_config, &finding, id, Kind::Blob, slot, msg_lines);
+        }
+    }
+    errors
+}
+
+/// Render one blob finding at its resolved severity, the way `fsck_obj()`'s
+/// error callback does. `fsck_finish()`'s failures are always `ERROR_OBJECT`,
+/// and so are `fsck_blob()`'s here: a `.gitmodules` blob git found through a
+/// pack is still reported by `fsck_finish()`, which is outside `verify_pack()`.
+fn emit_blob_finding(
+    msg_config: &MsgConfig,
+    finding: &Finding,
+    id: ObjectId,
+    kind: Kind,
+    slot: Slot,
+    msg_lines: &mut Vec<(Slot, ObjectId, String)>,
+) -> u8 {
+    match msg_config.severity(finding, &id) {
+        Severity::Ignore => 0,
+        Severity::Info | Severity::Warn => {
+            msg_lines.push((
+                slot,
+                id,
+                format!("warning in {kind} {id}: {}: {}", finding.msg.id, finding.text),
+            ));
+            0
+        }
+        Severity::Error | Severity::Fatal => {
+            msg_lines.push((
+                slot,
+                id,
+                format!("error in {kind} {id}: {}: {}", finding.msg.id, finding.text),
+            ));
+            ERROR_OBJECT
+        }
+    }
 }
 
 /// Every object directory git would search: the repository's own, plus each
@@ -1558,7 +1864,7 @@ macro_rules! msg {
     ($konst:ident, $id:literal, $fsck:literal, $receive:literal, $sev:ident) => {
         #[doc = concat!("`", $id, "`, whose severity comes from `", $fsck, "` under ")]
         #[doc = concat!("`git fsck` and from `", $receive, "` under `git receive-pack`.")]
-        const $konst: Msg = Msg {
+        pub const $konst: Msg = Msg {
             id: $id,
             fsck_key: $fsck,
             receive_key: $receive,
@@ -1600,6 +1906,29 @@ msg!(LARGE_PATHNAME, "largePathname", "fsck.largePathname", "receive.fsck.largeP
 msg!(MISSING_TAGGER_ENTRY, "missingTaggerEntry", "fsck.missingTaggerEntry", "receive.fsck.missingTaggerEntry", Info);
 msg!(BAD_TAG_NAME, "badTagName", "fsck.badTagName", "receive.fsck.badTagName", Info);
 msg!(EXTRA_HEADER_ENTRY, "extraHeaderEntry", "fsck.extraHeaderEntry", "receive.fsck.extraHeaderEntry", Ignore);
+msg!(BAD_TREE, "badTree", "fsck.badTree", "receive.fsck.badTree", Error);
+
+// --- the four special paths, reported against the *tree* that names them
+// (`fsck_tree`'s per-entry block) ------------------------------------------
+msg!(GITMODULES_SYMLINK, "gitmodulesSymlink", "fsck.gitmodulesSymlink", "receive.fsck.gitmodulesSymlink", Error);
+msg!(GITATTRIBUTES_SYMLINK, "gitattributesSymlink", "fsck.gitattributesSymlink", "receive.fsck.gitattributesSymlink", Info);
+msg!(GITIGNORE_SYMLINK, "gitignoreSymlink", "fsck.gitignoreSymlink", "receive.fsck.gitignoreSymlink", Info);
+msg!(MAILMAP_SYMLINK, "mailmapSymlink", "fsck.mailmapSymlink", "receive.fsck.mailmapSymlink", Info);
+
+// --- blob-content checks, reported against the *blob* (`fsck_blob`) --------
+msg!(GITMODULES_PARSE, "gitmodulesParse", "fsck.gitmodulesParse", "receive.fsck.gitmodulesParse", Info);
+msg!(GITMODULES_NAME, "gitmodulesName", "fsck.gitmodulesName", "receive.fsck.gitmodulesName", Error);
+msg!(GITMODULES_URL, "gitmodulesUrl", "fsck.gitmodulesUrl", "receive.fsck.gitmodulesUrl", Error);
+msg!(GITMODULES_PATH, "gitmodulesPath", "fsck.gitmodulesPath", "receive.fsck.gitmodulesPath", Error);
+msg!(GITMODULES_UPDATE, "gitmodulesUpdate", "fsck.gitmodulesUpdate", "receive.fsck.gitmodulesUpdate", Error);
+msg!(GITATTRIBUTES_LARGE, "gitattributesLarge", "fsck.gitattributesLarge", "receive.fsck.gitattributesLarge", Error);
+msg!(GITATTRIBUTES_LINE_LENGTH, "gitattributesLineLength", "fsck.gitattributesLineLength", "receive.fsck.gitattributesLineLength", Error);
+
+// --- `fsck_finish()`'s two sweeps over the collected paths (`fsck_blobs`) --
+msg!(GITMODULES_MISSING, "gitmodulesMissing", "fsck.gitmodulesMissing", "receive.fsck.gitmodulesMissing", Error);
+msg!(GITMODULES_BLOB, "gitmodulesBlob", "fsck.gitmodulesBlob", "receive.fsck.gitmodulesBlob", Error);
+msg!(GITATTRIBUTES_MISSING, "gitattributesMissing", "fsck.gitattributesMissing", "receive.fsck.gitattributesMissing", Error);
+msg!(GITATTRIBUTES_BLOB, "gitattributesBlob", "fsck.gitattributesBlob", "receive.fsck.gitattributesBlob", Error);
 
 /// Every row this port implements, for severity resolution and for telling a
 /// misspelled `fsck.<x>` key from a real one.
@@ -1632,6 +1961,22 @@ pub const MSGS: &[Msg] = &[
     MISSING_TAGGER_ENTRY,
     BAD_TAG_NAME,
     EXTRA_HEADER_ENTRY,
+    BAD_TREE,
+    GITMODULES_SYMLINK,
+    GITATTRIBUTES_SYMLINK,
+    GITIGNORE_SYMLINK,
+    MAILMAP_SYMLINK,
+    GITMODULES_PARSE,
+    GITMODULES_NAME,
+    GITMODULES_URL,
+    GITMODULES_PATH,
+    GITMODULES_UPDATE,
+    GITATTRIBUTES_LARGE,
+    GITATTRIBUTES_LINE_LENGTH,
+    GITMODULES_MISSING,
+    GITMODULES_BLOB,
+    GITATTRIBUTES_MISSING,
+    GITATTRIBUTES_BLOB,
 ];
 
 /// The rest of `FOREACH_FSCK_MSG_ID`: ids git knows and this port never
@@ -1645,14 +1990,19 @@ pub const MSGS: &[Msg] = &[
 ///     `packedRefUnsorted`, `symlinkRef`, `badReftableTableName`, …) belong to
 ///     `git refs verify`, which the vendored crates do not implement (see
 ///     divergence 2 above);
-///   * **the `.gitmodules`/`.gitattributes`/`.gitignore`/`.mailmap` blob ids**
-///     need the blob-content lint git runs after collecting those paths from
-///     every tree, which this port does not run;
 ///   * **the ids reachable only past a parse failure** (`missingTree`,
 ///     `badTreeSha1`, `badParentSha1`, `missingObject`, `missingType`,
-///     `unknownType`, `emptyName`, …). git reaches those by fsck'ing a raw
-///     buffer its own object parser already rejected; this port only reaches
-///     `fsck_object` for objects gix could parse, so they can never fire.
+///     `unknownType`, …). git reaches those by fsck'ing a raw buffer through
+///     `fsck_buffer()` directly — `git mktag`, and `index-pack --strict` over a
+///     hand-built pack. `builtin/fsck.c` never does: `fsck_loose()` and
+///     `fsck_obj_buffer()` both run `parse_object_buffer()` first and skip
+///     `fsck_obj()` when it fails, which is the `object could not be parsed`
+///     path this port reproduces. So these ids are unreachable *from either of
+///     this port's two entry points*, not merely unimplemented;
+///   * **`gitmodulesLarge`**, which git only reports when `read_loose_object()`
+///     streamed the blob past `core.bigFileThreshold` instead of loading it.
+///     This port always loads the blob, so the `NULL` buffer that triggers the
+///     id never arises.
 const UNPORTED_MSG_IDS: &[&str] = &[
     "badGpgsig",
     "badHeaderContinuation",
@@ -1668,27 +2018,11 @@ const UNPORTED_MSG_IDS: &[&str] = &[
     "badRefName",
     "badRefOid",
     "badReftableTableName",
-    "badTree",
     "badTreeSha1",
     "badType",
     "emptyName",
     "emptyPackedRefsFile",
-    "gitattributesBlob",
-    "gitattributesLarge",
-    "gitattributesLineLength",
-    "gitattributesMissing",
-    "gitattributesSymlink",
-    "gitignoreSymlink",
-    "gitmodulesBlob",
     "gitmodulesLarge",
-    "gitmodulesMissing",
-    "gitmodulesName",
-    "gitmodulesParse",
-    "gitmodulesPath",
-    "gitmodulesSymlink",
-    "gitmodulesUpdate",
-    "gitmodulesUrl",
-    "mailmapSymlink",
     "missingObject",
     "missingTag",
     "missingTagEntry",
@@ -1894,15 +2228,34 @@ fn read_skip_list(path: &str) -> Result<HashSet<ObjectId>, String> {
     Ok(out)
 }
 
+/// What one `fsck_object()` call produced: the findings about the object
+/// itself, plus the two `fsck_options` oidsets a tree contributes to.
+#[derive(Default)]
+pub struct Checked {
+    /// Findings in git's reporting order; the caller decides which of them are
+    /// severe enough to print.
+    pub findings: Vec<Finding>,
+    /// Plain `error:` lines the tree-entry decoder printed itself. They carry
+    /// no msg-id, so no `fsck.<msg-id>` severity and no skip list applies —
+    /// `init_tree_desc_gently()` and `update_tree_entry_gently()` call
+    /// `error()` directly.
+    pub raw: Vec<String>,
+    /// Ids a tree entry named `.gitmodules` — `options->gitmodules_found`.
+    /// Their contents are linted once the whole odb has been walked.
+    pub gitmodules: Vec<ObjectId>,
+    /// The same for `.gitattributes` — `options->gitattributes_found`.
+    pub gitattributes: Vec<ObjectId>,
+}
+
 /// `fsck.c::fsck_object` for the three types whose contents this port lints.
-/// Findings come back in git's reporting order; the caller decides which of
-/// them are severe enough to print.
-pub fn check_object(kind: Kind, data: &[u8]) -> Vec<Finding> {
-    let mut out = Vec::new();
+/// A blob is linted separately by [`check_blob`], because whether it is linted
+/// at all depends on the trees walked before it.
+pub fn check_object(kind: Kind, data: &[u8], strict: bool) -> Checked {
+    let mut out = Checked::default();
     match kind {
-        Kind::Commit => check_commit(data, &mut out),
-        Kind::Tree => check_tree(data, &mut out),
-        Kind::Tag => check_tag(data, &mut out),
+        Kind::Commit => check_commit(data, &mut out.findings),
+        Kind::Tree => check_tree(data, &mut out, strict),
+        Kind::Tag => check_tag(data, &mut out.findings),
         Kind::Blob => {}
     }
     out
@@ -2071,13 +2424,125 @@ fn skip_line(data: &[u8]) -> Option<&[u8]> {
     data.iter().position(|&b| b == b'\n').map(|i| &data[i + 1..])
 }
 
-/// git's tree-entry mode set. `S_IFREG | 0664` is also accepted outside
-/// `--strict`, which this port folds in: it does not run the strict mode table.
-const GOOD_MODES: [u32; 6] = [0o100644, 0o100664, 0o100755, 0o120000, 0o040000, 0o160000];
+/// The `switch (mode)` in `fsck_tree`'s loop. `S_IFREG | 0664` is a seventh
+/// mode git also accepts, but only when `--strict` is off.
+const GOOD_MODES: [u32; 5] = [0o100644, 0o100755, 0o120000, 0o040000, 0o160000];
+
+/// The raw size of a SHA-1, `the_hash_algo->rawsz`.
+const RAWSZ: usize = 20;
+
+/// One decoded tree entry — `struct name_entry` plus the raw mode field, which
+/// `zeroPaddedFilemode` needs.
+struct TreeEntry<'a> {
+    /// The mode as `parse_mode()` returns it, truncated to git's `uint16_t`.
+    mode: u32,
+    /// The mode exactly as it was spelled in the buffer.
+    raw_mode: &'a [u8],
+    /// The entry name, up to but not including its NUL.
+    name: &'a [u8],
+    /// The entry's raw object id.
+    oid: &'a [u8],
+}
+
+/// `tree-walk.c::decode_tree_entry`, returning the message
+/// `init_tree_desc_gently()`/`update_tree_entry_gently()` would print on
+/// failure. The two `strlen`-based reads git makes past `size` are bounded here
+/// instead, and report `too-short tree object`.
+fn decode_tree_entry(buf: &[u8]) -> Result<TreeEntry<'_>, &'static str> {
+    if buf.len() < RAWSZ + 3 || buf[buf.len() - (RAWSZ + 1)] != 0 {
+        return Err("too-short tree object");
+    }
+    // `parse_mode()`: octal digits up to the separating space.
+    if buf[0] == b' ' {
+        return Err("malformed mode in tree entry");
+    }
+    let mut mode: u32 = 0;
+    let mut at = 0usize;
+    loop {
+        let Some(&c) = buf.get(at) else { return Err("malformed mode in tree entry") };
+        at += 1;
+        if c == b' ' {
+            break;
+        }
+        if !(b'0'..=b'7').contains(&c) {
+            return Err("malformed mode in tree entry");
+        }
+        // git accumulates into an `unsigned int` and stores a `uint16_t`.
+        mode = ((mode << 3) + (c - b'0') as u32) & 0xffff;
+    }
+    let raw_mode = &buf[..at - 1];
+    let path = &buf[at..];
+    if path.first() == Some(&0) {
+        return Err("empty filename in tree entry");
+    }
+    let Some(nul) = path.iter().position(|&b| b == 0) else {
+        return Err("too-short tree object");
+    };
+    if path.len() < nul + 1 + RAWSZ {
+        return Err("too-short tree object");
+    }
+    Ok(TreeEntry {
+        mode,
+        raw_mode,
+        name: &path[..nul],
+        oid: &path[nul + 1..nul + 1 + RAWSZ],
+    })
+}
+
+/// How far past an entry the next one starts — `update_tree_entry_internal`'s
+/// `end - buf`.
+fn tree_entry_span(entry: &TreeEntry<'_>) -> usize {
+    entry.raw_mode.len() + 1 + entry.name.len() + 1 + RAWSZ
+}
+
+/// Where a tree walk stopped.
+enum TreeStop {
+    /// The whole buffer decoded.
+    End,
+    /// `init_tree_desc_gently()` rejected the very first entry, which is what
+    /// makes `fsck_walk_tree()` return `-1` and the caller print `broken links`.
+    AtInit(&'static str),
+    /// `update_tree_entry_gently()` rejected a later entry. The walk stops
+    /// quietly — `tree_entry_gently()` just reports end-of-tree.
+    AtUpdate(&'static str),
+}
+
+/// `init_tree_desc_gently()` followed by `update_tree_entry_gently()` until the
+/// buffer runs out or an entry fails to decode.
+fn tree_entries(data: &[u8]) -> (Vec<TreeEntry<'_>>, TreeStop) {
+    let mut out = Vec::new();
+    if data.is_empty() {
+        return (out, TreeStop::End);
+    }
+    let mut buf = data;
+    let entry = match decode_tree_entry(buf) {
+        Ok(entry) => entry,
+        Err(msg) => return (out, TreeStop::AtInit(msg)),
+    };
+    let mut span = tree_entry_span(&entry);
+    out.push(entry);
+    loop {
+        if buf.len() < span {
+            // `update_tree_entry_internal()`'s `die("too-short tree file")`,
+            // which `decode_tree_entry`'s own guard makes unreachable here.
+            return (out, TreeStop::AtUpdate("too-short tree file"));
+        }
+        buf = &buf[span..];
+        if buf.is_empty() {
+            return (out, TreeStop::End);
+        }
+        let entry = match decode_tree_entry(buf) {
+            Ok(entry) => entry,
+            Err(msg) => return (out, TreeStop::AtUpdate(msg)),
+        };
+        span = tree_entry_span(&entry);
+        out.push(entry);
+    }
+}
 
 /// `fsck.c::fsck_tree`. Every defect is accumulated over the whole tree and
 /// reported once, in git's fixed order.
-fn check_tree(data: &[u8], out: &mut Vec<Finding>) {
+fn check_tree(data: &[u8], checked: &mut Checked, strict: bool) {
     let mut has_null_oid = false;
     let mut has_full_path = false;
     let mut has_dot = false;
@@ -2089,34 +2554,86 @@ fn check_tree(data: &[u8], out: &mut Vec<Finding>) {
     let mut not_properly_sorted = false;
     let mut has_large_name = false;
 
-    let mut p = data;
-    let mut previous: Option<Vec<u8>> = None;
-    while !p.is_empty() {
-        let Some(space) = p.iter().position(|&b| b == b' ') else { return };
-        let mode_field = &p[..space];
-        let Some(nul) = p[space + 1..].iter().position(|&b| b == 0) else { return };
-        let name = &p[space + 1..space + 1 + nul];
-        let oid_at = space + 1 + nul + 1;
-        if oid_at + 20 > p.len() {
-            return;
+    let (entries, stop) = tree_entries(data);
+    if let TreeStop::AtInit(msg) = stop {
+        // `init_tree_desc_gently()` printed its own diagnostic and `fsck_tree`
+        // gave up before accumulating anything.
+        checked.raw.push(format!("error: {msg}"));
+        report(&mut checked.findings, &BAD_TREE, "cannot be parsed as a tree");
+        return;
+    }
+    let out = &mut checked.findings;
+    // `update_tree_entry_gently()` prints, `fsck_tree` reports `badTree` and
+    // breaks — before the accumulated findings below, and after skipping the
+    // last entry's mode and ordering checks.
+    let checked_entries = match stop {
+        TreeStop::AtUpdate(msg) => {
+            checked.raw.push(format!("error: {msg}"));
+            report(out, &BAD_TREE, "cannot be parsed as a tree");
+            entries.len() - 1
         }
-        let oid = &p[oid_at..oid_at + 20];
-        p = &p[oid_at + 20..];
+        _ => entries.len(),
+    };
 
-        let Some(mode) = std::str::from_utf8(mode_field)
-            .ok()
-            .and_then(|m| u32::from_str_radix(m, 8).ok())
-        else {
-            return;
-        };
-        has_zero_pad |= mode_field.first() == Some(&b'0');
-        has_bad_modes |= !GOOD_MODES.contains(&mode);
+    let mut previous: Option<Vec<u8>> = None;
+    for (index, entry) in entries.iter().enumerate() {
+        let TreeEntry { mode, raw_mode, name, oid } = *entry;
+        has_zero_pad |= raw_mode.first() == Some(&b'0');
         has_null_oid |= oid.iter().all(|&b| b == 0);
         has_full_path |= name.contains(&b'/');
         has_dot |= name == b".";
         has_dotdot |= name == b"..";
         has_dotgit |= is_dotgit(name);
         has_large_name |= name.len() > 4096;
+
+        // The four special paths. Unlike everything above these are reported
+        // per entry, in entry order and ahead of the accumulated findings —
+        // `fsck_tree()` calls `report()` inside the loop for them.
+        let entry_id = ObjectId::from_bytes_or_panic(oid);
+        let is_link = mode & 0o170000 == 0o120000;
+        if is_special(name, Special::Gitmodules) {
+            if is_link {
+                report(out, &GITMODULES_SYMLINK, ".gitmodules is a symbolic link");
+            } else {
+                checked.gitmodules.push(entry_id);
+            }
+        }
+        if is_special(name, Special::Gitattributes) {
+            if is_link {
+                report(out, &GITATTRIBUTES_SYMLINK, ".gitattributes is a symlink");
+            } else {
+                checked.gitattributes.push(entry_id);
+            }
+        }
+        if is_link {
+            if is_special(name, Special::Gitignore) {
+                report(out, &GITIGNORE_SYMLINK, ".gitignore is a symlink");
+            }
+            if is_special(name, Special::Mailmap) {
+                report(out, &MAILMAP_SYMLINK, ".mailmap is a symlink");
+            }
+        }
+        // `fsck_tree()` re-tests every `\`-separated tail as an NTFS short
+        // name, so `x\.gitmodules` counts as `.gitmodules` too.
+        for (i, _) in name.iter().enumerate().filter(|(_, &b)| b == b'\\') {
+            let tail = &name[i + 1..];
+            has_dotgit |= is_dotgit(tail);
+            if is_ntfs_dot(tail, b"gitmodules", b"gi7eba") {
+                if is_link {
+                    report(out, &GITMODULES_SYMLINK, ".gitmodules is a symbolic link");
+                } else {
+                    checked.gitmodules.push(entry_id);
+                }
+            }
+        }
+
+        // The mode and ordering checks sit *after* `update_tree_entry_gently()`
+        // in git's loop, so the entry the advance failed on skips both.
+        if index >= checked_entries {
+            continue;
+        }
+        // `S_IFREG | 0664` falls through to `has_bad_modes` only under `--strict`.
+        has_bad_modes |= !GOOD_MODES.contains(&mode) && (strict || mode != 0o100664);
 
         // `verify_ordered`: names compare with a directory's implicit trailing
         // slash, so `a` (tree) sorts after `a.`
@@ -2181,6 +2698,544 @@ fn is_dotgit(name: &[u8]) -> bool {
     };
     trimmed.eq_ignore_ascii_case(b".git") || trimmed.eq_ignore_ascii_case(b"git~1")
 }
+
+/// The four paths whose contents `fsck_tree()` singles out, each with the
+/// needle `is_hfs_dot_generic()` takes and the 6-character NTFS short-name
+/// prefix `is_ntfs_dot_generic()` takes (`path.c`).
+#[derive(Clone, Copy)]
+enum Special {
+    /// `.gitmodules`
+    Gitmodules,
+    /// `.gitattributes`
+    Gitattributes,
+    /// `.gitignore`
+    Gitignore,
+    /// `.mailmap`
+    Mailmap,
+}
+
+/// `is_hfs_dot<x>(name) || is_ntfs_dot<x>(name)`, the pair `fsck_tree()` tests
+/// each entry name against.
+fn is_special(name: &[u8], which: Special) -> bool {
+    let (needle, short): (&[u8], &[u8]) = match which {
+        Special::Gitmodules => (b"gitmodules", b"gi7eba"),
+        Special::Gitattributes => (b"gitattributes", b"gi7d29"),
+        Special::Gitignore => (b"gitignore", b"gi250a"),
+        Special::Mailmap => (b"mailmap", b"maba30"),
+    };
+    is_hfs_dot(name, needle) || is_ntfs_dot(name, needle, short)
+}
+
+/// `utf8.c::is_hfs_dot_generic` over ASCII: a leading `.`, then the needle
+/// compared case-insensitively, then end-of-name or a directory separator.
+/// git additionally folds away the Unicode codepoints `next_hfs_char()` ignores
+/// (zero-width joiners, the direction marks); those spellings are not covered,
+/// exactly as for [`is_dotgit`].
+fn is_hfs_dot(name: &[u8], needle: &[u8]) -> bool {
+    let Some(rest) = name.strip_prefix(b".") else { return false };
+    if rest.len() < needle.len() || !rest[..needle.len()].eq_ignore_ascii_case(needle) {
+        return false;
+    }
+    // `is_dir_sep()`, which off Windows is `/` alone.
+    matches!(rest.get(needle.len()), None | Some(b'/'))
+}
+
+/// `path.c::is_ntfs_dot_generic`, ported whole — it is pure ASCII. Three
+/// spellings match: `.<needle>`, the regular short name `<needle[..6]>~1`
+/// through `~4`, and the 8.3 fall-back short name built from
+/// `<shortname_prefix>`. Each may be followed by any run of spaces and periods,
+/// and ends at NUL or `:`.
+fn is_ntfs_dot(name: &[u8], needle: &[u8], shortname_prefix: &[u8]) -> bool {
+    /// The `only_spaces_and_periods:` label: everything left must be `' '` or
+    /// `'.'` until the name ends or a `:` appears.
+    fn only_spaces_and_periods(name: &[u8], mut i: usize) -> bool {
+        loop {
+            match name.get(i) {
+                None | Some(b':') => return true,
+                Some(b' ') | Some(b'.') => i += 1,
+                Some(_) => return false,
+            }
+        }
+    }
+
+    if let Some(rest) = name.strip_prefix(b".") {
+        if rest.len() >= needle.len() && rest[..needle.len()].eq_ignore_ascii_case(needle) {
+            return only_spaces_and_periods(name, needle.len() + 1);
+        }
+    }
+    if name.len() >= 8
+        && name[..6].eq_ignore_ascii_case(&needle[..6])
+        && name[6] == b'~'
+        && (b'1'..=b'4').contains(&name[7])
+    {
+        return only_spaces_and_periods(name, 8);
+    }
+
+    let mut saw_tilde = false;
+    let mut i = 0usize;
+    while i < 8 {
+        let Some(&c) = name.get(i) else { return false };
+        if saw_tilde {
+            if !c.is_ascii_digit() {
+                return false;
+            }
+        } else if c == b'~' {
+            i += 1;
+            match name.get(i) {
+                Some(&d) if (b'1'..=b'9').contains(&d) => {}
+                _ => return false,
+            }
+            saw_tilde = true;
+        } else if i >= 6 || c & 0x80 != 0 {
+            return false;
+        } else if c.to_ascii_lowercase() != shortname_prefix[i] {
+            return false;
+        }
+        i += 1;
+    }
+    only_spaces_and_periods(name, i)
+}
+
+/// `attr.h::ATTR_MAX_LINE_LENGTH`.
+const ATTR_MAX_LINE_LENGTH: usize = 2048;
+/// `attr.h::ATTR_MAX_FILE_SIZE`.
+const ATTR_MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
+
+/// `fsck.c::fsck_blob`: lint a blob some tree named `.gitmodules` and/or
+/// `.gitattributes`. `as_modules`/`as_attrs` are the two `oidset_contains()`
+/// tests; a blob no tree singled out has nothing checked at all.
+pub fn check_blob(data: &[u8], as_modules: bool, as_attrs: bool) -> Vec<Finding> {
+    let mut out = Vec::new();
+    if as_modules {
+        check_gitmodules_blob(data, &mut out);
+    }
+    if as_attrs {
+        // git's `!buf` half of this test is the streamed-blob case
+        // (`gitmodulesLarge`'s sibling) which this port cannot reach.
+        if data.len() > ATTR_MAX_FILE_SIZE {
+            report(&mut out, &GITATTRIBUTES_LARGE, ".gitattributes too large to parse");
+            return out;
+        }
+        // `strchrnul()` over a NUL-terminated buffer: git stops at the first
+        // NUL, so a line's length is measured within that prefix.
+        let text = match data.iter().position(|&b| b == 0) {
+            Some(nul) => &data[..nul],
+            None => data,
+        };
+        for line in text.split(|&b| b == b'\n') {
+            if line.len() >= ATTR_MAX_LINE_LENGTH {
+                report(
+                    &mut out,
+                    &GITATTRIBUTES_LINE_LENGTH,
+                    ".gitattributes has too long lines to parse",
+                );
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// `fsck.c::fsck_gitmodules_fn` run over every `submodule.<name>.<key>` the
+/// blob sets, in file order. The submodule *name* is re-checked for every key
+/// in its section, which is why a two-key section reports `gitmodulesName`
+/// twice.
+fn check_gitmodules_blob(data: &[u8], out: &mut Vec<Finding>) {
+    let file = match gix::config::File::from_bytes_no_includes(
+        data,
+        gix::config::file::Metadata::api(),
+        gix::config::file::init::Options::default(),
+    ) {
+        Ok(file) => file,
+        // `git_config_from_mem()` failed; `CONFIG_ERROR_SILENT` swallows the
+        // parser's own diagnostic and fsck reports the id instead.
+        Err(_) => {
+            report(out, &GITMODULES_PARSE, "could not parse gitmodules blob");
+            return;
+        }
+    };
+    for section in file.sections() {
+        if !section.header().name().eq_ignore_ascii_case(b"submodule") {
+            continue;
+        }
+        // `parse_config_key()` requires a subsection; `[submodule]` with no
+        // name is not a submodule entry.
+        let Some(name) = section.header().subsection_name() else { continue };
+        let name = name.to_string();
+        // `value_names()` yields one entry per *occurrence*, and so does git's
+        // callback, so a repeated key is counted off against `values()`.
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for key in section.body().value_names() {
+            if !submodule_name_ok(name.as_bytes()) {
+                report(out, &GITMODULES_NAME, format!("disallowed submodule name: {name}"));
+            }
+            let nth = seen.entry(key.to_lowercase()).or_insert(0);
+            let value = section.body().values(&key).get(*nth).cloned();
+            *nth += 1;
+            // A valueless key reaches git's callback with `value == NULL`,
+            // which every check below tests for.
+            let Some(value) = value else { continue };
+            let value = value.to_string();
+            if key.eq_ignore_ascii_case("url") && !submodule_url_ok(&value) {
+                report(out, &GITMODULES_URL, format!("disallowed submodule url: {value}"));
+            }
+            if key.eq_ignore_ascii_case("path") && value.starts_with('-') {
+                report(out, &GITMODULES_PATH, format!("disallowed submodule path: {value}"));
+            }
+            // `parse_submodule_update_type()` returns `SM_UPDATE_COMMAND` for
+            // anything starting with `!` that is not one of the four names.
+            let is_command = !matches!(value.as_str(), "none" | "checkout" | "rebase" | "merge")
+                && value.starts_with('!');
+            if key.eq_ignore_ascii_case("update") && is_command {
+                report(
+                    out,
+                    &GITMODULES_UPDATE,
+                    format!("disallowed submodule update setting: {value}"),
+                );
+            }
+        }
+    }
+}
+
+/// `submodule-config.c::check_submodule_name`: no empty name, and no `..` as a
+/// whole path component under either separator.
+fn submodule_name_ok(name: &[u8]) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let is_sep = |b: u8| b == b'/' || b == b'\\';
+    // git enters the check "inside a component" and re-enters it after every
+    // separator, so both the first component and every later one are tested.
+    let mut starts = vec![0usize];
+    starts.extend(name.iter().enumerate().filter(|(_, &b)| is_sep(b)).map(|(i, _)| i + 1));
+    for start in starts {
+        let rest = &name[start.min(name.len())..];
+        if rest.starts_with(b"..") && matches!(rest.get(2), None | Some(&b'/') | Some(&b'\\')) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `submodule-config.c::check_submodule_url`.
+fn submodule_url_ok(url: &str) -> bool {
+    // `looks_like_command_line_option()`
+    if url.starts_with('-') {
+        return false;
+    }
+    let relative = url.starts_with("./") || url.starts_with("../");
+    if relative || url.starts_with("git://") {
+        // Appending this to an http URL and url-decoding it must not smuggle a
+        // newline in.
+        if url_decode(url.as_bytes()).contains(&b'\n') {
+            return false;
+        }
+        // CVE-2020-11008: a URL that escapes its own root with `../` can
+        // overwrite the host field.
+        let (dotdots, next) = count_leading_dotdots(url);
+        if dotdots > 0 && (next.starts_with(':') || next.starts_with('/')) {
+            return false;
+        }
+        return true;
+    }
+    match url_to_curl_url(url) {
+        Some(curl_url) => match url_normalize(curl_url) {
+            Some(normalized) => !url_decode(normalized.as_bytes()).contains(&b'\n'),
+            None => false,
+        },
+        None => true,
+    }
+}
+
+/// `submodule-config.c::count_leading_dotdots`: how many `../` components the
+/// URL opens with, plus what follows all the leading `./` and `../`.
+fn count_leading_dotdots(url: &str) -> (usize, &str) {
+    let mut count = 0usize;
+    let mut rest = url;
+    loop {
+        if let Some(tail) = rest.strip_prefix("../") {
+            count += 1;
+            rest = tail;
+        } else if let Some(tail) = rest.strip_prefix("./") {
+            rest = tail;
+        } else {
+            return (count, rest);
+        }
+    }
+}
+
+/// `submodule-config.c::url_to_curl_url`: the URL git-remote-curl would be
+/// handed, when this is a transport it implements.
+fn url_to_curl_url(url: &str) -> Option<&str> {
+    for prefix in ["http::", "https::", "ftp::", "ftps::"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            return Some(rest);
+        }
+    }
+    for prefix in ["http://", "https://", "ftp://", "ftps://"] {
+        if url.starts_with(prefix) {
+            return Some(url);
+        }
+    }
+    None
+}
+
+/// `url.c::url_decode`, which is `url_decode_mem(url, strlen(url))`: everything
+/// up to the first `:` is the scheme and is copied verbatim, the rest is
+/// percent-decoded. A `%` that is not followed by two hex digits, or that spells
+/// `%00`, is left as a literal `%` — `url_decode_internal()` only substitutes
+/// when `hex2chr()` returns a value greater than zero.
+fn url_decode(url: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(url.len());
+    let mut i = match url.iter().position(|&b| b == b':') {
+        Some(colon) if colon > 0 => {
+            out.extend_from_slice(&url[..colon]);
+            colon
+        }
+        _ => 0,
+    };
+    while i < url.len() {
+        let c = url[i];
+        if c == 0 {
+            break;
+        }
+        if c == b'%' && url.len() - i >= 3 {
+            if let Some(val) = hex2chr(&url[i + 1..i + 3]).filter(|&v| v > 0) {
+                out.push(val);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// `hex-ll.c::hex2chr`: two hex digits as a byte, or `None` when either is not
+/// a hex digit.
+fn hex2chr(pair: &[u8]) -> Option<u8> {
+    let hi = (pair[0] as char).to_digit(16)?;
+    let lo = (pair[1] as char).to_digit(16)?;
+    Some((hi * 16 + lo) as u8)
+}
+
+const URL_ALPHADIGIT: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+/// `urlmatch.c`'s `URL_SCHEME_CHARS`.
+const URL_SCHEME_EXTRA: &[u8] = b"+.-";
+/// `urlmatch.c`'s `URL_HOST_CHARS` extras — `[:]` is there for IPv6 literals.
+const URL_HOST_EXTRA: &[u8] = b".-_[:]";
+/// `urlmatch.c`'s `URL_UNSAFE_CHARS`; the `0x00-0x1F`/`0x7F-0xFF` half is a
+/// range test rather than a set.
+const URL_UNSAFE_CHARS: &[u8] = b" <>\"%{}|\\^`";
+/// `urlmatch.c`'s `URL_RESERVED` — `URL_GEN_RESERVED URL_SUB_RESERVED`.
+const URL_RESERVED: &[u8] = b":/?#[]@!$&'()*+,;=";
+
+/// `strspn`: how many leading bytes of `s` are in `set`.
+fn strspn(s: &[u8], set: &[u8]) -> usize {
+    s.iter().take_while(|b| set.contains(b)).count()
+}
+
+/// `strcspn`: how many leading bytes of `s` are *not* in `set`.
+fn strcspn(s: &[u8], set: &[u8]) -> usize {
+    s.iter().take_while(|b| !set.contains(b)).count()
+}
+
+/// `urlmatch.c::append_normalized_escapes` with `esc_extra` empty and `esc_ok`
+/// always `URL_RESERVED`, which is how `url_normalize_1()` calls it. Returns
+/// `false` for a `%` not followed by two hex digits.
+fn append_normalized_escapes(buf: &mut Vec<u8>, from: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < from.len() {
+        let mut ch = from[i];
+        i += 1;
+        let mut was_esc = false;
+        if ch == b'%' {
+            if from.len() - i < 2 {
+                return false;
+            }
+            let Some(val) = hex2chr(&from[i..i + 2]) else { return false };
+            ch = val;
+            i += 2;
+            was_esc = true;
+        }
+        if ch <= 0x1F
+            || ch >= 0x7F
+            || URL_UNSAFE_CHARS.contains(&ch)
+            || (was_esc && URL_RESERVED.contains(&ch))
+        {
+            buf.extend_from_slice(format!("%{ch:02X}").as_bytes());
+        } else {
+            buf.push(ch);
+        }
+    }
+    true
+}
+
+/// `urlmatch.c::url_normalize` (that is, `url_normalize_1` with `allow_globs`
+/// off). Returns the normalized URL, or `None` for a URL it rejects — which is
+/// all `check_submodule_url()` needs, since it only asks whether the result is
+/// `NULL` and whether decoding it yields a newline.
+fn url_normalize(url: &str) -> Option<String> {
+    let url = url.as_bytes();
+    let mut url_len = url.len();
+    let mut norm: Vec<u8> = Vec::with_capacity(url_len);
+
+    // Scheme plus the `://` suffix, lowercased; no %-escapes allowed, and the
+    // first character must be alphabetic.
+    let spanned = strspn(url, &[URL_ALPHADIGIT, URL_SCHEME_EXTRA].concat());
+    if spanned == 0
+        || !url[0].is_ascii_alphabetic()
+        || spanned + 3 > url_len
+        || url[spanned] != b':'
+        || url[spanned + 1] != b'/'
+        || url[spanned + 2] != b'/'
+    {
+        return None;
+    }
+    let mut pos = 0usize;
+    url_len -= spanned + 3;
+    for _ in 0..spanned + 3 {
+        norm.push(url[pos].to_ascii_lowercase());
+        pos += 1;
+    }
+
+    // Any `user:password@`, with its %-escapes normalized.
+    let slash = pos + strcspn(&url[pos..], b"/?#");
+    let at = url[pos..].iter().position(|&b| b == b'@').map(|i| pos + i);
+    if let Some(at) = at.filter(|&a| a < slash) {
+        if at > pos && !append_normalized_escapes(&mut norm, &url[pos..at]) {
+            return None;
+        }
+        norm.push(b'@');
+        url_len -= (at + 1) - pos;
+        pos = at + 1;
+    }
+
+    // The host, excluding any port; no %-escapes allowed. Only a `file:` URL
+    // may leave it out.
+    let mut has_host = false;
+    if url_len == 0 || matches!(url.get(pos), Some(b':' | b'/' | b'?' | b'#')) {
+        if !norm.starts_with(b"file:") {
+            return None;
+        }
+    } else {
+        has_host = true;
+    }
+    let mut colon = slash - 1;
+    while colon > pos && url[colon] != b':' && url[colon] != b']' {
+        colon -= 1;
+    }
+    if url[colon] != b':' {
+        colon = slash;
+    } else if !has_host && colon < slash && colon + 1 != slash {
+        // `file:` URLs may not have a port number.
+        return None;
+    }
+    if strspn(&url[pos..], &[URL_ALPHADIGIT, URL_HOST_EXTRA].concat()) < colon - pos {
+        return None;
+    }
+    while pos < colon {
+        norm.push(url[pos].to_ascii_lowercase());
+        pos += 1;
+    }
+
+    // The port, with leading zeros dropped and the scheme's default removed.
+    if colon < slash {
+        pos += 1;
+        pos += strspn(&url[pos..], b"0");
+        if pos == slash && url[pos - 1] == b'0' {
+            pos -= 1;
+        }
+        let digits = &url[pos..slash];
+        if pos == slash {
+            // `:` with no number, same as the default.
+        } else if digits == b"80" && norm.starts_with(b"http:") {
+        } else if digits == b"443" && norm.starts_with(b"https:") {
+        } else {
+            if strspn(digits, b"0123456789") < digits.len() {
+                return None;
+            }
+            // A 16-bit port, and 0 means "next available" so it is not one.
+            let pnum: u64 = if digits.len() <= 5 {
+                std::str::from_utf8(digits).ok()?.parse().unwrap_or(0)
+            } else {
+                0
+            };
+            if pnum == 0 || pnum > 65535 {
+                return None;
+            }
+            norm.push(b':');
+            norm.extend_from_slice(digits);
+        }
+        pos = slash;
+    }
+
+    // The path, with `.`/`..` segments resolved and a leading `/` added if it
+    // is missing, being careful not to unescape any delimiter.
+    let path_off = norm.len();
+    norm.push(b'/');
+    if url.get(pos) == Some(&b'/') {
+        pos += 1;
+    }
+    loop {
+        let seg_start_off = norm.len();
+        let next_slash = pos + strcspn(&url[pos..], b"/?#");
+        let mut skip_add_slash = false;
+        if !append_normalized_escapes(&mut norm, &url[pos..next_slash]) {
+            return None;
+        }
+        match &norm[seg_start_off..] {
+            b"." => {
+                // Drop the `.`, but never the path's leading `/`.
+                if seg_start_off == path_off + 1 {
+                    norm.truncate(norm.len() - 1);
+                    skip_add_slash = true;
+                } else {
+                    norm.truncate(norm.len() - 2);
+                }
+            }
+            b".." => {
+                // Drop the `..` and the segment before it, but never the
+                // leading `/` — with nothing before it the URL is invalid.
+                let mut prev = norm.len() - 3;
+                if prev == path_off {
+                    return None;
+                }
+                loop {
+                    prev -= 1;
+                    if norm[prev] == b'/' {
+                        break;
+                    }
+                }
+                if prev == path_off {
+                    norm.truncate(prev + 1);
+                    skip_add_slash = true;
+                } else {
+                    norm.truncate(prev);
+                }
+            }
+            _ => {}
+        }
+        pos = next_slash;
+        if url.get(pos) != Some(&b'/') {
+            break;
+        }
+        pos += 1;
+        if !skip_add_slash {
+            norm.push(b'/');
+        }
+    }
+
+    // Whatever query or fragment is left, %-escapes normalized.
+    if pos < url.len() && !append_normalized_escapes(&mut norm, &url[pos..]) {
+        return None;
+    }
+    // Everything appended above is ASCII: an escape or a byte that passed the
+    // `>= 0x7F` test.
+    String::from_utf8(norm).ok()
+}
+
 
 /// `fsck.c::fsck_tag`, entered only for a tag gix already parsed — so the
 /// `object`/`type`/`tag` lines are present and the ids git reports for their

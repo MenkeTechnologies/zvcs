@@ -41,6 +41,10 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 ///   * `-k`/`--keep`                  → keep the downloaded pack (always the case here)
 ///   * `--write-commit-graph`         → write the commit-graph after fetching
 ///   * `--recurse-submodules[=yes|no]`, `-j`/`--jobs <n>` → fetch in populated submodules
+///   * `--upload-pack <path>`         → run `<path>` instead of `git-upload-pack` on the other end
+///   * `-o`/`--server-option <opt>`   → protocol-v2 `server-option=<opt>` line (repeatable)
+///   * `--refmap <refspec>`           → map the command-line refspecs' results with `<refspec>`
+///     instead of the remote's configured ones (repeatable; `--refmap=''` stores nowhere)
 ///
 /// Config-supplied defaults (overridden by the matching flag, git precedence
 /// CLI > config > built-in default):
@@ -52,18 +56,24 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 ///   * `fetch.recurseSubmodules`  → default for `--recurse-submodules`
 ///   * `fetch.parallel`           → default for `-j`/`--jobs`
 ///   * `fetch.output`             → `compact` abbreviates the `<from> -> <to>` columns
+///   * `remote.<name>.uploadpack` → default for `--upload-pack`
+///   * `remote.<name>.serverOption` → default set of `-o`/`--server-option` values
+///
+/// Command-line refspecs go through git's two-stage match (`get_ref_map` in
+/// `builtin/fetch.c`): the refspecs on the command line select the refs, and
+/// the remote's configured refspecs — or `--refmap` — then map *only those*
+/// onto local tracking refs. That second stage is why `git fetch origin main`
+/// still updates `refs/remotes/origin/main`; those opportunistic updates are
+/// reported in the summary but contribute no `FETCH_HEAD` row, exactly as
+/// git's `FETCH_HEAD_IGNORE` does.
 ///
 /// The per-ref summary is written to stderr in `git fetch` layout (`From <url>`
 /// header plus one aligned line per changed or pruned ref), or to stdout in the
 /// machine-readable layout under `--porcelain`. Options that require substrate
 /// gitoxide's high-level fetch does not expose are rejected rather than silently
-/// ignored: `--filter`, `--set-upstream`, `--atomic`, `--upload-pack`,
-/// `--refetch`, `--update-shallow`, `--server-option`, `--ipv4`/`--ipv6`, the
-/// `--negotiation-*` family and `--auto-maintenance`/`--auto-gc`, plus
-/// `--refmap`, which needs git's two-stage match (command-line refspecs select
-/// the refs, the refmap then maps only those onto tracking refs) — gitoxide's
-/// ref-map applies every refspec to every advertised ref, so a refmap glob would
-/// create tracking refs git never touches.
+/// ignored: `--filter`, `--set-upstream`, `--atomic`, `--refetch`,
+/// `--update-shallow`, `--ipv4`/`--ipv6`, the `--negotiation-*` family and
+/// `--auto-maintenance`/`--auto-gc`.
 // The final `take_value!` expansion bumps the `i` cursor that no later arm reads;
 // the write is needed by every other expansion, so it can't be removed.
 #[allow(unused_assignments)]
@@ -98,6 +108,8 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     let mut write_commit_graph: Option<bool> = None;
     let mut recurse_submodules: Option<Recurse> = None;
     let mut jobs: Option<usize> = None;
+    // `--refmap` (repeatable). Kept as raw strings because an empty one is legal and doesn't parse.
+    let mut refmap: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -261,6 +273,21 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                     .map_err(|_| anyhow::anyhow!("--shallow-exclude expects a valid ref, got {v:?}"))?;
                 shallow_exclude.push(name);
             }
+            // The program to run instead of `git-upload-pack` on the other end. git passes it verbatim to
+            // whatever spawns the service, so it can be a path or (over ssh) a whole command line.
+            "--upload-pack" => opts.upload_pack = Some(take_value!("--upload-pack")),
+
+            // Protocol-v2 server options, repeatable, transmitted as `server-option=<value>` lines.
+            "-o" | "--server-option" => opts.server_options.push(take_value!("--server-option").into()),
+
+            // git's `parse_refmap_arg`: repeatable, no negation, and an empty value is the documented way to
+            // say "don't store anywhere" — it appends a refspec that matches nothing rather than clearing the
+            // list, which still counts as "a refmap was given".
+            "--refmap" => {
+                let v = take_value!("--refmap");
+                refmap.push(v);
+            }
+
             // Options requiring substrate the high-level fetch does not expose.
             "--filter" => {
                 let _ = take_value!("--filter");
@@ -371,6 +398,60 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         };
     }
     let all = all_flag.unwrap_or(false);
+
+    // Every refspec git accepts on the command line, from `--stdin` or via `--refmap` goes through
+    // `refspec_append()`, which dies on a malformed one before anything is fetched.
+    // Under `--all`/`--multiple` every positional is a remote name, so there are no refspecs to expand
+    // or check. Otherwise `tag <name>` is git's shorthand for `refs/tags/<name>:refs/tags/<name>`.
+    let mut positional_specs: Vec<String> = Vec::new();
+    if !all && !multiple {
+        let mut rest = positionals.iter().skip(1);
+        while let Some(arg) = rest.next() {
+            if *arg == "tag" {
+                let name = rest
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("you need to specify a tag name"))?;
+                positional_specs.push(format!("refs/tags/{name}:refs/tags/{name}"));
+            } else {
+                positional_specs.push((*arg).to_string());
+            }
+        }
+    }
+    for spec in positional_specs
+        .iter()
+        .map(String::as_str)
+        .chain(stdin_specs.iter().map(String::as_str))
+        .chain(refmap.iter().map(String::as_str))
+        .filter(|s| !s.is_empty())
+    {
+        if !refspec_globs_agree(spec) {
+            eprintln!("fatal: invalid refspec '{spec}'");
+            return Ok(ExitCode::from(128));
+        }
+    }
+
+    // `--refmap` is the second half of git's two-stage match, so it only means anything once the first stage
+    // has command-line refspecs to select refs with. `--all`/`--multiple` read every positional as a remote,
+    // leaving no refspecs at all.
+    if !refmap.is_empty() {
+        let has_refspecs = !positional_specs.is_empty() || (!all && !multiple && !stdin_specs.is_empty());
+        if !has_refspecs {
+            eprintln!("fatal: --refmap option is only meaningful with command-line refspec(s)");
+            return Ok(ExitCode::from(128));
+        }
+        opts.refmap = Some(
+            refmap
+                .iter()
+                // git's documented `--refmap=''`: it appends a refspec that matches nothing, which is how the
+                // fetch is told to store nowhere while still counting as a refmap.
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    gix::refspec::parse(s.as_str().into(), gix::refspec::parse::Operation::Fetch)
+                        .map(|s| s.to_owned())
+                })
+                .collect::<Result<_, _>>()?,
+        );
+    }
 
     // Turning the forced-update check off makes the summary silently misreport
     // rewritten branches as fast-forwards, so git says so once per invocation —
@@ -505,7 +586,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             }
         } else {
             let name = positionals.first().map(|s| BStr::new(*s));
-            let mut refspecs: Vec<&str> = positionals.iter().skip(1).copied().collect();
+            let mut refspecs: Vec<&str> = positional_specs.iter().map(String::as_str).collect();
             refspecs.extend(stdin_specs.iter().map(String::as_str));
             match fetch_one(
                 &repo,
@@ -655,6 +736,13 @@ struct FetchOpts {
     compact: bool,
     /// Resolved `-j`/`--jobs` / `fetch.parallel`, always at least 1.
     jobs: usize,
+    /// `--upload-pack <path>`; `remote.<name>.uploadpack` supplies the per-remote default.
+    upload_pack: Option<String>,
+    /// `-o`/`--server-option`, repeatable; `remote.<name>.serverOption` supplies the default.
+    server_options: Vec<BString>,
+    /// The refspecs `--refmap` supplied, already parsed. `None` means no `--refmap` was given at all,
+    /// which is what decides whether the configured refspecs act as the opportunistic ones.
+    refmap: Option<Vec<gix::refspec::RefSpec>>,
 }
 
 impl Default for FetchOpts {
@@ -679,6 +767,9 @@ impl Default for FetchOpts {
             write_commit_graph: false,
             compact: false,
             jobs: 1,
+            upload_pack: None,
+            server_options: Vec::new(),
+            refmap: None,
         }
     }
 }
@@ -841,6 +932,85 @@ fn fetch_head_note(id: gix::ObjectId, for_merge: bool, remote_ref: &str, url: &s
     note
 }
 
+/// git's glob rules for a *fetch* refspec (`parse_refspec()` in `refspec.c`).
+///
+/// A `*` on one side must be matched by a `*` on the other, and a pattern source with no destination at all
+/// is refused — `refs/heads/*` alone would name a set of refs with nowhere to put them. Negative (`^`) specs
+/// carry only a left-hand side and are exempt from the second rule.
+fn refspec_globs_agree(spec: &str) -> bool {
+    let (negative, body) = match spec.strip_prefix('^') {
+        Some(rest) => (true, rest),
+        None => (false, spec.strip_prefix('+').unwrap_or(spec)),
+    };
+    // git splits on the *last* colon.
+    let (src, dst) = match body.rfind(':') {
+        Some(at) => (&body[..at], Some(&body[at + 1..])),
+        None => (body, None),
+    };
+    let dst_is_glob = dst.is_some_and(|d| d.contains('*'));
+    if !src.is_empty() && src.contains('*') {
+        if dst.is_some() && !dst_is_glob {
+            return false;
+        }
+        if dst.is_none() && !negative {
+            return false;
+        }
+    } else if dst_is_glob {
+        return false;
+    }
+    true
+}
+
+/// The program to run instead of `git-upload-pack` on the other end.
+///
+/// `--upload-pack` wins over `remote.<name>.uploadpack`, which git reads in `get_upload_pack()`.
+pub(super) fn upload_pack_program(
+    repo: &gix::Repository,
+    remote_name: Option<&str>,
+    opts_upload_pack: Option<&str>,
+) -> Option<BString> {
+    if let Some(program) = opts_upload_pack {
+        return Some(program.into());
+    }
+    let name = remote_name?;
+    repo.config_snapshot()
+        .string(&format!("remote.{name}.uploadpack"))
+        .map(|v| v.to_owned())
+}
+
+/// The protocol-v2 server options to transmit.
+///
+/// `--server-option` replaces `remote.<name>.serverOption` rather than adding to it, as documented: "These
+/// server options can be overridden by the `--server-option=` command line arguments."
+pub(super) fn server_options_for(
+    repo: &gix::Repository,
+    remote_name: Option<&str>,
+    from_command_line: &[BString],
+) -> Vec<BString> {
+    if !from_command_line.is_empty() {
+        return from_command_line.to_vec();
+    }
+    let Some(name) = remote_name else {
+        return Vec::new();
+    };
+    repo.config_snapshot()
+        .strings(&format!("remote.{name}.serverOption"))
+        .map(|values| {
+            values
+                .into_iter()
+                // An empty value in a higher-priority file clears everything inherited so far.
+                .fold(Vec::new(), |mut acc, v| {
+                    if v.is_empty() {
+                        acc.clear();
+                    } else {
+                        acc.push(v.to_owned());
+                    }
+                    acc
+                })
+        })
+        .unwrap_or_default()
+}
+
 /// Run the fetch pipeline for a single remote and print its summary.
 #[allow(clippy::too_many_arguments)]
 fn fetch_one(
@@ -860,6 +1030,15 @@ fn fetch_one(
     if credentials_in_url(repo, remote.url(gix::remote::Direction::Fetch)) == Verdict::Fatal {
         return Ok(Verdict::Fatal);
     }
+
+    // The configured fetch refspecs, captured before command-line refspecs replace them: with explicit
+    // refspecs they become git's *opportunistic* second stage, mapping the refs the command line selected onto
+    // the tracking refs they would normally land in (`get_ref_map` in `builtin/fetch.c`).
+    let configured_refspecs: Vec<gix::refspec::RefSpec> = remote
+        .refspecs(gix::remote::Direction::Fetch)
+        .iter()
+        .map(|s| s.to_ref().to_owned())
+        .collect();
 
     // Tag handling: `-t` → all tags, `-n` → none. Injected as an implicit
     // `refs/tags/*:refs/tags/*` refspec by the ref-map builder.
@@ -891,6 +1070,19 @@ fn fetch_one(
             .map(|s| forced(s.to_ref().to_bstring()))
             .collect();
         remote.replace_refspecs(specs, gix::remote::Direction::Fetch)?;
+    }
+
+    // git's `*autotags`: automatic tag following is armed by a command-line refspec only if that refspec has a
+    // destination. `git fetch <remote> <branch>` therefore fetches no tags at all, while
+    // `git fetch <remote> <branch>:<dst>` does. An explicit `--tags`/`--no-tags` decides on its own.
+    if explicit_refspecs && opts.tags.is_none() {
+        let any_destination = remote
+            .refspecs(gix::remote::Direction::Fetch)
+            .iter()
+            .any(|s| s.to_ref().destination().is_some());
+        if !any_destination {
+            remote = remote.with_fetch_tags(Tags::None);
+        }
     }
 
     // `--prefetch` rewrites every destination under `refs/prefetch/` and forces
@@ -939,8 +1131,42 @@ fn fetch_one(
             .to_owned(),
         );
     }
+    // git's second matching stage. With command-line refspecs the configured refspecs no longer select refs;
+    // they map the refs that were selected onto their tracking refs, so `git fetch origin main` still moves
+    // `refs/remotes/origin/main`. `--refmap` replaces them for that purpose only.
+    let mut opportunistic_refspecs = if explicit_refspecs {
+        opts.refmap.clone().unwrap_or(configured_refspecs)
+    } else {
+        Vec::new()
+    };
+    if opts.prefetch {
+        // `filter_prefetch_refspec` rewrites `remote->fetch` as well as the command-line refspecs.
+        opportunistic_refspecs = opportunistic_refspecs
+            .iter()
+            .filter_map(|s| prefetch_spec(s.to_ref().to_bstring().as_bstr()))
+            .filter_map(|s| {
+                gix::refspec::parse(s.as_ref(), gix::refspec::parse::Operation::Fetch)
+                    .ok()
+                    .map(|s| s.to_owned())
+            })
+            .collect();
+    } else if opts.force {
+        opportunistic_refspecs = opportunistic_refspecs
+            .iter()
+            .filter_map(|s| {
+                gix::refspec::parse(
+                    forced(s.to_ref().to_bstring()).as_ref(),
+                    gix::refspec::parse::Operation::Fetch,
+                )
+                .ok()
+                .map(|s| s.to_owned())
+            })
+            .collect();
+    }
+
     let map_options = gix::remote::ref_map::Options {
         extra_refspecs,
+        opportunistic_refspecs,
         ..Default::default()
     };
 
@@ -952,10 +1178,36 @@ fn fetch_one(
     let url = display_url(&raw_url).to_string();
     let abbrev = abbrev_len(repo);
 
+    let connect_options = gix::remote::connect::Options {
+        upload_pack: upload_pack_program(repo, remote_name.as_deref(), opts.upload_pack.as_deref()),
+    };
+    let server_options = server_options_for(repo, remote_name.as_deref(), &opts.server_options);
+
     let should_interrupt = AtomicBool::new(false);
-    let outcome = remote
-        .connect(gix::remote::Direction::Fetch)?
-        .prepare_fetch(&mut *progress, map_options)?
+    let prepared = match remote
+        .connect_with_options(gix::remote::Direction::Fetch, connect_options)?
+        .with_server_options(server_options)
+        .prepare_fetch(&mut *progress, map_options)
+    {
+        Ok(p) => p,
+        // git's `die_if_server_options()` also prints the advice line, and both it and the
+        // "server doesn't support" case are `fatal:` exits rather than per-remote failures.
+        Err(gix::remote::fetch::prepare::Error::RefMap(
+            e @ gix::remote::ref_map::Error::ServerOptionsRequireV2,
+        )) => {
+            eprintln!("hint: see protocol.version in 'git help config' for more details");
+            eprintln!("fatal: {e}");
+            return Ok(Verdict::Fatal);
+        }
+        Err(gix::remote::fetch::prepare::Error::RefMap(
+            e @ gix::remote::ref_map::Error::ServerOptionsUnsupported,
+        )) => {
+            eprintln!("fatal: {e}");
+            return Ok(Verdict::Fatal);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let outcome = prepared
         .with_dry_run(opts.dry_run)
         .with_shallow(opts.shallow.clone().unwrap_or_default())
         .with_reflog_message(RefLogMessage::Prefixed {
@@ -994,6 +1246,17 @@ fn fetch_one(
             .unwrap_or_default();
         let remote_id = mapping.remote.as_id().map(ToOwned::to_owned);
 
+        // Opportunistic mappings exist only to move the tracking ref. git marks them `FETCH_HEAD_IGNORE`
+        // because their row would duplicate the one the command-line refspec already contributed.
+        let opportunistic = ref_map.is_opportunistic(mapping);
+        // git marks every entry a *command-line* refspec produced `FETCH_HEAD_MERGE`. Refs that only
+        // automatic tag following pulled in are added afterwards and keep the default `not-for-merge`.
+        let from_command_line = explicit_refspecs
+            && matches!(
+                mapping.spec_index,
+                gix::protocol::fetch::refmap::SpecIndex::ExplicitInRemote(_)
+            );
+
         let from = mapping
             .remote
             .as_name()
@@ -1016,10 +1279,11 @@ fn fetch_one(
                     continue;
                 }
                 if let Some(id) = remote_id {
-                    let for_merge = explicit_refspecs
-                        || upstream.is_some_and(|(r, m)| {
-                            Some(r.as_str()) == remote_name.as_deref() && *m == remote_full
-                        });
+                    let for_merge = from_command_line
+                        || (!explicit_refspecs
+                            && upstream.is_some_and(|(r, m)| {
+                                Some(r.as_str()) == remote_name.as_deref() && *m == remote_full
+                            }));
                     fetch_head_rows.push((
                         fetch_head_note(id, for_merge, &remote_full, &url),
                         for_merge,
@@ -1059,11 +1323,12 @@ fn fetch_one(
 
         // Every mapping with a local destination contributes a FETCH_HEAD row,
         // whether or not the tracking ref actually moved.
-        if let Some(id) = remote_id {
-            let for_merge = explicit_refspecs
-                || upstream.is_some_and(|(r, m)| {
-                    Some(r.as_str()) == remote_name.as_deref() && *m == remote_full
-                });
+        if let (Some(id), false) = (remote_id, opportunistic) {
+            let for_merge = from_command_line
+                || (!explicit_refspecs
+                    && upstream.is_some_and(|(r, m)| {
+                        Some(r.as_str()) == remote_name.as_deref() && *m == remote_full
+                    }));
             fetch_head_rows.push((
                 fetch_head_note(id, for_merge, &remote_full, &url),
                 for_merge,

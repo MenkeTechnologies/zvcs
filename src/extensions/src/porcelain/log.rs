@@ -11,6 +11,8 @@ use gix::hash::ObjectId;
 use gix::object::tree::diff::ChangeDetached;
 use gix::objs::tree::EntryKind;
 
+use super::line_log;
+
 /// The terminal width git assumes for `--stat` when stdout is not a terminal.
 const STAT_TERM_WIDTH: usize = 80;
 
@@ -173,6 +175,14 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///     same pipeline as `git diff`, so the two produce byte-identical patches. The root
 ///     commit's empty-tree diff obeys `log.showRoot` (default true); `--root` forces it on.
 ///   * `--graph`                                 → git's ASCII commit graph (see below)
+///   * `-L<start>,<end>:<file>` and its
+///     `<start>,+<n>` / `<start>,-<n>` / `/<regex>/` / `:<funcname>` / `^:<funcname>`
+///     spellings, repeatable across files and across ranges of one file → git's
+///     line-level traversal (see [`super::line_log`]): only the commits that changed
+///     a tracked line are shown, each with a diff clipped to that line range. `-L`
+///     implies `--topo-order` and, with no other diff format given, `-p`; it is
+///     rejected against a pathspec and against the count formats exactly as git
+///     rejects them.
 ///
 /// Output separation follows git's `format:` (separator) versus `tformat:`
 /// (terminator) distinction, which is why `--format=%s` and `--pretty=format:%s`
@@ -339,6 +349,12 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // changed line matches). Both diff each commit against its first parent.
     let mut pickaxe_s: Option<String> = None;
     let mut pickaxe_g: Option<String> = None;
+    // `-L<range>:<file>`, repeatable: line-level traversal (see `line_log`).
+    let mut line_ranges: Vec<String> = Vec::new();
+    // `-s`/`--no-patch` resets the diff output format to git's NO_OUTPUT. That is a
+    // non-empty format, so `-L` does not fall back to its `DIFF_FORMAT_PATCH`
+    // default after one — even though every individual format flag is off again.
+    let mut saw_no_patch = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -514,9 +530,21 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             source_mode = true;
         } else if a == "--no-source" {
             source_mode = false;
+        } else if a == "-L" {
+            // git's `OPT_CALLBACK('L', ...)` takes its value as the next argv token
+            // and its parse-options layer rejects a missing one with exit 129.
+            i += 1;
+            let Some(v) = args.get(i) else {
+                eprintln!("error: switch `L' requires a value");
+                return Ok(ExitCode::from(129));
+            };
+            line_ranges.push(v.clone());
+        } else if let Some(v) = a.strip_prefix("-L") {
+            line_ranges.push(v.to_string());
         } else if a == "-s" || a == "--no-patch" {
             // Suppress diff output — git treats `-s` as order-sensitive, so a
             // later `--stat`/`-p` re-enables whichever format follows it.
+            saw_no_patch = true;
             stat = false;
             numstat = false;
             shortstat = false;
@@ -666,6 +694,26 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
+    // `-L` (`rev->line_level_traverse`). git rejects the combinations it cannot
+    // render in `setup_revisions`, before the pathspec check in `cmd_log_init_finish`.
+    let line_level = !line_ranges.is_empty();
+    if line_level {
+        // git's allowed set is PATCH / NO_OUTPUT / RAW / NAME / NAME_STATUS /
+        // SUMMARY; the count formats are not in it.
+        if stat || numstat || shortstat {
+            eprintln!("fatal: -L does not yet support the requested diff format");
+            return Ok(ExitCode::from(128));
+        }
+        if !pathspecs.is_empty() {
+            eprintln!("fatal: -L<range>:<file> cannot be used with pathspec");
+            return Ok(ExitCode::from(128));
+        }
+        // `if (!revs->diffopt.output_format) output_format = DIFF_FORMAT_PATCH;`
+        if !patch && !name_only && !name_status && !saw_no_patch && !quiet {
+            patch = true;
+        }
+    }
+
     // git checks this combination before touching the repository.
     if graph && reverse {
         eprintln!("fatal: options '--graph' and '--reverse' cannot be used together");
@@ -692,6 +740,9 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // reached from (a rev argument, a full refname for `--all`, or `HEAD`). A commit
     // inherits the source of the tip that first reaches it during the walk.
     let mut tip_sources: Vec<String> = Vec::new();
+    // Parallel to `tips`: the argument or refname each was named by, which is what
+    // `check_single_commit`'s "More than one commit to dig from" reports under `-L`.
+    let mut tip_names: Vec<String> = Vec::new();
     // Split each revision arg into positive tips and negative (excluded) tips to
     // support git's range forms: `A..B` (= `^A B`), `A...B` (symmetric difference —
     // exclude the merge-base), and a leading `^A`. An empty endpoint means `HEAD`
@@ -749,6 +800,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         match repo.rev_parse_single(spec.as_str()) {
             Ok(id) => {
                 tips.push(peel_to_commit(&repo, id.detach()));
+                tip_names.push(spec.clone());
                 if source_mode {
                     tip_sources.push(spec.clone());
                 }
@@ -792,6 +844,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             if let Ok(obj) = repo.find_object(oid) {
                 if obj.kind == gix::objs::Kind::Commit {
                     tips.push(oid);
+                    tip_names.push(full.to_string());
                     if source_mode {
                         tip_sources.push(full.to_string());
                     }
@@ -811,6 +864,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         }
         if let Some(id) = repo.head()?.try_peel_to_id()? {
             tips.push(id.detach());
+            tip_names.push("HEAD".to_string());
             if source_mode {
                 tip_sources.push("HEAD".to_string());
             }
@@ -832,6 +886,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // one, no topological re-sort needs the whole set, and `--reverse` does not
     // need the tail. Anything else walks the full history as before.
     let unfiltered = pathspecs.is_empty()
+        && !line_level
         && !only_merges
         && !no_merges
         && min_parents.is_none()
@@ -849,12 +904,81 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let budget = (unfiltered && max_count.is_some())
         .then(|| skip.saturating_add(max_count.unwrap_or(0)));
     let mut nodes = walk(&repo, &tips, &tip_sources, first_parent, &hidden, budget)?;
-    let effective_order = match (order, graph) {
+    // `-L` sets `revs->topo_order = 1` without touching `sort_order`, so it walks
+    // topologically unless `--date-order` asked for the date-ordered variant.
+    let effective_order = match (order, graph || line_level) {
         (Order::Default, true) => Order::Topo,
         (o, _) => o,
     };
     if effective_order != Order::Default {
         nodes = topo_sort(nodes, effective_order == Order::Date);
+    }
+
+    // `-L`: carry the tracked ranges backward through the history, keeping only the
+    // commits that took blame for one. The file pairs a kept commit is responsible
+    // for are held for the output pass below.
+    let mut line_log_pairs: HashMap<ObjectId, Vec<(line_log::Pair, Vec<line_log::Range>)>> =
+        HashMap::new();
+    if line_level {
+        // A positional token that turned out to name a path only becomes a pathspec
+        // during the loop above, which is why this repeats the earlier check.
+        if !pathspecs.is_empty() {
+            eprintln!("fatal: -L<range>:<file> cannot be used with pathspec");
+            return Ok(ExitCode::from(128));
+        }
+        // `check_single_commit`: the ranges are resolved against exactly one commit,
+        // so several positive tips leave the starting blob undefined.
+        if tips.len() > 1 {
+            eprintln!(
+                "fatal: More than one commit to dig from: {} and {}?",
+                tip_names.get(1).map(String::as_str).unwrap_or_default(),
+                tip_names.first().map(String::as_str).unwrap_or_default()
+            );
+            return Ok(ExitCode::from(128));
+        }
+        let Some(start) = tips.first().copied() else {
+            eprintln!("fatal: No commit specified?");
+            return Ok(ExitCode::from(128));
+        };
+        let tracked = match line_log::parse_lines(&repo, start, &line_ranges) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("fatal: {}", e.0);
+                return Ok(ExitCode::from(128));
+            }
+        };
+        let mut tracker = line_log::Tracker::new(&repo, start, tracked, first_parent);
+        let mut kept = Vec::with_capacity(nodes.len());
+        // Every walked commit's post-line-log parent list plus whether it survived,
+        // which is what `line_log_rewrite_one` reads (a dropped commit is git's
+        // TREESAME).
+        let mut seen: HashMap<ObjectId, (Vec<ObjectId>, bool)> = HashMap::new();
+        for mut node in nodes.into_iter() {
+            let (range, parents) = tracker.process(node.id, &node.parents)?;
+            node.parents = parents;
+            seen.insert(node.id, (node.parents.clone(), range.is_some()));
+            if let Some(range) = range {
+                line_log_pairs.insert(node.id, line_log::queue_pairs(&range));
+                kept.push(node);
+            }
+        }
+        // `line_log_filter` finishes with `rewrite_parents()`, which git runs only
+        // when the caller wants ancestry — `--graph` and `--parents` are what set
+        // `rewrite_parents` here. Every other format never prints a parent.
+        if graph || show_parents {
+            for node in &mut kept {
+                let mut rewritten: Vec<ObjectId> = Vec::with_capacity(node.parents.len());
+                for p in &node.parents {
+                    if let Some(id) = line_log_rewrite_one(*p, &seen, &hidden) {
+                        if !rewritten.contains(&id) {
+                            rewritten.push(id);
+                        }
+                    }
+                }
+                node.parents = rewritten;
+            }
+        }
+        nodes = kept;
     }
 
     // Path-limited traversal: keep only commits that touched a matching pathspec,
@@ -1084,10 +1208,40 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         }
         let mut block = entries.get(&repo, &nodes, ni, &abbrev_cache)?;
 
+        // `log_tree_diff` short-circuits under `-L`: it flushes the pairs
+        // `line_log_queue_pairs()` produced and returns, so neither the merge rule
+        // nor `log.showRoot` applies — a surviving merge simply has no pairs, and a
+        // root commit's creation pair is shown like any other.
+        if line_level {
+            let pairs = line_log_pairs.get(&node.id).map(Vec::as_slice).unwrap_or(&[]);
+            let mut diff: Vec<u8> = Vec::new();
+            if name_status {
+                for (pair, _) in pairs {
+                    let (status, path) = line_log_name_status(pair);
+                    diff.push(status);
+                    diff.push(b'\t');
+                    diff.extend_from_slice(path);
+                    diff.push(b'\n');
+                }
+            } else if name_only {
+                for (pair, _) in pairs {
+                    diff.extend_from_slice(&pair.path);
+                    diff.push(b'\n');
+                }
+            } else if emit_patch && !pairs.is_empty() {
+                diff = super::diff::line_range_patch(&repo, pairs, 3)?;
+            }
+            if !diff.is_empty() {
+                if !matches!(pretty, Pretty::Oneline) && !block.is_empty() {
+                    block.push(b'\n');
+                }
+                block.extend_from_slice(&diff);
+            }
+        }
         // A root commit's diff (against the empty tree) is only shown when
         // `show_root` is set — git's `log.showRoot` (default true), forced on by
         // `--root`. Non-root commits are unaffected.
-        if (want_names || emit_patch)
+        else if (want_names || emit_patch)
             && node.parents.len() < 2
             && (show_root || !node.parents.is_empty())
         {
@@ -1213,6 +1367,41 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+/// `line_log_rewrite_one`: replace a parent that `-L` dropped by the first commit
+/// below it that is worth drawing an edge to. The walk stops at a merge, at an
+/// excluded (`^rev`) commit, and at a commit `-L` kept; running out of parents
+/// removes the edge entirely (git's `rewrite_one_noparents`).
+fn line_log_rewrite_one(
+    parent: ObjectId,
+    seen: &HashMap<ObjectId, (Vec<ObjectId>, bool)>,
+    hidden: &HashSet<ObjectId>,
+) -> Option<ObjectId> {
+    let mut p = parent;
+    loop {
+        let Some((parents, kept)) = seen.get(&p) else {
+            return Some(p);
+        };
+        if parents.len() > 1 || hidden.contains(&p) || *kept {
+            return Some(p);
+        }
+        p = *parents.first()?;
+    }
+}
+
+/// The `--name-status` letter and path of a `-L` file pair.
+///
+/// `diff_resolve_rename_copy()` re-derives the letter from the two filespecs of the
+/// `diff_filepair_dup()` the `-L` queue holds, and that copy carries no rename flag —
+/// so even a pair whose sides name different files reports a plain `M`.
+/// `diff_flush_raw()` then prints the pre-image path for anything but `R`/`C`.
+fn line_log_name_status(pair: &line_log::Pair) -> (u8, &gix::bstr::BString) {
+    match (pair.old, pair.new) {
+        (None, _) => (b'A', &pair.path),
+        (_, None) => (b'D', &pair.old_path),
+        _ => (b'M', &pair.old_path),
     }
 }
 
@@ -1552,13 +1741,13 @@ impl PatchWindow {
     }
 }
 
-struct Node {
-    id: ObjectId,
-    parents: Vec<ObjectId>,
-    time: i64,
+pub(crate) struct Node {
+    pub(crate) id: ObjectId,
+    pub(crate) parents: Vec<ObjectId>,
+    pub(crate) time: i64,
     /// `--source`: the ref/argument this commit was first reached from. Empty when
     /// `--source` is off (the field is never rendered in that case).
-    source: String,
+    pub(crate) source: String,
 }
 
 /// Heap order for the walk's frontier: newest commit-date first, ties broken by
@@ -1948,7 +2137,7 @@ fn walk(
 /// git's `sort_in_topological_order`: an indegree count over the already-walked
 /// set, drained through a queue that is date-ordered for `--date-order` and a
 /// LIFO stack for `--topo-order`.
-fn topo_sort(nodes: Vec<Node>, by_date: bool) -> Vec<Node> {
+pub(crate) fn topo_sort(nodes: Vec<Node>, by_date: bool) -> Vec<Node> {
     let mut indegree: std::collections::HashMap<ObjectId, usize> =
         nodes.iter().map(|n| (n.id, 1usize)).collect();
     for node in &nodes {

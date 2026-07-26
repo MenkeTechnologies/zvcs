@@ -47,6 +47,36 @@ pub fn three_way_merge(
     labels: gix::merge::blob::builtin_driver::text::Labels<'_>,
     should_interrupt: &AtomicBool,
 ) -> Result<Applied> {
+    three_way_merge_verbose(
+        repo,
+        base_tree,
+        ours_tree,
+        theirs_tree,
+        old_index,
+        labels,
+        should_interrupt,
+        true,
+    )
+}
+
+/// [`three_way_merge`] with git's `show_msgs` switch made explicit.
+///
+/// `merge-ort-wrappers.c` computes `show_msgs = !!opt->verbosity` and passes it
+/// to `merge_switch_to_result()`, so a caller that reads `merge.verbosity` (only
+/// `git merge` does — the sequencer's picks print unconditionally) can silence
+/// the `Auto-merging` / `CONFLICT (…)` block by passing `false`. Everything else
+/// — the merged tree, the conflicted index, the worktree update — is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn three_way_merge_verbose(
+    repo: &gix::Repository,
+    base_tree: ObjectId,
+    ours_tree: ObjectId,
+    theirs_tree: ObjectId,
+    old_index: &gix::index::File,
+    labels: gix::merge::blob::builtin_driver::text::Labels<'_>,
+    should_interrupt: &AtomicBool,
+    show_msgs: bool,
+) -> Result<Applied> {
     let mut merge = repo.merge_trees(
         base_tree,
         ours_tree,
@@ -63,7 +93,7 @@ pub fn three_way_merge(
     let mut conflicts: Vec<BString> = Vec::new();
     for conflict in &merge.conflicts {
         let path = conflict.changes_in_resolution().0.location().to_owned();
-        if conflict.content_merge().is_some() {
+        if show_msgs && conflict.content_merge().is_some() {
             println!("Auto-merging {path}");
         }
         if !conflict.is_unresolved(unresolved) {
@@ -76,7 +106,9 @@ pub fn three_way_merge(
         } else {
             "content"
         };
-        println!("CONFLICT ({kind}): Merge conflict in {path}");
+        if show_msgs {
+            println!("CONFLICT ({kind}): Merge conflict in {path}");
+        }
         conflicts.push(path);
     }
 

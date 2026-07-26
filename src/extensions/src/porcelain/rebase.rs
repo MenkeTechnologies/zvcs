@@ -928,12 +928,32 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         try_imply!(ty, "--trailer");
     }
 
-    // "all am options except -q are compatible only with --apply"
+    // "all am options except -q are compatible only with --apply". The two
+    // config keys below are the merge backend's own defaults, so reaching the
+    // apply backend with either of them on — and no command-line `--no-…` to
+    // clear it — is a contradiction git refuses rather than silently drops.
+    // `rebase.rebaseMerges` is `git_parse_maybe_bool`'d, and a non-boolean value
+    // (`rebase-cousins` / `no-rebase-cousins`) counts as on.
     if !git_am_opts.is_empty() || ty == Backend::Apply {
         let has_real_am_opt = git_am_opts.iter().any(|o| o != "-q");
         if has_real_am_opt || ty == Backend::Apply {
+            let snap = repo.config_snapshot();
+            let cfg_rebase_merges = snap
+                .string("rebase.rebaseMerges")
+                .map(|_| snap.boolean("rebase.rebaseMerges").unwrap_or(true));
+            let cfg_update_refs = snap.boolean("rebase.updateRefs");
             if ty == Backend::Merge {
                 die!("apply options and merge options cannot be used together");
+            } else if rebase_merges == -1 && cfg_rebase_merges == Some(true) {
+                die!(
+                    "apply options are incompatible with rebase.rebaseMerges.  \
+                     Consider adding --no-rebase-merges"
+                );
+            } else if update_refs == -1 && cfg_update_refs == Some(true) {
+                die!(
+                    "apply options are incompatible with rebase.updateRefs.  \
+                     Consider adding --no-update-refs"
+                );
             }
             ty = Backend::Apply;
         }

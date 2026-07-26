@@ -1,25 +1,26 @@
-//! `git send-email` — send a collection of patches as email. **The sending
-//! itself is not ported: every path that would compose or transmit a message
-//! bails.**
+//! `git send-email` — send a collection of patches as email.
 //!
 //! Stock `git-send-email` is a Perl script (`git-send-email.perl`, 2474 lines in
-//! git 2.55.0). Almost none of what it does is git work. It drives `Net::SMTP` /
-//! `Net::SMTP::SSL` (or forks a `sendmail` binary), authenticates over SASL via
-//! `Authen::SASL`, encodes headers with RFC 2047 and bodies with
-//! quoted-printable/base64, parses addresses with `Mail::Address`, opens
-//! `$GIT_EDITOR` for `--compose`/`--annotate`, prompts interactively for
-//! `--confirm`, and delegates any revision arguments to `git format-patch`.
-//! None of that has a substrate in the vendored gitoxide crates under
-//! `src/ported`: there is no SMTP client, no TLS-wrapped mail transport, no SASL
-//! implementation, no MIME encoder and no RFC 822 address parser. Faking the
-//! transmission is not an option — the whole observable result of a real
-//! `send-email` run is the bytes that reach a server.
+//! git 2.55.0). Almost none of what it does is git work: it composes RFC 2822
+//! messages out of patch files and then hands them either to a `sendmail`-style
+//! program or to a `Net::SMTP` socket.
 //!
-//! What *is* ported is the surface that is byte-verifiable without a mail
-//! server: the three-pass `Getopt::Long` scan, the usage block, and every `die`
-//! the script reaches before it needs a transport — including the complete
-//! `--dump-aliases` path, which is pure file parsing. All output below was
-//! captured from git 2.55.0 on Darwin.
+//! The composing half and the program transport are ported in full. Every
+//! configuration variable and option that steers *which bytes get produced* —
+//! the sender, the recipient lists, the alias files, the mailmap, the `Cc`
+//! suppressions, the threading headers, the transfer encoding, the validation
+//! hook, the confirmation prompt, the editor sessions — is live here, and the
+//! bytes that reach the program are byte-identical to the ones stock produces
+//! (modulo `Date:` and `Message-ID:`, which are functions of the clock and the
+//! pid).
+//!
+//! What is not ported is the socket transport. `Net::SMTP` / `Net::SMTP::SSL`,
+//! `IO::Socket::SSL` and SASL through `Authen::SASL` have no substrate in the
+//! vendored gitoxide crates under `src/ported`, and faking a conversation with a
+//! mail server is not an option. A run that would open a socket bails, naming
+//! what it would have used; `--sendmail-cmd`, an absolute `--smtp-server` and
+//! `--dry-run` all work. All output below was captured from git 2.55.0 on
+//! Darwin.
 //!
 //! ### Covered (byte-identical stdout/stderr and exit code)
 //!
@@ -47,10 +48,17 @@
 //!   or configuration option) ``, `Unknown --suppress-cc field: '<x>'` and
 //!   `Unknown --confirm setting: '<x>'`, in that order — the order the script
 //!   evaluates them.
-//! * `read_config`: `sendemail.<identity>.*` before `sendemail.*`, first prefix
-//!   wins per setting, `sendemail.identity` yielding to `--identity` and
-//!   `--no-identity`, list-valued keys (`aliasesfile`, `suppresscc`) taking
-//!   every value, scalar keys taking the last.
+//! * `read_config` over all three setting tables: `sendemail.<identity>.*`
+//!   before `sendemail.*`, first prefix wins per setting, `sendemail.identity`
+//!   yielding to `--identity` and `--no-identity`, list-valued keys
+//!   (`aliasesfile`, `suppresscc`, `to`, `cc`, `bcc`, `smtpserveroption`)
+//!   taking every value, scalar keys taking the last, `signedoffbycc` and
+//!   `signedoffcc` feeding one variable under two setting names, and paths
+//!   going through `Git::config_path`. The command line then writes the same
+//!   variables, in the order the options were spelled, which is why
+//!   `--suppress-cc` and `--smtp-server-option` append to what the
+//!   configuration set rather than replacing it while `--to`/`--cc`/`--bcc`
+//!   accumulate separately and replace it wholesale.
 //! * `--dump-aliases`: the alias files named by `sendemail.aliasesfile` are read
 //!   with the parser named by `sendemail.aliasfiletype`, and the alias names are
 //!   printed one per line in byte order, exit 0. All six parsers are
@@ -75,6 +83,25 @@
 //!   `=?UTF-8?q?…?=` word when it holds a non-ASCII byte, in plain double quotes
 //!   (backslash-escaping `\` and CR) when it holds a special or control
 //!   character, and verbatim otherwise.
+//! * The whole per-patch pipeline: the argument loop that turns files and
+//!   directories into `@files` (with `is_format_patch_arg` disambiguating a name
+//!   that is also a revision), `handle_backup_files`, the 8-bit scan that fills
+//!   `%broken_encoding`, the `*** SUBJECT HERE ***` refusal, `pre_process_file`
+//!   (header unfolding, `header-cmd`, the `%suppress_cc` decisions for the
+//!   `From:`/`To:`/`Cc:` headers and the body's `-by:`/`Cc:` trailers,
+//!   `to-cmd`/`cc-cmd`), `process_address_list` (`Mail::Address` parse, alias
+//!   expansion, `sanitize_address`, `extract_valid_address` validation and
+//!   `git check-mailmap`), `apply_transfer_encoding` (`MIME::QuotedPrint` and
+//!   `MIME::Base64`, `auto` picking quoted-printable for a 999-byte line or a
+//!   CR), `gen_header`, the `--confirm` prompt with its `inform` block, the
+//!   threading of `In-Reply-To:`/`References:` across a series, `validate_patch`
+//!   (the `sendemail-validate` hook through `git hook run`, the 998-character
+//!   limit, and `Git::port_num` for the SMTP port), `do_edit` for `--annotate`,
+//!   the `--batch-size`/`--relogin-delay` pause, and the `imap-send` copy.
+//! * The transport for `--sendmail-cmd` and for an absolute `--smtp-server`: the
+//!   `-f <envelope>`, `-i`, recipient and `--smtp-server-option` argument
+//!   vector, `"$header\n$message"` on the program's stdin, and both the `quiet`
+//!   (`Sent`/`Dry-Sent`) and verbose (`OK. Log says:` …) reports.
 //!
 //! ### Exit status of the `die` paths
 //!
@@ -85,13 +112,37 @@
 //! no `sende?mail.*` key is set anywhere and 255 if any is — which is what this
 //! module computes. `usage()` calls `exit(1)` explicitly and is not affected.
 //!
+//! That accounting holds for the diagnostics the script reaches early. Later on
+//! it stops holding, because `$!` is whatever errno the last failed libc call in
+//! the Perl runtime happened to leave behind: the same `die` observed exit 2
+//! after the patches had been read and 25 after the validation hook had run. The
+//! errno is an artefact of Perl's own internal probing, not of anything the
+//! script decides, so it is not reproduced; these paths exit 1 or 255 by the
+//! rule above. Their messages are byte-identical, except that a `die` whose
+//! message does not end in a newline gets ` at <path-to-git-send-email> line
+//! <n>.` appended by Perl — a path into the stock installation, which nothing
+//! here can or should print. Those messages are:
+//! `Send this email reply required`, `invalid transfer encoding`, `cannot send
+//! message as 7bit`, `The destination IMAP folder is not properly defined.`,
+//! `The required SMTP server is not properly defined.`, `No subject line in
+//! <f>?`, `can't open file <f>` and the three `execute_cmd` failures.
+//!
 //! ### Not covered
 //!
-//! * Everything from `is_format_patch_arg` onwards: delegating to
-//!   `git format-patch`, reading patches, `--compose`/`--annotate` editor
-//!   sessions, `--confirm` prompting, `--validate` hook runs, header
-//!   construction, MIME/RFC 2047 encoding, `--dry-run`, and the SMTP or
-//!   `sendmail` transport. These bail, naming the missing substrate.
+//! * The `Net::SMTP` transport: opening a socket, STARTTLS or implicit SSL,
+//!   `ssl_verify_params`, SASL authentication through `git credential`, `MAIL
+//!   FROM`/`RCPT TO`/`DATA`, and the Outlook `Message-ID` recovery. A run that
+//!   would reach it bails. The settings that exist only to steer it —
+//!   `smtpEncryption`, `smtpUser`, `smtpPass`, `smtpDomain`, `smtpAuth`, the
+//!   three `smtpSSL*` paths and `outlookidfix` — are therefore not read out of
+//!   the configuration at all; their options still parse and are named in the
+//!   bail. `--smtp-debug` likewise steers only `Net::SMTP`'s own tracing.
+//! * `--compose`: the introductory message is written into `$GIT_EDITOR` from a
+//!   template and then re-parsed for its headers. It bails, as does
+//!   `sendemail.composeEncoding`, which nothing else reads.
+//! * Revision arguments, which the script turns into patches by running
+//!   `git format-patch -o <tmpdir>`. Naming patch files or a directory works;
+//!   anything that falls through to `@rev_list_opts` bails.
 //! * `--git-completion-helper`, which shells out to
 //!   `git format-patch --git-completion-helper` and prints the union of both
 //!   option lists. It bails.
@@ -100,6 +151,15 @@
 //! * The `pine` parser matches on tab-delimited field structure rather than by
 //!   backtracking the original regex character for character; the alias name it
 //!   yields is the first field, which is all `--dump-aliases` prints.
+//! * Header bytes that are not valid UTF-8. `$message` is carried and written as
+//!   raw bytes, but a header line is decoded lossily before it is matched, so a
+//!   display name in a legacy 8-bit charset would not survive verbatim. Patch
+//!   headers out of `format-patch` are RFC 2047 encoded and unaffected.
+//! * `Term::ReadLine`'s prompt decoration. With no terminal to open, `ask`
+//!   returns its default without printing, which is what the script does and
+//!   what every prompt path here was compared against; with a terminal the
+//!   prompt is written plainly rather than with the ANSI attributes
+//!   `Term::ReadLine::Perl` adds.
 
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -333,10 +393,6 @@ impl Parsed {
         self.hits.iter().any(|h| h.id == id)
     }
 
-    /// Every value stored for `id`, in order, as Perl's array assignment leaves it.
-    fn all(&self, id: &str) -> Vec<&str> {
-        self.hits.iter().filter(|h| h.id == id).filter_map(|h| h.value.as_deref()).collect()
-    }
 }
 
 /// One candidate spelling of an option, as `Getopt::Long` registers it.
@@ -560,61 +616,397 @@ fn known_keys(cfg: Option<&ConfigFile>) -> Known {
     Known(map)
 }
 
-/// The settings `read_config` fills in that anything reachable here depends on.
-/// The rest of `%config_settings` steers composition and transport, which bail.
-#[derive(Default)]
-struct Config {
-    alias_files: Vec<String>,
-    alias_file_type: Option<String>,
+/// Where a `%config_bool_settings` entry lands in [`Settings`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoolTarget {
+    Thread,
+    ChainReplyTo,
+    SuppressFrom,
+    SignedOffByCc,
+    CoverCc,
+    CoverTo,
+    Validate,
+    MultiEdit,
+    Annotate,
+    XMailer,
+    ForbidSendmailVariables,
+    Mailmap,
+    UseImapOnly,
+}
+
+/// `%config_bool_settings`. Each entry is spelled as the configuration variable
+/// itself for the unqualified `sendemail` prefix; [`identity_key`] rewrites it
+/// for the `sendemail.<identity>` pass.
+///
+/// The `outlookidfix` setting is deliberately absent: `is_outlook()` is
+/// consulted only after a `Net::SMTP` conversation has produced a server reply,
+/// so nothing this module can reach would observe it. See the module docs.
+const BOOL_SETTINGS: &[(&str, BoolTarget)] = &[
+    ("sendemail.thread", BoolTarget::Thread),
+    ("sendemail.chainreplyto", BoolTarget::ChainReplyTo),
+    ("sendemail.suppressfrom", BoolTarget::SuppressFrom),
+    ("sendemail.signedoffbycc", BoolTarget::SignedOffByCc),
+    ("sendemail.cccover", BoolTarget::CoverCc),
+    ("sendemail.tocover", BoolTarget::CoverTo),
+    ("sendemail.signedoffcc", BoolTarget::SignedOffByCc),
+    ("sendemail.validate", BoolTarget::Validate),
+    ("sendemail.multiedit", BoolTarget::MultiEdit),
+    ("sendemail.annotate", BoolTarget::Annotate),
+    ("sendemail.xmailer", BoolTarget::XMailer),
+    ("sendemail.forbidsendmailvariables", BoolTarget::ForbidSendmailVariables),
+    ("sendemail.mailmap", BoolTarget::Mailmap),
+    ("sendemail.useimaponly", BoolTarget::UseImapOnly),
+];
+
+/// Where a `%config_path_settings` entry lands. These go through
+/// `Git::config_path`, so `~/` is expanded.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathTarget {
+    AliasesFile,
+    MailmapFile,
+    MailmapBlob,
+}
+
+/// `%config_path_settings`. `aliasesfile` is the only list-valued one.
+///
+/// The three `smtpssl*` paths are deliberately absent: `ssl_verify_params()` is
+/// the only thing that reads them, and it exists to configure an
+/// `IO::Socket::SSL` this module never opens. See the module docs.
+const PATH_SETTINGS: &[(&str, PathTarget)] = &[
+    ("sendemail.aliasesfile", PathTarget::AliasesFile),
+    ("sendemail.mailmap.file", PathTarget::MailmapFile),
+    ("sendemail.mailmap.blob", PathTarget::MailmapBlob),
+];
+
+/// Where a `%config_settings` entry lands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValueTarget {
+    SmtpServer,
+    SmtpServerPort,
+    SmtpServerOption,
+    BatchSize,
+    ReloginDelay,
+    ImapSentFolder,
+    To,
+    ToCmd,
+    Cc,
+    CcCmd,
+    HeaderCmd,
+    AliasFileType,
+    Bcc,
+    SuppressCc,
+    EnvelopeSender,
+    Confirm,
+    From,
+    Assume8BitEncoding,
+    TransferEncoding,
+    SendmailCmd,
+}
+
+impl ValueTarget {
+    /// The `ref($target) eq "ARRAY"` test: a list-valued setting takes every
+    /// value the key has, a scalar one only the last.
+    fn is_list(self) -> bool {
+        matches!(
+            self,
+            ValueTarget::SmtpServerOption
+                | ValueTarget::To
+                | ValueTarget::Cc
+                | ValueTarget::Bcc
+                | ValueTarget::SuppressCc
+        )
+    }
+}
+
+/// `%config_settings`.
+const VALUE_SETTINGS: &[(&str, ValueTarget)] = &[
+    ("sendemail.smtpserver", ValueTarget::SmtpServer),
+    ("sendemail.smtpserverport", ValueTarget::SmtpServerPort),
+    ("sendemail.smtpserveroption", ValueTarget::SmtpServerOption),
+    ("sendemail.smtpbatchsize", ValueTarget::BatchSize),
+    ("sendemail.smtprelogindelay", ValueTarget::ReloginDelay),
+    ("sendemail.imapsentfolder", ValueTarget::ImapSentFolder),
+    ("sendemail.to", ValueTarget::To),
+    ("sendemail.tocmd", ValueTarget::ToCmd),
+    ("sendemail.cc", ValueTarget::Cc),
+    ("sendemail.cccmd", ValueTarget::CcCmd),
+    ("sendemail.headercmd", ValueTarget::HeaderCmd),
+    ("sendemail.aliasfiletype", ValueTarget::AliasFileType),
+    ("sendemail.bcc", ValueTarget::Bcc),
+    ("sendemail.suppresscc", ValueTarget::SuppressCc),
+    ("sendemail.envelopesender", ValueTarget::EnvelopeSender),
+    ("sendemail.confirm", ValueTarget::Confirm),
+    ("sendemail.from", ValueTarget::From),
+    ("sendemail.assume8bitencoding", ValueTarget::Assume8BitEncoding),
+    ("sendemail.transferencoding", ValueTarget::TransferEncoding),
+    ("sendemail.sendmailcmd", ValueTarget::SendmailCmd),
+];
+
+/// Rewrite a `sendemail.<name>` literal for the `sendemail.<identity>` pass,
+/// which `read_config` runs first so that an identity subsection wins.
+fn identity_key(literal: &str, identity: &str) -> String {
+    format!("sendemail.{identity}.{}", &literal["sendemail.".len()..])
+}
+
+/// The script's configuration variables, with the same defaults the `my`
+/// declarations give them. `Option` stands for Perl's `undef`, which several of
+/// these are tested for rather than used.
+struct Settings {
+    thread: bool,
+    chain_reply_to: bool,
+    suppress_from: Option<bool>,
+    signed_off_by_cc: Option<bool>,
+    cover_cc: Option<bool>,
+    cover_to: Option<bool>,
+    validate: bool,
+    multiedit: Option<bool>,
+    annotate: Option<bool>,
+    use_xmailer: bool,
     forbid_sendmail_variables: bool,
+    mailmap: bool,
+    use_imap_only: bool,
+
+    alias_files: Vec<String>,
+    mailmap_file: Option<String>,
+    mailmap_blob: Option<String>,
+
+    smtp_server: Option<String>,
+    smtp_server_port: Option<String>,
+    smtp_server_options: Vec<String>,
     batch_size: Option<String>,
     relogin_delay: Option<String>,
+    imap_sent_folder: Option<String>,
+    config_to: Vec<String>,
+    to_cmd: Option<String>,
+    config_cc: Vec<String>,
+    cc_cmd: Option<String>,
+    header_cmd: Option<String>,
+    alias_file_type: Option<String>,
+    config_bcc: Vec<String>,
     suppress_cc: Vec<String>,
+    envelope_sender: Option<String>,
     confirm: Option<String>,
-    /// Whether `sendemail.suppressfrom` or `sendemail.signedoffbycc` was set;
-    /// either creates a key in `%suppress_cc` and so changes `--confirm`'s
-    /// default from `auto` to `compose`.
-    suppress_toggles: bool,
+    sender: Option<String>,
+    auto_8bit_encoding: Option<String>,
+    target_xfer_encoding: String,
+    sendmail_cmd: Option<String>,
+
+    /// The settings that steer a `Net::SMTP` conversation and nothing else.
+    /// Their configuration variables are not read — see [`Smtp`].
+    smtp: Smtp,
+}
+
+/// The `Net::SMTP` half of `%config_settings`, filled from the command line
+/// only.
+///
+/// The `smtpEncryption`, `smtpUser`, `smtpPass`, `smtpDomain`, `smtpAuth`,
+/// `smtpSSLCertPath`, `smtpSSLClientCert`, `smtpSSLClientKey` and
+/// `outlookidfix` settings all land here in the script, and every one is read
+/// exclusively inside the socket transport — `smtp_auth_maybe`,
+/// `ssl_verify_params`, the `Net::SMTP->new` calls and `is_outlook`. That
+/// transport is not ported, so reading those variables out of the configuration
+/// would change nothing; they are left unread rather than given a home that
+/// only ever feeds a diagnostic. The matching options still parse and are
+/// reported when a socket would have been opened.
+#[derive(Default)]
+struct Smtp {
+    encryption: Option<String>,
+    authuser: Option<String>,
+    authpass: Option<String>,
+    domain: Option<String>,
+    auth: Option<String>,
+    ssl_cert_path: Option<String>,
+    ssl_client_cert: Option<String>,
+    ssl_client_key: Option<String>,
+    outlook_id_fix: Option<bool>,
+}
+
+impl Smtp {
+    /// The settings a socket conversation would have used, for the bail that
+    /// stands in for it.
+    fn describe(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut push = |name: &str, v: Option<&str>| {
+            if let Some(v) = v {
+                parts.push(format!("{name}={v}"));
+            }
+        };
+        push("encryption", self.encryption.as_deref());
+        push("user", self.authuser.as_deref());
+        push("password", self.authpass.as_deref().map(|_| "<given>"));
+        push("domain", self.domain.as_deref());
+        push("auth", self.auth.as_deref());
+        push("ssl-cert-path", self.ssl_cert_path.as_deref());
+        push("ssl-client-cert", self.ssl_client_cert.as_deref());
+        push("ssl-client-key", self.ssl_client_key.as_deref());
+        if let Some(v) = self.outlook_id_fix {
+            parts.push(format!("outlook-id-fix={v}"));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" (requested: {})", parts.join(", "))
+        }
+    }
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            thread: true,
+            chain_reply_to: false,
+            suppress_from: None,
+            signed_off_by_cc: None,
+            cover_cc: None,
+            cover_to: None,
+            validate: true,
+            multiedit: None,
+            annotate: None,
+            use_xmailer: true,
+            forbid_sendmail_variables: true,
+            mailmap: false,
+            use_imap_only: false,
+            alias_files: Vec::new(),
+            mailmap_file: None,
+            mailmap_blob: None,
+            smtp_server: None,
+            smtp_server_port: None,
+            smtp_server_options: Vec::new(),
+            batch_size: None,
+            relogin_delay: None,
+            imap_sent_folder: None,
+            config_to: Vec::new(),
+            to_cmd: None,
+            config_cc: Vec::new(),
+            cc_cmd: None,
+            header_cmd: None,
+            alias_file_type: None,
+            config_bcc: Vec::new(),
+            suppress_cc: Vec::new(),
+            envelope_sender: None,
+            confirm: None,
+            sender: None,
+            auto_8bit_encoding: None,
+            target_xfer_encoding: "auto".into(),
+            sendmail_cmd: None,
+            smtp: Smtp::default(),
+        }
+    }
+}
+
+impl Settings {
+    fn set_bool(&mut self, target: BoolTarget, v: bool) {
+        match target {
+            BoolTarget::Thread => self.thread = v,
+            BoolTarget::ChainReplyTo => self.chain_reply_to = v,
+            BoolTarget::SuppressFrom => self.suppress_from = Some(v),
+            BoolTarget::SignedOffByCc => self.signed_off_by_cc = Some(v),
+            BoolTarget::CoverCc => self.cover_cc = Some(v),
+            BoolTarget::CoverTo => self.cover_to = Some(v),
+            BoolTarget::Validate => self.validate = v,
+            BoolTarget::MultiEdit => self.multiedit = Some(v),
+            BoolTarget::Annotate => self.annotate = Some(v),
+            BoolTarget::XMailer => self.use_xmailer = v,
+            BoolTarget::ForbidSendmailVariables => self.forbid_sendmail_variables = v,
+            BoolTarget::Mailmap => self.mailmap = v,
+            BoolTarget::UseImapOnly => self.use_imap_only = v,
+        }
+    }
+
+    fn set_path(&mut self, target: PathTarget, values: &[String]) {
+        let last = || values.last().cloned();
+        match target {
+            PathTarget::AliasesFile => self.alias_files = values.to_vec(),
+            PathTarget::MailmapFile => self.mailmap_file = last(),
+            PathTarget::MailmapBlob => self.mailmap_blob = last(),
+        }
+    }
+
+    fn set_value(&mut self, target: ValueTarget, values: &[String]) {
+        let last = || values.last().cloned();
+        match target {
+            ValueTarget::SmtpServer => self.smtp_server = last(),
+            ValueTarget::SmtpServerPort => self.smtp_server_port = last(),
+            ValueTarget::SmtpServerOption => self.smtp_server_options = values.to_vec(),
+            ValueTarget::BatchSize => self.batch_size = last(),
+            ValueTarget::ReloginDelay => self.relogin_delay = last(),
+            ValueTarget::ImapSentFolder => self.imap_sent_folder = last(),
+            ValueTarget::To => self.config_to = values.to_vec(),
+            ValueTarget::ToCmd => self.to_cmd = last(),
+            ValueTarget::Cc => self.config_cc = values.to_vec(),
+            ValueTarget::CcCmd => self.cc_cmd = last(),
+            ValueTarget::HeaderCmd => self.header_cmd = last(),
+            ValueTarget::AliasFileType => self.alias_file_type = last(),
+            ValueTarget::Bcc => self.config_bcc = values.to_vec(),
+            ValueTarget::SuppressCc => self.suppress_cc = values.to_vec(),
+            ValueTarget::EnvelopeSender => self.envelope_sender = last(),
+            ValueTarget::Confirm => self.confirm = last(),
+            ValueTarget::From => self.sender = last(),
+            ValueTarget::Assume8BitEncoding => self.auto_8bit_encoding = last(),
+            ValueTarget::TransferEncoding => {
+                if let Some(v) = last() {
+                    self.target_xfer_encoding = v;
+                }
+            }
+            ValueTarget::SendmailCmd => self.sendmail_cmd = last(),
+        }
+    }
 }
 
 /// `read_config(\%known_config_keys, \%configured, $prefix)`, called for
-/// `sendemail.<identity>` and then `sendemail`. `%configured` is what makes the
-/// first prefix win.
-fn read_config(cfg: &mut Config, known: &Known, prefix: &str, configured: &mut BTreeSet<&'static str>) {
-    // %config_bool_settings.
-    if let Some(v) = known.boolean(&format!("{prefix}.forbidsendmailvariables")) {
-        if configured.insert("forbidsendmailvariables") {
-            cfg.forbid_sendmail_variables = v;
+/// `sendemail.<identity>` and then `sendemail`. `%configured` is keyed by the
+/// *setting* name, which is what makes the first prefix win — and what lets
+/// `signedoffbycc` and `signedoffcc` both feed one variable.
+fn read_config(
+    s: &mut Settings,
+    known: &Known,
+    identity: Option<&str>,
+    configured: &mut BTreeSet<&'static str>,
+) {
+    let key = |literal: &str| match identity {
+        Some(id) => identity_key(literal, id),
+        None => literal.to_string(),
+    };
+    // Every literal below is `sendemail.<setting>`; the setting name is what
+    // `%configured` records.
+    let setting_of = |literal: &'static str| &literal["sendemail.".len()..];
+
+    for (literal, target) in BOOL_SETTINGS {
+        let k = key(literal);
+        if !known.exists(&k) {
+            continue;
         }
-    }
-    for setting in ["suppressfrom", "signedoffbycc", "signedoffcc"] {
-        if known.exists(&format!("{prefix}.{setting}")) {
-            cfg.suppress_toggles = true;
+        let Some(v) = known.boolean(&k) else { continue };
+        if configured.insert(setting_of(literal)) {
+            s.set_bool(*target, v);
         }
     }
 
-    // %config_path_settings: aliasesfile is list valued.
-    if let Some(values) = known.0.get(&format!("{prefix}.aliasesfile")) {
-        if !values.is_empty() && configured.insert("aliasesfile") {
-            cfg.alias_files = values.iter().map(|v| expand_path(v)).collect();
+    for (literal, target) in PATH_SETTINGS {
+        let k = key(literal);
+        let Some(values) = known.0.get(&k) else { continue };
+        let values: Vec<String> = values.iter().map(|v| expand_path(v)).collect();
+        // `next unless @values` for the array target, `next unless defined $v`
+        // for a scalar: a key present with no value yields neither.
+        if values.is_empty() {
+            continue;
+        }
+        if configured.insert(setting_of(literal)) {
+            s.set_path(*target, &values);
         }
     }
 
-    // %config_settings: scalars take the last value, lists take all of them.
-    for (setting, target) in [
-        ("aliasfiletype", &mut cfg.alias_file_type),
-        ("smtpbatchsize", &mut cfg.batch_size),
-        ("smtprelogindelay", &mut cfg.relogin_delay),
-        ("confirm", &mut cfg.confirm),
-    ] {
-        let Some(v) = known.last(&format!("{prefix}.{setting}")) else { continue };
-        if configured.insert(setting) {
-            *target = Some(v.to_string());
+    for (literal, target) in VALUE_SETTINGS {
+        let k = key(literal);
+        let Some(values) = known.0.get(&k) else { continue };
+        // A scalar takes `->[-1]` and skips when that is undef; a list takes
+        // every defined value and is assigned even when the result is empty.
+        if !target.is_list() && values.is_empty() {
+            continue;
         }
-    }
-
-    if known.exists(&format!("{prefix}.suppresscc")) && configured.insert("suppresscc") {
-        cfg.suppress_cc = known.0.get(&format!("{prefix}.suppresscc")).cloned().unwrap_or_default();
+        if configured.insert(setting_of(literal)) {
+            s.set_value(*target, values);
+        }
     }
 }
 
@@ -1000,7 +1392,7 @@ enum AliasScan {
 /// type leaves the files unread, as the
 /// `if (@alias_files and $aliasfiletype and defined $parse_alias{$aliasfiletype})`
 /// guard in the script does, and `%aliases` stays empty.
-fn parse_aliases(cfg: &Config) -> AliasScan {
+fn parse_aliases(cfg: &Settings) -> AliasScan {
     let mut aliases = Aliases::new();
     let Some(file_type) = cfg.alias_file_type.as_deref() else {
         return AliasScan::Parsed(aliases);
@@ -1583,6 +1975,601 @@ fn errno_text(e: &std::io::Error) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Time
+// ---------------------------------------------------------------------------
+
+/// Seconds since the epoch, as Perl's `time`.
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `localtime`/`gmtime` for one instant.
+fn broken_down(t: i64, local: bool) -> libc::tm {
+    let tt = t as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        if local {
+            libc::localtime_r(&tt, &mut tm);
+        } else {
+            libc::gmtime_r(&tt, &mut tm);
+        }
+    }
+    tm
+}
+
+const WDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS: [&str; 12] =
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// `format_2822_time` — the `Date:` header. The zone offset is derived by
+/// differencing local and GMT the way the script does, rather than read out of
+/// `tm_gmtoff`, so the two `die`s it can raise are reachable.
+fn format_2822_time(t: i64) -> Result<String, &'static str> {
+    let l = broken_down(t, true);
+    let g = broken_down(t, false);
+    if l.tm_sec != g.tm_sec {
+        return Err("local zone differs from GMT by a non-minute interval\n");
+    }
+    let mut localmin = l.tm_min + l.tm_hour * 60;
+    let gmtmin = g.tm_min + g.tm_hour * 60;
+    if (g.tm_wday + 1).rem_euclid(7) == l.tm_wday {
+        localmin += 1440;
+    } else if (g.tm_wday - 1).rem_euclid(7) == l.tm_wday {
+        localmin -= 1440;
+    } else if g.tm_wday != l.tm_wday {
+        return Err("local time offset greater than or equal to 24 hours\n");
+    }
+    let offset = localmin - gmtmin;
+    let offhour = offset / 60;
+    let offmin = offset.rem_euclid(60).abs();
+    if offhour.abs() >= 24 {
+        return Err("local time offset greater than or equal to 24 hours\n");
+    }
+    Ok(format!(
+        "{}, {:2} {} {} {:02}:{:02}:{:02} {}{:02}{:02}",
+        WDAYS[l.tm_wday as usize % 7],
+        l.tm_mday,
+        MONTHS[l.tm_mon as usize % 12],
+        l.tm_year + 1900,
+        l.tm_hour,
+        l.tm_min,
+        l.tm_sec,
+        if offset >= 0 { '+' } else { '-' },
+        offhour.abs(),
+        offmin
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Prompting
+// ---------------------------------------------------------------------------
+
+/// `ask` — `Term::ReadLine` over the controlling terminal.
+///
+/// The script bails out to `$default` `unless defined $term->IN and defined
+/// fileno($term->IN) …`, which is what happens whenever there is no terminal to
+/// attach to; that is the whole of the non-interactive behaviour and nothing is
+/// printed on the way. With a terminal the prompt is written to it and one line
+/// is read back, up to ten times.
+///
+/// `Term::ReadLine::Perl` decorates the prompt with ANSI attributes when it is
+/// the chosen back end; that decoration is a property of the Perl module and is
+/// not reproduced.
+fn ask(
+    prompt: &str,
+    valid: Option<&dyn Fn(&str) -> bool>,
+    default: Option<&str>,
+    confirm_only: bool,
+) -> Option<String> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty");
+    let Ok(tty) = tty else { return default.map(str::to_string) };
+    let Ok(mut out) = tty.try_clone() else { return default.map(str::to_string) };
+    let mut reader = BufReader::new(tty);
+
+    let mut read_line = |out: &mut std::fs::File, prompt: &str| -> Option<String> {
+        let _ = write!(out, "{prompt}");
+        let _ = out.flush();
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line.trim_end_matches(['\n', '\r']).to_string()),
+        }
+    };
+
+    for _ in 0..10 {
+        let Some(resp) = read_line(&mut out, prompt) else {
+            // EOF: `print "\n"` goes to stdout, not to the terminal handle.
+            println!();
+            return default.map(str::to_string);
+        };
+        if resp.is_empty() {
+            if let Some(d) = default {
+                return Some(d.to_string());
+            }
+        }
+        if valid.is_none_or(|f| f(&resp)) {
+            return Some(resp);
+        }
+        if confirm_only {
+            let q = format!("Are you sure you want to use <{resp}> [y/N]? ");
+            if let Some(yesno) = read_line(&mut out, &q) {
+                if yesno.to_ascii_lowercase().contains('y') {
+                    return Some(resp);
+                }
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Addresses
+// ---------------------------------------------------------------------------
+
+/// `$local_part_regexp` — `[^<>"\s@]`.
+fn is_local_char(b: u8) -> bool {
+    !matches!(b, b'<' | b'>' | b'"' | b'@') && !is_ws(b)
+}
+
+/// `$domain_regexp`'s label character class — `[^.<>"\s@]`.
+fn is_label_char(b: u8) -> bool {
+    is_local_char(b) && b != b'.'
+}
+
+/// `extract_valid_address`. `Email::Valid` is not a core module and is absent
+/// from the Perl the stock script runs under, so the documented fallback — a
+/// leftmost `local-part@domain` search — is the live path.
+fn extract_valid_address(address: &str) -> Option<String> {
+    let b = address.as_bytes();
+    if !b.is_empty() && b.iter().all(|&c| is_local_char(c)) {
+        return Some(address.to_string());
+    }
+    // `s/^\s*<(.*)>\s*$/$1/` — greedy, so the last `>` closes it.
+    let trimmed = address.trim_matches(|c: char| c.is_ascii_whitespace());
+    let inner = match (trimmed.strip_prefix('<'), trimmed.strip_suffix('>')) {
+        (Some(_), Some(_)) if trimmed.len() >= 2 => &trimmed[1..trimmed.len() - 1],
+        _ => address,
+    };
+
+    let s = inner.as_bytes();
+    for start in 0..s.len() {
+        if !is_local_char(s[start]) {
+            continue;
+        }
+        // The local part is a maximal run: a shorter one would end on an allowed
+        // character, never on the `@` the pattern needs next.
+        let mut i = start;
+        while i < s.len() && is_local_char(s[i]) {
+            i += 1;
+        }
+        if s.get(i) != Some(&b'@') {
+            continue;
+        }
+        let mut j = i + 1;
+        let label = |s: &[u8], mut k: usize| {
+            while k < s.len() && is_label_char(s[k]) {
+                k += 1;
+            }
+            k
+        };
+        let first = label(s, j);
+        if first == j {
+            continue;
+        }
+        j = first;
+        let mut labels = 0;
+        while s.get(j) == Some(&b'.') {
+            let next = label(s, j + 1);
+            if next == j + 1 {
+                break;
+            }
+            j = next;
+            labels += 1;
+        }
+        if labels == 0 {
+            continue;
+        }
+        return Some(inner[start..j].to_string());
+    }
+    None
+}
+
+/// `unique_email_list` — dedupe on the extracted address, keep the entry.
+fn unique_email_list(entries: &[String]) -> Result<Vec<String>, String> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out = Vec::new();
+    for e in entries {
+        let clean = extract_valid_address(e).ok_or_else(|| e.clone())?;
+        if seen.insert(clean) {
+            out.push(e.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// `strip_garbage_one_address` — trim whatever trails a body address.
+fn strip_garbage_one_address(addr: &str) -> String {
+    let addr = addr.trim_end_matches('\n');
+    // `^(("[^"]*"|[^"<]*)? *<[^>]*>).*`
+    if let Some(open) = addr.find('<') {
+        let head = &addr[..open];
+        let head_ok = if head.starts_with('"') {
+            // `"[^"]*"` then optional spaces.
+            match head[1..].find('"') {
+                Some(i) => head[2 + i..].bytes().all(|c| c == b' '),
+                None => false,
+            }
+        } else {
+            !head.contains('"')
+        };
+        if head_ok {
+            if let Some(close) = addr[open..].find('>') {
+                return addr[..open + close + 1].to_string();
+            }
+        }
+    }
+    // `^([^"#,\s]*)`
+    let end = addr
+        .bytes()
+        .position(|c| matches!(c, b'"' | b'#' | b',') || is_ws(c))
+        .unwrap_or(addr.len());
+    addr[..end].to_string()
+}
+
+// ---------------------------------------------------------------------------
+// RFC 2047 subjects and transfer encodings
+// ---------------------------------------------------------------------------
+
+/// `unquote_rfc2047` — decode every `q`-encoded word, returning the text and the
+/// charset of the last word decoded.
+fn unquote_rfc2047(s: &str) -> (String, Option<String>) {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut charset = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' && bytes.get(i + 1) == Some(&b'?') {
+            if let Some(end) = encoded_word_end(bytes, i) {
+                let word = &s[i..end];
+                let body = &word[2..word.len() - 2];
+                let mut parts = body.splitn(3, '?');
+                let (cs, enc, text) =
+                    (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                charset = Some(cs.to_string());
+                if enc.eq_ignore_ascii_case("q") {
+                    let t = text.as_bytes();
+                    let mut k = 0;
+                    while k < t.len() {
+                        match t[k] {
+                            b'_' => {
+                                out.push(b' ');
+                                k += 1;
+                            }
+                            b'=' if k + 2 < t.len() => {
+                                match u8::from_str_radix(&text[k + 1..k + 3], 16) {
+                                    Ok(v) => {
+                                        out.push(v);
+                                        k += 3;
+                                    }
+                                    Err(_) => {
+                                        out.push(t[k]);
+                                        k += 1;
+                                    }
+                                }
+                            }
+                            c => {
+                                out.push(c);
+                                k += 1;
+                            }
+                        }
+                    }
+                } else {
+                    out.extend_from_slice(text.as_bytes());
+                }
+                i = end;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    (String::from_utf8_lossy(&out).into_owned(), charset)
+}
+
+/// The end offset of the `$re_encoded_word` starting at `at`, if there is one.
+fn encoded_word_end(s: &[u8], at: usize) -> Option<usize> {
+    let token = |b: u8| !b"][()<>@,;:\\\"/?.= ".contains(&b) && (0x21..0x7f).contains(&b);
+    let text = |b: u8| b != b'?' && (0x21..0x7f).contains(&b);
+    let mut i = at + 2;
+    let cs = i;
+    while i < s.len() && token(s[i]) {
+        i += 1;
+    }
+    if i == cs || s.get(i) != Some(&b'?') {
+        return None;
+    }
+    i += 1;
+    let en = i;
+    while i < s.len() && token(s[i]) {
+        i += 1;
+    }
+    if i == en || s.get(i) != Some(&b'?') {
+        return None;
+    }
+    i += 1;
+    let tx = i;
+    while i < s.len() && text(s[i]) {
+        i += 1;
+    }
+    if i == tx || s.get(i) != Some(&b'?') || s.get(i + 1) != Some(&b'=') {
+        return None;
+    }
+    Some(i + 2)
+}
+
+/// `subject_needs_rfc2047_quoting` then `quote_rfc2047`.
+fn quote_subject(subject: &str, encoding: &str) -> String {
+    if subject.is_ascii() && !subject.contains("=?") {
+        return subject.to_string();
+    }
+    let mut out = format!("=?{encoding}?q?");
+    for &b in subject.as_bytes() {
+        if b.is_ascii_alphanumeric() || b"-!*+/".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("={b:02X}"));
+        }
+    }
+    out.push_str("?=");
+    out
+}
+
+/// `MIME::QuotedPrint::encode($message, "\n", 0)` — text mode, so a newline is a
+/// line break rather than an escape, trailing blanks on a line are escaped, and
+/// no output line exceeds 76 bytes including the soft-break `=`.
+fn encode_qp(input: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
+    for line in input.split_inclusive(|&b| b == b'\n') {
+        let (body, eol): (&[u8], &[u8]) = match line.strip_suffix(b"\n") {
+            Some(b) => (b, b"\n"),
+            None => (line, b""),
+        };
+        let mut column = 0usize;
+        let mut pending: Vec<u8> = Vec::new();
+        let emit = |out: &mut Vec<u8>, column: &mut usize, tok: &[u8]| {
+            if *column + tok.len() > 75 {
+                out.push(b'=');
+                out.push(b'\n');
+                *column = 0;
+            }
+            out.extend_from_slice(tok);
+            *column += tok.len();
+        };
+        for &b in body {
+            if b == b' ' || b == b'\t' {
+                // Rule 3: blanks are literal unless they end the line.
+                pending.push(b);
+                continue;
+            }
+            for &p in &pending {
+                emit(&mut out, &mut column, &[p]);
+            }
+            pending.clear();
+            if (33..=60).contains(&b) || (62..=126).contains(&b) {
+                emit(&mut out, &mut column, &[b]);
+            } else {
+                emit(&mut out, &mut column, format!("={b:02X}").as_bytes());
+            }
+        }
+        for &p in &pending {
+            emit(&mut out, &mut column, format!("={p:02X}").as_bytes());
+        }
+        out.extend_from_slice(eol);
+    }
+    out
+}
+
+/// `MIME::QuotedPrint::decode`.
+fn decode_qp(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    for line in input.split_inclusive(|&b| b == b'\n') {
+        let (body, had_eol) = match line.strip_suffix(b"\n") {
+            Some(b) => (b, true),
+            None => (line, false),
+        };
+        // Trailing whitespace on an encoded line is not significant.
+        let body = {
+            let mut end = body.len();
+            while end > 0 && (body[end - 1] == b' ' || body[end - 1] == b'\t' || body[end - 1] == b'\r') {
+                end -= 1;
+            }
+            &body[..end]
+        };
+        let soft = body.ends_with(b"=");
+        let body = if soft { &body[..body.len() - 1] } else { body };
+        let mut i = 0;
+        while i < body.len() {
+            if body[i] == b'=' && i + 2 < body.len() + 1 && i + 2 <= body.len() {
+                let hex = std::str::from_utf8(&body[i + 1..i + 3]).ok();
+                if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(body[i]);
+            i += 1;
+        }
+        if had_eol && !soft {
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// `MIME::Base64::encode($message, "\n")` — 76 characters per line.
+fn encode_base64(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut column = 0;
+    for chunk in input.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        let quad = [
+            B64[(n >> 18) as usize & 63],
+            B64[(n >> 12) as usize & 63],
+            if chunk.len() > 1 { B64[(n >> 6) as usize & 63] } else { b'=' },
+            if chunk.len() > 2 { B64[n as usize & 63] } else { b'=' },
+        ];
+        out.extend_from_slice(&quad);
+        column += 4;
+        if column >= 76 {
+            out.push(b'\n');
+            column = 0;
+        }
+    }
+    if column > 0 {
+        out.push(b'\n');
+    }
+    out
+}
+
+/// `MIME::Base64::decode`.
+fn decode_base64(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for &c in input {
+        let Some(v) = B64.iter().position(|&x| x == c) else { continue };
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// `apply_transfer_encoding($message, $from, $to)`.
+fn apply_transfer_encoding(
+    message: Vec<u8>,
+    from: &str,
+    to: &str,
+) -> Result<(Vec<u8>, String), &'static str> {
+    if from == to && from != "7bit" {
+        return Ok((message, to.to_string()));
+    }
+    let message = match from {
+        "quoted-printable" => decode_qp(&message),
+        "base64" => decode_base64(&message),
+        _ => message,
+    };
+    let to = if to == "auto" {
+        // `/(?:.{999,}|\r)/` — a line of 999 or more bytes, or any CR.
+        let long = message.split(|&b| b == b'\n').any(|l| l.len() >= 999);
+        if long || message.contains(&b'\r') {
+            "quoted-printable"
+        } else {
+            "8bit"
+        }
+    } else {
+        to
+    };
+    match to {
+        "7bit" if message.iter().any(|&b| b >= 0x80) => Err("cannot send message as 7bit"),
+        "7bit" | "8bit" => Ok((message, to.to_string())),
+        "quoted-printable" => Ok((encode_qp(&message), to.to_string())),
+        "base64" => Ok((encode_base64(&message), to.to_string())),
+        _ => Err("invalid transfer encoding"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subprocesses
+// ---------------------------------------------------------------------------
+
+/// Perl's `\Q…\E` — backslash-escape every byte that is not a word character,
+/// which is how the file name reaches the shell in `execute_cmd`.
+fn quotemeta(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `execute_cmd($prefix, $cmd, $file)` — run `<cmd> <file>` through the shell
+/// and collect its lines. A blank line ends the output; anything after one is an
+/// error.
+fn execute_cmd(prefix: &str, cmd: &str, file: &str) -> Result<Vec<String>, String> {
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{cmd} {}", quotemeta(file)))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|_| format!("({prefix}) Could not execute '{cmd}'"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = Vec::new();
+    let mut seen_blank = false;
+    for line in text.split_inclusive('\n') {
+        if seen_blank {
+            return Err(format!("({prefix}) Malformed output from '{cmd}'"));
+        }
+        if line == "\n" || line.is_empty() {
+            seen_blank = true;
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    if !out.status.success() {
+        return Err(format!("({prefix}) failed to close pipe to '{cmd}'"));
+    }
+    Ok(lines)
+}
+
+/// This binary, so the script's `Git::command('check-mailmap', …)` and
+/// `Git::command_input_pipe(['imap-send', …])` reach the ported subcommands
+/// rather than whatever `git` happens to be on `PATH`.
+fn self_exe() -> std::path::PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| "git".into())
+}
+
+/// `unfold_headers` — RFC 2822 continuation lines are folded into their header.
+fn unfold_headers(lines: &[String]) -> Vec<String> {
+    let mut headers: Vec<String> = Vec::new();
+    for line in lines {
+        if line.trim_matches(|c: char| c.is_ascii_whitespace()).is_empty() {
+            break;
+        }
+        let continuation = line
+            .strip_prefix(|c: char| c.is_ascii_whitespace())
+            .is_some()
+            && line.trim_start_matches(|c: char| c.is_ascii_whitespace()).starts_with(|c: char| !c.is_ascii_whitespace());
+        if continuation && !headers.is_empty() {
+            let last = headers.last_mut().expect("non-empty");
+            while last.ends_with('\n') {
+                last.pop();
+            }
+            last.push(' ');
+            last.push_str(line.trim_start_matches(|c: char| c.is_ascii_whitespace()));
+        } else {
+            headers.push(line.clone());
+        }
+    }
+    headers
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1599,18 +2586,519 @@ fn die(msg: &str, known: &Known) -> ExitCode {
     ExitCode::from(if known.0.is_empty() { 1 } else { 255 })
 }
 
+/// A `die` or an `exit` raised on the way to sending.
+enum Stop {
+    /// The message exactly as the script writes it, newline included.
+    Die(String),
+    /// `exit(<code>)`, which the prompting paths reach.
+    Exit(u8),
+    /// A path whose substrate is genuinely absent; reported through `anyhow`
+    /// like every other unported surface in this tree.
+    Unported(String),
+}
+
+type Step<T> = std::result::Result<T, Stop>;
+
+fn died(msg: impl Into<String>) -> Stop {
+    Stop::Die(msg.into())
+}
+
+/// Whether `send_message` must prompt before sending.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Needs {
+    No,
+    Yes,
+    /// The Cc list grew past what the user asked for; the long explanation is
+    /// printed once ahead of the prompt.
+    Inform,
+}
+
+/// What the user chose at the `--confirm` prompt.
+enum Sent {
+    Yes,
+    No,
+    Edit,
+}
+
+/// The script's file-scoped state, from `read_config` through the send loop.
+struct Mailer {
+    repo: Option<gix::Repository>,
+    s: Settings,
+    aliases: Aliases,
+
+    quiet: bool,
+    dry_run: bool,
+    force: bool,
+    no_header_cmd: bool,
+    annotate: bool,
+    initial_subject: Option<String>,
+    initial_in_reply_to: Option<String>,
+    reply_to: Option<String>,
+    initial_to: Vec<String>,
+    initial_cc: Vec<String>,
+    initial_bcc: Vec<String>,
+    /// `%suppress_cc`. A key with a false value still counts as present, which
+    /// is what flips `--confirm`'s default.
+    suppress: BTreeMap<String, bool>,
+    confirm: String,
+    confirm_unconfigured: bool,
+
+    sender: String,
+    files: Vec<String>,
+    broken_encoding: BTreeSet<String>,
+    time: i64,
+
+    message_id: Option<String>,
+    subject: Option<String>,
+    in_reply_to: Option<String>,
+    references: String,
+    message: Vec<u8>,
+    to: Vec<String>,
+    cc: Vec<String>,
+    xh: Vec<String>,
+    needs_confirm: Needs,
+    message_num: i64,
+    ask_default: Option<String>,
+    num_sent: u64,
+    id_stamp: Option<String>,
+    id_serial: u64,
+    prompting: bool,
+    editor: Option<String>,
+    imap_copy: Vec<Vec<u8>>,
+}
+
+impl Mailer {
+    fn suppressed(&self, key: &str) -> bool {
+        self.suppress.get(key).copied().unwrap_or(false)
+    }
+
+    /// `Git::ident_person(@repo, $what)` — `"$name <$email>"`.
+    fn ident_person(&self, author: bool) -> Option<String> {
+        let repo = self.repo.as_ref()?;
+        let sig = if author { repo.author() } else { repo.committer() }?.ok()?;
+        Some(format!("{} <{}>", sig.name, sig.email))
+    }
+
+    /// `make_message_id` — `<stamp.pid-serial-address>`.
+    fn make_message_id(&mut self) {
+        if self.id_stamp.is_none() {
+            let tm = broken_down(now_seconds(), false);
+            self.id_stamp = Some(format!(
+                "{:04}{:02}{:02}{:02}{:02}{:02}.{}",
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec,
+                std::process::id()
+            ));
+            self.id_serial = 0;
+        }
+        self.id_serial += 1;
+        let uniq = format!("{}-{}", self.id_stamp.as_deref().unwrap_or(""), self.id_serial);
+
+        let mut du_part = String::new();
+        let candidates = [
+            Some(self.sender.clone()),
+            self.ident_person(false),
+            self.ident_person(true),
+        ];
+        for c in candidates.into_iter().flatten() {
+            if let Some(v) = extract_valid_address(&sanitize_address(&c)) {
+                if !v.is_empty() {
+                    du_part = v;
+                    break;
+                }
+            }
+        }
+        if du_part.is_empty() {
+            du_part = format!("user@{}", hostname());
+        }
+        self.message_id = Some(format!("<{uniq}-{du_part}>"));
+    }
+
+    /// `expand_aliases`, then the `expands to itself` fatal.
+    fn expand(&self, addrs: &[String]) -> Step<Vec<String>> {
+        expand_aliases(addrs, &self.aliases)
+            .map_err(|a| died(format!("fatal: alias '{a}' expands to itself\n")))
+    }
+
+    /// `validate_address_list` — an address no `local@domain` can be pulled out
+    /// of is reported and then dropped, edited or quit on.
+    fn validate_address_list(&self, list: Vec<String>) -> Step<Vec<String>> {
+        let mut out = Vec::new();
+        for addr in list {
+            let mut addr = addr;
+            loop {
+                if extract_valid_address(&addr).is_some() {
+                    out.push(addr);
+                    break;
+                }
+                eprintln!("error: unable to extract a valid address from: {addr}");
+                let answer = ask(
+                    "What to do with this address? ([q]uit|[d]rop|[e]dit): ",
+                    Some(&|r: &str| {
+                        let r = r.to_ascii_lowercase();
+                        ["quit", "q", "drop", "d", "edit", "e"].iter().any(|p| r.starts_with(p))
+                    }),
+                    Some("q"),
+                    false,
+                )
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+                if answer.starts_with('d') {
+                    break;
+                }
+                if answer.starts_with('q') {
+                    return Err(Stop::Exit(0));
+                }
+                addr = ask(
+                    "To whom should the emails be sent (if anyone)? ",
+                    Some(&|r: &str| r.contains('@') && r.split('@').nth(1).is_some_and(|d| d.contains('.'))),
+                    Some(""),
+                    true,
+                )
+                .unwrap_or_default();
+            }
+        }
+        Ok(out)
+    }
+
+    /// `mailmap_address_list` — `git check-mailmap` with the configured file and
+    /// blob, then the `<>` wrapping a bare address comes back in is removed.
+    fn mailmap_address_list(&self, list: Vec<String>) -> Step<Vec<String>> {
+        if list.is_empty() || !self.s.mailmap {
+            return Ok(list);
+        }
+        let mut cmd = std::process::Command::new(self_exe());
+        cmd.arg("check-mailmap");
+        if let Some(f) = &self.s.mailmap_file {
+            cmd.arg(format!("--mailmap-file={f}"));
+        }
+        if let Some(b) = &self.s.mailmap_blob {
+            cmd.arg(format!("--mailmap-blob={b}"));
+        }
+        cmd.args(&list);
+        let out = cmd
+            .output()
+            .map_err(|e| died(format!("fatal: cannot run check-mailmap: {e}\n")))?;
+        if !out.status.success() {
+            std::io::Write::write_all(&mut std::io::stderr(), &out.stderr).ok();
+            return Err(Stop::Exit(u8::try_from(out.status.code().unwrap_or(1)).unwrap_or(1)));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| match (l.strip_prefix('<'), l.strip_suffix('>')) {
+                (Some(_), Some(_)) if l.len() >= 2 => l[1..l.len() - 1].to_string(),
+                _ => l.to_string(),
+            })
+            .collect())
+    }
+
+    /// `process_address_list`.
+    fn process_address_list(&self, list: &[String]) -> Step<Vec<String>> {
+        let parsed: Vec<String> = list.iter().flat_map(|l| parse_address_line(l)).collect();
+        let expanded = self.expand(&parsed)?;
+        let sanitized: Vec<String> = expanded.iter().map(|a| sanitize_address(a)).collect();
+        let validated = self.validate_address_list(sanitized)?;
+        self.mailmap_address_list(validated)
+    }
+
+    /// `do_edit` — `sendemail.multiEdit` decides whether the editor sees every
+    /// file at once or one per invocation.
+    fn do_edit(&mut self, files: &[String]) -> Step<()> {
+        if self.editor.is_none() {
+            let out = std::process::Command::new(self_exe())
+                .args(["var", "GIT_EDITOR"])
+                .output()
+                .map_err(|e| died(format!("fatal: cannot run git var: {e}\n")))?;
+            self.editor =
+                Some(String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_string());
+        }
+        let editor = self.editor.clone().unwrap_or_default();
+        let die_msg = "the editor exited uncleanly, aborting everything\n";
+        let run = |batch: &[String]| -> Step<()> {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{editor} \"$@\""))
+                .arg(&editor)
+                .args(batch)
+                .status()
+                .map_err(|_| died(die_msg))?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(died(die_msg))
+            }
+        };
+        // `if (defined($multiedit) && !$multiedit)` — one editor per file only
+        // when the setting is present and false.
+        if self.s.multiedit == Some(false) {
+            for f in files {
+                run(std::slice::from_ref(f))?;
+            }
+            Ok(())
+        } else {
+            run(files)
+        }
+    }
+
+    /// `gen_header` — the recipient list and the header block that goes with it.
+    fn gen_header(&mut self) -> Step<(Vec<String>, String)> {
+        let recipients = unique_email_list(&self.to)
+            .map_err(|a| died(format!("error: unable to extract a valid address from: {a}\n")))?;
+        // Drop from Cc anything already on the To line.
+        let mut kept = Vec::new();
+        for entry in &self.cc {
+            let cc = extract_valid_address(entry).ok_or_else(|| {
+                died(format!("error: unable to extract a valid address from: {entry}\n"))
+            })?;
+            let dup = recipients.iter().any(|r| *r == cc || r.ends_with(&format!("<{cc}>")));
+            if !dup {
+                kept.push(entry.clone());
+            }
+        }
+        self.cc = kept;
+
+        let to = recipients.join(",\n\t");
+        let mut all = recipients.clone();
+        all.extend(self.cc.iter().cloned());
+        all.extend(self.initial_bcc.iter().cloned());
+        let all = unique_email_list(&all)
+            .map_err(|a| died(format!("error: unable to extract a valid address from: {a}\n")))?;
+        let envelope: Vec<String> = all
+            .iter()
+            .map(|e| {
+                extract_valid_address(e).ok_or_else(|| {
+                    died(format!("error: unable to extract a valid address from: {e}\n"))
+                })
+            })
+            .collect::<Step<Vec<String>>>()?;
+
+        let date = format_2822_time(self.time).map_err(died)?;
+        self.time += 1;
+
+        let cc = unique_email_list(&self.cc)
+            .map_err(|a| died(format!("error: unable to extract a valid address from: {a}\n")))?
+            .join(",\n\t");
+        let ccline = if cc.is_empty() { String::new() } else { format!("\nCc: {cc}") };
+        if self.message_id.is_none() {
+            self.make_message_id();
+        }
+
+        let mut header = format!(
+            "From: {}\nTo: {to}{ccline}\nSubject: {}\nDate: {date}\nMessage-ID: {}\n",
+            self.sender,
+            self.subject.clone().unwrap_or_default(),
+            self.message_id.clone().unwrap_or_default(),
+        );
+        if self.s.use_xmailer {
+            header.push_str(&format!("X-Mailer: git-send-email {GIT_VERSION}\n"));
+        }
+        if self.in_reply_to.as_deref().is_some_and(|s| !s.is_empty()) {
+            header.push_str(&format!("In-Reply-To: {}\n", self.in_reply_to.clone().unwrap_or_default()));
+            header.push_str(&format!("References: {}\n", self.references));
+        }
+        if self.reply_to.as_deref().is_some_and(|s| !s.is_empty()) {
+            header.push_str(&format!("Reply-To: {}\n", self.reply_to.clone().unwrap_or_default()));
+        }
+        if !self.xh.is_empty() {
+            header.push_str(&self.xh.join("\n"));
+            header.push('\n');
+        }
+        Ok((envelope, header))
+    }
+
+    /// `send_message` — prompt if asked to, then hand the bytes to the sendmail
+    /// program (or to nothing at all, under `--dry-run`).
+    fn send_message(&mut self) -> Step<Sent> {
+        let (recipients, mut header) = self.gen_header()?;
+
+        let mut params: Vec<String> = vec!["-i".into()];
+        params.extend(recipients.iter().cloned());
+        let mut raw_from = self.sender.clone();
+        if let Some(es) = &self.s.envelope_sender {
+            if es != "auto" {
+                raw_from = es.clone();
+            }
+        }
+        raw_from = extract_valid_address(&raw_from).unwrap_or_default();
+        if self.s.envelope_sender.is_some() {
+            params.splice(0..0, ["-f".to_string(), raw_from.clone()]);
+        }
+
+        if self.needs_confirm != Needs::No && !self.dry_run {
+            println!("\n{header}");
+            if self.needs_confirm == Needs::Inform {
+                self.confirm_unconfigured = false;
+                self.ask_default = Some("y".into());
+                print!("{INFORM}");
+            }
+            let answer = ask(
+                "Send this email? ([y]es|[n]o|[e]dit|[q]uit|[a]ll): ",
+                Some(&|r: &str| {
+                    let r = r.to_ascii_lowercase();
+                    ["yes", "y", "no", "n", "edit", "e", "quit", "q", "all", "a"]
+                        .iter()
+                        .any(|p| r.starts_with(p))
+                }),
+                self.ask_default.as_deref(),
+                false,
+            );
+            let Some(answer) = answer else {
+                return Err(died("Send this email reply required\n"));
+            };
+            let answer = answer.to_ascii_lowercase();
+            if answer.starts_with('n') {
+                self.message_num -= 1;
+                return Ok(Sent::No);
+            } else if answer.starts_with('e') {
+                self.message_num -= 1;
+                return Ok(Sent::Edit);
+            } else if answer.starts_with('q') {
+                return Err(Stop::Exit(0));
+            } else if answer.starts_with('a') {
+                self.confirm = "never".into();
+            }
+        }
+
+        params.splice(0..0, self.s.smtp_server_options.iter().cloned());
+
+        let absolute_server =
+            self.s.smtp_server.as_deref().is_some_and(|s| std::path::Path::new(s).is_absolute());
+        if self.dry_run {
+            // Nothing leaves the process.
+        } else if self.s.use_imap_only {
+            if self.s.imap_sent_folder.is_none() {
+                return Err(died("The destination IMAP folder is not properly defined.\n"));
+            }
+        } else if self.s.sendmail_cmd.is_some() || absolute_server {
+            let mut cmd = match &self.s.sendmail_cmd {
+                Some(sc) => {
+                    let mut c = std::process::Command::new("sh");
+                    c.arg("-c").arg(format!("{sc} \"$@\"")).arg("-").args(&params);
+                    c
+                }
+                None => {
+                    let mut c =
+                        std::process::Command::new(self.s.smtp_server.clone().unwrap_or_default());
+                    c.args(&params);
+                    c
+                }
+            };
+            let mut child = cmd
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| died(format!("{e}\n")))?;
+            let mut body = header.clone().into_bytes();
+            body.push(b'\n');
+            body.extend_from_slice(&self.message);
+            {
+                let stdin = child.stdin.as_mut().expect("piped");
+                std::io::Write::write_all(stdin, &body).map_err(|e| died(format!("{e}\n")))?;
+            }
+            let status = child.wait().map_err(|e| died(format!("{e}\n")))?;
+            if !status.success() {
+                return Err(died("Broken pipe\n"));
+            }
+        } else if self.s.smtp_server.is_none() {
+            return Err(died("The required SMTP server is not properly defined.\n"));
+        } else {
+            return Err(Stop::Unported(format!(
+                "unsupported: reaching {}{} needs an SMTP client (Net::SMTP over TLS, SASL \
+                 authentication through git-credential), which no vendored crate under src/ported \
+                 provides — pass an absolute path as --smtp-server, or --sendmail-cmd, to hand the \
+                 message to a local program instead",
+                self.s.smtp_server.clone().unwrap_or_default(),
+                self.s.smtp.describe()
+            )));
+        }
+
+        let subject = self.subject.clone().unwrap_or_default();
+        if self.quiet {
+            println!("{} {subject}", if self.dry_run { "Dry-Sent" } else { "Sent" });
+        } else {
+            println!("{}", if self.dry_run { "Dry-OK. Log says:" } else { "OK. Log says:" });
+            if self.s.sendmail_cmd.is_none() && !absolute_server {
+                println!("Server: {}", self.s.smtp_server.clone().unwrap_or_default());
+                println!("MAIL FROM:<{raw_from}>");
+                for e in &recipients {
+                    println!("RCPT TO:<{e}>");
+                }
+            } else {
+                let sm = self
+                    .s
+                    .sendmail_cmd
+                    .clone()
+                    .unwrap_or_else(|| self.s.smtp_server.clone().unwrap_or_default());
+                println!("Sendmail: {sm} {}", params.join(" "));
+            }
+            print!("{header}");
+            println!();
+            println!("Result: OK");
+        }
+
+        if self.s.imap_sent_folder.is_some() && !self.dry_run {
+            if !self.initial_bcc.is_empty() {
+                header.push_str(&format!("Bcc: {}\n", self.initial_bcc.join(", ")));
+            }
+            let mut copy = format!("From git-send-email\n{header}\n").into_bytes();
+            copy.extend_from_slice(&self.message);
+            self.imap_copy.push(copy);
+        }
+        Ok(Sent::Yes)
+    }
+}
+
+/// The `X-Mailer:` version. The script substitutes git's own version here.
+const GIT_VERSION: &str = "2.55.0";
+
+/// The block printed once when the Cc list grew on its own.
+const INFORM: &str = concat!(
+    "    The Cc list above has been expanded by additional\n",
+    "    addresses found in the patch commit message. By default\n",
+    "    send-email prompts before sending whenever this occurs.\n",
+    "    This behavior is controlled by the sendemail.confirm\n",
+    "    configuration setting.\n",
+    "\n",
+    "    For additional information, run 'git send-email --help'.\n",
+    "    To retain the current behavior, but squelch this message,\n",
+    "    run 'git config --global sendemail.confirm auto'.\n",
+    "\n",
+);
+
+/// `Sys::Hostname::hostname()`, for the fallback message-id domain.
+fn hostname() -> String {
+    let mut buf = [0i8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
+        return "localhost".into();
+    }
+    let bytes: Vec<u8> = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// `git send-email` — send a collection of patches as email.
 ///
-/// Reproduces the script's three option passes and every path that terminates
-/// before a transport is needed: `-h`, the `--dump-aliases` incompatibility
-/// checks, the `sendmail.*` configuration check, the `--format-patch`,
-/// `--batch-size`, `--suppress-cc` and `--confirm` validations, and the whole
-/// `--dump-aliases` alias-file scan. Composing or sending anything bails,
-/// naming the missing substrate.
+/// Reproduces the script's three option passes, `read_config` over all three
+/// setting tables, `--dump-aliases`/`--translate-aliases`, and the whole compose
+/// and send path down to a sendmail-style program (`--sendmail-cmd`, or an
+/// absolute `--smtp-server`) and to `--dry-run`. Talking SMTP over a socket
+/// bails, as does `--compose` and delegating a revision range to
+/// `git format-patch`.
 pub fn send_email(args: &[String]) -> Result<ExitCode> {
     let (config_file, in_repo) = load_config();
     let known = known_keys(config_file.as_ref());
+    match run(args, &known, in_repo) {
+        Ok(code) => Ok(code),
+        Err(Stop::Die(msg)) => Ok(die(&msg, &known)),
+        Err(Stop::Exit(code)) => Ok(ExitCode::from(code)),
+        Err(Stop::Unported(msg)) => bail!(msg),
+    }
+}
 
+fn run(args: &[String], known: &Known, in_repo: bool) -> Step<ExitCode> {
     // sendemail.identity is read before anything else, then overridden by
     // --identity and cleared by --no-identity.
     let mut identity = known.last("sendemail.identity").map(str::to_string);
@@ -1622,12 +3110,12 @@ pub fn send_email(args: &[String]) -> Result<ExitCode> {
         identity = None;
     }
 
-    let mut cfg = Config { forbid_sendmail_variables: true, ..Config::default() };
+    let mut s = Settings::default();
     let mut configured = BTreeSet::new();
     if let Some(id) = identity.as_deref() {
-        read_config(&mut cfg, &known, &format!("sendemail.{id}"), &mut configured);
+        read_config(&mut s, known, Some(id), &mut configured);
     }
-    read_config(&mut cfg, &known, "sendemail", &mut configured);
+    read_config(&mut s, known, None, &mut configured);
 
     let pass2 = getoptions(&pass1.rest, DUMP_ALIASES_OPTIONS);
     let help = pass2.seen("h");
@@ -1635,88 +3123,191 @@ pub fn send_email(args: &[String]) -> Result<ExitCode> {
     let translate_aliases = pass2.seen("translate-aliases");
 
     if !help && (dump_aliases || translate_aliases) && !pass2.rest.is_empty() {
-        return Ok(die("--dump-aliases incompatible with other options\n", &known));
+        return Err(died("--dump-aliases incompatible with other options\n"));
     }
     if !help && dump_aliases && translate_aliases {
-        return Ok(die("--dump-aliases and --translate-aliases are mutually exclusive\n", &known));
+        return Err(died("--dump-aliases and --translate-aliases are mutually exclusive\n"));
     }
 
     let pass3 = getoptions(&pass2.rest, OPTIONS);
+
+    // The command line writes the same variables `read_config` filled, in the
+    // order the options were spelled.
+    let mut getopt_to: Vec<String> = Vec::new();
+    let mut getopt_cc: Vec<String> = Vec::new();
+    let mut getopt_bcc: Vec<String> = Vec::new();
+    let mut no_to = false;
+    let mut no_cc = false;
+    let mut no_bcc = false;
+    let mut no_header_cmd = false;
+    let mut quiet = false;
+    let mut dry_run = false;
+    let mut force = false;
+    let mut compose = false;
+    let mut format_patch: Option<bool> = None;
+    let mut initial_subject: Option<String> = None;
+    let mut initial_in_reply_to: Option<String> = None;
+    let mut reply_to: Option<String> = None;
+
+    for hit in &pass3.hits {
+        let val = || hit.value.clone();
+        let on = !hit.negated;
+        match hit.id {
+            "sender" => s.sender = val(),
+            "in-reply-to" => initial_in_reply_to = val(),
+            "reply-to" => reply_to = val(),
+            "subject" => initial_subject = val(),
+            "to" => getopt_to.extend(val()),
+            "to-cmd" => s.to_cmd = val(),
+            "no-to" => no_to = true,
+            "cc" => getopt_cc.extend(val()),
+            "no-cc" => no_cc = true,
+            "bcc" => getopt_bcc.extend(val()),
+            "no-bcc" => no_bcc = true,
+            "chain-reply-to" => s.chain_reply_to = on,
+            "sendmail-cmd" => s.sendmail_cmd = val(),
+            "smtp-server" => s.smtp_server = val(),
+            "smtp-server-option" => s.smtp_server_options.extend(val()),
+            "smtp-server-port" => s.smtp_server_port = val(),
+            "smtp-user" => s.smtp.authuser = val(),
+            "smtp-pass" => s.smtp.authpass = val(),
+            "smtp-ssl" => s.smtp.encryption = Some("ssl".into()),
+            "smtp-encryption" => s.smtp.encryption = val(),
+            "smtp-ssl-cert-path" => s.smtp.ssl_cert_path = val(),
+            "smtp-ssl-client-cert" => s.smtp.ssl_client_cert = val(),
+            "smtp-ssl-client-key" => s.smtp.ssl_client_key = val(),
+            "smtp-domain" => s.smtp.domain = val(),
+            "smtp-auth" => s.smtp.auth = val(),
+            "no-smtp-auth" => s.smtp.auth = Some("none".into()),
+            "imap-sent-folder" => s.imap_sent_folder = val(),
+            "use-imap-only" => s.use_imap_only = on,
+            "annotate" => s.annotate = Some(on),
+            "compose" => compose = true,
+            "quiet" => quiet = true,
+            "cc-cmd" => s.cc_cmd = val(),
+            "header-cmd" => s.header_cmd = val(),
+            "no-header-cmd" => no_header_cmd = true,
+            "suppress-from" => s.suppress_from = Some(on),
+            "suppress-cc" => s.suppress_cc.extend(val()),
+            "signed-off-cc" => s.signed_off_by_cc = Some(on),
+            "cc-cover" => s.cover_cc = Some(on),
+            "to-cover" => s.cover_to = Some(on),
+            "confirm" => s.confirm = val(),
+            "dry-run" => dry_run = true,
+            "envelope-sender" => s.envelope_sender = val(),
+            "thread" => s.thread = on,
+            "validate" => s.validate = on,
+            "transfer-encoding" => s.target_xfer_encoding = val().unwrap_or_default(),
+            "mailmap" | "use-mailmap" => s.mailmap = on,
+            "format-patch" => format_patch = Some(on),
+            "8bit-encoding" => s.auto_8bit_encoding = val(),
+            "force" => force = true,
+            "xmailer" => s.use_xmailer = on,
+            "batch-size" => s.batch_size = val(),
+            "relogin-delay" => s.relogin_delay = val(),
+            "outlook-id-fix" => s.smtp.outlook_id_fix = Some(on),
+            _ => {}
+        }
+    }
+
+    // "Munge any either config or getopt, not both variables".
+    let initial_to = if !getopt_to.is_empty() {
+        getopt_to
+    } else if no_to {
+        Vec::new()
+    } else {
+        s.config_to.clone()
+    };
+    let initial_cc = if !getopt_cc.is_empty() {
+        getopt_cc
+    } else if no_cc {
+        Vec::new()
+    } else {
+        s.config_cc.clone()
+    };
+    let initial_bcc = if !getopt_bcc.is_empty() {
+        getopt_bcc
+    } else if no_bcc {
+        Vec::new()
+    } else {
+        s.config_bcc.clone()
+    };
 
     if help {
         return Ok(usage());
     }
     if pass3.seen("git-completion-helper") {
-        bail!(
+        return Err(Stop::Unported(
             "unsupported flag \"--git-completion-helper\": it prints this script's option list \
              unioned with `git format-patch --git-completion-helper`, which means running \
-             format-patch's own completion helper (ported: option parsing, -h, --dump-aliases)"
-        );
+             format-patch's own completion helper"
+                .into(),
+        ));
     }
 
-    if cfg.forbid_sendmail_variables && known.0.keys().any(|k| k.starts_with("sendmail.")) {
-        return Ok(die(
+    if s.forbid_sendmail_variables && known.0.keys().any(|k| k.starts_with("sendmail.")) {
+        return Err(died(
             "fatal: found configuration options for 'sendmail'\n\
              git-send-email is configured with the sendemail.* options - note the 'e'.\n\
              Set sendemail.forbidSendmailVariables to false to disable this check.\n",
-            &known,
         ));
     }
 
-    // `$format_patch` is only true for `--format-patch`; `--no-format-patch`
-    // sets it to 0, which is falsy and so does not trigger this.
-    let format_patch = pass3.last("format-patch").map(|h| !h.negated).unwrap_or(false);
-    if format_patch && !in_repo {
-        return Ok(die("Cannot run git format-patch from outside a repository\n", &known));
+    if format_patch == Some(true) && !in_repo {
+        return Err(died("Cannot run git format-patch from outside a repository\n"));
     }
 
-    let batch_size = pass3.last("batch-size").and_then(|h| h.value.clone()).or(cfg.batch_size.clone());
-    let relogin_delay =
-        pass3.last("relogin-delay").and_then(|h| h.value.clone()).or(cfg.relogin_delay.clone());
-    if relogin_delay.is_some() && batch_size.is_none() {
-        return Ok(die(
+    if s.relogin_delay.is_some() && s.batch_size.is_none() {
+        return Err(died(
             "`batch-size` and `relogin` must be specified together (via command-line or \
              configuration option)\n",
-            &known,
         ));
     }
 
-    // @suppress_cc is the command line's if given, else the config's.
-    let cli_suppress: Vec<String> = pass3.all("suppress-cc").into_iter().map(str::to_string).collect();
-    let suppress_cc = if cli_suppress.is_empty() { cfg.suppress_cc.clone() } else { cli_suppress };
-    let mut suppress_keys: BTreeSet<String> = BTreeSet::new();
-    for entry in &suppress_cc {
+    // Set CC suppressions.
+    let mut suppress: BTreeMap<String, bool> = BTreeMap::new();
+    for entry in &s.suppress_cc {
         let ok = matches!(
             entry.as_str(),
             "all" | "cccmd" | "cc" | "author" | "self" | "sob" | "body" | "bodycc" | "misc-by"
         );
         if !ok {
-            return Ok(die(&format!("Unknown --suppress-cc field: '{entry}'\n"), &known));
+            return Err(died(format!("Unknown --suppress-cc field: '{entry}'\n")));
         }
-        suppress_keys.insert(entry.clone());
+        suppress.insert(entry.clone(), true);
     }
-    // `$suppress_cc{'self'} = …` and `$suppress_cc{'sob'} = …` create their keys
-    // even when the value is false, which is what makes %suppress_cc non-empty
-    // and flips --confirm's default to 'compose'.
-    if pass3.seen("suppress-from") || pass3.seen("signed-off-cc") || cfg.suppress_toggles {
-        suppress_keys.insert("self".into());
+    if suppress.remove("all").is_some() {
+        for e in ["cccmd", "cc", "author", "self", "sob", "body", "bodycc", "misc-by"] {
+            suppress.insert(e.into(), true);
+        }
     }
+    // The explicit old-style toggles trump --suppress-cc, and create their key
+    // even when false — which is what makes %suppress_cc non-empty.
+    if let Some(v) = s.suppress_from {
+        suppress.insert("self".into(), v);
+    }
+    if let Some(v) = s.signed_off_by_cc {
+        suppress.insert("sob".into(), !v);
+    }
+    if suppress.get("body").copied().unwrap_or(false) {
+        for e in ["sob", "bodycc", "misc-by"] {
+            suppress.insert(e.into(), true);
+        }
+    }
+    suppress.remove("body");
 
-    let confirm = pass3
-        .last("confirm")
-        .and_then(|h| h.value.clone())
-        .or(cfg.confirm.clone())
-        .unwrap_or_else(|| {
-            if suppress_keys.is_empty() { "auto".into() } else { "compose".into() }
-        });
+    let confirm_unconfigured = s.confirm.is_none();
+    let confirm = s
+        .confirm
+        .clone()
+        .unwrap_or_else(|| if suppress.is_empty() { "auto".into() } else { "compose".into() });
     // The regex is a prefix match, not an exact one: `autopilot` is accepted.
-    let confirm_ok = ["auto", "cc", "compose", "always", "never"].iter().any(|p| confirm.starts_with(p));
-    if !confirm_ok {
-        return Ok(die(&format!("Unknown --confirm setting: '{confirm}'\n"), &known));
+    if !["auto", "cc", "compose", "always", "never"].iter().any(|p| confirm.starts_with(p)) {
+        return Err(died(format!("Unknown --confirm setting: '{confirm}'\n")));
     }
 
-    let aliases = match parse_aliases(&cfg) {
-        AliasScan::Died(code) => return Ok(ExitCode::from(code)),
+    let aliases = match parse_aliases(&s) {
+        AliasScan::Died(code) => return Err(Stop::Exit(code)),
         AliasScan::Parsed(aliases) => aliases,
     };
     if dump_aliases {
@@ -1732,16 +3323,13 @@ pub fn send_email(args: &[String]) -> Result<ExitCode> {
         // `while (<STDIN>) { … }` — each line is parsed as an address list,
         // expanded through the aliases, sanitized, and printed one per line.
         let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)?;
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
+            .map_err(|e| died(format!("{e}\n")))?;
         let input = String::from_utf8_lossy(&bytes);
         for line in input.split_inclusive('\n') {
             let parsed = parse_address_line(line);
-            let expanded = match expand_aliases(&parsed, &aliases) {
-                Ok(list) => list,
-                Err(alias) => {
-                    return Ok(die(&format!("fatal: alias '{alias}' expands to itself\n"), &known))
-                }
-            };
+            let expanded = expand_aliases(&parsed, &aliases)
+                .map_err(|a| died(format!("fatal: alias '{a}' expands to itself\n")))?;
             for addr in expanded {
                 println!("{}", sanitize_address(&addr));
             }
@@ -1749,11 +3337,875 @@ pub fn send_email(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    bail!(
-        "unsupported: sending patches needs an SMTP client (Net::SMTP, TLS, SASL) or a sendmail \
-         binary, RFC 2047 header and MIME body encoding, Mail::Address parsing, an editor session \
-         for --compose/--annotate, and delegation to git format-patch — none of which has a \
-         substrate in the vendored gitoxide crates (ported: option parsing, -h, the config and \
-         validation diagnostics, --dump-aliases)"
-    );
+    let repo = gix::discover(".").ok();
+    let mut m = Mailer {
+        repo,
+        s,
+        aliases,
+        quiet,
+        dry_run,
+        force,
+        no_header_cmd,
+        annotate: false,
+        initial_subject,
+        initial_in_reply_to,
+        reply_to,
+        initial_to,
+        initial_cc,
+        initial_bcc,
+        suppress,
+        confirm,
+        confirm_unconfigured,
+        sender: String::new(),
+        files: Vec::new(),
+        broken_encoding: BTreeSet::new(),
+        time: 0,
+        message_id: None,
+        subject: None,
+        in_reply_to: None,
+        references: String::new(),
+        message: Vec::new(),
+        to: Vec::new(),
+        cc: Vec::new(),
+        xh: Vec::new(),
+        needs_confirm: Needs::No,
+        message_num: 0,
+        ask_default: None,
+        num_sent: 0,
+        id_stamp: None,
+        id_serial: 0,
+        prompting: false,
+        editor: None,
+        imap_copy: Vec::new(),
+    };
+    m.annotate = m.s.annotate.unwrap_or(false);
+
+    if compose {
+        return Err(Stop::Unported(
+            "unsupported flag \"--compose\": the introductory message is written in \
+             $GIT_EDITOR from a template and then re-parsed for its headers, a session with no \
+             deterministic output to compare against"
+                .into(),
+        ));
+    }
+
+    m.files = collect_files(m.repo.as_ref(), &pass3.rest, format_patch)?;
+    resolve_sender(&mut m)?;
+    m.time = now_seconds() - (m.files.len() as i64 - 1);
+    handle_backup_files(&mut m);
+
+    if m.files.is_empty() {
+        eprint!("\nNo patch files specified!\n\n");
+        return Ok(usage());
+    }
+    if !m.quiet {
+        for f in &m.files {
+            println!("{f}");
+        }
+    }
+
+    if m.annotate {
+        let files = m.files.clone();
+        m.do_edit(&files)?;
+    }
+
+    scan_broken_encoding(&mut m)?;
+
+    if !m.force {
+        for f in &m.files {
+            let subject = get_patch_subject(f)?;
+            if subject.contains("*** SUBJECT HERE ***") {
+                return Err(died(format!(
+                    "Refusing to send because the patch\n\t{f}\nhas the template subject \
+                     '*** SUBJECT HERE ***'. Pass --force if you really want to send.\n"
+                )));
+            }
+        }
+    }
+
+    if m.initial_to.is_empty() && m.s.to_cmd.is_none() {
+        let to = ask(
+            "To whom should the emails be sent (if anyone)? ",
+            Some(&|r: &str| r.contains('@') && r.split('@').nth(1).is_some_and(|d| d.contains('.'))),
+            Some(""),
+            true,
+        );
+        if let Some(to) = to {
+            m.initial_to.extend(parse_address_line(&to));
+        }
+        m.prompting = true;
+    }
+
+    let to = m.process_address_list(&m.initial_to.clone())?;
+    m.initial_to = to;
+    let cc = m.process_address_list(&m.initial_cc.clone())?;
+    m.initial_cc = cc;
+    let bcc = m.process_address_list(&m.initial_bcc.clone())?;
+    m.initial_bcc = bcc;
+
+    if m.s.thread && m.initial_in_reply_to.is_none() && m.prompting {
+        m.initial_in_reply_to = ask(
+            "Message-ID to be used as In-Reply-To for the first email (if any)? ",
+            Some(&|r: &str| r.contains('@') && r.split('@').nth(1).is_some_and(|d| d.contains('.'))),
+            Some(""),
+            true,
+        );
+    }
+    if let Some(irt) = m.initial_in_reply_to.clone() {
+        let t = irt.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        let t = t.strip_prefix('<').unwrap_or(t);
+        let t = t.trim_end_matches(|c: char| c.is_ascii_whitespace());
+        let t = t.strip_suffix('>').unwrap_or(t);
+        let t = t.trim_end_matches(|c: char| c.is_ascii_whitespace());
+        m.initial_in_reply_to = Some(if t.is_empty() { String::new() } else { format!("<{t}>") });
+    }
+
+    if let Some(rt) = m.reply_to.clone() {
+        let rt = rt.trim_matches(|c: char| c.is_ascii_whitespace()).to_string();
+        let expanded = m.expand(&[rt])?;
+        m.reply_to = Some(sanitize_address(expanded.first().map(String::as_str).unwrap_or("")));
+    }
+
+    if m.s.sendmail_cmd.is_none() && m.s.smtp_server.is_none() {
+        let mut paths: Vec<String> =
+            vec!["/usr/sbin/sendmail".into(), "/usr/lib/sendmail".into()];
+        if let Ok(path) = std::env::var("PATH") {
+            paths.extend(path.split(':').map(|d| format!("{d}/sendmail")));
+        }
+        m.s.sendmail_cmd = paths.into_iter().find(|p| is_executable(p));
+        if m.s.sendmail_cmd.is_none() {
+            m.s.smtp_server = Some("localhost".into());
+        }
+    }
+
+    if m.s.validate {
+        validate_all(&mut m)?;
+    }
+
+    m.in_reply_to = m.initial_in_reply_to.clone();
+    m.references = m.initial_in_reply_to.clone().unwrap_or_default();
+    m.message_num = 0;
+    for t in m.files.clone() {
+        loop {
+            let quiet = m.quiet;
+            pre_process_file(&mut m, &t, quiet)?;
+            let sent = m.send_message()?;
+            if let Sent::Edit = sent {
+                m.do_edit(std::slice::from_ref(&t))?;
+                continue;
+            }
+            let was_sent = matches!(sent, Sent::Yes);
+            if m.s.thread {
+                if was_sent
+                    && (m.s.chain_reply_to
+                        || m.in_reply_to.as_deref().unwrap_or("").is_empty()
+                        || m.message_num == 1)
+                {
+                    m.in_reply_to = m.message_id.clone();
+                    let id = m.message_id.clone().unwrap_or_default();
+                    if m.references.is_empty() {
+                        m.references = id;
+                    } else {
+                        m.references.push_str(&format!("\n {id}"));
+                    }
+                }
+            } else if m.initial_in_reply_to.is_none() {
+                m.in_reply_to = None;
+                m.references = String::new();
+            }
+            m.message_id = None;
+            m.num_sent += 1;
+            if let Some(bs) = m.s.batch_size.as_deref().and_then(|v| v.parse::<u64>().ok()) {
+                if m.num_sent == bs {
+                    m.num_sent = 0;
+                    if let Some(d) = m.s.relogin_delay.as_deref().and_then(|v| v.parse::<u64>().ok())
+                    {
+                        std::thread::sleep(std::time::Duration::from_secs(d));
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    if let Some(folder) = m.s.imap_sent_folder.clone() {
+        if !m.imap_copy.is_empty() && !m.dry_run {
+            println!("\nStarting git imap-send...");
+            let mut input: Vec<u8> = Vec::new();
+            for (i, c) in m.imap_copy.iter().enumerate() {
+                if i > 0 {
+                    input.push(b'\n');
+                }
+                input.extend_from_slice(c);
+            }
+            let child = std::process::Command::new(self_exe())
+                .args(["imap-send", "-f", &folder])
+                .stdin(std::process::Stdio::piped())
+                .spawn();
+            let ok = match child {
+                Ok(mut child) => {
+                    if let Some(stdin) = child.stdin.as_mut() {
+                        std::io::Write::write_all(stdin, &input).ok();
+                    }
+                    drop(child.stdin.take());
+                    child.wait().map(|st| st.success()).unwrap_or(false)
+                }
+                Err(_) => false,
+            };
+            if !ok {
+                eprintln!("Warning: failed to send messages to IMAP folder {folder}");
+            }
+        }
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Whether the path names a file with any execute bit, as Perl's `-x` reports.
+fn is_executable(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|md| md.is_file() && md.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// `is_format_patch_arg` plus the argument loop that fills `@files`.
+fn collect_files(
+    repo: Option<&gix::Repository>,
+    rest: &[String],
+    format_patch: Option<bool>,
+) -> Step<Vec<String>> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let is_format_patch_arg = |f: &str| -> Step<bool> {
+        // `return unless $repo`, then a `rev-parse --verify --quiet` that only
+        // succeeds for something that names an object.
+        let Some(repo) = repo else { return Ok(false) };
+        if repo.rev_parse_single(f).is_err() {
+            return Ok(false);
+        }
+        match format_patch {
+            Some(v) => Ok(v),
+            None => Err(died(format!(
+                "File '{f}' exists but it could also be the range of commits\n\
+                 to produce patches for.  Please disambiguate by...\n\
+                 \n    * Saying \"./{f}\" if you mean a file; or\n\
+                 \x20   * Giving --format-patch option if you mean a range.\n"
+            ))),
+        }
+    };
+
+    let mut files: Vec<String> = Vec::new();
+    let mut rev_list_opts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let f = &rest[i];
+        i += 1;
+        if f == "--" {
+            rev_list_opts.push(f.clone());
+            rev_list_opts.extend_from_slice(&rest[i..]);
+            break;
+        }
+        let md = std::fs::metadata(f).ok();
+        if md.as_ref().is_some_and(std::fs::Metadata::is_dir) && !is_format_patch_arg(f)? {
+            let mut entries: Vec<String> = std::fs::read_dir(f)
+                .map_err(|e| died(format!("Failed to opendir {f}: {e}\n")))?
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            entries.sort();
+            for e in entries {
+                let p = std::path::Path::new(f).join(&e);
+                if p.is_file() {
+                    files.push(p.to_string_lossy().into_owned());
+                }
+            }
+        } else if md.as_ref().is_some_and(|md| md.is_file() || md.file_type().is_fifo())
+            && !is_format_patch_arg(f)?
+        {
+            files.push(f.clone());
+        } else {
+            rev_list_opts.push(f.clone());
+        }
+    }
+
+    if !rev_list_opts.is_empty() {
+        if repo.is_none() {
+            return Err(died("Cannot run git format-patch from outside a repository\n"));
+        }
+        return Err(Stop::Unported(format!(
+            "unsupported: \"{}\" is a revision specification, which send-email turns into patches \
+             by running `git format-patch -o <tmpdir>` and then mailing the result — pass the \
+             patch files themselves instead",
+            rev_list_opts.join(" ")
+        )));
+    }
+    Ok(files)
+}
+
+/// `$sender` — `sendemail.from`/`--from`, else the repository identity, then
+/// `sanitize_address`.
+fn resolve_sender(m: &mut Mailer) -> Step<()> {
+    let raw = match m.s.sender.clone() {
+        Some(v) => {
+            let v = v.trim_matches(|c: char| c.is_ascii_whitespace()).to_string();
+            let expanded = m.expand(&[v])?;
+            expanded.first().cloned().unwrap_or_default()
+        }
+        None => m
+            .ident_person(true)
+            .filter(|v| !v.is_empty())
+            .or_else(|| m.ident_person(false))
+            .unwrap_or_default(),
+    };
+    m.sender = sanitize_address(&raw);
+    Ok(())
+}
+
+/// `handle_backup_files` — consecutive names that differ only by a non-alnum
+/// suffix are editor backups, and are confirmed once per suffix.
+fn handle_backup_files(m: &mut Mailer) {
+    let mut result = Vec::new();
+    let mut last: Option<String> = None;
+    let mut known_suffix: Option<String> = None;
+    for file in m.files.clone() {
+        let mut skip = false;
+        if let Some(prev) = &last {
+            if prev.len() < file.len() && file.starts_with(prev.as_str()) {
+                let suffix = &file[prev.len()..];
+                if !suffix.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+                    if known_suffix.as_deref() == Some(suffix) {
+                        println!(
+                            "Skipping {file} with backup suffix '{}'.",
+                            known_suffix.clone().unwrap_or_default()
+                        );
+                        skip = true;
+                    } else {
+                        let answer = ask(
+                            &format!("Do you really want to send {file}? [y|N]: "),
+                            Some(&|r: &str| {
+                                let r = r.to_ascii_lowercase();
+                                r.starts_with('y') || r.starts_with('n')
+                            }),
+                            Some("n"),
+                            false,
+                        )
+                        .unwrap_or_default();
+                        skip = answer != "y";
+                        if skip {
+                            known_suffix = Some(suffix.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        last = Some(file.clone());
+        if !skip {
+            result.push(file);
+        }
+    }
+    m.files = result;
+}
+
+/// `get_patch_subject` — the first `Subject:` line, `GIT: `-prefixed.
+fn get_patch_subject(fname: &str) -> Step<String> {
+    let text = std::fs::read(fname).unwrap_or_default();
+    for line in text.split_inclusive(|&b| b == b'\n') {
+        let line = String::from_utf8_lossy(line);
+        if let Some(rest) = line.strip_prefix("Subject: ") {
+            return Ok(format!("GIT: {}", rest.trim_end_matches('\n')));
+        }
+    }
+    Err(died(format!("No subject line in {fname}?\n")))
+}
+
+/// `%broken_encoding` and the `sendemail.assume8bitEncoding` prompt.
+fn scan_broken_encoding(m: &mut Mailer) -> Step<()> {
+    for f in &m.files {
+        let text = std::fs::read(f).map_err(|e| died(format!("unable to open {f}: {e}\n")))?;
+        let mut lines = text.split_inclusive(|&b| b == b'\n');
+        let mut nonascii = false;
+        let mut declares_8bit = false;
+        for line in lines.by_ref() {
+            if line == b"\n" || line.is_empty() {
+                break;
+            }
+            if line.starts_with(b"Subject") && line.iter().any(|&b| b >= 0x80) {
+                nonascii = true;
+            }
+            let l = String::from_utf8_lossy(line);
+            if l.starts_with("Content-Transfer-Encoding: ") && l.contains("8bit") {
+                declares_8bit = true;
+            }
+        }
+        if !nonascii {
+            nonascii = lines.flatten().any(|&b| b >= 0x80);
+        }
+        if nonascii && !declares_8bit {
+            m.broken_encoding.insert(f.clone());
+        }
+    }
+    if m.s.auto_8bit_encoding.is_none() && !m.broken_encoding.is_empty() {
+        println!("The following files are 8bit, but do not declare a Content-Transfer-Encoding.");
+        for f in &m.broken_encoding {
+            println!("    {f}");
+        }
+        // With no terminal `ask` hands back the default straight away, and
+        // "UTF-8" is a charset, so the loop runs exactly once.
+        let encoding = ask(
+            "Declare which 8bit encoding to use [default: UTF-8]? ",
+            Some(&|r: &str| !r.is_empty() && !r.bytes().any(is_ws)),
+            Some("UTF-8"),
+            false,
+        );
+        m.s.auto_8bit_encoding = encoding.or(Some("UTF-8".into()));
+    }
+    Ok(())
+}
+
+/// The `if ($validate)` block: the SMTP port check, then the hook and the
+/// 998-character line check for every file that is not a FIFO.
+fn validate_all(m: &mut Mailer) -> Step<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let real: Vec<String> = m
+        .files
+        .iter()
+        .filter(|f| !std::fs::metadata(f).map(|md| md.file_type().is_fifo()).unwrap_or(false))
+        .cloned()
+        .collect();
+
+    if let Some(port) = m.s.smtp_server_port.clone() {
+        match port_num(&port) {
+            Some(p) => m.s.smtp_server_port = Some(p),
+            None => return Err(died(format!("error: invalid SMTP port '{port}'\n"))),
+        }
+    }
+
+    std::env::set_var("GIT_SENDEMAIL_FILE_TOTAL", real.len().to_string());
+    m.in_reply_to = m.initial_in_reply_to.clone();
+    m.references = m.initial_in_reply_to.clone().unwrap_or_default();
+    m.message_num = 0;
+    let mut result = Ok(());
+    for (i, r) in real.iter().enumerate() {
+        std::env::set_var("GIT_SENDEMAIL_FILE_COUNTER", (i + 1).to_string());
+        result = pre_process_file(m, r, true).and_then(|()| validate_patch(m, r));
+        if result.is_err() {
+            break;
+        }
+    }
+    std::env::remove_var("GIT_SENDEMAIL_FILE_COUNTER");
+    std::env::remove_var("GIT_SENDEMAIL_FILE_TOTAL");
+    result
+}
+
+/// `Git::port_num` — a 16-bit number, or a service name `getservbyname` knows.
+fn port_num(port: &str) -> Option<String> {
+    if let Ok(n) = port.parse::<u32>() {
+        if port.bytes().all(|b| b.is_ascii_digit()) && n > 0 && n <= 65535 {
+            return Some(port.to_string());
+        }
+    }
+    let name = std::ffi::CString::new(port).ok()?;
+    let ent = unsafe { libc::getservbyname(name.as_ptr(), std::ptr::null()) };
+    if ent.is_null() {
+        return None;
+    }
+    // `s_port` is in network byte order; Perl's getservbyname returns it in host
+    // order, which is what the caller compares and prints.
+    let port = u16::from_be(unsafe { (*ent).s_port } as u16);
+    Some(port.to_string())
+}
+
+/// `validate_patch` — the `sendemail-validate` hook, then the line-length limit.
+fn validate_patch(m: &mut Mailer, fname: &str) -> Step<()> {
+    if let Some(repo) = &m.repo {
+        let hooks_path = match repo.config_snapshot().string("core.hooksPath") {
+            Some(p) => std::path::PathBuf::from(p.to_string()),
+            None => repo.git_dir().join("hooks"),
+        };
+        let hook = hooks_path.join("sendemail-validate");
+        if is_executable(&hook.to_string_lossy()) {
+            let target = std::fs::canonicalize(fname)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| fname.to_string());
+            let git_dir = repo.git_dir().to_path_buf();
+            let work_dir = repo.workdir().unwrap_or(&git_dir).to_path_buf();
+            let cwd_save = std::env::current_dir().ok();
+
+            let (_, header) = m.gen_header()?;
+            let header_file = git_dir.join(format!(".gitsendemail.header.{}", std::process::id()));
+            std::fs::write(&header_file, &header)
+                .map_err(|e| died(format!("Failed to open {}: {e}\n", header_file.display())))?;
+
+            std::env::set_current_dir(&work_dir).map_err(|e| died(format!("chdir: {e}\n")))?;
+            let status = std::process::Command::new(self_exe())
+                .args(["hook", "run", "--ignore-missing", "sendemail-validate", "--"])
+                .arg(&target)
+                .arg(&header_file)
+                .env("GIT_DIR", &git_dir)
+                .status();
+            if let Some(cwd) = cwd_save {
+                std::env::set_current_dir(cwd).map_err(|e| died(format!("chdir: {e}\n")))?;
+            }
+            std::fs::remove_file(&header_file).ok();
+
+            let code = match status {
+                Ok(st) if st.success() => None,
+                Ok(st) => Some(st.code().unwrap_or(0)),
+                Err(_) => Some(1),
+            };
+            if let Some(code) = code {
+                let cmd_msg = "git hook run --ignore-missing sendemail-validate -- <patch> <header>";
+                return Err(died(format!(
+                    "fatal: {fname}: rejected by sendemail-validate hook\n\
+                     fatal: command '{cmd_msg}' died with exit code {code}\n\
+                     warning: no patches were sent\n"
+                )));
+            }
+        }
+    }
+
+    if !matches!(m.s.target_xfer_encoding.as_str(), "auto" | "quoted-printable" | "base64") {
+        let text = std::fs::read(fname)
+            .map_err(|e| died(format!("unable to open {fname}: {e}\n")))?;
+        for (n, line) in text.split_inclusive(|&b| b == b'\n').enumerate() {
+            if line.len() > 998 {
+                return Err(died(format!(
+                    "fatal: {fname}:{} is longer than 998 characters\nwarning: no patches were sent\n",
+                    n + 1
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `pre_process_file` — read one patch, work out its recipients, its extra
+/// headers and its transfer encoding.
+fn pre_process_file(m: &mut Mailer, t: &str, quiet: bool) -> Step<()> {
+    let raw = std::fs::read(t).map_err(|_| died(format!("can't open file {t}\n")))?;
+    let mut author: Option<String> = None;
+    let mut sauthor: Option<String> = None;
+    let mut author_encoding: Option<String> = None;
+    let mut has_content_type = false;
+    let mut body_encoding: Option<String> = None;
+    let mut xfer_encoding: Option<String> = None;
+    let mut has_mime_version = false;
+    m.to.clear();
+    m.cc.clear();
+    m.xh.clear();
+    m.subject = m.initial_subject.clone();
+    m.message = Vec::new();
+    m.message_num += 1;
+    m.message_id = None;
+
+    let mut lines = raw.split_inclusive(|&b| b == b'\n');
+    let mut header_lines: Vec<String> = Vec::new();
+    for line in lines.by_ref() {
+        let text = String::from_utf8_lossy(line).into_owned();
+        if text.trim_matches(|c: char| c.is_ascii_whitespace()).is_empty() {
+            break;
+        }
+        header_lines.push(text);
+    }
+    let mut header = unfold_headers(&header_lines);
+    if !m.no_header_cmd {
+        if let Some(cmd) = m.s.header_cmd.clone() {
+            let extra = execute_cmd("header-cmd", &cmd, t).map_err(|e| died(format!("{e}\n")))?;
+            header.extend(unfold_headers(&extra));
+        }
+    }
+
+    let mut input_format: Option<&str> = None;
+    for raw_line in &header {
+        if raw_line.starts_with("From ") {
+            input_format = Some("mbox");
+            continue;
+        }
+        let line = raw_line.trim_end_matches('\n');
+        if input_format.is_none() && is_header_line(line) {
+            input_format = Some("mbox");
+        }
+        if input_format == Some("mbox") {
+            if let Some(v) = header_value(line, "Subject") {
+                m.subject = Some(v);
+            } else if let Some(v) = header_value(line, "From") {
+                let (a, enc) = unquote_rfc2047(&v);
+                let sa = sanitize_address(&a);
+                author = Some(a);
+                author_encoding = enc;
+                let skip = m.suppressed("author")
+                    || (m.suppressed("self") && sa == m.sender);
+                sauthor = Some(sa);
+                if !skip {
+                    if !quiet {
+                        println!("(mbox) Adding cc: {v} from line '{line}'");
+                    }
+                    m.cc.push(v);
+                }
+            } else if let Some(v) = header_value(line, "To") {
+                for addr in parse_address_line(&v) {
+                    if !quiet {
+                        println!("(mbox) Adding to: {addr} from line '{line}'");
+                    }
+                    m.to.push(addr);
+                }
+            } else if let Some(v) = header_value(line, "Cc") {
+                for addr in parse_address_line(&v) {
+                    let (q, _) = unquote_rfc2047(&addr);
+                    let sa = sanitize_address(&q);
+                    let skip =
+                        if sa == m.sender { m.suppressed("self") } else { m.suppressed("cc") };
+                    if skip {
+                        continue;
+                    }
+                    if !quiet {
+                        println!("(mbox) Adding cc: {addr} from line '{line}'");
+                    }
+                    m.cc.push(addr);
+                }
+            } else if starts_ci(line, "Content-type:") {
+                has_content_type = true;
+                if let Some(i) = line.to_ascii_lowercase().find("charset=") {
+                    let rest = &line[i + 8..];
+                    let rest = rest.strip_prefix('"').unwrap_or(rest);
+                    let end = rest.find(['"', ' ']).unwrap_or(rest.len());
+                    body_encoding = Some(rest[..end].to_string());
+                }
+                m.xh.push(line.to_string());
+            } else if starts_ci(line, "MIME-Version") {
+                has_mime_version = true;
+                m.xh.push(line.to_string());
+            } else if let Some(v) = prefix_ci(line, "Message-ID: ") {
+                m.message_id = Some(v.to_string());
+            } else if let Some(v) = prefix_ci(line, "Content-Transfer-Encoding: ") {
+                xfer_encoding.get_or_insert_with(|| v.to_string());
+            } else if let Some(v) = prefix_ci(line, "In-Reply-To: ") {
+                if m.initial_in_reply_to.as_deref().unwrap_or("").is_empty() || m.s.thread {
+                    m.in_reply_to = Some(v.to_string());
+                }
+            } else if let Some(v) = prefix_ci(line, "Reply-To: ") {
+                m.reply_to = Some(v.to_string());
+            } else if let Some(v) = prefix_ci(line, "References: ") {
+                if m.initial_in_reply_to.as_deref().unwrap_or("").is_empty() || m.s.thread {
+                    m.references = v.to_string();
+                }
+            } else if !starts_ci(line, "Date:") && is_header_line_with_value(line) {
+                m.xh.push(line.to_string());
+            }
+        } else {
+            // The traditional format: line 1 is a Cc, line 2 the subject.
+            input_format = Some("lots");
+            if m.cc.is_empty() && !m.suppressed("cc") {
+                if !quiet {
+                    println!("(non-mbox) Adding cc: {line} from line '{line}'");
+                }
+                m.cc.push(line.to_string());
+            } else if m.subject.is_none() {
+                m.subject = Some(line.to_string());
+            }
+        }
+    }
+
+    for line in lines {
+        m.message.extend_from_slice(line);
+        let text = String::from_utf8_lossy(line);
+        let text = text.trim_end_matches('\n');
+        let Some((what, c)) = body_cc_line(text) else { continue };
+        let c = strip_garbage_one_address(&c);
+        let sc = sanitize_address(&c);
+        if sc == m.sender {
+            if m.suppressed("self") {
+                continue;
+            }
+        } else if what.eq_ignore_ascii_case("signed-off-by") {
+            if m.suppressed("sob") {
+                continue;
+            }
+        } else if what.to_ascii_lowercase().ends_with("-by") {
+            if m.suppressed("misc-by") {
+                continue;
+            }
+        } else if what.eq_ignore_ascii_case("cc") && m.suppressed("bodycc") {
+            continue;
+        }
+        if !(c.contains('@') || (c.contains('<') && c.contains('>'))) {
+            if !quiet {
+                println!("(body) Ignoring {what} from line '{text}'");
+            }
+            continue;
+        }
+        m.cc.push(sc.clone());
+        if !quiet {
+            println!("(body) Adding cc: {sc} from line '{text}'");
+        }
+    }
+
+    if let Some(cmd) = m.s.to_cmd.clone() {
+        let more = recipients_cmd(m, "to-cmd", "to", &cmd, t, quiet)?;
+        m.to.extend(more);
+    }
+    if let Some(cmd) = m.s.cc_cmd.clone() {
+        if !m.suppressed("cccmd") {
+            let more = recipients_cmd(m, "cc-cmd", "cc", &cmd, t, quiet)?;
+            m.cc.extend(more);
+        }
+    }
+
+    let broken = m.broken_encoding.contains(t);
+    let auto8 = m.s.auto_8bit_encoding.clone().unwrap_or_default();
+    if broken && !has_content_type {
+        xfer_encoding.get_or_insert_with(|| "8bit".into());
+        has_content_type = true;
+        m.xh.push(format!("Content-Type: text/plain; charset={auto8}"));
+        body_encoding = Some(auto8.clone());
+    }
+    if broken {
+        let subject = m.subject.clone().unwrap_or_default();
+        if !is_rfc2047_quoted(&subject) {
+            m.subject = Some(quote_subject(&subject, &auto8));
+        }
+    }
+
+    if let Some(sa) = &sauthor {
+        if *sa != m.sender {
+            let mut msg = format!("From: {}\n\n", author.clone().unwrap_or_default()).into_bytes();
+            msg.extend_from_slice(&m.message);
+            m.message = msg;
+            if let Some(enc) = &author_encoding {
+                if !has_content_type {
+                    xfer_encoding.get_or_insert_with(|| "8bit".into());
+                    m.xh.push(format!("Content-Type: text/plain; charset={enc}"));
+                } else if body_encoding.as_deref() != Some(enc.as_str()) {
+                    // The script notes it should re-encode here and does not.
+                }
+            }
+        }
+    }
+
+    let from = xfer_encoding.unwrap_or_else(|| "8bit".into());
+    let target = m.s.target_xfer_encoding.clone();
+    let (message, encoding) =
+        apply_transfer_encoding(std::mem::take(&mut m.message), &from, &target)
+            .map_err(|e| died(format!("{e}\n")))?;
+    m.message = message;
+    m.xh.push(format!("Content-Transfer-Encoding: {encoding}"));
+    if !has_mime_version {
+        m.xh.insert(0, "MIME-Version: 1.0".into());
+    }
+
+    let confirm = m.confirm.as_str();
+    let needs = confirm == "always"
+        || (matches!(confirm, "auto" | "cc") && !m.cc.is_empty())
+        || (matches!(confirm, "auto" | "compose") && false);
+    m.needs_confirm = if needs {
+        if m.confirm_unconfigured && !m.cc.is_empty() {
+            Needs::Inform
+        } else {
+            Needs::Yes
+        }
+    } else {
+        Needs::No
+    };
+
+    let processed_to = m.process_address_list(&m.to.clone())?;
+    let processed_cc = m.process_address_list(&m.cc.clone())?;
+    let mut to = m.initial_to.clone();
+    to.extend(processed_to);
+    m.to = to;
+    let mut cc = m.initial_cc.clone();
+    cc.extend(processed_cc);
+    m.cc = cc;
+
+    if m.message_num == 1 {
+        if m.s.cover_cc == Some(true) {
+            m.initial_cc = m.cc.clone();
+        }
+        if m.s.cover_to == Some(true) {
+            m.initial_to = m.to.clone();
+        }
+    }
+    Ok(())
+}
+
+/// `recipients_cmd` — run `sendemail.toCmd`/`sendemail.ccCmd` for one patch.
+fn recipients_cmd(
+    m: &Mailer,
+    prefix: &str,
+    what: &str,
+    cmd: &str,
+    file: &str,
+    quiet: bool,
+) -> Step<Vec<String>> {
+    let lines = execute_cmd(prefix, cmd, file).map_err(|e| died(format!("{e}\n")))?;
+    let mut out = Vec::new();
+    for line in lines {
+        let address = sanitize_address(line.trim_matches(|c: char| c.is_ascii_whitespace()));
+        if address == m.sender && m.suppressed("self") {
+            continue;
+        }
+        if !quiet {
+            println!("({prefix}) Adding {what}: {address} from: '{cmd}'");
+        }
+        out.push(address);
+    }
+    Ok(out)
+}
+
+/// `/^[-A-Za-z]+:\s/`.
+fn is_header_line(line: &str) -> bool {
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() && (b[i] == b'-' || b[i].is_ascii_alphabetic()) {
+        i += 1;
+    }
+    i > 0 && b.get(i) == Some(&b':') && b.get(i + 1).is_some_and(|&c| is_ws(c))
+}
+
+/// `/^[-A-Za-z]+:\s+\S/` — a header that carries a value.
+fn is_header_line_with_value(line: &str) -> bool {
+    if !is_header_line(line) {
+        return false;
+    }
+    let rest = &line[line.find(':').unwrap_or(0) + 1..];
+    rest.starts_with(|c: char| c.is_ascii_whitespace())
+        && rest.trim_start_matches(|c: char| c.is_ascii_whitespace()).chars().next().is_some()
+}
+
+fn starts_ci(line: &str, prefix: &str) -> bool {
+    line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+fn prefix_ci<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    starts_ci(line, prefix).then(|| &line[prefix.len()..])
+}
+
+/// `/^(?:Subject|From|To|Cc):\s+(.*)$/i` — the value with its leading run of
+/// whitespace removed.
+fn header_value(line: &str, name: &str) -> Option<String> {
+    let rest = prefix_ci(line, &format!("{name}:"))?;
+    let trimmed = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    if trimmed.len() == rest.len() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// `/^([a-z][a-z-]*-by|Cc): (.*)/i` over a body line.
+fn body_cc_line(line: &str) -> Option<(String, String)> {
+    let colon = line.find(": ")?;
+    let name = &line[..colon];
+    let value = &line[colon + 2..];
+    if name.eq_ignore_ascii_case("cc") {
+        return Some((name.to_string(), value.to_string()));
+    }
+    let b = name.as_bytes();
+    if !b.first().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !b.iter().all(|&c| c.is_ascii_alphabetic() || c == b'-') {
+        return None;
+    }
+    name.to_ascii_lowercase().ends_with("-by").then(|| (name.to_string(), value.to_string()))
 }

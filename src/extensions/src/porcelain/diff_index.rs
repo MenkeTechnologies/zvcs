@@ -59,8 +59,11 @@
 //! Status letters produced: `A`, `D`, `T` (the `S_IFMT` bits of the two modes differ,
 //! e.g. file ↔ symlink), `M`, and `U` for unmerged paths under `--cached`.
 //!
-//! Options that only steer colour or patch/stat *shaping* (`--color` bare,
-//! `--ws-error-highlight=`, `--anchored=`, `--color-moved[=]`,
+//! `--color[=<when>]`/`--no-color` and `--ws-error-highlight=<kind>` are honoured for
+//! real: the patch and stat are painted from the `color.diff.*` slots with git's
+//! `ws.c` whitespace-error markup.
+//!
+//! Options that only steer patch/stat *shaping* (`--anchored=`, `--color-moved[=]`,
 //! `--word-diff` bare, `--ignore-submodules` bare, `--ignore-blank-lines`, `-B`,
 //! `-l<n>`, `-a`/`--text`, `-W`, …) are accepted and ignored for the raw, `--name-only`
 //! and `--name-status` listings — stock git's bytes there are identical with and without
@@ -161,6 +164,7 @@ use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
 use regex::bytes::Regex;
 
+use super::diff_color;
 use super::diff_files::{count_changes_sides, render_dirstat, DirStat};
 
 /// The file-type bits of a mode, as in `<sys/stat.h>`.
@@ -312,6 +316,11 @@ struct Opts {
     /// `DIFF_FORMAT_RAW` only when nothing else was asked for, so a bare `--dirstat`
     /// prints directories alone while `--raw --dirstat` prints both.
     emit_pairs: bool,
+    /// `--color[=<when>]` / `--no-color`; `None` defers to `color.diff` /
+    /// `diff.color` / `color.ui` and the terminal test.
+    color_when: Option<diff_color::ColorWhen>,
+    /// `--ws-error-highlight=<kind>`, seeded from `diff.wsErrorHighlight`.
+    ws_error_highlight: u32,
     /// `--skip-to=<path>` / `--rotate-to=<path>`: `(is_skip, path)`, last one wins.
     /// git reorders the queued pairs at flush time so output starts at `<path>`; skip
     /// drops everything before it, rotate wraps the earlier pairs to the end. A `<path>`
@@ -430,7 +439,6 @@ fn render_only_option(a: &str) -> bool {
         "-D",
         "-W",
         "--break-rewrites",
-        "--color",
         "--color-moved",
         "--color-words",
         "--default-prefix",
@@ -445,7 +453,6 @@ fn render_only_option(a: &str) -> bool {
         "--ita-invisible-in-index",
         "--ita-visible-in-index",
         "--minimal",
-        "--no-color",
         "--no-color-moved",
         "--no-color-moved-ws",
         "--no-diff-merges",
@@ -480,7 +487,6 @@ fn render_only_option(a: &str) -> bool {
         "--output-indicator-old=",
         "--src-prefix=",
         "--word-diff-regex=",
-        "--ws-error-highlight=",
     ];
     if EXACT.contains(&a) || WITH_VALUE.iter().any(|p| a.starts_with(*p)) {
         return true;
@@ -646,8 +652,15 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         irreversible_delete: false,
         dirstat: None,
         emit_pairs: true,
+        color_when: None,
+        // git's `ws_error_highlight_default`; `diff.wsErrorHighlight` replaces it
+        // once the repository is discovered, unless a flag already set it.
+        ws_error_highlight: diff_color::WSEH_NEW,
         skip_or_rotate: None,
     };
+    // Whether a `--ws-error-highlight` flag was seen, so the config default does
+    // not overwrite it (git reads the config first and the flag last).
+    let mut wseh_explicit = false;
     let mut quiet = false;
     let mut merge_base = false;
     // `--raw` given explicitly, which is what makes git print the pair listing
@@ -956,23 +969,39 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                     ));
                 }
             }
+            // `OPT_COLOR_FLAG` → `git_config_colorbool`: `--color=<when>` accepts only
+            // `always`, `auto` or `never` (case-insensitively); anything else, empty
+            // included, is exit 129, deferred with its argv index so a bad revision
+            // earlier in argv still wins with git's 128.
+            "--color" => opts.color_when = Some(diff_color::ColorWhen::Always),
+            "--no-color" => opts.color_when = Some(diff_color::ColorWhen::Never),
             s if s.starts_with("--color=") => {
-                // `OPT_COLOR_FLAG` → `git_config_colorbool`: `--color=<when>` accepts only
-                // `always`, `auto` or `never` (case-insensitively); anything else, empty
-                // included, is exit 129. Bare `--color` (below, `render_only_option`) means
-                // `always` and is always accepted.
-                let val = &s["--color=".len()..];
-                match val.to_ascii_lowercase().as_str() {
-                    "always" => {
-                        // Forced colour would tint the patch/stat; refuse if one is asked.
-                        content_altering.get_or_insert_with(|| s.to_owned());
-                    }
-                    "auto" | "never" => {}
-                    _ => {
+                match diff_color::parse_color_when(&s["--color=".len()..]) {
+                    Some(w) => opts.color_when = Some(w),
+                    None => {
                         deferred.get_or_insert((
                             cur,
                             129,
                             b"error: option `color' expects \"always\", \"auto\", or \"never\"\n".to_vec(),
+                        ));
+                    }
+                }
+            }
+            // `--ws-error-highlight=<kind>` / `--ws-error-highlight <kind>`: which
+            // sides get whitespace-error markup.
+            s if s.starts_with("--ws-error-highlight=") => {
+                let val = &s["--ws-error-highlight=".len()..];
+                match diff_color::parse_ws_error_highlight(val) {
+                    Ok(v) => {
+                        opts.ws_error_highlight = v;
+                        wseh_explicit = true;
+                    }
+                    Err(accepted) => {
+                        deferred.get_or_insert((
+                            cur,
+                            129,
+                            format!("error: unknown value after ws-error-highlight={}\n", &val[..accepted])
+                                .into_bytes(),
                         ));
                     }
                 }
@@ -1123,6 +1152,11 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     }
 
     let repo = gix::discover(".")?;
+    if !wseh_explicit {
+        if let Ok(v) = diff_color::ws_error_highlight_default(&repo) {
+            opts.ws_error_highlight = v;
+        }
+    }
 
     // git's `setup_revisions`: each positional before `--` is tried as a revision.
     // The first that resolves is the tree-ish; a further one that also resolves is
@@ -1358,6 +1392,13 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         // need the two sides' bytes and, for the patch, the rendered hunks; every other
         // format reads only the recorded modes and ids.
         let workdir = repo.workdir().map(Path::to_path_buf);
+        // `--color[=<when>]` / `--no-color`, falling back to `color.diff` /
+        // `diff.color` / `color.ui` and the terminal test.
+        let colors = diff_color::DiffColors::resolve(
+            &repo,
+            diff_color::resolve_color(&repo, opts.color_when),
+        );
+        let ws_rule = diff_color::whitespace_rule_cfg(&repo);
         let need_analyses = opts.patch || opts.numstat || opts.diffstat || opts.shortstat;
         let analyses: Vec<IdxAnalysis> = if need_analyses {
             deltas
@@ -1389,7 +1430,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                     render_numstat(&mut rest, &stats, &opts);
                 }
                 if opts.diffstat {
-                    render_stat(&mut rest, &stats, &opts);
+                    render_stat(&mut rest, &stats, &opts, &colors);
                 }
                 if opts.shortstat {
                     render_shortstat(&mut rest, &stats);
@@ -1412,8 +1453,26 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             if separator {
                 rest.push(b'\n');
             }
+            // Each pair is rendered uncolored, then re-emitted through git's
+            // `fn_out_consume()` chain with that pair's whitespace state.
+            let paint_opts = diff_color::PaintOptions {
+                ws_error_highlight: opts.ws_error_highlight,
+                ..Default::default()
+            };
             for (d, an) in deltas.iter().zip(&analyses) {
-                render_patch(&mut rest, d, an, &opts);
+                let mut section: Vec<u8> = Vec::new();
+                render_patch(&mut section, d, an, &opts);
+                let file = diff_color::FilePaint {
+                    ws_rule,
+                    blank_at_eof: diff_color::check_blank_at_eof(&an.old_data, &an.new_data),
+                };
+                rest.extend_from_slice(&diff_color::colorize_patch(
+                    &section,
+                    &colors,
+                    &paint_opts,
+                    &[file],
+                    file,
+                ));
             }
         }
 
@@ -2615,7 +2674,12 @@ fn scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
 }
 
 /// `show_stats()`. A non-tty terminal width is git's `term_columns()` fallback of 80.
-fn render_stat(out: &mut Vec<u8>, files: &[StatFile], opts: &Opts) {
+fn render_stat(
+    out: &mut Vec<u8>,
+    files: &[StatFile],
+    opts: &Opts,
+    colors: &diff_color::DiffColors,
+) {
     if files.is_empty() {
         return;
     }
@@ -2722,7 +2786,12 @@ fn render_stat(out: &mut Vec<u8>, files: &[StatFile], opts: &Opts) {
                 out.push(b'\n');
                 continue;
             }
-            out.extend_from_slice(format!(" {deleted} -> {added} bytes\n").as_bytes());
+            // `show_stats()` paints the two byte counts with the old/new colors.
+            out.push(b' ');
+            diff_color::paint(out, colors, diff_color::DiffSlot::Old, deleted.to_string().as_bytes());
+            out.extend_from_slice(b" -> ");
+            diff_color::paint(out, colors, diff_color::DiffSlot::New, added.to_string().as_bytes());
+            out.extend_from_slice(b" bytes\n");
             continue;
         }
         if f.is_unmerged {
@@ -2753,8 +2822,13 @@ fn render_stat(out: &mut Vec<u8>, files: &[StatFile], opts: &Opts) {
         if added + deleted != 0 {
             out.push(b' ');
         }
-        out.extend_from_slice(&b"+".repeat(add.max(0) as usize));
-        out.extend_from_slice(&b"-".repeat(del.max(0) as usize));
+        // `show_graph()`: each run carries its own color, and emits nothing when empty.
+        if add > 0 {
+            diff_color::paint(out, colors, diff_color::DiffSlot::New, &b"+".repeat(add as usize));
+        }
+        if del > 0 {
+            diff_color::paint(out, colors, diff_color::DiffSlot::Old, &b"-".repeat(del as usize));
+        }
         out.push(b'\n');
     }
 

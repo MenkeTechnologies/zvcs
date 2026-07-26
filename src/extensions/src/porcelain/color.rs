@@ -214,7 +214,15 @@ pub(crate) fn want_color_stdout(repo: &gix::Repository, section: &str) -> bool {
         .string(&format!("color.{section}"))
         .or_else(|| snapshot.string("color.ui"))
         .map(|v| v.to_string());
-    match colorbool(raw.as_deref()) {
+    want_color_stdout_raw(repo, raw.as_deref())
+}
+
+/// git's `want_color()` applied to a raw value the caller already resolved.
+/// Commands whose switch has more than one spelling — `git diff`'s `color.diff`
+/// and `diff.color` are the same setting — pick the winning value themselves and
+/// then hand it here for the `always`/`never`/`auto` decision.
+pub(crate) fn want_color_stdout_raw(repo: &gix::Repository, raw: Option<&str>) -> bool {
+    match colorbool(raw) {
         ColorBool::Always => true,
         ColorBool::Never => false,
         ColorBool::Auto => auto_color_stdout(repo),

@@ -437,6 +437,13 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     // long renderer runs; `None` leaves the format uncommented (git's default).
     let mut comment_prefix: Option<String> = None;
 
+    // `status.relativePaths`, git's `s->relative_paths` (default 1), resolved
+    // alongside the other `git_status_config` keys below.
+    let relative_paths: bool;
+
+    // `status.submoduleSummary`, git's `s->submodule_summary`.
+    let submodule_summary_limit: Option<i64>;
+
     // With no format/branch flag on the command line, `status.short` selects the
     // colored short display and `status.branch` adds the `## <branch>` header.
     // A flag (including `--long` / `--no-branch`) always wins over the config.
@@ -490,7 +497,33 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         if snap.boolean("status.displayCommentPrefix") == Some(true) {
             comment_prefix = Some(resolve_comment_string(&snap));
         }
+        // `status.relativePaths` (git's `git_status_config`), default on: it is
+        // what makes `cmd_status`' closing `if (s.relative_paths) s.prefix =
+        // prefix;` hand the cwd prefix to every `quote_path` call.
+        relative_paths = snap.boolean("status.relativePaths") != Some(false);
+        // `status.submoduleSummary` is `git_config_bool_or_int`: a plain integer
+        // is the `--summary-limit`, while a boolean `true` becomes git's `-1`
+        // sentinel (no limit). git skips the whole section under
+        // `--ignore-submodules=all`.
+        submodule_summary_limit = match snap.integer("status.submoduleSummary") {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None if snap.boolean("status.submoduleSummary") == Some(true) => Some(-1),
+            None => None,
+        }
+        .filter(|_| !matches!(ignore_submodules, Some(gix::submodule::config::Ignore::All)));
     }
+
+    // git's `s->prefix`. Two renderers drop it regardless of the config:
+    // `wt_porcelain_print` resets `relative_paths`/`prefix` before printing (v1
+    // is a stable machine format), and every `-z` path bypasses `quote_path`
+    // entirely and writes the raw index path.
+    let path_prefix: Option<BString> = if relative_paths && !porcelain && !null_term {
+        display_prefix(&repo)?
+    } else {
+        None
+    };
+    let path_prefix: Option<&[u8]> = path_prefix.as_ref().map(|p| p.as_slice());
 
     // Resolve the deferred booleans: absent `--show-stash`/config means off;
     // `quick` is git's `AHEAD_BEHIND_QUICK` (only `--no-ahead-behind` /
@@ -542,6 +575,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             ignore_submodules,
             ignore_all,
             null_term,
+            path_prefix,
         );
     }
 
@@ -735,6 +769,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 &untracked_paths,
                 &ignored_paths,
                 &colors,
+                path_prefix,
             ));
             print!("{out}");
         }
@@ -764,6 +799,8 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 colopts,
                 verbose,
                 repo.workdir(),
+                path_prefix,
+                submodule_summary_limit,
             )
         );
     }
@@ -1075,6 +1112,7 @@ fn porcelain_v2_output(
     ignore_submodules: Option<gix::submodule::config::Ignore>,
     ignore_all: bool,
     null_term: bool,
+    prefix: Option<&[u8]>,
 ) -> Result<ExitCode> {
     use gix::bstr::ByteSlice;
     use std::collections::BTreeMap;
@@ -1486,8 +1524,8 @@ fn porcelain_v2_output(
                 r.h_i,
                 kind as char,
                 score,
-                quote_path(path),
-                quote_path(orig),
+                quote_path(path, prefix),
+                quote_path(orig, prefix),
             )
         } else {
             format!(
@@ -1497,7 +1535,7 @@ fn porcelain_v2_output(
                 r.m_w,
                 r.h_h,
                 r.h_i,
-                quote_path(path),
+                quote_path(path, prefix),
             )
         };
         lines.push((path.clone(), line));
@@ -1544,7 +1582,7 @@ fn porcelain_v2_output(
             sh[0],
             sh[1],
             sh[2],
-            quote_path(path),
+            quote_path(path, prefix),
         );
         lines.push((path.clone(), line));
     }
@@ -1557,10 +1595,10 @@ fn porcelain_v2_output(
     untracked_paths.sort();
     ignored_paths.sort();
     for p in &untracked_paths {
-        out.push_str(&format!("? {}\n", quote_path(p)));
+        out.push_str(&format!("? {}\n", quote_path(p, prefix)));
     }
     for p in &ignored_paths {
-        out.push_str(&format!("! {}\n", quote_path(p)));
+        out.push_str(&format!("! {}\n", quote_path(p, prefix)));
     }
 
     print!("{out}");
@@ -1576,11 +1614,119 @@ fn type_class(mode: gix::index::entry::Mode) -> u8 {
     }
 }
 
-/// C-style path quoting matching git's default `core.quotePath=true`: a path is
-/// wrapped in double quotes and escaped when it contains control bytes, a quote,
-/// a backslash, or any byte >= 0x80; otherwise it is emitted verbatim.
-fn quote_path(path: impl AsRef<[u8]>) -> String {
-    let bytes = path.as_ref();
+/// git's `prefix` — the path from the work-tree root down to the current
+/// directory, with a trailing `/`. `None` at the top level (git passes a NULL
+/// prefix there, which `relative_path` short-circuits on).
+fn display_prefix(repo: &gix::Repository) -> Result<Option<BString>> {
+    Ok(match repo.prefix()? {
+        Some(p) if !p.as_os_str().is_empty() => {
+            let mut b = gix::path::into_bstr(p).into_owned();
+            b.push(b'/');
+            Some(b)
+        }
+        _ => None,
+    })
+}
+
+/// Port of `relative_path()` (path.c): re-express the repository-root-relative
+/// `input` relative to `prefix` (itself root-relative, with a trailing `/`).
+///
+/// Both arguments are relative here, so git's `have_same_root` is always true
+/// and the DOS-drive skip is a no-op — the scan therefore starts at index 0 of
+/// each. The loop walks the common byte prefix, remembering the last directory
+/// boundary it crossed (`prefix_off` / `input_off`); what is left of `prefix`
+/// past that boundary becomes one `../` per component, and what is left of
+/// `input` is appended verbatim. A path equal to the prefix renders as `./`.
+fn relative_path(input: &[u8], prefix: &[u8]) -> Vec<u8> {
+    let (in_len, prefix_len) = (input.len(), prefix.len());
+    if in_len == 0 {
+        return b"./".to_vec();
+    } else if prefix_len == 0 {
+        return input.to_vec();
+    }
+
+    let (mut in_off, mut prefix_off) = (0usize, 0usize);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < prefix_len && j < in_len && prefix[i] == input[j] {
+        if prefix[i] == b'/' {
+            while i < prefix_len && prefix[i] == b'/' {
+                i += 1;
+            }
+            while j < in_len && input[j] == b'/' {
+                j += 1;
+            }
+            prefix_off = i;
+            in_off = j;
+        } else {
+            i += 1;
+            j += 1;
+        }
+    }
+
+    if i >= prefix_len && prefix_off < prefix_len {
+        // `prefix` looks like a prefix of `input`, and does not end in `/`.
+        if j >= in_len {
+            // input="a/b", prefix="a/b"
+            in_off = in_len;
+        } else if input[j] == b'/' {
+            // input="a/b/c", prefix="a/b"
+            while j < in_len && input[j] == b'/' {
+                j += 1;
+            }
+            in_off = j;
+        } else {
+            // input="a/bbb/c", prefix="a/b" — not a component prefix after all.
+            i = prefix_off;
+        }
+    } else if j >= in_len && in_off < in_len {
+        // `input` is shorter than `prefix` and does not end in `/`.
+        if i < prefix_len && prefix[i] == b'/' {
+            // input="a/b", prefix="a/b/c/"
+            while i < prefix_len && prefix[i] == b'/' {
+                i += 1;
+            }
+            in_off = in_len;
+        }
+    }
+    let rest = &input[in_off..];
+
+    if i >= prefix_len {
+        return if rest.is_empty() { b"./".to_vec() } else { rest.to_vec() };
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(rest.len());
+    while i < prefix_len {
+        if prefix[i] == b'/' {
+            out.extend_from_slice(b"../");
+            while i < prefix_len && prefix[i] == b'/' {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    if prefix[prefix_len - 1] != b'/' {
+        out.extend_from_slice(b"../");
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
+/// Port of `quote_path()` (quote.c): make `path` relative to `prefix` (git's
+/// `s->prefix`, which is `NULL` whenever `status.relativePaths` is off or the
+/// format never re-bases paths), then apply the C-style quoting of
+/// `core.quotePath=true` — the path is wrapped in double quotes and escaped when
+/// it contains control bytes, a quote, a backslash, or any byte >= 0x80;
+/// otherwise it is emitted verbatim.
+fn quote_path(path: impl AsRef<[u8]>, prefix: Option<&[u8]>) -> String {
+    let rebased;
+    let bytes = match prefix {
+        Some(p) => {
+            rebased = relative_path(path.as_ref(), p);
+            rebased.as_slice()
+        }
+        None => path.as_ref(),
+    };
     let needs = bytes
         .iter()
         .any(|&b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || b >= 0x80);
@@ -1796,6 +1942,42 @@ fn verbose_patch(workdir: Option<&std::path::Path>, args: &[&str]) -> String {
     }
 }
 
+/// `wt_longstatus_print_submodule_summary`: run `git submodule summary
+/// --cached|--files --for-status --summary-limit <n>` (plus `HEAD` for the
+/// staged side) and, when it produced anything, prefix the section header and a
+/// blank line. git shells out for this too, so re-executing this binary's own
+/// `submodule summary` keeps the body byte-identical rather than forking a
+/// second renderer.
+fn submodule_summary(workdir: Option<&std::path::Path>, uncommitted: bool, limit: i64) -> String {
+    let (Some(dir), Ok(exe)) = (workdir, std::env::current_exe()) else {
+        return String::new();
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.current_dir(dir)
+        .args(["submodule", "summary"])
+        .arg(if uncommitted { "--files" } else { "--cached" })
+        .arg("--for-status")
+        .arg("--summary-limit")
+        .arg(limit.to_string());
+    if !uncommitted {
+        // `s->amend ? "HEAD^" : "HEAD"`; `git status` never amends.
+        cmd.arg("HEAD");
+    }
+    let body = match cmd.output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(_) => return String::new(),
+    };
+    if body.is_empty() {
+        return String::new();
+    }
+    let header = if uncommitted {
+        "Submodules changed but not updated:"
+    } else {
+        "Submodule changes to be committed:"
+    };
+    format!("{header}\n\n{body}")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_long(
     head_state: &HeadState,
@@ -1817,6 +1999,10 @@ fn render_long(
     colopts: u32,
     verbose: u32,
     workdir: Option<&std::path::Path>,
+    prefix: Option<&[u8]>,
+    // git's `s->submodule_summary` once the `--ignore-submodules=all` gate has
+    // been applied: `Some(<summary-limit>)` (`-1` = unlimited) or `None` for off.
+    submodule_summary_limit: Option<i64>,
 ) -> String {
     let mut out = String::new();
     // When columns are active, the untracked/ignored path lists are replaced by a
@@ -1887,8 +2073,8 @@ fn render_long(
         for (kind, path, orig) in staged {
             let label = stage_label(*kind);
             let body = match orig {
-                Some(o) => format!("{label:<12}{} -> {}", quote_path(o), quote_path(path)),
-                None => format!("{label:<12}{}", quote_path(path)),
+                Some(o) => format!("{label:<12}{} -> {}", quote_path(o, prefix), quote_path(path, prefix)),
+                None => format!("{label:<12}{}", quote_path(path, prefix)),
             };
             out.push_str(&format!("\t{}\n", colors.paint(Slot::Added, &body)));
         }
@@ -1902,7 +2088,7 @@ fn render_long(
         }
         for (mask, path) in unmerged {
             let label = unmerged_label(*mask);
-            let body = format!("{label:<17}{}", quote_path(path));
+            let body = format!("{label:<17}{}", quote_path(path, prefix));
             out.push_str(&format!("\t{}\n", colors.paint(Slot::Unmerged, &body)));
         }
         out.push('\n');
@@ -1922,10 +2108,17 @@ fn render_long(
         }
         for (kind, path) in unstaged {
             let label = work_label(*kind);
-            let body = format!("{label:<12}{}", quote_path(path));
+            let body = format!("{label:<12}{}", quote_path(path, prefix));
             out.push_str(&format!("\t{}\n", colors.paint(Slot::Changed, &body)));
         }
         out.push('\n');
+    }
+
+    // `status.submoduleSummary`, between `wt_longstatus_print_changed` and the
+    // untracked listing: the staged side first, then the unstaged one.
+    if let Some(limit) = submodule_summary_limit {
+        out.push_str(&submodule_summary(workdir, false, limit));
+        out.push_str(&submodule_summary(workdir, true, limit));
     }
 
     let committable = !staged.is_empty();
@@ -1955,12 +2148,13 @@ fn render_long(
                     colors,
                     comment_prefix.is_some(),
                     untracked,
+                    prefix,
                 ));
             } else {
                 for path in untracked {
                     out.push_str(&format!(
                         "\t{}\n",
-                        colors.paint(Slot::Untracked, &quote_path(path))
+                        colors.paint(Slot::Untracked, &quote_path(path, prefix))
                     ));
                 }
             }
@@ -1982,12 +2176,13 @@ fn render_long(
                     colors,
                     comment_prefix.is_some(),
                     ignored,
+                    prefix,
                 ));
             } else {
                 for path in ignored {
                     out.push_str(&format!(
                         "\t{}\n",
-                        colors.paint(Slot::Untracked, &quote_path(path))
+                        colors.paint(Slot::Untracked, &quote_path(path, prefix))
                     ));
                 }
             }
@@ -2120,6 +2315,7 @@ fn status_column_block(
     colors: &StatusColors,
     comment: bool,
     paths: &[BString],
+    prefix: Option<&[u8]>,
 ) -> String {
     let header_sgr = slot_sgr(colors, Slot::Header);
     let untracked_sgr = slot_sgr(colors, Slot::Untracked);
@@ -2133,7 +2329,7 @@ fn status_column_block(
     indent.push('\t');
     indent.push_str(&untracked_sgr);
     let nl = if colored { "\x1b[m\n" } else { "\n" };
-    let items: Vec<Vec<u8>> = paths.iter().map(|p| quote_path(p).into_bytes()).collect();
+    let items: Vec<Vec<u8>> = paths.iter().map(|p| quote_path(p, prefix).into_bytes()).collect();
     let opts = super::column::ColumnOptions {
         width: 0,
         padding: 1,
@@ -2218,6 +2414,7 @@ fn render_short(
     untracked: &[BString],
     ignored: &[BString],
     colors: &StatusColors,
+    prefix: Option<&[u8]>,
 ) -> String {
     struct Short {
         x: u8,
@@ -2281,16 +2478,16 @@ fn render_short(
         };
         match &e.orig {
             Some(o) => {
-                out.push_str(&format!("{cols} {} -> {}\n", quote_path(o), quote_path(path)))
+                out.push_str(&format!("{cols} {} -> {}\n", quote_path(o, prefix), quote_path(path, prefix)))
             }
-            None => out.push_str(&format!("{cols} {}\n", quote_path(path))),
+            None => out.push_str(&format!("{cols} {}\n", quote_path(path, prefix))),
         }
     }
     for path in untracked {
-        out.push_str(&format!("{} {}\n", colors.paint(Slot::Untracked, "??"), quote_path(path)));
+        out.push_str(&format!("{} {}\n", colors.paint(Slot::Untracked, "??"), quote_path(path, prefix)));
     }
     for path in ignored {
-        out.push_str(&format!("{} {}\n", colors.paint(Slot::Untracked, "!!"), quote_path(path)));
+        out.push_str(&format!("{} {}\n", colors.paint(Slot::Untracked, "!!"), quote_path(path, prefix)));
     }
     out
 }
@@ -2512,5 +2709,35 @@ fn work_char(kind: WorkKind) -> u8 {
         WorkKind::Deleted => b'D',
         WorkKind::TypeChange => b'T',
         WorkKind::Added => b'A',
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relative_path;
+
+    fn rel(input: &str, prefix: &str) -> String {
+        String::from_utf8(relative_path(input.as_bytes(), prefix.as_bytes())).unwrap()
+    }
+
+    /// The four shapes `relative_path()` (path.c) distinguishes, spelled with the
+    /// repo-relative paths `git status` actually feeds it: a path below the
+    /// prefix keeps only its tail, a sibling directory walks up one level per
+    /// prefix component, a path at the repository root walks up all of them, and
+    /// a prefix that is a *byte* prefix but not a *component* prefix must not be
+    /// mistaken for a parent.
+    #[test]
+    fn relative_path_rebases_against_the_cwd_prefix() {
+        assert_eq!(rel("sub/b.txt", "sub/"), "b.txt");
+        assert_eq!(rel("sub/deep/c.txt", "sub/"), "deep/c.txt");
+        assert_eq!(rel("a.txt", "sub/"), "../a.txt");
+        assert_eq!(rel("a.txt", "sub/deep/"), "../../a.txt");
+        assert_eq!(rel("sub/b.txt", "sub/deep/"), "../b.txt");
+        // "subdir/" is not below "sub/" — the shared `sub` is not a component.
+        assert_eq!(rel("subdir/x", "sub/"), "../subdir/x");
+        // An empty prefix is git's NULL: the path is returned untouched.
+        assert_eq!(rel("sub/b.txt", ""), "sub/b.txt");
+        // in == prefix-without-slash is git's `in="/a/b", prefix="/a/b"` arm.
+        assert_eq!(rel("sub", "sub/"), "./");
     }
 }

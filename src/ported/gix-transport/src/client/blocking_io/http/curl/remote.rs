@@ -350,6 +350,22 @@ pub fn new() -> Worker {
                     ssl_verify,
                     http_version,
                     backend,
+                    ssl_ca_path,
+                    ssl_cert,
+                    ssl_key,
+                    resolve,
+                    tcp_keepalive_idle_seconds,
+                    tcp_keepalive_interval_seconds,
+                    // `curl`'s `CURLOPT_TCP_KEEPCNT` is not exposed by the `curl` crate, so
+                    // `http.keepAliveCount` is honored by the `reqwest` backend only.
+                    tcp_keepalive_count: _,
+                    cookie_file,
+                    save_cookies,
+                    min_sessions: _,
+                    post_buffer_bytes: _,
+                    max_retries: _,
+                    retry_after_seconds: _,
+                    max_retry_time_seconds: _,
                 },
         } in req_recv
         {
@@ -368,6 +384,36 @@ pub fn new() -> Worker {
 
             if let Some(ca_info) = ssl_ca_info {
                 handle.cainfo(ca_info)?;
+            }
+            if let Some(ca_path) = ssl_ca_path {
+                handle.capath(ca_path)?;
+            }
+            if let Some(cert) = ssl_cert {
+                handle.ssl_cert(cert)?;
+            }
+            if let Some(key) = ssl_key {
+                handle.ssl_key(key)?;
+            }
+            if !resolve.is_empty() {
+                let mut list = curl::easy::List::new();
+                for entry in &resolve {
+                    list.append(entry)?;
+                }
+                handle.resolve(list)?;
+            }
+            // `http.cookieFile` and `http.saveCookies` drive curl's own cookie engine, where the jar is
+            // only written when the file is also set as `CURLOPT_COOKIEJAR`.
+            if let Some(path) = cookie_file {
+                handle.cookie_file(&path)?;
+                if save_cookies {
+                    handle.cookie_jar(&path)?;
+                }
+            }
+            if let Some(seconds) = tcp_keepalive_idle_seconds {
+                handle.tcp_keepidle(std::time::Duration::from_secs(seconds))?;
+            }
+            if let Some(seconds) = tcp_keepalive_interval_seconds {
+                handle.tcp_keepintvl(std::time::Duration::from_secs(seconds))?;
             }
 
             if let Some(ref mut curl_options) = backend.as_ref().and_then(|backend| backend.lock().ok()) {

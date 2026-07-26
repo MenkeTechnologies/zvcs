@@ -13,6 +13,7 @@ use gix::objs::{Kind, TreeRefIter};
 use gix::prelude::ObjectIdExt;
 use gix::revision::plumbing::Spec as RevSpec;
 
+use super::line_log;
 use super::log::{DecorateStyle, Decorations, Mailmap};
 
 /// git's floor for an abbreviated object id, used for the all-zero side of an
@@ -49,6 +50,14 @@ const STAT_TERM_WIDTH: usize = 80;
 ///   * `--source` / `--no-source`, annotating the header with the argument the
 ///     commit was reached from — the endpoint token for a range, with git's
 ///     parent-inheritance across a walk
+///
+/// `-L<start>,<end>:<file>` (and its `+<n>`/`-<n>`/`/<regex>/`/`:<funcname>`
+/// spellings, repeatable) selects git's line-level history — the same machinery
+/// `git log -L` uses, since `cmd_show` shares `cmd_log_init_finish`. Given a range
+/// argument it becomes a walk and behaves exactly like `git log -L`; given a single
+/// commit it keeps git's `no_walk` shape, where the pending commit's parents are
+/// never parsed and the tracked ranges therefore print as a brand-new file (a merge
+/// prints its header alone). See [`super::line_log`].
 ///
 /// Diff output formats: `-p`/`--patch`, `--stat`, `--raw`, `--name-only`,
 /// `-s`/`--no-patch`, and `-q`/`--quiet`. Their interaction is git's, reproduced in
@@ -124,6 +133,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `--use-mailmap`/`--mailmap`: `None` until a flag is seen, then `log.mailmap`
     // supplies the default.
     let mut cli_mailmap: Option<bool> = None;
+    // `-L<range>:<file>`, repeatable: line-level history (see `line_log`). Shared
+    // with `git log` — `cmd_show` runs the same `cmd_log_init_finish`.
+    let mut line_ranges: Vec<String> = Vec::new();
+    let mut pending_line_range = false;
 
     for a in args {
         let s = a.as_str();
@@ -140,6 +153,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             }
             continue;
         }
+        if std::mem::take(&mut pending_line_range) {
+            line_ranges.push(a.clone());
+            continue;
+        }
         if let Some(include) = pending_decorate_refs.take() {
             if include {
                 decorate_refs.push(a.clone());
@@ -151,6 +168,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         match s {
             "-S" => pending_pickaxe = Some('S'),
             "-G" => pending_pickaxe = Some('G'),
+            "-L" => pending_line_range = true,
             "--" => after_dashdash = true,
             "-p" | "-u" | "--patch" => formats.patch = true,
             // `-s` resets the diff output format rather than adding to it, which is
@@ -225,6 +243,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     pickaxe_s = Some(v.to_string());
                 } else if let Some(v) = s.strip_prefix("-G") {
                     pickaxe_g = Some(v.to_string());
+                } else if let Some(v) = s.strip_prefix("-L") {
+                    line_ranges.push(v.to_string());
                 } else if let Some(v) = s.strip_prefix("--stat=") {
                     // `--stat[=<width>[,<name-width>[,<count>]]]`: an aliased form that
                     // sets the total width (and optionally the name column / line cap),
@@ -257,6 +277,21 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // no third format) is rejected there, matching git's `diff_setup_done`.
     if quiet {
         formats.no_output = true;
+    }
+    // `-L` (`rev->line_level_traverse`), rejected against the formats and the
+    // pathspec exactly as `cmd_log_init_finish` rejects them.
+    let line_level = !line_ranges.is_empty();
+    if line_level {
+        if formats.stat {
+            return Ok(fatal("-L does not yet support the requested diff format\n"));
+        }
+        if !pathspecs.is_empty() {
+            return Ok(fatal("-L<range>:<file> cannot be used with pathspec\n"));
+        }
+    }
+    if pending_line_range {
+        eprintln!("error: switch `L' requires a value");
+        return Ok(ExitCode::from(129));
     }
     // A trailing `--decorate-refs`/`--decorate-refs-exclude` with nothing after it
     // is git's parse-options "requires a value" usage error (exit 129).
@@ -467,7 +502,76 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         decorations: decorations.as_ref(),
         mailmap: mailmap.as_ref(),
     };
-    if needs_walk {
+    if line_level {
+        // `check_single_commit`: the ranges are resolved against exactly one pending
+        // commit, so several positive endpoints leave the starting blob undefined.
+        if walk_tips.len() > 1 {
+            return Ok(fatal(&format!(
+                "More than one commit to dig from: {} and {}?\n",
+                walk_tip_sources.get(1).map(String::as_str).unwrap_or_default(),
+                walk_tip_sources.first().map(String::as_str).unwrap_or_default()
+            )));
+        }
+        let Some(start) = walk_tips.first().copied() else {
+            return Ok(fatal("No commit specified?\n"));
+        };
+        let start = match repo.find_object(start).map_err(|e| e.to_string()).and_then(|o| o.peel_to_kind(Kind::Commit).map_err(|e| e.to_string())) {
+            Ok(o) => o.id,
+            Err(_) => {
+                let name = walk_tip_sources.first().map(String::as_str).unwrap_or_default();
+                return Ok(fatal(&format!("Non commit {name}?\n")));
+            }
+        };
+        let tracked = match line_log::parse_lines(&repo, start, &line_ranges) {
+            Ok(t) => t,
+            Err(e) => return Ok(fatal(&format!("{}\n", e.0))),
+        };
+        if needs_walk {
+            // A range endpoint clears `no_walk`, so this is `cmd_log_walk` — the same
+            // line-level traversal `git log -L` runs, topological order included.
+            let mut nodes: Vec<super::log::Node> = Vec::new();
+            let mut platform = repo.rev_walk(vec![start]).with_hidden(walk_hidden);
+            if first_parent {
+                platform = platform.first_parent_only();
+            }
+            for info in platform.all()? {
+                let info = info?;
+                let commit = repo.find_object(info.id)?.try_into_commit()?;
+                nodes.push(super::log::Node {
+                    id: info.id,
+                    parents: commit.parent_ids().map(|p| p.detach()).collect(),
+                    time: commit.time()?.seconds,
+                    source: String::new(),
+                });
+            }
+            nodes = super::log::topo_sort(nodes, false);
+            let mut tracker = line_log::Tracker::new(&repo, start, tracked, first_parent);
+            for node in &nodes {
+                let (Some(range), _) = tracker.process(node.id, &node.parents)? else {
+                    continue;
+                };
+                let pairs = line_log::queue_pairs(&range);
+                show_one(&repo, &mut out, &node.id.to_string(), node.id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, None, &mut shown_one, Some(&pairs))?;
+            }
+        } else {
+            // `no_walk` never parses the pending commit's parents, so their tree ids
+            // read back as absent and every tracked file is queued as a creation —
+            // which is why `git show -L` prints the range as a brand-new file. A
+            // merge takes the multi-parent path instead, whose bookkeeping clears the
+            // commit's own record, so it shows a header and no diff at all.
+            let commit = repo.find_object(start)?.try_into_commit()?;
+            let is_merge = commit.parent_ids().count() > 1;
+            let mut pairs: Vec<(line_log::Pair, Vec<line_log::Range>)> = Vec::new();
+            if !is_merge {
+                let mut tracker = line_log::Tracker::new(&repo, start, tracked, first_parent);
+                if let (Some(range), _) = tracker.process(start, &[])? {
+                    pairs = line_log::queue_pairs(&range);
+                }
+            }
+            let spec = walk_tip_sources.first().map(String::as_str).unwrap_or("HEAD");
+            show_one(&repo, &mut out, spec, start, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(spec), &mut shown_one, Some(&pairs))?;
+        }
+    } else if needs_walk {
         let mut platform = repo.rev_walk(walk_tips).with_hidden(walk_hidden);
         if first_parent {
             platform = platform.first_parent_only();
@@ -478,11 +582,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             let source = source_mode
                 .then(|| sources.get(&id).cloned().unwrap_or_default())
                 .unwrap_or_default();
-            show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(source.as_str()), &mut shown_one)?;
+            show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(source.as_str()), &mut shown_one, None)?;
         }
     } else {
         for (spec, id) in &plain {
-            show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(*spec), &mut shown_one)?;
+            show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(*spec), &mut shown_one, None)?;
         }
     }
 
@@ -838,6 +942,9 @@ fn show_one(
     shown: &mut Vec<ObjectId>,
     source: Option<&str>,
     shown_one: &mut bool,
+    // `line_log_queue_pairs()`' output under `-L`: `Some` replaces the whole diff
+    // section with the tracked file pairs, clipped to their ranges.
+    line_log_pairs: Option<&[(line_log::Pair, Vec<line_log::Range>)]>,
 ) -> Result<()> {
     let mut obj = repo.find_object(id)?;
     loop {
@@ -857,7 +964,7 @@ fn show_one(
                 }
                 shown.push(obj.id);
                 let commit = obj.try_into_commit()?;
-                show_commit(repo, out, &commit, pretty, selection, pathspecs, disp, pickaxe, source, shown_one)?;
+                show_commit(repo, out, &commit, pretty, selection, pathspecs, disp, pickaxe, source, shown_one, line_log_pairs)?;
                 break;
             }
             Kind::Tag => {
@@ -959,6 +1066,7 @@ fn show_commit(
     pickaxe: &Pickaxe,
     source: Option<&str>,
     shown_one: &mut bool,
+    line_log_pairs: Option<&[(line_log::Pair, Vec<line_log::Range>)]>,
 ) -> Result<()> {
     let parents: Vec<_> = commit.parent_ids().collect();
     let is_merge = parents.len() > 1;
@@ -975,7 +1083,11 @@ fn show_commit(
     // The pickaxe applies to the first-parent / non-merge path; a merge's combined
     // `--cc` diff is never paired with pickaxe by git-fuzzy and is left unfiltered.
     let pickaxe_path = pickaxe.active() && !(is_merge && !disp.first_parent);
-    let files: Vec<FileChange> = if diff_shown {
+    let files: Vec<FileChange> = if line_log_pairs.is_some() {
+        // `-L` renders `line_log_queue_pairs()`' pairs, not the commit's own change
+        // set, so none of the collection below runs.
+        Vec::new()
+    } else if diff_shown {
         let mut f = collect_changes(repo, commit, parents.first().map(|p| p.detach()))?;
         if !pathspecs.is_empty() {
             f.retain(|c| matches_pathspec(&c.path, pathspecs));
@@ -993,7 +1105,7 @@ fn show_commit(
     } else {
         Vec::new()
     };
-    if pickaxe_path && diff_shown && files.is_empty() {
+    if pickaxe_path && diff_shown && files.is_empty() && line_log_pairs.is_none() {
         return Ok(());
     }
 
@@ -1064,6 +1176,42 @@ fn show_commit(
     }
 
     if selection == Selection::Disabled {
+        return Ok(());
+    }
+
+    // `log_tree_diff` short-circuits under `-L`: it flushes the queued pairs and
+    // returns, so the merge and root-commit rules below never apply.
+    if let Some(pairs) = line_log_pairs {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        if !header_empty && !matches!(pretty, Pretty::Oneline) {
+            out.push(b'\n');
+        }
+        match selection {
+            Selection::Disabled => {}
+            Selection::Names => {
+                for (pair, _) in pairs {
+                    out.extend_from_slice(&pair.path);
+                    out.push(b'\n');
+                }
+            }
+            Selection::Blocks { raw, patch, .. } => {
+                let mut wrote_block = false;
+                if raw {
+                    let files: Vec<FileChange> =
+                        pairs.iter().map(|(p, _)| line_log_change(repo, p)).collect();
+                    emit_raw(repo, out, &files)?;
+                    wrote_block = true;
+                }
+                if patch {
+                    if wrote_block {
+                        out.push(b'\n');
+                    }
+                    out.extend_from_slice(&super::diff::line_range_patch(repo, pairs, 3)?);
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -1193,6 +1341,41 @@ fn matches_pathspec(path: &[u8], pathspecs: &[Vec<u8>]) -> bool {
 
 /// One file-level change, with everything the four output formats need resolved
 /// once so the blob contents are read at most a single time.
+/// A `-L` file pair as the `--raw` renderer wants it. Only the identity fields are
+/// filled: the content-bearing ones are unused by `emit_raw`, and `-L` never routes
+/// its patch through this record.
+fn line_log_change(repo: &gix::Repository, pair: &line_log::Pair) -> FileChange {
+    let null = repo.object_hash().null();
+    let mode = |s: line_log::Side| {
+        s.map(|(_, k)| u32::from(gix::objs::tree::EntryMode::from(k).value()))
+    };
+    // `diff_resolve_rename_copy()` re-derives the status from the two filespecs of
+    // the `diff_filepair_dup()` the `-L` queue holds, which carries no rename flag —
+    // so a pair whose sides name different files is still a plain `M`, printed under
+    // its pre-image path.
+    let (status, path) = match (pair.old, pair.new) {
+        (None, _) => (b'A', &pair.path),
+        (_, None) => (b'D', &pair.old_path),
+        _ => (b'M', &pair.old_path),
+    };
+    FileChange {
+        path: path.to_vec(),
+        status,
+        old_mode: mode(pair.old),
+        new_mode: mode(pair.new),
+        old_id: pair.old.map_or(null, |(id, _)| id),
+        new_id: pair.new.map_or(null, |(id, _)| id),
+        old_content: Vec::new(),
+        new_content: Vec::new(),
+        old_is_sub: matches!(pair.old, Some((_, EntryKind::Commit))),
+        new_is_sub: matches!(pair.new, Some((_, EntryKind::Commit))),
+        is_binary: false,
+        mode_only: false,
+        added: 0,
+        deleted: 0,
+    }
+}
+
 struct FileChange {
     path: Vec<u8>,
     /// `A`, `D`, `M`, or `T`, as used by `--raw`.

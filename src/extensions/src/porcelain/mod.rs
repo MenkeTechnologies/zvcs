@@ -5,6 +5,7 @@
 //! same on-disk `.git`.
 
 mod add;
+pub(crate) mod add_patch;
 mod am;
 mod annotate;
 mod apply;
@@ -50,10 +51,15 @@ mod daemon;
 mod describe;
 mod diagnose;
 mod diff;
+/// The `color.diff.*` slot table and git's colored-patch emit layer, shared by
+/// every diff-producing command.
+pub(crate) mod diff_color;
 mod diff_files;
 mod diff_index;
 mod diff_pairs;
 mod diff_tree;
+/// The diffcore rename/copy/break passes shared by the diff-producing commands.
+mod diffcore_rename;
 mod difftool;
 #[allow(non_snake_case)] // maps to git's `difftool--helper` subcommand
 mod difftool__helper;
@@ -89,6 +95,7 @@ mod instaweb;
 mod interpret_trailers;
 mod jump;
 mod last_modified;
+mod line_log;
 mod log;
 mod ls_files;
 mod ls_remote;

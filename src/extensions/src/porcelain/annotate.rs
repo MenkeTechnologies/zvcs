@@ -247,6 +247,9 @@ pub fn annotate(args: &[String]) -> Result<ExitCode> {
         since: None,
         rewrites: Some(gix::diff::Rewrites::default()),
         ignore_whitespace: opts.ignore_whitespace,
+        // `git annotate` has no `--ignore-rev`; it is `git blame -c` with the same
+        // option set minus the blame-only flags.
+        ignore_revs: Default::default(),
     };
 
     let outcome = match repo.blame_file(rel_path.as_bytes().as_bstr(), suspect, blame_options) {

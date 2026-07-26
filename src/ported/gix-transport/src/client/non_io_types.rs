@@ -43,6 +43,12 @@ pub(crate) mod connect {
         pub ssh: crate::client::blocking_io::ssh::connect::Options,
         /// If `true`, all packetlines received or sent will be passed to the facilities of the `gix-trace` crate.
         pub trace: bool,
+        /// The program to run in place of `git-upload-pack` on the other end, from git's `--upload-pack <path>`
+        /// or `remote.<name>.uploadpack`.
+        ///
+        /// Only the transports that spawn the service themselves honour it, which is `file://`/local paths and
+        /// `ssh://` — the same ones git passes it to.
+        pub upload_pack: Option<bstr::BString>,
     }
 
     /// The error used in `connect()`.

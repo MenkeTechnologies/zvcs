@@ -22,10 +22,11 @@
 //! (with markers) in the worktree. With `--recurse-submodules`, any matched,
 //! active submodule whose gitlink appears in the restore source has its worktree
 //! reset to the recorded commit (local modifications overwritten, submodule HEAD
-//! detached), matching git-restore(1). Interactive `--patch` stays unimplemented
-//! (no non-interactive hunk-selection semantics here).
+//! detached), matching git-restore(1). `-p`/`--patch` runs the interactive hunk
+//! selector ([`super::add_patch`]) against whichever of the index / worktree the
+//! `--staged` / `--worktree` flags select.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU8;
 use std::path::Path;
@@ -273,9 +274,27 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         }
     };
 
+    // `-U`/`--unified`, `--inter-hunk-context`, `--[no-]auto-advance`: the
+    // interactive hunk selector's options, parsed and diagnosed by the same code
+    // `git reset` and `git checkout` use.
+    let mut patch_opts = super::reset::PatchDiffOpts::default();
+    let mut patch_mode = false;
+
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
+        // A value still owed to `-U`/`--inter-hunk-context` is taken verbatim,
+        // even past `--`, exactly as parse-options takes it.
+        if patch_opts.awaiting_value() || !after_dashdash {
+            match patch_opts.take_arg(a) {
+                Err(code) => return Ok(code),
+                Ok(true) => {
+                    i += 1;
+                    continue;
+                }
+                Ok(false) => {}
+            }
+        }
         if after_dashdash {
             pathspecs.push(a.clone());
             i += 1;
@@ -337,10 +356,8 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             // (context knobs only affect interactive `--patch`, unsupported here).
             "-q" | "--quiet" | "--progress" | "--no-progress"
             | "--ignore-skip-worktree-bits" | "--no-ignore-skip-worktree-bits" => {}
-            "-U" | "--unified" | "--inter-hunk-context" => {
-                i += 1;
-            }
-            "-p" | "--patch" => bail!("interactive patch mode (-p/--patch) is not supported"),
+            "-p" | "--patch" => patch_mode = true,
+            "--no-patch" => patch_mode = false,
             "--recurse-submodules" => recurse_submodules = true,
             "--no-recurse-submodules" => recurse_submodules = false,
             s if s.starts_with("--source=") => source = Some(s["--source=".len()..].to_string()),
@@ -357,7 +374,6 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--pathspec-from-file=") => {
                 pathspec_from_file = Some(s["--pathspec-from-file=".len()..].to_string());
             }
-            s if s.starts_with("-U") && s.len() > 2 => {}
             s if s.starts_with("-s") && s.len() > 2 => source = Some(s[2..].to_string()),
             s if s.starts_with('-') && s != "-" => {
                 eprintln!("error: unknown option `{}'", s.trim_start_matches('-'));
@@ -419,6 +435,56 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     if !staged && !worktree {
         worktree = true;
     }
+
+    if let Err(code) = patch_opts.finish() {
+        return Ok(code);
+    }
+    if let Some(code) = patch_opts.require_patch(patch_mode) {
+        return Ok(code);
+    }
+
+    // `-p`: hand the paths to the interactive hunk selector. The patch mode
+    // follows git's `checkout_paths()` mapping of the two targets:
+    // `--worktree` alone is `ADD_P_WORKTREE`, `--staged` alone is `ADD_P_RESET`
+    // (index only), and both together are `ADD_P_CHECKOUT`. `--source` supplies
+    // the revision — resolved to a hex oid unless it is literally `HEAD`, since
+    // `diff-index` cannot take an `<a>...<b>` range.
+    if patch_mode {
+        if !worktree && source.is_none() {
+            eprintln!("fatal: '--worktree' must be used when '--source' is not specified");
+            return Ok(ExitCode::from(128));
+        }
+        if pathspec_from_file.is_some() {
+            eprintln!("fatal: options '--pathspec-from-file' and '--patch' cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
+        if merge_active {
+            eprintln!("fatal: options '--merge' and '--patch' cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
+        if ignore_unmerged {
+            eprintln!("fatal: '--ignore-unmerged' cannot be used with updating paths");
+            return Ok(ExitCode::from(128));
+        }
+        let repo = gix::discover(".")?;
+        let revision = match source.as_deref() {
+            None | Some("HEAD") => source.clone(),
+            Some(r) => Some(repo.rev_parse_single(r)?.detach().to_string()),
+        };
+        let mode = match (staged, worktree) {
+            (true, true) => super::add_patch::Mode::Checkout,
+            (true, false) => super::add_patch::Mode::Reset,
+            _ => super::add_patch::Mode::Worktree,
+        };
+        return super::add_patch::run(
+            &repo,
+            mode,
+            revision.as_deref(),
+            patch_opts.to_interactive(false),
+            &pathspecs,
+        );
+    }
+
     if pathspecs.is_empty() {
         eprintln!("fatal: you must specify path(s) to restore");
         return Ok(ExitCode::from(128));

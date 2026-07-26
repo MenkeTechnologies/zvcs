@@ -1,34 +1,31 @@
 //! `git pack-objects` — create a packed archive of objects.
 //!
-//! # Pack bytes differ from git's by design
+//! # Pack bytes differ from git's, but the compression does not
 //!
-//! git's pack writer runs a delta search (`--window`, `--depth`) and emits
-//! `OFS_DELTA` entries for whatever it finds, after sorting entries by type,
-//! name-hash and size. The vendored `gix-pack` computes no deltas at all: its
-//! only output mode is documented as "Copy base objects and deltas from packs,
-//! while non-packed objects will be treated as base objects (i.e. without trying
-//! to delta compress them)"
-//! (`gix-pack/src/data/output/entry/iter_from_counts.rs:362-366`).
+//! The pack written here is delta-compressed by
+//! [`gix_pack::data::output::delta`], which is git's own delta machinery ported
+//! from `diff-delta.c` and `builtin/pack-objects.c`: the same Rabin-fingerprint
+//! encoder, the same sliding window sorted by type, name-hash and size, and the
+//! same `--window`/`--depth`/`--window-memory` heuristics deciding which pairs
+//! are worth deltifying. `--delta-base-offset` selects `OBJ_OFS_DELTA` over
+//! `OBJ_REF_DELTA` exactly as it does in git.
 //!
-//! So the pack written here is **well-formed and complete but undeltified**: it
-//! holds exactly the objects git would pack, in a different order, at a larger
-//! size, under a different trailing checksum — and therefore under a different
-//! `<base-name>-<hash>.{pack,idx,rev}` filename. `git verify-pack`, `git
-//! index-pack --verify` and `git unpack-objects` all accept it. What is *not*
-//! reproduced is git's byte stream, which no amount of option handling can fix
-//! without a delta compressor. Every artifact this module writes is therefore
-//! correct-by-construction rather than byte-identical, and that tradeoff is
-//! stated here rather than left for a reader to infer from a checksum mismatch.
+//! What still differs is the *byte stream*. The objects are enumerated in this
+//! module's own order rather than git's `compute_write_order()`, deltas are
+//! never reused from an existing pack (every pair is searched afresh), and there
+//! are no preferred bases or delta islands to steer the search. So the pack has
+//! the same objects and comparable size, but a different layout, a different
+//! trailing checksum, and therefore a different `<base-name>-<hash>.{pack,idx,rev}`
+//! filename. `git verify-pack`, `git index-pack --verify` and `git
+//! unpack-objects` all accept it.
 //!
-//! The same reasoning covers the knobs that exist purely to steer the delta
-//! search or the encoding: `--window`, `--depth`, `--window-memory`,
-//! `--no-reuse-delta`, `--no-reuse-object`, `--delta-base-offset`,
-//! `--delta-islands`, `--threads`, `--name-hash-version`, `--path-walk`,
-//! `--sparse` and `--shallow` are accepted and change nothing observable, since
-//! there is no delta search for them to steer. `--thin` and
-//! `--write-bitmap-index` are likewise accepted without effect: a thin pack is a
-//! delta special case, and no EWAH bitmap writer exists in the vendored crates
-//! (the string `bitmap` does not occur under `gix-pack/src`).
+//! The knobs with nothing to steer are the ones tied to substrate that is still
+//! missing: `--no-reuse-delta` and `--no-reuse-object` (no pack entry is ever
+//! reused, so there is no reuse to switch off), `--delta-islands`,
+//! `--name-hash-version`, `--path-walk`, `--sparse` and `--shallow`. `--thin`
+//! and `--write-bitmap-index` are likewise accepted without effect: a thin pack
+//! needs bases outside the pack, and no EWAH bitmap writer exists in the
+//! vendored crates.
 //!
 //! # What is reproduced exactly
 //!
@@ -80,8 +77,9 @@
 //!     pack is always written. Splitting only ever triggers on repositories far
 //!     larger than the limit, and the split boundary is a function of the delta
 //!     encoding this module does not have.
-//!   * `pack.compression`/`core.compression` is not read from config, so the
-//!     compression diagnostic fires only for a value given on the command line.
+//!   * the compression *diagnostic* (`bad pack compression level <n>`) fires
+//!     only for a value given on the command line; an out-of-range
+//!     `pack.compression`/`core.compression` is ignored rather than fatal.
 //!   * `pack.packSizeLimit` supplies `--max-pack-size`'s default, is validated
 //!     the moment the config is read (ahead of parse-options, so a bad value is
 //!     fatal even for `-h`), and warns below git's 1 MiB floor — but, like
@@ -97,6 +95,12 @@
 //!   * `pack.indexVersion`, `pack.writeReverseIndex` — the `.idx` format and
 //!     whether a `.rev` accompanies the pack.
 //!   * `pack.packSizeLimit` — as above.
+//!   * `pack.window`, `pack.depth`, `pack.windowMemory`, `pack.deltaCacheSize`,
+//!     `pack.deltaCacheLimit`, `pack.threads` — the delta search, each
+//!     overridable by its command-line counterpart. A window or depth of zero
+//!     turns the search off and every object is stored whole.
+//!   * `pack.compression`, falling back to `core.compression` — the zlib level
+//!     every entry is deflated at, shadowed by `--compression`.
 //!   * `core.fsync` / `core.fsyncMethod` — the pack is hardened when the `pack`
 //!     component is in the set, its `.idx`/`.rev`/`.mtimes` when `pack-metadata`
 //!     is. `core.fsyncObjectFiles` is read for its deprecation warning and its
@@ -314,6 +318,21 @@ struct State {
     revs: bool,
     /// `--incremental`: leave out objects an existing pack already holds.
     incremental: bool,
+    /// `--window=<n>`: how many objects the delta search compares each object
+    /// against. Overrides `pack.window`.
+    window: Option<i64>,
+    /// `--depth=<n>`: the longest delta chain to produce. Overrides `pack.depth`.
+    depth: Option<i64>,
+    /// `--window-memory=<n>`: the delta window's memory ceiling in bytes.
+    /// Overrides `pack.windowMemory`.
+    window_memory: Option<u64>,
+    /// `--threads=<n>`: how many threads search for deltas. Overrides
+    /// `pack.threads`; zero means one per logical core.
+    threads: Option<i64>,
+    /// `--delta-base-offset` / `--no-delta-base-offset`: whether deltas name
+    /// their base by pack offset (`OBJ_OFS_DELTA`) or by object id
+    /// (`OBJ_REF_DELTA`). Unset leaves git's default, which is by object id.
+    delta_base_offset: Option<bool>,
     /// `--filter=<spec>`, as given; see [`apply_filter`].
     filter: Option<String>,
     /// Whether the end-of-run summary goes to stderr: `-q` and `--progress`
@@ -452,13 +471,20 @@ fn execute(st: &State) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let packed = write_pack(&repo, &counts, compression(st))?;
+    let delta = match DeltaConfig::from_repo(&repo) {
+        Ok(cfg) => cfg.apply(st),
+        Err(message) => {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+    };
+    let packed = write_pack(&repo, &counts, compression(&repo, st), &delta)?;
 
     if st.stdout {
         let mut out = std::io::stdout().lock();
         out.write_all(&packed.bytes)?;
         out.flush()?;
-        report_progress(st, packed.entries.len());
+        report_progress(st, packed.entries.len(), packed.deltas);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -529,11 +555,26 @@ fn execute(st: &State) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `--compression=<n>` as a zlib level. Out-of-range values never reach here
-/// (`preflight` rejects them), and `-1` is zlib's "use the default".
-fn compression(st: &State) -> gix::zlib::Compression {
-    match st.compression {
-        Some(level) if level >= 0 => {
+/// The zlib level pack entries are deflated at.
+///
+/// `--compression=<n>` wins, then `pack.compression`, then `core.compression`,
+/// then zlib's own default — git's `git_default_config()` order. Out-of-range
+/// command-line values never reach here (`preflight` rejects them), and `-1` is
+/// zlib's "use the default"; an out-of-range *config* value is ignored the same
+/// way, since git's own reader clamps rather than dies for these two keys.
+fn compression(repo: &gix::Repository, st: &State) -> gix::zlib::Compression {
+    let configured = || {
+        let snapshot = repo.config_snapshot();
+        snapshot
+            .integer("pack.compression")
+            .or_else(|| snapshot.integer("core.compression"))
+    };
+    let level = match st.compression {
+        Some(level) => Some(level),
+        None => configured(),
+    };
+    match level {
+        Some(level) if (0..=9).contains(&level) => {
             gix::zlib::Compression::new(level as i32).unwrap_or(gix::zlib::Compression::DEFAULT)
         }
         _ => gix::zlib::Compression::DEFAULT,
@@ -544,44 +585,93 @@ fn compression(st: &State) -> gix::zlib::Compression {
 /// and `-q` (or the absence of both, stderr not being a terminal here)
 /// suppresses.
 ///
-/// The delta counts are always zero, which is the truth about the pack written
-/// here rather than a stand-in for git's numbers; see the module docs.
-fn report_progress(st: &State, total: usize) {
+/// The reuse counts are always zero, which is the truth about the pack written
+/// here — nothing is ever copied out of an existing pack — rather than a
+/// stand-in for git's numbers; see the module docs.
+fn report_progress(st: &State, total: usize, deltas: usize) {
     if st.progress {
-        eprintln!("Total {total} (delta 0), reused 0 (delta 0), pack-reused 0 (from 0)");
+        eprintln!("Total {total} (delta {deltas}), reused 0 (delta 0), pack-reused 0 (from 0)");
     }
 }
 
 /// One entry as it was written into the pack.
 #[derive(Clone)]
-struct PackedEntry {
-    id: ObjectId,
+pub(crate) struct PackedEntry {
+    pub(crate) id: ObjectId,
     /// Byte offset of the entry header within the pack.
-    offset: u64,
+    pub(crate) offset: u64,
     /// CRC-32 over the entry's bytes in the pack (header plus compressed data),
     /// which is what a v2 `.idx` stores.
-    crc32: u32,
+    pub(crate) crc32: u32,
 }
 
 /// A finished pack held in memory, alongside the per-entry data its `.idx`,
 /// `.rev` and `.mtimes` companions need.
-struct Packed {
-    bytes: Vec<u8>,
-    id: ObjectId,
-    entries: Vec<PackedEntry>,
+pub(crate) struct Packed {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) id: ObjectId,
+    pub(crate) entries: Vec<PackedEntry>,
+    /// How many entries were written as deltas, for the end-of-run summary.
+    deltas: usize,
 }
 
-/// Encode `counts` into a version-2 pack.
+/// Build a complete packfile from an explicit set of object ids and return its
+/// raw bytes (`PACK` header … trailing hash). Used by `send-pack` to produce the
+/// pack streamed to a remote's receive-pack. Objects that cannot be read are
+/// dropped, matching [`write_pack`]'s own tolerance.
 ///
-/// Every entry is written as a base object: there is no delta search here, for
-/// the reason the module docs give. That also makes the entry header trivial —
-/// `to_entry_header`'s base-distance callback exists only for `DeltaRef` and is
-/// therefore unreachable.
-/// Build a complete, undeltified packfile from an explicit set of object ids and
-/// return its raw bytes (`PACK` header … trailing hash). Used by `send-pack` to
-/// produce the pack streamed to a remote's receive-pack. Objects that cannot be
-/// read are dropped, matching [`write_pack`]'s own tolerance.
+/// The repository's `pack.*` delta settings apply, but `OBJ_REF_DELTA` is used
+/// rather than `OBJ_OFS_DELTA`, which is what `pack-objects` does when nothing
+/// passed `--delta-base-offset`. A receiver that predates offset deltas can
+/// still read the result.
 pub(crate) fn pack_bytes_for(repo: &gix::Repository, ids: &[ObjectId]) -> Result<Vec<u8>> {
+    pack_bytes_with(repo, ids, false)
+}
+
+/// [`pack_bytes_for`], with the caller choosing how deltas name their base.
+///
+/// `git repack` and `git gc` set `allow_ofs_delta` from
+/// `repack.useDeltaBaseOffset`, whose default is true; a pack written for a
+/// remote leaves it false, which is `pack-objects`' own default.
+pub(crate) fn pack_bytes_with(
+    repo: &gix::Repository,
+    ids: &[ObjectId],
+    allow_ofs_delta: bool,
+) -> Result<Vec<u8>> {
+    Ok(packed_for(
+        repo,
+        ids,
+        WriteOptions {
+            allow_ofs_delta,
+            ..WriteOptions::default()
+        },
+    )?
+    .bytes)
+}
+
+/// What a caller outside this module can steer the pack writer with. Everything
+/// left unset comes from the repository's `pack.*` config, as it does for
+/// `pack-objects` itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WriteOptions {
+    /// `repack.useDeltaBaseOffset`: emit `OBJ_OFS_DELTA` rather than
+    /// `OBJ_REF_DELTA`.
+    pub(crate) allow_ofs_delta: bool,
+    /// Shadows `pack.window`, as `gc --aggressive` does with
+    /// `--window=<gc.aggressiveWindow>`.
+    pub(crate) window: Option<usize>,
+    /// Shadows `pack.depth`, as `gc --aggressive` does with
+    /// `--depth=<gc.aggressiveDepth>`.
+    pub(crate) depth: Option<usize>,
+}
+
+/// Build the pack for `ids` and hand back its bytes together with the per-entry
+/// offsets and CRCs an `.idx`, `.rev` or `.mtimes` needs.
+pub(crate) fn packed_for(
+    repo: &gix::Repository,
+    ids: &[ObjectId],
+    options: WriteOptions,
+) -> Result<Packed> {
     let counts: Vec<pack::data::output::Count> = ids
         .iter()
         .map(|id| pack::data::output::Count {
@@ -589,37 +679,173 @@ pub(crate) fn pack_bytes_for(repo: &gix::Repository, ids: &[ObjectId]) -> Result
             entry_pack_location: pack::data::output::count::PackLocation::NotLookedUp,
         })
         .collect();
-    Ok(write_pack(repo, &counts, gix::zlib::Compression::default())?.bytes)
+    let mut delta = DeltaConfig::from_repo(repo).unwrap_or_default();
+    delta.allow_ofs_delta = options.allow_ofs_delta;
+    if let Some(window) = options.window {
+        delta.search.window = window;
+    }
+    if let Some(depth) = options.depth {
+        delta.search.depth = depth;
+    }
+    write_pack(repo, &counts, compression(repo, &State::default()), &delta)
 }
 
+/// git's delta-search knobs, resolved the way `cmd_pack_objects` resolves them:
+/// `git_pack_config()` first, then the command line, then the post-parse clamps.
+#[derive(Debug, Clone, Copy)]
+struct DeltaConfig {
+    search: pack::data::output::delta::Options,
+    /// `--delta-base-offset`: emit `OBJ_OFS_DELTA` instead of `OBJ_REF_DELTA`.
+    /// git's `allow_ofs_delta`, which defaults off — `git repack` is what turns
+    /// it on, from `repack.useDeltaBaseOffset`.
+    allow_ofs_delta: bool,
+}
+
+impl Default for DeltaConfig {
+    fn default() -> Self {
+        DeltaConfig {
+            search: pack::data::output::delta::Options::default(),
+            allow_ofs_delta: false,
+        }
+    }
+}
+
+impl DeltaConfig {
+    /// The `pack.*` half, as `git_pack_config()` reads it. `Err` carries the
+    /// `fatal:` line git dies with for a value it cannot read.
+    fn from_repo(repo: &gix::Repository) -> Result<Self, String> {
+        let mut cfg = DeltaConfig::default();
+        let search = &mut cfg.search;
+        if let Some(v) = crate::config::config_int(repo, "pack.window")? {
+            search.window = usize::try_from(v).unwrap_or(0);
+        }
+        if let Some(v) = crate::config::config_int(repo, "pack.depth")? {
+            search.depth = usize::try_from(v).unwrap_or(0);
+        }
+        if let Some(v) = crate::config::config_ulong(repo, "pack.windowMemory")? {
+            search.window_memory_limit = v;
+        }
+        if let Some(v) = crate::config::config_int(repo, "pack.deltaCacheSize")? {
+            search.max_delta_cache_size = u64::try_from(v).unwrap_or(0);
+        }
+        if let Some(v) = crate::config::config_int(repo, "pack.deltaCacheLimit")? {
+            search.cache_max_small_delta_size = u64::try_from(v).unwrap_or(0);
+        }
+        if let Some(v) = crate::config::config_int(repo, "pack.threads")? {
+            if v < 0 {
+                return Err(format!("invalid number of threads specified ({v})"));
+            }
+            search.threads = v as usize;
+        }
+        Ok(cfg)
+    }
+
+    /// Apply the command line over the config, then git's post-parse clamps from
+    /// `cmd_pack_objects`: a negative `--window`/`--depth` means "off", and a
+    /// depth or delta-cache limit beyond what git's bit-fields can hold is
+    /// lowered with a warning.
+    fn apply(mut self, st: &State) -> Self {
+        if let Some(v) = st.window {
+            self.search.window = usize::try_from(v).unwrap_or(0);
+        }
+        if let Some(v) = st.depth {
+            self.search.depth = usize::try_from(v).unwrap_or(0);
+        }
+        if let Some(v) = st.window_memory {
+            self.search.window_memory_limit = v;
+        }
+        if let Some(v) = st.threads {
+            self.search.threads = usize::try_from(v).unwrap_or(0);
+        }
+        if let Some(v) = st.delta_base_offset {
+            self.allow_ofs_delta = v;
+        }
+
+        // `depth >= 1 << OE_DEPTH_BITS` and `cache_max_small_delta_size >= 1 <<
+        // OE_Z_DELTA_BITS`, with git's own wording.
+        const MAX_DEPTH: usize = (1 << 12) - 1;
+        const MAX_CACHE_LIMIT: u64 = (1 << 20) - 1;
+        if self.search.depth > MAX_DEPTH {
+            eprintln!(
+                "warning: delta chain depth {} is too deep, forcing {MAX_DEPTH}",
+                self.search.depth
+            );
+            self.search.depth = MAX_DEPTH;
+        }
+        if self.search.cache_max_small_delta_size > MAX_CACHE_LIMIT {
+            eprintln!("warning: pack.deltaCacheLimit is too high, forcing {MAX_CACHE_LIMIT}");
+            self.search.cache_max_small_delta_size = MAX_CACHE_LIMIT;
+        }
+        self
+    }
+}
+
+/// Encode `counts` into a version-2 pack, delta-compressing it first.
+///
+/// Three phases, matching git's: resolve every object's type and size, run the
+/// sliding-window delta search over them, then serialise. The write order is the
+/// order `counts` arrives in, except that a delta's base is always emitted
+/// first — which is what makes an `OBJ_OFS_DELTA`'s backwards distance
+/// representable and what git's `write_one()` recursion guarantees too.
 fn write_pack(
     repo: &gix::Repository,
     counts: &[pack::data::output::Count],
     level: gix::zlib::Compression,
+    delta: &DeltaConfig,
 ) -> Result<Packed> {
+    use pack::data::output::delta;
+
     // Entries are encoded before the header is written, because the header
     // carries the entry *count* and an object that turns out to be unreadable
     // must not be counted. git likewise drops such an object and packs the rest.
     const HEADER_LEN: u64 = 12;
-    let mut body: Vec<u8> = Vec::new();
-    let mut entries: Vec<PackedEntry> = Vec::with_capacity(counts.len());
-    let mut buf = Vec::new();
+
+    // Phase 1: types and sizes, from the object headers alone. An object whose
+    // header cannot be read is dropped here and never reaches the pack.
+    let mut objects: Vec<delta::Object> = Vec::with_capacity(counts.len());
     for count in counts {
-        let Ok((data, _location)) = repo.objects.find(&count.id, &mut buf) else {
+        use gix::odb::HeaderExt;
+        let Ok(header) = repo.objects.header(count.id) else {
             continue;
         };
-        let entry = pack::data::output::Entry::from_data(count, &data, level)?;
-        let start = body.len();
-        let header = entry.to_entry_header(pack::data::Version::V2, |_| {
-            unreachable!("no delta is ever emitted, so no base distance is ever requested")
-        });
-        header.write_to(entry.decompressed_size as u64, &mut body)?;
-        body.extend_from_slice(&entry.compressed_data);
-        entries.push(PackedEntry {
+        objects.push(delta::Object {
             id: count.id,
-            offset: HEADER_LEN + start as u64,
-            crc32: gix::features::hash::crc32(&body[start..]),
+            kind: header.kind(),
+            size: header.size(),
+            name_hash: 0,
         });
+    }
+    assign_name_hashes(repo, &mut objects);
+
+    // Phase 2: the delta search.
+    let deltas = delta::find_deltas(
+        &objects,
+        &delta.search,
+        || repo.clone(),
+        |repo, id| {
+            let mut buf = Vec::new();
+            repo.objects.find(id, &mut buf).ok().map(|(object, _)| object.data.to_owned())
+        },
+    );
+
+    // Phase 3: serialise, base before delta.
+    let mut body: Vec<u8> = Vec::new();
+    let mut entries: Vec<PackedEntry> = Vec::with_capacity(objects.len());
+    let mut offsets: Vec<Option<u64>> = vec![None; objects.len()];
+    let mut written_deltas = 0usize;
+    for at in 0..objects.len() {
+        write_entry(
+            repo,
+            at,
+            &objects,
+            &deltas,
+            delta.allow_ofs_delta,
+            level,
+            &mut body,
+            &mut offsets,
+            &mut entries,
+            &mut written_deltas,
+        )?;
     }
 
     let kind = repo.object_hash();
@@ -633,7 +859,209 @@ fn write_pack(
     hasher.update(&bytes[..]);
     let id = hasher.try_finalize()?;
     bytes.extend_from_slice(id.as_slice());
-    Ok(Packed { bytes, id, entries })
+    Ok(Packed {
+        bytes,
+        id,
+        entries,
+        deltas: written_deltas,
+    })
+}
+
+/// The pack header is 12 bytes, so every entry offset is that much past its
+/// position in the body being assembled.
+const PACK_HEADER_LEN: u64 = 12;
+
+/// Append one object to `body`, first appending whatever it deltifies against.
+///
+/// git's `write_one()`: recursion over the delta chain is what guarantees a base
+/// precedes its deltas no matter which order the caller walks the objects in.
+/// The chain is at most `pack.depth` long, so the recursion is bounded by the
+/// same limit git bounds it by.
+#[expect(clippy::too_many_arguments)]
+fn write_entry(
+    repo: &gix::Repository,
+    at: usize,
+    objects: &[pack::data::output::delta::Object],
+    deltas: &[Option<pack::data::output::delta::Delta>],
+    allow_ofs_delta: bool,
+    level: gix::zlib::Compression,
+    body: &mut Vec<u8>,
+    offsets: &mut [Option<u64>],
+    entries: &mut Vec<PackedEntry>,
+    written_deltas: &mut usize,
+) -> Result<()> {
+    if offsets[at].is_some() {
+        return Ok(());
+    }
+    if let Some(delta) = &deltas[at] {
+        write_entry(
+            repo,
+            delta.base,
+            objects,
+            deltas,
+            allow_ofs_delta,
+            level,
+            body,
+            offsets,
+            entries,
+            written_deltas,
+        )?;
+    }
+
+    let mut buf = Vec::new();
+    let Ok((object, _location)) = repo.objects.find(&objects[at].id, &mut buf) else {
+        // Readable header, unreadable body: drop it, and with it any delta that
+        // named it as a base, which the `offsets` gap below takes care of.
+        return Ok(());
+    };
+
+    // A delta whose base was itself dropped cannot be written as a delta.
+    let base_offset = deltas[at].as_ref().and_then(|delta| offsets[delta.base]);
+    let payload = match (&deltas[at], base_offset) {
+        (Some(delta), Some(_)) => delta_bytes(repo, &objects[delta.base].id, delta, &object)?,
+        _ => None,
+    };
+
+    let start = body.len();
+    let offset = PACK_HEADER_LEN + start as u64;
+    let (header, decompressed_size, raw) = match (payload, base_offset) {
+        (Some(delta), Some(base_offset)) => {
+            let header = if allow_ofs_delta {
+                pack::data::entry::Header::OfsDelta {
+                    base_distance: offset - base_offset,
+                }
+            } else {
+                pack::data::entry::Header::RefDelta {
+                    base_id: objects[deltas[at].as_ref().expect("delta present").base].id,
+                }
+            };
+            let size = delta.len() as u64;
+            *written_deltas += 1;
+            (header, size, delta)
+        }
+        _ => {
+            let header = match object.kind {
+                gix::object::Kind::Tree => pack::data::entry::Header::Tree,
+                gix::object::Kind::Blob => pack::data::entry::Header::Blob,
+                gix::object::Kind::Commit => pack::data::entry::Header::Commit,
+                gix::object::Kind::Tag => pack::data::entry::Header::Tag,
+            };
+            (header, object.data.len() as u64, object.data.to_owned())
+        }
+    };
+
+    header.write_to(decompressed_size, body)?;
+    deflate_into(&raw, level, body)?;
+    offsets[at] = Some(offset);
+    entries.push(PackedEntry {
+        id: objects[at].id,
+        offset,
+        crc32: gix::features::hash::crc32(&body[start..]),
+    });
+    Ok(())
+}
+
+/// The delta bytes for `at`: the ones the search cached, or a fresh delta
+/// against the same base when the cache had no room for them. git does the same
+/// in `get_delta()`.
+///
+/// `None` means the base could not be re-read or could not be indexed, in which
+/// case the caller writes a base object instead — always valid, only larger.
+fn delta_bytes(
+    repo: &gix::Repository,
+    base_id: &ObjectId,
+    delta: &pack::data::output::delta::Delta,
+    target: &gix::objs::Data<'_>,
+) -> Result<Option<Vec<u8>>> {
+    use pack::data::output::delta::Index;
+    if let Some(data) = &delta.data {
+        return Ok(Some(data.clone()));
+    }
+    let mut buf = Vec::new();
+    let Ok((base, _location)) = repo.objects.find(base_id, &mut buf) else {
+        return Ok(None);
+    };
+    let Some(index) = Index::new(base.data) else {
+        return Ok(None);
+    };
+    Ok(index.create(target.data, 0))
+}
+
+/// Deflate `data` at `level` straight onto the end of `out`.
+fn deflate_into(data: &[u8], level: gix::zlib::Compression, out: &mut Vec<u8>) -> Result<()> {
+    let mut deflate = gix::zlib::stream::deflate::Write::new(std::mem::take(out), level);
+    std::io::copy(&mut &data[..], &mut deflate)?;
+    deflate.flush()?;
+    *out = deflate.into_inner();
+    Ok(())
+}
+
+/// Attach git's `pack_name_hash()` to every object that a tree in this set names.
+///
+/// The hash is what makes the delta search's sort put successive revisions of
+/// one file next to each other; without it the sort falls back to size alone and
+/// the window rarely holds two related objects at once. git computes it during
+/// its object walk, where the path is already in hand; the walk that produced
+/// `objects` here keeps no paths, so this recovers them by descending the trees
+/// in the set once.
+///
+/// Objects no tree names — commits, tags, and root trees — keep a hash of zero,
+/// which is what git gives them too.
+fn assign_name_hashes(repo: &gix::Repository, objects: &mut [pack::data::output::delta::Object]) {
+    use pack::data::output::delta::name_hash;
+    use std::collections::VecDeque;
+
+    let mut position: std::collections::HashMap<ObjectId, usize> = std::collections::HashMap::new();
+    for (at, object) in objects.iter().enumerate() {
+        position.insert(object.id, at);
+    }
+
+    // Seed with the root tree of every commit in the set; those are the only
+    // trees whose path is known without a parent.
+    let mut queue: VecDeque<(ObjectId, Vec<u8>)> = VecDeque::new();
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    for object in objects.iter() {
+        if object.kind != gix::object::Kind::Commit {
+            continue;
+        }
+        let Ok(commit) = repo.find_commit(object.id) else {
+            continue;
+        };
+        if let Ok(tree) = commit.tree_id() {
+            if seen.insert(tree.detach()) {
+                queue.push_back((tree.detach(), Vec::new()));
+            }
+        }
+    }
+
+    let mut buf = Vec::new();
+    while let Some((id, prefix)) = queue.pop_front() {
+        let Ok((object, _location)) = repo.objects.find(&id, &mut buf) else {
+            continue;
+        };
+        if object.kind != gix::object::Kind::Tree {
+            continue;
+        }
+        let Ok(tree) = gix::objs::TreeRef::from_bytes(object.data, repo.object_hash()) else {
+            continue;
+        };
+        for entry in &tree.entries {
+            let mut path = prefix.clone();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(entry.filename);
+            let child = entry.oid.to_owned();
+            if let Some(&at) = position.get(&child) {
+                if objects[at].name_hash == 0 {
+                    objects[at].name_hash = name_hash(&path);
+                }
+            }
+            if entry.mode.is_tree() && seen.insert(child) {
+                queue.push_back((child, path));
+            }
+        }
+    }
 }
 
 /// The `.idx` for a pack, in version 1 or 2.
@@ -644,7 +1072,7 @@ fn write_pack(
 /// A v2 index cannot represent an offset of 2 GiB or more inline; git spills
 /// those into a 64-bit table flagged by the high bit. Packs written here are far
 /// below that, but the table is emitted correctly rather than assumed away.
-fn index_file(
+pub(super) fn index_file(
     kind: gix::hash::Kind,
     version: u64,
     pack_id: &ObjectId,
@@ -715,7 +1143,7 @@ fn index_file(
 /// indexed; this one exists because the entries here have not been written
 /// anywhere yet — and must not be, since the destination may be unwritable and
 /// the resulting diagnostic has to name the `.pack`, not a temporary.
-fn reverse_index_file(
+pub(super) fn reverse_index_file(
     kind: gix::hash::Kind,
     pack_id: &ObjectId,
     sorted: &[PackedEntry],
@@ -1711,6 +2139,18 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
             st.name_hash_version = on.then(|| to_number(value.unwrap_or("0"))).flatten();
         }
         "max-pack-size" => st.max_pack_size = on.then(|| to_number(value.unwrap_or("0"))).flatten(),
+        // `--no-window`/`--no-depth`/`--no-threads` are `OPT_INTEGER` negations,
+        // which parse-options resolves to zero rather than to "unset".
+        "window" => st.window = Some(if on { to_number(value.unwrap_or("0")).unwrap_or(0) } else { 0 }),
+        "depth" => st.depth = Some(if on { to_number(value.unwrap_or("0")).unwrap_or(0) } else { 0 }),
+        "window-memory" => {
+            st.window_memory = on
+                .then(|| to_number(value.unwrap_or("0")))
+                .flatten()
+                .and_then(|n| u64::try_from(n).ok());
+        }
+        "threads" => st.threads = Some(if on { to_number(value.unwrap_or("0")).unwrap_or(0) } else { 0 }),
+        "delta-base-offset" => st.delta_base_offset = Some(on),
         // Already validated by `check_index_version`, so the `strtoul` prefix is
         // the version and the rest is the `,<offset>` tail.
         "index-version" => st.index_version = value.map(|v| strtoul(v).0),

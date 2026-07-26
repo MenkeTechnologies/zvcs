@@ -128,11 +128,14 @@ pub(crate) mod hero {
 
         impl Handshake {
             /// Prepare fetching a [refmap](RefMap) if not present in the handshake.
+            ///
+            /// `server_options` are sent along with the `ls-refs` command if the server supports them.
             pub fn prepare_lsrefs_or_extract_refmap(
                 &mut self,
                 user_agent: Feature,
                 prefix_from_spec_as_filter_on_remote: bool,
                 refmap_context: crate::fetch::refmap::init::Context,
+                server_options: &[bstr::BString],
             ) -> Result<ObtainRefMap<'_>, crate::fetch::refmap::init::Error> {
                 if let Some(refs) = self.refs.take() {
                     return Ok(ObtainRefMap::Existing(RefMap::from_refs(
@@ -147,7 +150,7 @@ pub(crate) mod hero {
                     RefPrefixes::from_refspecs(&all_refspecs)
                 });
                 Ok(ObtainRefMap::LsRefsCommand(
-                    crate::LsRefsCommand::new(prefix_refs, &self.capabilities, user_agent),
+                    crate::LsRefsCommand::new(prefix_refs, &self.capabilities, user_agent, server_options),
                     refmap_context,
                 ))
             }

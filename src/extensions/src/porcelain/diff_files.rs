@@ -68,6 +68,9 @@
 //!     (or `diff --combined` under a bare `-c`) and, when a raw/name format is also
 //!     on, the record is the `::`-prefixed combined form.
 //!   * `-0`/`-1`/`-2`/`-3`, `--base`/`--ours`/`--theirs` (unmerged stage selection).
+//!   * `--color[=always|auto|never]`/`--no-color` and `--ws-error-highlight=<kind>`:
+//!     the patch and the stat graph are painted from the `color.diff.*` slots, with
+//!     git's `ws.c` whitespace-error markup driven by `core.whitespace`.
 //!   * `--exit-code`, `--quiet`, `-s`/`--no-patch`.
 //!   * `--line-prefix=<s>`, `--rotate-to=<p>`, `--skip-to=<p>`, `--relative[=<p>]`/`--no-relative`.
 //!   * `--ignore-submodules[=all|dirty|untracked|none]`.
@@ -89,6 +92,9 @@
 //!     `--dirstat=lines`): imara-diff has no patience variant, so rather than silently
 //!     substituting Myers this bails. `--patience` with a raw/name/summary listing is a
 //!     no-op, since those never diff line content.
+//!   * `--color-moved[=<mode>]` for any mode other than `no`: moved-block detection is
+//!     not ported, so the flag is refused rather than accepted and ignored — with color
+//!     now really on, ignoring it would print lines in the wrong slot.
 //!   * `-M`/`--find-renames` rename *pairing* (an intent-to-add worktree file matched
 //!     to a staged deletion): accepted as a no-op, so such a pair is still reported as
 //!     a separate `D`+`A` rather than a single `R`.
@@ -109,6 +115,8 @@ use gix::hash::ObjectId;
 use gix::objs::tree::EntryKind;
 use gix::prelude::ObjectIdExt;
 use regex::bytes::Regex;
+
+use super::diff_color;
 
 // ---------------------------------------------------------------------------
 // output formats — mirrors DIFF_FORMAT_* in diff.h
@@ -320,9 +328,14 @@ struct Opts {
     ignore_lines: Vec<Needle>,
     /// The spelling of the first `-I`, for the bail when a patch is also asked for.
     ignore_flag: Option<String>,
-    /// A flag that rewrites content output (forced color, word diff). Harmless
-    /// for raw listings, so it only bails once a content format is requested.
+    /// A flag that rewrites content output (word diff). Harmless for raw
+    /// listings, so it only bails once a content format is requested.
     content_altering: Option<String>,
+    /// `--color[=<when>]` / `--no-color`; `None` defers to `color.diff` /
+    /// `diff.color` / `color.ui` and the terminal test.
+    color_when: Option<diff_color::ColorWhen>,
+    /// `--ws-error-highlight=<kind>`, seeded from `diff.wsErrorHighlight`.
+    ws_error_highlight: u32,
     /// `--src-prefix=`/`--dst-prefix=`/`--no-prefix`; `-R` swaps the two.
     src_prefix: String,
     dst_prefix: String,
@@ -686,6 +699,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         ignore_lines: Vec::new(),
         ignore_flag: None,
         content_altering: None,
+        color_when: None,
+        // `diff.wsErrorHighlight`, or git's `WSEH_NEW` default.
+        ws_error_highlight: diff_color::ws_error_highlight_default(repo)
+            .unwrap_or(diff_color::WSEH_NEW),
         src_prefix: "a/".to_owned(),
         dst_prefix: "b/".to_owned(),
         ind_new: b'+',
@@ -720,9 +737,21 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
     // `setup_revisions()` records the first pathspec; from then on any dashed
     // option is rejected before it is even classified.
     let mut seen_non_option = false;
+    // `--ws-error-highlight <kind>` also spells its value as the next argument,
+    // which parse-options consumes before anything else — `--` included.
+    let mut wseh_pending = false;
 
     for a in args {
         let s = a.as_str();
+        if wseh_pending {
+            wseh_pending = false;
+            opts.ws_error_highlight = parse_ws_error_highlight_opt(s)?;
+            continue;
+        }
+        if s == "--ws-error-highlight" {
+            wseh_pending = true;
+            continue;
+        }
         if after_dashdash {
             if s.is_empty() {
                 return Err(Fatal::EmptyPathspec);
@@ -906,13 +935,10 @@ const ACCEPTED_NOOP: &[&str] = &[
     "--indent-heuristic",
     "--no-indent-heuristic",
     "--submodule",
-    "--no-color",
-    // Colored *moves* need color to be on, and it never is here: NO_COLOR is
-    // honored and stdout is not a terminal.
-    "--color-moved",
+    // Colored *moves* are not detected by this port; the flag is left in the
+    // unsupported list below rather than silently accepted.
     "--no-color-moved",
     "--no-color-moved-ws",
-    "--ws-error-highlight",
     "--text",
     "-a",
     "--function-context",
@@ -948,9 +974,7 @@ const ACCEPTED_NOOP_VALUED: &[&str] = &[
     // both only matter for files big enough to produce adjacent hunks.
     "--inter-hunk-context=",
     "--submodule=",
-    "--color-moved=",
     "--color-moved-ws=",
-    "--ws-error-highlight=",
     "--diff-merges=",
     "-l",
     "--break-rewrites=",
@@ -1016,7 +1040,10 @@ fn classify(s: &str, opts: &mut Opts, quiet: &mut bool) -> Result<Flag, Fatal> {
             opts.src_prefix = "a/".to_owned();
             opts.dst_prefix = "b/".to_owned();
         }
-        "--color" | "--word-diff" | "--color-words" => {
+        // `--color[=<when>]` / `--no-color` (`OPT_COLOR_FLAG`).
+        "--color" => opts.color_when = Some(diff_color::ColorWhen::Always),
+        "--no-color" => opts.color_when = Some(diff_color::ColorWhen::Never),
+        "--word-diff" | "--color-words" => {
             if opts.content_altering.is_none() {
                 opts.content_altering = Some(s.to_owned());
             }
@@ -1143,19 +1170,12 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
         }
     }
     // parse-options `OPT_COLOR_FLAG` accepts only a case-insensitive `always`,
-    // `auto` or `never`; any other value (including empty) is a usage error with
-    // git's own message and exit 129. `--color=never|auto` is what this always
-    // produces anyway — NO_COLOR is honored and stdout is a pipe — so only an
-    // explicit `always` alters content.
+    // `auto`, `never` and the boolean spellings `true`/`false`; any other value
+    // (including empty) is a usage error with git's own message and exit 129.
     if let Some(v) = s.strip_prefix("--color=") {
-        match v.to_ascii_lowercase().as_str() {
-            "always" => {
-                if opts.content_altering.is_none() {
-                    opts.content_altering = Some(s.to_owned());
-                }
-            }
-            "auto" | "never" => {}
-            _ => return Err(Fatal::ColorValue),
+        match diff_color::parse_color_when(v) {
+            Some(w) => opts.color_when = Some(w),
+            None => return Err(Fatal::ColorValue),
         }
         return Ok(Flag::Handled);
     }
@@ -1310,20 +1330,27 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
         return Ok(Flag::Handled);
     }
     // `--ws-error-highlight=<kinds>`: a comma list drawn from old/new/context/all/
-    // default/none. Highlighting needs color, which is never on here, so the value
-    // is a no-op — but a bad token is git's own 129 usage error.
+    // default/none, deciding which sides get whitespace-error markup.
     if let Some(v) = s.strip_prefix("--ws-error-highlight=") {
-        validate_ws_error_highlight(v)?;
+        opts.ws_error_highlight = parse_ws_error_highlight_opt(v)?;
         return Ok(Flag::Handled);
     }
-    // `--color-moved=<mode>`: colored moves need color (never on here), so this is a
-    // no-op, but an unknown mode is git's 129 error.
+    // `--color-moved[=<mode>]`: moved-block detection is not ported, so any mode
+    // that would actually recolor lines is refused rather than ignored. `no`
+    // (and its `false` spelling) asks for exactly the behavior this port has.
+    // An unknown mode is still git's own 129 error, checked first.
     if let Some(v) = s.strip_prefix("--color-moved=") {
-        const MODES: &[&str] = &["no", "default", "plain", "blocks", "zebra", "dimmed-zebra", "dimmed_zebra"];
-        if v.is_empty() || MODES.contains(&v) {
+        const MODES: &[&str] = &["no", "default", "plain", "blocks", "zebra", "dimmed-zebra", "dimmed_zebra", "false"];
+        if !v.is_empty() && !MODES.contains(&v) {
+            return Err(Fatal::ColorMoved(v.to_owned()));
+        }
+        if matches!(v, "no" | "false") {
             return Ok(Flag::Handled);
         }
-        return Err(Fatal::ColorMoved(v.to_owned()));
+        return Ok(Flag::Unsupported);
+    }
+    if s == "--color-moved" {
+        return Ok(Flag::Unsupported);
     }
     if ACCEPTED_NOOP.contains(&s) || ACCEPTED_NOOP_VALUED.iter().any(|p| s.starts_with(p)) {
         return Ok(Flag::Handled);
@@ -1464,38 +1491,12 @@ fn validate_magnitude(v: &str, opt: &'static str) -> Result<(), Fatal> {
     Ok(())
 }
 
-/// `parse_ws_error_highlight()`: walk the comma list left to right, matching each
-/// token exactly against the recognized kinds. On the first token that does not
-/// match, git reports the accepted prefix consumed so far (a trailing comma is fine
-/// because the walk simply ends). An empty value is accepted.
-fn validate_ws_error_highlight(v: &str) -> Result<(), Fatal> {
-    const KINDS: &[&str] = &["old", "new", "context", "all", "default", "none"];
-    let b = v.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        let mut matched: Option<usize> = None;
-        for k in KINDS {
-            let kb = k.as_bytes();
-            if b[i..].starts_with(kb) {
-                let after = i + kb.len();
-                if after == b.len() || b[after] == b',' {
-                    matched = Some(kb.len());
-                    break;
-                }
-            }
-        }
-        match matched {
-            Some(len) => {
-                i += len;
-                if i < b.len() {
-                    // skip the separating comma
-                    i += 1;
-                }
-            }
-            None => return Err(Fatal::WsErrorHighlight(v[..i].to_owned())),
-        }
-    }
-    Ok(())
+/// `diff_opt_ws_error_highlight()`: parse the comma list, turning git's negative
+/// return — the length of the value it had already accepted — into the message
+/// tail it prints.
+fn parse_ws_error_highlight_opt(v: &str) -> Result<u32, Fatal> {
+    diff_color::parse_ws_error_highlight(v)
+        .map_err(|accepted| Fatal::WsErrorHighlight(v[..accepted].to_owned()))
 }
 
 /// git's `looks_like_pathspec()`: long-form magic, or an unescaped glob character.
@@ -1537,6 +1538,11 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
         .ok_or_else(|| anyhow::anyhow!("this operation must be run in a work tree"))?
         .to_owned();
     let hash_kind = repo.object_hash();
+    // `--color[=<when>]` / `--no-color`, falling back to `color.diff` /
+    // `diff.color` / `color.ui` and the terminal test.
+    let colors =
+        diff_color::DiffColors::resolve(repo, diff_color::resolve_color(repo, opts.color_when));
+    let ws_rule = diff_color::whitespace_rule_cfg(repo);
     let (mut deltas, mut combined) = collect(repo, paths, &opts)?;
 
     // git emits index order, which for these records is a byte-wise path sort
@@ -1704,7 +1710,7 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
                 render_numstat(&mut rest, &stats, &opts);
             }
             if opts.fmt & F_DIFFSTAT != 0 {
-                render_stat(&mut rest, &stats, &opts);
+                render_stat(&mut rest, &stats, &opts, &colors);
             }
             if opts.fmt & F_SHORTSTAT != 0 {
                 render_shortstat(&mut rest, &stats);
@@ -1739,9 +1745,39 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
         if separator {
             rest.push(b'\n');
         }
-        rest.extend_from_slice(&combined_patch);
+        // The patch is assembled uncolored first, then re-emitted through git's
+        // `fn_out_consume()` chain with each file pair's whitespace state. The
+        // combined (`--cc`) sections carry no per-pair pre/post images, so they go
+        // through the default state, exactly as `check_blank_at_eof()` leaves it
+        // when the two sides were never compared.
+        let paint_opts = diff_color::PaintOptions {
+            ws_error_highlight: opts.ws_error_highlight,
+            indicators: (opts.ind_new, opts.ind_old, opts.ind_ctx),
+            // `diff.suppressBlankEmpty` is not read by this module, so the sign of
+            // an empty context line is always kept, as git's default does.
+            suppress_blank_empty: false,
+        };
+        rest.extend_from_slice(&diff_color::colorize_patch(
+            &combined_patch,
+            &colors,
+            &paint_opts,
+            &[],
+            diff_color::FilePaint::new(ws_rule),
+        ));
         for (d, an) in deltas.iter().zip(&analyses) {
-            render_patch(&mut rest, d, an, &opts);
+            let mut section: Vec<u8> = Vec::new();
+            render_patch(&mut section, d, an, &opts);
+            let file = diff_color::FilePaint {
+                ws_rule,
+                blank_at_eof: diff_color::check_blank_at_eof(&an.old_data, &an.new_data),
+            };
+            rest.extend_from_slice(&diff_color::colorize_patch(
+                &section,
+                &colors,
+                &paint_opts,
+                &[file],
+                file,
+            ));
         }
     }
 
@@ -2811,7 +2847,12 @@ fn scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
 
 /// `show_stats()`. `stat_width == -1` means "terminal width", which is 80 for a
 /// non-tty just like git's `term_columns()` fallback.
-fn render_stat(out: &mut Vec<u8>, files: &[StatFile], opts: &Opts) {
+fn render_stat(
+    out: &mut Vec<u8>,
+    files: &[StatFile],
+    opts: &Opts,
+    colors: &diff_color::DiffColors,
+) {
     if files.is_empty() {
         return;
     }
@@ -2927,7 +2968,12 @@ fn render_stat(out: &mut Vec<u8>, files: &[StatFile], opts: &Opts) {
                 out.push(b'\n');
                 continue;
             }
-            out.extend_from_slice(format!(" {deleted} -> {added} bytes\n").as_bytes());
+            // `show_stats()` paints the two byte counts with the old/new colors.
+            out.push(b' ');
+            diff_color::paint(out, colors, diff_color::DiffSlot::Old, deleted.to_string().as_bytes());
+            out.extend_from_slice(b" -> ");
+            diff_color::paint(out, colors, diff_color::DiffSlot::New, added.to_string().as_bytes());
+            out.extend_from_slice(b" bytes\n");
             continue;
         }
         if f.is_unmerged {
@@ -2963,8 +3009,14 @@ fn render_stat(out: &mut Vec<u8>, files: &[StatFile], opts: &Opts) {
         if added + deleted != 0 {
             out.push(b' ');
         }
-        out.extend_from_slice(&b"+".repeat(add.max(0) as usize));
-        out.extend_from_slice(&b"-".repeat(del.max(0) as usize));
+        // `show_graph()`: each run carries its own color and emits nothing at all
+        // when it is empty.
+        if add > 0 {
+            diff_color::paint(out, colors, diff_color::DiffSlot::New, &b"+".repeat(add as usize));
+        }
+        if del > 0 {
+            diff_color::paint(out, colors, diff_color::DiffSlot::Old, &b"-".repeat(del as usize));
+        }
         out.push(b'\n');
     }
 

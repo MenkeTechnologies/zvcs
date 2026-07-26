@@ -443,7 +443,25 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // `-h`/`--help` never writes the index, so a contended repo must not turn a
     // help request into a queued job with empty output.
     let is_help = args.iter().any(|a| a == "-h" || a == "--help");
-    let is_lock_verb = LOCK_VERBS.contains(&sub) && !is_help;
+    // Interactive hunk selection (`add -p`, `reset -p`, `checkout -p`,
+    // `restore -p`, `commit -p`/`-i`) writes nothing itself: it renders hunks,
+    // waits on the user, and hands each accepted selection to a `git apply`
+    // CHILD, which takes the lane for the microseconds it needs. Holding the
+    // lane in the parent would (a) block every other zvcs writer for as long as
+    // the user reads, and (b) deadlock the child, which would find the lane busy
+    // and queue itself as a job instead of applying. Same reasoning as `-h`: the
+    // verb is in `LOCK_VERBS` for its non-interactive form only.
+    let is_interactive_patch = matches!(
+        sub,
+        "add" | "stage" | "reset" | "checkout" | "restore" | "commit" | "stash"
+    ) && args.iter().any(|a| {
+        a == "-p"
+            || a == "--patch"
+            // `-i`/`--interactive` only reaches the hunk selector from `add`
+            // (`git commit -i` is `--include`, `git am -i` is unrelated).
+            || (matches!(sub, "add" | "stage") && (a == "-i" || a == "--interactive"))
+    });
+    let is_lock_verb = LOCK_VERBS.contains(&sub) && !is_help && !is_interactive_patch;
     let queued_rerun = std::env::var_os("ZVCS_QUEUED").is_some();
     let _queue_guard = if is_lock_verb && !queued_rerun {
         match gix::discover(".") {

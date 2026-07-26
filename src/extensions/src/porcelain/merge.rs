@@ -85,12 +85,15 @@
 //! * `--into-name <name>`: a port of git's `into_name` — override the merge
 //!   message's destination (the ` into <name>` title and the
 //!   `merge.suppressDest` test), rather than the real current branch.
-//! * The default-matching negations `--no-rerere-autoupdate`,
-//!   `--no-verify-signatures`, `--no-strategy` (git's `option_parse_strategy`
-//!   no-ops on `unset`), and `--overwrite-ignore`, accepted as no-ops: each
-//!   names behaviour this build already performs (no rerere, no signature
-//!   verification, ignored files overwritten), so passing them reproduces stock
-//!   git rather than erroring.
+//! * The default-matching negations `--no-rerere-autoupdate`, `--no-strategy`
+//!   (git's `option_parse_strategy` no-ops on `unset`), and
+//!   `--overwrite-ignore`, accepted as no-ops: each names behaviour this build
+//!   already performs (no rerere, ignored files overwritten), so passing them
+//!   reproduces stock git rather than erroring.
+//! * `--[no-]verify-signatures` and `merge.verifySignatures`: a port of
+//!   `verify_merge_signature()`, run over the heads left after the
+//!   already-reachable ones are dropped, with `gpg.minTrustLevel` deciding
+//!   whether git applies its own `TRUST_MARGINAL` floor on top.
 //!
 //! What is refused or deferred rather than faked:
 //!
@@ -105,12 +108,6 @@
 //! * `--rerere-autoupdate`: rerere's *recording* half is not ported (see
 //!   `rerere.rs`, whose record/forget paths `bail!` rather than guess a conflict
 //!   id without `ll_merge()`), so there is nothing to auto-stage.
-//! * `--verify-signatures`: `gitsig::verify` reports the signing *key id*, while
-//!   git's diagnostics (`Commit %s has a good GPG signature by %s`, `… has an
-//!   untrusted GPG signature, allegedly by %s`) quote gpg's `GOODSIG` user name.
-//!   Reproducing them needs that name plumbed out of `gitsig`, which lives
-//!   outside this module; duplicating the gpg invocation here instead would fork
-//!   the verification path, so the flag stays rejected.
 //! * `--no-overwrite-ignore`: needs gitignore-aware checkout.
 //!
 //! Known fidelity gaps, stated rather than hidden: the diffstat is computed
@@ -221,6 +218,9 @@ struct Opts {
     /// `--commit` was given explicitly (for the `--squash` incompatibility check).
     commit_given: bool,
     signoff: bool,
+    /// `--verify-signatures` / `--no-verify-signatures`; `None` defers to
+    /// `merge.verifySignatures`.
+    verify_signatures: Option<bool>,
     allow_unrelated: bool,
     no_verify: bool,
     quiet: bool,
@@ -260,6 +260,7 @@ impl Default for Opts {
             commit: None,
             commit_given: false,
             signoff: false,
+            verify_signatures: None,
             allow_unrelated: false,
             no_verify: false,
             quiet: false,
@@ -417,15 +418,16 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             // Flags whose git behaviour is already this build's default, accepted
             // as no-ops so they match stock git rather than erroring:
             //  * `--no-rerere-autoupdate`: no rerere machinery runs here anyway.
-            //  * `--no-verify-signatures`: signatures are never verified.
             //  * `--overwrite-ignore`: ignored files are overwritten (git's default).
             //  * `--no-strategy`: git's `option_parse_strategy` returns early on
             //    `unset` without clearing the strategy list, so it is a no-op that
             //    leaves any earlier `-s` in force (default `ort` when none given).
-            "--no-rerere-autoupdate"
-            | "--no-verify-signatures"
-            | "--overwrite-ignore"
-            | "--no-strategy" => {}
+            "--no-rerere-autoupdate" | "--overwrite-ignore" | "--no-strategy" => {}
+            // `--[no-]verify-signatures` / `merge.verifySignatures`: check every
+            // head's signature before merging it. `None` leaves the config to
+            // decide.
+            "--verify-signatures" => opts.verify_signatures = Some(true),
+            "--no-verify-signatures" => opts.verify_signatures = Some(false),
             // Verbosity: git keeps a signed level; only quiet has an observable
             // effect on stdout (it silences the summary/diffstat). `--verbose`'s
             // extra diagnostics go to stderr and are not reproduced.
@@ -648,6 +650,123 @@ fn abort() -> Result<ExitCode> {
 // merge
 // ---------------------------------------------------------------------------
 
+/// Port of `verify_merge_signature()` (commit.c). Returns `Some(exit)` for each
+/// `die()` — a bad signature, a good-but-untrusted one, or no signature at all —
+/// and prints the `has a good GPG signature by` line on the accepting path
+/// unless `-q` lowered the verbosity below zero.
+///
+/// git quotes gpg's *signer name* (`sigc->signer`, the text after the key id on
+/// the `GOODSIG`/`BADSIG` status line), not the key id, hence
+/// [`crate::gitsig::evaluate_full`].
+fn verify_merge_signature(
+    repo: &gix::Repository,
+    id: ObjectId,
+    quiet: bool,
+    check_trust: bool,
+) -> Result<Option<ExitCode>> {
+    use crate::gitsig::{GStatus, Trust};
+
+    let hex = id.attach(repo).shorten_or_id().to_string();
+    let raw = repo.find_object(id)?.data.clone();
+    let sig = crate::gitsig::evaluate_full(&raw);
+
+    // The C switches on `sigc->result`, and every case but 'G' and 'B' — including
+    // the untrusted/expired/revoked codes — falls into the same `default: /* 'N' */`
+    // arm, so an unverifiable signature reports as an absent one.
+    match sig.status {
+        GStatus::Good | GStatus::GoodUnknown => {
+            if check_trust && sig.trust < Trust::Marginal {
+                eprintln!(
+                    "fatal: Commit {hex} has an untrusted GPG signature, allegedly by {}.",
+                    sig.signer
+                );
+                return Ok(Some(ExitCode::from(128)));
+            }
+        }
+        GStatus::Bad => {
+            eprintln!(
+                "fatal: Commit {hex} has a bad GPG signature allegedly by {}.",
+                sig.signer
+            );
+            return Ok(Some(ExitCode::from(128)));
+        }
+        _ => {
+            eprintln!("fatal: Commit {hex} does not have a GPG signature.");
+            return Ok(Some(ExitCode::from(128)));
+        }
+    }
+    if !quiet {
+        println!("Commit {hex} has a good GPG signature by {}", sig.signer);
+    }
+    Ok(None)
+}
+
+/// `merge_options.verbosity`, as `init_merge_options()` resolves it: the
+/// built-in default of 2, overridden by `merge.verbosity`, then by the
+/// `GIT_MERGE_VERBOSITY` environment variable (`strtol`, so trailing garbage is
+/// ignored and an unparsable value reads as 0). `merge-ort-wrappers.c` turns it
+/// into `show_msgs = !!verbosity`, which is the only part of the scale this
+/// build's output surface can express: levels 1–5 all print the same
+/// `Auto-merging` / `CONFLICT (…)` block, level 0 prints none of it.
+fn merge_verbosity(repo: &gix::Repository) -> i64 {
+    if let Ok(env) = std::env::var("GIT_MERGE_VERBOSITY") {
+        let digits = env.trim_start();
+        let end = digits
+            .char_indices()
+            .position(|(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
+            .unwrap_or(digits.len());
+        return digits[..end].parse().unwrap_or(0);
+    }
+    repo.config_snapshot().integer("merge.verbosity").unwrap_or(2)
+}
+
+/// Port of `setup_with_upstream()`: with no commit on the command line and
+/// `merge.defaultToUpstream` on, `git merge` merges the current branch's
+/// configured upstream — `branch.<name>.merge` mapped through
+/// `remote.<remote>.fetch` to its remote-tracking ref. `Err` carries git's
+/// `die()` text (without the `fatal: ` prefix) for each way that can fail.
+fn setup_with_upstream(repo: &gix::Repository) -> std::result::Result<Vec<String>, String> {
+    use gix::bstr::ByteSlice;
+
+    let head = repo.head_ref().ok().flatten();
+    let full = head
+        .as_ref()
+        .map(|r| r.name().to_owned())
+        .ok_or_else(|| "No current branch.".to_string())?;
+    let name = full.shorten().to_owned();
+
+    let snap = repo.config_snapshot();
+    if snap.string(format!("branch.{name}.remote").as_str()).is_none() {
+        return Err("No remote for the current branch.".into());
+    }
+    // `branch->merge_nr`: the `branch.<name>.merge` entries, in config order.
+    let sources: Vec<gix::bstr::BString> = snap
+        .plumbing()
+        .values::<gix::bstr::BString>(format!("branch.{name}.merge").as_str())
+        .unwrap_or_default();
+    if sources.is_empty() {
+        return Err("No default upstream defined for the current branch.".into());
+    }
+
+    // `branch->merge[i]->dst`, i.e. the remote-tracking ref the refspec maps the
+    // source to. gix resolves the whole `branch.<name>.{remote,merge}` pair at
+    // once, so a single source (git's overwhelmingly common case) is looked up
+    // directly; git reports the unmapped ones by name.
+    match repo.branch_remote_tracking_ref_name(full.as_ref(), gix::remote::Direction::Fetch) {
+        Some(Ok(dst)) if sources.len() == 1 => Ok(vec![dst.as_bstr().to_string()]),
+        _ => {
+            let remote = snap
+                .string(format!("branch.{name}.remote").as_str())
+                .map(|v| v.to_str_lossy().into_owned())
+                .unwrap_or_default();
+            Err(format!(
+                "No remote-tracking branch for {} from {remote}",
+                sources[0]
+            ))
+        }
+    }
+}
+
 fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     let repo = gix::discover(".")?;
 
@@ -657,11 +776,28 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    if refs.is_empty() {
-        // git dies here rather than defaulting to anything.
-        eprintln!("fatal: No remote for the current branch.");
-        return Ok(ExitCode::from(128));
-    }
+    // `if (!argc) { if (default_to_upstream) argc = setup_with_upstream(&argv);
+    // else die(...); }` — the sole reader of `merge.defaultToUpstream`, which
+    // git defaults to true.
+    let upstream_refs;
+    let refs: &[String] = if refs.is_empty() {
+        if repo.config_snapshot().boolean("merge.defaultToUpstream") == Some(false) {
+            eprintln!("fatal: No commit specified and merge.defaultToUpstream not set.");
+            return Ok(ExitCode::from(128));
+        }
+        match setup_with_upstream(&repo) {
+            Ok(v) => {
+                upstream_refs = v;
+                &upstream_refs
+            }
+            Err(msg) => {
+                eprintln!("fatal: {msg}");
+                return Ok(ExitCode::from(128));
+            }
+        }
+    } else {
+        refs
+    };
 
     // Current HEAD state. An unborn branch has no commit to fast-forward from;
     // a real merge into it would be a checkout, which is out of scope.
@@ -689,6 +825,30 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     for spec in refs {
         let id = repo.rev_parse_single(spec.as_str())?.object()?.peel_to_commit()?.id;
         targets.push(id);
+    }
+
+    // `--verify-signatures` / `merge.verifySignatures`. git runs this over the
+    // heads `collect_parents()` kept, and that function has already dropped every
+    // head reachable from HEAD — which is why `Already up to date.` preempts the
+    // check while a fast-forward does not.
+    if opts.verify_signatures.unwrap_or_else(|| {
+        repo.config_snapshot().boolean("merge.verifySignatures") == Some(true)
+    }) {
+        // `gpg.minTrustLevel` moves the floor into `check_signature()` itself, so
+        // git clears its own `TRUST_MARGINAL` test when the key is configured.
+        let check_trust = repo.config_snapshot().string("gpg.minTrustLevel").is_none();
+        for id in &targets {
+            let reachable = repo
+                .merge_bases_many(local_id, &[*id])?
+                .iter()
+                .any(|b| b.detach() == *id);
+            if reachable {
+                continue;
+            }
+            if let Some(code) = verify_merge_signature(&repo, *id, opts.quiet, check_trust)? {
+                return Ok(code);
+            }
+        }
     }
 
     // `-s ours`: every head becomes a parent while our tree is kept verbatim.
@@ -766,7 +926,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             current: Some(BStr::new(b"HEAD")),
             other: Some(BStr::new(spec.as_bytes())),
         };
-        let applied = crate::merge_apply::three_way_merge(
+        let applied = crate::merge_apply::three_way_merge_verbose(
             &repo,
             base_tree,
             head_tree,
@@ -774,6 +934,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             &old_index,
             labels,
             &should_interrupt,
+            merge_verbosity(&repo) != 0,
         )?;
         let mut index = applied.index;
         index.write(Default::default())?;
@@ -1151,7 +1312,7 @@ fn do_octopus(
             current: Some(BStr::new(b"HEAD")),
             other: Some(BStr::new(spec.as_bytes())),
         };
-        let applied = crate::merge_apply::three_way_merge(
+        let applied = crate::merge_apply::three_way_merge_verbose(
             repo,
             base_tree,
             mrt,
@@ -1159,6 +1320,7 @@ fn do_octopus(
             &cur_index,
             labels,
             &should_interrupt,
+            merge_verbosity(repo) != 0,
         )?;
         cur_index = applied.index;
         cur_index.write(Default::default())?;

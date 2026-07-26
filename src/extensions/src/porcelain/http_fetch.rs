@@ -309,12 +309,19 @@ struct RemotePack {
 
 impl Walker {
     fn new(repo: gix::Repository, base: String, url_slash: String, verbose: bool) -> Self {
+        // Stock `http-fetch` runs through `http.c`, so the whole `http.*` family applies to the dumb
+        // protocol too. Feed the repository's HTTP options into the client the same way the smart
+        // transport does; a URL that cannot be parsed simply leaves the defaults in place.
+        let mut http = Remote::default();
+        if let Ok(Some(options)) = repo.transport_options(base.as_str(), None) {
+            http.configure(&*options).ok();
+        }
         Walker {
             repo,
             base,
             base_slash: url_slash,
             verbose,
-            http: Remote::default(),
+            http,
             seen: HashSet::new(),
             complete: HashSet::new(),
             frontier: BinaryHeap::new(),

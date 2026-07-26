@@ -39,3 +39,6 @@ pub mod entry;
 
 ///
 pub mod bytes;
+
+///
+pub mod delta;

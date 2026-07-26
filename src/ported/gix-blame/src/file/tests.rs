@@ -31,6 +31,8 @@ impl From<(Range<u32>, ObjectId, Range<u32>)> for UnblamedHunk {
             range_in_blamed_file,
             suspects: [(suspect, range_in_destination)].into(),
             source_file_name: None,
+            ignored: false,
+            unblamable: false,
         }
     }
 }

@@ -20,7 +20,10 @@
 //!     silently and without touching the repository. git only consults a task's
 //!     `auto_condition` under `--auto`; absent the flag every selected task
 //!     counts as needed, so the answer is independent of the task set, of the
-//!     `maintenance.<task>.enabled` config and of repository state. `--auto`
+//!     `maintenance.<task>.enabled` config and of repository state. The one
+//!     config read that survives is `maintenance.strategy`, which git validates
+//!     before deriving a task set — an unusable value is fatal here too, unless
+//!     `--task` named the set and made the read unnecessary. `--auto`
 //!     itself is not ported — see `is_needed_sub`.
 //!
 //! `run` is a task driver, and this port runs the tasks that have a home in the
@@ -130,15 +133,36 @@ const TASKS: [&str; 10] = [
     "geometric-repack",
 ];
 
-/// The tasks a bare `maintenance run` selects, in the order it runs them.
+/// The order a *config-driven* selection runs tasks in — a bare
+/// `maintenance run` and a `maintenance run --schedule=<frequency>` alike, both
+/// of which pick their set from `maintenance.strategy`,
+/// `maintenance.<task>.enabled` and `maintenance.<task>.schedule` rather than
+/// from `--task`.
 ///
-/// This is *not* [`TASKS`] filtered by an `enabled` flag: git 2.55.0 runs the
-/// default set in a different order from an explicit `--task` selection. Read
-/// off the same trace, a bare `maintenance run` in a repository with no
-/// `maintenance.strategy` gives `pack-refs`, `reflog-expire`,
-/// `geometric-repack`, `commit-graph`, `worktree-prune`, `rerere-gc` — note
-/// `geometric-repack` third here and last in `TASKS`.
-const DEFAULT_TASKS: [&str; 6] = [
+/// This is a second, genuinely different order from [`TASKS`], not a rearranged
+/// copy: read off git 2.55.0 with all ten tasks switched on
+/// (`GIT_TRACE2_PERF=1`, keeping the `region_enter` lines whose category is
+/// `maintenance`), a run selected by config enters them as below, while the same
+/// ten passed as `--task` arguments enter in the `TASKS` sequence — `gc` moves
+/// from fourth to seventh and `geometric-repack` from tenth to sixth.
+const CONFIG_ORDER: [&str; 10] = [
+    "pack-refs",
+    "reflog-expire",
+    "prefetch",
+    "loose-objects",
+    "incremental-repack",
+    "geometric-repack",
+    "gc",
+    "commit-graph",
+    "worktree-prune",
+    "rerere-gc",
+];
+
+/// The tasks the `geometric` strategy enables, which is what a bare
+/// `maintenance run` gets when `maintenance.strategy` is unset — git documents
+/// `geometric` as "the default strategy for manual maintenance", and a run with
+/// no config at all does select exactly these six.
+const GEOMETRIC_TASKS: [&str; 6] = [
     "pack-refs",
     "reflog-expire",
     "geometric-repack",
@@ -147,16 +171,127 @@ const DEFAULT_TASKS: [&str; 6] = [
     "rerere-gc",
 ];
 
-/// The only task a `maintenance run` selects once `maintenance.strategy` is set
-/// and no `--schedule` narrows the selection.
+/// How often a task is scheduled, ordered so that `Hourly < Daily < Weekly`.
 ///
-/// Setting the key changes the default set wholesale rather than merely
-/// attaching schedules to it: with `maintenance.strategy=incremental` and no
-/// `--schedule`, git 2.55.0 runs `gc` and nothing else.
-const STRATEGY_TASKS: [&str; 1] = ["gc"];
+/// A `--schedule=<frequency>` run selects every task whose own frequency is at
+/// most the requested one, so an hourly task also runs in the daily and weekly
+/// passes — checked against git 2.55.0 with a single task pinned at each
+/// frequency and each of the three passes requested.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Schedule {
+    Hourly,
+    Daily,
+    Weekly,
+}
 
-/// Every `--schedule=<frequency>` value git accepts.
-const SCHEDULES: [&str; 3] = ["hourly", "daily", "weekly"];
+impl Schedule {
+    /// git's `parse_schedule`. Anything unrecognized is "never", and that is
+    /// final: a `maintenance.<task>.schedule` git cannot parse keeps the task out
+    /// of every scheduled run rather than falling back to the strategy's own
+    /// frequency for it (git 2.55.0 with `maintenance.strategy=geometric` and
+    /// `maintenance.commit-graph.schedule=bogus` runs the other five geometric
+    /// tasks weekly and never `commit-graph`).
+    ///
+    /// The comparison is case-insensitive, which git 2.55.0 accepts on both
+    /// sides: `--schedule=HOURLY` runs the same set as `--schedule=hourly`, and
+    /// `maintenance.pack-refs.schedule = Hourly` schedules the task just as the
+    /// lowercase spelling does.
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "hourly" => Some(Schedule::Hourly),
+            "daily" => Some(Schedule::Daily),
+            "weekly" => Some(Schedule::Weekly),
+            _ => None,
+        }
+    }
+}
+
+/// A `maintenance.strategy` value git accepts.
+///
+/// git 2.55.0 takes exactly these three, case-insensitively, and dies on
+/// anything else — including the `none` its own documentation lists, which the
+/// code never implemented. So `maintenance.strategy = none` is a fatal, not an
+/// empty task set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Strategy {
+    Gc,
+    Geometric,
+    Incremental,
+}
+
+/// The configured `maintenance.strategy`, `Ok(None)` when the key is unset, or
+/// the rejected spelling for git's `fatal: unknown maintenance strategy: '…'`.
+///
+/// git only reads the key when the selection is config-driven: a `--task` run
+/// never looks at it, and so never rejects a bad value.
+fn configured_strategy(repo: &gix::Repository) -> std::result::Result<Option<Strategy>, String> {
+    let Some(value) = repo.config_snapshot().string("maintenance.strategy") else {
+        return Ok(None);
+    };
+    let value = value.to_string();
+    match value.to_ascii_lowercase().as_str() {
+        "gc" => Ok(Some(Strategy::Gc)),
+        "geometric" => Ok(Some(Strategy::Geometric)),
+        "incremental" => Ok(Some(Strategy::Incremental)),
+        _ => Err(value),
+    }
+}
+
+/// The tasks `maintenance.strategy` enables for a *manual* run — one with
+/// neither `--task` nor `--schedule`.
+///
+/// An unset key means `geometric`, git's documented default for manual
+/// maintenance. `gc` and `incremental` both reduce a manual run to the single
+/// `gc` task, the latter because git runs the incremental tasks only on a
+/// schedule ("Manual repository maintenance uses the gc task").
+fn strategy_manual_tasks(strategy: Option<Strategy>) -> &'static [&'static str] {
+    match strategy.unwrap_or(Strategy::Geometric) {
+        Strategy::Geometric => &GEOMETRIC_TASKS,
+        Strategy::Gc | Strategy::Incremental => &["gc"],
+    }
+}
+
+/// The frequency `maintenance.strategy` attaches to `task`, or `None` when that
+/// strategy does not schedule it.
+///
+/// An unset key schedules nothing at all — which is why
+/// `maintenance.<task>.schedule` alone never makes a task run: membership in
+/// this table is also what supplies the task's default `enabled` state for a
+/// scheduled run, so a task the strategy does not schedule additionally needs an
+/// explicit `maintenance.<task>.enabled = true`.
+///
+/// The three tables were read off git 2.55.0 by requesting each of the three
+/// frequencies under each strategy.
+fn strategy_schedule(strategy: Option<Strategy>, task: &str) -> Option<Schedule> {
+    let table: &[(&str, Schedule)] = match strategy? {
+        Strategy::Gc => &[("gc", Schedule::Daily)],
+        Strategy::Geometric => &[
+            ("commit-graph", Schedule::Hourly),
+            ("pack-refs", Schedule::Daily),
+            ("geometric-repack", Schedule::Daily),
+            ("reflog-expire", Schedule::Weekly),
+            ("worktree-prune", Schedule::Weekly),
+            ("rerere-gc", Schedule::Weekly),
+        ],
+        Strategy::Incremental => &[
+            ("prefetch", Schedule::Hourly),
+            ("commit-graph", Schedule::Hourly),
+            ("loose-objects", Schedule::Daily),
+            ("incremental-repack", Schedule::Daily),
+            ("pack-refs", Schedule::Weekly),
+        ],
+    };
+    table
+        .iter()
+        .find(|(name, _)| *name == task)
+        .map(|(_, schedule)| *schedule)
+}
+
+/// git's `fatal: unknown maintenance strategy: '<value>'`, exit 128.
+fn unknown_strategy(value: &str) -> ExitCode {
+    eprintln!("fatal: unknown maintenance strategy: '{value}'");
+    ExitCode::from(128)
+}
 
 /// Every `--scheduler=<scheduler>` value git accepts.
 const SCHEDULERS: [&str; 5] = ["auto", "crontab", "systemd-timer", "launchctl", "schtasks"];
@@ -241,7 +376,7 @@ fn option_name(arg: &str) -> Option<String> {
 /// `git maintenance run` — validate arguments, then run the selected tasks.
 fn run_sub(args: &[String]) -> Result<ExitCode> {
     let mut auto = false;
-    let mut scheduled = false;
+    let mut scheduled: Option<Schedule> = None;
     let mut selected: Vec<String> = Vec::new();
     let mut end_of_opts = false;
     let mut i = 0;
@@ -306,11 +441,11 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
     // git rejects these combinations after parsing, and dies rather than raising
     // a usage error. `--auto` is checked first: with all three given, git 2.55.0
     // names `--auto` and `--schedule=`, not `--task=`.
-    if auto && scheduled {
+    if auto && scheduled.is_some() {
         eprintln!("fatal: options '--auto' and '--schedule=' cannot be used together");
         return Ok(ExitCode::from(128));
     }
-    if !selected.is_empty() && scheduled {
+    if !selected.is_empty() && scheduled.is_some() {
         eprintln!("fatal: options '--task=' and '--schedule=' cannot be used together");
         return Ok(ExitCode::from(128));
     }
@@ -318,6 +453,19 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
     let Ok(repo) = gix::discover(".") else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
+    };
+
+    // git validates `maintenance.strategy` only when it is about to consult it,
+    // which a `--task` run never does — `run --task=gc` succeeds under a strategy
+    // value that makes a bare `run` die. The check lands before `--auto`'s work,
+    // so a bad value is fatal even there.
+    let strategy = if selected.is_empty() {
+        match configured_strategy(&repo) {
+            Ok(strategy) => strategy,
+            Err(value) => return Ok(unknown_strategy(&value)),
+        }
+    } else {
+        None
     };
 
     if auto {
@@ -331,7 +479,7 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
         );
     }
 
-    run_tasks(&repo, &selected, scheduled)
+    run_tasks(&repo, &selected, scheduled, strategy)
 }
 
 /// Run the selected maintenance tasks in git's order and report the way git's
@@ -340,11 +488,10 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
 /// # Selection
 ///
 /// `selected` is the `--task` set, empty when none was given. With it non-empty
-/// the tasks run in [`TASKS`] order; otherwise the default set applies —
-/// [`DEFAULT_TASKS`] normally, [`STRATEGY_TASKS`] once `maintenance.strategy` is
-/// configured — and `maintenance.<task>.enabled` can add or remove any task from
-/// it. A `--schedule` run (`scheduled`) selects by each task's schedule, and
-/// without `maintenance.strategy` no task has one, so nothing runs.
+/// the tasks run in [`TASKS`] order and the config is not consulted at all.
+/// Otherwise [`plan`] derives the set from `maintenance.strategy`,
+/// `maintenance.<task>.enabled` and — for a `--schedule` run —
+/// `maintenance.<task>.schedule`, in [`CONFIG_ORDER`].
 ///
 /// # What the tasks do
 ///
@@ -391,8 +538,13 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
 /// `objects/info/commit-graph` — git's split graph does not write that path —
 /// but both are real gaps, and a `maintenance run` that exits 0 has not done
 /// them.
-fn run_tasks(repo: &gix::Repository, selected: &[String], scheduled: bool) -> Result<ExitCode> {
-    let order = plan(repo, selected, scheduled);
+fn run_tasks(
+    repo: &gix::Repository,
+    selected: &[String],
+    scheduled: Option<Schedule>,
+    strategy: Option<Strategy>,
+) -> Result<ExitCode> {
+    let order = plan(repo, selected, scheduled, strategy);
 
     // git reports a failing task on stderr and keeps going, then exits 1 —
     // `error: task 'incremental-repack' failed` on a repository with no packs,
@@ -449,18 +601,18 @@ fn run_tasks(repo: &gix::Repository, selected: &[String], scheduled: bool) -> Re
 }
 
 /// Which tasks run, in the order they run.
-fn plan(repo: &gix::Repository, selected: &[String], scheduled: bool) -> Vec<&'static str> {
-    // `--schedule` picks tasks by their configured schedule. Without
-    // `maintenance.strategy` no task has one, so the run is empty — git 2.55.0
-    // exits 0 having entered no task region for any of hourly/daily/weekly.
-    // With a strategy set the schedules exist (incremental gives prefetch and
-    // commit-graph hourly, loose-objects and incremental-repack daily, pack-refs
-    // weekly), and those tasks are the unported ones, so nothing is claimed here
-    // that the task bodies would not refuse anyway.
-    if scheduled {
-        return Vec::new();
-    }
-
+///
+/// `--task` short-circuits everything below it: git ignores the config entirely
+/// once a task is named. Otherwise the set comes from `maintenance.strategy`,
+/// with `maintenance.<task>.enabled` and — for a `--schedule` run —
+/// `maintenance.<task>.schedule` overriding what the strategy decided, and the
+/// order comes from [`CONFIG_ORDER`].
+fn plan(
+    repo: &gix::Repository,
+    selected: &[String],
+    scheduled: Option<Schedule>,
+    strategy: Option<Strategy>,
+) -> Vec<&'static str> {
     if !selected.is_empty() {
         return TASKS
             .into_iter()
@@ -469,28 +621,36 @@ fn plan(repo: &gix::Repository, selected: &[String], scheduled: bool) -> Vec<&'s
     }
 
     let config = repo.config_snapshot();
-    let strategy = config.string("maintenance.strategy").is_some();
-    let default: &[&'static str] = if strategy {
-        &STRATEGY_TASKS
-    } else {
-        &DEFAULT_TASKS
+    let enabled = |name: &str| config.boolean(&format!("maintenance.{name}.enabled"));
+
+    let Some(frequency) = scheduled else {
+        // A manual run: the strategy's task set, with `enabled` adding to it or
+        // removing from it.
+        let default = strategy_manual_tasks(strategy);
+        return CONFIG_ORDER
+            .into_iter()
+            .filter(|name| enabled(name).unwrap_or_else(|| default.contains(name)))
+            .collect();
     };
 
-    // `maintenance.<task>.enabled` overrides membership either way. Ordering
-    // follows the default set for the tasks in it, then `TASKS` for any the
-    // config switched on.
-    let enabled = |name: &str| config.boolean(&format!("maintenance.{name}.enabled"));
-    let mut tasks: Vec<&'static str> = default
-        .iter()
-        .copied()
-        .filter(|name| enabled(name).unwrap_or(true))
-        .collect();
-    for name in TASKS {
-        if !tasks.contains(&name) && enabled(name) == Some(true) {
-            tasks.push(name);
-        }
-    }
-    tasks
+    // A scheduled run: a task needs both a frequency at or below the requested
+    // one and an `enabled` verdict, and the strategy supplies the default for
+    // each. `maintenance.<task>.schedule`, when present, replaces the strategy's
+    // frequency outright — including when it is unparseable, which reads as
+    // "never".
+    CONFIG_ORDER
+        .into_iter()
+        .filter(|name| {
+            let schedule = match config.string(&format!("maintenance.{name}.schedule")) {
+                Some(value) => Schedule::parse(&value.to_string()),
+                None => strategy_schedule(strategy, name),
+            };
+            if schedule.is_none_or(|schedule| schedule > frequency) {
+                return false;
+            }
+            enabled(name).unwrap_or_else(|| strategy_schedule(strategy, name).is_some())
+        })
+        .collect()
 }
 
 /// A delegate's outcome as the success flag git's task runner works in.
@@ -519,13 +679,19 @@ fn strings(args: &[&str]) -> Vec<String> {
 /// repository ...` and exits 128, while `is-needed --task=bogus` outside a
 /// repository reports the bad task name instead.
 ///
-/// Without `--auto` the answer is unconditionally 0. git only consults a task's
-/// `auto_condition` when `--auto` is given; with the flag absent every selected
-/// task counts as needed, so the reply does not depend on the task set, on the
-/// `maintenance.<task>.enabled` config, or on the state of the repository. That
-/// was checked against git 2.55.0 in an empty repo, a bare repo, a freshly
-/// `gc`-ed repo and a detached HEAD, for each of the nine task names and with
-/// every task explicitly disabled — 0 in every case.
+/// Without `--auto` the answer is 0 whenever it is reached. git only consults a
+/// task's `auto_condition` when `--auto` is given; with the flag absent every
+/// selected task counts as needed, so the reply does not depend on the task set,
+/// on the `maintenance.<task>.enabled` config, or on the state of the
+/// repository. That was checked against git 2.55.0 in an empty repo, a bare
+/// repo, a freshly `gc`-ed repo and a detached HEAD, for each of the nine task
+/// names and with every task explicitly disabled — 0 in every case.
+///
+/// The exception is `maintenance.strategy`: deriving the default task set reads
+/// it, so a value outside `gc`/`geometric`/`incremental` is fatal (128) before
+/// any answer is given. `--task` supplies the set directly and skips the read,
+/// which is why `is-needed --task=gc` still exits 0 under a strategy value that
+/// makes a bare `is-needed` die.
 ///
 /// `--auto` is the part that is not ported. Its per-task conditions rest on
 /// git's loose-object estimator, which counts the entries of the single
@@ -543,6 +709,7 @@ fn strings(args: &[&str]) -> Vec<String> {
 fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
     let mut auto = false;
     let mut end_of_opts = false;
+    let mut selected = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -564,12 +731,14 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
                 if let Some(code) = check_task(value) {
                     return Ok(code);
                 }
+                selected = true;
                 i += 1;
             }
             _ if a.starts_with("--task=") => {
                 if let Some(code) = check_task(&a["--task=".len()..]) {
                     return Ok(code);
                 }
+                selected = true;
             }
             _ => match option_name(a) {
                 Some(msg) => return Ok(usage_error(IS_NEEDED_USAGE, Some(&msg))),
@@ -581,9 +750,18 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
 
     // git checks the repository only after parse-options has had its say, so
     // `is-needed --task=bogus` outside a repository still reports the bad task.
-    if gix::discover(".").is_err() {
+    let Ok(repo) = gix::discover(".") else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
+    };
+
+    // Without `--task` the answer is derived from the strategy's task set, so an
+    // unusable `maintenance.strategy` is fatal here exactly as it is for `run` —
+    // and, as there, naming a task skips the read and with it the rejection.
+    if !selected {
+        if let Err(value) = configured_strategy(&repo) {
+            return Ok(unknown_strategy(&value));
+        }
     }
 
     if auto {
@@ -740,13 +918,15 @@ fn check_task(value: &str) -> Option<ExitCode> {
 }
 
 /// Validate a `--task` or `--schedule` value the way git's option callbacks do,
-/// recording an accepted task name in `selected`.
+/// recording an accepted task name in `selected` and an accepted frequency in
+/// `scheduled` — the callback overwrites, so a repeated `--schedule` keeps the
+/// last one.
 ///
 /// Returns `Some(exit_code)` when the value is rejected, `None` when accepted.
 fn check_value(
     name: &str,
     value: &str,
-    scheduled: &mut bool,
+    scheduled: &mut Option<Schedule>,
     selected: &mut Vec<String>,
 ) -> Result<Option<ExitCode>> {
     match name {
@@ -761,12 +941,12 @@ fn check_value(
             }
         }
         "schedule" => {
-            if !SCHEDULES.contains(&value) {
+            let Some(frequency) = Schedule::parse(value) else {
                 // git's `parse_schedule` dies rather than raising a usage error.
                 eprintln!("fatal: unrecognized --schedule argument '{value}'");
                 return Ok(Some(ExitCode::from(128)));
-            }
-            *scheduled = true;
+            };
+            *scheduled = Some(frequency);
         }
         _ => bail!("internal: unexpected option name {name:?}"),
     }

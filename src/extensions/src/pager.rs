@@ -92,7 +92,7 @@ pub fn maybe_setup(cmd: &str, forced: Option<bool>) {
 
 /// git's `git_pager()` program chain: `$GIT_PAGER`, then `core.pager`, then
 /// `$PAGER`, then the compiled-in `less`.
-fn resolve_pager(cfg: Option<&gix::config::Snapshot<'_>>) -> String {
+pub(crate) fn resolve_pager(cfg: Option<&gix::config::Snapshot<'_>>) -> String {
     if let Some(p) = env_nonempty("GIT_PAGER") {
         return p;
     }

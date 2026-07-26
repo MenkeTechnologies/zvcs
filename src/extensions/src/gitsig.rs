@@ -160,6 +160,80 @@ pub fn verify(sig: &[u8], payload: &[u8]) -> (GStatus, String) {
     }
 }
 
+/// git's `enum signature_trust_level`, in the same order — the scale
+/// `gpg.minTrustLevel` and `verify_merge_signature`'s `TRUST_MARGINAL` floor are
+/// compared against. `TRUST_UNDEFINED` is the value `check_signature()` starts
+/// from, so an unparsed / absent `TRUST_*` status reads as undefined.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Trust {
+    Undefined,
+    Never,
+    Marginal,
+    Fully,
+    Ultimate,
+}
+
+/// git's `struct signature_check`, reduced to the fields this crate reads.
+pub struct SigCheck {
+    /// `sigc->result`, the `%G?` character.
+    pub status: GStatus,
+    /// `sigc->key` — the signing key's long id.
+    pub key: String,
+    /// `sigc->signer` — the user name gpg's `GOODSIG`/`BADSIG`/… line names after
+    /// the key id. This is what git's `Commit %s has a good GPG signature by %s`
+    /// diagnostics quote, not the key id.
+    pub signer: String,
+    /// `sigc->trust_level`, from the `TRUST_*` status line.
+    pub trust: Trust,
+}
+
+/// [`evaluate`] with git's full `signature_check` result — the signer name and
+/// trust level that `verify_merge_signature()` needs and `%G?` alone cannot
+/// carry. Same gpg invocation as [`verify`]; no second verification path.
+pub fn evaluate_full(raw: &[u8]) -> SigCheck {
+    match split_signed(raw) {
+        None => SigCheck {
+            status: GStatus::NoSignature,
+            key: String::new(),
+            signer: String::new(),
+            trust: Trust::Undefined,
+        },
+        Some((sig, payload)) => verify_full(&sig, &payload),
+    }
+}
+
+/// [`verify`] with git's full `signature_check` result. See [`evaluate_full`].
+pub fn verify_full(sig: &[u8], payload: &[u8]) -> SigCheck {
+    let cannot_check = || SigCheck {
+        status: GStatus::CannotCheck,
+        key: String::new(),
+        signer: String::new(),
+        trust: Trust::Undefined,
+    };
+    if sig.starts_with(b"-----BEGIN SSH SIGNATURE-----") {
+        return cannot_check();
+    }
+    let Some(sigfile) = write_temp("sig", sig) else { return cannot_check() };
+    let Some(payfile) = write_temp("pay", payload) else {
+        let _ = std::fs::remove_file(&sigfile);
+        return cannot_check();
+    };
+    let out = Command::new("gpg")
+        .args(["--batch", "--no-tty", "--status-fd=1", "--verify"])
+        .arg(&sigfile)
+        .arg(&payfile)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    let _ = std::fs::remove_file(&sigfile);
+    let _ = std::fs::remove_file(&payfile);
+    match out {
+        Ok(o) => parse_gpg_status_full(&o.stdout),
+        Err(_) => cannot_check(),
+    }
+}
+
 /// Map gpg's machine-readable `--status-fd` output to a [`GStatus`] and key,
 /// following git's precedence (bad/revoked/expired take precedence over good).
 fn parse_gpg_status(status: &[u8]) -> (GStatus, String) {
@@ -214,6 +288,45 @@ fn parse_gpg_status(status: &[u8]) -> (GStatus, String) {
         GStatus::CannotCheck
     };
     (status, key)
+}
+
+/// [`parse_gpg_status`] plus the two fields `%G?` throws away: the signer name
+/// each `GOODSIG`/`BADSIG`/`EXPSIG`/`EXPKEYSIG`/`REVKEYSIG` line carries after
+/// its key id (git's `GPG_STATUS_STDSIG`), and the `TRUST_<level>` line.
+fn parse_gpg_status_full(status: &[u8]) -> SigCheck {
+    let (gstatus, key) = parse_gpg_status(status);
+    let text = String::from_utf8_lossy(status);
+    let mut signer = String::new();
+    let mut trust = Trust::Undefined;
+    for line in text.lines() {
+        let l = line.strip_prefix("[GNUPG:] ").unwrap_or(line);
+        let (tag, rest) = match l.split_once(' ') {
+            Some(p) => p,
+            None => (l, ""),
+        };
+        match tag {
+            // `GPG_STATUS_STDSIG`: `<KEYID> <name...>`; the name runs to EOL.
+            "GOODSIG" | "BADSIG" | "EXPSIG" | "EXPKEYSIG" | "REVKEYSIG" => {
+                if signer.is_empty() {
+                    if let Some((_, name)) = rest.split_once(' ') {
+                        signer = name.to_string();
+                    }
+                }
+            }
+            _ => {
+                if let Some(level) = tag.strip_prefix("TRUST_") {
+                    trust = match level {
+                        "NEVER" => Trust::Never,
+                        "MARGINAL" => Trust::Marginal,
+                        "FULLY" => Trust::Fully,
+                        "ULTIMATE" => Trust::Ultimate,
+                        _ => Trust::Undefined,
+                    };
+                }
+            }
+        }
+    }
+    SigCheck { status: gstatus, key, signer, trust }
 }
 
 /// Write `data` to a uniquely-named temp file, returning its path. Unique per

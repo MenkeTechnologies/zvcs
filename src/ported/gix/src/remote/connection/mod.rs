@@ -3,7 +3,7 @@ use gix_transport::client::async_io::Transport;
 #[cfg(feature = "blocking-network-client")]
 use gix_transport::client::blocking_io::Transport;
 
-use crate::{Remote, types::RemoteDetached};
+use crate::{Remote, bstr::BString, types::RemoteDetached};
 
 /// A function that performs a given credential action, trying to obtain credentials for an operation that needs it.
 pub type AuthenticateFn<'a> = Box<dyn FnMut(gix_credentials::helper::Action) -> gix_credentials::protocol::Result + 'a>;
@@ -22,6 +22,8 @@ where
     pub(crate) transport: gix_protocol::SendFlushOnDrop<T>,
     pub(crate) handshake: Option<gix_protocol::Handshake>,
     pub(crate) trace: bool,
+    /// Protocol-v2 server options to send with every request made through this connection.
+    pub(crate) server_options: Vec<BString>,
 }
 
 /// Like [`Connection`], but without borrowing its remote or repository.
@@ -35,6 +37,8 @@ where
     pub(crate) transport: gix_protocol::SendFlushOnDrop<T>,
     pub(crate) handshake: Option<gix_protocol::Handshake>,
     pub(crate) trace: bool,
+    /// Protocol-v2 server options to send with every request made through this connection.
+    pub(crate) server_options: Vec<BString>,
 }
 
 mod access;

@@ -28,6 +28,10 @@ pub enum Error {
     Transport(#[from] gix_protocol::transport::client::Error),
     #[error(transparent)]
     ConfigureCredentials(#[from] crate::config::credential_helpers::Error),
+    #[error("server options require protocol version 2 or later")]
+    ServerOptionsRequireV2,
+    #[error("server doesn't support 'server-option'")]
+    ServerOptionsUnsupported,
 }
 
 impl gix_protocol::transport::IsSpuriousError for Error {
@@ -54,6 +58,11 @@ pub struct Options {
     ///
     /// This is useful for handling `remote.<name>.tagOpt` for example.
     pub extra_refspecs: Vec<gix_refspec::RefSpec>,
+    /// Refspecs for the second stage of git's two-stage match, applied only to the refs the remote's own
+    /// refspecs selected, to derive the local tracking refs to update opportunistically.
+    ///
+    /// See [`gix_protocol::fetch::refmap::init::Context::opportunistic_refspecs`].
+    pub opportunistic_refspecs: Vec<gix_refspec::RefSpec>,
 }
 
 impl Default for Options {
@@ -62,6 +71,7 @@ impl Default for Options {
             prefix_from_spec_as_filter_on_remote: true,
             handshake_parameters: Vec::new(),
             extra_refspecs: Vec::new(),
+            opportunistic_refspecs: Vec::new(),
         }
     }
 }
@@ -124,6 +134,7 @@ where
             prefix_from_spec_as_filter_on_remote,
             handshake_parameters,
             mut extra_refspecs,
+            opportunistic_refspecs,
         }: Options,
     ) -> Result<fetch::RefMap, Error> {
         let _span = gix_trace::coarse!("remote::Connection::ref_map()");
@@ -162,15 +173,28 @@ where
         )
         .await?;
 
+        // git refuses the whole operation rather than dropping the options: `die_if_server_options()` for a v0/v1
+        // server, and `server_supports_v2("server-option", 1)` for a v2 one that doesn't advertise them.
+        if !self.server_options.is_empty() {
+            if handshake.server_protocol_version != gix_transport::Protocol::V2 {
+                return Err(Error::ServerOptionsRequireV2);
+            }
+            if !handshake.capabilities.contains("server-option") {
+                return Err(Error::ServerOptionsUnsupported);
+            }
+        }
+
         let context = fetch::refmap::init::Context {
             fetch_refspecs: self.remote.fetch_specs.clone(),
             extra_refspecs,
+            opportunistic_refspecs,
         };
 
         let fetch_refmap = handshake.prepare_lsrefs_or_extract_refmap(
             repo.config.user_agent_tuple(),
             prefix_from_spec_as_filter_on_remote,
             context,
+            &self.server_options,
         )?;
 
         #[cfg(feature = "async-network-client")]

@@ -246,14 +246,17 @@ fn load_config() -> Option<ConfigFile> {
     }
 }
 
-/// `count_messages()` — how many `From `-delimited messages carrying `From:`,
-/// `Date:` and `Subject:` headers, in that order, the buffer holds.
+/// `count_messages()` — how many `From `-delimited messages the buffer holds.
 ///
-/// Only the zero / non-zero distinction is observable without a server, but the
-/// scan is reproduced faithfully: positions advance the way the C `strstr`
-/// chain does, so a header block that appears before its `From ` line, or a
-/// `From ` line that is not at the start of the buffer and not reachable from
-/// five bytes past the previous match, does not count.
+/// The scan has two shapes. A `From git-send-email` line — the one
+/// `git send-email` writes for its `sendemail.imapSentFolder` copy — needs only
+/// a `From: ` and then a `To: ` header after it; any other `From ` line needs
+/// `From: `, `Date: ` and `Subject: `, in that order. Only the zero / non-zero
+/// distinction is observable without a server, but the scan is reproduced
+/// faithfully: positions advance the way the C `strstr` chain does, so a header
+/// block that appears before its `From ` line, or a `From ` line that is not at
+/// the start of the buffer and not reachable from five bytes past the previous
+/// match, does not count.
 fn count_messages(buf: &[u8]) -> usize {
     // The C code scans a NUL-terminated `strbuf`, so an embedded NUL ends it.
     let buf = match buf.iter().position(|&b| b == 0) {
@@ -269,15 +272,22 @@ fn count_messages(buf: &[u8]) -> usize {
             .position(|w| w == needle)
             .map(|i| i + from)
     };
+    let at = |p: usize, needle: &[u8]| p <= buf.len() && buf[p..].starts_with(needle);
 
     let mut count = 0;
     let mut p = 0usize;
     loop {
-        if buf[p..].starts_with(b"From ") {
-            let Some(i) = find(p + 5, b"\nFrom: ") else { break };
-            let Some(j) = find(i + 7, b"\nDate: ") else { break };
-            let Some(k) = find(j + 7, b"\nSubject: ") else { break };
-            p = k + 10;
+        if at(p, b"From ") {
+            if at(p, b"From git-send-email") {
+                let Some(i) = find(p + 5, b"\nFrom: ") else { break };
+                let Some(j) = find(i + 7, b"\nTo: ") else { break };
+                p = j + 5;
+            } else {
+                let Some(i) = find(p + 5, b"\nFrom: ") else { break };
+                let Some(j) = find(i + 7, b"\nDate: ") else { break };
+                let Some(k) = find(j + 7, b"\nSubject: ") else { break };
+                p = k + 10;
+            }
             count += 1;
         }
         let Some(n) = find(p + 5, b"\nFrom ") else { break };

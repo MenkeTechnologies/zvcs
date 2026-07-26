@@ -32,13 +32,24 @@ pub(crate) mod function {
                     });
                 }
                 Box::new(
-                    crate::client::blocking_io::file::connect(url.path, options.version, options.trace)
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+                    crate::client::blocking_io::file::connect_with_program(
+                        url.path,
+                        options.version,
+                        options.trace,
+                        options.upload_pack,
+                    )
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
                 )
             }
             gix_url::Scheme::Ssh => Box::new({
-                crate::client::blocking_io::ssh::connect(url, options.version, options.ssh, options.trace)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                crate::client::blocking_io::ssh::connect_with_program(
+                    url,
+                    options.version,
+                    options.ssh,
+                    options.trace,
+                    options.upload_pack,
+                )
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
             }),
             gix_url::Scheme::Git => {
                 if url.user().is_some() {

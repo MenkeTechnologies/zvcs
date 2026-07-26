@@ -52,6 +52,17 @@ mod error {
 }
 pub use error::Error;
 
+/// Additional knobs for [`Remote::connect_with_options()`] that affect how the transport itself is built.
+#[derive(Debug, Default, Clone)]
+pub struct Options {
+    /// The program to run in place of `git-upload-pack` on the other end, from git's `--upload-pack <path>`
+    /// or `remote.<name>.uploadpack`.
+    ///
+    /// Only `file://`/local and `ssh://` transports spawn the service themselves and can honour it, which is
+    /// exactly where git applies it too.
+    pub upload_pack: Option<crate::bstr::BString>,
+}
+
 /// Establishing connections to remote hosts (without performing a git-handshake).
 impl<'repo> Remote<'repo> {
     /// Create a new connection using `transport` to communicate, with `progress` to indicate changes.
@@ -70,6 +81,7 @@ impl<'repo> Remote<'repo> {
             handshake: None,
             transport: gix_protocol::SendFlushOnDrop::new(transport, trace),
             trace,
+            server_options: Vec::new(),
         }
     }
 
@@ -87,6 +99,17 @@ impl<'repo> Remote<'repo> {
         &self,
         direction: crate::remote::Direction,
     ) -> Result<Connection<'_, 'static, 'repo, Box<dyn Transport + Send>>, Error> {
+        self.connect_with_options(direction, Options::default()).await
+    }
+
+    /// Like [`connect()`](Self::connect()), but with additional control over how the transport is built.
+    #[cfg(any(feature = "blocking-network-client", feature = "async-network-client-async-std"))]
+    #[gix_protocol::maybe_async::maybe_async]
+    pub async fn connect_with_options(
+        &self,
+        direction: crate::remote::Direction,
+        options: Options,
+    ) -> Result<Connection<'_, 'static, 'repo, Box<dyn Transport + Send>>, Error> {
         let (url, version) = self.sanitized_url_and_version(direction)?;
         #[cfg(feature = "blocking-network-client")]
         let scheme_is_ssh = url.scheme == gix_url::Scheme::Ssh;
@@ -100,6 +123,7 @@ impl<'repo> Remote<'repo> {
                     .transpose()?
                     .unwrap_or_default(),
                 trace: self.repo.config.trace_packet(),
+                upload_pack: options.upload_pack,
             },
         )
         .await?;

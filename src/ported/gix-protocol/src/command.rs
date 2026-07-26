@@ -21,6 +21,22 @@ mod with_io {
 
     use crate::{Command, command::Feature};
 
+    /// Turn `options` into the `server-option=<value>` capability lines of a V2 request.
+    ///
+    /// The `server-option` capability is a top-level one, not a value of the command being invoked, and git
+    /// refuses to run at all when it is missing (`server_supports_v2("server-option", 1)` in
+    /// `write_fetch_command_and_capabilities()` dies). Callers are expected to have rejected that case after the
+    /// handshake, so an absent capability here just means there is nothing to send.
+    pub fn server_options(capabilities: &Capabilities, options: &[BString]) -> Vec<Feature> {
+        if options.is_empty() || !capabilities.contains("server-option") {
+            return Vec::new();
+        }
+        options
+            .iter()
+            .map(|option| ("server-option", Some(option.to_string())))
+            .collect()
+    }
+
     impl Command {
         /// Only V2
         fn all_argument_prefixes(&self) -> &'static [&'static str] {
@@ -219,7 +235,10 @@ mod with_io {
                             continue;
                         }
                         match *feature {
-                            "agent" | "object-format" => {}
+                            // Neither is advertised as a value of the command's own capability: `agent` and
+                            // `object-format` are top-level, and `server-option` is gated on the top-level
+                            // capability of the same name before it is ever added.
+                            "agent" | "object-format" | "server-option" => {}
                             _ => {
                                 return Err(Error::UnsupportedCapability {
                                     command: self.as_str(),
@@ -250,4 +269,4 @@ mod with_io {
     }
 }
 #[cfg(any(test, feature = "async-client", feature = "blocking-client"))]
-pub use with_io::validate_argument_prefixes;
+pub use with_io::{server_options, validate_argument_prefixes};

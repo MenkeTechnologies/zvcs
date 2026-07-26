@@ -104,6 +104,8 @@ pub mod blame_file {
         pub rewrites: Option<gix_diff::Rewrites>,
         /// Ignore whitespace differences when diffing revisions (`git blame -w`).
         pub ignore_whitespace: bool,
+        /// Commits whose changes should not be attributed to them (`git blame --ignore-rev`).
+        pub ignore_revs: std::collections::HashSet<gix_hash::ObjectId>,
     }
 
     /// The error returned by [Repository::blame_file()](crate::Repository::blame_file()).

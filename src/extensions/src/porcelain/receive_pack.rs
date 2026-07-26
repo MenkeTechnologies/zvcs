@@ -59,9 +59,12 @@
 //!   * **`receive.fsckObjects` / `transfer.fsckObjects`** run the object-content
 //!     message layer ([`super::fsck::check_object`]) over every received object
 //!     at `receive.fsck.<msg-id>` severities, with `receive.fsck.skipList`
-//!     exemptions. The transfer check is always `--strict`, so a defaulted
-//!     warning is an error here. An error fails the whole push with
-//!     `fatal: fsck error in packed object`.
+//!     exemptions, followed by `fsck_finish()`'s lint of every `.gitmodules` and
+//!     `.gitattributes` blob the received trees named ([`super::fsck::check_blob`]).
+//!     The transfer check is always `--strict`, so a defaulted warning is an
+//!     error here. An error fails the whole push with
+//!     `fatal: fsck error in packed object` from the per-object pass, or
+//!     `fatal: fsck error in pack objects` from the `fsck_finish()` sweep.
 //!   * **`receive.denyCurrentBranch`, `receive.denyDeleteCurrent`,
 //!     `receive.denyDeletes`, `receive.denyNonFastForwards`** are checked per
 //!     command in `update()`'s order, each producing git's own band-2 message
@@ -105,11 +108,15 @@
 use anyhow::{anyhow, bail, Result};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
+use std::collections::HashSet;
 use std::io::{BufRead, Read, Write};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-use super::fsck::{check_object, MsgConfig, MsgSource, Severity};
+use super::fsck::{
+    check_blob, check_object, Finding, MsgConfig, MsgSource, Severity, GITATTRIBUTES_BLOB,
+    GITATTRIBUTES_MISSING, GITMODULES_BLOB, GITMODULES_MISSING,
+};
 
 /// The flags this port implements, quoted in every rejection message.
 const PORTED: &str = "ported: -q/--quiet, --http-backend-info-refs/--advertise-refs";
@@ -1078,25 +1085,105 @@ fn fsck_received(
     config: &Config,
     band: &mut Band,
 ) -> Result<(), String> {
+    // Which of `unpack-objects`/`index-pack`'s two `die()`s the caller gets:
+    // the per-object pass says `fsck error in packed object`, `fsck_finish()`
+    // says `fsck error in pack objects`, and git dies at the first of the two it
+    // reaches.
     let mut failed = false;
-    for id in received {
-        let Ok(object) = repo.find_object(*id) else { continue };
-        for finding in check_object(object.kind, &object.data) {
-            match config.fsck_msgs.severity(&finding, id) {
-                Severity::Ignore => {}
-                Severity::Info | Severity::Warn => {
-                    band.warning(&format!("object {id}: {}: {}", finding.msg.id, finding.text));
-                }
-                Severity::Error | Severity::Fatal => {
-                    band.error(&format!("object {id}: {}: {}", finding.msg.id, finding.text));
-                    failed = true;
-                    break;
-                }
+    // `fsck_options`' two oidsets, filled by every tree the pack carried and
+    // drained by `fsck_finish()` below.
+    let mut gitmodules: HashSet<gix::ObjectId> = HashSet::new();
+    let mut gitattributes: HashSet<gix::ObjectId> = HashSet::new();
+    /// One finding at its resolved severity, in `index-pack`/`unpack-objects`'
+    /// spelling — which names the object rather than its type.
+    fn report(
+        config: &Config,
+        band: &mut Band,
+        finding: &Finding,
+        id: &gix::ObjectId,
+        failed: &mut bool,
+    ) {
+        match config.fsck_msgs.severity(finding, id) {
+            Severity::Ignore => {}
+            Severity::Info | Severity::Warn => {
+                band.warning(&format!("object {id}: {}: {}", finding.msg.id, finding.text));
+            }
+            Severity::Error | Severity::Fatal => {
+                band.error(&format!("object {id}: {}: {}", finding.msg.id, finding.text));
+                *failed = true;
             }
         }
     }
+
+    for id in received {
+        let Ok(object) = repo.find_object(*id) else { continue };
+        let checked = check_object(object.kind, &object.data, true);
+        // The tree-entry decoder's own `error:` lines, already prefixed.
+        for line in &checked.raw {
+            band.write(&format!("{line}\n"));
+        }
+        gitmodules.extend(checked.gitmodules);
+        gitattributes.extend(checked.gitattributes);
+        for finding in &checked.findings {
+            report(config, band, finding, id, &mut failed);
+        }
+    }
+
+    // `fsck_finish()`: every blob the trees pointed at, whether or not the pack
+    // carried it. Pack order first so the report is reproducible; anything the
+    // pack did not carry follows in id order.
+    let mut queue: Vec<gix::ObjectId> = received
+        .iter()
+        .copied()
+        .filter(|id| gitmodules.contains(id) || gitattributes.contains(id))
+        .collect();
+    let mut rest: Vec<gix::ObjectId> = gitmodules
+        .union(&gitattributes)
+        .copied()
+        .filter(|id| !queue.contains(id))
+        .collect();
+    rest.sort();
+    queue.append(&mut rest);
+
+    let failed_before_finish = failed;
+    for id in queue {
+        let as_modules = gitmodules.contains(&id);
+        let as_attrs = gitattributes.contains(&id);
+        // `fsck_blobs()` reports the failure to read the blob, or its being
+        // some other type, once per sweep that named it.
+        let (missing, non_blob) = match repo.find_object(id) {
+            Ok(object) if object.kind == gix::object::Kind::Blob => {
+                for finding in check_blob(&object.data, as_modules, as_attrs) {
+                    report(config, band, &finding, &id, &mut failed);
+                }
+                continue;
+            }
+            Ok(_) => (false, true),
+            Err(_) => (true, false),
+        };
+        for (present, missing_msg, blob_msg, label) in [
+            (as_modules, &GITMODULES_MISSING, &GITMODULES_BLOB, ".gitmodules"),
+            (as_attrs, &GITATTRIBUTES_MISSING, &GITATTRIBUTES_BLOB, ".gitattributes"),
+        ] {
+            if !present {
+                continue;
+            }
+            let finding = if missing {
+                Finding { msg: missing_msg, text: format!("unable to read {label} blob") }
+            } else {
+                debug_assert!(non_blob);
+                Finding { msg: blob_msg, text: format!("non-blob found at {label}") }
+            };
+            report(config, band, &finding, &id, &mut failed);
+        }
+    }
+
     if failed {
-        return Err("fsck error in packed object".into());
+        return Err(if failed_before_finish {
+            "fsck error in packed object".into()
+        } else {
+            "fsck error in pack objects".into()
+        });
     }
     Ok(())
 }

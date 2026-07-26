@@ -39,13 +39,15 @@
 //!   * untracked embedded git repositories are not auto-converted to submodules
 //!     (git's "adding embedded git repository" path); a *tracked* submodule's
 //!     gitlink IS updated to its current HEAD (see the gitlink pass below).
-//!   * interactive/patch/edit modes are rejected — they require a TTY here.
+//!   * `-i`/`--interactive` (the numbered main menu of `add-interactive.c`) and
+//!     `-e`/`--edit` (diff into an editor, then `apply --recount --cached`) are
+//!     rejected. `-p`/`--patch` IS served, by [`super::add_patch`].
 //!   * `-U/--unified`, `--inter-hunk-context`, `--[no-]auto-advance` only configure
-//!     the interactive/patch diff. Their values are magnitude-validated exactly as
-//!     git's `OPT_MAGNITUDE` (bad value ⇒ exit 129), then — since patch mode is
-//!     never entered here — git's `fatal: the option '<x>' requires
-//!     '--interactive/--patch'` (exit 128) is reproduced. A bare `--auto-advance`
-//!     is the default and stages normally; only `--no-auto-advance` triggers it.
+//!     the interactive/patch diff. Their values are validated exactly as git's
+//!     `OPT_INTEGER` (bad value ⇒ exit 129) and, without `-p`/`-i`, git's
+//!     `fatal: the option '<x>' requires '--interactive/--patch'` (exit 128) is
+//!     reproduced. A bare `--auto-advance` is the default and stages normally;
+//!     only `--no-auto-advance` triggers it.
 //! ```
 
 use anyhow::{bail, Result};
@@ -87,18 +89,31 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     let mut chmod: Option<bool> = None;
     let mut from_file: Option<String> = None;
     let mut file_nul = false;
-    // Interactive/patch-only diff options: `-U`/`--unified`, `--inter-hunk-context`,
-    // and `--[no-]auto-advance`. Only whether each was set (and, for auto-advance,
-    // whether it was turned *off*) matters here — see the post-loop requires check.
-    let mut unified_seen = false;
-    let mut interhunk_seen = false;
-    let mut auto_advance: Option<bool> = None;
+    // `-U`/`--unified`, `--inter-hunk-context` and `--[no-]auto-advance` configure
+    // the interactive hunk selector; shared verbatim with `git reset`/`git checkout`.
+    let mut patch_opts = super::reset::PatchDiffOpts::default();
+    // `-p`/`--patch` and `-i`/`--interactive` (git's `patch_interactive` and
+    // `add_interactive`; both are `OPT_BOOL`, so the `--no-` forms clear them).
+    let mut patch_interactive = false;
+    let mut add_interactive = false;
     let mut pathspecs: Vec<String> = Vec::new();
     let mut positional_only = false;
 
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
+        // A value still owed to `-U`/`--unified`/`--inter-hunk-context` is taken
+        // verbatim, even past `--`, the way parse-options takes it.
+        if patch_opts.awaiting_value() || !positional_only {
+            match patch_opts.take_arg(a) {
+                Err(code) => return Ok(code),
+                Ok(true) => {
+                    i += 1;
+                    continue;
+                }
+                Ok(false) => {}
+            }
+        }
         if positional_only {
             pathspecs.push(a.clone());
             i += 1;
@@ -168,71 +183,15 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--pathspec-from-file=") => {
                 from_file = Some(s["--pathspec-from-file=".len()..].to_string());
             }
-            // Interactive modes need a TTY / editor that does not exist here.
-            "-p" | "--patch" => bail!("interactive patch mode (-p/--patch) is not ported"),
-            "-i" | "--interactive" => bail!("interactive mode (-i/--interactive) is not ported"),
+            // Interactive hunk selection (`add-patch.c`), served by
+            // [`super::add_patch`]. `-e`/`--edit` (diff the worktree into an
+            // editor and `apply --recount --cached` the result) is a separate
+            // machine and stays unported.
+            "-p" | "--patch" => patch_interactive = true,
+            "--no-patch" => patch_interactive = false,
+            "-i" | "--interactive" => add_interactive = true,
+            "--no-interactive" => add_interactive = false,
             "-e" | "--edit" => bail!("edit mode (-e/--edit) needs an interactive editor; not ported"),
-            // `-U`/`--unified`, `--inter-hunk-context`, and `--[no-]auto-advance`
-            // exist only to configure the interactive/patch diff. git parses (and
-            // magnitude-validates) their values here but only consumes them once
-            // `--patch`/`--interactive` runs, dying otherwise (checked after the
-            // loop). The value is discarded; only its validity, and the fact the
-            // option was given, are observable. `-U`/`--unified` take a separate
-            // value; `-U` reports itself as a short `switch`, the long forms as
-            // `option`. git always consumes the next argv element as the value
-            // (so `-U -A` treats `-A` as the value), matching `--chmod` above.
-            "-U" | "--unified" => {
-                let short = a == "-U";
-                let name = if short { "U" } else { "unified" };
-                i += 1;
-                if let Err(code) = check_magnitude(args.get(i).map(String::as_str), short, name) {
-                    return Ok(code);
-                }
-                unified_seen = true;
-            }
-            "--inter-hunk-context" => {
-                i += 1;
-                if let Err(code) =
-                    check_magnitude(args.get(i).map(String::as_str), false, "inter-hunk-context")
-                {
-                    return Ok(code);
-                }
-                interhunk_seen = true;
-            }
-            "--auto-advance" => auto_advance = Some(true),
-            "--no-auto-advance" => auto_advance = Some(false),
-            // Sticky value forms `-U<n>`, `--unified=<n>`, `--inter-hunk-context=<n>`.
-            s if s.starts_with("-U") && !s.starts_with("--") && s.len() > 2 => {
-                if let Err(code) = check_magnitude(Some(&s[2..]), true, "U") {
-                    return Ok(code);
-                }
-                unified_seen = true;
-            }
-            s if s.starts_with("--unified=") => {
-                if let Err(code) = check_magnitude(Some(&s["--unified=".len()..]), false, "unified") {
-                    return Ok(code);
-                }
-                unified_seen = true;
-            }
-            s if s.starts_with("--inter-hunk-context=") => {
-                if let Err(code) = check_magnitude(
-                    Some(&s["--inter-hunk-context=".len()..]),
-                    false,
-                    "inter-hunk-context",
-                ) {
-                    return Ok(code);
-                }
-                interhunk_seen = true;
-            }
-            // `--[no-]auto-advance` is a pure toggle: a `=value` is a usage error.
-            s if s.starts_with("--auto-advance=") => {
-                eprintln!("error: option `auto-advance' takes no value");
-                return Ok(ExitCode::from(129));
-            }
-            s if s.starts_with("--no-auto-advance=") => {
-                eprintln!("error: option `no-auto-advance' takes no value");
-                return Ok(ExitCode::from(129));
-            }
             // Bundled short flags like `-nv`; every char must be a known toggle.
             other if other.starts_with('-') && !other.starts_with("--") && other.len() > 1 => {
                 for c in other[1..].chars() {
@@ -243,6 +202,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                         'A' => all = true,
                         'u' => update_only = true,
                         'N' => intent_to_add = true,
+                        'p' => patch_interactive = true,
+                        'i' => add_interactive = true,
                         _ => return usage_error(format!("unknown switch `{c}'")),
                     }
                 }
@@ -253,25 +214,46 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    // `-U`/`--unified`, `--inter-hunk-context`, and `--no-auto-advance` only feed
-    // the interactive/patch diff machinery, which this port does not serve. git
-    // collects them into `add_p_opt` and, when neither `--patch` nor `--interactive`
-    // is active, dies here — before pathspec setup, `--ignore-missing`, the
-    // empty-pathspec check, and even the `-A`/`-u` conflict (verified against git
-    // 2.55.0). `-p`/`-i`/`-e` already bailed above, so reaching this point means
-    // patch mode is off; reproduce the fatal. The cited option follows git's fixed
-    // precedence: `--unified`, then `--inter-hunk-context`, then `--no-auto-advance`
-    // (a bare `--auto-advance` is the default and never triggers it).
-    if unified_seen || interhunk_seen || auto_advance == Some(false) {
-        let opt = if unified_seen {
-            "--unified"
-        } else if interhunk_seen {
-            "--inter-hunk-context"
-        } else {
-            "--no-auto-advance"
-        };
-        eprintln!("fatal: the option '{opt}' requires '--interactive/--patch'");
-        return Ok(ExitCode::from(128));
+    if let Err(code) = patch_opts.finish() {
+        return Ok(code);
+    }
+
+    // git's `cmd_add` order: the two `cannot be negative` fatals, then `-p`
+    // implying `-i`, then either the interactive hand-off (with its two
+    // "cannot be used together" fatals) or the three
+    // `requires '--interactive/--patch'` fatals — all of it before pathspec
+    // setup, `--ignore-missing`, the empty-pathspec check and the `-A`/`-u`
+    // conflict (verified against git 2.55.0).
+    if patch_interactive {
+        add_interactive = true;
+    }
+    if let Some(code) = patch_opts.require_patch_named(add_interactive, "--interactive/--patch") {
+        return Ok(code);
+    }
+    if add_interactive {
+        if dry_run {
+            return usage_fatal(
+                "options '--dry-run' and '--interactive/--patch' cannot be used together".into(),
+            );
+        }
+        if from_file.is_some() {
+            return usage_fatal(
+                "options '--pathspec-from-file' and '--interactive/--patch' cannot be used together"
+                    .into(),
+            );
+        }
+        if !patch_interactive {
+            // `git add -i`'s numbered main menu (`add-interactive.c`) is a
+            // separate machine and is not ported; `-p` is.
+            bail!("interactive mode (-i/--interactive) is not ported");
+        }
+        return super::add_patch::run(
+            &repo,
+            super::add_patch::Mode::Add,
+            None,
+            patch_opts.to_interactive(false),
+            &pathspecs,
+        );
     }
 
     // `--pathspec-from-file`: read pathspecs from a file (or stdin for `-`).
@@ -799,74 +781,6 @@ fn os_err_message(e: &std::io::Error) -> String {
         Some(idx) => s[..idx].to_string(),
         None => s,
     }
-}
-
-/// Validate a `-U`/`--unified`/`--inter-hunk-context` value the way git's
-/// `parse_options` does for an `OPT_MAGNITUDE`, emitting git's exact `error:` line
-/// and exit 129 on failure. `short` selects the `switch `U'` vs `option `<name>'`
-/// wording. `value` is `None` when the option was given with no argument at all.
-///
-/// git's own error text differs by failure kind (verified against git 2.55.0):
-/// ```text
-///   * no argument            -> `<label> requires a value`
-///   * present but empty       -> `<label> expects a numerical value`
-///   * non-empty, not a number -> `<label> expects an integer value with an optional k/m/g suffix`
-/// ```
-/// These lines are printed alone — a value error carries no usage block.
-fn check_magnitude(value: Option<&str>, short: bool, name: &str) -> std::result::Result<(), ExitCode> {
-    let label = if short {
-        format!("switch `{name}'")
-    } else {
-        format!("option `{name}'")
-    };
-    match value {
-        None => eprintln!("error: {label} requires a value"),
-        Some("") => eprintln!("error: {label} expects a numerical value"),
-        Some(v) if is_valid_magnitude(v) => return Ok(()),
-        Some(_) => {
-            eprintln!("error: {label} expects an integer value with an optional k/m/g suffix")
-        }
-    }
-    Err(ExitCode::from(129))
-}
-
-/// git's `OPT_MAGNITUDE` acceptance test, ported from `git_parse_unsigned` +
-/// `get_unit_factor` (config.c): reject any `-`; `strtoumax(_, 0)` must consume at
-/// least one digit (base auto-detected — `0x` hex, a leading `0` octal, else
-/// decimal); the trailing unit must be empty or one of `k`/`m`/`g` (case-insensitive).
-/// The parsed magnitude is discarded here — only its validity is observable — so the
-/// overflow-past-`ULONG_MAX` arm (which also fails, with the same exit code) is not
-/// reproduced.
-fn is_valid_magnitude(s: &str) -> bool {
-    if s.contains('-') {
-        return false;
-    }
-    let b = s.as_bytes();
-    let mut i = 0;
-    // strtoumax skips leading ASCII whitespace and an optional leading `+`.
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i < b.len() && b[i] == b'+' {
-        i += 1;
-    }
-    // Auto-detect the base the way strtoumax(_, 0) does.
-    let (radix, digits_start) = if i + 1 < b.len() && b[i] == b'0' && (b[i + 1] | 0x20) == b'x' {
-        (16u32, i + 2)
-    } else if i < b.len() && b[i] == b'0' {
-        // A lone leading `0` is itself an octal digit, so the run is never empty.
-        (8u32, i)
-    } else {
-        (10u32, i)
-    };
-    let mut j = digits_start;
-    while j < b.len() && (b[j] as char).is_digit(radix) {
-        j += 1;
-    }
-    if j == digits_start {
-        return false; // no digit consumed (e.g. "0x", "abc", "")
-    }
-    matches!(&s[j..], "" | "k" | "K" | "m" | "M" | "g" | "G")
 }
 
 /// `--chmod` value parse: `+x` => `Some(true)`, `-x` => `Some(false)`, else `None`.

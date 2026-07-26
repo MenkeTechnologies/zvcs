@@ -142,7 +142,10 @@ impl PrepareFetch {
             // Determine target branch from user-specified ref_name or default branch
             if let Some(ref_name) = &self.ref_name {
                 let prev_tags = std::mem::replace(&mut remote.fetch_tags, remote::fetch::Tags::None);
-                let mut connection = remote.connect(remote::Direction::Fetch).await?;
+                let mut connection = remote
+                    .connect_with_options(remote::Direction::Fetch, self.connect_options.clone())
+                    .await?
+                    .with_server_options(self.server_options.clone());
                 if let Some(f) = self.configure_connection.as_mut() {
                     f(&mut connection).map_err(Error::RemoteConnection)?;
                 }
@@ -166,7 +169,10 @@ impl PrepareFetch {
                 // For shallow clones without a specified ref, we need to determine the ref to clone.
                 // Just fetch HEAD for that.
                 let prev_tags = std::mem::replace(&mut remote.fetch_tags, remote::fetch::Tags::None);
-                let mut connection = remote.connect(remote::Direction::Fetch).await?;
+                let mut connection = remote
+                    .connect_with_options(remote::Direction::Fetch, self.connect_options.clone())
+                    .await?
+                    .with_server_options(self.server_options.clone());
                 if let Some(f) = self.configure_connection.as_mut() {
                     f(&mut connection).map_err(Error::RemoteConnection)?;
                 }
@@ -277,7 +283,10 @@ impl PrepareFetch {
         .to_owned();
         let pending_pack = {
             // For shallow clones, we already connected once, so we need to connect again
-            let mut connection = remote.connect(remote::Direction::Fetch).await?;
+            let mut connection = remote
+                    .connect_with_options(remote::Direction::Fetch, self.connect_options.clone())
+                    .await?
+                    .with_server_options(self.server_options.clone());
             if let Some(f) = self.configure_connection.as_mut() {
                 f(&mut connection).map_err(Error::RemoteConnection)?;
             }
@@ -319,7 +328,10 @@ impl PrepareFetch {
                     // On the very special occasion that we fail as there is a remote `refs/heads/HEAD` reference that clashes
                     // with our implicit refspec, retry without it. Maybe this tells us that we shouldn't have that implicit
                     // refspec, as git can do this without connecting twice.
-                    let connection = remote.connect(remote::Direction::Fetch).await?;
+                    let connection = remote
+                    .connect_with_options(remote::Direction::Fetch, self.connect_options.clone())
+                    .await?
+                    .with_server_options(self.server_options.clone());
                     let connection = connection.into_detached();
                     fetch_opts.extra_refspecs.remove(head_refspec_idx);
                     connection.prepare_fetch(&repo, &mut progress, fetch_opts).await?

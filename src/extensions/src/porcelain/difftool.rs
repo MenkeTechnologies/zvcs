@@ -106,9 +106,12 @@ struct Opts {
     no_index: bool,
     /// `-d`/`--dir-diff` was given (its negation clears it).
     dir_diff: bool,
-    /// `-g`/`--gui` was given (its negation clears it). Steers the tool config
-    /// key order (`diff.guitool` first).
-    gui: bool,
+    /// git's tri-state `use_gui_tool` (`-1` unset / `0` / `1`): `-g`/`--gui` and
+    /// `--no-gui` pin it (the C then exports `GIT_MERGETOOL_GUI`), while an unset
+    /// value leaves `gui_mode` to consult `difftool.guiDefault`. Steers the tool
+    /// config key order (`diff.guitool` first) and the `--tool`/`--extcmd`
+    /// incompatibility, which only an explicit `--gui` triggers.
+    gui: Option<bool>,
     /// `-y`/`--no-prompt` → `Some(false)`, `--prompt` → `Some(true)`, unset →
     /// `None` (the `difftool.prompt`/`mergetool.prompt` default applies).
     prompt: Option<bool>,
@@ -166,8 +169,8 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
             "--no-dir-diff" => opts.dir_diff = false,
             "-y" | "--no-prompt" => opts.prompt = Some(false),
             "--prompt" => opts.prompt = Some(true),
-            "-g" | "--gui" => opts.gui = true,
-            "--no-gui" => opts.gui = false,
+            "-g" | "--gui" => opts.gui = Some(true),
+            "--no-gui" => opts.gui = Some(false),
             "--symlinks" | "--no-symlinks" => {}
             "--trust-exit-code" => opts.trust = Some(true),
             "--no-trust-exit-code" => opts.trust = Some(false),
@@ -212,7 +215,7 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
                             return Ok(ExitCode::from(129));
                         }
                         'y' => opts.prompt = Some(false),
-                        'g' => opts.gui = true,
+                        'g' => opts.gui = Some(true),
                         'd' => opts.dir_diff = true,
                         't' | 'x' => {
                             // The value is the rest of the cluster if non-empty,
@@ -314,6 +317,11 @@ struct DiffCmd {
     append: bool,
     /// The name shown in the `Launch '<label>' [Y/n]?` prompt.
     label: String,
+    /// `get_merge_tool_path`'s answer — `difftool.<tool>.path`, else
+    /// `mergetool.<tool>.path`, else the tool name. `run_merge_tool` assigns it
+    /// to `merge_tool_path` before `diff_cmd`, so a `.cmd` can spell it.
+    /// `--extcmd` never reaches `get_merge_tool_path`, so it stays empty there.
+    tool_path: String,
 }
 
 /// `run_file_diff` + `git-difftool--helper.sh`: enumerate the changed paths with
@@ -393,10 +401,10 @@ fn run_file_diff(repo: &gix::Repository, opts: &Opts) -> Result<ExitCode> {
                     None => 1,
                     // `test "$ans" = n` — skip this file, `$?` is 0.
                     Some(ans) if ans == "n" => 0,
-                    Some(_) => run_cmd(&cmd.text, &local, &remote, &merged, cmd.append)?,
+                    Some(_) => run_cmd(&cmd.text, &local, &remote, &merged, cmd.append, &cmd.tool_path)?,
                 }
             } else {
-                run_cmd(&cmd.text, &local, &remote, &merged, cmd.append)?
+                run_cmd(&cmd.text, &local, &remote, &merged, cmd.append, &cmd.tool_path)?
             };
 
             // Command not found (127), not executable (126) or death by signal.
@@ -419,7 +427,12 @@ fn run_file_diff(repo: &gix::Repository, opts: &Opts) -> Result<ExitCode> {
 fn resolve_command(snapshot: &gix::config::Snapshot<'_>, opts: &Opts) -> Result<DiffCmd> {
     // `use_ext_cmd`: a non-empty `--extcmd` wins outright and appends the paths.
     if let Some(x) = opts.extcmd.as_deref().filter(|v| !v.is_empty()) {
-        return Ok(DiffCmd { text: x.to_owned(), append: true, label: x.to_owned() });
+        return Ok(DiffCmd {
+            text: x.to_owned(),
+            append: true,
+            label: x.to_owned(),
+            tool_path: String::new(),
+        });
     }
 
     // The tool name: `--tool` (git's `GIT_DIFF_TOOL`) wins, else
@@ -427,7 +440,12 @@ fn resolve_command(snapshot: &gix::config::Snapshot<'_>, opts: &Opts) -> Result<
     let tool = match opts.tool.as_deref().filter(|v| !v.is_empty()) {
         Some(t) => t.to_owned(),
         None => {
-            let keys: &[&str] = if opts.gui {
+            // `gui_mode`: with `GIT_MERGETOOL_GUI` unset (no `-g`/`--no-gui`)
+            // `get_gui_default` reads `difftool.guiDefault`.
+            let gui = opts
+                .gui
+                .unwrap_or_else(|| super::mergetool::gui_default(snapshot, "difftool.guiDefault"));
+            let keys: &[&str] = if gui {
                 &["diff.guitool", "merge.guitool", "diff.tool", "merge.tool"]
             } else {
                 &["diff.tool", "merge.tool"]
@@ -455,7 +473,12 @@ fn resolve_command(snapshot: &gix::config::Snapshot<'_>, opts: &Opts) -> Result<
         .map(|v| v.to_str_lossy().into_owned())
         .filter(|v| !v.is_empty());
     match cmd {
-        Some(c) => Ok(DiffCmd { text: c, append: false, label: tool }),
+        Some(c) => Ok(DiffCmd {
+            text: c,
+            append: false,
+            tool_path: super::mergetool::merge_tool_path(snapshot, &tool, true),
+            label: tool,
+        }),
         None => bail!(
             "built-in diff tool {tool:?} has no difftool.{tool}.cmd/mergetool.{tool}.cmd config; \
              its diff_cmd lives in a mergetools/ shell script under $(git --exec-path), which is not \
@@ -582,7 +605,14 @@ fn write_temp(tmpdir: &Path, side: &str, path: &[u8], content: &[u8]) -> Result<
 /// `eval $cmd '"$LOCAL"' '"$REMOTE"'` (`append == true`, `--extcmd`), with
 /// `LOCAL`/`REMOTE`/`MERGED`/`BASE` in scope, run in a child `sh` to keep the
 /// word-splitting and quoting identical, returning the `$?` a shell would see.
-fn run_cmd(text: &str, local: &Path, remote: &Path, merged: &str, append: bool) -> Result<i32> {
+fn run_cmd(
+    text: &str,
+    local: &Path,
+    remote: &Path,
+    merged: &str,
+    append: bool,
+    tool_path: &str,
+) -> Result<i32> {
     // `--extcmd`: `export BASE; eval $GIT_DIFFTOOL_EXTCMD '"$LOCAL"' '"$REMOTE"'`.
     const EXTCMD: &str = r#"LOCAL="$1"
 REMOTE="$2"
@@ -590,12 +620,15 @@ MERGED="$3"
 BASE="$3"
 export BASE
 eval $4 '"$LOCAL"' '"$REMOTE"'"#;
-    // User tool: `run_diff_cmd` → `( eval $merge_tool_cmd )` with GIT_PREFIX set.
+    // User tool: `run_diff_cmd` → `( eval $merge_tool_cmd )` with GIT_PREFIX set
+    // and `merge_tool_path` assigned by the enclosing `run_merge_tool`, so a
+    // `.cmd` that spells `$merge_tool_path` sees `difftool.<tool>.path`.
     const TOOL: &str = r#"LOCAL="$1"
 REMOTE="$2"
 MERGED="$3"
 BASE="$3"
 export BASE
+merge_tool_path="$5"
 GIT_PREFIX="${GIT_PREFIX:-.}"
 export GIT_PREFIX
 ( eval $4 )"#;
@@ -609,6 +642,7 @@ export GIT_PREFIX
         .arg(remote)
         .arg(merged)
         .arg(text)
+        .arg(tool_path)
         .stdin(Stdio::inherit())
         .status()?;
     Ok(wait_status(status))
@@ -661,7 +695,7 @@ fn no_index(opts: &Opts) -> Result<ExitCode> {
                         Some(_) => {}
                     }
                 }
-                let status = run_cmd(x, Path::new(a), Path::new(b), b, true)?;
+                let status = run_cmd(x, Path::new(a), Path::new(b), b, true, "")?;
                 if status >= 126 {
                     return Ok(ExitCode::from(status as u8));
                 }
@@ -810,7 +844,7 @@ fn usage_error(msg: &str) -> ExitCode {
 /// diagnostics. `None` when fewer than two are set. On stderr, exit 128.
 fn incompatible_opt3(opts: &Opts) -> Option<ExitCode> {
     let mut set: Vec<&str> = Vec::new();
-    if opts.gui {
+    if opts.gui == Some(true) {
         set.push("--gui");
     }
     if opts.tool.is_some() {

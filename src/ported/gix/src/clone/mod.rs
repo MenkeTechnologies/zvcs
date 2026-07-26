@@ -33,6 +33,12 @@ pub struct PrepareFetch {
     /// Options for preparing a fetch operation.
     #[cfg(any(feature = "async-network-client", feature = "blocking-network-client"))]
     fetch_options: remote::ref_map::Options,
+    /// How to build the transport, notably which program to run in place of `git-upload-pack`.
+    #[cfg(any(feature = "async-network-client", feature = "blocking-network-client"))]
+    connect_options: remote::connect::Options,
+    /// Protocol-v2 server options to send with every request.
+    #[cfg(any(feature = "async-network-client", feature = "blocking-network-client"))]
+    server_options: Vec<BString>,
     /// The url to clone from
     #[cfg_attr(not(feature = "blocking-network-client"), allow(dead_code))]
     url: gix_url::Url,
@@ -140,6 +146,10 @@ impl PrepareFetch {
             configure_remote: None,
             #[cfg(any(feature = "async-network-client", feature = "blocking-network-client"))]
             configure_connection: None,
+            #[cfg(any(feature = "async-network-client", feature = "blocking-network-client"))]
+            connect_options: Default::default(),
+            #[cfg(any(feature = "async-network-client", feature = "blocking-network-client"))]
+            server_options: Vec::new(),
             shallow: remote::fetch::Shallow::NoChange,
             ref_name: None,
             remove_worktree_on_drop,
@@ -201,6 +211,19 @@ mod access_feat {
         /// Set additional options to adjust parts of the fetch operation that are not affected by the git configuration.
         pub fn with_fetch_options(mut self, opts: crate::remote::ref_map::Options) -> Self {
             self.fetch_options = opts;
+            self
+        }
+
+        /// Adjust how the transport itself is built, e.g. to run a different program in place of
+        /// `git-upload-pack` (git's `--upload-pack`).
+        pub fn with_connect_options(mut self, opts: crate::remote::connect::Options) -> Self {
+            self.connect_options = opts;
+            self
+        }
+
+        /// Send `options` as protocol-v2 `server-option` lines with every request (git's `--server-option`).
+        pub fn with_server_options(mut self, options: Vec<crate::bstr::BString>) -> Self {
+            self.server_options = options;
             self
         }
     }

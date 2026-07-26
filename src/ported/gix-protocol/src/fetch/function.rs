@@ -46,6 +46,7 @@ pub async fn fetch<P, T, E>(
         transport,
         user_agent,
         trace_packetlines,
+        server_options,
     }: Context<'_, T>,
     Options {
         shallow_file,
@@ -68,6 +69,10 @@ where
     let fetch_features = {
         let mut f = fetch.default_features(protocol_version, &handshake.capabilities);
         f.push(user_agent);
+        f.extend(crate::command::server_options(
+            &handshake.capabilities,
+            &server_options,
+        ));
         f
     };
 

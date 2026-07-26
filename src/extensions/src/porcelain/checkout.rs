@@ -46,7 +46,8 @@
 //!   * `-m`/`--merge` is accepted: with a clean worktree it is byte-identical to
 //!     a plain switch, and the dirty case is governed by the same conservative
 //!     clean-check as every other switch here.
-//!   * `-p`/`--patch` (interactive hunk selection) still bails — it needs a TTY.
+//!   * `-p`/`--patch` runs the interactive hunk selector ([`super::add_patch`]),
+//!     restoring the picked hunks into the index and the worktree.
 //!   * `-U`/`--unified <n>`, `--inter-hunk-context <n>` and `--[no-]auto-advance`
 //!     configure that hunk selector and nothing else, but are still observable
 //!     without `--patch`: their values go through parse-options' `OPT_INTEGER`
@@ -106,6 +107,9 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // interactive-hunk-selector options, shared verbatim with `git reset` and
     // refused after the loop exactly as git refuses them without `--patch`.
     let mut patch_opts = super::reset::PatchDiffOpts::default();
+    // `-p`/`--patch`: hand the paths to the interactive hunk selector instead of
+    // restoring them wholesale.
+    let mut patch_mode = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -237,7 +241,8 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             "--overwrite-ignore" | "--no-overwrite-ignore" => {}
             "--ignore-other-worktrees" | "--no-ignore-other-worktrees" => {}
             "--ignore-skip-worktree-bits" | "--no-ignore-skip-worktree-bits" => {}
-            "-p" | "--patch" => bail!("interactive patch checkout (-p) needs a TTY"),
+            "-p" | "--patch" => patch_mode = true,
+            "--no-patch" => patch_mode = false,
             "--recurse-submodules" => recurse_submodules = Some(true),
             "--no-recurse-submodules" => recurse_submodules = Some(false),
             // `--recurse-submodules=<pathspec>` limits which submodules move; this
@@ -255,10 +260,47 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // git collects the hunk-selector options into `add_p_opt` and refuses them
     // right after parse-options, before any ref or pathspec is resolved — so a
     // `-U 3` alongside an unknown branch reports the option, not the branch
-    // (verified against git 2.55.0). `--patch` bails in the loop above, so patch
-    // mode is never in effect here.
-    if let Some(code) = patch_opts.require_patch(false) {
+    // (verified against git 2.55.0).
+    if let Some(code) = patch_opts.require_patch(patch_mode) {
         return Ok(code);
+    }
+
+    // `-p`: `git checkout -p [<tree-ish>] [--] [<pathspec>...]` selects hunks to
+    // restore into BOTH the index and the worktree (git's `ADD_P_CHECKOUT`). The
+    // exact patch mode depends on the source: the index when no tree-ish is
+    // given, `HEAD` verbatim, and any other tree-ish resolved to its hex oid —
+    // `checkout_paths()` does the same substitution because `diff-index` cannot
+    // take an `<a>...<b>` range.
+    if patch_mode {
+        if pathspec_from_file.is_some() {
+            eprintln!("fatal: options '--pathspec-from-file' and '--patch' cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
+        // Without `--`, a leading positional is the tree-ish only when it
+        // resolves as a revision; otherwise every positional is a pathspec.
+        let (rev, specs): (Option<&str>, &[&str]) = if has_dashdash {
+            match pre.len() {
+                0 => (None, post.as_slice()),
+                1 => (Some(pre[0]), post.as_slice()),
+                _ => bail!("only one <tree-ish> may precede `--`"),
+            }
+        } else if !pre.is_empty() && repo.rev_parse_single(pre[0]).is_ok() {
+            (Some(pre[0]), &pre[1..])
+        } else {
+            (None, pre.as_slice())
+        };
+        let revision = match rev {
+            None | Some("HEAD") => rev.map(str::to_string),
+            Some(r) => Some(repo.rev_parse_single(r)?.detach().to_string()),
+        };
+        let specs: Vec<String> = specs.iter().map(|s| s.to_string()).collect();
+        return super::add_patch::run(
+            &repo,
+            super::add_patch::Mode::Checkout,
+            revision.as_deref(),
+            patch_opts.to_interactive(false),
+            &specs,
+        );
     }
 
     // Resolve submodule recursion: explicit flag wins, else `submodule.recurse`.

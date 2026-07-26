@@ -24,8 +24,58 @@ impl Http {
     pub const VERSION: Version = Version::new_with_validate("version", &config::Tree::HTTP, validate::Version)
         .with_deviation("fails on illformed UTF-8");
     /// The `http.userAgent` key.
-    pub const USER_AGENT: keys::String =
-        keys::String::new_string("userAgent", &config::Tree::HTTP).with_deviation("fails on illformed UTF-8");
+    pub const USER_AGENT: keys::String = keys::String::new_string("userAgent", &config::Tree::HTTP)
+        .with_environment_override("GIT_HTTP_USER_AGENT")
+        .with_deviation("fails on illformed UTF-8");
+    /// The `http.cookieFile` key.
+    pub const COOKIE_FILE: keys::Path = keys::Path::new_path("cookieFile", &config::Tree::HTTP);
+    /// The `http.saveCookies` key.
+    pub const SAVE_COOKIES: keys::Boolean = keys::Boolean::new_boolean("saveCookies", &config::Tree::HTTP)
+        .with_note("has no effect unless `http.cookieFile` is set to a non-empty path");
+    /// The `http.sslCAPath` key.
+    pub const SSL_CA_PATH: keys::Path =
+        keys::Path::new_path("sslCAPath", &config::Tree::HTTP).with_environment_override("GIT_SSL_CAPATH");
+    /// The `http.sslCert` key.
+    pub const SSL_CERT: keys::Path =
+        keys::Path::new_path("sslCert", &config::Tree::HTTP).with_environment_override("GIT_SSL_CERT");
+    /// The `http.sslKey` key.
+    pub const SSL_KEY: keys::Path =
+        keys::Path::new_path("sslKey", &config::Tree::HTTP).with_environment_override("GIT_SSL_KEY");
+    /// The `http.curloptResolve` multi-var.
+    pub const CURLOPT_RESOLVE: keys::String = keys::String::new_string("curloptResolve", &config::Tree::HTTP)
+        .with_deviation("fails on illformed UTF-8, and entries without a parsable IP address are ignored");
+    /// The `http.keepAliveIdle` key.
+    pub const KEEP_ALIVE_IDLE: keys::UnsignedInteger =
+        keys::UnsignedInteger::new_unsigned_integer("keepAliveIdle", &config::Tree::HTTP)
+            .with_environment_override("GIT_HTTP_KEEPALIVE_IDLE");
+    /// The `http.keepAliveInterval` key.
+    pub const KEEP_ALIVE_INTERVAL: keys::UnsignedInteger =
+        keys::UnsignedInteger::new_unsigned_integer("keepAliveInterval", &config::Tree::HTTP)
+            .with_environment_override("GIT_HTTP_KEEPALIVE_INTERVAL");
+    /// The `http.keepAliveCount` key.
+    pub const KEEP_ALIVE_COUNT: keys::UnsignedInteger =
+        keys::UnsignedInteger::new_unsigned_integer("keepAliveCount", &config::Tree::HTTP)
+            .with_environment_override("GIT_HTTP_KEEPALIVE_COUNT");
+    /// The `http.minSessions` key.
+    pub const MIN_SESSIONS: keys::UnsignedInteger =
+        keys::UnsignedInteger::new_unsigned_integer("minSessions", &config::Tree::HTTP).with_note(
+            "maps onto the number of connections kept alive between requests, as there is no notion of a curl session",
+        );
+    /// The `http.postBuffer` key.
+    pub const POST_BUFFER: keys::UnsignedInteger =
+        keys::UnsignedInteger::new_unsigned_integer("postBuffer", &config::Tree::HTTP);
+    /// The `http.maxRetries` key.
+    pub const MAX_RETRIES: keys::UnsignedInteger =
+        keys::UnsignedInteger::new_unsigned_integer("maxRetries", &config::Tree::HTTP)
+            .with_environment_override("GIT_HTTP_MAX_RETRIES");
+    /// The `http.retryAfter` key.
+    pub const RETRY_AFTER: keys::UnsignedInteger =
+        keys::UnsignedInteger::new_unsigned_integer("retryAfter", &config::Tree::HTTP)
+            .with_environment_override("GIT_HTTP_RETRY_AFTER");
+    /// The `http.maxRetryTime` key.
+    pub const MAX_RETRY_TIME: keys::UnsignedInteger =
+        keys::UnsignedInteger::new_unsigned_integer("maxRetryTime", &config::Tree::HTTP)
+            .with_environment_override("GIT_HTTP_MAX_RETRY_TIME");
     /// The `http.extraHeader` key.
     pub const EXTRA_HEADER: ExtraHeader =
         ExtraHeader::new_with_validate("extraHeader", &config::Tree::HTTP, validate::ExtraHeader)
@@ -73,6 +123,20 @@ impl Section for Http {
             &Self::SCHANNEL_USE_SSL_CA_INFO,
             &Self::SSL_CA_INFO,
             &Self::SCHANNEL_CHECK_REVOKE,
+            &Self::COOKIE_FILE,
+            &Self::SAVE_COOKIES,
+            &Self::SSL_CA_PATH,
+            &Self::SSL_CERT,
+            &Self::SSL_KEY,
+            &Self::CURLOPT_RESOLVE,
+            &Self::KEEP_ALIVE_IDLE,
+            &Self::KEEP_ALIVE_INTERVAL,
+            &Self::KEEP_ALIVE_COUNT,
+            &Self::MIN_SESSIONS,
+            &Self::POST_BUFFER,
+            &Self::MAX_RETRIES,
+            &Self::RETRY_AFTER,
+            &Self::MAX_RETRY_TIME,
         ]
     }
 }

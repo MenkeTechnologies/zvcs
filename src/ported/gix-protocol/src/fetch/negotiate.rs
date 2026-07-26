@@ -306,20 +306,26 @@ pub fn add_wants(
         .zip(remote_ref_target_known)
         .filter_map(|(m, known)| (is_shallow || !*known).then_some(m))
         .filter(|m| !mapping_is_ignored(m));
+    // The same remote ref can be reached by more than one mapping — an explicit refspec and the opportunistic
+    // one that derives its tracking ref both point at it — and asking for it twice would have the server emit
+    // a duplicate `wanted-refs` entry.
+    let mut sent = std::collections::HashSet::new();
     for want in wants {
         let id_on_remote = want.remote.as_id();
         if !arguments.can_use_ref_in_want() || matches!(want.remote, refmap::Source::ObjectId(_)) {
-            if let Some(id) = id_on_remote {
+            if let Some(id) = id_on_remote.filter(|id| sent.insert(bstr::BString::from(id.to_hex().to_string()))) {
                 arguments.want(id);
                 has_want = true;
             }
         } else {
-            arguments.want_ref(
-                want.remote
-                    .as_name()
-                    .expect("name available if this isn't an object id"),
-            );
-            has_want = true;
+            let name = want
+                .remote
+                .as_name()
+                .expect("name available if this isn't an object id");
+            if sent.insert(name.to_owned()) {
+                arguments.want_ref(name);
+                has_want = true;
+            }
         }
         let id_is_annotated_tag_we_have = id_on_remote
             .and_then(|id| objects.try_header(id).ok().flatten().map(|h| (id, h)))

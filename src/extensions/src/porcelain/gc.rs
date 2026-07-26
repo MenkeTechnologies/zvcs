@@ -92,18 +92,21 @@
 //!     [`super::update_server_info::update_server_info`], which `repack` refreshes
 //!     at the end of a successful run.
 //!
-//! ## Pack bytes differ from git's by design
+//! ## Pack bytes differ from git's, but the compression does not
 //!
-//! The packs written here are **base-only**: every object is stored whole and
-//! zlib-deflated, with no delta search. git's are delta-compressed, so its packs
-//! are smaller and share no bytes with these, and the checksum embedded in a
-//! pack's filename differs too. What is reproduced is the *object storage
-//! layout* — which objects end up loose, which end up packed, how many packs and
-//! sidecars exist, and that every one of them is well-formed. `git fsck`,
+//! The packs come from `pack-objects`' writer, so they are delta-compressed by
+//! git's own machinery ported into [`gix_pack::data::output::delta`], under the
+//! repository's `pack.*` settings and `repack.useDeltaBaseOffset`, with
+//! `--aggressive` widening the search to `gc.aggressiveWindow` /
+//! `gc.aggressiveDepth`.
+//!
+//! The bytes still differ from git's, because objects are enumerated in this
+//! module's own order rather than git's `compute_write_order()` and no delta is
+//! ever reused from an existing pack — so the checksum embedded in a pack's
+//! filename differs too. What is reproduced is the *object storage layout* —
+//! which objects end up loose, which end up packed, how many packs and sidecars
+//! exist, and that every one of them is well-formed. `git fsck`,
 //! `git verify-pack` and `git cat-file` all accept the result.
-//!
-//! Delta compression would change the bytes, not the layout. It is a size
-//! optimization, and its absence costs disk space rather than correctness.
 //!
 //! # Not performed
 //!
@@ -111,11 +114,13 @@
 //!
 //!   1. **Reachability bitmaps** (`.bitmap`). git writes one for a large enough
 //!      repack; it is a lookup accelerator, and its absence changes no answer.
-//!   2. **`--aggressive`, `--keep-largest-pack`, `--max-cruft-size`.** All three
-//!      tune *how* git deltas or splits packs. With no delta search there is
-//!      nothing for the first two to tune, and the fixtures' cruft packs are far
-//!      below any size limit. They are accepted, and `--max-cruft-size` (with
-//!      its `gc.maxCruftSize` default) still warns below git's 1 MiB floor.
+//!   2. **`--keep-largest-pack`, `--max-cruft-size`.** Both select *which*
+//!      objects a pack holds rather than how it is compressed: this port always
+//!      rewrites every pack, and the fixtures' cruft packs are far below any
+//!      size limit. They are accepted, and `--max-cruft-size` (with its
+//!      `gc.maxCruftSize` default) still warns below git's 1 MiB floor.
+//!      `--aggressive` *is* honoured: it widens the delta search to
+//!      `gc.aggressiveWindow` and `gc.aggressiveDepth`.
 //!
 //! `--detach` is accepted and always ignored: this port runs synchronously, so
 //! the work is complete by the time `gc` returns rather than shortly after.
@@ -126,7 +131,6 @@
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -223,6 +227,10 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     };
 
     let mut auto = false;
+    // `--aggressive`: widen the delta search to `gc.aggressiveWindow` /
+    // `gc.aggressiveDepth`, which is what git's own `--aggressive` forwards to
+    // its `repack` child.
+    let mut aggressive = false;
     // `None` until a `--prune` form is seen, so `gc.pruneExpire` can supply the
     // default only when the command line was silent — matching git, where the
     // command line overrides the config.
@@ -256,12 +264,14 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             "--no-prune" => prune = Some(Prune::Disabled),
             "--cruft" => cruft = Some(true),
             "--no-cruft" => cruft = Some(false),
+            "--aggressive" => aggressive = true,
+            "--no-aggressive" => aggressive = false,
             // Boolean flags with no effect here, and their `--no-` forms, exactly
-            // as listed in USAGE. `--aggressive`/`--keep-largest-pack` tune a
-            // delta search this port does not perform; `--quiet`/`--detach` are
+            // as listed in USAGE. `--keep-largest-pack` selects which packs to
+            // rewrite, which this port does not vary; `--quiet`/`--detach` are
             // covered in the module docs.
-            "-q" | "--quiet" | "--no-quiet" | "--aggressive"
-            | "--no-aggressive" | "--detach" | "--no-detach" | "--force" | "--no-force"
+            "-q" | "--quiet" | "--no-quiet"
+            | "--detach" | "--no-detach" | "--force" | "--no-force"
             | "--keep-largest-pack"
             // `--no-expire-to` is a valid negation (USAGE spells it `--[no-]expire-to`);
             // `--max-cruft-size` has no `--no-` form, so one is left to error out.
@@ -424,7 +434,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         expire_reflogs(&repo)?;
     }
 
-    repack_all(&repo, unreachable)?;
+    repack_all(&repo, unreachable, delta_options(&repo, aggressive))?;
 
     // `repack` has already removed every unreachable object under `Drop`, so the
     // delegate finds nothing left to do; it still runs, because it also sweeps
@@ -469,6 +479,31 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
 
 // --- repacking -------------------------------------------------------------
 
+/// How the repack's pack writer is steered.
+///
+/// `repack.useDeltaBaseOffset` decides how a delta names its base, defaulting to
+/// by-offset as it does in git. `--aggressive` then substitutes
+/// `gc.aggressiveWindow` (250) and `gc.aggressiveDepth` (50) for `pack.window`
+/// and `pack.depth`, which is exactly what git's `--aggressive` pushes onto its
+/// `repack` child's argument list — and, like git, a value of zero or less is
+/// dropped rather than forwarded, leaving the `pack.*` value in place.
+fn delta_options(repo: &gix::Repository, aggressive: bool) -> super::pack_objects::WriteOptions {
+    let snapshot = repo.config_snapshot();
+    let mut options = super::pack_objects::WriteOptions {
+        allow_ofs_delta: snapshot.boolean("repack.useDeltaBaseOffset").unwrap_or(true),
+        ..super::pack_objects::WriteOptions::default()
+    };
+    if aggressive {
+        let positive = |key: &str, default: i64| {
+            let value = snapshot.integer(key).unwrap_or(default);
+            usize::try_from(value).ok().filter(|n| *n > 0)
+        };
+        options.window = positive("gc.aggressiveWindow", 250);
+        options.depth = positive("gc.aggressiveDepth", 50);
+    }
+    options
+}
+
 /// `git repack -ad`: rewrite the whole local object store into one pack holding
 /// every reachable object, then dispose of the rest as `unreachable` says.
 ///
@@ -481,7 +516,11 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
 /// Packs marked with a `.keep` are left alone entirely, as git leaves them: they
 /// are neither rewritten nor deleted, and the objects they hold are not copied
 /// into the new pack.
-fn repack_all(repo: &gix::Repository, unreachable: Unreachable) -> Result<()> {
+fn repack_all(
+    repo: &gix::Repository,
+    unreachable: Unreachable,
+    delta: super::pack_objects::WriteOptions,
+) -> Result<()> {
     let hash = repo.object_hash();
     let objdir = repo.objects.store_ref().path().to_path_buf();
     let pack_dir = objdir.join("pack");
@@ -525,7 +564,7 @@ fn repack_all(repo: &gix::Repository, unreachable: Unreachable) -> Result<()> {
     // The new pack has to be written before anything is removed: every object in
     // it is read back out of the very packs and loose files being replaced.
     let mut written = Vec::new();
-    if let Some(base) = write_bundle(repo, &pack_dir, &keep, None)? {
+    if let Some(base) = write_bundle(repo, &pack_dir, &keep, None, delta)? {
         written.push(base);
     }
     if unreachable == Unreachable::Cruft {
@@ -540,7 +579,7 @@ fn repack_all(repo: &gix::Repository, unreachable: Unreachable) -> Result<()> {
                 (*id, stamp)
             })
             .collect();
-        if let Some(base) = write_bundle(repo, &pack_dir, &rest, Some(&mtimes))? {
+        if let Some(base) = write_bundle(repo, &pack_dir, &rest, Some(&mtimes), delta)? {
             written.push(base);
         }
     }
@@ -668,18 +707,23 @@ fn local_packs(pack_dir: &Path, hash: gix::hash::Kind) -> Vec<(String, pack::ind
 /// Write one pack and its sidecars for `ids`, returning the `pack-<hash>` base
 /// name, or `None` when there was nothing to write.
 ///
-/// `ids` must already be sorted by object id: that order *is* the pack index's
-/// order, and the objects are written to the pack in it as well.
+/// The pack comes from `pack-objects`' writer, so it is delta-compressed under
+/// the repository's `pack.*` settings, with `repack.useDeltaBaseOffset` choosing
+/// how a delta names its base and `gc --aggressive` widening the search per
+/// `gc.aggressiveWindow` / `gc.aggressiveDepth`. Its entries are therefore *not*
+/// in `ids` order — a base has to precede the deltas that need it — so the
+/// index's three parallel columns are rebuilt from the writer's own record of
+/// where each object landed.
 ///
-/// Every object is stored whole — a base entry, zlib-deflated, no delta. git
-/// runs a delta search here and its pack is therefore smaller and shares no
-/// bytes with this one, right down to the checksum in the filename. See the
-/// module docs; the layout is what is being reproduced, not the bytes.
+/// An object the writer could not read is absent from the pack, and is dropped
+/// from the index and the `.mtimes` alongside it rather than left as a dangling
+/// entry.
 fn write_bundle(
     repo: &gix::Repository,
     pack_dir: &Path,
     ids: &[ObjectId],
     mtimes: Option<&HashMap<ObjectId, u32>>,
+    delta: super::pack_objects::WriteOptions,
 ) -> Result<Option<String>> {
     if ids.is_empty() {
         return Ok(None);
@@ -688,87 +732,39 @@ fn write_bundle(
     std::fs::create_dir_all(pack_dir)
         .with_context(|| format!("create {}", pack_dir.display()))?;
 
+    let packed = super::pack_objects::packed_for(repo, ids, delta)
+        .with_context(|| format!("build a pack of {} objects", ids.len()))?;
+    if packed.entries.is_empty() {
+        return Ok(None);
+    }
+
+    // A v2 index stores its three columns in object-id order, whatever order the
+    // pack itself is in.
+    let mut by_oid = packed.entries.clone();
+    by_oid.sort_unstable_by_key(|entry| entry.id);
+    let written: Vec<ObjectId> = by_oid.iter().map(|entry| entry.id).collect();
+    let offsets: Vec<u64> = by_oid.iter().map(|entry| entry.offset).collect();
+    let crcs: Vec<u32> = by_oid.iter().map(|entry| entry.crc32).collect();
+
     // The pack is built under a temporary name because its final name is its own
     // checksum, which is only known once the last byte is in. This is also how
     // git writes it.
     let tmp = pack_dir.join("tmp_pack_zvcs_gc");
-    let mut offsets: Vec<u64> = Vec::with_capacity(ids.len());
-    let mut crcs: Vec<u32> = Vec::with_capacity(ids.len());
-    let pack_hash;
-    {
-        let file = std::fs::File::create(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
-        let mut out = std::io::BufWriter::new(file);
-        let mut hasher = gix::hash::hasher(hash);
-        let mut written: u64 = 0;
+    std::fs::write(&tmp, &packed.bytes).with_context(|| format!("create {}", tmp.display()))?;
 
-        let entries = u32::try_from(ids.len()).context("a pack holds at most u32::MAX objects")?;
-        let mut header = Vec::with_capacity(12);
-        header.extend_from_slice(b"PACK");
-        header.extend_from_slice(&2u32.to_be_bytes());
-        header.extend_from_slice(&entries.to_be_bytes());
-        hasher.update(&header);
-        out.write_all(&header)?;
-        written += header.len() as u64;
-
-        for id in ids {
-            let object = repo
-                .find_object(*id)
-                .with_context(|| format!("read object {id} while repacking"))?;
-            let mut entry = Vec::new();
-            entry_header(object.kind).write_to(object.data.len() as u64, &mut entry)?;
-            entry.extend_from_slice(&deflate(&object.data)?);
-
-            offsets.push(written);
-            // The `.idx`'s CRC32 covers the entry as it sits in the pack: its
-            // header and its compressed body, and nothing else.
-            crcs.push(gix::features::hash::crc32(&entry));
-            hasher.update(&entry);
-            out.write_all(&entry)?;
-            written += entry.len() as u64;
-        }
-
-        pack_hash = hasher.try_finalize()?;
-        out.write_all(pack_hash.as_slice())?;
-        out.flush()?;
-    }
-
+    let pack_hash = packed.id;
     let base = format!("pack-{pack_hash}");
     std::fs::rename(&tmp, pack_dir.join(format!("{base}.pack")))
         .with_context(|| format!("install {base}.pack"))?;
 
     let pack_id = pack_hash.as_slice();
-    write_sidecar(pack_dir, &base, "idx", &index_bytes(hash, ids, &offsets, &crcs, pack_id)?)?;
+    write_sidecar(pack_dir, &base, "idx", &index_bytes(hash, &written, &offsets, &crcs, pack_id)?)?;
     write_sidecar(pack_dir, &base, "rev", &reverse_index_bytes(hash, &offsets, pack_id)?)?;
     if let Some(mtimes) = mtimes {
-        let stamps: Vec<u32> = ids.iter().map(|id| mtimes.get(id).copied().unwrap_or(0)).collect();
+        let stamps: Vec<u32> = written.iter().map(|id| mtimes.get(id).copied().unwrap_or(0)).collect();
         write_sidecar(pack_dir, &base, "mtimes", &mtimes_bytes(hash, &stamps, pack_id)?)?;
     }
     Ok(Some(base))
-}
-
-/// The pack-entry header for a base object of `kind`.
-fn entry_header(kind: gix::objs::Kind) -> pack::data::entry::Header {
-    match kind {
-        Kind::Commit => pack::data::entry::Header::Commit,
-        Kind::Tree => pack::data::entry::Header::Tree,
-        Kind::Blob => pack::data::entry::Header::Blob,
-        Kind::Tag => pack::data::entry::Header::Tag,
-    }
-}
-
-/// Deflate one object body at the level git uses for packs, which is
-/// `pack.compression`'s default rather than the loose-object default.
-///
-/// Driven with `io::copy` and a final `flush`, which is what
-/// `gix_pack::data::output::Entry::from_data` does: the deflate adapter reports
-/// a short write when its output buffer needs draining, and `flush` is what
-/// emits the stream's terminating block.
-fn deflate(data: &[u8]) -> Result<Vec<u8>> {
-    let mut out = gix::zlib::stream::deflate::Write::new(Vec::new(), gix::zlib::Compression::DEFAULT);
-    std::io::copy(&mut &*data, &mut out)?;
-    out.flush()?;
-    Ok(out.into_inner())
 }
 
 fn write_sidecar(pack_dir: &Path, base: &str, ext: &str, bytes: &[u8]) -> Result<()> {
@@ -780,10 +776,12 @@ fn write_sidecar(pack_dir: &Path, base: &str, ext: &str, bytes: &[u8]) -> Result
 /// ids, their CRC32s and their offsets as three parallel columns, and finally
 /// the pack's checksum and the index's own.
 ///
-/// Only the 32-bit offset column is emitted. An offset past 2 GiB would need the
-/// 64-bit spill table, which cannot arise here: these packs are undeltified
-/// copies of a repository that fit in memory one object at a time, and a pack
-/// that large would have to be built by a delta-aware writer anyway.
+/// Only the 32-bit offset column is emitted, so an entry beyond 2 GiB into the
+/// pack cannot be indexed; it would need the 64-bit spill table that
+/// [`super::pack_objects::index_file`] writes. Reaching that needs a repository
+/// whose whole reachable set exceeds 2 GiB after delta compression, which is
+/// past what this writer — which assembles the pack in memory — supports
+/// anyway.
 fn index_bytes(
     hash: gix::hash::Kind,
     ids: &[ObjectId],

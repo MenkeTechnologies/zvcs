@@ -19,15 +19,13 @@
 //! the refs have been fetched, exactly where git validates them, so an
 //! unreachable remote still reports the transport failure rather than the key.
 //!
+//! `--upload-pack=<exec>` (and its hidden synonym `--exec`) selects the program run in place of
+//! `git-upload-pack`, defaulting to `remote.<name>.uploadpack`; `-o`/`--server-option` is transmitted as
+//! protocol-v2 `server-option=<value>` capability lines on the `ls-refs` request, defaulting to
+//! `remote.<name>.serverOption`.
+//!
 //! Known gaps:
 //!
-//! * `--upload-pack=<exec>` (and its hidden synonym `--exec`) bails:
-//!   `Remote::connect` exposes no hook for the remote helper path, so honouring
-//!   it is not possible in the vendored crates.
-//! * `-o`/`--server-option` is parsed and validated but *not* transmitted:
-//!   gitoxide has no protocol-v2 server-option plumbing (no `server_option`
-//!   symbol exists anywhere under `gix-protocol`). Servers that would reject an
-//!   unknown option therefore see a request git would have made differently.
 //! * `--sort` keys beyond `refname`, `objectname`, `creatordate`,
 //!   `committerdate`, `authordate` and `taggerdate` are refused with git's
 //!   `unknown field name` fatal. git accepts more `for-each-ref` atoms than
@@ -81,6 +79,11 @@ struct Opts {
     get_url: bool,   // --get-url: print the expanded URL and never connect
     /// Raw `--sort=<key>` arguments in command-line order; validated late.
     sort: Vec<String>,
+    /// `-o`/`--server-option`, sent as protocol-v2 `server-option=<value>` lines with `ls-refs`.
+    server_options: Vec<gix::bstr::BString>,
+    /// `--upload-pack=<exec>` (git's hidden `--exec` synonym sets the same variable): the program to run in
+    /// place of `git-upload-pack` on the other end.
+    upload_pack: Option<String>,
 }
 
 /// One output record: a ref advertised by the remote, or the synthetic `^{}`
@@ -145,6 +148,8 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         quiet: false,
         exit_code: false,
         get_url: false,
+        server_options: Vec::new(),
+        upload_pack: None,
         sort: Vec::new(),
     };
     let mut positionals: Vec<&str> = Vec::new();
@@ -204,8 +209,13 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
 
     // `prefix_from_spec_as_filter_on_remote` must be off: ls-remote lists every
     // advertised ref, not just the ones the remote's refspecs would fetch.
-    let connection = match remote.connect(gix::remote::Direction::Fetch) {
-        Ok(c) => c,
+    let remote_name = remote.name().map(|n| n.as_bstr().to_string());
+    let connect_options = gix::remote::connect::Options {
+        upload_pack: super::fetch::upload_pack_program(&repo, remote_name.as_deref(), opts.upload_pack.as_deref()),
+    };
+    let server_options = super::fetch::server_options_for(&repo, remote_name.as_deref(), &opts.server_options);
+    let connection = match remote.connect_with_options(gix::remote::Direction::Fetch, connect_options) {
+        Ok(c) => c.with_server_options(server_options),
         Err(e) => {
             eprintln!("fatal: {e}");
             return Ok(ExitCode::from(128));
@@ -358,11 +368,13 @@ fn parse_args<'a>(
             "quiet" => boolean(&mut opts.quiet)?,
             "exit-code" => boolean(&mut opts.exit_code)?,
             "get-url" => boolean(&mut opts.get_url)?,
-            "sort" | "server-option" => {
-                // `--no-sort` / `--no-server-option` discard what was collected.
+            "sort" | "server-option" | "upload-pack" | "exec" => {
+                // `--no-sort` / `--no-server-option` / `--no-upload-pack` discard what was collected.
                 if !on {
-                    if name == "sort" {
-                        opts.sort.clear();
+                    match name {
+                        "sort" => opts.sort.clear(),
+                        "server-option" => opts.server_options.clear(),
+                        _ => opts.upload_pack = None,
                     }
                     continue;
                 }
@@ -379,20 +391,13 @@ fn parse_args<'a>(
                         }
                     },
                 };
-                // Server options are consumed and dropped: gitoxide has no
-                // protocol-v2 server-option plumbing to hand them to.
-                if name == "sort" {
-                    opts.sort.push(value);
+                // `--exec` is git's hidden synonym for `--upload-pack`; both set the same `uploadpack`
+                // variable in `builtin/ls-remote.c`, and the last one given wins.
+                match name {
+                    "sort" => opts.sort.push(value),
+                    "server-option" => opts.server_options.push(value.into()),
+                    _ => opts.upload_pack = Some(value),
                 }
-            }
-            "upload-pack" | "exec" => {
-                // `--exec` is git's hidden synonym for `--upload-pack` (both set
-                // the same `uploadpack` variable in builtin/ls-remote.c). Honouring
-                // either needs a remote-helper path hook `Remote::connect` does not
-                // expose; bail rather than silently ignore it. Stock git accepts
-                // `--exec`, so it must not fall through to "unknown option".
-                bail_unsupported(&format!("--{name}"));
-                return Err(ExitCode::from(128));
             }
             other => {
                 eprintln!("error: unknown option `{other}'");
@@ -779,6 +784,8 @@ mod tests {
             exit_code: false,
             get_url: false,
             sort: Vec::new(),
+            server_options: Vec::new(),
+            upload_pack: None,
         }
     }
 

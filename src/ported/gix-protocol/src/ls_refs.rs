@@ -139,14 +139,19 @@ pub(crate) mod function {
         ///
         /// Use [`crate::ls_refs::RefPrefixes::from_refspecs()`] to construct `ref_prefixes`
         /// from refspecs, or [`crate::ls_refs::RefPrefixes::new()`] to build them manually.
+        ///
+        /// `server_options` are transmitted as `server-option=<value>` capability lines if the server advertised
+        /// the `server-option` capability, which is how git's `get_remote_refs()` passes `--server-option` along.
         pub fn new(
             ref_prefixes: Option<RefPrefixes>,
             capabilities: &'a Capabilities,
             agent: crate::command::Feature,
+            server_options: &[BString],
         ) -> Self {
             let ls_refs = Command::LsRefs;
             let mut features = ls_refs.default_features(gix_transport::Protocol::V2, capabilities);
             features.push(agent);
+            features.extend(crate::command::server_options(capabilities, server_options));
             let mut arguments = ls_refs.initial_v2_arguments(&features);
             if capabilities
                 .capability("ls-refs")

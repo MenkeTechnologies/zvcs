@@ -311,10 +311,21 @@ fn approxidate(value: &str) -> i64 {
 /// bit-clearing semantics: `--no-show-name`, `--no-show-number`, `--no-porcelain`
 /// (clears the porcelain bit only), `--no-line-porcelain` (clears both porcelain
 /// bits, so it also cancels a preceding `-p`), and `--no-abbrev` (equivalent to
-/// `--abbrev=0`, i.e. the full hash). The `--no-` forms of the unimplemented
-/// options (`--no-incremental`, `--no-show-stats`, `--no-score-debug`,
-/// `--no-ignore-rev`, `--no-ignore-revs-file`) each select git's default, which
-/// this port already produces, so they are accepted as no-ops.
+/// `--abbrev=0`, i.e. the full hash). `--no-ignore-rev` / `--no-ignore-revs-file`
+/// clear their `OPT_STRING_LIST`s, config-supplied entries included. The `--no-`
+/// forms of the unimplemented options (`--no-incremental`, `--no-show-stats`,
+/// `--no-score-debug`) each select git's default, which this port already
+/// produces, so they are accepted as no-ops.
+///
+/// `--ignore-rev <rev>`, `--ignore-revs-file <file>` and `blame.ignoreRevsFile`
+/// are implemented against a port of git's fingerprint matcher: once the ordinary
+/// diff has handed everything it can to the parents, the lines still held by an
+/// ignored commit are matched to the parents' lines by byte-pair similarity
+/// (`guess_line_blames()`), and whichever find a match are handed over too.
+/// `blame.markIgnoredLines` marks the re-attributed lines with `?` and
+/// `blame.markUnblamableLines` marks the lines that found no match with `*`, each
+/// spending one column of the object-name field, and both emit their own
+/// `ignored` / `unblamable` line in the porcelain formats.
 ///
 /// Flags that are not implemented are rejected with a terse message rather than
 /// emitting wrong output, each for a concrete reason:
@@ -328,10 +339,9 @@ fn approxidate(value: &str) -> i64 {
 ///     reference count of git's `blame_origin` graph, which depends on which
 ///     origins the walk kept alive rather than on the attribution itself.
 ///   * `-M` / `-C` — line move/copy detection happens inside the walk
-///     (`find_move_in_parent` / `find_copy_in_parent`), which `gix-blame` has no
-///     hook for.
-///   * `--ignore-rev` / `--ignore-revs-file` — re-attributing a line off an
-///     ignored commit is `guess_line_blames()`, another walk-level heuristic.
+///     (`find_move_in_parent` / `find_copy_in_parent`), splitting entries against
+///     *other* origins of the same commit; `gix-blame` tracks one source path per
+///     hunk and has no scoreboard of origins to split against.
 ///   * `-S <revs-file>` — installs commit grafts that rewrite the ancestry the
 ///     walk follows.
 ///   * `--reverse`, regex/function `-L` forms, `--date=human` and the `-local`
@@ -377,11 +387,38 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         Err(code) => return Ok(code),
     };
 
+    // `blame.ignoreRevsFile` is an `OPT_STRING_LIST` fed from the config callback, so
+    // every occurrence in file order contributes and an empty value clears what came
+    // before it. git resolves each through `git_config_pathname`, which expands `~`.
+    let ignore_revs_file_default: Vec<String> = repo
+        .config_snapshot()
+        .plumbing()
+        .strings("blame.ignoreRevsFile")
+        .unwrap_or_default()
+        .iter()
+        .map(|v| v.to_str_lossy().into_owned())
+        .fold(Vec::new(), |mut acc, value| {
+            if value.is_empty() {
+                acc.clear();
+            } else {
+                acc.push(expand_tilde(&value));
+            }
+            acc
+        });
+    let mark_unblamable_lines =
+        repo.config_snapshot().boolean("blame.markUnblamableLines") == Some(true);
+    let mark_ignored_lines = repo.config_snapshot().boolean("blame.markIgnoredLines") == Some(true);
+
     let mut opts = Options::parse(
         args,
-        show_email_default,
-        show_root_default,
-        blank_boundary_default,
+        ConfigDefaults {
+            show_email: show_email_default,
+            show_root: show_root_default,
+            blank_boundary: blank_boundary_default,
+            ignore_revs_file: ignore_revs_file_default,
+            mark_unblamable_lines,
+            mark_ignored_lines,
+        },
     )?;
 
     // git's `--progress` handling, run straight after `parse_options` and before
@@ -442,8 +479,45 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         }
     };
 
+    // git's `build_ignorelist`, run before `setup_scoreboard`, so a bad ignore list is
+    // reported before a bad path is.
+    let ignore_revs = match build_ignorelist(&repo, &opts) {
+        Ok(set) => set,
+        Err(code) => return Ok(code),
+    };
+
     // Translate the user's path (relative to CWD) into a repo-root-relative path.
     let rel_path = repo_relative_path(&repo, &opts.file)?;
+
+    // git refuses a path the blamed commit does not have. Which diagnostic it uses
+    // depends on whether a final image is overlaid on top of that commit:
+    //   * with an overlay (no revision, or `--contents`) the fake commit's
+    //     `verify_working_tree_path` looks in its parents' trees and then in the
+    //     index, and only then dies with the quoted, always-`HEAD` form;
+    //   * without one, `setup_scoreboard` fails to fill the blob and names the
+    //     revision as the user typed it.
+    let overlay = opts.contents.is_some() || opts.rev.is_none();
+    let path_in_suspect = repo
+        .rev_parse_single(format!("{suspect}:{rel_path}").as_str())
+        .is_ok();
+    let mut index_only = false;
+    if !path_in_suspect {
+        let mut err = std::io::stderr().lock();
+        if !overlay {
+            let rev = opts.rev.as_deref().unwrap_or("HEAD");
+            writeln!(err, "fatal: no such path {rel_path} in {rev}")?;
+            err.flush()?;
+            return Ok(ExitCode::from(128));
+        }
+        if !path_in_index(&repo, &rel_path) {
+            writeln!(err, "fatal: no such path '{rel_path}' in HEAD")?;
+            err.flush()?;
+            return Ok(ExitCode::from(128));
+        }
+        // The path is only in the index, so there is nothing to blame it against:
+        // every line belongs to the synthetic commit holding the final image.
+        index_only = true;
+    }
 
     // The final image is overlaid on top of the suspect when either no revision
     // was given (git blames the working-tree copy) or `--contents` supplies an
@@ -481,6 +555,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         since: None,
         rewrites: Some(gix::diff::Rewrites::default()),
         ignore_whitespace: opts.ignore_whitespace,
+        ignore_revs: ignore_revs.clone(),
     };
 
     // A blame of (commit, path) is a pure function of immutable objects, so the
@@ -493,8 +568,14 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     // not the whole file's attribution.
     // The key must separate `-w` from a plain blame: they diff differently, so their
     // attributions differ and must not share a cache entry.
+    //
+    // An `--ignore-rev` blame is not cached at all: its result depends on the ignore
+    // set *and* carries per-line `ignored`/`unblamable` flags the run encoding has no
+    // room for, so a cache entry would either collide with a plain blame or lose the
+    // flags.
     let algo_key = format!("{:?}|w={}", opts.diff_algorithm, opts.ignore_whitespace);
-    let cache_key = opts.ranges.is_empty().then(|| (suspect.to_string(), rel_path.clone(), algo_key));
+    let cache_key = (opts.ranges.is_empty() && ignore_revs.is_empty() && !index_only)
+        .then(|| (suspect.to_string(), rel_path.clone(), algo_key));
     // The blamed blob identifies the file content the attribution belongs to.
     let blamed_blob = repo
         .rev_parse_single(format!("{suspect}:{rel_path}").as_str())
@@ -511,6 +592,9 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     // `(lines, blob content)` — the overlay path needs the blamed blob's bytes,
     // which come from the outcome on a miss and from the object on a hit.
     let (mut lines, blamed_bytes) = match cached {
+        // Nothing to blame against: the file exists only in the index, so the empty
+        // `HEAD` image below leaves every line with the synthetic commit.
+        _ if index_only => (Vec::new(), Vec::new()),
         Some((lines, bytes)) => (lines, bytes),
         None => {
             let outcome = repo
@@ -555,6 +639,9 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     let info = collect_commit_info(&repo, &lines, &opts, &null_id, &rel_path)?;
 
     if opts.porcelain {
+        // The synthetic commit only records a `previous` origin when it actually
+        // handed lines to one, which never happens when the path is index-only.
+        let head_id = if index_only { None } else { head_id };
         emit_porcelain(&repo, &lines, &info, &rel_path, head_id, &null_id, &opts)
     } else {
         emit_human(&repo, &lines, &info, &rel_path, &opts, &colors)
@@ -665,6 +752,8 @@ fn lines_from_cache(
                 orig_no: orig_no + k,
                 source_name: source_name.clone(),
                 content: content.get(idx)?.clone(),
+                ignored: false,
+                unblamable: false,
             });
         }
     }
@@ -678,6 +767,12 @@ struct Line {
     orig_no: u32,
     source_name: Option<Vec<u8>>,
     content: Vec<u8>,
+    /// git's `blame_entry::ignored`: the line reached this commit through the
+    /// `--ignore-rev` similarity match rather than through a diff.
+    ignored: bool,
+    /// git's `blame_entry::unblamable`: the line belongs to an ignored commit but
+    /// no similar line was found in any parent.
+    unblamable: bool,
 }
 
 /// Flatten `gix-blame`'s hunks into one `Line` per line of the blamed file.
@@ -702,6 +797,8 @@ fn materialize_lines(outcome: &gix::blame::Outcome) -> Vec<Line> {
                 orig_no: source_start + i + 1,
                 source_name: source_name.clone(),
                 content,
+                ignored: entry.ignored,
+                unblamable: entry.unblamable,
             });
         }
     }
@@ -769,6 +866,8 @@ fn overlay_worktree(
                 orig_no: src.orig_no,
                 source_name: src.source_name.clone(),
                 content,
+                ignored: src.ignored,
+                unblamable: src.unblamable,
             }),
             None => out.push(Line {
                 commit_id: null_id,
@@ -776,6 +875,8 @@ fn overlay_worktree(
                 orig_no: final_no,
                 source_name: None,
                 content,
+                ignored: false,
+                unblamable: false,
             }),
         }
     }
@@ -921,21 +1022,35 @@ fn object_name_width(repo: &gix::Repository, opts: &Options) -> usize {
     width
 }
 
-/// Emit the object-name column into `buf`, following git's `print_marks` +
-/// `emit_other` interplay:
+/// Emit the object-name column into `buf`, following git's `emit_other`, which
+/// spends the column budget on markers first and prints what is left of the hex:
 ///   * `-b` (`blank_boundary`) blanks a boundary commit's name to spaces — and
-///     also suppresses the `^` marker, so the whole column is `name_width` spaces.
+///     also suppresses the `^` marker, but does *not* give the column back, so
+///     the blanked run is still `name_width` wide.
 ///   * otherwise a boundary commit takes one column for `^` (never in
-///     annotate-compat mode, which prints no marker) and `name_width - 1` hex digits.
-///   * a normal commit prints `name_width` hex digits.
-fn emit_object_name(buf: &mut Vec<u8>, ci: &CommitInfo, name_width: usize, opts: &Options) {
-    if ci.boundary && opts.blank_boundary {
-        pad(buf, name_width);
-    } else if ci.boundary && !opts.annotate_compat {
+///     annotate-compat mode, which prints no marker).
+///   * `blame.markUnblamableLines` then takes a column for `*`, and
+///     `blame.markIgnoredLines` one for `?`, in that order.
+///   * whatever budget remains is filled with hex digits.
+fn emit_object_name(buf: &mut Vec<u8>, ci: &CommitInfo, line: &Line, name_width: usize, opts: &Options) {
+    let mut length = name_width;
+    let blanked = ci.boundary && opts.blank_boundary;
+    if ci.boundary && !blanked && !opts.annotate_compat {
         buf.push(b'^');
-        buf.extend_from_slice(&ci.hex.as_bytes()[..name_width - 1]);
+        length -= 1;
+    }
+    if opts.mark_unblamable_lines && line.unblamable {
+        buf.push(b'*');
+        length -= 1;
+    }
+    if opts.mark_ignored_lines && line.ignored {
+        buf.push(b'?');
+        length -= 1;
+    }
+    if blanked {
+        pad(buf, length);
     } else {
-        buf.extend_from_slice(&ci.hex.as_bytes()[..name_width]);
+        buf.extend_from_slice(&ci.hex.as_bytes()[..length]);
     }
 }
 
@@ -964,7 +1079,7 @@ fn emit_annotate_compat(
         let ci = &info[&line.commit_id];
         buf.clear();
 
-        emit_object_name(&mut buf, ci, name_width, opts);
+        emit_object_name(&mut buf, ci, line, name_width, opts);
 
         // format_time pads the date to `blame_date_width` first; the trailing
         // `%10s` then never fires because every mode's width is >= 10.
@@ -1051,7 +1166,7 @@ fn emit_human(
         }
 
         // Object name (boundary `^` marker, `-b` blanking).
-        emit_object_name(&mut buf, ci, name_width, opts);
+        emit_object_name(&mut buf, ci, line, name_width, opts);
 
         // Source filename column (left-justified).
         if show_file {
@@ -1155,6 +1270,14 @@ fn emit_porcelain(
                 && (opts.line_porcelain || shown.insert(first.commit_id)) {
                     write_detail(&mut out, ci, previous.as_ref(), path)?;
                 }
+            // git's `emit_porcelain_per_line_details`, printed for every line right
+            // after the (possibly absent) commit detail block.
+            if opts.mark_unblamable_lines && line.unblamable {
+                out.write_all(b"unblamable\n")?;
+            }
+            if opts.mark_ignored_lines && line.ignored {
+                out.write_all(b"ignored\n")?;
+            }
             out.write_all(b"\t")?;
             out.write_all(&line.content)?;
             out.write_all(b"\n")?;
@@ -1224,6 +1347,9 @@ fn group_lines(lines: &[Line]) -> Vec<Group> {
                 && prev.source_name == line.source_name
                 && prev.orig_no + 1 == line.orig_no
                 && prev.final_no + 1 == line.final_no
+                // `blame_coalesce()` also refuses to merge across these.
+                && prev.ignored == line.ignored
+                && prev.unblamable == line.unblamable
         });
         if extends {
             let last = groups.len() - 1;
@@ -1321,6 +1447,104 @@ enum Targets {
     Fatal(ExitCode),
     /// `opts.file`, `opts.rev` and `opts.suspect_id` are now populated.
     Resolved,
+}
+
+/// Expand a leading `~` / `~/` to `$HOME`, which is what `git_config_pathname` does
+/// for `blame.ignoreRevsFile`.
+fn expand_tilde(value: &str) -> String {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return value.to_string();
+    };
+    let expanded = if value == "~" {
+        home
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        return value.to_string();
+    };
+    expanded.to_string_lossy().into_owned()
+}
+
+/// git's `verify_working_tree_path` fallback: the path is tracked in the index even
+/// though the blamed commit does not have it (it was just `git add`ed, or is
+/// unmerged). Blame then still works, against an empty history.
+fn path_in_index(repo: &gix::Repository, rel_path: &str) -> bool {
+    let Ok(index) = repo.index_or_empty() else {
+        return false;
+    };
+    // git looks for the exact name at any stage, so an unmerged path counts too.
+    let entries = index.entries();
+    entries
+        .iter()
+        .any(|e| &**e.path(&index) == rel_path.as_bytes())
+}
+
+/// git's `peel_to_commit_oid`: peel tags until a commit is reached. Anything that is
+/// not a commit and not a tag chain ending in one yields `None`, which
+/// `oidset_parse_file_carefully` treats as "skip this line".
+fn peel_ignored_oid(repo: &gix::Repository, oid: ObjectId) -> Option<ObjectId> {
+    repo.find_object(oid)
+        .ok()?
+        .peel_to_commit()
+        .ok()
+        .map(|c| c.id().detach())
+}
+
+/// git's `build_ignorelist`: the revision files first (in the order config and
+/// command line contributed them), then the `--ignore-rev` arguments.
+///
+/// A file that cannot be opened, and a line in one that is not a full object name,
+/// are fatal; a well-formed object name that is not a commit is skipped silently. An
+/// `--ignore-rev` argument that names nothing is fatal.
+fn build_ignorelist(
+    repo: &gix::Repository,
+    opts: &Options,
+) -> Result<HashSet<ObjectId>, ExitCode> {
+    let mut set: HashSet<ObjectId> = HashSet::new();
+
+    for path in &opts.ignore_revs_file {
+        let Ok(data) = std::fs::read(path) else {
+            eprintln!("fatal: could not open object name list: {path}");
+            return Err(ExitCode::from(128));
+        };
+        for raw in data.split(|b| *b == b'\n') {
+            // `strbuf_getline` drops the terminator and a trailing CR; then trailing
+            // comments and surrounding whitespace go, and blank lines are skipped.
+            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+            let line = match line.iter().position(|b| *b == b'#') {
+                Some(hash) => &line[..hash],
+                None => line,
+            };
+            let line = line.trim_ascii();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(oid) = ObjectId::from_hex(line) else {
+                eprintln!(
+                    "fatal: invalid object name: {}",
+                    String::from_utf8_lossy(line)
+                );
+                return Err(ExitCode::from(128));
+            };
+            if let Some(commit) = peel_ignored_oid(repo, oid) {
+                set.insert(commit);
+            }
+        }
+    }
+
+    for rev in &opts.ignore_rev {
+        match resolve_commit(repo, rev) {
+            Some(id) => {
+                set.insert(id);
+            }
+            None => {
+                eprintln!("fatal: cannot find revision {rev} to ignore");
+                return Err(ExitCode::from(128));
+            }
+        }
+    }
+
+    Ok(set)
 }
 
 /// git's `is_a_rev`: the name resolves to some object in the repository.
@@ -1687,6 +1911,17 @@ struct Options {
     /// `--contents <file>`: use `<file>`'s contents (or stdin for `-`) as the
     /// final image, on top of the suspect commit (default HEAD).
     contents: Option<String>,
+    /// `--ignore-rev <rev>`, in command-line order. `--no-ignore-rev` clears it,
+    /// matching `OPT_STRING_LIST`'s negation.
+    ignore_rev: Vec<String>,
+    /// `blame.ignoreRevsFile` values followed by `--ignore-revs-file <file>`
+    /// values, which git keeps in one list. `--no-ignore-revs-file` clears it,
+    /// config-supplied entries included.
+    ignore_revs_file: Vec<String>,
+    /// `blame.markUnblamableLines`.
+    mark_unblamable_lines: bool,
+    /// `blame.markIgnoredLines`.
+    mark_ignored_lines: bool,
     /// Raw `--date` value before repo-side validation; `None` if not given.
     date_arg: Option<String>,
     /// Resolved date mode for the human-format timestamp column, after applying
@@ -1694,13 +1929,33 @@ struct Options {
     date_mode: DateMode,
 }
 
+/// The `blame.*` config keys `git_blame_config` reads before `parse_options` runs,
+/// each of which the command line can still override.
+struct ConfigDefaults {
+    /// `blame.showEmail`.
+    show_email: bool,
+    /// `blame.showRoot`.
+    show_root: bool,
+    /// `blame.blankBoundary`.
+    blank_boundary: bool,
+    /// `blame.ignoreRevsFile`, in file order; an empty value clears the list.
+    ignore_revs_file: Vec<String>,
+    /// `blame.markUnblamableLines`.
+    mark_unblamable_lines: bool,
+    /// `blame.markIgnoredLines`.
+    mark_ignored_lines: bool,
+}
+
 impl Options {
-    fn parse(
-        args: &[String],
-        show_email_default: bool,
-        show_root_default: bool,
-        blank_boundary_default: bool,
-    ) -> Result<Options> {
+    fn parse(args: &[String], defaults: ConfigDefaults) -> Result<Options> {
+        let ConfigDefaults {
+            show_email: show_email_default,
+            show_root: show_root_default,
+            blank_boundary: blank_boundary_default,
+            ignore_revs_file: ignore_revs_file_default,
+            mark_unblamable_lines,
+            mark_ignored_lines,
+        } = defaults;
         let mut ranges: Vec<RangeInclusive<u32>> = Vec::new();
         let mut long = false;
         let mut suppress = false;
@@ -1720,6 +1975,8 @@ impl Options {
         let mut ignore_whitespace = false;
         let mut diff_algorithm: Option<gix::diff::blob::Algorithm> = None;
         let mut contents: Option<String> = None;
+        let mut ignore_rev: Vec<String> = Vec::new();
+        let mut ignore_revs_file: Vec<String> = ignore_revs_file_default;
         // Raw `--date` value (last one wins); resolved against the repo in `blame`.
         let mut date_arg: Option<String> = None;
         // Positionals before the first `--`; `post` collects those after it.
@@ -1845,19 +2102,39 @@ impl Options {
                 // abbreviation", so `--no-abbrev` is exactly `--abbrev=0` (verified
                 // identical to `-l` on stock git).
                 "--no-abbrev" => abbrev = Some(0),
+                // git declares both as `OPT_STRING_LIST`, so each occurrence appends
+                // and the `--no-` form clears the whole list — including, for
+                // `--ignore-revs-file`, the entries `blame.ignoreRevsFile` put there.
+                "--ignore-rev" => {
+                    i += 1;
+                    let v = args
+                        .get(i)
+                        .ok_or_else(|| anyhow!("option `--ignore-rev` requires a value"))?;
+                    ignore_rev.push(v.clone());
+                }
+                _ if a.starts_with("--ignore-rev=") => {
+                    ignore_rev.push(a["--ignore-rev=".len()..].to_string());
+                }
+                "--no-ignore-rev" => ignore_rev.clear(),
+                "--ignore-revs-file" => {
+                    i += 1;
+                    let v = args
+                        .get(i)
+                        .ok_or_else(|| anyhow!("option `--ignore-revs-file` requires a value"))?;
+                    ignore_revs_file.push(v.clone());
+                }
+                _ if a.starts_with("--ignore-revs-file=") => {
+                    ignore_revs_file.push(a["--ignore-revs-file=".len()..].to_string());
+                }
+                "--no-ignore-revs-file" => ignore_revs_file.clear(),
                 // The `--no-` forms of options whose positive form needs substrate
                 // this port does not have (`--incremental`, `--show-stats`,
-                // `--score-debug`, `--ignore-rev`, `--ignore-revs-file`). Each
-                // positive default is off/empty, so the negated form requests
-                // exactly the behavior this port already produces; stock git emits
-                // byte-identical stdout for them (verified), so they are accepted
-                // as no-ops rather than rejected. The positive forms remain
-                // refused below.
-                "--no-incremental"
-                | "--no-show-stats"
-                | "--no-score-debug"
-                | "--no-ignore-rev"
-                | "--no-ignore-revs-file" => {}
+                // `--score-debug`). Each positive default is off, so the negated
+                // form requests exactly the behavior this port already produces;
+                // stock git emits byte-identical stdout for them (verified), so they
+                // are accepted as no-ops rather than rejected. The positive forms
+                // remain refused below.
+                "--no-incremental" | "--no-show-stats" | "--no-score-debug" => {}
                 _ if a.starts_with("-L") => parse_line_range(&a[2..], &mut ranges)?,
                 _ if a.starts_with("--abbrev=") => {
                     let v = &a["--abbrev=".len()..];
@@ -1898,6 +2175,10 @@ impl Options {
             ignore_whitespace,
             diff_algorithm,
             contents,
+            ignore_rev,
+            ignore_revs_file,
+            mark_unblamable_lines,
+            mark_ignored_lines,
             date_arg,
             // Overwritten in `blame` once blame.date / `--date` are resolved.
             date_mode: DateMode::Iso8601,

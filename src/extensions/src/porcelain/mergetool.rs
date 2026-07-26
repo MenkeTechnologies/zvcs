@@ -97,7 +97,9 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
     // `mergetool.prompt` default. All three only matter once a conflicted path is
     // reached, so they are captured rather than acted on here.
     let mut explicit_tool: Option<String> = None;
-    let mut gui = false;
+    // git's `GIT_MERGETOOL_GUI`, which starts empty: `-g`/`--gui` and `--no-gui`
+    // pin it, and an unset value defers to `mergetool.guiDefault` in `gui_mode`.
+    let mut gui: Option<bool> = None;
     let mut prompt_flag: Option<bool> = None;
     let mut i = 0usize;
     while i < rest.len() {
@@ -124,8 +126,8 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
             }
         } else if matches!(a, "--no-gui" | "-g" | "--gui" | "-y" | "--no-prompt" | "--prompt") {
             match a {
-                "-g" | "--gui" => gui = true,
-                "--no-gui" => gui = false,
+                "-g" | "--gui" => gui = Some(true),
+                "--no-gui" => gui = Some(false),
                 "-y" | "--no-prompt" => prompt_flag = Some(false),
                 "--prompt" => prompt_flag = Some(true),
                 _ => {}
@@ -159,7 +161,12 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
     let snapshot = repo.config_snapshot();
     let selection = match &explicit_tool {
         Some(t) => Selection { tool: Some(t.clone()), guessed: false, guidance: Vec::new() },
-        None => select_merge_tool(&snapshot, gui),
+        // `gui_mode`: an unpinned `GIT_MERGETOOL_GUI` falls back to
+        // `mergetool.guiDefault`, which is what selects the `merge.guitool` key.
+        None => select_merge_tool(
+            &snapshot,
+            gui.unwrap_or_else(|| gui_default(&snapshot, "mergetool.guiDefault")),
+        ),
     };
     let show_prompt_default = prompt_enabled(&snapshot, prompt_flag);
     if !selection.guidance.is_empty() {
@@ -217,6 +224,9 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
             .map(|v| v.to_str_lossy().into_owned())
             .filter(|v| !v.is_empty())
     };
+    // `get_merge_tool_path` (merge mode): `mergetool.<tool>.path`, else the tool
+    // name. `run_merge_tool` puts it in `merge_tool_path` for the `.cmd` eval.
+    let tool_path = merge_tool_path(&snapshot, &tool, false);
     // `trust_exit_code`: user tools default to false, so only an explicit
     // `mergetool.<tool>.trustExitCode=true` lets the tool's exit code decide.
     let trust_exit_code = !tool.is_empty()
@@ -262,6 +272,7 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
             f.as_bstr(),
             &tool,
             tool_cmd.as_deref(),
+            &tool_path,
             trust_exit_code,
             keep_backup,
             keep_temporaries,
@@ -305,6 +316,7 @@ fn merge_file(
     path: &gix::bstr::BStr,
     tool: &str,
     tool_cmd: Option<&str>,
+    tool_path: &str,
     trust_exit_code: bool,
     keep_backup: bool,
     keep_temporaries: bool,
@@ -354,6 +366,7 @@ fn merge_file(
                 index,
                 path,
                 cmd,
+                tool_path,
                 trust_exit_code,
                 keep_backup,
                 keep_temporaries,
@@ -377,6 +390,7 @@ fn run_user_tool(
     index: &gix::index::File,
     path: &gix::bstr::BStr,
     cmd: &str,
+    tool_path: &str,
     trust_exit_code: bool,
     keep_backup: bool,
     keep_temporaries: bool,
@@ -434,11 +448,11 @@ fn run_user_tool(
     // `run_merge_cmd`: a trusted exit code, else touch-then-`check_unchanged`.
     let temps: [&Path; 4] = [&local, &remote, &base, &backup];
     let success = if trust_exit_code {
-        run_merge_cmd(cmd, &base, &local, &remote, &merged)? == 0
+        run_merge_cmd(cmd, &base, &local, &remote, &merged, tool_path)? == 0
     } else {
         // `touch "$BACKUP"` so `check_unchanged` can compare mtimes.
         touch(&backup)?;
-        let _ = run_merge_cmd(cmd, &base, &local, &remote, &merged)?;
+        let _ = run_merge_cmd(cmd, &base, &local, &remote, &merged, tool_path)?;
         check_unchanged(&merged, &backup, out)?
     };
 
@@ -460,7 +474,9 @@ fn run_user_tool(
     }
     // Reuse the native `git add` porcelain to hash the resolved work-tree file and
     // collapse stages 1/2/3 to a single stage-0 entry.
-    super::add::add(&["add".to_string(), merged.clone()])?;
+    // `add()` is handed the post-verb argument vector (dispatch splits the verb
+    // off), so the leading `--` is the pathspec separator, not the subcommand.
+    super::add::add(&["--".to_string(), merged.clone()])?;
     cleanup_temp_files(&temps, dir);
     Ok(MergeOutcome::Success)
 }
@@ -486,17 +502,28 @@ fn checkout_staged_file(
     Ok(())
 }
 
-/// `( eval $merge_tool_cmd )` with BASE/LOCAL/REMOTE/MERGED in scope, run in a
-/// child `sh` (as git's user-tool `merge_cmd` does), returning the `$?` a shell
-/// would see.
-fn run_merge_cmd(cmd: &str, base: &Path, local: &Path, remote: &Path, merged: &str) -> Result<i32> {
+/// `( eval $merge_tool_cmd )` with BASE/LOCAL/REMOTE/MERGED and
+/// `merge_tool_path` in scope, run in a child `sh` (as git's user-tool
+/// `merge_cmd` does), returning the `$?` a shell would see. `run_merge_tool`
+/// assigns `merge_tool_path` before calling `merge_cmd`, and the `( eval … )`
+/// subshell inherits it, so a `.cmd` that spells `$merge_tool_path` sees the
+/// `mergetool.<tool>.path` value.
+fn run_merge_cmd(
+    cmd: &str,
+    base: &Path,
+    local: &Path,
+    remote: &Path,
+    merged: &str,
+    tool_path: &str,
+) -> Result<i32> {
     const SCRIPT: &str = r#"BASE="$1"
 LOCAL="$2"
 REMOTE="$3"
 MERGED="$4"
+merge_tool_path="$5"
 GIT_PREFIX="${GIT_PREFIX:-.}"
 export GIT_PREFIX
-eval "$5""#;
+eval "$6""#;
     let status = Command::new("sh")
         .arg("-c")
         .arg(SCRIPT)
@@ -505,10 +532,48 @@ eval "$5""#;
         .arg(local)
         .arg(remote)
         .arg(merged)
+        .arg(tool_path)
         .arg(cmd)
         .stdin(std::process::Stdio::inherit())
         .status()?;
     Ok(wait_status(status))
+}
+
+/// `get_merge_tool_path` reduced to the case this module can run — a
+/// user-defined tool, whose configured `.cmd` makes the `type` availability
+/// check moot. The path is `mergetool.<tool>.path` when set (in diff mode
+/// `difftool.<tool>.path` is consulted first), else `translate_merge_tool_path`,
+/// which for a user tool is the identity on the tool name.
+pub(crate) fn merge_tool_path(
+    snapshot: &gix::config::Snapshot<'_>,
+    tool: &str,
+    diff_mode: bool,
+) -> String {
+    let key = |section: &str| {
+        snapshot
+            .string(&format!("{section}.{tool}.path"))
+            .map(|v| v.to_str_lossy().into_owned())
+            .filter(|v| !v.is_empty())
+    };
+    let configured = if diff_mode {
+        key("difftool").or_else(|| key("mergetool"))
+    } else {
+        key("mergetool")
+    };
+    configured.unwrap_or_else(|| tool.to_owned())
+}
+
+/// `get_gui_default` (git-mergetool--lib.sh): `<section>.guiDefault` decides
+/// whether `gui_mode` is on when neither `-g`/`--gui` nor `--no-gui` was given.
+/// The literal value `auto` (case-insensitively) defers to `$DISPLAY` being
+/// non-empty; anything else is read as a boolean defaulting to false.
+pub(crate) fn gui_default(snapshot: &gix::config::Snapshot<'_>, key: &str) -> bool {
+    match snapshot.string(key) {
+        Some(v) if v.to_str_lossy().eq_ignore_ascii_case("auto") => {
+            std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty())
+        }
+        _ => snapshot.boolean(key) == Some(true),
+    }
 }
 
 /// `check_unchanged`: success when `MERGED` is newer than `BACKUP` (`test -nt`),

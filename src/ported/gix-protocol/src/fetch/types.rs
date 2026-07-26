@@ -35,6 +35,11 @@ pub struct Context<'a, T> {
     pub user_agent: crate::command::Feature,
     /// If `true`, output all packetlines using the `gix-trace` machinery.
     pub trace_packetlines: bool,
+    /// Protocol-v2 server options to transmit with the `fetch` command, from git's `--server-option`
+    /// and `remote.<name>.serverOption`.
+    ///
+    /// They are dropped unless the server advertised the `server-option` capability.
+    pub server_options: Vec<bstr::BString>,
 }
 
 #[cfg(feature = "fetch")]
@@ -130,6 +135,17 @@ mod with_fetch {
         ///
         /// They are never persisted nor are they typically presented to the user.
         pub extra_refspecs: Vec<gix_refspec::RefSpec>,
+        /// The index into [`Self::extra_refspecs`] at which the *opportunistic* refspecs begin, if there are any.
+        ///
+        /// Opportunistic refspecs are the second stage of git's two-stage match (`get_ref_map()` in
+        /// `builtin/fetch.c`): the explicit refspecs select refs on the remote, and only those refs are then
+        /// mapped onto local tracking refs by these. They exist so that `git fetch <remote> <branch>` still
+        /// updates `refs/remotes/<remote>/<branch>`.
+        ///
+        /// Mappings produced by them are marked `FETCH_HEAD_IGNORE` by git, i.e. they update the tracking ref
+        /// but contribute no `FETCH_HEAD` row; use [`refmap::SpecIndex::implicit_index()`] against this offset
+        /// to tell them apart.
+        pub opportunistic_specs_offset: Option<usize>,
         /// Information about the fixes applied to the `mapping` due to validation and sanitization.
         pub fixes: Vec<gix_refspec::match_group::validate::Fix>,
         /// All refs advertised by the remote.
@@ -141,6 +157,15 @@ mod with_fetch {
     }
 
     impl RefMap {
+        /// Return `true` if `mapping` was produced by an opportunistic refspec, meaning it updates a local tracking
+        /// ref but must not contribute a `FETCH_HEAD` row (git's `FETCH_HEAD_IGNORE`).
+        pub fn is_opportunistic(&self, mapping: &refmap::Mapping) -> bool {
+            match (self.opportunistic_specs_offset, mapping.spec_index.implicit_index()) {
+                (Some(offset), Some(idx)) => idx >= offset,
+                _ => false,
+            }
+        }
+
         /// Return `true` if the explicit fetch refspecs represented by this mapping failed to match the remote in a way
         /// that should typically be reported as "no mapping".
         ///

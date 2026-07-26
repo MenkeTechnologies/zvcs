@@ -37,6 +37,8 @@ pub mod reqwest;
 
 mod traits;
 
+pub mod cookies;
+
 ///
 pub mod options {
     /// A function to authenticate a URL.
@@ -172,6 +174,65 @@ pub struct Options {
     pub verbose: bool,
     /// If set, use this path to point to a file with CA certificates to verify peers.
     pub ssl_ca_info: Option<PathBuf>,
+    /// If set, use this path to point to a *directory* whose files each contain CA certificates to verify peers.
+    ///
+    /// Refers to `http.sslCAPath`.
+    pub ssl_ca_path: Option<PathBuf>,
+    /// If set, the path to a PEM file with the client certificate to authenticate with.
+    ///
+    /// Refers to `http.sslCert`.
+    pub ssl_cert: Option<PathBuf>,
+    /// If set, the path to a PEM file with the private key belonging to [`ssl_cert`][Self::ssl_cert].
+    /// If unset while `ssl_cert` is set, the certificate file is expected to contain the key as well.
+    ///
+    /// Refers to `http.sslKey`.
+    pub ssl_key: Option<PathBuf>,
+    /// Pre-resolved host addresses in curl's `[+-]HOST:PORT[:ADDRESS[,ADDRESS]]` format, applied in order.
+    ///
+    /// Refers to `http.curloptResolve`.
+    pub resolve: Vec<String>,
+    /// The time an idle connection waits before TCP keepalive probes are sent, or `None` for the implementation default.
+    ///
+    /// Refers to `http.keepAliveIdle`.
+    pub tcp_keepalive_idle_seconds: Option<u64>,
+    /// The time between TCP keepalive probes, or `None` for the implementation default.
+    ///
+    /// Refers to `http.keepAliveInterval`.
+    pub tcp_keepalive_interval_seconds: Option<u64>,
+    /// The number of TCP keepalive probes to send before dropping the connection, or `None` for the implementation default.
+    ///
+    /// Refers to `http.keepAliveCount`.
+    pub tcp_keepalive_count: Option<u32>,
+    /// The number of connections to keep alive across requests, or `None` for the implementation default.
+    ///
+    /// Refers to `http.minSessions`.
+    pub min_sessions: Option<usize>,
+    /// The greatest amount of bytes a `POST` body may have before it is streamed with
+    /// `Transfer-Encoding: chunked` instead of being buffered and sent with `Content-Length`.
+    ///
+    /// Refers to `http.postBuffer`.
+    pub post_buffer_bytes: Option<u64>,
+    /// How often to retry a request that was answered with `429 Too Many Requests`. `0` disables retrying.
+    ///
+    /// Refers to `http.maxRetries`.
+    pub max_retries: u32,
+    /// How long to wait before retrying a `429 Too Many Requests` response that carries no `Retry-After` header.
+    ///
+    /// Refers to `http.retryAfter`.
+    pub retry_after_seconds: u64,
+    /// The longest a single retry of a `429 Too Many Requests` response may wait. A longer requested delay fails the request.
+    ///
+    /// Refers to `http.maxRetryTime`.
+    pub max_retry_time_seconds: u64,
+    /// A file with previously stored cookie lines to send with matching requests, in the Netscape cookie
+    /// file format or as plain `Set-Cookie` headers.
+    ///
+    /// Refers to `http.cookieFile`.
+    pub cookie_file: Option<PathBuf>,
+    /// Whether cookies received while requesting are stored back into [`cookie_file`][Self::cookie_file].
+    ///
+    /// Refers to `http.saveCookies`.
+    pub save_cookies: bool,
     /// The SSL version or version range to use, or `None` to let the TLS backend determine which versions are acceptable.
     pub ssl_version: Option<SslVersionRangeInclusive>,
     /// Controls whether to perform SSL identity verification or not. Turning this off is not recommended and can lead to
@@ -199,6 +260,22 @@ impl Default for Options {
             connect_timeout: None,
             verbose: false,
             ssl_ca_info: None,
+            ssl_ca_path: None,
+            ssl_cert: None,
+            ssl_key: None,
+            resolve: Vec::new(),
+            tcp_keepalive_idle_seconds: None,
+            tcp_keepalive_interval_seconds: None,
+            tcp_keepalive_count: None,
+            min_sessions: None,
+            // `git`'s `max_request_buffer` default, see `http.postBuffer`.
+            post_buffer_bytes: Some(1024 * 1024),
+            max_retries: 0,
+            retry_after_seconds: 0,
+            // `git`'s `http_max_retry_time` default of five minutes, see `http.maxRetryTime`.
+            max_retry_time_seconds: 300,
+            cookie_file: None,
+            save_cookies: false,
             ssl_version: None,
             ssl_verify: true,
             http_version: None,

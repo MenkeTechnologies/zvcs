@@ -263,6 +263,13 @@ impl PatchDiffOpts {
     /// selector, so callers pass `false` and every non-default value is refused
     /// exactly as stock git refuses it.
     pub(super) fn require_patch(&self, patch: bool) -> Option<ExitCode> {
+        self.require_patch_named(patch, "--patch")
+    }
+
+    /// [`Self::require_patch`] with the name git cites for "patch mode" in this
+    /// command: `--patch` for `reset`/`checkout`, `--interactive/--patch` for
+    /// `add` and `commit`, whose `-i` reaches the same hunk selector.
+    pub(super) fn require_patch_named(&self, patch: bool, what: &str) -> Option<ExitCode> {
         if self.unified < -1 {
             eprintln!("fatal: '--unified' cannot be negative");
             return Some(ExitCode::from(128));
@@ -283,8 +290,20 @@ impl PatchDiffOpts {
         } else {
             return None;
         };
-        eprintln!("fatal: the option '{opt}' requires '--patch'");
+        eprintln!("fatal: the option '{opt}' requires '{what}'");
         Some(ExitCode::from(128))
+    }
+
+    /// The values, once validated, as the hunk selector's [`Options`].
+    ///
+    /// [`Options`]: super::add_patch::Options
+    pub(super) fn to_interactive(self, disallow_edit: bool) -> super::add_patch::Options {
+        super::add_patch::Options {
+            context: self.unified,
+            interhunk: self.inter_hunk_context,
+            auto_advance: self.auto_advance,
+            disallow_edit,
+        }
     }
 }
 
@@ -429,6 +448,8 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     // interactive-hunk-selector options, refused after the argument split below
     // exactly as git refuses them without `--patch`.
     let mut patch_opts = PatchDiffOpts::default();
+    // `-p`/`--patch`: unstage hunks interactively instead of whole paths.
+    let mut patch_mode = false;
     // `--recurse-submodules[=<bool>]` / `--no-recurse-submodules`. `None` = fall
     // back to `submodule.recurse`; `Some(b)` = explicit flag. Only the
     // worktree-updating modes (`--hard`, `--merge`, `--keep`) can move a
@@ -467,7 +488,8 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             "--no-refresh" => refresh = false,
             "--merge" => mode = Some(ResetMode::Merge),
             "--keep" => mode = Some(ResetMode::Keep),
-            "-p" | "--patch" => bail!("--patch is unsupported (interactive hunk selection not ported)"),
+            "-p" | "--patch" => patch_mode = true,
+            "--no-patch" => patch_mode = false,
             "-N" | "--intent-to-add" => intent_to_add = true,
             "--no-intent-to-add" => intent_to_add = false,
             "--pathspec-from-file" => take_pff_value = true,
@@ -559,9 +581,27 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     // revision still reports `ambiguous argument` first) and before every other
     // compatibility check, including `Cannot do soft reset with paths.` and
     // `the option '-N' requires '--mixed'` (verified against git 2.55.0).
-    // `--patch` is never in effect here: it bails in the parse loop above.
-    if let Some(code) = patch_opts.require_patch(false) {
+    if let Some(code) = patch_opts.require_patch(patch_mode) {
         return Ok(code);
+    }
+
+    // `-p`: `git reset -p [<tree-ish>] [--] [<pathspec>...]` picks hunks to
+    // unstage — `ADD_P_RESET`, whose diff is `diff-index --cached <rev>` and
+    // whose apply is `apply -R --cached`. `<rev>` defaults to HEAD; any other
+    // tree-ish flips the mode to the forward `patch_mode_reset_nothead`.
+    if patch_mode {
+        if mode.is_some() {
+            eprintln!("fatal: options '--patch' and '--{{hard,mixed,soft}}' cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
+        let revision = commit_spec.unwrap_or("HEAD").to_string();
+        return super::add_patch::run(
+            &repo,
+            super::add_patch::Mode::Reset,
+            Some(&revision),
+            patch_opts.to_interactive(false),
+            &paths,
+        );
     }
 
     // `parse_pathspec_from_file()` (builtin/reset.c): a NUL separator needs the file

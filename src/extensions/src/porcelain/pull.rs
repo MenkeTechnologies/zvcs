@@ -7,8 +7,9 @@
 //! `--depth`/`--deepen`/`--unshallow`, `--shallow-since`/`--shallow-exclude`,
 //! `-q`/`-v`, `--progress`/`--no-progress`, `--dry-run`, `-a`/`--append`,
 //! `--show-forced-updates`/`--no-show-forced-updates`,
-//! `-k`/`--keep`, `--recurse-submodules`, `-j`/`--jobs`, and the `From …`
-//! per-ref summary git prints to stderr.
+//! `-k`/`--keep`, `--recurse-submodules`, `-j`/`--jobs`, `--upload-pack`,
+//! `-o`/`--server-option`, `--refmap`, and the `From …` per-ref summary git
+//! prints to stderr.
 //!
 //! The integration step is the ported [`merge`](super::merge) by default, or the
 //! ported [`rebase`](super::rebase) when a rebase is requested. The rebase is
@@ -39,8 +40,7 @@
 //! (interactive todo editing needs a TTY editor loop), `--autostash` over a
 //! dirty tree on the merge path (needs a 3-way stash apply the stash port lacks),
 //! `--set-upstream`, `--compact-summary` (the merge port has no compact-summary
-//! renderer), `--upload-pack`, `--update-shallow`, `--refmap`,
-//! `-o`/`--server-option`, `-4`/`-6` and the `--negotiation-*` family (no
+//! renderer), `--update-shallow`, `-4`/`-6` and the `--negotiation-*` family (no
 //! gitoxide substrate — see [`fetch`](super::fetch)), and
 //! `--gpg-sign`/`-S`/`--verify-signatures` (GPG is not vendored).
 
@@ -129,6 +129,9 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let mut f_show_forced: Option<bool> = None;
     let mut f_recurse: Option<String> = None;
     let mut f_jobs: Option<String> = None;
+    let mut f_upload_pack: Option<String> = None;
+    let mut f_server_options: Vec<String> = Vec::new();
+    let mut f_refmap: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -216,6 +219,9 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             // Only an attached value sets it.
             "-j" | "--jobs" => f_jobs = inline.clone(),
             "--no-jobs" => f_jobs = None,
+            "--upload-pack" => f_upload_pack = Some(take_value!("upload-pack")),
+            "-o" | "--server-option" => f_server_options.push(take_value!("server-option")),
+            "--refmap" => f_refmap.push(take_value!("refmap")),
 
             // `--verify` (default) / `--no-verify` reach the merge, which runs
             // the `pre-merge-commit` and `commit-msg` hooks.
@@ -371,13 +377,22 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     if let Some(j) = &f_jobs {
         fetch_args.push(format!("--jobs={j}"));
     }
+    if let Some(p) = &f_upload_pack {
+        fetch_args.push(format!("--upload-pack={p}"));
+    }
+    for o in &f_server_options {
+        fetch_args.push(format!("--server-option={o}"));
+    }
+    for r in &f_refmap {
+        fetch_args.push(format!("--refmap={r}"));
+    }
     // `--all` fans out over every configured remote and takes no repository
-    // argument; otherwise the first positional names the remote to fetch (the
-    // configured default refspec updates the tracking ref merged/rebased below).
+    // argument; otherwise git hands the whole `<remote> [<refspec>…]` tail to the
+    // fetch (`run_fetch()` in `builtin/pull.c`). The refspecs select what is
+    // downloaded, and the remote's configured refspecs still update the tracking
+    // ref that the merge or rebase below reads, via the opportunistic second stage.
     if !f_all {
-        if let Some(r) = positionals.first() {
-            fetch_args.push((*r).to_string());
-        }
+        fetch_args.extend(positionals.iter().map(|p| (*p).to_string()));
     }
     // Network / bad-remote failures surface as `Err`; a ref-rejection returns a
     // non-success code with the summary already printed. The tracking-ref check

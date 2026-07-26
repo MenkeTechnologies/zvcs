@@ -34,7 +34,18 @@ where
             transport: self.transport,
             handshake: self.handshake,
             trace: self.trace,
+            server_options: self.server_options,
         }
+    }
+
+    /// Send `options` as protocol-v2 `server-option` lines with every request made through this connection.
+    ///
+    /// This is git's `--server-option`/`-o` and `remote.<name>.serverOption`. Requesting them from a server that
+    /// doesn't speak protocol v2 or doesn't advertise the `server-option` capability is an error, reported when
+    /// the handshake result is known.
+    pub fn with_server_options(mut self, options: Vec<crate::bstr::BString>) -> Self {
+        self.server_options = options;
+        self
     }
 
     /// Provide configuration to be used before the first handshake is conducted.
@@ -130,6 +141,7 @@ where
             transport: self.transport,
             handshake: self.handshake,
             trace: self.trace,
+            server_options: self.server_options,
         }
     }
 }

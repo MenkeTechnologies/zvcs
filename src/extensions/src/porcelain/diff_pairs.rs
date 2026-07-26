@@ -52,6 +52,15 @@
 //! * `--minimal`, `--histogram`, `--diff-algorithm=<myers|minimal|histogram>` — choose the
 //!   internal blob-diff algorithm (an unknown name errors with exit 129, like git's
 //!   `parse_algorithm`)
+//! * rename/copy/break detection — `-M`/`--find-renames[=<n>]`, `-C`/`--find-copies[=<n>]`,
+//!   `-C -C`/`--find-copies-harder`, `--no-renames`, `--rename-empty`/`--no-rename-empty`,
+//!   `-B`/`--break-rewrites[=<n>[/<m>]]` and the `-l<n>` rename limit — through the port of
+//!   `diffcore-delta.c`/`diffcore-rename.c`/`diffcore-break.c` in [`super::diffcore_rename`].
+//!   Detection is off unless asked for: `diff.renames` is a porcelain default and
+//!   `diff-pairs` is plumbing, so the status letters read off stdin survive untouched
+//!   (`builtin/diff-pairs.c` sets `skip_resolving_statuses` for exactly that reason).
+//! * `--color[=<when>]` / `--no-color` and `--ws-error-highlight=<kind>`, with the
+//!   `color.diff.*` slots and `core.whitespace` rules the emit layer paints from
 //! * `--exit-code`, `--quiet` (implies `-s` and `--exit-code`)
 //! * `--abbrev[=<n>]` — accepted and ignored, which is what stock git does here.
 //!   `core.abbrev` itself *is* honoured.
@@ -64,21 +73,20 @@
 //! * Tree-object pairs (`040000` on either side) are rejected with `tree objects not
 //!   supported`, exit 128 — this matches stock git's `builtin/diff-pairs.c`, which dies
 //!   with the same message rather than recursing.
-//! * `--color`, `--ws-error-highlight`, `--color-moved`, `--color-moved-ws`,
+//! * `--color-moved`, `--color-moved-ws`,
 //!   `--word-diff`, `--word-diff-regex`, `--color-words`, `--check`, `--binary`,
 //!   `--dirstat`/`--cumulative`/`--dirstat-by-file`, `--anchored`, `-O`/`--order`,
 //!   `--textconv`/`--ext-diff`, `--submodule`/`--ignore-submodules` and `--max-depth`:
-//!   each needs machinery this port does not have (a colour layer, a `ws.c` whitespace
-//!   checker, zlib-exact binary patches, `diffcore-delta`'s spanhash damage estimate, a
+//!   each needs machinery this port does not have (moved-block detection, a word
+//!   splitter, zlib-exact binary patches, `diffcore-delta`'s spanhash damage estimate, a
 //!   patience differ, external filters, tree recursion) and is rejected rather than
 //!   accepted as a silent no-op.
 //! * `--patience` / `--diff-algorithm=patience`: imara-diff has no patience variant, so
 //!   these bail rather than silently substituting Myers (the same floor `git diff` hits).
-//! * Rename/copy *detection* (`-M`/`--find-renames`, `-C`/`--find-copies`,
-//!   `--find-copies-harder`, `-B`/`--break-rewrites`) is not performed, so those options
-//!   are rejected. `--no-renames` — which asks for exactly the behaviour this port has —
-//!   is honoured, and `-l<n>` and `--rename-empty`, which only tune a rename pass, are
-//!   accepted for the same reason they change nothing in git without `-M`/`-C`.
+//! * `--find-copies-harder` is parsed and fed to `diffcore_rename`, but a `diff-pairs`
+//!   batch only ever contains the pairs stdin listed: git supplies the unmodified pairs
+//!   the option needs from a tree walk, and there is none here, so it behaves as plain
+//!   `-C` on any input that does not itself list unmodified pairs.
 //! * `--ita-invisible-in-index` / `--ita-visible-in-index` are accepted and inert: they
 //!   only steer a diff computed against the index, which this command never reads.
 //! * `--follow` is fatal (`--follow requires exactly one pathspec`), matching git — the
@@ -100,6 +108,9 @@ use gix::hash::ObjectId;
 use gix::objs::tree::EntryKind;
 use gix::prelude::ObjectIdExt;
 use regex::bytes::Regex;
+
+use super::diff_color;
+use super::diffcore_rename;
 
 /// Stock git's `diff-pairs` usage block, byte-for-byte including the trailing blank
 /// line. Printed on `-h` (stdout, exit 129).
@@ -482,6 +493,15 @@ struct Opts {
     /// `-O<file>`: `diffcore_order`'s glob list, read lazily so an unreadable file is only
     /// fatal once there is a non-empty queue to sort — exactly `prepare_order`'s timing.
     orderfile: Option<String>,
+    /// The `diffcore_std()` rename/copy/break knobs. `diff-pairs` is plumbing, so
+    /// detection is off unless `-M`/`-C`/`-B` asks for it (`diff.renames` is a
+    /// porcelain-only default and is never read here).
+    rename: diffcore_rename::Options,
+    /// `--color[=<when>]` / `--no-color`; `None` defers to `color.diff` /
+    /// `diff.color` / `color.ui` and the terminal test.
+    color_when: Option<diff_color::ColorWhen>,
+    /// `--ws-error-highlight=<kind>`, seeded from `diff.wsErrorHighlight`.
+    ws_error_highlight: u32,
 }
 
 /// One raw-format record: a pre-computed file pair.
@@ -496,6 +516,10 @@ struct Pair {
     old_path: BString,
     /// Equal to `old_path` unless the status carries a second path (rename/copy).
     new_path: BString,
+    /// git's `check_pair_status()` case `0`: `diffcore_break()` produced this pair and
+    /// no `diff_resolve_rename_copy()` ran to give it a status letter, which is fatal
+    /// in every format that consults the status (all of them except `--summary`).
+    unresolved: bool,
 }
 
 impl Pair {
@@ -572,7 +596,15 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         func_context: false,
         inter_hunk_ctx: 0,
         orderfile: None,
+        rename: diffcore_rename::Options::default(),
+        color_when: None,
+        // git's `ws_error_highlight_default`; `diff.wsErrorHighlight` replaces it
+        // once the repository is open, unless a flag already set it.
+        ws_error_highlight: diff_color::WSEH_NEW,
     };
+    // Whether a `--ws-error-highlight` flag was seen, so the config default does not
+    // overwrite it (git reads the config first and the command line last).
+    let mut wseh_explicit = false;
     let mut nul = false;
     // `--output=<file>`: git redirects the whole diff stream into this file.
     let mut output_file: Option<String> = None;
@@ -673,6 +705,38 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
             }
             "--full-index" => opts.full_index = true,
             "--no-full-index" => opts.full_index = false,
+            // `--color[=<when>]` / `--no-color` (`OPT_COLOR_FLAG`).
+            "--color" => opts.color_when = Some(diff_color::ColorWhen::Always),
+            "--no-color" => opts.color_when = Some(diff_color::ColorWhen::Never),
+            _ if s.starts_with("--color=") => {
+                match diff_color::parse_color_when(&s["--color=".len()..]) {
+                    Some(w) => opts.color_when = Some(w),
+                    None => {
+                        eprintln!(
+                            "error: option `color' expects \"always\", \"auto\", or \"never\""
+                        );
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            // `--ws-error-highlight=<kind>` (`diff_opt_ws_error_highlight()`), whose
+            // error tail is the prefix of the value git had already accepted.
+            _ if s.starts_with("--ws-error-highlight=") => {
+                let v = &s["--ws-error-highlight=".len()..];
+                match diff_color::parse_ws_error_highlight(v) {
+                    Ok(val) => {
+                        opts.ws_error_highlight = val;
+                        wseh_explicit = true;
+                    }
+                    Err(accepted) => {
+                        eprintln!(
+                            "error: unknown value after ws-error-highlight={}",
+                            &v[..accepted]
+                        );
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
             "--no-prefix" => {
                 opts.src_prefix.clear();
                 opts.dst_prefix.clear();
@@ -888,26 +952,79 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
             // pathspec at all, so the flag is always fatal here.
             "--follow" => follow = true,
             "--no-follow" => follow = false,
-            // Rename-detection knobs. This port never runs `diffcore_rename` — the pairs
-            // arrive pre-computed — so `--no-renames`, which asks for exactly that, is
-            // honoured, and the two options that only tune a rename pass (`-l<n>`'s
-            // rename limit and `--rename-empty`'s empty-blob sources) have no effect,
-            // just as they have none in git without `-M`/`-C`. `-M`/`-C`/`-B` themselves
-            // stay rejected rather than silently doing nothing.
-            "--no-renames" | "--rename-empty" | "--no-rename-empty" => {}
+            // Rename/copy/break detection. `diff-pairs` runs the same `diffcore_std()`
+            // passes as any other diff command over the pairs it read from stdin
+            // (`builtin/diff-pairs.c` calls `diffcore_std()` per batch), so these are
+            // parsed exactly as `diff.c` does and handed to `diffcore_rename`.
+            "--no-renames" => opts.rename.detect_rename = 0,
+            "--rename-empty" => opts.rename.rename_empty = true,
+            "--no-rename-empty" => opts.rename.rename_empty = false,
+            "-M" | "--find-renames" => {
+                opts.rename.rename_score = 0;
+                opts.rename.detect_rename = diffcore_rename::DETECT_RENAME;
+            }
+            _ if s.starts_with("--find-renames=") || (s.starts_with("-M") && s.len() > 2) => {
+                let raw = s.strip_prefix("--find-renames=").unwrap_or(&s[2..]);
+                let (score, rest) = diffcore_rename::parse_rename_score(raw);
+                if !rest.is_empty() {
+                    eprintln!("error: invalid argument to find-renames");
+                    return Ok(ExitCode::from(129));
+                }
+                opts.rename.rename_score = score;
+                opts.rename.detect_rename = diffcore_rename::DETECT_RENAME;
+            }
+            "-C" | "--find-copies" => {
+                opts.rename.rename_score = 0;
+                if opts.rename.detect_rename == diffcore_rename::DETECT_COPY {
+                    opts.rename.find_copies_harder = true;
+                } else {
+                    opts.rename.detect_rename = diffcore_rename::DETECT_COPY;
+                }
+            }
+            _ if s.starts_with("--find-copies=") || (s.starts_with("-C") && s.len() > 2) => {
+                let raw = s.strip_prefix("--find-copies=").unwrap_or(&s[2..]);
+                let (score, rest) = diffcore_rename::parse_rename_score(raw);
+                if !rest.is_empty() {
+                    eprintln!("error: invalid argument to find-copies");
+                    return Ok(ExitCode::from(129));
+                }
+                opts.rename.rename_score = score;
+                if opts.rename.detect_rename == diffcore_rename::DETECT_COPY {
+                    opts.rename.find_copies_harder = true;
+                } else {
+                    opts.rename.detect_rename = diffcore_rename::DETECT_COPY;
+                }
+            }
+            "--find-copies-harder" => opts.rename.find_copies_harder = true,
+            "--no-find-copies-harder" => opts.rename.find_copies_harder = false,
+            "-B" | "--break-rewrites" => opts.rename.break_opt = 0,
+            _ if s.starts_with("--break-rewrites=") || (s.starts_with("-B") && s.len() > 2) => {
+                let raw = s.strip_prefix("--break-rewrites=").unwrap_or(&s[2..]);
+                match diffcore_rename::parse_break_opt(raw) {
+                    Ok(v) => opts.rename.break_opt = v,
+                    Err(()) => {
+                        eprintln!("error: break-rewrites expects <n>/<m> form");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
             "-l" => {
                 let v = want_value!(s.len());
-                if v.parse::<i64>().is_err() {
+                match v.parse::<i64>() {
+                    Ok(n) => opts.rename.rename_limit = n,
+                    Err(_) => {
+                        eprintln!("error: option `l' expects a numerical value");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            _ if s.starts_with("-l") => match s[2..].parse::<i64>() {
+                Ok(n) => opts.rename.rename_limit = n,
+                Err(_) => {
                     eprintln!("error: option `l' expects a numerical value");
                     return Ok(ExitCode::from(129));
                 }
-            }
-            _ if s.starts_with("-l") => {
-                if s[2..].parse::<i64>().is_err() {
-                    eprintln!("error: option `l' expects a numerical value");
-                    return Ok(ExitCode::from(129));
-                }
-            }
+            },
             // `ita_invisible_in_index` is only consulted when a diff is computed against
             // the index (`diff-lib.c`). `diff-pairs` reads its pairs from stdin and never
             // opens the index, so both spellings are inert here, in git as well.
@@ -951,6 +1068,16 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
+    if !wseh_explicit {
+        if let Ok(v) = diff_color::ws_error_highlight_default(&repo) {
+            opts.ws_error_highlight = v;
+        }
+    }
+    // `--color[=<when>]` / `--no-color`, falling back to `color.diff` / `diff.color`
+    // / `color.ui` and the terminal test.
+    let colors =
+        diff_color::DiffColors::resolve(&repo, diff_color::resolve_color(&repo, opts.color_when));
+    let ws_rule = diff_color::whitespace_rule_cfg(&repo);
 
     // Finalize the pickaxe now that the whole line has been read.
     opts.pickaxe = match finalize_pickaxe(
@@ -996,6 +1123,9 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
     };
     let mut any_pair = false;
     let mut batch: Vec<Pair> = Vec::new();
+    // `diff_result_code()` prints the rename-limit warnings once, after the whole
+    // stream has been written.
+    let mut warnings = diffcore_rename::Warnings::default();
     let mut cursor = 0usize;
 
     // Records are NUL-terminated fields; a zero-length header field closes a batch.
@@ -1007,7 +1137,7 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         cursor += end + 1;
 
         if header.is_empty() {
-            match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev)? {
+            match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, ws_rule, &mut warnings)? {
                 Ok(()) => {}
                 Err(code) => return Ok(code),
             }
@@ -1044,11 +1174,12 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         batch.push(pair);
     }
 
-    match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev)? {
+    match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, ws_rule, &mut warnings)? {
         Ok(()) => {}
         Err(code) => return Ok(code),
     }
     out.flush()?;
+    warnings.emit("diff.renameLimit");
 
     Ok(if opts.exit_code && any_pair {
         ExitCode::from(1)
@@ -1286,6 +1417,7 @@ fn parse_header(header: &[u8], hexsz: usize) -> Result<(u8, Pair), String> {
             status,
             old_path: BString::default(),
             new_path: BString::default(),
+            unresolved: false,
         },
     ))
 }
@@ -1310,6 +1442,95 @@ fn parse_oid(body: &[u8], at: usize, hexsz: usize) -> Result<ObjectId, String> {
     ObjectId::from_hex(&body[at..end]).map_err(|_| fail())
 }
 
+/// Reads a filespec's blob for [`diffcore_rename`]. Every side of a `diff-pairs`
+/// record names an object in the database, so `diff_populate_filespec()` here is just
+/// an odb lookup.
+struct OdbContent<'a> {
+    repo: &'a gix::Repository,
+}
+
+impl diffcore_rename::Content for OdbContent<'_> {
+    fn size(&mut self, spec: &diffcore_rename::FileSpec) -> Option<u64> {
+        // `check_size_only = 1`: the odb header answers without inflating the blob.
+        let header = self.repo.find_header(spec.oid).ok()?;
+        (header.kind() == gix::object::Kind::Blob).then(|| header.size())
+    }
+
+    fn data(&mut self, spec: &diffcore_rename::FileSpec) -> Option<Vec<u8>> {
+        self.repo.find_object(spec.oid).ok().map(|o| o.detach().data)
+    }
+}
+
+/// The `diffcore_std()` break / rename / merge-broken slice over one batch, rewriting
+/// `pairs` in place with the detected renames, copies and rewrites plus the status
+/// tokens `diff_resolve_rename_copy()` assigns.
+fn run_rename_detection(
+    repo: &gix::Repository,
+    pairs: &mut Vec<Pair>,
+    opts: &diffcore_rename::Options,
+) -> std::result::Result<diffcore_rename::Warnings, ExitCode> {
+    let mut q = diffcore_rename::Queue::default();
+    for p in pairs.iter() {
+        // A mode of zero is git's `!DIFF_FILE_VALID`; the record's own (all-zero)
+        // object id is kept so it round-trips into the rebuilt pair unchanged.
+        let one = q.add_spec(diffcore_rename::FileSpec::new(
+            p.old_path.clone(),
+            p.old_mode,
+            p.old_id,
+            p.old_valid(),
+        ));
+        let two = q.add_spec(diffcore_rename::FileSpec::new(
+            p.new_path.clone(),
+            p.new_mode,
+            p.new_id,
+            p.new_valid(),
+        ));
+        // The record's own status and score come along: without `-M` git never calls
+        // `diff_resolve_rename_copy()` (`skip_resolving_statuses`), so these are what
+        // the output has to reproduce.
+        let idx = q.add_pair(one, two);
+        q.pairs[idx].status = p.kind();
+        q.pairs[idx].score = p.score() * (diffcore_rename::MAX_SCORE as u32) / 100;
+    }
+
+    let mut opts = *opts;
+    opts.hash_kind = repo.object_hash();
+    let mut content = OdbContent { repo };
+    let warnings = diffcore_rename::run(&mut q, &opts, &mut content);
+    // `builtin/diff-pairs.c` sets `skip_resolving_statuses` when no rename detection
+    // was asked for, leaving the statuses read off stdin alone.
+    if opts.detect_rename != 0 {
+        diffcore_rename::resolve_rename_copy(&mut q);
+    }
+
+    pairs.clear();
+    for p in &q.pairs {
+        let one = &q.specs[p.one];
+        let two = &q.specs[p.two];
+        // A pair that reached the flush with no status at all — which is what `-B`
+        // without `-M` leaves behind for every pair it broke — is `check_pair_status()`'s
+        // fatal case, raised by whichever render block reaches it first.
+        let unresolved = p.status == 0;
+        let mut status = BString::from(vec![if unresolved { b'M' } else { p.status }]);
+        if p.score != 0 {
+            status.extend_from_slice(
+                format!("{:03}", diffcore_rename::similarity_index(p.score)).as_bytes(),
+            );
+        }
+        pairs.push(Pair {
+            old_mode: one.mode,
+            new_mode: two.mode,
+            old_id: one.oid,
+            new_id: two.oid,
+            status,
+            old_path: one.path.clone(),
+            new_path: two.path.clone(),
+            unresolved,
+        });
+    }
+    Ok(warnings)
+}
+
 /// Render one batch of pairs after running git's `diffcore_std` pipeline over it.
 ///
 /// The inner `Result` carries a git fatal exit code (e.g. an unreadable blob) so the
@@ -1322,12 +1543,32 @@ fn flush(
     batch: &[Pair],
     opts: &Opts,
     base_abbrev: usize,
+    colors: &diff_color::DiffColors,
+    ws_rule: u32,
+    warnings: &mut diffcore_rename::Warnings,
 ) -> Result<std::result::Result<(), ExitCode>> {
     if batch.is_empty() || opts.formats.no_output {
         return Ok(Ok(()));
     }
 
     let mut pairs: Vec<Pair> = batch.to_vec();
+
+    // ---- diffcore_std order: break -> rename -> merge-broken -> pickaxe ----
+    // `builtin/diff-pairs.c` calls `diffcore_std()` per batch, and only sets
+    // `skip_resolving_statuses` when no detection was asked for — so the status
+    // letters read off stdin survive untouched unless `-M`/`-C`/`-B` is present.
+    if opts.rename.detect_rename != 0 || opts.rename.break_opt != -1 {
+        match run_rename_detection(repo, &mut pairs, &opts.rename) {
+            // `needed_rename_limit` is reset by every `too_many_rename_candidates()`
+            // call, so the last batch's value is the one `diff_result_code()` reports;
+            // `degraded_cc_to_c` is only ever set, never cleared.
+            Ok(w) => {
+                warnings.needed_rename_limit = w.needed_rename_limit;
+                warnings.degraded_cc_to_c |= w.degraded_cc_to_c;
+            }
+            Err(code) => return Ok(Err(code)),
+        }
+    }
 
     // ---- diffcore_std order: pickaxe -> rotate -> apply_filter ----
     if let Some(px) = &opts.pickaxe {
@@ -1396,11 +1637,19 @@ fn flush(
 
     let mut buf: Vec<u8> = Vec::new();
     let lp = opts.line_prefix.as_slice();
+    // `check_pair_status()` is consulted by the raw/name loop, the diffstat loop and
+    // the patch loop — in that order — but never by `--summary`. Raise its fatal at
+    // whichever of those blocks runs first, after flushing what git already printed.
+    let unresolved = pairs.iter().any(|p| p.unresolved);
+    let unresolved_fatal = || fatal("internal error in diff-resolve-rename-copy");
 
     // ---- name/raw group ----
     // These records are NUL-terminated and carry a NUL between their own fields, so the
     // line prefix is written once per record rather than once per NUL.
     if opts.formats.name_group() {
+        if unresolved {
+            return Ok(Err(unresolved_fatal()));
+        }
         for p in &pairs {
             buf.extend_from_slice(lp);
             render_name(&mut buf, p, &opts.formats);
@@ -1409,6 +1658,10 @@ fn flush(
 
     // ---- content analyses (numstat/stat/shortstat share these) ----
     let stats_wanted = opts.formats.numstat || opts.formats.stat || opts.formats.shortstat;
+    if stats_wanted && unresolved {
+        out.write_all(&buf)?;
+        return Ok(Err(unresolved_fatal()));
+    }
     let files: Vec<StatFile> = if stats_wanted {
         let mut analyses = Vec::with_capacity(pairs.len());
         for p in &pairs {
@@ -1433,7 +1686,7 @@ fn flush(
     }
     if opts.formats.stat {
         let mut sub = Vec::new();
-        render_stat(&mut sub, &files, &opts.stat);
+        render_stat(&mut sub, &files, &opts.stat, colors);
         append_prefixed(&mut buf, lp, &sub);
     }
     if opts.formats.shortstat {
@@ -1455,6 +1708,10 @@ fn flush(
     // ---- patch ----
     // git sets `separator` whenever any non-patch format is requested (even if it
     // produced no bytes), so `--stat -p` with an empty stat still emits the NUL.
+    if opts.formats.patch && unresolved {
+        out.write_all(&buf)?;
+        return Ok(Err(unresolved_fatal()));
+    }
     if opts.formats.patch {
         let separator = opts.formats.name_group()
             || opts.formats.numstat
@@ -1468,7 +1725,9 @@ fn flush(
         }
         let mut sub = Vec::new();
         for p in &pairs {
-            if let Err(code) = render_patch(&mut sub, repo, cache, p, opts, base_abbrev) {
+            if let Err(code) =
+                render_patch(&mut sub, repo, cache, p, opts, base_abbrev, colors, ws_rule)
+            {
                 append_prefixed(&mut buf, lp, &sub);
                 out.write_all(&buf)?;
                 return Ok(Err(code));
@@ -1599,6 +1858,7 @@ fn as_deletion(p: &Pair) -> Pair {
         status: BString::from("D"),
         old_path: p.old_path.clone(),
         new_path: p.old_path.clone(),
+        unresolved: false,
     }
 }
 
@@ -1612,6 +1872,7 @@ fn as_creation(p: &Pair) -> Pair {
         status: BString::from("A"),
         old_path: p.new_path.clone(),
         new_path: p.new_path.clone(),
+        unresolved: false,
     }
 }
 
@@ -1787,6 +2048,20 @@ fn analyze(
         }
         Operation::ExternalCommand { .. } => Err(fatal("external diff drivers are not supported")),
         Operation::InternalDiff { algorithm } => {
+            // `builtin_diff()`: a `-B` rewrite that stayed a modification never runs
+            // xdiff. `emit_rewrite_diff()` replaces the whole file in one hunk, and the
+            // diffstat counts the same way (`count_lines()` on each side).
+            if p.kind() == b'M' && p.score() != 0 {
+                let hunks = emit_rewrite_diff(&old_data, &new_data, opts);
+                return Ok(Analysis {
+                    add: count_lines(&new_data),
+                    del: count_lines(&old_data),
+                    binary: false,
+                    old_data,
+                    new_data,
+                    hunks,
+                });
+            }
             // `--diff-algorithm`/`--minimal`/`--histogram` override gitoxide's pick.
             let (add, del, hunks) =
                 text_analysis(&old_data, &new_data, opts, opts.algo.unwrap_or(algorithm))?;
@@ -1799,6 +2074,80 @@ fn analyze(
                 hunks,
             })
         }
+    }
+}
+
+/// `count_lines()`: lines in a buffer, counting an unterminated final line.
+fn count_lines(data: &[u8]) -> u32 {
+    if data.is_empty() {
+        return 0;
+    }
+    let mut count = data.iter().filter(|&&b| b == b'\n').count() as u32;
+    if data[data.len() - 1] != b'\n' {
+        count += 1; // no trailing newline
+    }
+    count
+}
+
+/// `add_line_count()`: the range half of a rewrite's `@@` line.
+fn rewrite_line_count(count: u32) -> String {
+    match count {
+        0 => "0,0".to_string(),
+        1 => "1".to_string(),
+        n => format!("1,{n}"),
+    }
+}
+
+/// `emit_rewrite_diff()`: a `-B` rewrite's body — one hunk spanning both whole files,
+/// every old line removed and every new line added, with no context. `-D` prints the
+/// pre-image range as `?,?` and drops the removed lines entirely.
+fn emit_rewrite_diff(old_data: &[u8], new_data: &[u8], opts: &Opts) -> Vec<u8> {
+    let lc_a = count_lines(old_data);
+    let lc_b = count_lines(new_data);
+    let mut out = Vec::new();
+    out.extend_from_slice(b"@@ -");
+    if opts.irreversible_delete {
+        out.extend_from_slice(b"?,?");
+    } else {
+        out.extend_from_slice(rewrite_line_count(lc_a).as_bytes());
+    }
+    out.extend_from_slice(b" +");
+    out.extend_from_slice(rewrite_line_count(lc_b).as_bytes());
+    out.extend_from_slice(b" @@\n");
+    if lc_a != 0 && !opts.irreversible_delete {
+        emit_rewrite_lines(&mut out, opts.ind_old, old_data);
+    }
+    if lc_b != 0 {
+        emit_rewrite_lines(&mut out, opts.ind_new, new_data);
+    }
+    out
+}
+
+/// `emit_rewrite_lines()`: every line of `data` prefixed by `prefix`, with git's
+/// incomplete-last-line marker when the buffer does not end in a newline.
+fn emit_rewrite_lines(out: &mut Vec<u8>, prefix: u8, data: &[u8]) {
+    let mut rest = data;
+    let mut ended_with_newline = false;
+    while !rest.is_empty() {
+        let (line, tail) = match rest.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                ended_with_newline = true;
+                (&rest[..=i], &rest[i + 1..])
+            }
+            None => {
+                ended_with_newline = false;
+                (rest, &rest[rest.len()..])
+            }
+        };
+        out.push(prefix);
+        out.extend_from_slice(line);
+        if !ended_with_newline {
+            out.push(b'\n');
+        }
+        rest = tail;
+    }
+    if !ended_with_newline {
+        out.extend_from_slice(b"\\ No newline at end of file\n");
     }
 }
 
@@ -2412,7 +2761,12 @@ fn scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
 
 /// `show_stats()`. `stat_width == -1` means "terminal width", which is 80 for a
 /// non-tty just like git's `term_columns()` fallback.
-fn render_stat(out: &mut Vec<u8>, files: &[StatFile], sw: &StatWidths) {
+fn render_stat(
+    out: &mut Vec<u8>,
+    files: &[StatFile],
+    sw: &StatWidths,
+    colors: &diff_color::DiffColors,
+) {
     if files.is_empty() {
         return;
     }
@@ -2528,7 +2882,12 @@ fn render_stat(out: &mut Vec<u8>, files: &[StatFile], sw: &StatWidths) {
                 out.push(b'\n');
                 continue;
             }
-            out.extend_from_slice(format!(" {deleted} -> {added} bytes\n").as_bytes());
+            // `show_stats()` paints the two byte counts with the old/new colors.
+            out.push(b' ');
+            diff_color::paint(out, colors, diff_color::DiffSlot::Old, deleted.to_string().as_bytes());
+            out.extend_from_slice(b" -> ");
+            diff_color::paint(out, colors, diff_color::DiffSlot::New, added.to_string().as_bytes());
+            out.extend_from_slice(b" bytes\n");
             continue;
         }
 
@@ -2557,8 +2916,13 @@ fn render_stat(out: &mut Vec<u8>, files: &[StatFile], sw: &StatWidths) {
         if added + deleted != 0 {
             out.push(b' ');
         }
-        out.extend_from_slice(&b"+".repeat(add.max(0) as usize));
-        out.extend_from_slice(&b"-".repeat(del.max(0) as usize));
+        // `show_graph()`: each run carries its own color, and emits nothing when empty.
+        if add > 0 {
+            diff_color::paint(out, colors, diff_color::DiffSlot::New, &b"+".repeat(add as usize));
+        }
+        if del > 0 {
+            diff_color::paint(out, colors, diff_color::DiffSlot::Old, &b"-".repeat(del as usize));
+        }
         out.push(b'\n');
     }
 
@@ -2579,6 +2943,10 @@ fn summary_is_empty(pairs: &[Pair]) -> bool {
         match p.kind() {
             b'A' | b'D' | b'C' | b'R' => return false,
             _ => {
+                // A `-B` rewrite carries a score and prints its own summary line.
+                if p.score() != 0 {
+                    return false;
+                }
                 if p.old_mode != 0 && p.new_mode != 0 && p.old_mode != p.new_mode {
                     return false;
                 }
@@ -2595,7 +2963,17 @@ fn render_summary(out: &mut Vec<u8>, p: &Pair) {
         b'A' => summary_mode_name(out, "create", p.new_mode, &p.new_path),
         b'C' => summary_rename_copy(out, "copy", p),
         b'R' => summary_rename_copy(out, "rename", p),
-        _ => summary_mode_change(out, p, true),
+        _ => {
+            // `diff_summary()`'s default arm: a `-B` rewrite that stayed a modification
+            // announces itself and suppresses the name on the mode-change line.
+            let score = p.score();
+            if score != 0 {
+                out.extend_from_slice(b" rewrite ");
+                out.extend_from_slice(&p.new_path);
+                out.extend_from_slice(format!(" ({score}%)\n").as_bytes());
+            }
+            summary_mode_change(out, p, score == 0);
+        }
     }
 }
 
@@ -2701,6 +3079,7 @@ fn pprint_rename(a: &[u8], b: &[u8]) -> Vec<u8> {
 
 /// Render one pair as one or two `diff --git` file sections (a type change splits into
 /// a deletion patch followed by a creation patch, exactly as `run_diff()` does).
+#[allow(clippy::too_many_arguments)]
 fn render_patch(
     out: &mut Vec<u8>,
     repo: &gix::Repository,
@@ -2708,15 +3087,38 @@ fn render_patch(
     p: &Pair,
     opts: &Opts,
     base_abbrev: usize,
+    colors: &diff_color::DiffColors,
+    ws_rule: u32,
 ) -> std::result::Result<(), ExitCode> {
     let steps: Vec<Pair> = if p.type_changed() {
         vec![as_deletion(p), as_creation(p)]
     } else {
         vec![p.clone()]
     };
+    let paint_opts = diff_color::PaintOptions {
+        ws_error_highlight: opts.ws_error_highlight,
+        indicators: (opts.ind_new, opts.ind_old, opts.ind_context),
+        // `diff.suppressBlankEmpty` is not read by this module, so the sign of an
+        // empty context line is always kept, as git's default does.
+        suppress_blank_empty: false,
+    };
     for step in &steps {
         let an = analyze(repo, cache, step, opts)?;
-        emit_patch(out, repo, step, &an, opts, base_abbrev);
+        // Each section is assembled uncolored, then re-emitted through git's
+        // `fn_out_consume()` chain with this pair's own whitespace state.
+        let mut section: Vec<u8> = Vec::new();
+        emit_patch(&mut section, repo, step, &an, opts, base_abbrev);
+        let file = diff_color::FilePaint {
+            ws_rule,
+            blank_at_eof: diff_color::check_blank_at_eof(&an.old_data, &an.new_data),
+        };
+        out.extend_from_slice(&diff_color::colorize_patch(
+            &section,
+            colors,
+            &paint_opts,
+            &[file],
+            file,
+        ));
     }
     Ok(())
 }
@@ -2780,6 +3182,10 @@ fn emit_patch(
         out.extend_from_slice(format!("{verb} to ").as_bytes());
         out.extend_from_slice(&p.new_path);
         out.push(b'\n');
+    } else if kind == b'M' && p.score() != 0 {
+        // `fill_metainfo()`'s MODIFIED arm: a `-B` rewrite reports how *dis*similar
+        // the two sides are instead of a rename header.
+        out.extend_from_slice(format!("dissimilarity index {}%\n", p.score()).as_bytes());
     }
 
     if p.old_id != p.new_id {

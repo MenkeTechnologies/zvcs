@@ -29,7 +29,7 @@ mod cherry;
 mod cherry_pick;
 mod clean;
 mod clone;
-mod color;
+pub(crate) mod color;
 mod column;
 mod commit;
 mod commit_graph;

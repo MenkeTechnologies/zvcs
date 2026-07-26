@@ -193,6 +193,15 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         eprintln!("From {url}");
     }
 
+    // `transfer.credentialsInUrl` is consulted before the connection is opened,
+    // sharing the fetch port's implementation so both commands report the same
+    // sentence for the same URL.
+    if super::fetch::credentials_in_url(&repo, remote.url(gix::remote::Direction::Fetch))
+        == super::fetch::Verdict::Fatal
+    {
+        return Ok(ExitCode::from(128));
+    }
+
     // `prefix_from_spec_as_filter_on_remote` must be off: ls-remote lists every
     // advertised ref, not just the ones the remote's refspecs would fetch.
     let connection = match remote.connect(gix::remote::Direction::Fetch) {

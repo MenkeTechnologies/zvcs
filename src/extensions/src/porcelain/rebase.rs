@@ -76,12 +76,34 @@
 //!   applied commit <abbrev>`). Deciding that needs a patch-id per commit; nothing
 //!   vendored computes one, so such commits are re-picked (they usually merge to a
 //!   no-op) rather than dropped.
-//! * The **`--continue`/`--skip`/`--abort`/`--quit`/`--edit-todo`/
-//!   `--show-current-patch`** state machine (the `.git/rebase-merge` directory),
-//!   `--root` (mints a root commit), `--fork-point` (walks the upstream reflog),
-//!   `--autostash` against a dirty tree (writes a stash commit), and `-v`/`--stat`
-//!   past the up-to-date exit (the upstream diffstat). Each is rejected with a
-//!   message naming the reason; none is silently ignored.
+//! * `-v`/`--verbose` past the up-to-date exit. `-v` prints the upstream diffstat
+//!   *and* a second, post-replay diffstat the sequencer emits in verbose mode;
+//!   only the first is ported, so `-v` is rejected with a message naming the
+//!   reason rather than emitting half of git's output. Plain `--stat` (and
+//!   `rebase.stat=true`, which sets the same bit and nothing else) is ported.
+//! * `--edit-todo` (interactive todo editing) and `--exec`. Each is rejected with
+//!   a message naming the reason; none is silently ignored.
+//!
+//! ### `--root`
+//!
+//! `--root` replays every commit reachable from `<branch>` rather than the
+//! `<upstream>..<branch>` range: `builtin/rebase.c` leaves `options.upstream`
+//! NULL and builds its revision range as `<onto>..<orig_head>`. Without `--onto`
+//! it first mints a stand-in `<onto>` — an empty-tree commit with no parents,
+//! `options.squash_onto` — checks HEAD out at it, and lets the sequencer turn the
+//! first pick into a *new root commit* (`CREATE_ROOT_COMMIT`) instead of a child
+//! of that stand-in. Both shapes are ported here, including `do_pick_commit()`'s
+//! fast-forward arm, which is what makes a plain `git rebase --root` over an
+//! already-rooted linear history a no-op that leaves every commit id untouched
+//! (reflog `rebase: fast-forward`) while `git rebase --root -f` rewrites them.
+//!
+//! ### Config
+//!
+//! `rebase.backend`, `rebase.autoStash`, `rebase.forkPoint` (false ⇒
+//! `--no-fork-point`) and `rebase.stat` (true ⇒ `--stat`) are read as the
+//! defaults their command-line options override. The remaining `rebase.*` keys
+//! all default behavior that lives behind an unported feature — see
+//! `tests/rebase_config.rs` for which, and why wiring them would diverge.
 //!
 //! `--signoff`/`--trailer` are *not* refused up front, and *not* refused at all
 //! when the todo is empty: like git they only set `REBASE_FORCE`, so an
@@ -315,6 +337,24 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // is why the explicit flag wins over the config both ways.
     if repo.config_snapshot().boolean("rebase.autoStash") == Some(true) {
         autostash = true;
+    }
+    // `rebase.stat` is the default for `--stat`/`--no-stat`: it sets or clears
+    // REBASE_DIFFSTAT and nothing else, so unlike `-v` it never turns on
+    // REBASE_VERBOSE and never disables the preemptive fast-forward. The `--stat`
+    // / `--no-stat` / `-q` / `-v` arms in the loop below overwrite it.
+    match repo.config_snapshot().boolean("rebase.stat") {
+        Some(true) => flags |= DIFFSTAT,
+        Some(false) => flags &= !DIFFSTAT,
+        None => {}
+    }
+    // `rebase.forkPoint`: `opts->fork_point = git_config_bool(...) ? -1 : 0`, i.e.
+    // only the `false` side is a decision — it pins `--no-fork-point` so a rebase
+    // against the branch's tracking ref does not walk the upstream reflog. `true`
+    // restores the -1 "unset" state, which is already the initial value.
+    match repo.config_snapshot().boolean("rebase.forkPoint") {
+        Some(true) => fork_point = -1,
+        Some(false) => fork_point = 0,
+        None => {}
     }
 
     // --- parse_options ----------------------------------------------------
@@ -937,9 +977,11 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // `--root without --onto requires the merge backend` (128) and mints nothing —
     // and is skipped entirely when `--onto` supplies the base (`git rebase --root
     // --onto HEAD -- a b` usage-errors with no object written).
-    if root && onto_name.is_none() {
-        write_synth_root(&repo)?;
-    }
+    let squash_onto = if root && onto_name.is_none() {
+        Some(write_synth_root(&repo)?)
+    } else {
+        None
+    };
 
     // git resolves `<upstream>` here. With `--root` no upstream token is
     // consumed, so `builtin/rebase.c`'s `--root` arm ends with `if (argc > 1)
@@ -975,12 +1017,15 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     drop(head);
 
     // --- <upstream> --------------------------------------------------------
-    if root {
-        // With no `--onto`, git mints a fresh root commit (`commit_tree("")`),
-        // which changes the object database before anything else happens.
-        bail!("unsupported flag \"--root\" (rebasing onto a synthesized root commit requires commit replay)");
-    }
-    let upstream_spec = match positional.first() {
+    // `--root` consumes no `<upstream>` token: `builtin/rebase.c` leaves
+    // `options.upstream` NULL and derives the replay range from `<onto>` instead,
+    // so the whole resolution below — including the missing-default-upstream
+    // report and `--fork-point` — is skipped, and the first positional is
+    // `[<branch>]` rather than `<upstream>`.
+    let upstream_spec = if root {
+        String::new()
+    } else {
+        match positional.first() {
         Some(s) if s == "-" => "@{-1}".to_string(),
         Some(s) => s.clone(),
         None => {
@@ -1018,16 +1063,27 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
+        }
     };
-    let Some(upstream_oid) = peel_to_commit(&repo, &upstream_spec) else {
-        die!("invalid upstream '{upstream_spec}'");
+    let upstream_oid = if root {
+        None
+    } else {
+        match peel_to_commit(&repo, &upstream_spec) {
+            Some(oid) => Some(oid),
+            None => die!("invalid upstream '{upstream_spec}'"),
+        }
     };
 
     // --- <branch> ----------------------------------------------------------
     // git checks out `<branch>` before rebasing. That checkout is out of scope
     // here, so only the already-current branch is accepted — but the argument is
     // still validated the way git validates it, in git's order.
-    let branch_name = match positional.get(1) {
+    let branch_arg = if root {
+        positional.first()
+    } else {
+        positional.get(1)
+    };
+    let branch_name = match branch_arg {
         Some(requested) => {
             let is_branch = repo
                 .try_find_reference(&format!("refs/heads/{requested}"))
@@ -1052,8 +1108,13 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     };
 
     // --- <onto> ------------------------------------------------------------
+    // `--root` without `--onto` stands the minted root commit in as `<onto>`, by
+    // its full hex id — which is what lands in the `rebase (start): checkout <…>`
+    // reflog entry, exactly as stock git records it.
     let onto_spec = if keep_base {
         format!("{upstream_spec}...{branch_name}")
+    } else if let Some(oid) = squash_onto {
+        oid.to_string()
     } else {
         onto_name.clone().unwrap_or_else(|| upstream_spec.clone())
     };
@@ -1087,7 +1148,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // `--keep-base` defaults `--reapply-cherry-picks` on, which git models by
     // moving the upstream to the onto so nothing looks already-applied.
     let upstream_oid = if keep_base && reapply_cherry_picks == 1 {
-        onto_oid
+        Some(onto_oid)
     } else {
         upstream_oid
     };
@@ -1130,8 +1191,15 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- can_fast_forward() ------------------------------------------------
+    // git calls `can_fast_forward()` with `options.upstream`, which `--root`
+    // leaves NULL, so the preemptive fast-forward is never taken under `--root`:
+    // `git rebase --root --onto <head>` finishes with `Successfully rebased and
+    // updated <ref>.` rather than `Current branch <b> is up to date.`.
     let branch_base = merge_base_unique(&repo, onto_oid, head_oid)?;
-    let can_ff = can_fast_forward(&repo, branch_base, onto_oid, upstream_oid, head_oid)?;
+    let can_ff = match upstream_oid {
+        Some(up) => can_fast_forward(&repo, branch_base, onto_oid, up, head_oid)?,
+        None => false,
+    };
     if allow_preemptive_ff && can_ff {
         if flags & FORCE == 0 {
             if flags & NO_QUIET != 0 {
@@ -1158,8 +1226,28 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
 
+    // `--stat` (and `rebase.stat=true`): the diffstat of what changed upstream,
+    // `diff_tree_oid(merge_base, onto)` with DIFF_FORMAT_DIFFSTAT|DIFF_FORMAT_SUMMARY
+    // on stdout. A null merge base (unrelated histories) diffs against the empty
+    // tree. Rendering is delegated to the `diff` porcelain, which drives the same
+    // machinery; the one deviation is git's `detect_rename`, which this port has
+    // nowhere, so a rename renders as a delete plus an add.
+    //
+    // `-v` additionally sets REBASE_VERBOSE, which prefixes a `Changes from <a> to
+    // <b>:` line *and* makes the sequencer emit a second, post-replay diffstat of
+    // its own. That second one is not ported, so `-v` past this point is still
+    // refused rather than answered with half of git's output.
     if flags & DIFFSTAT != 0 {
-        bail!("unsupported flag \"-v\"/\"--stat\" (the upstream diffstat is not ported)");
+        if flags & VERBOSE != 0 {
+            bail!("unsupported flag \"-v\"/\"--verbose\" (the sequencer's post-replay diffstat is not ported)");
+        }
+        let base = branch_base.unwrap_or_else(|| ObjectId::empty_tree(repo.object_hash()));
+        super::diff::diff(&[
+            "--stat".to_string(),
+            "--summary".to_string(),
+            base.to_string(),
+            onto_oid.to_string(),
+        ])?;
     }
 
     // --- decide whether anything would be replayed -------------------------
@@ -1171,7 +1259,10 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // dropped) is excluded from the replay. In the common case the fork point is
     // the plain merge-base — an ancestor of the upstream — so hiding it changes
     // nothing.
-    let mut hidden: Vec<ObjectId> = vec![upstream_oid];
+    // Under `--root` there is no upstream and git's range is `<onto>..<orig_head>`
+    // instead, which is why `git rebase --root --onto <base>` replays only what
+    // `<base>` does not already contain.
+    let mut hidden: Vec<ObjectId> = vec![upstream_oid.unwrap_or(onto_oid)];
     if let Some(fp) = fork_point_oid {
         hidden.push(fp);
     }
@@ -1398,9 +1489,13 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             .as_ref()
             .map(|b| b.as_bstr().to_string())
             .unwrap_or_else(|| "detached HEAD".to_string());
+        // `opts.allow_ff = !(options->flags & REBASE_FORCE)`: without `-f`/`--no-ff`
+        // a pick whose parent is already the tip is fast-forwarded to rather than
+        // re-committed, so its commit id survives the rebase.
         return replay_picks(
             &repo, onto_oid, &picks, head_name, onto_oid, head_oid, &committer,
-            &should_interrupt, autostash_oid,
+            &should_interrupt, autostash_oid, flags & FORCE == 0, squash_onto,
+            flags & NO_QUIET == 0,
         );
     } else if apply_backend {
         println!("Fast-forwarded {branch_name} to {onto_spec}.");
@@ -1462,7 +1557,12 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
 /// reproducing git's ordering means writing it here — even on the invocations git
 /// goes on to reject with the usage block. Only the loose object is written; no
 /// ref, reflog, `ORIG_HEAD`, or index entry is touched, matching git.
-fn write_synth_root(repo: &gix::Repository) -> Result<()> {
+///
+/// The returned id is git's `options.squash_onto`: it stands in as `<onto>` (and
+/// so names the `rebase (start): checkout <oid>` reflog entry), and a pick made
+/// while the tip is still this commit becomes a new root commit rather than its
+/// child.
+fn write_synth_root(repo: &gix::Repository) -> Result<ObjectId> {
     let author = repo
         .author()
         .ok_or_else(|| anyhow!("author identity is not configured"))??
@@ -1471,16 +1571,17 @@ fn write_synth_root(repo: &gix::Repository) -> Result<()> {
         .committer()
         .ok_or_else(|| anyhow!("committer identity is not configured"))??
         .to_owned()?;
-    repo.write_object(&gix::objs::Commit {
-        message: BString::default(),
-        tree: ObjectId::empty_tree(repo.object_hash()),
-        author,
-        committer,
-        encoding: None,
-        parents: Default::default(),
-        extra_headers: Default::default(),
-    })?;
-    Ok(())
+    Ok(repo
+        .write_object(&gix::objs::Commit {
+            message: BString::default(),
+            tree: ObjectId::empty_tree(repo.object_hash()),
+            author,
+            committer,
+            encoding: None,
+            parents: Default::default(),
+            extra_headers: Default::default(),
+        })?
+        .detach())
 }
 
 /// Resolve `onto..head` into replay steps by walking first parents from `head`
@@ -1723,6 +1824,19 @@ struct RebaseState {
     todo: Vec<ObjectId>,
     /// The commit whose pick stopped on a conflict.
     stopped: ObjectId,
+    /// `--root` without `--onto`: the synthesized empty root commit standing in
+    /// as `<onto>`. A pick made while the tip still *is* that commit becomes a
+    /// new root commit rather than its child. git records the same value in
+    /// `$state_dir/squash-onto`.
+    squash_onto: Option<ObjectId>,
+    /// `opts.allow_ff` — false under `-f`/`--no-ff`. Recorded as the presence of
+    /// a `no-ff` marker file so a resumed rebase keeps re-committing rather than
+    /// fast-forwarding a pick whose parent is already the tip.
+    allow_ff: bool,
+    /// `-q`/`--quiet`: no `Rebasing (n/m)` progress and no
+    /// `Successfully rebased …` summary. git records the same thing as the
+    /// presence of `$state_dir/quiet`.
+    quiet: bool,
 }
 
 fn rebase_merge_dir(repo: &gix::Repository) -> std::path::PathBuf {
@@ -1738,6 +1852,22 @@ fn write_rebase_state(repo: &gix::Repository, st: &RebaseState) -> Result<()> {
     std::fs::write(dir.join("orig-head"), format!("{}\n", st.orig_head))?;
     std::fs::write(dir.join("interactive"), b"")?;
     std::fs::write(dir.join("stopped-sha"), format!("{}\n", st.stopped))?;
+    match st.squash_onto {
+        Some(oid) => std::fs::write(dir.join("squash-onto"), format!("{oid}\n"))?,
+        None => {
+            let _ = std::fs::remove_file(dir.join("squash-onto"));
+        }
+    }
+    if st.allow_ff {
+        let _ = std::fs::remove_file(dir.join("no-ff"));
+    } else {
+        std::fs::write(dir.join("no-ff"), b"")?;
+    }
+    if st.quiet {
+        std::fs::write(dir.join("quiet"), b"")?;
+    } else {
+        let _ = std::fs::remove_file(dir.join("quiet"));
+    }
     let todo: String = st.todo.iter().map(|o| format!("pick {o}\n")).collect();
     std::fs::write(dir.join("git-rebase-todo"), todo)?;
     Ok(())
@@ -1765,12 +1895,20 @@ fn read_rebase_state(repo: &gix::Repository) -> Result<RebaseState> {
         .filter_map(|l| l.trim().strip_prefix("pick "))
         .filter_map(|rest| ObjectId::from_hex(rest.split_whitespace().next()?.as_bytes()).ok())
         .collect();
+    let squash_onto = read("squash-onto")
+        .ok()
+        .and_then(|s| ObjectId::from_hex(s.as_bytes()).ok());
+    let allow_ff = !dir.join("no-ff").exists();
+    let quiet = dir.join("quiet").exists();
     Ok(RebaseState {
         head_name,
         onto,
         orig_head,
         todo,
         stopped,
+        squash_onto,
+        allow_ff,
+        quiet,
     })
 }
 
@@ -1934,6 +2072,13 @@ fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
         let stopped = repo.find_commit(st.stopped)?;
         let message: BString = stopped.message_raw()?.to_owned();
         let author = stopped.author()?.to_owned()?;
+        // Same `CREATE_ROOT_COMMIT` rule as [`replay_picks`]: a `--root` rebase
+        // whose *first* pick is the one that stopped resumes into a root commit.
+        let parents = if Some(tip) == st.squash_onto {
+            Default::default()
+        } else {
+            std::iter::once(tip).collect()
+        };
         let new = repo
             .write_object(&gix::objs::Commit {
                 message: message.clone(),
@@ -1941,7 +2086,7 @@ fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
                 author,
                 committer: committer.clone(),
                 encoding: None,
-                parents: std::iter::once(tip).collect(),
+                parents,
                 extra_headers: Default::default(),
             })?
             .detach();
@@ -1964,6 +2109,9 @@ fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
         &should_interrupt,
         // Carry any autostash the stopped rebase saved through to its conclusion.
         read_autostash(repo),
+        st.allow_ff,
+        st.squash_onto,
+        st.quiet,
     )
 }
 
@@ -1982,13 +2130,18 @@ fn replay_picks(
     committer: &gix::actor::Signature,
     should_interrupt: &AtomicBool,
     autostash: Option<ObjectId>,
+    allow_ff: bool,
+    squash_onto: Option<ObjectId>,
+    quiet: bool,
 ) -> Result<ExitCode> {
     let empty_tree = ObjectId::empty_tree(repo.object_hash());
     let mut cur_index = repo.index_from_tree(&repo.find_commit(tip)?.tree_id()?.detach())?;
     let total = picks.len();
 
     for (n, oid) in picks.iter().enumerate() {
-        eprint!("Rebasing ({}/{total})\r", n + 1);
+        if !quiet {
+            eprint!("Rebasing ({}/{total})\r", n + 1);
+        }
         let commit = repo.find_commit(*oid)?;
         let message: BString = commit.message_raw()?.to_owned();
         let subject: BString = match message.find_byte(b'\n') {
@@ -2030,6 +2183,9 @@ fn replay_picks(
                     orig_head,
                     todo: remaining,
                     stopped: *oid,
+                    squash_onto,
+                    allow_ff,
+                    quiet,
                 },
             )?;
             // The rebase stopped for conflicts; hand the autostash to the
@@ -2054,6 +2210,30 @@ fn replay_picks(
             return Ok(ExitCode::from(1));
         }
 
+        // `do_pick_commit()`'s fast-forward arm: with `allow_ff` (i.e. no
+        // `-f`/`--no-ff`) a pick that would land on the very parent it already
+        // has is not re-committed at all — `HEAD` is moved straight to the
+        // existing commit and the reflog records `rebase: fast-forward`. Under
+        // `--root` without `--onto` the same arm applies to a root commit while
+        // the tip is still the synthesized stand-in, which git treats as unborn.
+        // That is what makes a plain `git rebase --root` over an already-rooted
+        // linear history leave every commit id untouched.
+        //
+        // The three-way merge above still ran, and that is what keeps the
+        // worktree and index in step; it is a no-op on content here, because
+        // `base == ours` makes the merged tree exactly the picked commit's tree.
+        let parent = commit.parent_ids().next().map(|p| p.detach());
+        let fast_forward = allow_ff
+            && match parent {
+                Some(p) => p == tip,
+                None => Some(tip) == squash_onto,
+            };
+        if fast_forward {
+            set_head(repo, Target::Object(*oid), "rebase: fast-forward")?;
+            tip = *oid;
+            continue;
+        }
+
         // A pick whose changes are already present merges to no tree change — this
         // is the observable result of git's patch-id equivalence, which drops a
         // commit already applied upstream. git drops such a pick rather than
@@ -2065,7 +2245,16 @@ fn replay_picks(
             continue;
         }
 
+        // `CREATE_ROOT_COMMIT`: while the tip is still the synthesized stand-in
+        // `<onto>` that `--root` without `--onto` minted, the pick becomes a new
+        // *root* commit instead of that stand-in's child, so the rebased history
+        // keeps exactly one root.
         let author = commit.author()?.to_owned()?;
+        let parents = if Some(tip) == squash_onto {
+            Default::default()
+        } else {
+            std::iter::once(tip).collect()
+        };
         let new = repo
             .write_object(&gix::objs::Commit {
                 message: message.clone(),
@@ -2073,7 +2262,7 @@ fn replay_picks(
                 author,
                 committer: committer.clone(),
                 encoding: None,
-                parents: std::iter::once(tip).collect(),
+                parents,
                 extra_headers: Default::default(),
             })?
             .detach();
@@ -2087,10 +2276,13 @@ fn replay_picks(
 
     // Finish: re-point the branch at the new tip and re-attach HEAD, then drop the
     // state directory.
+    //
+    // git's `head_name` here is the *full* refname, and both the reflog message
+    // and the `Successfully rebased and updated <…>.` line quote it verbatim —
+    // `refs/heads/topic`, not `topic`.
     let label = if head_name != "detached HEAD" {
         let name = full_name(&head_name)?;
-        let short = name.as_bstr().to_string();
-        let short = short.strip_prefix("refs/heads/").unwrap_or(&short).to_string();
+        let label = name.as_bstr().to_string();
         repo.edit_reference(RefEdit {
             change: Change::Update {
                 log: LogChange {
@@ -2107,9 +2299,9 @@ fn replay_picks(
         set_head(
             repo,
             Target::Symbolic(name),
-            &format!("rebase (finish): returning to {short}"),
+            &format!("rebase (finish): returning to {label}"),
         )?;
-        short
+        label
     } else {
         "detached HEAD".to_string()
     };
@@ -2117,9 +2309,11 @@ fn replay_picks(
     // The replay completed; re-apply the autostash onto the new tip before the
     // summary line, matching git's finish_rebase ordering.
     if let Some(oid) = autostash {
-        crate::porcelain::stash::apply_autostash(repo, oid, false)?;
+        crate::porcelain::stash::apply_autostash(repo, oid, quiet)?;
     }
-    eprintln!("Successfully rebased and updated {label}.");
+    if !quiet {
+        eprintln!("Successfully rebased and updated {label}.");
+    }
     Ok(ExitCode::SUCCESS)
 }
 

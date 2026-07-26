@@ -416,6 +416,11 @@ fn serve(repo: &gix::Repository, advertise_only: bool) -> Result<ExitCode> {
 /// flush. Mirrors git's `send_ref`/`upload-pack` advertisement shape.
 fn advertisement(repo: &gix::Repository) -> Result<Vec<u8>> {
     let mut out = Vec::new();
+    // `upload-pack` filters its ref list through `ref_is_hidden()` exactly as
+    // `receive-pack` does, off `uploadpack.hideRefs` plus the shared
+    // `transfer.hideRefs`.
+    let config = repo.config_snapshot();
+    let hidden = super::receive_pack::hide_ref_patterns(&config, "uploadpack.hideRefs");
     let head_target = repo
         .head_ref()
         .ok()
@@ -435,6 +440,9 @@ fn advertisement(repo: &gix::Repository) -> Result<Vec<u8>> {
     for reference in repo.references()?.all()? {
         let Ok(mut reference) = reference else { continue };
         let name = reference.name().as_bstr().to_string();
+        if super::receive_pack::ref_is_hidden(&hidden, &name) {
+            continue;
+        }
         let Ok(id) = reference.follow_to_object() else { continue };
         let oid = id.detach();
         let line = if sent_caps {

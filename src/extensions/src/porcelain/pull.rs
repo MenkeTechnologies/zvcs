@@ -5,7 +5,10 @@
 //! the ported [`fetch`](super::fetch), so its option surface is available to
 //! `pull` verbatim: `--all`, `-f`/`--force`, `-t`/`--tags`, `-p`/`--prune`,
 //! `--depth`/`--deepen`/`--unshallow`, `--shallow-since`/`--shallow-exclude`,
-//! `-q`/`-v`, and the `From …` per-ref summary git prints to stderr.
+//! `-q`/`-v`, `--progress`/`--no-progress`, `--dry-run`, `-a`/`--append`,
+//! `--show-forced-updates`/`--no-show-forced-updates`,
+//! `-k`/`--keep`, `--recurse-submodules`, `-j`/`--jobs`, and the `From …`
+//! per-ref summary git prints to stderr.
 //!
 //! The integration step is the ported [`merge`](super::merge) by default, or the
 //! ported [`rebase`](super::rebase) when a rebase is requested. The rebase is
@@ -35,7 +38,10 @@
 //! `--signoff` are honored on the *rebase* path), `--rebase=interactive`
 //! (interactive todo editing needs a TTY editor loop), `--autostash` over a
 //! dirty tree on the merge path (needs a 3-way stash apply the stash port lacks),
-//! `--set-upstream`/`-a`/`--append` (not exposed by the high-level fetch), and
+//! `--set-upstream`, `--compact-summary` (the merge port has no compact-summary
+//! renderer), `--upload-pack`, `--update-shallow`, `--refmap`,
+//! `-o`/`--server-option`, `-4`/`-6` and the `--negotiation-*` family (no
+//! gitoxide substrate — see [`fetch`](super::fetch)), and
 //! `--gpg-sign`/`-S`/`--verify-signatures` (GPG is not vendored).
 
 use anyhow::{bail, Result};
@@ -98,6 +104,10 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let mut strategy_opts: Vec<String> = Vec::new(); // -X / --strategy-option
     let mut signoff = false;
     let mut autostash: Option<bool> = None;
+    // `--verify` (git's default) / `--no-verify`: forwarded to `merge`, which
+    // runs the `pre-merge-commit` and `commit-msg` hooks. git's pull passes it
+    // only to the merge, never to the rebase.
+    let mut no_verify = false;
 
     // Knobs forwarded to `fetch`.
     let mut f_all = false;
@@ -111,6 +121,14 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let mut f_shallow_exclude: Vec<String> = Vec::new();
     let mut f_quiet = false;
     let mut f_verbose = false;
+    // Fetch knobs with no merge/rebase meaning, forwarded verbatim.
+    let mut f_progress: Option<bool> = None;
+    let mut f_dry_run = false;
+    let mut f_append = false;
+    let mut f_keep = false;
+    let mut f_show_forced: Option<bool> = None;
+    let mut f_recurse: Option<String> = None;
+    let mut f_jobs: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -177,6 +195,32 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "--shallow-exclude" => f_shallow_exclude.push(take_value!("shallow-exclude")),
             "-q" | "--quiet" => f_quiet = true,
             "-v" | "--verbose" => f_verbose = true,
+            "--progress" => f_progress = Some(true),
+            "--no-progress" => f_progress = Some(false),
+            // git's pull runs the fetch with `--dry-run` and then returns
+            // without integrating anything (`builtin/pull.c` returns right after
+            // `run_fetch`), so nothing is merged or rebased.
+            "--dry-run" => f_dry_run = true,
+            "--no-dry-run" => f_dry_run = false,
+            "-a" | "--append" => f_append = true,
+            "--no-append" => f_append = false,
+            "-k" | "--keep" => f_keep = true,
+            "--show-forced-updates" => f_show_forced = Some(true),
+            "--no-show-forced-updates" => f_show_forced = Some(false),
+            "--recurse-submodules" => {
+                f_recurse = Some(inline.clone().unwrap_or_else(|| "yes".into()))
+            }
+            "--no-recurse-submodules" => f_recurse = Some("no".into()),
+            // git's pull declares `-j`/`--jobs` with an *optional* value, so a
+            // detached `5` in `git pull -j 5` is a positional, not the count.
+            // Only an attached value sets it.
+            "-j" | "--jobs" => f_jobs = inline.clone(),
+            "--no-jobs" => f_jobs = None,
+
+            // `--verify` (default) / `--no-verify` reach the merge, which runs
+            // the `pre-merge-commit` and `commit-msg` hooks.
+            "--verify" => no_verify = false,
+            "--no-verify" => no_verify = true,
 
             // Merge-only integration options the merge port does not implement,
             // with no rebase equivalent: refused rather than faked.
@@ -206,9 +250,6 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             // Absent substrate.
             "--set-upstream" => {
                 bail!("--set-upstream is not supported (not exposed by the high-level fetch)")
-            }
-            "-a" | "--append" => {
-                bail!("--append is not supported (FETCH_HEAD is not written)")
             }
             "-S" | "--gpg-sign" => bail!("--gpg-sign is not supported (GPG is not vendored)"),
             "--verify-signatures" | "--no-verify-signatures" => {
@@ -305,6 +346,31 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     if f_verbose {
         fetch_args.push("--verbose".into());
     }
+    match f_progress {
+        Some(true) => fetch_args.push("--progress".into()),
+        Some(false) => fetch_args.push("--no-progress".into()),
+        None => {}
+    }
+    if f_dry_run {
+        fetch_args.push("--dry-run".into());
+    }
+    if f_append {
+        fetch_args.push("--append".into());
+    }
+    if f_keep {
+        fetch_args.push("--keep".into());
+    }
+    match f_show_forced {
+        Some(true) => fetch_args.push("--show-forced-updates".into()),
+        Some(false) => fetch_args.push("--no-show-forced-updates".into()),
+        None => {}
+    }
+    if let Some(r) = &f_recurse {
+        fetch_args.push(format!("--recurse-submodules={r}"));
+    }
+    if let Some(j) = &f_jobs {
+        fetch_args.push(format!("--jobs={j}"));
+    }
     // `--all` fans out over every configured remote and takes no repository
     // argument; otherwise the first positional names the remote to fetch (the
     // configured default refspec updates the tracking ref merged/rebased below).
@@ -316,7 +382,14 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // Network / bad-remote failures surface as `Err`; a ref-rejection returns a
     // non-success code with the summary already printed. The tracking-ref check
     // below then reports the missing upstream, as git's pull does.
-    let _ = super::fetch(&fetch_args)?;
+    let fetch_code = super::fetch(&fetch_args)?;
+
+    // `--dry-run` stops here: git's pull returns right after `run_fetch` without
+    // touching the worktree, so no merge or rebase is attempted and the tracking
+    // refs the integration step would need were never written.
+    if f_dry_run {
+        return Ok(fetch_code);
+    }
 
     // The upstream ref must now exist locally; if the fetch produced no such
     // tracking ref the requested branch does not exist on the remote.
@@ -432,6 +505,11 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let mut merge_args: Vec<String> = Vec::new();
     if let Some(f) = ff_flag {
         merge_args.push(f.to_string());
+    }
+    // git's pull hands `--no-verify` to the merge only; the rebase path never
+    // sees it (`builtin/pull.c` pushes it in `run_merge`).
+    if no_verify {
+        merge_args.push("--no-verify".into());
     }
     match stat {
         Some(true) => merge_args.push("--stat".into()),

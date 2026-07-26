@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use std::cmp::Ordering;
-use std::io::{IsTerminal, Write as _};
+use std::io::Write as _;
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -774,6 +774,10 @@ struct Colors {
     current: String,
     local: String,
     remote: String,
+    /// `color.branch.reset` — the sequence that closes a colored name. git makes
+    /// this a slot of its own (`BRANCH_COLOR_RESET`), so a user can replace the
+    /// plain `\e[m` with any spec.
+    reset: String,
 }
 
 impl Colors {
@@ -797,20 +801,7 @@ fn resolve_colors(repo: &gix::Repository, when: ColorWhen) -> Colors {
     let on = match when {
         ColorWhen::Always => true,
         ColorWhen::Never => false,
-        ColorWhen::Auto => {
-            let snap = repo.config_snapshot();
-            let raw = snap
-                .string("color.branch")
-                .or_else(|| snap.string("color.ui"))
-                .map(|v| v.to_string());
-            match raw.as_deref() {
-                Some("always") => true,
-                None | Some("auto" | "true" | "yes" | "on" | "1" | "") => {
-                    std::io::stdout().is_terminal()
-                }
-                _ => false,
-            }
-        }
+        ColorWhen::Auto => super::color::want_color_stdout(repo, "branch"),
     };
     if !on {
         return Colors {
@@ -818,6 +809,7 @@ fn resolve_colors(repo: &gix::Repository, when: ColorWhen) -> Colors {
             current: String::new(),
             local: String::new(),
             remote: String::new(),
+            reset: String::new(),
         };
     }
     let snap = repo.config_snapshot();
@@ -833,6 +825,14 @@ fn resolve_colors(repo: &gix::Repository, when: ColorWhen) -> Colors {
         current: slot("color.branch.current", "green"),
         local: slot("color.branch.local", "normal"),
         remote: slot("color.branch.remote", "red"),
+        // git's `BRANCH_COLOR_RESET` default is the bare reset, which
+        // `color_sgr` renders from the `reset` attribute as `\e[0m`; git emits
+        // `\e[m` for it, so the default is kept literal.
+        reset: match snap.string("color.branch.reset") {
+            Some(spec) => super::color::parse_color_spec(&spec.to_string())
+                .unwrap_or_else(|| RESET.to_string()),
+            None => RESET.to_string(),
+        },
     }
 }
 
@@ -1013,7 +1013,7 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             };
             let pad = " ".repeat(width - e.display.chars().count());
             if colors.on {
-                println!("{marker}{}{}{pad}{RESET} {info}", colors.open(e), e.display);
+                println!("{marker}{}{}{pad}{} {info}", colors.open(e), e.display, colors.reset);
             } else {
                 println!("{marker}{}{pad} {info}", e.display);
             }
@@ -1028,7 +1028,7 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     for e in &entries {
         let marker = if e.current { "* " } else { "  " };
         let line = if colors.on {
-            format!("{marker}{}{}{RESET}", colors.open(e), e.display)
+            format!("{marker}{}{}{}", colors.open(e), e.display, colors.reset)
         } else {
             format!("{marker}{}", e.display)
         };

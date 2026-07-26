@@ -37,8 +37,15 @@ use crate::lock::RepoLock;
 ///   * `git init --shared[=<permissions>]`                (group/world/octal sharing)
 ///   * `git init --object-format=<hash>` / `--object-format <hash>`
 ///                                                        (`sha1` accepted; `sha256` rejected — see deviations)
+///     with git's precedence: the option > the `GIT_DEFAULT_HASH` env var >
+///     the `init.defaultObjectFormat` config > the compiled-in `sha1`.
 ///   * `git init --ref-format=<format>` / `--ref-format <format>`
 ///                                                        (`files` accepted; `reftable` rejected — see deviations)
+///     with git's precedence: the option > the `GIT_DEFAULT_REF_FORMAT` env var >
+///     the `init.defaultRefFormat` config > the compiled-in `files`.
+///   * `init.defaultSubmodulePathConfig=true` seeds
+///     `extensions.submodulePathConfig=true` (and the `core.repositoryformatversion=1`
+///     bump it requires) into the new repository, exactly like stock git.
 ///   * `--no-bare` / `--no-quiet` / `--no-template` / `--no-separate-git-dir` /
 ///     `--no-initial-branch` / `--no-object-format` / `--no-ref-format`
 ///                                                        (git's auto-generated negations; reset to default, last-wins)
@@ -179,40 +186,30 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    // Validate `--object-format` / `--ref-format` before any repository is
-    // touched, matching git (`builtin/init-db.c` calls `hash_algo_by_name` and
-    // dies on an unknown value before `create_default_files`; the same holds on
-    // reinit — `git init --object-format=bogus <existing>` dies rather than
-    // reprinting the reinit line).
+    // Resolve the repository formats with git's precedence (`builtin/init-db.c`
+    // + `setup.c`): the command-line option wins, then the `GIT_DEFAULT_HASH` /
+    // `GIT_DEFAULT_REF_FORMAT` environment variable, then the
+    // `init.defaultObjectFormat` / `init.defaultRefFormat` config, then the
+    // compiled-in `sha1` / `files`. The first two levels are fatal on an
+    // unrecognized value; the config level only warns and falls back to the
+    // compiled-in default (verified against stock git 2.55.0: `GIT_DEFAULT_REF_FORMAT=bogus
+    // git init` dies with `fatal: unknown ref storage format 'bogus'`, while
+    // `init.defaultObjectFormat=bogus` prints `warning: unknown hash algorithm
+    // 'bogus'` and still creates a sha1 repository).
     //
-    // git's `hash_algo_by_name` recognizes exactly `sha1` and `sha256`; anything
-    // else is `unknown hash algorithm '<v>'`. gix lays down sha1 repositories, so
-    // `sha1` (also the default) is a no-op that matches stock git byte-for-byte.
-    // `sha256` requires a verified sha256 object write path that is not vendored,
-    // so it is rejected honestly rather than silently producing a sha1 repo.
+    // Levels 1-2 are validated here, before any repository is touched, exactly
+    // where git validates them; the config level is read after the repository
+    // exists, because that is the only place a config snapshot is available.
+    let object_format = object_format.or_else(|| std::env::var("GIT_DEFAULT_HASH").ok());
+    let ref_format = ref_format.or_else(|| std::env::var("GIT_DEFAULT_REF_FORMAT").ok());
     if let Some(fmt) = object_format.as_deref() {
-        match fmt {
-            "sha1" => {}
-            "sha256" => anyhow::bail!(
-                "the sha256 object format is not supported: no vendored, verified \
-                 sha256 object write path"
-            ),
-            other => anyhow::bail!("unknown hash algorithm '{other}'"),
+        if check_object_format(fmt)? == FormatCheck::Unrecognized {
+            anyhow::bail!("unknown hash algorithm '{fmt}'");
         }
     }
-
-    // `--ref-format` recognizes exactly `files` and `reftable` (verified against
-    // stock git: `--ref-format=bogus` dies with `unknown ref storage format
-    // '<v>'`). `files` is the default backend gix writes, so it is a no-op match.
-    // `reftable` has no vendored backend and is rejected honestly.
     if let Some(fmt) = ref_format.as_deref() {
-        match fmt {
-            "files" => {}
-            "reftable" => anyhow::bail!(
-                "the reftable ref storage format is not supported: no vendored \
-                 reftable backend"
-            ),
-            other => anyhow::bail!("unknown ref storage format '{other}'"),
+        if check_ref_format(fmt)? == FormatCheck::Unrecognized {
+            anyhow::bail!("unknown ref storage format '{fmt}'");
         }
     }
 
@@ -269,6 +266,27 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     } else {
         gix::init(&target).map_err(|e| anyhow::anyhow!("{e}"))?
     };
+
+    // The config level of the format precedence chain: consulted only when
+    // neither the option nor the environment variable named a format. An
+    // unrecognized value is a warning and falls back to the compiled-in default,
+    // matching stock git; a *recognized but unimplemented* value (`sha256` /
+    // `reftable`) is rejected with the same honest error the option produces,
+    // rather than silently laying down a repository in the other format.
+    if object_format.is_none() {
+        if let Some(fmt) = config_string(&repo, "init.defaultObjectFormat") {
+            if check_object_format(&fmt)? == FormatCheck::Unrecognized {
+                eprintln!("warning: unknown hash algorithm '{fmt}'");
+            }
+        }
+    }
+    if ref_format.is_none() {
+        if let Some(fmt) = config_string(&repo, "init.defaultRefFormat") {
+            if check_ref_format(&fmt)? == FormatCheck::Unrecognized {
+                eprintln!("warning: unknown ref storage format '{fmt}'");
+            }
+        }
+    }
 
     // Resolve the initial branch name, matching git's precedence exactly:
     //   1. `-b <name>` / `--initial-branch=<name>` on the command line, else
@@ -352,6 +370,14 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         apply_template(tpl, &git_dir)?;
     }
 
+    // `init.defaultSubmodulePathConfig=true` asks every new repository to opt into
+    // the submodule-path extension, which git records as
+    // `extensions.submodulePathConfig=true` plus the `core.repositoryformatversion=1`
+    // bump every extension requires.
+    if config_bool(&repo, "init.defaultSubmodulePathConfig") == Some(true) {
+        enable_submodule_path_config(&git_dir)?;
+    }
+
     // `--shared[=...]`: record the sharing config and widen permissions across the
     // whole git dir, porting git's `create_default_files` config write and
     // `adjust_shared_perm` (which git applies per-file during creation; a single
@@ -370,6 +396,76 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The outcome of checking a requested object/ref storage format name against
+/// the formats git knows and this port implements.
+#[derive(PartialEq, Eq)]
+enum FormatCheck {
+    /// A name git recognizes and this port lays down (`sha1` / `files`).
+    Implemented,
+    /// A name git does not recognize at all. The caller decides whether that is
+    /// fatal (command line / environment) or a warning (config).
+    Unrecognized,
+}
+
+/// git's `hash_algo_by_name` recognizes exactly `sha1` and `sha256`. gix lays
+/// down sha1 repositories, so `sha1` (also the compiled-in default) is a no-op
+/// that matches stock git byte-for-byte. `sha256` needs a verified sha256 object
+/// write path that is not vendored (the `gix` `sha256` feature is off), so it is
+/// rejected honestly rather than silently producing a sha1 repository.
+fn check_object_format(fmt: &str) -> Result<FormatCheck> {
+    match fmt {
+        "sha1" => Ok(FormatCheck::Implemented),
+        "sha256" => anyhow::bail!(
+            "the sha256 object format is not supported: no vendored, verified \
+             sha256 object write path"
+        ),
+        _ => Ok(FormatCheck::Unrecognized),
+    }
+}
+
+/// git's ref storage formats are exactly `files` and `reftable`. `files` is the
+/// backend gix writes, so it is a no-op match; `reftable` has no vendored
+/// backend and is rejected honestly.
+fn check_ref_format(fmt: &str) -> Result<FormatCheck> {
+    match fmt {
+        "files" => Ok(FormatCheck::Implemented),
+        "reftable" => anyhow::bail!(
+            "the reftable ref storage format is not supported: no vendored \
+             reftable backend"
+        ),
+        _ => Ok(FormatCheck::Unrecognized),
+    }
+}
+
+/// Read a non-empty string config value from `repo`'s resolved configuration
+/// (any scope), the way git's `git_config_get_string` sees it.
+fn config_string(repo: &gix::Repository, key: &str) -> Option<String> {
+    repo.config_snapshot()
+        .string(key)
+        .map(|v| v.to_string())
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// Read a boolean config value from `repo`'s resolved configuration (any scope).
+fn config_bool(repo: &gix::Repository, key: &str) -> Option<bool> {
+    repo.config_snapshot().boolean(key)
+}
+
+/// Record the submodule-path extension in `git_dir`'s config the way stock git
+/// does: `extensions.submodulePathConfig=true` together with the
+/// `core.repositoryformatversion=1` bump that any `extensions.*` entry requires.
+/// Shared with `git clone`, which honors `init.defaultSubmodulePathConfig` too.
+pub(super) fn enable_submodule_path_config(git_dir: &Path) -> Result<()> {
+    let path = git_dir.join("config");
+    let mut file =
+        gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    file.set_raw_value_by("extensions", None, "submodulePathConfig", "true")?;
+    file.set_raw_value_by("core", None, "repositoryformatversion", "1")?;
+    std::fs::write(&path, file.to_bstring())?;
+    Ok(())
 }
 
 /// Build a bare repository inside a non-empty `target`. gix hard-refuses this
@@ -392,8 +488,9 @@ fn init_bare_into_nonempty(target: &Path) -> Result<gix::Repository> {
 /// Move the freshly-created git dir (`src`, i.e. `<target>/.git`) to the
 /// requested `real` location and write a `gitdir: <abs>` link file at
 /// `<target>/.git`. Returns the absolute real git dir. Ports `separate_git_dir()`
-/// from git's `setup.c` for the fresh-init case.
-fn relocate_git_dir(src: &Path, target: &Path, real: &str) -> Result<PathBuf> {
+/// from git's `setup.c` for the fresh-init case. Shared with `git clone`, whose
+/// `--separate-git-dir` lands on the same on-disk result.
+pub(super) fn relocate_git_dir(src: &Path, target: &Path, real: &str) -> Result<PathBuf> {
     let real_pb = {
         let p = PathBuf::from(real);
         if p.is_absolute() {
@@ -438,8 +535,9 @@ fn relocate_git_dir(src: &Path, target: &Path, real: &str) -> Result<PathBuf> {
 /// that dir *instead of* the default. So the default-template artifacts are
 /// stripped first, letting the requested template fully define the
 /// template-provided files while structural files (`HEAD`, `config`, `objects/`,
-/// `refs/`) remain.
-fn apply_template(template: &str, git_dir: &Path) -> Result<()> {
+/// `refs/`) remain. Shared with `git clone --template=<dir>`, which git routes
+/// through the very same `copy_templates()` call during its own init step.
+pub(super) fn apply_template(template: &str, git_dir: &Path) -> Result<()> {
     let src = {
         let p = PathBuf::from(template);
         if p.is_absolute() {

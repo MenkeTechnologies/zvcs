@@ -36,6 +36,45 @@
 //! * `--signoff`, `-F`/`--file`, `--cleanup=<mode>`, `-q`/`--quiet`,
 //!   `-v`/`--verbose`, and `--no-verify` (bypassing the `pre-merge-commit` and
 //!   `commit-msg` hooks).
+//! * `--log[=<n>]`/`--no-log` (and its `merge.log`/`merge.summary` defaults): the
+//!   `* <origin>:` shortlog of every merged head folded into the merge message,
+//!   a port of `fmt_merge_msg()`'s shortlog loop — including the
+//!   `: (<n> commits)` header plus trailing `...` when more commits were merged
+//!   than listed, the `merge.branchdesc` branch description, and the `By`/`Via`
+//!   credit lines (which git emits only under `--edit`).
+//! * `--compact-summary`/`--no-compact-summary` and `merge.stat`/`merge.diffstat`
+//!   (`false`, `true`, `compact`): git's `show_diffstat` tri-state. The compact
+//!   form drops the `create mode`/`delete mode` summary block and folds it into
+//!   each diffstat name as ` (new)`, ` (new +x)`, ` (new +l)`, ` (gone)`,
+//!   ` (mode +x)`, ` (mode -x)`, ` (mode +l)`, ` (mode -l)` — a port of
+//!   `get_compact_summary()`. `--no-compact-summary` suppresses the diffstat
+//!   entirely, as `option_parse_compact_summary()`'s `unset` does.
+//! * `-e`/`--edit`/`--no-edit`, resolved through `default_edit_option()`: the
+//!   merge message is written to `MERGE_MSG` with git's commented editor block
+//!   below it (the scissors variant under `--cleanup=scissors`), opened with the
+//!   `GIT_EDITOR` → `core.editor` → `$VISUAL` → `$EDITOR` → `vi` chain (`:` is
+//!   the no-op editor), and the edited text is then stripped of comment lines,
+//!   since an edited message defaults to `COMMIT_MSG_CLEANUP_ALL`. A failing
+//!   editor or an empty message aborts with git's `Not committing merge; use
+//!   'git commit' to complete the merge.` and leaves the merge in progress.
+//! * `--autostash`/`--no-autostash` and `merge.autoStash`: a dirty worktree is
+//!   snapshotted into a stash-like commit parked under the `MERGE_AUTOSTASH` ref
+//!   (`Created autostash: <id>`), the merge runs against the clean tree, and the
+//!   changes are re-applied afterwards (`Applied autostash.`). A merge that stops
+//!   early — conflict, `--squash`, `--no-commit` — leaves the ref in place and
+//!   prints git's ``When finished, apply stashed changes with `git stash pop` ``.
+//! * `-S`/`--gpg-sign[=<keyid>]`/`--no-gpg-sign` and `commit.gpgsign`: the merge
+//!   commit is signed through `gpg.program` with `-S<keyid>`, else
+//!   `user.signingKey`, else the committer identity (git's `get_signing_key()`),
+//!   and the armored signature is carried as the commit's `gpgsig` header. A gpg
+//!   failure reproduces git's `error: gpg failed to sign the data:` followed by
+//!   gpg's own diagnostics and `fatal: failed to write commit object`.
+//! * `--progress`/`--no-progress`: accepted and inert. In `builtin/merge.c`
+//!   `show_progress` has exactly one consumer, `o.show_rename_progress`, which
+//!   forces merge-ort's delayed "Performing inexact rename detection" meter;
+//!   this build's merge runs no such meter, so neither spelling can change a
+//!   byte of its output.
+//! * `commit.cleanup` — the same `cleanup_arg` `--cleanup` sets.
 //! * `-m`/`--message` accumulation: repeated `-m` values are joined into
 //!   paragraphs by a blank line (a port of `option_parse_message`), so
 //!   `-m a -m b` produces `a\n\nb`.
@@ -46,40 +85,51 @@
 //! * `--into-name <name>`: a port of git's `into_name` — override the merge
 //!   message's destination (the ` into <name>` title and the
 //!   `merge.suppressDest` test), rather than the real current branch.
-//! * The default-matching negations `--no-log`, `--no-rerere-autoupdate`,
-//!   `--no-verify-signatures`, `--no-gpg-sign`, `--no-autostash`,
-//!   `--no-progress`, `--no-compact-summary`, `--no-strategy` (git's
-//!   `option_parse_strategy` no-ops on `unset`), and `--overwrite-ignore`,
-//!   accepted as no-ops: each names behaviour this build already performs
-//!   (no shortlog,
-//!   no rerere, no signature verification, unsigned commit, no autostash, no
-//!   progress, ordinary diffstat, ignored files overwritten), so passing them
-//!   reproduces stock git rather than erroring.
+//! * The default-matching negations `--no-rerere-autoupdate`,
+//!   `--no-verify-signatures`, `--no-strategy` (git's `option_parse_strategy`
+//!   no-ops on `unset`), and `--overwrite-ignore`, accepted as no-ops: each
+//!   names behaviour this build already performs (no rerere, no signature
+//!   verification, ignored files overwritten), so passing them reproduces stock
+//!   git rather than erroring.
 //!
 //! What is refused or deferred rather than faked:
 //!
 //! * `-s recursive`/`resolve`/`subtree`: distinct conflict-resolution engines
 //!   that are not vendored, refused rather than aliased onto `ort`.
-//! * `-X`/`--strategy-option`, `--log[=<n>]` (positive counts), the enabling
-//!   `--autostash`, `--rerere-autoupdate`, `--progress`, `--compact-summary`,
-//!   and `--no-overwrite-ignore`: these need substrate not reachable from this
-//!   file (blob-merge options threaded through `merge_apply::three_way_merge`,
-//!   the `fmt-merge-msg` shortlog builder, stash create/apply, the rerere store,
-//!   a progress meter, the compact-summary diff renderer, and gitignore-aware
-//!   checkout respectively); left rejected.
-//! * `-e`/`--edit` (interactive editor), `-S`/`--gpg-sign`,
-//!   `--verify-signatures` (no signing/verification driver).
+//! * `-X`/`--strategy-option`: the strategy options (`ours`, `theirs`,
+//!   `ignore-space-change`, `diff-algorithm=`, `renormalize`, `find-renames=`)
+//!   have to reach the blob/tree merge itself, and the shared
+//!   `merge_apply::three_way_merge` takes no options — it builds
+//!   `Repository::tree_merge_options()` internally. Accepting `-X` here would
+//!   silently ignore it, so it stays rejected.
+//! * `--rerere-autoupdate`: rerere's *recording* half is not ported (see
+//!   `rerere.rs`, whose record/forget paths `bail!` rather than guess a conflict
+//!   id without `ll_merge()`), so there is nothing to auto-stage.
+//! * `--verify-signatures`: `gitsig::verify` reports the signing *key id*, while
+//!   git's diagnostics (`Commit %s has a good GPG signature by %s`, `… has an
+//!   untrusted GPG signature, allegedly by %s`) quote gpg's `GOODSIG` user name.
+//!   Reproducing them needs that name plumbed out of `gitsig`, which lives
+//!   outside this module; duplicating the gpg invocation here instead would fork
+//!   the verification path, so the flag stays rejected.
+//! * `--no-overwrite-ignore`: needs gitignore-aware checkout.
 //!
 //! Known fidelity gaps, stated rather than hidden: the diffstat is computed
 //! with rename detection off, while `git merge` enables it, so a merge that
 //! renames a file reports it as a delete plus a create instead of a `rename`
 //! summary line; diffstat column widths measure Unicode scalar values rather
 //! than terminal columns; `--verbose`'s extra stderr diagnostics are not
-//! emitted; and a `pre-merge-commit` hook that edits the index is not reflected
-//! in the committed tree (the pre-computed merge tree is committed).
+//! emitted; a `pre-merge-commit` hook that edits the index is not reflected
+//! in the committed tree (the pre-computed merge tree is committed); the
+//! `prepare-commit-msg` hook is not run before the editor; `default_edit_option`
+//! tests that stdin and stdout are both terminals rather than that they are the
+//! same file; `--signoff` adds its trailer before the `--edit` comment block
+//! rather than through `ignored_log_message_bytes()`; and
+//! `Automatic merge went well; stopped before committing as requested` is
+//! printed on stdout where git uses stderr.
 
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
@@ -87,11 +137,17 @@ use std::sync::atomic::AtomicBool;
 use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::index::entry::{Mode, Stage, Stat};
-use gix::object::tree::diff::{Action, Change as TreeChange};
+use gix::object::tree::{diff::Action, diff::Change as TreeChange, EntryKind};
+use gix::objs::WriteTo;
+use gix::prelude::ObjectIdExt;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 use gix::revision::walk::Sorting;
 use gix::traverse::commit::simple::CommitTimeOrder;
+
+/// git's `DEFAULT_MERGE_LOG_LEN` — how many shortlog entries a valueless
+/// `--log` (or `merge.log = true`) asks for.
+const DEFAULT_MERGE_LOG_LEN: i64 = 20;
 
 /// The mutually exclusive top-level modes of `git merge`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -134,6 +190,21 @@ enum Cleanup {
     Scissors,
 }
 
+/// git's `show_diffstat` tri-state (`MERGE_SHOW_DIFFSTAT` /
+/// `MERGE_SHOW_COMPACTSUMMARY` / off), driven by `--stat`/`--no-stat`,
+/// `--compact-summary`/`--no-compact-summary` and `merge.stat`/`merge.diffstat`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatMode {
+    /// `show_diffstat == 0`: nothing is printed after the merge.
+    None,
+    /// `MERGE_SHOW_DIFFSTAT`: the diffstat plus the `create mode`/`delete mode`
+    /// summary block (`DIFF_FORMAT_DIFFSTAT | DIFF_FORMAT_SUMMARY`).
+    Diffstat,
+    /// `MERGE_SHOW_COMPACTSUMMARY`: the diffstat alone, with the summary folded
+    /// into each name as ` (new)`/` (gone)`/` (mode +x)`… (`stat_with_summary`).
+    CompactSummary,
+}
+
 /// Everything the argument loop gathers for a real merge, so the merge helpers
 /// take one struct rather than a growing parameter list.
 struct Opts {
@@ -141,7 +212,7 @@ struct Opts {
     /// Whether `--no-ff` was passed explicitly (needed for the `--squash`
     /// incompatibility check, which git keys off the literal flag).
     no_ff_given: bool,
-    show_stat: bool,
+    stat: StatMode,
     /// `-m`/`--message` or `-F`/`--file` contents (the latter read eagerly).
     message: Option<String>,
     squash: bool,
@@ -159,6 +230,23 @@ struct Opts {
     /// composing the merge message's ` into <name>` title (a port of git's
     /// `into_name`, which overrides `current_branch` in `fmt_merge_msg`).
     into_name: Option<String>,
+    /// `--log[=<n>]`/`--no-log`, seeded from `merge.log`/`merge.summary`: how
+    /// many shortlog entries to fold into the merge message. git keeps the count
+    /// signed, so a negative `--log=<n>` lists nothing but still emits the block.
+    log_len: i64,
+    /// `merge.branchdesc` — whether `branch.<name>.description` is spliced into
+    /// a merged local branch's shortlog block.
+    branch_desc: bool,
+    /// `-e`/`--edit`/`--no-edit`; `None` leaves git's `default_edit_option()` to
+    /// decide (no message given and stdin/stdout are the same terminal).
+    edit: Option<bool>,
+    /// `--autostash`/`--no-autostash` and `merge.autoStash`.
+    autostash: bool,
+    /// `-S`/`--gpg-sign[=<keyid>]`/`--no-gpg-sign` and `commit.gpgsign`:
+    /// `Some(key)` signs the merge commit, an empty key deferring to
+    /// `user.signingKey` (and, failing that, the committer identity, as git's
+    /// `get_signing_key()` does).
+    sign: Option<String>,
 }
 
 impl Default for Opts {
@@ -166,7 +254,7 @@ impl Default for Opts {
         Opts {
             ff: Ff::Allow,
             no_ff_given: false,
-            show_stat: true,
+            stat: StatMode::Diffstat,
             message: None,
             squash: false,
             commit: None,
@@ -178,6 +266,11 @@ impl Default for Opts {
             cleanup: Cleanup::Default,
             strategy: Strategy::Ort,
             into_name: None,
+            log_len: -1,
+            branch_desc: false,
+            edit: None,
+            autostash: false,
+            sign: None,
         }
     }
 }
@@ -189,11 +282,13 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
     // A pending `-F`/`--file` read, resolved after parsing so the diagnostic
     // order matches git (options first, file open second).
     let mut file: Option<String> = None;
+    // git's `merge_log_config`, applied only after the options are parsed: a
+    // `--log=<n>` that leaves the count negative falls back to it.
+    let mut merge_log_config: i64 = 0;
 
-    // git reads merge.ff and merge.stat as the defaults; the CLI flags below
-    // override them (`--ff`/`--no-ff`/`--ff-only`, `--stat`/`--no-stat`).
-    // merge.suppressDest is consulted later, in `dest_suppressed`, when the
-    // default merge message's title is composed.
+    // The `git_merge_config()` defaults, applied before the CLI options below
+    // override them. merge.suppressDest is consulted later, in `dest_suppressed`,
+    // when the default merge message's title is composed.
     if let Ok(repo) = gix::discover(".") {
         let snap = repo.config_snapshot();
         match snap.string("merge.ff").map(|v| v.to_string().to_ascii_lowercase()).as_deref() {
@@ -202,8 +297,26 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             Some(_) => opts.ff = Ff::Allow, // true/yes/on/1/valueless → allow
             None => {}
         }
-        if snap.boolean("merge.stat") == Some(false) {
-            opts.show_stat = false;
+        if let Some(mode) = stat_config(&snap) {
+            opts.stat = mode;
+        }
+        merge_log_config = shortlog_config(&snap);
+        opts.branch_desc = snap.boolean("merge.branchdesc").unwrap_or(false);
+        opts.autostash = snap.boolean("merge.autoStash").unwrap_or(false);
+        // `commit.gpgsign` sets git's `sign_commit` to the empty key, meaning
+        // "sign, letting `get_signing_key()` choose".
+        if snap.boolean("commit.gpgsign") == Some(true) {
+            opts.sign = Some(String::new());
+        }
+        // `commit.cleanup` feeds the same `cleanup_arg` `--cleanup` sets.
+        if let Some(v) = snap.string("commit.cleanup") {
+            match parse_cleanup(&v.to_string()) {
+                Some(mode) => opts.cleanup = mode,
+                None => {
+                    eprintln!("fatal: Invalid cleanup mode {v}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         }
     }
 
@@ -220,8 +333,12 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
                 opts.no_ff_given = true;
             }
             "--ff-only" => opts.ff = Ff::Only,
-            "--stat" | "--summary" => opts.show_stat = true,
-            "--no-stat" | "--no-summary" | "-n" => opts.show_stat = false,
+            "--stat" | "--summary" => opts.stat = StatMode::Diffstat,
+            "--no-stat" | "--no-summary" | "-n" => opts.stat = StatMode::None,
+            // `option_parse_compact_summary`: set → the compact summary, unset →
+            // no diffstat at all (`show_diffstat = 0`), not "back to --stat".
+            "--compact-summary" => opts.stat = StatMode::CompactSummary,
+            "--no-compact-summary" => opts.stat = StatMode::None,
             "--squash" => opts.squash = true,
             "--no-squash" => opts.squash = false,
             "--commit" => {
@@ -253,38 +370,72 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             // `--no-into-name`: git's OPT_STRING negation sets `into_name` to
             // NULL, restoring the real target branch as the message destination.
             "--no-into-name" => opts.into_name = None,
+            // `--log[=<n>]` is git's `OPT_INTEGER` with `PARSE_OPT_OPTARG` and a
+            // default of DEFAULT_MERGE_LOG_LEN, so only the `=<n>` spelling takes a
+            // value (`--log 5` leaves `5` as a head to merge). `--no-log` is 0.
+            "--log" => opts.log_len = DEFAULT_MERGE_LOG_LEN,
+            "--no-log" => opts.log_len = 0,
+            _ if a.starts_with("--log=") => {
+                let value = &a["--log=".len()..];
+                match parse_option_int(value) {
+                    Some(n) => opts.log_len = n,
+                    // parse-options.c distinguishes the two failures: an empty
+                    // argument never reaches `git_parse_int`.
+                    None if value.is_empty() => {
+                        eprintln!("error: option `log' expects a numerical value");
+                        return Ok(ExitCode::from(129));
+                    }
+                    None => {
+                        eprintln!(
+                            "error: option `log' expects an integer value with an optional k/m/g suffix"
+                        );
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            // `--autostash`: stash the dirty worktree before the merge and restore
+            // it afterwards (`create_autostash_ref`/`apply_autostash_ref`).
+            "--autostash" => opts.autostash = true,
+            "--no-autostash" => opts.autostash = false,
+            // `-S`/`--gpg-sign[=<keyid>]`: an OPTARG option, so only the attached
+            // spellings carry a key; `--no-gpg-sign` clears `sign_commit`.
+            "-S" | "--gpg-sign" => opts.sign = Some(String::new()),
+            "--no-gpg-sign" => opts.sign = None,
+            _ if a.starts_with("--gpg-sign=") => {
+                opts.sign = Some(a["--gpg-sign=".len()..].to_string())
+            }
+            _ if a.len() > 2 && a.starts_with("-S") && !a.starts_with("--") => {
+                opts.sign = Some(a[2..].to_string())
+            }
+            // `--progress`/`--no-progress` force or suppress git's progress
+            // meters. In `builtin/merge.c` `show_progress` feeds exactly one
+            // consumer, `o.show_rename_progress`, which drives merge-ort's delayed
+            // "Performing inexact rename detection" meter; this build's merge has
+            // no such meter to force, so both spellings are accepted and change
+            // nothing (see the module docs).
+            "--progress" | "--no-progress" => {}
             // Flags whose git behaviour is already this build's default, accepted
             // as no-ops so they match stock git rather than erroring:
-            //  * `--no-log`: no shortlog is added to the merge message (this build
-            //    never adds one).
             //  * `--no-rerere-autoupdate`: no rerere machinery runs here anyway.
             //  * `--no-verify-signatures`: signatures are never verified.
-            //  * `--no-gpg-sign`: commits are never signed.
-            //  * `--no-autostash`: no stash is taken (a dirty worktree is refused,
-            //    as git does without autostash).
             //  * `--overwrite-ignore`: ignored files are overwritten (git's default).
-            //  * `--no-progress`: no progress is emitted (as under a non-tty).
-            //  * `--no-compact-summary`: the ordinary diffstat is shown.
             //  * `--no-strategy`: git's `option_parse_strategy` returns early on
             //    `unset` without clearing the strategy list, so it is a no-op that
             //    leaves any earlier `-s` in force (default `ort` when none given).
-            "--no-log"
-            | "--no-rerere-autoupdate"
+            "--no-rerere-autoupdate"
             | "--no-verify-signatures"
-            | "--no-gpg-sign"
-            | "--no-autostash"
             | "--overwrite-ignore"
-            | "--no-progress"
-            | "--no-compact-summary"
             | "--no-strategy" => {}
             // Verbosity: git keeps a signed level; only quiet has an observable
             // effect on stdout (it silences the summary/diffstat). `--verbose`'s
             // extra diagnostics go to stderr and are not reproduced.
             "-q" | "--quiet" => opts.quiet = true,
             "-v" | "--verbose" => opts.quiet = false,
-            // We never open an editor, so `--no-edit` is the natural state; `-e`
-            // is deferred (see the module docs).
-            "--no-edit" => {}
+            // `-e`/`--edit`/`--no-edit`: whether the merge message is opened in an
+            // editor before the merge commit is written. Left `None` here so
+            // `default_edit_option()` decides (see `edit_wanted`).
+            "-e" | "--edit" => opts.edit = Some(true),
+            "--no-edit" => opts.edit = Some(false),
             // `-m`/`--message` accumulate into one buffer, joined by a blank line
             // (git's `option_parse_message`: `buf->len ? "\n\n" : ""`), so
             // `-m a -m b` yields the two-paragraph message `a\n\nb`.
@@ -370,6 +521,13 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             _ => refs.push(a.to_string()),
         }
         i += 1;
+    }
+
+    // `if (shortlog_len < 0) shortlog_len = (merge_log_config > 0) ? … : 0;` —
+    // an unset (or negative) `--log` count defers to `merge.log`/`merge.summary`,
+    // and a negative config value means no shortlog at all.
+    if opts.log_len < 0 {
+        opts.log_len = if merge_log_config > 0 { merge_log_config } else { 0 };
     }
 
     // `-F <path>` — read now, after option parsing. `-` and an empty value are
@@ -574,6 +732,11 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // daemon is running), matching the zsync/zbump write path.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
+    // `--autostash`: snapshot and reset the dirty worktree before anything is
+    // touched, so the merge runs against a clean tree and the local changes come
+    // back at the end (or stay recoverable in MERGE_AUTOSTASH if it stops).
+    let stash = begin_autostash(&repo, opts)?;
+
     // Never clobber uncommitted work.
     if repo.is_dirty()? {
         anyhow::bail!("worktree has uncommitted changes; refusing to merge");
@@ -583,7 +746,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     let head_tree = repo.find_object(local_id)?.peel_to_tree()?.id;
     let target_tree = repo.find_object(target_id)?.peel_to_tree()?.id;
     let should_interrupt = AtomicBool::new(false);
-    let message = merge_message(&repo, spec, branch.as_ref(), opts.message.clone(), opts.into_name.as_deref())?;
+    let message = compose_message(&repo, refs, &targets, branch.as_ref(), local_id, opts)?;
 
     // Diverged histories: a genuine three-way merge (`ort` strategy) of HEAD and
     // the target against their merge base (an empty tree for unrelated histories).
@@ -627,6 +790,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
                 opts,
                 "ort",
                 spec,
+                stash,
             );
         }
 
@@ -646,6 +810,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         if !opts.quiet {
             println!("Automatic merge failed; fix conflicts and then commit the result.");
         }
+        end_autostash(&repo, stash, false)?;
         return Ok(ExitCode::from(1));
     }
 
@@ -665,6 +830,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             opts,
             "ort",
             spec,
+            stash,
         );
     }
 
@@ -680,14 +846,13 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
                 target_id.to_hex_with_len(7)
             );
             println!("Fast-forward");
-            if opts.show_stat {
-                print!("{}", diffstat(&repo, head_tree, target_tree)?);
-            }
+            print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
         }
         write_squash_msg(&repo, &[target_id], local_id)?;
         if !opts.quiet {
             println!("Squash commit -- not updating HEAD");
         }
+        end_autostash(&repo, stash, false)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -703,10 +868,9 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             target_id.to_hex_with_len(7)
         );
         println!("Fast-forward");
-        if opts.show_stat {
-            print!("{}", diffstat(&repo, head_tree, target_tree)?);
-        }
+        print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
     }
+    end_autostash(&repo, stash, true)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -727,6 +891,7 @@ fn finalize_clean(
     opts: &Opts,
     strategy_name: &str,
     spec_label: &str,
+    stash: Option<ObjectId>,
 ) -> Result<ExitCode> {
     set_orig_head(repo, local_id)?;
     let do_commit = opts.commit.unwrap_or(!opts.squash);
@@ -740,22 +905,19 @@ fn finalize_clean(
         if !opts.quiet {
             println!("Squash commit -- not updating HEAD");
         }
+        end_autostash(repo, stash, false)?;
         return Ok(ExitCode::SUCCESS);
     }
 
     // `--no-commit`: leave the merge in progress for `git commit` to finalize.
     if !do_commit {
         let git_dir = repo.git_dir();
-        let mut merge_head = String::new();
-        for t in targets {
-            merge_head.push_str(&format!("{t}\n"));
-        }
-        std::fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
-        std::fs::write(git_dir.join("MERGE_MODE"), merge_mode(opts.ff))?;
+        write_merge_heads(repo, targets, opts.ff)?;
         std::fs::write(git_dir.join("MERGE_MSG"), &message)?;
         if !opts.quiet {
             println!("Automatic merge went well; stopped before committing as requested");
         }
+        end_autostash(repo, stash, false)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -765,23 +927,52 @@ fn finalize_clean(
         return Ok(ExitCode::from(1));
     }
 
+    // git's `prepare_to_commit()` from here: build the buffer, persist the merge
+    // state, run the editor and the `commit-msg` hook over that file, then clean
+    // the message up and refuse an empty one.
+    let edit = match edit_wanted(opts) {
+        Ok(edit) => edit,
+        Err(code) => return Ok(code),
+    };
+    let comment = comment_char(repo);
     let mut msg = message;
     if opts.signoff {
         append_signoff(repo, &mut msg)?;
     }
-    let comment = comment_char(repo);
-    msg = cleanup_message(&msg, opts.cleanup, &comment);
+    if edit {
+        append_editor_comment(&mut msg, opts.cleanup, &comment);
+    }
 
-    // `commit-msg` gets the message file (via MERGE_MSG) and may rewrite it.
+    let git_dir = repo.git_dir();
+    write_merge_heads(repo, targets, opts.ff)?;
+    let msg_path = git_dir.join("MERGE_MSG");
+    std::fs::write(&msg_path, &msg)?;
+
+    if edit && !launch_editor(repo, &msg_path)? {
+        eprintln!("Not committing merge; use 'git commit' to complete the merge.");
+        return Ok(ExitCode::from(1));
+    }
+    // `commit-msg` gets the same file and may rewrite it.
     if !opts.no_verify {
-        let msg_path = repo.git_dir().join("MERGE_MSG");
-        std::fs::write(&msg_path, &msg)?;
         let arg = msg_path.to_string_lossy().into_owned();
         if !crate::hooks::run(repo, "commit-msg", &[&arg], None)? {
             return Ok(ExitCode::from(1));
         }
-        msg = std::fs::read_to_string(&msg_path)?;
-        let _ = std::fs::remove_file(&msg_path);
+    }
+    msg = std::fs::read_to_string(&msg_path)?;
+    // `get_cleanup_mode(cleanup_arg, 0 < option_edit)`: with no explicit
+    // `--cleanup`/`commit.cleanup`, an edited message is stripped of its comment
+    // lines (`COMMIT_MSG_CLEANUP_ALL`) while an unedited one only loses
+    // whitespace (`COMMIT_MSG_CLEANUP_SPACE`).
+    let cleanup = match (opts.cleanup, edit) {
+        (Cleanup::Default, true) => Cleanup::Strip,
+        (mode, _) => mode,
+    };
+    msg = cleanup_message(&msg, cleanup, &comment);
+    if msg.is_empty() {
+        eprintln!("error: Empty commit message.");
+        eprintln!("Not committing merge; use 'git commit' to complete the merge.");
+        return Ok(ExitCode::from(1));
     }
 
     let author = repo
@@ -793,7 +984,7 @@ fn finalize_clean(
     let mut parents: Vec<ObjectId> = Vec::with_capacity(targets.len() + 1);
     parents.push(local_id);
     parents.extend_from_slice(targets);
-    let commit = gix::objs::Commit {
+    let mut commit = gix::objs::Commit {
         message: msg.into(),
         tree: merged_tree,
         author: author.to_owned()?,
@@ -802,6 +993,13 @@ fn finalize_clean(
         parents: parents.into_iter().collect(),
         extra_headers: Default::default(),
     };
+    // `-S`/`--gpg-sign`/`commit.gpgsign`: sign the serialized commit and carry the
+    // armored signature as the `gpgsig` header.
+    if let Some(key) = &opts.sign {
+        if let Err(code) = sign_commit(repo, &mut commit, key) {
+            return Ok(code);
+        }
+    }
     let new_id = repo.write_object(&commit)?.detach();
     advance(
         repo,
@@ -810,13 +1008,27 @@ fn finalize_clean(
         new_id,
         format!("merge {spec_label}: Merge made by the '{strategy_name}' strategy."),
     )?;
+    // git's `finish()` → `remove_merge_branch_state()`: the merge is over.
+    remove_merge_state(git_dir, false);
     if !opts.quiet {
         println!("Merge made by the '{strategy_name}' strategy.");
-        if opts.show_stat {
-            print!("{}", diffstat(repo, head_tree, merged_tree)?);
-        }
+        print!("{}", diffstat(repo, head_tree, merged_tree, opts.stat)?);
     }
+    end_autostash(repo, stash, true)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// git's `write_merge_heads()`: every merged head in `MERGE_HEAD`, plus the
+/// `MERGE_MODE` marker that records whether the merge may fast-forward.
+fn write_merge_heads(repo: &gix::Repository, targets: &[ObjectId], ff: Ff) -> Result<()> {
+    let git_dir = repo.git_dir();
+    let mut merge_head = String::new();
+    for t in targets {
+        merge_head.push_str(&format!("{t}\n"));
+    }
+    std::fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
+    std::fs::write(git_dir.join("MERGE_MODE"), merge_mode(ff))?;
+    Ok(())
 }
 
 /// `-s ours`: record every head as a parent, keep our tree verbatim. Never
@@ -846,6 +1058,7 @@ fn merge_ours(
     }
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let stash = begin_autostash(repo, opts)?;
     if repo.is_dirty()? {
         anyhow::bail!("worktree has uncommitted changes; refusing to merge");
     }
@@ -856,22 +1069,7 @@ fn merge_ours(
     // Our tree is unchanged; sync the index (a no-op checkout).
     update_worktree(repo, &old_index, head_tree, &should_interrupt)?;
 
-    let message = match &opts.message {
-        Some(m) => {
-            let mut m = m.clone();
-            if !m.ends_with('\n') {
-                m.push('\n');
-            }
-            m
-        }
-        None if refs.len() == 1 => {
-            merge_message(repo, refs[0].as_str(), branch, None, opts.into_name.as_deref())?
-        }
-        None => {
-            let specs: Vec<&str> = refs.iter().map(String::as_str).collect();
-            octopus_message(&specs)
-        }
-    };
+    let message = compose_message(repo, refs, targets, branch, local_id, opts)?;
     let spec_label = refs.join(" ");
     finalize_clean(
         repo,
@@ -884,6 +1082,7 @@ fn merge_ours(
         opts,
         "ours",
         &spec_label,
+        stash,
     )
 }
 
@@ -908,6 +1107,7 @@ fn do_octopus(
         .collect();
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let stash = begin_autostash(repo, opts)?;
     if repo.is_dirty()? {
         anyhow::bail!("worktree has uncommitted changes; refusing to merge");
     }
@@ -977,6 +1177,7 @@ fn do_octopus(
             if !opts.quiet {
                 println!("Automatic merge failed; fix conflicts and then commit the result.");
             }
+            end_autostash(repo, stash, false)?;
             return Ok(ExitCode::from(1));
         }
         mrt = applied.tree_id;
@@ -988,6 +1189,7 @@ fn do_octopus(
         if !opts.quiet {
             println!("Already up to date.");
         }
+        end_autostash(repo, stash, true)?;
         return Ok(ExitCode::SUCCESS);
     }
     // Everything collapsed onto one line via fast-forward — a plain fast-forward,
@@ -1004,21 +1206,13 @@ fn do_octopus(
         if !opts.quiet {
             println!("Fast-forward");
         }
+        end_autostash(repo, stash, true)?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    // The default octopus message, or the explicit `-m`/`-F` text.
-    let specs: Vec<&str> = refs.iter().map(String::as_str).collect();
-    let message = match &opts.message {
-        Some(m) => {
-            let mut m = m.clone();
-            if !m.ends_with('\n') {
-                m.push('\n');
-            }
-            m
-        }
-        None => octopus_message(&specs),
-    };
+    // The default octopus message (or the explicit `-m`/`-F` text), plus the
+    // `--log` shortlog of every merged head.
+    let message = compose_message(repo, refs, targets, None, local_id, opts)?;
     // The finish (squash / stop-before-commit / commit) is shared with the two-head
     // paths; every merged head becomes a parent (`mrc` minus HEAD).
     let extra_parents: Vec<ObjectId> = mrc.iter().copied().filter(|p| *p != local_id).collect();
@@ -1033,6 +1227,7 @@ fn do_octopus(
         opts,
         "octopus",
         &refs.join(" "),
+        stash,
     )
 }
 
@@ -1045,6 +1240,611 @@ fn octopus_message(refs: &[&str]) -> String {
         None => String::new(),
     };
     format!("Merge branches {joined}\n")
+}
+
+// ---------------------------------------------------------------------------
+// Configuration: merge.stat/merge.diffstat, merge.log/merge.summary
+// ---------------------------------------------------------------------------
+
+/// `git_parse_maybe_bool_text()`: the textual booleans only. An empty value is
+/// false and anything else is "not a boolean" (`None`).
+///
+/// Fidelity gap shared with the rest of this build: gix reports a *valueless*
+/// key (`[merge]\n\tstat`) as an empty value, where git would see `NULL` and
+/// treat it as true.
+fn maybe_bool_text(value: &BStr) -> Option<bool> {
+    let text = value.to_str().ok()?;
+    if text.is_empty() {
+        return Some(false);
+    }
+    match text.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" => Some(true),
+        "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// `merge.stat` / `merge.diffstat` — equivalent keys in `git_merge_config()`, so
+/// the last one in configuration order wins. A boolean picks between no diffstat
+/// and the ordinary one; the literal `compact` selects the compact summary; any
+/// other value falls back to the ordinary diffstat (git's `default:` branch).
+fn stat_config(snapshot: &gix::config::Snapshot<'_>) -> Option<StatMode> {
+    let mut chosen = None;
+    for section in snapshot.plumbing().sections() {
+        let header = section.header();
+        if header.subsection_name().is_some()
+            || !header.name().to_string().eq_ignore_ascii_case("merge")
+        {
+            continue;
+        }
+        // Per-name cursors over the two spellings, walked in the order the
+        // section actually lists them (as `comment_string` does for core.*).
+        let body = section.body();
+        let stats = body.values("stat");
+        let diffstats = body.values("diffstat");
+        let (mut stat_at, mut diffstat_at) = (0usize, 0usize);
+
+        for value_name in body.value_names() {
+            let value = if value_name.eq_ignore_ascii_case("stat") {
+                let value = stats.get(stat_at);
+                stat_at += 1;
+                value
+            } else if value_name.eq_ignore_ascii_case("diffstat") {
+                let value = diffstats.get(diffstat_at);
+                diffstat_at += 1;
+                value
+            } else {
+                continue;
+            };
+            let Some(value) = value else { continue };
+            let value: &BStr = value.as_ref();
+            chosen = Some(match maybe_bool_text(value) {
+                Some(false) => StatMode::None,
+                Some(true) => StatMode::Diffstat,
+                None if value == BStr::new("compact") => StatMode::CompactSummary,
+                None => StatMode::Diffstat,
+            });
+        }
+    }
+    chosen
+}
+
+/// `merge.log` / `merge.summary` (the deprecated synonym) folded to a shortlog
+/// length by `git_config_bool_or_int()`: an integer is taken as-is, a true
+/// boolean is `DEFAULT_MERGE_LOG_LEN`, a false one (and an unset key) is 0.
+fn shortlog_config(snapshot: &gix::config::Snapshot<'_>) -> i64 {
+    let plumbing = snapshot.plumbing();
+    let log = plumbing.values::<BString>("merge.log").unwrap_or_default();
+    let summary = plumbing.values::<BString>("merge.summary").unwrap_or_default();
+    log.last()
+        .or(summary.last())
+        .and_then(|v| bool_or_int(v.as_bstr()))
+        .unwrap_or(0)
+}
+
+/// `git_parse_int()` behind parse-options' `OPT_INTEGER`: `strtoimax` over the
+/// value (leading whitespace allowed) with an optional `k`/`m`/`g` binary
+/// suffix. `None` is git's "not an integer".
+fn parse_option_int(value: &str) -> Option<i64> {
+    let (digits, factor) = match value.chars().last() {
+        Some('k' | 'K') => (&value[..value.len() - 1], 1024i64),
+        Some('m' | 'M') => (&value[..value.len() - 1], 1024 * 1024),
+        Some('g' | 'G') => (&value[..value.len() - 1], 1024 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    digits.trim_start().parse::<i64>().ok()?.checked_mul(factor)
+}
+
+/// `git_config_bool_or_int()` as the shortlog length reads it.
+fn bool_or_int(value: &BStr) -> Option<i64> {
+    let text = value.to_str().ok()?;
+    if let Ok(n) = text.trim().parse::<i64>() {
+        return Some(n);
+    }
+    match text.to_ascii_lowercase().as_str() {
+        "" | "true" | "yes" | "on" => Some(DEFAULT_MERGE_LOG_LEN),
+        "false" | "no" | "off" => Some(0),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The merge message: title, `--log` shortlog, `--edit` comment block
+// ---------------------------------------------------------------------------
+
+/// How one merged ref is named, in the two spellings git needs: the `merge_name()`
+/// description that goes into the title, and the `handle_line()` *origin* that
+/// heads the `--log` shortlog block.
+struct SpecOrigin {
+    /// e.g. `branch 'topic'`, `tag 'v1'`, `commit 'abc123'`.
+    described: String,
+    /// e.g. `topic`, `tag 'v1'`, `commit 'abc123'` — git keeps the `tag ` prefix
+    /// and drops the quotes only when the whole origin is quoted.
+    origin: String,
+    /// Whether the origin is a local branch (gates `merge.branchdesc`).
+    is_local_branch: bool,
+}
+
+/// The whole merge commit message: the title (or the explicit `-m`/`-F` text)
+/// followed by the `--log` shortlog of every merged head.
+fn compose_message(
+    repo: &gix::Repository,
+    refs: &[String],
+    targets: &[ObjectId],
+    branch: Option<&FullName>,
+    local_id: ObjectId,
+    opts: &Opts,
+) -> Result<String> {
+    // git's `opts.add_title = !have_message`: an explicit message replaces the
+    // generated title but never the shortlog.
+    let mut msg = match (&opts.message, refs.len()) {
+        (Some(m), _) => {
+            let mut m = m.clone();
+            if !m.ends_with('\n') {
+                m.push('\n');
+            }
+            m
+        }
+        (None, 1) => merge_message(repo, &refs[0], branch, opts.into_name.as_deref())?,
+        (None, _) => {
+            let specs: Vec<&str> = refs.iter().map(String::as_str).collect();
+            octopus_message(&specs)
+        }
+    };
+    if opts.log_len != 0 {
+        append_shortlog(repo, refs, targets, local_id, opts, &mut msg)?;
+    }
+    Ok(msg)
+}
+
+/// The `--log[=<n>]` block: one `* <origin>:` shortlog per merged head, a port of
+/// `fmt_merge_msg()`'s shortlog loop. `credit_people` (the `By`/`Via` comment
+/// lines) is on only under `--edit`, as `builtin/merge.c` sets it.
+fn append_shortlog(
+    repo: &gix::Repository,
+    refs: &[String],
+    targets: &[ObjectId],
+    head: ObjectId,
+    opts: &Opts,
+    out: &mut String,
+) -> Result<()> {
+    let comment = comment_char(repo);
+    let credit = matches!(edit_wanted(opts), Ok(true));
+    complete_line(out);
+    for (spec, tip) in refs.iter().zip(targets.iter()) {
+        let origin = describe_spec(repo, spec);
+        shortlog(repo, &origin, *tip, head, opts, &comment, credit, out)?;
+    }
+    complete_line(out);
+    Ok(())
+}
+
+/// git's `shortlog()`: the `* <name>:` block for one merged tip, listing at most
+/// `limit` subjects (newest first) and switching the header to
+/// `: (<n> commits)` with a trailing `...` when more were merged.
+#[allow(clippy::too_many_arguments)]
+fn shortlog(
+    repo: &gix::Repository,
+    origin: &SpecOrigin,
+    tip: ObjectId,
+    head: ObjectId,
+    opts: &Opts,
+    comment: &str,
+    credit: bool,
+    out: &mut String,
+) -> Result<()> {
+    let limit = opts.log_len;
+    let mut count = 0usize;
+    let mut subjects: Vec<String> = Vec::new();
+    let mut authors: Vec<(BString, usize)> = Vec::new();
+    let mut committers: Vec<(BString, usize)> = Vec::new();
+
+    let walk = repo
+        .rev_walk([tip])
+        .with_hidden([head])
+        .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
+    for info in walk.all()? {
+        let commit = info?.object()?;
+        if commit.parent_ids().count() > 1 {
+            // Merges are not listed, but their committer is still credited.
+            record_person(&mut committers, commit.committer()?.trim().name);
+            continue;
+        }
+        if count == 0 {
+            record_person(&mut committers, commit.committer()?.trim().name);
+        }
+        record_person(&mut authors, commit.author()?.trim().name);
+        count += 1;
+        if subjects.len() as i64 > limit {
+            continue;
+        }
+        let message = commit.message()?;
+        let subject = message.summary();
+        if subject.is_empty() {
+            subjects.push(commit.id.to_hex().to_string());
+        } else {
+            subjects.push(subject.to_str_lossy().into_owned());
+        }
+    }
+
+    if credit {
+        add_people_info(repo, &mut authors, &mut committers, comment, out);
+    }
+
+    if count as i64 > limit {
+        out.push_str(&format!("\n* {}: ({count} commits)\n", origin.origin));
+    } else {
+        out.push_str(&format!("\n* {}:\n", origin.origin));
+    }
+
+    if origin.is_local_branch && opts.branch_desc {
+        add_branch_desc(repo, &origin.origin, out);
+    }
+
+    for (i, subject) in subjects.iter().enumerate() {
+        if i as i64 >= limit {
+            out.push_str("  ...\n");
+        } else {
+            out.push_str(&format!("  {subject}\n"));
+        }
+    }
+    Ok(())
+}
+
+/// git's `record_person()`: count one appearance, keeping the list sorted by name.
+fn record_person(people: &mut Vec<(BString, usize)>, name: &BStr) {
+    match people.binary_search_by(|(known, _)| known.as_bstr().cmp(name)) {
+        Ok(at) => people[at].1 += 1,
+        Err(at) => people.insert(at, (name.to_owned(), 1)),
+    }
+}
+
+/// git's `add_people_info()`: the `By`/`Via` credit lines, ordered by descending
+/// appearance count.
+fn add_people_info(
+    repo: &gix::Repository,
+    authors: &mut [(BString, usize)],
+    committers: &mut [(BString, usize)],
+    comment: &str,
+    out: &mut String,
+) {
+    authors.sort_by_key(|a| std::cmp::Reverse(a.1));
+    committers.sort_by_key(|c| std::cmp::Reverse(c.1));
+    let me_author = identity(repo.author());
+    let me_committer = identity(repo.committer());
+    credit_people(authors, "By", me_author.as_deref(), comment, out);
+    credit_people(committers, "Via", me_committer.as_deref(), comment, out);
+}
+
+/// `git_author_info(IDENT_NO_DATE)` / `git_committer_info(IDENT_NO_DATE)`.
+fn identity(
+    configured: Option<std::result::Result<gix::actor::SignatureRef<'_>, gix::config::time::Error>>,
+) -> Option<String> {
+    let signature = configured?.ok()?;
+    Some(format!(
+        "{} <{}>",
+        signature.name.to_str_lossy(),
+        signature.email.to_str_lossy()
+    ))
+}
+
+/// git's `credit_people()`: the line is skipped when nobody, or only the
+/// configured identity, would be credited.
+fn credit_people(
+    people: &[(BString, usize)],
+    label: &str,
+    me: Option<&str>,
+    comment: &str,
+    out: &mut String,
+) {
+    let only_me = people.len() == 1
+        && me.is_some_and(|me| {
+            me.as_bytes()
+                .strip_prefix(people[0].0.as_slice())
+                .is_some_and(|rest| rest.starts_with(b" <"))
+        });
+    if people.is_empty() || only_me {
+        return;
+    }
+    out.push_str(&format!("\n{comment} {label} "));
+    add_people_count(people, out);
+}
+
+/// git's `add_people_count()`.
+fn add_people_count(people: &[(BString, usize)], out: &mut String) {
+    match people {
+        [] => {}
+        [(name, _)] => out.push_str(&name.to_str_lossy()),
+        [(a, an), (b, bn)] => out.push_str(&format!(
+            "{} ({an}) and {} ({bn})",
+            a.to_str_lossy(),
+            b.to_str_lossy()
+        )),
+        [(a, an), ..] => out.push_str(&format!("{} ({an}) and others", a.to_str_lossy())),
+    }
+}
+
+/// git's `add_branch_desc()`: `branch.<name>.description`, one `  : <line>` per
+/// line (a literal prefix, not a comment one), ahead of the shortlog subjects.
+fn add_branch_desc(repo: &gix::Repository, name: &str, out: &mut String) {
+    let snapshot = repo.config_snapshot();
+    let Some(desc) = snapshot.string(format!("branch.{name}.description").as_str()) else {
+        return;
+    };
+    for line in desc.to_str_lossy().split_inclusive('\n') {
+        out.push_str(&format!("  : {line}"));
+    }
+    complete_line(out);
+}
+
+/// git's `strbuf_add_commented_lines()`: every line gets the comment prefix, and
+/// a separating space unless the line is empty or starts with a tab.
+fn add_commented_lines(text: &str, comment: &str, out: &mut String) {
+    for line in text.split_inclusive('\n') {
+        out.push_str(comment);
+        if !line.starts_with('\n') && !line.starts_with('\t') {
+            out.push(' ');
+        }
+        out.push_str(line);
+        if !line.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+}
+
+/// git's `strbuf_complete_line()`.
+fn complete_line(out: &mut String) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+/// The comment block `prepare_to_commit()` appends below the message when an
+/// editor is opened. Under `--cleanup=scissors` the cut line comes first and the
+/// closing sentence changes, since comment lines survive that mode.
+fn append_editor_comment(msg: &mut String, cleanup: Cleanup, comment: &str) {
+    // git strips the message's trailing newline and adds one back; the net effect
+    // on a message that already ends in a newline is nothing.
+    complete_line(msg);
+    if cleanup == Cleanup::Scissors {
+        msg.push_str(&format!(
+            "{comment} ------------------------ >8 ------------------------\n"
+        ));
+        add_commented_lines(
+            "Do not modify or remove the line above.\nEverything below it will be ignored.\n",
+            comment,
+            msg,
+        );
+        msg.push_str(&format!("{comment}\n"));
+    }
+    add_commented_lines(
+        "Please enter a commit message to explain why this merge is necessary,\n\
+         especially if it merges an updated upstream into a topic branch.\n\n",
+        comment,
+        msg,
+    );
+    if cleanup == Cleanup::Scissors {
+        add_commented_lines("An empty message aborts the commit.\n", comment, msg);
+    } else {
+        add_commented_lines(
+            &format!(
+                "Lines starting with '{comment}' will be ignored, and an empty message aborts\n\
+                 the commit.\n"
+            ),
+            comment,
+            msg,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --edit: the editor hand-off
+// ---------------------------------------------------------------------------
+
+/// git's `default_edit_option()` resolved against `-e`/`--edit`/`--no-edit`: an
+/// explicit flag wins, an explicit message means no editor, `GIT_MERGE_AUTOEDIT`
+/// decides next, and otherwise the editor is opened only for an interactive run.
+///
+/// Fidelity gap: git additionally requires stdin and stdout to be the *same*
+/// file (same device/inode/mode), which is not reachable without `fstat` on the
+/// descriptors; both being terminals is the test here.
+fn edit_wanted(opts: &Opts) -> std::result::Result<bool, ExitCode> {
+    if let Some(edit) = opts.edit {
+        return Ok(edit);
+    }
+    if opts.message.is_some() {
+        return Ok(false);
+    }
+    if let Ok(value) = std::env::var("GIT_MERGE_AUTOEDIT") {
+        return match value.to_ascii_lowercase().as_str() {
+            "" | "true" | "yes" | "on" | "1" => Ok(true),
+            "false" | "no" | "off" | "0" => Ok(false),
+            _ => {
+                eprintln!("fatal: Bad value '{value}' in environment 'GIT_MERGE_AUTOEDIT'");
+                Err(ExitCode::from(128))
+            }
+        };
+    }
+    Ok(std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
+}
+
+/// git's `git_editor()`: `GIT_EDITOR`, then `core.editor`, then `$VISUAL`
+/// (skipped on a dumb terminal), then `$EDITOR`, then `vi` — and nothing at all
+/// when the terminal is dumb and none of them is set.
+fn resolve_editor(repo: &gix::Repository, dumb: bool) -> Option<String> {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    if let Some(e) = env("GIT_EDITOR") {
+        return Some(e);
+    }
+    if let Some(e) = repo.config_snapshot().string("core.editor") {
+        return Some(e.to_string());
+    }
+    if !dumb {
+        if let Some(e) = env("VISUAL") {
+            return Some(e);
+        }
+    }
+    if let Some(e) = env("EDITOR") {
+        return Some(e);
+    }
+    if dumb {
+        return None;
+    }
+    Some("vi".to_string())
+}
+
+/// Open `path` in the configured editor and wait, git's `launch_editor()`. The
+/// command runs through the shell so `core.editor = "code -w"` works, and stdio
+/// is inherited so an interactive editor owns the terminal. `:` is git's
+/// documented no-op editor. Returns whether the edit succeeded; the diagnostics
+/// on failure are git's own.
+fn launch_editor(repo: &gix::Repository, path: &Path) -> Result<bool> {
+    let dumb = std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true);
+    let Some(editor) = resolve_editor(repo, dumb) else {
+        eprintln!("error: Terminal is dumb, but EDITOR unset");
+        return Ok(false);
+    };
+    if editor == ":" {
+        return Ok(true);
+    }
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$@\""))
+        .arg(&editor) // $0
+        .arg(path) // $1
+        .status();
+    match status {
+        Ok(status) if status.success() => Ok(true),
+        Ok(_) => {
+            eprintln!("error: there was a problem with the editor '{editor}'");
+            Ok(false)
+        }
+        Err(e) => {
+            eprintln!("error: unable to start editor '{editor}': {e}");
+            Ok(false)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --autostash
+// ---------------------------------------------------------------------------
+
+/// The ref git parks the autostash commit under while the merge runs.
+const MERGE_AUTOSTASH: &str = "MERGE_AUTOSTASH";
+
+/// git's `create_autostash_ref()`: with `--autostash` (or `merge.autoStash`) and
+/// a dirty worktree, snapshot the local changes into a stash-like commit, reset
+/// the tracked tree to `HEAD`, and remember the commit under `MERGE_AUTOSTASH`.
+/// A clean worktree stashes nothing, exactly as git's own dirty-check decides.
+fn begin_autostash(repo: &gix::Repository, opts: &Opts) -> Result<Option<ObjectId>> {
+    if !opts.autostash || !repo.is_dirty()? {
+        return Ok(None);
+    }
+    let id = crate::porcelain::stash::create_autostash(repo)?;
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: "merge: autostash".into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(id),
+        },
+        name: MERGE_AUTOSTASH
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("invalid ref name {MERGE_AUTOSTASH}: {e}"))?,
+        deref: false,
+    })?;
+    println!("Created autostash: {}", id.attach(repo).shorten_or_id());
+    Ok(Some(id))
+}
+
+/// The other half: `apply_autostash_ref()` once the merge produced a new `HEAD`,
+/// or — when it stopped early (conflict, `--squash`, `--no-commit`) — git's
+/// pointer at the stash it left behind under `MERGE_AUTOSTASH`.
+fn end_autostash(repo: &gix::Repository, stash: Option<ObjectId>, applied: bool) -> Result<()> {
+    let Some(id) = stash else { return Ok(()) };
+    if !applied {
+        println!("When finished, apply stashed changes with `git stash pop`");
+        return Ok(());
+    }
+    // The shared apply reports on stdout for `rebase`; merge's own notices go to
+    // stderr, so it runs quiet here and the messages are emitted below.
+    let conflicts = crate::porcelain::stash::apply_autostash(repo, id, true)?;
+    if conflicts.is_empty() {
+        repo.edit_reference(RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::Any,
+                log: RefLog::AndReference,
+            },
+            name: MERGE_AUTOSTASH
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("invalid ref name {MERGE_AUTOSTASH}: {e}"))?,
+            deref: false,
+        })?;
+        eprintln!("Applied autostash.");
+    } else {
+        // git keeps the stash reachable so the user can retry the apply.
+        eprintln!("Applying autostash resulted in conflicts.");
+        eprintln!("Your changes are safe in the stash.");
+        eprintln!("You can run \"git stash pop\" or \"git stash drop\" at any time.");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// -S / --gpg-sign
+// ---------------------------------------------------------------------------
+
+/// git's `sign_commit_to_strbuf()`: sign the serialized commit and attach the
+/// armored signature as its `gpgsig` header. The key is `-S<keyid>` when given,
+/// else `user.signingKey`, else the committer identity — git's
+/// `get_signing_key()` ladder — and the program is `gpg.program`.
+fn sign_commit(
+    repo: &gix::Repository,
+    commit: &mut gix::objs::Commit,
+    key: &str,
+) -> std::result::Result<(), ExitCode> {
+    let snapshot = repo.config_snapshot();
+    let program = snapshot
+        .string("gpg.program")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "gpg".to_string());
+    let signing_key = if !key.is_empty() {
+        key.to_string()
+    } else {
+        match snapshot.string("user.signingKey") {
+            Some(v) => v.to_string(),
+            None => match identity(repo.committer()) {
+                Some(me) => me,
+                None => {
+                    eprintln!("fatal: no committer identity to sign with");
+                    return Err(ExitCode::from(128));
+                }
+            },
+        }
+    };
+
+    let mut payload = Vec::new();
+    if let Err(e) = commit.write_to(&mut payload) {
+        eprintln!("fatal: failed to serialize commit object: {e}");
+        return Err(ExitCode::from(128));
+    }
+    match crate::gitsig::sign(&payload, &program, Some(&signing_key)) {
+        Ok(signature) => {
+            commit
+                .extra_headers
+                .push(("gpgsig".into(), signature.into()));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("error: gpg failed to sign the data:\n{e}\n");
+            eprintln!("fatal: failed to write commit object");
+            Err(ExitCode::from(128))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1292,8 +2092,12 @@ fn continue_merge(opts: &Opts) -> Result<ExitCode> {
     let index = repo.open_index()?;
     if index.entries().iter().any(|e| e.stage() != Stage::Unconflicted) {
         eprintln!("error: Committing is not possible because you have unmerged files.");
-        eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
-        eprintln!("hint: as appropriate to mark resolution and make a commit.");
+        // `error_resolve_conflict` (sequencer.c) prints the error unconditionally
+        // and the two-line direction only under `advice.resolveConflict`.
+        crate::advice::Advice::ResolveConflict.advise_plain(
+            "Fix them up in the work tree, and then use 'git add/rm <file>'\n\
+             as appropriate to mark resolution and make a commit.",
+        );
         eprintln!("fatal: Exiting because of an unresolved conflict.");
         return Ok(ExitCode::from(128));
     }
@@ -1422,38 +2226,9 @@ fn merge_message(
     repo: &gix::Repository,
     spec: &str,
     branch: Option<&FullName>,
-    explicit: Option<String>,
     into_name: Option<&str>,
 ) -> Result<String> {
-    if let Some(mut m) = explicit {
-        if !m.ends_with('\n') {
-            m.push('\n');
-        }
-        return Ok(m);
-    }
-
-    // gix resolves a partial name through the same rule list git's `dwim_ref`
-    // uses ("", tags, heads, remotes), so the full name it lands on is the
-    // category git would have reported. An invalid ref name (`main~2`) is not
-    // an error here, it just means no ref matched.
-    let described = match repo.try_find_reference(spec) {
-        Ok(Some(r)) => {
-            let full = r.name().as_bstr().to_str_lossy().into_owned();
-            if full.starts_with("refs/heads/") {
-                format!("branch '{spec}'")
-            } else if full.starts_with("refs/tags/") {
-                format!("tag '{spec}'")
-            } else if full.starts_with("refs/remotes/") {
-                format!("remote-tracking branch '{spec}'")
-            } else {
-                format!("commit '{spec}'")
-            }
-        }
-        _ => match early_part_of_branch(repo, spec) {
-            Some(d) => d,
-            None => format!("commit '{spec}'"),
-        },
-    };
+    let described = describe_spec(repo, spec).described;
 
     // git's `into_name` overrides the destination name verbatim (used both for
     // the ` into <name>` title and the `merge.suppressDest` test); otherwise the
@@ -1514,11 +2289,66 @@ fn suppress_dest_patterns(repo: &gix::Repository) -> Vec<BString> {
     }
 }
 
+/// Classify one merged ref the way `merge_name()` writes it into git's
+/// FETCH_HEAD-shaped buffer and `handle_line()` reads it back out.
+///
+/// gix resolves a partial name through the same rule list git's `dwim_ref`
+/// uses ("", tags, heads, remotes), so the full name it lands on is the category
+/// git would have reported. An invalid ref name (`main~2`) is not an error here,
+/// it just means no ref matched.
+///
+/// The origin is `handle_line()`'s: the `branch `/`remote-tracking branch `
+/// prefix is dropped and the surrounding quotes with it, `tag ` is kept (so the
+/// quotes survive), and anything else — a raw commit — is used verbatim.
+fn describe_spec(repo: &gix::Repository, spec: &str) -> SpecOrigin {
+    if let Ok(Some(r)) = repo.try_find_reference(spec) {
+        let full = r.name().as_bstr().to_str_lossy().into_owned();
+        if full.starts_with("refs/heads/") {
+            return SpecOrigin {
+                described: format!("branch '{spec}'"),
+                origin: spec.to_string(),
+                is_local_branch: true,
+            };
+        }
+        if full.starts_with("refs/tags/") {
+            return SpecOrigin {
+                described: format!("tag '{spec}'"),
+                origin: format!("tag '{spec}'"),
+                is_local_branch: false,
+            };
+        }
+        if full.starts_with("refs/remotes/") {
+            return SpecOrigin {
+                described: format!("remote-tracking branch '{spec}'"),
+                origin: spec.to_string(),
+                is_local_branch: false,
+            };
+        }
+    } else if let Some((name, early)) = early_part_of_branch(repo, spec) {
+        // `branch 'x' (early part)` no longer ends in a quote, so git's
+        // quote-stripping leaves the trailing tag — and the quotes — in place.
+        return SpecOrigin {
+            described: format!("branch '{name}'{}", if early { " (early part)" } else { "" }),
+            origin: if early {
+                format!("'{name}' (early part)")
+            } else {
+                name
+            },
+            is_local_branch: true,
+        };
+    }
+    SpecOrigin {
+        described: format!("commit '{spec}'"),
+        origin: format!("commit '{spec}'"),
+        is_local_branch: false,
+    }
+}
+
 /// `merge_name()`'s second attempt: `<name>^^^` or `<name>~<number>` naming a
 /// point inside an existing branch. The suffix is stripped and, if a branch by
 /// the remaining name exists, that branch is what git reports — tagged
 /// `(early part)` whenever the suffix actually walks back at least one commit.
-fn early_part_of_branch(repo: &gix::Repository, spec: &str) -> Option<String> {
+fn early_part_of_branch(repo: &gix::Repository, spec: &str) -> Option<(String, bool)> {
     let bytes = spec.as_bytes();
     let mut len = 0usize;
     let mut early = false;
@@ -1543,10 +2373,7 @@ fn early_part_of_branch(repo: &gix::Repository, spec: &str) -> Option<String> {
     }
     let stripped = &spec[..bytes.len() - len];
     match repo.try_find_reference(format!("refs/heads/{stripped}").as_str()) {
-        Ok(Some(_)) => Some(format!(
-            "branch '{stripped}'{}",
-            if early { " (early part)" } else { "" }
-        )),
+        Ok(Some(_)) => Some((stripped.to_string(), early)),
         _ => None,
     }
 }
@@ -1693,6 +2520,41 @@ struct StatRow {
     /// Deleted lines, or the old blob's byte size when `binary`.
     deleted: u64,
     binary: bool,
+    /// `get_compact_summary()`'s annotation for this pair, used only under
+    /// `--compact-summary`; `None` for a content-only modification.
+    compact: Option<&'static str>,
+}
+
+/// Port of `get_compact_summary()` (diff.c): the parenthesized note
+/// `--compact-summary` folds into a diffstat name, in git's order — creation
+/// (`new`/`new +x`/`new +l`), deletion (`gone`), then the symlink and
+/// executable-bit mode transitions.
+fn compact_comment(old: Option<EntryKind>, new: Option<EntryKind>) -> Option<&'static str> {
+    // DIFF_STATUS_ADDED.
+    if old.is_none() {
+        return Some(match new {
+            Some(EntryKind::Link) => "new +l",
+            Some(EntryKind::BlobExecutable) => "new +x",
+            _ => "new",
+        });
+    }
+    // DIFF_STATUS_DELETED.
+    if new.is_none() {
+        return Some("gone");
+    }
+    let (old, new) = (old.expect("old present"), new.expect("new present"));
+    let (old_link, new_link) = (old == EntryKind::Link, new == EntryKind::Link);
+    if old_link && !new_link {
+        Some("mode -l")
+    } else if !old_link && new_link {
+        Some("mode +l")
+    } else if old == EntryKind::Blob && new == EntryKind::BlobExecutable {
+        Some("mode +x")
+    } else if old == EntryKind::BlobExecutable && new == EntryKind::Blob {
+        Some("mode -x")
+    } else {
+        None
+    }
 }
 
 /// git's `decimal_width`.
@@ -1747,14 +2609,35 @@ fn quote_path(path: &[u8]) -> String {
     out
 }
 
-/// The `DIFF_FORMAT_DIFFSTAT | DIFF_FORMAT_SUMMARY` block `finish()`
-/// (builtin/merge.c) prints after a merge, rendered as one string.
-fn diffstat(repo: &gix::Repository, old_tree: ObjectId, new_tree: ObjectId) -> Result<String> {
-    let (rows, summary) = collect(repo, old_tree, new_tree)?;
+/// The block `finish()` (builtin/merge.c) prints after a merge, rendered as one
+/// string: `DIFF_FORMAT_DIFFSTAT | DIFF_FORMAT_SUMMARY` for `--stat`, and the
+/// diffstat alone with `stat_with_summary` — each name carrying its
+/// ` (new)`/` (gone)`/` (mode +x)` annotation — for `--compact-summary`.
+fn diffstat(
+    repo: &gix::Repository,
+    old_tree: ObjectId,
+    new_tree: ObjectId,
+    mode: StatMode,
+) -> Result<String> {
+    if mode == StatMode::None {
+        return Ok(String::new());
+    }
+    let (mut rows, summary) = collect(repo, old_tree, new_tree)?;
     let mut out = String::new();
+    if mode == StatMode::CompactSummary {
+        // `fill_print_name()` appends the annotation to the name, so it counts
+        // towards the name column's width.
+        for row in &mut rows {
+            if let Some(comment) = row.compact {
+                row.name.push_str(&format!(" ({comment})"));
+            }
+        }
+    }
     emit_stats(&mut out, &rows);
-    for line in &summary {
-        out.push_str(&format!(" {line}\n"));
+    if mode == StatMode::Diffstat {
+        for line in &summary {
+            out.push_str(&format!(" {line}\n"));
+        }
     }
     Ok(out)
 }
@@ -1774,7 +2657,14 @@ fn collect(
     // blob diff declined because a side is binary — the ids whose sizes git
     // reports instead. Sizes are looked up after the walk so the callback stays
     // infallible.
-    type RawRow = (BString, String, Option<(u64, u64)>, Option<ObjectId>, Option<ObjectId>);
+    type RawRow = (
+        BString,
+        String,
+        Option<(u64, u64)>,
+        Option<ObjectId>,
+        Option<ObjectId>,
+        Option<&'static str>,
+    );
     let mut raw: Vec<RawRow> = Vec::new();
     let mut summary: Vec<(BString, String)> = Vec::new();
 
@@ -1785,20 +2675,28 @@ fn collect(
     let _rewrites = platform.for_each_to_obtain_tree(&new, |change| {
         let path: BString = change.location().to_owned();
         let display = quote_path(&path[..]);
-        let (old_id, new_id) = match change {
+        let (old_id, new_id, compact) = match change {
             TreeChange::Addition { entry_mode, id, .. } => {
                 summary.push((
                     path.clone(),
                     format!("create mode {:06o} {display}", entry_mode.value()),
                 ));
-                (None, Some(id.detach()))
+                (
+                    None,
+                    Some(id.detach()),
+                    compact_comment(None, Some(entry_mode.kind())),
+                )
             }
             TreeChange::Deletion { entry_mode, id, .. } => {
                 summary.push((
                     path.clone(),
                     format!("delete mode {:06o} {display}", entry_mode.value()),
                 ));
-                (Some(id.detach()), None)
+                (
+                    Some(id.detach()),
+                    None,
+                    compact_comment(Some(entry_mode.kind()), None),
+                )
             }
             TreeChange::Modification {
                 previous_entry_mode,
@@ -1817,10 +2715,24 @@ fn collect(
                         ),
                     ));
                 }
-                (Some(previous_id.detach()), Some(id.detach()))
+                (
+                    Some(previous_id.detach()),
+                    Some(id.detach()),
+                    compact_comment(Some(previous_entry_mode.kind()), Some(entry_mode.kind())),
+                )
             }
             // Rewrites cannot occur: rename tracking is off above.
-            TreeChange::Rewrite { source_id, id, .. } => (Some(source_id.detach()), Some(id.detach())),
+            TreeChange::Rewrite {
+                source_entry_mode,
+                source_id,
+                entry_mode,
+                id,
+                ..
+            } => (
+                Some(source_id.detach()),
+                Some(id.detach()),
+                compact_comment(Some(source_entry_mode.kind()), Some(entry_mode.kind())),
+            ),
         };
 
         let counts = change
@@ -1829,7 +2741,7 @@ fn collect(
             .and_then(|mut p| p.line_counts().ok())
             .flatten()
             .map(|c| (u64::from(c.insertions), u64::from(c.removals)));
-        raw.push((path, display, counts, old_id, new_id));
+        raw.push((path, display, counts, old_id, new_id, compact));
 
         resource_cache.clear_resource_cache_keep_allocation();
         Ok::<_, std::convert::Infallible>(Action::Continue(()))
@@ -1845,14 +2757,21 @@ fn collect(
     };
 
     let mut rows: Vec<(BString, StatRow)> = Vec::with_capacity(raw.len());
-    for (path, name, counts, old_id, new_id) in raw {
+    for (path, name, counts, old_id, new_id, compact) in raw {
         let row = match counts {
-            Some((added, deleted)) => StatRow { name, added, deleted, binary: false },
+            Some((added, deleted)) => StatRow {
+                name,
+                added,
+                deleted,
+                binary: false,
+                compact,
+            },
             None => StatRow {
                 name,
                 added: blob_size(new_id)?,
                 deleted: blob_size(old_id)?,
                 binary: true,
+                compact,
             },
         };
         rows.push((path, row));

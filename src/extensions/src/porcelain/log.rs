@@ -71,7 +71,7 @@ fn parse_stat_geometry(sw: &mut StatWidths, spec: &str) {
 /// decorations are shown and, when shown, with short (`main`) or full
 /// (`refs/heads/main`) ref names.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DecorateStyle {
+pub(crate) enum DecorateStyle {
     /// No decorations on the built-in header/oneline formats.
     Off,
     /// `main`, `tag: v1`, `origin/main`.
@@ -85,7 +85,7 @@ enum DecorateStyle {
 /// `Short` when stdout is a terminal and `Off` otherwise, matching git's
 /// `auto_decoration_style`. Returns `None` for a value git rejects — config
 /// treats that as `Off`, while `--decorate=<value>` makes it fatal.
-fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
+pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
     let lower = value.to_ascii_lowercase();
     match lower.as_str() {
         "true" | "yes" | "on" | "short" => return Some(DecorateStyle::Short),
@@ -149,6 +149,19 @@ fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///     NO_OUTPUT: with no diff requested it changes nothing (`git log` shows no diff
 ///     by default), and any explicit `-p`/`--stat` still wins, so its only visible
 ///     effect is the `--name-only`/`--name-status` + NO_OUTPUT conflict
+///   * `--decorate[=short|full|auto|no]` / `--no-decorate` → ref decorations on the
+///     built-in header/oneline formats, defaulting to `log.decorate` and then to
+///     `auto`. `--decorate-refs=<pattern>` and `--decorate-refs-exclude=<pattern>`
+///     (both repeatable, matched with git's `normalize_glob_ref` +
+///     `match_ref_pattern` rules) narrow which refs may decorate, and
+///     `--clear-decorations` empties both lists and drops the default
+///     known-namespace restriction, exposing refs such as `refs/bisect/*`.
+///     `log.excludeDecoration` and `log.initialDecorationSet=all` are honored
+///   * `--use-mailmap`/`--mailmap` and their `--no-` forms → resolve the
+///     `Author:`/`Commit:` identities of the built-in header formats through
+///     `.mailmap`, defaulting to `log.mailmap` (true, as in git since 2.24).
+///     Like git, this affects only `pp_user_info`'s formats: `oneline`, `raw` and
+///     user formats print the identity as the commit recorded it
 ///   * `--source` / `--no-source`                  → annotate each commit with the
 ///     ref/argument it was first reached from (`\t<source>` after the hash), on the
 ///     built-in header formats (not the user or `reference` formats), with git's
@@ -200,9 +213,13 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // Config supplies the defaults; the flags below override them. git reads
     // these in `git_log_config` before parsing args, and validates `log.date`
     // there — an invalid value is fatal even when `--date` later overrides it.
-    let (cfg_abbrev_commit, cfg_date_mode, cfg_show_root, cfg_decorate) = {
+    let (cfg_abbrev_commit, cfg_date_mode, cfg_show_root, cfg_decorate, cfg_mailmap) = {
         let snap = repo.config_snapshot();
         let abbrev = snap.boolean("log.abbrevCommit").unwrap_or(false);
+        // `log.mailmap` has defaulted to true since git 2.24, so the built-in
+        // formats route identities through `.mailmap` unless `--no-use-mailmap`
+        // or `log.mailmap=false` turns it off.
+        let mailmap = snap.boolean("log.mailmap").unwrap_or(true);
         // `log.decorate` sets the default decoration style for the built-in
         // header/oneline formats. It reuses git's `parse_decoration_style`, so it
         // accepts a maybe-bool plus `short`/`full`/`auto`; an invalid value is
@@ -233,7 +250,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             }
             None => DateMode::Default,
         };
-        (abbrev, date, show_root, decorate)
+        (abbrev, date, show_root, decorate, mailmap)
     };
 
     // `--stat` width geometry, seeded from `diff.statNameWidth`/`diff.statGraphWidth`
@@ -282,6 +299,15 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         DecorateStyle::Off
     };
     let mut decorate = cfg_decorate.unwrap_or(builtin_decorate);
+    // `--decorate-refs=<pattern>` / `--decorate-refs-exclude=<pattern>` (both
+    // repeatable) and `--clear-decorations`, which empties them again and drops
+    // git's default "known namespaces" include list.
+    let mut decorate_refs: Vec<String> = Vec::new();
+    let mut decorate_refs_exclude: Vec<String> = Vec::new();
+    let mut default_decoration_filter = true;
+    // `--use-mailmap`/`--mailmap`: route the author/committer identity of the
+    // built-in header formats through `.mailmap`. Seeded from `log.mailmap`.
+    let mut use_mailmap = cfg_mailmap;
     let mut all = false;
     let mut reverse = false;
     let mut only_merges = false;
@@ -354,6 +380,34 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
             }
         } else if a == "--no-decorate" {
             decorate = DecorateStyle::Off;
+        } else if a == "--decorate-refs" || a == "--decorate-refs-exclude" {
+            // git's `OPT_STRING_LIST` also takes its value as the next argv token,
+            // and its parse-options layer rejects a missing one with exit 129.
+            i += 1;
+            let Some(v) = args.get(i) else {
+                eprintln!("error: option `{}' requires a value", &a[2..]);
+                return Ok(ExitCode::from(129));
+            };
+            if a == "--decorate-refs" {
+                decorate_refs.push(v.clone());
+            } else {
+                decorate_refs_exclude.push(v.clone());
+            }
+        } else if let Some(v) = a.strip_prefix("--decorate-refs=") {
+            decorate_refs.push(v.to_string());
+        } else if let Some(v) = a.strip_prefix("--decorate-refs-exclude=") {
+            decorate_refs_exclude.push(v.to_string());
+        } else if a == "--clear-decorations" {
+            // git's `clear_decorations_callback`: forget every pattern given so
+            // far and stop applying the default namespace filter, so refs outside
+            // the known namespaces become decoratable.
+            decorate_refs.clear();
+            decorate_refs_exclude.clear();
+            default_decoration_filter = false;
+        } else if a == "--use-mailmap" || a == "--mailmap" {
+            use_mailmap = true;
+        } else if a == "--no-use-mailmap" || a == "--no-mailmap" {
+            use_mailmap = false;
         } else if a == "--oneline" {
             pretty = Pretty::Oneline;
             terminator = true;
@@ -923,21 +977,35 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     let want_color = match color {
         ColorWhen::Always => true,
         ColorWhen::Never => false,
-        ColorWhen::Auto => {
-            std::io::stdout().is_terminal()
-                || matches!(
-                    std::env::var("GIT_PAGER_IN_USE").ok().as_deref(),
-                    Some("true" | "1" | "yes" | "on")
-                )
-        }
+        // git routes `git log`'s coloring through the diff machinery, so the
+        // config switch is `color.diff` falling back to `color.ui`; `auto` then
+        // asks whether stdout is a terminal or a `color.pager` pager.
+        ColorWhen::Auto => super::color::want_color_stdout(&repo, "diff"),
     };
     // `%d`/`%D` need a commit→refs map; build it only when the format asks for one
     // so plain formats pay nothing for the ref scan.
     let decorations = if pretty_uses_decoration(&pretty) || decorate != DecorateStyle::Off {
-        Some(build_decorations(&repo)?)
+        let filter = DecorationFilter::build(
+            &repo,
+            &decorate_refs,
+            &decorate_refs_exclude,
+            default_decoration_filter,
+        );
+        Some(build_decorations(&repo, &filter)?)
     } else {
         None
     };
+    // git's `color.decorate.<slot>` table, plus the `color.diff.commit` color it
+    // paints the decoration punctuation and the commit object name with. Resolved
+    // once; the disabled table when this run is not coloring at all.
+    let deco_colors = if want_color {
+        super::color::DecorateColors::resolve(&repo)
+    } else {
+        super::color::DecorateColors::disabled()
+    };
+    // `--use-mailmap` / `log.mailmap`: loaded once (worktree `.mailmap`, then
+    // `mailmap.blob`, then `mailmap.file`) and shared by every rendered record.
+    let mailmap = use_mailmap.then(|| Mailmap::load(&repo));
     // Relative dates (`%cr`/`%ar`, `--date=relative`) are measured against now.
     let now = now_secs();
 
@@ -978,10 +1046,12 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
         show_parents,
         date_mode,
         want_color,
+        colors: &deco_colors,
         now,
         decorations: decorations.as_ref(),
         decorate,
         source_mode,
+        mailmap: mailmap.as_ref(),
         terminator,
         empty_user_format,
         pretty: &pretty,
@@ -1241,10 +1311,15 @@ struct EntryParams<'a> {
     show_parents: bool,
     date_mode: DateMode,
     want_color: bool,
+    /// The resolved `color.decorate.*` / `color.diff.commit` slots.
+    colors: &'a super::color::DecorateColors,
     now: i64,
     decorations: Option<&'a Decorations>,
     decorate: DecorateStyle,
     source_mode: bool,
+    /// `--use-mailmap` / `log.mailmap`: the loaded mailmap, or `None` when the
+    /// identities are shown as recorded.
+    mailmap: Option<&'a Mailmap>,
     terminator: bool,
     empty_user_format: bool,
     pretty: &'a Pretty,
@@ -1389,10 +1464,12 @@ fn entry_block(
         date_mode: p.date_mode,
         extra,
         want_color: p.want_color,
+        colors: p.colors,
         now: p.now,
         decorations: p.decorations,
         decorate: p.decorate,
         source: if p.source_mode { Some(node.source.as_bytes()) } else { None },
+        mailmap: p.mailmap,
     };
     let mut block: Vec<u8> = Vec::new();
     render_entry(&mut block, &commit, p.pretty, &ctx)?;
@@ -1774,6 +1851,28 @@ fn insert_by_date(list: &mut Vec<Node>, node: Node) {
     list.insert(pos, node);
 }
 
+/// `--source` for a revision walk: commit → the tip name it was first reached
+/// from, computed by the same walk `git log` uses so the inheritance rule
+/// (`add_parents_to_list`: a parent takes its child's source) is identical.
+///
+/// `git show <range>` needs this because its own traversal only yields ids;
+/// resolving the source separately here keeps one implementation of the rule.
+pub(crate) fn source_map(
+    repo: &gix::Repository,
+    tips: &[ObjectId],
+    tip_sources: &[String],
+    first_parent: bool,
+    exclude: &[ObjectId],
+) -> Result<HashMap<ObjectId, String>> {
+    let hidden = if exclude.is_empty() {
+        HashSet::new()
+    } else {
+        ancestor_closure(repo, exclude)?
+    };
+    let nodes = walk(repo, tips, tip_sources, first_parent, &hidden, None)?;
+    Ok(nodes.into_iter().map(|n| (n.id, n.source)).collect())
+}
+
 /// Breadth-first walk over the reachable history, newest commit first. With
 /// `first_parent`, only the first parent of each commit is followed — git's
 /// `--first-parent`.
@@ -2062,12 +2161,12 @@ fn expand_format(
         let Some(&p) = chars.get(i) else { break };
         i += 1;
         match p {
-            // Under `%C(auto)`, git paints the commit hash magenta (`\e[35m`).
-            'H' => push_maybe_auto(out, &commit.id().to_string(), auto && ctx.want_color),
+            // Under `%C(auto)`, git paints the commit hash with `color.diff.commit`.
+            'H' => push_maybe_auto(out, &commit.id().to_string(), auto_commit_color(ctx, auto)),
 'h' => push_maybe_auto(
                 out,
                 &ctx.abbrev.borrow_mut().get(commit.id()),
-                auto && ctx.want_color,
+                auto_commit_color(ctx, auto),
             ),
             'T' => out.extend_from_slice(commit.tree_id()?.to_string().as_bytes()),
 't' => {
@@ -2236,15 +2335,43 @@ fn parse_color_spec(spec: &str, want_color: bool, auto: &mut bool, out_empty: bo
     }
 }
 
-/// Emit `text`, painted magenta when `colored` (git's `%C(auto)` color for the
-/// commit hash `%h`/`%H`).
-fn push_maybe_auto(out: &mut Vec<u8>, text: &str, colored: bool) {
-    if colored {
-        out.extend_from_slice(b"\x1b[35m");
+/// Write a built-in format's commit object name — `<hash>` for `oneline`, the
+/// `commit <hash>` header otherwise — in `color.diff.commit`. git's span covers
+/// exactly the prefix and the hash: `--parents`, `--source` and the decorations
+/// that follow it are all outside, each opening their own color.
+fn write_commit_name(out: &mut Vec<u8>, prefix: &[u8], id: &str, ctx: &RenderCtx<'_>) {
+    let color = &ctx.colors.commit;
+    if !color.is_empty() {
+        out.extend_from_slice(color.as_bytes());
+    }
+    out.extend_from_slice(prefix);
+    out.extend_from_slice(id.as_bytes());
+    if !color.is_empty() {
+        out.extend_from_slice(b"\x1b[m");
+    }
+}
+
+/// The `color.diff.commit` sequence for a `%C(auto)`-gated placeholder: the
+/// configured color when this run colors and a `%C(auto)` has been seen, else
+/// the empty string (which paints nothing).
+fn auto_commit_color<'a>(ctx: &'a RenderCtx<'_>, auto: bool) -> &'a str {
+    if auto && ctx.want_color {
+        &ctx.colors.commit
+    } else {
+        ""
+    }
+}
+
+/// Emit `text` in `commit` — git's `color.diff.commit`, which is the color
+/// `%C(auto)` gives the commit hash `%h`/`%H`. An empty `commit` (coloring off, or
+/// a spec that selects nothing) emits the text bare, with no reset.
+fn push_maybe_auto(out: &mut Vec<u8>, text: &str, commit: &str) {
+    if commit.is_empty() {
+        out.extend_from_slice(text.as_bytes());
+    } else {
+        out.extend_from_slice(commit.as_bytes());
         out.extend_from_slice(text.as_bytes());
         out.extend_from_slice(b"\x1b[m");
-    } else {
-        out.extend_from_slice(text.as_bytes());
     }
 }
 
@@ -2268,29 +2395,184 @@ fn color_base(name: &str) -> Option<u8> {
 // Decorations (%d / %D)
 // ---------------------------------------------------------------------------
 
-/// The kinds of ref a commit can be decorated with, in git's color scheme.
+/// The kinds of ref a commit can be decorated with, in git's color scheme —
+/// `log-tree.c`'s `decoration_colors[]` indexed by `enum decoration_type`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DecoKind {
+    /// `HEAD` itself (bold cyan), the entry the `HEAD -> <branch>` fold hangs off.
+    Head,
     Tag,
     LocalBranch,
     RemoteBranch,
+    /// The single `refs/stash` ref (bold magenta).
+    Stash,
+    /// Any other ref, reachable only once the default namespace filter is
+    /// relaxed by `--clear-decorations` / `log.initialDecorationSet=all`.
+    /// git's `DECORATION_NONE`, whose color slot is a bare reset.
+    Other,
 }
 
-/// One ref pointing at a commit: `origin/main`, `v1.0`, `main`, …
+/// One ref pointing at a commit, stored under its full name
+/// (`refs/remotes/origin/main`); `--decorate=short` prettifies it at render time.
 struct Deco {
     kind: DecoKind,
-    name: String,
+    full: String,
 }
 
 /// The ref→commit map plus HEAD state needed to render `%d`/`%D`.
-struct Decorations {
-    /// Commit oid → the branch/tag/remote refs pointing at it (annotated tags
-    /// peeled through to their commit).
+pub(crate) struct Decorations {
+    /// Commit oid → the refs pointing at it (annotated tags peeled through to
+    /// their commit), including `HEAD` itself when it survived the filter.
     map: HashMap<ObjectId, Vec<Deco>>,
-    /// The commit HEAD resolves to (peeled), or `None` when HEAD is unborn.
-    head_oid: Option<ObjectId>,
-    /// The branch HEAD symbolically points to, for the `HEAD -> <branch>` form.
+    /// The full refname HEAD symbolically points at (`refs/heads/main`), for the
+    /// `HEAD -> <branch>` fold. `None` when HEAD is detached or unborn.
     head_branch: Option<String>,
+}
+
+/// git's `prettify_refname`: strip the three namespaces whose short form is
+/// unambiguous. Everything else (`refs/stash`, `refs/custom/thing`) is shown in
+/// full even under `--decorate=short`.
+fn prettify_refname(full: &str) -> &str {
+    full.strip_prefix("refs/heads/")
+        .or_else(|| full.strip_prefix("refs/tags/"))
+        .or_else(|| full.strip_prefix("refs/remotes/"))
+        .unwrap_or(full)
+}
+
+/// One normalized decoration-filter pattern — the product of git's
+/// `refs.c:normalize_glob_ref`.
+struct RefPattern {
+    /// The pattern with `refs/` prepended unless it already started with `refs/`
+    /// or was the literal `HEAD`, and any trailing `/` stripped.
+    text: String,
+    /// git's `item->util`: set when the *original* pattern held no glob
+    /// metacharacter (`has_glob_specials` = `strpbrk(pattern, "?*[")`), which
+    /// turns matching into a `/`-bounded prefix test instead of a wildmatch.
+    literal: bool,
+}
+
+impl RefPattern {
+    /// git's `refs.c:normalize_glob_ref` with a `NULL` prefix.
+    fn new(pattern: &str) -> RefPattern {
+        let mut text = String::new();
+        if !pattern.starts_with("refs/") && pattern != "HEAD" {
+            text.push_str("refs/");
+        }
+        text.push_str(pattern);
+        if text.ends_with('/') {
+            text.pop();
+        }
+        RefPattern {
+            text,
+            literal: !pattern.contains(['?', '*', '[']),
+        }
+    }
+
+    /// git's `log-tree.c:match_ref_pattern`: a literal pattern matches a whole
+    /// path prefix (`refs/heads` matches `refs/heads/main` but not
+    /// `refs/headsfoo`), a glob pattern goes through `wildmatch(…, 0)`.
+    fn matches(&self, refname: &str) -> bool {
+        if self.literal {
+            match refname.strip_prefix(&self.text) {
+                Some(rest) => rest.is_empty() || rest.starts_with('/'),
+                None => false,
+            }
+        } else {
+            wildmatch(self.text.as_bytes(), refname.as_bytes())
+        }
+    }
+}
+
+/// git's `struct decoration_filter`: which refs are allowed to decorate a commit.
+///
+/// The three lists are consulted in git's order (`log-tree.c:ref_filter_match`):
+/// a `--decorate-refs-exclude` hit rejects outright; otherwise, when
+/// `--decorate-refs` was given at all, only a hit there is kept; otherwise a
+/// `log.excludeDecoration` hit rejects. Anything else is decorated.
+pub(crate) struct DecorationFilter {
+    include: Vec<RefPattern>,
+    exclude: Vec<RefPattern>,
+    exclude_config: Vec<RefPattern>,
+}
+
+/// The refs git decorates by default — `refs.c:ref_namespace[]` filtered to the
+/// entries that carry a `decoration` type, in declaration order. Used verbatim
+/// as the default `include` list, which is why an unknown namespace such as
+/// `refs/bisect/` is invisible until `--clear-decorations` drops this list.
+const DEFAULT_DECORATION_NAMESPACES: [&str; 6] = [
+    "HEAD",
+    "refs/heads/",
+    "refs/tags/",
+    "refs/remotes/",
+    "refs/stash",
+    "refs/replace/",
+];
+
+impl DecorationFilter {
+    /// git's `builtin/log.c:set_default_decoration_filter` followed by the
+    /// normalization `load_ref_decorations` performs on all three lists.
+    ///
+    /// `use_default` is git's `use_default_decoration_filter`, which starts set
+    /// and is cleared by `--clear-decorations`. `log.excludeDecoration` is read
+    /// unconditionally — and because a non-empty list of any kind suppresses the
+    /// namespace defaults, configuring it alone also exposes refs outside the
+    /// known namespaces.
+    pub(crate) fn build(
+        repo: &gix::Repository,
+        include_cli: &[String],
+        exclude_cli: &[String],
+        mut use_default: bool,
+    ) -> DecorationFilter {
+        let snap = repo.config_snapshot();
+        let mut include: Vec<RefPattern> = include_cli.iter().map(|p| RefPattern::new(p)).collect();
+        let exclude: Vec<RefPattern> = exclude_cli.iter().map(|p| RefPattern::new(p)).collect();
+        // `log.excludeDecoration` is multi-valued: git appends every occurrence
+        // across the whole config hierarchy rather than letting the last win.
+        let exclude_config: Vec<RefPattern> = snap
+            .plumbing()
+            .strings("log.excludeDecoration")
+            .into_iter()
+            .flatten()
+            .map(|v| RefPattern::new(&v.to_str_lossy()))
+            .collect();
+
+        // `log.initialDecorationSet=all` relaxes the filter exactly as
+        // `--clear-decorations` does.
+        if use_default
+            && snap
+                .string("log.initialDecorationSet")
+                .is_some_and(|v| v.to_str_lossy() == "all")
+        {
+            use_default = false;
+        }
+        if use_default
+            && include.is_empty()
+            && exclude.is_empty()
+            && exclude_config.is_empty()
+        {
+            include.extend(DEFAULT_DECORATION_NAMESPACES.iter().map(|n| RefPattern::new(n)));
+        }
+
+        DecorationFilter {
+            include,
+            exclude,
+            exclude_config,
+        }
+    }
+
+    /// Port of `log-tree.c:ref_filter_match`.
+    fn matches(&self, refname: &str) -> bool {
+        if self.exclude.iter().any(|p| p.matches(refname)) {
+            return false;
+        }
+        if !self.include.is_empty() {
+            return self.include.iter().any(|p| p.matches(refname));
+        }
+        if self.exclude_config.iter().any(|p| p.matches(refname)) {
+            return false;
+        }
+        true
+    }
 }
 
 /// Does this format use a decoration placeholder, so the ref map is worth
@@ -2308,53 +2590,63 @@ fn pretty_uses_decoration(pretty: &Pretty) -> bool {
     false
 }
 
-/// Build the commit→refs decoration map: every branch, remote-tracking branch,
-/// and tag (peeled to its commit), plus where HEAD points.
-fn build_decorations(repo: &gix::Repository) -> Result<Decorations> {
+/// Build the commit→refs decoration map — git's `load_ref_decorations`: every
+/// ref that survives `filter` (peeled through annotated tags to its commit),
+/// then `HEAD`, which git adds last and therefore renders first.
+///
+/// `refs/replace/*` is skipped: git turns those into a `replaced` decoration on
+/// the object being *replaced*, which is a mechanism this port does not model,
+/// so the ref decorating its own target would be plainly wrong.
+pub(crate) fn build_decorations(repo: &gix::Repository, filter: &DecorationFilter) -> Result<Decorations> {
     let mut map: HashMap<ObjectId, Vec<Deco>> = HashMap::new();
     for r in repo.references()?.all()? {
         let r = r.map_err(|e| anyhow!("{e}"))?;
         let Ok(full) = r.name().as_bstr().to_str().map(str::to_owned) else {
             continue;
         };
-        let kind_name = if let Some(n) = full.strip_prefix("refs/heads/") {
-            (DecoKind::LocalBranch, n.to_string())
-        } else if let Some(n) = full.strip_prefix("refs/remotes/") {
-            (DecoKind::RemoteBranch, n.to_string())
-        } else if let Some(n) = full.strip_prefix("refs/tags/") {
-            (DecoKind::Tag, n.to_string())
-        } else {
-            // HEAD, refs/stash, refs/notes/* and friends aren't shown by `%d`.
+        if !filter.matches(&full) || full.starts_with("refs/replace/") {
             continue;
+        }
+        // git's `add_ref_decoration` classifies by the first `ref_namespace[]`
+        // entry the refname matches; anything unclaimed is `DECORATION_NONE`.
+        let kind = if full.starts_with("refs/heads/") {
+            DecoKind::LocalBranch
+        } else if full.starts_with("refs/tags/") {
+            DecoKind::Tag
+        } else if full.starts_with("refs/remotes/") {
+            DecoKind::RemoteBranch
+        } else if full == "refs/stash" {
+            DecoKind::Stash
+        } else {
+            DecoKind::Other
         };
         // Peel through annotated tags so a tag ref decorates its target commit.
         let Ok(id) = r.into_fully_peeled_id() else {
             continue;
         };
-        map.entry(id.detach()).or_default().push(Deco {
-            kind: kind_name.0,
-            name: kind_name.1,
-        });
+        map.entry(id.detach()).or_default().push(Deco { kind, full });
     }
 
-    let mut head_oid = None;
     let mut head_branch = None;
-    if let Ok(head) = repo.head() {
-        if let Some(name) = head.referent_name() {
-            if let Ok(full) = name.as_bstr().to_str() {
-                if let Some(b) = full.strip_prefix("refs/heads/") {
-                    head_branch = Some(b.to_string());
+    if filter.matches("HEAD") {
+        if let Ok(head) = repo.head() {
+            if let Some(name) = head.referent_name() {
+                if let Ok(full) = name.as_bstr().to_str() {
+                    if full.starts_with("refs/") {
+                        head_branch = Some(full.to_string());
+                    }
                 }
             }
+            if let Some(id) = head.id() {
+                map.entry(id.detach()).or_default().push(Deco {
+                    kind: DecoKind::Head,
+                    full: "HEAD".to_string(),
+                });
+            }
         }
-        head_oid = head.id().map(|id| id.detach());
     }
 
-    Ok(Decorations {
-        map,
-        head_oid,
-        head_branch,
-    })
+    Ok(Decorations { map, head_branch })
 }
 
 /// Expand `%d` (`wrap` true: ` (…)`) or `%D` (`wrap` false: bare) for `commit`.
@@ -2371,90 +2663,107 @@ fn expand_decoration(
     let Some(decos) = ctx.decorations else {
         return;
     };
-    let id = commit.id().detach();
-    let head_here = decos.head_oid == Some(id);
-    let refs_here = decos.map.get(&id);
-    if !head_here && refs_here.is_none_or(|v| v.is_empty()) {
+    // git's decorations stay plain until a `%C(auto)` turns coloring on for the
+    // rest of the format, so an un-auto'd run gets the disabled table.
+    let disabled;
+    let colors = if auto && ctx.want_color {
+        ctx.colors
+    } else {
+        disabled = super::color::DecorateColors::disabled();
+        &disabled
+    };
+    format_decorations(out, decos, &commit.id().detach(), full_refs, colors, wrap);
+}
+
+/// Port of `log-tree.c:format_decorations`: the ` (HEAD -> main, tag: v1)` list
+/// for one commit. `wrap` picks `%d`'s parenthesised form over `%D`'s bare one,
+/// `full_refs` picks `--decorate=full` over `short`, and `colors` supplies git's
+/// `decoration_colors[]` as configured by `color.decorate.<slot>` (the disabled
+/// table renders the list uncolored). Emits nothing when the commit carries no
+/// surviving decoration.
+pub(crate) fn format_decorations(
+    out: &mut Vec<u8>,
+    decos: &Decorations,
+    id: &ObjectId,
+    full_refs: bool,
+    colors: &super::color::DecorateColors,
+    wrap: bool,
+) {
+    let Some(refs) = decos.map.get(id) else {
+        return;
+    };
+    if refs.is_empty() {
         return;
     }
 
-    let color_on = auto && ctx.want_color;
     const RESET: &str = "\x1b[m";
     let paint = |text: &str, code: &str| -> String {
-        if color_on {
-            format!("{code}{text}{RESET}")
-        } else {
+        if code.is_empty() {
             text.to_string()
+        } else {
+            format!("{code}{text}{RESET}")
         }
     };
-    // git colors: HEAD bold cyan, local branch bold green, remote bold red, tag
-    // bold yellow, all punctuation plain magenta.
-    let punct = |text: &str| paint(text, "\x1b[35m");
+    // git's slot defaults: HEAD bold cyan, local branch bold green, remote bold
+    // red, tag bold yellow, stash bold magenta, anything else a bare reset. The
+    // punctuation between and around the entries takes `color.diff.commit`, the
+    // same color the commit object name it follows is painted with.
+    let punct = |text: &str| paint(text, &colors.commit);
+    let color_of = |kind: DecoKind| match kind {
+        DecoKind::Head => colors.head.as_str(),
+        DecoKind::LocalBranch => colors.branch.as_str(),
+        DecoKind::RemoteBranch => colors.remote_branch.as_str(),
+        DecoKind::Tag => colors.tag.as_str(),
+        DecoKind::Stash => colors.stash.as_str(),
+        DecoKind::Other => colors.none.as_str(),
+    };
+    let show = |d: &Deco| -> String {
+        // `--decorate=full` / `log.decorate=full` renders the full ref name
+        // (`refs/heads/main`) in place of the prettified one (`main`).
+        if full_refs {
+            d.full.clone()
+        } else {
+            prettify_refname(&d.full).to_string()
+        }
+    };
 
-    // The branch HEAD points to is folded into `HEAD -> <branch>`, so it is not
-    // also listed on its own.
-    let head_branch = if head_here { decos.head_branch.as_deref() } else { None };
+    // git's `current_pointed_by_HEAD`: the `HEAD -> <branch>` fold happens only
+    // when BOTH the `HEAD` decoration and the local branch it resolves to are on
+    // this commit and survived the filter. The branch is then not listed twice.
+    let head_here = refs.iter().any(|d| d.kind == DecoKind::Head);
+    let folded: Option<&Deco> = head_here.then(|| decos.head_branch.as_deref()).flatten().and_then(
+        |branch| {
+            refs.iter()
+                .find(|d| d.kind == DecoKind::LocalBranch && d.full == branch)
+        },
+    );
+
+    // git prepends each decoration as it iterates refs in ascending full-refname
+    // order and adds `HEAD` last, so the display order is `HEAD` first and then
+    // DESCENDING full refname: refs/heads/dev, refs/heads/feature, refs/tags/v1
+    // -> (tag: v1, feature, dev).
+    let mut ordered: Vec<&Deco> = refs
+        .iter()
+        .filter(|d| folded.is_none_or(|f| !std::ptr::eq(*d, f)))
+        .collect();
+    ordered.sort_by_key(|d| (d.kind != DecoKind::Head, std::cmp::Reverse(d.full.clone())));
 
     let mut entries: Vec<String> = Vec::new();
-    if head_here {
-        match head_branch {
-            Some(b) => {
-                // The branch HEAD points at is a local branch, so its full form
-                // carries the `refs/heads/` prefix.
-                let shown = if full_refs {
-                    format!("refs/heads/{b}")
-                } else {
-                    b.to_string()
-                };
-                entries.push(format!(
-                    "{}{}{}",
-                    paint("HEAD", "\x1b[1;36m"),
-                    punct(" -> "),
-                    paint(&shown, "\x1b[1;32m")
-                ));
-            }
-            None => entries.push(paint("HEAD", "\x1b[1;36m")),
+    for d in ordered {
+        let mut entry = String::new();
+        // git colors the `tag: ` prefix and the tag name as two separate
+        // bold-yellow spans.
+        if d.kind == DecoKind::Tag {
+            entry.push_str(&paint("tag: ", color_of(d.kind)));
         }
-    }
-
-    if let Some(refs) = refs_here {
-        // git prepends each decoration as it iterates refs in ascending
-        // full-refname order, so the display order is DESCENDING full refname:
-        // refs/heads/dev, refs/heads/feature, refs/tags/v1 -> (tag: v1, feature,
-        // dev). The branch HEAD points to is folded into `HEAD -> <branch>`.
-        let full = |d: &Deco| -> String {
-            let prefix = match d.kind {
-                DecoKind::LocalBranch => "refs/heads/",
-                DecoKind::RemoteBranch => "refs/remotes/",
-                DecoKind::Tag => "refs/tags/",
-            };
-            format!("{prefix}{}", d.name)
-        };
-        let mut ordered: Vec<&Deco> = refs
-            .iter()
-            .filter(|d| !(d.kind == DecoKind::LocalBranch && Some(d.name.as_str()) == head_branch))
-            .collect();
-        ordered.sort_by_key(|d| std::cmp::Reverse(full(d)));
-        for d in ordered {
-            // `--decorate=full` / `log.decorate=full` renders the full ref name
-            // (`refs/heads/main`) in place of the short one (`main`).
-            let shown = if full_refs { full(d) } else { d.name.clone() };
-            match d.kind {
-                DecoKind::LocalBranch => entries.push(paint(&shown, "\x1b[1;32m")),
-                // git colors the `tag: ` prefix and the tag name as two separate
-                // bold-yellow spans.
-                DecoKind::Tag => entries.push(format!(
-                    "{}{}",
-                    paint("tag: ", "\x1b[1;33m"),
-                    paint(&shown, "\x1b[1;33m")
-                )),
-                DecoKind::RemoteBranch => entries.push(paint(&shown, "\x1b[1;31m")),
+        entry.push_str(&paint(&show(d), color_of(d.kind)));
+        if d.kind == DecoKind::Head {
+            if let Some(f) = folded {
+                entry.push_str(&punct(" -> "));
+                entry.push_str(&paint(&show(f), color_of(f.kind)));
             }
         }
-    }
-
-    if entries.is_empty() {
-        return;
+        entries.push(entry);
     }
 
     // `%d` wraps in ` (…)`; `%D` emits the bare, comma-separated list.
@@ -2835,6 +3144,9 @@ struct RenderCtx<'a> {
     /// Whether `%C`/`%C(...)` color placeholders and `%C(auto)`-gated decoration
     /// emit ANSI escapes (git's `want_color`).
     want_color: bool,
+    /// The `color.decorate.*` slots and `color.diff.commit`, resolved from config;
+    /// the disabled table when coloring is off.
+    colors: &'a super::color::DecorateColors,
     /// Current time in epoch seconds, for relative dates (`%cr`/`%ar`).
     now: i64,
     /// Commit→refs map plus HEAD info for `%d`/`%D`; `None` when the format has no
@@ -2849,6 +3161,12 @@ struct RenderCtx<'a> {
     /// `\t<source>` after the hash on the built-in header formats. `None` when
     /// `--source` is off (and for user/`reference` formats, which git leaves bare).
     source: Option<&'a [u8]>,
+    /// `--use-mailmap` / `log.mailmap`: rewrites the `Author:`/`Commit:` lines of
+    /// the built-in header formats through `.mailmap`. `None` leaves the
+    /// identities as the commit recorded them. git applies it in `pp_user_info`
+    /// only, so `oneline`, `raw` and user formats are unaffected — `%aN`/`%aE`
+    /// consult the mailmap on their own, independent of this flag.
+    mailmap: Option<&'a Mailmap>,
 }
 
 /// Render one commit's header in the selected format. Built-in formats end with
@@ -2868,7 +3186,7 @@ fn render_entry(
 
     match pretty {
         Pretty::Oneline => {
-            out.extend_from_slice(id.as_bytes());
+            write_commit_name(out, b"", &id, ctx);
             out.extend_from_slice(&ctx.extra);
             write_source(out, ctx);
             // `--decorate`: ` (HEAD -> main, tag: v1)` between the hash and subject.
@@ -2904,9 +3222,8 @@ fn render_entry(
         Pretty::Raw => {
             let author = commit.author()?;
             let committer = commit.committer()?;
-            out.extend_from_slice(b"commit ");
             // Raw always shows the full commit id; `--parents` still decorates it.
-            out.extend_from_slice(commit.id().to_string().as_bytes());
+            write_commit_name(out, b"commit ", &commit.id().to_string(), ctx);
             out.extend_from_slice(&ctx.extra);
             write_source(out, ctx);
             out.push(b'\n');
@@ -2922,8 +3239,7 @@ fn render_entry(
         }
         Pretty::Medium | Pretty::Short | Pretty::Full | Pretty::Fuller => {
             let author = commit.author()?;
-            out.extend_from_slice(b"commit ");
-            out.extend_from_slice(id.as_bytes());
+            write_commit_name(out, b"commit ", &id, ctx);
             out.extend_from_slice(&ctx.extra);
             write_source(out, ctx);
             // `--decorate`: ` (HEAD -> main, tag: v1)` after the commit id.
@@ -2955,13 +3271,13 @@ fn render_entry(
                     let committer = commit.committer()?;
                     let at = author.time()?;
                     let ct = committer.time()?;
-                    write_person(out, b"Author:     ", &author);
+                    write_person(out, b"Author:     ", &author, ctx.mailmap);
                     writeln!(
                         out,
                         "AuthorDate: {}",
                         fmt_time(at.seconds, at.offset, ctx.date_mode, ctx.now)
                     )?;
-                    write_person(out, b"Commit:     ", &committer);
+                    write_person(out, b"Commit:     ", &committer, ctx.mailmap);
                     writeln!(
                         out,
                         "CommitDate: {}",
@@ -2970,12 +3286,12 @@ fn render_entry(
                 }
                 Pretty::Full => {
                     let committer = commit.committer()?;
-                    write_person(out, b"Author: ", &author);
-                    write_person(out, b"Commit: ", &committer);
+                    write_person(out, b"Author: ", &author, ctx.mailmap);
+                    write_person(out, b"Commit: ", &committer, ctx.mailmap);
                 }
                 _ => {
                     // medium / short
-                    write_person(out, b"Author: ", &author);
+                    write_person(out, b"Author: ", &author, ctx.mailmap);
                     if matches!(pretty, Pretty::Medium) {
                         let time = author.time()?;
                         writeln!(
@@ -3011,13 +3327,115 @@ fn write_source(out: &mut Vec<u8>, ctx: &RenderCtx<'_>) {
     }
 }
 
-/// Write git's `<label> <name> <<email>>` header line.
-fn write_person(out: &mut Vec<u8>, label: &[u8], sig: &gix::actor::SignatureRef<'_>) {
+/// Write git's `<label> <name> <<email>>` header line, mapped through the
+/// mailmap when `--use-mailmap` / `log.mailmap` supplied one — git's
+/// `pp_user_info`, which is the single place the built-in formats resolve an
+/// identity.
+pub(crate) fn write_person(
+    out: &mut Vec<u8>,
+    label: &[u8],
+    sig: &gix::actor::SignatureRef<'_>,
+    mailmap: Option<&Mailmap>,
+) {
+    let (mut name, mut email): (&[u8], &[u8]) = (sig.name, sig.email);
+    if let Some(info) = mailmap.and_then(|m| m.lookup(name, email)) {
+        if let Some(e) = &info.email {
+            email = e;
+        }
+        if let Some(n) = &info.name {
+            name = n;
+        }
+    }
     out.extend_from_slice(label);
-    out.extend_from_slice(sig.name);
+    out.extend_from_slice(name);
     out.extend_from_slice(b" <");
-    out.extend_from_slice(sig.email);
+    out.extend_from_slice(email);
     out.extend_from_slice(b">\n");
+}
+
+/// git's mailmap lookup structure (`mailmap.c`), built from the entries
+/// gitoxide parsed out of the repository's mailmap sources.
+///
+/// `gix_mailmap::Snapshot::resolve` cannot be used directly: it also normalizes
+/// the *case* of the address to the mailmap's spelling, even for an entry that
+/// only renames the author. git leaves the address exactly as the commit
+/// recorded it there, so `Renamed Nick <NICK@X.com>` keeps its capitals. Only
+/// the lookup is reimplemented here; finding, reading and parsing the mailmap
+/// files is still gitoxide's (`Repository::open_mailmap`).
+#[derive(Default)]
+pub(crate) struct Mailmap {
+    /// Keyed by the ASCII-lowercased old email, which is how git's `strcasecmp`
+    /// comparison behaves.
+    by_email: HashMap<Vec<u8>, MailmapEmail>,
+}
+
+/// All entries sharing one commit email — git's `struct mailmap_entry`.
+#[derive(Default)]
+struct MailmapEmail {
+    /// The mapping used when no `<old-name>` qualifier matched.
+    simple: MailmapInfo,
+    /// Name-qualified mappings, keyed by the ASCII-lowercased old name.
+    by_name: HashMap<Vec<u8>, MailmapInfo>,
+}
+
+/// The replacement name and/or email a matched entry supplies — git's
+/// `struct mailmap_info`. An entry with neither is "no match".
+#[derive(Default)]
+pub(crate) struct MailmapInfo {
+    name: Option<Vec<u8>>,
+    email: Option<Vec<u8>>,
+}
+
+impl Mailmap {
+    /// Load every mailmap source gitoxide knows about (worktree `.mailmap`, then
+    /// `mailmap.blob`, then `mailmap.file`) and index it git's way.
+    pub(crate) fn load(repo: &gix::Repository) -> Mailmap {
+        let snapshot = repo.open_mailmap();
+        let mut map = Mailmap::default();
+        // git's `add_mapping`: a name-qualified line owns its own sub-entry, an
+        // unqualified line overrides only the fields it carries.
+        for entry in snapshot.entries() {
+            let slot = map.by_email.entry(lower_ascii(entry.old_email())).or_default();
+            match entry.old_name() {
+                None => {
+                    if let Some(n) = entry.new_name() {
+                        slot.simple.name = Some(n.to_vec());
+                    }
+                    if let Some(e) = entry.new_email() {
+                        slot.simple.email = Some(e.to_vec());
+                    }
+                }
+                Some(old_name) => {
+                    slot.by_name.insert(
+                        lower_ascii(old_name),
+                        MailmapInfo {
+                            name: entry.new_name().map(|n| n.to_vec()),
+                            email: entry.new_email().map(|e| e.to_vec()),
+                        },
+                    );
+                }
+            }
+        }
+        map
+    }
+
+    /// git's `map_user`: find the email, then prefer a name-qualified sub-entry
+    /// when one matches, else fall back to the unqualified mapping.
+    fn lookup(&self, name: &[u8], email: &[u8]) -> Option<&MailmapInfo> {
+        let slot = self.by_email.get(&lower_ascii(email))?;
+        let info = if slot.by_name.is_empty() {
+            &slot.simple
+        } else {
+            slot.by_name.get(&lower_ascii(name)).unwrap_or(&slot.simple)
+        };
+        (info.name.is_some() || info.email.is_some()).then_some(info)
+    }
+}
+
+/// The ASCII-lowercased lookup key for a mailmap email or name, matching the
+/// `strcasecmp` git compares them with.
+fn lower_ascii(s: &[u8]) -> Vec<u8> {
+    s.iter().map(u8::to_ascii_lowercase).collect()
 }
 
 /// Write a raw-format identity line: `<role> <name> <<email>> <seconds> +ZZZZ`.

@@ -42,6 +42,15 @@
 //!   * `git tag -a|-m|-F …`            → create an annotated tag object.
 //!   * `git tag --cleanup=<mode>`      → `verbatim`/`whitespace`/`strip` message
 //!                                       cleanup for `-m`/`-F`.
+//!   * `git tag --trailer <tok>[(=|:)<val>]…` → append/merge trailers into the tag
+//!                                       message before `--cleanup` runs, through
+//!                                       the very engine `git interpret-trailers`
+//!                                       drives (with `--no-divider`, so a `---`
+//!                                       line in the body never ends it). Honors
+//!                                       every `trailer.*` config key that command
+//!                                       does, and implies an annotated tag.
+//!                                       `--no-trailer` drops the trailers gathered
+//!                                       so far.
 //!   * `git tag -f …`                  → force, printing the `Updated tag` line.
 //!   * `git tag --create-reflog …`     → force-create the tag's reflog, writing git's
 //!                                       `tag: tagging <abbrev> (<subject>, <date>)` line.
@@ -51,12 +60,17 @@
 //! Exit codes follow git: fatal errors exit 128, a bad object name for a filter
 //! exits 129, and a failed delete exits 1.
 //!
+//! Config read here: the multi-valued `tag.sort` (default listing order), and the
+//! two signing switches `tag.gpgSign` / `tag.forceSignAnnotated` — both of which
+//! ask for a GPG-signed tag object, so they are honored by refusing exactly as an
+//! explicit `-s` does rather than by quietly writing an unsigned tag.
+//!
 //! Genuinely not backed here, and refused rather than faked: cryptographic
-//! signing (`-s`, `-u`) and verification (`-v`), an editor-supplied message (`-a`
-//! with neither `-m` nor `-F`, `-e`), forced ANSI color (`--color`/`--color=always`),
-//! custom trailers (`--trailer`), the git gecos identity fallback, and `--format`
-//! atoms outside the set handled by [`render_atom`] (`align`, `describe`,
-//! `upstream`, relative/custom dates, …).
+//! signing (`-s`, `-u`, `tag.gpgSign`, `tag.forceSignAnnotated`) and verification
+//! (`-v`), an editor-supplied message (`-a` with neither `-m` nor `-F`, `-e`),
+//! forced ANSI color (`--color`/`--color=always`), the git gecos identity
+//! fallback, and `--format` atoms outside the set handled by [`render_atom`]
+//! (`align`, `describe`, `upstream`, relative/custom dates, …).
 
 use anyhow::{anyhow, bail, Result};
 use std::cmp::Ordering;
@@ -156,6 +170,9 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     let mut cleanup: Option<String> = None;
     let mut messages: Vec<Vec<u8>> = Vec::new();
     let mut message_file: Option<String> = None;
+    // `--trailer` arguments in command-line order; git keeps them in a `strvec`
+    // and hands the whole list to the trailer engine once the message is final.
+    let mut trailers: Vec<String> = Vec::new();
     let mut positionals: Vec<&str> = Vec::new();
     let mut operands_only = false;
 
@@ -207,6 +224,8 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             // OPT_FILENAME / OPT_STRING negations do (each sets its target back to
             // NULL when unset).
             "--no-file" => message_file = None,
+            // git's `OPT_STRVEC` unset empties the accumulated trailer list.
+            "--no-trailer" => trailers.clear(),
             "--no-format" => format = None,
             "--no-cleanup" => cleanup = None,
             // git's `points-at` is a `parse_opt_object_name` callback whose unset
@@ -268,6 +287,10 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                     merged = Some(rest.to_string());
                 } else if let Some(rest) = a.strip_prefix("--no-merged=") {
                     no_merged = Some(rest.to_string());
+                } else if let Some(rest) = a.strip_prefix("--trailer=") {
+                    trailers.push(rest.to_string());
+                } else if a == "--trailer" {
+                    trailers.push(take_value(args, &mut i, "trailer")?.to_string());
                 } else if let Some(rest) = a.strip_prefix("--message=") {
                     messages.push(rest.as_bytes().to_vec());
                 } else if a == "--message" || a == "-m" {
@@ -428,7 +451,27 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         );
     }
 
-    let annotate = annotate || !messages.is_empty() || message_file.is_some();
+    // git's `create_tag_object`: anything that fills a message body — `-a`, `-m`,
+    // `-F` or `--trailer` — turns the lightweight ref into a real tag object.
+    let annotate_given = annotate;
+    let annotate = annotate || !messages.is_empty() || message_file.is_some() || !trailers.is_empty();
+
+    // Both signing config keys ask for a GPG-signed tag object. `tag.gpgSign`
+    // sets `opt.sign` before options are parsed (so it also implies `annotate`);
+    // `tag.forceSignAnnotated` signs a tag object only when `-a` was *not* spelled
+    // out. Neither can be honored without a signing implementation, so they take
+    // the same refusal an explicit `-s` gets rather than silently producing an
+    // unsigned tag.
+    if repo.config_snapshot().boolean("tag.gpgSign") == Some(true) {
+        bail!("signed tags (tag.gpgSign) are not supported")
+    }
+    if annotate
+        && !annotate_given
+        && repo.config_snapshot().boolean("tag.forceSignAnnotated") == Some(true)
+    {
+        bail!("signed tags (tag.forceSignAnnotated) are not supported")
+    }
+
     create_tag(
         &repo,
         &positionals,
@@ -437,6 +480,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         &messages,
         message_file.as_deref(),
         cleanup.as_deref(),
+        &trailers,
         create_reflog,
     )
 }
@@ -1596,6 +1640,7 @@ fn create_tag(
     messages: &[Vec<u8>],
     message_file: Option<&str>,
     cleanup: Option<&str>,
+    trailers: &[String],
     create_reflog: bool,
 ) -> Result<ExitCode> {
     if positionals.len() > 2 {
@@ -1652,6 +1697,14 @@ fn create_tag(
                 _ => join_messages(messages),
             },
         };
+        // git amends the message with `--trailer`s first and only then runs
+        // `--cleanup`, so a trailer's own trailing whitespace and the blank lines
+        // the trailer engine leaves behind are stripped exactly like body text —
+        // and `--cleanup=verbatim` (git's `CLEANUP_NONE`) keeps both verbatim.
+        let raw = match amend_with_trailers(repo, raw, trailers)? {
+            Some(amended) => amended,
+            None => return Ok(ExitCode::from(128)),
+        };
         let message = match mode {
             CleanupMode::Verbatim => raw,
             // `whitespace` and `strip` coincide for `-m`/`-F` input (no comment
@@ -1669,9 +1722,25 @@ fn create_tag(
             })??
             .to_owned()?;
 
+        let target_kind = repo.find_header(target)?.kind();
+        // `create_tag` (builtin/tag.c) warns when the object being tagged is
+        // itself a tag, naming the user's own `<object>` argument so the
+        // suggested command is a copy-paste fix. Lightweight tags never reach
+        // `create_tag`, so they are silent, and the hint precedes the ref update.
+        if target_kind == Kind::Tag {
+            crate::advice::Advice::NestedTag.advise_in(
+                repo,
+                &format!(
+                    "You have created a nested tag. The object referred to by your new tag is\n\
+                     already a tag. If you meant to tag the object that it points to, use:\n\
+                     \n\
+                     \tgit tag -f {name} {spec}^{{}}"
+                ),
+            );
+        }
         let object = gix::objs::Tag {
             target,
-            target_kind: repo.find_header(target)?.kind(),
+            target_kind,
             name: BString::from(name.as_bytes().to_vec()),
             tagger: Some(tagger),
             message: BString::from(message),
@@ -1716,6 +1785,96 @@ fn create_tag(
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Port of `validate_trailer_args()` (trailer.c). Before any trailer is applied
+/// git checks each `--trailer` argument for two things: it must be non-empty, and
+/// `find_separator()` must not land on offset 0. The latter happens exactly when
+/// the argument's first byte is itself a separator (`find_separator` returns the
+/// index of the first separator byte it meets, so 0 is reachable only from byte
+/// 0), which leaves no key in front of it. git's separator set here is `=` plus
+/// `trailer.separators` (default `:`). Returns git's `error:` text for the first
+/// offending argument.
+fn validate_trailer_args(repo: &gix::Repository, trailers: &[String]) -> Option<String> {
+    let configured = repo
+        .config_snapshot()
+        .string("trailer.separators")
+        .map(|v| v.to_vec());
+    let mut separators: Vec<u8> = vec![b'='];
+    separators.extend_from_slice(configured.as_deref().unwrap_or(b":"));
+
+    for t in trailers {
+        let Some(&first) = t.as_bytes().first() else {
+            return Some("empty --trailer argument".to_string());
+        };
+        if separators.contains(&first) {
+            return Some(format!(
+                "invalid trailer '{t}': missing key before separator"
+            ));
+        }
+    }
+    None
+}
+
+/// Port of `amend_file_with_trailers()` (trailer.c) — the helper `git tag` and
+/// `git commit` share for `--trailer`. git validates the arguments, then runs the
+/// finished message through the trailer engine with `--no-divider` set, so a
+/// `---` line in the body never ends the log message. A failure of either step is
+/// reported as `fatal: unable to pass trailers to --trailers` and no tag object
+/// is written.
+///
+/// The message round-trips through `$GIT_DIR/TAG_EDITMSG` — the same file git
+/// writes and unlinks — because that lets this port hand the work to its own
+/// [`super::interpret_trailers`] implementation unchanged: same engine, same
+/// `trailer.*` configuration, no second copy of the trailer rules. `Ok(None)`
+/// means the diagnostics were printed already.
+fn amend_with_trailers(
+    repo: &gix::Repository,
+    message: Vec<u8>,
+    trailers: &[String],
+) -> Result<Option<Vec<u8>>> {
+    if trailers.is_empty() {
+        return Ok(Some(message));
+    }
+    if let Some(err) = validate_trailer_args(repo, trailers) {
+        eprintln!("error: {err}");
+        eprintln!("fatal: unable to pass trailers to --trailers");
+        return Ok(None);
+    }
+
+    let path = repo.git_dir().join("TAG_EDITMSG");
+    std::fs::write(&path, &message)
+        .map_err(|e| anyhow!("could not write '{}': {e}", path.display()))?;
+
+    let mut argv = vec![
+        "--in-place".to_string(),
+        "--no-divider".to_string(),
+        path.to_string_lossy().into_owned(),
+    ];
+    for t in trailers {
+        argv.push("--trailer".to_string());
+        argv.push(t.clone());
+    }
+    // The argument vector is built here and already validated, so the engine's
+    // remaining failure modes are unreadable `trailer.*` config and I/O on the
+    // file just written — both surface as `Err`.
+    let outcome = super::interpret_trailers::interpret_trailers(&argv);
+    let amended = std::fs::read(&path);
+    let _ = std::fs::remove_file(&path);
+
+    if let Err(e) = outcome {
+        eprintln!("error: {e}");
+        eprintln!("fatal: unable to pass trailers to --trailers");
+        return Ok(None);
+    }
+    match amended {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) => {
+            eprintln!("error: could not read '{}': {e}", path.display());
+            eprintln!("fatal: unable to pass trailers to --trailers");
+            Ok(None)
+        }
+    }
 }
 
 /// Message cleanup modes accepted for `-m`/`-F`.

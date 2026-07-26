@@ -57,6 +57,224 @@ const USAGE: &str = concat!(
 const NOT_COMMITTED_NAME: &[u8] = b"Not Committed Yet";
 const NOT_COMMITTED_MAIL: &[u8] = b"not.committed.yet";
 
+/// git's reset sequence — `ESC [ m`, not `ESC [ 0 m` (`GIT_COLOR_RESET`).
+const COLOR_RESET: &str = "\x1b[m";
+
+/// `GIT_COLOR_CYAN`, the built-in fallback for `color.blame.repeatedLines`.
+const COLOR_CYAN: &str = "\x1b[36m";
+
+/// git's `setup_default_color_by_age()` seed for the heat table.
+const DEFAULT_COLOR_BY_AGE: &str = "blue,12 month ago,white,1 month ago,red";
+
+/// Blame's two coloring modes, resolved from `blame.coloring`, `color.blame.*`
+/// and the command line — git's `OUTPUT_COLOR_LINE` / `OUTPUT_SHOW_AGE_WITH_COLOR`
+/// bits plus the `repeated_meta_color` / `colorfield` globals of
+/// `builtin/blame.c`.
+///
+/// Note that blame colors unconditionally: unlike `git status` or `git diff` it
+/// never consults `color.ui` / `want_color()`, so the SGR sequences appear even
+/// when stdout is a pipe (verified against git 2.55.0).
+struct BlameColors {
+    /// `--color-lines` / `blame.coloring=repeatedLines`.
+    color_lines: bool,
+    /// `--color-by-age` / `blame.coloring=highlightRecent`.
+    color_by_age: bool,
+    /// `blame.coloring`'s contribution, applied only when the command line left
+    /// both bits clear.
+    config_lines: bool,
+    /// `blame.coloring`'s contribution for the age mode.
+    config_age: bool,
+    /// `color.blame.repeatedLines`, empty when unset or unparseable.
+    repeated: String,
+    /// git's `colorfield`: `(hop, sgr)` in table order, the last entry carrying
+    /// `i64::MAX` so it always matches.
+    heat: Vec<(i64, String)>,
+}
+
+impl BlameColors {
+    /// Read the coloring configuration exactly as `git_blame_config` does.
+    ///
+    /// A `color.blame.highlightRecent` git rejects is fatal (128) here as it is
+    /// there; a `color.blame.repeatedLines` it rejects only warns and leaves the
+    /// built-in cyan in place; an unknown `blame.coloring` only warns.
+    fn from_config(repo: &gix::Repository) -> Result<Self, ExitCode> {
+        let snapshot = repo.config_snapshot();
+
+        // `setup_default_color_by_age()` runs before the config callback, so a
+        // repository without `color.blame.highlightRecent` gets git's table.
+        let mut heat = match parse_color_fields(DEFAULT_COLOR_BY_AGE) {
+            ColorFields::Ok(fields) => fields,
+            ColorFields::Fatal(code) => return Err(code),
+        };
+        if let Some(value) = snapshot.string("color.blame.highlightRecent") {
+            match parse_color_fields(&value.to_str_lossy()) {
+                ColorFields::Ok(fields) => heat = fields,
+                ColorFields::Fatal(code) => return Err(code),
+            }
+        }
+
+        // `color_parse_mem` failing leaves `repeated_meta_color` untouched (so
+        // the cyan default below still applies) after two diagnostics.
+        let repeated = match snapshot.string("color.blame.repeatedLines") {
+            Some(value) => {
+                let spec = value.to_str_lossy().into_owned();
+                match super::color::parse_color_spec(&spec) {
+                    Some(sgr) => sgr,
+                    None => {
+                        eprintln!("error: invalid color value: {spec}");
+                        eprintln!(
+                            "warning: invalid value for 'color.blame.repeatedLines': '{spec}'"
+                        );
+                        String::new()
+                    }
+                }
+            }
+            None => String::new(),
+        };
+
+        // `blame.coloring` ORs into `coloring_mode`; `none` clears both bits. The
+        // config callback sees every occurrence in file order, so all values are
+        // folded in rather than just the last one.
+        let (mut config_lines, mut config_age) = (false, false);
+        for value in snapshot
+            .plumbing()
+            .strings("blame.coloring")
+            .unwrap_or_default()
+            .iter()
+            .map(|v| v.to_str_lossy().into_owned())
+        {
+            match value.as_str() {
+                "repeatedLines" => config_lines = true,
+                "highlightRecent" => config_age = true,
+                "none" => {
+                    config_lines = false;
+                    config_age = false;
+                }
+                other => eprintln!("warning: invalid value for 'blame.coloring': '{other}'"),
+            }
+        }
+
+        Ok(BlameColors {
+            color_lines: false,
+            color_by_age: false,
+            config_lines,
+            config_age,
+            repeated,
+            heat,
+        })
+    }
+
+    /// cmd_blame's final coloring decision, taken between `blame_coalesce()` and
+    /// `output()`:
+    ///   * `blame.coloring` only applies when *neither* bit is set — so
+    ///     `--no-color-lines` clears the bit and thereby re-enables the config
+    ///     value, which stock git does too;
+    ///   * an unset `color.blame.repeatedLines` falls back to cyan, but only when
+    ///     line coloring is on and the format is not porcelain;
+    ///   * the annotate-compat format (`-c`) clears both bits last.
+    fn apply_command_line(&mut self, opts: &Options) {
+        self.color_lines = opts.color_lines;
+        self.color_by_age = opts.color_by_age;
+        if !self.color_lines && !self.color_by_age {
+            self.color_lines = self.config_lines;
+            self.color_by_age = self.config_age;
+        }
+        if !opts.porcelain && self.repeated.is_empty() && self.color_lines {
+            self.repeated = COLOR_CYAN.to_string();
+        }
+        if opts.annotate_compat {
+            self.color_lines = false;
+            self.color_by_age = false;
+        }
+    }
+
+    /// git's `determine_line_heat`: the first bucket whose hop is not older than
+    /// the author time wins, and the sentinel bucket catches everything newer.
+    fn heat_for(&self, author_time: i64) -> &str {
+        let mut i = 0;
+        while i + 1 < self.heat.len() && author_time > self.heat[i].0 {
+            i += 1;
+        }
+        &self.heat[i].1
+    }
+
+    /// The `(color, reset)` pair `emit_other` would put around the metadata of
+    /// the `cnt`-th line of a blame entry authored at `author_time`.
+    fn for_line(&self, cnt: usize, author_time: i64) -> (Option<&str>, Option<&str>) {
+        let default_color = self.color_by_age.then(|| self.heat_for(author_time));
+        let (mut color, mut reset) = match default_color {
+            Some(c) => (Some(c), Some(COLOR_RESET)),
+            None => (None, None),
+        };
+        if self.color_lines {
+            if cnt > 0 {
+                color = Some(self.repeated.as_str());
+                reset = Some(COLOR_RESET);
+            } else {
+                color = default_color;
+                reset = default_color.map(|_| COLOR_RESET);
+            }
+        }
+        (color, reset)
+    }
+}
+
+/// The outcome of parsing a `color.blame.highlightRecent` value.
+enum ColorFields {
+    Ok(Vec<(i64, String)>),
+    /// git already reported the failure; return this status (128).
+    Fatal(ExitCode),
+}
+
+/// git's `parse_color_fields` (`builtin/blame.c`): a comma-separated list that
+/// alternates color, date, color, date, …, and must end on a color. Each date is
+/// an approxidate "hop"; the trailing color is stored with `TIME_MAX` so the
+/// lookup always terminates. Items are used verbatim — git splits on `,` without
+/// trimming, and its color parser skips the leading blanks itself.
+fn parse_color_fields(spec: &str) -> ColorFields {
+    let mut fields: Vec<(i64, String)> = Vec::new();
+    let mut pending = String::new();
+    // git's `next`, seeded to EXPECT_COLOR.
+    let mut expect_color = true;
+    for item in spec.split(',') {
+        if expect_color {
+            match super::color::parse_color_spec(item) {
+                Some(sgr) => pending = sgr,
+                None => {
+                    eprintln!("error: invalid color value: {item}");
+                    eprintln!("fatal: expecting a color: {item}");
+                    return ColorFields::Fatal(ExitCode::from(128));
+                }
+            }
+        } else {
+            fields.push((approxidate(item), std::mem::take(&mut pending)));
+        }
+        expect_color = !expect_color;
+    }
+    // Ending on a date leaves git expecting a color, which it refuses to invent.
+    if expect_color {
+        eprintln!("fatal: must end with a color");
+        return ColorFields::Fatal(ExitCode::from(128));
+    }
+    fields.push((i64::MAX, pending));
+    ColorFields::Ok(fields)
+}
+
+/// git's approxidate, as `parse_color_fields` uses it for each heat threshold:
+/// an absolute or relative date resolved against `GIT_TEST_DATE_NOW`/now, with
+/// an unparseable value falling back to now — the same rule `log`'s
+/// `--since`/`--until` handling follows.
+fn approxidate(value: &str) -> i64 {
+    let now_s = crate::date::now_seconds();
+    if value.trim() == "now" {
+        return now_s;
+    }
+    let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now_s.max(0) as u64);
+    gix::date::parse(value, Some(now))
+        .map(|t| t.seconds)
+        .unwrap_or(now_s)
+}
+
 /// `git blame` — line-by-line last-modifying commit, backed by `gix-blame`.
 ///
 /// Implemented invocation forms, reproducing stock `git blame` byte for byte:
@@ -77,23 +295,47 @@ const NOT_COMMITTED_MAIL: &[u8] = b"not.committed.yet";
 /// (roots) are prefixed with `^` as git does.
 ///
 /// Also implemented: `-b`, `--root`, `-t`, `-c` (annotate-compat), `-l`,
-/// `--contents <file>` (and `--contents -` from stdin), `--diff-algorithm`, and
-/// `--date=relative`.
+/// `--contents <file>` (and `--contents -` from stdin), `--diff-algorithm`,
+/// `-w`, `--date=relative`, `--color-lines`, `--color-by-age` and
+/// `--progress`/`--no-progress`.
+///
+/// Coloring follows `builtin/blame.c` exactly: `blame.coloring` supplies the
+/// default mode when neither color option is given, `color.blame.repeatedLines`
+/// (default cyan) paints the metadata of every line after the first in an entry,
+/// and `color.blame.highlightRecent` (default
+/// `blue,12 month ago,white,1 month ago,red`) buckets lines by author date.
+/// Blame never consults `color.ui`, so the sequences are emitted even into a
+/// pipe, and the porcelain and annotate-compat formats are never colored.
 ///
 /// The `--[no-]` negation forms git advertises are honored with git's exact
 /// bit-clearing semantics: `--no-show-name`, `--no-show-number`, `--no-porcelain`
 /// (clears the porcelain bit only), `--no-line-porcelain` (clears both porcelain
 /// bits, so it also cancels a preceding `-p`), and `--no-abbrev` (equivalent to
 /// `--abbrev=0`, i.e. the full hash). The `--no-` forms of the unimplemented
-/// options (`--no-incremental`, `--no-show-stats`, `--no-progress`,
-/// `--no-score-debug`, `--no-color-lines`, `--no-color-by-age`,
+/// options (`--no-incremental`, `--no-show-stats`, `--no-score-debug`,
 /// `--no-ignore-rev`, `--no-ignore-revs-file`) each select git's default, which
 /// this port already produces, so they are accepted as no-ops.
 ///
-/// Flags that are not implemented (`--incremental`, `-M`/`-C` line-move
-/// detection, `--reverse`, `-w`, `--ignore-rev`, `--ignore-revs-file`, `-S`,
-/// regex/function `-L` forms, `--date=human`, the `-local` date variants, …)
-/// are rejected with a terse message rather than emitting wrong output.
+/// Flags that are not implemented are rejected with a terse message rather than
+/// emitting wrong output, each for a concrete reason:
+///   * `--incremental` — git streams *uncoalesced* entries in walk order
+///     (`blame_coalesce()` runs afterwards), while `gix-blame` only exposes the
+///     coalesced attribution, so the entry list would differ.
+///   * `--show-stats` — the counters are git's own walk instrumentation
+///     (`num_read_blob` / `num_get_patch` / `num_commits`); `gix-blame` counts
+///     different events and cannot be mapped onto them.
+///   * `--score-debug` — the second column is `ent->suspect->refcnt`, the live
+///     reference count of git's `blame_origin` graph, which depends on which
+///     origins the walk kept alive rather than on the attribution itself.
+///   * `-M` / `-C` — line move/copy detection happens inside the walk
+///     (`find_move_in_parent` / `find_copy_in_parent`), which `gix-blame` has no
+///     hook for.
+///   * `--ignore-rev` / `--ignore-revs-file` — re-attributing a line off an
+///     ignored commit is `guess_line_blames()`, another walk-level heuristic.
+///   * `-S <revs-file>` — installs commit grafts that rewrite the ancestry the
+///     walk follows.
+///   * `--reverse`, regex/function `-L` forms, `--date=human` and the `-local`
+///     date variants.
 pub fn blame(args: &[String]) -> Result<ExitCode> {
     let mut repo = gix::discover(".")?;
     // Object-heavy path: give gix the caches it does not enable by default —
@@ -126,12 +368,41 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         None => DateMode::Iso8601,
     };
 
+    // git's `setup_default_color_by_age()` and the three coloring config keys,
+    // all read by `git_blame_config` *before* `parse_options` runs — so a
+    // malformed `color.blame.highlightRecent` is fatal even when the command
+    // line also has an unknown option (verified against git 2.55.0).
+    let mut colors = match BlameColors::from_config(&repo) {
+        Ok(c) => c,
+        Err(code) => return Ok(code),
+    };
+
     let mut opts = Options::parse(
         args,
         show_email_default,
         show_root_default,
         blank_boundary_default,
     )?;
+
+    // git's `--progress` handling, run straight after `parse_options` and before
+    // any path or revision is resolved: the machine formats refuse it outright,
+    // and otherwise an unspecified value means `isatty(2)`.
+    let show_progress = if opts.porcelain {
+        if opts.show_progress == Some(true) {
+            let mut err = std::io::stderr().lock();
+            writeln!(
+                err,
+                "fatal: --progress can't be used with --incremental or porcelain formats"
+            )?;
+            err.flush()?;
+            return Ok(ExitCode::from(128));
+        }
+        false
+    } else {
+        opts.show_progress
+            .unwrap_or_else(|| std::io::stderr().is_terminal())
+    };
+    let progress_started = std::time::Instant::now();
 
     // `--date=<mode>` overrides blame.date; git validates it the same way.
     opts.date_mode = match opts.date_arg.take() {
@@ -269,9 +540,16 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // git's `stop_progress()`, which sits between `assign_blame` and `output`.
+    finish_progress(show_progress, progress_started, lines.len())?;
+
     if lines.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }
+
+    // cmd_blame folds `blame.coloring` in only when neither color bit survived
+    // argument parsing, then clears both bits for the annotate-compat format.
+    colors.apply_command_line(&opts);
 
     let null_id = ObjectId::null(repo.object_hash());
     let info = collect_commit_info(&repo, &lines, &opts, &null_id, &rel_path)?;
@@ -279,8 +557,43 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     if opts.porcelain {
         emit_porcelain(&repo, &lines, &info, &rel_path, head_id, &null_id, &opts)
     } else {
-        emit_human(&repo, &lines, &info, &rel_path, &opts)
+        emit_human(&repo, &lines, &info, &rel_path, &opts, &colors)
     }
+}
+
+/// git's delayed "Blaming lines" progress meter (`start_delayed_progress` /
+/// `stop_progress`), reported on stderr.
+///
+/// git only starts displaying once the meter has outlived `GIT_PROGRESS_DELAY`
+/// (default 2) one-second ticks, and `stop_progress` prints nothing at all when
+/// it never started — which is every blame that finishes promptly, so the common
+/// case is reproduced exactly (verified: stock git writes 0 bytes to stderr for
+/// `blame --progress` on a small file).
+///
+/// The per-entry ticks git emits once the meter *has* started come from its
+/// `found_guilty_entry` callback, which fires as the history walk assigns blame.
+/// `gix-blame` computes the whole attribution in one call and exposes no such
+/// hook, so a long blame prints the final `100% (n/n), done.` line without the
+/// intermediate `\r`-terminated updates. stdout is unaffected either way.
+fn finish_progress(
+    show_progress: bool,
+    started: std::time::Instant,
+    num_lines: usize,
+) -> Result<()> {
+    if !show_progress {
+        return Ok(());
+    }
+    let delay = std::env::var("GIT_PROGRESS_DELAY")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2);
+    if started.elapsed() < std::time::Duration::from_secs(delay) {
+        return Ok(());
+    }
+    let mut err = std::io::stderr().lock();
+    writeln!(err, "Blaming lines: 100% ({num_lines}/{num_lines}), done.")?;
+    err.flush()?;
+    Ok(())
 }
 
 /// Run-length encode an attribution: consecutive lines from the same commit,
@@ -681,11 +994,22 @@ fn emit_human(
     info: &HashMap<ObjectId, CommitInfo>,
     rel_path: &str,
     opts: &Options,
+    colors: &BlameColors,
 ) -> Result<ExitCode> {
     let name_width = object_name_width(repo, opts);
 
     if opts.annotate_compat {
         return emit_annotate_compat(lines, info, name_width, opts);
+    }
+
+    // `emit_other` colors per blame entry: `cnt` counts lines within the entry,
+    // and only `cnt > 0` takes the repeated-metadata color. The entries are the
+    // coalesced groups the porcelain format also emits.
+    let mut cnt_in_entry: Vec<usize> = vec![0; lines.len()];
+    for group in group_lines(lines) {
+        for k in 0..group.len {
+            cnt_in_entry[group.start + k] = k;
+        }
     }
 
     let show_file = opts.show_name || lines.iter().any(|l| l.source_name.is_some());
@@ -715,9 +1039,16 @@ fn emit_human(
     let mut out = std::io::BufWriter::new(stdout.lock());
     let mut buf: Vec<u8> = Vec::with_capacity(128);
 
-    for line in lines {
+    for (idx, line) in lines.iter().enumerate() {
         let ci = &info[&line.commit_id];
         buf.clear();
+
+        // The color prefix wraps the whole metadata block, boundary marker
+        // included, and the reset lands after the `") "` that ends it.
+        let (color, reset) = colors.for_line(cnt_in_entry[idx], ci.author_time);
+        if let Some(color) = color {
+            buf.extend_from_slice(color.as_bytes());
+        }
 
         // Object name (boundary `^` marker, `-b` blanking).
         emit_object_name(&mut buf, ci, name_width, opts);
@@ -762,6 +1093,9 @@ fn emit_human(
         pad(&mut buf, w_line.saturating_sub(s.len()));
         buf.extend_from_slice(s.as_bytes());
         buf.extend_from_slice(b") ");
+        if let Some(reset) = reset {
+            buf.extend_from_slice(reset.as_bytes());
+        }
         buf.extend_from_slice(&line.content);
         buf.push(b'\n');
 
@@ -1338,6 +1672,14 @@ struct Options {
     raw_timestamp: bool,
     /// `-c`: git-annotate-compatible output format.
     annotate_compat: bool,
+    /// `--color-lines` (git's `OUTPUT_COLOR_LINE`): color the metadata of every
+    /// line after the first in a blame entry.
+    color_lines: bool,
+    /// `--color-by-age` (git's `OUTPUT_SHOW_AGE_WITH_COLOR`): color the metadata
+    /// by the author date's bucket in the `color.blame.highlightRecent` table.
+    color_by_age: bool,
+    /// `--progress` / `--no-progress`; `None` is git's default (`isatty(2)`).
+    show_progress: Option<bool>,
     /// `-w`: ignore whitespace differences when diffing revisions.
     ignore_whitespace: bool,
     /// `--diff-algorithm=<algo>`; `None` falls back to `diff.algorithm`.
@@ -1372,6 +1714,9 @@ impl Options {
         let mut show_root = show_root_default;
         let mut raw_timestamp = false;
         let mut annotate_compat = false;
+        let mut color_lines = false;
+        let mut color_by_age = false;
+        let mut show_progress: Option<bool> = None;
         let mut ignore_whitespace = false;
         let mut diff_algorithm: Option<gix::diff::blob::Algorithm> = None;
         let mut contents: Option<String> = None;
@@ -1414,6 +1759,18 @@ impl Options {
                 "-t" => raw_timestamp = true,
                 // `-c` selects git-annotate-compatible output.
                 "-c" => annotate_compat = true,
+                // git declares both color options with `OPT_BIT`, so the `--no-`
+                // form clears the bit — and a cleared bit lets `blame.coloring`
+                // apply again (verified against stock git: `-c blame.coloring=
+                // repeatedLines blame --no-color-lines` is still colored).
+                "--color-lines" => color_lines = true,
+                "--no-color-lines" => color_lines = false,
+                "--color-by-age" => color_by_age = true,
+                "--no-color-by-age" => color_by_age = false,
+                // git's `OPT_BOOL(0, "progress", &show_progress, …)` over a
+                // tri-state seeded to -1: unset means "auto" (`isatty(2)`).
+                "--progress" => show_progress = Some(true),
+                "--no-progress" => show_progress = Some(false),
                 "-w" => ignore_whitespace = true,
                 // git's `--porcelain` and `--line-porcelain` are bit flags on one
                 // field, so `--line-porcelain` wins no matter the order.
@@ -1490,18 +1847,15 @@ impl Options {
                 "--no-abbrev" => abbrev = Some(0),
                 // The `--no-` forms of options whose positive form needs substrate
                 // this port does not have (`--incremental`, `--show-stats`,
-                // `--progress`, `--score-debug`, `--color-lines`, `--color-by-age`,
-                // `--ignore-rev`, `--ignore-revs-file`). Each positive default is
-                // off/empty, so the negated form requests exactly the behavior this
-                // port already produces; stock git emits byte-identical stdout for
-                // them (verified), so they are accepted as no-ops rather than
-                // rejected. The positive forms remain refused below.
+                // `--score-debug`, `--ignore-rev`, `--ignore-revs-file`). Each
+                // positive default is off/empty, so the negated form requests
+                // exactly the behavior this port already produces; stock git emits
+                // byte-identical stdout for them (verified), so they are accepted
+                // as no-ops rather than rejected. The positive forms remain
+                // refused below.
                 "--no-incremental"
                 | "--no-show-stats"
-                | "--no-progress"
                 | "--no-score-debug"
-                | "--no-color-lines"
-                | "--no-color-by-age"
                 | "--no-ignore-rev"
                 | "--no-ignore-revs-file" => {}
                 _ if a.starts_with("-L") => parse_line_range(&a[2..], &mut ranges)?,
@@ -1538,6 +1892,9 @@ impl Options {
             show_root,
             raw_timestamp,
             annotate_compat,
+            color_lines,
+            color_by_age,
+            show_progress,
             ignore_whitespace,
             diff_algorithm,
             contents,

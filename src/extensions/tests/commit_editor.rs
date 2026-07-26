@@ -79,10 +79,33 @@ fn commit_template_seeds_the_message() {
     let tmpl = repo.join("tmpl");
     std::fs::write(&tmpl, "seeded subject\n").unwrap();
     git(&repo, &["config", "commit.template", tmpl.to_str().unwrap()]);
-    // Editor appends nothing — the template alone becomes the message.
-    let out = commit_with_editor(&repo, &home, ":", &[]);
+    // The template seeds the buffer; the editor adds a body, so the recorded
+    // message is the template's subject followed by what was typed.
+    let out = commit_with_editor(
+        &repo,
+        &home,
+        r#"sh -c 'printf "\nbody line\n" >> "$1"' _"#,
+        &[],
+    );
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(subject(&repo), "seeded subject");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn untouched_template_aborts_the_commit() {
+    // git's `template_untouched()`: leaving a `-t`/`commit.template` buffer exactly
+    // as it was handed over aborts rather than recording the template verbatim.
+    let (repo, home) = fixture("untouched");
+    let tmpl = repo.join("tmpl");
+    std::fs::write(&tmpl, "seeded subject\n").unwrap();
+    let out = commit_with_editor(&repo, &home, ":", &["-t", tmpl.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("you did not edit the message"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 

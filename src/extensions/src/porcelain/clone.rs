@@ -2,11 +2,13 @@ use anyhow::{bail, Result};
 use prodash::Root as _;
 use std::io::IsTerminal;
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
+use gix::bstr::ByteSlice;
+use gix::protocol::handshake::Ref;
 use gix::remote::fetch::{Shallow, Tags};
 
 /// `git clone <url> [<directory>]` — clone a repository into a new directory.
@@ -21,27 +23,100 @@ use gix::remote::fetch::{Shallow, Tags};
 ///   * `git clone <url>`             → clone into a directory named after the URL
 ///   * `git clone <url> <directory>` → clone into an explicit directory
 ///   * `git clone --bare <url> [<directory>]`
+///   * `--mirror`                    → bare + `+refs/*:refs/*` + `remote.<name>.mirror`
 ///   * `-o`/`--origin <name>`        → track upstream under `<name>` instead of `origin`
 ///   * `-b`/`--branch <branch>`      → check out `<branch>` instead of the remote's `HEAD`
 ///   * `-n`/`--no-checkout`          → set up refs/`HEAD` but do not populate a worktree
+///   * `-c`/`--config <key>=<value>` → seed the new repository's configuration (repeatable)
+///   * `--single-branch`/`--no-single-branch` → clone one branch, or force the wildcard
 ///   * `--depth <n>`                 → shallow clone truncated to `<n>` commits
 ///   * `--shallow-since <time>`      → shallow boundary at a cutoff date
 ///   * `--shallow-exclude <ref>`     → exclude history reachable from a ref (repeatable)
 ///   * `--no-tags`                   → do not fetch tags
 ///   * `--reject-shallow`            → refuse to clone from a shallow remote
-///   * `--recursive`/`--recurse-submodules[=<pathspec>]` → update submodules after clone
+///   * `--template <dir>`            → seed the new git dir from a template directory
+///   * `--separate-git-dir <dir>`    → real git dir elsewhere + a `gitdir:` link file
+///   * `-s`/`--shared`, `--reference <repo>`, `--reference-if-able <repo>`,
+///     `--dissociate`               → `objects/info/alternates` borrowing
+///   * `--sparse`                    → cone-mode sparse checkout of the top level only
+///   * `--ref-format <format>`       → `files` accepted; `reftable` rejected (see below)
+///   * `--recursive`/`--recurse-submodules[=<pathspec>]` → update submodules after
+///     clone and record `submodule.active`
+///   * `--remote-submodules`         → submodules track their remote branch
+///
+/// `init.defaultSubmodulePathConfig` is honored here as it is in `git init`.
 ///
 /// Progress (remote sideband + local receive/resolve/checkout) is rendered to
 /// stderr like git: shown when stderr is a terminal, forced on with `--progress`,
 /// and suppressed by `-q`/`--quiet` or `--no-progress`.
 /// Any other option is rejected explicitly rather than silently mis-handled.
+///
+/// # Refspec and `HEAD` setup
+///
+/// gitoxide's clone always installs `+refs/heads/*:refs/remotes/<name>/*` (or,
+/// for a shallow clone, the single-branch spec it derives itself) and cannot have
+/// that spec cleared — `Remote::with_refspecs` only appends. The
+/// `configure_remote` hook does hand out the owning `Repository`, though, so the
+/// option combinations that need a *different* refspec build a brand new remote
+/// from that repository and return it in place of gitoxide's. Whatever remote is
+/// returned is what gets fetched with *and* what gets written to
+/// `remote.<name>.*`, which is exactly git's model:
+/// ```text
+///   --mirror              +refs/*:refs/*            (+ `mirror = true`)
+///   --bare                +refs/heads/*:refs/heads/*
+///   --single-branch       +refs/heads/<b>:refs/remotes/<name>/<b>
+///   --no-single-branch    +refs/heads/*:refs/remotes/<name>/*
+/// ```
+/// `--single-branch` resolves `<b>` from the remote's own advertisement (the
+/// branch `HEAD` points at, or the `--branch` argument, which may name a tag and
+/// then maps onto itself) — the same ls-refs round trip git makes.
+///
+/// Two leftovers of gitoxide's clone are cleaned up afterwards so a bare or
+/// mirrored clone matches stock git byte-for-byte: the `HEAD:refs/remotes/<name>/HEAD`
+/// refspec gitoxide always adds implicitly (removed unless the remote really
+/// advertised that ref), and the `remote.<name>.fetch` / `remote.<name>.tagOpt` /
+/// `branch.<name>.*` entries git does not persist for those modes.
+///
+/// # Deviations (surfaced honestly, never faked)
+/// ```text
+///   * `-s`/`--shared` and `--reference` record the alternate in
+///     `objects/info/alternates` before the fetch, so the borrow is real and
+///     subsequent object lookups resolve through it; whether the negotiation
+///     actually skips the borrowed objects is up to gitoxide's object database,
+///     so the disk-space saving git guarantees is not guaranteed here.
+///   * `--dissociate` writes no alternate at all. The pack is fetched in full,
+///     which is the state git reaches by copying the borrowed objects in, so the
+///     resulting repository is self-contained either way.
+///   * `--ref-format=reftable` is rejected with an honest "not supported" error
+///     (no vendored reftable backend). `--ref-format=files` is the format gix
+///     writes and is honored; any other value reproduces git's exact
+///     `unknown ref storage format '<v>'`.
+///   * `--depth` combined with `--no-single-branch` costs one extra ls-refs round
+///     trip, because gitoxide has already resolved its implicit single-branch
+///     refspec by the time the replacement wildcard remote is installed.
+///   * `--single-branch` fetches every tag, not only the ones reachable from the
+///     branch. git auto-follows tags during negotiation; the vendored
+///     `Tags::Included` maps `refs/tags/*:refs/tags/*` exactly like `Tags::All`
+///     (`gix-protocol/src/fetch/types.rs:241`) and no reachability filter exists
+///     anywhere in the vendored crates, so an unreachable tag — and the history
+///     it pins — is transferred too. Pruning the extra tag refs afterwards would
+///     hide the over-fetch rather than fix it, so they are left visible.
+///   * Fetched refs are written packed (gitoxide's clone sets
+///     `with_write_packed_refs_only`), where stock git leaves some of them loose.
+///     The ref set is identical; only the loose/packed split differs.
+/// ```
 pub fn clone(args: &[String]) -> Result<ExitCode> {
     let mut bare = false;
+    let mut mirror = false;
     let mut quiet = false;
     // `Some(true)` = `--progress` forced, `Some(false)` = `--no-progress`,
     // `None` = default (progress iff stderr is a terminal), matching git.
     let mut force_progress: Option<bool> = None;
     let mut recurse_submodules = false;
+    // The `<pathspec>` arguments of `--recurse-submodules[=<pathspec>]`, recorded
+    // as `submodule.active` in the new repository the way git does.
+    let mut submodule_pathspecs: Vec<String> = Vec::new();
+    let mut remote_submodules = false;
     let mut no_checkout = false;
     let mut origin: Option<String> = None;
     let mut branch: Option<String> = None;
@@ -50,12 +125,27 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `--reject-shallow` (`true`) / `--no-reject-shallow` (`false`); `None` leaves
     // it unspecified so the `clone.rejectShallow` config value, if any, decides.
     let mut reject_shallow: Option<bool> = None;
+    // `--single-branch` (`true`) / `--no-single-branch` (`false`); `None` leaves the
+    // choice to gitoxide, which single-branches a shallow clone like git does.
+    let mut single_branch: Option<bool> = None;
     // Shallow-boundary selectors that combine (git's `--shallow-exclude` is a
     // repeatable list → `deepen_not`, `--shallow-since` → `deepen_since`, and the
     // two may be given together). Resolved into a single `Shallow` after parsing.
     let mut depth: Option<NonZeroU32> = None;
     let mut shallow_exclude: Vec<gix::refs::PartialName> = Vec::new();
     let mut shallow_since: Option<gix::date::Time> = None;
+    // `-c <key>=<value>`, in command-line order; repeats of a key are kept so each
+    // value is written, as git documents.
+    let mut config_pairs: Vec<(String, String)> = Vec::new();
+    let mut template: Option<String> = None;
+    let mut separate_git_dir: Option<String> = None;
+    let mut ref_format: Option<String> = None;
+    // `--reference <repo>` / `--reference-if-able <repo>`: the bool records
+    // whether a missing repository is a warning (`if-able`) or fatal.
+    let mut references: Vec<(String, bool)> = Vec::new();
+    let mut shared = false;
+    let mut dissociate = false;
+    let mut sparse = false;
     let mut positionals: Vec<&str> = Vec::new();
 
     let mut i = 0;
@@ -98,6 +188,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--" => end_of_options = true,
             "--bare" => bare = true,
             "--no-bare" => bare = false,
+            // `--mirror` implies `--bare` (git-clone(1)); the implication is applied
+            // after parsing so a later `--no-mirror` can still take it back.
+            "--mirror" => mirror = true,
+            "--no-mirror" => mirror = false,
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
             // `-v`/`--verbose` only adds output detail in git; the clone result
@@ -118,11 +212,31 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--no-origin" => origin = None,
             "-b" | "--branch" => branch = Some(take_value!("--branch")),
             "--no-branch" => branch = None,
+            "-c" | "--config" => {
+                let raw = take_value!("--config");
+                config_pairs.push(parse_config_pair(&raw)?);
+            }
             "--no-tags" => tags = Some(Tags::None),
             // `--tags` resets to git's default (all tags fetched).
             "--tags" => tags = None,
             "--reject-shallow" => reject_shallow = Some(true),
             "--no-reject-shallow" => reject_shallow = Some(false),
+            "--single-branch" => single_branch = Some(true),
+            "--no-single-branch" => single_branch = Some(false),
+            "--template" => template = Some(take_value!("--template")),
+            "--no-template" => template = None,
+            "--separate-git-dir" => separate_git_dir = Some(take_value!("--separate-git-dir")),
+            "--no-separate-git-dir" => separate_git_dir = None,
+            "--ref-format" => ref_format = Some(take_value!("--ref-format")),
+            "--no-ref-format" => ref_format = None,
+            "--reference" => references.push((take_value!("--reference"), false)),
+            "--reference-if-able" => references.push((take_value!("--reference-if-able"), true)),
+            "-s" | "--shared" => shared = true,
+            "--no-shared" => shared = false,
+            "--dissociate" => dissociate = true,
+            "--no-dissociate" => dissociate = false,
+            "--sparse" => sparse = true,
+            "--no-sparse" => sparse = false,
             "--depth" => {
                 let v = take_value!("--depth");
                 let n: u32 = v
@@ -151,13 +265,69 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // `--recursive` / `--recurse-submodules[=<pathspec>]`: after the clone,
             // initialize and update submodules recursively. A pathspec-limited
             // recurse is honored as a full recursive update.
-            "--recursive" | "--recurse-submodules" => recurse_submodules = true,
-            "--no-recursive" | "--no-recurse-submodules" => recurse_submodules = false,
+            "--recursive" | "--recurse-submodules" => {
+                recurse_submodules = true;
+                if let Some(pathspec) = inline_val.clone() {
+                    submodule_pathspecs.push(pathspec);
+                }
+            }
+            "--no-recursive" | "--no-recurse-submodules" => {
+                recurse_submodules = false;
+                submodule_pathspecs.clear();
+            }
+            // `--remote-submodules` is `git submodule update --remote`, which this
+            // port implements, so it is passed straight through to that update.
+            "--remote-submodules" => remote_submodules = true,
+            "--no-remote-submodules" => remote_submodules = false,
+            // git's attached short-option forms (`-o<name>`, `-b<name>`,
+            // `-c<key>=<value>` in the synopsis). Checked after the exact matches
+            // so the detached forms above still win.
+            other if other.starts_with("-o") && other.len() > 2 => {
+                origin = Some(other[2..].to_string());
+            }
+            other if other.starts_with("-b") && other.len() > 2 => {
+                branch = Some(other[2..].to_string());
+            }
+            other if other.starts_with("-c") && other.len() > 2 => {
+                config_pairs.push(parse_config_pair(&other[2..])?);
+            }
             other if other.starts_with('-') && other.len() > 1 => {
                 bail!("unsupported option {other:?}");
             }
             other => positionals.push(other),
         }
+    }
+
+    // `--mirror` implies `--bare` (git-clone(1): "This implies --bare").
+    if mirror {
+        bare = true;
+    }
+
+    // git's ref storage formats are exactly `files` and `reftable`. `files` is the
+    // backend gix writes, so it is a no-op that matches stock git; `reftable` has
+    // no vendored backend and is rejected honestly rather than silently producing
+    // a files-backed repository.
+    if let Some(fmt) = ref_format.as_deref() {
+        match fmt {
+            "files" => {}
+            "reftable" => bail!(
+                "the reftable ref storage format is not supported: no vendored \
+                 reftable backend"
+            ),
+            other => bail!("unknown ref storage format '{other}'"),
+        }
+    }
+
+    // git refuses to combine these (`builtin/clone.c`, verified against stock git:
+    // `fatal: options '--bare' and '--separate-git-dir' cannot be used together`).
+    if bare && separate_git_dir.is_some() {
+        bail!("options '--bare' and '--separate-git-dir' cannot be used together");
+    }
+    // A sparse checkout needs a worktree; stock git fails the clone here with
+    // `fatal: this operation must be run in a work tree` /
+    // `error: failed to initialize sparse-checkout`.
+    if sparse && bare {
+        bail!("failed to initialize sparse-checkout: this operation must be run in a work tree");
     }
 
     let url_str = match positionals.first() {
@@ -231,16 +401,56 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         eprintln!("Cloning into '{dir}'...");
     }
 
-    // Build the clone platform and apply the parsed options. `--origin` renames
-    // the remote (and its tracking refspec), `--branch` selects the ref to fetch
-    // and check out, `--depth`/`--shallow-*` set the shallow boundary, `--no-tags`
-    // suppresses tag fetching, and `--reject-shallow` is injected as an in-memory
-    // `clone.rejectShallow` override so the fetch aborts on a shallow remote.
+    // Build the clone platform. This already lays the repository down on disk, so
+    // the template and alternates below land in the very git dir the fetch will
+    // populate — the window git uses for the same work between `init_db()` and
+    // the first fetch.
     let mut prepare = if bare {
-        gix::prepare_clone_bare(url, dst)?
+        gix::prepare_clone_bare(url.clone(), dst)?
     } else {
-        gix::prepare_clone(url, dst)?
+        gix::prepare_clone(url.clone(), dst)?
     };
+
+    // `--template=<dir>`: git runs its init step with the template, so the sample
+    // hooks, `description` and `info/exclude` come from there instead of the
+    // built-in default. Same code path `git init --template` uses.
+    if let Some(tpl) = template.as_deref().filter(|t| !t.is_empty()) {
+        super::init::apply_template(tpl, &git_dir)?;
+    }
+
+    // `-s`/`--shared` and `--reference`/`--reference-if-able`: record the object
+    // stores to borrow from in `objects/info/alternates` *before* the fetch, which
+    // is where git writes them. `--dissociate` asks for a self-contained result, so
+    // nothing is recorded and the full pack is fetched instead.
+    if !dissociate {
+        let mut alternates: Vec<PathBuf> = Vec::new();
+        // git only shares "when the repository to clone is on the local machine",
+        // so a URL that names no openable local repository leaves `-s` a no-op.
+        if shared {
+            if let Some(objects) = local_path_of(&url).and_then(|p| objects_dir_of(&p).ok()) {
+                alternates.push(objects);
+            }
+        }
+        for (path, if_able) in &references {
+            match objects_dir_of(Path::new(path)) {
+                Ok(objects) => alternates.push(objects),
+                Err(e) if *if_able => {
+                    eprintln!("info: Could not add alternate for '{path}': {e}");
+                }
+                Err(e) => bail!("{e}"),
+            }
+        }
+        if !alternates.is_empty() {
+            write_alternates(&git_dir, &alternates)?;
+        }
+    }
+
+    // Apply the parsed options. `--origin` renames the remote (and its tracking
+    // refspec), `--branch` selects the ref to fetch and check out,
+    // `--depth`/`--shallow-*` set the shallow boundary, and `--reject-shallow` /
+    // `-c <key>=<value>` are injected as in-memory config so the fetch and the
+    // checkout that follows it see them — git likewise promises `-c` takes effect
+    // "before the remote history is fetched or any files checked out".
     if let Some(name) = &origin {
         prepare = prepare
             .with_remote_name(name.as_str())
@@ -252,12 +462,99 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             .map_err(|_| anyhow::anyhow!("--branch expects a valid branch name, got {name:?}"))?;
     }
     prepare = prepare.with_shallow(shallow);
-    if let Some(tags) = tags {
-        prepare = prepare.configure_remote(move |r| Ok(r.with_fetch_tags(tags)));
-    }
+
+    let mut overrides: Vec<String> = config_pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
     if let Some(reject) = reject_shallow {
-        prepare = prepare
-            .with_in_memory_config_overrides(Some(format!("clone.rejectShallow={reject}")));
+        overrides.push(format!("clone.rejectShallow={reject}"));
+    }
+    if !overrides.is_empty() {
+        prepare = prepare.with_in_memory_config_overrides(overrides);
+    }
+
+    // Decide which refspec set this clone needs and, with it, which tag mode.
+    // Supplying `configure_remote` at all suppresses gitoxide's own clone default
+    // of `Tags::All`, so every plan that is not a single-branch clone has to ask
+    // for it back explicitly. `Tags::All` is written to `remote.<name>.tagOpt`,
+    // which git does not do, so those cases strip the key again afterwards.
+    let plan = if mirror {
+        Some(Refspecs::Mirror)
+    } else if single_branch == Some(true) {
+        Some(Refspecs::Single {
+            branch: branch.clone(),
+            bare,
+        })
+    } else if bare {
+        Some(Refspecs::Bare)
+    } else if single_branch == Some(false) {
+        Some(Refspecs::Wildcard)
+    } else {
+        None
+    };
+    let forced_all_tags = matches!(plan, Some(Refspecs::Bare) | Some(Refspecs::Wildcard))
+        && tags != Some(Tags::None);
+    let fetch_tags: Option<Tags> = if tags == Some(Tags::None) || mirror {
+        Some(Tags::None)
+    } else if forced_all_tags {
+        Some(Tags::All)
+    } else {
+        None
+    };
+
+    // What `--single-branch` resolved against the remote: the ref actually
+    // fetched, and the branch the remote's `HEAD` points at. The clean-up below
+    // needs both to decide whether git would have created `refs/remotes/<name>/HEAD`
+    // — it only does so when the remote's own `HEAD` branch is among the fetched refs.
+    let single_outcome: SingleOutcome = Default::default();
+
+    // `+refs/*:refs/*` cannot be turned into an ls-refs `ref-prefix`:
+    // `RefSpecRef::prefix` gives up on a `*` in the first path component
+    // (`gix-refspec/src/spec.rs:147`) and `expand_prefixes` then emits the pattern
+    // itself, so the server is asked for refs literally starting with `refs/*` and
+    // advertises none. Turning the prefix filter off makes the remote advertise
+    // everything and lets gitoxide match locally — which is what `--mirror` wants
+    // anyway. Only the mirror refspec needs this; every other plan has a literal
+    // prefix (`refs/heads/`) that the filter handles correctly.
+    if matches!(plan, Some(Refspecs::Mirror)) {
+        prepare = prepare.with_fetch_options(gix::remote::ref_map::Options {
+            prefix_from_spec_as_filter_on_remote: false,
+            ..Default::default()
+        });
+    }
+
+    if plan.is_some() || fetch_tags.is_some() {
+        let plan = plan.clone();
+        let url_for_remote = url.clone();
+        let explicit_origin = origin.clone();
+        let single_outcome = single_outcome.clone();
+        prepare = prepare.configure_remote(move |r| {
+            let Some(plan) = plan.as_ref() else {
+                // Only the tag mode changes; keep the refspec gitoxide chose,
+                // which for a shallow clone is its derived single-branch spec.
+                return Ok(match fetch_tags {
+                    Some(t) => r.with_fetch_tags(t),
+                    None => r,
+                });
+            };
+            let repo = r.repo;
+            let remote_name = resolve_remote_name(repo, explicit_origin.as_deref());
+            let specs = plan.refspecs(repo, &url_for_remote, &remote_name, &single_outcome)?;
+            // Build a fresh remote rather than adding to `r`: `with_refspecs` only
+            // appends, so replacing gitoxide's wildcard spec is impossible in place.
+            let mut remote = repo.remote_at(url_for_remote.clone())?;
+            if !specs.is_empty() {
+                remote = remote.with_refspecs(
+                    specs.iter().map(String::as_str),
+                    gix::remote::Direction::Fetch,
+                )?;
+            }
+            if let Some(t) = fetch_tags {
+                remote = remote.with_fetch_tags(t);
+            }
+            Ok(remote)
+        });
     }
 
     // Drive gitoxide's fetch/checkout through a prodash tree and render it to
@@ -299,6 +596,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         prodash::render::line::render(std::io::stderr(), root.downgrade(), opts)
     });
 
+    // Whether the remote advertised any `refs/remotes/*` of its own. gitoxide always
+    // fetches `HEAD:refs/remotes/<name>/HEAD`, so for a bare or mirrored clone —
+    // where git creates no remote-tracking refs at all — that ref has to be removed
+    // again, unless a mirror refspec legitimately copied the remote's own ones over.
+    let mut remote_advertised_tracking_refs = false;
+
     // Run the clone, capturing the result so the renderer is always torn down
     // (cursor restored, thread joined) before any error is propagated.
     let result = (|| -> Result<()> {
@@ -306,7 +609,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // A bare clone never checks out a worktree; `--no-checkout` likewise
             // fetches the pack and writes the refs/`HEAD` but leaves the worktree
             // (and index) empty. Fetching is the whole job in both cases.
-            prepare.fetch_only(op.add_child("fetch"), &should_interrupt)?;
+            let (_repo, outcome) = prepare.fetch_only(op.add_child("fetch"), &should_interrupt)?;
+            remote_advertised_tracking_refs = outcome
+                .ref_map
+                .remote_refs
+                .iter()
+                .any(|r| r.unpack().0.starts_with(b"refs/remotes/"));
         } else {
             // `git clone 'url'...`
             let (mut checkout, _) =
@@ -323,28 +631,486 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     }
     result?;
 
+    // `--separate-git-dir`: move the git dir to the requested path and leave a
+    // `gitdir: <abs>` link file behind, the same relocation `git init` performs.
+    // Everything below works on the relocated dir, as git's post-init steps do.
+    let git_dir = match &separate_git_dir {
+        Some(real) => super::init::relocate_git_dir(&git_dir, dst, real)?,
+        None => git_dir,
+    };
+
+    // Reconcile `.git/config` with what stock git leaves behind: strip the entries
+    // gitoxide persisted that git does not, add the ones git writes itself, and
+    // apply the `-c` pairs last so gitoxide's own config rewrites cannot drop them.
+    finalize_config(
+        &git_dir,
+        &ConfigFixups {
+            set_mirror: mirror,
+            drop_fetch: bare && !mirror,
+            drop_tag_opt: forced_all_tags,
+            drop_branch_sections: bare,
+            // "The resulting clone has submodule.active set to the provided
+            // pathspec, or '.' (meaning all submodules) if no pathspec is
+            // provided" (git-clone(1)). git records it whenever the option is
+            // given, even for `--bare` / `-n`, where the update itself is skipped.
+            submodule_active: recurse_submodules.then(|| {
+                if submodule_pathspecs.is_empty() {
+                    vec![".".to_string()]
+                } else {
+                    submodule_pathspecs.clone()
+                }
+            }),
+            config_pairs: &config_pairs,
+        },
+    )?;
+
+    // Drop gitoxide's implicit `refs/remotes/<name>/HEAD` wherever git would not
+    // have written it: a bare or mirrored clone has no remote-tracking hierarchy at
+    // all, and a `--single-branch` clone only gets the symbolic head when the branch
+    // the remote's `HEAD` points at is the one that was fetched.
+    let drop_head_tracking = if bare {
+        !remote_advertised_tracking_refs
+    } else {
+        match &*single_outcome.lock().expect("clone is single-threaded here") {
+            Some((fetched, head_target)) => head_target.as_deref() != fetched.as_deref(),
+            None => false,
+        }
+    };
+    if drop_head_tracking {
+        remove_remote_tracking_head(&git_dir)?;
+    }
+
+    // `init.defaultSubmodulePathConfig=true` opts every new repository into the
+    // submodule-path extension; git applies it to `git clone` exactly as it does
+    // to `git init` (verified against stock git 2.55.0, which writes
+    // `extensions.submodulepathconfig=true` and `core.repositoryformatversion=1`
+    // into a fresh clone). Read from the clone itself, so every config scope the
+    // repository sees participates.
+    if gix::open(&git_dir)
+        .ok()
+        .and_then(|repo| repo.config_snapshot().boolean("init.defaultSubmodulePathConfig"))
+        == Some(true)
+    {
+        super::init::enable_submodule_path_config(&git_dir)?;
+    }
+
     // git closes the clone banner with `done.` (suppressed by `-q`).
     if !quiet {
         eprintln!("done.");
     }
 
+    // `--sparse`: git initializes a cone-mode sparse-checkout containing only the
+    // top-level files. This port's own `sparse-checkout set --cone` writes the
+    // identical `info/sparse-checkout` pattern pair and `config.worktree` keys and
+    // prunes the worktree, so it is re-executed here rather than duplicated.
+    if sparse {
+        let code = run_self(&dir, &["sparse-checkout", "set", "--cone"])?;
+        if code != 0 {
+            return Ok(ExitCode::from(code));
+        }
+    }
+
     // `--recursive` / `--recurse-submodules`: after a successful non-bare,
     // checked-out clone, initialize and update submodules recursively by
     // re-executing this binary's own ported `submodule update --init --recursive`
-    // in the new worktree.
+    // in the new worktree. `--remote-submodules` adds git's `--remote`, which
+    // updates each submodule to its remote-tracking branch instead of the
+    // superproject's recorded commit.
     if recurse_submodules && !bare && !no_checkout {
-        let exe = std::env::current_exe()?;
-        let status = std::process::Command::new(&exe)
-            .arg("-C")
-            .arg(&dir)
-            .args(["submodule", "update", "--init", "--recursive"])
-            .status()?;
-        if !status.success() {
-            return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
+        let mut sub: Vec<&str> = vec!["submodule", "update", "--init", "--recursive"];
+        if remote_submodules {
+            sub.push("--remote");
+        }
+        let code = run_self(&dir, &sub)?;
+        if code != 0 {
+            return Ok(ExitCode::from(code));
         }
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// The refspec set a clone needs, chosen from the option combination. gitoxide
+/// installs `+refs/heads/*:refs/remotes/<name>/*` (or its own single-branch spec
+/// for a shallow clone) and `Remote::with_refspecs` can only append to that, so
+/// every variant here is realized by building a *replacement* remote from the
+/// repository `configure_remote` hands out.
+#[derive(Clone)]
+enum Refspecs {
+    /// `--mirror`: `+refs/*:refs/*` — every ref maps onto itself.
+    Mirror,
+    /// `--bare`: `+refs/heads/*:refs/heads/*` — remote branch heads become local
+    /// branch heads, with no `refs/remotes/` mapping (git-clone(1) `--bare`).
+    Bare,
+    /// `--single-branch`: exactly one ref, resolved from the remote.
+    Single {
+        /// The `--branch` argument, if any; otherwise the branch `HEAD` points at.
+        branch: Option<String>,
+        /// Whether the destination is a bare clone (branch heads map onto
+        /// themselves instead of into `refs/remotes/<name>/`).
+        bare: bool,
+    },
+    /// `--no-single-branch`: the wildcard, stated explicitly so it also overrides
+    /// the implicit single-branch refspec gitoxide derives for a shallow clone.
+    Wildcard,
+}
+
+/// What a `--single-branch` clone resolved against the remote: `(the ref that is
+/// being fetched, the branch the remote's `HEAD` points at)`. Shared with the
+/// `configure_remote` closure, which is the only place that talks to the remote
+/// early enough to know either.
+type SingleOutcome = std::sync::Arc<std::sync::Mutex<Option<(Option<String>, Option<String>)>>>;
+
+impl Refspecs {
+    /// The concrete fetch refspecs for this plan. `Single` performs an ls-refs
+    /// round trip against the remote — the same lookup git does to learn which
+    /// branch to restrict the clone to — and records what it found in `outcome`.
+    fn refspecs(
+        &self,
+        repo: &gix::Repository,
+        url: &gix::Url,
+        remote_name: &str,
+        outcome: &SingleOutcome,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(match self {
+            Refspecs::Mirror => vec!["+refs/*:refs/*".to_string()],
+            Refspecs::Bare => vec!["+refs/heads/*:refs/heads/*".to_string()],
+            Refspecs::Wildcard => vec![format!("+refs/heads/*:refs/remotes/{remote_name}/*")],
+            Refspecs::Single { branch, bare } => {
+                let (fetched, head_target) = resolve_single_ref(repo, url, branch.as_deref())?;
+                *outcome.lock().expect("clone is single-threaded here") =
+                    Some((fetched.clone(), head_target));
+                match fetched {
+                    Some(full) => vec![single_branch_refspec(&full, remote_name, *bare)],
+                    // "If the HEAD at the remote did not point at any branch when
+                    // --single-branch clone was made, no remote-tracking branch is
+                    // created" (git-clone(1)).
+                    None => Vec::new(),
+                }
+            }
+        })
+    }
+}
+
+/// The refspec for a single-branch clone of `full_ref_name`. A branch maps into
+/// `refs/remotes/<name>/<short>` (or onto itself for a bare clone); anything else
+/// — `--branch` may name a tag — maps onto itself, as git does.
+fn single_branch_refspec(full_ref_name: &str, remote_name: &str, bare: bool) -> String {
+    let destination = match full_ref_name.strip_prefix("refs/heads/") {
+        Some(short) if !bare => format!("refs/remotes/{remote_name}/{short}"),
+        _ => full_ref_name.to_string(),
+    };
+    format!("+{full_ref_name}:{destination}")
+}
+
+/// Ask the remote which ref a `--single-branch` clone should be restricted to:
+/// the `--branch` argument resolved against the advertisement (a branch first,
+/// then a tag, matching git's `--branch` lookup order), or the branch the remote's
+/// `HEAD` points at. Returns `(the ref to fetch, the remote `HEAD` branch)`; the
+/// first is `None` when no `--branch` was given and the remote `HEAD` names no
+/// branch, the second whenever the remote advertises no symbolic `HEAD`.
+fn resolve_single_ref(
+    repo: &gix::Repository,
+    url: &gix::Url,
+    branch: Option<&str>,
+) -> Result<(Option<String>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+    let remote = repo.remote_at(url.clone())?;
+    let connection = remote.connect(gix::remote::Direction::Fetch)?;
+    // The probe remote carries no refspecs, so the server must advertise
+    // everything rather than only what a refspec prefix would allow.
+    let (map, _handshake) = connection.ref_map(
+        gix::progress::Discard,
+        gix::remote::ref_map::Options {
+            prefix_from_spec_as_filter_on_remote: false,
+            ..Default::default()
+        },
+    )?;
+
+    let advertised = |name: &str| {
+        map.remote_refs
+            .iter()
+            .any(|r| r.unpack().0 == name.as_bytes())
+    };
+
+    // The branch the remote's own `HEAD` points at, if it advertises one.
+    let head_target = map.remote_refs.iter().find_map(|r| match r {
+        Ref::Symbolic {
+            full_ref_name,
+            target,
+            ..
+        }
+        | Ref::Unborn {
+            full_ref_name,
+            target,
+        } if full_ref_name == "HEAD" => Some(target.to_string()),
+        _ => None,
+    });
+
+    let fetched = match branch {
+        Some(name) => {
+            let candidates = if name.starts_with("refs/") {
+                vec![name.to_string()]
+            } else {
+                vec![
+                    format!("refs/heads/{name}"),
+                    format!("refs/tags/{name}"),
+                    name.to_string(),
+                ]
+            };
+            Some(
+                candidates
+                    .into_iter()
+                    .find(|c| advertised(c))
+                    .ok_or_else(|| format!("Remote branch {name} not found in upstream"))?,
+            )
+        }
+        None => head_target.clone(),
+    };
+    Ok((fetched, head_target))
+}
+
+/// The remote name this clone will use, with git's precedence: `-o`/`--origin`,
+/// else the `clone.defaultRemoteName` config, else `origin`. Mirrors the
+/// resolution gitoxide performs internally, which it does not expose.
+fn resolve_remote_name(repo: &gix::Repository, explicit: Option<&str>) -> String {
+    match explicit {
+        Some(name) => name.to_string(),
+        None => repo
+            .config_snapshot()
+            .string("clone.defaultRemoteName")
+            .map(|v| v.to_string())
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "origin".to_string()),
+    }
+}
+
+/// The `.git/config` entries that have to be reconciled after gitoxide wrote the
+/// remote section, so the result matches what stock git leaves behind.
+struct ConfigFixups<'a> {
+    /// `--mirror` records `remote.<name>.mirror = true`.
+    set_mirror: bool,
+    /// A bare clone persists no `remote.<name>.fetch` (git-clone(1): "neither
+    /// remote-tracking branches nor the related configuration variables are
+    /// created"), even though the fetch itself used a refspec.
+    drop_fetch: bool,
+    /// `remote.<name>.tagOpt` written only because asking gitoxide for
+    /// `Tags::All` persists it; git writes the key solely for `--no-tags`.
+    drop_tag_opt: bool,
+    /// A bare clone creates no `branch.<name>` section.
+    drop_branch_sections: bool,
+    /// `submodule.active` values recorded by `--recurse-submodules[=<pathspec>]`.
+    submodule_active: Option<Vec<String>>,
+    /// `-c <key>=<value>` pairs, in command-line order.
+    config_pairs: &'a [(String, String)],
+}
+
+/// Apply [`ConfigFixups`] to `<git_dir>/config`.
+///
+/// The `-c` values are written here, after the clone, rather than before the
+/// fetch: gitoxide re-serializes the whole local configuration from its own
+/// in-memory snapshot when it records `branch.<name>.*`, which would drop
+/// anything written to the file behind its back. The fetch and checkout still
+/// observe them, because they are also handed to gitoxide as in-memory overrides.
+fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
+    if !fixups.set_mirror
+        && !fixups.drop_fetch
+        && !fixups.drop_tag_opt
+        && !fixups.drop_branch_sections
+        && fixups.submodule_active.is_none()
+        && fixups.config_pairs.is_empty()
+    {
+        return Ok(());
+    }
+
+    let path = git_dir.join("config");
+    let mut file =
+        gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let remote_name = file
+        .sections()
+        .find(|s| s.header().name() == "remote")
+        .and_then(|s| s.header().subsection_name().map(ToString::to_string));
+
+    if let Some(name) = remote_name {
+        if let Ok(mut section) = file.section_mut("remote", Some(name.as_str().into())) {
+            if fixups.drop_fetch {
+                while section.remove("fetch").is_some() {}
+            }
+            if fixups.drop_tag_opt {
+                while section.remove("tagOpt").is_some() {}
+            }
+            if fixups.set_mirror {
+                section.push("mirror", Some("true".into()))?;
+            }
+        }
+    }
+
+    if fixups.drop_branch_sections {
+        let subsections: Vec<_> = file
+            .sections()
+            .filter(|s| s.header().name() == "branch")
+            .filter_map(|s| s.header().subsection_name().map(ToString::to_string))
+            .collect();
+        for sub in subsections {
+            while file.remove_section("branch", Some(sub.as_str().into())).is_some() {}
+        }
+    }
+
+    if let Some(pathspecs) = &fixups.submodule_active {
+        let mut section = file
+            .section_mut_or_create_new("submodule", None)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        for pathspec in pathspecs {
+            section.push("active", Some(pathspec.as_str().into()))?;
+        }
+    }
+
+    // git writes every `-c` value, so a key given twice ends up with two values.
+    for (key, value) in fixups.config_pairs {
+        let (section, subsection, name) = split_config_key(key)?;
+        let mut sec = file
+            .section_mut_or_create_new(&section, subsection.as_deref().map(Into::into))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        sec.push(name.as_str(), Some(value.as_str().into()))?;
+    }
+
+    std::fs::write(&path, file.to_bstring())?;
+    Ok(())
+}
+
+/// Delete `refs/remotes/*/HEAD`, the remote-tracking ref gitoxide always creates
+/// from its implicit `HEAD:refs/remotes/<name>/HEAD` refspec. Callers invoke this
+/// only where git writes no such ref, so the only candidate present is gitoxide's
+/// own. The ref is removed whether it is loose or packed; nothing else under
+/// `refs/remotes/` is touched.
+fn remove_remote_tracking_head(git_dir: &Path) -> Result<()> {
+    let repo = match gix::open(git_dir) {
+        Ok(r) => r,
+        // A repository we cannot reopen has nothing for us to clean up; the clone
+        // itself already succeeded.
+        Err(_) => return Ok(()),
+    };
+    let names: Vec<gix::refs::FullName> = repo
+        .references()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .prefixed("refs/remotes/")
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .filter_map(Result::ok)
+        .map(|r| r.name().to_owned())
+        .filter(|n| n.as_bstr().ends_with(b"/HEAD"))
+        .collect();
+    for name in names {
+        repo.edit_reference(gix::refs::transaction::RefEdit {
+            change: gix::refs::transaction::Change::Delete {
+                expected: gix::refs::transaction::PreviousValue::Any,
+                log: gix::refs::transaction::RefLog::AndReference,
+            },
+            name,
+            deref: false,
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    // A deleted loose ref leaves its directories behind; git's clone never creates
+    // them at all, so prune the empty ones back to (and excluding) `refs/`.
+    prune_empty_dirs(&git_dir.join("refs").join("remotes"));
+    Ok(())
+}
+
+/// Remove `dir` and every empty directory inside it, deepest first. Non-empty
+/// directories, and anything that is not a directory, are left alone.
+fn prune_empty_dirs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.path().is_dir() {
+            prune_empty_dirs(&entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// Split a `-c <key>=<value>` argument the way git's `git_config_parse_parameter`
+/// does: a bare `<key>` with no `=` is the boolean `true` (verified against stock
+/// git 2.55.0 — `git clone -c foo.bar …` writes `bar = true`), and a key with no
+/// section is rejected with git's `key does not contain a section: <key>`.
+///
+/// Validation happens here, during parsing, so a bad key fails before the
+/// destination directory is created — exactly where git rejects it.
+fn parse_config_pair(raw: &str) -> Result<(String, String)> {
+    let (key, value) = match raw.split_once('=') {
+        Some((k, v)) => (k, v.to_string()),
+        None => (raw, "true".to_string()),
+    };
+    split_config_key(key)?;
+    Ok((key.to_string(), value))
+}
+
+/// Split a config key into `(section, subsection, name)`. git splits at the first
+/// dot for the section and the last dot for the variable name; everything between
+/// is the (dot-tolerant) subsection.
+fn split_config_key(key: &str) -> Result<(String, Option<String>, String)> {
+    let first = key
+        .find('.')
+        .ok_or_else(|| anyhow::anyhow!("key does not contain a section: {key}"))?;
+    let last = key.rfind('.').expect("a first dot implies a last dot");
+    let section = &key[..first];
+    let name = &key[last + 1..];
+    if section.is_empty() || name.is_empty() {
+        bail!("key does not contain variable name: {key}");
+    }
+    let subsection = (first != last).then(|| key[first + 1..last].to_string());
+    Ok((section.to_string(), subsection, name.to_string()))
+}
+
+/// The local filesystem path a clone URL names, if any. `-s`/`--shared` only
+/// applies "when the repository to clone is on the local machine", which is
+/// exactly the `file://` and bare-path URLs gix classifies as `Scheme::File`.
+fn local_path_of(url: &gix::Url) -> Option<PathBuf> {
+    (url.scheme == gix::url::Scheme::File)
+        .then(|| gix::path::from_bstr(url.path.as_bstr()).into_owned())
+}
+
+/// The object directory to borrow from for `--shared`/`--reference`: the
+/// `objects` directory of the repository at `path`, absolute and symlink-resolved,
+/// which is the form git records in `objects/info/alternates`.
+fn objects_dir_of(path: &Path) -> Result<PathBuf> {
+    let repo = gix::open(path)
+        .map_err(|_| anyhow::anyhow!("reference repository '{}' is not a local repository.", path.display()))?;
+    let objects = repo.git_dir().join("objects");
+    Ok(std::fs::canonicalize(&objects).unwrap_or(objects))
+}
+
+/// Write `objects/info/alternates` with one absolute object-directory path per
+/// line, the format git's `add_to_alternates_file` produces.
+fn write_alternates(git_dir: &Path, alternates: &[PathBuf]) -> Result<()> {
+    let info = git_dir.join("objects").join("info");
+    std::fs::create_dir_all(&info)?;
+    let mut body = String::new();
+    for path in alternates {
+        body.push_str(&path.to_string_lossy());
+        body.push('\n');
+    }
+    std::fs::write(info.join("alternates"), body)?;
+    Ok(())
+}
+
+/// Re-execute this binary's own porcelain inside the freshly cloned `dir`, the
+/// way git's clone shells out to `git submodule update` and `git sparse-checkout`.
+/// Returns the child's exit code.
+fn run_self(dir: &str, args: &[&str]) -> Result<u8> {
+    let exe = std::env::current_exe()?;
+    let status = std::process::Command::new(&exe)
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .status()?;
+    Ok(if status.success() {
+        0
+    } else {
+        status.code().unwrap_or(1) as u8
+    })
 }
 
 /// Derive the default clone directory from a repository URL, mirroring git's

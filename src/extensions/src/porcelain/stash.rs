@@ -12,9 +12,13 @@
 //!   builds `I` and `W`, appends the `refs/stash` reflog entry, and resets the
 //!   tracked worktree + index back to `HEAD`. Untracked files are left in place.
 //! * `list`  — one `stash@{N}: <message>` line per reflog entry, newest first.
-//! * `pop` / `apply` — restore the index to `I`'s tree and the worktree to `W`'s
-//!   tree; `pop` then drops the entry. Restricted to the non-conflicting case
-//!   (see below).
+//! * `pop` / `apply` — restore the worktree to `W`'s tree; `pop` then drops the
+//!   entry. Restricted to the non-conflicting case (see below). The staged state
+//!   is restored only under `--index` (or `stash.index=true`, which is exactly
+//!   that option's default): git's plain `apply` leaves everything *unstaged*,
+//!   resetting the index to the stash's base. `--no-index` countermands the
+//!   config. Both then run `git status` unless `-q`/`--quiet` was given, which
+//!   also silences `pop`'s `Dropped …` line.
 //! * `drop` / `clear` — remove one / all entries, rewriting the reflog exactly
 //!   like `git reflog delete --rewrite --updateref`.
 //! * `create` — build the `I`/`W` commit graph and print the `W` id without
@@ -33,8 +37,15 @@
 //! ### Honest boundaries (precise bail, never fake success)
 //!
 //! * `-u/--include-untracked`, `-a/--all`, `-p/--patch`, `-k/--keep-index`,
-//!   `-S/--staged`, pathspec-limited stashing, and `--index` on apply are not
-//!   backed and bail with a message naming the unsupported flag.
+//!   `-S/--staged` and pathspec-limited stashing are not backed and bail with a
+//!   message naming the unsupported flag.
+//! * `stash.index` is honored for `apply`/`pop` (and `branch`, which git always
+//!   applies with the index). git also lets it reach the `--autostash` re-apply
+//!   of `merge`/`rebase`/`pull`; that path always behaves as `--no-index` here,
+//!   because restoring the staged state across a *moved* `HEAD` needs a second
+//!   three-way merge of the index tree that is not ported.
+//! * `stash.showIncludeUntracked` is not read: it defaults `git stash show -u`,
+//!   which needs the untracked (`^3`) tree this port neither writes nor reads.
 //! * `apply`/`pop` only handle a clean apply: the current worktree+index must be
 //!   clean and `HEAD` unchanged since the stash was made (guaranteed right after
 //!   a `push`). A dirty target needs a real 3-way merge, which bails explicitly.
@@ -74,15 +85,14 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
         }
         Some("list") => list(&repo, &args[1..]),
         Some("pop") => {
-            let n = parse_stash_index(positional(&args[1..]))?;
+            let opts = parse_apply_options(&repo, &args[1..])?;
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-            apply_or_pop(&repo, n, true)
+            apply_or_pop(&repo, &opts, true)
         }
         Some("apply") => {
-            reject_apply_flags(&args[1..])?;
-            let n = parse_stash_index(positional(&args[1..]))?;
+            let opts = parse_apply_options(&repo, &args[1..])?;
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-            apply_or_pop(&repo, n, false)
+            apply_or_pop(&repo, &opts, false)
         }
         Some("drop") => {
             let n = parse_stash_index(positional(&args[1..]))?;
@@ -454,8 +464,11 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     super::checkout::checkout(&["-b".to_string(), branch, b_commit.to_string()])?;
 
     // The checkout moved HEAD/worktree on disk; re-open so the restore sees it.
+    // `branch_stash` calls `do_apply_stash(..., 1, ...)`: the index is always
+    // restored here, whatever `stash.index` says, so the staged state a stash
+    // captured comes back staged on the new branch.
     let repo = gix::discover(".")?;
-    restore_stash_commit(&repo, commit_id)?;
+    restore_stash_commit(&repo, commit_id, true)?;
 
     // `do_apply_stash` ends by running `git status` (non-quiet).
     super::status::status(&[])?;
@@ -490,28 +503,44 @@ fn list(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 }
 
 /// `git stash apply` / `pop` — restore `stash@{n}` onto a clean worktree+index.
-fn apply_or_pop(repo: &gix::Repository, n: usize, pop: bool) -> Result<ExitCode> {
+///
+/// Port of `do_apply_stash`'s tail: the restore, then `git status` (skipped under
+/// `-q`), and for `pop` the `Dropped …` line — which `-q` silences too.
+fn apply_or_pop(repo: &gix::Repository, opts: &ApplyOptions, pop: bool) -> Result<ExitCode> {
     let entries = read_stash_reflog(repo)?;
     if entries.is_empty() {
         bail!("No stash entries found.");
     }
+    let n = opts.index_in_stash;
     let commit_id = entries.get(n).map(|(id, _)| *id).ok_or_else(|| anyhow!("stash@{{{n}}} is not a valid reference"))?;
 
-    restore_stash_commit(repo, commit_id)?;
+    restore_stash_commit(repo, commit_id, opts.restore_index)?;
 
+    if !opts.quiet {
+        super::status::status(&[])?;
+    }
     if pop {
         let dropped = drop_reflog_entry(repo, n)?;
-        println!("Dropped refs/stash@{{{n}}} ({dropped})");
+        if !opts.quiet {
+            println!("Dropped refs/stash@{{{n}}} ({dropped})");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
 
-/// Restore the index to the stash's `I` tree and the worktree to its `W` tree,
-/// for the clean-apply case only: the current tree must be clean and still at the
-/// stash's base (`b_tree`). A dirty/moved target needs a real 3-way merge, which
-/// is not backed. Shared by `apply`/`pop` and `branch` (where the prior checkout
-/// guarantees the clean base).
-fn restore_stash_commit(repo: &gix::Repository, commit_id: ObjectId) -> Result<()> {
+/// Restore the worktree to the stash's `W` tree, for the clean-apply case only:
+/// the current tree must be clean and still at the stash's base (`b_tree`). A
+/// dirty/moved target needs a real 3-way merge, which is not backed. Shared by
+/// `apply`/`pop` and `branch` (where the prior checkout guarantees the clean
+/// base).
+///
+/// `restore_index` is `do_apply_stash`'s `index` argument: with it the index is
+/// rebuilt from the stash's `I` (staged) tree, so what was staged when the stash
+/// was made is staged again; without it the index is reset to the stash's base,
+/// which is what leaves every restored change *unstaged* — git's default, and
+/// the reason a plain `git stash apply` reports ` M` rather than `M ` for a path
+/// that had been `git add`ed. `git stash branch` always passes `true`.
+fn restore_stash_commit(repo: &gix::Repository, commit_id: ObjectId, restore_index: bool) -> Result<()> {
     let commit = repo.find_commit(commit_id)?;
     let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
     if parents.len() < 2 {
@@ -551,7 +580,8 @@ fn restore_stash_commit(repo: &gix::Repository, commit_id: ObjectId) -> Result<(
     let should_interrupt = AtomicBool::new(false);
     let fresh = sync_worktree(repo, w_tree, &affected, &w_map, &should_interrupt)?;
     let old_index = repo.open_index()?;
-    write_target_index(repo, i_tree, &old_index, &fresh)?;
+    let index_tree = if restore_index { i_tree } else { base_tree };
+    write_target_index(repo, index_tree, &old_index, &fresh)?;
     Ok(())
 }
 
@@ -961,16 +991,49 @@ fn parse_store_options(args: &[String]) -> Result<(Option<String>, bool, String)
     Ok((message, quiet, positionals.into_iter().next().expect("exactly one")))
 }
 
-/// `apply` shares `pop`'s restrictions; `--index` needs staged-state restore.
-fn reject_apply_flags(args: &[String]) -> Result<()> {
+/// The resolved `git stash apply` / `git stash pop` command line.
+struct ApplyOptions {
+    /// Which reflog entry to restore; `stash@{0}` when no `<stash>` was given.
+    index_in_stash: usize,
+    /// `--index`: rebuild the index from the stash's staged (`I`) tree.
+    restore_index: bool,
+    /// `-q`/`--quiet`: skip the trailing `git status` and `pop`'s `Dropped …`.
+    quiet: bool,
+}
+
+/// Parse the `apply`/`pop` option table (`-q`/`--quiet`, `--index`/`--no-index`,
+/// at most one `<stash>`).
+///
+/// `stash.index` seeds `restore_index` before the loop, exactly as `git_config`
+/// runs before `parse_options`, so an explicit `--no-index` on the command line
+/// countermands the config and an explicit `--index` is redundant with it.
+fn parse_apply_options(repo: &gix::Repository, args: &[String]) -> Result<ApplyOptions> {
+    let mut restore_index = repo.config_snapshot().boolean("stash.index").unwrap_or(false);
+    let mut quiet = false;
+    let mut spec: Option<&str> = None;
     for a in args {
         match a.as_str() {
-            "--index" => bail!("`--index` (restoring the staged state separately) is not ported"),
+            "--index" => restore_index = true,
+            "--no-index" => restore_index = false,
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
             "-p" | "--patch" => bail!("--patch is not ported"),
-            _ => {}
+            other if other.starts_with('-') && other != "-" => {
+                bail!("unsupported stash option '{other}'")
+            }
+            other => {
+                if spec.is_some() {
+                    bail!("Too many revisions specified");
+                }
+                spec = Some(other);
+            }
         }
     }
-    Ok(())
+    Ok(ApplyOptions {
+        index_in_stash: parse_stash_index(spec)?,
+        restore_index,
+        quiet,
+    })
 }
 
 #[cfg(test)]

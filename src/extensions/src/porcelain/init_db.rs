@@ -26,10 +26,15 @@ use std::process::ExitCode;
 ///     path / no vendored reftable backend) rather than being silently ignored,
 ///     so no run ever produces a repo that differs from what the flag asked for.
 ///     An otherwise unrecognized value reproduces git's exact error text.
+///   * Every configuration source `init` consults is consulted here too:
+///     `init.defaultBranch`, `init.templateDir`, `init.defaultObjectFormat`,
+///     `init.defaultRefFormat` (each behind its `GIT_DEFAULT_HASH` /
+///     `GIT_DEFAULT_REF_FORMAT` / `GIT_TEMPLATE_DIR` environment override) and
+///     `init.defaultSubmodulePathConfig`.
 ///   * The divergences documented on [`super::init::init`] apply here unchanged:
 ///     reinitialization does not re-copy missing template hooks or
-///     `info/exclude`, and `--bare` into a non-empty directory surfaces gix's
-///     `DirectoryNotEmpty` where stock git permits it.
+///     `info/exclude`, and a configured `sha256` / `reftable` format is rejected
+///     rather than silently laid down in the other format.
 ///
 /// Two further inherited divergences, both on stderr and both belonging to
 /// `init` rather than to this synonym:

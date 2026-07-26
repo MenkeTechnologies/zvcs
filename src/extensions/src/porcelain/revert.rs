@@ -646,13 +646,20 @@ fn revert_one(
         }
     } else if index_state.unmerged {
         eprintln!("error: Reverting is not possible because you have unmerged files.");
-        eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
-        eprintln!("hint: as appropriate to mark resolution and make a commit.");
+        // `error_resolve_conflict` (sequencer.c) prints the error unconditionally
+        // and the two-line direction only under `advice.resolveConflict`.
+        crate::advice::Advice::ResolveConflict.advise_plain(
+            "Fix them up in the work tree, and then use 'git add/rm <file>'\n\
+             as appropriate to mark resolution and make a commit.",
+        );
         eprintln!("fatal: revert failed");
         return Ok(Step::Failed(ExitCode::from(128)));
     } else if index_state.differs_from_head {
         eprintln!("error: your local changes would be overwritten by revert.");
-        eprintln!("hint: commit your changes or stash them to proceed.");
+        // `error_dirty_index` (sequencer.c) gates its one-line direction on
+        // `advice.commitBeforeMerge`; the `error:` line above always prints.
+        crate::advice::Advice::CommitBeforeMerge
+            .advise_plain("commit your changes or stash them to proceed.");
         eprintln!("fatal: revert failed");
         return Ok(Step::Failed(ExitCode::from(128)));
     }

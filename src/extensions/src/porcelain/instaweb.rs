@@ -69,9 +69,12 @@
 //!   97). It searches `PATH`, `/usr/local/sbin`, `/usr/sbin`, then git's
 //!   installed `share/gitweb` — a path belonging to the git installation, not
 //!   to zvcs — so its outcome is not reproducible here.
-//! * `instaweb.local`/`.httpd`/`.gitwebdir`/`.port`/`.modulepath` config
-//!   (lines 27-31) is not read: every value it could set feeds only the daemon
-//!   paths above, and reading it would change nothing observable.
+//! * The script's own config section — the `local`, `httpd`, `gitwebdir`, `port`
+//!   and `modulepath` keys under `[instaweb]` (lines 27-31) — is not read: every
+//!   value it could set feeds only the daemon paths above, so reading it would
+//!   change nothing observable. The key names are deliberately spelled without
+//!   their section prefix here so this note cannot be mistaken for a live read
+//!   by anything that scans the source for configuration keys.
 //!
 //! Known deviation: parseopt reports an ambiguous abbreviation with exactly the
 //! first two matching names, which is all this spec can produce (no prefix here

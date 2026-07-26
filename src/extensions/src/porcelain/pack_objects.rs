@@ -82,11 +82,25 @@
 //!     encoding this module does not have.
 //!   * `pack.compression`/`core.compression` is not read from config, so the
 //!     compression diagnostic fires only for a value given on the command line.
+//!   * `pack.packSizeLimit` supplies `--max-pack-size`'s default, is validated
+//!     the moment the config is read (ahead of parse-options, so a bad value is
+//!     fatal even for `-h`), and warns below git's 1 MiB floor — but, like
+//!     `--max-pack-size` itself, does not split the output.
 //!   * `--missing=allow-promisor` does not additionally imply
 //!     `--exclude-promisor-objects` handling.
 //!   * `--include-tag` adds no tags beyond those the object set already names.
 //!   * `--cruft-expiration=<time>` is parsed but does not filter by mtime; every
 //!     cruft object is written with its current mtime.
+//!
+//! # Configuration honoured
+//!
+//!   * `pack.indexVersion`, `pack.writeReverseIndex` — the `.idx` format and
+//!     whether a `.rev` accompanies the pack.
+//!   * `pack.packSizeLimit` — as above.
+//!   * `core.fsync` / `core.fsyncMethod` — the pack is hardened when the `pack`
+//!     component is in the set, its `.idx`/`.rev`/`.mtimes` when `pack-metadata`
+//!     is. `core.fsyncObjectFiles` is read for its deprecation warning and its
+//!     effect on the `loose-object` component.
 
 use anyhow::Result;
 use gix::hash::ObjectId;
@@ -347,6 +361,23 @@ pub fn pack_objects(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
+    // git calls `git_config(git_pack_config, ...)` *before* `parse_options`, so a
+    // `pack.packSizeLimit` it cannot read is fatal ahead of every parse
+    // diagnostic — even ahead of `-h`. Verified against git 2.55.0: inside a repo
+    // both `pack-objects -h` and `pack-objects --nosuch` report the bad number
+    // instead. Outside a repository git never gets that far ("not a git
+    // repository" wins), which is why the read is skipped when discovery fails.
+    let pack_size_limit_cfg = match gix::discover(".") {
+        Ok(repo) => match crate::config::config_ulong(&repo, "pack.packSizeLimit") {
+            Ok(limit) => limit,
+            Err(message) => {
+                eprintln!("fatal: {message}");
+                return Ok(ExitCode::from(128));
+            }
+        },
+        Err(_) => None,
+    };
+
     let state = match parse(args) {
         Parsed::Exit(code) => return Ok(code),
         Parsed::Ok(state) => state,
@@ -356,7 +387,45 @@ pub fn pack_objects(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
+    // git's post-parse `pack_size_limit` resolution, in its own order:
+    //
+    // ```c
+    // if (!pack_to_stdout && !pack_size_limit)
+    //     pack_size_limit = pack_size_limit_cfg;
+    // if (pack_to_stdout && pack_size_limit)          /* handled in preflight() */
+    //     die(_("--max-pack-size cannot be used to build a pack for transfer"));
+    // if (pack_size_limit && pack_size_limit < 1024*1024) {
+    //     warning(_("minimum pack size limit is 1 MiB"));
+    //     pack_size_limit = 1024*1024;
+    // }
+    // ```
+    //
+    // The config value therefore never reaches the `--stdout` die (it is only
+    // adopted when *not* writing to stdout), and an explicit `--max-pack-size`
+    // shadows it entirely. This port writes one pack regardless of the limit (see
+    // the module docs), so the sub-1-MiB warning is the whole of its observable
+    // effect — the same position `gc` puts its `gc.maxCruftSize` warning in.
+    let pack_size_limit = match st_max_pack_size(&state) {
+        Some(explicit) => Some(explicit),
+        None if !state.stdout => pack_size_limit_cfg,
+        None => None,
+    };
+    if pack_size_limit.is_some_and(|n| n > 0 && n < MIN_PACK_SIZE_LIMIT) {
+        eprintln!("warning: minimum pack size limit is 1 MiB");
+    }
+
     execute(&state)
+}
+
+/// git's 1 MiB floor for `pack_size_limit`: any smaller non-zero limit warns and
+/// is then raised to this.
+const MIN_PACK_SIZE_LIMIT: u64 = 1024 * 1024;
+
+/// `--max-pack-size` as an unsigned limit, or `None` when it was absent or zero
+/// (git's "unset"). The option is an `OPT_MAGNITUDE`, so a negative value cannot
+/// reach here.
+fn st_max_pack_size(st: &State) -> Option<u64> {
+    st.max_pack_size.filter(|n| *n > 0).and_then(|n| u64::try_from(n).ok())
 }
 
 /// Run the command proper: work out the object set, encode it into a pack, and
@@ -417,28 +486,41 @@ fn execute(st: &State) -> Result<ExitCode> {
     by_oid.sort_unstable_by_key(|a| a.id);
 
     let kind = repo.object_hash();
+    // The pack is the `pack` fsync component; everything written beside it is
+    // `pack-metadata`, per `core.fsync`'s component list.
+    use crate::config::FsyncComponent::{Pack, PackMetadata};
     let mut files = vec![
-        (format!("{base}-{hex_id}.pack"), packed.bytes.clone()),
+        (format!("{base}-{hex_id}.pack"), packed.bytes.clone(), Pack),
         (
             format!("{base}-{hex_id}.idx"),
             index_file(kind, index_version, &packed.id, &by_oid)?,
+            PackMetadata,
         ),
     ];
     if write_rev {
         files.push((
             format!("{base}-{hex_id}.rev"),
             reverse_index_file(kind, &packed.id, &by_oid)?,
+            PackMetadata,
         ));
     }
     if st.cruft {
         files.push((
             format!("{base}-{hex_id}.mtimes"),
             mtimes_file(&repo, kind, &packed.id, &by_oid)?,
+            PackMetadata,
         ));
     }
 
-    for (path, bytes) in &files {
-        if let Some(code) = write_artifact(path.as_str(), &bytes[..]) {
+    let fsync = match crate::config::FsyncPolicy::load(&repo) {
+        Ok(policy) => policy,
+        Err(message) => {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+    };
+    for (path, bytes, component) in &files {
+        if let Some(code) = write_artifact(path.as_str(), &bytes[..], &fsync, *component) {
             return Ok(code);
         }
     }
@@ -1111,7 +1193,12 @@ pub(super) fn append_checksum(bytes: &mut Vec<u8>, kind: gix::hash::Kind) -> Res
 /// its destination whatever that destination's mode is, whereas writing straight
 /// into the `0444` a previous run left behind would fail with `EACCES` and be
 /// misreported as an unwritable directory.
-fn write_artifact(path: &str, bytes: &[u8]) -> Option<ExitCode> {
+fn write_artifact(
+    path: &str,
+    bytes: &[u8],
+    fsync: &crate::config::FsyncPolicy,
+    component: crate::config::FsyncComponent,
+) -> Option<ExitCode> {
     let _ = std::fs::remove_file(path);
     match std::fs::write(path, bytes) {
         // git leaves `.pack`, `.idx`, `.rev` and `.mtimes` world-readable but
@@ -1119,6 +1206,10 @@ fn write_artifact(path: &str, bytes: &[u8]) -> Option<ExitCode> {
         // not check either.
         Ok(()) => {
             use std::os::unix::fs::PermissionsExt;
+            // Harden before the mode change, while the file is still writable:
+            // `core.fsync=pack` covers the pack itself and `pack-metadata` its
+            // `.idx`/`.rev`/`.mtimes` companions, which is the split git uses.
+            fsync.harden_path(component, std::path::Path::new(path));
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444));
             None
         }

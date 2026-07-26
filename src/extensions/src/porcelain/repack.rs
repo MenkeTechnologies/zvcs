@@ -98,8 +98,10 @@
 //!     reachable — every harness fixture — git writes no cruft pack either, so
 //!     this is only observable where unreachable objects exist.
 //!   * **`--max-pack-size`** does not split the output; one pack is always
-//!     written. git's `warning: minimum pack size limit is 1 MiB` below 1 MiB is
-//!     likewise not emitted.
+//!     written. Its diagnostics *are* reproduced: a value below 1 MiB warns
+//!     `warning: minimum pack size limit is 1 MiB`, and `pack.packSizeLimit`
+//!     supplies the default (validated ahead of parse-options, so an unreadable
+//!     value is fatal even for `-h`).
 //!   * **`--geometric`** repacks everything rather than selecting the subset of
 //!     packs that restores a geometric size progression.
 //!   * **`--filter=tree:<depth>`** is accepted but not applied to the traversal;
@@ -282,6 +284,9 @@ struct State {
     filter_to_dir: Option<String>,
     /// Every `--keep-pack` name; those packs survive `-d`.
     keep_packs: Vec<String>,
+    /// `--max-pack-size=<n>` as the magnitude git parsed, which repack forwards
+    /// to its `pack-objects` child. Zero is git's "unset".
+    max_pack_size: Option<u64>,
 }
 
 /// The outcome of parsing: either a fully-formed request, or a diagnostic that
@@ -307,6 +312,21 @@ pub fn repack(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
+    // git reads the pack config before parse-options here too, so an unreadable
+    // `pack.packSizeLimit` is fatal ahead of every parse diagnostic — verified
+    // against git 2.55.0, where `repack -h` under a bad value reports the number
+    // rather than printing usage.
+    let pack_size_limit_cfg = match gix::discover(".") {
+        Ok(repo) => match crate::config::config_ulong(&repo, "pack.packSizeLimit") {
+            Ok(limit) => limit,
+            Err(message) => {
+                eprintln!("fatal: {message}");
+                return Ok(ExitCode::from(128));
+            }
+        },
+        Err(_) => None,
+    };
+
     let state = match parse(args) {
         Parsed::Exit(code) => return Ok(code),
         Parsed::Ok(state) => state,
@@ -316,8 +336,24 @@ pub fn repack(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
+    // git's repack does not apply the limit itself: it forwards
+    // `--max-pack-size` (or, absent one, `pack.packSizeLimit`) to the
+    // `pack-objects` child, and the warning below is the child's. It therefore
+    // precedes everything repack prints, including `Nothing new to pack.` — which
+    // is where it lands here too, since this port packs inline instead of
+    // spawning. Like `pack-objects`, this port writes one pack whatever the limit
+    // says, so the warning is its only observable effect.
+    let pack_size_limit = state.max_pack_size.filter(|n| *n > 0).or(pack_size_limit_cfg);
+    if pack_size_limit.is_some_and(|n| n > 0 && n < MIN_PACK_SIZE_LIMIT) {
+        eprintln!("warning: minimum pack size limit is 1 MiB");
+    }
+
     execute(&state)
 }
+
+/// git's 1 MiB floor for `pack_size_limit`: any smaller non-zero limit warns and
+/// is then raised to this.
+const MIN_PACK_SIZE_LIMIT: u64 = 1024 * 1024;
 
 /// Do the repacking, for a repository discovered from the current directory.
 ///
@@ -968,6 +1004,14 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
         "cruft" => {
             st.cruft = on;
             st.all_into_one |= on;
+        }
+        // Forwarded verbatim to `pack-objects`, where it shadows
+        // `pack.packSizeLimit` and drives the 1 MiB floor warning.
+        "max-pack-size" => {
+            st.max_pack_size = value
+                .filter(|_| on)
+                .and_then(scaled)
+                .and_then(|n| u64::try_from(n).ok())
         }
         "quiet" => st.quiet = on,
         "keep-unreachable" => st.keep_unreachable = on,

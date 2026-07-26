@@ -51,6 +51,29 @@
 //! `-`), NUL- or newline-separated; they feed the same path form as inline
 //! pathspecs and reject being combined with inline pathspecs.
 //!
+//! ## `--recurse-submodules[=<bool>]`
+//!
+//! git's `option_parse_recurse_submodules_worktree_updater()`. The value is a
+//! plain boolean (`git_parse_maybe_bool`), so `--recurse-submodules=on-demand` is
+//! rejected with `fatal: bad recurse-submodules argument: on-demand` during the
+//! parse, and `submodule.recurse` supplies the default when neither the flag nor
+//! its `--no-` form is given. It rides only on the worktree-updating modes —
+//! `--hard`, `--merge`, `--keep` — because git routes it through
+//! `unpack_trees()`, which `--soft`/`--mixed` never run. Each active, initialized
+//! submodule whose worktree HEAD differs from the gitlink the reset just recorded
+//! is moved to it (the shared [`super::checkout::maybe_recurse_submodules`]).
+//!
+//! ## The interactive-hunk options
+//!
+//! `-U`/`--unified <n>`, `--inter-hunk-context <n>` and `--[no-]auto-advance`
+//! configure git's hunk selector and nothing else, but they are still observable
+//! without `--patch`: parse-options validates their values as `OPT_INTEGER`
+//! (`k`/`m`/`g` suffixes, `int` range check), and `cmd_reset()` then refuses any
+//! non-default value with `fatal: '--unified' cannot be negative` or `fatal: the
+//! option '<x>' requires '--patch'`. Both are reproduced, in git's order — after
+//! `parse_args()` verifies the leading positional, before every other
+//! compatibility check. See [`PatchDiffOpts`], shared with `git checkout`.
+//!
 //! ## Deferred
 //!
 //! `--patch`/`-p` (interactive hunk selection) is unsupported.
@@ -85,6 +108,266 @@ impl ResetMode {
             ResetMode::Merge => "merge",
             ResetMode::Keep => "keep",
         }
+    }
+}
+
+/// The three options `git reset`, `git checkout` and `git add` share for
+/// configuring the interactive hunk selector (`add-patch.c`'s `add_p_opt`):
+/// `-U`/`--unified <n>`, `--inter-hunk-context <n>` and `--[no-]auto-advance`.
+///
+/// None of them can change a byte of output on their own — they only take effect
+/// once `--patch` runs the hunk selector — but they are *not* inert: after
+/// parsing, git refuses the whole command when one of them was set to anything
+/// but its default and patch mode is off. That refusal, and parse-options'
+/// `OPT_INTEGER` value validation, are the entire observable behavior of these
+/// options outside `--patch`, and both are reproduced here.
+///
+/// Shared by [`reset`] and [`super::checkout::checkout`] so the two parse and
+/// diagnose them identically.
+#[derive(Clone, Copy)]
+pub(super) struct PatchDiffOpts {
+    /// `-U`/`--unified <n>` — git's `add_p_opt.context`. `-1` means "unset";
+    /// anything below `-1` is git's `cannot be negative` fatal.
+    unified: i32,
+    /// `--inter-hunk-context <n>` — git's `add_p_opt.interhunkcontext`, same
+    /// `-1` sentinel.
+    inter_hunk_context: i32,
+    /// `--[no-]auto-advance` — git's `add_p_opt.auto_advance`, on by default, so
+    /// only `--no-auto-advance` is ever observable outside `--patch`.
+    auto_advance: bool,
+    /// Set while a value-taking option has consumed its flag but not yet its
+    /// value: `Some((<name>, <short?>))`. parse-options takes the *next* argv
+    /// element verbatim, whatever it looks like.
+    pending: Option<(&'static str, bool)>,
+}
+
+impl Default for PatchDiffOpts {
+    fn default() -> Self {
+        Self {
+            unified: -1,
+            inter_hunk_context: -1,
+            auto_advance: true,
+            pending: None,
+        }
+    }
+}
+
+impl PatchDiffOpts {
+    /// True while a separate value is owed, so the caller must hand the next
+    /// token to [`Self::take_arg`] even after a `--` end-of-options marker.
+    pub(super) fn awaiting_value(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Feed one argv token. `Ok(true)` means it belonged to these options and was
+    /// consumed; `Ok(false)` means the caller keeps parsing it; `Err(code)` is the
+    /// exit code of a parse-options diagnostic already written to stderr.
+    pub(super) fn take_arg(&mut self, arg: &str) -> std::result::Result<bool, ExitCode> {
+        if let Some((name, short)) = self.pending.take() {
+            self.store(name, short, Some(arg))?;
+            return Ok(true);
+        }
+        match arg {
+            "-U" => self.pending = Some(("unified", true)),
+            "--unified" => self.pending = Some(("unified", false)),
+            "--inter-hunk-context" => self.pending = Some(("inter-hunk-context", false)),
+            "--auto-advance" => self.auto_advance = true,
+            "--no-auto-advance" => self.auto_advance = false,
+            // Sticky value forms.
+            _ if arg.starts_with("-U") && !arg.starts_with("--") => {
+                self.store("unified", true, Some(&arg[2..]))?;
+            }
+            _ if arg.starts_with("--unified=") => {
+                self.store("unified", false, Some(&arg["--unified=".len()..]))?;
+            }
+            _ if arg.starts_with("--inter-hunk-context=") => {
+                self.store(
+                    "inter-hunk-context",
+                    false,
+                    Some(&arg["--inter-hunk-context=".len()..]),
+                )?;
+            }
+            // `--[no-]auto-advance` is a pure toggle; a `=value` is a usage error.
+            _ if arg.starts_with("--auto-advance=") => {
+                eprintln!("error: option `auto-advance' takes no value");
+                return Err(ExitCode::from(129));
+            }
+            _ if arg.starts_with("--no-auto-advance=") => {
+                eprintln!("error: option `no-auto-advance' takes no value");
+                return Err(ExitCode::from(129));
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// End of argv with a value still owed: parse-options' `requires a value`.
+    pub(super) fn finish(&self) -> std::result::Result<(), ExitCode> {
+        match self.pending {
+            Some((name, short)) => {
+                eprintln!("error: {} requires a value", opt_label(name, short));
+                Err(ExitCode::from(129))
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Validate and record one `-U`/`--inter-hunk-context` value, reproducing
+    /// parse-options' `OPTION_INTEGER` diagnostics in git's own order: an absent
+    /// value, then an empty one, then one `git_parse_int()` rejects, then one
+    /// outside the `int` range.
+    fn store(
+        &mut self,
+        name: &'static str,
+        short: bool,
+        value: Option<&str>,
+    ) -> std::result::Result<(), ExitCode> {
+        let label = opt_label(name, short);
+        let raw = match value {
+            None => {
+                eprintln!("error: {label} requires a value");
+                return Err(ExitCode::from(129));
+            }
+            Some("") => {
+                eprintln!("error: {label} expects a numerical value");
+                return Err(ExitCode::from(129));
+            }
+            Some(v) => v,
+        };
+        let Some(parsed) = git_parse_int(raw) else {
+            eprintln!("error: {label} expects an integer value with an optional k/m/g suffix");
+            return Err(ExitCode::from(129));
+        };
+        let Ok(narrowed) = i32::try_from(parsed) else {
+            eprintln!(
+                "error: value {raw} for {label} not in range [{},{}]",
+                i32::MIN,
+                i32::MAX
+            );
+            return Err(ExitCode::from(129));
+        };
+        if name == "unified" {
+            self.unified = narrowed;
+        } else {
+            self.inter_hunk_context = narrowed;
+        }
+        Ok(())
+    }
+
+    /// git's post-parse refusal block, in git's fixed order (verified against git
+    /// 2.55.0): both `cannot be negative` checks first, then the three
+    /// `requires '--patch'` checks. `Some(code)` means the diagnostic has been
+    /// written and the command must exit with it.
+    ///
+    /// `patch` is whether `--patch` is in effect; this port never enters the hunk
+    /// selector, so callers pass `false` and every non-default value is refused
+    /// exactly as stock git refuses it.
+    pub(super) fn require_patch(&self, patch: bool) -> Option<ExitCode> {
+        if self.unified < -1 {
+            eprintln!("fatal: '--unified' cannot be negative");
+            return Some(ExitCode::from(128));
+        }
+        if self.inter_hunk_context < -1 {
+            eprintln!("fatal: '--inter-hunk-context' cannot be negative");
+            return Some(ExitCode::from(128));
+        }
+        if patch {
+            return None;
+        }
+        let opt = if self.unified != -1 {
+            "--unified"
+        } else if self.inter_hunk_context != -1 {
+            "--inter-hunk-context"
+        } else if !self.auto_advance {
+            "--no-auto-advance"
+        } else {
+            return None;
+        };
+        eprintln!("fatal: the option '{opt}' requires '--patch'");
+        Some(ExitCode::from(128))
+    }
+}
+
+/// parse-options names a short option `switch \`c'` and a long one `option \`n'`
+/// in its diagnostics.
+fn opt_label(name: &str, short: bool) -> String {
+    if short {
+        "switch `U'".to_string()
+    } else {
+        format!("option `{name}'")
+    }
+}
+
+/// git's `git_parse_int()` (config.c): `strtoimax(v, &end, 0)` — leading ASCII
+/// whitespace, an optional sign, then a base auto-detected from the prefix (`0x`
+/// hex, a leading `0` octal, else decimal) — followed by `get_unit_factor(end)`,
+/// which scales by 1, 1024, 1024² or 1024³ for an empty tail or a single
+/// `k`/`m`/`g` in either case. `None` for anything else. The accumulator is `i128`
+/// so a value too large for `intmax_t` still lands outside the caller's `int`
+/// range check rather than wrapping.
+fn git_parse_int(v: &str) -> Option<i128> {
+    let b = v.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let negative = match b.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let (radix, mut i) = if i + 1 < b.len() && b[i] == b'0' && (b[i + 1] | 0x20) == b'x' {
+        (16u32, i + 2)
+    } else if i < b.len() && b[i] == b'0' {
+        // A lone leading `0` is itself an octal digit, so the digit run is never empty.
+        (8u32, i)
+    } else {
+        (10u32, i)
+    };
+    let start = i;
+    let mut magnitude: i128 = 0;
+    while i < b.len() {
+        let Some(d) = (b[i] as char).to_digit(radix) else {
+            break;
+        };
+        magnitude = magnitude.saturating_mul(radix as i128) + d as i128;
+        // Saturate well past `int` range so the caller reports "not in range".
+        magnitude = magnitude.min(i64::MAX as i128);
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    let factor: i128 = match b[i..] {
+        [] => 1,
+        [u] => match u | 0x20 {
+            b'k' => 1024,
+            b'm' => 1024 * 1024,
+            b'g' => 1024 * 1024 * 1024,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let scaled = magnitude.saturating_mul(factor);
+    Some(if negative { -scaled } else { scaled })
+}
+
+/// git's `git_parse_maybe_bool()`: the canonical spellings first
+/// (`git_parse_maybe_bool_text`, where the empty string is false), then a fall
+/// back to `git_parse_int()` where any non-zero integer is true. Drives
+/// `--recurse-submodules=<v>`, whose value git parses as a plain boolean — which
+/// is why `on-demand` is rejected there.
+fn git_parse_maybe_bool(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "yes" | "on" | "true" => Some(true),
+        "no" | "off" | "false" | "" => Some(false),
+        _ => git_parse_int(v).map(|n| n != 0),
     }
 }
 
@@ -142,6 +425,15 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     let mut take_pff_value = false;
     let mut positionals: Vec<&str> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
+    // `-U`/`--unified`, `--inter-hunk-context`, `--[no-]auto-advance`: the
+    // interactive-hunk-selector options, refused after the argument split below
+    // exactly as git refuses them without `--patch`.
+    let mut patch_opts = PatchDiffOpts::default();
+    // `--recurse-submodules[=<bool>]` / `--no-recurse-submodules`. `None` = fall
+    // back to `submodule.recurse`; `Some(b)` = explicit flag. Only the
+    // worktree-updating modes (`--hard`, `--merge`, `--keep`) can move a
+    // submodule, matching git's `unpack_trees()` submodule updater.
+    let mut recurse_submodules: Option<bool> = None;
 
     for a in args {
         // `--pathspec-from-file <file>` (separate-argument form): parse-options
@@ -150,6 +442,15 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             pathspec_from_file = Some(a.clone());
             take_pff_value = false;
             continue;
+        }
+        // Likewise for a `-U`/`--unified`/`--inter-hunk-context` value still owed;
+        // outside that, these options are only recognised before `--`.
+        if patch_opts.awaiting_value() || !saw_dd {
+            match patch_opts.take_arg(a) {
+                Err(code) => return Ok(code),
+                Ok(true) => continue,
+                Ok(false) => {}
+            }
         }
         if saw_dd {
             paths.push(a.clone());
@@ -176,6 +477,23 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--pathspec-from-file=") => {
                 pathspec_from_file = Some(s["--pathspec-from-file=".len()..].to_string());
             }
+            // `--recurse-submodules[=<bool>]`: git's
+            // `option_parse_recurse_submodules_worktree_updater()`, whose value is a
+            // plain boolean (`parse_update_recurse_submodules_arg()` →
+            // `git_parse_maybe_bool`), so `on-demand` is as invalid as any other
+            // non-boolean and dies inside the parse loop.
+            "--recurse-submodules" => recurse_submodules = Some(true),
+            "--no-recurse-submodules" => recurse_submodules = Some(false),
+            s if s.starts_with("--recurse-submodules=") => {
+                let val = &s["--recurse-submodules=".len()..];
+                match git_parse_maybe_bool(val) {
+                    Some(b) => recurse_submodules = Some(b),
+                    None => {
+                        eprintln!("fatal: bad recurse-submodules argument: {val}");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+            }
             other if other.starts_with("--") => {
                 eprintln!("error: unknown option `{}'", &other[2..]);
                 eprint!("{USAGE}");
@@ -196,6 +514,14 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         eprintln!("error: option `pathspec-from-file' requires a value");
         return Ok(ExitCode::from(129));
     }
+    if let Err(code) = patch_opts.finish() {
+        return Ok(code);
+    }
+
+    // An explicit `--[no-]recurse-submodules` wins over `submodule.recurse`, which
+    // git reads into the same `config_update_recurse_submodules` slot.
+    let recurse_submodules = recurse_submodules
+        .unwrap_or_else(|| repo.config_snapshot().boolean("submodule.recurse") == Some(true));
 
     // ---- 2. Split positionals into an optional <commit> and pathspecs. ----
     // With `--`, a lone token before it is the commit; everything after is a path.
@@ -226,6 +552,16 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         if std::fs::symlink_metadata(first).is_err() {
             return Ok(ambiguous_argument(first));
         }
+    }
+
+    // git collects the hunk-selector options into `add_p_opt` and refuses them
+    // here — after `parse_args()` has verified the leading positional (so a bad
+    // revision still reports `ambiguous argument` first) and before every other
+    // compatibility check, including `Cannot do soft reset with paths.` and
+    // `the option '-N' requires '--mixed'` (verified against git 2.55.0).
+    // `--patch` is never in effect here: it bails in the parse loop above.
+    if let Some(code) = patch_opts.require_patch(false) {
+        return Ok(code);
     }
 
     // `parse_pathspec_from_file()` (builtin/reset.c): a NUL separator needs the file
@@ -336,6 +672,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         }
         move_head(&repo, target_commit, reflog_spec)?;
         remove_branch_state(repo.git_dir());
+        super::checkout::maybe_recurse_submodules(&repo, recurse_submodules, true)?;
         if !quiet {
             let summary = commit.message()?.summary().into_owned();
             println!("HEAD is now at {} {}", commit.short_id()?, summary);
@@ -361,6 +698,10 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         ResetMode::Hard => {
             let should_interrupt = AtomicBool::new(false);
             reset_worktree_hard(&repo, &old_index, target_tree, &should_interrupt)?;
+            // `--recurse-submodules` only reaches the worktree-updating modes: git
+            // routes it through `unpack_trees()`, which `--soft`/`--mixed` never run.
+            // The move itself is silent in git, hence the unconditional quiet flag.
+            super::checkout::maybe_recurse_submodules(&repo, recurse_submodules, true)?;
             if !quiet {
                 let summary = commit.message()?.summary().into_owned();
                 println!("HEAD is now at {} {}", commit.short_id()?, summary);

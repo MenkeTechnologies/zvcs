@@ -49,9 +49,26 @@
 //! `--all-match` gates a file on every pattern matching it, `--heading`/`--break`
 //! reshape the grouping, and `--color` emits git's default ANSI colouring.
 //!
-//! Not covered: `-O`/`--open-files-in-pager` (an interactive pager), and — within
-//! the function-context renderers — funcname detection driven by git's built-in
-//! userdiff regex tables (see above; such files are refused, not approximated).
+//! `-O`/`--open-files-in-pager[=<pager>]` is ported: git turns the search into a
+//! name-only one, collects the matched paths and hands them to the pager as its
+//! arguments (`run_pager` in builtin/grep.c). The pager is resolved exactly as
+//! `git_pager()` does — `GIT_PAGER`, then `core.pager`, then `PAGER`, then
+//! `less`, with an empty value or `cat` turning the whole thing off — spawned
+//! through git's `use_shell` rule, and for a `less`/`vi` pager with a single
+//! pattern the `+/<pattern>` (and `-I` under `-i`) search arguments are prepended.
+//! `--cached` or a `<tree>` argument alongside it is the fatal git makes of it,
+//! and a non-zero pager exit becomes this command's exit status.
+//!
+//! `grep.threads`/`--threads` are read for their diagnostics only: a worker-thread
+//! count cannot change the output of a search that emits in path order, but git's
+//! `invalid number of threads specified` fatal and its `ignoring --threads`
+//! warning under `-O` are observable, so both are reproduced.
+//!
+//! Not covered: `grep.fallbackToNoIndex` (it turns a repo-less invocation into a
+//! `--no-index` one, and this port's `--no-index` still requires a repository to
+//! discover), and — within the function-context renderers — funcname detection
+//! driven by git's built-in userdiff regex tables (see above; such files are
+//! refused, not approximated).
 //!
 //! The function-context renderers only shape the *rendering* of a match, so they
 //! are accepted during parsing (git itself diagnoses a missing pattern before it
@@ -119,14 +136,52 @@ enum Source {
     Blob(gix::hash::ObjectId),
 }
 
-// git's default `color.grep.*` slots, as the escape sequences it emits for each
-// output component (`grep.c`/`color.c`): filename magenta, separators cyan, line
-// and column numbers green, a match bold red, and a reset after each field.
-const C_FILENAME: &[u8] = b"\x1b[35m";
-const C_SEP: &[u8] = b"\x1b[36m";
-const C_LINENO: &[u8] = b"\x1b[32m";
-const C_MATCH: &[u8] = b"\x1b[1;31m";
+/// git's reset sequence, emitted after every colored field.
 const C_RESET: &[u8] = b"\x1b[m";
+
+/// The `color.grep.*` slots (git's `grep_config`), resolved once per process from
+/// the repository's config — or from git's built-in defaults when there is no
+/// repository, as under `git grep --no-index` outside a work tree. The accessors
+/// below hand each output component its slot.
+static COLORS: std::sync::OnceLock<super::color::GrepColors> = std::sync::OnceLock::new();
+
+/// The resolved slot table, reading the config on first use.
+fn colors() -> &'static super::color::GrepColors {
+    COLORS.get_or_init(|| match gix::discover(".") {
+        Ok(repo) => super::color::GrepColors::resolve(&repo),
+        Err(_) => super::color::GrepColors::defaults(),
+    })
+}
+
+/// `color.grep.filename` — the filename prefix.
+fn c_filename() -> &'static [u8] {
+    colors().filename.as_bytes()
+}
+
+/// `color.grep.separator` — the `:`/`-`/`=` field separators.
+fn c_sep() -> &'static [u8] {
+    colors().separator.as_bytes()
+}
+
+/// `color.grep.lineNumber` — the `-n` line-number field.
+fn c_lineno() -> &'static [u8] {
+    colors().line_number.as_bytes()
+}
+
+/// `color.grep.column` — the `--column` column-number field.
+fn c_column() -> &'static [u8] {
+    colors().column.as_bytes()
+}
+
+/// `color.grep.matchSelected` — matched text on a selected line.
+fn c_match() -> &'static [u8] {
+    colors().match_selected.as_bytes()
+}
+
+/// `color.grep.function` — the `-p` funcname line's body.
+fn c_function() -> &'static [u8] {
+    colors().function.as_bytes()
+}
 
 /// State gathered during option parsing that is resolved after the "no pattern
 /// given" diagnosis (which git makes first, before looking at these).
@@ -136,6 +191,16 @@ struct Deferred {
     /// incompatibility check; the flag is otherwise a no-op here.
     set_changing: Option<String>,
     all_match: bool,
+}
+
+/// What `-O`/`--open-files-in-pager` asked for. git registers the option with
+/// `PARSE_OPT_OPTARG` and a `"dummy"` default, then swaps that sentinel for
+/// `git_pager()`'s answer; an explicitly named pager is used verbatim.
+enum PagerReq {
+    /// `-O` / `--open-files-in-pager` with no value: resolve `git_pager()`.
+    Default,
+    /// `-O<pager>` / `--open-files-in-pager=<pager>`: this command line.
+    Named(String),
 }
 
 /// One token of the `--and`/`--or`/`--not`/`(`/`)` boolean grammar, in the order
@@ -179,7 +244,10 @@ enum Expr {
 ///     `-C`/`--context`, `-<num>`, `-W`/`--function-context`,
 ///     `-p`/`--show-function`
 ///   * content: `--textconv` (runs a configured `diff.<driver>.textconv`)
-///   * accepted no-ops: `--[no-]ext-grep`, `--threads`,
+///   * pager: `-O`/`--open-files-in-pager[=<pager>]`, `--no-open-files-in-pager`
+///   * threads: `--threads`/`grep.threads` (validated and diagnosed; a thread
+///     count cannot change path-ordered output)
+///   * accepted no-ops: `--[no-]ext-grep`,
 ///     `--recurse-submodules`/`--no-recurse-submodules`
 ///   * `[--] <pathspec>...`
 ///
@@ -221,12 +289,20 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     let mut textconv = false;
     let mut deferred = Deferred::default();
     let mut dialect = Dialect::Basic;
+    // `-O`/`--open-files-in-pager`, and git's `num_threads` (0 = "pick a count",
+    // which is what an unset `grep.threads` and an absent `--threads` leave it at).
+    let mut pager_req: Option<PagerReq> = None;
+    let mut num_threads: i64 = 0;
 
     // git's `grep_config`: config-provided defaults, applied before the CLI loop
     // below overrides them (`--[no-]line-number`, `-E`/`-F`/`-G`/`-P`, …). Done
     // via a cheap early discover so it also works ahead of the main repo open.
     if let Ok(repo) = gix::discover(".") {
         let snap = repo.config_snapshot();
+        // `color.grep`, falling back to `color.ui`, is git's default for whether
+        // the output is colored at all; an explicit `--color`/`--no-color` below
+        // overrides it.
+        opts.color = super::color::want_color_stdout(&repo, "grep");
         if snap.boolean("grep.lineNumber") == Some(true) {
             opts.line_number = true;
         }
@@ -247,6 +323,22 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 if snap.boolean("grep.extendedRegexp") == Some(true) {
                     dialect = Dialect::Extended;
                 }
+            }
+        }
+        // `grep.threads` seeds git's worker count. Its two diagnostics fire from
+        // inside `grep_config`, which is why they beat even the missing-pattern
+        // fatal: a value that is not an integer, and a negative one.
+        if let Some(raw) = snap.string("grep.threads") {
+            let raw = raw.to_string();
+            match parse_config_int(&raw) {
+                Some(n) if n < 0 => {
+                    eprintln!(
+                        "fatal: invalid number of threads specified ({n}) for grep.threads"
+                    );
+                    return Ok(ExitCode::from(128));
+                }
+                Some(n) => num_threads = n,
+                None => return Ok(bad_numeric_config(&raw, "grep.threads")),
             }
         }
     }
@@ -385,11 +477,21 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                     Err(code) => return Ok(code),
                 },
                 // Worker-thread count cannot change the output of a
-                // single-threaded search: git orders results by path either way.
+                // single-threaded search (git orders results by path either way),
+                // but the value is kept for the diagnostics resolved below.
                 "threads" => match parse_int(name, &value!()) {
-                    Ok(_) => {}
+                    Ok(n) => num_threads = n,
                     Err(code) => return Ok(code),
                 },
+                // `PARSE_OPT_OPTARG`: the pager is only ever spelled inline, so a
+                // following argument stays the pattern.
+                "open-files-in-pager" => {
+                    pager_req = Some(match inline.clone() {
+                        Some(v) => PagerReq::Named(v),
+                        None => PagerReq::Default,
+                    })
+                }
+                "no-open-files-in-pager" => pager_req = None,
                 // `--no-textconv` is git's default for grep, and `--ext-grep` is
                 // documented as ignored by modern builds.
                 "textconv" => textconv = true,
@@ -563,6 +665,18 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                     c = group.len();
                     continue;
                 }
+                // `-O` takes an optional value, so it consumes only the rest of
+                // its own group — never the next argument.
+                'O' => {
+                    let rest: String = group[c + 1..].iter().collect();
+                    pager_req = Some(if rest.is_empty() {
+                        PagerReq::Default
+                    } else {
+                        PagerReq::Named(rest)
+                    });
+                    c = group.len();
+                    continue;
+                }
                 'e' => {
                     let p = short_value!('e');
                     tokens.push(Tok::Atom(p.clone()));
@@ -714,6 +828,48 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     if opts.max_count == 0 {
         return Ok(ExitCode::from(1));
     }
+
+    // `-O`'s pager, resolved as git's `git_pager()` does. git swaps its `"dummy"`
+    // sentinel for this before it even looks for a pattern; an explicitly named
+    // pager skips the resolution (and so is never turned off by the `cat` rule).
+    let pager: Option<String> = match &pager_req {
+        None => None,
+        Some(PagerReq::Named(p)) => Some(p.clone()),
+        Some(PagerReq::Default) => git_pager(&repo),
+    };
+
+    // git's thread bookkeeping: `-O` forces a single thread and warns when the
+    // user asked for more, and only without `-O` is a negative count fatal.
+    if pager.is_some() {
+        if num_threads > 1 {
+            eprintln!("warning: invalid option combination, ignoring --threads");
+        }
+    } else if num_threads < 0 {
+        eprintln!("fatal: invalid number of threads specified ({num_threads})");
+        return Ok(ExitCode::from(128));
+    }
+
+    // The pager is fed worktree paths to open, so there is nothing for it to show
+    // for index-only or tree contents.
+    if pager.is_some() && (opts.cached || !revs.is_empty()) {
+        eprintln!("fatal: --open-files-in-pager only works on the worktree");
+        return Ok(ExitCode::from(128));
+    }
+
+    // git's own `-O` setup: colour off, and the search reduced to the name-only
+    // one whose output feeds the path list. `-L` keeps its own listing (its
+    // branch returns before the name-only one) and `-q` still prints nothing, so
+    // both are left to the precedence `search_file` already implements. The NUL
+    // terminator is git's `null_following_name`, which also means the collected
+    // paths are the raw bytes rather than C-quoted ones.
+    if pager.is_some() {
+        opts.color = false;
+        opts.nul = true;
+        if !opts.files_without {
+            opts.files_with = true;
+        }
+    }
+
     if let Some(code) = source_conflict(&opts) {
         return Ok(code);
     }
@@ -1013,7 +1169,16 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     }
 
     let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut term = std::io::BufWriter::new(stdout.lock());
+    // git's `-O` swaps its output function for `append_path`, so under a pager the
+    // same search writes into this buffer and the pager's argument vector is built
+    // from it afterwards. The two context-bearing branches below are unreachable
+    // then: `-O` forces a name-only search, which clears `renders_lines`.
+    let mut pager_buf: Vec<u8> = Vec::new();
+    let mut out: &mut dyn Write = match pager {
+        Some(_) => &mut pager_buf,
+        None => &mut term,
+    };
     let mut any_hit = false;
 
     // With `-A`/`-B`/`-C` the printed match lines gain surrounding context and a
@@ -1091,11 +1256,159 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     }
 
     out.flush()?;
-    Ok(if any_hit {
-        ExitCode::SUCCESS
+    if !any_hit {
+        return Ok(ExitCode::from(1));
+    }
+    // git only reaches `run_pager()` on a hit, and adopts a failing pager's exit
+    // status as its own.
+    if let Some(pager) = pager {
+        // git only prepends the pager's search arguments when its whole
+        // `pattern_list` is one entry — a lone pattern, with no `-e` sibling and
+        // no `--and`/`--not`/`()` token beside it.
+        let single = if tokens.len() == 1 { patterns.first() } else { None };
+        return Ok(run_pager(&pager, &pager_buf, single, opts.ignore_case));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// git's `git_pager()` chain, forced down the `stdout_is_tty` branch the way
+/// `cmd_grep` calls it: `$GIT_PAGER`, then `core.pager`, then `$PAGER`, then the
+/// compiled-in `less`. A value that came from the environment or config and is
+/// either empty or exactly `cat` turns paging off; the built-in default never
+/// does.
+fn git_pager(repo: &gix::Repository) -> Option<String> {
+    let configured = std::env::var("GIT_PAGER").ok().or_else(|| {
+        repo.config_snapshot().string("core.pager").map(|v| v.to_string())
+    });
+    let pager = match configured.or_else(|| std::env::var("PAGER").ok()) {
+        None => return Some("less".into()),
+        Some(p) => p,
+    };
+    if pager.is_empty() || pager == "cat" {
+        return None;
+    }
+    Some(pager)
+}
+
+/// git's `run_pager()` (builtin/grep.c): hand the pager the paths the name-only
+/// search collected, as its arguments, in the current directory. `collected` is
+/// the NUL-terminated path list `append_path` built.
+///
+/// With a single pattern and a `less`- or `vi`-named pager, git first prepends
+/// the search arguments that jump the pager to the first match: `-I` for a
+/// case-insensitive `less`, then `+/<pattern>` — with `less` taking an extra `*`
+/// before the pattern. The pager name is compared after stripping a leading
+/// directory, but only when the trailing component is exactly four bytes long,
+/// which is git's own `pager[len - 5]` test (so `/bin/less` is recognised and
+/// `/bin/vi` is not).
+fn run_pager(
+    pager: &str,
+    collected: &[u8],
+    single_pattern: Option<&String>,
+    ignore_case: bool,
+) -> ExitCode {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(pattern) = single_pattern {
+        let name = match pager.len().checked_sub(5) {
+            Some(i) if pager.as_bytes()[i] == b'/' => &pager[i + 1..],
+            _ => pager,
+        };
+        if ignore_case && name == "less" {
+            args.push("-I".into());
+        }
+        if name == "less" || name == "vi" {
+            let star = if name == "less" { "*" } else { "" };
+            args.push(format!("+/{star}{pattern}").into());
+        }
+    }
+    for path in collected.split(|&b| b == 0).filter(|p| !p.is_empty()) {
+        args.push(std::ffi::OsStr::from_bytes(path).to_owned());
+    }
+
+    let status = spawn_with_shell(pager, &args);
+    match status {
+        Ok(code) if code == 0 => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
+        Err(e) => {
+            eprintln!("error: cannot run {pager}: {}", errno_text(&e));
+            // git's `run_command` returns -1, and `run_pager` exits with it.
+            ExitCode::from(255)
+        }
+    }
+}
+
+/// git's `use_shell` child rule (`prepare_shell_cmd` in run-command.c): a command
+/// carrying any shell metacharacter is run as `sh -c '<cmd> "$@"' <cmd> <args>`
+/// (or plain `sh -c '<cmd>'` when there are no arguments); anything else is
+/// executed directly.
+fn spawn_with_shell(cmd: &str, args: &[std::ffi::OsString]) -> std::io::Result<i32> {
+    const META: &[u8] = b"|&;<>()$`\\\"' \t\n*?[#~=%";
+    let mut child = if cmd.bytes().any(|b| META.contains(&b)) {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c");
+        if args.is_empty() {
+            c.arg(cmd);
+        } else {
+            c.arg(format!("{cmd} \"$@\"")).arg(cmd).args(args);
+        }
+        c
     } else {
-        ExitCode::from(1)
+        let mut c = std::process::Command::new(cmd);
+        c.args(args);
+        c
+    };
+    let status = child.status()?;
+    // git's `wait_or_whine` reports a signalled child as 128 + the signal.
+    Ok(match status.code() {
+        Some(code) => code,
+        None => 128 + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0),
     })
+}
+
+/// The `$!` wording git's `error: cannot run <cmd>: <reason>` prints for the
+/// errnos an exec can raise here.
+fn errno_text(e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => "No such file or directory".into(),
+        std::io::ErrorKind::PermissionDenied => "Permission denied".into(),
+        _ => e.to_string(),
+    }
+}
+
+/// git's `git_config_int` on a `grep.threads` value: a decimal integer with an
+/// optional `k`/`m`/`g`/`t` scale suffix. `None` means it will not parse at all.
+fn parse_config_int(raw: &str) -> Option<i64> {
+    let (digits, scale): (&str, i64) = match raw.as_bytes().last() {
+        Some(b'k' | b'K') => (&raw[..raw.len() - 1], 1024),
+        Some(b'm' | b'M') => (&raw[..raw.len() - 1], 1024 * 1024),
+        Some(b'g' | b'G') => (&raw[..raw.len() - 1], 1024 * 1024 * 1024),
+        Some(b't' | b'T') => (&raw[..raw.len() - 1], 1024_i64.pow(4)),
+        _ => (raw, 1),
+    };
+    digits.trim().parse::<i64>().ok()?.checked_mul(scale)
+}
+
+/// git's `config_error_nonbool` shape for a numeric config value that will not
+/// parse: `fatal: bad numeric config value '<raw>' for '<key>': <reason>`, exit
+/// 128. git says `out of range` when a well-formed number overflows and
+/// `invalid unit` otherwise.
+fn bad_numeric_config(raw: &str, key: &str) -> ExitCode {
+    let digits = match raw.as_bytes().last() {
+        Some(c) if matches!(c.to_ascii_lowercase(), b'k' | b'm' | b'g' | b't') => {
+            &raw[..raw.len() - 1]
+        }
+        _ => raw,
+    };
+    let digits = digits.strip_prefix(['+', '-']).unwrap_or(digits);
+    let reason = if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        "out of range"
+    } else {
+        "invalid unit"
+    };
+    eprintln!("fatal: bad numeric config value '{raw}' for '{key}': {reason}");
+    ExitCode::from(128)
 }
 
 /// Read the `-f`/`--file` pattern file: each non-empty line is one pattern (OR'd
@@ -1891,7 +2204,7 @@ fn fc_emit<W: Write>(out: &mut W, cx: &Fc, idx: usize, sign: u8, last_shown: &mu
                     break;
                 }
                 write_line_header(out, cx.name, lno, start + 1, sign, cx.opts)?;
-                write_field(out, &line[start..start + len], C_MATCH, cx.opts.color)?;
+                write_field(out, &line[start..start + len], c_match(), cx.opts.color)?;
                 out.write_all(b"\n")?;
                 at = start + len;
             }
@@ -1903,15 +2216,33 @@ fn fc_emit<W: Write>(out: &mut W, cx: &Fc, idx: usize, sign: u8, last_shown: &mu
     }
     // The heading name prints once, when nothing has been shown yet.
     if cx.opts.heading && *last_shown == 0 {
-        write_field(out, cx.name, C_FILENAME, cx.opts.color)?;
+        write_field(out, cx.name, c_filename(), cx.opts.color)?;
         out.write_all(b"\n")?;
     }
     let col = if is_match_line { cx.col1[idx] } else { 0 };
     write_line_header(out, cx.name, lno, col, sign, cx.opts)?;
     if is_match_line {
-        write_body(out, cx.lv[idx], cx.ev.matcher, cx.opts.color && !cx.opts.invert)?;
+        write_body(
+            out,
+            cx.lv[idx],
+            cx.ev.matcher,
+            cx.opts.color,
+            Body::Selected,
+            !cx.opts.invert,
+        )?;
     } else {
-        out.write_all(cx.lv[idx])?;
+        // A funcname line is painted whole with `color.grep.function`; a context
+        // line uses `color.grep.context` and, under `-v` where the context lines
+        // are the ones that matched, highlights those matches with `matchContext`.
+        let kind = if sign == b'=' { Body::Function } else { Body::Context };
+        write_body(
+            out,
+            cx.lv[idx],
+            cx.ev.matcher,
+            cx.opts.color,
+            kind,
+            cx.opts.invert,
+        )?;
     }
     out.write_all(b"\n")?;
     *last_shown = lno;
@@ -2096,16 +2427,16 @@ fn write_line_header(
 ) -> Result<()> {
     let sep: &[u8] = if opts.nul { b"\0" } else { std::slice::from_ref(&sign) };
     if opts.show_names && !opts.heading {
-        write_field(out, name, C_FILENAME, opts.color)?;
-        write_field(out, sep, C_SEP, opts.color)?;
+        write_field(out, name, c_filename(), opts.color)?;
+        write_field(out, sep, c_sep(), opts.color)?;
     }
     if opts.line_number {
-        write_field(out, lno.to_string().as_bytes(), C_LINENO, opts.color)?;
-        write_field(out, sep, C_SEP, opts.color)?;
+        write_field(out, lno.to_string().as_bytes(), c_lineno(), opts.color)?;
+        write_field(out, sep, c_sep(), opts.color)?;
     }
     if opts.column && col != 0 {
-        write_field(out, col.to_string().as_bytes(), C_LINENO, opts.color)?;
-        write_field(out, sep, C_SEP, opts.color)?;
+        write_field(out, col.to_string().as_bytes(), c_column(), opts.color)?;
+        write_field(out, sep, c_sep(), opts.color)?;
     }
     Ok(())
 }
@@ -2188,7 +2519,7 @@ fn render_context(
                     out.write_all(b"--\n")?;
                 }
                 if opts.heading {
-                    write_field(out, name, C_FILENAME, opts.color)?;
+                    write_field(out, name, c_filename(), opts.color)?;
                     out.write_all(b"\n")?;
                 }
                 first_hunk_of_file = false;
@@ -2208,7 +2539,7 @@ fn render_context(
                         break;
                     }
                     write_prefix(out, name, idx + 1, start + 1, opts)?;
-                    write_field(out, &line[start..start + len], C_MATCH, opts.color)?;
+                    write_field(out, &line[start..start + len], c_match(), opts.color)?;
                     out.write_all(b"\n")?;
                     at = start + len;
                 }
@@ -2216,12 +2547,14 @@ fn render_context(
                 let col = ev.test(line).1;
                 write_prefix(out, name, idx + 1, col, opts)?;
                 // A `-v` line is not itself a match, so it is never highlighted.
-                write_body(out, line, ev.matcher, opts.color && !opts.invert)?;
+                write_body(out, line, ev.matcher, opts.color, Body::Selected, !opts.invert)?;
                 out.write_all(b"\n")?;
             }
         } else if !(opts.only_matching && !opts.invert) {
             write_context_prefix(out, name, idx + 1, opts)?;
-            out.write_all(line)?;
+            // Context lines carry `color.grep.context`; under `-v` they are the
+            // lines that matched, so their matches take `color.grep.matchContext`.
+            write_body(out, line, ev.matcher, opts.color, Body::Context, opts.invert)?;
             out.write_all(b"\n")?;
         }
         // Under `-o` a context line has no matched substring to show, so it emits
@@ -2238,12 +2571,12 @@ fn render_context(
 fn write_context_prefix(out: &mut impl Write, name: &[u8], lno: usize, opts: &Opts) -> Result<()> {
     let sep: &[u8] = if opts.nul { b"\0" } else { b"-" };
     if opts.show_names && !opts.heading {
-        write_field(out, name, C_FILENAME, opts.color)?;
-        write_field(out, sep, C_SEP, opts.color)?;
+        write_field(out, name, c_filename(), opts.color)?;
+        write_field(out, sep, c_sep(), opts.color)?;
     }
     if opts.line_number {
-        write_field(out, lno.to_string().as_bytes(), C_LINENO, opts.color)?;
-        write_field(out, sep, C_SEP, opts.color)?;
+        write_field(out, lno.to_string().as_bytes(), c_lineno(), opts.color)?;
+        write_field(out, sep, c_sep(), opts.color)?;
     }
     Ok(())
 }
@@ -2309,14 +2642,14 @@ fn search_file(
                     break; // an empty pattern has no non-empty part to show
                 }
                 write_prefix(out, name, lno + 1, start + 1, opts)?;
-                write_field(out, &line[start..start + len], C_MATCH, opts.color)?;
+                write_field(out, &line[start..start + len], c_match(), opts.color)?;
                 out.write_all(b"\n")?;
                 at = start + len;
             }
         } else {
             write_prefix(out, name, lno + 1, col1, opts)?;
             // A `-v` line is not itself a match, so it is never highlighted.
-            write_body(out, line, ev.matcher, opts.color && !opts.invert)?;
+            write_body(out, line, ev.matcher, opts.color, Body::Selected, !opts.invert)?;
             out.write_all(b"\n")?;
         }
     }
@@ -2325,7 +2658,7 @@ fn search_file(
     let term: &[u8] = if opts.nul { b"\0" } else { b"\n" };
     if opts.files_without {
         if !hit && !opts.quiet {
-            write_field(out, name, C_FILENAME, opts.color)?;
+            write_field(out, name, c_filename(), opts.color)?;
             out.write_all(term)?;
         }
         return Ok(!hit);
@@ -2335,15 +2668,15 @@ fn search_file(
     }
     if opts.files_with {
         if hit {
-            write_field(out, name, C_FILENAME, opts.color)?;
+            write_field(out, name, c_filename(), opts.color)?;
             out.write_all(term)?;
         }
         return Ok(hit);
     }
     if opts.count && count > 0 {
         if opts.show_names {
-            write_field(out, name, C_FILENAME, opts.color)?;
-            write_field(out, if opts.nul { b"\0" } else { b":" }, C_SEP, opts.color)?;
+            write_field(out, name, c_filename(), opts.color)?;
+            write_field(out, if opts.nul { b"\0" } else { b":" }, c_sep(), opts.color)?;
         }
         writeln!(out, "{count}")?;
     }
@@ -2364,24 +2697,26 @@ fn write_prefix(
 ) -> Result<()> {
     let sep: &[u8] = if opts.nul { b"\0" } else { b":" };
     if opts.show_names && !opts.heading {
-        write_field(out, name, C_FILENAME, opts.color)?;
-        write_field(out, sep, C_SEP, opts.color)?;
+        write_field(out, name, c_filename(), opts.color)?;
+        write_field(out, sep, c_sep(), opts.color)?;
     }
     if opts.line_number {
-        write_field(out, lno.to_string().as_bytes(), C_LINENO, opts.color)?;
-        write_field(out, sep, C_SEP, opts.color)?;
+        write_field(out, lno.to_string().as_bytes(), c_lineno(), opts.color)?;
+        write_field(out, sep, c_sep(), opts.color)?;
     }
     if opts.column {
-        write_field(out, column.to_string().as_bytes(), C_LINENO, opts.color)?;
-        write_field(out, sep, C_SEP, opts.color)?;
+        write_field(out, column.to_string().as_bytes(), c_column(), opts.color)?;
+        write_field(out, sep, c_sep(), opts.color)?;
     }
     Ok(())
 }
 
 /// Write one output field, wrapped in `code`/reset when `color` is set and left
-/// bare otherwise.
+/// bare otherwise. A slot that resolved to no color (git's default for
+/// `color.grep.context`, `selected` and `function`) emits neither the escape nor
+/// the reset, exactly as git's `color_output` leaves an empty color alone.
 fn write_field(out: &mut impl Write, bytes: &[u8], code: &[u8], color: bool) -> Result<()> {
-    if color {
+    if color && !code.is_empty() {
         out.write_all(code)?;
         out.write_all(bytes)?;
         out.write_all(C_RESET)?;
@@ -2391,23 +2726,57 @@ fn write_field(out: &mut impl Write, bytes: &[u8], code: &[u8], color: bool) -> 
     Ok(())
 }
 
-/// Write a matched line's body. Without `--color` the whole line goes out as-is;
-/// with it, each matched span is wrapped in the match colour and the gaps stay
-/// plain, exactly as git highlights a selected line.
-fn write_body(out: &mut impl Write, line: &[u8], matcher: &Matcher, color: bool) -> Result<()> {
+/// Which line a body belongs to, which picks the pair of `color.grep.*` slots it
+/// is painted with (git's `show_line`).
+#[derive(Clone, Copy, PartialEq)]
+enum Body {
+    /// A selected (matching) line: gaps use `selected`, matches `matchSelected`.
+    Selected,
+    /// A `-A`/`-B`/`-C` context line: gaps use `context`, matches `matchContext`
+    /// — reachable under `-v`, where the context lines are the matching ones.
+    Context,
+    /// A `-p` funcname line: the whole body uses `function` and nothing in it is
+    /// highlighted.
+    Function,
+}
+
+/// Write a line's body. Without `--color` the whole line goes out as-is; with it,
+/// each matched span is wrapped in the line kind's match color and each gap in
+/// its non-matching color, exactly as git paints a selected or context line.
+/// `highlight` is false where the line has no matched span to show (`-v` selected
+/// lines), leaving the whole body in the gap color.
+fn write_body(
+    out: &mut impl Write,
+    line: &[u8],
+    matcher: &Matcher,
+    color: bool,
+    kind: Body,
+    highlight: bool,
+) -> Result<()> {
     if !color {
         return out.write_all(line).map_err(Into::into);
+    }
+    let (gap, hit) = match kind {
+        Body::Selected => (colors().selected.as_bytes(), c_match()),
+        Body::Context => (
+            colors().context.as_bytes(),
+            colors().match_context.as_bytes(),
+        ),
+        Body::Function => (c_function(), c_function()),
+    };
+    if !highlight || kind == Body::Function {
+        return write_field(out, line, gap, true);
     }
     let mut at = 0usize;
     while let Some((start, len)) = next_match(line, matcher, at) {
         if len == 0 {
             break;
         }
-        out.write_all(&line[at..start])?;
-        write_field(out, &line[start..start + len], C_MATCH, true)?;
+        write_field(out, &line[at..start], gap, true)?;
+        write_field(out, &line[start..start + len], hit, true)?;
         at = start + len;
     }
-    out.write_all(&line[at..])?;
+    write_field(out, &line[at..], gap, true)?;
     Ok(())
 }
 
@@ -2429,7 +2798,7 @@ fn open_group(
         out.write_all(b"\n")?;
     }
     if opts.heading {
-        write_field(out, name, C_FILENAME, opts.color)?;
+        write_field(out, name, c_filename(), opts.color)?;
         out.write_all(b"\n")?;
     }
     *emitted_any = true;
@@ -2705,6 +3074,7 @@ fn unsupported(flag: &str) -> String {
          -A/-B/-C context, -W/-p function context, --and/--or/--not/() grammar, \
          --heading, --break, --all-match, --full-name, --cached, --untracked, \
          --no-index/--index, --[no-]exclude-standard, --recurse-submodules, --textconv, \
-         --color, <tree>/<revision> search, and pathspecs)"
+         --color, -O/--open-files-in-pager, --threads, <tree>/<revision> search, \
+         and pathspecs)"
     )
 }

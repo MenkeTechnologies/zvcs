@@ -471,7 +471,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
         }
         if !blocks.is_empty() {
             let joined = blocks.join("\nerror: ");
-            if crate::advice::enabled("rmHints") {
+            if crate::advice::Advice::RmHints.enabled() {
                 let hint = if opts.cached {
                     "(use -f to force removal)"
                 } else {

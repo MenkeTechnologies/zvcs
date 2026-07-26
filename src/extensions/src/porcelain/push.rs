@@ -41,6 +41,8 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     // command line; if so it wins over `push.recurseSubmodules` (git reads config
     // before parse_options, so the flag's assignment lands last).
     let mut recurse_explicit = false;
+    // Same for `--follow-tags`/`--no-follow-tags` against `push.followTags`.
+    let mut follow_tags_explicit = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -76,7 +78,10 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "--no-all" | "--no-branches" => f.all = false,
             "--tags" => f.tags = true,
             "--no-tags" => f.tags = false,
-            "--follow-tags" => f.follow_tags = true,
+            "--follow-tags" => {
+                f.follow_tags = true;
+                follow_tags_explicit = true;
+            }
             "-u" | "--set-upstream" => f.set_upstream = true,
             "--no-set-upstream" => f.set_upstream = false,
             "--porcelain" => f.porcelain = true,
@@ -94,7 +99,10 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "--no-atomic" => f.atomic = false,
             "--no-mirror" => f.mirror = false,
             "--no-prune" => f.prune = false,
-            "--no-follow-tags" => f.follow_tags = false,
+            "--no-follow-tags" => {
+                f.follow_tags = false;
+                follow_tags_explicit = true;
+            }
             "--receive-pack" | "--exec" => {
                 let _ = take_value(inline)?;
             }
@@ -162,6 +170,15 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         if !recurse_explicit {
             if let Some(v) = snap.string("push.recurseSubmodules") {
                 f.recurse = parse_recurse(&v.to_string())?;
+            }
+        }
+
+        // `push.followTags` — the default for `--follow-tags`
+        // (`git_push_config`: `TRANSPORT_PUSH_FOLLOW_TAGS`). The flag, in
+        // either direction, overrides it.
+        if !follow_tags_explicit {
+            if let Some(on) = snap.boolean("push.followTags") {
+                f.follow_tags = on;
             }
         }
 
@@ -896,6 +913,10 @@ fn tracking_ref_for(remote: &gix::Remote<'_>, pushed: &str) -> Option<String> {
 /// Print the human `To <url>` status block (git prints it on stderr) and return
 /// the exit code: failure if the unpack failed or any ref was rejected.
 fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
+    // git's two independent switches over this block: `color.transport` for the
+    // per-ref summary field and `color.push` for the trailing error line. Both are
+    // `auto` against stderr and neither consults `color.ui`.
+    let colors = super::color::PushColors::resolve(gix::discover(".").ok().as_ref());
     let mut any_failed = outcome.unpack.is_err();
     if let Err(reason) = &outcome.unpack {
         eprintln!("error: unpack failed: {reason}");
@@ -916,6 +937,9 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
     }
 
     eprintln!("To {}", outcome.url);
+    // Every rejected ref with its reason, which `advise_rejections` folds into
+    // the single advice block git prints under the status list.
+    let mut rejected: Vec<(&str, &str)> = Vec::new();
     for s in &outcome.statuses {
         let short = |oid: &ObjectId| oid.to_hex_with_len(7).to_string();
         let src_dst = format!("{} -> {}", short_ref(&s.name), short_ref(&s.name));
@@ -950,7 +974,12 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
             }
             Err(reason) => {
                 any_failed = true;
-                eprintln!(" ! [rejected]        {src_dst} ({reason})");
+                rejected.push((s.name.as_str(), reason.as_str()));
+                // git colors the padded summary field alone (`color.transport` /
+                // `color.transport.rejected`), leaving the space before the
+                // refspec outside the span.
+                let summary = super::color::PushColors::paint(&colors.rejected, "! [rejected]       ");
+                eprintln!(" {summary} {src_dst} ({reason})");
             }
         }
     }
@@ -959,10 +988,84 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
     }
 
     if any_failed {
-        eprintln!("error: failed to push some refs to '{}'", outcome.url);
+        // `color.push` / `color.push.error`. git closes the span *after* the
+        // newline, so the reset lands at the start of the following line.
+        let line = format!("error: failed to push some refs to '{}'", outcome.url);
+        if colors.error.is_empty() {
+            eprintln!("{line}");
+        } else {
+            eprint!("{}{line}\n\x1b[m", colors.error);
+        }
+        advise_rejections(&rejected);
         return Ok(ExitCode::from(1));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The advice tail `do_push` (builtin/push.c) prints after the rejection block.
+/// git folds every rejected ref into a reason bitmask and prints **one** hint,
+/// picking the first reason in this fixed priority order; each hint is
+/// suppressed by its own `advice.*` slot *and* by the umbrella
+/// `advice.pushUpdateRejected` (which `advice.pushNonFastForward` also gates).
+///
+/// The two reasons the push protocol here produces are the non-fast-forward
+/// rejection — split by whether the rejected ref is the checked-out branch, as
+/// `transport_push` splits `REJECT_NON_FF_HEAD` from `REJECT_NON_FF_OTHER` — and
+/// "fetch first", for a remote ref pointing at an object we do not have.
+fn advise_rejections(rejected: &[(&str, &str)]) {
+    use crate::advice::Advice;
+
+    if rejected.is_empty() {
+        return;
+    }
+    let Ok(repo) = gix::discover(".") else { return };
+    if !Advice::PushUpdateRejected.enabled_in(&repo) {
+        return;
+    }
+    // `resolve_refdup("HEAD")`: the full name of the branch HEAD points at, so a
+    // rejected `refs/heads/main` on a checked-out `main` is the "current branch"
+    // case and any other rejected branch is the "pushed branch tip" case.
+    let head = repo
+        .head_ref()
+        .ok()
+        .flatten()
+        .map(|r| r.name().as_bstr().to_string());
+    let non_ff_head = head.as_deref().is_some_and(|h| {
+        rejected
+            .iter()
+            .any(|(n, reason)| *reason == "non-fast-forward" && *n == h)
+    });
+    let non_ff_other = rejected
+        .iter()
+        .any(|(n, reason)| *reason == "non-fast-forward" && Some(*n) != head.as_deref());
+    let fetch_first = rejected.iter().any(|(_, reason)| *reason == "fetch first");
+
+    if non_ff_head {
+        Advice::PushNonFFCurrent.advise_plain_in(
+            &repo,
+            "Updates were rejected because the tip of your current branch is behind\n\
+             its remote counterpart. If you want to integrate the remote changes,\n\
+             use 'git pull' before pushing again.\n\
+             See the 'Note about fast-forwards' in 'git push --help' for details.",
+        );
+    } else if non_ff_other {
+        Advice::PushNonFFMatching.advise_plain_in(
+            &repo,
+            "Updates were rejected because a pushed branch tip is behind its remote\n\
+             counterpart. If you want to integrate the remote changes, use 'git pull'\n\
+             before pushing again.\n\
+             See the 'Note about fast-forwards' in 'git push --help' for details.",
+        );
+    } else if fetch_first {
+        Advice::PushFetchFirst.advise_plain_in(
+            &repo,
+            "Updates were rejected because the remote contains work that you do not\n\
+             have locally. This is usually caused by another repository pushing to\n\
+             the same ref. If you want to integrate the remote changes, use\n\
+             'git pull' before pushing again.\n\
+             See the 'Note about fast-forwards' in 'git push --help' for details.",
+        );
+    }
 }
 
 /// `--porcelain`: machine-readable output — `<flag>\t<ref>\t<summary>` per ref,

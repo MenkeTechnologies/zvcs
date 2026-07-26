@@ -78,6 +78,18 @@ enum Untracked {
 ///   * `status.displayCommentPrefix` — prefixes every long-format line with the
 ///     comment string (`core.commentString`/`core.commentChar`, default `#`); the
 ///     trailing summary / stash lines stay unprefixed, matching git.
+///   * `git status -v|--verbose` (`OPT__VERBOSE_MORE`, so `-vv`/`-v -v` count up,
+///     `--no-verbose` resets) — `wt_status_print_verbose()`. One appends the
+///     staged patch to the long format; two also label it `Changes to be
+///     committed:` with `c/`…`i/` prefixes (only when something is committable —
+///     otherwise git leaves the configured prefixes alone), then a 50-dash rule,
+///     `Changes not staged for commit:` and the index↔worktree patch with
+///     `i/`…`w/` prefixes. The section labels and rule go through
+///     `status_printf` and so pick up `status.displayCommentPrefix`; the patch
+///     bodies do not. Like git, the verbose patches ignore the command line's
+///     pathspec, and the short / porcelain formats ignore `-v` entirely. The
+///     patches come from this binary's own `git diff`, so they are byte-identical
+///     to it (see [`verbose_patch`]).
 ///   * unmerged (conflicted) paths, in both long and short form.
 ///   * `git status [--] <pathspec>...` — limits the report to matching paths
 ///     (the gix status iterator is given the patterns), across every format.
@@ -144,6 +156,11 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     // from `column.ui` / `column.status` before the command line is parsed so a
     // `--column` flag overrides the config (git's `git_status_config` runs during
     // config, `parseopt_column_callback` after).
+    // `-v`/`--verbose` is git's `OPT__VERBOSE_MORE`, a count-up: one appends the
+    // staged patch to the long format, two or more also label it and append the
+    // unstaged patch. `--no-verbose` resets the count to zero. The short and
+    // porcelain formats ignore it entirely.
+    let mut verbose: u32 = 0;
     let mut colopts: u32 = super::column::DISABLED;
     if let Err(msg) = super::column::config_colopts(&mut colopts, "status") {
         eprint!("{msg}");
@@ -201,6 +218,8 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 branch_header = false;
                 branch_explicit = true;
             }
+            "--verbose" => verbose += 1,
+            "--no-verbose" => verbose = 0,
             "--show-stash" => show_stash = Some(true),
             "--no-show-stash" => show_stash = Some(false),
             // `--ahead-behind` selects FULL counts, `--no-ahead-behind` the QUICK
@@ -299,7 +318,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                             branch_header = true;
                             branch_explicit = true;
                         }
-                        'v' => {}
+                        'v' => verbose += 1,
                         'z' => null_term = true,
                         'u' => {
                             // A bare `-u` (no attached value) is git's `all` default;
@@ -478,6 +497,11 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     // `status.aheadBehind=false` selects it, everything else is FULL).
     let show_stash = show_stash.unwrap_or(false);
     let quick = ahead_behind == Some(false);
+    // `wt_status_prepare`: `s->hints = advice_enabled(ADVICE_STATUS_HINTS)`.
+    // Every parenthesized "(use …)" direction in the long format hangs off this
+    // one flag, and the trailing summary switches to its short wording when it is
+    // off. The short/porcelain formats carry no hints at all.
+    let hints = crate::advice::Advice::StatusHints.enabled_in(&repo);
 
     // Resolve the head into an owned description so the borrow ends before we
     // re-open references for the tracking computation.
@@ -722,7 +746,8 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
             "{}",
             render_long(
                 &head_state,
-                &tracking_lines(tracking.as_ref(), quick),
+                &tracking_lines(tracking.as_ref(), quick, hints),
+                hints,
                 unborn,
                 merging,
                 untracked,
@@ -737,6 +762,8 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
                 &colors,
                 comment_prefix.as_deref(),
                 colopts,
+                verbose,
+                repo.workdir(),
             )
         );
     }
@@ -1625,14 +1652,21 @@ fn tracking_info(repo: &gix::Repository) -> Result<Option<Tracking>> {
 /// Build the tracking header line(s) for the long format, matching git's
 /// `format_tracking_info` output including advice hints. Empty when there is no
 /// upstream configured.
-fn tracking_lines(tracking: Option<&Tracking>, quick: bool) -> String {
+///
+/// `hints` is git's `!(s->hints)` argument to `format_tracking_info`
+/// (`show_divergence_advice`): with `advice.statusHints=false` the state line
+/// stays but the "(use …)" line under it is dropped.
+fn tracking_lines(tracking: Option<&Tracking>, quick: bool, hints: bool) -> String {
     let Some(t) = tracking else {
         return String::new();
     };
+    // Each state's advice line, appended only when hints are on.
+    let advice = |line: &str| if hints { format!("  ({line})\n") } else { String::new() };
     let upstream = &t.upstream;
     if t.gone {
         return format!(
-            "Your branch is based on '{upstream}', but the upstream is gone.\n  (use \"git branch --unset-upstream\" to fixup)\n"
+            "Your branch is based on '{upstream}', but the upstream is gone.\n{}",
+            advice("use \"git branch --unset-upstream\" to fixup")
         );
     }
     let (ahead, behind) = (t.ahead, t.behind);
@@ -1641,21 +1675,25 @@ fn tracking_lines(tracking: Option<&Tracking>, quick: bool) -> String {
     } else if quick {
         // AHEAD_BEHIND_QUICK: git knows the branches differ but not by how much.
         format!(
-            "Your branch and '{upstream}' refer to different commits.\n  (use \"git status --ahead-behind\" for details)\n"
+            "Your branch and '{upstream}' refer to different commits.\n{}",
+            advice("use \"git status --ahead-behind\" for details")
         )
     } else if behind == 0 {
         let noun = if ahead == 1 { "commit" } else { "commits" };
         format!(
-            "Your branch is ahead of '{upstream}' by {ahead} {noun}.\n  (use \"git push\" to publish your local commits)\n"
+            "Your branch is ahead of '{upstream}' by {ahead} {noun}.\n{}",
+            advice("use \"git push\" to publish your local commits")
         )
     } else if ahead == 0 {
         let noun = if behind == 1 { "commit" } else { "commits" };
         format!(
-            "Your branch is behind '{upstream}' by {behind} {noun}, and can be fast-forwarded.\n  (use \"git pull\" to update your local branch)\n"
+            "Your branch is behind '{upstream}' by {behind} {noun}, and can be fast-forwarded.\n{}",
+            advice("use \"git pull\" to update your local branch")
         )
     } else {
         format!(
-            "Your branch and '{upstream}' have diverged,\nand have {ahead} and {behind} different commits each, respectively.\n  (use \"git pull\" if you want to integrate the remote branch with yours)\n"
+            "Your branch and '{upstream}' have diverged,\nand have {ahead} and {behind} different commits each, respectively.\n{}",
+            advice("use \"git pull\" if you want to integrate the remote branch with yours")
         )
     }
 }
@@ -1731,10 +1769,38 @@ fn count_commits(repo: &gix::Repository, tip: ObjectId, hidden: ObjectId) -> Res
     Ok(walk.take_while(Result::is_ok).count())
 }
 
+/// Render one of the two patches `git status -v` appends, by re-executing this
+/// binary's own `git diff` with the flags git gives its verbose `rev_info`.
+///
+/// Going through the real `diff` implementation rather than a second renderer is
+/// what keeps the appended patch byte-identical to `git diff` — index-line
+/// abbreviation, rename detection, `diff.*` config and the hunk formatting all
+/// come from one place. The child runs at the top of the working tree because
+/// git's verbose diff is repo-wide and root-relative regardless of where `status`
+/// was invoked.
+///
+/// A child that cannot be spawned (or a bare repository, which has no worktree to
+/// diff) contributes no patch, exactly as git's empty diff would.
+fn verbose_patch(workdir: Option<&std::path::Path>, args: &[&str]) -> String {
+    let (Some(dir), Ok(exe)) = (workdir, std::env::current_exe()) else {
+        return String::new();
+    };
+    let out = std::process::Command::new(exe)
+        .current_dir(dir)
+        .arg("diff")
+        .args(args)
+        .output();
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_long(
     head_state: &HeadState,
     tracking: &str,
+    hints: bool,
     unborn: bool,
     merging: bool,
     untracked_mode: Untracked,
@@ -1749,6 +1815,8 @@ fn render_long(
     colors: &StatusColors,
     comment_prefix: Option<&str>,
     colopts: u32,
+    verbose: u32,
+    workdir: Option<&std::path::Path>,
 ) -> String {
     let mut out = String::new();
     // When columns are active, the untracked/ignored path lists are replaced by a
@@ -1788,11 +1856,15 @@ fn render_long(
     if merging {
         if unmerged.is_empty() {
             out.push_str("All conflicts fixed but you are still merging.\n");
-            out.push_str("  (use \"git commit\" to conclude merge)\n");
+            if hints {
+                out.push_str("  (use \"git commit\" to conclude merge)\n");
+            }
         } else {
             out.push_str("You have unmerged paths.\n");
-            out.push_str("  (fix conflicts and run \"git commit\")\n");
-            out.push_str("  (use \"git merge --abort\" to abort the merge)\n");
+            if hints {
+                out.push_str("  (fix conflicts and run \"git commit\")\n");
+                out.push_str("  (use \"git merge --abort\" to abort the merge)\n");
+            }
         }
         out.push('\n');
     }
@@ -1805,7 +1877,7 @@ fn render_long(
         out.push_str("Changes to be committed:\n");
         // Mid-merge git offers no unstage hint, as `git restore --staged` is not
         // the right advice while `MERGE_HEAD` is around.
-        if !merging {
+        if hints && !merging {
             if unborn {
                 out.push_str("  (use \"git rm --cached <file>...\" to unstage)\n");
             } else {
@@ -1825,7 +1897,9 @@ fn render_long(
 
     if !unmerged.is_empty() {
         out.push_str("Unmerged paths:\n");
-        out.push_str(unmerged_hint(unmerged));
+        if hints {
+            out.push_str(unmerged_hint(unmerged));
+        }
         for (mask, path) in unmerged {
             let label = unmerged_label(*mask);
             let body = format!("{label:<17}{}", quote_path(path));
@@ -1838,10 +1912,14 @@ fn render_long(
         let any_deleted = unstaged.iter().any(|(k, _)| matches!(k, WorkKind::Deleted));
         let add_hint = if any_deleted { "git add/rm" } else { "git add" };
         out.push_str("Changes not staged for commit:\n");
-        out.push_str(&format!(
-            "  (use \"{add_hint} <file>...\" to update what will be committed)\n"
-        ));
-        out.push_str("  (use \"git restore <file>...\" to discard changes in working directory)\n");
+        if hints {
+            out.push_str(&format!(
+                "  (use \"{add_hint} <file>...\" to update what will be committed)\n"
+            ));
+            out.push_str(
+                "  (use \"git restore <file>...\" to discard changes in working directory)\n",
+            );
+        }
         for (kind, path) in unstaged {
             let label = work_label(*kind);
             let body = format!("{label:<12}{}", quote_path(path));
@@ -1856,12 +1934,20 @@ fn render_long(
         // git only mentions the suppressed listing when the run is committable —
         // otherwise the trailing summary already carries the `-u` hint.
         if committable {
-            out.push_str("Untracked files not listed (use -u option to show untracked files)\n");
+            if hints {
+                out.push_str(
+                    "Untracked files not listed (use -u option to show untracked files)\n",
+                );
+            } else {
+                out.push_str("Untracked files not listed\n");
+            }
         }
     } else {
         if !untracked.is_empty() {
             out.push_str("Untracked files:\n");
-            out.push_str("  (use \"git add <file>...\" to include in what will be committed)\n");
+            if hints {
+                out.push_str("  (use \"git add <file>...\" to include in what will be committed)\n");
+            }
             if column_on {
                 out.push_str(&format!("\u{1}{}\u{1}\n", blocks.len()));
                 blocks.push(status_column_block(
@@ -1882,7 +1968,11 @@ fn render_long(
         }
         if show_ignored && !ignored.is_empty() {
             out.push_str("Ignored files:\n");
-            out.push_str("  (use \"git add -f <file>...\" to include in what will be committed)\n");
+            if hints {
+                out.push_str(
+                    "  (use \"git add -f <file>...\" to include in what will be committed)\n",
+                );
+            }
             // git colors ignored paths with the untracked slot — there is no
             // separate `color.status.ignored`.
             if column_on {
@@ -1905,6 +1995,41 @@ fn render_long(
         }
     }
 
+    // `wt_status_print_verbose()`: `-v` appends the staged patch, `-vv` labels it
+    // and appends the unstaged one too. It runs *before* the trailing summary and
+    // ignores the command line's pathspec entirely — git builds a fresh `rev_info`
+    // for it, so `git status -v -- b.txt` still shows a staged `a.txt` (verified
+    // against git 2.55.0). Section labels and the rule go through `status_printf`
+    // and so pick up `status.displayCommentPrefix`; the patch bodies bypass it,
+    // which is what the sentinel/`blocks` splice below reproduces.
+    if verbose > 0 {
+        // git only overrides the prefixes on the branch that also prints the
+        // header, so a `-v` (or a `-vv` with nothing committable) leaves the diff
+        // on its configured defaults — `diff.noprefix` / `diff.mnemonicprefix`
+        // then apply to it, exactly as they do to `git diff --cached`.
+        let labelled = verbose > 1 && committable;
+        if labelled {
+            out.push_str("Changes to be committed:\n");
+        }
+        let mut staged_args: Vec<&str> = vec!["--cached"];
+        if labelled {
+            staged_args.extend_from_slice(&["--src-prefix=c/", "--dst-prefix=i/"]);
+        }
+        out.push_str(&format!("\u{1}{}\u{1}\n", blocks.len()));
+        blocks.push(verbose_patch(workdir, &staged_args));
+
+        let workdir_dirty = !unstaged.is_empty() || !unmerged.is_empty();
+        if verbose > 1 && workdir_dirty {
+            out.push_str(&format!("{}\n", "-".repeat(50)));
+            out.push_str("Changes not staged for commit:\n");
+            out.push_str(&format!("\u{1}{}\u{1}\n", blocks.len()));
+            blocks.push(verbose_patch(
+                workdir,
+                &["--src-prefix=i/", "--dst-prefix=w/"],
+            ));
+        }
+    }
+
     // Trailing summary + stash line — git emits both with plain `fprintf`, never
     // through `status_printf`, so they are NOT comment-prefixed even under
     // `status.displayCommentPrefix`. They are collected into `trailer` and appended
@@ -1915,14 +2040,32 @@ fn render_long(
     // (git's "committable" state), matching stock output.
     if !committable {
         let workdir_dirty = !unstaged.is_empty() || !unmerged.is_empty();
+        // Each summary has a hints-on and a hints-off wording in
+        // `wt_longstatus_print`; only the clean-tree line is the same either way.
         let summary = if workdir_dirty {
-            "no changes added to commit (use \"git add\" and/or \"git commit -a\")"
+            if hints {
+                "no changes added to commit (use \"git add\" and/or \"git commit -a\")"
+            } else {
+                "no changes added to commit"
+            }
         } else if !untracked.is_empty() {
-            "nothing added to commit but untracked files present (use \"git add\" to track)"
+            if hints {
+                "nothing added to commit but untracked files present (use \"git add\" to track)"
+            } else {
+                "nothing added to commit but untracked files present"
+            }
         } else if unborn {
-            "nothing to commit (create/copy files and use \"git add\" to track)"
+            if hints {
+                "nothing to commit (create/copy files and use \"git add\" to track)"
+            } else {
+                "nothing to commit"
+            }
         } else if untracked_mode == Untracked::No {
-            "nothing to commit (use -u to show untracked files)"
+            if hints {
+                "nothing to commit (use -u to show untracked files)"
+            } else {
+                "nothing to commit"
+            }
         } else {
             "nothing to commit, working tree clean"
         };

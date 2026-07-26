@@ -69,7 +69,11 @@ const ERROR_PACK: u8 = 4;
 ///                                       failure. The fsck message layer git also
 ///                                       re-runs over packed objects is not part of
 ///                                       it; see divergence 1.
-///   * `--strict` / `--no-strict`     — accepted; see divergence 1.
+///   * `--strict` / `--no-strict`     — promotes every message-layer warning
+///                                       that no `fsck.<msg-id>` configured to
+///                                       an error, leaving info-severity ids
+///                                       (`badFilemode`, `badTagName`,
+///                                       `missingTaggerEntry`) alone.
 ///   * `--lost-found`                  — writes dangling objects into
 ///                                       `$GIT_DIR/lost-found/{commit,other}/`,
 ///                                       forcing `check_full` on and reflogs off
@@ -89,19 +93,20 @@ const ERROR_PACK: u8 = 4;
 ///
 /// ### Known divergences from stock git — read before trusting a clean result
 ///
-/// 1. **No fsck message layer.** git additionally lints object *contents*
-///    (`badDate`, `missingEmail`, `zeroPaddedFilemode`, `hasDotgit`,
-///    `duplicateEntries`, and the rest of the `fsck.<msg-id>` set) and exits 2
-///    when an error-severity message fires. None of that lives in the vendored
-///    crates, so a repository whose only defect is a semantic lint violation is
-///    reported clean here while stock git exits 2. `--strict` selects a stricter
-///    severity table for that same layer, so it is accepted and changes nothing.
+/// 1. **The fsck message layer covers 28 of git's 76 message ids.** git lints
+///    object *contents* on top of the connectivity walk and exits 1 when an
+///    error-severity message fires; that layer is ported below (see [`MSGS`]),
+///    including `fsck.<msg-id>` severities, `--strict` promotion and
+///    `fsck.skipList`. What is *not* covered is listed id by id in
+///    [`UNPORTED_MSG_IDS`]: the reference-database ids (`git refs verify` has no
+///    equivalent here), the `.gitmodules`/`.gitattributes` blob ids, and the ids
+///    git only reaches by linting a buffer its own object parser already
+///    rejected. A repository whose only defect is one of those is reported clean
+///    here while stock git reports it.
 ///    `--full` verifies pack *integrity* (checksums, per-object hash/CRC) via the
-///    gix pack verifier, but the object-*content* message layer git re-runs over
-///    packed objects through `verify_pack()`'s `fsck_obj_buffer` callback is part
-///    of this same missing layer, so it is not reproduced. This port is
-///    equivalent in depth to `git fsck --connectivity-only` for object content,
-///    plus pack checksum/CRC verification when `--full` is in effect.
+///    gix pack verifier; the message layer runs over packed objects too, since
+///    the object-directory scan below iterates the whole odb rather than only
+///    its loose half.
 /// 2. **No `git refs verify`.** git checks the reference database by default
 ///    (`--references`) by running `git refs verify`; there is no equivalent in the
 ///    vendored crates. Both spellings of the flag are accepted because the check
@@ -226,6 +231,16 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `git_fsck_config()` runs before any checking, so a bad `fsck.<msg-id>`
+    // value or an unreadable `fsck.skipList` dies before a line is printed.
+    let msg_config = match MsgConfig::new(&repo, MsgSource::Fsck { strict: opt.strict }) {
+        Ok(c) => c,
+        Err(fatal) => {
+            eprintln!("fatal: {fatal}");
+            return Ok(ExitCode::from(128));
+        }
+    };
+
     let mut errors: u8 = 0;
     let mut state = State::default();
 
@@ -286,6 +301,8 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // sees as used. `dangling` is precisely "unreachable and never used", so
     // this pass has to cover unreachable objects too.
     let mut scan_lines: Vec<(ObjectId, String)> = Vec::new();
+    // `fsck_object()`'s own findings, which go to stderr rather than stdout.
+    let mut msg_lines: Vec<(ObjectId, String)> = Vec::new();
     // `fsck_source()` announces the directory once per odb source before walking
     // it; `--connectivity-only` skips `fsck_source()` altogether.
     if opt.verbose && !opt.connectivity_only {
@@ -320,6 +337,42 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         if opt.connectivity_only {
             continue;
         }
+
+        // `fsck_obj()` runs `fsck_object()` next, and returns early when it
+        // reported an error — so an object that fails the message layer
+        // contributes no `root`/`tagged` line.
+        let object = repo.find_object(id)?;
+        let mut failed = false;
+        for finding in check_object(kind, &object.data) {
+            match msg_config.severity(&finding, &id) {
+                Severity::Ignore => {}
+                Severity::Info | Severity::Warn => msg_lines.push((
+                    id,
+                    format!("warning in {kind} {id}: {}: {}", finding.msg.id, finding.text),
+                )),
+                Severity::Error | Severity::Fatal => {
+                    msg_lines.push((
+                        id,
+                        format!("error in {kind} {id}: {}: {}", finding.msg.id, finding.text),
+                    ));
+                    // A loose object is checked by `fsck_object_dir()`, whose
+                    // failures are `ERROR_OBJECT`; a packed one is checked by
+                    // `verify_pack()`'s `fsck_obj_buffer` callback, and git
+                    // reports the whole pack instead with `ERROR_PACK`.
+                    errors |= if is_loose(&repo, id) {
+                        ERROR_OBJECT
+                    } else {
+                        ERROR_PACK
+                    };
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            continue;
+        }
+
         if opt.show_root && decoded.is_root_commit {
             scan_lines.push((id, format!("root {id}")));
         }
@@ -350,6 +403,29 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             );
         }
         scan_lines.sort_by_key(|(id, _)| id.as_bytes()[0]);
+    }
+
+    // The message layer's lines are emitted from the same scan, so they are
+    // ordered — and refused when ambiguous — by the same rule.
+    if msg_lines.len() > 1 {
+        let mut by_subdir: HashSet<u8> = HashSet::new();
+        let distinct: Vec<ObjectId> = {
+            let mut seen = HashSet::new();
+            msg_lines.iter().map(|(id, _)| *id).filter(|id| seen.insert(*id)).collect()
+        };
+        let collides = distinct.iter().any(|id| !by_subdir.insert(id.as_bytes()[0]));
+        if collides || has_packs(&repo) {
+            bail!(
+                "refusing to guess the output order: git emits these {} object-content messages \
+                 during its object-directory scan, and two of them share the raw readdir() \
+                 sequence of one .git/objects/?? subdirectory",
+                msg_lines.len()
+            );
+        }
+        msg_lines.sort_by_key(|(id, _)| id.as_bytes()[0]);
+    }
+    for (_, line) in &msg_lines {
+        eprintln!("{line}");
     }
     if show_progress && !opt.connectivity_only {
         // `fsck_object_dir()` runs once per odb source (the main object directory
@@ -572,6 +648,8 @@ struct Options {
     write_lost_and_found: bool,
     verbose: bool,
     progress: Option<bool>,
+    /// `--strict`: promotes every *defaulted* message-layer warning to an error.
+    strict: bool,
     objects: Vec<String>,
 }
 
@@ -591,6 +669,7 @@ impl Default for Options {
             write_lost_and_found: false,
             verbose: false,
             progress: None,
+            strict: false,
             objects: Vec::new(),
         }
     }
@@ -670,11 +749,10 @@ impl Options {
             // `check_full` gates `verify_pack()`, ported below as a pack integrity
             // check; `check_references` gates `git refs verify`, which the vendored
             // crates do not expose, so it is tracked only so `--progress` and the
-            // packs guard behave. `strict` selects a message-layer severity this
-            // port does not implement.
+            // packs guard behave.
             7 => self.check_full = on,
             8 => self.connectivity_only = on,
-            9 => {} // strict
+            9 => self.strict = on,
             10 => self.write_lost_and_found = on,
             11 => self.progress = Some(on),
             12 => self.name_objects = on,
@@ -815,9 +893,16 @@ fn decode(repo: &gix::Repository, id: ObjectId) -> Result<Decoded> {
     let mut tag = None;
     match object.kind {
         Kind::Commit => {
-            let commit = gix::objs::CommitRef::from_bytes(&object.data, repo.object_hash())?;
-            children.push((commit.tree(), Kind::Tree));
-            let parents: Vec<ObjectId> = commit.parents().collect();
+            // gix validates the whole header; `parse_commit_buffer()` only reads
+            // the `tree` and `parent` lines, and leaves everything else to the
+            // message layer. Fall back to those two fields so a commit git
+            // parses — one with a broken ident line, say — is linted rather
+            // than declared corrupt.
+            let (tree, parents) = match gix::objs::CommitRef::from_bytes(&object.data, repo.object_hash()) {
+                Ok(commit) => (commit.tree(), commit.parents().collect::<Vec<_>>()),
+                Err(e) => commit_links(&object.data).ok_or(e)?,
+            };
+            children.push((tree, Kind::Tree));
             is_root_commit = parents.is_empty();
             children.extend(parents.into_iter().map(|p| (p, Kind::Commit)));
         }
@@ -833,10 +918,16 @@ fn decode(repo: &gix::Repository, id: ObjectId) -> Result<Decoded> {
             }
         }
         Kind::Tag => {
-            let parsed = gix::objs::TagRef::from_bytes(&object.data, repo.object_hash())?;
-            let target = parsed.target();
-            children.push((target, parsed.target_kind));
-            tag = Some((parsed.target_kind, target, parsed.name.to_string()));
+            // Same as for commits: `parse_tag_buffer()` reads only `object`,
+            // `type` and `tag`, so an extra header or a missing tagger is a
+            // message-layer matter, not a parse failure.
+            let (target, target_kind, name) =
+                match gix::objs::TagRef::from_bytes(&object.data, repo.object_hash()) {
+                    Ok(parsed) => (parsed.target(), parsed.target_kind, parsed.name.to_string()),
+                    Err(e) => tag_links(&object.data).ok_or(e)?,
+                };
+            children.push((target, target_kind));
+            tag = Some((target_kind, target, name));
         }
         Kind::Blob => {}
     }
@@ -845,6 +936,41 @@ fn decode(repo: &gix::Repository, id: ObjectId) -> Result<Decoded> {
         is_root_commit,
         tag,
     })
+}
+
+/// `commit.c::parse_commit_buffer` reduced to what `fsck_walk_commit()` needs:
+/// the `tree` line and every `parent` line, both of which must be well formed
+/// or git itself reports the object as unparseable.
+fn commit_links(data: &[u8]) -> Option<(ObjectId, Vec<ObjectId>)> {
+    let rest = data.strip_prefix(b"tree ")?;
+    let (tree, mut rest) = take_oid_line(rest)?;
+    let mut parents = Vec::new();
+    while let Some(after) = rest.strip_prefix(b"parent ") {
+        let (parent, tail) = take_oid_line(after)?;
+        parents.push(parent);
+        rest = tail;
+    }
+    Some((tree, parents))
+}
+
+/// `tag.c::parse_tag_buffer` reduced to the three headers `fsck_walk_tag()`
+/// needs: the target id, its type and the tag name.
+fn tag_links(data: &[u8]) -> Option<(ObjectId, Kind, String)> {
+    let rest = data.strip_prefix(b"object ")?;
+    let (target, rest) = take_oid_line(rest)?;
+    let rest = rest.strip_prefix(b"type ")?;
+    let eol = rest.iter().position(|&b| b == b'\n')?;
+    let kind = Kind::from_bytes(&rest[..eol]).ok()?;
+    let rest = rest[eol + 1..].strip_prefix(b"tag ")?;
+    let eol = rest.iter().position(|&b| b == b'\n')?;
+    Some((target, kind, String::from_utf8_lossy(&rest[..eol]).into_owned()))
+}
+
+/// One hex object id followed by a newline, and the rest of the buffer.
+fn take_oid_line(data: &[u8]) -> Option<(ObjectId, &[u8])> {
+    let eol = data.iter().position(|&b| b == b'\n')?;
+    let id = ObjectId::from_hex(&data[..eol]).ok()?;
+    Some((id, &data[eol + 1..]))
 }
 
 /// git's default head set minus reflogs and the index: every reference plus
@@ -1115,16 +1241,28 @@ fn has_packs(repo: &gix::Repository) -> bool {
 /// "Checking object directories" progress block per source. Sources are deduped
 /// by canonical path, matching git's device/inode dedup closely enough for the
 /// count, which is all the identical progress blocks need.
-fn odb_source_count(repo: &gix::Repository) -> usize {
+/// Whether `id` exists as a loose object in any odb source — which decides
+/// whether git found it through `fsck_object_dir()` or through `verify_pack()`,
+/// and so which error bit its messages set.
+fn is_loose(repo: &gix::Repository, id: ObjectId) -> bool {
+    let hex = id.to_hex().to_string();
+    odb_sources(repo)
+        .into_iter()
+        .any(|objdir| objdir.join(&hex[..2]).join(&hex[2..]).is_file())
+}
+
+/// Every object directory git would search: the repository's own, plus each
+/// alternate reached transitively.
+fn odb_sources(repo: &gix::Repository) -> Vec<PathBuf> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut out: Vec<PathBuf> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![repo.common_dir().join("objects")];
-    let mut count = 0usize;
     while let Some(objdir) = stack.pop() {
         let canon = objdir.canonicalize().unwrap_or_else(|_| objdir.clone());
         if !seen.insert(canon) {
             continue;
         }
-        count += 1;
+        out.push(objdir.clone());
         let Ok(content) = std::fs::read(objdir.join("info").join("alternates")) else {
             continue;
         };
@@ -1133,15 +1271,20 @@ fn odb_source_count(repo: &gix::Repository) -> usize {
                 continue;
             }
             let p = Path::new(std::ffi::OsStr::from_bytes(line));
-            let alt = if p.is_absolute() {
+            stack.push(if p.is_absolute() {
                 p.to_path_buf()
             } else {
                 objdir.join(p)
-            };
-            stack.push(alt);
+            });
         }
     }
-    count
+    out
+}
+
+/// How many object directories `fsck_object_dir()` runs over, which is how
+/// many progress blocks `--progress` prints.
+fn odb_source_count(repo: &gix::Repository) -> usize {
+    odb_sources(repo).len()
 }
 
 /// Every linked worktree's HEAD, index, and per-worktree reflogs as heads,
@@ -1349,4 +1492,753 @@ fn slot(id: &ObjectId, size: usize) -> usize {
 fn fatal_corrupt(id: ObjectId, err: &dyn std::fmt::Display) -> ExitCode {
     eprintln!("fatal: object {id} is corrupt: {err}");
     ExitCode::from(128)
+}
+
+// ===========================================================================
+// The fsck message layer — `fsck.c`
+// ===========================================================================
+//
+// On top of the connectivity walk git lints object *contents*: every commit,
+// tree and tag it reads goes through `fsck_object()`, which reports one
+// `<msg-id>` per defect as
+//
+// ```text
+// error in commit <oid>: missingEmail: invalid author/committer line - missing email
+// ```
+//
+// on stderr. Each id carries a default severity that `fsck.<msg-id>` (for
+// `git fsck`) or `receive.fsck.<msg-id>` (for `git receive-pack`) overrides
+// with `error`, `warn` or `ignore`, `--strict` promotes every *defaulted*
+// warning to an error, and `fsck.skipList` / `receive.fsck.skipList` name a
+// file of object ids whose messages are dropped wholesale.
+//
+// Which ids are here is decided by one rule: a row exists only when this port
+// actually performs the check *and* the check can fire on both the `git fsck`
+// and the `receive-pack` path. That excludes every id git reports from a place
+// this port has no equivalent of — see [`UNPORTED_MSG_IDS`].
+
+/// `fsck.h`'s `enum fsck_msg_type`. `Ignore`, `Warn` and `Error` are the three
+/// values a `fsck.<msg-id>` variable can name; `Info` is a default only.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Severity {
+    /// The message is not reported at all.
+    Ignore,
+    /// `fsck_vreport()` prints an `FSCK_INFO` message as a warning, but
+    /// `fsck_msg_severity()` only promotes `FSCK_WARN` under `--strict`, so an
+    /// info-severity default stays a warning there.
+    Info,
+    /// Reported as `warning in <type> <oid>: …`; does not affect the exit code.
+    Warn,
+    /// Reported as `error in <type> <oid>: …`; sets `ERROR_OBJECT`.
+    Error,
+    /// `FSCK_FATAL`: reported exactly like `Error`, but
+    /// `fsck_set_msg_type_from_ids()` refuses to demote it — configuring
+    /// anything but `error` dies with `Cannot demote <id> to <value>`.
+    Fatal,
+}
+
+/// One row of `fsck.h`'s `FOREACH_FSCK_MSG_ID` table.
+pub struct Msg {
+    /// The `<msg-id>` git prints in front of the message text.
+    pub id: &'static str,
+    /// The variable `git fsck` reads for this check's severity.
+    pub fsck_key: &'static str,
+    /// The variable `git receive-pack` reads for it. git deliberately does
+    /// *not* let this fall back to `fsck_key` (`git help config`: "the
+    /// receive.fsck.<msg-id> … variables will not fall back on the
+    /// fsck.<msg-id> configuration").
+    pub receive_key: &'static str,
+    /// `fsck.h`'s severity for the id when nothing configures it.
+    pub default: Severity,
+}
+
+/// Build one table row; the two config keys are always `fsck.<id>` and
+/// `receive.fsck.<id>`, spelled out so both are greppable literals.
+macro_rules! msg {
+    ($konst:ident, $id:literal, $fsck:literal, $receive:literal, $sev:ident) => {
+        #[doc = concat!("`", $id, "`, whose severity comes from `", $fsck, "` under ")]
+        #[doc = concat!("`git fsck` and from `", $receive, "` under `git receive-pack`.")]
+        const $konst: Msg = Msg {
+            id: $id,
+            fsck_key: $fsck,
+            receive_key: $receive,
+            default: Severity::$sev,
+        };
+    };
+}
+
+// --- commit header checks (`verify_headers`, `fsck_commit`, `fsck_ident`) ---
+msg!(MISSING_AUTHOR, "missingAuthor", "fsck.missingAuthor", "receive.fsck.missingAuthor", Error);
+msg!(MULTIPLE_AUTHORS, "multipleAuthors", "fsck.multipleAuthors", "receive.fsck.multipleAuthors", Error);
+msg!(MISSING_COMMITTER, "missingCommitter", "fsck.missingCommitter", "receive.fsck.missingCommitter", Error);
+msg!(MISSING_NAME_BEFORE_EMAIL, "missingNameBeforeEmail", "fsck.missingNameBeforeEmail", "receive.fsck.missingNameBeforeEmail", Error);
+msg!(BAD_EMAIL, "badEmail", "fsck.badEmail", "receive.fsck.badEmail", Error);
+msg!(MISSING_EMAIL, "missingEmail", "fsck.missingEmail", "receive.fsck.missingEmail", Error);
+msg!(MISSING_SPACE_BEFORE_EMAIL, "missingSpaceBeforeEmail", "fsck.missingSpaceBeforeEmail", "receive.fsck.missingSpaceBeforeEmail", Error);
+msg!(MISSING_SPACE_BEFORE_DATE, "missingSpaceBeforeDate", "fsck.missingSpaceBeforeDate", "receive.fsck.missingSpaceBeforeDate", Error);
+msg!(ZERO_PADDED_DATE, "zeroPaddedDate", "fsck.zeroPaddedDate", "receive.fsck.zeroPaddedDate", Error);
+msg!(BAD_DATE_OVERFLOW, "badDateOverflow", "fsck.badDateOverflow", "receive.fsck.badDateOverflow", Error);
+msg!(BAD_DATE, "badDate", "fsck.badDate", "receive.fsck.badDate", Error);
+msg!(BAD_TIMEZONE, "badTimezone", "fsck.badTimezone", "receive.fsck.badTimezone", Error);
+msg!(NUL_IN_COMMIT, "nulInCommit", "fsck.nulInCommit", "receive.fsck.nulInCommit", Warn);
+msg!(UNTERMINATED_HEADER, "unterminatedHeader", "fsck.unterminatedHeader", "receive.fsck.unterminatedHeader", Fatal);
+msg!(NUL_IN_HEADER, "nulInHeader", "fsck.nulInHeader", "receive.fsck.nulInHeader", Fatal);
+
+// --- tree checks (`fsck_tree`) ---------------------------------------------
+msg!(NULL_SHA1, "nullSha1", "fsck.nullSha1", "receive.fsck.nullSha1", Warn);
+msg!(FULL_PATHNAME, "fullPathname", "fsck.fullPathname", "receive.fsck.fullPathname", Warn);
+msg!(HAS_DOT, "hasDot", "fsck.hasDot", "receive.fsck.hasDot", Warn);
+msg!(HAS_DOTDOT, "hasDotdot", "fsck.hasDotdot", "receive.fsck.hasDotdot", Warn);
+msg!(HAS_DOTGIT, "hasDotgit", "fsck.hasDotgit", "receive.fsck.hasDotgit", Warn);
+msg!(ZERO_PADDED_FILEMODE, "zeroPaddedFilemode", "fsck.zeroPaddedFilemode", "receive.fsck.zeroPaddedFilemode", Warn);
+msg!(BAD_FILEMODE, "badFilemode", "fsck.badFilemode", "receive.fsck.badFilemode", Info);
+msg!(DUPLICATE_ENTRIES, "duplicateEntries", "fsck.duplicateEntries", "receive.fsck.duplicateEntries", Error);
+msg!(TREE_NOT_SORTED, "treeNotSorted", "fsck.treeNotSorted", "receive.fsck.treeNotSorted", Error);
+msg!(LARGE_PATHNAME, "largePathname", "fsck.largePathname", "receive.fsck.largePathname", Warn);
+
+// --- tag checks (`fsck_tag`) -----------------------------------------------
+msg!(MISSING_TAGGER_ENTRY, "missingTaggerEntry", "fsck.missingTaggerEntry", "receive.fsck.missingTaggerEntry", Info);
+msg!(BAD_TAG_NAME, "badTagName", "fsck.badTagName", "receive.fsck.badTagName", Info);
+msg!(EXTRA_HEADER_ENTRY, "extraHeaderEntry", "fsck.extraHeaderEntry", "receive.fsck.extraHeaderEntry", Ignore);
+
+/// Every row this port implements, for severity resolution and for telling a
+/// misspelled `fsck.<x>` key from a real one.
+pub const MSGS: &[Msg] = &[
+    MISSING_AUTHOR,
+    MULTIPLE_AUTHORS,
+    MISSING_COMMITTER,
+    MISSING_NAME_BEFORE_EMAIL,
+    BAD_EMAIL,
+    MISSING_EMAIL,
+    MISSING_SPACE_BEFORE_EMAIL,
+    MISSING_SPACE_BEFORE_DATE,
+    ZERO_PADDED_DATE,
+    BAD_DATE_OVERFLOW,
+    BAD_DATE,
+    BAD_TIMEZONE,
+    NUL_IN_COMMIT,
+    UNTERMINATED_HEADER,
+    NUL_IN_HEADER,
+    NULL_SHA1,
+    FULL_PATHNAME,
+    HAS_DOT,
+    HAS_DOTDOT,
+    HAS_DOTGIT,
+    ZERO_PADDED_FILEMODE,
+    BAD_FILEMODE,
+    DUPLICATE_ENTRIES,
+    TREE_NOT_SORTED,
+    LARGE_PATHNAME,
+    MISSING_TAGGER_ENTRY,
+    BAD_TAG_NAME,
+    EXTRA_HEADER_ENTRY,
+];
+
+/// The rest of `FOREACH_FSCK_MSG_ID`: ids git knows and this port never
+/// reports. They are listed by bare id and not by variable name on purpose —
+/// nothing reads a `fsck.<one-of-these>` variable, so naming one would claim
+/// support that does not exist. Configuring one is accepted (git would too)
+/// and changes nothing, which is the honest outcome for a check that is not
+/// performed. Three groups:
+///
+///   * **the reference-database ids** (`badRefName`, `badRefContent`,
+///     `packedRefUnsorted`, `symlinkRef`, `badReftableTableName`, …) belong to
+///     `git refs verify`, which the vendored crates do not implement (see
+///     divergence 2 above);
+///   * **the `.gitmodules`/`.gitattributes`/`.gitignore`/`.mailmap` blob ids**
+///     need the blob-content lint git runs after collecting those paths from
+///     every tree, which this port does not run;
+///   * **the ids reachable only past a parse failure** (`missingTree`,
+///     `badTreeSha1`, `badParentSha1`, `missingObject`, `missingType`,
+///     `unknownType`, `emptyName`, …). git reaches those by fsck'ing a raw
+///     buffer its own object parser already rejected; this port only reaches
+///     `fsck_object` for objects gix could parse, so they can never fire.
+const UNPORTED_MSG_IDS: &[&str] = &[
+    "badGpgsig",
+    "badHeaderContinuation",
+    "badHeadTarget",
+    "badName",
+    "badObjectSha1",
+    "badPackedRefEntry",
+    "badPackedRefHeader",
+    "badParentSha1",
+    "badRefContent",
+    "badReferentName",
+    "badRefFiletype",
+    "badRefName",
+    "badRefOid",
+    "badReftableTableName",
+    "badTree",
+    "badTreeSha1",
+    "badType",
+    "emptyName",
+    "emptyPackedRefsFile",
+    "gitattributesBlob",
+    "gitattributesLarge",
+    "gitattributesLineLength",
+    "gitattributesMissing",
+    "gitattributesSymlink",
+    "gitignoreSymlink",
+    "gitmodulesBlob",
+    "gitmodulesLarge",
+    "gitmodulesMissing",
+    "gitmodulesName",
+    "gitmodulesParse",
+    "gitmodulesPath",
+    "gitmodulesSymlink",
+    "gitmodulesUpdate",
+    "gitmodulesUrl",
+    "mailmapSymlink",
+    "missingObject",
+    "missingTag",
+    "missingTagEntry",
+    "missingTree",
+    "missingType",
+    "missingTypeEntry",
+    "packedRefEntryNotTerminated",
+    "packedRefUnsorted",
+    "refMissingNewline",
+    "symlinkRef",
+    "symrefTargetIsNotARef",
+    "trailingRefContent",
+    "unknownType",
+];
+
+/// One reported defect: the table row that names it plus the rendered text.
+pub struct Finding {
+    /// The row, which decides the severity and prints the `<msg-id>:` prefix.
+    pub msg: &'static Msg,
+    /// The message body, already formatted (`nulInHeader` and `badTagName`
+    /// interpolate).
+    pub text: String,
+}
+
+/// Whether the caller is `git fsck` or `git receive-pack`, which picks the
+/// variable family and the `--strict` behaviour.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MsgSource {
+    /// `fsck.<msg-id>` / `fsck.skipList`, with `--strict` honoured.
+    Fsck { strict: bool },
+    /// `receive.fsck.<msg-id>` / `receive.fsck.skipList`. The transfer check
+    /// always runs `index-pack`/`unpack-objects` with `--strict`, so a
+    /// defaulted warning is an error here even though the same object only
+    /// warns under a plain `git fsck`.
+    Receive,
+}
+
+/// The resolved severity of every message id plus the skipped-object set —
+/// `fsck.c`'s `struct fsck_options` fields `msg_type` and `skiplist`.
+pub struct MsgConfig {
+    /// Severity per `Msg::id`.
+    levels: HashMap<&'static str, Severity>,
+    /// Object ids the skip list names; every message about them is dropped.
+    skip: HashSet<ObjectId>,
+    /// A `die()` that `git fsck` reaches while reading its own configuration,
+    /// but `receive-pack` only reaches inside the `index-pack`/`unpack-objects`
+    /// child it hands `--strict=<types>` to — so the pusher sees it on the
+    /// side band and the push fails with that child's abnormal exit rather
+    /// than the session dying before the advertisement.
+    pub deferred_fatal: Option<String>,
+}
+
+impl MsgConfig {
+    /// Resolve every severity from the repository's configuration.
+    ///
+    /// Returns the message git dies with — without its `fatal: ` prefix — for
+    /// a bad value (`Unknown fsck message type`) or, under `git fsck` only, a
+    /// misspelled id (`Unhandled message id`). The two failures the transfer
+    /// side only reaches inside its child land in [`Self::deferred_fatal`].
+    pub fn new(repo: &gix::Repository, source: MsgSource) -> Result<Self, String> {
+        let config = repo.config_snapshot();
+        let strict = matches!(source, MsgSource::Fsck { strict: true } | MsgSource::Receive);
+        let mut deferred_fatal: Option<String> = None;
+        let mut levels = HashMap::with_capacity(MSGS.len());
+        for m in MSGS {
+            let key = match source {
+                MsgSource::Fsck { .. } => m.fsck_key,
+                MsgSource::Receive => m.receive_key,
+            };
+            let level = match config.string(key) {
+                Some(v) => {
+                    let value = v.to_string();
+                    // `is_valid_msg_type()` runs in receive-pack's own config
+                    // callback, so an unknown *value* is fatal on both paths.
+                    let level = parse_severity(&value)?;
+                    if m.default == Severity::Fatal && level != Severity::Error {
+                        let text = format!("Cannot demote {} to {value}", m.id.to_lowercase());
+                        match source {
+                            MsgSource::Fsck { .. } => return Err(text),
+                            MsgSource::Receive => {
+                                deferred_fatal.get_or_insert(text);
+                            }
+                        }
+                    }
+                    level
+                }
+                // `fsck_msg_severity()`: an unconfigured warning becomes an
+                // error under `--strict`; a configured one, and an
+                // info-severity default, are left alone.
+                None if strict && m.default == Severity::Warn => Severity::Error,
+                None => m.default,
+            };
+            levels.insert(m.id, level);
+        }
+
+        // git validates *every* variable in the family, including the ids this
+        // port does not check, and dies on one it does not know at all.
+        let (section, subsection) = match source {
+            MsgSource::Fsck { .. } => ("fsck", None),
+            MsgSource::Receive => ("receive", Some("fsck")),
+        };
+        for name in value_names(&config, section, subsection) {
+            let lower = name.to_lowercase();
+            if lower == "skiplist" {
+                continue;
+            }
+            let known = MSGS.iter().any(|m| m.id.eq_ignore_ascii_case(&name))
+                || UNPORTED_MSG_IDS.iter().any(|id| id.eq_ignore_ascii_case(&name));
+            if known {
+                continue;
+            }
+            // `git help config`: an unknown `fsck.<msg-id>` kills fsck, while
+            // the same under `receive.fsck.` is only a warning.
+            match source {
+                MsgSource::Fsck { .. } => return Err(format!("Unhandled message id: {lower}")),
+                MsgSource::Receive => eprintln!("warning: skipping unknown msg id '{lower}'"),
+            }
+        }
+
+        let skip_key = match source {
+            MsgSource::Fsck { .. } => "fsck.skipList",
+            MsgSource::Receive => "receive.fsck.skipList",
+        };
+        let skip = match config.string(skip_key) {
+            Some(path) => match read_skip_list(&path.to_string()) {
+                Ok(skip) => skip,
+                // `init_skiplist()` runs where the checking runs, so the
+                // transfer side hits this inside its child.
+                Err(text) => match source {
+                    MsgSource::Fsck { .. } => return Err(text),
+                    MsgSource::Receive => {
+                        deferred_fatal.get_or_insert(text);
+                        HashSet::new()
+                    }
+                },
+            },
+            None => HashSet::new(),
+        };
+        Ok(Self {
+            levels,
+            skip,
+            deferred_fatal,
+        })
+    }
+
+    /// `fsck.c::report()` minus the printing: the severity a finding about
+    /// `oid` is reported at, or `Ignore` when it is suppressed.
+    pub fn severity(&self, finding: &Finding, oid: &ObjectId) -> Severity {
+        let level = self.levels.get(finding.msg.id).copied().unwrap_or(finding.msg.default);
+        if level != Severity::Ignore && self.skip.contains(oid) {
+            return Severity::Ignore;
+        }
+        level
+    }
+}
+
+/// Every value name configured in `[<section> "<subsection>"]`, across all
+/// files of the snapshot, so a misspelled id can be diagnosed.
+fn value_names(
+    config: &gix::config::Snapshot<'_>,
+    section: &str,
+    subsection: Option<&str>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(sections) = config.plumbing().sections_by_name(section) else {
+        return out;
+    };
+    for s in sections {
+        let sub = s.header().subsection_name().map(|n| n.to_string());
+        if sub.as_deref() != subsection {
+            continue;
+        }
+        out.extend(s.body().value_names());
+    }
+    out
+}
+
+/// `fsck.c::parse_msg_type` — the three names, compared case-sensitively.
+fn parse_severity(value: &str) -> Result<Severity, String> {
+    match value {
+        "error" => Ok(Severity::Error),
+        "warn" => Ok(Severity::Warn),
+        "ignore" => Ok(Severity::Ignore),
+        other => Err(format!("Unknown fsck message type: '{other}'")),
+    }
+}
+
+/// `fsck.c::init_skiplist` plus `oidset_parse_file_carefully`: one object id
+/// per line, with `#` comments, blank lines and surrounding whitespace ignored.
+fn read_skip_list(path: &str) -> Result<HashSet<ObjectId>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|_| format!("could not open object name list: {path}"))?;
+    let mut out = HashSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let id = ObjectId::from_hex(line.as_bytes())
+            .map_err(|_| format!("invalid object name: {line}"))?;
+        out.insert(id);
+    }
+    Ok(out)
+}
+
+/// `fsck.c::fsck_object` for the three types whose contents this port lints.
+/// Findings come back in git's reporting order; the caller decides which of
+/// them are severe enough to print.
+pub fn check_object(kind: Kind, data: &[u8]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    match kind {
+        Kind::Commit => check_commit(data, &mut out),
+        Kind::Tree => check_tree(data, &mut out),
+        Kind::Tag => check_tag(data, &mut out),
+        Kind::Blob => {}
+    }
+    out
+}
+
+/// Push one finding.
+fn report(out: &mut Vec<Finding>, msg: &'static Msg, text: impl Into<String>) {
+    out.push(Finding { msg, text: text.into() });
+}
+
+/// `fsck.c::verify_headers`: the header block must be terminated, and must not
+/// contain a NUL. Returns `true` when it reported, which stops the caller —
+/// everything after this point indexes into the buffer.
+fn verify_headers(data: &[u8], out: &mut Vec<Finding>) -> bool {
+    for (i, &b) in data.iter().enumerate() {
+        match b {
+            0 => {
+                report(out, &NUL_IN_HEADER, format!("unterminated header: NUL at offset {i}"));
+                return true;
+            }
+            b'\n' if data.get(i + 1) == Some(&b'\n') => return false,
+            _ => {}
+        }
+    }
+    // No blank line: a body is optional, but the last header line still has to
+    // end in a newline.
+    if data.last() == Some(&b'\n') {
+        return false;
+    }
+    report(out, &UNTERMINATED_HEADER, "unterminated header");
+    true
+}
+
+/// `fsck.c::fsck_commit`, entered only for a commit gix already parsed — so the
+/// `tree`/`parent` lines are known well formed and the ids git would report
+/// there (`missingTree`, `badTreeSha1`, `badParentSha1`) cannot arise. Anything
+/// unexpected in those lines stops the check instead of reporting an id this
+/// port does not claim.
+fn check_commit(data: &[u8], out: &mut Vec<Finding>) {
+    if verify_headers(data, out) {
+        return;
+    }
+    let Some(mut p) = strip(data, b"tree ") else { return };
+    let Some(rest) = skip_line(p) else { return };
+    p = rest;
+    while let Some(after) = strip(p, b"parent ") {
+        let Some(rest) = skip_line(after) else { return };
+        p = rest;
+    }
+
+    let mut authors = 0;
+    while let Some(after) = strip(p, b"author ") {
+        authors += 1;
+        match check_ident(after, out) {
+            None => return,
+            Some(rest) => p = rest,
+        }
+    }
+    if authors < 1 {
+        report(out, &MISSING_AUTHOR, "invalid format - expected 'author' line");
+        return;
+    }
+    if authors > 1 {
+        report(out, &MULTIPLE_AUTHORS, "invalid format - multiple 'author' lines");
+        return;
+    }
+    let Some(after) = strip(p, b"committer ") else {
+        report(out, &MISSING_COMMITTER, "invalid format - expected 'committer' line");
+        return;
+    };
+    if check_ident(after, out).is_none() {
+        return;
+    }
+    if data.contains(&0) {
+        report(out, &NUL_IN_COMMIT, "NUL byte in the commit object body");
+    }
+}
+
+/// `fsck.c::fsck_ident`, checked branch by branch in git's order. `ident`
+/// starts just past `author `/`committer `/`tagger `. `None` means a defect was
+/// pushed, which makes `fsck_commit`/`fsck_tag` return immediately; `Some` is
+/// the rest of the buffer, cursor advanced past the line.
+fn check_ident<'a>(ident: &'a [u8], out: &mut Vec<Finding>) -> Option<&'a [u8]> {
+    if ident.first() == Some(&b'<') {
+        report(out, &MISSING_NAME_BEFORE_EMAIL, "invalid author/committer line - missing space before email");
+        return None;
+    }
+    let mut i = span_to_email(ident, 0);
+    match ident.get(i) {
+        Some(b'>') => {
+            report(out, &BAD_EMAIL, "invalid author/committer line - bad email");
+            return None;
+        }
+        Some(b'<') => {}
+        _ => {
+            report(out, &MISSING_EMAIL, "invalid author/committer line - missing email");
+            return None;
+        }
+    }
+    if i == 0 || ident[i - 1] != b' ' {
+        report(out, &MISSING_SPACE_BEFORE_EMAIL, "invalid author/committer line - missing space before email");
+        return None;
+    }
+    i = span_to_email(ident, i + 1);
+    if ident.get(i) != Some(&b'>') {
+        report(out, &BAD_EMAIL, "invalid author/committer line - bad email");
+        return None;
+    }
+    i += 1;
+    if ident.get(i) != Some(&b' ') {
+        report(out, &MISSING_SPACE_BEFORE_DATE, "invalid author/committer line - missing space before date");
+        return None;
+    }
+    i += 1;
+    if ident.get(i) == Some(&b'0') && ident.get(i + 1) != Some(&b' ') {
+        report(out, &ZERO_PADDED_DATE, "invalid author/committer line - zero-padded date");
+        return None;
+    }
+    let digits = ident[i.min(ident.len())..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    // `parse_timestamp` is `strtoumax`, which saturates on overflow;
+    // `date_overflows` then rejects anything past `TIME_MAX` (`i64::MAX` here).
+    let value = std::str::from_utf8(&ident[i..i + digits])
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    if digits > 0 && value.is_none_or(|v| v > i64::MAX as u64) {
+        report(out, &BAD_DATE_OVERFLOW, "invalid author/committer line - date causes integer overflow");
+        return None;
+    }
+    if digits == 0 || ident.get(i + digits) != Some(&b' ') {
+        report(out, &BAD_DATE, "invalid author/committer line - bad date");
+        return None;
+    }
+    i += digits + 1;
+    let tz = &ident[i.min(ident.len())..];
+    let tz_ok = matches!(tz.first(), Some(b'+' | b'-'))
+        && tz.len() > 5
+        && tz[1..5].iter().all(u8::is_ascii_digit)
+        && tz[5] == b'\n';
+    if !tz_ok {
+        report(out, &BAD_TIMEZONE, "invalid author/committer line - bad time zone");
+        return None;
+    }
+    Some(skip_line(ident).unwrap_or(&[]))
+}
+
+/// `strcspn(p, "<>\n")` from `from`: the index of the first `<`, `>` or newline,
+/// or the buffer length.
+fn span_to_email(p: &[u8], from: usize) -> usize {
+    p.iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, b)| matches!(b, b'<' | b'>' | b'\n'))
+        .map_or(p.len(), |(i, _)| i)
+}
+
+/// `skip_prefix`: the remainder after `prefix`, or `None` when it is absent.
+fn strip<'a>(data: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    data.strip_prefix(prefix)
+}
+
+/// The remainder after the next newline, or `None` when there is none.
+fn skip_line(data: &[u8]) -> Option<&[u8]> {
+    data.iter().position(|&b| b == b'\n').map(|i| &data[i + 1..])
+}
+
+/// git's tree-entry mode set. `S_IFREG | 0664` is also accepted outside
+/// `--strict`, which this port folds in: it does not run the strict mode table.
+const GOOD_MODES: [u32; 6] = [0o100644, 0o100664, 0o100755, 0o120000, 0o040000, 0o160000];
+
+/// `fsck.c::fsck_tree`. Every defect is accumulated over the whole tree and
+/// reported once, in git's fixed order.
+fn check_tree(data: &[u8], out: &mut Vec<Finding>) {
+    let mut has_null_oid = false;
+    let mut has_full_path = false;
+    let mut has_dot = false;
+    let mut has_dotdot = false;
+    let mut has_dotgit = false;
+    let mut has_zero_pad = false;
+    let mut has_bad_modes = false;
+    let mut has_dup_entries = false;
+    let mut not_properly_sorted = false;
+    let mut has_large_name = false;
+
+    let mut p = data;
+    let mut previous: Option<Vec<u8>> = None;
+    while !p.is_empty() {
+        let Some(space) = p.iter().position(|&b| b == b' ') else { return };
+        let mode_field = &p[..space];
+        let Some(nul) = p[space + 1..].iter().position(|&b| b == 0) else { return };
+        let name = &p[space + 1..space + 1 + nul];
+        let oid_at = space + 1 + nul + 1;
+        if oid_at + 20 > p.len() {
+            return;
+        }
+        let oid = &p[oid_at..oid_at + 20];
+        p = &p[oid_at + 20..];
+
+        let Some(mode) = std::str::from_utf8(mode_field)
+            .ok()
+            .and_then(|m| u32::from_str_radix(m, 8).ok())
+        else {
+            return;
+        };
+        has_zero_pad |= mode_field.first() == Some(&b'0');
+        has_bad_modes |= !GOOD_MODES.contains(&mode);
+        has_null_oid |= oid.iter().all(|&b| b == 0);
+        has_full_path |= name.contains(&b'/');
+        has_dot |= name == b".";
+        has_dotdot |= name == b"..";
+        has_dotgit |= is_dotgit(name);
+        has_large_name |= name.len() > 4096;
+
+        // `verify_ordered`: names compare with a directory's implicit trailing
+        // slash, so `a` (tree) sorts after `a.`
+        let mut key = name.to_vec();
+        if mode & 0o170000 == 0o040000 {
+            key.push(b'/');
+        }
+        if let Some(prev) = &previous {
+            match key.cmp(prev) {
+                std::cmp::Ordering::Less => not_properly_sorted = true,
+                std::cmp::Ordering::Equal => has_dup_entries = true,
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        previous = Some(key);
+    }
+
+    if has_null_oid {
+        report(out, &NULL_SHA1, "contains entries pointing to null sha1");
+    }
+    if has_full_path {
+        report(out, &FULL_PATHNAME, "contains full pathnames");
+    }
+    if has_dot {
+        report(out, &HAS_DOT, "contains '.'");
+    }
+    if has_dotdot {
+        report(out, &HAS_DOTDOT, "contains '..'");
+    }
+    if has_dotgit {
+        report(out, &HAS_DOTGIT, "contains '.git'");
+    }
+    if has_zero_pad {
+        report(out, &ZERO_PADDED_FILEMODE, "contains zero-padded file modes");
+    }
+    if has_bad_modes {
+        report(out, &BAD_FILEMODE, "contains bad file modes");
+    }
+    if has_dup_entries {
+        report(out, &DUPLICATE_ENTRIES, "contains duplicate file entries");
+    }
+    if not_properly_sorted {
+        report(out, &TREE_NOT_SORTED, "not properly sorted");
+    }
+    if has_large_name {
+        report(out, &LARGE_PATHNAME, "contains excessively large pathname");
+    }
+}
+
+/// The spellings of `.git` git's `is_hfs_dotgit`/`is_ntfs_dotgit` reject that
+/// are expressible in ASCII: any case of `.git`, and the NTFS forms `.git`
+/// with trailing dots or spaces plus the `git~1` short name. The Unicode
+/// confusables `is_hfs_dotgit` also folds away (zero-width joiners, the
+/// Hebrew/Arabic direction marks) are not covered.
+fn is_dotgit(name: &[u8]) -> bool {
+    let trimmed: &[u8] = {
+        let mut end = name.len();
+        while end > 0 && (name[end - 1] == b'.' || name[end - 1] == b' ') {
+            end -= 1;
+        }
+        &name[..end]
+    };
+    trimmed.eq_ignore_ascii_case(b".git") || trimmed.eq_ignore_ascii_case(b"git~1")
+}
+
+/// `fsck.c::fsck_tag`, entered only for a tag gix already parsed — so the
+/// `object`/`type`/`tag` lines are present and the ids git reports for their
+/// absence cannot arise. The `tag` name is still validated, because gix accepts
+/// names `check_refname_format()` rejects.
+fn check_tag(data: &[u8], out: &mut Vec<Finding>) {
+    if verify_headers(data, out) {
+        return;
+    }
+    let Some(p) = strip(data, b"object ") else { return };
+    let Some(p) = skip_line(p) else { return };
+    let Some(p) = strip(p, b"type ") else { return };
+    let Some(p) = skip_line(p) else { return };
+    let Some(p) = strip(p, b"tag ") else { return };
+    let Some(eol) = p.iter().position(|&b| b == b'\n') else { return };
+    let name = &p[..eol];
+    if !refname_ok(name) {
+        report(out, &BAD_TAG_NAME, format!("invalid 'tag' name: {}", String::from_utf8_lossy(name)));
+    }
+    let p = &p[eol + 1..];
+    let rest = match strip(p, b"tagger ") {
+        None => {
+            // Early tags have no tagger, so git only warns.
+            report(out, &MISSING_TAGGER_ENTRY, "invalid format - expected 'tagger' line");
+            p
+        }
+        Some(after) => match check_ident(after, out) {
+            None => return,
+            Some(rest) => rest,
+        },
+    };
+    if !rest.is_empty() && !rest.starts_with(b"\n") {
+        report(out, &EXTRA_HEADER_ENTRY, "invalid format - extra header(s) after 'tagger'");
+    }
+}
+
+/// `refs.c::check_refname_format(refs/tags/<name>, 0)` reduced to the rules a
+/// tag name can break: no empty component, no leading dot or trailing `.lock`
+/// in a component, no `..`, no ASCII control character, none of ` ~^:?*[\`,
+/// no trailing slash and no `@{`.
+fn refname_ok(name: &[u8]) -> bool {
+    if name.is_empty() || name.ends_with(b"/") || name.ends_with(b".") {
+        return false;
+    }
+    for component in name.split(|&b| b == b'/') {
+        if component.is_empty() || component.starts_with(b".") || component.ends_with(b".lock") {
+            return false;
+        }
+    }
+    for (i, &b) in name.iter().enumerate() {
+        let bad = b < 0x20
+            || b == 0x7f
+            || matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+            || (b == b'.' && name.get(i + 1) == Some(&b'.'))
+            || (b == b'@' && name.get(i + 1) == Some(&b'{'));
+        if bad {
+            return false;
+        }
+    }
+    true
 }

@@ -59,6 +59,22 @@
 //!   An unset or unrecognised `aliasfiletype` yields no aliases, as in the
 //!   script. A file that cannot be opened produces `opening <file>: <errno>` and
 //!   exits with the errno, as Perl's `die` does.
+//! * `--translate-aliases`: every line of stdin is run through
+//!   `parse_address_line` (`Mail::Address`'s tokeniser, parser and `format`),
+//!   `expand_aliases` (recursive, with the `alias '<x>' expands to itself` fatal
+//!   for a cycle) and `sanitize_address_list`, and printed one address per line,
+//!   exit 0. An address that names no alias passes through as it is. The alias
+//!   values come from the same six parsers `--dump-aliases` uses, split with
+//!   `Text::ParseWords::quotewords` exactly as each parser asks for it — on
+//!   commas everywhere except mailrc, which splits on whitespace and drops the
+//!   quotes.
+//!
+//!   `sanitize_address` is reproduced in full: the display name is left alone
+//!   when it is already an ASCII quoted string or an RFC 2047 encoded word,
+//!   otherwise its unescaped quotes are removed and it is re-quoted — as a
+//!   `=?UTF-8?q?…?=` word when it holds a non-ASCII byte, in plain double quotes
+//!   (backslash-escaping `\` and CR) when it holds a special or control
+//!   character, and verbatim otherwise.
 //!
 //! ### Exit status of the `die` paths
 //!
@@ -76,9 +92,6 @@
 //!   sessions, `--confirm` prompting, `--validate` hook runs, header
 //!   construction, MIME/RFC 2047 encoding, `--dry-run`, and the SMTP or
 //!   `sendmail` transport. These bail, naming the missing substrate.
-//! * `--translate-aliases`, which needs `Mail::Address` parsing and
-//!   `sanitize_address_list` (RFC 822 phrase quoting against the configured
-//!   sender). It bails.
 //! * `--git-completion-helper`, which shells out to
 //!   `git format-patch --git-completion-helper` and prints the union of both
 //!   option lists. It bails.
@@ -645,8 +658,9 @@ fn skip_non_ws(s: &[u8], mut i: usize) -> usize {
 }
 
 /// `/^\s*alias\s+(?:-group\s+\S+\s+)*(\S+)\s+(.*)$/` — the mutt parser. Returns
-/// the alias name.
-fn mutt_alias(line: &[u8]) -> Option<String> {
+/// the alias name and its addresses: `$2` with a `#` comment stripped, split on
+/// commas by `split_addrs`, with `\"` unescaped so it is not escaped twice.
+fn mutt_alias(line: &[u8]) -> Option<(String, Vec<String>)> {
     let mut i = skip_ws(line, 0);
     if !line[i..].starts_with(b"alias") {
         return None;
@@ -687,16 +701,31 @@ fn mutt_alias(line: &[u8]) -> Option<String> {
         }
         // `\s+` then `(.*)$`, which may be empty — a trailing newline satisfies
         // the `\s+`, so `alias bob\n` does define `bob`.
-        if skip_ws(line, end) == end {
+        let value_start = skip_ws(line, end);
+        if value_start == end {
             continue;
         }
-        return Some(String::from_utf8_lossy(&line[start..end]).into_owned());
+        // The greedy `\s+` swallows the newline when only whitespace follows,
+        // leaving `(.*)` empty; otherwise `(.*)` runs to just before it.
+        let value = if value_start >= line.len() {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&line[value_start..line.len() - 1]).into_owned()
+        };
+        // `$addr =~ s/#.*$//` — mutt allows `#` comments.
+        let value = match value.find('#') {
+            Some(i) => value[..i].to_string(),
+            None => value,
+        };
+        let addrs = split_addrs(&value).into_iter().map(|a| a.replace("\\\"", "\"")).collect();
+        return Some((String::from_utf8_lossy(&line[start..end]).into_owned(), addrs));
     }
     None
 }
 
-/// `/^alias\s+(\S+)\s+(.*?)\s*$/` — the mailrc parser.
-fn mailrc_alias(line: &[u8]) -> Option<String> {
+/// `/^alias\s+(\S+)\s+(.*?)\s*$/` — the mailrc parser. Its addresses are
+/// whitespace separated (`quotewords('\s+', 0, $2)`), not comma separated.
+fn mailrc_alias(line: &[u8]) -> Option<(String, Vec<String>)> {
     if !line.starts_with(b"alias") {
         return None;
     }
@@ -707,14 +736,23 @@ fn mailrc_alias(line: &[u8]) -> Option<String> {
     }
     i = after;
     let end = skip_non_ws(line, i);
-    if end == i || skip_ws(line, end) == end {
+    if end == i {
         return None;
     }
-    Some(String::from_utf8_lossy(&line[i..end]).into_owned())
+    let value_start = skip_ws(line, end);
+    if value_start == end {
+        return None;
+    }
+    // The lazy `(.*?)` with a trailing `\s*$` is exactly the value with its
+    // surrounding whitespace (the newline included) trimmed off.
+    let value = String::from_utf8_lossy(&line[value_start..]).into_owned();
+    let addrs = parse_words(Delim::Space, false, value.trim_end_matches(|c: char| c.is_ascii_whitespace()));
+    Some((String::from_utf8_lossy(&line[i..end]).into_owned(), addrs))
 }
 
-/// `/^(\S+)\s+=\s+[^=]+=\s(\S+)/` — the elm parser.
-fn elm_alias(line: &[u8]) -> Option<String> {
+/// `/^(\S+)\s+=\s+[^=]+=\s(\S+)/` — the elm parser. `$2` is a single
+/// whitespace-free run, still split on commas by `split_addrs`.
+fn elm_alias(line: &[u8]) -> Option<(String, Vec<String>)> {
     let end = skip_non_ws(line, 0);
     if end == 0 {
         return None;
@@ -741,12 +779,14 @@ fn elm_alias(line: &[u8]) -> Option<String> {
     if !line.get(ws + 1).is_some_and(|&c| !is_ws(c)) {
         return None;
     }
-    Some(String::from_utf8_lossy(&line[..end]).into_owned())
+    let value = String::from_utf8_lossy(&line[ws + 1..skip_non_ws(line, ws + 1)]).into_owned();
+    Some((String::from_utf8_lossy(&line[..end]).into_owned(), split_addrs(&value)))
 }
 
 /// `/\(define-mail-alias\s+"(\S+?)"\s+"(\S+?)"\)/` — the gnus parser. The
-/// pattern is unanchored, so it is searched for anywhere in the line.
-fn gnus_alias(line: &[u8]) -> Option<String> {
+/// pattern is unanchored, so it is searched for anywhere in the line. `$2` is
+/// stored as the single address, without any comma splitting.
+fn gnus_alias(line: &[u8]) -> Option<(String, Vec<String>)> {
     let needle = b"(define-mail-alias";
     let mut from = 0;
     while let Some(off) = line[from..].windows(needle.len()).position(|w| w == needle) {
@@ -760,7 +800,7 @@ fn gnus_alias(line: &[u8]) -> Option<String> {
 }
 
 /// The tail of the gnus pattern, starting just past `(define-mail-alias`.
-fn gnus_at(line: &[u8], mut i: usize) -> Option<String> {
+fn gnus_at(line: &[u8], mut i: usize) -> Option<(String, Vec<String>)> {
     let after = skip_ws(line, i);
     if after == i {
         return None;
@@ -773,11 +813,11 @@ fn gnus_at(line: &[u8], mut i: usize) -> Option<String> {
         return None;
     }
     i = after;
-    let (_addr, next) = quoted_word(line, i)?;
+    let (addr, next) = quoted_word(line, i)?;
     if line.get(next) != Some(&b')') {
         return None;
     }
-    Some(name)
+    Some((name, vec![addr]))
 }
 
 /// `"(\S+?)"` — a double-quoted run of at least one non-whitespace character.
@@ -796,7 +836,7 @@ fn quoted_word(line: &[u8], i: usize) -> Option<(String, usize)> {
 }
 
 /// `parse_sendmail_alias` — one logical (continuation-joined) line.
-fn sendmail_alias(logical: &[u8], aliases: &mut BTreeSet<String>) {
+fn sendmail_alias(logical: &[u8], aliases: &mut Aliases) {
     let text = String::from_utf8_lossy(logical);
     if text.contains('"') {
         eprintln!("warning: sendmail alias with quotes is not supported: {text}");
@@ -804,16 +844,17 @@ fn sendmail_alias(logical: &[u8], aliases: &mut BTreeSet<String>) {
         eprintln!("warning: `:include:` not supported: {text}");
     } else if text.contains('/') || text.contains('|') {
         eprintln!("warning: `/file` or `|pipe` redirection not supported: {text}");
-    } else if let Some(name) = sendmail_name(logical) {
-        aliases.insert(name);
+    } else if let Some((name, addrs)) = sendmail_name(logical) {
+        aliases.insert(name, addrs);
     } else {
         eprintln!("warning: sendmail line is not recognized: {text}");
     }
 }
 
 /// `/^(\S+?)\s*:\s*(.+)$/`. `\S+?` is non-greedy, so the shortest prefix that
-/// lands on a colon with a non-empty remainder wins.
-fn sendmail_name(line: &[u8]) -> Option<String> {
+/// lands on a colon with a non-empty remainder wins; `$2` runs to end of line
+/// and is split on commas.
+fn sendmail_name(line: &[u8]) -> Option<(String, Vec<String>)> {
     for len in 1..=line.len() {
         if is_ws(line[len - 1]) {
             return None;
@@ -826,14 +867,18 @@ fn sendmail_name(line: &[u8]) -> Option<String> {
         if rest >= line.len() {
             continue;
         }
-        return Some(String::from_utf8_lossy(&line[..len]).into_owned());
+        let value = String::from_utf8_lossy(&line[rest..]).into_owned();
+        return Some((
+            String::from_utf8_lossy(&line[..len]).into_owned(),
+            split_addrs(&value),
+        ));
     }
     None
 }
 
 /// `parse_sendmail_aliases` — blank and `#` lines are dropped, a trailing `\`
 /// or a leading blank on the next line continues the current one.
-fn parse_sendmail(text: &[u8], aliases: &mut BTreeSet<String>) {
+fn parse_sendmail(text: &[u8], aliases: &mut Aliases) {
     let mut acc: Vec<u8> = Vec::new();
     for line in chomped_lines(text) {
         if line.iter().all(|&c| is_ws(c)) {
@@ -871,8 +916,9 @@ fn parse_sendmail(text: &[u8], aliases: &mut BTreeSet<String>) {
 /// The pine parser, whose record is a tab-delimited line plus any following
 /// lines that begin with a space. The record matches when it has three to five
 /// tab-separated fields, the first has no whitespace and the third is non-empty;
-/// the alias is the first field.
-fn parse_pine(text: &[u8], aliases: &mut BTreeSet<String>) {
+/// the alias is the first field and its addresses are the third, with the
+/// optional parentheses of `\(?([^\t]+?)\)?` peeled off, split on commas.
+fn parse_pine(text: &[u8], aliases: &mut Aliases) {
     let lines = chomped_lines(text);
     let mut i = 0;
     while i < lines.len() {
@@ -891,7 +937,21 @@ fn parse_pine(text: &[u8], aliases: &mut BTreeSet<String>) {
         if fields[0].is_empty() || fields[0].iter().any(|&c| is_ws(c)) || fields[2].is_empty() {
             continue;
         }
-        aliases.insert(String::from_utf8_lossy(fields[0]).into_owned());
+        // `\(?` is greedy, and the lazy `([^\t]+?)` then stops one byte short of
+        // a closing `)` because `\)?` can absorb it — but neither may leave the
+        // capture empty, which is what the `+` demands.
+        let mut value = fields[2];
+        if value.first() == Some(&b'(') && value.len() > 1 {
+            value = &value[1..];
+        }
+        if value.last() == Some(&b')') && value.len() > 1 {
+            value = &value[..value.len() - 1];
+        }
+        let value = String::from_utf8_lossy(value).into_owned();
+        aliases.insert(
+            String::from_utf8_lossy(fields[0]).into_owned(),
+            split_addrs(&value),
+        );
     }
 }
 
@@ -911,19 +971,28 @@ fn chomped_lines(text: &[u8]) -> Vec<Vec<u8>> {
 /// The line-oriented parsers see `$_` with its newline still attached, because
 /// they never `chomp`. That matters: `\s+` in their patterns can be satisfied by
 /// the newline alone.
-fn parse_line_oriented(text: &[u8], aliases: &mut BTreeSet<String>, f: fn(&[u8]) -> Option<String>) {
+fn parse_line_oriented(
+    text: &[u8],
+    aliases: &mut Aliases,
+    f: fn(&[u8]) -> Option<(String, Vec<String>)>,
+) {
     for mut line in chomped_lines(text) {
         line.push(b'\n');
-        if let Some(name) = f(&line) {
-            aliases.insert(name);
+        if let Some((name, addrs)) = f(&line) {
+            aliases.insert(name, addrs);
         }
     }
 }
 
-/// The result of the alias-file scan: either the alias names, or the exit code
-/// of a `die` raised while opening one of the files.
-enum Aliases {
-    Names(BTreeSet<String>),
+/// `%aliases` — each alias name mapped to the address list it expands to. A
+/// later definition replaces an earlier one, as assigning to a Perl hash does,
+/// and the key order is the byte order `sort keys %aliases` produces.
+type Aliases = BTreeMap<String, Vec<String>>;
+
+/// The result of the alias-file scan: either `%aliases`, or the exit code of a
+/// `die` raised while opening one of the files.
+enum AliasScan {
+    Parsed(Aliases),
     Died(u8),
 }
 
@@ -931,14 +1000,16 @@ enum Aliases {
 /// type leaves the files unread, as the
 /// `if (@alias_files and $aliasfiletype and defined $parse_alias{$aliasfiletype})`
 /// guard in the script does, and `%aliases` stays empty.
-fn parse_aliases(cfg: &Config) -> Aliases {
-    let mut aliases = BTreeSet::new();
-    let Some(file_type) = cfg.alias_file_type.as_deref() else { return Aliases::Names(aliases) };
+fn parse_aliases(cfg: &Config) -> AliasScan {
+    let mut aliases = Aliases::new();
+    let Some(file_type) = cfg.alias_file_type.as_deref() else {
+        return AliasScan::Parsed(aliases);
+    };
     if cfg.alias_files.is_empty() {
-        return Aliases::Names(aliases);
+        return AliasScan::Parsed(aliases);
     }
     if !matches!(file_type, "mutt" | "mailrc" | "pine" | "elm" | "sendmail" | "gnus") {
-        return Aliases::Names(aliases);
+        return AliasScan::Parsed(aliases);
     }
 
     for file in &cfg.alias_files {
@@ -948,7 +1019,7 @@ fn parse_aliases(cfg: &Config) -> Aliases {
                 // Perl: `die "opening $file: $!\n"`, and `die` exits with `$!`.
                 eprintln!("opening {file}: {}", errno_text(&e));
                 let code = u8::try_from(e.raw_os_error().unwrap_or(255)).unwrap_or(255);
-                return Aliases::Died(code);
+                return AliasScan::Died(code);
             }
         };
         match file_type {
@@ -961,7 +1032,544 @@ fn parse_aliases(cfg: &Config) -> Aliases {
             _ => unreachable!("filtered above"),
         }
     }
-    Aliases::Names(aliases)
+    AliasScan::Parsed(aliases)
+}
+
+// ---------------------------------------------------------------------------
+// Address lists: Text::ParseWords, Mail::Address and sanitize_address
+// ---------------------------------------------------------------------------
+
+/// The field delimiter `Text::ParseWords::parse_line` is handed, in the two
+/// spellings `git-send-email.perl` uses.
+#[derive(Clone, Copy)]
+enum Delim {
+    /// `'\s*,\s*'` — `split_addrs`, for a comma-separated alias value.
+    Comma,
+    /// `'\s+'` — the mailrc parser, whose addresses are whitespace separated.
+    Space,
+}
+
+impl Delim {
+    /// The length of the delimiter's match starting exactly at `at`, or `None`
+    /// when it does not match there. Both spellings are greedy, so the surrounding
+    /// whitespace is part of the delimiter and never part of a field.
+    fn at(self, s: &[u8], at: usize) -> Option<usize> {
+        let ws = skip_ws(s, at);
+        match self {
+            Delim::Comma if s.get(ws) == Some(&b',') => Some(skip_ws(s, ws + 1) - at),
+            Delim::Space if ws > at => Some(ws - at),
+            _ => None,
+        }
+    }
+}
+
+/// `split_addrs` — `quotewords('\s*,\s*', 1, $addr)`. `keep` is on, so quoted
+/// sections come back with their quotes and escapes intact.
+fn split_addrs(value: &str) -> Vec<String> {
+    parse_words(Delim::Comma, true, value)
+}
+
+/// `Text::ParseWords::parse_line`, transcribed from its single alternation:
+/// a double- or single-quoted section (escapes with `\`), or a lazy unquoted run
+/// terminated by end of string, by the delimiter, or by a quote that opens the
+/// next section. With `keep` the quotes and escapes survive; without it, `\x`
+/// collapses to `x` in unquoted text and in double-quoted sections.
+///
+/// A run that cannot be tokenised at all — an unterminated quote — makes Perl's
+/// `parse_line` return the empty list, and `quotewords` then discards whatever it
+/// had; that is what the empty vector here means. Perl's trailing `undef` piece
+/// (produced when the string ends on a delimiter) becomes an empty string, which
+/// expands and prints identically.
+fn parse_words(delim: Delim, keep: bool, line: &str) -> Vec<String> {
+    let s = line.as_bytes();
+    let mut pieces: Vec<String> = Vec::new();
+    let mut word: Option<String> = None;
+    let mut i = 0;
+
+    while i < s.len() {
+        let (text, delim_len) = if s[i] == b'"' || s[i] == b'\'' {
+            let quote = s[i];
+            let Some(end) = quoted_section(s, i, quote) else { return Vec::new() };
+            let inner = String::from_utf8_lossy(&s[i + 1..end]).into_owned();
+            let text = if keep {
+                format!("{q}{inner}{q}", q = quote as char)
+            } else if quote == b'"' {
+                unescape(&inner)
+            } else {
+                inner
+            };
+            i = end + 1;
+            (text, 0)
+        } else {
+            let start = i;
+            let mut p = i;
+            let delim_len = loop {
+                if p == s.len() {
+                    break 0;
+                }
+                if let Some(n) = delim.at(s, p) {
+                    break n;
+                }
+                // `(?!^)(?=["'])`: a quote ends the unquoted run, but never at
+                // the very start of what is left of the line.
+                if p > start && (s[p] == b'"' || s[p] == b'\'') {
+                    break 0;
+                }
+                match s[p] {
+                    b'\\' if p + 1 < s.len() => p += 2,
+                    b'\\' | b'"' | b'\'' => return Vec::new(),
+                    _ => p += 1,
+                }
+            };
+            let raw = String::from_utf8_lossy(&s[start..p]).into_owned();
+            i = p + delim_len;
+            (if keep { raw } else { unescape(&raw) }, delim_len)
+        };
+
+        word.get_or_insert_with(String::new).push_str(&text);
+        if delim_len > 0 {
+            pieces.push(word.take().unwrap_or_default());
+        }
+        if i >= s.len() {
+            pieces.push(word.take().unwrap_or_default());
+        }
+    }
+    pieces
+}
+
+/// The end offset of the closing quote of the section that starts at `at`, per
+/// `(?>[^\\<q>]*(?:\\.[^\\<q>]*)*)<q>`, or `None` when it is never closed.
+fn quoted_section(s: &[u8], at: usize, quote: u8) -> Option<usize> {
+    let mut j = at + 1;
+    loop {
+        while j < s.len() && s[j] != quote && s[j] != b'\\' {
+            j += 1;
+        }
+        match s.get(j) {
+            Some(&b'\\') if j + 1 < s.len() => j += 2,
+            Some(&c) if c == quote => return Some(j),
+            _ => return None,
+        }
+    }
+}
+
+/// Perl's `s/\\(.)/$1/sg`: drop the backslash of every escape pair.
+fn unescape(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() {
+            out.push(b[i + 1]);
+            i += 2;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `parse_address_line` — `map { $_->format } Mail::Address->parse($line)`.
+fn parse_address_line(line: &str) -> Vec<String> {
+    mail_address_parse(line).iter().map(format_address).collect()
+}
+
+/// One `Mail::Address` object: `[phrase, address, comment]`.
+struct MailAddress {
+    phrase: String,
+    address: String,
+    comment: String,
+}
+
+/// `Mail::Address::_tokenise`. Every token is either a parenthesised comment, a
+/// quoted string or bracketed domain literal (delimiters included), an atom, or
+/// one of RFC 822's single-character specials; a trailing `,` is appended so the
+/// last address is completed by the same code path as the rest.
+fn mail_tokenise(line: &str) -> Vec<String> {
+    // `s/\A\s+//` then `s/[\r\n]+/ /g`.
+    let collapsed: Vec<u8> = {
+        let trimmed = line.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        let mut out: Vec<u8> = Vec::with_capacity(trimmed.len());
+        let mut in_break = false;
+        for &b in trimmed.as_bytes() {
+            if b == b'\r' || b == b'\n' {
+                if !in_break {
+                    out.push(b' ');
+                }
+                in_break = true;
+            } else {
+                out.push(b);
+                in_break = false;
+            }
+        }
+        out
+    };
+    let s = &collapsed[..];
+
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        // `s/^\s*\(/(/` — a comment, with any whitespace ahead of it dropped.
+        let after_ws = skip_ws(s, i);
+        if s.get(after_ws) == Some(&b'(') {
+            let (field, next) = mail_comment(s, after_ws);
+            words.push(field);
+            i = next;
+            continue;
+        }
+        match s[i] {
+            b'"' | b'[' => {
+                let close = if s[i] == b'"' { b'"' } else { b']' };
+                // `"(?:[^"\\]+|\\.)*"` / `\[(?:[^\]\\]+|\\.)*\]`, which keep
+                // their delimiters in the token.
+                match quoted_section(s, i, close) {
+                    Some(end) => {
+                        words.push(String::from_utf8_lossy(&s[i..=end]).into_owned());
+                        i = skip_ws(s, end + 1);
+                        continue;
+                    }
+                    // Unterminated: the alternation falls through to the
+                    // single-special branch, which matches the delimiter alone.
+                    None => {}
+                }
+                words.push(String::from_utf8_lossy(&s[i..=i]).into_owned());
+                i = skip_ws(s, i + 1);
+            }
+            b if is_special(b) => {
+                words.push(String::from_utf8_lossy(&s[i..=i]).into_owned());
+                i = skip_ws(s, i + 1);
+            }
+            b if is_ws(b) => i = skip_ws(s, i),
+            _ => {
+                let end = i + s[i..]
+                    .iter()
+                    .position(|&b| is_ws(b) || is_special(b))
+                    .unwrap_or(s.len() - i);
+                words.push(String::from_utf8_lossy(&s[i..end]).into_owned());
+                i = skip_ws(s, end);
+            }
+        }
+    }
+    words.push(",".into());
+    words
+}
+
+/// The `[^\s()<>\@,;:\\".[\]]` complement: RFC 822's specials, which are each
+/// their own token.
+fn is_special(b: u8) -> bool {
+    b"()<>@,;:\\\".[]".contains(&b)
+}
+
+/// The nested-comment scanner of `_tokenise`'s `PAREN` loop, returning the token
+/// (with its trailing whitespace trimmed) and the offset just past it.
+fn mail_comment(s: &[u8], mut i: usize) -> (String, usize) {
+    // A run of `([^()\\]|\\.)*` — text that is neither a parenthesis nor an
+    // unfinished escape.
+    let run = |s: &[u8], mut j: usize| -> usize {
+        while j < s.len() {
+            match s[j] {
+                b'\\' if j + 1 < s.len() => j += 2,
+                b'\\' | b'(' | b')' => break,
+                _ => j += 1,
+            }
+        }
+        j
+    };
+
+    let mut field: Vec<u8> = Vec::new();
+    let mut depth = 0usize;
+    'paren: while s.get(i) == Some(&b'(') {
+        let start = i;
+        i = run(s, i + 1);
+        field.extend_from_slice(&s[start..i]);
+        depth += 1;
+        loop {
+            let end = run(s, i);
+            if s.get(end) != Some(&b')') {
+                break;
+            }
+            let after = skip_ws(s, end + 1);
+            field.extend_from_slice(&s[i..after]);
+            i = after;
+            depth -= 1;
+            if depth == 0 {
+                break 'paren;
+            }
+            let more = run(s, i);
+            if more > i {
+                field.extend_from_slice(&s[i..more]);
+                i = more;
+            }
+        }
+    }
+    while field.last().is_some_and(|&b| is_ws(b)) {
+        field.pop();
+    }
+    (String::from_utf8_lossy(&field).into_owned(), i)
+}
+
+/// `Mail::Address::parse` over the token stream: `<`/`>` switch into and out of
+/// the address, a `,` or `;` completes the address being built, and outside the
+/// angle brackets a token joins the phrase when one is coming and the address
+/// otherwise.
+fn mail_address_parse(line: &str) -> Vec<MailAddress> {
+    let tokens = mail_tokenise(line);
+    let mut phrase: Vec<String> = Vec::new();
+    let mut comment: Vec<String> = Vec::new();
+    let mut address: Vec<String> = Vec::new();
+    let mut objs: Vec<MailAddress> = Vec::new();
+    let mut depth = 0usize;
+    let mut next = find_next(0, &tokens);
+
+    // `_complete`: emit an object unless all three parts are empty.
+    fn complete(
+        phrase: &mut Vec<String>,
+        address: &mut Vec<String>,
+        comment: &mut Vec<String>,
+        objs: &mut Vec<MailAddress>,
+    ) {
+        if !(phrase.is_empty() && address.is_empty() && comment.is_empty()) {
+            objs.push(MailAddress {
+                phrase: phrase.join(" "),
+                address: address.concat(),
+                comment: comment.join(" "),
+            });
+        }
+        phrase.clear();
+        address.clear();
+        comment.clear();
+    }
+
+    for idx in 0..tokens.len() {
+        let t = tokens[idx].as_str();
+        if t.starts_with('(') {
+            comment.push(t.into());
+        } else if t == "<" {
+            depth += 1;
+        } else if t == ">" {
+            depth = depth.saturating_sub(1);
+        } else if t == "," || t == ";" {
+            complete(&mut phrase, &mut address, &mut comment, &mut objs);
+            depth = 0;
+            next = find_next(idx + 1, &tokens);
+        } else if depth > 0 {
+            address.push(t.into());
+        } else if next == "<" {
+            phrase.push(t.into());
+        } else if matches!(t, "." | "@" | ":" | ";")
+            || address.is_empty()
+            || matches!(address[address.len() - 1].as_str(), "." | "@" | ":" | ";")
+        {
+            address.push(t.into());
+        } else {
+            complete(&mut phrase, &mut address, &mut comment, &mut objs);
+            depth = 0;
+            address.push(t.into());
+        }
+    }
+    objs
+}
+
+/// `_find_next`: the first `,`, `;` or `<` at or after `idx`, or the empty
+/// string. A `<` ahead means the tokens up to it are a display phrase.
+fn find_next(idx: usize, tokens: &[String]) -> &str {
+    tokens[idx..]
+        .iter()
+        .map(String::as_str)
+        .find(|t| matches!(*t, "," | ";" | "<"))
+        .unwrap_or("")
+}
+
+/// `Mail::Address::format` for one address: the phrase (quoted unless it is
+/// already quoted or consists only of `atext`), the address in angle brackets,
+/// and any comment forced into parentheses.
+fn format_address(a: &MailAddress) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !a.phrase.is_empty() {
+        if is_all_atext(&a.phrase) || has_unescaped_quote(&a.phrase) {
+            parts.push(a.phrase.clone());
+        } else {
+            parts.push(format!("\"{}\"", a.phrase));
+        }
+        if !a.address.is_empty() {
+            parts.push(format!("<{}>", a.address));
+        }
+    } else if !a.address.is_empty() {
+        parts.push(a.address.clone());
+    }
+
+    let mut comment = a.comment.clone();
+    if comment.bytes().any(|b| !is_ws(b)) {
+        // `s/^\s*\(?/(/` and `s/\)?\s*$/)/`.
+        let body = comment.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        let body = body.strip_prefix('(').unwrap_or(body);
+        let body = body.trim_end_matches(|c: char| c.is_ascii_whitespace());
+        let body = body.strip_suffix(')').unwrap_or(body);
+        comment = format!("({body})");
+    }
+    if !comment.is_empty() {
+        parts.push(comment);
+    }
+    parts.join(" ")
+}
+
+/// `/^(?:\s*[-\w !#$%&'*+\/=?^`{|}~]\s*)+$/`: every byte is whitespace or one of
+/// RFC 2822's `atext` characters, and at least one is `atext`.
+fn is_all_atext(s: &str) -> bool {
+    let atext = |b: u8| {
+        b.is_ascii_alphanumeric() || b"-_ !#$%&'*+/=?^`{|}~".contains(&b)
+    };
+    let bytes = s.as_bytes();
+    !bytes.is_empty() && bytes.iter().all(|&b| atext(b) || is_ws(b)) && bytes.iter().any(|&b| atext(b))
+}
+
+/// `/(?<!\\)"/`: a double quote that is not backslash-escaped.
+fn has_unescaped_quote(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.iter().enumerate().any(|(i, &c)| c == b'"' && (i == 0 || b[i - 1] != b'\\'))
+}
+
+/// `sanitize_address`: keep an already-quoted or encoded display name as it is,
+/// otherwise strip its stray quotes and re-quote it — RFC 2047 for non-ASCII,
+/// plain double quotes when it carries a special or control character.
+fn sanitize_address(recipient: &str) -> String {
+    // `s/(.*>).*$/$1/` — drop whatever trails the last `>`.
+    let recipient = match recipient.rfind('>') {
+        Some(i) => &recipient[..=i],
+        None => recipient,
+    };
+    // `/^(.*?)\s*(<.*)/` — the lazy name stops at the first `<`.
+    let Some(angle) = recipient.find('<') else {
+        return recipient.to_string();
+    };
+    let name = recipient[..angle].trim_end_matches(|c: char| c.is_ascii_whitespace());
+    let addr = &recipient[angle..];
+    // Perl's falsiness: an empty name — and the literal `0` — take this branch.
+    if name.is_empty() || name == "0" {
+        return recipient.to_string();
+    }
+    if is_rfc2047_quoted(name) {
+        return recipient.to_string();
+    }
+
+    // `s/(^|[^\\])"/$1/g` — remove every quote that is not escaped.
+    let b = name.as_bytes();
+    let mut stripped: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if i == 0 && b[0] == b'"' {
+            i = 1;
+        } else if i + 1 < b.len() && b[i] != b'\\' && b[i + 1] == b'"' {
+            stripped.push(b[i]);
+            i += 2;
+        } else {
+            stripped.push(b[i]);
+            i += 1;
+        }
+    }
+
+    let name = if stripped.iter().any(|&c| c >= 0x80) {
+        quote_rfc2047(&stripped)
+    } else if stripped.iter().any(|&c| b"[]()<>@,;:\\\".".contains(&c) || c < 0x20 || c == 0x7f) {
+        // `s/([\\\r])/\\$1/g` then wrap in double quotes.
+        let mut escaped = String::from("\"");
+        for &c in &stripped {
+            if c == b'\\' || c == b'\r' {
+                escaped.push('\\');
+            }
+            escaped.push(c as char);
+        }
+        escaped.push('"');
+        escaped
+    } else {
+        String::from_utf8_lossy(&stripped).into_owned()
+    };
+    format!("{name} {addr}")
+}
+
+/// `is_rfc2047_quoted`: at most 75 characters, and either an entirely ASCII
+/// double-quoted string or a single RFC 2047 encoded word.
+fn is_rfc2047_quoted(s: &str) -> bool {
+    if s.chars().count() > 75 {
+        return false;
+    }
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') && s.is_ascii() {
+        return true;
+    }
+    is_encoded_word(s)
+}
+
+/// `$re_encoded_word` — `=?<token>?<token>?<encoded-text>?=` anchored to the
+/// whole string.
+fn is_encoded_word(s: &str) -> bool {
+    // `$re_token`: no specials, no `=`, `/`, `?`, `.`, space, control or 8-bit.
+    let token = |b: u8| !b"][()<>@,;:\\\"/?.= ".contains(&b) && (0x21..0x7f).contains(&b);
+    let text = |b: u8| b != b'?' && (0x21..0x7f).contains(&b);
+    let Some(body) = s.strip_prefix("=?").and_then(|r| r.strip_suffix("?=")) else {
+        return false;
+    };
+    let mut parts = body.splitn(3, '?');
+    let (Some(charset), Some(encoding), Some(encoded)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    !charset.is_empty()
+        && charset.bytes().all(token)
+        && !encoding.is_empty()
+        && encoding.bytes().all(token)
+        && !encoded.is_empty()
+        && encoded.bytes().all(text)
+}
+
+/// `quote_rfc2047($_, 'UTF-8')`: every byte outside `-a-zA-Z0-9!*+/` becomes
+/// `=<HH>`, and the result is wrapped as a `q`-encoded word.
+fn quote_rfc2047(bytes: &[u8]) -> String {
+    let mut out = String::from("=?UTF-8?q?");
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || b"-!*+/".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("={b:02X}"));
+        }
+    }
+    out.push_str("?=");
+    out
+}
+
+/// `expand_aliases`: replace each address that names an alias with that alias's
+/// own addresses, recursively. An alias reached while it is already being
+/// expanded is the `expands to itself` fatal.
+fn expand_aliases(addrs: &[String], aliases: &Aliases) -> Result<Vec<String>, String> {
+    fn one(
+        alias: &str,
+        aliases: &Aliases,
+        active: &mut Vec<String>,
+        out: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if active.iter().any(|a| a == alias) {
+            return Err(alias.to_string());
+        }
+        match aliases.get(alias) {
+            Some(expansion) => {
+                active.push(alias.to_string());
+                for next in expansion {
+                    one(next, aliases, active, out)?;
+                }
+                active.pop();
+            }
+            None => out.push(alias.to_string()),
+        }
+        Ok(())
+    }
+
+    let mut out = Vec::new();
+    let mut active = Vec::new();
+    for addr in addrs {
+        one(addr, aliases, &mut active, &mut out)?;
+    }
+    Ok(out)
 }
 
 /// Perl's `$!` stringification for the errnos an `open` can raise here.
@@ -1108,25 +1716,37 @@ pub fn send_email(args: &[String]) -> Result<ExitCode> {
     }
 
     let aliases = match parse_aliases(&cfg) {
-        Aliases::Died(code) => return Ok(ExitCode::from(code)),
-        Aliases::Names(names) => names,
+        AliasScan::Died(code) => return Ok(ExitCode::from(code)),
+        AliasScan::Parsed(aliases) => aliases,
     };
     if dump_aliases {
         // `print "$_\n" for (sort keys %aliases); exit(0);` — Perl's default
-        // sort is by byte value, which is what BTreeSet iterates in.
-        for alias in &aliases {
+        // sort is by byte value, which is what BTreeMap iterates in.
+        for alias in aliases.keys() {
             println!("{alias}");
         }
         return Ok(ExitCode::SUCCESS);
     }
 
     if translate_aliases {
-        bail!(
-            "unsupported flag \"--translate-aliases\": it needs RFC 822 address parsing \
-             (Mail::Address) and sanitize_address_list's phrase quoting, neither of which has a \
-             substrate in the vendored gitoxide crates (ported: option parsing, -h, config \
-             validation, --dump-aliases)"
-        );
+        // `while (<STDIN>) { … }` — each line is parsed as an address list,
+        // expanded through the aliases, sanitized, and printed one per line.
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)?;
+        let input = String::from_utf8_lossy(&bytes);
+        for line in input.split_inclusive('\n') {
+            let parsed = parse_address_line(line);
+            let expanded = match expand_aliases(&parsed, &aliases) {
+                Ok(list) => list,
+                Err(alias) => {
+                    return Ok(die(&format!("fatal: alias '{alias}' expands to itself\n"), &known))
+                }
+            };
+            for addr in expanded {
+                println!("{}", sanitize_address(&addr));
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
     }
 
     bail!(

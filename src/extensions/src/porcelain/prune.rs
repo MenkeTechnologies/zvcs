@@ -98,6 +98,13 @@
 //! fetch and `close_over` already drops any unresolvable link, so its walk
 //! already matches the flagged walk byte-for-byte.
 //!
+//! `gc.recentObjectsHook` is honoured as the third source of "recent" roots,
+//! alongside the loose and packed mtime scans: each configured command is run,
+//! its stdout read as one hex object id per line, and every id the repository
+//! holds seeded into the traversal so it and its descendants survive. It is gated
+//! on the same non-zero `mark_recent` the mtime scans are, so `--expire=never`
+//! skips it entirely. See [`collect_hook_roots`].
+//!
 //! Not ported, and rejected with a precise reason rather than approximated:
 //!   * A shallow repository, because git additionally rewrites `.git/shallow`
 //!     via `prune_shallow()`, and there is no shallow-file writer here.
@@ -274,6 +281,9 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
 
     let objdir = repo.objects.store_ref().path().to_path_buf();
     collect_recent_roots(&objdir, repo.object_hash(), expire, &mut roots);
+    if let Err(code) = collect_hook_roots(&repo, expire, &mut roots) {
+        return Ok(code);
+    }
     let reachable = close_over(&repo, roots);
 
     let display_root = display_objdir(&repo, &objdir);
@@ -656,6 +666,135 @@ fn collect_recent_roots(
             roots.extend(index.iter().map(|entry| entry.oid));
         }
     }
+}
+
+/// `gc.recentObjectsHook`: extra traversal roots named by an external command,
+/// the last step of `add_unseen_recent_objects_to_traversal()`.
+///
+/// Each configured value is a command whose stdout is read as one hex object id
+/// per line; every id the repository actually holds becomes a root, so it and its
+/// descendants survive the prune "regardless of their true age"
+/// (`git-config(1)`). Ids the repository does not hold are ignored; a line that
+/// is not an object id is not.
+///
+/// The hook set is gated exactly as git gates the whole recent-object step, on
+/// `mark_recent` being non-zero — so `--expire=never` (which is `0`) never runs
+/// it, while `--expire=now` (`TIME_MAX`) does. Multiple values are supported and
+/// **all** must exit 0.
+///
+/// Verified against git 2.55.0, each shape one invocation at a time:
+///
+/// ```text
+/// hook echoing an unreachable blob's id  -> the blob is no longer pruned
+/// hook echoing an id the repo lacks      -> ignored, the blob is still pruned
+/// hook printing a non-id line            -> error: invalid extra cruft tip: '<line>'
+///                                           fatal: unable to enumerate additional recent objects   (128)
+/// hook exiting non-zero                  -> fatal: unable to enumerate additional recent objects   (128)
+/// hook naming a missing program          -> fatal: cannot exec '<cmd>': No such file or directory
+///                                           fatal: unable to enumerate additional recent objects   (128)
+/// --expire=never with any of the above   -> silent, exit 0
+/// ```
+fn collect_hook_roots(
+    repo: &gix::Repository,
+    expire: i64,
+    roots: &mut Vec<ObjectId>,
+) -> std::result::Result<(), ExitCode> {
+    if expire == 0 {
+        return Ok(());
+    }
+    let hooks = configured_hooks(repo);
+    if hooks.is_empty() {
+        return Ok(());
+    }
+
+    let hash = repo.object_hash();
+    for hook in hooks {
+        let Some(output) = run_recent_objects_hook(&hook) else {
+            eprintln!("fatal: unable to enumerate additional recent objects");
+            return Err(ExitCode::from(128));
+        };
+        for line in output.lines() {
+            let Ok(oid) = ObjectId::from_hex(line.as_bytes()) else {
+                eprintln!("error: invalid extra cruft tip: '{line}'");
+                eprintln!("fatal: unable to enumerate additional recent objects");
+                return Err(ExitCode::from(128));
+            };
+            if oid.kind() != hash || !repo.has_object(oid) {
+                // "Objects which cannot be found in the repository are ignored."
+                continue;
+            }
+            roots.push(oid);
+        }
+    }
+    Ok(())
+}
+
+/// Every `gc.recentObjectsHook` value in the merged config, in order — git reads
+/// the key into a `string_list`, so repeats accumulate rather than overriding.
+fn configured_hooks(repo: &gix::Repository) -> Vec<String> {
+    use gix::bstr::ByteSlice as _;
+
+    // The section walk below exists only to recover those repeats. When the key is
+    // unset it would walk every section to find nothing, so a plain lookup decides
+    // that far commoner case first.
+    if repo.config_snapshot().string("gc.recentObjectsHook").is_none() {
+        return Vec::new();
+    }
+
+    let config = repo.config_snapshot().plumbing().clone();
+    let mut hooks = Vec::new();
+    for section in config.sections() {
+        let header = section.header();
+        if header.subsection_name().is_some() || !header.name().to_string().eq_ignore_ascii_case("gc") {
+            continue;
+        }
+        for value in section.body().values("recentObjectsHook") {
+            hooks.push(value.to_str_lossy().into_owned());
+        }
+    }
+    hooks
+}
+
+/// Run one hook and return its stdout, or `None` when it could not be started or
+/// did not exit 0.
+///
+/// git runs these through `RUN_USING_SHELL`, whose `prepare_shell_cmd()` only
+/// *actually* involves a shell when the command contains one of the characters
+/// below; anything else is `exec`'d directly, which is why a missing program
+/// reports git's own `cannot exec` rather than the shell's diagnostic. Both
+/// halves are reproduced, including that the child's stderr is inherited.
+fn run_recent_objects_hook(command: &str) -> Option<String> {
+    use std::process::{Command, Stdio};
+
+    /// `prepare_shell_cmd()`'s metacharacter set: a command containing any of
+    /// these goes to `sh -c`, everything else is exec'd as a bare program.
+    const SHELL_SPECIAL: &[char] = &[
+        '|', '&', ';', '<', '>', '(', ')', '$', '`', '\\', '"', '\'', ' ', '\t', '\n', '*', '?',
+        '[', '#', '~', '=', '%',
+    ];
+
+    let mut cmd = if command.contains(SHELL_SPECIAL) {
+        let mut c = Command::new("/bin/sh");
+        c.arg("-c").arg(command);
+        c
+    } else {
+        Command::new(command)
+    };
+    let output = match cmd.stdin(Stdio::null()).output() {
+        Ok(output) => output,
+        Err(err) => {
+            // git's `sane_execvp` failure, with `strerror` alone — Rust appends
+            // its own ` (os error <n>)`, which git does not print.
+            let reason = err.to_string();
+            let reason = reason.split(" (os error ").next().unwrap_or(&reason);
+            eprintln!("fatal: cannot exec '{command}': {reason}");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
 }
 
 /// `lstat()`'s `st_mtime`, in whole seconds, which is what git compares against

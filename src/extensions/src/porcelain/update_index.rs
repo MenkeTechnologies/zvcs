@@ -43,6 +43,11 @@
 //! assume-unchanged (`CE_VALID`) bit on every entry this command writes, so the
 //! `h` marker shows up in `git ls-files -v`.
 //!
+//! The index write itself honours `index.recordEndOfIndexEntries` (and its
+//! `index.threads` default), `index.skipHash`, and the `index` component of
+//! `core.fsync` / `core.fsyncMethod`; `core.fsyncObjectFiles` is read for its
+//! deprecation warning.
+//!
 //! Accepted but not represented on disk, because the vendored `gix_index` writes
 //! neither the extension nor a pinned header version. Each is invisible to
 //! `git status` / `git ls-files`, so behaviour observable through git itself is
@@ -143,6 +148,16 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
     // every entry this command writes carry the `CE_VALID` bit.
     let ignore_stat = repo.config_snapshot().boolean("core.ignoreStat") == Some(true);
 
+    // `core.fsync`'s diagnostics belong with the config read, ahead of any work,
+    // which is where git's `git_default_core_config` emits them.
+    let fsync = match crate::config::FsyncPolicy::load(&repo) {
+        Ok(policy) => policy,
+        Err(message) => {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+    };
+
     let workdir = repo.workdir().map(|w| normalize_lexically(
             &std::fs::canonicalize(w).unwrap_or_else(|_| w.to_owned()),
         ));
@@ -210,7 +225,10 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
                 if ctx.tree_stale {
                     ctx.index.remove_tree();
                 }
-                ctx.index.write(gix::index::write::Options::default())?;
+                ctx.index.write(crate::config::index_write_options(&ctx.repo))?;
+                // `core.fsync=index` (or an aggregate containing it) hardens the
+                // index git has just rewritten; the platform default does not.
+                fsync.harden_path(crate::config::FsyncComponent::Index, ctx.index.path());
             }
             Ok(if ctx.has_errors {
                 ExitCode::from(1)

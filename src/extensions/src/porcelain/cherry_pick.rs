@@ -536,7 +536,10 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
     // --- stage 6: git's `require_clean_work_tree` --------------------------
     if repo.is_dirty()? {
         eprintln!("error: your local changes would be overwritten by cherry-pick.");
-        eprintln!("hint: commit your changes or stash them to proceed.");
+        // `error_dirty_index` (sequencer.c) gates its one-line direction on
+        // `advice.commitBeforeMerge`; the `error:` line above always prints.
+        crate::advice::Advice::CommitBeforeMerge
+            .advise_plain("commit your changes or stash them to proceed.");
         return Ok(sequencer_failed_tail());
     }
 
@@ -923,8 +926,12 @@ fn continue_pick(repo: &gix::Repository, git_dir: &std::path::Path) -> Result<Ex
     let index = repo.open_index()?;
     if index.entries().iter().any(|e| e.stage_raw() != 0) {
         eprintln!("error: Committing is not possible because you have unmerged files.");
-        eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
-        eprintln!("hint: as appropriate to mark resolution and make a commit.");
+        // `error_resolve_conflict` (sequencer.c) prints the error unconditionally
+        // and the two-line direction only under `advice.resolveConflict`.
+        crate::advice::Advice::ResolveConflict.advise_plain(
+            "Fix them up in the work tree, and then use 'git add/rm <file>'\n\
+             as appropriate to mark resolution and make a commit.",
+        );
         eprintln!("fatal: Exiting because of an unresolved conflict.");
         return Ok(ExitCode::from(128));
     }

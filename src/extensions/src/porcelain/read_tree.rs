@@ -29,6 +29,16 @@
 //!   `--index-output=<file>`, `--exclude-per-directory=<file>`,
 //!   `--[no-]sparse-checkout`, `--[no-]recurse-submodules`, `--[no-]debug-unpack`.
 //!
+//! ## Configuration honoured
+//!
+//! * `core.maxTreeDepth` — the tree-recursion fail-safe. A tree deeper than the
+//!   limit stops the read with `error: exceeded maximum allowed tree depth` and
+//!   exit 128, leaving the index untouched; the limit defaults to 2048, is read
+//!   through `git_config_int` (so an unparseable value is fatal and a negative
+//!   one rejects every tree), and is not charged for a `--prefix`.
+//! * `core.fsync` / `core.fsyncMethod` — the index write is hardened when the
+//!   `index` component is in the set.
+//!
 //! Options are parsed the way `parse-options` does: short switches cluster (`-mu`),
 //! value-taking options accept both `--name=<v>` and `--name <v>`, every boolean has
 //! its `--no-` form, `--` ends the option scan, and a usage error prints git's usage
@@ -166,6 +176,42 @@ fn parse_maybe_bool(v: &str) -> Option<bool> {
 fn rejected(msg: impl std::fmt::Display) -> Result<ExitCode> {
     eprintln!("error: {msg}");
     Ok(ExitCode::from(128))
+}
+
+/// git's `core.maxTreeDepth`: the recursion fail-safe `read_tree_at()` checks on
+/// entry, defaulting to 2048 off Windows (`git-config(1)`, git 2.55.0).
+///
+/// Read through `git_config_int`, so a value it cannot parse is fatal and a
+/// *negative* one is a perfectly good number that simply rejects every tree —
+/// both reproduced here (`Err` carries git's `die_bad_number` line).
+fn max_tree_depth(repo: &gix::Repository) -> std::result::Result<i64, String> {
+    Ok(crate::config::config_int(repo, "core.maxTreeDepth")?.unwrap_or(2048))
+}
+
+/// git's `error("exceeded maximum allowed tree depth")` — an `error:` line, but
+/// exit 128, because `read_tree_at()`'s failure propagates out of `read_tree()`
+/// as a die rather than as a warning.
+const TOO_DEEP: &str = "exceeded maximum allowed tree depth";
+
+/// Whether every path `index` took from a tree stays inside `max` levels of tree
+/// recursion.
+///
+/// `read_tree_at()` enters the root tree at depth 0 and checks `depth >
+/// max_allowed_tree_depth` on each recursive call, so a blob at `a/b/c/d/f.txt`
+/// is reached from a tree at depth 4 and needs `core.maxTreeDepth >= 4` — which
+/// is exactly the number of `/` in its path, and is how the depth is counted
+/// here. Measuring the paths rather than re-walking the trees keeps the check
+/// free: the entries are already in memory, and reading them again would double
+/// the cost of every `read-tree` for a fail-safe that essentially never fires.
+///
+/// The one divergence: a tree whose deepest branch ends in an *empty* tree
+/// contributes no index entry, so git counts one level that this does not.
+fn within_tree_depth(index: &gix::index::File, max: i64) -> bool {
+    let backing = index.path_backing();
+    index.entries().iter().all(|e| {
+        let depth = e.path_in(backing).iter().filter(|b| **b == b'/').count();
+        i64::try_from(depth).is_ok_and(|d| d <= max)
+    })
 }
 
 pub fn read_tree(args: &[String]) -> Result<ExitCode> {
@@ -361,6 +407,21 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
         return fatal("You need to resolve your current index first");
     }
 
+    // `core.maxTreeDepth` bounds the tree recursion every form below performs, so
+    // it is resolved once here; an unreadable value is fatal exactly as
+    // `git_config_int` makes it.
+    let depth_limit = match max_tree_depth(&repo) {
+        Ok(limit) => limit,
+        Err(message) => return fatal(message),
+    };
+
+    // Resolved before the write so `core.fsync`'s diagnostics land where git
+    // prints them — while reading config, ahead of the work — rather than after.
+    let fsync = match crate::config::FsyncPolicy::load(&repo) {
+        Ok(policy) => policy,
+        Err(message) => return fatal(message),
+    };
+
     // ---- Build the index this invocation wants to end up with. ----
     let mut new_index = if o.read_empty || tree_ids.is_empty() {
         gix::index::File::from_state(
@@ -368,12 +429,15 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
             repo.index_path(),
         )
     } else if let Some(prefix) = &o.prefix {
-        match bind_prefix(&repo, &old, tree_ids[0], prefix)? {
+        match bind_prefix(&repo, &old, tree_ids[0], prefix, depth_limit)? {
             Ok(index) => index,
             Err(code) => return Ok(code),
         }
     } else {
-        union_of_trees(&repo, &tree_ids)?
+        match union_of_trees(&repo, &tree_ids, depth_limit)? {
+            Ok(index) => index,
+            Err(code) => return Ok(code),
+        }
     };
 
     // `-m`/`--reset` carry the stat cache of entries the tree leaves untouched, so a
@@ -469,7 +533,10 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
         new_index.set_path(out.clone());
     }
     new_index.remove_tree();
-    new_index.write(Default::default())?;
+    new_index.write(crate::config::index_write_options(&repo))?;
+    // `core.fsync=index` (or an aggregate that contains it) hardens the index git
+    // has just rewritten; the default set does not, so this is normally a no-op.
+    fsync.harden_path(crate::config::FsyncComponent::Index, new_index.path());
 
     Ok(ExitCode::SUCCESS)
 }
@@ -477,10 +544,26 @@ pub fn read_tree(args: &[String]) -> Result<ExitCode> {
 /// The index built by reading `tree_ids` in order: the union of their entries, with
 /// a later tree replacing an earlier one at the same path. All entries are stage 0
 /// with a zeroed stat cache, which is what stock git produces for a plain read.
-fn union_of_trees(repo: &gix::Repository, tree_ids: &[ObjectId]) -> Result<gix::index::File> {
+///
+/// Each tree is checked against `depth_limit` (`core.maxTreeDepth`) as it is read,
+/// so a too-deep tree stops the read before the index is touched — git leaves the
+/// old index in place on this failure.
+fn union_of_trees(
+    repo: &gix::Repository,
+    tree_ids: &[ObjectId],
+    depth_limit: i64,
+) -> Result<std::result::Result<gix::index::File, ExitCode>> {
     let mut index = repo.index_from_tree(&tree_ids[0])?;
+    if !within_tree_depth(&index, depth_limit) {
+        eprintln!("error: {TOO_DEEP}");
+        return Ok(Err(ExitCode::from(128)));
+    }
     for id in &tree_ids[1..] {
         let extra = repo.index_from_tree(id)?;
+        if !within_tree_depth(&extra, depth_limit) {
+            eprintln!("error: {TOO_DEEP}");
+            return Ok(Err(ExitCode::from(128)));
+        }
         let extra_paths: HashSet<BString> = {
             let backing = extra.path_backing();
             extra.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
@@ -492,18 +575,24 @@ fn union_of_trees(repo: &gix::Repository, tree_ids: &[ObjectId]) -> Result<gix::
         }
         index.sort_entries();
     }
-    Ok(index)
+    Ok(Ok(index))
 }
 
 /// `--prefix=<p>`: keep `old` and add every entry of `tree` under `<p>/`.
 ///
-/// Returns `Err(ExitCode)` for git's bind-overlap rejection so the caller can exit
-/// with git's code and message instead of an `anyhow` error.
+/// Returns `Err(ExitCode)` for git's bind-overlap rejection and for the
+/// `core.maxTreeDepth` rejection, so the caller can exit with git's code and
+/// message instead of an `anyhow` error. The depth is measured on the tree as
+/// read, *before* the prefix is applied — git's `read_tree_at()` starts the
+/// prefix as its base string at depth 0, so `--prefix=p/q/r/` costs no levels
+/// (verified against git 2.55.0: a one-level tree binds under a three-segment
+/// prefix even at `core.maxTreeDepth=0`).
 fn bind_prefix(
     repo: &gix::Repository,
     old: &gix::index::File,
     tree: ObjectId,
     prefix: &str,
+    depth_limit: i64,
 ) -> Result<std::result::Result<gix::index::File, ExitCode>> {
     let prefix = if prefix.is_empty() || prefix.ends_with('/') {
         prefix.to_string()
@@ -518,6 +607,10 @@ fn bind_prefix(
 
     let mut index = gix::index::File::clone(old);
     let from_tree = repo.index_from_tree(&tree)?;
+    if !within_tree_depth(&from_tree, depth_limit) {
+        eprintln!("error: {TOO_DEEP}");
+        return Ok(Err(ExitCode::from(128)));
+    }
     let backing = from_tree.path_backing().to_owned();
     for e in from_tree.entries() {
         let mut path = BString::from(prefix.as_bytes());

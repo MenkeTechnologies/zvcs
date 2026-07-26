@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,6 +12,8 @@ use gix::objs::tree::EntryKind;
 use gix::objs::{Kind, TreeRefIter};
 use gix::prelude::ObjectIdExt;
 use gix::revision::plumbing::Spec as RevSpec;
+
+use super::log::{DecorateStyle, Decorations, Mailmap};
 
 /// git's floor for an abbreviated object id, used for the all-zero side of an
 /// `index`/raw line where there is no real object to disambiguate against.
@@ -34,6 +36,19 @@ const STAT_TERM_WIDTH: usize = 80;
 /// Pretty formats: the default `medium`, `--oneline`, and `--format=`/`--pretty=`
 /// with the placeholder subset listed in [`expand_format`]. Any other placeholder
 /// is rejected rather than silently dropped.
+///
+/// Header decoration and identity flags, shared with `git log` and rendered by
+/// its code so the two commands emit identical bytes:
+///   * `--decorate[=short|full|auto|no]` / `--no-decorate`, defaulting to
+///     `log.decorate` and then to `auto`, with `--decorate-refs=<pattern>`,
+///     `--decorate-refs-exclude=<pattern>`, `--clear-decorations`,
+///     `log.excludeDecoration` and `log.initialDecorationSet` filtering which
+///     refs may decorate
+///   * `--use-mailmap`/`--mailmap` (and their `--no-` forms), defaulting to
+///     `log.mailmap` (true), which resolves the `Author:` line through `.mailmap`
+///   * `--source` / `--no-source`, annotating the header with the argument the
+///     commit was reached from — the endpoint token for a range, with git's
+///     parent-inheritance across a walk
 ///
 /// Diff output formats: `-p`/`--patch`, `--stat`, `--raw`, `--name-only`,
 /// `-s`/`--no-patch`, and `-q`/`--quiet`. Their interaction is git's, reproduced in
@@ -91,6 +106,24 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `--stat` width geometry; seeded from config after repo discovery, then any
     // explicit `--stat*` flag below wins (git precedence).
     let mut stat_widths = StatWidths::default();
+    // `--decorate[=<style>]` / `--no-decorate`, shared with `git log`. `None` means
+    // no flag was given, so `log.decorate` (and then git's `auto` default) decides.
+    let mut cli_decorate: Option<DecorateStyle> = None;
+    // `--decorate-refs=<pattern>` / `--decorate-refs-exclude=<pattern>` (both
+    // repeatable) and `--clear-decorations`, which empties them again and drops
+    // git's default known-namespace include list.
+    let mut decorate_refs: Vec<String> = Vec::new();
+    let mut decorate_refs_exclude: Vec<String> = Vec::new();
+    let mut default_decoration_filter = true;
+    // Set while a `--decorate-refs`/`--decorate-refs-exclude` given in the
+    // separate-value form waits for its pattern in the next argv token.
+    let mut pending_decorate_refs: Option<bool> = None;
+    // `--source`: annotate each shown commit with the argument it was reached
+    // from (`\t<source>` after the hash), as `git log --source` does.
+    let mut source_mode = false;
+    // `--use-mailmap`/`--mailmap`: `None` until a flag is seen, then `log.mailmap`
+    // supplies the default.
+    let mut cli_mailmap: Option<bool> = None;
 
     for a in args {
         let s = a.as_str();
@@ -104,6 +137,14 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             match kind {
                 'S' => pickaxe_s = Some(a.clone()),
                 _ => pickaxe_g = Some(a.clone()),
+            }
+            continue;
+        }
+        if let Some(include) = pending_decorate_refs.take() {
+            if include {
+                decorate_refs.push(a.clone());
+            } else {
+                decorate_refs_exclude.push(a.clone());
             }
             continue;
         }
@@ -133,6 +174,23 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             // combined (`--cc`) diff. A no-op for a single non-merge commit.
             "--first-parent" => first_parent = true,
             "--no-first-parent" => first_parent = false,
+            // Ref decorations on the `commit <id>` / oneline header, exactly as
+            // `git log` renders them (same filter, same ordering, same colors).
+            "--decorate" => cli_decorate = Some(DecorateStyle::Short),
+            "--no-decorate" => cli_decorate = Some(DecorateStyle::Off),
+            "--decorate-refs" => pending_decorate_refs = Some(true),
+            "--decorate-refs-exclude" => pending_decorate_refs = Some(false),
+            // git's `clear_decorations_callback`: forget every pattern given so
+            // far and stop applying the default namespace filter.
+            "--clear-decorations" => {
+                decorate_refs.clear();
+                decorate_refs_exclude.clear();
+                default_decoration_filter = false;
+            }
+            "--source" => source_mode = true,
+            "--no-source" => source_mode = false,
+            "--use-mailmap" | "--mailmap" => cli_mailmap = Some(true),
+            "--no-use-mailmap" | "--no-mailmap" => cli_mailmap = Some(false),
             // We never colorize; accept the flags that request no/auto color.
             "--no-color" | "--color=never" | "--color=auto" => {}
             _ => {
@@ -152,6 +210,17 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                         Some(p) => pretty = p,
                         None => return Ok(fatal(&format!("invalid --pretty format: {spec}\n"))),
                     }
+                } else if let Some(v) = s.strip_prefix("--decorate=") {
+                    // git's `decorate_callback` dies on a value its
+                    // `parse_decoration_style` rejects, unlike `log.decorate`.
+                    match super::log::parse_decoration_style(v) {
+                        Some(st) => cli_decorate = Some(st),
+                        None => return Ok(fatal(&format!("invalid --decorate option: {v}\n"))),
+                    }
+                } else if let Some(v) = s.strip_prefix("--decorate-refs=") {
+                    decorate_refs.push(v.to_string());
+                } else if let Some(v) = s.strip_prefix("--decorate-refs-exclude=") {
+                    decorate_refs_exclude.push(v.to_string());
                 } else if let Some(v) = s.strip_prefix("-S") {
                     pickaxe_s = Some(v.to_string());
                 } else if let Some(v) = s.strip_prefix("-G") {
@@ -189,6 +258,17 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     if quiet {
         formats.no_output = true;
     }
+    // A trailing `--decorate-refs`/`--decorate-refs-exclude` with nothing after it
+    // is git's parse-options "requires a value" usage error (exit 129).
+    if let Some(include) = pending_decorate_refs {
+        let name = if include {
+            "decorate-refs"
+        } else {
+            "decorate-refs-exclude"
+        };
+        eprintln!("error: option `{name}' requires a value");
+        return Ok(ExitCode::from(129));
+    }
     if let Pretty::User(fmt) = &pretty {
         // Reject unknown placeholders before any output is produced.
         check_format(fmt)?;
@@ -204,9 +284,24 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `git log`; the CLI flags parsed above win where present. git reads these in
     // `git_log_config` and validates `log.date` there — an invalid value is fatal
     // even when `--date` later overrides it, so it is checked unconditionally.
-    let (abbrev_commit, date_mode, show_root) = {
+    let (abbrev_commit, date_mode, show_root, decorate, use_mailmap) = {
         let snap = repo.config_snapshot();
         let cfg_abbrev = snap.boolean("log.abbrevCommit").unwrap_or(false);
+        // `log.decorate` supplies the default decoration style; git's built-in
+        // default is `auto`, which is `short` on a terminal and off in a pipe. An
+        // invalid config value is `Off` (git's `decoration_style = 0`), never fatal.
+        let cfg_decorate: DecorateStyle = match snap.boolean("log.decorate") {
+            Some(true) => DecorateStyle::Short,
+            Some(false) => DecorateStyle::Off,
+            None => match snap.string("log.decorate") {
+                Some(v) => super::log::parse_decoration_style(&v.to_str_lossy())
+                    .unwrap_or(DecorateStyle::Off),
+                None if std::io::stdout().is_terminal() => DecorateStyle::Short,
+                None => DecorateStyle::Off,
+            },
+        };
+        // `log.mailmap` has defaulted to true since git 2.24.
+        let cfg_mailmap = snap.boolean("log.mailmap").unwrap_or(true);
         // `log.showRoot` defaults to true: a root commit is shown as a creation
         // event (its diff against the empty tree). `--root` forces it on; there is
         // no `--no-root`, so config is the only way to suppress the root diff.
@@ -243,8 +338,27 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             cli_abbrev.unwrap_or(cfg_abbrev),
             cli_date.unwrap_or(cfg_date),
             force_root || cfg_show_root,
+            cli_decorate.unwrap_or(cfg_decorate),
+            cli_mailmap.unwrap_or(cfg_mailmap),
         )
     };
+
+    // The commit→refs map for `--decorate`, filtered exactly as `git log` filters
+    // it; skipped entirely when no decorations will be shown so the ref scan costs
+    // nothing on a plain `git show`.
+    let decorations = if decorate == DecorateStyle::Off {
+        None
+    } else {
+        let filter = super::log::DecorationFilter::build(
+            &repo,
+            &decorate_refs,
+            &decorate_refs_exclude,
+            default_decoration_filter,
+        );
+        Some(super::log::build_decorations(&repo, &filter)?)
+    };
+    // `--use-mailmap` / `log.mailmap`: loaded once and shared by every commit.
+    let mailmap = use_mailmap.then(|| Mailmap::load(&repo));
 
     // git resolves every revision before rendering anything, so a bad revision
     // produces no stdout at all even when an earlier one was fine. Ranges (`a..b`),
@@ -254,6 +368,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut walk_hidden: Vec<ObjectId> = Vec::new();
     let mut plain: Vec<(&str, ObjectId)> = Vec::new();
     let mut needs_walk = false;
+    // Parallel to `walk_tips` and used only under `--source`: the name git records
+    // for each pending object, which is the endpoint token rather than the whole
+    // argument (`main~2..main` names its tip `main`).
+    let mut walk_tip_sources: Vec<String> = Vec::new();
     for spec in &specs {
         let parsed = match repo.rev_parse(BStr::new(*spec)) {
             Ok(p) => p.detach(),
@@ -263,6 +381,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             RevSpec::Include(id) | RevSpec::ExcludeParents(id) => {
                 plain.push((*spec, id));
                 walk_tips.push(id);
+                walk_tip_sources.push((*spec).to_string());
             }
             RevSpec::Exclude(id) => {
                 needs_walk = true;
@@ -271,6 +390,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             RevSpec::Range { from, to } => {
                 needs_walk = true;
                 walk_tips.push(to);
+                walk_tip_sources.push(range_endpoint(spec, "..", true));
                 walk_hidden.push(from);
             }
             RevSpec::Merge { theirs, ours } => {
@@ -278,7 +398,9 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 // computes as `theirs ours --not $(merge-base theirs ours)`.
                 needs_walk = true;
                 walk_tips.push(theirs);
+                walk_tip_sources.push(range_endpoint(spec, "...", false));
                 walk_tips.push(ours);
+                walk_tip_sources.push(range_endpoint(spec, "...", true));
                 for mb in repo.merge_bases_many(theirs, &[ours])? {
                     walk_hidden.push(mb.detach());
                 }
@@ -288,10 +410,24 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 let commit = repo.find_object(id)?.try_into_commit()?;
                 for p in commit.parent_ids() {
                     walk_tips.push(p.detach());
+                    walk_tip_sources.push((*spec).to_string());
                 }
             }
         }
     }
+    // `--source` over a walk: resolve each reached commit's source with git's own
+    // inheritance rule, shared with `git log --source`.
+    let sources = if source_mode && needs_walk {
+        super::log::source_map(
+            &repo,
+            &walk_tips,
+            &walk_tip_sources,
+            first_parent,
+            &walk_hidden,
+        )?
+    } else {
+        std::collections::HashMap::new()
+    };
 
     let selection = match formats.resolve() {
         Ok(sel) => sel,
@@ -319,6 +455,18 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // git marks each commit it prints as SHOWN, so a commit named twice (or reached
     // twice by a walk) is printed once. Blobs, trees, and tags are not deduplicated.
     let mut shown: Vec<ObjectId> = Vec::new();
+    // git's `rev_info.shown_one`, which drives the inter-record separator.
+    let mut shown_one = false;
+    let disp = DisplayOpts {
+        abbrev_commit,
+        date_mode,
+        show_root,
+        first_parent,
+        stat: stat_widths,
+        decorate,
+        decorations: decorations.as_ref(),
+        mailmap: mailmap.as_ref(),
+    };
     if needs_walk {
         let mut platform = repo.rev_walk(walk_tips).with_hidden(walk_hidden);
         if first_parent {
@@ -327,13 +475,14 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         let walk = platform.all()?;
         for info in walk {
             let id = info?.id;
-            let disp = DisplayOpts { abbrev_commit, date_mode, show_root, first_parent, stat: stat_widths };
-            show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown)?;
+            let source = source_mode
+                .then(|| sources.get(&id).cloned().unwrap_or_default())
+                .unwrap_or_default();
+            show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(source.as_str()), &mut shown_one)?;
         }
     } else {
         for (spec, id) in &plain {
-            let disp = DisplayOpts { abbrev_commit, date_mode, show_root, first_parent, stat: stat_widths };
-            show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown)?;
+            show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(*spec), &mut shown_one)?;
         }
     }
 
@@ -343,6 +492,29 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         // A downstream `| head` closing the pipe is not an error.
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// The name git records for one endpoint of a range argument under `--source`.
+///
+/// `handle_dotdot_1` passes the endpoint token — not the whole argument — to
+/// `add_pending_object`, so `main~2..main` names its tip `main` and an omitted
+/// endpoint (`..main`, `main..`) means `HEAD`.
+fn range_endpoint(spec: &str, sep: &str, right: bool) -> String {
+    let picked = match spec.split_once(sep) {
+        Some((a, b)) => {
+            if right {
+                b
+            } else {
+                a
+            }
+        }
+        None => spec,
+    };
+    if picked.is_empty() {
+        "HEAD".to_string()
+    } else {
+        picked.to_string()
     }
 }
 
@@ -556,8 +728,7 @@ impl Formats {
 
 /// The display knobs `git show` shares with `git log`, resolved once from config
 /// and the command line.
-#[derive(Clone, Copy)]
-struct DisplayOpts {
+struct DisplayOpts<'a> {
     /// `log.abbrevCommit` / `--abbrev-commit`: abbreviate the `commit <id>` line.
     abbrev_commit: bool,
     /// `log.date` / `--date=<mode>`: the format of the `Date:` line.
@@ -570,6 +741,14 @@ struct DisplayOpts {
     first_parent: bool,
     /// `--stat` width geometry (see [`StatWidths`]).
     stat: StatWidths,
+    /// `--decorate` / `log.decorate`: the decoration style for the `commit <id>`
+    /// and oneline headers. `Off` appends nothing.
+    decorate: DecorateStyle,
+    /// The commit→refs map behind `decorate`; `None` when decorations are off.
+    decorations: Option<&'a Decorations>,
+    /// `--use-mailmap` / `log.mailmap`: rewrites the `Author:` line through
+    /// `.mailmap`. `None` shows the identity as the commit recorded it.
+    mailmap: Option<&'a Mailmap>,
 }
 
 /// `--stat` width geometry, in git's `stat_width`/`stat_name_width`/`stat_graph_width`
@@ -645,6 +824,7 @@ impl Pickaxe {
 /// Render the object `id` (named `spec` on the command line), peeling annotated
 /// tags to their target after printing the tag header.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn show_one(
     repo: &gix::Repository,
     out: &mut Vec<u8>,
@@ -653,9 +833,11 @@ fn show_one(
     pretty: &Pretty,
     selection: Selection,
     pathspecs: &[Vec<u8>],
-    disp: &DisplayOpts,
+    disp: &DisplayOpts<'_>,
     pickaxe: &Pickaxe,
     shown: &mut Vec<ObjectId>,
+    source: Option<&str>,
+    shown_one: &mut bool,
 ) -> Result<()> {
     let mut obj = repo.find_object(id)?;
     loop {
@@ -675,7 +857,7 @@ fn show_one(
                 }
                 shown.push(obj.id);
                 let commit = obj.try_into_commit()?;
-                show_commit(repo, out, &commit, pretty, selection, pathspecs, disp, pickaxe)?;
+                show_commit(repo, out, &commit, pretty, selection, pathspecs, disp, pickaxe, source, shown_one)?;
                 break;
             }
             Kind::Tag => {
@@ -685,6 +867,34 @@ fn show_one(
         }
     }
     Ok(())
+}
+
+/// `--source`: git's `show_log` prints `\t<source>` right after the commit hash
+/// on the built-in header formats. A no-op when `--source` is off, and never
+/// called for user formats, which git leaves bare.
+fn write_source(out: &mut Vec<u8>, source: Option<&str>) {
+    if let Some(src) = source {
+        out.push(b'\t');
+        out.extend_from_slice(src.as_bytes());
+    }
+}
+
+/// `--decorate`: append ` (HEAD -> main, tag: v1)` after the commit hash, in the
+/// selected style. Rendered by `git log`'s decoration formatter so the two
+/// commands emit the same bytes. Never colorized: `git show` here is always the
+/// `--no-color` case.
+fn write_decorations(out: &mut Vec<u8>, id: &gix::hash::oid, disp: &DisplayOpts<'_>) {
+    let (Some(decos), true) = (disp.decorations, disp.decorate != DecorateStyle::Off) else {
+        return;
+    };
+    super::log::format_decorations(
+        out,
+        decos,
+        &id.to_owned(),
+        disp.decorate == DecorateStyle::Full,
+        &super::color::DecorateColors::disabled(),
+        true,
+    );
 }
 
 /// `tree <name>` header followed by the top-level entry names. git echoes the name
@@ -745,8 +955,10 @@ fn show_commit(
     pretty: &Pretty,
     selection: Selection,
     pathspecs: &[Vec<u8>],
-    disp: &DisplayOpts,
+    disp: &DisplayOpts<'_>,
     pickaxe: &Pickaxe,
+    source: Option<&str>,
+    shown_one: &mut bool,
 ) -> Result<()> {
     let parents: Vec<_> = commit.parent_ids().collect();
     let is_merge = parents.len() > 1;
@@ -785,9 +997,20 @@ fn show_commit(
         return Ok(());
     }
 
+    // git's `show_log`: a separator format (everything but the terminator formats
+    // `oneline` and `tformat:`) puts a blank line before every record but the
+    // first, which is what separates two commits of `git show A..B`. The
+    // terminator formats already ended the previous record with a newline.
+    if *shown_one && matches!(pretty, Pretty::Medium) {
+        out.push(b'\n');
+    }
+    *shown_one = true;
+
     match pretty {
         Pretty::Oneline => {
             out.extend_from_slice(commit.id().shorten_or_id().to_string().as_bytes());
+            write_source(out, source);
+            write_decorations(out, commit.id().as_ref(), disp);
             out.push(b' ');
             out.extend_from_slice(&subject(commit.message_raw()?));
             out.push(b'\n');
@@ -804,10 +1027,13 @@ fn show_commit(
             // `log.abbrevCommit`/`--abbrev-commit` shortens the `commit` line; the
             // `Merge:` parents are always abbreviated, as in git.
             if disp.abbrev_commit {
-                writeln!(out, "commit {}", commit.id().shorten_or_id())?;
+                write!(out, "commit {}", commit.id().shorten_or_id())?;
             } else {
-                writeln!(out, "commit {}", commit.id())?;
+                write!(out, "commit {}", commit.id())?;
             }
+            write_source(out, source);
+            write_decorations(out, commit.id().as_ref(), disp);
+            out.push(b'\n');
             if is_merge {
                 out.extend_from_slice(b"Merge:");
                 for p in &parents {
@@ -818,11 +1044,9 @@ fn show_commit(
             }
 
             let author = commit.author()?;
-            out.extend_from_slice(b"Author: ");
-            out.extend_from_slice(author.name);
-            out.extend_from_slice(b" <");
-            out.extend_from_slice(author.email);
-            out.extend_from_slice(b">\n");
+            // `--use-mailmap`/`log.mailmap` resolves the identity here, which is
+            // the one place git's built-in formats print it (`pp_user_info`).
+            super::log::write_person(out, b"Author: ", &author, disp.mailmap);
             let t = author.time()?;
             let date = format_date(t.seconds, t.offset, disp.date_mode);
             writeln!(out, "Date:   {date}")?;

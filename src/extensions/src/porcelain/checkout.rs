@@ -47,6 +47,13 @@
 //!     a plain switch, and the dirty case is governed by the same conservative
 //!     clean-check as every other switch here.
 //!   * `-p`/`--patch` (interactive hunk selection) still bails — it needs a TTY.
+//!   * `-U`/`--unified <n>`, `--inter-hunk-context <n>` and `--[no-]auto-advance`
+//!     configure that hunk selector and nothing else, but are still observable
+//!     without `--patch`: their values go through parse-options' `OPT_INTEGER`
+//!     validation and `cmd_checkout()` then refuses any non-default one with
+//!     `fatal: '--unified' cannot be negative` / `fatal: the option '<x>'
+//!     requires '--patch'`, right after the parse and before any ref or pathspec
+//!     is resolved. Shared with `git reset` — see [`super::reset::PatchDiffOpts`].
 //!   * `--conflict <style>` is validated and implies `-m`; the style only affects
 //!     the deferred dirty-merge rendering, so on the clean-switch path honored
 //!     here it is a no-op (the 3-way carry is refused by the same clean-check as
@@ -95,10 +102,27 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // switch, each initialized submodule's worktree is moved to the gitlink the
     // superproject now records (git's `submodule_move_head` via the worktree updater).
     let mut recurse_submodules: Option<bool> = None;
+    // `-U`/`--unified`, `--inter-hunk-context`, `--[no-]auto-advance`: the
+    // interactive-hunk-selector options, shared verbatim with `git reset` and
+    // refused after the loop exactly as git refuses them without `--patch`.
+    let mut patch_opts = super::reset::PatchDiffOpts::default();
 
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
+        // A `-U`/`--unified`/`--inter-hunk-context` value still owed is taken
+        // verbatim even past `--`, the way parse-options takes it; outside that,
+        // these options are only recognised before `--`.
+        if patch_opts.awaiting_value() || !has_dashdash {
+            match patch_opts.take_arg(a) {
+                Err(code) => return Ok(code),
+                Ok(true) => {
+                    i += 1;
+                    continue;
+                }
+                Ok(false) => {}
+            }
+        }
         if has_dashdash {
             post.push(a);
             i += 1;
@@ -223,6 +247,18 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             _ => pre.push(a),
         }
         i += 1;
+    }
+
+    if let Err(code) = patch_opts.finish() {
+        return Ok(code);
+    }
+    // git collects the hunk-selector options into `add_p_opt` and refuses them
+    // right after parse-options, before any ref or pathspec is resolved — so a
+    // `-U 3` alongside an unknown branch reports the option, not the branch
+    // (verified against git 2.55.0). `--patch` bails in the loop above, so patch
+    // mode is never in effect here.
+    if let Some(code) = patch_opts.require_patch(false) {
+        return Ok(code);
     }
 
     // Resolve submodule recursion: explicit flag wins, else `submodule.recurse`.
@@ -427,7 +463,11 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
 /// submodule, so the move stays faithful (dirty-worktree refusal, nested
 /// recursion) without duplicating checkout logic. Uninitialized submodules (no
 /// repo of their own) are skipped, exactly like git.
-fn maybe_recurse_submodules(repo: &gix::Repository, recurse: bool, quiet: bool) -> Result<()> {
+pub(super) fn maybe_recurse_submodules(
+    repo: &gix::Repository,
+    recurse: bool,
+    quiet: bool,
+) -> Result<()> {
     if !recurse {
         return Ok(());
     }

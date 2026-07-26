@@ -9,6 +9,76 @@ use gix::objs::tree::EntryMode;
 use gix::prelude::ObjectIdExt;
 use gix::ObjectId;
 
+/// git's `status_format` for `git commit`'s report (builtin/commit.c). `None` is
+/// the unset default and the only value that still records a commit; every other
+/// value implies `--dry-run`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusFormat {
+    /// Unset — commit for real unless `--dry-run` was given.
+    None,
+    /// `--long` — git's default report shape.
+    Long,
+    /// `-s`/`--short`.
+    Short,
+    /// `--porcelain` (v1; commit's `--porcelain` takes no version).
+    Porcelain,
+}
+
+/// git's `sign_commit` pointer as a tri-state: unspecified (so `commit.gpgSign`
+/// decides), explicitly off (`--no-gpg-sign`), or on with an optional key id.
+enum GpgSign {
+    /// No `-S`/`--no-gpg-sign` on the command line.
+    Unset,
+    /// `--no-gpg-sign`, which also overrides `commit.gpgSign`.
+    Off,
+    /// `-S` / `-S<keyid>` / `--gpg-sign=<keyid>`.
+    On(Option<String>),
+}
+
+/// A resolved gpg signing setup: the program (`gpg.program`, default `gpg`) and
+/// the key (`-S<keyid>` else `user.signingKey`; `None` lets gpg pick its default).
+struct Signer {
+    /// The signing program git would exec — `gpg.program` or plain `gpg`.
+    program: String,
+    /// The key id passed as `-u`, when one is configured or was given.
+    key: Option<String>,
+}
+
+impl Signer {
+    /// Resolve the program and key from config, with `key` (from `-S<keyid>`)
+    /// taking precedence over `user.signingKey`, exactly as git does.
+    fn resolve(snap: &gix::config::Snapshot<'_>, key: Option<String>) -> Self {
+        Signer {
+            program: snap
+                .string("gpg.program")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "gpg".to_string()),
+            key: key.or_else(|| snap.string("user.signingKey").map(|v| v.to_string())),
+        }
+    }
+}
+
+/// Everything `dry_run_commit()` needs: the report shape plus which index the
+/// report is taken against (`-a`, `-i`/`--include`, or a pathspec-limited commit).
+struct DryRun {
+    /// The resolved `status_format`.
+    format: StatusFormat,
+    /// `-z`/`--null`.
+    null_term: bool,
+    /// `-b`/`--branch`, unset when the config default should apply.
+    branch_header: Option<bool>,
+    /// `--[no-]ahead-behind`, unset when the config default should apply.
+    ahead_behind: Option<bool>,
+    /// The raw `-u`/`--untracked-files` argument, validated by the status engine.
+    untracked: Option<String>,
+    /// `-a`/`--all`.
+    all: bool,
+    /// `-i`/`--include`.
+    include: bool,
+    /// The pathspecs, if any.
+    pathspecs: Vec<String>,
+}
+
 /// `git commit` — record a commit from the staged index.
 ///
 /// Supported invocation forms (the ones the meta workflow relies on):
@@ -43,16 +113,41 @@ use gix::ObjectId;
 /// committer identity, a faithful port of `append_signoff()`. `--squash <commit>`
 /// and `--fixup <commit>` (including `--fixup=amend:<commit>`) build git's
 /// autosquash-formatted message from the referenced commit.
+/// `--trailer <token>[(=|:)<value>]` runs the message through the same engine
+/// `git interpret-trailers --in-place --no-divider` uses, exactly as git spawns it.
 ///
 /// `git commit [--only|-o] <paths>` (the default when paths are given) records a
 /// pathspec-limited commit: the tree is HEAD's tree with only the listed paths
 /// taken from the worktree, other paths' staged changes disregarded, and the same
-/// paths are then staged into the real index. `-a` together with paths is refused,
-/// and `--amend` with paths is allowed.
+/// paths are then staged into the real index. `-i`/`--include <paths>` instead
+/// adds the listed paths to the index first and then commits the whole index.
+/// `-a` together with paths (or with `-o`/`-i`) is refused, and `--amend` with
+/// paths is allowed. `--pathspec-from-file=<file>` (`--pathspec-file-nul`) reads
+/// the same pathspecs from a file or, for `-`, from stdin.
 ///
-/// Options still not backed (`-p`/`--patch`, `-S`/`--gpg-sign`, `--fixup=reword:`,
-/// `-e`/`--edit`, `-t`/`--template`, `--cleanup`, `--dry-run`, `--porcelain`, …)
-/// fail with a precise message rather than silently doing the wrong thing.
+/// `--dry-run` (and the formats that imply it — `--short`, `--long`,
+/// `--porcelain`, `-z`) prints the would-be commit's status through the very
+/// engine `git status` uses and exits `0` when something is committable, `1`
+/// when nothing is; `--branch`, `--ahead-behind` and `-u<mode>` tune that report.
+/// The prepared index (`-a`, `-i`, `--only`) is installed for the report and the
+/// real one restored afterward, so a dry run never changes the repository.
+///
+/// `--cleanup=<mode>` (`commit.cleanup`) selects git's message cleanup, resolved
+/// against whether an editor is used, and `-t`/`--template` (`commit.template`)
+/// seeds it — an unedited template aborts the commit exactly as git's
+/// `template_untouched()` does. `-e`/`--edit` and `--no-edit` force the editor on
+/// and off, `--status`/`--no-status` (`commit.status`) gate the commented status
+/// block, and `-v`/`--verbose` (`commit.verbose`) appends the staged diff below a
+/// scissors line. `-n`/`--no-verify` and `--verify` toggle the `pre-commit` and
+/// `commit-msg` hooks; `--no-post-rewrite` suppresses the `post-rewrite` hook an
+/// `--amend` otherwise fires. `-S`/`--gpg-sign[=<keyid>]` (`commit.gpgSign`,
+/// `user.signingKey`, `gpg.program`) writes a `gpgsig` header.
+///
+/// Options still not backed (`-p`/`--patch`, `--interactive`, `-U`/`--unified`,
+/// `--inter-hunk-context`, `--fixup=reword:`) fail with a precise message rather
+/// than silently doing the wrong thing. There is no hunk-selection engine here,
+/// and the two diff-shaping options exist only to feed one, so all four are
+/// refused outright instead of being accepted into a no-op.
 pub fn commit(args: &[String]) -> Result<ExitCode> {
     // --- argument parsing ------------------------------------------------
     let mut messages: Vec<String> = Vec::new();
@@ -60,9 +155,13 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut allow_empty_message = false;
     let mut quiet = false;
     let mut all = false;
-    let mut no_verify = false;
+    // `--verify` / `-n`/`--no-verify`, last occurrence winning, gating the
+    // `pre-commit` and `commit-msg` hooks.
+    let mut verify = true;
     let mut amend = false;
-    let mut no_edit = false;
+    // git's tri-state `edit_flag`: `Some(true)` from `-e`/`--edit`, `Some(false)`
+    // from `--no-edit`, `None` when unspecified (the message source decides).
+    let mut edit_flag: Option<bool> = None;
     let mut reset_author = false;
     let mut author_arg: Option<String> = None;
     let mut date_arg: Option<String> = None;
@@ -82,6 +181,31 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // tree is HEAD's tree with only these paths replaced by their worktree content.
     let mut pathspecs: Vec<String> = Vec::new();
     let mut positional_only = false;
+    // `--dry-run` and the status-report options it drives. `status_format` other
+    // than `None` implies a dry run, exactly as `parse_and_validate_options()`
+    // does; `-z` promotes an unset/long format to porcelain first.
+    let mut dry_run = false;
+    let mut status_format = StatusFormat::None;
+    let mut null_term = false;
+    let mut branch_header: Option<bool> = None;
+    let mut ahead_behind: Option<bool> = None;
+    let mut untracked_arg: Option<String> = None;
+    // `-o`/`--only` (the default when paths are given) vs `-i`/`--include`.
+    let mut only_flag = false;
+    let mut include_flag = false;
+    // Message shaping: `--cleanup=<mode>`, `--trailer`, `-t`/`--template`,
+    // `--status`, `-v`/`--verbose`.
+    let mut cleanup_arg: Option<String> = None;
+    let mut trailer_args: Vec<String> = Vec::new();
+    let mut template_arg: Option<String> = None;
+    let mut status_flag: Option<bool> = None;
+    let mut verbose: Option<bool> = None;
+    // `--no-post-rewrite` suppresses the `post-rewrite` hook an amend fires.
+    let mut post_rewrite = true;
+    let mut gpg_sign = GpgSign::Unset;
+    // `--pathspec-from-file=<file>` (`-` = stdin) with `--pathspec-file-nul`.
+    let mut pathspec_from_file: Option<String> = None;
+    let mut pathspec_file_nul = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -145,7 +269,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "--allow-empty-message" => allow_empty_message = true,
             "-q" | "--quiet" => quiet = true,
             "-a" | "--all" => all = true,
-            "-n" | "--no-verify" => no_verify = true,
+            "--no-all" => all = false,
+            // `-n`/`--no-verify` skips `pre-commit` + `commit-msg`; `--verify` is
+            // its opposite, and the last one on the command line wins.
+            "-n" | "--no-verify" => verify = false,
+            "--verify" => verify = true,
             "-s" | "--signoff" => signoff = true,
             "--no-signoff" => signoff = false,
             "--squash" => {
@@ -168,13 +296,16 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 squash_arg = Some(s["--squash=".len()..].to_string())
             }
             s if s.starts_with("--fixup=") => fixup_arg = Some(s["--fixup=".len()..].to_string()),
-            // `-v`/`--verbose` shows the diff in the commit-message editor; the
-            // recorded commit is identical, so it is accepted (a no-op for `-m`).
-            "-v" | "--verbose" => {}
+            // `-v`/`--verbose` appends the staged diff below a scissors line in the
+            // commit-message editor and truncates the message there afterward.
+            "-v" | "--verbose" => verbose = Some(true),
+            "--no-verbose" => verbose = Some(false),
             // Everything after `--` is a pathspec, even if it looks like a flag.
             "--" => positional_only = true,
             "--amend" => amend = true,
-            "--no-edit" => no_edit = true,
+            "--no-amend" => amend = false,
+            "-e" | "--edit" => edit_flag = Some(true),
+            "--no-edit" => edit_flag = Some(false),
             "--reset-author" => reset_author = true,
             "--author" => {
                 i += 1;
@@ -188,7 +319,113 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 author_arg = Some(s["--author=".len()..].to_string())
             }
             s if s.starts_with("--message=") => messages.push(s["--message=".len()..].to_string()),
+            // --- the status-report family (git's `dry_run` + `status_format`) ---
+            "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
+            "--short" => status_format = StatusFormat::Short,
+            "--long" => status_format = StatusFormat::Long,
+            "--porcelain" => status_format = StatusFormat::Porcelain,
+            // Every `--no-` form resets the format to git's `STATUS_FORMAT_NONE`,
+            // which is also the "commit for real" state.
+            "--no-short" | "--no-long" | "--no-porcelain" => status_format = StatusFormat::None,
+            // Unlike `git status`, commit's `--porcelain` is a plain switch.
+            s if s.starts_with("--porcelain=") => {
+                anyhow::bail!("option `porcelain' takes no value")
+            }
+            "-z" | "--null" => null_term = true,
+            "--no-null" => null_term = false,
+            "-b" | "--branch" => branch_header = Some(true),
+            "--no-branch" => branch_header = Some(false),
+            "--ahead-behind" => ahead_behind = Some(true),
+            "--no-ahead-behind" => ahead_behind = Some(false),
+            // `-u`/`--untracked-files` is an OPTARG string defaulting to `all`;
+            // the `--no-` form resets it to unspecified.
+            "-u" | "--untracked-files" => untracked_arg = Some("all".to_string()),
+            "--no-untracked-files" => untracked_arg = None,
+            s if s.starts_with("--untracked-files=") => {
+                untracked_arg = Some(s["--untracked-files=".len()..].to_string())
+            }
+            // --- what gets committed ------------------------------------------
+            "-o" | "--only" => only_flag = true,
+            "--no-only" => only_flag = false,
+            "-i" | "--include" => include_flag = true,
+            "--no-include" => include_flag = false,
+            "--pathspec-from-file" => {
+                i += 1;
+                pathspec_from_file = Some(
+                    args.get(i)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("option `--pathspec-from-file` requires a value")
+                        })?
+                        .clone(),
+                );
+            }
+            s if s.starts_with("--pathspec-from-file=") => {
+                pathspec_from_file = Some(s["--pathspec-from-file=".len()..].to_string())
+            }
+            "--no-pathspec-from-file" => pathspec_from_file = None,
+            "--pathspec-file-nul" => pathspec_file_nul = true,
+            "--no-pathspec-file-nul" => pathspec_file_nul = false,
+            // --- message shaping -----------------------------------------------
+            "--cleanup" => {
+                i += 1;
+                cleanup_arg = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("option `--cleanup` requires a value"))?
+                        .clone(),
+                );
+            }
+            s if s.starts_with("--cleanup=") => {
+                cleanup_arg = Some(s["--cleanup=".len()..].to_string())
+            }
+            "--no-cleanup" => cleanup_arg = None,
+            "--trailer" => {
+                i += 1;
+                trailer_args.push(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("option `--trailer` requires a value"))?
+                        .clone(),
+                );
+            }
+            s if s.starts_with("--trailer=") => {
+                trailer_args.push(s["--trailer=".len()..].to_string())
+            }
+            "--no-trailer" => trailer_args.clear(),
+            "-t" | "--template" => {
+                i += 1;
+                template_arg = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("option `--template` requires a value"))?
+                        .clone(),
+                );
+            }
+            s if s.starts_with("--template=") => {
+                template_arg = Some(s["--template=".len()..].to_string())
+            }
+            "--no-template" => template_arg = None,
+            "--status" => status_flag = Some(true),
+            "--no-status" => status_flag = Some(false),
+            // --- hooks and signing ---------------------------------------------
+            "--post-rewrite" => post_rewrite = true,
+            "--no-post-rewrite" => post_rewrite = false,
+            "-S" | "--gpg-sign" => gpg_sign = GpgSign::On(None),
+            s if s.starts_with("--gpg-sign=") => {
+                gpg_sign = GpgSign::On(Some(s["--gpg-sign=".len()..].to_string()))
+            }
+            "--no-gpg-sign" => gpg_sign = GpgSign::Off,
+            // Interactive/patch staging has no engine here, and `-U`/
+            // `--inter-hunk-context` only ever feed it, so all four are rejected
+            // outright rather than accepted into a no-op — accepting them would
+            // claim support for hunk selection that does not exist.
             s if s.starts_with("--") => anyhow::bail!("unsupported option `{s}`"),
+            // `-S<keyid>` and `-u<mode>` take an *attached* value only, so they are
+            // resolved before the generic short-cluster split below.
+            s if s.starts_with("-S") && s.len() > 2 => {
+                gpg_sign = GpgSign::On(Some(s[2..].to_string()))
+            }
+            s if s.starts_with("-u") && s.len() > 2 => {
+                untracked_arg = Some(s[2..].to_string())
+            }
             // A bundled short-flag cluster, e.g. `-am <msg>`, `-qam <msg>`,
             // `-amMSG`. git's parse-options treats every char as its own option;
             // the first one that takes a value consumes the rest of the cluster,
@@ -199,10 +436,37 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                     match c {
                         'a' => all = true,
                         'q' => quiet = true,
-                        'n' => no_verify = true,
+                        'n' => verify = false,
                         's' => signoff = true,
-                        'v' => {}
-                        'm' | 'F' | 'C' | 'c' => {
+                        'v' => verbose = Some(true),
+                        'e' => edit_flag = Some(true),
+                        'o' => only_flag = true,
+                        'i' => include_flag = true,
+                        'z' => null_term = true,
+                        'b' => branch_header = Some(true),
+                        // Optional-value short flags: bare in a cluster they take
+                        // their default, an attached value ends the cluster.
+                        'u' | 'S' => {
+                            let rest = &cluster[at + c.len_utf8()..];
+                            match c {
+                                'u' => {
+                                    untracked_arg = Some(if rest.is_empty() {
+                                        "all".to_string()
+                                    } else {
+                                        rest.to_string()
+                                    })
+                                }
+                                _ => {
+                                    gpg_sign = GpgSign::On(
+                                        (!rest.is_empty()).then(|| rest.to_string()),
+                                    )
+                                }
+                            }
+                            if !rest.is_empty() {
+                                break;
+                            }
+                        }
+                        'm' | 'F' | 'C' | 'c' | 't' => {
                             // Value-taking flags consume the rest of the cluster,
                             // else the next argv element. `-c` also sets reedit.
                             let rest = &cluster[at + c.len_utf8()..];
@@ -224,6 +488,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                                     reuse_arg = Some(val);
                                     reedit = true;
                                 }
+                                't' => template_arg = Some(val),
                                 _ => unreachable!(),
                             }
                             break;
@@ -238,13 +503,86 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
+    // --- option validation (git's `parse_and_validate_options`) ----------
+    // `--pathspec-from-file` supplies the pathspec list instead of the command
+    // line, so it is resolved before every pathspec-dependent check below.
+    if pathspec_from_file.is_some() && !pathspecs.is_empty() {
+        anyhow::bail!("'--pathspec-from-file' and pathspec arguments cannot be used together");
+    }
+    if pathspec_file_nul && pathspec_from_file.is_none() {
+        anyhow::bail!("the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+    }
+    if let Some(src) = &pathspec_from_file {
+        if all {
+            anyhow::bail!("options '--pathspec-from-file' and '-a' cannot be used together");
+        }
+        pathspecs = read_pathspec_file(src, pathspec_file_nul)?;
+    }
+    if only_flag && include_flag {
+        anyhow::bail!("options '-i/--include' and '-o/--only' cannot be used together");
+    }
+    if all && only_flag {
+        anyhow::bail!("options '-o/--only' and '-a/--all' cannot be used together");
+    }
+    if all && include_flag {
+        anyhow::bail!("options '-i/--include' and '-a/--all' cannot be used together");
+    }
+    if (only_flag || include_flag) && pathspecs.is_empty() {
+        anyhow::bail!("No paths with --include/--only does not make sense.");
+    }
     // `git commit -a <paths>` is rejected outright, exactly as git does.
     if all && !pathspecs.is_empty() {
         anyhow::bail!("paths '{} ...' with -a does not make sense", pathspecs[0]);
     }
     // Pathspec-limited ("only") mode: build the commit tree from HEAD's tree with
-    // only the listed paths taken from the worktree.
-    let only_mode = !pathspecs.is_empty();
+    // only the listed paths taken from the worktree. `-i`/`--include` instead adds
+    // the listed paths to the index and commits the whole index, so it is *not*
+    // an only-mode commit even though it carries paths.
+    let only_mode = !pathspecs.is_empty() && !include_flag;
+
+    // `-z` promotes an unset (or explicitly long) format to porcelain, and any
+    // format at all implies a dry run — git's `finalize_deferred_config()` plus
+    // the `status_format != STATUS_FORMAT_NONE` rule in cmd_commit.
+    if null_term && matches!(status_format, StatusFormat::None | StatusFormat::Long) {
+        status_format = StatusFormat::Porcelain;
+    }
+    if status_format != StatusFormat::None {
+        dry_run = true;
+    }
+
+    // --- repository + serialized read-modify-write -----------------------
+    let repo = gix::discover(".")?;
+    // Serialize tree build + commit + HEAD update through the repo coordinator so
+    // concurrent zvcs writers queue instead of racing. Held across the whole op.
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+
+    // `--dry-run` returns before any message is read, any hook fires and any
+    // object is written — git's `cmd_commit` branches to `dry_run_commit()` right
+    // after option validation.
+    if dry_run {
+        if amend && repo.head()?.try_peel_to_id()?.is_none() {
+            anyhow::bail!("You have nothing to amend.");
+        }
+        if amend {
+            anyhow::bail!(
+                "--dry-run with --amend is not ported: git reports against HEAD^, \
+                 which the status engine cannot be pointed at"
+            );
+        }
+        return dry_run_commit(
+            &repo,
+            &DryRun {
+                format: status_format,
+                null_term,
+                branch_header,
+                ahead_behind,
+                untracked: untracked_arg.clone(),
+                all,
+                include: include_flag,
+                pathspecs: pathspecs.clone(),
+            },
+        );
+    }
 
     // `-F <file>` (repeatable) supplies the message from a file, joined with any
     // `-m` blocks in the order given; `-` reads stdin. Read here so it feeds the
@@ -275,12 +613,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             message.push('\n');
         }
     }
-
-    // --- repository + serialized read-modify-write -----------------------
-    let repo = gix::discover(".")?;
-    // Serialize tree build + commit + HEAD update through the repo coordinator so
-    // concurrent zvcs writers queue instead of racing. Held across the whole op.
-    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     // `-C`/`-c <commit>`: resolve the commit whose message and author are reused.
     let reuse_commit = match &reuse_arg {
@@ -405,6 +737,15 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if all {
         stage_tracked_changes(&repo)?;
     }
+    // --- `-i`/`--include <paths>`: stage the named paths, then commit it all ---
+    // git's `prepare_index` treats `also && pathspec.nr` exactly like `-a`: the
+    // paths are added to the real index up front and the commit is a normal,
+    // whole-index commit afterward.
+    if include_flag {
+        let mut index = open_or_empty_index(&repo)?;
+        include_stage(&repo, &pathspecs, &index)?.apply_to(&mut index);
+        index.write(gix::index::write::Options::default())?;
+    }
 
     // --- build a tree object from the index ------------------------------
     // A freshly-init'd repo has no index file yet. `open_index` errors on the
@@ -431,7 +772,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `pre-commit` runs before the commit is built; a non-zero exit aborts it
     // (the hook prints its own diagnostics, so we exit quietly). `--no-verify`
     // skips it, as it does `commit-msg`.
-    if !no_verify && !crate::hooks::run(&repo, "pre-commit", &[], None)? {
+    if verify && !crate::hooks::run(&repo, "pre-commit", &[], None)? {
         return Ok(ExitCode::from(1));
     }
 
@@ -514,64 +855,135 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         anyhow::bail!("nothing to commit (no changes staged)");
     }
 
-    // --- message when none was given on the CLI --------------------------
-    // `--amend --no-edit` reuses HEAD's message verbatim. Otherwise git opens
-    // the editor (seeded with HEAD's message for a plain `--amend`), or, for a
-    // normal commit, on the status template.
-    if !from_flags {
-        if amend && no_edit {
-            message = amend_head
-                .as_ref()
-                .expect("amend implies HEAD")
-                .message_raw()?
-                .to_string();
-            if !message.ends_with('\n') {
-                message.push('\n');
-            }
-        } else {
-            // Seed the editor with the `--squash`/`--fixup=amend:` template if
-            // any, else the reused message (`-c`), else HEAD's on an `--amend`,
-            // else the empty status template.
-            let seed = if let Some(s) = &squash_fixup_seed {
-                Some(s.clone())
-            } else if let Some(rc) = &reuse_commit {
-                Some(rc.message_raw()?.to_string())
-            } else if amend {
-                Some(
-                    amend_head
-                        .as_ref()
-                        .expect("amend implies HEAD")
-                        .message_raw()?
-                        .to_string(),
-                )
-            } else {
-                None
-            };
-            message = obtain_message_via_editor(&repo, is_root, seed.as_deref())?;
-            if message.trim().is_empty() && !allow_empty_message {
-                anyhow::bail!("Aborting commit due to empty commit message.");
-            }
-            if !message.ends_with('\n') {
-                message.push('\n');
-            }
+    // --- message: `prepare_to_commit()` -----------------------------------
+    // git decides *once* whether an editor is used: a `-m`/`-F`/`-C` message
+    // source turns it off, then an explicit `-e`/`--no-edit` overrides that. The
+    // answer also picks the default cleanup mode, so it is computed first.
+    let no_edit = edit_flag == Some(false);
+    let use_editor = match edit_flag {
+        Some(v) => v,
+        None => !from_flags,
+    };
+    let snap = repo.config_snapshot();
+    let cleanup = resolve_cleanup(cleanup_arg.as_deref(), &snap, use_editor)?;
+    let comment = comment_prefix(&snap);
+    // `-v`/`--verbose` (`commit.verbose`) appends the staged diff under a cut line.
+    let verbose = verbose.unwrap_or_else(|| snap.boolean("commit.verbose") == Some(true));
+    // `--status`/`--no-status`, defaulting to `commit.status` (git's `include_status`).
+    let include_status = status_flag.unwrap_or_else(|| snap.boolean("commit.status") != Some(false));
+    // `-t`/`--template <file>` beats `commit.template`; both seed the buffer and
+    // both arm git's `template_untouched()` abort.
+    let template_file: Option<std::path::PathBuf> = match &template_arg {
+        Some(t) => Some(expand_tilde(t)),
+        None => snap.string("commit.template").map(|v| expand_tilde(&v.to_string())),
+    };
+
+    // The buffer git hands the editor (and, without one, the message itself).
+    let mut buf = if from_flags {
+        message.clone()
+    } else if amend && no_edit {
+        let mut m = amend_head
+            .as_ref()
+            .expect("amend implies HEAD")
+            .message_raw()?
+            .to_string();
+        if !m.ends_with('\n') {
+            m.push('\n');
         }
-    }
-    // `-s`/`--signoff`: append a `Signed-off-by:` trailer with the committer
-    // identity, exactly as `append_signoff()` (sequencer.c) does — placed before
-    // the `commit-msg` hook so it, like git, sees the final message.
+        m
+    } else if let Some(s) = &squash_fixup_seed {
+        s.clone()
+    } else if let Some(rc) = &reuse_commit {
+        rc.message_raw()?.to_string()
+    } else if amend {
+        amend_head
+            .as_ref()
+            .expect("amend implies HEAD")
+            .message_raw()?
+            .to_string()
+    } else if let Some(path) = &template_file {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("could not read commit template '{}': {e}", path.display()))?
+    } else {
+        String::new()
+    };
+    // The template text as git compares it in `template_untouched()`: the file's
+    // contents cleaned with the same mode, and only when it actually seeded `buf`.
+    let template_seed: Option<String> = match (&template_file, from_flags) {
+        (Some(path), false)
+            if squash_fixup_seed.is_none() && reuse_commit.is_none() && !amend =>
+        {
+            Some(cleanup_message(
+                &std::fs::read_to_string(path).unwrap_or_default(),
+                &comment,
+                cleanup,
+                false,
+            ))
+        }
+        _ => None,
+    };
+
+    // `-s`/`--signoff` appends `Signed-off-by:` *before* the buffer is written, so
+    // the editor and the `--trailer` pass both see it — `append_signoff()`
+    // (sequencer.c) called from `prepare_to_commit()`.
     if signoff {
         let committer = repo
             .committer()
             .transpose()?
             .ok_or_else(|| anyhow::anyhow!("unable to determine committer identity"))?;
         let ident = format!("{} <{}>", committer.name, committer.email);
-        append_signoff(&mut message, &ident);
+        append_signoff(&mut buf, &ident);
+    }
+
+    // The commented help + status block, and the `-v` diff below the cut line, go
+    // into the editor buffer only — git gates both on `use_editor && include_status`.
+    let msg_path = repo.git_dir().join("COMMIT_EDITMSG");
+    if use_editor && include_status {
+        if !buf.is_empty() && !buf.ends_with('\n') {
+            buf.push('\n');
+        }
+        buf.push_str(&editor_status_block(&repo, is_root, &comment, cleanup)?);
+    }
+    std::fs::write(&msg_path, &buf)?;
+    if use_editor && include_status && verbose {
+        append_verbose_diff(&repo, &msg_path, cleanup)?;
+    }
+
+    // `--trailer <token>[(=|:)<value>]`: git runs
+    // `git interpret-trailers --in-place --no-divider <COMMIT_EDITMSG> <args>`;
+    // we call the very same implementation in-process.
+    if !trailer_args.is_empty() {
+        apply_trailers(&msg_path, &trailer_args)?;
+    }
+
+    if use_editor {
+        launch_editor(&snap, &msg_path)?;
+    }
+    message = cleanup_message(&std::fs::read_to_string(&msg_path)?, &comment, cleanup, verbose);
+
+    // An untouched template aborts the commit — `template_untouched()`, which
+    // compares the cleaned-up template against the cleaned-up result.
+    if !allow_empty_message {
+        if let Some(tmpl) = &template_seed {
+            if template_untouched(&message, tmpl, cleanup, &comment) {
+                eprintln!("Aborting commit; you did not edit the message.");
+                return Ok(ExitCode::from(1));
+            }
+        }
+    }
+    if message.trim().is_empty() && !allow_empty_message {
+        if from_flags {
+            anyhow::bail!("empty commit message (use --allow-empty-message to override)");
+        }
+        anyhow::bail!("Aborting commit due to empty commit message.");
+    }
+    if !message.is_empty() && !message.ends_with('\n') {
+        message.push('\n');
     }
 
     // `commit-msg` gets the message file and may rewrite it (e.g. add a trailer);
     // a non-zero exit aborts. Re-read afterward to pick up any edits.
-    if !no_verify {
-        let msg_path = repo.git_dir().join("COMMIT_EDITMSG");
+    if verify {
         std::fs::write(&msg_path, &message)?;
         let arg = msg_path.to_string_lossy().into_owned();
         if !crate::hooks::run(&repo, "commit-msg", &[&arg], None)? {
@@ -636,6 +1048,17 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             .to_owned()?)
     };
 
+    // `-S`/`--gpg-sign[=<keyid>]` (or `commit.gpgSign`) makes the object carry a
+    // `gpgsig` header; the key is the flag's, else `user.signingKey`, and the
+    // program `gpg.program`. `None` leaves the untouched `Repository::commit`
+    // fast paths in charge, so an unsigned commit is byte-for-byte as before.
+    let signer: Option<Signer> = match gpg_sign {
+        GpgSign::Off => None,
+        GpgSign::Unset if snap.boolean("commit.gpgSign") != Some(true) => None,
+        GpgSign::Unset => Some(Signer::resolve(&snap, None)),
+        GpgSign::On(key) => Some(Signer::resolve(&snap, key)),
+    };
+
     // --- write the commit and advance HEAD -------------------------------
     let commit_id = if amend {
         // `--amend`: `Repository::commit`'s ref update requires the ref to equal
@@ -645,15 +1068,15 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         // and writing git's `commit (amend):` reflog line.
         let author = author_owned.as_ref().expect("amend computes an author");
         let committer = committer_owned()?;
-        let new: ObjectId = repo
-            .new_commit_as(
-                committer.to_ref(&mut gix::date::parse::TimeBuf::default()),
-                author.to_ref(&mut gix::date::parse::TimeBuf::default()),
-                &message,
-                tree_id,
-                parents,
-            )?
-            .id;
+        let new: ObjectId = write_commit_object(
+            &repo,
+            &committer,
+            author,
+            &message,
+            tree_id,
+            parents,
+            signer.as_ref(),
+        )?;
         let prev = head_tip.expect("amend implies HEAD");
         repo.edit_reference(gix::refs::transaction::RefEdit {
             change: gix::refs::transaction::Change::Update {
@@ -665,6 +1088,56 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 expected: gix::refs::transaction::PreviousValue::MustExistAndMatch(
                     gix::refs::Target::Object(prev),
                 ),
+                new: gix::refs::Target::Object(new),
+            },
+            name: "HEAD"
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
+            deref: true,
+        })?;
+        new.attach(&repo)
+    } else if signer.is_some() {
+        // A signed commit needs the `gpgsig` header, which `Repository::commit`
+        // cannot carry, so the object is written here and `HEAD` advanced with
+        // gix's own `commit`/`commit (initial)` reflog line — the same wording and
+        // the same first-parent safety check the fast path uses.
+        let committer = committer_owned()?;
+        let author = match &author_owned {
+            Some(a) => a.clone(),
+            None => repo
+                .author()
+                .transpose()?
+                .ok_or_else(|| anyhow::anyhow!("unable to determine author identity"))?
+                .to_owned()?,
+        };
+        let parent_count = parents.len();
+        let first_parent = parents.first().copied();
+        let new = write_commit_object(
+            &repo,
+            &committer,
+            &author,
+            &message,
+            tree_id,
+            parents,
+            signer.as_ref(),
+        )?;
+        repo.edit_reference(gix::refs::transaction::RefEdit {
+            change: gix::refs::transaction::Change::Update {
+                log: gix::refs::transaction::LogChange {
+                    mode: gix::refs::transaction::RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: gix::reference::log::message(
+                        "commit",
+                        message.as_str().into(),
+                        parent_count,
+                    ),
+                },
+                expected: match first_parent {
+                    Some(p) => gix::refs::transaction::PreviousValue::MustExistAndMatch(
+                        gix::refs::Target::Object(p),
+                    ),
+                    None => gix::refs::transaction::PreviousValue::MustNotExist,
+                },
                 new: gix::refs::Target::Object(new),
             },
             name: "HEAD"
@@ -693,6 +1166,16 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         // to be the current tip — the same ref-safety check git performs.
         repo.commit("HEAD", &message, tree_id, parents)?
     };
+
+    // `--amend` rewrites a commit, so git notifies `post-rewrite` with the
+    // `amend` mode and one `<old-sha1> SP <new-sha1>` line on stdin;
+    // `--no-post-rewrite` suppresses it. Its exit status is ignored.
+    if amend && post_rewrite {
+        if let Some(prev) = head_tip {
+            let payload = format!("{} {}\n", prev, commit_id.detach());
+            let _ = crate::hooks::run(&repo, "post-rewrite", &["amend"], Some(payload.as_bytes()));
+        }
+    }
 
     // `post-commit` is a notification hook: it runs after the commit regardless of
     // `--no-verify`, and its exit status is ignored.
@@ -811,6 +1294,418 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `--pathspec-from-file=<file>` — the pathspec list read from a file, or from
+/// stdin for `-`. Entries are separated by `NUL` with `--pathspec-file-nul` and
+/// by newlines otherwise; git also drops a trailing `\r` from the line form.
+fn read_pathspec_file(src: &str, nul: bool) -> Result<Vec<String>> {
+    let raw = if src == "-" {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
+        buf
+    } else {
+        std::fs::read(src)
+            .map_err(|e| anyhow::anyhow!("could not open '{src}' for reading: {e}"))?
+    };
+    let sep = if nul { b'\0' } else { b'\n' };
+    Ok(raw
+        .split(|&b| b == sep)
+        .map(|s| {
+            let s = if !nul { s.strip_suffix(b"\r").unwrap_or(s) } else { s };
+            String::from_utf8_lossy(s).into_owned()
+        })
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// Open the on-disk index, or an empty one when the repo has never had a file
+/// (a freshly-`init`'d repository).
+///
+/// `open_index`'s Err variant is large; boxing it would churn every call site.
+#[allow(clippy::result_large_err)]
+fn open_or_empty_index(repo: &gix::Repository) -> Result<gix::index::File> {
+    if repo.index_path().exists() {
+        Ok(repo.open_index()?)
+    } else {
+        Ok(gix::index::File::from_state(
+            gix::index::State::new(repo.object_hash()),
+            repo.index_path(),
+        ))
+    }
+}
+
+/// The (path → id, mode) view of an index, used to decide which pathspec-matched
+/// paths are modifications and which have vanished from the worktree.
+fn tracked_map(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode)> {
+    let backing = index.path_backing();
+    index
+        .entries()
+        .iter()
+        .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode)))
+        .collect()
+}
+
+/// `git commit --dry-run` (and the `--short`/`--long`/`--porcelain`/`-z` formats
+/// that imply it) — a faithful port of `dry_run_commit()` (builtin/commit.c).
+///
+/// git prepares the index the commit *would* use, points `wt_status` at it, and
+/// rolls the preparation back, exiting `0` when something was committable and `1`
+/// when nothing was. The report itself comes from the same engine `git status`
+/// runs, so the output is identical to `git status` with the matching flags — the
+/// prepared index is installed for the duration and the real one put back, which
+/// leaves the repository byte-for-byte unchanged just like git's rollback.
+fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
+    // `-u<mode>` is validated before the report is produced so an invalid mode is
+    // a fatal error rather than a status-engine usage message mid-dry-run.
+    if let Some(u) = &o.untracked {
+        if !matches!(u.as_str(), "no" | "normal" | "all") {
+            anyhow::bail!("Invalid untracked files mode '{u}'");
+        }
+    }
+
+    // The index git would commit from: `-a` stages tracked changes, `-i` adds the
+    // named paths to the real index, and a pathspec-limited commit builds the
+    // "false index" from HEAD's tree plus those paths.
+    let prepared: Option<gix::index::File> = if o.all {
+        let mut index = open_or_empty_index(repo)?;
+        collect_tracked_changes(repo, &index)?.apply_to(&mut index);
+        Some(index)
+    } else if o.include {
+        let mut index = open_or_empty_index(repo)?;
+        include_stage(repo, &o.pathspecs, &index)?.apply_to(&mut index);
+        Some(index)
+    } else if !o.pathspecs.is_empty() {
+        Some(only_mode_stage(repo, &o.pathspecs)?.0)
+    } else {
+        None
+    };
+
+    let committable = index_differs_from_head(repo, prepared.as_ref())?;
+
+    // Translate commit's report flags into the status engine's own spelling.
+    let mut sargs: Vec<String> = Vec::new();
+    sargs.push(
+        match o.format {
+            StatusFormat::Short => "--short",
+            StatusFormat::Porcelain => "--porcelain",
+            StatusFormat::Long | StatusFormat::None => "--long",
+        }
+        .to_string(),
+    );
+    if o.null_term {
+        sargs.push("-z".to_string());
+    }
+    if let Some(b) = o.branch_header {
+        sargs.push(if b { "--branch" } else { "--no-branch" }.to_string());
+    }
+    if let Some(ab) = o.ahead_behind {
+        sargs.push(if ab { "--ahead-behind" } else { "--no-ahead-behind" }.to_string());
+    }
+    if let Some(u) = &o.untracked {
+        sargs.push(format!("--untracked-files={u}"));
+    }
+
+    match &prepared {
+        Some(index) => {
+            let _swap = IndexSwap::install(repo, index)?;
+            super::status::status(&sargs)?;
+        }
+        None => {
+            super::status::status(&sargs)?;
+        }
+    }
+
+    Ok(if committable {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+/// Whether the given index (or the on-disk one when `None`) records anything
+/// different from `HEAD`'s tree — git's `wt_status.committable`, which decides a
+/// dry run's exit status. An unmerged entry always counts as committable.
+fn index_differs_from_head(
+    repo: &gix::Repository,
+    index: Option<&gix::index::File>,
+) -> Result<bool> {
+    let owned;
+    let index = match index {
+        Some(i) => i,
+        None => {
+            owned = open_or_empty_index(repo)?;
+            &owned
+        }
+    };
+    let flatten = |idx: &gix::index::File| -> Vec<(BString, Option<EntryMode>, ObjectId)> {
+        let backing = idx.path_backing();
+        idx.entries()
+            .iter()
+            .map(|e| (e.path_in(backing).to_owned(), e.mode.to_tree_entry_mode(), e.id))
+            .collect()
+    };
+    if index.entries().iter().any(|e| e.stage() != Stage::Unconflicted) {
+        return Ok(true);
+    }
+    let head_tree = match repo.head()?.try_peel_to_id()? {
+        Some(id) => Some(repo.find_commit(id.detach())?.tree_id()?.detach()),
+        None => None,
+    };
+    let old = match head_tree {
+        Some(t) => flatten(&repo.index_from_tree(&t)?),
+        None => Vec::new(),
+    };
+    Ok(flatten(index) != old)
+}
+
+/// Installs a prepared index as the repository's index for the lifetime of the
+/// guard, restoring the original on drop — the equivalent of git pointing
+/// `the_repository->index_file` at its `next-index-<pid>` file and rolling back.
+///
+/// The original file is *moved* aside rather than copied, so it comes back with
+/// its inode, mode and mtime intact, and the restore runs on every exit path
+/// including a panic. `index.lock` is held exclusively for the whole window —
+/// the same lock git's own `prepare_index()` takes with `LOCK_DIE_ON_ERROR`, so
+/// a concurrent writer (stock git included) cannot walk into the swap.
+struct IndexSwap {
+    /// The repository index path the prepared index was written to.
+    index: std::path::PathBuf,
+    /// Where the original was moved, or `None` when there was no index file.
+    backup: Option<std::path::PathBuf>,
+    /// The `index.lock` this guard created and must remove.
+    lock: std::path::PathBuf,
+}
+
+impl IndexSwap {
+    /// Take `index.lock`, move the real index aside and write `prepared` in its
+    /// place. Fails while another process holds the lock, exactly as git does.
+    fn install(repo: &gix::Repository, prepared: &gix::index::File) -> Result<Self> {
+        let index = repo.index_path();
+        let lock = index.with_file_name("index.lock");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Unable to create '{}': {e}\n\n\
+                     Another git process seems to be running in this repository.",
+                    lock.display()
+                )
+            })?;
+        // From here on the guard owns the lock, so every failure path removes it.
+        let mut guard = IndexSwap { index, backup: None, lock };
+        if guard.index.exists() {
+            let backup = guard.index.with_file_name("index.zvcs-dry-run");
+            std::fs::rename(&guard.index, &backup)?;
+            guard.backup = Some(backup);
+        }
+        let mut bytes = Vec::new();
+        prepared.write_to(&mut bytes, gix::index::write::Options::default())?;
+        std::fs::write(&guard.index, &bytes)?;
+        Ok(guard)
+    }
+}
+
+impl Drop for IndexSwap {
+    fn drop(&mut self) {
+        match &self.backup {
+            Some(b) => {
+                let _ = std::fs::rename(b, &self.index);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.index);
+            }
+        }
+        let _ = std::fs::remove_file(&self.lock);
+    }
+}
+
+/// The commented block git puts below the message in the editor buffer: the
+/// cleanup-mode-specific hint (or, for `scissors`, the cut line) followed by a
+/// minimal status header.
+///
+/// The hint wording is git's, chosen by cleanup mode in `prepare_to_commit()`.
+/// The status body is a reduced form of `wt_status_print()` — the branch line and
+/// the initial-commit marker — not the full staged/unstaged/untracked listing.
+fn editor_status_block(
+    repo: &gix::Repository,
+    is_root: bool,
+    comment: &str,
+    cleanup: Cleanup,
+) -> Result<String> {
+    let mut buf = String::from("\n");
+    match cleanup {
+        Cleanup::Strip => {
+            buf.push_str(&format!(
+                "{comment} Please enter the commit message for your changes. Lines starting\n"
+            ));
+            buf.push_str(&format!(
+                "{comment} with '{comment}' will be ignored, and an empty message aborts the commit.\n"
+            ));
+        }
+        Cleanup::Scissors => buf.push_str(&scissors_line(comment)),
+        Cleanup::Whitespace | Cleanup::Verbatim => {
+            buf.push_str(&format!(
+                "{comment} Please enter the commit message for your changes. Lines starting\n"
+            ));
+            buf.push_str(&format!(
+                "{comment} with '{comment}' will be kept; you may remove them yourself if you want to.\n"
+            ));
+            buf.push_str(&format!(
+                "{comment} An empty message aborts the commit.\n"
+            ));
+        }
+    }
+    buf.push_str(&format!("{comment}\n"));
+    match repo.head_name()? {
+        Some(b) => buf.push_str(&format!("{comment} On branch {}\n", b.shorten())),
+        None => buf.push_str(&format!("{comment} HEAD detached\n")),
+    }
+    if is_root {
+        buf.push_str(&format!("{comment}\n{comment} Initial commit\n"));
+    }
+    buf.push_str(&format!("{comment}\n"));
+    Ok(buf)
+}
+
+/// git's `wt_status_add_cut_line()`: the `>8` scissors line plus the two-line
+/// explanation, each commented with the configured prefix.
+fn scissors_line(comment: &str) -> String {
+    format!(
+        "{comment} ------------------------ >8 ------------------------\n\
+         {comment} Do not modify or remove the line above.\n\
+         {comment} Everything below it will be ignored.\n"
+    )
+}
+
+/// `-v`/`--verbose`: append the staged diff below a cut line so the editor shows
+/// what is about to be committed. git renders it in-process; we run this very
+/// binary's `diff --cached`, whose output is the same, straight into the buffer.
+/// The message is truncated at the cut line afterward, so the diff never lands in
+/// the commit.
+fn append_verbose_diff(
+    repo: &gix::Repository,
+    msg_path: &std::path::Path,
+    cleanup: Cleanup,
+) -> Result<()> {
+    use std::io::Write as _;
+    let comment = comment_prefix(&repo.config_snapshot());
+    let mut file = std::fs::OpenOptions::new().append(true).open(msg_path)?;
+    // `--cleanup=scissors` already put the cut line above the status block, and
+    // git never writes a second one.
+    if cleanup != Cleanup::Scissors {
+        file.write_all(scissors_line(&comment).as_bytes())?;
+    }
+    file.flush()?;
+    let exe = std::env::current_exe()?;
+    let workdir = repo.workdir().unwrap_or_else(|| repo.git_dir()).to_owned();
+    let _ = std::process::Command::new(exe)
+        .args(["diff", "--cached"])
+        .current_dir(&workdir)
+        .stdout(file)
+        .stderr(std::process::Stdio::null())
+        .status();
+    Ok(())
+}
+
+/// `--trailer <token>[(=|:)<value>]` — git spawns
+/// `git interpret-trailers --in-place --no-divider <COMMIT_EDITMSG> <--trailer v>…`
+/// and we call that exact implementation, with that exact argument order.
+fn apply_trailers(msg_path: &std::path::Path, trailers: &[String]) -> Result<()> {
+    let mut args: Vec<String> = vec![
+        "--in-place".to_string(),
+        "--no-divider".to_string(),
+        msg_path.to_string_lossy().into_owned(),
+    ];
+    for t in trailers {
+        args.push("--trailer".to_string());
+        args.push(t.clone());
+    }
+    super::interpret_trailers::interpret_trailers(&args)?;
+    Ok(())
+}
+
+/// Port of `template_untouched()` (builtin/commit.c): true when the cleaned-up
+/// message is the cleaned-up template with nothing but blanks and comments added,
+/// which aborts the commit. `verbatim` cleanup exempts a non-empty message.
+fn template_untouched(message: &str, template: &str, cleanup: Cleanup, comment: &str) -> bool {
+    if cleanup == Cleanup::Verbatim && !message.is_empty() {
+        return false;
+    }
+    let rest = message.strip_prefix(template).unwrap_or(message);
+    // `rest_is_empty()`: only whitespace and comment lines may follow.
+    rest.lines()
+        .all(|l| l.trim().is_empty() || l.starts_with(comment))
+}
+
+/// Resolve `--cleanup=<mode>` (else `commit.cleanup`) into git's
+/// `commit_msg_cleanup_mode` — a port of `get_cleanup_mode()`, whose `default`
+/// and `scissors` answers both depend on whether an editor is used.
+fn resolve_cleanup(
+    arg: Option<&str>,
+    snap: &gix::config::Snapshot<'_>,
+    use_editor: bool,
+) -> Result<Cleanup> {
+    let configured = snap.string("commit.cleanup").map(|v| v.to_string());
+    let mode = arg.or(configured.as_deref());
+    Ok(match mode {
+        None | Some("default") => {
+            if use_editor {
+                Cleanup::Strip
+            } else {
+                Cleanup::Whitespace
+            }
+        }
+        Some("verbatim") => Cleanup::Verbatim,
+        Some("whitespace") => Cleanup::Whitespace,
+        Some("strip") => Cleanup::Strip,
+        Some("scissors") => {
+            if use_editor {
+                Cleanup::Scissors
+            } else {
+                Cleanup::Whitespace
+            }
+        }
+        Some(other) => anyhow::bail!("Invalid cleanup mode {other}"),
+    })
+}
+
+/// Write the commit object, optionally carrying a `gpgsig` header.
+///
+/// git signs the *unsigned* serialization and then inserts the armored signature
+/// as an extra header, which is exactly what happens here: the object is encoded
+/// once without the header, handed to `gpg -bsa`, and re-encoded with `gpgsig`
+/// first among the extra headers — the slot git writes it in.
+fn write_commit_object(
+    repo: &gix::Repository,
+    committer: &gix::actor::Signature,
+    author: &gix::actor::Signature,
+    message: &str,
+    tree: ObjectId,
+    parents: Vec<ObjectId>,
+    signer: Option<&Signer>,
+) -> Result<ObjectId> {
+    let mut commit = gix::objs::Commit {
+        tree,
+        parents: parents.into(),
+        author: author.clone(),
+        committer: committer.clone(),
+        encoding: None,
+        message: message.into(),
+        extra_headers: Vec::new(),
+    };
+    if let Some(s) = signer {
+        let mut payload = Vec::new();
+        gix::objs::WriteTo::write_to(&commit, &mut payload)?;
+        let sig = crate::gitsig::sign(&payload, &s.program, s.key.as_deref()).map_err(|e| {
+            eprintln!("error: gpg failed to sign the data:\n{e}");
+            anyhow::anyhow!("failed to write commit object")
+        })?;
+        commit.extra_headers.push(("gpgsig".into(), sig.into()));
+    }
+    Ok(repo.write_object(&commit)?.detach())
+}
+
 /// `git commit <pathspec>...` — git's default `--only`/`-o` mode.
 ///
 /// The commit tree is HEAD's tree with only the matched pathspec paths replaced
@@ -831,11 +1726,59 @@ fn build_only_mode_tree(
     repo: &gix::Repository,
     pathspecs: &[String],
 ) -> Result<(ObjectId, Vec<StagedEntry>)> {
-    if repo.workdir().is_none() {
-        anyhow::bail!("this operation must be run in a work tree");
-    }
+    // The commit tree comes from git's "false index" — HEAD's tree with only the
+    // matched paths taken from the worktree. The same staged set is then applied
+    // to the real index, so the worktree is walked and hashed exactly once.
+    let (temp, staged) = only_mode_stage(repo, pathspecs)?;
 
-    // HEAD's tree — a pathspec-limited commit needs a prior commit to build upon.
+    let hash = repo.object_hash();
+    let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
+    let mut new_entries: Vec<(BString, EntryMode, ObjectId)> = Vec::new();
+    {
+        let backing = temp.path_backing();
+        new_entries.reserve(temp.entries().len());
+        for entry in temp.entries() {
+            let path = entry.path_in(backing);
+            let mode = entry
+                .mode
+                .to_tree_entry_mode()
+                .ok_or_else(|| anyhow::anyhow!("index entry `{path}` has an unrepresentable mode"))?;
+            editor.upsert(
+                path.split(|&b| b == b'/').map(|c| c.as_bstr()),
+                mode.kind(),
+                entry.id,
+            )?;
+            new_entries.push((path.to_owned(), mode, entry.id));
+        }
+    }
+    let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
+
+    // Stage the same paths into the REAL on-disk index, leaving all other entries
+    // — git's step (2)/(3), which is what makes the partial commit visible to the
+    // next one.
+    let mut real = open_or_empty_index(repo)?;
+    staged.apply_to(&mut real);
+    real.write(gix::index::write::Options::default())?;
+
+    Ok((tree_id, new_entries))
+}
+
+/// `-i`/`--include <paths>`: refresh the *index-known* paths from the worktree,
+/// which is what `add_files_to_cache()` does for git's `also` mode. Untracked
+/// paths are not added — a pathspec that matches none of the index is fatal.
+fn include_stage(
+    repo: &gix::Repository,
+    pathspecs: &[String],
+    index: &gix::index::File,
+) -> Result<StagedSet> {
+    let tracked = tracked_map(index);
+    let known: HashSet<BString> = tracked.keys().cloned().collect();
+    stage_pathspecs(repo, pathspecs, &tracked, &known)
+}
+
+/// HEAD's tree id, refusing an unborn branch the way a pathspec-limited commit
+/// must (it has no base tree to build upon).
+fn head_tree(repo: &gix::Repository) -> Result<ObjectId> {
     let head_commit = repo
         .head()?
         .try_peel_to_id()?
@@ -843,20 +1786,103 @@ fn build_only_mode_tree(
             anyhow::anyhow!("cannot do a pathspec-limited commit on an unborn branch (no HEAD)")
         })?
         .detach();
-    let head_tree_id = repo.find_commit(head_commit)?.tree_id()?.detach();
+    Ok(repo.find_commit(head_commit)?.tree_id()?.detach())
+}
 
-    // Temp index seeded from HEAD's tree: the base the commit tree is built from,
-    // so unrelated staged changes in the real index are disregarded.
+/// git's "false index" for a partial commit: HEAD's tree with only the matched
+/// pathspec paths replaced by their worktree content. Everything else keeps its
+/// HEAD version, so staged changes to other paths are disregarded.
+///
+/// The pathspecs are matched against git's `overlay_tree_on_index` view — the
+/// real index unioned with HEAD's tree — so a path that is staged but not yet in
+/// HEAD counts, while a wholly untracked one does not. The staged set is returned
+/// alongside so the caller can replay it onto the real index without re-hashing.
+fn only_mode_stage(
+    repo: &gix::Repository,
+    pathspecs: &[String],
+) -> Result<(gix::index::File, StagedSet)> {
+    let head_tree_id = head_tree(repo)?;
     let mut temp = repo.index_from_tree(&head_tree_id)?;
+    let tracked = tracked_map(&temp);
+    let mut known: HashSet<BString> = tracked.keys().cloned().collect();
+    let real = open_or_empty_index(repo)?;
+    let backing = real.path_backing();
+    known.extend(real.entries().iter().map(|e| e.path_in(backing).to_owned()));
+    let staged = stage_pathspecs(repo, pathspecs, &tracked, &known)?;
+    staged.apply_to(&mut temp);
+    Ok((temp, staged))
+}
 
-    // HEAD-tracked paths (path -> (id, mode)) for modification/deletion decisions.
-    let tracked: HashMap<BString, (ObjectId, Mode)> = {
-        let backing = temp.path_backing();
-        temp.entries()
+/// A worktree file to write into an index: the blob that was hashed for it, its
+/// mode and the stat data that lets a later `git status` skip re-reading it.
+struct StagedFile {
+    /// Repo-relative path.
+    path: BString,
+    /// The blob id written for the worktree content.
+    id: ObjectId,
+    /// The index mode derived from the file (regular, executable, symlink).
+    mode: Mode,
+    /// The worktree stat data recorded alongside the entry.
+    stat: Stat,
+}
+
+/// The outcome of matching pathspecs (or, for `-a`, every tracked path) against
+/// the worktree: entries to (re)write and paths that vanished and must go.
+struct StagedSet {
+    /// Paths whose worktree content was hashed into the object database.
+    staged: Vec<StagedFile>,
+    /// Tracked paths whose worktree file is gone.
+    deletions: Vec<BString>,
+}
+
+impl StagedSet {
+    /// Nothing matched — used to skip an index write entirely.
+    fn is_empty(&self) -> bool {
+        self.staged.is_empty() && self.deletions.is_empty()
+    }
+
+    /// Replace every touched path in `index` wholesale, then restore sort order.
+    /// The tree-cache extension is dropped so a later tree build cannot pick up a
+    /// stale subtree for a path that just moved.
+    fn apply_to(&self, index: &mut gix::index::File) {
+        let remove: HashSet<BString> = self
+            .staged
             .iter()
-            .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode)))
-            .collect()
-    };
+            .map(|s| s.path.clone())
+            .chain(self.deletions.iter().cloned())
+            .collect();
+        index.remove_entries(|_, path, _| remove.contains(&path.to_owned()));
+        for s in &self.staged {
+            index.dangerously_push_entry(s.stat, s.id, Flags::empty(), s.mode, s.path.as_ref());
+        }
+        index.sort_entries();
+        index.remove_tree();
+    }
+}
+
+/// Hash the worktree content of every path matching `pathspecs`, and collect the
+/// tracked paths the pathspecs match whose worktree file has vanished.
+///
+/// `tracked` is the base the deletion decision is taken against — HEAD's tree for
+/// a partial (`--only`) commit, the real index for `-i`/`--include`. `known` is
+/// the set of paths git will consider at all: only-mode uses the index overlaid
+/// with HEAD, `--include` the index alone, and a pathspec matching nothing in it
+/// is the fatal `did not match any file(s) known to git`. So neither mode ever
+/// picks up a wholly untracked file, exactly as git's `list_paths()` and
+/// `add_files_to_cache()` refuse to.
+///
+/// A pathspec matches a path when the path equals it or lives under `<spec>/`;
+/// literal files and directory prefixes are supported, as are the worktree globs
+/// the dirwalk resolves. Blob hashing and mode detection mirror `git add`.
+fn stage_pathspecs(
+    repo: &gix::Repository,
+    pathspecs: &[String],
+    tracked: &HashMap<BString, (ObjectId, Mode)>,
+    known: &HashSet<BString>,
+) -> Result<StagedSet> {
+    if repo.workdir().is_none() {
+        anyhow::bail!("this operation must be run in a work tree");
+    }
 
     // Walk the worktree for files matching the pathspecs (mirrors `git add`).
     let patterns: Vec<BString> = pathspecs
@@ -870,13 +1896,7 @@ fn build_only_mode_tree(
     let dirwalk_index = repo.index_or_load_from_head_or_empty()?;
     let mut iter = repo.dirwalk_iter(dirwalk_index, patterns, Default::default(), options)?;
 
-    struct Staged {
-        path: BString,
-        id: ObjectId,
-        mode: Mode,
-        stat: Stat,
-    }
-    let mut staged: Vec<Staged> = Vec::new();
+    let mut staged: Vec<StagedFile> = Vec::new();
     let mut staged_set: HashSet<BString> = HashSet::new();
 
     for item in iter.by_ref() {
@@ -887,10 +1907,9 @@ fn build_only_mode_tree(
             _ => continue,
         }
         let path = entry.rela_path;
-        let already_tracked = tracked.contains_key(&path);
-        // An ignored, untracked path is not committed (a tracked-but-ignored path
-        // is still restaged); no `-f` exists on `git commit`.
-        if matches!(entry.status, gix::dir::entry::Status::Ignored(_)) && !already_tracked {
+        // git only ever updates paths it already knows: `git commit <untracked>`
+        // and `git commit -i <untracked>` both fail rather than adding the file.
+        if !known.contains(&path) {
             continue;
         }
         let Some(abs) = repo.workdir_path(&path) else {
@@ -922,7 +1941,7 @@ fn build_only_mode_tree(
         };
         let id = repo.write_blob(&bytes)?.detach();
         staged_set.insert(path.clone());
-        staged.push(Staged { path, id, mode, stat: Stat::from_fs(&md)? });
+        staged.push(StagedFile { path, id, mode, stat: Stat::from_fs(&md)? });
     }
 
     // Recover the pathspec matcher (used to decide deletions) from the walk.
@@ -946,9 +1965,11 @@ fn build_only_mode_tree(
         }
     }
 
-    // Each explicit (non-magic, non-glob) pathspec must match something, exactly
-    // as git's `pathspec '<x>' did not match any files`. A tracked path that is
-    // present but unchanged still counts as a match (its tree entry is untouched).
+    // Each explicit (non-magic, non-glob) pathspec must match a path git already
+    // knows — `report_path_error()`'s `did not match any file(s) known to git`. A
+    // known path that is present but unchanged still counts (its entry is simply
+    // left alone), which is why the whole `known` set is searched, not just the
+    // paths that were restaged.
     for p in pathspecs {
         if p == "." || p.starts_with(':') || p.contains(['*', '?', '[']) {
             continue;
@@ -956,70 +1977,15 @@ fn build_only_mode_tree(
         let pb = p.as_bytes();
         let mut prefix = pb.to_vec();
         prefix.push(b'/');
-        let matched = staged_set
+        let matched = known
             .iter()
-            .chain(deletions.iter())
-            .chain(tracked.keys())
             .any(|x| x.as_slice() == pb || x.as_slice().starts_with(&prefix));
         if !matched {
-            anyhow::bail!("pathspec '{p}' did not match any files");
+            anyhow::bail!("pathspec '{p}' did not match any file(s) known to git");
         }
     }
 
-    // Apply the staged/deleted paths to both the temp index (→ commit tree) and
-    // the real on-disk index (→ visible to later commits). The tree-cache is
-    // dropped from each so a stale subtree cannot be captured.
-    let remove: HashSet<BString> = staged
-        .iter()
-        .map(|s| s.path.clone())
-        .chain(deletions.iter().cloned())
-        .collect();
-
-    temp.remove_entries(|_, path, _| remove.contains(&path.to_owned()));
-    for s in &staged {
-        temp.dangerously_push_entry(s.stat, s.id, Flags::empty(), s.mode, s.path.as_ref());
-    }
-    temp.sort_entries();
-    temp.remove_tree();
-
-    // Build the commit tree from the temp index.
-    let hash = repo.object_hash();
-    let mut editor = gix::objs::tree::Editor::new(gix::objs::Tree::empty(), &repo.objects, hash);
-    let mut new_entries: Vec<(BString, EntryMode, ObjectId)> = Vec::new();
-    {
-        let backing = temp.path_backing();
-        new_entries.reserve(temp.entries().len());
-        for entry in temp.entries() {
-            let path = entry.path_in(backing);
-            let mode = entry
-                .mode
-                .to_tree_entry_mode()
-                .ok_or_else(|| anyhow::anyhow!("index entry `{path}` has an unrepresentable mode"))?;
-            editor.upsert(
-                path.split(|&b| b == b'/').map(|c| c.as_bstr()),
-                mode.kind(),
-                entry.id,
-            )?;
-            new_entries.push((path.to_owned(), mode, entry.id));
-        }
-    }
-    let tree_id = editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?;
-
-    // Stage the same paths into the REAL on-disk index, leaving all other entries.
-    let mut real = if repo.index_path().exists() {
-        repo.open_index()?
-    } else {
-        gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path())
-    };
-    real.remove_entries(|_, path, _| remove.contains(&path.to_owned()));
-    for s in &staged {
-        real.dangerously_push_entry(s.stat, s.id, Flags::empty(), s.mode, s.path.as_ref());
-    }
-    real.sort_entries();
-    real.remove_tree();
-    real.write(gix::index::write::Options::default())?;
-
-    Ok((tree_id, new_entries))
+    Ok(StagedSet { staged, deletions })
 }
 
 /// Stage every *tracked* path whose worktree state diverges from the index —
@@ -1033,22 +1999,31 @@ fn build_only_mode_tree(
 /// Content filters (`autocrlf`, `clean`/`smudge`) are not applied, matching the
 /// same deviation `git add` carries in this port.
 fn stage_tracked_changes(repo: &gix::Repository) -> Result<()> {
-    if repo.workdir().is_none() {
-        anyhow::bail!("this operation must be run in a work tree");
-    }
     if !repo.index_path().exists() {
         return Ok(());
     }
-    let index = repo.open_index()?;
-
-    /// A tracked path whose worktree content or mode moved.
-    struct Staged {
-        path: BString,
-        id: ObjectId,
-        mode: Mode,
-        stat: Stat,
+    let mut index = repo.open_index()?;
+    let staged = collect_tracked_changes(repo, &index)?;
+    if staged.is_empty() {
+        return Ok(());
     }
-    let mut staged: Vec<Staged> = Vec::new();
+    staged.apply_to(&mut index);
+    index.write(gix::index::write::Options::default())?;
+    Ok(())
+}
+
+/// The `-a`/`--all` scan itself: every stage-0, non-gitlink index entry whose
+/// worktree content or mode moved, plus the tracked paths that vanished.
+/// Split out from [`stage_tracked_changes`] so `--dry-run -a` can build the
+/// prepared index without writing it.
+fn collect_tracked_changes(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+) -> Result<StagedSet> {
+    if repo.workdir().is_none() {
+        anyhow::bail!("this operation must be run in a work tree");
+    }
+    let mut staged: Vec<StagedFile> = Vec::new();
     let mut deletions: Vec<BString> = Vec::new();
 
     {
@@ -1099,7 +2074,7 @@ fn stage_tracked_changes(repo: &gix::Repository) -> Result<()> {
                 continue;
             }
             let id = repo.write_blob(&bytes)?.detach();
-            staged.push(Staged {
+            staged.push(StagedFile {
                 path,
                 id,
                 mode,
@@ -1108,28 +2083,7 @@ fn stage_tracked_changes(repo: &gix::Repository) -> Result<()> {
         }
     }
 
-    if staged.is_empty() && deletions.is_empty() {
-        return Ok(());
-    }
-
-    // Replace every touched path wholesale, then restore sort order. The
-    // tree-cache extension is dropped so the tree build below cannot pick up a
-    // stale subtree for a path that just moved.
-    let mut index = repo.open_index()?;
-    let remove: HashSet<BString> = staged
-        .iter()
-        .map(|s| s.path.clone())
-        .chain(deletions.iter().cloned())
-        .collect();
-    index.remove_entries(|_, path, _| remove.contains(&path.to_owned()));
-    for s in &staged {
-        index.dangerously_push_entry(s.stat, s.id, Flags::empty(), s.mode, s.path.as_ref());
-    }
-    index.sort_entries();
-    index.remove_tree();
-    index.write(gix::index::write::Options::default())?;
-
-    Ok(())
+    Ok(StagedSet { staged, deletions })
 }
 
 /// The git-internal octal representation of a tree entry mode, e.g. `100644`.
@@ -1161,68 +2115,6 @@ fn parse_author_ident(s: &str) -> Result<(String, String)> {
             "--author '{s}': only the `Name <email>` form is supported (author search is not ported)"
         ),
     }
-}
-
-fn obtain_message_via_editor(
-    repo: &gix::Repository,
-    is_root: bool,
-    seed: Option<&str>,
-) -> Result<String> {
-    let snap = repo.config_snapshot();
-    let comment = comment_prefix(&snap);
-
-    let mut buf = String::new();
-
-    // `--amend` seeds the buffer with HEAD's existing message so the editor opens
-    // pre-filled, exactly as git does.
-    if let Some(seed) = seed {
-        buf.push_str(seed);
-        if !buf.is_empty() && !buf.ends_with('\n') {
-            buf.push('\n');
-        }
-    }
-
-    // `commit.template`, if configured, seeds the buffer (git reads it verbatim).
-    if let Some(path) = snap.string("commit.template") {
-        let path = expand_tilde(&path.to_string());
-        match std::fs::read_to_string(&path) {
-            Ok(text) => buf.push_str(&text),
-            Err(e) => anyhow::bail!("could not read commit.template '{}': {e}", path.display()),
-        }
-        if !buf.is_empty() && !buf.ends_with('\n') {
-            buf.push('\n');
-        }
-    }
-
-    // Commented help + a minimal status header, mirroring git's wt-status block.
-    // Omitted entirely when `commit.status=false`, exactly as git does.
-    if snap.boolean("commit.status") != Some(false) {
-        let branch = repo.head_name()?.map(|n| n.shorten().to_string());
-        buf.push('\n');
-        buf.push_str(&format!(
-            "{comment} Please enter the commit message for your changes. Lines starting\n"
-        ));
-        buf.push_str(&format!(
-            "{comment} with '{comment}' will be ignored, and an empty message aborts the commit.\n"
-        ));
-        buf.push_str(&format!("{comment}\n"));
-        match &branch {
-            Some(b) => buf.push_str(&format!("{comment} On branch {b}\n")),
-            None => buf.push_str(&format!("{comment} HEAD detached\n")),
-        }
-        if is_root {
-            buf.push_str(&format!("{comment}\n{comment} Initial commit\n"));
-        }
-        buf.push_str(&format!("{comment}\n"));
-    }
-
-    // Write the template to COMMIT_EDITMSG, edit in place, read it back.
-    let path = repo.git_dir().join("COMMIT_EDITMSG");
-    std::fs::write(&path, &buf)?;
-    launch_editor(&snap, &path)?;
-    let edited = std::fs::read_to_string(&path)?;
-
-    Ok(cleanup_message(&edited, &comment, cleanup_mode(&snap)))
 }
 
 /// The comment prefix for message templates: `core.commentString` (a multi-byte
@@ -1278,6 +2170,20 @@ fn resolve_editor(snap: &gix::config::Snapshot<'_>) -> Result<String> {
 /// commands work, and stdio is inherited so the interactive editor owns the tty.
 fn launch_editor(snap: &gix::config::Snapshot<'_>, path: &std::path::Path) -> Result<()> {
     let editor = resolve_editor(snap)?;
+    // `launch_specified_editor` (editor.c): when stderr is a terminal and
+    // `advice.waitingForEditor` is on, git says why it is blocked before handing
+    // the tty over. A dumb terminal cannot erase the line afterwards, so it gets
+    // a newline instead of the erase sequence. The hint is never printed when
+    // stderr is redirected, which is why scripted runs see none of this.
+    let waiting = std::io::IsTerminal::is_terminal(&std::io::stderr())
+        && crate::advice::Advice::WaitingForEditor.enabled();
+    let dumb = std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true);
+    if waiting {
+        use std::io::Write;
+        let tail = if dumb { "\n" } else { " " };
+        eprint!("hint: Waiting for your editor to close the file...{tail}");
+        let _ = std::io::stderr().flush();
+    }
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!("{editor} \"$@\""))
@@ -1285,35 +2191,47 @@ fn launch_editor(snap: &gix::config::Snapshot<'_>, path: &std::path::Path) -> Re
         .arg(path) // $1
         .status()
         .map_err(|e| anyhow::anyhow!("cannot run editor '{editor}': {e}"))?;
+    // `term_clear_line()`: wipe the "Waiting for your editor" line so the
+    // command's real output starts on a clean line.
+    if waiting && !dumb {
+        use std::io::Write;
+        eprint!("\r\x1b[K");
+        let _ = std::io::stderr().flush();
+    }
     if !status.success() {
         anyhow::bail!("there was a problem with the editor '{editor}'");
     }
     Ok(())
 }
 
-/// The `commit.cleanup` modes this port implements; `scissors` degrades to
-/// `strip` (safe — it only removes more), and unknown values likewise.
+/// git's `commit_msg_cleanup_mode` (builtin/commit.c), resolved by
+/// [`resolve_cleanup`] from `--cleanup`/`commit.cleanup` and whether an editor
+/// is used.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Cleanup {
+    /// `strip` (`COMMIT_MSG_CLEANUP_ALL`) — whitespace cleanup plus comment lines.
     Strip,
+    /// `whitespace` (`COMMIT_MSG_CLEANUP_SPACE`).
     Whitespace,
+    /// `verbatim` (`COMMIT_MSG_CLEANUP_NONE`) — the message is recorded as typed.
     Verbatim,
+    /// `scissors` — whitespace cleanup after truncating at the `>8` cut line.
+    Scissors,
 }
 
-/// `commit.cleanup`, defaulting to `strip` (git's default when a message is read
-/// from an editor).
-fn cleanup_mode(snap: &gix::config::Snapshot<'_>) -> Cleanup {
-    match snap.string("commit.cleanup").map(|v| v.to_string()).as_deref() {
-        Some("verbatim") => Cleanup::Verbatim,
-        Some("whitespace") => Cleanup::Whitespace,
-        _ => Cleanup::Strip,
-    }
-}
-
-/// Apply git's message cleanup: `verbatim` leaves the text untouched; otherwise
-/// trailing whitespace is trimmed, runs of blank lines are collapsed, and
-/// leading/trailing blank lines are dropped. `strip` additionally removes lines
-/// beginning with the comment prefix.
-fn cleanup_message(raw: &str, comment: &str, mode: Cleanup) -> String {
+/// Apply git's `cleanup_message()`: `scissors` (and any `-v`/`--verbose` run)
+/// first truncates the buffer at the `>8` cut line, then `verbatim` leaves the
+/// text untouched while the others trim trailing whitespace, collapse runs of
+/// blank lines and drop leading/trailing blank lines. `strip` additionally
+/// removes lines beginning with the comment prefix.
+fn cleanup_message(raw: &str, comment: &str, mode: Cleanup, verbose: bool) -> String {
+    // `strbuf_setlen(msg, wt_status_locate_end(...))` — the cut line and
+    // everything below it never reach the commit.
+    let raw = if verbose || mode == Cleanup::Scissors {
+        &raw[..wt_status_locate_end(raw.as_bytes(), comment)]
+    } else {
+        raw
+    };
     if let Cleanup::Verbatim = mode {
         return raw.to_string();
     }
@@ -1671,7 +2589,7 @@ fn ignore_non_trailer(buf: &[u8]) -> usize {
     let mut boc = 0usize; // beginning of the trailing comment run (0 = none)
     let mut bol = 0usize;
     let mut in_conflicts = false;
-    let cutoff = wt_status_locate_end(buf);
+    let cutoff = wt_status_locate_end(buf, "#");
     while bol < cutoff {
         let next = match buf[bol..].iter().position(|&c| c == b'\n') {
             Some(p) => bol + p + 1,
@@ -1703,11 +2621,13 @@ fn ignore_non_trailer(buf: &[u8]) -> usize {
 
 /// Port of `wt_status_locate_end()` (wt-status.c): the length up to a `>8`
 /// scissors line (`# ------------------------ >8 ------------------------`), or
-/// the full length when there is none.
-fn wt_status_locate_end(s: &[u8]) -> usize {
+/// the full length when there is none. `comment` is git's `comment_line_str`.
+fn wt_status_locate_end(s: &[u8], comment: &str) -> usize {
     let cut: &[u8] = b"------------------------ >8 ------------------------\n";
-    let mut pattern: Vec<u8> = Vec::with_capacity(3 + cut.len());
-    pattern.extend_from_slice(b"\n# ");
+    let mut pattern: Vec<u8> = Vec::with_capacity(2 + comment.len() + cut.len());
+    pattern.push(b'\n');
+    pattern.extend_from_slice(comment.as_bytes());
+    pattern.push(b' ');
     pattern.extend_from_slice(cut);
     if s.starts_with(&pattern[1..]) {
         return 0;

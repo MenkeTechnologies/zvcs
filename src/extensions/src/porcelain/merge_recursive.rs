@@ -143,8 +143,12 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
     let old_index = repo.index_or_load_from_head()?.into_owned();
     if old_index.entries().iter().any(|e| e.stage_raw() != 0) {
         eprintln!("error: Merging is not possible because you have unmerged files.");
-        eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
-        eprintln!("hint: as appropriate to mark resolution and make a commit.");
+        // `error_resolve_conflict` (sequencer.c) prints the error unconditionally
+        // and the two-line direction only under `advice.resolveConflict`.
+        crate::advice::Advice::ResolveConflict.advise_plain(
+            "Fix them up in the work tree, and then use 'git add/rm <file>'\n\
+             as appropriate to mark resolution and make a commit.",
+        );
         eprintln!("fatal: Exiting because of an unresolved conflict.");
         return Ok(ExitCode::from(128));
     }

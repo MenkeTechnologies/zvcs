@@ -252,7 +252,26 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
         };
         Some(tree)
     } else {
-        None
+        // `compute_default_attr_source` (attr.c): with no `--source`, the
+        // attribute source falls back to `GIT_ATTR_SOURCE` and then to the
+        // `attr.tree` config, either of which names a tree to read
+        // `.gitattributes` from instead of the working tree. A value that does
+        // not resolve to a tree is ignored here rather than fatal — git only
+        // dies for it when the source was requested explicitly.
+        std::env::var("GIT_ATTR_SOURCE")
+            .ok()
+            .or_else(|| {
+                repo.config_snapshot()
+                    .string("attr.tree")
+                    .map(|v| v.to_string())
+            })
+            .and_then(|spec| {
+                repo.rev_parse_single(spec.as_str())
+                    .ok()
+                    .and_then(|id| id.object().ok())
+                    .and_then(|obj| obj.peel_to_tree().ok())
+                    .map(|tree| tree.id)
+            })
     };
 
     // Where `.gitattributes` blobs come from. git's default direction is

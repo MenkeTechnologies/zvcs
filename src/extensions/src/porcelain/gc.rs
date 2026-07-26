@@ -347,19 +347,16 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // run is a below-threshold `--auto` no-op; only a bare `gc -h`, which
     // returned above before the repo was opened, escapes it. `--max-cruft-size`
     // still overrides the *value* when both are present.
-    if let Some((raw, origin)) = effective_max_cruft_size(&repo) {
-        match parse_config_ulong(&raw) {
-            Ok(size) => {
-                if max_cruft_size.is_none() {
-                    max_cruft_size = Some(size);
-                }
+    match crate::config::config_ulong(&repo, "gc.maxCruftSize") {
+        Ok(Some(size)) => {
+            if max_cruft_size.is_none() {
+                max_cruft_size = Some(size);
             }
-            Err(reason) => {
-                eprintln!(
-                    "fatal: bad numeric config value '{raw}' for 'gc.maxcruftsize'{origin}: {reason}"
-                );
-                return Ok(ExitCode::from(128));
-            }
+        }
+        Ok(None) => {}
+        Err(message) => {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
         }
     }
 
@@ -1522,104 +1519,6 @@ fn parse_size(raw: &str) -> Option<u64> {
     // `u64` parsing rejects a leading `-` and any non-digit, matching git's
     // "non-negative integer" wording.
     digits.parse::<u64>().ok()?.checked_mul(multiplier)
-}
-
-/// The effective `gc.maxCruftSize` value, if set anywhere, paired with git's
-/// origin clause for the diagnostic it prints when the value is unreadable.
-///
-/// The merged config is walked in order and the last `gc.maxCruftSize` kept,
-/// reproducing git's last-value-wins, and the winning value's source is carried
-/// so a rejection can name it exactly as `git_config_ulong` does: a file-backed
-/// value adds ` in file <path>` (git renders the repository config as
-/// `.git/config`, so the leading `./` gitoxide reports is trimmed), while a
-/// value from `-c`/environment adds nothing — matching git 2.55.0's output for
-/// both sources.
-fn effective_max_cruft_size(repo: &gix::Repository) -> Option<(String, String)> {
-    let config = repo.config_snapshot().plumbing().clone();
-    let mut found: Option<(String, Option<PathBuf>)> = None;
-    for section in config.sections() {
-        let header = section.header();
-        if header.subsection_name().is_some()
-            || !header.name().to_string().eq_ignore_ascii_case("gc")
-        {
-            continue;
-        }
-        let path = section.meta().path.clone();
-        for value in section.body().values("maxCruftSize") {
-            found = Some((value.to_str_lossy().into_owned(), path.clone()));
-        }
-    }
-    let (raw, path) = found?;
-    let origin = match path {
-        Some(p) => {
-            let shown = p.to_string_lossy();
-            format!(" in file {}", shown.strip_prefix("./").unwrap_or(&shown))
-        }
-        None => String::new(),
-    };
-    Some((raw, origin))
-}
-
-/// git's `git_parse_ulong`, the parser behind `git_config_ulong` and hence
-/// behind `gc.maxCruftSize`. Returns the byte count, or the reason string git's
-/// `die_bad_number` prints after the value: `"invalid unit"` for a value it
-/// cannot read, `"out of range"` for one that overflows an `unsigned long`.
-///
-/// The grammar is C `strtoumax` with base 0 (`0x400` is hex, `010` is octal,
-/// everything else decimal) followed by `get_unit_factor`: an optional single
-/// `k`/`m`/`g` magnitude suffix, either case, with nothing after it. A leading
-/// `+` is accepted and leading ASCII whitespace is skipped; a leading `-`, an
-/// empty value, or any trailing junk (a stray character, a second suffix) is an
-/// invalid unit. Verified one value at a time against git 2.55.0's
-/// `gc.maxcruftsize` diagnostics — `1k`/`0x400`/`010`/`0k` parse, `2m` clears
-/// the floor, `-1`/`1.5`/`1x`/``/`5 ` are invalid units, and a 24-digit value is
-/// out of range.
-fn parse_config_ulong(raw: &str) -> Result<u64, &'static str> {
-    const INVALID: &str = "invalid unit";
-    const RANGE: &str = "out of range";
-
-    // git guards `*value == '-'` because `strtoumax` would otherwise negate and
-    // wrap a negative into a huge unsigned. Trimming first folds ` -1` in with
-    // `-1`, matching git's rejection of both.
-    let rest = raw.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
-    let rest = match rest.strip_prefix('-') {
-        Some(_) => return Err(INVALID),
-        None => rest.strip_prefix('+').unwrap_or(rest),
-    };
-
-    let (radix, digits) = if let Some(r) = rest
-        .strip_prefix("0x")
-        .or_else(|| rest.strip_prefix("0X"))
-    {
-        (16u32, r)
-    } else if rest.len() > 1 && rest.starts_with('0') {
-        // Base 0 reads a leading zero as octal, and the zero is part of the
-        // number: `0k` is 0 with a `k` suffix, not an empty number, so the `0`
-        // is kept rather than stripped.
-        (8, rest)
-    } else {
-        (10, rest)
-    };
-
-    let split = digits
-        .find(|c: char| !c.is_digit(radix))
-        .unwrap_or(digits.len());
-    let (number, tail) = digits.split_at(split);
-    if number.is_empty() {
-        return Err(INVALID);
-    }
-    let value = u64::from_str_radix(number, radix).map_err(|_| RANGE)?;
-
-    // `get_unit_factor`: an empty tail scales by one, one k/m/g byte scales and
-    // must end the string, anything else is not a unit.
-    let factor: u64 = match tail.as_bytes() {
-        [] => 1,
-        [b'k' | b'K'] => 1024,
-        [b'm' | b'M'] => 1024 * 1024,
-        [b'g' | b'G'] => 1024 * 1024 * 1024,
-        _ => return Err(INVALID),
-    };
-    value.checked_mul(factor).ok_or(RANGE)
 }
 
 /// `parse_max_cruft_size()` reports through `error()` rather than

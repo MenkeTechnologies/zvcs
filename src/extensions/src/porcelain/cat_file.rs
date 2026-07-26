@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::io::{BufRead, Write};
 use std::process::ExitCode;
 
-use gix::bstr::ByteSlice;
+use gix::bstr::{BStr, ByteSlice};
 use gix::objs::tree::EntryKind;
 use gix::objs::{Kind, TreeRefIter};
 
@@ -75,13 +75,19 @@ fn die_usage(msg: &str) -> Result<ExitCode> {
     Ok(ExitCode::from(129))
 }
 
-/// The four mutually exclusive query modes (`OPT_CMDMODE` in git).
+/// git's single `OPT_CMDMODE` group for this builtin. `-t`/`-s`/`-p`/`-e` are the
+/// query modes, `--textconv`/`--filters` the two content transforms, and
+/// `--batch-all-objects` shares the same slot (value `'b'`) — which is why git
+/// rejects it next to `-p` but accepts it next to `--batch`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Type,
     Size,
     Print,
     Exists,
+    Textconv,
+    Filters,
+    AllObjects,
 }
 
 impl Mode {
@@ -92,7 +98,16 @@ impl Mode {
             Mode::Size => "-s",
             Mode::Print => "-p",
             Mode::Exists => "-e",
+            Mode::Textconv => "--textconv",
+            Mode::Filters => "--filters",
+            Mode::AllObjects => "--batch-all-objects",
         }
+    }
+
+    /// git's `opt_cw`: the two transform modes are the only ones a batch stream
+    /// tolerates, because they configure it rather than replace it.
+    fn is_transform(self) -> bool {
+        matches!(self, Mode::Textconv | Mode::Filters)
     }
 }
 
@@ -118,6 +133,11 @@ enum BatchKind {
 ///   * `git cat-file (--batch | --batch-check | --batch-command)` → batch stream
 ///   * `git cat-file --filters <rev>:<path>` → object with worktree filters applied
 ///   * `git cat-file --batch --filters` → batch stream, each blob smudged by path
+///   * `git cat-file --textconv <rev>:<path>` → object rendered by the
+///     `diff.<driver>.textconv` program the path's `diff` gitattribute names,
+///     falling back to `-p` output when no driver applies
+///   * `git cat-file --batch --textconv` → batch stream, each blob run through the
+///     textconv program for the path given after the object name
 ///
 /// `--use-mailmap`/`--mailmap` rewrites author/committer/tagger identities in
 /// commit and tag output. `--batch-all-objects`, `--buffer`, `--unordered`, `-Z`
@@ -133,24 +153,26 @@ enum BatchKind {
 /// <len>\n<name>`, a cycle `loop <len>\n<name>`, and a non-directory prefix
 /// `notdir <len>\n<name>`.
 ///
-/// Not ported: `--textconv` (needs the configured external `diff.*.textconv`
-/// program; gix-filter has no textconv driver, standalone or in batch),
-/// the `%(objectsize:disk)` / `%(deltabase)` format atoms (require pack-entry
-/// internals gix's header lookup does not expose), and `--filter` specs beyond
-/// `blob:none` / `blob:limit=<n>` / `object:type=<t>`.
+/// `--textconv` runs the external program named by `diff.<driver>.textconv` for
+/// the driver the path's `diff` gitattribute selects, over a temporary copy of
+/// the blob in its checked-out form — a port of `userdiff_find_by_path()` plus
+/// `prep_temp_blob()`/`run_textconv()`. `diff.<driver>.cachetextconv` is not read:
+/// it only decides whether the result is memoised in a notes tree, and no output
+/// depends on it.
+///
+/// Not ported: the `%(objectsize:disk)` / `%(deltabase)` format atoms (require
+/// pack-entry internals gix's header lookup does not expose), and `--filter` specs
+/// beyond `blob:none` / `blob:limit=<n>` / `object:type=<t>`.
 pub fn cat_file(args: &[String]) -> Result<ExitCode> {
     let mut mode: Option<Mode> = None;
     let mut batch: Option<BatchKind> = None;
     let mut batch_dup = false;
     let mut batch_format: Option<String> = None;
-    let mut all_objects = false;
     let mut buffer = false;
     let mut unordered = false;
     let mut nul_in = false;
     let mut nul_out = false;
     let mut nul_flag: Option<&'static str> = None;
-    let mut textconv = false;
-    let mut filters = false;
     let mut path: Option<String> = None;
     let mut filter: Option<String> = None;
     let mut use_mailmap = false;
@@ -168,6 +190,26 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                 batch = Some($kind);
                 batch_format = $fmt;
             }
+        }};
+    }
+
+    // git's cmdmode slot. `parse_options` rejects the first conflicting pair it
+    // meets and names the newcomer before the option already in effect; repeating
+    // the same mode is not a conflict.
+    macro_rules! set_mode {
+        ($next:expr) => {{
+            let next = $next;
+            if let Some(prev) = mode {
+                if prev != next {
+                    eprintln!(
+                        "error: options '{}' and '{}' cannot be used together",
+                        next.flag(),
+                        prev.flag()
+                    );
+                    return Ok(ExitCode::from(129));
+                }
+            }
+            mode = Some(next);
         }};
     }
 
@@ -194,7 +236,7 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                 "batch" => set_batch!(BatchKind::Contents, attached),
                 "batch-check" => set_batch!(BatchKind::Check, attached),
                 "batch-command" => set_batch!(BatchKind::Command, attached),
-                "batch-all-objects" => all_objects = true,
+                "batch-all-objects" => set_mode!(Mode::AllObjects),
                 // Hidden compat boolean. git accepts it (and its `--no-` form)
                 // as a no-op for every object gix can represent; it only alters
                 // reading of loose objects whose type header is not one of the
@@ -207,8 +249,8 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                 "no-unordered" => unordered = false,
                 "follow-symlinks" => follow_symlinks = true,
                 "no-follow-symlinks" => follow_symlinks = false,
-                "textconv" => textconv = true,
-                "filters" => filters = true,
+                "textconv" => set_mode!(Mode::Textconv),
+                "filters" => set_mode!(Mode::Filters),
                 "use-mailmap" | "mailmap" => use_mailmap = true,
                 "no-use-mailmap" | "no-mailmap" => use_mailmap = false,
                 "no-path" => path = None,
@@ -282,19 +324,7 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                         }
                     };
                     if let Some(next) = next {
-                        // git rejects the first conflicting pair it meets and
-                        // names the newcomer before the option already in effect.
-                        if let Some(prev) = mode {
-                            if prev != next {
-                                eprintln!(
-                                    "error: options '{}' and '{}' cannot be used together",
-                                    next.flag(),
-                                    prev.flag()
-                                );
-                                return Ok(ExitCode::from(129));
-                            }
-                        }
-                        mode = Some(next);
+                        set_mode!(next);
                     }
                 }
                 continue;
@@ -311,6 +341,16 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
+    // Split the cmdmode slot into the three roles it plays. `--textconv` and
+    // `--filters` become the batch stream's transform (git's `transform_mode`)
+    // rather than a mode of their own; `--batch-all-objects` is a batch modifier;
+    // everything else is a standalone query.
+    let textconv = mode == Some(Mode::Textconv);
+    let filters = mode == Some(Mode::Filters);
+    let all_objects = mode == Some(Mode::AllObjects);
+    let transform = mode.filter(|m| m.is_transform());
+    let mode = mode.filter(|m| !m.is_transform() && *m != Mode::AllObjects);
+
     if let (Some(m), Some(_)) = (mode, batch) {
         return die_usage(&format!("'{}' is incompatible with batch mode", m.flag()));
     }
@@ -319,7 +359,7 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         return die_usage("'--batch-all-objects' requires a batch mode");
     }
 
-    if path.is_some() && !(textconv || filters) {
+    if path.is_some() && transform.is_none() {
         return die_usage("'--path=<path|tree-ish>' needs '--filters' or '--textconv'");
     }
 
@@ -350,21 +390,9 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         return die_usage("batch modes take no arguments");
     }
 
-    if textconv && batch.is_none() {
-        // Not ported: textconv runs the configured external `diff.*.textconv`
-        // program, which has no gix-filter equivalent.
-        eprintln!("fatal: git cat-file: --textconv is not yet ported");
-        return Ok(ExitCode::from(128));
-    }
-
-    if textconv && batch.is_some() {
-        // Not ported: textconv inside a batch runs the external `diff.*.textconv`
-        // program per record, which gix-filter has no driver for.
-        eprintln!("fatal: git cat-file: --textconv with batch is not yet ported");
-        return Ok(ExitCode::from(128));
-    }
-    // `--filters` inside a batch (git's transform_mode 'w') is ported: each blob is
-    // smudged through the worktree pipeline using its per-line path (see run_batch).
+    // Both transforms are ported inside a batch too (git's `transform_mode`):
+    // `--filters` smudges each blob through the worktree pipeline, `--textconv`
+    // runs its `diff.*.textconv` program, both keyed by the per-record path.
 
     // ---- dispatch ----------------------------------------------------------
 
@@ -379,13 +407,16 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
             nul_out,
             filter.as_deref(),
             use_mailmap,
-            filters,
+            transform,
             follow_symlinks,
         );
     }
 
     if filters {
         return run_filters(&positional, path.as_deref());
+    }
+    if textconv {
+        return run_textconv(&positional, path.as_deref(), use_mailmap);
     }
 
     let repo = gix::discover(".")?;
@@ -443,21 +474,39 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                 eprintln!("fatal: Not a valid object name {spec}");
                 return Ok(ExitCode::from(128));
             };
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            if object.kind == Kind::Tree {
-                write_tree_listing(&mut out, &object.data, oid.kind())?;
-            } else if use_mailmap && matches!(object.kind, Kind::Commit | Kind::Tag) {
-                let mm = repo.open_mailmap();
-                out.write_all(&apply_mailmap(&object.data, &mm))?;
-            } else {
-                // blob / commit / tag: raw content, no added newline.
-                out.write_all(&object.data)?;
-            }
-            out.flush()?;
-            Ok(ExitCode::SUCCESS)
+            print_object(&repo, oid, &object.data, object.kind, use_mailmap)
         }
+        // Handled before the repository is opened.
+        Mode::Textconv | Mode::Filters | Mode::AllObjects => unreachable!(
+            "the transform and batch-modifier cmdmodes are dispatched earlier"
+        ),
     }
+}
+
+/// git's `case 'p'` of `cat_one_file()`: a tree is rendered the way `git ls-tree`
+/// renders it, and every other object is emitted raw — with mailmap rewriting of
+/// commit/tag identities when `--use-mailmap` was given. `--textconv` falls
+/// through to exactly this when no textconv driver applies to the path.
+fn print_object(
+    repo: &gix::Repository,
+    oid: gix::hash::ObjectId,
+    data: &[u8],
+    kind: Kind,
+    use_mailmap: bool,
+) -> Result<ExitCode> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if kind == Kind::Tree {
+        write_tree_listing(&mut out, data, oid.kind())?;
+    } else if use_mailmap && matches!(kind, Kind::Commit | Kind::Tag) {
+        let mm = repo.open_mailmap();
+        out.write_all(&apply_mailmap(data, &mm))?;
+    } else {
+        // blob / commit / tag: raw content, no added newline.
+        out.write_all(data)?;
+    }
+    out.flush()?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The `git cat-file <type> <object>` form: resolve the object, peel it to the
@@ -516,50 +565,336 @@ fn run_filters(positional: &[&str], path: Option<&str>) -> Result<ExitCode> {
     }
     let spec = positional[0];
 
-    // git resolves the path either from `--path` or by splitting `<rev>:<path>`.
-    let rela = match path {
-        Some(p) => p.to_string(),
-        None => match spec.split_once(':') {
-            Some((_, p)) if !p.is_empty() => p.to_string(),
-            _ => {
-                return die_usage(&format!(
-                    "<object>:<path> required, only <object> '{spec}' given"
-                ));
-            }
-        },
-    };
-
+    // git resolves the object first, then insists on a path for it.
     let repo = gix::discover(".")?;
-    let Ok(id) = repo.rev_parse_single(spec) else {
+    let id = match resolve_transform_spec(&repo, spec) {
+        Ok(id) => id,
+        Err(code) => return Ok(code),
+    };
+    let rela = match required_path(spec, path) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+
+    let Ok(object) = repo.find_object(id) else {
         eprintln!("fatal: Not a valid object name {spec}");
         return Ok(ExitCode::from(128));
     };
-    let Ok(object) = repo.find_object(id.detach()) else {
-        eprintln!("fatal: Not a valid object name {spec}");
-        return Ok(ExitCode::from(128));
-    };
-    if object.kind != Kind::Blob {
-        eprintln!("fatal: git cat-file {spec}: bad file");
-        return Ok(ExitCode::from(128));
-    }
-    let blob = object.data.clone();
-
-    let (mut pipeline, _index) = repo.filter_pipeline(None)?;
-    let mut converted = pipeline.convert_to_worktree(
-        &blob,
-        rela.as_bytes().as_bstr(),
-        gix::filter::plumbing::driver::apply::Delay::Forbid,
-    )?;
-
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    std::io::copy(&mut converted, &mut out)?;
-    drop(converted);
+    // git's `filter_object()` only runs the pipeline over a blob; anything else
+    // (a tree from `<rev>:`, a commit reached through `--path`) is written raw.
+    if object.kind == Kind::Blob {
+        let blob = object.data.clone();
+        let (mut pipeline, _index) = repo.filter_pipeline(None)?;
+        let mut converted = pipeline.convert_to_worktree(
+            &blob,
+            rela.as_bytes().as_bstr(),
+            gix::filter::plumbing::driver::apply::Delay::Forbid,
+        )?;
+        std::io::copy(&mut converted, &mut out)?;
+        drop(converted);
+    } else {
+        out.write_all(&object.data)?;
+    }
     out.flush()?;
     Ok(ExitCode::SUCCESS)
 }
 
+/// The `<path>` both transforms need, from `--path=<p>` or from the `<rev>:<path>`
+/// spec. git asks `get_oid_with_context()` for it with `GET_OID_REQUIRE_PATH`, so
+/// a spec with no `:` at all dies with exit 128 and no usage block. A `<rev>:` with
+/// an empty tail does carry a path — the root tree's — and is accepted.
+fn required_path(spec: &str, path: Option<&str>) -> std::result::Result<String, ExitCode> {
+    match path {
+        Some(p) => Ok(p.to_string()),
+        None => match spec.split_once(':') {
+            Some((_, p)) => Ok(p.to_string()),
+            None => {
+                eprintln!("fatal: <object>:<path> required, only <object> '{spec}' given");
+                Err(ExitCode::from(128))
+            }
+        },
+    }
+}
+
+/// Resolve a transform mode's `<rev>[:<path>]` argument, reproducing the
+/// diagnostics `get_oid_with_context_1()` and `diagnose_invalid_oid_path()`
+/// (object-name.c) print. The blanket "Not a valid object name" only covers a
+/// bare `<rev>` that does not resolve; once a `:` is present git reports either
+/// the bad revision or the missing path, and says whether the path is at least
+/// present in the working tree.
+fn resolve_transform_spec(
+    repo: &gix::Repository,
+    spec: &str,
+) -> std::result::Result<gix::hash::ObjectId, ExitCode> {
+    if let Ok(id) = repo.rev_parse_single(spec) {
+        return Ok(id.detach());
+    }
+    let Some((rev, file)) = spec.split_once(':') else {
+        eprintln!("fatal: Not a valid object name {spec}");
+        return Err(ExitCode::from(128));
+    };
+    // `:<path>` is the index form, whose miss `diagnose_invalid_index_path()`
+    // words differently because two sources were consulted.
+    if rev.is_empty() {
+        eprintln!("fatal: path '{file}' does not exist (neither on disk nor in the index)");
+        return Err(ExitCode::from(128));
+    }
+    if repo.rev_parse_single(rev).is_err() {
+        eprintln!("fatal: invalid object name '{rev}'.");
+        return Err(ExitCode::from(128));
+    }
+    if std::path::Path::new(file).exists() {
+        eprintln!("fatal: path '{file}' exists on disk, but not in '{rev}'");
+    } else {
+        eprintln!("fatal: path '{file}' does not exist in '{rev}'");
+    }
+    Err(ExitCode::from(128))
+}
+
+// ---- textconv --------------------------------------------------------------
+
+/// git's textconv machinery — `userdiff_find_by_path()` (userdiff.c) plus
+/// `fill_textconv()`/`run_textconv()` (diff.c) — reduced to what `cat-file` asks
+/// of it: map a path to the driver named by its `diff` gitattribute, look up that
+/// driver's `diff.<name>.textconv` program, and run it over the blob's
+/// checked-out content.
+struct Textconv<'repo> {
+    repo: &'repo gix::Repository,
+    /// The gitattributes stack in git's default check-in direction (worktree
+    /// `.gitattributes` first, index as the fallback), which is what
+    /// `userdiff_find_by_path()` queries.
+    stack: gix::AttributeStack<'repo>,
+    outcome: gix::attrs::search::Outcome,
+    /// `prep_temp_blob()` writes the *worktree* form of the blob, so the program
+    /// sees what a checkout would have produced.
+    pipeline: gix::filter::Pipeline<'repo>,
+    _index: gix::worktree::IndexPersistedOrInMemory,
+}
+
+/// Whether the blob was converted, and how it failed if it was not.
+enum Converted {
+    /// The driver's stdout.
+    Text(Vec<u8>),
+    /// No `diff` attribute, no such driver, or the driver has no `textconv`:
+    /// `textconv_object()` returns 0 and git falls through to plain output.
+    NoDriver,
+    /// `run_textconv()` returned NULL, which `fill_textconv()` turns into
+    /// `die(_("unable to read files to diff"))`.
+    Failed,
+}
+
+impl<'repo> Textconv<'repo> {
+    fn new(repo: &'repo gix::Repository) -> Result<Self> {
+        let (pipeline, index) = repo.filter_pipeline(None)?;
+        // The stack copies out the id-mappings it needs, so the index it was
+        // built from does not have to outlive it.
+        let worktree_index = repo.index_or_empty()?;
+        let stack = repo.attributes_only(
+            &worktree_index,
+            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+        )?;
+        Ok(Self {
+            repo,
+            stack,
+            outcome: gix::attrs::search::Outcome::default(),
+            pipeline,
+            _index: index,
+        })
+    }
+
+    /// `userdiff_find_by_path()` + `userdiff_get_textconv()`: the `diff` attribute
+    /// must carry a driver *name* — the boolean forms (`diff` / `-diff`) select
+    /// git's built-in true/false drivers, which have no textconv — and that
+    /// driver must configure `diff.<name>.textconv`.
+    fn program(&mut self, path: &BStr) -> Result<Option<String>> {
+        // `<rev>:` names the root tree with an empty path; no pattern matches it,
+        // so no driver applies.
+        if path.is_empty() {
+            return Ok(None);
+        }
+        // The stack only knows an attribute's name once a file declaring it has
+        // been parsed, so descend first, then size the outcome, then match.
+        let mode = Some(gix::index::entry::Mode::FILE);
+        let _ = self.stack.at_entry(path, mode)?;
+        self.outcome
+            .initialize_with_selection(self.stack.attributes_collection(), ["diff"]);
+        let platform = self.stack.at_entry(path, mode)?;
+        platform.matching_attributes(&mut self.outcome);
+
+        let Some(m) = self.outcome.iter_selected().next() else {
+            return Ok(None);
+        };
+        let gix::attrs::StateRef::Value(value) = m.assignment.state else {
+            return Ok(None);
+        };
+        let name = value.as_bstr().to_str_lossy().into_owned();
+        Ok(diff_driver_textconv(self.repo, &name))
+    }
+
+    /// `textconv_object()`: run the path's textconv program over `blob`, or report
+    /// that no driver applies.
+    fn convert(&mut self, path: &BStr, blob: &[u8]) -> Result<Converted> {
+        let Some(program) = self.program(path)? else {
+            return Ok(Converted::NoDriver);
+        };
+        Ok(match self.run(&program, path, blob)? {
+            Some(text) => Converted::Text(text),
+            None => Converted::Failed,
+        })
+    }
+
+    /// `prep_temp_blob()` + `run_textconv()`: materialise the blob in a private
+    /// temporary directory under its own basename — the name the program is handed
+    /// — and capture the program's stdout. `None` when the program could not be
+    /// started or exited non-zero, which is git's NULL return.
+    fn run(&mut self, program: &str, path: &BStr, blob: &[u8]) -> Result<Option<Vec<u8>>> {
+        let dir = temp_blob_dir()?;
+        let base = path
+            .rsplit(|&b| b == b'/')
+            .find(|c| !c.is_empty())
+            .unwrap_or(b"blob");
+        let file = dir.join(std::ffi::OsString::from(
+            String::from_utf8_lossy(base).into_owned(),
+        ));
+
+        // `prep_temp_blob()` runs `convert_to_working_tree()` before writing, so a
+        // path with smudge/eol/ident filters reaches the program checked out.
+        let mut converted = self.pipeline.convert_to_worktree(
+            blob,
+            path,
+            gix::filter::plumbing::driver::apply::Delay::Forbid,
+        )?;
+        let mut handle = std::fs::File::create(&file)?;
+        std::io::copy(&mut converted, &mut handle)?;
+        drop(converted);
+        drop(handle);
+
+        let output = textconv_command(program, &file).output();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        match output {
+            Ok(o) if o.status.success() => Ok(Some(o.stdout)),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `diff.<name>.textconv` from the merged configuration, last definition winning.
+/// Subsection names are compared byte for byte, as git compares them.
+fn diff_driver_textconv(repo: &gix::Repository, name: &str) -> Option<String> {
+    let snapshot = repo.config_snapshot();
+    let mut winner: Option<String> = None;
+    for section in snapshot.sections() {
+        let header = section.header();
+        if !header.name().to_string().eq_ignore_ascii_case("diff") {
+            continue;
+        }
+        if header.subsection_name() != Some(BStr::new(name.as_bytes())) {
+            continue;
+        }
+        if let Some(v) = section.body().value("textconv") {
+            winner = Some(v.to_str_lossy().into_owned());
+        }
+    }
+    winner
+}
+
+/// `run_textconv()` builds the child with `use_shell`, so git's
+/// `prepare_shell_cmd()` decides the shape: a command carrying any shell
+/// metacharacter is run as `sh -c '<cmd> "$@"' <cmd> <file>`, and a bare program
+/// name is executed directly with the file as its only argument.
+fn textconv_command(program: &str, file: &std::path::Path) -> std::process::Command {
+    const SHELL_META: &[u8] = b"|&;<>()$`\\\"' \t\n*?[#~=%";
+    if program.bytes().any(|b| SHELL_META.contains(&b)) {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("{program} \"$@\"")).arg(program);
+        cmd.arg(file);
+        cmd
+    } else {
+        let mut cmd = std::process::Command::new(program);
+        cmd.arg(file);
+        cmd
+    }
+}
+
+/// `mks_tempfile_ts()`'s directory: a fresh `git-blob-XXXXXX` under `TMPDIR`, so
+/// the blob can keep its own basename inside it.
+fn temp_blob_dir() -> Result<std::path::PathBuf> {
+    let base = std::env::temp_dir();
+    for attempt in 0..64u32 {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let dir = base.join(format!(
+            "git-blob-{:06x}",
+            (std::process::id() ^ stamp ^ attempt) & 0xff_ffff
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!("could not create a temporary directory in {}", base.display())
+}
+
+/// `git cat-file --textconv (<rev>:<path> | --path=<path> <rev>)`: emit the object
+/// as its path's `diff.<driver>.textconv` program renders it. git's `case 'c'`
+/// falls through to `case 'p'` whenever no driver applies, so an unconfigured path
+/// prints the object exactly as `-p` would.
+fn run_textconv(positional: &[&str], path: Option<&str>, use_mailmap: bool) -> Result<ExitCode> {
+    if positional.is_empty() {
+        return die_usage("<rev> required with '--textconv'");
+    }
+    if positional.len() > 1 {
+        return die_usage("too many arguments");
+    }
+    let spec = positional[0];
+
+    let repo = gix::discover(".")?;
+    let oid = match resolve_transform_spec(&repo, spec) {
+        Ok(id) => id,
+        Err(code) => return Ok(code),
+    };
+    let rela = match required_path(spec, path) {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
+    let Ok(object) = repo.find_object(oid) else {
+        eprintln!("fatal: Not a valid object name {spec}");
+        return Ok(ExitCode::from(128));
+    };
+
+    let mut textconv = Textconv::new(&repo)?;
+    match textconv.convert(rela.as_bytes().as_bstr(), &object.data)? {
+        Converted::Text(text) => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            out.write_all(&text)?;
+            out.flush()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Converted::Failed => {
+            eprintln!("fatal: unable to read files to diff");
+            Ok(ExitCode::from(128))
+        }
+        Converted::NoDriver => print_object(&repo, oid, &object.data, object.kind, use_mailmap),
+    }
+}
+
 // ---- batch stream ----------------------------------------------------------
+
+/// git's `batch_options.transform_mode`: with `'w'` (`--filters`) every blob is
+/// smudged through the worktree pipeline, with `'c'` (`--textconv`) it is run
+/// through its path's `diff.<driver>.textconv` program. Both consume the record's
+/// trailing path, which is why either one turns on whitespace splitting.
+enum Transform<'repo> {
+    Filters(gix::filter::Pipeline<'repo>),
+    Textconv(Textconv<'repo>),
+}
 
 /// One piece of a compiled `--batch`/`--batch-check` format string.
 enum Token {
@@ -738,7 +1073,7 @@ fn run_batch(
     output_nul: bool,
     filter: Option<&str>,
     use_mailmap: bool,
-    filters: bool,
+    transform_mode: Option<Mode>,
     follow_symlinks: bool,
 ) -> Result<ExitCode> {
     // `-Z` sets both; `-z` sets only the input delimiter (stdout stays newline).
@@ -773,13 +1108,13 @@ fn run_batch(
         None
     };
 
-    // When `--filters` is combined with a batch mode, git sets transform_mode 'w'
-    // and smudges each blob through the worktree pipeline, keyed by the per-line
-    // path. Build the pipeline once and reuse it across every record.
-    let mut fpipe = if filters {
-        Some(repo.filter_pipeline(None)?.0)
-    } else {
-        None
+    // A transform combined with a batch mode is git's `transform_mode`: every
+    // blob is rewritten before it is emitted, keyed by the record's trailing
+    // path. Build the state once and reuse it across every record.
+    let mut xform = match transform_mode {
+        Some(Mode::Filters) => Some(Transform::Filters(repo.filter_pipeline(None)?.0)),
+        Some(Mode::Textconv) => Some(Transform::Textconv(Textconv::new(&repo)?)),
+        _ => None,
     };
 
     let stdout = std::io::stdout();
@@ -817,7 +1152,7 @@ fn run_batch(
                 want_contents,
                 output_delim,
                 mailmap.as_ref(),
-                fpipe.as_mut(),
+                xform.as_mut(),
             )? {
                 EmitOutcome::Ok => {}
                 EmitOutcome::Die(code) => {
@@ -859,7 +1194,7 @@ fn run_batch(
                     output_delim,
                     objfilter.as_ref(),
                     mailmap.as_ref(),
-                    fpipe.as_mut(),
+                    xform.as_mut(),
                     follow_symlinks,
                 )? {
                     CommandResult::Ok => {}
@@ -880,7 +1215,8 @@ fn run_batch(
                     output_delim,
                     objfilter.as_ref(),
                     mailmap.as_ref(),
-                    fpipe.as_mut(),
+                    true,
+                    xform.as_mut(),
                     follow_symlinks,
                 )? {
                     EmitOutcome::Ok => {
@@ -926,7 +1262,7 @@ fn handle_command(
     delim: u8,
     filter: Option<&ObjFilter>,
     mailmap: Option<&gix::mailmap::Snapshot>,
-    filters_pipeline: Option<&mut gix::filter::Pipeline<'_>>,
+    transform: Option<&mut Transform<'_>>,
     follow_symlinks: bool,
 ) -> Result<CommandResult> {
     // Split the command word from its argument on the first ASCII space.
@@ -945,7 +1281,7 @@ fn handle_command(
             Ok(CommandResult::Ok)
         }
         b"contents" => {
-            match process_request(out, repo, fmt, arg, true, delim, filter, mailmap, filters_pipeline, follow_symlinks)? {
+            match process_request(out, repo, fmt, arg, true, delim, filter, mailmap, false, transform, follow_symlinks)? {
                 EmitOutcome::Ok => {
                     if !buffer {
                         out.flush()?;
@@ -956,7 +1292,7 @@ fn handle_command(
             }
         }
         b"info" => {
-            match process_request(out, repo, fmt, arg, false, delim, filter, mailmap, filters_pipeline, follow_symlinks)? {
+            match process_request(out, repo, fmt, arg, false, delim, filter, mailmap, false, transform, follow_symlinks)? {
                 EmitOutcome::Ok => {
                     if !buffer {
                         out.flush()?;
@@ -988,14 +1324,16 @@ fn process_request(
     delim: u8,
     filter: Option<&ObjFilter>,
     mailmap: Option<&gix::mailmap::Snapshot>,
-    filters_pipeline: Option<&mut gix::filter::Pipeline<'_>>,
+    split_rest: bool,
+    transform: Option<&mut Transform<'_>>,
     follow_symlinks: bool,
 ) -> Result<EmitOutcome> {
     // `%(rest)` in the format splits the line at the first whitespace run: the
-    // head is the object name, the tail becomes `%(rest)`. git also forces this
-    // split whenever a transform mode is active (`--filters`), because the tail
-    // is then consumed as the blob's path.
-    let (name, rest): (&[u8], &[u8]) = if fmt.has_rest || filters_pipeline.is_some() {
+    // head is the object name, the tail becomes `%(rest)`. A transform mode forces
+    // the same split, because the tail is then consumed as the blob's path. git
+    // performs it in `batch_objects()`'s stdin loop only, so `--batch-command`
+    // never splits — its whole argument is the object name (`split_rest`).
+    let (name, rest): (&[u8], &[u8]) = if split_rest && (fmt.has_rest || transform.is_some()) {
         match line.iter().position(|&b| b == b' ' || b == b'\t') {
             Some(ws) => {
                 let mut end = ws;
@@ -1025,7 +1363,7 @@ fn process_request(
             delim,
             filter,
             mailmap,
-            filters_pipeline,
+            transform,
         );
     }
 
@@ -1072,7 +1410,7 @@ fn process_request(
         want_contents,
         delim,
         mailmap,
-        filters_pipeline,
+        transform,
     )
 }
 
@@ -1112,7 +1450,7 @@ fn emit_follow(
     delim: u8,
     filter: Option<&ObjFilter>,
     mailmap: Option<&gix::mailmap::Snapshot>,
-    filters_pipeline: Option<&mut gix::filter::Pipeline<'_>>,
+    transform: Option<&mut Transform<'_>>,
 ) -> Result<EmitOutcome> {
     match resolve_follow_symlinks(repo, name) {
         FollowResult::Missing => {
@@ -1171,7 +1509,7 @@ fn emit_follow(
                 want_contents,
                 delim,
                 mailmap,
-                filters_pipeline,
+                transform,
             )
         }
     }
@@ -1376,7 +1714,7 @@ fn emit_object(
     want_contents: bool,
     delim: u8,
     mailmap: Option<&gix::mailmap::Snapshot>,
-    filters_pipeline: Option<&mut gix::filter::Pipeline<'_>>,
+    transform: Option<&mut Transform<'_>>,
 ) -> Result<EmitOutcome> {
     let mut info = Vec::new();
     render_info(fmt, &oid, kind, size, rest, &mut info);
@@ -1384,25 +1722,38 @@ fn emit_object(
     out.write_all(&[delim])?;
 
     if want_contents {
-        // git's `print_object_or_die`: under `--filters` (transform_mode 'w') a
-        // blob is smudged through the worktree pipeline using `rest` as its path;
-        // every other object is emitted raw.
-        if matches!((&filters_pipeline, kind), (Some(_), Kind::Blob)) {
+        // git's `print_object_or_die`: a transform rewrites blobs only, using
+        // `rest` as the path; every other object is emitted raw either way.
+        if matches!((&transform, kind), (Some(_), Kind::Blob)) {
             if rest.is_empty() {
                 // git: die("missing path for '%s'", oid). The info line above was
                 // already written, matching git's ordering.
                 eprintln!("fatal: missing path for '{}'", oid.to_hex());
                 return Ok(EmitOutcome::Die(128));
             }
-            let pipeline = filters_pipeline.expect("Some checked above");
             let object = repo.find_object(oid)?;
-            let mut converted = pipeline.convert_to_worktree(
-                &object.data,
-                rest.as_bstr(),
-                gix::filter::plumbing::driver::apply::Delay::Forbid,
-            )?;
-            std::io::copy(&mut converted, out)?;
-            drop(converted);
+            match transform.expect("Some checked above") {
+                Transform::Filters(pipeline) => {
+                    let mut converted = pipeline.convert_to_worktree(
+                        &object.data,
+                        rest.as_bstr(),
+                        gix::filter::plumbing::driver::apply::Delay::Forbid,
+                    )?;
+                    std::io::copy(&mut converted, out)?;
+                    drop(converted);
+                }
+                // `textconv_object()` returning 0 leaves git with the raw blob,
+                // which it then emits unchanged; only a driver that ran and failed
+                // is fatal.
+                Transform::Textconv(tc) => match tc.convert(rest.as_bstr(), &object.data)? {
+                    Converted::Text(text) => out.write_all(&text)?,
+                    Converted::NoDriver => out.write_all(&object.data)?,
+                    Converted::Failed => {
+                        eprintln!("fatal: unable to read files to diff");
+                        return Ok(EmitOutcome::Die(128));
+                    }
+                },
+            }
         } else {
             let object = repo.find_object(oid)?;
             // `%(objectsize)` above stays the on-disk size; mailmap only rewrites

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::collections::HashSet;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -61,6 +61,7 @@ struct Opts {
     deleted: bool,         // -d / --deleted
     modified: bool,        // -m / --modified
     others: bool,          // -o / --others
+    killed: bool,          // -k / --killed (untracked paths blocking a checkout)
     ignored: bool,         // -i / --ignored (show only excluded paths)
     directory: bool,       // --directory (collapse wholly-untracked directories)
     /// git's `DIR_HIDE_EMPTY_DIRECTORIES` (wired as `OPT_NEGBIT`): default off,
@@ -75,8 +76,16 @@ struct Opts {
     error_unmatch: bool,   // --error-unmatch
     debug: bool,           // --debug (dump the cache entry's stat data)
     zero: bool,            // -z
+    eol: bool,             // --eol (show index/worktree line endings and the eol attribute)
+    recurse_submodules: bool, // --recurse-submodules
+    /// `--sparse`: leave sparse directory entries collapsed. Without it, git
+    /// expands a sparse index to a full one before listing (`ensure_full_index`).
+    sparse: bool,
     full_name: bool,       // --full-name
     exclude_standard: bool, // --exclude-standard (add the standard git exclusions)
+    /// git's `exc_given`, latched by `-x`, `-X` and `--exclude-standard` as they
+    /// are parsed; it gates the `--ignored needs some exclude pattern` guard.
+    exc_given: bool,
     /// `--with-tree <tree-ish>`: overlay the named tree onto the index so paths
     /// removed since that tree still appear. Holds the raw tree-ish spelling.
     with_tree: Option<String>,
@@ -102,11 +111,28 @@ impl Opts {
     fn shows_index_entries(&self) -> bool {
         self.cached || self.stage
     }
+
+    /// git assigns the non-empty status tags under any of `-t`, `-v` and `-f`
+    /// (`if (show_tag || show_valid_bit || show_fsmonitor_bit)`), so `-v` on its
+    /// own prints them too — with `get_tag` lowercasing the marked entries.
+    fn shows_tags(&self) -> bool {
+        self.tags || self.valid_bit || self.fsmonitor_bit
+    }
 }
 
 /// Print `msg` followed by git's usage block and return git's usage exit code.
+/// This is parse-options' own diagnostic for a malformed command line.
 fn usage_error(msg: &str) -> ExitCode {
     eprintln!("error: {msg}");
+    eprint!("{USAGE}");
+    ExitCode::from(129)
+}
+
+/// git's `usage_msg_opt`, used for the incompatible-option combinations the
+/// command rejects after parsing: a `fatal:` line, a blank line, then the usage
+/// block, still at exit code 129.
+fn usage_fatal(msg: &str) -> ExitCode {
+    eprintln!("fatal: {msg}\n");
     eprint!("{USAGE}");
     ExitCode::from(129)
 }
@@ -198,21 +224,46 @@ fn pathspec_parse_fatal(err: &gix::pathspec::parse::Error, raw: &str) -> Option<
 ///
 /// Supported invocations:
 ///   * `-c/--cached` (the default), `-s/--stage`, `-u/--unmerged`
-///   * `-d/--deleted`, `-m/--modified`, `-o/--others`, `--directory`
+///   * `-d/--deleted`, `-m/--modified`, `-o/--others`, `-k/--killed`, `--directory`
 ///   * `--empty-directory`/`--no-empty-directory` (show/hide empty untracked dirs)
 ///   * `-t` (status tags), `--deduplicate`, `--error-unmatch`
 ///   * `--full-name`, `-z`, `--abbrev[=<n>]`, `--with-tree <tree-ish>`
+///   * `--eol`, `--sparse`, `--recurse-submodules`
 ///   * trailing pathspecs, optionally after `--`
 ///
-/// Output ordering mirrors git exactly: the directory walk (`--others`) is
-/// emitted first, then a single pass over the index emits, per entry, the
-/// cached line, the deleted line, and the modified line in that order.
+/// Output ordering mirrors git exactly: the directory walk emits its `--others`
+/// lines and then its `--killed` lines (git's `show_other_files` followed by
+/// `show_killed_files` over the same collected entries), then a single pass over
+/// the index emits, per entry, the cached line, the deleted line, and the
+/// modified line in that order.
 ///
-/// Exclude handling (`-x`, `-X`, `-i`, `--exclude-standard`), `-v`, `-f`,
-/// `--debug`, `--format`, `--resolve-undo` and `--with-tree` are ported.
-/// `-k/--killed`, `--eol`, `--sparse`, `--exclude-per-directory` and
-/// `--recurse-submodules` are not ported (each needs substrate gix does not
-/// expose) and are rejected rather than silently ignored.
+/// Exclude handling is git's: `-x`/`-X` form the highest-priority override group
+/// and `--exclude-standard` adds `info/exclude`, `core.excludesFile` and the
+/// per-directory `.gitignore` files. Nothing on disk is consulted when neither was
+/// given, so the directory walk hands over every untracked *and* ignored path and
+/// this exclude stack alone classifies them.
+///
+/// `--exclude-per-directory=<file>` stays rejected: gix's per-directory ignore
+/// stack (`gix_worktree::stack::state::ignore::Ignore::push_directory`) reads a
+/// hard-coded `.gitignore` and never consults its own
+/// `exclude_file_name_for_directories`, and the directory walk behind `-o` does
+/// the same, so a caller-chosen file name cannot be honoured from here.
+///
+/// `--eol` reproduces git's `write_eolinfo`: `i/<eolinfo> w/<eolinfo>
+/// attr/<eolattr>` columns derived from `convert.c`'s text statistics over the
+/// indexed blob and the worktree file, plus the `text`/`crlf`/`eol` attributes.
+/// The same statistics back the `%(eolinfo:index)`, `%(eolinfo:worktree)` and
+/// `%(eolattr)` `--format` atoms.
+///
+/// `--recurse-submodules` opens every active submodule gitlink and lists its
+/// index with the submodule path prefixed, recursing for nested submodules; git's
+/// `-d/-o/-u/-k/-m/--resolve-undo/--with-tree` and `--error-unmatch` rejections
+/// are reproduced. `--sparse` keeps sparse directory entries collapsed; without
+/// it a sparse index is expanded to a full one first, exactly like git's
+/// `ensure_full_index`, including its `advice.sparseIndexExpanded` hint.
+///
+/// `-v`, `-f`, `--debug`, `--format`, `--resolve-undo` and `--with-tree` are
+/// ported as well.
 pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     let mut opts = Opts::default();
     let mut no_more_flags = false;
@@ -248,6 +299,14 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             "--no-modified" => opts.modified = false,
             "--others" => opts.others = true,
             "--no-others" => opts.others = false,
+            "--killed" => opts.killed = true,
+            "--no-killed" => opts.killed = false,
+            "--eol" => opts.eol = true,
+            "--no-eol" => opts.eol = false,
+            "--recurse-submodules" => opts.recurse_submodules = true,
+            "--no-recurse-submodules" => opts.recurse_submodules = false,
+            "--sparse" => opts.sparse = true,
+            "--no-sparse" => opts.sparse = false,
             "--ignored" => opts.ignored = true,
             "--no-ignored" => opts.ignored = false,
             "--directory" => opts.directory = true,
@@ -260,29 +319,38 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             "--no-error-unmatch" => opts.error_unmatch = false,
             "--debug" => opts.debug = true,
             "--no-debug" => opts.debug = false,
-            "--exclude-standard" => opts.exclude_standard = true,
+            // git's `option_parse_exclude_standard` latches `exc_given` and calls
+            // `setup_standard_excludes`.
+            "--exclude-standard" => {
+                opts.exclude_standard = true;
+                opts.exc_given = true;
+            }
             "--full-name" => opts.full_name = true,
             "--abbrev" => opts.abbrev = Some(None),
             "--no-abbrev" => opts.abbrev = None,
             "--exclude" => match args.get(i + 1) {
                 Some(v) => {
                     opts.exclude.push(v.clone());
+                    opts.exc_given = true;
                     i += 1;
                 }
                 None => return Ok(usage_error("option `exclude' requires a value")),
             },
             _ if s.starts_with("--exclude=") => {
                 opts.exclude.push(s["--exclude=".len()..].to_string());
+                opts.exc_given = true;
             }
             "--exclude-from" => match args.get(i + 1) {
                 Some(v) => {
                     opts.exclude_from.push(v.clone());
+                    opts.exc_given = true;
                     i += 1;
                 }
                 None => return Ok(usage_error("option `exclude-from' requires a value")),
             },
             _ if s.starts_with("--exclude-from=") => {
                 opts.exclude_from.push(s["--exclude-from=".len()..].to_string());
+                opts.exc_given = true;
             }
             "--format" => match args.get(i + 1) {
                 Some(v) => {
@@ -339,6 +407,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                         'd' => opts.deleted = true,
                         'm' => opts.modified = true,
                         'o' => opts.others = true,
+                        'k' => opts.killed = true,
                         'i' => opts.ignored = true,
                         't' => opts.tags = true,
                         'v' => opts.valid_bit = true,
@@ -361,6 +430,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                                     }
                                 }
                             };
+                            opts.exc_given = true;
                             if c == 'x' {
                                 opts.exclude.push(val);
                             } else {
@@ -381,13 +451,17 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    // `--format` shares git's exact incompatibility set (exit 129). `-k` and
-    // `--eol` aren't parsed here, so `-s`/`-o`/`-t`/`--resolve-undo`/
-    // `--deduplicate` are the selectors that can actually co-occur.
+    // `--format` shares git's exact incompatibility set (exit 129).
     if opts.format.is_some()
-        && (opts.stage || opts.others || opts.tags || opts.dedup || opts.resolve_undo)
+        && (opts.stage
+            || opts.others
+            || opts.killed
+            || opts.tags
+            || opts.dedup
+            || opts.resolve_undo
+            || opts.eol)
     {
-        return Ok(usage_error(
+        return Ok(usage_fatal(
             "--format cannot be used with -s, -o, -k, -t, --resolve-undo, --deduplicate, --eol",
         ));
     }
@@ -396,33 +470,65 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     if opts.unmerged {
         opts.stage = true;
     }
-    // With no selector at all, git lists the cache. `-i` is not a selector, so it
-    // leaves the default in place — which is what lets `git ls-files -i` reach the
-    // "needs some exclude pattern" diagnostic below.
+    // git's `if (show_tag || show_stage) skipping_duplicates = 0;`: the tag and
+    // stage columns make every line distinguishable, so dedup is turned off.
+    if opts.tags || opts.stage {
+        opts.dedup = false;
+    }
+
+    // git's `--recurse-submodules` guards, both fatal (exit 128) and both checked
+    // before the default `-c` is applied, so `--recurse-submodules` on its own is
+    // fine while any of the worktree-facing selectors is not.
+    if opts.recurse_submodules
+        && (opts.deleted
+            || opts.others
+            || opts.unmerged
+            || opts.killed
+            || opts.modified
+            || opts.resolve_undo
+            || opts.with_tree.is_some())
+    {
+        eprintln!("fatal: ls-files --recurse-submodules unsupported mode");
+        return Ok(ExitCode::from(128));
+    }
+    if opts.recurse_submodules && opts.error_unmatch {
+        eprintln!("fatal: ls-files --recurse-submodules does not support --error-unmatch");
+        return Ok(ExitCode::from(128));
+    }
+
+    // git's two `-i` guards, in order, each fatal (exit 128). Both run *before*
+    // the implicit `-c` below, so a bare `ls-files -i` reports the first one.
+    if opts.ignored && !opts.others && !opts.cached {
+        eprintln!("fatal: ls-files -i must be used with either -o or -c");
+        return Ok(ExitCode::from(128));
+    }
+    if opts.ignored && !opts.exc_given {
+        eprintln!("fatal: ls-files --ignored needs some exclude pattern");
+        return Ok(ExitCode::from(128));
+    }
+
+    // With no selector at all, git lists the cache.
     if !opts.cached
         && !opts.stage
         && !opts.deleted
         && !opts.modified
         && !opts.others
+        && !opts.killed
         && !opts.unmerged
         && !opts.resolve_undo
     {
         opts.cached = true;
     }
 
-    // git's two `-i` guards, in order, each fatal (exit 128).
-    if opts.ignored && !opts.others && !opts.cached {
-        eprintln!("fatal: ls-files -i must be used with either -o or -c");
-        return Ok(ExitCode::from(128));
-    }
-    let exc_given = !opts.exclude.is_empty() || !opts.exclude_from.is_empty() || opts.exclude_standard;
-    if opts.ignored && !exc_given {
-        eprintln!("fatal: ls-files --ignored needs some exclude pattern");
-        return Ok(ExitCode::from(128));
-    }
-
     let repo = gix::discover(".")?;
     let mut index = repo.open_index()?;
+
+    // git's lazy `ensure_full_index`: unless `--sparse` was asked for, a sparse
+    // directory entry is replaced by the blobs of the tree it stands for, each
+    // marked skip-worktree, before any index-derived line is produced.
+    if !opts.sparse && (opts.shows_index_entries() || opts.deleted || opts.modified) {
+        expand_sparse_index(&repo, &mut index)?;
+    }
 
     // `--with-tree <tree-ish>` overlays the named tree onto the index so that
     // paths removed since that tree are still listed (git's
@@ -471,9 +577,11 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             .map(|e| e.path(&index).to_owned())
             .collect();
 
+        // The recorder reports the trees it descends through as well; only the
+        // leaves are paths git's `overlay_tree_on_index` puts into the index.
         let tree_entries = tree.traverse().breadthfirst.files()?;
         for te in tree_entries {
-            if stage0.contains(te.filepath.as_bstr()) {
+            if te.mode.is_tree() || stage0.contains(te.filepath.as_bstr()) {
                 continue;
             }
             index.dangerously_push_entry(
@@ -530,20 +638,19 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     // ignore files are consulted, exactly like git.
     let mut matcher = Excludes::build(&repo, &index, &opts)?;
 
-    // `-i` needs the walk to surface ignored paths too, which gix normally drops.
-    let worktree = if opts.others || opts.modified || opts.deleted {
+    // git runs `fill_directory` for `-o` *or* `-k`; both read the same collected
+    // entry list. For `-k` without `-o` git also sets `DIR_COLLECT_KILLED_ONLY`,
+    // which prunes directories the index has nothing at or below — nothing under
+    // such a directory can ever be killed, so skipping that pruning costs walk
+    // time but cannot change which entries the killed test keeps.
+    let walk = opts.others || opts.killed;
+    let worktree = if walk || opts.modified || opts.deleted {
         // git shows empty untracked directories (`dir/`) under `--directory` by
         // default; `--no-empty-directory` suppresses them. gix's walk hides them
         // unless `emit_empty_directories` is set, so enable it to match git's
         // default whenever a collapsed `--directory` walk is in play.
-        let emit_empty = opts.others && opts.directory && !opts.hide_empty_dir;
-        Some(collect_worktree(
-            &repo,
-            opts.others,
-            opts.directory,
-            opts.ignored,
-            emit_empty,
-        )?)
+        let emit_empty = walk && opts.directory && !opts.hide_empty_dir;
+        Some(collect_worktree(&repo, walk, emit_empty)?)
     } else {
         None
     };
@@ -559,36 +666,88 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     // trailing stat block) so the emit loop can stay a verbatim byte copy.
     let terminator = if opts.zero { b'\0' } else { b'\n' };
 
+    // The convert-stat machinery behind `--eol` and the three `%(eol…)` format
+    // atoms. It caches an attribute stack, so build it once and only when a
+    // caller can actually reach it.
+    let mut eol = if opts.eol || opts.format.is_some() {
+        Some(Eol::new(&repo, &index)?)
+    } else {
+        None
+    };
+
     let mut lines: Vec<Vec<u8>> = Vec::new();
 
     // Phase 1: the directory walk, exactly as git emits it before touching the
-    // index. Only `--others` prints these `? ` lines.
-    if opts.others {
+    // index — every `? ` line first (`show_other_files`), then every `K ` line
+    // (`show_killed_files`), both drawn from the same collected entry list.
+    if walk {
         if let Some(state) = &worktree {
             // The pathspec is matched against the bare path; the trailing slash
-            // that `--directory` prints is presentation only. Under `-i` the
-            // candidate set is untracked ∪ ignored so our own exclude stack — not
-            // gix's `.gitignore` classification — decides which to keep.
-            let extra: &[(BString, bool)] = if opts.ignored { &state.ignored } else { &[] };
-            let mut others: Vec<(&BString, bool)> = state
+            // that `--directory` prints is presentation only. The candidate set is
+            // untracked ∪ ignored so our own exclude stack — not gix's `.gitignore`
+            // classification — decides which to keep.
+            let mut candidates: Vec<(BString, bool)> = state
                 .others
                 .iter()
-                .chain(extra.iter())
                 .filter(|(path, is_dir)| ps.is_included(path.as_bstr(), Some(*is_dir)))
-                .map(|(path, is_dir)| (path, *is_dir))
+                .map(|(path, is_dir)| {
+                    if opts.directory {
+                        collapse_other_directory(&index, path.as_bstr(), *is_dir)
+                    } else {
+                        (path.clone(), *is_dir)
+                    }
+                })
                 .collect();
-            others.sort();
-            others.dedup();
-            for (path, is_dir) in others {
-                // `-i` keeps only excluded paths; the default keeps only the rest.
-                if matcher.is_excluded(path.as_bstr(), is_dir) != opts.ignored {
-                    continue;
+            candidates.sort();
+            candidates.dedup();
+            // `-i` keeps only excluded paths; the default keeps only the rest.
+            // This is the whole of git's `dir->entries`, so `-o` and `-k` share it.
+            // A directory entry carries git's trailing `/` in its very name, which
+            // both the killed test and the printed line depend on.
+            let entries: Vec<BString> = candidates
+                .into_iter()
+                .filter(|(path, is_dir)| matcher.is_excluded(path.as_bstr(), *is_dir) == opts.ignored)
+                .map(|(mut name, is_dir)| {
+                    if is_dir {
+                        name.push(b'/');
+                    }
+                    name
+                })
+                .collect();
+
+            if opts.others {
+                // `show_other_files` drops anything the index already knows under
+                // that name; `show_killed_files` below deliberately does not.
+                for name in entries.iter().filter(|n| index_name_is_other(&index, n.as_bstr())) {
+                    let display = strip_prefix(name.as_bstr(), prefix.as_ref()).to_vec();
+                    lines.push(render(
+                        &opts,
+                        "? ",
+                        None,
+                        &repo,
+                        name.as_bstr(),
+                        &display,
+                        quote,
+                        terminator,
+                        eol.as_mut(),
+                    ));
                 }
-                let mut display = strip_prefix(path.as_bstr(), prefix.as_ref()).to_vec();
-                if is_dir {
-                    display.push(b'/');
+            }
+            if opts.killed {
+                for name in entries.iter().filter(|n| is_killed(&index, n.as_bstr())) {
+                    let display = strip_prefix(name.as_bstr(), prefix.as_ref()).to_vec();
+                    lines.push(render(
+                        &opts,
+                        "K ",
+                        None,
+                        &repo,
+                        name.as_bstr(),
+                        &display,
+                        quote,
+                        terminator,
+                        eol.as_mut(),
+                    ));
                 }
-                lines.push(render(&opts, "? ", None, &repo, &display, quote, terminator));
             }
         }
     }
@@ -596,8 +755,37 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     // Phase 2: one pass over the index; each entry can contribute a cached line,
     // a deleted line, and a modified line, in that order.
     let mut matched: HashSet<usize> = HashSet::new();
+    // git's `is_submodule_active` gate on the gitlink entries `--recurse-submodules`
+    // descends into. Resolved once per repository, as `.gitmodules` cannot change
+    // mid-listing.
+    let active = active_submodules(&repo, &opts);
     for entry in index.entries() {
         let path = entry.path(&index);
+        // git's `show_ce` swaps an active submodule's own line for the listing of
+        // that submodule's index *before* it consults the pathspec, which is what
+        // lets a spec name something inside the submodule.
+        if opts.recurse_submodules
+            && opts.shows_index_entries()
+            && entry.mode == gix::index::entry::Mode::COMMIT
+            && active.contains(path)
+        {
+            if !opts.ignored || matcher.is_excluded(path, true) {
+                emit_submodule(
+                    &repo,
+                    path,
+                    path,
+                    &opts,
+                    &mut ps,
+                    &mut matcher,
+                    prefix.as_ref(),
+                    quote,
+                    terminator,
+                    eol.as_mut(),
+                    &mut lines,
+                )?;
+            }
+            continue;
+        }
         let Some(m) = ps.pattern_matching_relative_path(path, Some(false)) else {
             continue;
         };
@@ -617,6 +805,8 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         let display = strip_prefix(path, prefix.as_ref());
 
         if opts.shows_index_entries() && !(opts.unmerged && stage == 0) {
+            // git's `show_ce` replaces an active submodule's own line with the
+            // listing of that submodule's index; the gitlink itself is not shown.
             let tag = if entry
                 .flags
                 .contains(gix::index::entry::Flags::SKIP_WORKTREE)
@@ -627,7 +817,17 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             } else {
                 "H "
             };
-            lines.push(render(&opts, tag, Some(entry), &repo, display, quote, terminator));
+            lines.push(render(
+                &opts,
+                tag,
+                Some(entry),
+                &repo,
+                path,
+                display,
+                quote,
+                terminator,
+                eol.as_mut(),
+            ));
         }
 
         if opts.deleted || opts.modified {
@@ -639,10 +839,30 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             let (is_deleted, is_modified) =
                 entry_worktree_change(&repo, state, entry, path, direct);
             if opts.deleted && is_deleted {
-                lines.push(render(&opts, "R ", Some(entry), &repo, display, quote, terminator));
+                lines.push(render(
+                    &opts,
+                    "R ",
+                    Some(entry),
+                    &repo,
+                    path,
+                    display,
+                    quote,
+                    terminator,
+                    eol.as_mut(),
+                ));
             }
             if opts.modified && is_modified {
-                lines.push(render(&opts, "C ", Some(entry), &repo, display, quote, terminator));
+                lines.push(render(
+                    &opts,
+                    "C ",
+                    Some(entry),
+                    &repo,
+                    path,
+                    display,
+                    quote,
+                    terminator,
+                    eol.as_mut(),
+                ));
             }
         }
     }
@@ -720,15 +940,91 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// git's `ADVICE_MSG` from `sparse-index.c`, printed once through the `hint:`
+/// channel when a sparse index has to be expanded to a full one.
+const SPARSE_EXPANDED_ADVICE: &str = "\
+The sparse index is expanding to a full index, a slow operation.
+Your working directory likely has contents that are outside of
+your sparse-checkout patterns. Use 'git sparse-checkout list' to
+see your sparse-checkout definition and compare it to your working
+directory contents. Cleaning up any merge conflicts or staged
+changes before running 'git sparse-checkout clean' or 'git
+sparse-checkout reapply' may assist in this cleanup.";
+
+/// Port of git's `ensure_full_index`/`expand_index(istate, NULL)`.
+///
+/// A sparse index stores a whole out-of-cone directory as a single entry whose
+/// mode is `040000` and whose name carries a trailing `/`, pointing at the tree
+/// that directory would expand to. Replace each of those with the blobs of that
+/// tree, prefixed by the directory name and flagged `SKIP_WORKTREE`, which is
+/// what git's `add_path_to_index` callback produces.
+///
+/// Returns `true` when at least one entry was expanded, which is also the
+/// condition under which git emits its `advice.sparseIndexExpanded` hint.
+fn expand_sparse_index(repo: &gix::Repository, index: &mut gix::index::File) -> Result<bool> {
+    let sparse: Vec<(BString, gix::ObjectId)> = {
+        let state: &gix::index::State = index;
+        state
+            .entries()
+            .iter()
+            .filter(|e| e.mode == gix::index::entry::Mode::DIR)
+            .map(|e| (e.path(state).to_owned(), e.id))
+            .collect()
+    };
+    if sparse.is_empty() {
+        return Ok(false);
+    }
+
+    index.remove_entries(|_, _, e| e.mode == gix::index::entry::Mode::DIR);
+    for (dir, tree_id) in &sparse {
+        let Some(tree) = repo
+            .find_object(*tree_id)
+            .ok()
+            .and_then(|o| o.peel_to_tree().ok())
+        else {
+            continue;
+        };
+        // The traversal records the trees it descends through as well; only the
+        // leaves become index entries, which is what git's `add_path_to_index`
+        // callback does with its `READ_TREE_RECURSIVE` return.
+        for te in tree.traverse().breadthfirst.files()?.into_iter().filter(|te| !te.mode.is_tree()) {
+            let mut path = dir.clone();
+            path.extend_from_slice(&te.filepath);
+            index.dangerously_push_entry(
+                gix::index::entry::Stat::default(),
+                te.oid,
+                gix::index::entry::Flags::SKIP_WORKTREE,
+                gix::index::entry::Mode::from(te.mode),
+                path.as_bstr(),
+            );
+        }
+    }
+    index.sort_entries();
+
+    if repo
+        .config_snapshot()
+        .boolean("advice.sparseIndexExpanded")
+        .unwrap_or(true)
+    {
+        for line in SPARSE_EXPANDED_ADVICE.lines() {
+            eprintln!("hint: {line}");
+        }
+        eprintln!(
+            "hint: Disable this message with \"git config set advice.sparseIndexExpanded false\""
+        );
+    }
+    Ok(true)
+}
+
 /// The exclude machinery git configures from `-x`, `-X` and `--exclude-standard`.
 ///
-/// Two shapes, mirroring what git consults:
-///   * [`Excludes::Standard`] — a full worktree exclude stack (`info/exclude`,
+/// Three shapes, mirroring what git consults:
+///   * [`Excludes::Stack`] — the full worktree exclude stack (`info/exclude`,
 ///     `core.excludesFile`, per-directory `.gitignore`) with the `-x`/`-X`
 ///     patterns layered on top as the highest-priority override group. Built
 ///     only when `--exclude-standard` is given.
 ///   * [`Excludes::Overrides`] — just the `-x`/`-X` patterns, matched directly,
-///     with no on-disk ignore files consulted (git's behaviour without
+///     with no on-disk ignore files consulted at all (git's behaviour without
 ///     `--exclude-standard`).
 ///   * [`Excludes::None`] — nothing configured; nothing is ever excluded.
 #[allow(clippy::large_enum_variant)] // boxing would churn every construct/match site
@@ -738,7 +1034,7 @@ enum Excludes<'repo> {
         search: gix::ignore::Search,
         case: gix::glob::pattern::Case,
     },
-    Standard {
+    Stack {
         stack: gix::AttributeStack<'repo>,
     },
 }
@@ -761,25 +1057,27 @@ impl<'repo> Excludes<'repo> {
             }
         }
 
-        if opts.exclude_standard {
-            let stack = repo.excludes(
-                index,
-                Some(search),
-                gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
-            )?;
-            Ok(Excludes::Standard { stack })
+        let case = if repo
+            .config_snapshot()
+            .boolean("core.ignoreCase")
+            .unwrap_or(false)
+        {
+            gix::glob::pattern::Case::Fold
         } else {
-            let case = if repo
-                .config_snapshot()
-                .boolean("core.ignoreCase")
-                .unwrap_or(false)
-            {
-                gix::glob::pattern::Case::Fold
-            } else {
-                gix::glob::pattern::Case::Sensitive
-            };
-            Ok(Excludes::Overrides { search, case })
+            gix::glob::pattern::Case::Sensitive
+        };
+
+        // Without `--exclude-standard` no on-disk ignore file is consulted at all,
+        // so only the command-line patterns can match.
+        if !opts.exclude_standard {
+            return Ok(Excludes::Overrides { search, case });
         }
+        let stack = repo.excludes(
+            index,
+            Some(search),
+            gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
+        )?;
+        Ok(Excludes::Stack { stack })
     }
 
     /// Whether `path` is excluded, i.e. matched by a non-negated pattern.
@@ -789,7 +1087,7 @@ impl<'repo> Excludes<'repo> {
             Excludes::Overrides { search, case } => search
                 .pattern_matching_relative_path(path, Some(is_dir), *case)
                 .is_some_and(|m| !m.pattern.is_negative()),
-            Excludes::Standard { stack } => {
+            Excludes::Stack { stack } => {
                 let mode = is_dir.then_some(gix::index::entry::Mode::DIR);
                 stack
                     .at_entry(path, mode)
@@ -809,21 +1107,20 @@ struct Worktree {
     /// Paths carrying higher-stage (conflicted) entries; gitoxide folds their
     /// up-to-three stages into one status, so they are re-checked per entry.
     conflicted: HashSet<BString>,
-    /// Untracked paths from the directory walk, each flagged as a directory or
-    /// not (`--directory` prints collapsed directories with a `/`).
+    /// Every path the directory walk turned up — untracked *and* gix-ignored —
+    /// each flagged as a directory or not (`--directory` prints collapsed
+    /// directories with a `/`). This is git's `dir->entries` before its own
+    /// exclude verdict is applied: gix's `.gitignore` classification is discarded
+    /// because git consults no on-disk ignore file unless asked to, and the
+    /// `-x`/`-X`/`--exclude-per-directory` patterns it is asked to use can differ
+    /// from `.gitignore` entirely.
     others: Vec<(BString, bool)>,
-    /// Ignored paths, collected only under `-i` so the caller's own exclude stack
-    /// can classify the untracked ∪ ignored candidate set (gix's `.gitignore`
-    /// verdict is discarded — git's `-x`/`-X` patterns can differ from it).
-    ignored: Vec<(BString, bool)>,
 }
 
 /// Run one index↔worktree status pass and bucket the result.
 fn collect_worktree(
     repo: &gix::Repository,
     others: bool,
-    directory: bool,
-    want_ignored: bool,
     emit_empty: bool,
 ) -> Result<Worktree> {
     use gix::status::index_worktree::Item;
@@ -834,14 +1131,16 @@ fn collect_worktree(
         modified: HashSet::new(),
         conflicted: HashSet::new(),
         others: Vec::new(),
-        ignored: Vec::new(),
     };
 
-    let untracked = match (others, directory) {
-        (false, _) => gix::status::UntrackedFiles::None,
-        // `--directory` is git's "show 'other' directories' names only".
-        (true, true) => gix::status::UntrackedFiles::Collapsed,
-        (true, false) => gix::status::UntrackedFiles::Files,
+    // Always ask for individual files. `--directory` collapsing is git's own
+    // index-driven rule, applied by the caller over the full path list; gix's
+    // `Collapsed` mode decides it from what is tracked *and present*, which
+    // differs whenever a tracked file below the directory has been deleted.
+    let untracked = if others {
+        gix::status::UntrackedFiles::Files
+    } else {
+        gix::status::UntrackedFiles::None
     };
 
     // Pathspec filtering is applied by the caller against every candidate, so the
@@ -849,14 +1148,14 @@ fn collect_worktree(
     let mut platform = repo
         .status(gix::progress::Discard)?
         .untracked_files(untracked);
-    // `-i` needs ignored entries emitted individually (git lists ignored files,
-    // not collapsed directories, by default); `emit_empty` surfaces empty
-    // untracked directories so `--directory` can show them like git's default.
-    if want_ignored || emit_empty {
-        platform = platform.dirwalk_options(|mut o| {
-            if want_ignored {
-                o = o.emit_ignored(Some(gix::dir::walk::EmissionMode::Matching));
-            }
+    // gix hides `.gitignore`-matched paths from the walk, but git's walk only
+    // hides what the *caller's* exclude configuration matches, so ask for the
+    // ignored entries too and let [`Excludes`] deliver the single verdict.
+    // `emit_empty` surfaces empty untracked directories so `--directory` can show
+    // them like git's default.
+    if others {
+        platform = platform.dirwalk_options(move |mut o| {
+            o = o.emit_ignored(Some(gix::dir::walk::EmissionMode::Matching));
             if emit_empty {
                 o = o.emit_empty_directories(true);
             }
@@ -895,8 +1194,21 @@ fn collect_worktree(
                     gix::dir::entry::Status::Untracked => {
                         out.others.push((entry.rela_path, is_dir));
                     }
-                    gix::dir::entry::Status::Ignored(_) if want_ignored => {
-                        out.ignored.push((entry.rela_path, is_dir));
+                    // gix stops at a directory its `.gitignore` rules exclude and
+                    // reports just that directory. git's walk has no such rules
+                    // unless the caller supplied them, so recover the contents it
+                    // would have collected.
+                    gix::dir::entry::Status::Ignored(_) => {
+                        let plain_dir = matches!(
+                            entry.disk_kind,
+                            Some(gix::dir::entry::Kind::Directory)
+                        );
+                        match repo.workdir().filter(|_| plain_dir) {
+                            Some(root) => {
+                                expand_ignored_dir(root, entry.rela_path.as_bstr(), &mut out.others);
+                            }
+                            None => out.others.push((entry.rela_path, is_dir)),
+                        }
                     }
                     _ => {}
                 }
@@ -905,6 +1217,41 @@ fn collect_worktree(
         }
     }
     Ok(out)
+}
+
+/// Collect the paths git's `read_directory_recursive` would have gathered under
+/// `rela`, which gix handed over as one collapsed ignored directory.
+///
+/// Mirrors what that walk does with a `readdir` result: `.git` is never
+/// descended, a nested repository is reported as the directory itself, a symlink
+/// counts as a file rather than a directory to recurse into, and an empty
+/// directory contributes nothing.
+fn expand_ignored_dir(root: &Path, rela: &BStr, out: &mut Vec<(BString, bool)>) {
+    let dir = root.join(gix::path::from_bstr(rela));
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        out.push((rela.to_owned(), true));
+        return;
+    };
+    for entry in read.flatten() {
+        let name = gix::path::into_bstr(PathBuf::from(entry.file_name())).into_owned();
+        if name == ".git" {
+            continue;
+        }
+        let mut child = BString::from(rela.to_vec());
+        child.push(b'/');
+        child.extend_from_slice(&name);
+        // `file_type` does not follow symlinks, so a symlink to a directory is a
+        // file here, exactly as `DT_LNK` is for git.
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if dir.join(entry.file_name()).join(".git").exists() {
+                out.push((child, true));
+            } else {
+                expand_ignored_dir(root, child.as_bstr(), out);
+            }
+        } else {
+            out.push((child, false));
+        }
+    }
 }
 
 /// Decide `(deleted, modified)` for one index entry, the way git's per-entry
@@ -957,6 +1304,485 @@ fn entry_worktree_change(
     (false, modified)
 }
 
+/// git's `index_name_pos`: binary search for `name` at stage 0 over the index,
+/// which is ordered by name and then stage, returning `Err(insertion_point)` when
+/// there is no stage-0 entry under that exact name.
+fn index_name_pos(index: &gix::index::State, name: &[u8]) -> Result<usize, usize> {
+    index.entries().binary_search_by(|e| {
+        e.path(index)
+            .as_bytes()
+            .cmp(name)
+            .then_with(|| e.stage_raw().cmp(&0))
+    })
+}
+
+/// git's `index_name_is_other`: a walked path is reported by `-o` only when the
+/// index holds no entry under that name at any stage. A collapsed directory
+/// entry's trailing `/` is dropped before the lookup, which is what keeps
+/// `git ls-files -o --directory` from printing an untracked directory shadowing a
+/// tracked file of the same name — while `-k` still reports it as killed.
+fn index_name_is_other(index: &gix::index::State, name: &BStr) -> bool {
+    let bytes = name.as_bytes();
+    let bytes = bytes.strip_suffix(b"/").unwrap_or(bytes);
+    let Err(pos) = index_name_pos(index, bytes) else {
+        return false; // exact stage-0 match
+    };
+    // The entry at the insertion point carries the same name only when it is
+    // unmerged, which still counts as known to the index.
+    !index
+        .entries()
+        .get(pos)
+        .is_some_and(|e| e.path(index).as_bytes() == bytes)
+}
+
+/// git's `directory_exists_in_index` reduced to its `index_directory` verdict:
+/// does the index hold anything *below* `dir`? Names sort bytewise and `dir/`
+/// sorts before every path under it, so the first entry at or after `dir/` is the
+/// only one that can carry that prefix.
+fn index_has_directory(index: &gix::index::State, dir: &[u8]) -> bool {
+    let mut probe = dir.to_vec();
+    probe.push(b'/');
+    let pos = match index_name_pos(index, &probe) {
+        Ok(pos) | Err(pos) => pos,
+    };
+    index
+        .entries()
+        .get(pos)
+        .is_some_and(|e| e.path(index).as_bytes().starts_with(&probe))
+}
+
+/// git's `treat_directory` under `DIR_SHOW_OTHER_DIRECTORIES` (`--directory`): a
+/// walked path is reported as the outermost of its parent directories the index
+/// knows nothing below. A directory the index does have entries under is recursed
+/// into instead, which is why a path such as `a/b/deep` survives uncollapsed while
+/// `a/b/c.txt` is still tracked — even when that tracked file is gone from disk.
+fn collapse_other_directory(
+    index: &gix::index::State,
+    path: &BStr,
+    is_dir: bool,
+) -> (BString, bool) {
+    let bytes = path.as_bytes();
+    let mut at = 0;
+    while let Some(off) = bytes[at..].iter().position(|&b| b == b'/') {
+        let cut = at + off;
+        if index_has_directory(index, &bytes[..cut]) {
+            at = cut + 1;
+            continue;
+        }
+        return (BString::from(&bytes[..cut]), true);
+    }
+    (path.to_owned(), is_dir)
+}
+
+/// Port of the predicate inside git's `show_killed_files()`, applied to one
+/// collected directory entry (a directory entry carries git's trailing `/`).
+///
+/// A walked path is *killed* when checking the index out would have to remove it:
+/// either one of its leading directories is registered in the index as a file, so
+/// that file cannot be written while the directory is in the way, or the index
+/// registers something beneath the path, forcing it to become a directory.
+fn is_killed(index: &gix::index::State, name: &BStr) -> bool {
+    let bytes = name.as_bytes();
+    let entries = index.entries();
+    let mut start = 0;
+    while start < bytes.len() {
+        let Some(off) = bytes[start..].iter().position(|&b| b == b'/') else {
+            // No further slash: "if ent->name is prefix of an entry in the cache,
+            // it will be killed".
+            let Err(mut pos) = index_name_pos(index, bytes) else {
+                // git `BUG()`s here — the walk never collects an indexed path.
+                return false;
+            };
+            while entries.get(pos).is_some_and(|e| e.stage_raw() != 0) {
+                pos += 1; // skip unmerged
+            }
+            let Some(next) = entries.get(pos) else {
+                return false;
+            };
+            // `next` is the name immediately after `bytes`; does it expect
+            // `bytes` to be a directory?
+            let cand = next.path(index).as_bytes();
+            return cand.len() > bytes.len()
+                && cand.starts_with(bytes)
+                && cand[bytes.len()] == b'/';
+        };
+        // "If any of the leading directories in ent->name is registered in the
+        // cache, ent->name will be killed."
+        let cut = start + off;
+        if index_name_pos(index, &bytes[..cut]).is_ok() {
+            return true;
+        }
+        start = cut + 1;
+    }
+    false
+}
+
+/// The `text`/`crlf` attribute reduced to `convert.c`'s `enum convert_crlf_action`,
+/// in the `attr_action` form `get_convert_attr_ascii` renders — i.e. before
+/// `core.autocrlf`/`core.eol` get a say, which is why `text` stays `text`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CrlfAction {
+    Undefined,
+    Binary,
+    Text,
+    TextInput,
+    TextCrlf,
+    Auto,
+    AutoCrlf,
+    AutoInput,
+}
+
+impl CrlfAction {
+    /// git's `git_path_check_crlf`, shared by the `text` and `crlf` attributes.
+    fn from_state(state: gix::attrs::StateRef<'_>) -> Self {
+        match state {
+            gix::attrs::StateRef::Set => CrlfAction::Text,
+            gix::attrs::StateRef::Unset => CrlfAction::Binary,
+            gix::attrs::StateRef::Unspecified => CrlfAction::Undefined,
+            gix::attrs::StateRef::Value(v) => match v.as_bstr().as_bytes() {
+                b"input" => CrlfAction::TextInput,
+                b"auto" => CrlfAction::Auto,
+                _ => CrlfAction::Undefined,
+            },
+        }
+    }
+
+    /// git's `get_convert_attr_ascii` spelling of each action.
+    fn as_str(self) -> &'static str {
+        match self {
+            CrlfAction::Undefined => "",
+            CrlfAction::Binary => "-text",
+            CrlfAction::Text => "text",
+            CrlfAction::TextInput => "text eol=lf",
+            CrlfAction::TextCrlf => "text eol=crlf",
+            CrlfAction::Auto => "text=auto",
+            CrlfAction::AutoCrlf => "text=auto eol=crlf",
+            CrlfAction::AutoInput => "text=auto eol=lf",
+        }
+    }
+}
+
+/// git's `enum eol` as far as the `eol` attribute can express it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EolAttr {
+    Unset,
+    Lf,
+    Crlf,
+}
+
+impl EolAttr {
+    /// git's `git_path_check_eol`.
+    fn from_state(state: gix::attrs::StateRef<'_>) -> Self {
+        match state {
+            gix::attrs::StateRef::Value(v) => match v.as_bstr().as_bytes() {
+                b"lf" => EolAttr::Lf,
+                b"crlf" => EolAttr::Crlf,
+                _ => EolAttr::Unset,
+            },
+            _ => EolAttr::Unset,
+        }
+    }
+}
+
+/// The convert-stat machinery behind `--eol` and the three `%(eol…)` format atoms.
+struct Eol<'r> {
+    /// The object store every indexed blob is read from. git reads it from the
+    /// *superproject* even while listing a submodule, which is why a submodule's
+    /// entries report `i/none`; keeping one repository here reproduces that.
+    repo: &'r gix::Repository,
+    /// Absolute worktree root. git's `RUN_SETUP` has already chdir'd there, so its
+    /// `lstat(fullname)` is worktree-relative; this port keeps the caller's
+    /// directory and joins instead.
+    workdir: Option<PathBuf>,
+    stack: gix::AttributeStack<'r>,
+    outcome: gix::attrs::search::Outcome,
+}
+
+impl<'r> Eol<'r> {
+    fn new(repo: &'r gix::Repository, index: &gix::index::State) -> Result<Self> {
+        Ok(Eol {
+            repo,
+            workdir: repo.workdir().map(Path::to_path_buf),
+            stack: repo.attributes_only(
+                index,
+                gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+            )?,
+            outcome: gix::attrs::search::Outcome::default(),
+        })
+    }
+
+    /// git's `write_eolinfo`: `printf("i/%-5s w/%-5s attr/%-17s\t", …)`.
+    fn columns(&mut self, entry: Option<&gix::index::Entry>, full: &BStr) -> String {
+        let index = self.index_stats(entry);
+        let worktree = self.worktree_stats(full);
+        let attr = self.attr(full);
+        format!("i/{index:<5} w/{worktree:<5} attr/{attr:<17}\t")
+    }
+
+    /// git's `get_cached_convert_stats_ascii`, gated on the cache entry being a
+    /// regular file — a symlink or gitlink contributes an empty column.
+    fn index_stats(&mut self, entry: Option<&gix::index::Entry>) -> &'static str {
+        let Some(entry) = entry.filter(|e| {
+            matches!(
+                e.mode,
+                gix::index::entry::Mode::FILE | gix::index::entry::Mode::FILE_EXECUTABLE
+            )
+        }) else {
+            return "";
+        };
+        match self.repo.find_object(entry.id) {
+            // A blob git cannot read yields a NULL buffer, which its statistics
+            // report as "none" rather than as an error.
+            Ok(obj) => convert_stats_ascii(&obj.data),
+            Err(_) => convert_stats_ascii(&[]),
+        }
+    }
+
+    /// git's `lstat` + `get_wt_convert_stats_ascii` pair: only a regular file in
+    /// the worktree contributes a column.
+    fn worktree_stats(&mut self, full: &BStr) -> &'static str {
+        let Some(root) = self.workdir.as_ref() else {
+            return "";
+        };
+        let path = root.join(gix::path::from_bstr(full));
+        match std::fs::symlink_metadata(&path) {
+            Ok(md) if md.is_file() => match std::fs::read(&path) {
+                Ok(bytes) => convert_stats_ascii(&bytes),
+                Err(_) => "",
+            },
+            _ => "",
+        }
+    }
+
+    /// git's `get_convert_attr_ascii`: the `text`, `crlf` and `eol` attributes
+    /// combined the way `convert_attrs` records them in `ca->attr_action`.
+    fn attr(&mut self, full: &BStr) -> &'static str {
+        let mode = Some(gix::index::entry::Mode::FILE);
+        // The first descent loads the `.gitattributes` along the path so the
+        // collection knows every attribute name before the outcome is sized.
+        if self.stack.at_entry(full, mode).is_err() {
+            return "";
+        }
+        self.outcome
+            .initialize_with_selection(self.stack.attributes_collection(), ["text", "crlf", "eol"]);
+        let Ok(platform) = self.stack.at_entry(full, mode) else {
+            return "";
+        };
+        platform.matching_attributes(&mut self.outcome);
+        // `iter_selected` yields in the order the selection was given.
+        let states: Vec<_> = self
+            .outcome
+            .iter_selected()
+            .map(|m| m.assignment.state)
+            .collect();
+        let [text, crlf, eol] = states[..] else {
+            return "";
+        };
+
+        let mut action = CrlfAction::from_state(text);
+        if action == CrlfAction::Undefined {
+            action = CrlfAction::from_state(crlf);
+        }
+        if action != CrlfAction::Binary {
+            action = match (action, EolAttr::from_state(eol)) {
+                (CrlfAction::Auto, EolAttr::Lf) => CrlfAction::AutoInput,
+                (CrlfAction::Auto, EolAttr::Crlf) => CrlfAction::AutoCrlf,
+                (_, EolAttr::Lf) => CrlfAction::TextInput,
+                (_, EolAttr::Crlf) => CrlfAction::TextCrlf,
+                (action, EolAttr::Unset) => action,
+            };
+        }
+        action.as_str()
+    }
+}
+
+/// Port of `convert.c`'s `struct text_stat`, whose counts decide both the
+/// binary heuristic and the reported line-ending flavour.
+#[derive(Default)]
+struct TextStat {
+    nul: u32,
+    lonecr: u32,
+    lonelf: u32,
+    crlf: u32,
+    printable: u32,
+    nonprintable: u32,
+}
+
+/// Port of `convert.c`'s `gather_stats`.
+fn gather_stats(buf: &[u8]) -> TextStat {
+    let mut stats = TextStat::default();
+    let mut i = 0;
+    while i < buf.len() {
+        match buf[i] {
+            b'\r' => {
+                if buf.get(i + 1) == Some(&b'\n') {
+                    stats.crlf += 1;
+                    i += 1;
+                } else {
+                    stats.lonecr += 1;
+                }
+            }
+            b'\n' => stats.lonelf += 1,
+            // DEL
+            127 => stats.nonprintable += 1,
+            // BS, HT, ESC and FF read as printable; NUL is counted twice, once as
+            // a NUL and once (by fall-through) as non-printable.
+            c if c < 32 => match c {
+                0x08 | 0x09 | 0x1b | 0x0c => stats.printable += 1,
+                0 => {
+                    stats.nul += 1;
+                    stats.nonprintable += 1;
+                }
+                _ => stats.nonprintable += 1,
+            },
+            _ => stats.printable += 1,
+        }
+        i += 1;
+    }
+    // "If file ends with EOF then don't count this EOF as non-printable."
+    if buf.last() == Some(&0x1a) {
+        stats.nonprintable = stats.nonprintable.wrapping_sub(1);
+    }
+    stats
+}
+
+/// Port of `convert.c`'s `convert_is_binary`: the same heuristic `diff` uses,
+/// plus treating a bare CR as binary.
+fn is_binary(stats: &TextStat) -> bool {
+    stats.lonecr != 0 || stats.nul != 0 || (stats.printable >> 7) < stats.nonprintable
+}
+
+/// Port of `convert.c`'s `gather_convert_stats_ascii`, the `<eolinfo>` vocabulary
+/// documented for `--eol`. Empty (or unreadable) content reports `none`, matching
+/// git's `gather_convert_stats` early return for a NULL buffer.
+fn convert_stats_ascii(data: &[u8]) -> &'static str {
+    if data.is_empty() {
+        return "none";
+    }
+    let stats = gather_stats(data);
+    if is_binary(&stats) {
+        return "-text";
+    }
+    match (stats.crlf != 0, stats.lonelf != 0) {
+        (false, true) => "lf",
+        (true, false) => "crlf",
+        (true, true) => "mixed",
+        (false, false) => "none",
+    }
+}
+
+/// The submodule paths git's `is_submodule_active` would accept, empty unless
+/// `--recurse-submodules` was given.
+fn active_submodules(repo: &gix::Repository, opts: &Opts) -> HashSet<BString> {
+    if !opts.recurse_submodules {
+        return HashSet::new();
+    }
+    let Ok(Some(subs)) = repo.submodules() else {
+        return HashSet::new();
+    };
+    subs.filter(|sm| sm.is_active().unwrap_or(false))
+        .filter_map(|sm| sm.path().ok())
+        .collect()
+}
+
+/// Port of git's `show_submodule`: open the submodule checked out at `sub_rela`
+/// inside `parent`, read its index, and emit its entries under `name_prefix`,
+/// recursing for nested active submodules.
+///
+/// Only `--cached`/`--stage` can reach here — git rejects every worktree-facing
+/// selector alongside `--recurse-submodules` — so this reproduces just the
+/// cached-line half of `show_files`. A submodule whose repository or index cannot
+/// be opened is skipped, where git's `repo_submodule_init` returns and its
+/// `repo_read_index` dies.
+#[allow(clippy::too_many_arguments)] // mirrors the state show_files threads through
+fn emit_submodule(
+    parent: &gix::Repository,
+    sub_rela: &BStr,
+    name_prefix: &BStr,
+    opts: &Opts,
+    ps: &mut gix::Pathspec<'_>,
+    matcher: &mut Excludes<'_>,
+    prefix: Option<&BString>,
+    quote: bool,
+    terminator: u8,
+    mut eol: Option<&mut Eol<'_>>,
+    lines: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    let Some(workdir) = parent.workdir() else {
+        return Ok(());
+    };
+    let Ok(sub) = gix::open(workdir.join(gix::path::from_bstr(sub_rela))) else {
+        return Ok(());
+    };
+    let Ok(index) = sub.open_index() else {
+        return Ok(());
+    };
+    let active = active_submodules(&sub, opts);
+
+    for entry in index.entries() {
+        let path = entry.path(&index);
+        let mut full = BString::from(name_prefix.to_vec());
+        full.push(b'/');
+        full.extend_from_slice(path.as_bytes());
+
+        // A nested active submodule is descended into ahead of the pathspec, just
+        // as at the top level.
+        if entry.mode == gix::index::entry::Mode::COMMIT && active.contains(path) {
+            if !opts.ignored || matcher.is_excluded(full.as_bstr(), true) {
+                emit_submodule(
+                    &sub,
+                    path,
+                    full.as_bstr(),
+                    opts,
+                    ps,
+                    matcher,
+                    prefix,
+                    quote,
+                    terminator,
+                    eol.as_deref_mut(),
+                    lines,
+                )?;
+            }
+            continue;
+        }
+
+        let Some(m) = ps.pattern_matching_relative_path(full.as_bstr(), Some(false)) else {
+            continue;
+        };
+        if m.is_excluded() {
+            continue;
+        }
+        if opts.ignored && !matcher.is_excluded(full.as_bstr(), false) {
+            continue;
+        }
+
+        let stage = entry.stage_raw();
+        let tag = if entry
+            .flags
+            .contains(gix::index::entry::Flags::SKIP_WORKTREE)
+        {
+            "S "
+        } else if stage != 0 {
+            "M "
+        } else {
+            "H "
+        };
+        let display = strip_prefix(full.as_bstr(), prefix).to_vec();
+        lines.push(render(
+            opts,
+            tag,
+            Some(entry),
+            &sub,
+            full.as_bstr(),
+            &display,
+            quote,
+            terminator,
+            eol.as_deref_mut(),
+        ));
+    }
+    Ok(())
+}
+
 /// Render an object id the way git's `find_unique_abbrev` does for these
 /// columns: the full hex name when `--abbrev` was absent, the `core.abbrev`/auto
 /// length when `--abbrev` carried no value, or exactly `n` hex digits for
@@ -988,16 +1814,24 @@ fn resolve_undo_line(
     line
 }
 
-/// Build one output line: optional status tag, optional stage columns, path,
-/// the line terminator, and (under `--debug`) the trailing stat block.
+/// Build one output line: optional status tag, optional stage columns, the
+/// `--eol` columns, the path, the line terminator, and (under `--debug`) the
+/// trailing stat block.
+///
+/// `full` is the repository-root-relative name git passes to `write_eolinfo` —
+/// the same string it `lstat`s and looks attributes up for — while `display` is
+/// that name already reduced to the caller's current directory.
+#[allow(clippy::too_many_arguments)] // git's show_ce carries the same state
 fn render(
     opts: &Opts,
     tag: &str,
     entry: Option<&gix::index::Entry>,
     repo: &gix::Repository,
+    full: &BStr,
     display: &[u8],
     quote: bool,
     terminator: u8,
+    mut eol: Option<&mut Eol<'_>>,
 ) -> Vec<u8> {
     let mut line = Vec::with_capacity(display.len() + 64);
     let path_bytes = if quote {
@@ -1009,12 +1843,21 @@ fn render(
     // `--format` replaces the whole per-entry layout with the interpolated
     // template; it is validated to never co-occur with `-o`/`-s`/`-t`/dedup.
     if let Some(fmt) = &opts.format {
-        expand_format(&mut line, fmt, entry, repo, &path_bytes, opts.abbrev);
+        expand_format(
+            &mut line,
+            fmt,
+            entry,
+            repo,
+            full,
+            &path_bytes,
+            opts.abbrev,
+            eol.as_deref_mut(),
+        );
         line.push(terminator);
         return line;
     }
 
-    if opts.tags {
+    if opts.shows_tags() {
         // `-v`/`-f` lowercase the tag for 'assume unchanged' / 'fsmonitor clean'
         // index entries (git's `get_tag`); directory-walk results have no entry.
         let tag = alt_tag(opts, tag, entry);
@@ -1032,6 +1875,13 @@ fn render(
             )
             .as_bytes(),
         );
+    }
+    // git's `write_eolinfo` sits between the stage columns and the name, and its
+    // own trailing tab is what separates it from that name.
+    if opts.eol {
+        if let Some(eol) = eol.as_deref_mut() {
+            line.extend_from_slice(eol.columns(entry, full).as_bytes());
+        }
     }
     line.extend_from_slice(&path_bytes);
     line.push(terminator);
@@ -1102,16 +1952,19 @@ fn append_debug(line: &mut Vec<u8>, entry: &gix::index::Entry) {
 /// `%(objecttype)`, `%(objectsize)`, `%(objectsize:padded)`, `%(stage)` and
 /// `%(path)`, plus `%%` and `%x<hh>` byte escapes.
 ///
-/// The `%(eolinfo:index)`, `%(eolinfo:worktree)` and `%(eolattr)` atoms are
-/// recognised but expand to the empty string, as line-ending convert-stats are
-/// not ported. An unrecognised `%(...)` atom is copied through verbatim.
+/// `%(eolinfo:index)`, `%(eolinfo:worktree)` and `%(eolattr)` expand to the same
+/// convert-stat strings `--eol` prints, just without the column padding. An
+/// unrecognised `%(...)` atom is copied through verbatim.
+#[allow(clippy::too_many_arguments)] // mirrors show_ce_fmt's parameter set
 fn expand_format(
     out: &mut Vec<u8>,
     fmt: &str,
     entry: Option<&gix::index::Entry>,
     repo: &gix::Repository,
+    full: &BStr,
     path_bytes: &[u8],
     abbrev: Option<Option<usize>>,
+    mut eol: Option<&mut Eol<'_>>,
 ) {
     let chars: Vec<char> = fmt.chars().collect();
     let mut i = 0;
@@ -1173,9 +2026,21 @@ fn expand_format(
                         }
                     }
                     "path" => out.extend_from_slice(path_bytes),
-                    // Line-ending convert-stats are not ported; git yields empty
-                    // for these on binary/non-regular content and unset attrs.
-                    "eolinfo:index" | "eolinfo:worktree" | "eolattr" => {}
+                    "eolinfo:index" => {
+                        if let Some(eol) = eol.as_deref_mut() {
+                            out.extend_from_slice(eol.index_stats(entry).as_bytes());
+                        }
+                    }
+                    "eolinfo:worktree" => {
+                        if let Some(eol) = eol.as_deref_mut() {
+                            out.extend_from_slice(eol.worktree_stats(full).as_bytes());
+                        }
+                    }
+                    "eolattr" => {
+                        if let Some(eol) = eol.as_deref_mut() {
+                            out.extend_from_slice(eol.attr(full).as_bytes());
+                        }
+                    }
                     other => {
                         out.extend_from_slice(b"%(");
                         out.extend_from_slice(other.as_bytes());
@@ -1313,6 +2178,60 @@ mod tests {
         // under `-z` the NUL terminates and no quoting is applied by the caller.
         let z = resolve_undo_line("", 0o100755, "def4567", 3, b"x", b'\0');
         assert_eq!(z, b"100755 def4567 3\tx\0");
+    }
+
+    #[test]
+    fn convert_stats_follow_gits_eolinfo_vocabulary() {
+        // The five spellings `git ls-files --eol` documents, from convert.c's
+        // gather_convert_stats_ascii.
+        assert_eq!(convert_stats_ascii(b"a\nb\n"), "lf");
+        assert_eq!(convert_stats_ascii(b"a\r\nb\r\n"), "crlf");
+        assert_eq!(convert_stats_ascii(b"a\nb\r\n"), "mixed");
+        // No line terminator at all, and the NULL/empty buffer git reports the
+        // same way, are both "none".
+        assert_eq!(convert_stats_ascii(b"abc"), "none");
+        assert_eq!(convert_stats_ascii(b""), "none");
+        // A NUL byte and a bare CR are each enough to call it binary.
+        assert_eq!(convert_stats_ascii(b"a\0b\n"), "-text");
+        assert_eq!(convert_stats_ascii(b"a\rb"), "-text");
+        // BS, HT, ESC and FF count as printable, so they stay text.
+        assert_eq!(convert_stats_ascii(b"\x08\x09\x1b\x0c ok\n"), "lf");
+        // DEL is non-printable, and one of them outweighs `printable >> 7`.
+        assert_eq!(convert_stats_ascii(b"\x7f\n"), "-text");
+    }
+
+    #[test]
+    fn trailing_sub_byte_is_not_counted_as_non_printable() {
+        // convert.c decrements `nonprintable` when the last byte is 0x1A, which
+        // is what keeps a DOS-terminated text file out of the binary bucket.
+        assert_eq!(convert_stats_ascii(b"x\ny\n\x1a"), "lf");
+        // Without that adjustment the same content one byte earlier is binary,
+        // since 0x1A is otherwise a control byte.
+        assert_eq!(convert_stats_ascii(b"x\n\x1a\n"), "-text");
+    }
+
+    #[test]
+    fn eol_columns_match_gits_write_eolinfo_widths() {
+        // git: printf("i/%-5s w/%-5s attr/%-17s\t", …). The longest <eolinfo> is
+        // exactly 5 wide, so only the attribute column ever pads visibly.
+        let line = format!("i/{:<5} w/{:<5} attr/{:<17}\t", "lf", "crlf", "text eol=crlf");
+        assert_eq!(line, "i/lf    w/crlf  attr/text eol=crlf    \t");
+        let empty = format!("i/{:<5} w/{:<5} attr/{:<17}\t", "", "", "");
+        assert_eq!(empty, "i/      w/      attr/                 \t");
+        let binary = format!("i/{:<5} w/{:<5} attr/{:<17}\t", "-text", "mixed", "text=auto eol=crlf");
+        assert_eq!(binary, "i/-text w/mixed attr/text=auto eol=crlf\t");
+    }
+
+    #[test]
+    fn crlf_action_spellings_match_get_convert_attr_ascii() {
+        assert_eq!(CrlfAction::Undefined.as_str(), "");
+        assert_eq!(CrlfAction::Binary.as_str(), "-text");
+        assert_eq!(CrlfAction::Text.as_str(), "text");
+        assert_eq!(CrlfAction::TextInput.as_str(), "text eol=lf");
+        assert_eq!(CrlfAction::TextCrlf.as_str(), "text eol=crlf");
+        assert_eq!(CrlfAction::Auto.as_str(), "text=auto");
+        assert_eq!(CrlfAction::AutoCrlf.as_str(), "text=auto eol=crlf");
+        assert_eq!(CrlfAction::AutoInput.as_str(), "text=auto eol=lf");
     }
 
     #[test]

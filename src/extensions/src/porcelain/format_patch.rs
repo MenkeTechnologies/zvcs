@@ -81,6 +81,19 @@
 //!     whitespace-insensitive diffing, patience diff (imara-diff has Myers,
 //!     MyersMinimal and Histogram only), and rename/copy detection.
 //!
+//! ### Config
+//!
+//! The `format.*` keys read here are the defaults for the options above:
+//! `outputDirectory`, `numbered`, `suffix`, `subjectPrefix`, `signature`,
+//! `signatureFile`, `filenameMaxLength`, `coverLetter`, `to`, `cc`, `headers`,
+//! `encodeEmailHeaders` (the `--[no-]encode-email-headers` default; on), and
+//! `noprefix` (the `--no-prefix` default). `format.mboxrd` has no command-line
+//! spelling at all in format-patch and is read directly. The rest all default an
+//! option in the unported list above — `attach`, `commitListFormat`,
+//! `coverFromDescription`, `forceInBodyFrom`, `from`, `notes`, `signOff`,
+//! `thread`, `useAutoBase` — so none of them is read; `format.pretty` belongs to
+//! `log`/`show`, not here.
+//!
 //! Known deviations, stated rather than hidden: rename/copy detection is
 //! disabled (as elsewhere in this crate), so a commit that renames a file
 //! renders as a delete plus an add instead of git's `rename from`/`rename to`
@@ -219,6 +232,18 @@ struct Opts {
     cc: Vec<String>,
     /// `--add-header`: extra header lines, emitted verbatim before `To:`/`Cc:`.
     add_header: Vec<String>,
+    /// `--[no-]encode-email-headers`, defaulted by `format.encodeEmailHeaders`
+    /// (git's default is on): Q-encode `From:`/`Subject:` when they carry
+    /// non-ASCII. With it off the raw UTF-8 goes out, and the `MIME-Version:`/
+    /// `Content-*` block a non-ASCII message triggers is unaffected.
+    encode_email_headers: bool,
+    /// `format.mboxrd`: with `--stdout`, escape `/^>*From /` message-body lines
+    /// with one more `>` so an mbox reader cannot mistake them for a separator.
+    /// git has no command-line spelling of this for format-patch.
+    mboxrd: bool,
+    /// `--no-prefix`/`format.noprefix`: drop the `a/`+`b/` path prefixes from
+    /// `diff --git`, `---` and `+++`. `--default-prefix` puts them back.
+    noprefix: bool,
 
     // Revision selection.
     root: bool,
@@ -410,10 +435,8 @@ const NO_OP: &[&str] = &[
     "--no-thread",
     "--no-notes",
     "--no-base",
-    "--no-encode-email-headers",
     "--no-force-in-body-from",
     "--no-relative",
-    "--default-prefix",
     "--ita-invisible-in-index",
     "--binary",
 ];
@@ -459,7 +482,6 @@ const DEFERRED: &[&str] = &[
     "--inter-hunk-context",
     "--function-context",
     "--textconv",
-    "--no-prefix",
     "--line-prefix",
     "--output-indicator-new",
     "--output-indicator-old",
@@ -537,6 +559,9 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         to: cfg_list("format.to"),
         cc: cfg_list("format.cc"),
         add_header: cfg_list("format.headers"),
+        encode_email_headers: snap.boolean("format.encodeEmailHeaders").unwrap_or(true),
+        mboxrd: snap.boolean("format.mboxrd") == Some(true),
+        noprefix: snap.boolean("format.noprefix") == Some(true),
         root: false,
         max_count: None,
         skip: 0,
@@ -613,6 +638,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "--no-signature" => o.sig_cli = SigCli::No,
             "--zero-commit" => o.zero_commit = true,
             "--no-zero-commit" => o.zero_commit = false,
+            "--encode-email-headers" => o.encode_email_headers = true,
+            "--no-encode-email-headers" => o.encode_email_headers = false,
+            "--no-prefix" => o.noprefix = true,
+            "--default-prefix" => o.noprefix = false,
             "-p" | "--no-stat" => o.use_patch_format = true,
             // Each of these ORs its own `DIFF_FORMAT_*` bit in, which is what
             // makes them *replace* format-patch's `DIFFSTAT|SUMMARY` default
@@ -1801,7 +1830,7 @@ fn render_message(
         .format(gix::date::time::format::GIT_RFC2822)?;
     // `--in-reply-to` puts its headers ahead of everything, so it goes in first.
     write_in_reply_to(&mut sb, opts);
-    write_identity_headers(&mut sb, author_name, author_mail, &date);
+    write_identity_headers(&mut sb, author_name, author_mail, &date, opts.encode_email_headers);
 
     // Subject: — the first paragraph, folded onto one logical line, unless
     // `-k`/`--keep-subject` asked for the raw first paragraph (newlines and all).
@@ -1834,6 +1863,7 @@ fn render_message(
     let beginning_of_body = sb.len();
     let mut body: Vec<u8> = Vec::new();
     pp_remainder(rest, &mut body);
+    mboxrd_escape(&mut body, opts);
     sb.push_str(
         body.to_str()
             .map_err(|_| anyhow!("commit message is not valid UTF-8"))?,
@@ -1967,8 +1997,18 @@ fn render_cover_letter(
         }
     };
     write_in_reply_to(&mut sb, opts);
-    write_identity_headers(&mut sb, &name, &mail, &date);
+    write_identity_headers(&mut sb, &name, &mail, &date, opts.encode_email_headers);
     write_subject(&mut sb, COVER_SUBJECT, 0, total, opts);
+    // `make_cover_letter()` seeds `pp_title_line()` with
+    // `need_8bit_cte = has_non_ascii(committer)`: the cover letter carries no
+    // commit message, so it is the *identity* alone that decides whether the
+    // 8-bit MIME block is emitted — and it is emitted whether or not the header
+    // itself was Q-encoded.
+    if name.bytes().chain(mail.bytes()).any(|b| b >= 0x80) {
+        sb.push_str("MIME-Version: 1.0\n");
+        sb.push_str(&format!("Content-Type: text/plain; charset={ENCODING}\n"));
+        sb.push_str("Content-Transfer-Encoding: 8bit\n");
+    }
     write_extra_headers(&mut sb, opts);
     sb.push('\n');
     sb.push_str(COVER_BLURB);
@@ -2055,10 +2095,16 @@ fn write_from_line(out: &mut Vec<u8>, id: ObjectId, opts: &Opts) -> Result<()> {
 
 /// `From:` — RFC2047 when non-ASCII, RFC822 quoting for specials, else wrapped —
 /// followed by `Date:`.
-fn write_identity_headers(sb: &mut String, name: &str, mail: &str, date: &str) {
+///
+/// `encode` is git's `encode_email_headers` (`--[no-]encode-email-headers`,
+/// `format.encodeEmailHeaders`, default on). With it off the name goes out as raw
+/// UTF-8 through the ordinary quoting/wrapping path; only the Q-encoding is
+/// skipped, so the `MIME-Version:`/`Content-Transfer-Encoding: 8bit` block a
+/// non-ASCII message still emits is unchanged.
+fn write_identity_headers(sb: &mut String, name: &str, mail: &str, date: &str, encode: bool) {
     sb.push_str("From: ");
     let mut max_length = HEADER_MAX_LENGTH;
-    if needs_rfc2047_encoding(name) {
+    if encode && needs_rfc2047_encoding(name) {
         add_rfc2047(sb, name, true);
         max_length = 76;
     } else if name.bytes().any(is_rfc822_special) {
@@ -2096,13 +2142,41 @@ fn write_subject(sb: &mut String, title: &str, nr: usize, total: usize, opts: &O
     } else {
         sb.push_str("Subject: ");
     }
-    if needs_rfc2047_encoding(title) {
+    if opts.encode_email_headers && needs_rfc2047_encoding(title) {
         add_rfc2047(sb, title, false);
     } else {
         let consumed = -last_line_length(sb);
         wrap_text(sb, title, consumed, 1, HEADER_MAX_LENGTH);
     }
     sb.push('\n');
+}
+
+/// `format.mboxrd`: escape the message body's `/^>*From /` lines with one more
+/// `>`, so a reader splitting an mbox on `From ` cannot mistake a body line for
+/// a message separator. git models this as a distinct pretty format
+/// (`CMIT_FMT_MBOXRD`) whose `pp_remainder()` prepends the `>`, which is why it
+/// reaches the commit-message body only: the subject is a header, and every
+/// diff line already carries a ` `/`+`/`-` prefix. The config is honoured only
+/// with `--stdout`, exactly as git documents and implements it — patches written
+/// to files are never concatenated into an mbox by format-patch itself.
+fn mboxrd_escape(body: &mut Vec<u8>, opts: &Opts) {
+    if !opts.mboxrd || !opts.to_stdout {
+        return;
+    }
+    let mut out = Vec::with_capacity(body.len());
+    for line in body.split_inclusive(|&b| b == b'\n') {
+        if is_mboxrd_from(line) {
+            out.push(b'>');
+        }
+        out.extend_from_slice(line);
+    }
+    *body = out;
+}
+
+/// git's `is_mboxrd_from()`: a line matching `/^>*From /`.
+fn is_mboxrd_from(line: &[u8]) -> bool {
+    let rest = &line[line.iter().take_while(|&&b| b == b'>').count()..];
+    rest.starts_with(b"From ")
 }
 
 /// `In-Reply-To:`/`References:` for `--in-reply-to`, emitted ahead of `From:` on
@@ -3083,7 +3157,7 @@ fn emit_change(
             ..
         } => {
             let path: &[u8] = location;
-            emit_git_header(out, path);
+            emit_git_header(out, path, opts);
             writeln!(out, "new file mode {:o}", entry_mode.value())?;
             let is_sub = entry_mode.is_commit();
             let content = content_of(repo, *id, is_sub)?;
@@ -3099,7 +3173,7 @@ fn emit_change(
             ..
         } => {
             let path: &[u8] = location;
-            emit_git_header(out, path);
+            emit_git_header(out, path, opts);
             writeln!(out, "deleted file mode {:o}", entry_mode.value())?;
             let is_sub = entry_mode.is_commit();
             let content = content_of(repo, *id, is_sub)?;
@@ -3116,7 +3190,7 @@ fn emit_change(
             id,
         } => {
             let path: &[u8] = location;
-            emit_git_header(out, path);
+            emit_git_header(out, path, opts);
             let old_mode = format!("{:o}", previous_entry_mode.value());
             let new_mode = format!("{:o}", entry_mode.value());
             let mode_changed = old_mode != new_mode;
@@ -3175,12 +3249,25 @@ fn reject_binary(is_submodule: bool, content: &[u8], path: &[u8], opts: &Opts) -
 }
 
 /// `diff --git a/<path> b/<path>` line, with git's `quote_two()` C-quoting.
-fn emit_git_header(out: &mut Vec<u8>, path: &[u8]) {
+/// Under `--no-prefix`/`format.noprefix` both prefixes are empty, so git emits
+/// `diff --git <path> <path>`.
+fn emit_git_header(out: &mut Vec<u8>, path: &[u8], opts: &Opts) {
+    let (a, b) = prefixes(opts);
     out.extend_from_slice(b"diff --git ");
-    out.extend_from_slice(&quote_two("a/", path));
+    out.extend_from_slice(&quote_two(a, path));
     out.push(b' ');
-    out.extend_from_slice(&quote_two("b/", path));
+    out.extend_from_slice(&quote_two(b, path));
     out.push(b'\n');
+}
+
+/// The `a/`+`b/` source/destination prefixes, emptied by `--no-prefix` /
+/// `format.noprefix`.
+fn prefixes(opts: &Opts) -> (&'static str, &'static str) {
+    if opts.noprefix {
+        ("", "")
+    } else {
+        ("a/", "b/")
+    }
 }
 
 /// Emit the `---`/`+++` headers and hunks, returning `(added, deleted)` line
@@ -3199,8 +3286,9 @@ fn emit_body(
         return Ok(counts);
     }
 
-    emit_file_header(out, b"--- ", old, "a/");
-    emit_file_header(out, b"+++ ", new, "b/");
+    let (a, b) = prefixes(opts);
+    emit_file_header(out, b"--- ", old, a);
+    emit_file_header(out, b"+++ ", new, b);
     out.extend_from_slice(&hunks);
     Ok(counts)
 }

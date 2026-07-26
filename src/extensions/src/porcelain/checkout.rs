@@ -1220,7 +1220,13 @@ fn update_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId) -> Result
     let should_interrupt = AtomicBool::new(false);
 
     // Current tracked state (worktree == this when clean), with real stats.
-    let old = repo.index_or_load_from_head()?.into_owned();
+    // `_or_empty` because the first checkout of a repository has neither: a
+    // freshly `init`ed repo that has only fetched objects has no index file and
+    // an unborn `HEAD`, and the plain `index_or_load_from_head` peels that
+    // unborn `HEAD` and fails. git checks out into exactly that state — it is
+    // how `git init && git fetch <url> <sha> && git checkout <sha>` works, the
+    // sequence tree-sitter grammar fetchers use.
+    let old = repo.index_or_load_from_head_or_empty()?.into_owned();
     let mut old_map: HashMap<BString, (ObjectId, Mode, Stat)> =
         HashMap::with_capacity(old.entries().len());
     {

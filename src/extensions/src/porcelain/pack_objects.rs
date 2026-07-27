@@ -629,8 +629,6 @@ pub(crate) struct Packed {
     pub(crate) bytes: Vec<u8>,
     pub(crate) id: ObjectId,
     pub(crate) entries: Vec<PackedEntry>,
-    /// How many entries were written as deltas, for the end-of-run summary.
-    deltas: usize,
 }
 
 /// Build a complete packfile from an explicit set of object ids and return its
@@ -928,7 +926,6 @@ fn write_pack(
         bytes,
         id,
         entries,
-        deltas: written_deltas,
     })
 }
 

@@ -3070,7 +3070,9 @@ const INFORM: &str = concat!(
 
 /// `Sys::Hostname::hostname()`, for the fallback message-id domain.
 fn hostname() -> String {
-    let mut buf = [0i8; 256];
+    // `c_char`, not `i8`: it is unsigned on aarch64 Linux and signed on x86_64
+    // and Darwin, so naming the concrete type builds on one and not the other.
+    let mut buf = [0 as libc::c_char; 256];
     let rc = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
     if rc != 0 {
         return "localhost".into();

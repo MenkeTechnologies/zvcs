@@ -1019,9 +1019,16 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
 
     // Normal fast-forward. `--no-commit` does not stop a fast-forward (there is no
     // merge commit to stop before), matching git.
+    //
+    // The worktree moves before the ref does, which is the order git's
+    // `checkout_fast_forward()` establishes: when the checkout aborts, git leaves
+    // the branch where it was and only `ORIG_HEAD` is written (checked against git
+    // 2.55.0, whose refusal to clobber an untracked file leaves `refs/heads/main`
+    // unmoved). Advancing first would strand a branch two commits ahead of its own
+    // checkout, with every later `status` reporting the difference as staged work.
     set_orig_head(&repo, local_id)?;
-    advance(&repo, name, local_id, target_id, format!("merge {spec}: Fast-forward"))?;
     update_worktree(&repo, &old_index, target_tree, &should_interrupt)?;
+    advance(&repo, name, local_id, target_id, format!("merge {spec}: Fast-forward"))?;
     if !opts.quiet {
         println!(
             "Updating {}..{}",

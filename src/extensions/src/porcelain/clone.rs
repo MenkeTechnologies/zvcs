@@ -151,6 +151,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     let mut shared = false;
     let mut dissociate = false;
     let mut sparse = false;
+    // `--filter=<spec>`: the object filter of a partial clone, validated up front so a bad spec is
+    // rejected with git's own message before the destination directory is created.
+    let mut filter: Option<gix::protocol::fetch::filter::Filter> = None;
+    // `--also-filter-submodules` / `--no-also-filter-submodules`; `None` leaves the choice to
+    // `clone.filterSubmodules`.
+    let mut also_filter_submodules: Option<bool> = None;
     let mut positionals: Vec<&str> = Vec::new();
 
     let mut i = 0;
@@ -248,6 +254,18 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--no-dissociate" => dissociate = false,
             "--sparse" => sparse = true,
             "--no-sparse" => sparse = false,
+            // `--filter=<spec>`: ask the remote to withhold the objects `<spec>` selects against.
+            // git parses the spec in `cmd_clone`'s option table, so an invalid one never reaches the
+            // network; `Filter::from_str` reproduces both the grammar and the messages.
+            "--filter" => {
+                let raw = take_value!("--filter");
+                filter = Some(raw.parse().map_err(|e| anyhow::anyhow!("{e}"))?);
+            }
+            "--no-filter" => filter = None,
+            // `--also-filter-submodules`: apply the same filter to the submodules the clone recurses
+            // into (git's `option_also_filter_submodules`).
+            "--also-filter-submodules" => also_filter_submodules = Some(true),
+            "--no-also-filter-submodules" => also_filter_submodules = Some(false),
             "--depth" => {
                 let v = take_value!("--depth");
                 let n: u32 = v
@@ -326,6 +344,19 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                  reftable backend"
             ),
             other => bail!("unknown ref storage format '{other}'"),
+        }
+    }
+
+    // `--also-filter-submodules` is meaningless without something to pass down and something to pass
+    // it to. Verified against stock git 2.55.0, which reports the missing option and exits 128 — and
+    // which raises this only for the explicit flag, never for a `clone.filterSubmodules=true` that
+    // happens to be configured.
+    if also_filter_submodules == Some(true) {
+        if filter.is_none() {
+            bail!("the option '--also-filter-submodules' requires '--filter'");
+        }
+        if !recurse_submodules {
+            bail!("the option '--also-filter-submodules' requires '--recurse-submodules'");
         }
     }
 
@@ -473,6 +504,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             .map_err(|_| anyhow::anyhow!("--branch expects a valid branch name, got {name:?}"))?;
     }
     prepare = prepare.with_shallow(shallow);
+    prepare = prepare.with_filter(filter.clone());
 
     let mut overrides: Vec<String> = config_pairs
         .iter()
@@ -635,9 +667,24 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // again, unless a mirror refspec legitimately copied the remote's own ones over.
     let mut remote_advertised_tracking_refs = false;
 
+    // Whether the server accepted `--filter`. git keeps going when it did not, warning that the
+    // filter was ignored, so the warning is emitted from what the handshake advertised.
+    let mut filter_supported = true;
+
     // Run the clone, capturing the result so the renderer is always torn down
     // (cursor restored, thread joined) before any error is propagated.
     let result = (|| -> Result<()> {
+        // git's `transport.c` warns as soon as it has the capability list and then transfers
+        // everything, leaving the promisor configuration in place regardless.
+        let mut note_filter_support = |handshake: &gix::protocol::Handshake| {
+            filter_supported = gix::protocol::fetch::filter::is_supported(
+                handshake.server_protocol_version,
+                &handshake.capabilities,
+            );
+            if filter.is_some() && !filter_supported {
+                eprintln!("warning: filtering not recognized by server, ignoring");
+            }
+        };
         if bare || no_checkout {
             // A bare clone never checks out a worktree; `--no-checkout` likewise
             // fetches the pack and writes the refs/`HEAD` but leaves the worktree
@@ -648,10 +695,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 .remote_refs
                 .iter()
                 .any(|r| r.unpack().0.starts_with(b"refs/remotes/"));
+            note_filter_support(&outcome.handshake);
         } else {
             // `git clone 'url'...`
-            let (mut checkout, _) =
+            let (mut checkout, outcome) =
                 prepare.fetch_then_checkout(op.add_child("fetch"), &should_interrupt)?;
+            note_filter_support(&outcome.handshake);
             // Check out the branch `HEAD` points to. This is a no-op for an empty
             // remote, leaving an empty repository exactly like git does.
             checkout.main_worktree(op.add_child("checkout"), &should_interrupt)?;
@@ -686,6 +735,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // pathspec, or '.' (meaning all submodules) if no pathspec is
             // provided" (git-clone(1)). git records it whenever the option is
             // given, even for `--bare` / `-n`, where the update itself is skipped.
+            // `partial_clone_register()`: a partial clone records the remote it may go back to for
+            // the objects it skipped, and bumps the repository format so older git refuses it.
+            promisor_filter: filter.as_ref().map(|f| f.as_str().to_owned()),
             submodule_active: recurse_submodules.then(|| {
                 if submodule_pathspecs.is_empty() {
                     vec![".".to_string()]
@@ -938,6 +990,10 @@ struct ConfigFixups<'a> {
     drop_tag_opt: bool,
     /// A bare clone creates no `branch.<name>` section.
     drop_branch_sections: bool,
+    /// `--filter=<spec>`: register the remote as a promisor with this filter, the way git's
+    /// `partial_clone_register()` does — `remote.<name>.promisor = true`,
+    /// `remote.<name>.partialclonefilter = <spec>` and `core.repositoryformatversion = 1`.
+    promisor_filter: Option<String>,
     /// `submodule.active` values recorded by `--recurse-submodules[=<pathspec>]`.
     submodule_active: Option<Vec<String>>,
     /// `-c <key>=<value>` pairs, in command-line order.
@@ -957,6 +1013,7 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
         && !fixups.drop_tag_opt
         && !fixups.drop_branch_sections
         && fixups.submodule_active.is_none()
+        && fixups.promisor_filter.is_none()
         && fixups.config_pairs.is_empty()
     {
         return Ok(());
@@ -983,6 +1040,19 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
             if fixups.set_mirror {
                 section.push("mirror", Some("true".into()))?;
             }
+            if let Some(spec) = &fixups.promisor_filter {
+                section.push("promisor", Some("true".into()))?;
+                section.push("partialclonefilter", Some(spec.as_str().into()))?;
+            }
+        }
+    }
+
+    // `upgrade_repository_format(1)`. git bumps the version without adding an extension — verified
+    // against stock git 2.55.0, whose `--filter` clone leaves `core.repositoryformatversion = 1` and
+    // no `[extensions]` section at all.
+    if fixups.promisor_filter.is_some() {
+        if let Ok(mut core) = file.section_mut("core", None) {
+            core.set("repositoryformatversion", "1")?;
         }
     }
 

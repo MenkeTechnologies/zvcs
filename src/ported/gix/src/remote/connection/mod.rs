@@ -48,3 +48,7 @@ pub mod ref_map;
 
 ///
 pub mod fetch;
+
+///
+#[cfg(any(feature = "blocking-network-client", feature = "async-network-client"))]
+pub mod negotiate_only;

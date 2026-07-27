@@ -173,6 +173,10 @@ pub struct Store {
     alloc_limit_bytes: Option<usize>,
     /// The compression level to use when writing loose objects.
     loose_compression: gix_zlib::Compression,
+
+    /// The hook that fetches objects which are missing locally from a *promisor remote*, installed by
+    /// the caller that knows how to talk to one. See [`Store::set_promisor()`].
+    promisor: std::sync::OnceLock<store::PromisorFetchFn>,
 }
 
 /// Create a new cached handle to the object store with support for additional options.

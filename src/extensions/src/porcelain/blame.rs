@@ -424,7 +424,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     // git's `--progress` handling, run straight after `parse_options` and before
     // any path or revision is resolved: the machine formats refuse it outright,
     // and otherwise an unspecified value means `isatty(2)`.
-    let show_progress = if opts.porcelain {
+    let show_progress = if opts.porcelain || opts.incremental {
         if opts.show_progress == Some(true) {
             let mut err = std::io::stderr().lock();
             writeln!(
@@ -573,8 +573,14 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     // set *and* carries per-line `ignored`/`unblamable` flags the run encoding has no
     // room for, so a cache entry would either collide with a plain blame or lose the
     // flags.
+    //
+    // `--incremental` is not cached either: it needs the walk-order, uncoalesced entries,
+    // which the run encoding does not preserve.
     let algo_key = format!("{:?}|w={}", opts.diff_algorithm, opts.ignore_whitespace);
-    let cache_key = (opts.ranges.is_empty() && ignore_revs.is_empty() && !index_only)
+    let cache_key = (opts.ranges.is_empty()
+        && ignore_revs.is_empty()
+        && !index_only
+        && !opts.incremental)
         .then(|| (suspect.to_string(), rel_path.clone(), algo_key));
     // The blamed blob identifies the file content the attribution belongs to.
     let blamed_blob = repo
@@ -589,6 +595,9 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         lines_from_cache(&repo, blob, runs)
     });
 
+    // The entries in the order the walk finalized them, which only `--incremental`
+    // needs — and which is empty on a cache hit, where the walk never ran.
+    let mut uncoalesced: Vec<gix::blame::BlameEntry> = Vec::new();
     // `(lines, blob content)` — the overlay path needs the blamed blob's bytes,
     // which come from the outcome on a miss and from the object on a hit.
     let (mut lines, blamed_bytes) = match cached {
@@ -612,6 +621,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
                     runs: encode_runs(&lines),
                 });
             }
+            uncoalesced = outcome.uncoalesced_entries.clone();
             (lines, outcome.blob.clone())
         }
     };
@@ -631,11 +641,36 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    let null_id = ObjectId::null(repo.object_hash());
+
+    // `cmd_blame` jumps straight to cleanup after `assign_blame()` under
+    // `--incremental`: the entries were streamed as the walk found them, so neither the
+    // pager nor `blame_sort_final()`, `blame_coalesce()` or any output format runs.
+    if opts.incremental {
+        let mapped = match &worktree_content {
+            Some(content) => Some(worktree_line_map(
+                &repo,
+                &blamed_bytes,
+                content,
+                opts.diff_algorithm,
+            )?),
+            None => None,
+        };
+        let mut entries = incremental_entries(&uncoalesced, mapped.as_deref(), &null_id);
+        // With an overlay the walk ran over the whole file so that the overlay could be
+        // built in final-image coordinates, so `-L` still has to be applied here.
+        if !opts.ranges.is_empty() && worktree_content.is_some() {
+            entries = clip_to_ranges(entries, &opts.ranges);
+        }
+        let info = collect_commit_info(&repo, &lines, &opts, &null_id, &rel_path)?;
+        let head_id = if index_only { None } else { head_id };
+        return emit_incremental(&repo, &entries, &info, &rel_path, head_id, &null_id);
+    }
+
     // cmd_blame folds `blame.coloring` in only when neither color bit survived
     // argument parsing, then clears both bits for the annotate-compat format.
     colors.apply_command_line(&opts);
 
-    let null_id = ObjectId::null(repo.object_hash());
     let info = collect_commit_info(&repo, &lines, &opts, &null_id, &rel_path)?;
 
     if opts.porcelain {
@@ -819,35 +854,8 @@ fn overlay_worktree(
     worktree: &[u8],
     diff_algorithm: Option<gix::diff::blob::Algorithm>,
 ) -> Result<Vec<Line>> {
-    let input = gix::diff::blob::InternedInput::new(head_blob, worktree);
-    // `--diff-algorithm` applies to the fake-commit diff too, matching git which
-    // threads its `xdl_opts` through every diff in the blame.
-    let algorithm = match diff_algorithm {
-        Some(a) => a,
-        None => repo.diff_algorithm()?,
-    };
-    let mut diff = gix::diff::blob::Diff::compute(algorithm, &input);
-    diff.postprocess_lines(&input);
-
-    let after_len = input.after.len() as u32;
-
-    // Map each working-tree line to the `HEAD` line it is unchanged from, if any.
-    let mut mapped: Vec<Option<u32>> = vec![None; after_len as usize];
-    let (mut before, mut after) = (0u32, 0u32);
-    for hunk in diff.hunks() {
-        while after < hunk.after.start {
-            mapped[after as usize] = Some(before);
-            after += 1;
-            before += 1;
-        }
-        after = hunk.after.end;
-        before = hunk.before.end;
-    }
-    while after < after_len {
-        mapped[after as usize] = Some(before);
-        after += 1;
-        before += 1;
-    }
+    let mapped = worktree_line_map(repo, head_blob, worktree, diff_algorithm)?;
+    let after_len = mapped.len() as u32;
 
     let null_id = ObjectId::null(repo.object_hash());
     let tokens: Vec<&[u8]> = gix::diff::blob::sources::byte_lines(worktree).collect();
@@ -881,6 +889,45 @@ fn overlay_worktree(
         }
     }
     Ok(out)
+}
+
+/// The diff the synthetic working-tree commit takes part in, as a per-line map: for
+/// every line of the final image, the (0-based) line of `head_blob` it is unchanged
+/// from, or `None` when the line is new and therefore stays with that commit.
+fn worktree_line_map(
+    repo: &gix::Repository,
+    head_blob: &[u8],
+    worktree: &[u8],
+    diff_algorithm: Option<gix::diff::blob::Algorithm>,
+) -> Result<Vec<Option<u32>>> {
+    let input = gix::diff::blob::InternedInput::new(head_blob, worktree);
+    // `--diff-algorithm` applies to the fake-commit diff too, matching git which
+    // threads its `xdl_opts` through every diff in the blame.
+    let algorithm = match diff_algorithm {
+        Some(a) => a,
+        None => repo.diff_algorithm()?,
+    };
+    let mut diff = gix::diff::blob::Diff::compute(algorithm, &input);
+    diff.postprocess_lines(&input);
+
+    let after_len = input.after.len() as u32;
+    let mut mapped: Vec<Option<u32>> = vec![None; after_len as usize];
+    let (mut before, mut after) = (0u32, 0u32);
+    for hunk in diff.hunks() {
+        while after < hunk.after.start {
+            mapped[after as usize] = Some(before);
+            after += 1;
+            before += 1;
+        }
+        after = hunk.after.end;
+        before = hunk.before.end;
+    }
+    while after < after_len {
+        mapped[after as usize] = Some(before);
+        after += 1;
+        before += 1;
+    }
+    Ok(mapped)
 }
 
 /// Everything about a commit that either output format can need.
@@ -1288,12 +1335,210 @@ fn emit_porcelain(
     Ok(ExitCode::SUCCESS)
 }
 
-fn write_detail(
-    out: &mut impl Write,
-    ci: &CommitInfo,
-    previous: Option<&(String, Vec<u8>)>,
-    path: &[u8],
-) -> Result<()> {
+/// One entry of `git blame --incremental`: a stretch of the final image that one
+/// commit took responsibility for in one step of the walk, *before* `blame_coalesce()`
+/// would have merged it with an adjacent stretch of the same commit.
+struct IncrementalEntry {
+    commit_id: ObjectId,
+    /// 1-based first line in the *Source File* (git's `ent->s_lno + 1`).
+    orig_no: u32,
+    /// 1-based first line in the final image (git's `ent->lno + 1`).
+    final_no: u32,
+    num_lines: u32,
+    source_name: Option<Vec<u8>>,
+}
+
+/// Turn `gix-blame`'s walk-order entries into the entries git's `found_guilty_entry()`
+/// sees, optionally rebased onto the working-tree image.
+///
+/// Without an overlay this is a straight 0-based to 1-based translation. With one, git
+/// runs the whole walk on top of the synthetic commit holding the final image, so the
+/// entries it emits are these entries cut down to the lines that survived that first
+/// diff; the lines that did not survive stay with the synthetic commit, which the walk
+/// pops first and which therefore contributes the leading entries.
+fn incremental_entries(
+    entries: &[gix::blame::BlameEntry],
+    mapped: Option<&[Option<u32>]>,
+    null_id: &ObjectId,
+) -> Vec<IncrementalEntry> {
+    let Some(mapped) = mapped else {
+        return entries
+            .iter()
+            .map(|e| IncrementalEntry {
+                commit_id: e.commit_id,
+                orig_no: e.start_in_source_file + 1,
+                final_no: e.start_in_blamed_file + 1,
+                num_lines: e.len.get(),
+                source_name: e.source_file_name.as_ref().map(|n| n.to_vec()),
+            })
+            .collect();
+    };
+
+    let mut out: Vec<IncrementalEntry> = Vec::new();
+    // The synthetic commit keeps every line that the diff against the blamed blob
+    // reports as new, in one entry per contiguous run.
+    let mut i = 0usize;
+    while i < mapped.len() {
+        if mapped[i].is_some() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < mapped.len() && mapped[i].is_none() {
+            i += 1;
+        }
+        out.push(IncrementalEntry {
+            commit_id: *null_id,
+            orig_no: start as u32 + 1,
+            final_no: start as u32 + 1,
+            num_lines: (i - start) as u32,
+            source_name: None,
+        });
+    }
+
+    // The inverse map, so an entry stated in blamed-blob lines can be restated in lines
+    // of the final image.
+    let head_lines = mapped.iter().flatten().copied().max().map_or(0, |m| m as usize + 1);
+    let mut final_of_head: Vec<Option<u32>> = vec![None; head_lines];
+    for (final_no, head_no) in mapped.iter().enumerate() {
+        if let Some(head_no) = head_no {
+            final_of_head[*head_no as usize] = Some(final_no as u32);
+        }
+    }
+
+    for entry in entries {
+        let mut run: Option<(u32, u32, u32)> = None; // (orig_no, final_no, len)
+        for offset in 0..entry.len.get() {
+            let head_no = entry.start_in_blamed_file + offset;
+            let this = final_of_head.get(head_no as usize).copied().flatten();
+            match (this, &mut run) {
+                // The run continues only while both files stay contiguous, which is
+                // exactly what `blame_chunk()` splits an entry on.
+                (Some(f), Some((_, first_final, len))) if *first_final + *len == f => *len += 1,
+                (Some(f), slot) => {
+                    if let Some((orig_no, final_no, len)) = slot.take() {
+                        out.push(IncrementalEntry {
+                            commit_id: entry.commit_id,
+                            orig_no,
+                            final_no: final_no + 1,
+                            num_lines: len,
+                            source_name: entry.source_file_name.as_ref().map(|n| n.to_vec()),
+                        });
+                    }
+                    *slot = Some((entry.start_in_source_file + offset + 1, f, 1));
+                }
+                (None, slot) => {
+                    if let Some((orig_no, final_no, len)) = slot.take() {
+                        out.push(IncrementalEntry {
+                            commit_id: entry.commit_id,
+                            orig_no,
+                            final_no: final_no + 1,
+                            num_lines: len,
+                            source_name: entry.source_file_name.as_ref().map(|n| n.to_vec()),
+                        });
+                    }
+                }
+            }
+        }
+        if let Some((orig_no, final_no, len)) = run {
+            out.push(IncrementalEntry {
+                commit_id: entry.commit_id,
+                orig_no,
+                final_no: final_no + 1,
+                num_lines: len,
+                source_name: entry.source_file_name.as_ref().map(|n| n.to_vec()),
+            });
+        }
+    }
+    out
+}
+
+/// Keep only the parts of each entry that fall inside `ranges`, splitting an entry that
+/// straddles a boundary — what git gets for free by narrowing the scoreboard to `-L`
+/// before the walk starts.
+fn clip_to_ranges(
+    entries: Vec<IncrementalEntry>,
+    ranges: &[std::ops::RangeInclusive<u32>],
+) -> Vec<IncrementalEntry> {
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let mut run: Option<(u32, u32, u32)> = None; // (orig_no, final_no, len)
+        let mut flush = |run: &mut Option<(u32, u32, u32)>, out: &mut Vec<IncrementalEntry>| {
+            if let Some((orig_no, final_no, num_lines)) = run.take() {
+                out.push(IncrementalEntry {
+                    commit_id: entry.commit_id,
+                    orig_no,
+                    final_no,
+                    num_lines,
+                    source_name: entry.source_name.clone(),
+                });
+            }
+        };
+        for offset in 0..entry.num_lines {
+            let final_no = entry.final_no + offset;
+            if ranges.iter().any(|r| r.contains(&final_no)) {
+                match &mut run {
+                    Some((_, _, len)) => *len += 1,
+                    slot => *slot = Some((entry.orig_no + offset, final_no, 1)),
+                }
+            } else {
+                flush(&mut run, &mut out);
+            }
+        }
+        flush(&mut run, &mut out);
+    }
+    out
+}
+
+/// git's `found_guilty_entry()` under `--incremental`: stream every entry as the walk
+/// finalizes it, with the commit's detail block emitted only the first time that commit
+/// appears and the path information repeated for every entry.
+fn emit_incremental(
+    repo: &gix::Repository,
+    entries: &[IncrementalEntry],
+    info: &HashMap<ObjectId, CommitInfo>,
+    rel_path: &str,
+    head_id: Option<ObjectId>,
+    null_id: &ObjectId,
+) -> Result<ExitCode> {
+    let current_path = rel_path.as_bytes();
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
+    let mut shown: HashSet<ObjectId> = HashSet::new();
+    type PreviousCache = HashMap<(ObjectId, Vec<u8>), Option<(String, Vec<u8>)>>;
+    let mut previous_cache: PreviousCache = HashMap::new();
+
+    for entry in entries {
+        let ci = &info[&entry.commit_id];
+        let path = entry.source_name.as_deref().unwrap_or(current_path);
+        writeln!(
+            out,
+            "{} {} {} {}",
+            ci.hex, entry.orig_no, entry.final_no, entry.num_lines
+        )?;
+        if shown.insert(entry.commit_id) {
+            write_suspect_detail(&mut out, ci)?;
+        }
+        let key = (entry.commit_id, path.to_vec());
+        if !previous_cache.contains_key(&key) {
+            let previous = if &entry.commit_id == null_id {
+                head_id.map(|h| (h.to_hex().to_string(), current_path.to_vec()))
+            } else {
+                find_previous(repo, entry.commit_id, path)?
+            };
+            previous_cache.insert(key.clone(), previous);
+        }
+        write_filename_info(&mut out, previous_cache[&key].as_ref(), path)?;
+    }
+
+    out.flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// git's `emit_one_suspect_detail()`: everything about a commit that does not depend on
+/// the path.
+fn write_suspect_detail(out: &mut impl Write, ci: &CommitInfo) -> Result<()> {
     write_field(out, b"author", &ci.author_name)?;
     out.write_all(b"author-mail <")?;
     out.write_all(&ci.author_mail)?;
@@ -1310,6 +1555,16 @@ fn write_detail(
     if ci.boundary {
         out.write_all(b"boundary\n")?;
     }
+    Ok(())
+}
+
+/// git's `write_filename_info()`: the suspect information that does depend on the path,
+/// which is why it is repeated for every group rather than once per commit.
+fn write_filename_info(
+    out: &mut impl Write,
+    previous: Option<&(String, Vec<u8>)>,
+    path: &[u8],
+) -> Result<()> {
     if let Some((hex, prev_path)) = previous {
         out.write_all(b"previous ")?;
         out.write_all(hex.as_bytes())?;
@@ -1321,6 +1576,19 @@ fn write_detail(
     out.write_all(&quote_name(path))?;
     out.write_all(b"\n")?;
     Ok(())
+}
+
+/// The porcelain formats' commit block: git emits the path-independent detail and the
+/// path information together there, because it only prints the latter when it printed
+/// the former.
+fn write_detail(
+    out: &mut impl Write,
+    ci: &CommitInfo,
+    previous: Option<&(String, Vec<u8>)>,
+    path: &[u8],
+) -> Result<()> {
+    write_suspect_detail(out, ci)?;
+    write_filename_info(out, previous, path)
 }
 
 fn write_field(out: &mut impl Write, key: &[u8], value: &[u8]) -> Result<()> {
@@ -1904,6 +2172,9 @@ struct Options {
     color_by_age: bool,
     /// `--progress` / `--no-progress`; `None` is git's default (`isatty(2)`).
     show_progress: Option<bool>,
+    /// `--incremental`: stream every entry as the walk finalizes it, uncoalesced,
+    /// instead of printing the sorted-and-coalesced attribution at the end.
+    incremental: bool,
     /// `-w`: ignore whitespace differences when diffing revisions.
     ignore_whitespace: bool,
     /// `--diff-algorithm=<algo>`; `None` falls back to `diff.algorithm`.
@@ -1972,6 +2243,7 @@ impl Options {
         let mut color_lines = false;
         let mut color_by_age = false;
         let mut show_progress: Option<bool> = None;
+        let mut incremental = false;
         let mut ignore_whitespace = false;
         let mut diff_algorithm: Option<gix::diff::blob::Algorithm> = None;
         let mut contents: Option<String> = None;
@@ -2028,6 +2300,8 @@ impl Options {
                 // tri-state seeded to -1: unset means "auto" (`isatty(2)`).
                 "--progress" => show_progress = Some(true),
                 "--no-progress" => show_progress = Some(false),
+                // git's `OPT_BOOL(0, "incremental", &incremental, …)`.
+                "--incremental" => incremental = true,
                 "-w" => ignore_whitespace = true,
                 // git's `--porcelain` and `--line-porcelain` are bit flags on one
                 // field, so `--line-porcelain` wins no matter the order.
@@ -2134,7 +2408,8 @@ impl Options {
                 // stock git emits byte-identical stdout for them (verified), so they
                 // are accepted as no-ops rather than rejected. The positive forms
                 // remain refused below.
-                "--no-incremental" | "--no-show-stats" | "--no-score-debug" => {}
+                "--no-incremental" => incremental = false,
+                "--no-show-stats" | "--no-score-debug" => {}
                 _ if a.starts_with("-L") => parse_line_range(&a[2..], &mut ranges)?,
                 _ if a.starts_with("--abbrev=") => {
                     let v = &a["--abbrev=".len()..];
@@ -2172,6 +2447,7 @@ impl Options {
             color_lines,
             color_by_age,
             show_progress,
+            incremental,
             ignore_whitespace,
             diff_algorithm,
             contents,

@@ -1877,6 +1877,7 @@ dependencies = [
  "clru",
  "criterion",
  "document-features",
+ "gix-bitmap",
  "gix-chunk",
  "gix-diff",
  "gix-error",

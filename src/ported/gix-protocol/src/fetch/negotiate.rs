@@ -53,6 +53,28 @@ pub enum Action {
     },
 }
 
+/// Which local commits seed the negotiation, and which are claimed as `have` no matter what the
+/// algorithm picks.
+///
+/// This is git's `--negotiation-restrict` (alias `--negotiation-tip`) and `--negotiation-include`,
+/// carried in `fetch_pack_args::negotiation_tips` and consulted by `mark_tips()` in `fetch-pack.c`.
+#[derive(Debug, Clone, Default)]
+pub struct Restrictions {
+    /// If `Some`, seed the negotiator with exactly these commits instead of every local ref.
+    ///
+    /// `mark_tips()` returns right after walking `negotiation_tips` when they are present, so a ref
+    /// that isn't among them contributes no `have` of its own. It still takes part in the `COMPLETE`
+    /// marking, which happens over all refs either way.
+    ///
+    /// An empty `Vec` is meaningful: it seeds the negotiator with nothing at all.
+    pub tips: Option<Vec<gix_hash::ObjectId>>,
+    /// Commits that are sent as `have` with every request, whatever the algorithm selects.
+    ///
+    /// They are marked common when the negotiator is seeded, so it neither offers them itself nor
+    /// walks past them into their ancestry.
+    pub always_have: Vec<gix_hash::ObjectId>,
+}
+
 /// Key information about each round in the pack-negotiation, as produced by [`one_round()`].
 #[derive(Debug, Clone, Copy)]
 pub struct Round {
@@ -117,6 +139,8 @@ pub struct Round {
 /// * `mapping_is_ignored`
 ///     - `f(mapping) -> bool` returns `true` if the given mapping should not participate in change tracking.
 ///     - [`make_refmapping_ignore_predicate()`] is a typical implementation for this.
+/// * `restrictions`
+///     - Which commits seed the negotiator, and which are always claimed as `have`.
 #[expect(clippy::too_many_arguments)]
 pub fn mark_complete_and_common_ref<Out, F, E>(
     objects: &(impl gix_object::Find + gix_object::FindHeader + gix_object::Exists),
@@ -127,6 +151,7 @@ pub fn mark_complete_and_common_ref<Out, F, E>(
     ref_map: &RefMap,
     shallow: &Shallow,
     mapping_is_ignored: impl Fn(&refmap::Mapping) -> bool,
+    restrictions: &Restrictions,
 ) -> Result<Action, Error>
 where
     E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
@@ -204,8 +229,18 @@ where
     // (`git` is conditional here based on `deepen`, but it doesn't make sense and it's hard to extract from history when that happened).
     let mut queue = Queue::new();
     mark_all_refs_in_repo(refs, objects, graph, &mut queue, Flags::COMPLETE)?;
+    // git seeds the negotiator with the tips of every alternate in `find_common()`, one line after
+    // `mark_tips()` and outside its `negotiation_tips` early return, so they stay tips even when
+    // `--negotiation-restrict` replaced our own. They still take part in the cut-off walk below.
+    let mut alternate_tips = Vec::new();
     for (alt_refs, alt_objs) in alternates().map_err(|err| Error::AlternateRefsAndObjects(err.into()))? {
-        mark_all_refs_in_repo(&alt_refs, &alt_objs, graph, &mut queue, Flags::COMPLETE)?;
+        alternate_tips.extend(mark_all_refs_in_repo(
+            &alt_refs,
+            &alt_objs,
+            graph,
+            &mut queue,
+            Flags::COMPLETE,
+        )?);
     }
     // Keep track of the tips, which happen to be on our queue right, before we traverse the graph with cutoff.
     let tips = if let Some(cutoff) = cutoff_date {
@@ -241,8 +276,28 @@ where
     // As negotiators currently may rely on getting `known_common` calls first and tips after, we adhere to that which is the only
     // reason we cached the set of tips.
     gix_trace::detail!("mark tips", num_tips = tips.len()).into_scope(|| -> Result<_, Error> {
-        for tip in tips.iter_unordered() {
-            negotiator.add_tip(*tip, graph)?;
+        match restrictions.tips.as_deref() {
+            // git's `mark_tips()` walks `negotiation_tips` and returns, so no other local ref becomes
+            // a starting point for the `have` walk.
+            Some(only) => {
+                for id in only {
+                    negotiator.add_tip(*id, graph)?;
+                }
+            }
+            None => {
+                for tip in tips.iter_unordered() {
+                    negotiator.add_tip(*tip, graph)?;
+                }
+            }
+        }
+        for id in &alternate_tips {
+            negotiator.add_tip(*id, graph)?;
+        }
+        // `--negotiation-include`: claimed common before the walk starts, which is what keeps the
+        // algorithm from offering them a second time or descending into their ancestry. The `have`
+        // lines themselves are written by `one_round()`, every round.
+        for id in &restrictions.always_have {
+            negotiator.in_common_with_remote(*id, graph)?;
         }
         Ok(())
     })?;
@@ -369,14 +424,17 @@ fn mark_recent_complete_commits(
     Ok(())
 }
 
+/// Mark every ref tip in `store` with `mark`, push the newly marked ones onto `queue`, and return
+/// the ids of all tips seen — including the ones already marked, as they are tips all the same.
 fn mark_all_refs_in_repo(
     store: &gix_ref::file::Store,
     objects: &impl gix_object::Find,
     graph: &mut gix_negotiate::Graph<'_, '_>,
     queue: &mut Queue,
     mark: Flags,
-) -> Result<(), Error> {
+) -> Result<Vec<gix_hash::ObjectId>, Error> {
     let _span = gix_trace::detail!("mark_all_refs");
+    let mut tips = Vec::new();
     for local_ref in store.iter()?.all()? {
         let mut local_ref = local_ref?;
         let id = local_ref.peel_to_id_packed(store, objects, store.cached_packed_buffer()?.as_ref().map(|b| &***b))?;
@@ -390,8 +448,9 @@ fn mark_all_refs_in_repo(
         {
             queue.insert(commit.commit_time, id);
         }
+        tips.push(id);
     }
-    Ok(())
+    Ok(tips)
 }
 
 ///
@@ -449,12 +508,17 @@ pub mod one_round {
 ///
 /// Returns information about this round, and `true` if we are done and should stop negotiating *after* the `arguments` have
 /// been sent to the remote one last time.
+///
+/// `always_have` are git's `--negotiation-include` commits, written into every request ahead of the
+/// ones the algorithm picked. They are not counted towards this round's `haves_sent`, as they say
+/// nothing about whether the algorithm still has options left.
 pub fn one_round(
     negotiator: &mut dyn gix_negotiate::Negotiator,
     graph: &mut gix_negotiate::Graph<'_, '_>,
     state: &mut one_round::State,
     arguments: &mut crate::fetch::Arguments,
     previous_response: Option<&crate::fetch::Response>,
+    always_have: &[gix_hash::ObjectId],
 ) -> Result<(Round, bool), Error> {
     let mut seen_ack = false;
     if let Some(response) = previous_response {
@@ -475,6 +539,12 @@ pub fn one_round(
                 Acknowledgement::Nak => {}
             }
         }
+    }
+
+    // `--negotiation-include` is unconditional, so these lead every request — including the last one,
+    // which may carry nothing else but `done`.
+    for id in always_have {
+        arguments.have(id);
     }
 
     // `common` is set only if this is a stateless transport, and we repeat previously confirmed common commits as HAVE, because

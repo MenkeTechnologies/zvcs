@@ -35,6 +35,16 @@ impl PrepareFetch {
         self
     }
 
+    /// Make this a *partial* clone that asks the remote to withhold whatever `filter` selects against
+    /// (git's `--filter`).
+    ///
+    /// The caller is responsible for registering the remote as a promisor afterwards - see
+    /// [`crate::promisor`] - as the clone is otherwise left unable to read the objects it skipped.
+    pub fn with_filter(mut self, filter: Option<gix_protocol::fetch::filter::Filter>) -> Self {
+        self.filter = filter;
+        self
+    }
+
     /// Apply the given configuration `values` right before readying the actual fetch from the remote.
     /// The configuration is marked with [source API](gix_config::Source::Api), and will not be written back, it's
     /// retained only in memory.

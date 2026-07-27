@@ -36,6 +36,11 @@ pub enum Error {
     RejectShallowRemoteConfig(#[from] config::boolean::Error),
     #[error(transparent)]
     NegotiationAlgorithmConfig(#[from] config::key::GenericErrorWithValue),
+    #[error("Failed to mark the pack of a partial fetch as promisor at \"{}\"", path.display())]
+    WritePromisorFile {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl gix_protocol::transport::IsSpuriousError for Error {

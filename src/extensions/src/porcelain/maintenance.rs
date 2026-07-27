@@ -23,8 +23,23 @@
 //!     `maintenance.<task>.enabled` config and of repository state. The one
 //!     config read that survives is `maintenance.strategy`, which git validates
 //!     before deriving a task set — an unusable value is fatal here too, unless
-//!     `--task` named the set and made the read unnecessary. `--auto`
-//!     itself is not ported — see `is_needed_sub`.
+//!     `--task` named the set and made the read unnecessary. With `--auto` the
+//!     answer is the first task whose condition trips — see [`auto_condition`].
+//!
+//! `--auto` gates each task on the same per-task condition git's `tasks[]` table
+//! attaches to it, and each condition on its own `maintenance.<task>.auto` key:
+//! `loose-objects` counts loose objects, `commit-graph` walks the refs for
+//! commits the graph does not carry, `incremental-repack` counts packs outside
+//! the multi-pack-index, `geometric-repack` computes the pack geometry split,
+//! `pack-refs` weighs loose refs against the packed-refs file, `worktree-prune`
+//! counts prunable worktrees, `rerere-gc` looks for an `rr-cache` entry,
+//! `reflog-expire` counts expiring `HEAD` reflog entries, and `gc` reuses
+//! `need_to_gc()` plus the `pre-auto-gc` hook. `prefetch` is the one task git
+//! leaves without a condition, so `--auto` never selects it.
+//!
+//! [`run_auto_maintenance`] is the other half — the automatic run the commands
+//! that add objects trigger, gated on `maintenance.auto`/`gc.auto` and detached
+//! or not per `maintenance.autoDetach`/`gc.autoDetach`.
 //!
 //! `run` is a task driver, and this port runs the tasks that have a home in the
 //! tree — see [`run_tasks`] for the task set, the ordering, and the two tasks
@@ -36,13 +51,6 @@
 //! and then bails naming the substrate that is missing, rather than exiting 0
 //! and pretending the work happened:
 //!
-//!   * `run --auto` needs the same per-task condition heuristics as
-//!     `is-needed --auto`, below.
-//!   * `is-needed --auto` needs git's per-task condition heuristics, which rest
-//!     on a loose-object estimator that samples the `objects/17/` fanout
-//!     directory and scales by 256, plus multi-pack-index state. That sampling
-//!     is observable rather than incidental, and the answer is carried entirely
-//!     by the exit code, so a wrong guess would be silent.
 //!   * `start` and `stop` are OS scheduler integration — writing launchd plists,
 //!     crontab stanzas, systemd units or schtasks entries and invoking
 //!     `launchctl`/`crontab`/`systemctl`. None of that is repository work, none
@@ -299,6 +307,67 @@ const SCHEDULERS: [&str; 5] = ["auto", "crontab", "systemd-timer", "launchctl", 
 /// The multi-valued key holding the registry of maintained repositories.
 const REPO_KEY: &str = "maintenance.repo";
 
+/// `run_auto_maintenance()` — the automatic `maintenance run --auto` the
+/// commands that add objects trigger on their way out (`am`, `commit`, `fetch`,
+/// `merge`, `rebase`, `receive-pack`).
+///
+/// A faithful port of `run-command.c`'s `prepare_auto_maintenance()`:
+///
+///   * `maintenance.auto` switches it off. When that key is unset the decision
+///     falls back to `gc.auto`, which disables it at zero or below — the
+///     compatibility path from when this used to be `git gc --auto`.
+///   * `maintenance.autoDetach` decides whether the caller waits for the run.
+///     When it is unset `gc.autoDetach` answers instead, and when neither is set
+///     the run detaches. `GIT_TEST_MAINT_AUTO_DETACH=0` turns that default off,
+///     which is what makes the behaviour testable at all.
+///
+/// git builds `maintenance run --auto --[no-]quiet --[no-]detach` and lets the
+/// child daemonize itself; here the detached form is a child process with its
+/// standard streams on `/dev/null` — the state `daemonize()` leaves them in —
+/// that the caller does not wait for. Either way the caller never sees the
+/// child's output, and its own exit code is unaffected.
+pub fn run_auto_maintenance(repo: &gix::Repository, quiet: bool) -> Result<()> {
+    let config = repo.config_snapshot();
+    let enabled = match config.boolean("maintenance.auto") {
+        Some(value) => value,
+        None => config.integer("gc.auto").is_none_or(|threshold| threshold > 0),
+    };
+    if !enabled {
+        return Ok(());
+    }
+
+    let detach = config
+        .boolean("maintenance.autoDetach")
+        .or_else(|| config.boolean("gc.autoDetach"))
+        .unwrap_or_else(|| {
+            !matches!(
+                std::env::var("GIT_TEST_MAINT_AUTO_DETACH").as_deref(),
+                Ok("0" | "false")
+            )
+        });
+
+    let Ok(exe) = std::env::current_exe() else {
+        return Ok(());
+    };
+    let mut child = std::process::Command::new(exe);
+    child
+        .args(["maintenance", "run", "--auto"])
+        .arg(if quiet { "--quiet" } else { "--no-quiet" })
+        .arg(if detach { "--detach" } else { "--no-detach" })
+        .current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()));
+    if detach {
+        child
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // Not waited for: the child is the daemonized half of git's run.
+        let _ = child.spawn();
+    } else {
+        let _ = child.status();
+    }
+    Ok(())
+}
+
 /// `git maintenance` — dispatch to a subcommand.
 ///
 /// `run`, `register`, `unregister` and `is-needed` are ported; `start` and
@@ -468,18 +537,7 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
         None
     };
 
-    if auto {
-        bail!(
-            "maintenance run --auto is not ported: it gates every task on git's per-task \
-             auto-conditions, which rest on a loose-object estimator that samples the objects/17 \
-             fanout directory and scales by 256, and on multi-pack-index state; those thresholds \
-             have no counterpart in the vendored crates, and since --auto's only effect is to skip \
-             work silently, guessing them would be silently wrong \
-             (ported: run without --auto, register, unregister, and argument validation)"
-        );
-    }
-
-    run_tasks(&repo, &selected, scheduled, strategy)
+    run_tasks(&repo, &selected, scheduled, strategy, auto)
 }
 
 /// Run the selected maintenance tasks in git's order and report the way git's
@@ -497,7 +555,9 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
 ///
 ///   * **`pack-refs`** → [`super::pack_refs::pack_refs`] with `--all --prune`,
 ///     which is git's own argument list and a real port.
-///   * **`reflog-expire`** → [`expire_reflogs`], a real expiry.
+///   * **`reflog-expire`** → [`super::gc::expire_reflogs`], the same
+///     `reflog expire --all` port `git gc` runs, including the per-pattern
+///     `gc.<pattern>.reflogExpire*` policy and the reachability arm.
 ///   * **`geometric-repack`** and **`gc`** → the ported [`super::repack::repack`]
 ///     and [`super::gc::gc`], invoked with the exact argument lists git's
 ///     `run-command` uses (read off `GIT_TRACE2_PERF=1`, which prints each
@@ -518,7 +578,11 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
 ///     existing so a repository that never recorded a resolution does not enter
 ///     the delegate's `read_dir` error path, which git has no equivalent of.
 ///
-/// # The two tasks that do nothing, and why
+///   * **`worktree-prune`** → [`super::gc::prune_worktrees`], the same
+///     `worktree prune --expire <gc.worktreePruneExpire>` port `git gc` runs,
+///     with git's `locked` and expiry semantics.
+///
+/// # The one task that does nothing, and why
 ///
 ///   * **`commit-graph`**. git runs `commit-graph write --split --reachable`,
 ///     which writes `objects/info/commit-graphs/commit-graph-chain` and a
@@ -527,22 +591,15 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
 ///     one by hand is not a small thing done safely: a graph file that is
 ///     well-formed enough to be *loaded* but wrong in a chunk would make every
 ///     later git command silently traverse from bad data, which is worse than
-///     having no graph at all. So none is written, and none is claimed.
-///   * **`worktree-prune`**. git runs `worktree prune --expire 3.months.ago`,
-///     which removes `worktrees/<id>` administrative directories whose `gitdir`
-///     no longer resolves. `worktree.rs` has no prune port, and the removal is
-///     destructive with expiry and `locked` semantics that would have to be
-///     guessed at, so it is left to the module that owns worktree bookkeeping.
-///
-/// Both are skipped rather than approximated. Neither is visible in
-/// `objects/info/commit-graph` — git's split graph does not write that path —
-/// but both are real gaps, and a `maintenance run` that exits 0 has not done
-/// them.
+///     having no graph at all. So none is written, and none is claimed. It is
+///     skipped rather than approximated, and a `maintenance run` that exits 0
+///     has not written a commit-graph.
 fn run_tasks(
     repo: &gix::Repository,
     selected: &[String],
     scheduled: Option<Schedule>,
     strategy: Option<Strategy>,
+    auto: bool,
 ) -> Result<ExitCode> {
     let order = plan(repo, selected, scheduled, strategy);
 
@@ -551,13 +608,23 @@ fn run_tasks(
     // observed on git 2.55.0.
     let mut failed = false;
     for task in order {
+        // git's `maybe_run_task()`: under `--auto` a task runs only when its own
+        // `auto_condition` says the repository needs it, and a task git's table
+        // leaves without one (`prefetch`) never runs at all.
+        if auto && !auto_condition(repo, task) {
+            continue;
+        }
         let ok = match task {
-            "pack-refs" => delegate(super::pack_refs::pack_refs(&strings(&[
-                "pack-refs",
-                "--all",
-                "--prune",
-            ]))),
-            "reflog-expire" => expire_reflogs(repo).is_ok(),
+            // `maintenance_task_pack_refs()` forwards `--auto`, so the packing
+            // itself re-applies the same threshold the condition just checked.
+            "pack-refs" => {
+                let mut args = strings(&["pack-refs", "--all", "--prune"]);
+                if auto {
+                    args.push("--auto".to_owned());
+                }
+                delegate(super::pack_refs::pack_refs(&args))
+            }
+            "reflog-expire" => super::gc::expire_reflogs(repo).is_ok(),
             "geometric-repack" => delegate(super::repack::repack(&strings(&[
                 "repack",
                 "-d",
@@ -575,8 +642,9 @@ fn run_tasks(
                     // subcommand and prints the usage block.
                     || delegate(super::rerere::rerere(&strings(&["gc"])))
             }
-            // See the "two tasks that do nothing" section above.
-            "commit-graph" | "worktree-prune" => true,
+            "worktree-prune" => super::gc::prune_worktrees(repo).is_ok(),
+            // See the "one task that does nothing" section above.
+            "commit-graph" => true,
             // Selectable, but blocked on substrate no module in the tree has:
             // `prefetch` needs a fetch that rewrites refspecs into
             // `refs/prefetch/`, and `loose-objects`/`incremental-repack` need a
@@ -712,7 +780,7 @@ fn strings(args: &[&str]) -> Vec<String> {
 fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
     let mut auto = false;
     let mut end_of_opts = false;
-    let mut selected = false;
+    let mut selected: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -734,14 +802,15 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
                 if let Some(code) = check_task(value) {
                     return Ok(code);
                 }
-                selected = true;
+                push_task(&mut selected, value);
                 i += 1;
             }
             _ if a.starts_with("--task=") => {
-                if let Some(code) = check_task(&a["--task=".len()..]) {
+                let value = &a["--task=".len()..];
+                if let Some(code) = check_task(value) {
                     return Ok(code);
                 }
-                selected = true;
+                push_task(&mut selected, value);
             }
             _ => match option_name(a) {
                 Some(msg) => return Ok(usage_error(IS_NEEDED_USAGE, Some(&msg))),
@@ -761,163 +830,527 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
     // Without `--task` the answer is derived from the strategy's task set, so an
     // unusable `maintenance.strategy` is fatal here exactly as it is for `run` —
     // and, as there, naming a task skips the read and with it the rejection.
-    if !selected {
-        if let Err(value) = configured_strategy(&repo) {
-            return Ok(unknown_strategy(&value));
+    let strategy = if selected.is_empty() {
+        match configured_strategy(&repo) {
+            Ok(strategy) => strategy,
+            Err(value) => return Ok(unknown_strategy(&value)),
         }
-    }
+    } else {
+        None
+    };
 
     if auto {
-        bail!(
-            "maintenance is-needed --auto is not ported: the per-task conditions rest on git's \
-             loose-object estimator, which samples the objects/17 fanout directory and scales by \
-             256, and on multi-pack-index state; those thresholds have no counterpart in the \
-             vendored crates and the answer is carried by the exit code alone, so guessing it \
-             would be silently wrong (ported: is-needed without --auto, register, unregister, \
-             and argument validation)"
-        );
+        // git's loop stops at the first task whose condition says yes. The task
+        // set is the *manual* one — `is-needed` has no `--schedule`.
+        let needed = plan(&repo, &selected, None, strategy)
+            .into_iter()
+            .any(|task| auto_condition(&repo, task));
+        return Ok(if needed {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        });
     }
 
     // No `--auto`: no condition is evaluated, so every selected task is needed.
     Ok(ExitCode::SUCCESS)
 }
 
-/// git's default `gc.reflogExpire`, in seconds.
-const REFLOG_EXPIRE_DEFAULT: i64 = 90 * 24 * 60 * 60;
+// ---------------------------------------------------------------------------
+// `--auto` — git's per-task auto conditions (`builtin/gc.c`'s `tasks[]` table)
+// ---------------------------------------------------------------------------
 
-/// `git reflog expire --all` — drop reflog entries older than `gc.reflogExpire`.
+/// The verdict a `maintenance.<task>.auto` value carries.
 ///
-/// Every reflog under `logs/` is rewritten in place, keeping only the entries
-/// whose timestamp is at or after the cutoff. An emptied reflog is truncated,
-/// not deleted, which is what git leaves behind: after `maintenance run` on a
-/// fixture whose commits are dated 2023, `.git/logs/HEAD` exists and is 0 bytes.
-///
-/// A reflog line is
-/// `<old> <new> <name> <<email>> <seconds> <tz>\t<message>`, so the timestamp is
-/// the first field after the `>` that closes the email address. Parsing stops
-/// there: nothing else on the line is needed, and a line that does not parse is
-/// kept rather than dropped, so a format this does not understand costs history
-/// nothing.
-///
-/// # What is not reproduced
-///
-/// git has a second, shorter expiry — `gc.reflogExpireUnreachable`, 30 days by
-/// default — for entries whose new object is no longer reachable from the ref.
-/// Only the 90-day rule is applied here, so entries between the two cutoffs that
-/// git would drop are kept. That errs toward keeping history, which is the safe
-/// direction for a destructive operation, and it is invisible wherever every
-/// entry is on one side of both cutoffs.
-///
-/// Likewise only `never`, `now` and the default are understood as values of
-/// `gc.reflogExpire`; git accepts any approxidate. An unrecognised value leaves
-/// every reflog untouched rather than guessing at a cutoff, matching how
-/// [`super::gc`] treats a dated `gc.pruneExpire`.
-fn expire_reflogs(repo: &gix::Repository) -> Result<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    let cutoff = match repo
-        .config_snapshot()
-        .string("gc.reflogExpire")
-        .as_ref()
-        .and_then(|v| v.to_str().ok())
-    {
-        None => now - REFLOG_EXPIRE_DEFAULT,
-        Some("now") => now,
-        // `never` disables expiry; anything else is an approxidate this does not
-        // parse, and is treated the same way rather than guessed at.
-        Some(_) => return Ok(()),
-    };
-
-    // A linked worktree keeps its own `logs/HEAD` beside the shared `logs/refs`.
-    let mut roots = vec![repo.common_dir().join("logs")];
-    let private = repo.git_dir().join("logs");
-    if !roots.contains(&private) {
-        roots.push(private);
-    }
-    for root in roots {
-        for path in reflog_files(&root) {
-            expire_reflog(&path, cutoff)?;
-        }
-    }
-    Ok(())
+/// Every condition in git's table reads its key with `repo_config_get_int()`
+/// into a per-task default and then branches on the sign the same way: `0`
+/// switches the task off, a negative value forces it on without measuring
+/// anything, and a positive value is the threshold the task's own count is
+/// compared against.
+enum Gate {
+    Never,
+    Always,
+    Threshold(i64),
 }
 
-/// Every regular file under `root`, which for a reflog directory is every
-/// reflog: git mirrors ref names as paths there and stores nothing else.
-fn reflog_files(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+/// Read one `maintenance.<task>.auto`-shaped key and classify it. A missing or
+/// unparsable value leaves git's built-in `default` in place, which is what
+/// `repo_config_get_int()` does when it fails.
+fn gate(repo: &gix::Repository, key: &str, default: i64) -> Gate {
+    match repo.config_snapshot().integer(key).unwrap_or(default) {
+        0 => Gate::Never,
+        n if n < 0 => Gate::Always,
+        n => Gate::Threshold(n),
+    }
+}
+
+/// git's `maybe_run_task()` gate: whether `--auto` lets `task` run.
+///
+/// `prefetch` is the one selectable task git's table leaves without an
+/// `auto_condition`, and `maybe_run_task` treats a missing condition as "do not
+/// run", so `--auto` never prefetches.
+fn auto_condition(repo: &gix::Repository, task: &str) -> bool {
+    match task {
+        "pack-refs" => pack_refs_condition(repo),
+        "reflog-expire" => reflog_expire_condition(repo),
+        "worktree-prune" => worktree_prune_condition(repo),
+        "gc" => super::gc::gc_needed(repo) && pre_auto_gc_allows(repo),
+        "loose-objects" => loose_objects_condition(repo),
+        "commit-graph" => commit_graph_condition(repo),
+        "rerere-gc" => rerere_gc_condition(repo),
+        "incremental-repack" => incremental_repack_condition(repo),
+        "geometric-repack" => geometric_repack_condition(repo),
+        _ => false,
+    }
+}
+
+/// The tail of git's `need_to_gc()`: once a heuristic has tripped, the
+/// `pre-auto-gc` hook still gets to veto the run by exiting non-zero.
+fn pre_auto_gc_allows(repo: &gix::Repository) -> bool {
+    crate::hooks::run(repo, "pre-auto-gc", &[], None).unwrap_or(true)
+}
+
+/// `loose_object_auto_condition()`: at least `maintenance.loose-objects.auto`
+/// (default 100) loose objects exist. Unlike `too_many_loose_objects()` this
+/// counts for real — git walks the fan-out directories and stops at the limit.
+fn loose_objects_condition(repo: &gix::Repository) -> bool {
+    let limit = match gate(repo, "maintenance.loose-objects.auto", 100) {
+        Gate::Never => return false,
+        Gate::Always => return true,
+        Gate::Threshold(limit) => limit,
+    };
+    count_loose_objects(repo, limit) >= limit
+}
+
+/// Loose objects in the repository's own object directory, counted no further
+/// than `limit` — git's `for_each_loose_file_in_source` stops as soon as its
+/// callback returns non-zero.
+fn count_loose_objects(repo: &gix::Repository, limit: i64) -> i64 {
+    let objdir = repo.objects.store_ref().path().to_path_buf();
+    let name_len = repo.object_hash().len_in_hex() - 2;
+    let mut count: i64 = 0;
+    for fanout in 0..256u16 {
+        let Ok(entries) = std::fs::read_dir(objdir.join(format!("{fanout:02x}"))) else {
             continue;
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            match entry.file_type() {
-                Ok(t) if t.is_dir() => stack.push(path),
-                Ok(t) if t.is_file() => out.push(path),
-                _ => {}
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.len() != name_len
+                || !name.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                continue;
+            }
+            count += 1;
+            if count >= limit {
+                return count;
             }
         }
     }
-    out
+    count
 }
 
-/// Rewrite one reflog, keeping the entries at or after `cutoff`.
-///
-/// The file is only touched when something actually expired, so a run that
-/// changes nothing leaves every mtime alone.
-fn expire_reflog(path: &Path, cutoff: i64) -> Result<()> {
-    let Ok(body) = std::fs::read(path) else {
-        return Ok(());
-    };
+/// `rerere_gc_condition()`: an `rr-cache` directory exists and holds at least
+/// one entry. The limit is a plain on/off switch here — git compares nothing
+/// against it, so any positive value behaves like the default 1.
+fn rerere_gc_condition(repo: &gix::Repository) -> bool {
+    let limit = repo
+        .config_snapshot()
+        .integer("maintenance.rerere-gc.auto")
+        .unwrap_or(1);
+    if limit <= 0 {
+        return limit < 0;
+    }
+    std::fs::read_dir(repo.git_dir().join("rr-cache"))
+        .is_ok_and(|mut entries| entries.any(|e| e.is_ok()))
+}
 
-    let mut kept = Vec::with_capacity(body.len());
-    let mut dropped = false;
-    for line in body.split_inclusive(|b| *b == b'\n') {
-        match entry_timestamp(line) {
-            Some(at) if at < cutoff => dropped = true,
-            // Kept: either recent enough, or unparsable and so not ours to drop.
-            _ => kept.extend_from_slice(line),
+/// `worktree_prune_condition()`: at least `maintenance.worktree-prune.auto`
+/// (default 1) of the administrative directories under `worktrees/` are
+/// prunable, judged by the same `should_prune_worktree()` the task itself uses
+/// and the same `gc.worktreePruneExpire` cutoff.
+fn worktree_prune_condition(repo: &gix::Repository) -> bool {
+    let mut limit = repo
+        .config_snapshot()
+        .integer("maintenance.worktree-prune.auto")
+        .unwrap_or(1);
+    if limit <= 0 {
+        return limit < 0;
+    }
+    let Some(expire) = worktree_prune_expiry(repo) else {
+        // git's `parse_expiry_date` failure path leaves `should_prune` at 0.
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(repo.common_dir().join("worktrees")) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if limit == 0 {
+            break;
+        }
+        if super::gc::should_prune_worktree(&entry.path(), expire) {
+            limit -= 1;
         }
     }
-    if !dropped {
-        return Ok(());
-    }
-
-    // Rename into place so a reader never sees a half-written reflog. The
-    // temporary is a sibling, because a rename across filesystems is not atomic.
-    let name = match path.file_name() {
-        Some(name) => name.to_string_lossy().into_owned(),
-        None => return Ok(()),
-    };
-    let tmp = path.with_file_name(format!("{name}.zvcs-{}", std::process::id()));
-    std::fs::write(&tmp, &kept)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    limit == 0
 }
 
-/// The `<seconds>` field of a reflog line: the first token after the `>` that
-/// closes the committer's email address, which is the last `>` before the tab
-/// that starts the message.
-fn entry_timestamp(line: &[u8]) -> Option<i64> {
-    let head = match line.iter().position(|b| *b == b'\t') {
-        Some(at) => &line[..at],
-        None => line,
+/// `cfg->prune_worktrees_expire`, the `gc.worktreePruneExpire` cutoff that both
+/// the `worktree-prune` task and its auto condition measure against; `3.months.ago`
+/// when unset.
+fn worktree_prune_expiry(repo: &gix::Repository) -> Option<i64> {
+    let now = std::time::SystemTime::now();
+    match repo.config_snapshot().string("gc.worktreePruneExpire") {
+        Some(value) => super::gc::parse_reflog_expiry(value.to_str_lossy().as_ref(), now),
+        None => super::gc::parse_reflog_expiry("3.months.ago", now),
+    }
+}
+
+/// `reflog_expire_condition()`: at least `maintenance.reflog-expire.auto`
+/// (default 100) entries of `HEAD`'s reflog would be dropped by an expiry run.
+///
+/// git builds the policy from the `gc.*reflogExpire*` config and resolves it for
+/// `HEAD`, then counts with `should_expire_reflog_ent()`. That callback's
+/// reachability arm degenerates here: the condition leaves `mark_list` empty, so
+/// `is_unreachable()` reports every non-null commit as unreachable. With the
+/// defaults it never runs at all — `expire_total` (30 days) is later than
+/// `expire_unreachable` (90 days), so an entry old enough for the second test has
+/// already been caught by the first.
+fn reflog_expire_condition(repo: &gix::Repository) -> bool {
+    let limit = match gate(repo, "maintenance.reflog-expire.auto", 100) {
+        Gate::Never => return false,
+        Gate::Always => return true,
+        Gate::Threshold(limit) => limit,
     };
-    let after_email = head.iter().rposition(|b| *b == b'>')? + 1;
-    let rest = head.get(after_email..)?;
-    let token = rest.split(|b| *b == b' ').find(|f| !f.is_empty())?;
-    std::str::from_utf8(token).ok()?.parse().ok()
+
+    let now = std::time::SystemTime::now();
+    let now_secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let (expire_total, expire_unreach) =
+        super::gc::load_reflog_config(repo, now, now_secs).resolve("HEAD");
+
+    let Ok(body) = std::fs::read(repo.git_dir().join("logs").join("HEAD")) else {
+        return false;
+    };
+    let mut count: i64 = 0;
+    for line in body.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+        let Some((old, new, at)) = reflog_entry(line) else {
+            continue;
+        };
+        let expires = at < expire_total
+            || (at < expire_unreach && (!old.is_null() || !new.is_null()));
+        if expires {
+            count += 1;
+            if count >= limit {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// One reflog line as `(old, new, committer-seconds)`; `None` when the line does
+/// not parse, which git's iterator skips rather than counts.
+fn reflog_entry(line: &[u8]) -> Option<(gix::ObjectId, gix::ObjectId, i64)> {
+    let mut iter = gix::refs::file::log::iter::forward(line);
+    let parsed = iter.next()?.ok()?;
+    let at = parsed.signature.time().ok()?.seconds;
+    Some((parsed.previous_oid(), parsed.new_oid(), at))
+}
+
+/// `pack_refs_condition()`: more loose references than git's packed-refs-size
+/// heuristic allows.
+///
+/// The budget is `log2(packed-refs size / 100) * 5`, floored at 16 — roughly
+/// sixteen more loose refs per factor of ten of already-packed refs. Only the
+/// refs `pack-refs --all` would actually pack are counted: shared (non
+/// per-worktree) names that are neither symbolic nor broken.
+fn pack_refs_condition(repo: &gix::Repository) -> bool {
+    // git's `log2u(packed_size / 100) * 5`, floored at 16.
+    let packed_size = std::fs::metadata(repo.refs.packed_refs_path()).map_or(0usize, |m| m.len() as usize);
+    let scaled = packed_size / 100;
+    let log2 = if scaled == 0 {
+        0
+    } else {
+        usize::BITS as usize - 1 - scaled.leading_zeros() as usize
+    };
+    let limit = (log2 * 5).max(16);
+
+    let Ok(loose) = repo.refs.loose_iter() else {
+        return false;
+    };
+    let mut refcount = 0usize;
+    for reference in loose.filter_map(Result::ok) {
+        // `should_pack_ref()` under `--all`'s `*` include and no exclusions:
+        // per-worktree refs, symbolic refs and broken refs are never packed.
+        let name = reference.name.as_bstr();
+        if ["refs/bisect/", "refs/worktree/", "refs/rewritten/"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix.as_bytes()))
+        {
+            continue;
+        }
+        let Some(oid) = reference.target.try_id() else {
+            continue;
+        };
+        if !repo.has_object(oid) {
+            continue;
+        }
+        refcount += 1;
+        if refcount >= limit {
+            return true;
+        }
+    }
+    false
+}
+
+/// `should_write_commit_graph()`: at least `maintenance.commit-graph.auto`
+/// (default 100) reachable commits are missing from the commit-graph.
+///
+/// A depth-first walk from every reference, exactly as git's `dfs_on_ref` does:
+/// a commit already carried by the graph is neither counted nor descended
+/// through, because everything behind it is in the graph too.
+fn commit_graph_condition(repo: &gix::Repository) -> bool {
+    let limit = match gate(repo, "maintenance.commit-graph.auto", 100) {
+        Gate::Never => return false,
+        Gate::Always => return true,
+        Gate::Threshold(limit) => limit,
+    };
+
+    let graph = repo.commit_graph().ok();
+    let in_graph = |id: &gix::hash::oid| graph.as_ref().is_some_and(|g| g.lookup(id).is_some());
+
+    let Ok(platform) = repo.references() else {
+        return false;
+    };
+    let Ok(all) = platform.all() else {
+        return false;
+    };
+
+    let mut seen: std::collections::HashSet<gix::ObjectId> = std::collections::HashSet::new();
+    let mut count: i64 = 0;
+    for mut reference in all.filter_map(Result::ok) {
+        // `reference_get_peeled_oid()`: resolve the symref and follow tag chains.
+        let Ok(peeled) = reference.peel_to_id() else {
+            continue;
+        };
+        let Some(tip) = peel_to_commit(repo, peeled.detach()) else {
+            continue;
+        };
+        // git marks the tip SEEN before consulting the graph, so a tip shared by
+        // two refs is visited once whichever answer the graph gives.
+        if !seen.insert(tip) || in_graph(&tip) {
+            continue;
+        }
+        count += 1;
+        if count >= limit {
+            return true;
+        }
+        let mut stack = vec![tip];
+        while let Some(commit) = stack.pop() {
+            for parent in commit_parents(repo, commit) {
+                if in_graph(&parent) || !seen.insert(parent) {
+                    continue;
+                }
+                count += 1;
+                if count >= limit {
+                    return true;
+                }
+                stack.push(parent);
+            }
+        }
+    }
+    false
+}
+
+/// The commit `id` names, following tag chains; `None` when it is not a commit,
+/// which git's `odb_read_object_info(...) != OBJ_COMMIT` check skips.
+fn peel_to_commit(repo: &gix::Repository, id: gix::ObjectId) -> Option<gix::ObjectId> {
+    let object = repo.find_object(id).ok()?;
+    object.peel_to_kind(gix::object::Kind::Commit).ok().map(|c| c.id)
+}
+
+/// The parents of `id`, or an empty list when it cannot be read — git's
+/// `repo_parse_commit()` failure path, which skips the commit.
+fn commit_parents(repo: &gix::Repository, id: gix::ObjectId) -> Vec<gix::ObjectId> {
+    repo.find_object(id)
+        .ok()
+        .and_then(|o| o.try_into_commit().ok())
+        .map(|c| c.parent_ids().map(|p| p.detach()).collect())
+        .unwrap_or_default()
+}
+
+/// `incremental_repack_auto_condition()`: at least
+/// `maintenance.incremental-repack.auto` (default 10) packs are not covered by
+/// the multi-pack-index. The whole condition is off when `core.multiPackIndex`
+/// is false, which is the one place that key gates this task.
+fn incremental_repack_condition(repo: &gix::Repository) -> bool {
+    if repo.config_snapshot().boolean("core.multiPackIndex") == Some(false) {
+        return false;
+    }
+    let limit = match gate(repo, "maintenance.incremental-repack.auto", 10) {
+        Gate::Never => return false,
+        Gate::Always => return true,
+        Gate::Threshold(limit) => limit,
+    };
+
+    let pack_dir = repo.objects.store_ref().path().join("pack");
+    let indexed = midx_pack_names(&pack_dir);
+    let mut count: i64 = 0;
+    for pack in local_packs(&pack_dir, repo.object_hash()) {
+        if count >= limit {
+            break;
+        }
+        if !indexed.contains(&pack.index_name) {
+            count += 1;
+        }
+    }
+    count >= limit
+}
+
+/// The `.idx` names the multi-pack-index covers, empty when there is none.
+fn midx_pack_names(pack_dir: &Path) -> std::collections::HashSet<String> {
+    let midx = pack_dir.join("multi-pack-index");
+    let Ok(file) = gix::odb::pack::multi_index::File::at(&midx, None) else {
+        return std::collections::HashSet::new();
+    };
+    file.index_names()
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+        .collect()
+}
+
+/// `geometric_repack_auto_condition()`: the geometric split would merge at least
+/// two packs, or — when it would not — there are enough loose objects to be
+/// worth a new pack.
+fn geometric_repack_condition(repo: &gix::Repository) -> bool {
+    let auto_value = match gate(repo, "maintenance.geometric-repack.auto", 100) {
+        Gate::Never => return false,
+        Gate::Always => return true,
+        Gate::Threshold(value) => value,
+    };
+    if geometric_split(repo) > 0 {
+        return true;
+    }
+    super::gc::too_many_loose_objects(repo, auto_value)
+}
+
+/// `pack_geometry_split()` over the repository's own non-cruft, non-`.keep`,
+/// non-promisor packs: how many of them, taken in ascending object count, the
+/// next `repack --geometric=<factor>` would roll into one.
+///
+/// `maintenance.geometric-repack.splitFactor` (default 2) is the progression's
+/// ratio — the same value the task passes to `repack --geometric=`.
+pub(super) fn geometric_split(repo: &gix::Repository) -> usize {
+    let factor = repo
+        .config_snapshot()
+        .integer("maintenance.geometric-repack.splitFactor")
+        .unwrap_or(2)
+        .max(0) as u64;
+
+    let pack_dir = repo.objects.store_ref().path().join("pack");
+    let mut weights: Vec<u64> = local_packs(&pack_dir, repo.object_hash())
+        .into_iter()
+        .filter(|p| !p.keep && !p.cruft && !p.promisor)
+        .map(|p| p.objects)
+        .collect();
+    weights.sort_unstable();
+    compute_split(&weights, factor)
+}
+
+/// `compute_pack_geometry_split()`. `weights` is ascending; the answer is the
+/// number of packs at the light end that do not already form a geometric
+/// progression, grown by however many of the heavy packs the rolled-up pack
+/// would itself absorb.
+fn compute_split(weights: &[u64], factor: u64) -> usize {
+    if weights.is_empty() {
+        return 0;
+    }
+    // Count the packs that already form a progression, from the heavy end down.
+    let mut i = weights.len() - 1;
+    while i > 0 {
+        if weights[i] < factor.saturating_mul(weights[i - 1]) {
+            break;
+        }
+        i -= 1;
+    }
+    // The top element of the last-compared pair cannot be in the progression, so
+    // the split moves one right — unless the scan ran all the way to the end.
+    let mut split = if i == 0 { 0 } else { i + 1 };
+
+    let mut total: u64 = weights[..split].iter().copied().sum();
+    for &weight in &weights[split..] {
+        if weight >= factor.saturating_mul(total) {
+            break;
+        }
+        split += 1;
+        total = total.saturating_add(weight);
+    }
+    split
+}
+
+/// One pack in the repository's own `objects/pack`, carrying the `struct
+/// packed_git` flags the auto conditions branch on.
+struct Pack {
+    /// The `.idx` file name, which is how a multi-pack-index names its packs.
+    index_name: String,
+    /// Its object count, `pack_geometry_weight()`'s measure.
+    objects: u64,
+    /// A `.keep` file sits beside it.
+    keep: bool,
+    /// A `.mtimes` file sits beside it — git's `is_cruft`.
+    cruft: bool,
+    /// A `.promisor` file sits beside it.
+    promisor: bool,
+}
+
+/// Every pack in `pack_dir`. git's conditions only ever look at `pack_local`
+/// packs, which is exactly the repository's own pack directory — alternates
+/// live elsewhere and are never counted.
+fn local_packs(pack_dir: &Path, hash: gix::hash::Kind) -> Vec<Pack> {
+    let Ok(entries) = std::fs::read_dir(pack_dir) else {
+        return Vec::new();
+    };
+    let mut packs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("idx") {
+            continue;
+        }
+        // A pack with no `.pack` beside its index is not a pack git would open.
+        if !path.with_extension("pack").exists() {
+            continue;
+        }
+        let Ok(index) = gix::odb::pack::index::File::at(&path, hash) else {
+            continue;
+        };
+        let Some(index_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        packs.push(Pack {
+            index_name: index_name.to_owned(),
+            objects: u64::from(index.num_objects()),
+            keep: path.with_extension("keep").exists(),
+            cruft: path.with_extension("mtimes").exists(),
+            promisor: path.with_extension("promisor").exists(),
+        });
+    }
+    packs
 }
 
 /// Reject an unknown `--task` value the way git's callback does: a lone
 /// `error:` line, exit 129. `None` when the name is one git knows.
 fn check_task(value: &str) -> Option<ExitCode> {
     (!TASKS.contains(&value)).then(|| bare_error(&format!("'{value}' is not a valid task")))
+}
+
+/// Record an accepted `--task` name once: git's callback sets the task's
+/// `selected` bit, so naming one twice still runs it once.
+fn push_task(selected: &mut Vec<String>, value: &str) {
+    if !selected.iter().any(|s| s == value) {
+        selected.push(value.to_string());
+    }
 }
 
 /// Validate a `--task` or `--schedule` value the way git's option callbacks do,
@@ -937,11 +1370,7 @@ fn check_value(
             if let Some(code) = check_task(value) {
                 return Ok(Some(code));
             }
-            // git's callback sets the task's `selected` bit, so naming one twice
-            // still runs it once.
-            if !selected.iter().any(|s| s == value) {
-                selected.push(value.to_string());
-            }
+            push_task(selected, value);
         }
         "schedule" => {
             let Some(frequency) = Schedule::parse(value) else {

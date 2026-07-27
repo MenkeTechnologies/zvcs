@@ -50,6 +50,9 @@ pub struct PrepareFetch {
     ref_name: Option<gix_ref::PartialName>,
     /// If `true`, drop removes the entire worktree. Otherwise leave it alone.
     remove_worktree_on_drop: bool,
+    /// The object filter of a partial clone (git's `--filter`), if any.
+    #[cfg_attr(not(feature = "blocking-network-client"), allow(dead_code))]
+    filter: Option<gix_protocol::fetch::filter::Filter>,
 }
 
 /// The error returned by [`PrepareFetch::new()`].
@@ -153,6 +156,7 @@ impl PrepareFetch {
             shallow: remote::fetch::Shallow::NoChange,
             ref_name: None,
             remove_worktree_on_drop,
+            filter: None,
         })
     }
 }

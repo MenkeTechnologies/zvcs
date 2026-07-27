@@ -60,6 +60,10 @@ impl From<Mode> for Update {
 /// * …existing refs would not become 'unborn', i.e. point to a reference that doesn't exist and won't be created due to ref-specs
 ///
 /// With these safeguards in place, one can handle each naturally and implement mirrors or bare repos easily.
+///
+/// With `atomic` set, a single rejection means no ref is written at all — git's `--atomic`, which puts
+/// every update into one transaction and aborts it as soon as one of them can't be performed. The
+/// per-mapping [`Update`]s are produced either way, so the caller can report what would have happened.
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn update(
     repo: &Repository,
@@ -70,6 +74,7 @@ pub(crate) fn update(
     fetch_tags: fetch::Tags,
     dry_run: fetch::DryRun,
     write_packed_refs: fetch::WritePackedRefs,
+    atomic: bool,
 ) -> Result<update::Outcome, update::Error> {
     let _span = gix_trace::detail!("update_refs()", mappings = mappings.len());
     let mut edits = Vec::new();
@@ -318,7 +323,12 @@ pub(crate) fn update(
         }
     }
 
+    // gitoxide leaves a rejected mapping out of `edits` and applies the rest; `--atomic` is the
+    // promise that the rest doesn't get applied either.
+    let rejected_atomically = atomic && updates.iter().any(|update| update.mode.is_rejected());
+
     let edits = match dry_run {
+        fetch::DryRun::No if rejected_atomically => edits,
         fetch::DryRun::No => {
             let _span = gix_trace::detail!("apply", edits = edits.len());
             let (file_lock_fail, packed_refs_lock_fail) = repo
@@ -342,7 +352,11 @@ pub(crate) fn update(
         fetch::DryRun::Yes => edits,
     };
 
-    Ok(update::Outcome { edits, updates })
+    Ok(update::Outcome {
+        edits,
+        updates,
+        rejected_atomically,
+    })
 }
 
 /// Figure out if target of `edit` points to a reference that doesn't exist in `repo` and won't exist as it's not in any of `edits`.

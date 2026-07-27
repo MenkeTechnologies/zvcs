@@ -439,6 +439,12 @@ pub fn file(
             );
         }
 
+        // git's `assign_blame()` hands the entries a commit stayed responsible for to
+        // `found_guilty_entry()` right here, in `origin->suspects` order — which `blame_merge()`
+        // keeps sorted by the line in the *Blamed File*. `sort_batch_from` restores that order for
+        // the entries this iteration contributes, so `Outcome::uncoalesced_entries` matches the
+        // sequence git streams.
+        let batch_start = out.len();
         hunks_to_blame.retain_mut(|unblamed_hunk| {
             if unblamed_hunk.suspects.len() == 1 {
                 if let Some(entry) = BlameEntry::from_unblamed_hunk(unblamed_hunk, suspect) {
@@ -453,6 +459,7 @@ pub fn file(
             unblamed_hunk.remove_blame(suspect);
             true
         });
+        sort_batch_from(&mut out, batch_start);
     }
 
     debug_assert_eq!(
@@ -461,15 +468,28 @@ pub fn file(
         "only if there is no portion of the file left we have completed the blame"
     );
 
+    // `out` is in the order the walk finalized the entries, which is what
+    // `--incremental` streams; the sorted-and-coalesced form is a separate view of it.
+    let uncoalesced_entries = out.clone();
     // I don’t know yet whether it would make sense to use a data structure instead that preserves
     // order on insertion.
     out.sort_by_key(|a| a.start_in_blamed_file);
     Ok(Outcome {
         entries: coalesce_blame_entries(out),
+        uncoalesced_entries,
         blob: blamed_file_blob,
         statistics: stats,
         blame_path,
     })
+}
+
+/// Order the entries `out` gained since it was `batch_start` long by their position in the
+/// *Blamed File*.
+///
+/// One iteration of the walk contributes one such batch, and git emits the corresponding entries
+/// from `origin->suspects`, a list `blame_merge()` keeps sorted by that same position.
+fn sort_batch_from(out: &mut [BlameEntry], batch_start: usize) {
+    out[batch_start..].sort_by_key(|entry| entry.start_in_blamed_file);
 }
 
 /// Pass ownership of each unblamed hunk of `from` to `to`.
@@ -490,12 +510,14 @@ fn unblamed_to_out_is_done(
     suspect: ObjectId,
 ) -> bool {
     let mut without_suspect = Vec::new();
+    let batch_start = out.len();
     out.extend(hunks_to_blame.drain(..).filter_map(|hunk| {
         BlameEntry::from_unblamed_hunk(&hunk, suspect).or_else(|| {
             without_suspect.push(hunk);
             None
         })
     }));
+    sort_batch_from(out, batch_start);
     *hunks_to_blame = without_suspect;
     hunks_to_blame.is_empty()
 }

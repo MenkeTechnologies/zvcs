@@ -7,9 +7,14 @@
 //! `symref=HEAD:<target>` hint, the want/have loop, and a side-band-64k pack built
 //! from the negotiated closure (`push_proto::objects_to_send` +
 //! `pack_objects::pack_bytes_for`). Enough for a local (`file://`) or ssh
-//! clone/fetch served by this binary. Shallow/deepen and object filters are not
-//! negotiated (ignored); stateless-RPC (smart-HTTP) beyond `--advertise-refs` is
-//! not modelled. Argument parsing and repository resolution are checked against git
+//! clone/fetch served by this binary. The want policy of `receive_needs()` is
+//! enforced: a `want` outside the advertised ref tips is refused with
+//! `ERR upload-pack: not our ref <oid>` and exit 128 unless
+//! `uploadpack.allowTipSHA1InWant`, `uploadpack.allowReachableSHA1InWant` or
+//! `uploadpack.allowAnySHA1InWant` widens it (see [`WantPolicy`]).
+//! Shallow/deepen and object filters are not negotiated (ignored); stateless-RPC
+//! (smart-HTTP) beyond `--advertise-refs` is not modelled other than in that want
+//! policy. Argument parsing and repository resolution are checked against git
 //! 2.55.0 on Darwin:
 //!
 //!   * `-h` → the 368-byte usage block on **stdout**, exit 129, before any
@@ -50,11 +55,12 @@
 //!      `agent=git/2.55.0-Darwin` — the installed git's version string and
 //!      platform. It is not derivable from the repository or from the vendored
 //!      crates, and hardcoding one build's value would produce output that
-//!      matches on exactly one machine. The rest of the list is equally
+//!      matches on exactly one machine. Parts of the list are equally
 //!      environmental: `no-done` is advertised for `--advertise-refs` but not
-//!      for the full v0 exchange, and `filter`, `allow-tip-sha1-in-want`,
-//!      `allow-reachable-sha1-in-want` and `ref-in-want` each appear only when
-//!      the matching `uploadpack.*` config is set.
+//!      for the full v0 exchange, and `filter` and `ref-in-want` appear only
+//!      when the matching `uploadpack.*` config is set. The two
+//!      `allow-*-sha1-in-want` tokens *are* ported — see [`WantPolicy`] — because
+//!      they are a policy this server can actually enforce.
 //!   3. **Pack generation is not wired to a protocol.** `gix-pack` has
 //!      `data::output` (`count`, `entry`) for building a pack, but nothing
 //!      turns a negotiated want/have set into a side-band-multiplexed stream
@@ -302,7 +308,11 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
     let advertise_only = args
         .iter()
         .any(|a| a == "--advertise-refs" || a == "--http-backend-info-refs");
-    serve(&repo, advertise_only)
+    // git's want policy differs under `--stateless-rpc`: a smart-HTTP client may
+    // have chosen its wants from an advertisement a *different* process wrote, so
+    // a non-tip want is checked for reachability instead of refused outright.
+    let stateless_rpc = args.iter().any(|a| a == "--stateless-rpc");
+    serve(&repo, advertise_only, stateless_rpc)
 }
 
 // ---------------------------------------------------------------------------
@@ -314,9 +324,10 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
 /// does not already have. Enough for a local (`file://`) or ssh clone/fetch served
 /// by this binary. `advertise_only` (smart-HTTP info/refs) writes the advertisement
 /// and stops. Shallow/deepen and object filters are not negotiated (ignored).
-fn serve(repo: &gix::Repository, advertise_only: bool) -> Result<ExitCode> {
+fn serve(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool) -> Result<ExitCode> {
+    let policy = WantPolicy::from_config(repo);
     {
-        let adv = advertisement(repo)?;
+        let adv = advertisement(repo, policy)?;
         let mut out = std::io::stdout().lock();
         out.write_all(&adv)?;
         out.flush()?;
@@ -350,6 +361,17 @@ fn serve(repo: &gix::Repository, advertise_only: bool) -> Result<ExitCode> {
     }
     if wants.is_empty() {
         return Ok(ExitCode::SUCCESS); // client hung up after the advertisement (ls-remote)
+    }
+
+    // `receive_needs`: every `want` must be one this server is willing to serve.
+    if let Some(refused) = policy.refuse(repo, &wants, stateless_rpc)? {
+        let mut out = std::io::stdout().lock();
+        // git reports the refusal twice: an `ERR` pkt-line so the client sees a
+        // protocol-level reason, and the same text on stderr for the server log.
+        write_pkt(&mut out, format!("ERR upload-pack: not our ref {refused}").as_bytes())?;
+        out.flush()?;
+        eprintln!("error: git upload-pack: not our ref {refused}");
+        return Ok(ExitCode::from(128));
     }
 
     // --- haves until `done`, ACK/NAK per round -----------------------------------
@@ -414,7 +436,7 @@ fn serve(repo: &gix::Repository, advertise_only: bool) -> Result<ExitCode> {
 /// `symref=HEAD:<target>` so the client checks out the right branch), then every
 /// ref in name order, each annotated tag followed by its peeled `^{}` line, then a
 /// flush. Mirrors git's `send_ref`/`upload-pack` advertisement shape.
-fn advertisement(repo: &gix::Repository) -> Result<Vec<u8>> {
+fn advertisement(repo: &gix::Repository, policy: WantPolicy) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     // `upload-pack` filters its ref list through `ref_is_hidden()` exactly as
     // `receive-pack` does, off `uploadpack.hideRefs` plus the shared
@@ -426,7 +448,7 @@ fn advertisement(repo: &gix::Repository) -> Result<Vec<u8>> {
         .ok()
         .flatten()
         .map(|r| r.name().as_bstr().to_string());
-    let caps = capabilities(head_target.as_deref());
+    let caps = capabilities(head_target.as_deref(), policy);
     let mut sent_caps = false;
 
     // HEAD first, when it resolves to an object.
@@ -478,15 +500,144 @@ fn advertisement(repo: &gix::Repository) -> Result<Vec<u8>> {
 }
 
 /// The upload-pack capability list. `symref=HEAD:<target>` tells the client which
-/// branch HEAD follows so a clone checks it out.
-fn capabilities(head_target: Option<&str>) -> String {
+/// branch HEAD follows so a clone checks it out. The two `allow-*-sha1-in-want`
+/// tokens are emitted exactly when the matching bit of [`WantPolicy`] is set, as
+/// `write_v0_ref()` does off `data->allow_uor`.
+fn capabilities(head_target: Option<&str>, policy: WantPolicy) -> String {
     let mut caps =
         String::from("multi_ack_detailed side-band-64k thin-pack ofs-delta no-progress include-tag");
+    if policy.tip {
+        caps.push_str(" allow-tip-sha1-in-want");
+    }
+    if policy.reachable {
+        caps.push_str(" allow-reachable-sha1-in-want");
+    }
     if let Some(t) = head_target {
         caps.push_str(&format!(" symref=HEAD:{t}"));
     }
     caps.push_str(" object-format=sha1 agent=git/2.55.0-zvcs");
     caps
+}
+
+/// git's `allow_uor` bitset: which object ids a client may name in a `want` line
+/// beyond the ref tips this server advertised.
+///
+/// Ported from `upload_pack_config()` (upload-pack.c): `uploadpack.allowAnySHA1InWant`
+/// is `ALLOW_ANY_SHA1`, which is defined as *implying* the other two, so setting it
+/// also lights up both `allow-*-sha1-in-want` advertisement tokens.
+#[derive(Clone, Copy, Default)]
+struct WantPolicy {
+    /// `uploadpack.allowTipSHA1InWant` — a want may be the tip of *any* ref,
+    /// including one hidden from the advertisement.
+    tip: bool,
+    /// `uploadpack.allowReachableSHA1InWant` — a want may be any object reachable
+    /// from a ref.
+    reachable: bool,
+    /// `uploadpack.allowAnySHA1InWant` — a want may be any object in the repository.
+    any: bool,
+}
+
+impl WantPolicy {
+    /// Read the three `uploadpack.allow*SHA1InWant` booleans, applying git's
+    /// "any implies tip and reachable" relation.
+    fn from_config(repo: &gix::Repository) -> Self {
+        let config = repo.config_snapshot();
+        let any = config.boolean("uploadpack.allowAnySHA1InWant").unwrap_or(false);
+        WantPolicy {
+            tip: any || config.boolean("uploadpack.allowTipSHA1InWant").unwrap_or(false),
+            reachable: any
+                || config
+                    .boolean("uploadpack.allowReachableSHA1InWant")
+                    .unwrap_or(false),
+            any,
+        }
+    }
+
+    /// git's `allow_hidden_refs()`: whether hidden refs are left out of the set of
+    /// "our refs" a want is matched against. They are, unless exactly one of the
+    /// tip/reachable relaxations is in play without `allowAnySHA1InWant`.
+    fn hides_hidden_refs(self) -> bool {
+        self.any || !(self.tip || self.reachable)
+    }
+
+    /// The object ids a `want` may name for free — `mark_our_ref()`'s `OUR_REF`
+    /// set: every ref tip, minus the ones hidden from the advertisement when
+    /// [`hides_hidden_refs`][Self::hides_hidden_refs] says so.
+    fn our_refs(self, repo: &gix::Repository) -> Result<Vec<ObjectId>> {
+        let config = repo.config_snapshot();
+        let hidden = super::receive_pack::hide_ref_patterns(&config, "uploadpack.hideRefs");
+        let skip_hidden = self.hides_hidden_refs();
+        let mut out = Vec::new();
+        for reference in repo.references()?.all()? {
+            let Ok(mut reference) = reference else { continue };
+            let name = reference.name().as_bstr().to_string();
+            if skip_hidden && super::receive_pack::ref_is_hidden(&hidden, &name) {
+                continue;
+            }
+            if let Ok(id) = reference.follow_to_object() {
+                out.push(id.detach());
+            }
+        }
+        Ok(out)
+    }
+
+    /// The first `want` this server refuses to serve, or `None` when all of them
+    /// are acceptable. Ports `receive_needs()`'s want loop plus `check_non_tip()`:
+    /// an object that is not present at all is always refused; otherwise a want
+    /// outside the "our refs" set is refused unless `allowAnySHA1InWant` is on, or
+    /// it is reachable from one of them and either `allowReachableSHA1InWant` is on
+    /// or we are answering a stateless RPC.
+    fn refuse(
+        self,
+        repo: &gix::Repository,
+        wants: &[ObjectId],
+        stateless_rpc: bool,
+    ) -> Result<Option<ObjectId>> {
+        if let Some(missing) = wants.iter().find(|id| repo.find_object(**id).is_err()) {
+            return Ok(Some(*missing));
+        }
+        if self.any {
+            return Ok(None);
+        }
+        let ours = self.our_refs(repo)?;
+        let non_tip: Vec<ObjectId> = wants.iter().copied().filter(|id| !ours.contains(id)).collect();
+        if non_tip.is_empty() {
+            return Ok(None);
+        }
+        // `check_non_tip()` refuses immediately unless the reachability check is
+        // allowed to run at all.
+        if !stateless_rpc && !self.reachable {
+            return Ok(Some(non_tip[0]));
+        }
+        // `has_unreachable()`: `rev-list --stdin` with every "our ref" negated. A
+        // want that survives that walk is not an ancestor of anything we advertised.
+        let tips: Vec<ObjectId> = ours
+            .iter()
+            .filter_map(|id| peel_to_commit(repo, *id))
+            .collect();
+        for want in non_tip {
+            let Some(commit) = peel_to_commit(repo, want) else {
+                // `rev-list` dies on a want that is not commit-ish, which
+                // `has_unreachable()` turns into "unreachable".
+                return Ok(Some(want));
+            };
+            let reachable = repo
+                .merge_bases_many(commit, &tips)
+                .map(|bases| bases.iter().any(|base| base.detach() == commit))
+                .unwrap_or(false);
+            if !reachable {
+                return Ok(Some(want));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Peel `id` to the commit it names, or `None` when it names no commit — the
+/// distinction `rev-list` makes between a commit-ish argument and any other object.
+fn peel_to_commit(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
+    let object = repo.find_object(id).ok()?;
+    object.peel_to_kind(gix::objs::Kind::Commit).ok().map(|c| c.id)
 }
 
 /// Whether the client advertised capability `want` (a whole space-separated token).

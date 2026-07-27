@@ -19,4 +19,4 @@ pub mod encode;
 pub mod search;
 
 pub use encode::Index;
-pub use search::{Delta, Object, Options, find_deltas, name_hash};
+pub use search::{Delta, Islands, Object, Options, find_deltas, name_hash};

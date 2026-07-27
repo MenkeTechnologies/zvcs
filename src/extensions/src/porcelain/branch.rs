@@ -92,10 +92,12 @@ fn usage_exit() -> Result<ExitCode> {
     Ok(ExitCode::from(129))
 }
 
-/// The `refSyntax` advice git prints after rejecting a branch name.
-fn ref_syntax_hints() {
-    eprintln!("hint: See 'git help check-ref-format'");
-    eprintln!("hint: Disable this message with \"git config set advice.refSyntax false\"");
+/// The `refSyntax` advice git prints after rejecting a branch name. git spells
+/// this `advise_if_enabled(ADVICE_REF_SYNTAX, …)` (`builtin/branch.c`), so the
+/// `Disable this message with …` trailer appears only while the slot is
+/// unconfigured — setting `advice.refSyntax=true` keeps the hint and drops it.
+fn ref_syntax_hints(repo: &gix::Repository) {
+    crate::advice::Advice::RefSyntax.advise_in(repo, "See 'git help check-ref-format'");
 }
 
 /// Which ref namespace a listing covers. `-a`/`-r` are a single mode selector in
@@ -1178,9 +1180,7 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
     if gix::validate::reference::branch_name(BStr::new(full.as_bytes())).is_err() {
         let code = fatal(format!("'{name}' is not a valid branch name"))?;
-        if crate::advice::enabled("refSyntax") {
-            ref_syntax_hints();
-        }
+        ref_syntax_hints(repo);
         return Ok(code);
     }
 
@@ -1380,19 +1380,19 @@ fn set_upstream(repo: &gix::Repository, o: &Opts, upstream_spec: &str) -> Result
             let code = fatal(format!(
                 "the requested upstream branch '{upstream_spec}' does not exist"
             ))?;
-            if crate::advice::enabled("setUpstreamFailure") {
-                eprintln!("hint:");
-                eprintln!("hint: If you are planning on basing your work on an upstream");
-                eprintln!("hint: branch that already exists at the remote, you may need to");
-                eprintln!("hint: run \"git fetch\" to retrieve it.");
-                eprintln!("hint:");
-                eprintln!("hint: If you are planning to push out a new local branch that");
-                eprintln!("hint: will track its remote counterpart, you may want to use");
-                eprintln!("hint: \"git push -u\" to set the upstream config as you push.");
-                eprintln!(
-                    "hint: Disable this message with \"git config set advice.setUpstreamFailure false\""
-                );
-            }
+            // `advise_if_enabled(ADVICE_SET_UPSTREAM_FAILURE, upstream_advice)`
+            // in `branch.c`: the trailer is git's, not ours, so it appears only
+            // while the slot is unconfigured.
+            crate::advice::Advice::SetUpstreamFailure.advise_in(
+                repo,
+                "\nIf you are planning on basing your work on an upstream\n\
+                 branch that already exists at the remote, you may need to\n\
+                 run \"git fetch\" to retrieve it.\n\
+                 \n\
+                 If you are planning to push out a new local branch that\n\
+                 will track its remote counterpart, you may want to use\n\
+                 \"git push -u\" to set the upstream config as you push.",
+            );
             return Ok(code);
         }
     };
@@ -1531,9 +1531,7 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
     if gix::validate::reference::branch_name(BStr::new(new_full.as_bytes())).is_err() {
         let code = fatal(format!("'{new}' is not a valid branch name"))?;
-        if crate::advice::enabled("refSyntax") {
-            ref_syntax_hints();
-        }
+        ref_syntax_hints(repo);
         return Ok(code);
     }
 
@@ -1645,9 +1643,7 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
     if gix::validate::reference::branch_name(BStr::new(new_full.as_bytes())).is_err() {
         let code = fatal(format!("'{new}' is not a valid branch name"))?;
-        if crate::advice::enabled("refSyntax") {
-            ref_syntax_hints();
-        }
+        ref_syntax_hints(repo);
         return Ok(code);
     }
 
@@ -1818,12 +1814,10 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             };
             if !merged {
                 let code = error_exit(format!("the branch '{name}' is not fully merged"))?;
-                if crate::advice::enabled("forceDeleteBranch") {
-                    eprintln!("hint: If you are sure you want to delete it, run 'git branch -D {name}'");
-                    eprintln!(
-                        "hint: Disable this message with \"git config set advice.forceDeleteBranch false\""
-                    );
-                }
+                crate::advice::Advice::ForceDeleteBranch.advise_in(
+                    repo,
+                    &format!("If you are sure you want to delete it, run 'git branch -D {name}'"),
+                );
                 return Ok(code);
             }
         }

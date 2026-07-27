@@ -3,10 +3,12 @@
 //!
 //! Ported from `builtin/bugreport.c`. Covered, byte-identically with stock git:
 //! the option grammar (`-o`/`--output-directory`, `-s`/`--suffix`,
-//! `--no-suffix`, `--no-diagnose`, `--` , unique-prefix long-option
-//! abbreviation, `-h`), the `-h`/unknown-option/unknown-argument usage text and
-//! their exit codes, the report path construction (prefix + `strbuf_complete`
-//! slash + `git-bugreport[-<strftime suffix>].txt`), creation of the leading
+//! `--no-suffix`, `--diagnose[=<mode>]`, `--no-diagnose`, `--` , unique-prefix
+//! long-option abbreviation, `-h`), the `-h`/unknown-option/unknown-argument
+//! usage text and their exit codes, `setup_git_directory_gently`'s chdir to the
+//! worktree root with `prefix_filename()` on `-o` and the prefix stripped again
+//! for display, the report path construction (prefix + `strbuf_complete` slash +
+//! `git-bugreport[-<strftime suffix>].txt`), creation of the leading
 //! directories, `O_CREAT|O_EXCL` file creation and its `fatal:` diagnostics, the
 //! question template, the `[System Info]` / `[Enabled Hooks]` headers, the
 //! `uname` and `$SHELL` lines, the enabled-hook scan (28 documented hook names,
@@ -16,12 +18,15 @@
 //! the `:` no-op, `use_shell` quoting, the canonicalized path handed to the
 //! editor) with git's 0/1 exit code.
 //!
-//! Not covered:
+//! `--diagnose[=<mode>]` writes the `git-diagnostics-<suffix>.zip` archive next
+//! to the report before the report itself is written, out of the same
+//! `time(NULL)`, through [`super::diagnose::create_diagnostics_archive`]; that
+//! module's docs list what the archive does and does not reproduce. The option
+//! carries `PARSE_OPT_OPTARG`, so a mode must be attached with `=` and a bare
+//! `--diagnose bogus` leaves `bogus` as an unknown argument, as stock does.
 //!
-//!   * `--diagnose[=<mode>]` — needs a zip writer and `git diagnose`'s statistics
-//!     collector; neither exists in gitoxide. Rejected rather than approximated.
-//!
-//! Two divergences that cannot be closed, rather than gaps that could be filled:
+//! Three divergences that cannot be closed, rather than gaps that could be
+//! filled:
 //!
 //!   * The build-options part of `[System Info]` (`cpu`, `sizeof-long`,
 //!     `shell-path`, `rust`, `feature`, `gettext`, `libcurl`, `OpenSSL`, `zlib`,
@@ -35,12 +40,18 @@
 //!   * The `hint: Waiting for your editor to close the file...` line and the
 //!     line-erase that follows it are not emitted. Both fire only when stderr is
 //!     a terminal, so no piped invocation can observe the difference.
+//!   * `--no-suffix --diagnose` dies of `SIGSEGV` in stock (exit 139): the zip
+//!     path is built by handing `strbuf_addftime()` the `NULL` that
+//!     `--no-suffix` left behind, and it dereferences it. Verified against git
+//!     2.55.0. This port writes `git-diagnostics-.zip`, which is what that line
+//!     of `cmd_bugreport()` spells out when the format is empty.
 //!
 //! One approximation: hook executability is tested with `mode & 0o111` where git
 //! calls `access(X_OK)`, so a hook that is executable only for a different
 //! user/group is reported as enabled here.
 
-use anyhow::{bail, Result};
+use super::diagnose::{self, LocalTime, Mode, Setup};
+use anyhow::Result;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, ExitCode};
@@ -148,17 +159,26 @@ pub fn bugreport(args: &[String]) -> Result<ExitCode> {
         Parsed::Exit(code) => return Ok(ExitCode::from(code)),
     };
 
+    // `setup_git_directory_gently()` leaves the process at the worktree root and
+    // hands the command the subdirectory it started in; `prefix_filename()`
+    // re-attaches that subdirectory to a relative `-o` value. `now` is git's
+    // single `time(NULL)`, shared by the report's suffix and the archive's.
+    let start = Setup::enter();
+    let now = LocalTime::now();
+
     // Prepare the path to put the result: `<-o value>` (empty when unset), a
     // separating slash unless the buffer is empty or already ends in one, then
     // the file name.
-    let mut report_path = opts.output.clone().unwrap_or_default();
+    let mut report_path = start.prefix_filename(opts.output.as_deref().unwrap_or(""));
     if !report_path.is_empty() && !report_path.ends_with('/') {
         report_path.push('/');
     }
+    // `output_path_len` — the directory part, which the archive path reuses.
+    let output_path_len = report_path.len();
     report_path.push_str("git-bugreport");
     if let Some(suffix) = &opts.suffix {
         report_path.push('-');
-        report_path.push_str(&strftime_local(suffix)?);
+        report_path.push_str(&now.strftime(suffix));
     }
     report_path.push_str(".txt");
 
@@ -167,6 +187,20 @@ pub fn bugreport(args: &[String]) -> Result<ExitCode> {
     if let Some(parent) = Path::new(&report_path).parent() {
         if !parent.as_os_str().is_empty() && std::fs::create_dir_all(parent).is_err() {
             eprintln!("fatal: could not create leading directories for '{report_path}'");
+            return Ok(ExitCode::from(EXIT_FATAL));
+        }
+    }
+
+    // Prepare diagnostics, if requested — before the report, as git does, so its
+    // stdout report and `Diagnostics complete.` come out first.
+    if let Some(mode) = opts.diagnose {
+        let mut zip_path = report_path[..output_path_len].to_string();
+        zip_path.push_str("git-diagnostics-");
+        zip_path.push_str(&now.strftime(opts.suffix.as_deref().unwrap_or("")));
+        zip_path.push_str(".zip");
+
+        if let Err(e) = diagnose::create_diagnostics_archive(&zip_path, mode, &now) {
+            eprintln!("fatal: unable to create diagnostics archive {zip_path}: {e}");
             return Ok(ExitCode::from(EXIT_FATAL));
         }
     }
@@ -199,7 +233,12 @@ pub fn bugreport(args: &[String]) -> Result<ExitCode> {
     }
     drop(file);
 
-    eprintln!("Created new report at '{report_path}'.");
+    // git prints the path relative to the user — the start directory — but still
+    // hands the editor the path relative to the worktree root.
+    let shown = report_path
+        .strip_prefix(start.prefix())
+        .unwrap_or(&report_path);
+    eprintln!("Created new report at '{shown}'.");
 
     Ok(match launch_editor(repo.as_ref(), Path::new(&report_path)) {
         true => ExitCode::SUCCESS,
@@ -214,6 +253,8 @@ struct Opts {
     /// `-s`/`--suffix`, defaulting to git's `%Y-%m-%d-%H%M`; `None` after
     /// `--no-suffix`.
     suffix: Option<String>,
+    /// `--diagnose[=<mode>]`; `None` is git's `DIAGNOSE_NONE` default.
+    diagnose: Option<Mode>,
 }
 
 /// Either parsed options, or an exit status git would leave with immediately.
@@ -231,6 +272,7 @@ fn parse_options(args: &[String]) -> Result<Parsed> {
     let mut opts = Opts {
         output: None,
         suffix: Some("%Y-%m-%d-%H%M".to_string()),
+        diagnose: None,
     };
     let mut leftover: Vec<&str> = Vec::new();
     let mut no_more_opts = false;
@@ -287,12 +329,21 @@ fn parse_options(args: &[String]) -> Result<Parsed> {
                 },
             };
             match (name, negated) {
-                ("diagnose", true) => {}
-                ("diagnose", false) => bail!(
-                    "unsupported flag \"--diagnose\" (needs a zip writer and git diagnose's \
-                     statistics collector, neither of which gitoxide provides; ported: \
-                     --output-directory, --suffix, --no-suffix, --no-diagnose)"
-                ),
+                ("diagnose", true) => opts.diagnose = None,
+                // `PARSE_OPT_OPTARG`: a bare `--diagnose` means `stats`, and a
+                // mode only counts when it is attached with `=`.
+                ("diagnose", false) => {
+                    opts.diagnose = match attached {
+                        None => Some(Mode::Stats),
+                        Some(v) => match diagnose::parse_mode(v) {
+                            Some(m) => Some(m),
+                            None => {
+                                eprintln!("error: invalid --diagnose value '{v}'");
+                                return Ok(Parsed::Exit(EXIT_USAGE));
+                            }
+                        },
+                    }
+                }
                 ("output-directory", true) => opts.output = None,
                 ("output-directory", false) => {
                     let Some(v) = take_value(&mut i, attached, "option", name) else {
@@ -375,13 +426,9 @@ fn resolve_long(name: &str) -> Option<&'static str> {
 /// facts that hold for this binary; see the module docs.
 fn system_info(out: &mut String) {
     out.push_str("git version:\n");
-    out.push_str(&format!("git version {}\n", env!("CARGO_PKG_VERSION")));
-    out.push_str(&format!("cpu: {}\n", std::env::consts::ARCH));
-    out.push_str("no commit associated with this build\n");
-    out.push_str(&format!(
-        "sizeof-size_t: {}\n",
-        std::mem::size_of::<usize>()
-    ));
+    // The same block `git diagnose` puts at the head of its report, so the two
+    // can never disagree about what this binary is.
+    diagnose::version_info(out);
 
     out.push_str("uname: ");
     out.push_str(&uname_info());
@@ -440,24 +487,6 @@ fn populated_hooks(out: &mut String, repo: Option<&gix::Repository>) -> Result<(
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-}
-
-/// `strbuf_addftime(fmt, localtime_r(now))`.
-///
-/// Delegated to `date`, which formats through the same libc `strftime` git uses,
-/// so every conversion specifier behaves identically without reimplementing the
-/// format language or carrying a timezone database.
-fn strftime_local(fmt: &str) -> Result<String> {
-    let out = Command::new("date")
-        .arg(format!("+{fmt}"))
-        .output()
-        .map_err(|e| anyhow::anyhow!("could not run `date` to format the filename suffix: {e}"))?;
-    if !out.status.success() {
-        bail!("`date` rejected the strftime format {fmt:?}");
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    // `date` adds exactly one terminating newline of its own.
-    Ok(text.strip_suffix('\n').unwrap_or(&text).to_string())
 }
 
 /// `launch_editor()` — returns whether it succeeded, which is what git turns

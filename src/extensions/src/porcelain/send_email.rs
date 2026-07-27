@@ -5,7 +5,7 @@
 //! messages out of patch files and then hands them either to a `sendmail`-style
 //! program or to a `Net::SMTP` socket.
 //!
-//! The composing half and the program transport are ported in full. Every
+//! The composing half and both transports are ported in full. Every
 //! configuration variable and option that steers *which bytes get produced* —
 //! the sender, the recipient lists, the alias files, the mailmap, the `Cc`
 //! suppressions, the threading headers, the transfer encoding, the validation
@@ -14,13 +14,11 @@
 //! (modulo `Date:` and `Message-ID:`, which are functions of the clock and the
 //! pid).
 //!
-//! What is not ported is the socket transport. `Net::SMTP` / `Net::SMTP::SSL`,
-//! `IO::Socket::SSL` and SASL through `Authen::SASL` have no substrate in the
-//! vendored gitoxide crates under `src/ported`, and faking a conversation with a
-//! mail server is not an option. A run that would open a socket bails, naming
-//! what it would have used; `--sendmail-cmd`, an absolute `--smtp-server` and
-//! `--dry-run` all work. All output below was captured from git 2.55.0 on
-//! Darwin.
+//! The socket transport lives in [`super::smtp`], which ports the `Net::SMTP`
+//! branch of `send_message` along with the parts of `Net::SMTP`, `Net::Cmd`,
+//! `IO::Socket::SSL` and `Authen::SASL` it reaches; that module's own docs list
+//! what it covers and what it does not. All output below was captured from git
+//! 2.55.0 on Darwin.
 //!
 //! ### Covered (byte-identical stdout/stderr and exit code)
 //!
@@ -98,10 +96,27 @@
 //!   (the `sendemail-validate` hook through `git hook run`, the 998-character
 //!   limit, and `Git::port_num` for the SMTP port), `do_edit` for `--annotate`,
 //!   the `--batch-size`/`--relogin-delay` pause, and the `imap-send` copy.
+//! * `--compose`: the `.gitsendemail.msg.XXXXXX` template under the git
+//!   directory, the `GIT: ` comment block and per-patch subject list,
+//!   `--annotate` folding the patches into the same editor session, the
+//!   re-parse of the edited file into `<name>.final` (`GIT: ` stripping, the
+//!   `MIME-Version:`/`Content-Type:`/`Content-Transfer-Encoding:` block a
+//!   non-ASCII byte adds, `sendemail.composeEncoding` as that charset and as
+//!   `quote_subject`'s label, and the headers lifted back into `$sender`,
+//!   `@initial_to`, `@initial_cc`, `@initial_bcc`, `$reply_to`,
+//!   `$initial_subject` and `$initial_in_reply_to`), the `Summary email is
+//!   empty` skip, the composed message leading the series, and
+//!   `cleanup_compose_files`. `--no-compose` is not an option in the script
+//!   either: it falls through to `@rev_list_opts`.
 //! * The transport for `--sendmail-cmd` and for an absolute `--smtp-server`: the
 //!   `-f <envelope>`, `-i`, recipient and `--smtp-server-option` argument
 //!   vector, `"$header\n$message"` on the program's stdin, and both the `quiet`
 //!   (`Sent`/`Dry-Sent`) and verbose (`OK. Log says:` …) reports.
+//! * The socket transport: the session opened (and reused, and closed by
+//!   `--batch-size`) through [`super::smtp`], `smtp_auth_maybe`'s credential
+//!   round trip, the Outlook `Message-ID` recovery and its effect on the next
+//!   message's `In-Reply-To:`, and the `Result: <code> …` line the verbose
+//!   report ends with.
 //!
 //! ### Exit status of the `die` paths
 //!
@@ -129,17 +144,9 @@
 //!
 //! ### Not covered
 //!
-//! * The `Net::SMTP` transport: opening a socket, STARTTLS or implicit SSL,
-//!   `ssl_verify_params`, SASL authentication through `git credential`, `MAIL
-//!   FROM`/`RCPT TO`/`DATA`, and the Outlook `Message-ID` recovery. A run that
-//!   would reach it bails. The settings that exist only to steer it —
-//!   `smtpEncryption`, `smtpUser`, `smtpPass`, `smtpDomain`, `smtpAuth`, the
-//!   three `smtpSSL*` paths and `outlookidfix` — are therefore not read out of
-//!   the configuration at all; their options still parse and are named in the
-//!   bail. `--smtp-debug` likewise steers only `Net::SMTP`'s own tracing.
-//! * `--compose`: the introductory message is written into `$GIT_EDITOR` from a
-//!   template and then re-parsed for its headers. It bails, as does
-//!   `sendemail.composeEncoding`, which nothing else reads.
+//! * The SASL mechanisms beyond `PLAIN` and `LOGIN` that `Authen::SASL` would
+//!   supply, and `Authen::SASL`'s ranking between mechanisms — see
+//!   [`super::smtp`].
 //! * Revision arguments, which the script turns into patches by running
 //!   `git format-patch -o <tmpdir>`. Naming patch files or a directory works;
 //!   anything that falls through to `@rev_list_opts` bails.
@@ -155,6 +162,10 @@
 //!   raw bytes, but a header line is decoded lossily before it is matched, so a
 //!   display name in a legacy 8-bit charset would not survive verbatim. Patch
 //!   headers out of `format-patch` are RFC 2047 encoded and unaffected.
+//! * The `SIGINT`/`SIGTERM` handler, which resets the terminal attributes,
+//!   re-enables echo and names the surviving `--compose` temporaries. Nothing
+//!   here installs signal handlers, so an interrupted run leaves both files in
+//!   the git directory without saying so.
 //! * `Term::ReadLine`'s prompt decoration. With no terminal to open, `ask`
 //!   returns its default without printing, which is what the script does and
 //!   what every prompt path here was compared against; with a terminal the
@@ -631,16 +642,13 @@ enum BoolTarget {
     XMailer,
     ForbidSendmailVariables,
     Mailmap,
+    OutlookIdFix,
     UseImapOnly,
 }
 
 /// `%config_bool_settings`. Each entry is spelled as the configuration variable
 /// itself for the unqualified `sendemail` prefix; [`identity_key`] rewrites it
 /// for the `sendemail.<identity>` pass.
-///
-/// The `outlookidfix` setting is deliberately absent: `is_outlook()` is
-/// consulted only after a `Net::SMTP` conversation has produced a server reply,
-/// so nothing this module can reach would observe it. See the module docs.
 const BOOL_SETTINGS: &[(&str, BoolTarget)] = &[
     ("sendemail.thread", BoolTarget::Thread),
     ("sendemail.chainreplyto", BoolTarget::ChainReplyTo),
@@ -655,6 +663,7 @@ const BOOL_SETTINGS: &[(&str, BoolTarget)] = &[
     ("sendemail.xmailer", BoolTarget::XMailer),
     ("sendemail.forbidsendmailvariables", BoolTarget::ForbidSendmailVariables),
     ("sendemail.mailmap", BoolTarget::Mailmap),
+    ("sendemail.outlookidfix", BoolTarget::OutlookIdFix),
     ("sendemail.useimaponly", BoolTarget::UseImapOnly),
 ];
 
@@ -663,17 +672,19 @@ const BOOL_SETTINGS: &[(&str, BoolTarget)] = &[
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PathTarget {
     AliasesFile,
+    SmtpSslCertPath,
+    SmtpSslClientCert,
+    SmtpSslClientKey,
     MailmapFile,
     MailmapBlob,
 }
 
 /// `%config_path_settings`. `aliasesfile` is the only list-valued one.
-///
-/// The three `smtpssl*` paths are deliberately absent: `ssl_verify_params()` is
-/// the only thing that reads them, and it exists to configure an
-/// `IO::Socket::SSL` this module never opens. See the module docs.
 const PATH_SETTINGS: &[(&str, PathTarget)] = &[
     ("sendemail.aliasesfile", PathTarget::AliasesFile),
+    ("sendemail.smtpsslcertpath", PathTarget::SmtpSslCertPath),
+    ("sendemail.smtpsslclientcert", PathTarget::SmtpSslClientCert),
+    ("sendemail.smtpsslclientkey", PathTarget::SmtpSslClientKey),
     ("sendemail.mailmap.file", PathTarget::MailmapFile),
     ("sendemail.mailmap.blob", PathTarget::MailmapBlob),
 ];
@@ -681,9 +692,14 @@ const PATH_SETTINGS: &[(&str, PathTarget)] = &[
 /// Where a `%config_settings` entry lands.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ValueTarget {
+    SmtpEncryption,
     SmtpServer,
     SmtpServerPort,
     SmtpServerOption,
+    SmtpUser,
+    SmtpPass,
+    SmtpDomain,
+    SmtpAuth,
     BatchSize,
     ReloginDelay,
     ImapSentFolder,
@@ -699,6 +715,7 @@ enum ValueTarget {
     Confirm,
     From,
     Assume8BitEncoding,
+    ComposeEncoding,
     TransferEncoding,
     SendmailCmd,
 }
@@ -720,9 +737,14 @@ impl ValueTarget {
 
 /// `%config_settings`.
 const VALUE_SETTINGS: &[(&str, ValueTarget)] = &[
+    ("sendemail.smtpencryption", ValueTarget::SmtpEncryption),
     ("sendemail.smtpserver", ValueTarget::SmtpServer),
     ("sendemail.smtpserverport", ValueTarget::SmtpServerPort),
     ("sendemail.smtpserveroption", ValueTarget::SmtpServerOption),
+    ("sendemail.smtpuser", ValueTarget::SmtpUser),
+    ("sendemail.smtppass", ValueTarget::SmtpPass),
+    ("sendemail.smtpdomain", ValueTarget::SmtpDomain),
+    ("sendemail.smtpauth", ValueTarget::SmtpAuth),
     ("sendemail.smtpbatchsize", ValueTarget::BatchSize),
     ("sendemail.smtprelogindelay", ValueTarget::ReloginDelay),
     ("sendemail.imapsentfolder", ValueTarget::ImapSentFolder),
@@ -738,6 +760,7 @@ const VALUE_SETTINGS: &[(&str, ValueTarget)] = &[
     ("sendemail.confirm", ValueTarget::Confirm),
     ("sendemail.from", ValueTarget::From),
     ("sendemail.assume8bitencoding", ValueTarget::Assume8BitEncoding),
+    ("sendemail.composeencoding", ValueTarget::ComposeEncoding),
     ("sendemail.transferencoding", ValueTarget::TransferEncoding),
     ("sendemail.sendmailcmd", ValueTarget::SendmailCmd),
 ];
@@ -788,66 +811,42 @@ struct Settings {
     confirm: Option<String>,
     sender: Option<String>,
     auto_8bit_encoding: Option<String>,
+    /// `sendemail.composeEncoding` / `--compose-encoding`. Read by the
+    /// `--compose` block: it names the `charset=` of the `Content-Type:` header
+    /// the composed message gets when it holds a non-ASCII byte, and is the
+    /// charset label `quote_subject` puts in the encoded word for its
+    /// `Subject:`. `undef` there becomes `UTF-8`.
+    compose_encoding: Option<String>,
     target_xfer_encoding: String,
     sendmail_cmd: Option<String>,
 
-    /// The settings that steer a `Net::SMTP` conversation and nothing else.
-    /// Their configuration variables are not read — see [`Smtp`].
+    /// The settings that steer the `Net::SMTP` conversation and nothing else.
     smtp: Smtp,
 }
 
-/// The `Net::SMTP` half of `%config_settings`, filled from the command line
-/// only.
-///
-/// The `smtpEncryption`, `smtpUser`, `smtpPass`, `smtpDomain`, `smtpAuth`,
-/// `smtpSSLCertPath`, `smtpSSLClientCert`, `smtpSSLClientKey` and
-/// `outlookidfix` settings all land here in the script, and every one is read
-/// exclusively inside the socket transport — `smtp_auth_maybe`,
-/// `ssl_verify_params`, the `Net::SMTP->new` calls and `is_outlook`. That
-/// transport is not ported, so reading those variables out of the configuration
-/// would change nothing; they are left unread rather than given a home that
-/// only ever feeds a diagnostic. The matching options still parse and are
-/// reported when a socket would have been opened.
+/// The `Net::SMTP` half of the setting tables: the variables that only
+/// [`super::smtp`] reads — `Net::SMTP->new`, `ssl_verify_params`,
+/// `smtp_auth_maybe` and `is_outlook`.
 #[derive(Default)]
 struct Smtp {
+    /// `$smtp_encryption` — `ssl`, `tls`, or anything else for a session in the
+    /// clear. `$smtp_encryption = '' unless defined` runs before it is used.
     encryption: Option<String>,
+    /// `$smtp_authuser`.
     authuser: Option<String>,
+    /// `$smtp_authpass`.
     authpass: Option<String>,
+    /// `$smtp_domain` — what `EHLO` announces. `maildomain()` fills it in when
+    /// nothing else does.
     domain: Option<String>,
+    /// `$smtp_auth` — the allowed SASL mechanisms, or `none`.
     auth: Option<String>,
-    ssl_cert_path: Option<String>,
-    ssl_client_cert: Option<String>,
-    ssl_client_key: Option<String>,
+    /// `$smtp_ssl_cert_path`, `$smtp_ssl_client_cert` and
+    /// `$smtp_ssl_client_key`, which are `ssl_verify_params()`'s whole input.
+    ssl: super::smtp::Ssl,
+    /// `$outlook_id_fix`. `None` is the script's `'auto'`, which `is_outlook`
+    /// resolves against the server name on first use.
     outlook_id_fix: Option<bool>,
-}
-
-impl Smtp {
-    /// The settings a socket conversation would have used, for the bail that
-    /// stands in for it.
-    fn describe(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        let mut push = |name: &str, v: Option<&str>| {
-            if let Some(v) = v {
-                parts.push(format!("{name}={v}"));
-            }
-        };
-        push("encryption", self.encryption.as_deref());
-        push("user", self.authuser.as_deref());
-        push("password", self.authpass.as_deref().map(|_| "<given>"));
-        push("domain", self.domain.as_deref());
-        push("auth", self.auth.as_deref());
-        push("ssl-cert-path", self.ssl_cert_path.as_deref());
-        push("ssl-client-cert", self.ssl_client_cert.as_deref());
-        push("ssl-client-key", self.ssl_client_key.as_deref());
-        if let Some(v) = self.outlook_id_fix {
-            parts.push(format!("outlook-id-fix={v}"));
-        }
-        if parts.is_empty() {
-            String::new()
-        } else {
-            format!(" (requested: {})", parts.join(", "))
-        }
-    }
 }
 
 impl Default for Settings {
@@ -887,6 +886,7 @@ impl Default for Settings {
             confirm: None,
             sender: None,
             auto_8bit_encoding: None,
+            compose_encoding: None,
             target_xfer_encoding: "auto".into(),
             sendmail_cmd: None,
             smtp: Smtp::default(),
@@ -909,6 +909,7 @@ impl Settings {
             BoolTarget::XMailer => self.use_xmailer = v,
             BoolTarget::ForbidSendmailVariables => self.forbid_sendmail_variables = v,
             BoolTarget::Mailmap => self.mailmap = v,
+            BoolTarget::OutlookIdFix => self.smtp.outlook_id_fix = Some(v),
             BoolTarget::UseImapOnly => self.use_imap_only = v,
         }
     }
@@ -917,6 +918,9 @@ impl Settings {
         let last = || values.last().cloned();
         match target {
             PathTarget::AliasesFile => self.alias_files = values.to_vec(),
+            PathTarget::SmtpSslCertPath => self.smtp.ssl.cert_path = last(),
+            PathTarget::SmtpSslClientCert => self.smtp.ssl.client_cert = last(),
+            PathTarget::SmtpSslClientKey => self.smtp.ssl.client_key = last(),
             PathTarget::MailmapFile => self.mailmap_file = last(),
             PathTarget::MailmapBlob => self.mailmap_blob = last(),
         }
@@ -925,6 +929,11 @@ impl Settings {
     fn set_value(&mut self, target: ValueTarget, values: &[String]) {
         let last = || values.last().cloned();
         match target {
+            ValueTarget::SmtpEncryption => self.smtp.encryption = last(),
+            ValueTarget::SmtpUser => self.smtp.authuser = last(),
+            ValueTarget::SmtpPass => self.smtp.authpass = last(),
+            ValueTarget::SmtpDomain => self.smtp.domain = last(),
+            ValueTarget::SmtpAuth => self.smtp.auth = last(),
             ValueTarget::SmtpServer => self.smtp_server = last(),
             ValueTarget::SmtpServerPort => self.smtp_server_port = last(),
             ValueTarget::SmtpServerOption => self.smtp_server_options = values.to_vec(),
@@ -943,6 +952,7 @@ impl Settings {
             ValueTarget::Confirm => self.confirm = last(),
             ValueTarget::From => self.sender = last(),
             ValueTarget::Assume8BitEncoding => self.auto_8bit_encoding = last(),
+            ValueTarget::ComposeEncoding => self.compose_encoding = last(),
             ValueTarget::TransferEncoding => {
                 if let Some(v) = last() {
                     self.target_xfer_encoding = v;
@@ -2415,7 +2425,7 @@ fn decode_qp(input: &[u8]) -> Vec<u8> {
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// `MIME::Base64::encode($message, "\n")` — 76 characters per line.
-fn encode_base64(input: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_base64(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut column = 0;
     for chunk in input.chunks(3) {
@@ -2540,7 +2550,7 @@ fn execute_cmd(prefix: &str, cmd: &str, file: &str) -> Result<Vec<String>, Strin
 /// This binary, so the script's `Git::command('check-mailmap', …)` and
 /// `Git::command_input_pipe(['imap-send', …])` reach the ported subcommands
 /// rather than whatever `git` happens to be on `PATH`.
-fn self_exe() -> std::path::PathBuf {
+pub(crate) fn self_exe() -> std::path::PathBuf {
     std::env::current_exe().unwrap_or_else(|_| "git".into())
 }
 
@@ -2665,9 +2675,33 @@ struct Mailer {
     prompting: bool,
     editor: Option<String>,
     imap_copy: Vec<Vec<u8>>,
+    /// `$smtp` — the live `Net::SMTP` session, kept across messages and torn
+    /// down by `--batch-size`.
+    smtp: Option<super::smtp::Session>,
+    /// `$debug_net_smtp`.
+    smtp_debug: bool,
+
+    /// `$compose`: 0 when `--compose` was not given, 1 while the composed
+    /// message is part of the series, and -1 once an empty summary has taken it
+    /// back out. `-1` is still true in Perl, so it keeps driving the
+    /// `--confirm` default and the temporary-file cleanup.
+    compose: i32,
+    /// `$compose_filename`.
+    compose_filename: Option<String>,
 }
 
 impl Mailer {
+    /// `cleanup_compose_files` — both temporaries go, including on the `-1` path.
+    fn cleanup_compose_files(&self) {
+        if self.compose == 0 {
+            return;
+        }
+        if let Some(f) = &self.compose_filename {
+            std::fs::remove_file(f).ok();
+            std::fs::remove_file(format!("{f}.final")).ok();
+        }
+    }
+
     fn suppressed(&self, key: &str) -> bool {
         self.suppress.get(key).copied().unwrap_or(false)
     }
@@ -2751,6 +2785,7 @@ impl Mailer {
                     break;
                 }
                 if answer.starts_with('q') {
+                    self.cleanup_compose_files();
                     return Err(Stop::Exit(0));
                 }
                 addr = ask(
@@ -2910,8 +2945,152 @@ impl Mailer {
         Ok((envelope, header))
     }
 
+    /// `smtp_host_string()` — the server as the credential helper is told
+    /// about it.
+    fn smtp_host_string(&self) -> String {
+        let server = self.s.smtp_server.clone().unwrap_or_default();
+        match &self.s.smtp_server_port {
+            Some(port) => format!("{server}:{port}"),
+            None => server,
+        }
+    }
+
+    /// `is_outlook($host)`. The script resolves `'auto'` into 1 or 0 on the
+    /// first call and keeps the answer for the rest of the run, so this does
+    /// too.
+    fn is_outlook(&mut self, host: &str) -> bool {
+        let fixed = *self.s.smtp.outlook_id_fix.get_or_insert_with(|| {
+            host == "smtp.office365.com" || host == "smtp-mail.outlook.com"
+        });
+        fixed
+    }
+
+    /// The `Net::SMTP` branch of `send_message`: open (or reuse) the session,
+    /// authenticate, and hand over the envelope and the message.
+    fn smtp_send(
+        &mut self,
+        raw_from: &str,
+        recipients: &[String],
+        header: &mut String,
+    ) -> Step<()> {
+        let server = self.s.smtp_server.clone().unwrap_or_default();
+        // `$smtp_domain ||= maildomain();`
+        if self.s.smtp.domain.as_deref().unwrap_or_default().is_empty() {
+            self.s.smtp.domain = Some(super::smtp::maildomain());
+        }
+        let encryption = self.s.smtp.encryption.clone().unwrap_or_default();
+        let port_unset = self.s.smtp_server_port.as_deref().unwrap_or_default().is_empty();
+        if encryption == "ssl" {
+            // `$smtp_server_port ||= 465; # ssmtp`
+            if port_unset {
+                self.s.smtp_server_port = Some("465".into());
+            }
+        } else if self.smtp.is_none() && port_unset {
+            self.s.smtp_server_port = Some("25".into());
+        }
+
+        if self.smtp.is_none() {
+            let domain = self.s.smtp.domain.clone().unwrap_or_default();
+            let port = self.s.smtp_server_port.clone().unwrap_or_default();
+            let cfg = super::smtp::Connect {
+                server: &server,
+                port: &port,
+                domain: &domain,
+                encryption: &encryption,
+                ssl: &self.s.smtp.ssl,
+                debug: self.smtp_debug,
+            };
+            match super::smtp::Session::connect(&cfg) {
+                Ok(session) => self.smtp = Some(session),
+                Err(super::smtp::ConnectError::Die(msg)) => return Err(died(msg)),
+                Err(super::smtp::ConnectError::Undef) => {}
+            }
+        }
+        if self.smtp.is_none() {
+            let port = match &self.s.smtp_server_port {
+                Some(p) => format!(" port={p}"),
+                None => String::new(),
+            };
+            return Err(died(format!(
+                "Unable to initialize SMTP properly. Check config and use --smtp-debug. \
+                 VALUES: server={server} encryption={encryption} hello={}{port}\n",
+                self.s.smtp.domain.clone().unwrap_or_default()
+            )));
+        }
+
+        // `is_outlook` only ever consults the server name, so resolving it here
+        // rather than after `dataend` cannot change the answer.
+        let outlook = self.is_outlook(&server);
+        let debug = self.smtp_debug;
+        let host = self.smtp_host_string();
+        let auth = super::smtp::Auth {
+            user: self.s.smtp.authuser.as_deref(),
+            pass: self.s.smtp.authpass.as_deref(),
+            mechanisms: self.s.smtp.auth.as_deref(),
+            host,
+        };
+
+        // `"$header\n$message"`, which the script feeds to `datasend` one line
+        // at a time; the framing `Net::Cmd` applies is per line either way.
+        let mut body = header.clone().into_bytes();
+        body.push(b'\n');
+        body.extend_from_slice(&self.message);
+
+        let session = self.smtp.as_mut().expect("connected just above");
+        // `smtp_auth_maybe or die $smtp->message;`
+        if !session.auth_maybe(&auth).map_err(died)? {
+            return Err(died(session.message()));
+        }
+        if !session.mail(raw_from) {
+            return Err(died(session.message()));
+        }
+        if !session.recipients(recipients) {
+            return Err(died(session.message()));
+        }
+        if !session.data() {
+            return Err(died(session.message()));
+        }
+        if !session.datasend(&body) {
+            return Err(died(session.message()));
+        }
+        if !session.dataend() {
+            return Err(died(session.message()));
+        }
+
+        // Outlook discards the Message-ID it was given and assigns its own, so
+        // the one in the final reply is what a follow-up must thread against.
+        let reassigned = if outlook {
+            match angle_addr(&session.message()) {
+                Some(id) => Some(format!("<{id}>")),
+                None => {
+                    eprint!("Warning: Could not retrieve Message-ID from server response.\n");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let code = session.code();
+        let reply = session.message();
+
+        if let Some(id) = reassigned {
+            *header = replace_message_id(header, &id);
+            self.message_id = Some(id.clone());
+            if debug {
+                println!("Outlook reassigned Message-ID to: {id}");
+            }
+        }
+        // `$smtp->code =~ /250|200/`.
+        let code = code.to_string();
+        if !(code.contains("250") || code.contains("200")) {
+            let subject = self.subject.clone().unwrap_or_default();
+            return Err(died(format!("Failed to send {subject}\n{reply}")));
+        }
+        Ok(())
+    }
+
     /// `send_message` — prompt if asked to, then hand the bytes to the sendmail
-    /// program (or to nothing at all, under `--dry-run`).
+    /// program, to an SMTP session, or to nothing at all under `--dry-run`.
     fn send_message(&mut self) -> Step<Sent> {
         let (recipients, mut header) = self.gen_header()?;
 
@@ -2957,6 +3136,7 @@ impl Mailer {
                 self.message_num -= 1;
                 return Ok(Sent::Edit);
             } else if answer.starts_with('q') {
+                self.cleanup_compose_files();
                 return Err(Stop::Exit(0));
             } else if answer.starts_with('a') {
                 self.confirm = "never".into();
@@ -3005,14 +3185,7 @@ impl Mailer {
         } else if self.s.smtp_server.is_none() {
             return Err(died("The required SMTP server is not properly defined.\n"));
         } else {
-            return Err(Stop::Unported(format!(
-                "unsupported: reaching {}{} needs an SMTP client (Net::SMTP over TLS, SASL \
-                 authentication through git-credential), which no vendored crate under src/ported \
-                 provides — pass an absolute path as --smtp-server, or --sendmail-cmd, to hand the \
-                 message to a local program instead",
-                self.s.smtp_server.clone().unwrap_or_default(),
-                self.s.smtp.describe()
-            )));
+            self.smtp_send(&raw_from, &recipients, &mut header)?;
         }
 
         let subject = self.subject.clone().unwrap_or_default();
@@ -3036,7 +3209,16 @@ impl Mailer {
             }
             print!("{header}");
             println!();
-            println!("Result: OK");
+            match &self.smtp {
+                // `print "Result: ", $smtp->code, ' ', ($smtp->message =~
+                // /\n([^\n]+\n)$/s);` — the trailing line of a multi-line
+                // reply, and nothing at all when the reply had a single line.
+                Some(session) => {
+                    print!("Result: {} {}", session.code(), last_reply_line(&session.message()));
+                }
+                None => print!("Result: OK"),
+            }
+            println!();
         }
 
         if self.s.imap_sent_folder.is_some() && !self.dry_run {
@@ -3048,6 +3230,48 @@ impl Mailer {
             self.imap_copy.push(copy);
         }
         Ok(Sent::Yes)
+    }
+}
+
+/// `$smtp->message =~ /<([^>]+)>/` — the first angle-bracketed run of the
+/// server's reply, which is where Outlook puts the Message-ID it assigned.
+fn angle_addr(reply: &str) -> Option<&str> {
+    let open = reply.find('<')?;
+    let rest = &reply[open + 1..];
+    let close = rest.find('>')?;
+    (close > 0).then(|| &rest[..close])
+}
+
+/// `$header =~ s/^(Message-ID:\s*).*\n/${1}$message_id\n/m` — the first
+/// `Message-ID:` line takes the identifier the server assigned, keeping the
+/// spacing the header was written with.
+fn replace_message_id(header: &str, message_id: &str) -> String {
+    let mut out = String::with_capacity(header.len());
+    let mut replaced = false;
+    for line in header.split_inclusive('\n') {
+        match line.strip_prefix("Message-ID:") {
+            Some(rest) if !replaced => {
+                replaced = true;
+                let spacing: String =
+                    rest.chars().take_while(|c| c.is_ascii_whitespace() && *c != '\n').collect();
+                out.push_str("Message-ID:");
+                out.push_str(&spacing);
+                out.push_str(message_id);
+                out.push('\n');
+            }
+            _ => out.push_str(line),
+        }
+    }
+    out
+}
+
+/// `$smtp->message =~ /\n([^\n]+\n)$/s` — the last line of a multi-line reply,
+/// and the empty string when the reply had only one.
+fn last_reply_line(message: &str) -> &str {
+    let body = message.strip_suffix('\n').unwrap_or(message);
+    match body.rfind('\n') {
+        Some(pos) if !body[pos + 1..].is_empty() => &message[pos + 1..],
+        _ => "",
     }
 }
 
@@ -3069,7 +3293,7 @@ const INFORM: &str = concat!(
 );
 
 /// `Sys::Hostname::hostname()`, for the fallback message-id domain.
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     // `c_char`, not `i8`: it is unsigned on aarch64 Linux and signed on x86_64
     // and Darwin, so naming the concrete type builds on one and not the other.
     let mut buf = [0 as libc::c_char; 256];
@@ -3086,9 +3310,8 @@ fn hostname() -> String {
 /// Reproduces the script's three option passes, `read_config` over all three
 /// setting tables, `--dump-aliases`/`--translate-aliases`, and the whole compose
 /// and send path down to a sendmail-style program (`--sendmail-cmd`, or an
-/// absolute `--smtp-server`) and to `--dry-run`. Talking SMTP over a socket
-/// bails, as does `--compose` and delegating a revision range to
-/// `git format-patch`.
+/// absolute `--smtp-server`), to an SMTP server over a socket, and to
+/// `--dry-run`. Delegating a revision range to `git format-patch` bails.
 pub fn send_email(args: &[String]) -> Result<ExitCode> {
     let (config_file, in_repo) = load_config();
     let known = known_keys(config_file.as_ref());
@@ -3145,6 +3368,8 @@ fn run(args: &[String], known: &Known, in_repo: bool) -> Step<ExitCode> {
     let mut quiet = false;
     let mut dry_run = false;
     let mut force = false;
+    // `$debug_net_smtp`, which `Net::SMTP` takes as its `Debug` level.
+    let mut debug_net_smtp = false;
     let mut compose = false;
     let mut format_patch: Option<bool> = None;
     let mut initial_subject: Option<String> = None;
@@ -3175,16 +3400,21 @@ fn run(args: &[String], known: &Known, in_repo: bool) -> Step<ExitCode> {
             "smtp-pass" => s.smtp.authpass = val(),
             "smtp-ssl" => s.smtp.encryption = Some("ssl".into()),
             "smtp-encryption" => s.smtp.encryption = val(),
-            "smtp-ssl-cert-path" => s.smtp.ssl_cert_path = val(),
-            "smtp-ssl-client-cert" => s.smtp.ssl_client_cert = val(),
-            "smtp-ssl-client-key" => s.smtp.ssl_client_key = val(),
+            "smtp-ssl-cert-path" => s.smtp.ssl.cert_path = val(),
+            "smtp-ssl-client-cert" => s.smtp.ssl.client_cert = val(),
+            "smtp-ssl-client-key" => s.smtp.ssl.client_key = val(),
             "smtp-domain" => s.smtp.domain = val(),
             "smtp-auth" => s.smtp.auth = val(),
             "no-smtp-auth" => s.smtp.auth = Some("none".into()),
+            // `"smtp-debug:i"`: the value is optional, and an omitted one is 0.
+            "smtp-debug" => {
+                debug_net_smtp = val().and_then(|v| v.parse::<i64>().ok()).unwrap_or(0) != 0;
+            }
             "imap-sent-folder" => s.imap_sent_folder = val(),
             "use-imap-only" => s.use_imap_only = on,
             "annotate" => s.annotate = Some(on),
             "compose" => compose = true,
+            "compose-encoding" => s.compose_encoding = val(),
             "quiet" => quiet = true,
             "cc-cmd" => s.cc_cmd = val(),
             "header-cmd" => s.header_cmd = val(),
@@ -3379,17 +3609,12 @@ fn run(args: &[String], known: &Known, in_repo: bool) -> Step<ExitCode> {
         prompting: false,
         editor: None,
         imap_copy: Vec::new(),
+        smtp: None,
+        smtp_debug: debug_net_smtp,
+        compose: i32::from(compose),
+        compose_filename: None,
     };
     m.annotate = m.s.annotate.unwrap_or(false);
-
-    if compose {
-        return Err(Stop::Unported(
-            "unsupported flag \"--compose\": the introductory message is written in \
-             $GIT_EDITOR from a template and then re-parsed for its headers, a session with no \
-             deterministic output to compare against"
-                .into(),
-        ));
-    }
 
     m.files = collect_files(m.repo.as_ref(), &pass3.rest, format_patch)?;
     resolve_sender(&mut m)?;
@@ -3406,7 +3631,9 @@ fn run(args: &[String], known: &Known, in_repo: bool) -> Step<ExitCode> {
         }
     }
 
-    if m.annotate {
+    if m.compose > 0 {
+        compose_message(&mut m)?;
+    } else if m.annotate {
         let files = m.files.clone();
         m.do_edit(&files)?;
     }
@@ -3480,6 +3707,15 @@ fn run(args: &[String], known: &Known, in_repo: bool) -> Step<ExitCode> {
         }
     }
 
+    // `@files = ($compose_filename . ".final", @files)` — the composed message
+    // leads the series, so it is what `--validate` sees first and what the rest
+    // of the patches answer with `In-Reply-To:`.
+    if m.compose > 0 {
+        if let Some(f) = m.compose_filename.clone() {
+            m.files.insert(0, format!("{f}.final"));
+        }
+    }
+
     if m.s.validate {
         validate_all(&mut m)?;
     }
@@ -3519,7 +3755,12 @@ fn run(args: &[String], known: &Known, in_repo: bool) -> Step<ExitCode> {
             m.num_sent += 1;
             if let Some(bs) = m.s.batch_size.as_deref().and_then(|v| v.parse::<u64>().ok()) {
                 if m.num_sent == bs {
+                    // `$num_sent = 0; $smtp->quit if defined $smtp; undef $smtp;
+                    // undef $auth; sleep($relogin_delay) if defined`.
                     m.num_sent = 0;
+                    if let Some(session) = m.smtp.take() {
+                        session.quit();
+                    }
                     if let Some(d) = m.s.relogin_delay.as_deref().and_then(|v| v.parse::<u64>().ok())
                     {
                         std::thread::sleep(std::time::Duration::from_secs(d));
@@ -3528,6 +3769,13 @@ fn run(args: &[String], known: &Known, in_repo: bool) -> Step<ExitCode> {
             }
             break;
         }
+    }
+
+    m.cleanup_compose_files();
+
+    // `$smtp->quit if $smtp;`
+    if let Some(session) = m.smtp.take() {
+        session.quit();
     }
 
     if let Some(folder) = m.s.imap_sent_folder.clone() {
@@ -3721,6 +3969,215 @@ fn get_patch_subject(fname: &str) -> Step<String> {
     Err(died(format!("No subject line in {fname}?\n")))
 }
 
+/// The body of the `GIT: ` comment block, before `Git::prefix_lines` runs over
+/// it. Kept as the script spells it so the prefixing stays visible.
+const COMPOSE_HELP: &str = "Lines beginning in \"GIT:\" will be removed.\n\
+                            Consider including an overall diffstat or table of contents\n\
+                            for the patch you are writing.\n\
+                            \n\
+                            Clear the body content if you don't wish to send a summary.\n";
+
+/// `Git::prefix_lines` — `s/^/$prefix/mg`, which does not fire at the position
+/// after a newline that ends the string.
+fn prefix_lines(prefix: &str, s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + prefix.len());
+    for line in s.split_inclusive('\n') {
+        out.push_str(prefix);
+        out.push_str(line);
+    }
+    out
+}
+
+/// `/^<name>:\s*(.+)\s*$/i` on a line that still carries its newline.
+///
+/// `(.+)` cannot match a newline and needs at least one character, so `\s*`
+/// gives one back when everything after the colon is whitespace: `"Cc: \n"`
+/// captures a single space rather than failing. `(.+)` is greedy, so trailing
+/// whitespace stays in the capture while leading whitespace does not.
+fn compose_header_value(line: &str, name: &str) -> Option<String> {
+    let rest = prefix_ci(line, &format!("{name}:"))?;
+    let rest = rest.strip_suffix('\n').unwrap_or(rest);
+    let trimmed = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    if !trimmed.is_empty() {
+        return Some(trimmed.to_string());
+    }
+    Some(rest.chars().next_back()?.to_string())
+}
+
+/// A `File::Temp::tempfile(".gitsendemail.msg.XXXXXX", DIR => $dir)` name.
+/// Uniqueness comes from the exclusive create, not from the entropy.
+fn compose_temp_file(dir: &std::path::Path) -> Step<(String, std::fs::File)> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut seed = u64::from(std::process::id())
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+    let mut last = None;
+    for _ in 0..1000 {
+        let mut suffix = String::new();
+        for _ in 0..6 {
+            // xorshift64: enough spread for six characters.
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            suffix.push(ALPHABET[(seed % ALPHABET.len() as u64) as usize] as char);
+        }
+        let path = dir.join(format!(".gitsendemail.msg.{suffix}"));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(f) => return Ok((path.to_string_lossy().into_owned(), f)),
+            Err(e) => last = Some((path, e)),
+        }
+    }
+    let (path, e) = last.expect("the loop runs at least once");
+    Err(died(format!(
+        "Failed to open for writing {}: {}\n",
+        path.display(),
+        errno_text(&e)
+    )))
+}
+
+/// The `if ($compose)` block: write the summary template into a temporary file
+/// under the git directory, hand it to the editor, then read it back into
+/// `<name>.final` with the `GIT: ` lines removed and the headers it carries
+/// lifted back out into `$sender`, `@initial_to`, `@initial_cc`,
+/// `@initial_bcc`, `$reply_to`, `$initial_subject` and `$initial_in_reply_to`.
+///
+/// An all-blank body leaves `$compose` at -1, which keeps the composed message
+/// out of the series without switching `--compose` back off.
+fn compose_message(m: &mut Mailer) -> Step<()> {
+    let dir = match m.repo.as_ref() {
+        Some(r) => r.path().to_path_buf(),
+        None => std::path::PathBuf::from("."),
+    };
+    let (filename, mut handle) = compose_temp_file(&dir)?;
+    m.compose_filename = Some(filename.clone());
+
+    // `$sender || $repoauthor->() || $repocommitter->() || ''`. `$sender` is
+    // already resolved and sanitized by this point, so it is normally the one
+    // that wins.
+    let tpl_sender = if m.sender.is_empty() {
+        m.ident_person(true).or_else(|| m.ident_person(false)).unwrap_or_default()
+    } else {
+        m.sender.clone()
+    };
+    let tpl_subject = m.initial_subject.clone().unwrap_or_default();
+    let tpl_in_reply_to = m.initial_in_reply_to.clone().unwrap_or_default();
+    let tpl_reply_to = m.reply_to.clone().unwrap_or_default();
+    let tpl_to = m.initial_to.join(",");
+    let tpl_cc = m.initial_cc.join(",");
+    let tpl_bcc = m.initial_bcc.join(", ");
+
+    let mut template = format!("From {tpl_sender} # This line is ignored.\n");
+    template.push_str(&prefix_lines("GIT: ", COMPOSE_HELP));
+    template.push_str(&format!(
+        "From: {tpl_sender}\n\
+         To: {tpl_to}\n\
+         Cc: {tpl_cc}\n\
+         Bcc: {tpl_bcc}\n\
+         Reply-To: {tpl_reply_to}\n\
+         Subject: {tpl_subject}\n\
+         In-Reply-To: {tpl_in_reply_to}\n\
+         \n"
+    ));
+    for f in &m.files {
+        template.push_str(&get_patch_subject(f)?);
+        template.push('\n');
+    }
+    std::io::Write::write_all(&mut handle, template.as_bytes())
+        .map_err(|e| died(format!("Failed to open for writing {filename}: {}\n", errno_text(&e))))?;
+    drop(handle);
+
+    // `--annotate` puts the patches in front of the same editor session.
+    let mut batch = vec![filename.clone()];
+    if m.annotate {
+        batch.extend(m.files.iter().cloned());
+    }
+    m.do_edit(&batch)?;
+
+    let final_name = format!("{filename}.final");
+    let mut final_handle = std::fs::File::create(&final_name)
+        .map_err(|e| died(format!("Failed to open {filename}.final: {}\n", errno_text(&e))))?;
+    let composed = std::fs::read(&filename)
+        .map_err(|e| died(format!("Failed to open {filename}: {}\n", errno_text(&e))))?;
+
+    // `file_has_nonascii` over the whole file, before any line is dropped.
+    let mut need_8bit_cte = composed.iter().any(|&b| b >= 0x80);
+    let compose_encoding = m.s.compose_encoding.clone().unwrap_or_else(|| "UTF-8".into());
+    let mut in_body = false;
+    let mut summary_empty = true;
+    let mut final_body: Vec<u8> = Vec::with_capacity(composed.len());
+
+    for raw in composed.split_inclusive(|&b| b == b'\n') {
+        if raw.starts_with(b"GIT:") {
+            continue;
+        }
+        let line = String::from_utf8_lossy(raw).into_owned();
+        if in_body {
+            if raw != b"\n" {
+                summary_empty = false;
+            }
+        } else if raw == b"\n" {
+            in_body = true;
+            if need_8bit_cte {
+                final_body.extend_from_slice(
+                    format!(
+                        "MIME-Version: 1.0\n\
+                         Content-Type: text/plain; charset={compose_encoding}\n\
+                         Content-Transfer-Encoding: 8bit\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+        } else if starts_ci(&line, "MIME-Version:") {
+            need_8bit_cte = false;
+        } else if let Some(v) = compose_header_value(&line, "Subject") {
+            m.initial_subject = Some(v.clone());
+            // `quote_subject`'s own `shift || 'UTF-8'` means an empty setting
+            // still labels the encoded word `UTF-8`, unlike the `charset=`
+            // above, which takes it verbatim.
+            let label =
+                if compose_encoding.is_empty() { "UTF-8" } else { compose_encoding.as_str() };
+            final_body
+                .extend_from_slice(format!("Subject: {}\n", quote_subject(&v, label)).as_bytes());
+            continue;
+        } else if let Some(v) = compose_header_value(&line, "In-Reply-To") {
+            m.initial_in_reply_to = Some(v);
+            continue;
+        } else if let Some(v) = compose_header_value(&line, "Reply-To") {
+            m.reply_to = Some(v);
+        } else if let Some(v) = compose_header_value(&line, "From") {
+            m.sender = v;
+            continue;
+        } else if let Some(v) = compose_header_value(&line, "To") {
+            m.initial_to = parse_address_line(&v);
+            continue;
+        } else if let Some(v) = compose_header_value(&line, "Cc") {
+            m.initial_cc = parse_address_line(&v);
+            continue;
+        } else if starts_ci(&line, "Bcc:") {
+            // `/^Bcc:/i` captures nothing, so the `parse_address_line($1)` the
+            // script runs here is handed an undef — capture variables are scoped
+            // to the loop body, so nothing an earlier line matched survives into
+            // this iteration. The list is emptied, and a `--bcc` given on the
+            // command line is dropped by any `Bcc:` line in the template.
+            m.initial_bcc = Vec::new();
+            continue;
+        }
+        final_body.extend_from_slice(raw);
+    }
+
+    std::io::Write::write_all(&mut final_handle, &final_body)
+        .map_err(|e| died(format!("Failed to open {final_name}: {}\n", errno_text(&e))))?;
+    drop(final_handle);
+
+    if summary_empty {
+        println!("Summary email is empty, skipping it");
+        m.compose = -1;
+    }
+    Ok(())
+}
+
 /// `%broken_encoding` and the `sendemail.assume8bitEncoding` prompt.
 fn scan_broken_encoding(m: &mut Mailer) -> Step<()> {
     for f in &m.files {
@@ -3802,7 +4259,7 @@ fn validate_all(m: &mut Mailer) -> Step<()> {
 }
 
 /// `Git::port_num` — a 16-bit number, or a service name `getservbyname` knows.
-fn port_num(port: &str) -> Option<String> {
+pub(crate) fn port_num(port: &str) -> Option<String> {
     if let Ok(n) = port.parse::<u32>() {
         if port.bytes().all(|b| b.is_ascii_digit()) && n > 0 && n <= 65535 {
             return Some(port.to_string());
@@ -4100,7 +4557,7 @@ fn pre_process_file(m: &mut Mailer, t: &str, quiet: bool) -> Step<()> {
     let confirm = m.confirm.as_str();
     let needs = confirm == "always"
         || (matches!(confirm, "auto" | "cc") && !m.cc.is_empty())
-        || (matches!(confirm, "auto" | "compose") && false);
+        || (matches!(confirm, "auto" | "compose") && m.compose != 0 && m.message_num == 1);
     m.needs_confirm = if needs {
         if m.confirm_unconfigured && !m.cc.is_empty() {
             Needs::Inform

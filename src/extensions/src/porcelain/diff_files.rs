@@ -92,9 +92,6 @@
 //!     `--dirstat=lines`): imara-diff has no patience variant, so rather than silently
 //!     substituting Myers this bails. `--patience` with a raw/name/summary listing is a
 //!     no-op, since those never diff line content.
-//!   * `--color-moved[=<mode>]` for any mode other than `no`: moved-block detection is
-//!     not ported, so the flag is refused rather than accepted and ignored — with color
-//!     now really on, ignoring it would print lines in the wrong slot.
 //!   * `-M`/`--find-renames` rename *pairing* (an intent-to-add worktree file matched
 //!     to a staged deletion): accepted as a no-op, so such a pair is still reported as
 //!     a separate `D`+`A` rather than a single `R`.
@@ -288,6 +285,68 @@ impl Default for DirStat {
     }
 }
 
+/// `parse_dirstat_params()` (diff.c:141): fold a comma-separated parameter list into
+/// `ds`, returning the accumulated complaint text (empty when every parameter parsed).
+/// The caller decides what to do with it — `--dirstat=` dies, `diff.dirstat` warns.
+///
+/// An empty list is not split at all, so `--dirstat=` simply keeps the defaults.
+pub(crate) fn parse_dirstat_params(params: &str, ds: &mut DirStat) -> String {
+    let mut errors = String::new();
+    if params.is_empty() {
+        return errors;
+    }
+    for p in params.split(',') {
+        match p {
+            "changes" => {
+                ds.by_line = false;
+                ds.by_file = false;
+            }
+            "lines" => {
+                ds.by_line = true;
+                ds.by_file = false;
+            }
+            "files" => {
+                ds.by_line = false;
+                ds.by_file = true;
+            }
+            "noncumulative" => ds.cumulative = false,
+            "cumulative" => ds.cumulative = true,
+            _ => match parse_permille(p) {
+                Some(permille) => ds.permille = permille,
+                // git only reaches its `strtoul` when the first byte is a digit;
+                // anything else is an unknown parameter, not a bad number.
+                None if p.as_bytes().first().is_some_and(u8::is_ascii_digit) => errors
+                    .push_str(&format!("  Failed to parse dirstat cut-off percentage '{p}'\n")),
+                None => errors.push_str(&format!("  Unknown dirstat parameter '{p}'\n")),
+            },
+        }
+    }
+    errors
+}
+
+/// A dirstat cut-off percentage: a whole number plus at most one significant decimal
+/// digit, with any further digits read and discarded, and nothing left over — exactly
+/// what `parse_dirstat_params()`'s `strtoul` walk accepts.
+pub(crate) fn parse_permille(p: &str) -> Option<u32> {
+    let b = p.as_bytes();
+    if !b.first().is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let end = b.iter().position(|c| !c.is_ascii_digit()).unwrap_or(b.len());
+    // git reads this with `strtoul`, which saturates rather than failing; a threshold
+    // that large simply never matches.
+    let whole: u32 = p[..end].parse().unwrap_or(u32::MAX / 10);
+    let mut permille = whole.saturating_mul(10);
+    let mut rest = &b[end..];
+    if rest.first() == Some(&b'.') && rest.get(1).is_some_and(u8::is_ascii_digit) {
+        permille = permille.saturating_add(u32::from(rest[1] - b'0'));
+        rest = &rest[2..];
+        let extra = rest.iter().position(|c| !c.is_ascii_digit()).unwrap_or(rest.len());
+        rest = &rest[extra..];
+    }
+    rest.is_empty().then_some(permille)
+}
+
 /// The `--stat` geometry, in git's own `-1 == unset` encoding.
 struct StatWidths {
     width: i64,
@@ -336,6 +395,9 @@ struct Opts {
     color_when: Option<diff_color::ColorWhen>,
     /// `--ws-error-highlight=<kind>`, seeded from `diff.wsErrorHighlight`.
     ws_error_highlight: u32,
+    /// `--color-moved*` / `--word-diff*` / `--color-words`, resolved against
+    /// `diff.colorMoved` / `diff.colorMovedWS` / `diff.wordRegex` at render time.
+    move_word: diff_color::MoveWordOpts,
     /// `--src-prefix=`/`--dst-prefix=`/`--no-prefix`; `-R` swaps the two.
     src_prefix: String,
     dst_prefix: String,
@@ -509,6 +571,10 @@ enum Fatal {
     OptionAfterArg(String),
     /// `fatal: bad --ignore-submodules argument: <v>`, exit 128.
     BadIgnoreSubmodules(String),
+    /// `fatal: Failed to parse --dirstat/-X option parameter:\n<errmsg>`, exit 128 —
+    /// `parse_dirstat_opt()`'s `die()`, carrying the text `parse_dirstat_params()`
+    /// accumulated (which already ends in a newline of its own).
+    DirStatParams(String),
     /// `error: option 'inter-hunk-context' expects a numerical value`, exit 129.
     /// The `OPT_MAGNITUDE` empty-value branch.
     Magnitude(&'static str),
@@ -518,9 +584,10 @@ enum Fatal {
     /// `error: unknown value after ws-error-highlight=<prefix>`, exit 129, where
     /// `<prefix>` is the accepted portion of the value before the offending token.
     WsErrorHighlight(String),
-    /// `error: color moved setting must be one of …` + `error: bad --color-moved
-    /// argument: <v>`, exit 129.
-    ColorMoved(String),
+    /// An already-formatted `error: …` block from an option callback that git
+    /// reports verbatim before parse-options exits 129 — the `--color-moved`,
+    /// `--color-moved-ws` and `--word-diff` argument errors.
+    OptionError(String),
     /// `fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be
     /// used together`, exit 128. `diff_setup_done()` dies when `-s` (NO_OUTPUT) is
     /// left set alongside a name/status/check format.
@@ -574,6 +641,12 @@ impl Fatal {
             Fatal::NoSuchPath(p) => {
                 let _ = writeln!(err, "fatal: No such path '{p}' in the diff");
             }
+            Fatal::DirStatParams(errors) => {
+                let _ = write!(
+                    err,
+                    "fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n"
+                );
+            }
             Fatal::ColorValue => {
                 let _ = writeln!(
                     err,
@@ -602,12 +675,8 @@ impl Fatal {
                 let _ = writeln!(err, "error: unknown value after ws-error-highlight={prefix}");
                 return ExitCode::from(129);
             }
-            Fatal::ColorMoved(v) => {
-                let _ = writeln!(
-                    err,
-                    "error: color moved setting must be one of 'no', 'default', 'blocks', 'zebra', 'dimmed-zebra', 'plain'"
-                );
-                let _ = writeln!(err, "error: bad --color-moved argument: {v}");
+            Fatal::OptionError(msg) => {
+                let _ = writeln!(err, "{msg}");
                 return ExitCode::from(129);
             }
             Fatal::NameStatusNoPatch => {
@@ -703,6 +772,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         // `diff.wsErrorHighlight`, or git's `WSEH_NEW` default.
         ws_error_highlight: diff_color::ws_error_highlight_default(repo)
             .unwrap_or(diff_color::WSEH_NEW),
+        move_word: diff_color::MoveWordOpts::default(),
         src_prefix: "a/".to_owned(),
         dst_prefix: "b/".to_owned(),
         ind_new: b'+',
@@ -937,8 +1007,6 @@ const ACCEPTED_NOOP: &[&str] = &[
     "--submodule",
     // Colored *moves* are not detected by this port; the flag is left in the
     // unsupported list below rather than silently accepted.
-    "--no-color-moved",
-    "--no-color-moved-ws",
     "--text",
     "-a",
     "--function-context",
@@ -974,7 +1042,6 @@ const ACCEPTED_NOOP_VALUED: &[&str] = &[
     // both only matter for files big enough to produce adjacent hunks.
     "--inter-hunk-context=",
     "--submodule=",
-    "--color-moved-ws=",
     "--diff-merges=",
     "-l",
     "--break-rewrites=",
@@ -989,6 +1056,15 @@ const KNOWN_UNSUPPORTED: &[&str] = &[];
 const KNOWN_UNSUPPORTED_VALUED: &[&str] = &[];
 
 fn classify(s: &str, opts: &mut Opts, quiet: &mut bool) -> Result<Flag, Fatal> {
+    // `--color-moved[=<mode>]`, `--color-moved-ws=<modes>`, `--word-diff[=<mode>]`,
+    // `--word-diff-regex=<re>` and `--color-words[=<re>]`.
+    {
+        let Opts { move_word, color_when, .. } = opts;
+        if let Some(res) = move_word.parse_flag(s, color_when) {
+            res.map_err(Fatal::OptionError)?;
+            return Ok(Flag::Handled);
+        }
+    }
     match s {
         "--raw" => opts.fmt |= F_RAW,
         "--name-only" => opts.fmt |= F_NAME,
@@ -1043,11 +1119,6 @@ fn classify(s: &str, opts: &mut Opts, quiet: &mut bool) -> Result<Flag, Fatal> {
         // `--color[=<when>]` / `--no-color` (`OPT_COLOR_FLAG`).
         "--color" => opts.color_when = Some(diff_color::ColorWhen::Always),
         "--no-color" => opts.color_when = Some(diff_color::ColorWhen::Never),
-        "--word-diff" | "--color-words" => {
-            if opts.content_altering.is_none() {
-                opts.content_altering = Some(s.to_owned());
-            }
-        }
         "--pickaxe-all" => opts.pickaxe_all = true,
         "--pickaxe-regex" => opts.pickaxe_regex = true,
         "-w" | "--ignore-all-space" => opts.ws = Whitespace::IgnoreAll,
@@ -1176,13 +1247,6 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
         match diff_color::parse_color_when(v) {
             Some(w) => opts.color_when = Some(w),
             None => return Err(Fatal::ColorValue),
-        }
-        return Ok(Flag::Handled);
-    }
-    if s.starts_with("--word-diff=") || s.starts_with("--word-diff-regex=") || s.starts_with("--color-words=")
-    {
-        if s != "--word-diff=none" && opts.content_altering.is_none() {
-            opts.content_altering = Some(s.to_owned());
         }
         return Ok(Flag::Handled);
     }
@@ -1335,23 +1399,6 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
         opts.ws_error_highlight = parse_ws_error_highlight_opt(v)?;
         return Ok(Flag::Handled);
     }
-    // `--color-moved[=<mode>]`: moved-block detection is not ported, so any mode
-    // that would actually recolor lines is refused rather than ignored. `no`
-    // (and its `false` spelling) asks for exactly the behavior this port has.
-    // An unknown mode is still git's own 129 error, checked first.
-    if let Some(v) = s.strip_prefix("--color-moved=") {
-        const MODES: &[&str] = &["no", "default", "plain", "blocks", "zebra", "dimmed-zebra", "dimmed_zebra", "false"];
-        if !v.is_empty() && !MODES.contains(&v) {
-            return Err(Fatal::ColorMoved(v.to_owned()));
-        }
-        if matches!(v, "no" | "false") {
-            return Ok(Flag::Handled);
-        }
-        return Ok(Flag::Unsupported);
-    }
-    if s == "--color-moved" {
-        return Ok(Flag::Unsupported);
-    }
     if ACCEPTED_NOOP.contains(&s) || ACCEPTED_NOOP_VALUED.iter().any(|p| s.starts_with(p)) {
         return Ok(Flag::Handled);
     }
@@ -1395,42 +1442,15 @@ fn parse_stat_spec(v: &str, stat: &mut StatWidths) -> Result<(), Fatal> {
     Ok(())
 }
 
-/// `--dirstat=<param>,…` (`parse_dirstat_params()`). A bare number is a permille
-/// threshold with an optional single decimal digit.
+/// `parse_dirstat_opt()` (diff.c:5454): fold one `--dirstat=<param>,…` list into `ds`,
+/// dying with the complaint `parse_dirstat_params()` accumulated.
 fn parse_dirstat_spec(v: &str, ds: &mut DirStat) -> Result<(), Fatal> {
-    for part in v.split(',') {
-        match part {
-            "" => {}
-            "changes" => {
-                ds.by_line = false;
-                ds.by_file = false;
-            }
-            "lines" => {
-                ds.by_line = true;
-                ds.by_file = false;
-            }
-            "files" => {
-                ds.by_line = false;
-                ds.by_file = true;
-            }
-            "noncumulative" => ds.cumulative = false,
-            "cumulative" => ds.cumulative = true,
-            n => {
-                let (whole, frac) = match n.split_once('.') {
-                    Some((w, f)) => (w, f),
-                    None => (n, ""),
-                };
-                let whole: u32 = whole.parse().map_err(|_| Fatal::Usage)?;
-                let tenths: u32 = match frac.as_bytes().first() {
-                    None => 0,
-                    Some(b) if b.is_ascii_digit() => u32::from(b - b'0'),
-                    Some(_) => return Err(Fatal::Usage),
-                };
-                ds.permille = whole * 10 + tenths;
-            }
-        }
+    let errors = parse_dirstat_params(v, ds);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Fatal::DirStatParams(errors))
     }
-    Ok(())
 }
 
 /// `--diff-filter=<letters>` (`diff_opt_diff_filter()` plus `diff_setup_done()`).
@@ -1491,6 +1511,24 @@ fn validate_magnitude(v: &str, opt: &'static str) -> Result<(), Fatal> {
     Ok(())
 }
 
+/// How many times `needle` occurs in `hay`, without overlaps.
+fn count_occurrences_of(hay: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return 0;
+    }
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i + needle.len() <= hay.len() {
+        if &hay[i..i + needle.len()] == needle {
+            n += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
 /// `diff_opt_ws_error_highlight()`: parse the comma list, turning git's negative
 /// return — the length of the value it had already accepted — into the message
 /// tail it prints.
@@ -1543,6 +1581,14 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     let colors =
         diff_color::DiffColors::resolve(repo, diff_color::resolve_color(repo, opts.color_when));
     let ws_rule = diff_color::whitespace_rule_cfg(repo);
+    let extra = match opts.move_word.resolve(repo) {
+        Ok(e) => e,
+        Err(msg) => {
+            let mut err = std::io::stderr().lock();
+            let _ = writeln!(err, "{msg}");
+            return Ok(ExitCode::from(128));
+        }
+    };
     let (mut deltas, mut combined) = collect(repo, paths, &opts)?;
 
     // git emits index order, which for these records is a byte-wise path sort
@@ -1700,7 +1746,7 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             separator = true;
         }
         if opts.fmt & F_CHECKDIFF != 0 {
-            check_failed = render_check(&mut rest, &deltas, &analyses);
+            check_failed = render_check(&mut rest, &deltas, &analyses, ws_rule, &colors);
         }
 
         let dirstat_by_line = opts.fmt & F_DIRSTAT != 0 && opts.dirstat.by_line;
@@ -1745,11 +1791,13 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
         if separator {
             rest.push(b'\n');
         }
-        // The patch is assembled uncolored first, then re-emitted through git's
-        // `fn_out_consume()` chain with each file pair's whitespace state. The
-        // combined (`--cc`) sections carry no per-pair pre/post images, so they go
-        // through the default state, exactly as `check_blank_at_eof()` leaves it
-        // when the two sides were never compared.
+        // The whole patch is assembled uncolored first, then re-emitted in one pass
+        // through git's `fn_out_consume()` chain with each file pair's whitespace
+        // state — `diff_flush_patch_all_file_pairs()`'s ordering, which is what lets
+        // `--color-moved` and `--word-diff` see every pair at once. The combined
+        // (`--cc`) sections carry no per-pair pre/post images, so they go through the
+        // default state, exactly as `check_blank_at_eof()` leaves it when the two
+        // sides were never compared.
         let paint_opts = diff_color::PaintOptions {
             ws_error_highlight: opts.ws_error_highlight,
             indicators: (opts.ind_new, opts.ind_old, opts.ind_ctx),
@@ -1757,28 +1805,31 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             // an empty context line is always kept, as git's default does.
             suppress_blank_empty: false,
         };
-        rest.extend_from_slice(&diff_color::colorize_patch(
-            &combined_patch,
+        let mut plain = combined_patch.clone();
+        // Every `diff --cc` section ahead of the first ordinary pair consumes a slot,
+        // so the per-file states line up with the headers the re-emitter counts.
+        let combined_sections =
+            count_occurrences_of(&combined_patch, b"\ndiff --cc ") + usize::from(combined_patch.starts_with(b"diff --cc "));
+        let mut files: Vec<diff_color::FilePaint> =
+            vec![diff_color::FilePaint::new(ws_rule); combined_sections];
+        for (d, an) in deltas.iter().zip(&analyses) {
+            let before = plain.len();
+            render_patch(&mut plain, d, an, &opts);
+            if plain.len() != before {
+                files.push(diff_color::FilePaint {
+                    ws_rule,
+                    blank_at_eof: diff_color::check_blank_at_eof(&an.old_data, &an.new_data),
+                });
+            }
+        }
+        rest.extend_from_slice(&diff_color::colorize_patch_ex(
+            &plain,
             &colors,
             &paint_opts,
-            &[],
+            &files,
             diff_color::FilePaint::new(ws_rule),
+            &extra,
         ));
-        for (d, an) in deltas.iter().zip(&analyses) {
-            let mut section: Vec<u8> = Vec::new();
-            render_patch(&mut section, d, an, &opts);
-            let file = diff_color::FilePaint {
-                ws_rule,
-                blank_at_eof: diff_color::check_blank_at_eof(&an.old_data, &an.new_data),
-            };
-            rest.extend_from_slice(&diff_color::colorize_patch(
-                &section,
-                &colors,
-                &paint_opts,
-                &[file],
-                file,
-            ));
-        }
     }
 
     if !opts.line_prefix.is_empty() {
@@ -3272,11 +3323,24 @@ fn summary_mode_name(out: &mut Vec<u8>, verb: &str, mode: u32, path: &BString) {
 // --check
 // ---------------------------------------------------------------------------
 
-/// `builtin_checkdiff()` with git's default `core.whitespace`
-/// (`blank-at-eol,space-before-tab,blank-at-eof`). Returns whether anything was
-/// reported, which is `diff_result_code()`'s bit 1.
-fn render_check(out: &mut Vec<u8>, deltas: &[Delta], analyses: &[Analysis]) -> bool {
+/// `builtin_checkdiff()` (diff.c:4281) driving `checkdiff_consume()` (diff.c:3555),
+/// under `core.whitespace`. Returns `o->flags.check_failed`, which is
+/// `diff_result_code()`'s bit 1.
+///
+/// The hunk stream it walks is the one the command already computed, so unlike stock
+/// git — which runs a private `xecfg.ctxlen = 1`, `xpp.flags = 0` diff for the check —
+/// `-U<n>` and the whitespace-ignoring options do reach it here.
+fn render_check(
+    out: &mut Vec<u8>,
+    deltas: &[Delta],
+    analyses: &[Analysis],
+    ws_rule: u32,
+    colors: &diff_color::DiffColors,
+) -> bool {
     let mut failed = false;
+    let set = colors.get(diff_color::DiffSlot::New);
+    let ws_color = colors.get(diff_color::DiffSlot::Whitespace);
+    let reset = colors.reset();
     for (d, an) in deltas.iter().zip(analyses) {
         if d.unmerged || !d.new_valid() || an.binary {
             continue;
@@ -3289,17 +3353,35 @@ fn render_check(out: &mut Vec<u8>, deltas: &[Delta], analyses: &[Analysis]) -> b
             continue;
         };
         let mut lineno = 0usize;
+        // `checkdiff_consume()` remembers the previous record's marker so the
+        // `\ No newline at end of file` line can tell which side it belongs to.
+        let mut last_line_kind = 0u8;
         for line in byte_lines(hunks) {
+            let kind = line.first().copied().unwrap_or(0);
+            let previous_kind = last_line_kind;
+            last_line_kind = kind;
             match line.first().copied() {
                 Some(b'@') => {
                     lineno = hunk_new_start(line).saturating_sub(1);
                 }
                 Some(b' ') => lineno += 1,
+                Some(b'\\') => {
+                    // The incomplete last line, reported only when the record it
+                    // follows was an added one.
+                    if ws_rule & diff_color::WS_INCOMPLETE_LINE != 0 && previous_kind == b'+' {
+                        failed = true;
+                        out.extend_from_slice(&name);
+                        out.extend_from_slice(
+                            format!(
+                                ":{lineno}: {}.\n",
+                                whitespace_error_string(diff_color::WS_INCOMPLETE_LINE)
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                }
                 Some(b'+') => {
                     lineno += 1;
-                    // `is_conflict_marker()` sees the line terminator (it is what
-                    // satisfies the "whitespace after the marker" requirement),
-                    // while `ws_check()` strips it first, exactly like ws.c.
                     let raw = &line[1..];
                     if is_conflict_marker(raw) {
                         failed = true;
@@ -3308,19 +3390,34 @@ fn render_check(out: &mut Vec<u8>, deltas: &[Delta], analyses: &[Analysis]) -> b
                             format!(":{lineno}: leftover conflict marker\n").as_bytes(),
                         );
                     }
-                    if let Some(err) = ws_check(strip_terminator(raw)) {
-                        failed = true;
-                        out.extend_from_slice(&name);
-                        out.extend_from_slice(format!(":{lineno}: {err}.\n").as_bytes());
+                    let bad = ws_check(raw, ws_rule);
+                    if bad == 0 {
+                        continue;
                     }
+                    failed = true;
+                    out.extend_from_slice(&name);
+                    out.extend_from_slice(
+                        format!(":{lineno}: {}.\n", whitespace_error_string(bad)).as_bytes(),
+                    );
+                    // `emit_line(o, set, reset, line, 1)` prints the marker, then
+                    // `ws_check_emit()` repaints the body around its offending runs.
+                    out.extend_from_slice(set.as_bytes());
+                    out.push(b'+');
+                    out.extend_from_slice(reset.as_bytes());
+                    diff_color::ws_check_emit(out, raw, ws_rule, set, reset, ws_color);
                 }
                 _ => {}
             }
         }
-        if let Some(at) = check_blank_at_eof(&an.old_data, &new_lines) {
-            failed = true;
-            out.extend_from_slice(&name);
-            out.extend_from_slice(format!(":{at}: new blank line at EOF.\n").as_bytes());
+        if ws_rule & diff_color::WS_BLANK_AT_EOF != 0 {
+            if let Some(at) = check_blank_at_eof(&an.old_data, &new_lines) {
+                failed = true;
+                out.extend_from_slice(&name);
+                out.extend_from_slice(
+                    format!(":{at}: {}.\n", whitespace_error_string(diff_color::WS_BLANK_AT_EOF))
+                        .as_bytes(),
+                );
+            }
         }
     }
     failed
@@ -3340,43 +3437,133 @@ fn hunk_new_start(header: &[u8]) -> usize {
 
 /// `is_conflict_marker()` with git's default marker size of 7.
 fn is_conflict_marker(line: &[u8]) -> bool {
-    const SIZE: usize = 7;
-    if line.len() < SIZE + 1 {
+    is_conflict_marker_sized(line, DEFAULT_CONFLICT_MARKER_SIZE)
+}
+
+/// `ll_merge_marker_size()`'s default when no `conflict-marker-size` attribute
+/// applies (`DEFAULT_CONFLICT_MARKER_SIZE`, merge-ll.h).
+pub(crate) const DEFAULT_CONFLICT_MARKER_SIZE: usize = 7;
+
+/// `is_conflict_marker()` (diff.c:3522): `marker_size` repeats of one of
+/// `=`, `>`, `<`, `|` followed by a whitespace byte. The caller passes the line
+/// *with* its terminator, which is what can satisfy the trailing-space test.
+pub(crate) fn is_conflict_marker_sized(line: &[u8], marker_size: usize) -> bool {
+    if line.len() < marker_size + 1 {
         return false;
     }
     let first = line[0];
     if !matches!(first, b'=' | b'>' | b'<' | b'|') {
         return false;
     }
-    if line[1..SIZE].iter().any(|b| *b != first) {
+    if line[1..marker_size].iter().any(|b| *b != first) {
         return false;
     }
-    line[SIZE].is_ascii_whitespace()
+    diff_color::is_c_space(line[marker_size])
 }
 
-/// `ws_check()` restricted to git's default rule set, and
-/// `whitespace_error_string()`'s comma-joined wording.
-fn ws_check(line: &[u8]) -> Option<String> {
-    let mut errs: Vec<&str> = Vec::new();
-    if matches!(line.last().copied(), Some(b' ') | Some(b'\t')) {
-        errs.push("trailing whitespace");
+/// `ws_check()` (ws.c:267) — `ws_check_emit_1()` run with no output stream, so it
+/// only accumulates the `WS_*` bits the line violates under `ws_rule`. The caller
+/// passes the line body *including* its terminator, exactly as `checkdiff_consume()`
+/// hands `line + 1` to it.
+pub(crate) fn ws_check(line: &[u8], ws_rule: u32) -> u32 {
+    use diff_color::{
+        is_c_space, ws_tab_width, WS_BLANK_AT_EOL, WS_CR_AT_EOL, WS_INCOMPLETE_LINE,
+        WS_INDENT_WITH_NON_TAB, WS_SPACE_BEFORE_TAB, WS_TAB_IN_INDENT,
+    };
+    let mut result = 0u32;
+    let mut len = line.len();
+    let mut trailing_newline = false;
+
+    // The logic is simpler with the trailing newline (and, under `cr-at-eol`, the
+    // carriage return before it) temporarily out of the way.
+    if len > 0 && line[len - 1] == b'\n' {
+        trailing_newline = true;
+        len -= 1;
     }
-    // Space immediately before a tab anywhere in the leading indent.
-    let indent_len = line
-        .iter()
-        .position(|b| !matches!(*b, b' ' | b'\t'))
-        .unwrap_or(line.len());
-    if line[..indent_len]
-        .windows(2)
-        .any(|w| w[0] == b' ' && w[1] == b'\t')
-    {
-        errs.push("space before tab in indent");
+    if (ws_rule & WS_CR_AT_EOL) != 0 && len > 0 && line[len - 1] == b'\r' {
+        len -= 1;
     }
-    if errs.is_empty() {
-        None
+
+    let mut trailing_whitespace: Option<usize> = None;
+    if (ws_rule & WS_BLANK_AT_EOL) != 0 {
+        for i in (0..len).rev() {
+            if is_c_space(line[i]) {
+                trailing_whitespace = Some(i);
+                result |= WS_BLANK_AT_EOL;
+            } else {
+                break;
+            }
+        }
+    }
+    let trailing_whitespace = trailing_whitespace.unwrap_or(len);
+
+    if !trailing_newline && (ws_rule & WS_INCOMPLETE_LINE) != 0 {
+        result |= WS_INCOMPLETE_LINE;
+    }
+
+    // The indent: everything up to the first byte that is neither space nor tab.
+    // git's chain is an `else if`, so `space-before-tab` masks `tab-in-indent` on a
+    // tab that both rules would flag.
+    let mut written = 0usize;
+    let mut i = 0usize;
+    while i < trailing_whitespace {
+        if line[i] == b' ' {
+            i += 1;
+            continue;
+        }
+        if line[i] != b'\t' {
+            break;
+        }
+        if (ws_rule & WS_SPACE_BEFORE_TAB) != 0 && written < i {
+            result |= WS_SPACE_BEFORE_TAB;
+        } else if (ws_rule & WS_TAB_IN_INDENT) != 0 {
+            result |= WS_TAB_IN_INDENT;
+        }
+        written = i + 1;
+        i += 1;
+    }
+
+    if (ws_rule & WS_INDENT_WITH_NON_TAB) != 0 && i - written >= ws_tab_width(ws_rule) {
+        result |= WS_INDENT_WITH_NON_TAB;
+    }
+    result
+}
+
+/// `whitespace_error_string()` (ws.c:114): the comma-joined wording, in git's own
+/// order, with `trailing-space` collapsing its two constituent bits into one phrase.
+pub(crate) fn whitespace_error_string(ws: u32) -> String {
+    use diff_color::{
+        WS_BLANK_AT_EOF, WS_BLANK_AT_EOL, WS_INCOMPLETE_LINE, WS_INDENT_WITH_NON_TAB,
+        WS_SPACE_BEFORE_TAB, WS_TAB_IN_INDENT, WS_TRAILING_SPACE,
+    };
+    let mut err = String::new();
+    if ws & WS_TRAILING_SPACE == WS_TRAILING_SPACE {
+        err.push_str("trailing whitespace");
     } else {
-        Some(errs.join(", "))
+        if ws & WS_BLANK_AT_EOL != 0 {
+            err.push_str("trailing whitespace");
+        }
+        if ws & WS_BLANK_AT_EOF != 0 {
+            if !err.is_empty() {
+                err.push_str(", ");
+            }
+            err.push_str("new blank line at EOF");
+        }
     }
+    for (bit, text) in [
+        (WS_SPACE_BEFORE_TAB, "space before tab in indent"),
+        (WS_INDENT_WITH_NON_TAB, "indent with spaces"),
+        (WS_TAB_IN_INDENT, "tab in indent"),
+        (WS_INCOMPLETE_LINE, "no newline at the end of file"),
+    ] {
+        if ws & bit != 0 {
+            if !err.is_empty() {
+                err.push_str(", ");
+            }
+            err.push_str(text);
+        }
+    }
+    err
 }
 
 /// `check_blank_at_eof()`: the 1-based line of the first newly-added blank line

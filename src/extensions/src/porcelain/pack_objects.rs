@@ -335,6 +335,10 @@ struct State {
     delta_base_offset: Option<bool>,
     /// `--filter=<spec>`, as given; see [`apply_filter`].
     filter: Option<String>,
+    /// `--write-bitmap-index`: write a `.bitmap` beside the `.idx`.
+    write_bitmap_index: bool,
+    /// `--delta-islands`: honour `pack.island` in the delta search.
+    delta_islands: bool,
     /// Whether the phase meters and the end-of-run summary go to stderr. Seeded
     /// from `isatty(2)` in [`parse`], then `-q` and `--progress` (and
     /// `--all-progress`) override it, last one wins.
@@ -544,6 +548,13 @@ fn execute(st: &State) -> Result<ExitCode> {
             PackMetadata,
         ));
     }
+    if st.write_bitmap_index {
+        let mut bitmap = BitmapOptions::from_repo(&repo);
+        bitmap.write = true;
+        if let Some(bytes) = bitmap_file(&repo, &packed, &bitmap) {
+            files.push((format!("{base}-{hex_id}.bitmap"), bytes, PackMetadata));
+        }
+    }
 
     let fsync = match crate::config::FsyncPolicy::load(&repo) {
         Ok(policy) => policy,
@@ -621,6 +632,13 @@ pub(crate) struct PackedEntry {
     /// CRC-32 over the entry's bytes in the pack (header plus compressed data),
     /// which is what a v2 `.idx` stores.
     pub(crate) crc32: u32,
+    /// The object's own type, which stays the object's type even when the entry
+    /// holding it is a delta. A `.bitmap`'s four type bitmaps are built from
+    /// this.
+    pub(crate) kind: gix::object::Kind,
+    /// git's `pack_name_hash()` of the path the object was last seen at, which
+    /// is what a `.bitmap`'s hash-cache extension stores.
+    pub(crate) name_hash: u32,
 }
 
 /// A finished pack held in memory, alongside the per-entry data its `.idx`,
@@ -682,6 +700,9 @@ pub(crate) struct WriteOptions {
     /// Report the counting, compressing and writing phases on stderr the way
     /// git's progress meter does. See [`crate::progress`].
     pub(crate) progress: bool,
+    /// `repack.useDeltaIslands`: pass `--delta-islands` on, so the search
+    /// honours `pack.island`.
+    pub(crate) use_delta_islands: bool,
 }
 
 /// Build the pack for `ids` and hand back its bytes together with the per-entry
@@ -700,6 +721,7 @@ pub(crate) fn packed_for(
         .collect();
     let mut delta = DeltaConfig::from_repo(repo).unwrap_or_default();
     delta.allow_ofs_delta = options.allow_ofs_delta;
+    delta.use_islands = options.use_delta_islands;
     if let Some(window) = options.window {
         delta.search.window = window;
     }
@@ -724,6 +746,10 @@ struct DeltaConfig {
     /// git's `allow_ofs_delta`, which defaults off — `git repack` is what turns
     /// it on, from `repack.useDeltaBaseOffset`.
     allow_ofs_delta: bool,
+    /// `--delta-islands`: restrict the search to bases at least as reachable as
+    /// their targets, per `pack.island`. git's `use_delta_islands`, which
+    /// `git repack` turns on from `repack.useDeltaIslands`.
+    use_islands: bool,
 }
 
 impl Default for DeltaConfig {
@@ -731,6 +757,7 @@ impl Default for DeltaConfig {
         DeltaConfig {
             search: pack::data::output::delta::Options::default(),
             allow_ofs_delta: false,
+            use_islands: false,
         }
     }
 }
@@ -785,6 +812,7 @@ impl DeltaConfig {
         if let Some(v) = st.delta_base_offset {
             self.allow_ofs_delta = v;
         }
+        self.use_islands |= st.delta_islands;
 
         // `depth >= 1 << OE_DEPTH_BITS` and `cache_max_small_delta_size >= 1 <<
         // OE_Z_DELTA_BITS`, with git's own wording.
@@ -850,16 +878,22 @@ fn write_pack(
     counting.done();
     assign_name_hashes(repo, &mut objects);
 
-    // Phase 2: the delta search. git announces the thread count first, then
-    // reports the search itself as `Compressing objects`. The search parallelises
-    // internally and reports nothing until it returns, so the meter goes from
-    // nothing to complete in one step — the line git leaves on screen either way.
+    // Phase 2: the delta search, steered by `pack.island` when asked. git
+    // announces the thread count first, then reports the search itself as
+    // `Compressing objects`. The search parallelises internally and reports
+    // nothing until it returns, so the meter goes from nothing to complete in one
+    // step — the line git leaves on screen either way.
     //
     // Both lines are skipped when no delta can be found at all, which is git's
     // `if (nr_deltas)` gate: a one-object pack has nothing to deltify against,
     // and a zero window or depth disables the search. git counts its delta
     // *candidates* there, which this port does not work out separately, so the
     // count below is every object handed to the search.
+    let islands = if delta.use_islands {
+        load_delta_islands(repo, &objects)
+    } else {
+        delta::Islands::default()
+    };
     let searchable = objects.len() > 1 && delta.search.window > 0 && delta.search.depth > 0;
     let compressing_progress = progress && searchable;
     if compressing_progress {
@@ -872,6 +906,7 @@ fn write_pack(
         Meter::counted("Compressing objects", objects.len(), compressing_progress);
     let deltas = delta::find_deltas(
         &objects,
+        &islands,
         &delta.search,
         || repo.clone(),
         |repo, id| {
@@ -1019,6 +1054,8 @@ fn write_entry(
         id: objects[at].id,
         offset,
         crc32: gix::features::hash::crc32(&body[start..]),
+        kind: object.kind,
+        name_hash: objects[at].name_hash,
     });
     Ok(())
 }
@@ -1227,6 +1264,660 @@ pub(super) fn reverse_index_file(
     bytes.extend_from_slice(pack_id.as_slice());
     append_checksum(&mut bytes, kind)?;
     Ok(bytes)
+}
+
+/// Load the delta islands `pack.island` describes, as marks over `objects`;
+/// git's `load_delta_islands()` followed by the propagation
+/// `propagate_island_marks()` and `resolve_tree_islands()` do.
+///
+/// # What an island is for
+///
+/// On a server hosting many forks of one repository, every fork's refs live in
+/// one object store. Left alone the delta search will happily express a blob
+/// only fork A can reach as a delta against one only fork B can reach, and then
+/// serving fork A means sending fork B's object too. An island is the set of
+/// refs one fork owns; marking objects with the islands that reach them lets
+/// the search refuse exactly those cross-fork deltas.
+///
+/// # How the marks are derived
+///
+/// Each `pack.island` value is a regex over ref names, anchored at the start.
+/// A ref belongs to the island named by joining that regex's capture groups
+/// with `-`, so `refs/heads/(.*)` puts every branch on its own island and
+/// `refs/remotes/([^/]+)/` puts each remote on one. Later values win over
+/// earlier ones. Two islands whose refs point at exactly the same objects are
+/// collapsed into one, which is what keeps a thousand identical forks from
+/// costing a thousand bits.
+///
+/// The marks then flow the way objects are reachable: a commit passes its marks
+/// to its tree and its parents, and a tree to everything it names — trees first
+/// in ascending depth, so a subtree that several parents share ends up with all
+/// of their marks rather than whichever happened to be walked last.
+///
+/// An empty result means islands are switched off, which the search reads as
+/// "every pair is eligible".
+fn load_delta_islands(
+    repo: &gix::Repository,
+    objects: &[pack::data::output::delta::Object],
+) -> pack::data::output::delta::Islands {
+    use pack::data::output::delta::Islands;
+
+    let snapshot = repo.config_snapshot();
+    let patterns: Vec<String> = snapshot
+        .strings("pack.island")
+        .map(|values| values.iter().map(|v| v.to_string()).collect())
+        .unwrap_or_default();
+    if patterns.is_empty() {
+        return Islands::default();
+    }
+    let core_name = snapshot.string("pack.islandCore").map(|v| v.to_string());
+
+    // git anchors every island regex at the start of the ref name, adding the
+    // `^` itself when the value does not already carry one.
+    let mut expressions = Vec::with_capacity(patterns.len());
+    for pattern in &patterns {
+        let anchored = if pattern.starts_with('^') {
+            pattern.clone()
+        } else {
+            format!("^{pattern}")
+        };
+        match regex::Regex::new(&anchored) {
+            Ok(re) => expressions.push(re),
+            Err(err) => {
+                eprintln!("fatal: failed to load island regex for 'pack.island': {anchored} ({err})");
+                return Islands::default();
+            }
+        }
+    }
+
+    // Every ref, bucketed by the island name its matching regex names.
+    let mut islands: std::collections::BTreeMap<String, Vec<ObjectId>> = std::collections::BTreeMap::new();
+    if let Ok(platform) = repo.references() {
+        if let Ok(all) = platform.all() {
+            for reference in all.flatten() {
+                let name = reference.name().as_bstr().to_string();
+                // git walks the regexes backwards, so the last configured value
+                // that matches is the one that names the island.
+                let Some(matched) = expressions.iter().rev().find_map(|re| re.captures(&name)) else {
+                    continue;
+                };
+                let island_name = matched
+                    .iter()
+                    .skip(1)
+                    .flatten()
+                    .map(|group| group.as_str())
+                    .collect::<Vec<_>>()
+                    .join("-");
+                let mut reference = reference;
+                let Ok(id) = reference.peel_to_id_in_place() else {
+                    continue;
+                };
+                islands.entry(island_name).or_default().push(id.detach());
+            }
+        }
+    }
+    if islands.is_empty() {
+        return Islands::default();
+    }
+
+    // git's `deduplicate_islands()`: an island is identified by the sum of the
+    // first eight bytes of each of its object ids, and only the first island
+    // with a given sum survives. Forks that have not diverged therefore share
+    // one bit rather than each burning their own.
+    let hash_of = |ids: &Vec<ObjectId>| -> u64 {
+        ids.iter().fold(0u64, |sum, id| {
+            let bytes: [u8; 8] = id.as_bytes()[..8].try_into().expect("8 bytes");
+            sum.wrapping_add(u64::from_ne_bytes(bytes))
+        })
+    };
+    let core_hash = core_name
+        .as_deref()
+        .and_then(|name| islands.get(name))
+        .map(&hash_of);
+    let mut seen: HashSet<u64> = HashSet::new();
+    let surviving: Vec<(u64, &Vec<ObjectId>)> = islands
+        .values()
+        .map(|ids| (hash_of(ids), ids))
+        .filter(|(hash, _)| seen.insert(*hash))
+        .collect();
+
+    let position: std::collections::HashMap<ObjectId, usize> = objects
+        .iter()
+        .enumerate()
+        .map(|(at, object)| (object.id, at))
+        .collect();
+    let width = surviving.len().div_ceil(32).max(1);
+    let mut marks: Vec<Option<Vec<u32>>> = vec![None; objects.len()];
+    let mut core_bit = None;
+    for (bit, (hash, ids)) in surviving.iter().enumerate() {
+        if core_hash == Some(*hash) {
+            core_bit = Some(bit);
+        }
+        for id in ids.iter() {
+            if let Some(&at) = position.get(id) {
+                marks[at].get_or_insert_with(|| vec![0u32; width])[bit / 32] |= 1 << (bit % 32);
+            }
+        }
+    }
+    // `pack.islandCore` names the island whose objects git puts in the first
+    // pack layer; nothing here writes layered packs, so the only thing left to
+    // do with it is to have resolved which island it is, which the mark above
+    // records.
+    let _ = core_bit;
+
+    propagate_island_marks(repo, objects, &position, &mut marks, width);
+
+    Islands {
+        marks: marks
+            .into_iter()
+            .map(|mark| mark.map(std::sync::Arc::from))
+            .collect(),
+    }
+}
+
+/// Flow island marks from commits to their trees and parents, and from trees to
+/// their entries; git's `propagate_island_marks()` and `resolve_tree_islands()`.
+///
+/// Commits are walked newest first, which is the order git's own revision walk
+/// hands them over, so a mark reaches an ancestor before that ancestor is asked
+/// to pass it on. Trees are then walked in ascending depth for the same reason:
+/// a tree must have collected every mark that reaches it before it hands them
+/// to its children.
+fn propagate_island_marks(
+    repo: &gix::Repository,
+    objects: &[pack::data::output::delta::Object],
+    position: &std::collections::HashMap<ObjectId, usize>,
+    marks: &mut [Option<Vec<u32>>],
+    width: usize,
+) {
+    fn merge(marks: &mut [Option<Vec<u32>>], into: usize, from: &[u32], width: usize) {
+        let target = marks[into].get_or_insert_with(|| vec![0u32; width]);
+        for (word, bits) in target.iter_mut().zip(from) {
+            *word |= bits;
+        }
+    }
+
+    let mut commits: Vec<(usize, i64)> = Vec::new();
+    for (at, object) in objects.iter().enumerate() {
+        if object.kind != gix::object::Kind::Commit {
+            continue;
+        }
+        let Ok(commit) = repo.find_commit(object.id) else {
+            continue;
+        };
+        commits.push((at, commit.time().map(|time| time.seconds).unwrap_or(0)));
+    }
+    commits.sort_by(|a, b| b.1.cmp(&a.1));
+
+    for (at, _) in commits {
+        let Some(source) = marks[at].clone() else { continue };
+        let Ok(commit) = repo.find_commit(objects[at].id) else {
+            continue;
+        };
+        if let Ok(tree) = commit.tree_id() {
+            if let Some(&tree_at) = position.get(&tree.detach()) {
+                merge(marks, tree_at, &source, width);
+            }
+        }
+        for parent in commit.parent_ids() {
+            if let Some(&parent_at) = position.get(&parent.detach()) {
+                merge(marks, parent_at, &source, width);
+            }
+        }
+    }
+
+    // Tree depth, as git's `show_object()` records it from the path a tree was
+    // seen at: a root tree is depth zero and every path component adds one.
+    let depths = tree_depths(repo, objects, position);
+    let mut trees: Vec<(usize, u32)> = objects
+        .iter()
+        .enumerate()
+        .filter(|(_, object)| object.kind == gix::object::Kind::Tree)
+        .map(|(at, _)| (at, depths.get(&at).copied().unwrap_or(0)))
+        .collect();
+    trees.sort_by_key(|(_, depth)| *depth);
+
+    let mut buf = Vec::new();
+    for (at, _) in trees {
+        let Some(source) = marks[at].clone() else { continue };
+        let Ok((object, _location)) = repo.objects.find(&objects[at].id, &mut buf) else {
+            continue;
+        };
+        let Ok(tree) = gix::objs::TreeRef::from_bytes(object.data, repo.object_hash()) else {
+            continue;
+        };
+        let children: Vec<ObjectId> = tree
+            .entries
+            .iter()
+            .filter(|entry| !entry.mode.is_commit())
+            .map(|entry| entry.oid.to_owned())
+            .collect();
+        for child in children {
+            if let Some(&child_at) = position.get(&child) {
+                merge(marks, child_at, &source, width);
+            }
+        }
+    }
+}
+
+/// How deep in a tree each object was first seen, keyed by its position in
+/// `objects`.
+///
+/// git gets this for free from the path its object walk carries; the walk that
+/// produced `objects` keeps no paths, so this recovers the depths by descending
+/// from every commit's root tree once.
+fn tree_depths(
+    repo: &gix::Repository,
+    objects: &[pack::data::output::delta::Object],
+    position: &std::collections::HashMap<ObjectId, usize>,
+) -> std::collections::HashMap<usize, u32> {
+    use std::collections::VecDeque;
+
+    let mut out: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    let mut queue: VecDeque<(ObjectId, u32)> = VecDeque::new();
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    for object in objects {
+        if object.kind != gix::object::Kind::Commit {
+            continue;
+        }
+        let Ok(commit) = repo.find_commit(object.id) else {
+            continue;
+        };
+        if let Ok(tree) = commit.tree_id() {
+            if seen.insert(tree.detach()) {
+                queue.push_back((tree.detach(), 0));
+            }
+        }
+    }
+
+    let mut buf = Vec::new();
+    while let Some((id, depth)) = queue.pop_front() {
+        if let Some(&at) = position.get(&id) {
+            out.entry(at).and_modify(|d| *d = (*d).max(depth)).or_insert(depth);
+        }
+        let Ok((object, _location)) = repo.objects.find(&id, &mut buf) else {
+            continue;
+        };
+        let Ok(tree) = gix::objs::TreeRef::from_bytes(object.data, repo.object_hash()) else {
+            continue;
+        };
+        let children: Vec<ObjectId> = tree
+            .entries
+            .iter()
+            .filter(|entry| entry.mode.is_tree())
+            .map(|entry| entry.oid.to_owned())
+            .collect();
+        for child in children {
+            if seen.insert(child) {
+                queue.push_back((child, depth + 1));
+            }
+        }
+    }
+    out
+}
+
+/// Whether a `.bitmap` accompanies the pack, and what goes in it.
+///
+/// git resolves these in `git_pack_config()`; `write` on top of that is the
+/// `-b`/`--write-bitmap-index` flag or `repack.writeBitmaps`, depending on which
+/// command is asking.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BitmapOptions {
+    /// Write a `.bitmap` at all.
+    pub(crate) write: bool,
+    /// `pack.writeBitmapHashCache`, on by default in git.
+    pub(crate) hash_cache: bool,
+    /// `pack.writeBitmapLookupTable`, off by default in git.
+    pub(crate) lookup_table: bool,
+    /// `pack.preferBitmapTips`: ref prefixes whose tips are pulled into the
+    /// selection ahead of whatever the spacing rule would otherwise pick.
+    pub(crate) preferred_tips: Vec<String>,
+}
+
+impl BitmapOptions {
+    /// The `pack.*` half, with git's defaults. `write` is left to the caller.
+    pub(crate) fn from_repo(repo: &gix::Repository) -> Self {
+        let snapshot = repo.config_snapshot();
+        BitmapOptions {
+            write: false,
+            hash_cache: snapshot.boolean("pack.writeBitmapHashCache").unwrap_or(true),
+            lookup_table: snapshot.boolean("pack.writeBitmapLookupTable").unwrap_or(false),
+            preferred_tips: snapshot
+                .strings("pack.preferBitmapTips")
+                .map(|values| values.iter().map(|v| v.to_string()).collect())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// The `.bitmap` for a freshly written pack, or `None` when one cannot be
+/// written.
+///
+/// git's `bitmap_writer_*` sequence, in the order `write_pack_file()` runs it:
+/// build the four type bitmaps over the pack, select the commits worth an entry,
+/// compute each one's reachable set, and serialise. The serialising half lives in
+/// [`gix_pack::data::output::bitmap`]; this is the half that needs a repository.
+///
+/// # Reachability, and what "cannot be written" means
+///
+/// A bitmap answers "which objects in this pack does commit X reach", so it is
+/// only meaningful when the pack holds *every* such object. When the walk
+/// reaches something the pack does not have, git warns and fails the whole
+/// command; this warns with git's wording and writes no `.bitmap`, leaving a
+/// pack that is correct and merely uncached.
+///
+/// # Deliberate departure from git
+///
+/// git's `bitmap_builder_init()` runs a first-parent topological walk to find
+/// the *maximal* commits — the ones whose bitmaps can be shared between several
+/// selected commits — and builds those too, so a selected commit's bitmap is
+/// often assembled from parts rather than walked for. The set of bits each
+/// selected commit ends up with is the same either way; sharing decides how much
+/// walking it takes to get there. Here each selected commit is walked from, in
+/// ascending date order, stopping at any commit whose bitmap is already known —
+/// which is git's own `fill_bitmap_commit()` short-circuit and recovers most of
+/// the sharing on a linear history.
+pub(crate) fn bitmap_file(
+    repo: &gix::Repository,
+    packed: &Packed,
+    options: &BitmapOptions,
+) -> Option<Vec<u8>> {
+    use pack::data::output::bitmap;
+
+    if packed.entries.is_empty() {
+        return None;
+    }
+
+    // The two coordinate systems a `.bitmap` uses: bits address pack positions
+    // (offset order, which is how `packed.entries` was built), entry headers and
+    // the hash cache address index positions (object id order).
+    let pack_position: std::collections::HashMap<ObjectId, u32> = packed
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(at, entry)| (entry.id, at as u32))
+        .collect();
+    let mut by_oid: Vec<&PackedEntry> = packed.entries.iter().collect();
+    by_oid.sort_unstable_by_key(|entry| entry.id);
+    let index_position: std::collections::HashMap<ObjectId, u32> = by_oid
+        .iter()
+        .enumerate()
+        .map(|(at, entry)| (entry.id, at as u32))
+        .collect();
+
+    let kinds: Vec<gix::object::Kind> = packed.entries.iter().map(|entry| entry.kind).collect();
+    let name_hashes: Vec<u32> = by_oid.iter().map(|entry| entry.name_hash).collect();
+
+    // git's `indexed_commits`: every commit in the object list, newest first.
+    let preferred = preferred_tip_commits(repo, &options.preferred_tips);
+    let mut commits: Vec<(ObjectId, i64, bool, bool)> = Vec::new();
+    for entry in &packed.entries {
+        if entry.kind != gix::object::Kind::Commit {
+            continue;
+        }
+        let Ok(commit) = repo.find_commit(entry.id) else {
+            continue;
+        };
+        let date = commit.time().map(|time| time.seconds).unwrap_or(0);
+        let merge = commit.parent_ids().count() > 1;
+        commits.push((entry.id, date, merge, preferred.contains(&entry.id)));
+    }
+    if commits.is_empty() {
+        return None;
+    }
+    commits.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let selected_ids = select_commits(&commits);
+
+    // Ascending date, so that walking a commit is most likely to run into an
+    // ancestor whose bitmap has already been computed.
+    let mut order: Vec<ObjectId> = selected_ids.clone();
+    let dates: std::collections::HashMap<ObjectId, i64> =
+        commits.iter().map(|(id, date, _, _)| (*id, *date)).collect();
+    order.sort_by_key(|id| dates.get(id).copied().unwrap_or(0));
+
+    let words = packed.entries.len().div_ceil(64);
+    let mut computed: std::collections::HashMap<ObjectId, Vec<u64>> = std::collections::HashMap::new();
+    for id in &order {
+        let Some(reachable) = reachable_bitmap(repo, *id, words, &pack_position, &computed) else {
+            return None;
+        };
+        computed.insert(*id, reachable);
+    }
+
+    let selected: Vec<bitmap::Commit> = order
+        .iter()
+        .map(|id| bitmap::Commit {
+            index_position: index_position[id],
+            date: dates.get(id).copied().unwrap_or(0),
+            reachable: computed.remove(id).expect("just computed"),
+        })
+        .collect();
+
+    bitmap::write(
+        repo.object_hash(),
+        &packed.id,
+        &kinds,
+        &name_hashes,
+        selected,
+        bitmap::Options {
+            hash_cache: options.hash_cache,
+            lookup_table: options.lookup_table,
+        },
+    )
+    .ok()
+}
+
+/// The commits every `pack.preferBitmapTips` prefix points at, git's
+/// `for_each_preferred_bitmap_tip()` feeding `mark_bitmap_preferred_tip()`.
+///
+/// A prefix without a trailing slash grows one, so `refs/heads` matches
+/// `refs/heads/main` but not `refs/headsfoo`. Tags are peeled, since it is the
+/// commit that can carry a bitmap, not the tag object.
+fn preferred_tip_commits(repo: &gix::Repository, prefixes: &[String]) -> HashSet<ObjectId> {
+    let mut out = HashSet::new();
+    for prefix in prefixes {
+        let prefix = if prefix.ends_with('/') {
+            prefix.clone()
+        } else {
+            format!("{prefix}/")
+        };
+        let Ok(platform) = repo.references() else { continue };
+        let Ok(iter) = platform.prefixed(prefix.as_bytes()) else {
+            continue;
+        };
+        for reference in iter.flatten() {
+            let mut reference = reference;
+            let Ok(id) = reference.peel_to_id_in_place() else {
+                continue;
+            };
+            if repo.find_commit(id).is_ok() {
+                out.insert(id.detach());
+            }
+        }
+    }
+    out
+}
+
+/// git's `bitmap_writer_select_commits()`: take every commit when there are few
+/// of them, otherwise walk the date-ordered list in widening steps and take one
+/// commit from each step.
+///
+/// `commits` is `(id, date, is_merge, is_preferred_tip)`, newest first. Within a
+/// step git prefers a commit that a `pack.preferBitmapTips` ref points at, then
+/// the last merge it saw, and falls back to the commit the step lands on.
+fn select_commits(commits: &[(ObjectId, i64, bool, bool)]) -> Vec<ObjectId> {
+    /// git's `next_commit_index()`: no gap at all for the first hundred commits,
+    /// then a gap that widens to a hundred, then to five thousand.
+    fn next_commit_index(idx: usize) -> usize {
+        const MIN_COMMITS: usize = 100;
+        const MAX_COMMITS: usize = 5000;
+        const MUST_REGION: usize = 100;
+        const MIN_REGION: usize = 20000;
+
+        if idx <= MUST_REGION {
+            return 0;
+        }
+        if idx <= MIN_REGION {
+            return (idx - MUST_REGION).min(MIN_COMMITS);
+        }
+        (idx - MIN_REGION).min(MAX_COMMITS).max(MIN_COMMITS)
+    }
+
+    if commits.len() < 100 {
+        return commits.iter().map(|(id, _, _, _)| *id).collect();
+    }
+
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    loop {
+        let next = next_commit_index(i);
+        if i + next >= commits.len() {
+            break;
+        }
+        let mut chosen = commits[i + next].0;
+        if next != 0 {
+            for step in 0..=next {
+                let (id, _, merge, preferred) = commits[i + step];
+                if preferred {
+                    chosen = id;
+                    break;
+                }
+                if merge {
+                    chosen = id;
+                }
+            }
+        }
+        out.push(chosen);
+        i += next + 1;
+    }
+    out
+}
+
+/// Every object in the pack reachable from `start`, as a plain bitmap over pack
+/// positions; git's `fill_bitmap_commit()` plus `fill_bitmap_tree()`.
+///
+/// `None` means the pack does not hold the whole closure, which is the one
+/// condition under which no bitmap may be written.
+fn reachable_bitmap(
+    repo: &gix::Repository,
+    start: ObjectId,
+    words: usize,
+    pack_position: &std::collections::HashMap<ObjectId, u32>,
+    computed: &std::collections::HashMap<ObjectId, Vec<u64>>,
+) -> Option<Vec<u64>> {
+    fn get(bitmap: &[u64], at: u32) -> bool {
+        bitmap[at as usize / 64] & (1 << (at % 64)) != 0
+    }
+    fn set(bitmap: &mut [u64], at: u32) {
+        bitmap[at as usize / 64] |= 1 << (at % 64);
+    }
+
+    let mut bitmap = vec![0u64; words];
+    let mut queue: Vec<ObjectId> = vec![start];
+    let mut trees: Vec<ObjectId> = Vec::new();
+
+    while let Some(id) = queue.pop() {
+        if id != start {
+            if let Some(known) = computed.get(&id) {
+                for (word, bits) in bitmap.iter_mut().zip(known) {
+                    *word |= bits;
+                }
+                continue;
+            }
+        }
+        let Some(&pos) = pack_position.get(&id) else {
+            return warn_not_closed(&id);
+        };
+        set(&mut bitmap, pos);
+
+        let Ok(commit) = repo.find_commit(id) else {
+            return warn_not_closed(&id);
+        };
+        let Ok(tree) = commit.tree_id() else {
+            return warn_not_closed(&id);
+        };
+        trees.push(tree.detach());
+        for parent in commit.parent_ids() {
+            let parent = parent.detach();
+            let Some(&at) = pack_position.get(&parent) else {
+                return warn_not_closed(&parent);
+            };
+            if !get(&bitmap, at) {
+                set(&mut bitmap, at);
+                queue.push(parent);
+            }
+        }
+    }
+
+    for tree in trees {
+        let Some(&pos) = pack_position.get(&tree) else {
+            return warn_not_closed(&tree);
+        };
+        if get(&bitmap, pos) {
+            continue;
+        }
+        fill_tree(repo, &mut bitmap, tree, pos, pack_position)?;
+    }
+    Some(bitmap)
+}
+
+/// git's warning when an object the walk reached is not in the pack, and the
+/// `None` that abandons the `.bitmap` because of it.
+fn warn_not_closed<T>(id: &ObjectId) -> Option<T> {
+    eprintln!(
+        "warning: Failed to write bitmap index. Packfile doesn't have full closure \
+         (object {id} is missing)"
+    );
+    None
+}
+
+/// git's `fill_bitmap_tree()`: set the tree's own bit, then descend into every
+/// entry whose bit is not set yet.
+///
+/// A set bit means the whole subtree below it is already accounted for, which is
+/// what keeps this from re-walking shared trees.
+fn fill_tree(
+    repo: &gix::Repository,
+    bitmap: &mut [u64],
+    tree: ObjectId,
+    pos: u32,
+    pack_position: &std::collections::HashMap<ObjectId, u32>,
+) -> Option<()> {
+    bitmap[pos as usize / 64] |= 1 << (pos % 64);
+
+    let mut buf = Vec::new();
+    let Ok((object, _location)) = repo.objects.find(&tree, &mut buf) else {
+        return warn_not_closed(&tree);
+    };
+    let Ok(parsed) = gix::objs::TreeRef::from_bytes(object.data, repo.object_hash()) else {
+        return warn_not_closed(&tree);
+    };
+    let entries: Vec<(ObjectId, gix::object::tree::EntryMode)> = parsed
+        .entries
+        .iter()
+        .map(|entry| (entry.oid.to_owned(), entry.mode))
+        .collect();
+
+    for (id, mode) in entries {
+        if mode.is_tree() {
+            let Some(&child) = pack_position.get(&id) else {
+                return warn_not_closed(&id);
+            };
+            if bitmap[child as usize / 64] & (1 << (child % 64)) != 0 {
+                continue;
+            }
+            fill_tree(repo, bitmap, id, child, pack_position)?;
+        } else if mode.is_blob_or_symlink() {
+            let Some(&child) = pack_position.get(&id) else {
+                return warn_not_closed(&id);
+            };
+            bitmap[child as usize / 64] |= 1 << (child % 64);
+        }
+        // A gitlink names a commit in another repository, which is never packed
+        // here; git skips it too.
+    }
+    Some(())
 }
 
 /// The `.mtimes` a cruft pack carries: `MTME`, the format version, the hash
@@ -2170,6 +2861,8 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
         "unpacked" => st.unpacked = on,
         "incremental" => st.incremental = on,
         "non-empty" => st.non_empty = on,
+        "write-bitmap-index" => st.write_bitmap_index = on,
+        "delta-islands" => st.delta_islands = on,
         "quiet" => st.progress = !on,
         "progress" | "all-progress" => st.progress = on,
         "exclude-promisor-objects" => st.exclude_promisor = on,

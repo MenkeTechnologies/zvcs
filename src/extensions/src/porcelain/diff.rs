@@ -278,6 +278,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `--ws-error-highlight=<kind>`, seeded from `diff.wsErrorHighlight` (default
     // `WSEH_NEW`) once the repository's config is readable, below.
     let mut ws_error_highlight: u32;
+    // `--color-moved*` / `--word-diff*` / `--color-words`, layered over
+    // `diff.colorMoved` / `diff.colorMovedWS` / `diff.wordRegex` below.
+    let mut move_word = diff_color::MoveWordOpts::default();
     // The `diffcore_std()` rename/copy/break knobs. `git diff` is a porcelain, so
     // `init_diff_ui_defaults()` has already turned rename detection on by default;
     // `diff.renames` and the `-M`/`-C`/`--no-renames` flags override it below.
@@ -392,6 +395,15 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         }
         if after_dashdash {
             trailing_paths.push(a.clone());
+            continue;
+        }
+        // `--color-moved[=<mode>]`, `--color-moved-ws=<modes>`, `--word-diff[=<mode>]`,
+        // `--word-diff-regex=<re>` and `--color-words[=<re>]`.
+        if let Some(res) = move_word.parse_flag(a, &mut color_when) {
+            if let Err(msg) = res {
+                eprintln!("{msg}");
+                return Ok(ExitCode::from(129));
+            }
             continue;
         }
         match a.as_str() {
@@ -893,6 +905,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `diff.color` / `color.ui` and the terminal test.
     let colors = diff_color::DiffColors::resolve(&repo, diff_color::resolve_color(&repo, color_when));
     let ws_rule = diff_color::whitespace_rule_cfg(&repo);
+    let extra = match move_word.resolve(&repo) {
+        Ok(e) => e,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return Ok(ExitCode::from(128));
+        }
+    };
 
     // ---- render, in `diff_flush()` order ----------------------------------
     // `diff_flush()` bails out before printing anything at all when the change
@@ -949,32 +968,37 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // contributes no `diff --git` section of its own.
             let unmerged: BTreeSet<&BString> =
                 deltas.iter().filter(|d| d.unmerged).map(|d| &d.path).collect();
-            // Each file pair is rendered uncolored and then re-emitted through
-            // git's `fn_out_consume()` chain with that pair's whitespace state, so
-            // the blank-at-EOF check never leaks from one file to the next.
+            // The whole patch is assembled uncolored and then re-emitted in one
+            // pass through git's `fn_out_consume()` chain, carrying each pair's own
+            // whitespace state so the blank-at-EOF check never leaks from one file
+            // to the next. Emitting only after the last pair is what
+            // `diff_flush_patch_all_file_pairs()` does, and it is what lets
+            // `--color-moved` recognize a block that moved between two files.
             let paint_opts = diff_color::PaintOptions {
                 ws_error_highlight,
                 suppress_blank_empty,
                 ..Default::default()
             };
+            let mut plain: Vec<u8> = Vec::new();
+            let mut files: Vec<diff_color::FilePaint> = Vec::new();
             for (delta, an) in deltas.iter().zip(&analyses) {
                 if !delta.unmerged && unmerged.contains(&delta.path) {
                     continue;
                 }
-                let mut section: Vec<u8> = Vec::new();
-                render_patch(&mut section, &repo, delta, an, ctx, &r)?;
-                let file = diff_color::FilePaint {
-                    ws_rule,
-                    blank_at_eof: an.blank_at_eof,
-                };
-                out.extend_from_slice(&diff_color::colorize_patch(
-                    &section,
-                    &colors,
-                    &paint_opts,
-                    &[file],
-                    file,
-                ));
+                let before = plain.len();
+                render_patch(&mut plain, &repo, delta, an, ctx, &r)?;
+                if plain.len() != before {
+                    files.push(diff_color::FilePaint { ws_rule, blank_at_eof: an.blank_at_eof });
+                }
             }
+            out.extend_from_slice(&diff_color::colorize_patch_ex(
+                &plain,
+                &colors,
+                &paint_opts,
+                &files,
+                diff_color::FilePaint::new(ws_rule),
+                &extra,
+            ));
         }
     }
 

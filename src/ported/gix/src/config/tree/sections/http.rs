@@ -101,6 +101,12 @@ impl Http {
     /// The `http.schannelCheckRevoke` key.
     pub const SCHANNEL_CHECK_REVOKE: keys::Boolean =
         keys::Boolean::new_boolean("schannelCheckRevoke", &config::Tree::HTTP);
+    /// The `http.proactiveAuth` key.
+    pub const PROACTIVE_AUTH: ProactiveAuth =
+        keys::Any::new_with_validate("proactiveAuth", &config::Tree::HTTP, validate::ProactiveAuth);
+    /// The `http.emptyAuth` key.
+    pub const EMPTY_AUTH: EmptyAuth =
+        keys::Any::new_with_validate("emptyAuth", &config::Tree::HTTP, validate::EmptyAuth);
 }
 
 impl Section for Http {
@@ -137,9 +143,17 @@ impl Section for Http {
             &Self::MAX_RETRIES,
             &Self::RETRY_AFTER,
             &Self::MAX_RETRY_TIME,
+            &Self::PROACTIVE_AUTH,
+            &Self::EMPTY_AUTH,
         ]
     }
 }
+
+/// The `http.proactiveAuth` key.
+pub type ProactiveAuth = keys::Any<validate::ProactiveAuth>;
+
+/// The `http.emptyAuth` key.
+pub type EmptyAuth = keys::Any<validate::EmptyAuth>;
 
 /// The `http.followRedirects` key.
 pub type FollowRedirects = keys::Any<validate::FollowRedirects>;
@@ -295,6 +309,69 @@ mod key_impls {
         feature = "blocking-http-transport-reqwest",
         feature = "blocking-http-transport-curl"
     ))]
+    impl super::ProactiveAuth {
+        /// Convert `value` into the proactive-authentication mode, per `git help config`'s
+        /// `basic`/`auto`/`none` for `http.proactiveAuth`.
+        ///
+        /// An unrecognized value leaves the setting at its default, which is what `git`'s
+        /// `http_options()` does — it only `warning()`s and keeps `http_proactive_auth` as it was.
+        pub fn try_into_proactive_auth(
+            &'static self,
+            value: impl gix_utils::AsBStr,
+        ) -> gix_protocol::transport::client::blocking_io::http::options::ProactiveAuth {
+            use gix_protocol::transport::client::blocking_io::http::options::ProactiveAuth;
+
+            use crate::bstr::ByteSlice;
+            match value.as_bstr().as_bytes() {
+                b"basic" => ProactiveAuth::Basic,
+                b"auto" => ProactiveAuth::Auto,
+                _ => ProactiveAuth::None,
+            }
+        }
+    }
+
+    #[cfg(any(
+        feature = "blocking-http-transport-reqwest",
+        feature = "blocking-http-transport-curl"
+    ))]
+    impl super::EmptyAuth {
+        /// Convert `value` into the empty-authentication mode. `git`'s `http_options()` reads
+        /// `http.emptyAuth` as the literal `auto`, and anything else through `git_config_bool`, so
+        /// `yes`/`on`/`1` reach the same place as `true` and a key with no value at all is true.
+        pub fn try_into_empty_auth(
+            &'static self,
+            value: impl gix_utils::AsBStr,
+            boolean: impl FnOnce() -> Result<Option<bool>, gix_config::value::Error>,
+        ) -> Result<
+            gix_protocol::transport::client::blocking_io::http::options::EmptyAuth,
+            crate::config::key::GenericErrorWithValue,
+        > {
+            use gix_protocol::transport::client::blocking_io::http::options::EmptyAuth;
+
+            use crate::bstr::ByteSlice;
+            let value = value.as_bstr();
+            if value.as_bytes() == b"auto" {
+                return Ok(EmptyAuth::Auto);
+            }
+            let empty_value = value.is_empty();
+            match boolean().map_err(|err| {
+                crate::config::key::GenericErrorWithValue::from_value(self, value.into()).with_source(err)
+            })? {
+                Some(true) => Ok(EmptyAuth::Always),
+                Some(false) => Ok(EmptyAuth::Never),
+                // A key without a value separator (`[http] emptyAuth`) is git's implicit true; a
+                // value that is not a boolean at all is one `git_config_bool()` dies on, and under
+                // a lenient configuration it must not be read as an enabling one.
+                None if empty_value => Ok(EmptyAuth::Always),
+                None => Ok(EmptyAuth::Auto),
+            }
+        }
+    }
+
+    #[cfg(any(
+        feature = "blocking-http-transport-reqwest",
+        feature = "blocking-http-transport-curl"
+    ))]
     impl SslVersion {
         pub fn try_into_ssl_version(
             &'static self,
@@ -338,6 +415,30 @@ pub mod validate {
                 feature = "blocking-http-transport-curl"
             ))]
             super::Http::SSL_VERSION.try_into_ssl_version(_value)?;
+
+            Ok(())
+        }
+    }
+
+    /// `git` accepts any value here — an unknown one is a warning, not a failure — so there is
+    /// nothing to reject.
+    pub struct ProactiveAuth;
+    impl Validate for ProactiveAuth {
+        fn validate(&self, _value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+            Ok(())
+        }
+    }
+
+    pub struct EmptyAuth;
+    impl Validate for EmptyAuth {
+        fn validate(&self, _value: &BStr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+            #[cfg(any(
+                feature = "blocking-http-transport-reqwest",
+                feature = "blocking-http-transport-curl"
+            ))]
+            super::Http::EMPTY_AUTH.try_into_empty_auth(_value, || {
+                gix_config::Boolean::try_from(_value).map(|b| Some(b.0)).map_err(Into::into)
+            })?;
 
             Ok(())
         }

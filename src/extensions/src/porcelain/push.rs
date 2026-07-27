@@ -28,11 +28,16 @@ use super::push_proto::{self, Request};
 /// (that transport recursion is not wired here — skipping it would be data-losing).
 /// `--follow-tags` adds the annotated tags reachable from the refs being pushed
 /// and missing from the remote (see [`append_followed_tags`]).
-/// Flags whose semantics the send-pack scope cannot honor faithfully
-/// (`--mirror`, `--signed=yes|if-asked`, `--atomic`, `-o/--push-option`,
-/// `--prune`) are rejected
-/// rather than silently ignored; inert or already-matched flags (`--thin`,
-/// `--receive-pack`, `-4/-6`, `--verify`, …) are accepted.
+/// `--mirror`, `--prune`, `--atomic`, `--signed[=<mode>]` and `-o/--push-option`
+/// are negotiated by [`super::push_proto`], which refuses the push when the
+/// receiving end lacks the matching capability rather than downgrading it
+/// silently; inert or already-matched flags (`--thin`, `--receive-pack`,
+/// `-4/-6`, `--verify`, …) are accepted.
+///
+/// The `push.*` defaults honored here are `push.recurseSubmodules`,
+/// `push.followTags`, `push.autoSetupRemote` (with `push.default`),
+/// `push.gpgSign` and `push.pushOption`; an explicit command-line flag always
+/// wins, because git reads config in `git_push_config` *before* `parse_options`.
 pub fn push(args: &[String]) -> Result<ExitCode> {
     let mut f = Flags::default();
     let mut positionals: Vec<String> = Vec::new();
@@ -43,6 +48,8 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     let mut recurse_explicit = false;
     // Same for `--follow-tags`/`--no-follow-tags` against `push.followTags`.
     let mut follow_tags_explicit = false;
+    // Same for `--signed`/`--no-signed` against `push.gpgSign`.
+    let mut signed_explicit = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -93,9 +100,19 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "-v" | "--verbose" => f.verbose = true,
             "-q" | "--quiet" | "--progress" | "--no-progress"
             | "--thin" | "--no-thin" | "-4" | "--ipv4" | "-6" | "--ipv6"
-            | "--force-if-includes" | "--no-force-if-includes" | "--verify" | "--no-verify"
+            | "--verify" | "--no-verify"
             => {}
-            "--no-signed" => f.signed = push_proto::Signed::Never,
+            // `--force-if-includes` only ever does anything alongside a
+            // `--force-with-lease` that takes its expected value from the
+            // remote-tracking ref (`apply_cas()` sets `check_reachable` exactly
+            // there). Anywhere else git documents it as a no-op, so it is accepted;
+            // where it would bite, it is refused rather than silently dropped.
+            "--force-if-includes" => f.force_if_includes = true,
+            "--no-force-if-includes" => f.force_if_includes = false,
+            "--no-signed" => {
+                f.signed = push_proto::Signed::Never;
+                signed_explicit = true;
+            }
             "--no-atomic" => f.atomic = false,
             "--no-mirror" => f.mirror = false,
             "--no-prune" => f.prune = false,
@@ -134,6 +151,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
                     Some("if-asked") => push_proto::Signed::IfAsked,
                     Some(v) => bail!("bad signed argument: {v}"),
                 };
+                signed_explicit = true;
             }
             other => bail!("unsupported option {other:?}"),
         }
@@ -182,6 +200,44 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             }
         }
 
+        // `push.gpgSign` — the default for `--signed`. git's `git_push_config`
+        // runs the value through `git_parse_maybe_bool` and maps false/true to
+        // NEVER/ALWAYS, the literal `if-asked` to IF_ASKED, and dies on anything
+        // else. `--signed` in any form is parsed afterwards and so wins.
+        if !signed_explicit {
+            if let Some(v) = snap.string("push.gpgSign") {
+                let v = v.to_str_lossy().into_owned();
+                f.signed = match maybe_bool(&v) {
+                    Some(false) => push_proto::Signed::Never,
+                    Some(true) => push_proto::Signed::Always,
+                    None if v.eq_ignore_ascii_case("if-asked") => push_proto::Signed::IfAsked,
+                    None => bail!("invalid value for 'push.gpgSign'"),
+                };
+            }
+        }
+
+        // `push.pushOption` — the default list for `-o/--push-option`. git reads
+        // it with `parse_transport_option`, where an empty value *clears* what
+        // earlier occurrences accumulated, and then picks the command-line list
+        // over the configured one whole (`push_options_cmdline.nr ? … : …`) —
+        // the two are never merged.
+        if f.push_options.is_empty() {
+            f.push_options = snap
+                .plumbing()
+                .strings("push.pushOption")
+                .unwrap_or_default()
+                .iter()
+                .map(|v| v.to_str_lossy().into_owned())
+                .fold(Vec::new(), |mut acc, value| {
+                    if value.is_empty() {
+                        acc.clear();
+                    } else {
+                        acc.push(value);
+                    }
+                    acc
+                });
+        }
+
         // `push.autoSetupRemote` — on a bare default push whose current branch has
         // no configured upstream, act as if `--set-upstream`. Ported from git's
         // `setup_default_push_refspecs` (builtin/push.c): the SET_UPSTREAM flag is
@@ -208,6 +264,12 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // git validates the push-option list once, after the command line and
+    // `push.pushOption` have been reconciled, so a configured value is checked too.
+    if f.push_options.iter().any(|o| o.contains('\n')) {
+        bail!("push options must not have new line characters");
+    }
+
     let remote = match repo.find_remote(remote_name.as_str()) {
         Ok(r) => r,
         Err(_) => repo.remote_at(remote_name.as_str())?,
@@ -221,6 +283,20 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     if !matches!(f.lease, Lease::None) {
         for req in &mut requests {
             req.expected = lease_for(&repo, &remote, &f.lease, &req.name);
+        }
+        // `--force-if-includes` turns each of those leases into an additional
+        // reachability check (`check_if_includes_upstream`) over the *local*
+        // branch's reflog. That reverse mapping from remote ref back to the local
+        // branch is not retained here, so the flag is refused where it would
+        // change the outcome rather than being accepted and ignored.
+        if f.force_if_includes && requests.iter().any(|r| lease_uses_tracking(&f.lease, &r.name)) {
+            bail!(
+                "unsupported flag \"--force-if-includes\" alongside a --force-with-lease that reads \
+                 its expected value from the remote-tracking ref: it additionally requires the \
+                 remote tip to be reachable from the local branch's reflog, a check this port does \
+                 not perform — pass --no-force-if-includes, or give the lease an explicit \
+                 <ref>:<expect> value, which makes the flag a no-op in git too"
+            );
         }
     }
 
@@ -378,6 +454,9 @@ struct Flags {
     porcelain: bool,
     repo: Option<String>,
     lease: Lease,
+    /// `--force-if-includes`. Inert unless a lease resolves its expected value
+    /// from a remote-tracking ref; see the option-parsing arm for why.
+    force_if_includes: bool,
     recurse: Recurse,
 }
 
@@ -483,6 +562,18 @@ fn lease_for(
                 None
             }
         }
+    }
+}
+
+/// Whether the lease covering `remote_ref` takes its expected value from the
+/// remote-tracking ref rather than from a value spelled on the command line —
+/// git's `entry->use_tracking` / `use_tracking_for_rest`, the only case in which
+/// `--force-if-includes` has any effect.
+fn lease_uses_tracking(lease: &Lease, remote_ref: &str) -> bool {
+    match lease {
+        Lease::None => false,
+        Lease::Implicit => true,
+        Lease::Explicit { ref_name, expect } => expect.is_none() && ref_matches(ref_name, remote_ref),
     }
 }
 

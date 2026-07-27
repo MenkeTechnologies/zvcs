@@ -381,6 +381,7 @@ impl PrepareFetch {
             b
         };
         let outcome = pending_pack
+            .with_filter(self.filter.clone())
             .with_write_packed_refs_only(true)
             .with_reflog_message(RefLogMessage::Override {
                 message: reflog_message.clone(),
@@ -388,6 +389,19 @@ impl PrepareFetch {
             .with_shallow(self.shallow.clone())
             .receive(&repo, &mut progress, should_interrupt)
             .await?;
+
+        // A partial clone is only usable through its promisor remote, and the checkout that may follow
+        // right after needs the objects the filter withheld. The remote is not in `.git/config` as a
+        // promisor yet - the caller registers it there - so hand it over directly.
+        if let Some(filter) = self.filter.as_ref() {
+            crate::promisor::install_hook_for(
+                &repo,
+                vec![crate::promisor::Remote {
+                    name: remote_name.to_string(),
+                    filter: Some(filter.as_str().to_owned()),
+                }],
+            );
+        }
 
         // Before finalisation, the current repo handle still needs to
         // learn about the remote config written after it was opened.

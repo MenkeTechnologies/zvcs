@@ -82,49 +82,42 @@
 //!     `--max-count`, `<a>...<b>`, magic or wildcard pathspecs, …) with
 //!     `unsupported rev-list argument`. Accepting one and ignoring it would
 //!     silently rewrite a different set of commits than the user asked for.
-//!   * **`--index-filter`.** Its whole contract is that the user's own
-//!     `git rm --cached` / `git update-index` run against the scratch
-//!     `$GIT_INDEX_FILE`. This build's index plumbing ignores that variable and
-//!     `GIT_WORK_TREE` — `git read-tree -i -m HEAD` with `GIT_INDEX_FILE` set to
-//!     a fresh path writes no such file and resets the repository's own index
-//!     instead — so an index filter would silently leave the rewrite unchanged
-//!     while clobbering the caller's index. It is refused rather than run.
-//!     `--tree-filter` and `--subdirectory-filter` do not need it: see the
-//!     substitutions below.
 //!   * **`git commit-tree`'s ident handling is probed before anything is
 //!     rewritten.** The script's whole ident mechanism is `GIT_AUTHOR_DATE` in
 //!     git's raw `@<timestamp> <tz>` form, and it is the `git` on `PATH` that
-//!     has to parse it. This build does not: `git var GIT_AUTHOR_IDENT` reports
-//!     `invalid date in GIT_AUTHOR_DATE: Unknown date format: "@1112911993
-//!     +0000"`, and `git commit-tree` silently substitutes the current time and
-//!     keeps the trailing space `parse_ident_from_commit` leaves in the name.
-//!     Running the rewrite anyway would re-date every commit in the range, so
-//!     the run is refused up front with `refusing to rewrite: the 'git' on PATH
-//!     does not honour ...`. Stock git passes the probe. (Unlike stock, this
-//!     port does not prepend its own directory to `PATH`: `git` inside a filter
-//!     is whatever the user's `PATH` says, which for an installed shadow is
-//!     this binary.) The same gap shows up in two places the probe does not
-//!     guard, because they do not touch the rewritten commits: a reflog entry
-//!     written by this build's `git update-ref` is stamped with the current
-//!     time rather than the committer date the script still has exported, and
-//!     `--state-branch`'s `Sync` commit — written by this binary's
-//!     `commit-tree` — ignores a `GIT_COMMITTER_DATE` the caller exported in
-//!     that same raw form.
+//!     has to parse it. The probe stays because that `git` is whichever one the
+//!     user's `PATH` names — unlike stock, this port does not prepend its own
+//!     directory — so a `PATH` pointing at a build without the form would
+//!     otherwise re-date every commit in the range silently. Both stock git and
+//!     this build pass it: `gix_date`'s parser learned the form as a port of
+//!     git's `match_object_header_date` (`date.c:804-825`, mirrored in
+//!     `src/ported/gix-date/src/parse/function.rs`), which is what
+//!     `git var GIT_AUTHOR_IDENT` and `git commit-tree` read.
 //!
 //! Implementation substitutions, all stated rather than hidden:
 //!
-//!   * **The scratch index is gone; the tree is built directly.** The script
-//!     runs `git read-tree -i -m <commit>` into `$GIT_INDEX_FILE`,
+//!   * **Without an index filter the tree is built directly, not through the
+//!     scratch index.** For `--tree-filter` and `--subdirectory-filter` the
+//!     script runs `git read-tree -i -m <commit>` into `$GIT_INDEX_FILE`,
 //!     `git checkout-index -f -u -a` out of it, `git clean -d -q -f -x`,
 //!     `git update-index --add --replace --remove --stdin` back into it and
-//!     `git write-tree` off it. None of those honour `GIT_INDEX_FILE` in this
-//!     build, so all five are done natively: the commit's tree (or its
-//!     `--subdirectory-filter` subtree, or the empty tree when the commit has no
-//!     such directory) is written into the temporary work tree, everything left
-//!     from the previous commit is removed first, and after the tree filter the
-//!     work tree is hashed straight back into a tree object. The result is the
-//!     same tree the script's index round trip produces, and the same commits
-//!     come out, with three differences worth naming:
+//!     `git write-tree` off it, purely to get from one tree to the next; nothing
+//!     the user wrote ever looks at that index. Here those five steps are done
+//!     natively: the commit's tree (or its `--subdirectory-filter` subtree, or
+//!     the empty tree when the commit has no such directory) is written into the
+//!     temporary work tree, everything left from the previous commit is removed
+//!     first, and after the tree filter the work tree is hashed straight back
+//!     into a tree object. `--index-filter` is the case where the index *is* the
+//!     user's interface, so it gets a real one: the tree the filters have
+//!     produced so far is loaded into `$GIT_INDEX_FILE` with `git read-tree -i
+//!     -m <tree>`, the filter runs against it, and `git write-tree` reads the
+//!     result back at the script's own point in the loop. That works because
+//!     `GIT_INDEX_FILE` is now honoured — `gix::Repository::index_path()` reads
+//!     it, a port of what `setup_git_env()` passes to `repo_set_gitdir()` — so
+//!     the filter's `git rm --cached` and `git update-index` edit the scratch
+//!     index and leave the caller's alone.
+//!     The result is the same tree the script's index round trip produces, and
+//!     the same commits come out, with three differences worth naming:
 //!       - Checkout and re-hash apply no clean/smudge filters, where
 //!         `checkout-index`/`update-index` do. For a repository with no filters
 //!         (no `.gitattributes`, no `core.autocrlf`) that is identical; with
@@ -598,18 +591,6 @@ fn run(args: &[String]) -> Result<ExitCode> {
         return die(&format!("{} already exists, please remove it", opts.tempdir));
     }
 
-    // An index filter is `git rm --cached`/`git update-index` against
-    // `$GIT_INDEX_FILE`, which this build's plumbing ignores; it would leave the
-    // rewrite unchanged and the caller's own index clobbered. See the module
-    // documentation.
-    if !opts.filter_index.is_empty() {
-        return die(
-            "--index-filter is not ported: this build's index plumbing ignores GIT_INDEX_FILE, \
-             so the filter would edit your real index and change nothing in the rewrite. Use \
-             --tree-filter, which needs no scratch index here.",
-        );
-    }
-
     // The ident round-trip every rewritten commit depends on. See the module
     // documentation: this build's date parser rejects git's raw `@<ts> <tz>`
     // form, and running anyway would re-date the whole range.
@@ -780,6 +761,21 @@ impl Ctx {
             cmd.env(key, value);
         }
         cmd
+    }
+
+    /// Run a plumbing command and return `(status, stdout)`, with its stderr going
+    /// where the script's would — straight through to the caller's.
+    fn git_output(&self, args: &[&str]) -> Result<(i32, String)> {
+        let out = self
+            .git(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .output()
+            .map_err(|e| anyhow::anyhow!("could not run git {}: {e}", args.join(" ")))?;
+        Ok((
+            out.status.code().unwrap_or(1),
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ))
     }
 
     /// Run a plumbing command, letting its output through, and return its status.
@@ -1004,6 +1000,23 @@ fn rewrite(
             tree = hash_worktree(repo, &ctx.workdir, base_tree)?;
         }
 
+        // Line 442, the index filter. The script keeps one scratch index live for
+        // the whole iteration — `git read-tree -i -m $commit` at the top of the
+        // loop, `git update-index` after the tree filter — and this is the point
+        // at which the two agree on its contents, so the tree the filters have
+        // produced so far is loaded into `$GIT_INDEX_FILE` right here. The filter
+        // then sees exactly the entries the script would show it, and its own
+        // `git rm --cached` / `git update-index` write back to the same file.
+        if !opts.filter_index.is_empty() {
+            let code = ctx.git_status(&["read-tree", "-i", "-m", &tree.to_string()])?;
+            if code != 0 {
+                return die("Could not initialize the index");
+            }
+            if sh.run("eval \"$filter_index\" < /dev/null")? != 0 {
+                return die(&format!("index filter failed: {}", opts.filter_index));
+            }
+        }
+
         // Lines 445-460: the mapped parents, then the parent filter.
         let mut parentstr = String::new();
         let mut seen: Vec<String> = Vec::new();
@@ -1034,6 +1047,21 @@ fn rewrite(
         fs::write(ctx.tempdir.join("message-in"), body)?;
         if sh.run("eval \"$filter_msg\" < ../message-in > ../message")? != 0 {
             return die(&format!("msg filter failed: {}", opts.filter_msg));
+        }
+
+        // Lines 474-479: `tree=$(git write-tree)` under `$need_index`. Only the
+        // index filter needs it here — the other two `need_index` cases have
+        // already produced their tree without one — and it is read back at the
+        // script's point rather than at the filter, so a msg or parent filter
+        // that touches the index is still seen.
+        if !opts.filter_index.is_empty() {
+            let (code, out) = ctx.git_output(&["write-tree"])?;
+            if code != 0 {
+                return Err(Exit(code as u8).into());
+            }
+            tree = out.parse::<ObjectId>().map_err(|_| {
+                anyhow::anyhow!("git write-tree did not print a tree id: {out}")
+            })?;
         }
 
         // Lines 480-482: the commit filter, in its own shell, with `$workdir`

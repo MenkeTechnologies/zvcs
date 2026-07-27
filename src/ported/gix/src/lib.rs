@@ -430,6 +430,9 @@ pub mod filter;
 pub mod remote;
 
 ///
+pub mod promisor;
+
+///
 pub mod init;
 
 /// Not to be confused with 'status'.

@@ -545,7 +545,7 @@ fn repack_all(
     // remembers its path and mtime: the path so it can be unlinked once packed,
     // the mtime because a cruft pack has to record it.
     let loose = loose_objects(&objdir, hash);
-    let rewritable = local_packs(&pack_dir, hash);
+    let rewritable = local_packs(&pack_dir, hash, big_pack_threshold(repo));
 
     let mut existing: Vec<ObjectId> = loose.keys().copied().collect();
     // A packed object is dated by its `.pack`'s mtime, which is what git's
@@ -712,13 +712,36 @@ fn loose_objects(objdir: &Path, hash: gix::hash::Kind) -> HashMap<ObjectId, Loos
     out
 }
 
+/// `gc.bigPackThreshold`, in bytes, or zero when it is unset.
+///
+/// git's `find_base_packs()` turns it into a `--keep-pack=<name>` for every
+/// local pack at or above the size, which is the same instruction a `.keep` file
+/// carries: leave the pack where it is and do not copy its objects into the new
+/// one. Rewriting a pack that is already large is the expensive half of a `gc`
+/// and rarely buys anything, so this is how a big repository keeps `gc` cheap.
+///
+/// An unreadable value is treated as unset, matching git's `git_config_ulong`,
+/// which warns and moves on rather than dying here.
+fn big_pack_threshold(repo: &gix::Repository) -> u64 {
+    crate::config::config_ulong(repo, "gc.bigPackThreshold")
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+}
+
 /// Every local pack that may be rewritten, as `(base name, index)`.
 ///
 /// Alternates are deliberately not included: `repack` rewrites the repository's
 /// own object store and must not touch a store it merely borrows from. A pack
 /// beside a `.keep` file is skipped for the reason `git repack` skips it — the
-/// marker is a promise that the pack stays put.
-fn local_packs(pack_dir: &Path, hash: gix::hash::Kind) -> Vec<(String, pack::index::File)> {
+/// marker is a promise that the pack stays put — and so is one at or above
+/// `big_pack_threshold` bytes, which git keeps for the same reason by a
+/// different route.
+fn local_packs(
+    pack_dir: &Path,
+    hash: gix::hash::Kind,
+    big_pack_threshold: u64,
+) -> Vec<(String, pack::index::File)> {
     let mut out = Vec::new();
     let Some(names) = super::prune::read_dir_raw(pack_dir) else {
         return out;
@@ -730,6 +753,14 @@ fn local_packs(pack_dir: &Path, hash: gix::hash::Kind) -> Vec<(String, pack::ind
         };
         if pack_dir.join(format!("{base}.keep")).exists() {
             continue;
+        }
+        if big_pack_threshold > 0 {
+            let size = std::fs::metadata(pack_dir.join(format!("{base}.pack")))
+                .map(|md| md.len())
+                .unwrap_or(0);
+            if size >= big_pack_threshold {
+                continue;
+            }
         }
         if !matches!(std::fs::metadata(pack_dir.join(format!("{base}.pack"))), Ok(md) if md.is_file())
         {
@@ -948,58 +979,71 @@ fn pack_refs_enabled(repo: &gix::Repository) -> bool {
 /// `need_to_gc()`: true when either the loose-object or the pack-count
 /// heuristic trips. Ported from `builtin/gc.c`; both halves compare with `>`,
 /// and a non-positive threshold disables that half.
-fn gc_needed(repo: &gix::Repository) -> bool {
-    let cfg = repo.config_snapshot();
-    let objdir = repo.objects.store_ref().path().to_path_buf();
-
-    // `too_many_loose_objects()` deliberately samples a single fan-out directory
-    // and extrapolates, rather than walking all 256.
-    let auto_threshold = cfg.integer("gc.auto").unwrap_or(6700);
-    if auto_threshold > 0 {
-        // DIV_ROUND_UP(auto_threshold, 256)
-        let limit = auto_threshold.div_euclid(256) + i64::from(auto_threshold.rem_euclid(256) != 0);
-        let name_len = repo.object_hash().len_in_hex() - 2;
-        let mut loose: i64 = 0;
-        if let Ok(entries) = std::fs::read_dir(objdir.join("17")) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else { continue };
-                // git's check: exactly the remaining hex digits, nothing else.
-                if name.len() != name_len
-                    || !name.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-                {
-                    continue;
-                }
-                loose += 1;
-                if loose > limit {
-                    return true;
-                }
-            }
-        }
+pub(super) fn gc_needed(repo: &gix::Repository) -> bool {
+    // `gc.auto` at zero or below disables automatic gc outright — git returns
+    // before it ever counts packs, so a repository over `gc.autoPackLimit` is
+    // still left alone.
+    let auto_threshold = repo.config_snapshot().integer("gc.auto").unwrap_or(6700);
+    if auto_threshold <= 0 {
+        return false;
     }
+    too_many_packs(repo) || too_many_loose_objects(repo, auto_threshold)
+}
 
-    // `too_many_packs()` counts local packs, skipping any that are `.keep`-marked.
-    let pack_limit = cfg.integer("gc.autoPackLimit").unwrap_or(50);
-    if pack_limit > 0 {
-        let mut packs: i64 = 0;
-        if let Ok(entries) = std::fs::read_dir(objdir.join("pack")) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("pack") {
-                    continue;
-                }
-                if path.with_extension("keep").exists() {
-                    continue;
-                }
-                packs += 1;
-            }
+/// git's `too_many_loose_objects()`: the *approximate* loose-object count — the
+/// entries of the single `objects/17/` fan-out directory, extrapolated by 256 —
+/// against `limit` rounded up to the next multiple of 256. Both sides of git's
+/// comparison carry that factor of 256, so it divides out and the sampled count
+/// is compared against `DIV_ROUND_UP(limit, 256)` directly.
+///
+/// A missing `objects/17` is zero objects; any other read failure makes git
+/// return 0 here too, so an unreadable directory never triggers the task.
+pub(super) fn too_many_loose_objects(repo: &gix::Repository, limit: i64) -> bool {
+    let rounded = limit.div_euclid(256) + i64::from(limit.rem_euclid(256) != 0);
+    let name_len = repo.object_hash().len_in_hex() - 2;
+    let Ok(entries) = std::fs::read_dir(repo.objects.store_ref().path().join("17")) else {
+        return false;
+    };
+    let mut loose: i64 = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // git's check: exactly the remaining hex digits, nothing else.
+        if name.len() != name_len
+            || !name.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            continue;
         }
-        if packs > pack_limit {
+        loose += 1;
+        if loose > rounded {
             return true;
         }
     }
-
     false
+}
+
+/// git's `too_many_packs()`: more local, non-`.keep` packs than
+/// `gc.autoPackLimit` (default 50). A non-positive limit disables the check.
+pub(super) fn too_many_packs(repo: &gix::Repository) -> bool {
+    let limit = repo.config_snapshot().integer("gc.autoPackLimit").unwrap_or(50);
+    if limit <= 0 {
+        return false;
+    }
+    let mut packs: i64 = 0;
+    let Ok(entries) = std::fs::read_dir(repo.objects.store_ref().path().join("pack")) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pack") {
+            continue;
+        }
+        if path.with_extension("keep").exists() {
+            continue;
+        }
+        packs += 1;
+    }
+    packs > limit
 }
 
 // --- reflog expiry ---------------------------------------------------------
@@ -1043,7 +1087,7 @@ fn reflog_expire_enabled(repo: &gix::Repository) -> bool {
 /// `now`. A lighter approximation of [`super::prune`]'s approxidate handling:
 /// `.`/`,`/`_`/`/` split into words and a bare `<n> <unit>` is read as past.
 /// Unparseable values yield `None`, which callers treat as "unset".
-fn parse_reflog_expiry(value: &str, now: SystemTime) -> Option<i64> {
+pub(super) fn parse_reflog_expiry(value: &str, now: SystemTime) -> Option<i64> {
     let v = value.trim();
     match v {
         "" => return None,
@@ -1077,7 +1121,7 @@ struct ReflogEntryOpt {
 
 /// The resolved reflog-expire policy: the two default cutoffs plus any
 /// per-pattern overrides, mirroring `struct reflog_expire_options`.
-struct ReflogExpireConfig {
+pub(super) struct ReflogExpireConfig {
     default_total: i64,
     default_unreach: i64,
     entries: Vec<ReflogEntryOpt>,
@@ -1087,7 +1131,7 @@ impl ReflogExpireConfig {
     /// `reflog_expire_options_set_refname()`: the first pattern that matches
     /// wins, `refs/stash` never expires when unconfigured, otherwise the
     /// defaults apply. `gc` sets no explicit expiry, so the config always drives.
-    fn resolve(&self, refname: &str) -> (i64, i64) {
+    pub(super) fn resolve(&self, refname: &str) -> (i64, i64) {
         for ent in &self.entries {
             if wildmatch0(ent.pattern.as_bytes(), refname.as_bytes()) {
                 return (
@@ -1107,7 +1151,7 @@ impl ReflogExpireConfig {
 /// forms. The built-in defaults match `REFLOG_EXPIRE_OPTIONS_INIT`: total is
 /// `now - 30 days`, unreachable is `now - 90 days` (verified against git 2.55.0,
 /// whose macro values differ from the historical documentation).
-fn load_reflog_config(repo: &gix::Repository, now: SystemTime, now_secs: i64) -> ReflogExpireConfig {
+pub(super) fn load_reflog_config(repo: &gix::Repository, now: SystemTime, now_secs: i64) -> ReflogExpireConfig {
     let mut default_total = now_secs - 30 * 24 * 3600;
     let mut default_unreach = now_secs - 90 * 24 * 3600;
     let mut entries: Vec<ReflogEntryOpt> = Vec::new();
@@ -1209,7 +1253,7 @@ enum ReflogKind {
 }
 
 /// `reflog expire --all` over the main ref store's `logs/`.
-fn expire_reflogs(repo: &gix::Repository) -> Result<()> {
+pub(super) fn expire_reflogs(repo: &gix::Repository) -> Result<()> {
     let now = SystemTime::now();
     let now_secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     let cfg = load_reflog_config(repo, now, now_secs);
@@ -1492,7 +1536,7 @@ fn ref_tip_commit(repo: &gix::Repository, refname: &str) -> Option<ObjectId> {
 /// `builtin/worktree.c`'s `prune_worktrees()` restricted to the checks `gc`
 /// exercises. `gc` runs it non-verbose, so nothing is printed; a stale
 /// worktree's administrative directory is simply removed.
-fn prune_worktrees(repo: &gix::Repository) -> Result<()> {
+pub(super) fn prune_worktrees(repo: &gix::Repository) -> Result<()> {
     let now = SystemTime::now();
     let now_secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
 
@@ -1535,7 +1579,7 @@ fn prune_worktrees(repo: &gix::Repository) -> Result<()> {
 /// directory is invalid, its `gitdir` file is missing/empty, or the checkout it
 /// names is gone *and* the administrative `index` has aged past `expire`. A
 /// locked worktree is never pruned.
-fn should_prune_worktree(admin: &Path, expire: i64) -> bool {
+pub(super) fn should_prune_worktree(admin: &Path, expire: i64) -> bool {
     if !admin.is_dir() {
         return true;
     }

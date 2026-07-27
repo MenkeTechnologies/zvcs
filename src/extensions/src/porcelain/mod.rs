@@ -5,6 +5,7 @@
 //! same on-disk `.git`.
 
 mod add;
+pub(crate) mod add_interactive;
 pub(crate) mod add_patch;
 mod am;
 mod annotate;
@@ -170,6 +171,8 @@ mod show;
 mod show_branch;
 mod show_index;
 mod show_ref;
+/// The `Net::SMTP` transport `send_email` sends over; not a subcommand.
+mod smtp;
 mod sparse_checkout;
 mod stage;
 mod stash;

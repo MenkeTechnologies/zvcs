@@ -73,6 +73,15 @@ use gix_error::{Exn, ResultExt};
 ///     *   `2 minutes ago` (October 27, 2023 at 09:58:00 UTC)
 ///     *   `3 hours ago` (October 27, 2023 at 07:00:00 UTC)
 pub fn parse(input: &str, now: Option<SystemTime>) -> Result<Time, Exn<Error>> {
+    // `parse_date_basic()` (date.c:852-854) tries the object-header form before any
+    // other: an `@` prefix in front of the raw `<timestamp> <±hhmm>` a commit header
+    // carries. This is the form `git filter-branch` exports in `GIT_AUTHOR_DATE`, and
+    // the only one that pins both the timestamp and its zone exactly.
+    if let Some(rest) = input.strip_prefix('@') {
+        if let Some(val) = parse_object_header(rest) {
+            return Ok(val);
+        }
+    }
     Ok(if let Ok(val) = Date::strptime(SHORT.0, input) {
         let val = val
             .to_zoned(TimeZone::UTC)
@@ -100,6 +109,46 @@ pub fn parse(input: &str, now: Option<SystemTime>) -> Result<Time, Exn<Error>> {
     } else {
         return Err(Error::new_with_input("Unknown date format", input))?;
     })
+}
+
+/// `match_object_header_date()` (date.c:804-825): what git accepts behind the `@`
+/// prefix, which is the raw `<timestamp> <±hhmm>` of an object header.
+///
+/// Deliberately looser than [`parse_raw()`][crate::parse::raw::parse_raw]: git checks
+/// only that the timestamp is digits, that exactly one space and a sign follow it, and
+/// that the zone is exactly four digits ending the string or followed by a newline. It
+/// range-checks neither the hours nor the minutes, so `+9999` is a valid zone here.
+fn parse_object_header(input: &str) -> Option<Time> {
+    // `if (*date < '0' || '9' < *date) return -1;` then `parse_timestamp`, which is
+    // unsigned — a leading sign never reaches it.
+    if !input.as_bytes().first()?.is_ascii_digit() {
+        return None;
+    }
+    let digits = input.bytes().take_while(u8::is_ascii_digit).count();
+    let seconds: SecondsSinceUnixEpoch = input.get(..digits)?.parse().ok()?;
+
+    // `*end != ' ' || (end[1] != '+' && end[1] != '-')`.
+    let rest = input.get(digits..)?;
+    let sign: i32 = match rest.as_bytes().get(..2)? {
+        b" +" => 1,
+        b" -" => -1,
+        _ => return None,
+    };
+
+    // `strtol` followed by `end != date + 4`: exactly four digits, and then either the
+    // end of the string or a single newline.
+    let zone = rest.get(2..6)?;
+    if !zone.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let tail = rest.get(6..)?;
+    if !tail.is_empty() && tail != "\n" {
+        return None;
+    }
+
+    let hhmm: i32 = zone.parse().ok()?;
+    let minutes = (hhmm / 100) * 60 + (hhmm % 100);
+    Some(Time::new(seconds, sign * minutes * 60))
 }
 
 /// Unlike [`parse()`] which handles all kinds of input, this function only parses the commit-header format

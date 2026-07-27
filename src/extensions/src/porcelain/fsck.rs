@@ -1853,7 +1853,16 @@ pub struct Msg {
     /// *not* let this fall back to `fsck_key` (`git help config`: "the
     /// receive.fsck.<msg-id> … variables will not fall back on the
     /// fsck.<msg-id> configuration").
-    pub receive_key: &'static str,
+    ///
+    /// `None` for a row only `git mktag` can report. git accepts the
+    /// `receive.fsck.<msg-id>` spelling of every id in the table and forwards
+    /// it, but a transfer can never reach these checks: `index-pack` and
+    /// `unpack-objects` both run `parse_object_buffer()` before
+    /// `fsck_object()` and `die("invalid <type>")` when it fails, and the
+    /// pusher could not have built the object into a pack anyway —
+    /// `git update-ref` refuses to point a reference at an object that does
+    /// not parse. Reading the key would be claiming a check that cannot run.
+    pub receive_key: Option<&'static str>,
     /// `fsck.h`'s severity for the id when nothing configures it.
     pub default: Severity,
 }
@@ -1867,17 +1876,35 @@ macro_rules! msg {
         pub const $konst: Msg = Msg {
             id: $id,
             fsck_key: $fsck,
-            receive_key: $receive,
+            receive_key: Some($receive),
+            default: Severity::$sev,
+        };
+    };
+}
+
+/// Build one row for a check only `git mktag` reaches, so only `fsck.<id>`
+/// exists for it. See [`Msg::receive_key`].
+macro_rules! msg_mktag {
+    ($konst:ident, $id:literal, $fsck:literal, $sev:ident) => {
+        #[doc = concat!("`", $id, "`, whose severity comes from `", $fsck, "`. Only ")]
+        #[doc = "`git mktag` reports it: it is the one entry point that fscks a raw tag"]
+        #[doc = "buffer without `parse_tag_buffer()` rejecting it first."]
+        pub const $konst: Msg = Msg {
+            id: $id,
+            fsck_key: $fsck,
+            receive_key: None,
             default: Severity::$sev,
         };
     };
 }
 
 // --- commit header checks (`verify_headers`, `fsck_commit`, `fsck_ident`) ---
+msg!(BAD_PARENT_SHA1, "badParentSha1", "fsck.badParentSha1", "receive.fsck.badParentSha1", Error);
 msg!(MISSING_AUTHOR, "missingAuthor", "fsck.missingAuthor", "receive.fsck.missingAuthor", Error);
 msg!(MULTIPLE_AUTHORS, "multipleAuthors", "fsck.multipleAuthors", "receive.fsck.multipleAuthors", Error);
 msg!(MISSING_COMMITTER, "missingCommitter", "fsck.missingCommitter", "receive.fsck.missingCommitter", Error);
 msg!(MISSING_NAME_BEFORE_EMAIL, "missingNameBeforeEmail", "fsck.missingNameBeforeEmail", "receive.fsck.missingNameBeforeEmail", Error);
+msg!(BAD_NAME, "badName", "fsck.badName", "receive.fsck.badName", Error);
 msg!(BAD_EMAIL, "badEmail", "fsck.badEmail", "receive.fsck.badEmail", Error);
 msg!(MISSING_EMAIL, "missingEmail", "fsck.missingEmail", "receive.fsck.missingEmail", Error);
 msg!(MISSING_SPACE_BEFORE_EMAIL, "missingSpaceBeforeEmail", "fsck.missingSpaceBeforeEmail", "receive.fsck.missingSpaceBeforeEmail", Error);
@@ -1903,6 +1930,16 @@ msg!(TREE_NOT_SORTED, "treeNotSorted", "fsck.treeNotSorted", "receive.fsck.treeN
 msg!(LARGE_PATHNAME, "largePathname", "fsck.largePathname", "receive.fsck.largePathname", Warn);
 
 // --- tag checks (`fsck_tag`) -----------------------------------------------
+//
+// The first seven are the header walk `parse_tag_buffer()` shadows everywhere
+// but in `git mktag`; see [`Msg::receive_key`] and [`super::mktag`].
+msg_mktag!(MISSING_OBJECT, "missingObject", "fsck.missingObject", Error);
+msg_mktag!(BAD_OBJECT_SHA1, "badObjectSha1", "fsck.badObjectSha1", Error);
+msg_mktag!(MISSING_TYPE_ENTRY, "missingTypeEntry", "fsck.missingTypeEntry", Error);
+msg_mktag!(MISSING_TYPE, "missingType", "fsck.missingType", Error);
+msg_mktag!(BAD_TYPE, "badType", "fsck.badType", Error);
+msg_mktag!(MISSING_TAG_ENTRY, "missingTagEntry", "fsck.missingTagEntry", Error);
+msg_mktag!(MISSING_TAG, "missingTag", "fsck.missingTag", Error);
 msg!(MISSING_TAGGER_ENTRY, "missingTaggerEntry", "fsck.missingTaggerEntry", "receive.fsck.missingTaggerEntry", Info);
 msg!(BAD_TAG_NAME, "badTagName", "fsck.badTagName", "receive.fsck.badTagName", Info);
 msg!(EXTRA_HEADER_ENTRY, "extraHeaderEntry", "fsck.extraHeaderEntry", "receive.fsck.extraHeaderEntry", Ignore);
@@ -1933,10 +1970,12 @@ msg!(GITATTRIBUTES_BLOB, "gitattributesBlob", "fsck.gitattributesBlob", "receive
 /// Every row this port implements, for severity resolution and for telling a
 /// misspelled `fsck.<x>` key from a real one.
 pub const MSGS: &[Msg] = &[
+    BAD_PARENT_SHA1,
     MISSING_AUTHOR,
     MULTIPLE_AUTHORS,
     MISSING_COMMITTER,
     MISSING_NAME_BEFORE_EMAIL,
+    BAD_NAME,
     BAD_EMAIL,
     MISSING_EMAIL,
     MISSING_SPACE_BEFORE_EMAIL,
@@ -1958,6 +1997,13 @@ pub const MSGS: &[Msg] = &[
     DUPLICATE_ENTRIES,
     TREE_NOT_SORTED,
     LARGE_PATHNAME,
+    MISSING_OBJECT,
+    BAD_OBJECT_SHA1,
+    MISSING_TYPE_ENTRY,
+    MISSING_TYPE,
+    BAD_TYPE,
+    MISSING_TAG_ENTRY,
+    MISSING_TAG,
     MISSING_TAGGER_ENTRY,
     BAD_TAG_NAME,
     EXTRA_HEADER_ENTRY,
@@ -1984,21 +2030,32 @@ pub const MSGS: &[Msg] = &[
 /// nothing reads a `fsck.<one-of-these>` variable, so naming one would claim
 /// support that does not exist. Configuring one is accepted (git would too)
 /// and changes nothing, which is the honest outcome for a check that is not
-/// performed. Three groups:
+/// performed. Four groups:
 ///
-///   * **the reference-database ids** (`badRefName`, `badRefContent`,
-///     `packedRefUnsorted`, `symlinkRef`, `badReftableTableName`, …) belong to
+///   * **the reference-database ids** — `badHeadTarget`, `badPackedRefEntry`,
+///     `badPackedRefHeader`, `badRefContent`, `badReferentName`,
+///     `badRefFiletype`, `badRefName`, `badRefOid`, `badReftableTableName`,
+///     `emptyPackedRefsFile`, `packedRefEntryNotTerminated`,
+///     `packedRefUnsorted`, `refMissingNewline`, `symlinkRef`,
+///     `symrefTargetIsNotARef`, `trailingRefContent` — all belong to
 ///     `git refs verify`, which the vendored crates do not implement (see
 ///     divergence 2 above);
-///   * **the ids reachable only past a parse failure** (`missingTree`,
-///     `badTreeSha1`, `badParentSha1`, `missingObject`, `missingType`,
-///     `unknownType`, …). git reaches those by fsck'ing a raw buffer through
-///     `fsck_buffer()` directly — `git mktag`, and `index-pack --strict` over a
-///     hand-built pack. `builtin/fsck.c` never does: `fsck_loose()` and
-///     `fsck_obj_buffer()` both run `parse_object_buffer()` first and skip
-///     `fsck_obj()` when it fails, which is the `object could not be parsed`
-///     path this port reproduces. So these ids are unreachable *from either of
-///     this port's two entry points*, not merely unimplemented;
+///   * **the two commit ids no entry point can reach.** `missingTree` and
+///     `badTreeSha1` are reported by `fsck_commit()` for a `tree` header that
+///     `parse_commit_buffer()` has already rejected (`bogus commit object` /
+///     `bad tree pointer in commit`), and no command hands a raw commit buffer
+///     to `fsck_buffer()` — `git mktag` only takes tags. Their tag-side
+///     counterparts *are* ported, through `git mktag`; see [`MISSING_OBJECT`];
+///   * **four ids that are dead in git itself.** `emptyName` cannot be set:
+///     `fsck_tree()`'s `has_empty_name` is computed from an entry
+///     `decode_tree_entry()` has already accepted, and that rejects an empty
+///     filename first, so the tree is reported as `badTree` instead.
+///     `badGpgsig` and `badHeaderContinuation` both need a `gpgsig` value that
+///     runs to the end of the buffer with no newline, which `verify_headers()`
+///     already rejects as `unterminatedHeader` — and that id is `FSCK_FATAL`,
+///     so no configuration can demote it out of the way. `unknownType` is
+///     `fsck_buffer()`'s fallthrough for a type that is not one of the four,
+///     which no object database yields;
 ///   * **`gitmodulesLarge`**, which git only reports when `read_loose_object()`
 ///     streamed the blob past `core.bigFileThreshold` instead of loading it.
 ///     This port always loads the blob, so the `NULL` buffer that triggers the
@@ -2007,11 +2064,8 @@ const UNPORTED_MSG_IDS: &[&str] = &[
     "badGpgsig",
     "badHeaderContinuation",
     "badHeadTarget",
-    "badName",
-    "badObjectSha1",
     "badPackedRefEntry",
     "badPackedRefHeader",
-    "badParentSha1",
     "badRefContent",
     "badReferentName",
     "badRefFiletype",
@@ -2019,16 +2073,10 @@ const UNPORTED_MSG_IDS: &[&str] = &[
     "badRefOid",
     "badReftableTableName",
     "badTreeSha1",
-    "badType",
     "emptyName",
     "emptyPackedRefsFile",
     "gitmodulesLarge",
-    "missingObject",
-    "missingTag",
-    "missingTagEntry",
     "missingTree",
-    "missingType",
-    "missingTypeEntry",
     "packedRefEntryNotTerminated",
     "packedRefUnsorted",
     "refMissingNewline",
@@ -2088,11 +2136,14 @@ impl MsgConfig {
         let mut deferred_fatal: Option<String> = None;
         let mut levels = HashMap::with_capacity(MSGS.len());
         for m in MSGS {
+            // A `receive_key`-less row has no `receive-pack` spelling to read,
+            // so on that path it keeps its default (promoted, since the
+            // transfer side always checks strictly).
             let key = match source {
-                MsgSource::Fsck { .. } => m.fsck_key,
+                MsgSource::Fsck { .. } => Some(m.fsck_key),
                 MsgSource::Receive => m.receive_key,
             };
-            let level = match config.string(key) {
+            let level = match key.and_then(|key| config.string(key)) {
                 Some(v) => {
                     let value = v.to_string();
                     // `is_valid_msg_type()` runs in receive-pack's own config
@@ -2289,11 +2340,17 @@ fn verify_headers(data: &[u8], out: &mut Vec<Finding>) -> bool {
     true
 }
 
-/// `fsck.c::fsck_commit`, entered only for a commit gix already parsed — so the
-/// `tree`/`parent` lines are known well formed and the ids git would report
-/// there (`missingTree`, `badTreeSha1`, `badParentSha1`) cannot arise. Anything
-/// unexpected in those lines stops the check instead of reporting an id this
-/// port does not claim.
+/// `fsck.c::fsck_commit`, entered only for a commit `parse_commit_buffer()`
+/// already accepted — so the `tree` line is known well formed and the two ids
+/// git would report for it (`missingTree`, `badTreeSha1`) cannot arise; an
+/// unexpected `tree` line stops the check rather than claiming an id this port
+/// does not report.
+///
+/// A malformed `parent` line *can* survive that parse, because
+/// `parse_commit_buffer()` only enters its own parent loop while
+/// `bufptr + 47 < tail` — a `parent` line in the last 48 bytes of the buffer is
+/// never looked at there and reaches `fsck_commit` intact. So `badParentSha1`
+/// is reported here.
 fn check_commit(data: &[u8], out: &mut Vec<Finding>) {
     if verify_headers(data, out) {
         return;
@@ -2302,8 +2359,15 @@ fn check_commit(data: &[u8], out: &mut Vec<Finding>) {
     let Some(rest) = skip_line(p) else { return };
     p = rest;
     while let Some(after) = strip(p, b"parent ") {
-        let Some(rest) = skip_line(after) else { return };
-        p = rest;
+        // `parse_oid_hex_algop(buffer, &parent_oid, &p) || *p != '\n'`.
+        let well_formed = after.len() > HEXSZ
+            && after[..HEXSZ].iter().all(u8::is_ascii_hexdigit)
+            && after[HEXSZ] == b'\n';
+        if !well_formed {
+            report(out, &BAD_PARENT_SHA1, "invalid 'parent' line format - bad sha1");
+            return;
+        }
+        p = &after[HEXSZ + 1..];
     }
 
     let mut authors = 0;
@@ -2345,8 +2409,10 @@ fn check_ident<'a>(ident: &'a [u8], out: &mut Vec<Finding>) -> Option<&'a [u8]> 
     }
     let mut i = span_to_email(ident, 0);
     match ident.get(i) {
+        // git's name loop reports a `>` before any `<` as `badName`; only the
+        // second loop, past the `<`, calls the same shape `badEmail`.
         Some(b'>') => {
-            report(out, &BAD_EMAIL, "invalid author/committer line - bad email");
+            report(out, &BAD_NAME, "invalid author/committer line - bad name");
             return None;
         }
         Some(b'<') => {}
@@ -2430,6 +2496,9 @@ const GOOD_MODES: [u32; 5] = [0o100644, 0o100755, 0o120000, 0o040000, 0o160000];
 
 /// The raw size of a SHA-1, `the_hash_algo->rawsz`.
 const RAWSZ: usize = 20;
+
+/// The hex size of a SHA-1, `the_hash_algo->hexsz`.
+const HEXSZ: usize = RAWSZ * 2;
 
 /// One decoded tree entry — `struct name_entry` plus the raw mode field, which
 /// `zeroPaddedFilemode` needs.

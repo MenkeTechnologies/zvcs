@@ -135,6 +135,11 @@ pub(super) struct PatchDiffOpts {
     /// `--[no-]auto-advance` — git's `add_p_opt.auto_advance`, on by default, so
     /// only `--no-auto-advance` is ever observable outside `--patch`.
     auto_advance: bool,
+    /// Whether this command's option table carries `OPT_ADD_AUTO_ADVANCE` at all.
+    /// `git commit` does not (only `OPT_DIFF_UNIFIED` and
+    /// `OPT_DIFF_INTERHUNK_CONTEXT`), so there `--auto-advance` must stay an
+    /// unknown option rather than a silently accepted toggle.
+    has_auto_advance: bool,
     /// Set while a value-taking option has consumed its flag but not yet its
     /// value: `Some((<name>, <short?>))`. parse-options takes the *next* argv
     /// element verbatim, whatever it looks like.
@@ -147,12 +152,19 @@ impl Default for PatchDiffOpts {
             unified: -1,
             inter_hunk_context: -1,
             auto_advance: true,
+            has_auto_advance: true,
             pending: None,
         }
     }
 }
 
 impl PatchDiffOpts {
+    /// The same options without `--[no-]auto-advance`, for `git commit`, whose
+    /// option table stops at `OPT_DIFF_UNIFIED` / `OPT_DIFF_INTERHUNK_CONTEXT`.
+    pub(super) fn without_auto_advance() -> Self {
+        Self { has_auto_advance: false, ..Self::default() }
+    }
+
     /// True while a separate value is owed, so the caller must hand the next
     /// token to [`Self::take_arg`] even after a `--` end-of-options marker.
     pub(super) fn awaiting_value(&self) -> bool {
@@ -171,8 +183,8 @@ impl PatchDiffOpts {
             "-U" => self.pending = Some(("unified", true)),
             "--unified" => self.pending = Some(("unified", false)),
             "--inter-hunk-context" => self.pending = Some(("inter-hunk-context", false)),
-            "--auto-advance" => self.auto_advance = true,
-            "--no-auto-advance" => self.auto_advance = false,
+            "--auto-advance" if self.has_auto_advance => self.auto_advance = true,
+            "--no-auto-advance" if self.has_auto_advance => self.auto_advance = false,
             // Sticky value forms.
             _ if arg.starts_with("-U") && !arg.starts_with("--") => {
                 self.store("unified", true, Some(&arg[2..]))?;
@@ -188,11 +200,11 @@ impl PatchDiffOpts {
                 )?;
             }
             // `--[no-]auto-advance` is a pure toggle; a `=value` is a usage error.
-            _ if arg.starts_with("--auto-advance=") => {
+            _ if self.has_auto_advance && arg.starts_with("--auto-advance=") => {
                 eprintln!("error: option `auto-advance' takes no value");
                 return Err(ExitCode::from(129));
             }
-            _ if arg.starts_with("--no-auto-advance=") => {
+            _ if self.has_auto_advance && arg.starts_with("--no-auto-advance=") => {
                 eprintln!("error: option `no-auto-advance' takes no value");
                 return Err(ExitCode::from(129));
             }
@@ -270,6 +282,14 @@ impl PatchDiffOpts {
     /// command: `--patch` for `reset`/`checkout`, `--interactive/--patch` for
     /// `add` and `commit`, whose `-i` reaches the same hunk selector.
     pub(super) fn require_patch_named(&self, patch: bool, what: &str) -> Option<ExitCode> {
+        self.reject_negative()?;
+        self.require_patch_only(patch, what)
+    }
+
+    /// The `cannot be negative` half of [`Self::require_patch_named`], for
+    /// `git commit`, which runs it at the top of `prepare_index()` — several
+    /// pathspec refusals ahead of the `requires` half.
+    pub(super) fn reject_negative(&self) -> Option<ExitCode> {
         if self.unified < -1 {
             eprintln!("fatal: '--unified' cannot be negative");
             return Some(ExitCode::from(128));
@@ -278,6 +298,11 @@ impl PatchDiffOpts {
             eprintln!("fatal: '--inter-hunk-context' cannot be negative");
             return Some(ExitCode::from(128));
         }
+        None
+    }
+
+    /// The `requires '<what>'` half of [`Self::require_patch_named`].
+    pub(super) fn require_patch_only(&self, patch: bool, what: &str) -> Option<ExitCode> {
         if patch {
             return None;
         }

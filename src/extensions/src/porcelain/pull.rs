@@ -8,8 +8,9 @@
 //! `-q`/`-v`, `--progress`/`--no-progress`, `--dry-run`, `-a`/`--append`,
 //! `--show-forced-updates`/`--no-show-forced-updates`,
 //! `-k`/`--keep`, `--recurse-submodules`, `-j`/`--jobs`, `--upload-pack`,
-//! `-o`/`--server-option`, `--refmap`, and the `From …` per-ref summary git
-//! prints to stderr.
+//! `-o`/`--server-option`, `--refmap`,
+//! `--negotiation-restrict`/`--negotiation-tip`/`--negotiation-include`, and the
+//! `From …` per-ref summary git prints to stderr.
 //!
 //! The integration step is the ported [`merge`](super::merge) by default, or the
 //! ported [`rebase`](super::rebase) when a rebase is requested. The rebase is
@@ -40,8 +41,8 @@
 //! (interactive todo editing needs a TTY editor loop), `--autostash` over a
 //! dirty tree on the merge path (needs a 3-way stash apply the stash port lacks),
 //! `--set-upstream`, `--compact-summary` (the merge port has no compact-summary
-//! renderer), `--update-shallow`, `-4`/`-6` and the `--negotiation-*` family (no
-//! gitoxide substrate — see [`fetch`](super::fetch)), and
+//! renderer), `--update-shallow` and `-4`/`-6` (no gitoxide substrate — see
+//! [`fetch`](super::fetch)), and
 //! `--gpg-sign`/`-S`/`--verify-signatures` (GPG is not vendored).
 
 use anyhow::{bail, Result};
@@ -132,6 +133,10 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let mut f_upload_pack: Option<String> = None;
     let mut f_server_options: Vec<String> = Vec::new();
     let mut f_refmap: Vec<String> = Vec::new();
+    // `--negotiation-restrict`/`--negotiation-tip`/`--negotiation-include`, forwarded verbatim so the
+    // fetch resolves them against the same repository.
+    let mut f_negotiation_restrict: Vec<String> = Vec::new();
+    let mut f_negotiation_include: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -222,6 +227,10 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "--upload-pack" => f_upload_pack = Some(take_value!("upload-pack")),
             "-o" | "--server-option" => f_server_options.push(take_value!("server-option")),
             "--refmap" => f_refmap.push(take_value!("refmap")),
+            "--negotiation-restrict" | "--negotiation-tip" => {
+                f_negotiation_restrict.push(take_value!("negotiation-restrict"));
+            }
+            "--negotiation-include" => f_negotiation_include.push(take_value!("negotiation-include")),
 
             // `--verify` (default) / `--no-verify` reach the merge, which runs
             // the `pre-merge-commit` and `commit-msg` hooks.
@@ -385,6 +394,12 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     }
     for r in &f_refmap {
         fetch_args.push(format!("--refmap={r}"));
+    }
+    for t in &f_negotiation_restrict {
+        fetch_args.push(format!("--negotiation-restrict={t}"));
+    }
+    for t in &f_negotiation_include {
+        fetch_args.push(format!("--negotiation-include={t}"));
     }
     // `--all` fans out over every configured remote and takes no repository
     // argument; otherwise git hands the whole `<remote> [<refspec>…]` tail to the

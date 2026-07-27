@@ -83,6 +83,19 @@ reedline = "0.49"
 # ported from htoprs). 0.30 re-exports crossterm 0.29, matching the copy above, so
 # still no second crossterm is pulled in. Only the tty path uses it.
 ratatui = { version = "0.30.0", default-features = false, features = ["std", "crossterm"] }
+# `git send-email`'s SMTP socket transport: implicit TLS (`--smtp-encryption
+# ssl`) and STARTTLS (`tls`), driven from a blocking `StreamOwned` over the
+# TcpStream. The vendored gitoxide TLS stack above already pulls rustls in
+# transitively (`blocking-http-transport-reqwest-rust-tls`), so naming it here
+# adds no crate to the tree; the versions are the ones already in Cargo.lock.
+rustls = "0.23.42"
+# The certificate and private-key types, plus the PEM reader behind
+# `sendemail.smtpSSLCertPath`, `smtpSSLClientCert` and `smtpSSLClientKey`.
+# `std` is what turns on the file-reading half of `pki_types::pem`.
+rustls-pki-types = { version = "1.15.0", features = ["std"] }
+# The platform trust store, which is where `ssl_verify_params()` leaves the
+# handshake when no CA path is configured ("use the OpenSSL defaults").
+rustls-native-certs = "0.8.4"
 
 # macOS Keychain FFI for `git credential-osxkeychain` <get|store|erase>. The
 # vendored gitoxide TLS stack already pulls this crate in transitively; naming it

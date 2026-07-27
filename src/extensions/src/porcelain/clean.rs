@@ -272,6 +272,16 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
+    // `git_clean_config()` runs while the configuration is being read, before the
+    // command does anything, so an unparseable `column.ui`/`column.clean` is fatal
+    // for every `git clean` — `-n` and `-i` alike — not just the interactive path
+    // that goes on to use the value.
+    let mut colopts = 0u32;
+    if let Err(msg) = super::column::config_colopts_key(&mut colopts, "column.clean") {
+        eprint!("{msg}");
+        return Ok(ExitCode::from(128));
+    }
+
     // The prefix is the repo-relative current directory; it scopes the walk when
     // no pathspec is given, and every reported path is rendered relative to it.
     let prefix: BString = repo
@@ -400,7 +410,7 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
     // to the survivors that the removal pass below then deletes (or, with `-n`,
     // reports). With nothing to clean the loop is a no-op, matching git.
     if interactive {
-        targets = interactive_main_loop(&repo, targets, &prefix_parts);
+        targets = interactive_main_loop(&repo, targets, &prefix_parts, colopts);
     }
 
     let mut out = String::new();
@@ -771,58 +781,40 @@ fn read_line_interactively(stdin: &mut impl std::io::BufRead) -> Option<String> 
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// git's `term_columns()` in the non-TTY case: honour `COLUMNS` if it parses to a
-/// positive integer, otherwise fall back to 80.
-fn term_columns() -> usize {
-    if let Ok(v) = std::env::var("COLUMNS") {
-        let n = atoi(&v);
-        if n > 0 {
-            return n as usize;
-        }
+/// The `struct column_options` both of `clean.c`'s printers `memset` to zero and
+/// then fill in identically: `indent = "  "`, `padding = 2`, terminal width.
+fn clean_column_options() -> super::column::ColumnOptions {
+    super::column::ColumnOptions {
+        width: 0,
+        padding: 2,
+        indent: Some("  ".to_owned()),
+        nl: None,
     }
-    80
 }
 
-/// Render `items` with git's `print_columns(COL_ENABLED | COL_ROW)` layout used
-/// by `pretty_print_dels`/`print_highlight_menu_stuff`: indent `"  "`, padding 2,
-/// row-major fill into `term_columns() - 1` columns. Every string is ASCII once
-/// C-quoted, so byte length equals display width.
-fn print_columns_row(items: &[String]) -> String {
-    if items.is_empty() {
-        return String::new();
-    }
-    const INDENT: &str = "  ";
-    const PADDING: usize = 2;
-    let width = term_columns().saturating_sub(1);
-    let lens: Vec<usize> = items.iter().map(String::len).collect();
-    // `initial_width` in git: the widest cell plus the padding column.
-    let colwidth = lens.iter().max().copied().unwrap_or(0) + PADDING;
-    let mut cols = width.saturating_sub(INDENT.len()) / colwidth;
-    if cols == 0 {
-        cols = 1;
-    }
-    let rows = items.len().div_ceil(cols);
-    let mut out = String::new();
-    for y in 0..rows {
-        for x in 0..cols {
-            let i = x + y * cols;
-            if i >= items.len() {
-                break;
-            }
-            let newline = x == cols - 1 || i == items.len() - 1;
-            if x == 0 {
-                out.push_str(INDENT);
-            }
-            out.push_str(&items[i]);
-            if newline {
-                out.push('\n');
-            } else {
-                out.extend(std::iter::repeat_n(' ', colwidth - lens[i]));
-            }
-        }
-    }
-    out
+/// Render `items` the way `pretty_print_dels()` does: the layout bits come from
+/// `column.ui` / `column.clean` (git's `git_column_config(var, value, "clean",
+/// &colopts)`), but the *enable* bit is forced on, so `column.clean=never` still
+/// prints a table while `column.clean=plain` prints one item per line and
+/// `column.clean=column` fills down columns instead of across rows.
+fn print_dels_columns(colopts: u32, items: &[String]) -> String {
+    render(super::column::force_enabled(colopts), items)
 }
+
+/// Render `items` the way `pretty_print_menus()` does: a `local_colopts` of
+/// `COL_ENABLED | COL_ROW` that ignores `column.*` entirely.
+fn print_menu_columns(items: &[String]) -> String {
+    render(super::column::ENABLED_ROW, items)
+}
+
+/// Hand `items` to the shared `print_columns()` port. Every string is ASCII once
+/// C-quoted, so the byte-length display-width assumption inside it holds.
+fn render(colopts: u32, items: &[String]) -> String {
+    let cells: Vec<Vec<u8>> = items.iter().map(|s| s.as_bytes().to_vec()).collect();
+    let bytes = super::column::layout(&cells, colopts, &clean_column_options());
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 
 /// The display strings for the current del-list: each candidate rendered exactly
 /// as the removal pass would (`relative_to_prefix` then `quote_path`).
@@ -1028,7 +1020,7 @@ fn list_and_choose_menu(stdin: &mut impl std::io::BufRead) -> Option<usize> {
             .enumerate()
             .map(|(i, title)| format!(" {:2}: {}", i + 1, title))
             .collect();
-        print!("{}", print_columns_row(&disp));
+        print!("{}", print_menu_columns(&disp));
         print!("What now> ");
         let line = read_line_interactively(stdin)?;
         if line == "?" {
@@ -1060,7 +1052,7 @@ fn list_and_choose_strings(
             .enumerate()
             .map(|(i, s)| format!("{}{:2}: {}", if chosen[i] { "*" } else { " " }, i + 1, s))
             .collect();
-        print!("{}", print_columns_row(&disp));
+        print!("{}", print_menu_columns(&disp));
         print!("{prompt}>> ");
         let line = match read_line_interactively(stdin) {
             Some(l) => l,
@@ -1139,6 +1131,7 @@ fn filter_by_patterns_cmd(
     del: &mut Vec<(BString, BString, bool)>,
     prefix_parts: &[&[u8]],
     stdin: &mut impl std::io::BufRead,
+    colopts: u32,
 ) {
     let parse = gix::ignore::search::Ignore {
         support_precious: repo
@@ -1154,7 +1147,7 @@ fn filter_by_patterns_cmd(
         }
         if changed != 0 {
             let shown = shown_paths(del, prefix_parts);
-            print!("{}", print_columns_row(&shown));
+            print!("{}", print_dels_columns(colopts, &shown));
         }
         print!("Input ignore patterns>> ");
         let line = match read_line_interactively(stdin) {
@@ -1201,6 +1194,7 @@ fn interactive_main_loop(
     repo: &gix::Repository,
     mut del: Vec<(BString, BString, bool)>,
     prefix_parts: &[&[u8]],
+    colopts: u32,
 ) -> Vec<(BString, BString, bool)> {
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
@@ -1212,7 +1206,7 @@ fn interactive_main_loop(
             println!("Would remove the following items:");
         }
         let shown = shown_paths(&del, prefix_parts);
-        print!("{}", print_columns_row(&shown));
+        print!("{}", print_dels_columns(colopts, &shown));
 
         match list_and_choose_menu(&mut stdin) {
             // EOF at the command prompt behaves exactly like `quit`.
@@ -1225,7 +1219,7 @@ fn interactive_main_loop(
             Some(0) => break,
             // filter by pattern.
             Some(1) => {
-                filter_by_patterns_cmd(repo, &mut del, prefix_parts, &mut stdin);
+                filter_by_patterns_cmd(repo, &mut del, prefix_parts, &mut stdin, colopts);
                 if del.is_empty() {
                     println!("No more files to clean, exiting.");
                     break;

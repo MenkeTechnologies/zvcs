@@ -36,6 +36,8 @@ use std::process::ExitCode;
 use gix::hash::ObjectId;
 use gix::objs::{Kind, Write as _};
 
+use super::fsck::{self, Msg, Severity};
+
 /// git's usage block, printed on stderr after `error: unknown …`.
 const USAGE: &str = "\
 usage: git mktag
@@ -105,7 +107,13 @@ pub fn mktag(args: &[String]) -> Result<ExitCode> {
         .read_to_end(&mut buf)
         .map_err(|e| anyhow::anyhow!("could not read from stdin: {e}"))?;
 
-    let mut reporter = Reporter::new(strict, &repo)?;
+    // `Reporter::new` hands back git's `die()` text for an unusable `fsck.<id>`
+    // value; git exits 128 with it, so route it through the same helper as the
+    // other fatals rather than letting anyhow reformat it.
+    let mut reporter = match Reporter::new(strict, &repo) {
+        Ok(reporter) => reporter,
+        Err(msg) => return fatal(&msg),
+    };
     let tagged = fsck_tag(&buf, repo.object_hash(), &mut reporter);
 
     if reporter.failed {
@@ -147,77 +155,37 @@ fn fatal(msg: &str) -> Result<ExitCode> {
     Ok(ExitCode::from(128))
 }
 
-/// The fsck messages `mktag` can emit, named exactly as git's `camelcased` ids.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Msg {
-    NulInHeader,
-    UnterminatedHeader,
-    MissingObject,
-    BadObjectSha1,
-    MissingTypeEntry,
-    MissingType,
-    BadType,
-    MissingTagEntry,
-    MissingTag,
-    BadTagName,
-    MissingTaggerEntry,
-    MissingNameBeforeEmail,
-    BadName,
-    MissingEmail,
-    MissingSpaceBeforeEmail,
-    BadEmail,
-    MissingSpaceBeforeDate,
-    ZeroPaddedDate,
-    BadDateOverflow,
-    BadDate,
-    BadTimezone,
-    ExtraHeaderEntry,
-}
-
-impl Msg {
-    /// The id git prints ahead of the message text, and the `fsck.<id>` key.
-    fn id(self) -> &'static str {
-        match self {
-            Msg::NulInHeader => "nulInHeader",
-            Msg::UnterminatedHeader => "unterminatedHeader",
-            Msg::MissingObject => "missingObject",
-            Msg::BadObjectSha1 => "badObjectSha1",
-            Msg::MissingTypeEntry => "missingTypeEntry",
-            Msg::MissingType => "missingType",
-            Msg::BadType => "badType",
-            Msg::MissingTagEntry => "missingTagEntry",
-            Msg::MissingTag => "missingTag",
-            Msg::BadTagName => "badTagName",
-            Msg::MissingTaggerEntry => "missingTaggerEntry",
-            Msg::MissingNameBeforeEmail => "missingNameBeforeEmail",
-            Msg::BadName => "badName",
-            Msg::MissingEmail => "missingEmail",
-            Msg::MissingSpaceBeforeEmail => "missingSpaceBeforeEmail",
-            Msg::BadEmail => "badEmail",
-            Msg::MissingSpaceBeforeDate => "missingSpaceBeforeDate",
-            Msg::ZeroPaddedDate => "zeroPaddedDate",
-            Msg::BadDateOverflow => "badDateOverflow",
-            Msg::BadDate => "badDate",
-            Msg::BadTimezone => "badTimezone",
-            Msg::ExtraHeaderEntry => "extraHeaderEntry",
-        }
-    }
-
-    /// Git's built-in severity, before `fsck.<id>` config and before `--strict`.
-    fn default_severity(self) -> Severity {
-        match self {
-            Msg::BadTagName | Msg::MissingTaggerEntry | Msg::ExtraHeaderEntry => Severity::Warn,
-            _ => Severity::Error,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Severity {
-    Ignore,
-    Warn,
-    Error,
-}
+/// The `fsck.h` rows `mktag` can report, all from the shared message table so
+/// that one id has one spelling, one default and one `fsck.<id>` key across
+/// `git fsck`, `git receive-pack` and here.
+///
+/// The first seven exist for `mktag` alone: `builtin/fsck.c` and `index-pack`
+/// both run `parse_object_buffer()` before `fsck_object()` and never reach the
+/// header walk that reports them. See [`fsck::Msg::receive_key`].
+const ALL: [&Msg; 22] = [
+    &fsck::NUL_IN_HEADER,
+    &fsck::UNTERMINATED_HEADER,
+    &fsck::MISSING_OBJECT,
+    &fsck::BAD_OBJECT_SHA1,
+    &fsck::MISSING_TYPE_ENTRY,
+    &fsck::MISSING_TYPE,
+    &fsck::BAD_TYPE,
+    &fsck::MISSING_TAG_ENTRY,
+    &fsck::MISSING_TAG,
+    &fsck::BAD_TAG_NAME,
+    &fsck::MISSING_TAGGER_ENTRY,
+    &fsck::MISSING_NAME_BEFORE_EMAIL,
+    &fsck::BAD_NAME,
+    &fsck::MISSING_EMAIL,
+    &fsck::MISSING_SPACE_BEFORE_EMAIL,
+    &fsck::BAD_EMAIL,
+    &fsck::MISSING_SPACE_BEFORE_DATE,
+    &fsck::ZERO_PADDED_DATE,
+    &fsck::BAD_DATE_OVERFLOW,
+    &fsck::BAD_DATE,
+    &fsck::BAD_TIMEZONE,
+    &fsck::EXTRA_HEADER_ENTRY,
+];
 
 /// Applies severities and prints fsck messages the way `mktag` does.
 struct Reporter {
@@ -233,49 +201,31 @@ impl Reporter {
     ///
     /// Config keys are matched case-insensitively by `gix-config`, as git
     /// matches them. `info` is folded into `warn`, which is what `report()`
-    /// does before handing the message to the error callback.
-    fn new(strict: bool, repo: &gix::Repository) -> Result<Self> {
-        const ALL: [Msg; 22] = [
-            Msg::NulInHeader,
-            Msg::UnterminatedHeader,
-            Msg::MissingObject,
-            Msg::BadObjectSha1,
-            Msg::MissingTypeEntry,
-            Msg::MissingType,
-            Msg::BadType,
-            Msg::MissingTagEntry,
-            Msg::MissingTag,
-            Msg::BadTagName,
-            Msg::MissingTaggerEntry,
-            Msg::MissingNameBeforeEmail,
-            Msg::BadName,
-            Msg::MissingEmail,
-            Msg::MissingSpaceBeforeEmail,
-            Msg::BadEmail,
-            Msg::MissingSpaceBeforeDate,
-            Msg::ZeroPaddedDate,
-            Msg::BadDateOverflow,
-            Msg::BadDate,
-            Msg::BadTimezone,
-            Msg::ExtraHeaderEntry,
-        ];
-
+    /// does before handing the message to the error callback, and a
+    /// `FSCK_FATAL` row refuses to be demoted at all —
+    /// `fsck_set_msg_type_from_ids()` dies rather than accept it.
+    /// The `Err` is git's `die()` text, without its `fatal: ` prefix.
+    fn new(strict: bool, repo: &gix::Repository) -> Result<Self, String> {
         let snapshot = repo.config_snapshot();
         let mut overrides = Vec::new();
         for msg in ALL {
-            let Some(value) = snapshot.string(format!("fsck.{}", msg.id()).as_str()) else {
+            let Some(value) = snapshot.string(msg.fsck_key) else {
                 continue;
             };
+            let text = String::from_utf8_lossy(value.as_ref()).into_owned();
             let severity = match value.as_slice() {
                 b"ignore" => Severity::Ignore,
                 b"warn" | b"info" => Severity::Warn,
                 b"error" => Severity::Error,
-                other => bail!(
-                    "Unknown fsck message type: '{}'",
-                    String::from_utf8_lossy(other)
-                ),
+                _ => return Err(format!("Unknown fsck message type: '{text}'")),
             };
-            overrides.push((msg.id(), severity));
+            // `fsck_set_msg_type_from_ids()` refuses to soften a `FSCK_FATAL`
+            // row, so `fsck.nulInHeader=warn` kills the command outright rather
+            // than letting a NUL-bearing header through.
+            if msg.default == Severity::Fatal && severity != Severity::Error {
+                return Err(format!("Cannot demote {} to {text}", msg.id.to_lowercase()));
+            }
+            overrides.push((msg.id, severity));
         }
 
         Ok(Reporter {
@@ -285,11 +235,25 @@ impl Reporter {
         })
     }
 
-    fn severity(&self, msg: Msg) -> Severity {
-        self.overrides
-            .iter()
-            .find(|(id, _)| *id == msg.id())
-            .map_or_else(|| msg.default_severity(), |(_, s)| *s)
+    /// The severity one row is reported at.
+    ///
+    /// Unconfigured rows come from the table, folded the way `report()` folds
+    /// them before the callback sees them: `FSCK_INFO` prints as a warning and
+    /// `FSCK_FATAL` as an error. `extraHeaderEntry` is git's one explicit
+    /// override — `cmd_mktag()` calls `fsck_set_msg_type_from_ids(…, FSCK_WARN)`
+    /// on it, so it is a warning here rather than the table's `ignore`.
+    fn severity(&self, msg: &Msg) -> Severity {
+        if let Some((_, s)) = self.overrides.iter().find(|(id, _)| *id == msg.id) {
+            return *s;
+        }
+        if msg.id == fsck::EXTRA_HEADER_ENTRY.id {
+            return Severity::Warn;
+        }
+        match msg.default {
+            Severity::Info => Severity::Warn,
+            Severity::Fatal => Severity::Error,
+            other => other,
+        }
     }
 
     /// Emit one fsck message; `true` means "error", which aborts validation.
@@ -297,14 +261,14 @@ impl Reporter {
     /// `mktag`'s error callback turns a warning into an error whenever
     /// `--strict` is in effect, which is why a missing `tagger` line — a mere
     /// warning to `git fsck` — fails `mktag` by default.
-    fn report(&mut self, msg: Msg, text: &[u8]) -> bool {
+    fn report(&mut self, msg: &Msg, text: &[u8]) -> bool {
         let severity = match self.severity(msg) {
             Severity::Ignore => return false,
             Severity::Warn if !self.strict => "warning",
             _ => "error",
         };
-        let mut line = format!("{severity}: tag input does not pass fsck: {}: ", msg.id())
-            .into_bytes();
+        let mut line =
+            format!("{severity}: tag input does not pass fsck: {}: ", msg.id).into_bytes();
         line.extend_from_slice(text);
         line.push(b'\n');
         let _ = std::io::stderr().write_all(&line);
@@ -333,7 +297,7 @@ fn fsck_tag(
     }
 
     let Some(rest) = buf.strip_prefix(b"object ") else {
-        reporter.report(Msg::MissingObject, b"invalid format - expected 'object' line");
+        reporter.report(&fsck::MISSING_OBJECT, b"invalid format - expected 'object' line");
         return None;
     };
 
@@ -348,7 +312,7 @@ fn fsck_tag(
     };
     let Some(tagged_oid) = tagged_oid else {
         reporter.report(
-            Msg::BadObjectSha1,
+            &fsck::BAD_OBJECT_SHA1,
             b"invalid 'object' line format - bad sha1",
         );
         return None;
@@ -356,18 +320,18 @@ fn fsck_tag(
     let rest = &rest[hex_len + 1..];
 
     let Some(rest) = rest.strip_prefix(b"type ") else {
-        reporter.report(Msg::MissingTypeEntry, b"invalid format - expected 'type' line");
+        reporter.report(&fsck::MISSING_TYPE_ENTRY, b"invalid format - expected 'type' line");
         return None;
     };
     let Some(eol) = rest.iter().position(|b| *b == b'\n') else {
         reporter.report(
-            Msg::MissingType,
+            &fsck::MISSING_TYPE,
             b"invalid format - unexpected end after 'type' line",
         );
         return None;
     };
     let Ok(tagged_kind) = Kind::from_bytes(&rest[..eol]) else {
-        reporter.report(Msg::BadType, b"invalid 'type' value");
+        reporter.report(&fsck::BAD_TYPE, b"invalid 'type' value");
         return None;
     };
     let rest = &rest[eol + 1..];
@@ -376,12 +340,12 @@ fn fsck_tag(
     let found = Some((tagged_oid, tagged_kind));
 
     let Some(rest) = rest.strip_prefix(b"tag ") else {
-        reporter.report(Msg::MissingTagEntry, b"invalid format - expected 'tag' line");
+        reporter.report(&fsck::MISSING_TAG_ENTRY, b"invalid format - expected 'tag' line");
         return found;
     };
     let Some(eol) = rest.iter().position(|b| *b == b'\n') else {
         reporter.report(
-            Msg::MissingTag,
+            &fsck::MISSING_TAG,
             b"invalid format - unexpected end after 'tag' line",
         );
         return found;
@@ -392,7 +356,7 @@ fn fsck_tag(
     if gix::validate::reference::name(refname.as_slice().into()).is_err() {
         let mut text = b"invalid 'tag' name: ".to_vec();
         text.extend_from_slice(name);
-        if reporter.report(Msg::BadTagName, &text) {
+        if reporter.report(&fsck::BAD_TAG_NAME, &text) {
             return found;
         }
     }
@@ -402,7 +366,7 @@ fn fsck_tag(
     let rest = match rest.strip_prefix(b"tagger ") {
         None => {
             if reporter.report(
-                Msg::MissingTaggerEntry,
+                &fsck::MISSING_TAGGER_ENTRY,
                 b"invalid format - expected 'tagger' line",
             ) {
                 return found;
@@ -429,7 +393,7 @@ fn fsck_tag(
     // rejects it.
     if !rest.is_empty() && !rest.starts_with(b"\n") {
         reporter.report(
-            Msg::ExtraHeaderEntry,
+            &fsck::EXTRA_HEADER_ENTRY,
             b"invalid format - extra header(s) after 'tagger'",
         );
     }
@@ -444,7 +408,7 @@ fn verify_headers(buf: &[u8], reporter: &mut Reporter) -> bool {
         match b {
             0 => {
                 return reporter.report(
-                    Msg::NulInHeader,
+                    &fsck::NUL_IN_HEADER,
                     format!("unterminated header: NUL at offset {i}").as_bytes(),
                 )
             }
@@ -457,7 +421,7 @@ fn verify_headers(buf: &[u8], reporter: &mut Reporter) -> bool {
     if buf.last() == Some(&b'\n') {
         return false;
     }
-    reporter.report(Msg::UnterminatedHeader, b"unterminated header")
+    reporter.report(&fsck::UNTERMINATED_HEADER, b"unterminated header")
 }
 
 /// Port of `fsck_ident`, applied to the text following `tagger `.
@@ -466,12 +430,12 @@ fn verify_headers(buf: &[u8], reporter: &mut Reporter) -> bool {
 /// is well formed. The date is checked exactly as git checks it: no sign, no
 /// leading zero unless the timestamp is a bare `0`, a value that fits `time_t`,
 /// then a `[+-]HHMM` zone followed immediately by the newline.
-fn fsck_ident(ident: &[u8]) -> Option<(Msg, &'static str)> {
+fn fsck_ident(ident: &[u8]) -> Option<(&'static Msg, &'static str)> {
     const NAME_END: [u8; 3] = *b"<>\n";
 
     if ident.first() == Some(&b'<') {
         return Some((
-            Msg::MissingNameBeforeEmail,
+            &fsck::MISSING_NAME_BEFORE_EMAIL,
             "invalid author/committer line - missing space before email",
         ));
     }
@@ -481,16 +445,16 @@ fn fsck_ident(ident: &[u8]) -> Option<(Msg, &'static str)> {
         .unwrap_or(ident.len());
     match ident.get(at) {
         Some(b'>') => {
-            return Some((Msg::BadName, "invalid author/committer line - bad name"));
+            return Some((&fsck::BAD_NAME, "invalid author/committer line - bad name"));
         }
         Some(b'<') => {}
         _ => {
-            return Some((Msg::MissingEmail, "invalid author/committer line - missing email"));
+            return Some((&fsck::MISSING_EMAIL, "invalid author/committer line - missing email"));
         }
     }
     if at == 0 || ident[at - 1] != b' ' {
         return Some((
-            Msg::MissingSpaceBeforeEmail,
+            &fsck::MISSING_SPACE_BEFORE_EMAIL,
             "invalid author/committer line - missing space before email",
         ));
     }
@@ -501,13 +465,13 @@ fn fsck_ident(ident: &[u8]) -> Option<(Msg, &'static str)> {
         .position(|b| NAME_END.contains(b))
         .unwrap_or(rest.len());
     if rest.get(end) != Some(&b'>') {
-        return Some((Msg::BadEmail, "invalid author/committer line - bad email"));
+        return Some((&fsck::BAD_EMAIL, "invalid author/committer line - bad email"));
     }
     let rest = &rest[end + 1..];
 
     if rest.first() != Some(&b' ') {
         return Some((
-            Msg::MissingSpaceBeforeDate,
+            &fsck::MISSING_SPACE_BEFORE_DATE,
             "invalid author/committer line - missing space before date",
         ));
     }
@@ -515,13 +479,13 @@ fn fsck_ident(ident: &[u8]) -> Option<(Msg, &'static str)> {
 
     if rest.first() == Some(&b'0') && rest.get(1) != Some(&b' ') {
         return Some((
-            Msg::ZeroPaddedDate,
+            &fsck::ZERO_PADDED_DATE,
             "invalid author/committer line - zero-padded date",
         ));
     }
     let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
     if digits == 0 {
-        return Some((Msg::BadDate, "invalid author/committer line - bad date"));
+        return Some((&fsck::BAD_DATE, "invalid author/committer line - bad date"));
     }
     // `date_overflows` rejects anything that will not round-trip through time_t.
     let seconds = std::str::from_utf8(&rest[..digits])
@@ -529,12 +493,12 @@ fn fsck_ident(ident: &[u8]) -> Option<(Msg, &'static str)> {
         .and_then(|s| s.parse::<u64>().ok());
     if seconds.is_none_or(|s| s > i64::MAX as u64) {
         return Some((
-            Msg::BadDateOverflow,
+            &fsck::BAD_DATE_OVERFLOW,
             "invalid author/committer line - date causes integer overflow",
         ));
     }
     if rest.get(digits) != Some(&b' ') {
-        return Some((Msg::BadDate, "invalid author/committer line - bad date"));
+        return Some((&fsck::BAD_DATE, "invalid author/committer line - bad date"));
     }
     let zone = &rest[digits + 1..];
 
@@ -544,7 +508,7 @@ fn fsck_ident(ident: &[u8]) -> Option<(Msg, &'static str)> {
         && zone[5] == b'\n';
     if !well_formed {
         return Some((
-            Msg::BadTimezone,
+            &fsck::BAD_TIMEZONE,
             "invalid author/committer line - bad time zone",
         ));
     }

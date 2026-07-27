@@ -596,6 +596,11 @@ pub mod transport {
             InvalidSslVersion(#[from] crate::config::ssl_version::Error),
             #[error("The HTTP version must be 'HTTP/2' or 'HTTP/1.1'")]
             InvalidHttpVersion(#[from] crate::config::key::GenericErrorWithValue),
+            #[error("The 'http.emptyAuth' value must be 'auto' or a boolean")]
+            InvalidEmptyAuth(#[source] crate::config::key::GenericErrorWithValue),
+            #[error("Could not configure the credential helpers for proactive authentication")]
+            #[cfg(feature = "credentials")]
+            ConfigureAuthenticate(#[source] crate::config::snapshot::credential_helpers::Error),
             #[error("The follow redirects value 'initial', or boolean true or false")]
             InvalidFollowRedirects(#[source] crate::config::key::GenericErrorWithValue),
         }

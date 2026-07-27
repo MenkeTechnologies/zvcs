@@ -389,6 +389,13 @@ fn switch_existing(
         raw
     };
 
+    // `parse_branchname_arg()` resolves the name through `get_oid_mb()`, so the
+    // `core.warnAmbiguousRefs` warning `get_oid_basic()` emits lands here, before
+    // anything else switch prints. `--quiet` does not suppress it: git's
+    // `GET_OID_QUIETLY` is a rev-parse concept, and stock still warns under
+    // `git switch -q`.
+    super::rev_parse::warn_ambiguous_refname(repo, branch, false);
+
     let full = format!("refs/heads/{branch}");
 
     // Already on the requested branch → git reports it and exits 0 untouched.
@@ -417,10 +424,8 @@ fn switch_existing(
                     let sp = [remote_short.as_str()];
                     return switch_create(repo, branch, false, &sp, quiet, force, None);
                 }
-                Dwim::Many { count, hint_remote } => {
-                    if crate::advice::enabled("checkoutAmbiguousRemoteBranchName") {
-                        print_ambiguous_remote_hint(&hint_remote);
-                    }
+                Dwim::Many { count } => {
+                    crate::advice::ambiguous_remote_branch_name(repo, "switch");
                     return fatal(format!(
                         "'{branch}' matched multiple ({count}) remote tracking branches"
                     ));
@@ -704,7 +709,7 @@ enum Dwim {
     /// Exactly one remote has the branch; its short name (`<remote>/<branch>`).
     One(String),
     /// More than one remote has it — ambiguous.
-    Many { count: usize, hint_remote: String },
+    Many { count: usize },
     /// No remote has it.
     None,
 }
@@ -733,27 +738,9 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
                     return Ok(Dwim::One(format!("{def}/{name}")));
                 }
             }
-            Ok(Dwim::Many {
-                count: n,
-                hint_remote: matches[0].clone(),
-            })
+            Ok(Dwim::Many { count: n })
         }
     }
-}
-
-/// The `advise()` block git prints for an ambiguous DWIM name, verbatim.
-fn print_ambiguous_remote_hint(remote: &str) {
-    eprintln!("hint: If you meant to check out a remote tracking branch on, e.g. '{remote}',");
-    eprintln!("hint: you can do so by fully qualifying the name with the --track option:");
-    eprintln!("hint:");
-    eprintln!("hint:     git switch --track {remote}/<name>");
-    eprintln!("hint:");
-    eprintln!("hint: If you'd like to always have checkouts of an ambiguous <name> prefer");
-    eprintln!("hint: one remote, e.g. the '{remote}' remote, consider setting");
-    eprintln!("hint: checkout.defaultRemote={remote} in your config.");
-    eprintln!(
-        "hint: Disable this message with \"git config set advice.checkoutAmbiguousRemoteBranchName false\""
-    );
 }
 
 /// The upstream a newly created branch should track: `(remote, merge_ref,
@@ -885,25 +872,45 @@ fn install_tracking(
 /// git's rejection for a non-branch target: `fatal: a branch is expected, got
 /// <kind> '<x>'` plus the detach hint, exit 128.
 fn branch_expected(repo: &gix::Repository, branch: &str) -> Result<ExitCode> {
-    let hint =
-        "hint: If you want to detach HEAD at the commit, try again with the --detach option.";
-    if repo
-        .try_find_reference(format!("refs/tags/{branch}").as_str())?
-        .is_some()
-    {
-        eprintln!("fatal: a branch is expected, got tag '{branch}'");
-        eprintln!("{hint}");
-        return Ok(ExitCode::from(128));
-    }
-    match repo.rev_parse_single(BStr::new(branch)) {
-        Ok(id) => {
-            let full = id.detach().to_string();
-            eprintln!("fatal: a branch is expected, got commit '{full}'");
-            eprintln!("{hint}");
-            Ok(ExitCode::from(128))
+    // `die_expecting_a_branch()` first asks `repo_dwim_ref()` whether the name
+    // resolves to exactly one ref, and names *that ref* — short of its
+    // `refs/tags/` or `refs/remotes/` prefix — rather than an object id. Only a
+    // name that is no ref at all (a raw commit id, `HEAD^`, …) falls through to
+    // the `got commit '<name>'` wording, and that one echoes the *argument*.
+    let code = match dwim_ref(repo, branch) {
+        Some(full) => {
+            if let Some(tag) = full.strip_prefix("refs/tags/") {
+                eprintln!("fatal: a branch is expected, got tag '{tag}'");
+            } else if let Some(rb) = full.strip_prefix("refs/remotes/") {
+                eprintln!("fatal: a branch is expected, got remote branch '{rb}'");
+            } else {
+                eprintln!("fatal: a branch is expected, got '{full}'");
+            }
+            ExitCode::from(128)
         }
-        Err(_) => fatal(format!("invalid reference: {branch}")),
-    }
+        None => match repo.rev_parse_single(BStr::new(branch)) {
+            Ok(_) => {
+                eprintln!("fatal: a branch is expected, got commit '{branch}'");
+                ExitCode::from(128)
+            }
+            Err(_) => return fatal(format!("invalid reference: {branch}")),
+        },
+    };
+    // git checks `advice_enabled()` itself and then calls plain `advise()`, so
+    // there is no `Disable this message with …` trailer on this one.
+    crate::advice::Advice::SuggestDetachingHead.advise_plain_in(
+        repo,
+        "If you want to detach HEAD at the commit, try again with the --detach option.",
+    );
+    Ok(code)
+}
+
+/// `repo_dwim_ref()` for the `die_expecting_a_branch` case: the ref git treats as
+/// *the* match for `name`, or `None` when it names no ref. `HEAD` is in the rules
+/// and is resolved through, so `git switch HEAD` reports the branch HEAD points
+/// at rather than an object id.
+fn dwim_ref(repo: &gix::Repository, name: &str) -> Option<String> {
+    super::rev_parse::dwim_ref_matches(repo, name).into_iter().next()
 }
 
 /// Validate a name as a local branch, reporting git's fatal + advice on failure.
@@ -917,14 +924,7 @@ fn reject_invalid_branch_name(
         return None;
     }
     eprintln!("fatal: '{branch}' is not a valid branch name");
-    if repo
-        .config_snapshot()
-        .boolean("advice.refSyntax")
-        .unwrap_or(true)
-    {
-        eprintln!("hint: See 'git help check-ref-format'");
-        eprintln!("hint: Disable this message with \"git config set advice.refSyntax false\"");
-    }
+    crate::advice::Advice::RefSyntax.advise_in(repo, "See 'git help check-ref-format'");
     Some(ExitCode::from(128))
 }
 

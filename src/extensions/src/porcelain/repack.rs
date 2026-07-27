@@ -262,7 +262,11 @@ struct State {
     loosen_unreachable: bool,
     keep_unreachable: bool,
     cruft: bool,
-    write_bitmap: bool,
+    /// git's tri-state `write_bitmaps`: `None` is "nobody said", which
+    /// `repack.writeBitmaps` / `pack.writeBitmaps` then answer, and which
+    /// finally falls back to "only when everything goes into one pack in a bare
+    /// repository".
+    write_bitmap: Option<bool>,
     write_midx: bool,
     geometric: bool,
     filter: bool,
@@ -427,7 +431,14 @@ fn execute(st: &State) -> Result<ExitCode> {
         enumerating.advance(to_pack.len());
         enumerating.done();
     }
-    let written = write_pack(&repo, &to_pack, &pack_dir, write_rev, progress)?;
+    let written = write_pack(
+        &repo,
+        &to_pack,
+        &pack_dir,
+        write_rev,
+        progress,
+        write_bitmaps(st, &repo),
+    )?;
 
     // With `--filter` git writes a second pack holding the filtered-out objects.
     // Its own object set is empty here — the blob filters remove nothing the
@@ -476,23 +487,53 @@ fn execute(st: &State) -> Result<ExitCode> {
 /// entries, which is precisely what `repack.useDeltaBaseOffset=false` asks for.
 /// The naming rule is unchanged: a pack is named after its own trailing
 /// checksum, which is what git does and what `gc` does here.
+/// Whether this run writes a `.bitmap`, resolved as `cmd_repack()` resolves
+/// `write_bitmaps`.
+///
+/// `-b` / `--no-write-bitmap-index` decides outright. Failing that
+/// `repack.writeBitmaps`, or its older spelling `pack.writeBitmaps`, does. With
+/// nobody having said anything git falls back to writing one only when the whole
+/// repository goes into a single pack *and* the repository is bare — the case
+/// where the pack is guaranteed to hold the closure a bitmap needs.
+fn write_bitmaps(st: &State, repo: &gix::Repository) -> bool {
+    if let Some(explicit) = st.write_bitmap {
+        return explicit;
+    }
+    let snapshot = repo.config_snapshot();
+    if let Some(configured) = snapshot
+        .boolean("repack.writeBitmaps")
+        .or_else(|| snapshot.boolean("pack.writeBitmaps"))
+    {
+        return configured;
+    }
+    st.all_into_one && repo.is_bare()
+}
+
 fn write_pack(
     repo: &gix::Repository,
     ids: &[ObjectId],
     pack_dir: &Path,
     write_rev: bool,
     progress: bool,
+    write_bitmap: bool,
 ) -> Result<PathBuf> {
     let allow_ofs_delta = repo
         .config_snapshot()
         .boolean("repack.useDeltaBaseOffset")
         .unwrap_or(true);
+    // git's `repack.useDeltaIslands`, which `cmd_repack()` turns into
+    // `pack-objects --delta-islands`.
+    let use_delta_islands = repo
+        .config_snapshot()
+        .boolean("repack.useDeltaIslands")
+        .unwrap_or(false);
     let packed = super::pack_objects::packed_for(
         repo,
         ids,
         super::pack_objects::WriteOptions {
             allow_ofs_delta,
             progress,
+            use_delta_islands,
             ..super::pack_objects::WriteOptions::default()
         },
     )?;
@@ -517,6 +558,13 @@ fn write_pack(
             &base.with_extension("rev"),
             &super::pack_objects::reverse_index_file(kind, &packed.id, &by_oid)?,
         )?;
+    }
+    if write_bitmap {
+        let mut options = super::pack_objects::BitmapOptions::from_repo(repo);
+        options.write = true;
+        if let Some(bytes) = super::pack_objects::bitmap_file(repo, &packed, &options) {
+            fs::write(base.with_extension("bitmap"), bytes)?;
+        }
     }
     Ok(index_path)
 }
@@ -1016,7 +1064,7 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
         }
         "quiet" => st.quiet = on,
         "keep-unreachable" => st.keep_unreachable = on,
-        "write-bitmap-index" => st.write_bitmap = on,
+        "write-bitmap-index" => st.write_bitmap = Some(on),
         "unpack-unreachable" => st.loosen_unreachable = on,
         "write-midx" => st.write_midx = on,
         "geometric" => st.geometric = on,
@@ -1105,7 +1153,7 @@ fn short_opts(cluster: &str, args: &[String], i: &mut usize, st: &mut State) -> 
                 st.loosen_unreachable = true;
             }
             'k' => st.keep_unreachable = true,
-            'b' => st.write_bitmap = true,
+            'b' => st.write_bitmap = Some(true),
             // `-m` is git's undocumented short form of `--write-midx`.
             'm' => st.write_midx = true,
             'd' => st.delete_redundant = true,
@@ -1177,7 +1225,7 @@ fn preflight(st: &State) -> Option<ExitCode> {
         return Some(fatal("options '--geometric' and '-A/-a' cannot be used together"));
     }
 
-    if st.write_bitmap && !st.all_into_one && !st.write_midx {
+    if st.write_bitmap == Some(true) && !st.all_into_one && !st.write_midx {
         return Some(fatal(
             "Incremental repacks are incompatible with bitmap indexes.  Use\n\
              --no-write-bitmap-index or disable the pack.writeBitmaps configuration.",

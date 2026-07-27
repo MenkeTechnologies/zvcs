@@ -74,6 +74,21 @@ impl Ignore {
             parse,
         }
     }
+
+    /// Set the name of the per-directory ignore file to look for in each directory, git's
+    /// `dir->exclude_per_dir` as set by `--exclude-per-directory=<file>`. It *replaces*
+    /// `.gitignore` rather than being read in addition to it, just like in git.
+    ///
+    /// An empty `name` disables per-directory ignore files entirely, matching git's
+    /// `exclude_per_dir = NULL`.
+    ///
+    /// Note that [`id_mappings_from_index()`][crate::stack::State::id_mappings_from_index()] reads
+    /// this name as well, so prefer passing it to [`Ignore::new()`] before the mappings are built.
+    /// Setting it afterwards leaves the index fallback keyed to the previous name, which matches
+    /// git in that git only ever reads `exclude_per_dir` from the worktree.
+    pub fn set_exclude_file_name_for_directories(&mut self, name: &BStr) {
+        self.exclude_file_name_for_directories = name.to_owned();
+    }
 }
 
 impl Ignore {
@@ -175,7 +190,17 @@ impl Ignore {
         self.matched_directory_patterns_stack
             .push(self.matching_exclude_pattern_no_dir(rela_dir, Some(true), case));
 
-        let ignore_path_relative = gix_path::join_bstr_unix_pathsep(rela_dir, ".gitignore");
+        // Git's `dir->exclude_per_dir`, which `--exclude-per-directory=<file>` overrides and
+        // which defaults to `.gitignore`. An empty name is git's `exclude_per_dir = NULL`:
+        // no per-directory ignore file is consulted at all.
+        let exclude_file_name = self.exclude_file_name_for_directories.clone();
+        if exclude_file_name.is_empty() {
+            // Need one stack level per component so push and pop matches.
+            self.stack.patterns.push(Default::default());
+            return Ok(());
+        }
+
+        let ignore_path_relative = gix_path::join_bstr_unix_pathsep(rela_dir, exclude_file_name.as_bstr());
         let ignore_file_in_index = id_mappings.binary_search_by(|t| t.0.as_bstr().cmp(ignore_path_relative.as_ref()));
         match self.source {
             Source::IdMapping => {
@@ -199,7 +224,7 @@ impl Ignore {
                 let follow_symlinks = ignore_file_in_index.is_err();
                 let added = gix_glob::search::add_patterns_file(
                     &mut self.stack.patterns,
-                    dir.join(".gitignore"),
+                    dir.join(gix_path::from_bstr(exclude_file_name.as_bstr())),
                     follow_symlinks,
                     Some(root),
                     buf,

@@ -143,11 +143,14 @@ struct DryRun {
 /// `--amend` otherwise fires. `-S`/`--gpg-sign[=<keyid>]` (`commit.gpgSign`,
 /// `user.signingKey`, `gpg.program`) writes a `gpgsig` header.
 ///
-/// Options still not backed (`-p`/`--patch`, `--interactive`, `-U`/`--unified`,
-/// `--inter-hunk-context`, `--fixup=reword:`) fail with a precise message rather
-/// than silently doing the wrong thing. There is no hunk-selection engine here,
-/// and the two diff-shaping options exist only to feed one, so all four are
-/// refused outright instead of being accepted into a no-op.
+/// `-p`/`--patch` stages through the hunk selector ([`super::add_patch`]) and
+/// plain `--interactive` through the numbered menu ([`super::add_interactive`]),
+/// with `-U`/`--unified` and `--inter-hunk-context` shaping the diff they show;
+/// outside patch mode those two are refused, as git refuses them. The selection
+/// is rolled back when the commit does not go through — see [`InteractiveStage`].
+///
+/// `--fixup=reword:` is still not backed and fails with a precise message rather
+/// than silently doing the wrong thing.
 pub fn commit(args: &[String]) -> Result<ExitCode> {
     // --- argument parsing ------------------------------------------------
     let mut messages: Vec<String> = Vec::new();
@@ -206,10 +209,30 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `--pathspec-from-file=<file>` (`-` = stdin) with `--pathspec-file-nul`.
     let mut pathspec_from_file: Option<String> = None;
     let mut pathspec_file_nul = false;
+    // `-p`/`--patch` and `--interactive` (git's `patch_interactive` and
+    // `interactive`; both `OPT_BOOL`, so the `--no-` forms clear them). They hand
+    // staging to the hunk selector before the message is read.
+    let mut patch_interactive = false;
+    let mut interactive = false;
+    // `-U`/`--unified` and `--inter-hunk-context` shape the selector's diff.
+    // git's `commit` has no `--auto-advance`, unlike `add`/`reset`/`checkout`.
+    let mut patch_opts = super::reset::PatchDiffOpts::without_auto_advance();
 
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
+        // A value still owed to `-U`/`--unified`/`--inter-hunk-context` is taken
+        // verbatim, even past `--`, the way parse-options takes it.
+        if patch_opts.awaiting_value() || !positional_only {
+            match patch_opts.take_arg(a) {
+                Err(code) => return Ok(code),
+                Ok(true) => {
+                    i += 1;
+                    continue;
+                }
+                Ok(false) => {}
+            }
+        }
         if positional_only {
             pathspecs.push(args[i].clone());
             i += 1;
@@ -350,6 +373,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "--no-only" => only_flag = false,
             "-i" | "--include" => include_flag = true,
             "--no-include" => include_flag = false,
+            // Interactive staging: `-p` runs the hunk selector (`add-patch.c`),
+            // plain `--interactive` runs the numbered menu (`add-interactive.c`).
+            "-p" | "--patch" => patch_interactive = true,
+            "--no-patch" => patch_interactive = false,
+            "--interactive" => interactive = true,
+            "--no-interactive" => interactive = false,
             "--pathspec-from-file" => {
                 i += 1;
                 pathspec_from_file = Some(
@@ -413,10 +442,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 gpg_sign = GpgSign::On(Some(s["--gpg-sign=".len()..].to_string()))
             }
             "--no-gpg-sign" => gpg_sign = GpgSign::Off,
-            // Interactive/patch staging has no engine here, and `-U`/
-            // `--inter-hunk-context` only ever feed it, so all four are rejected
-            // outright rather than accepted into a no-op — accepting them would
-            // claim support for hunk selection that does not exist.
             s if s.starts_with("--") => anyhow::bail!("unsupported option `{s}`"),
             // `-S<keyid>` and `-u<mode>` take an *attached* value only, so they are
             // resolved before the generic short-cluster split below.
@@ -442,6 +467,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                         'e' => edit_flag = Some(true),
                         'o' => only_flag = true,
                         'i' => include_flag = true,
+                        'p' => patch_interactive = true,
                         'z' => null_term = true,
                         'b' => branch_header = Some(true),
                         // Optional-value short flags: bare in a cluster they take
@@ -504,19 +530,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- option validation (git's `parse_and_validate_options`) ----------
-    // `--pathspec-from-file` supplies the pathspec list instead of the command
-    // line, so it is resolved before every pathspec-dependent check below.
-    if pathspec_from_file.is_some() && !pathspecs.is_empty() {
-        anyhow::bail!("'--pathspec-from-file' and pathspec arguments cannot be used together");
+    if let Err(code) = patch_opts.finish() {
+        return Ok(code);
     }
-    if pathspec_file_nul && pathspec_from_file.is_none() {
-        anyhow::bail!("the option '--pathspec-file-nul' requires '--pathspec-from-file'");
-    }
-    if let Some(src) = &pathspec_from_file {
-        if all {
-            anyhow::bail!("options '--pathspec-from-file' and '-a' cannot be used together");
-        }
-        pathspecs = read_pathspec_file(src, pathspec_file_nul)?;
+    // `-p` implies `--interactive`, and the four ways of choosing what to stage
+    // are mutually exclusive (git's `die_for_incompatible_opt4(also, only, all,
+    // interactive)`, which names them in that order).
+    if patch_interactive {
+        interactive = true;
     }
     if only_flag && include_flag {
         anyhow::bail!("options '-i/--include' and '-o/--only' cannot be used together");
@@ -527,8 +548,48 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if all && include_flag {
         anyhow::bail!("options '-i/--include' and '-a/--all' cannot be used together");
     }
+    if include_flag && interactive {
+        anyhow::bail!(
+            "options '-i/--include' and '--interactive/-p/--patch' cannot be used together"
+        );
+    }
+    if only_flag && interactive {
+        anyhow::bail!("options '-o/--only' and '--interactive/-p/--patch' cannot be used together");
+    }
+    if all && interactive {
+        anyhow::bail!("options '-a/--all' and '--interactive/-p/--patch' cannot be used together");
+    }
+
+    // git's `prepare_index()` opens with the two `cannot be negative` fatals.
+    if let Some(code) = patch_opts.reject_negative() {
+        return Ok(code);
+    }
+    // `--pathspec-from-file` supplies the pathspec list instead of the command
+    // line, so it is resolved before every pathspec-dependent check below.
+    if pathspec_from_file.is_some() && !pathspecs.is_empty() {
+        anyhow::bail!("'--pathspec-from-file' and pathspec arguments cannot be used together");
+    }
+    if pathspec_file_nul && pathspec_from_file.is_none() {
+        anyhow::bail!("the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+    }
+    if let Some(src) = &pathspec_from_file {
+        if interactive {
+            anyhow::bail!(
+                "options '--pathspec-from-file' and '--interactive/--patch' cannot be used together"
+            );
+        }
+        if all {
+            anyhow::bail!("options '--pathspec-from-file' and '-a' cannot be used together");
+        }
+        pathspecs = read_pathspec_file(src, pathspec_file_nul)?;
+    }
     if (only_flag || include_flag) && pathspecs.is_empty() {
         anyhow::bail!("No paths with --include/--only does not make sense.");
+    }
+    // Outside patch mode the two diff-shaping options have nothing to feed, and
+    // git refuses the whole command rather than ignore them.
+    if let Some(code) = patch_opts.require_patch_only(interactive, "--interactive/--patch") {
+        return Ok(code);
     }
     // `git commit -a <paths>` is rejected outright, exactly as git does.
     if all && !pathspecs.is_empty() {
@@ -537,8 +598,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // Pathspec-limited ("only") mode: build the commit tree from HEAD's tree with
     // only the listed paths taken from the worktree. `-i`/`--include` instead adds
     // the listed paths to the index and commits the whole index, so it is *not*
-    // an only-mode commit even though it carries paths.
-    let only_mode = !pathspecs.is_empty() && !include_flag;
+    // an only-mode commit even though it carries paths. Interactive staging is
+    // likewise a whole-index commit: git's `prepare_index()` leaves its branch
+    // with `commit_style = COMMIT_NORMAL`, so paths there only narrow the diff
+    // the selector offers.
+    let only_mode = !pathspecs.is_empty() && !include_flag && !interactive;
 
     // `-z` promotes an unset (or explicitly long) format to porcelain, and any
     // format at all implies a dry run — git's `finalize_deferred_config()` plus
@@ -555,6 +619,32 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // Serialize tree build + commit + HEAD update through the repo coordinator so
     // concurrent zvcs writers queue instead of racing. Held across the whole op.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+
+    // --- `-p`/`--interactive`: hand staging to the hunk selector ----------
+    // git's `prepare_index()` runs `interactive_add()` before anything reads the
+    // index, so `--dry-run` reaches it too and then throws the selection away
+    // with the rest of the prepared index (`rollback_index_files()`); the guard
+    // below lives to the end of this function and does exactly that unless the
+    // commit succeeds.
+    let mut interactive_stage = None;
+    if interactive {
+        let guard = InteractiveStage::hold(&repo)?;
+        let status = if patch_interactive {
+            super::add_patch::run_status(
+                &repo,
+                super::add_patch::Mode::Add,
+                None,
+                patch_opts.to_interactive(false),
+                &pathspecs,
+            )?
+        } else {
+            super::add_interactive::run_status(&repo, patch_opts.to_interactive(false), &pathspecs)?
+        };
+        if status != 0 {
+            anyhow::bail!("interactive add failed");
+        }
+        interactive_stage = Some(guard);
+    }
 
     // `--dry-run` returns before any message is read, any hook fires and any
     // object is written — git's `cmd_commit` branches to `dry_run_commit()` right
@@ -1167,6 +1257,13 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         repo.commit("HEAD", &message, tree_id, parents)?
     };
 
+    // The commit is in the object store and `HEAD` points at it, which is git's
+    // `commit_index_files()` moment: the prepared index becomes the real one and
+    // an interactive selection is no longer rolled back.
+    if let Some(stage) = &mut interactive_stage {
+        stage.keep();
+    }
+
     // `--amend` rewrites a commit, so git notifies `post-rewrite` with the
     // `amend` mode and one `<old-sha1> SP <new-sha1>` line on stdin;
     // `--no-post-rewrite` suppresses it. Its exit status is ignored.
@@ -1466,6 +1563,63 @@ fn index_differs_from_head(
 /// including a panic. `index.lock` is held exclusively for the whole window —
 /// the same lock git's own `prepare_index()` takes with `LOCK_DIE_ON_ERROR`, so
 /// a concurrent writer (stock git included) cannot walk into the swap.
+/// The rollback half of git's `index.lock` around `commit --interactive`.
+///
+/// git writes the current index into `index.lock`, points `GIT_INDEX_FILE` at
+/// the lock, lets the selector stage into *that* copy, and only
+/// `commit_index_files()` — reached once the commit object exists and `HEAD` has
+/// moved — renames it over the real index. An aborted commit (empty message,
+/// failing `pre-commit`, an editor that exits non-zero) instead rolls the lock
+/// back and the selection is discarded.
+///
+/// This build's index plumbing ignores `GIT_INDEX_FILE`, so the `apply --cached`
+/// child would write the real index whatever the environment said. The selector
+/// therefore runs against the real index and the *original* bytes are held here
+/// instead, restored by [`Drop`] unless [`Self::keep`] has been called. Both
+/// end states — kept on success, discarded on abort — are git's.
+struct InteractiveStage {
+    /// The repository index the selector stages into.
+    index: std::path::PathBuf,
+    /// The index as it was before the selector ran, or `None` when the
+    /// repository had no index file at all.
+    original: Option<Vec<u8>>,
+    /// Set once the commit has succeeded, which disarms the rollback.
+    keep: bool,
+}
+
+impl InteractiveStage {
+    fn hold(repo: &gix::Repository) -> Result<Self> {
+        let index = repo.index_path();
+        let original = match std::fs::read(&index) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Self { index, original, keep: false })
+    }
+
+    /// git's `commit_index_files()`: the staged selection stands.
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for InteractiveStage {
+    fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
+        match &self.original {
+            Some(bytes) => {
+                let _ = std::fs::write(&self.index, bytes);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.index);
+            }
+        }
+    }
+}
+
 struct IndexSwap {
     /// The repository index path the prepared index was written to.
     index: std::path::PathBuf,

@@ -57,6 +57,39 @@ pub mod options {
         None,
     }
 
+    /// Possible settings for the `http.proactiveAuth` configuration option: whether to authenticate
+    /// before the server has asked for it with a `401`, and with which scheme.
+    #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum ProactiveAuth {
+        /// `none` — make the first request unauthenticated and only authenticate after a `401`.
+        #[default]
+        None,
+        /// `basic` — ask the credential helper for HTTP basic credentials up front.
+        Basic,
+        /// `auto` — let the helper pick the scheme. Without helper-provided `authtype` support this
+        /// is the same as `basic`, which is also what `git` falls back to for a helper that returns
+        /// only a username and password.
+        Auto,
+    }
+
+    /// Possible settings for the `http.emptyAuth` configuration option: whether to authenticate with
+    /// an empty username *and* password, which is how `curl` is told to drive a mechanism that needs
+    /// no username of its own.
+    #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum EmptyAuth {
+        /// `auto` (the default) — send empty credentials only when the server's `401` advertises a
+        /// mechanism that requires them, and otherwise ask the credential helper.
+        ///
+        /// This backend speaks only HTTP basic authentication, and no basic-auth server ever asks for
+        /// empty credentials, so this behaves exactly like [`Never`][Self::Never] here.
+        #[default]
+        Auto,
+        /// `true` — always send empty credentials on the very first request, before any `401`.
+        Always,
+        /// `false` — never send empty credentials.
+        Never,
+    }
+
     /// The way to configure a proxy for authentication if a username is present in the configured proxy.
     #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
     pub enum ProxyAuthMethod {
@@ -155,6 +188,18 @@ pub struct Options {
     /// If authentication is needed for the proxy as its URL contains a username, this method must be set to provide a password
     /// for it before making the request, and to store it if the connection succeeds.
     pub proxy_authenticate: Option<(gix_credentials::helper::Action, Arc<Mutex<options::AuthenticateFn>>)>,
+    /// Whether to authenticate against the *server* before it asks for it with a `401`.
+    ///
+    /// Refers to `http.proactiveAuth`.
+    pub proactive_auth: options::ProactiveAuth,
+    /// Whether to authenticate with an empty username and password instead of consulting the
+    /// credential helper.
+    ///
+    /// Refers to `http.emptyAuth`.
+    pub empty_auth: options::EmptyAuth,
+    /// The credentials to authenticate the server with, used when [`proactive_auth`][Self::proactive_auth]
+    /// asks for credentials up front. Without it, credentials are only obtained in reaction to a `401`.
+    pub authenticate: Option<(gix_credentials::helper::Action, Arc<Mutex<options::AuthenticateFn>>)>,
     /// The `HTTP` `USER_AGENT` string presented to an `HTTP` server, notably not the user agent present to the `git` server.
     ///
     /// If not overridden, it defaults to the user agent provided by `curl`, which is a deviation from how `git` handles this.
@@ -256,6 +301,9 @@ impl Default for Options {
             no_proxy: None,
             proxy_auth_method: Default::default(),
             proxy_authenticate: None,
+            proactive_auth: Default::default(),
+            empty_auth: Default::default(),
+            authenticate: None,
             user_agent: None,
             connect_timeout: None,
             verbose: false,
@@ -295,6 +343,14 @@ pub struct Transport<H: Http> {
     line_provider: Option<StreamingPeekableIter<H::ResponseBody>>,
     identity: Option<gix_sec::identity::Account>,
     trace: bool,
+    /// `http.proactiveAuth`, captured from the options passed to [`configure()`][client::TransportWithoutIO::configure()].
+    /// It lives here rather than in the backend because the identity the request is signed with does.
+    proactive_auth: options::ProactiveAuth,
+    /// `http.emptyAuth`, captured alongside it and for the same reason.
+    empty_auth: options::EmptyAuth,
+    /// The credential helper cascade for the server URL, invoked once before the first request when
+    /// [`proactive_auth`][Self::proactive_auth] asks for it.
+    authenticate: Option<(gix_credentials::helper::Action, Arc<Mutex<options::AuthenticateFn>>)>,
 }
 
 impl<H: Http> Transport<H> {
@@ -320,6 +376,9 @@ impl<H: Http> Transport<H> {
             line_provider: None,
             identity,
             trace,
+            proactive_auth: Default::default(),
+            empty_auth: Default::default(),
+            authenticate: None,
         }
     }
 }
@@ -426,7 +485,57 @@ impl<H: Http> client::TransportWithoutIO for Transport<H> {
     }
 
     fn configure(&mut self, config: &dyn Any) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        // `http.proactiveAuth` is decided here rather than in the backend: it changes *which*
+        // identity the transport signs the very first request with, and the identity lives on
+        // this type. The backend still receives the same options.
+        if let Some(options) = config.downcast_ref::<Options>() {
+            self.proactive_auth = options.proactive_auth;
+            self.empty_auth = options.empty_auth;
+            self.authenticate = options.authenticate.clone();
+        }
         self.http.configure(config)
+    }
+}
+
+impl<H: Http> Transport<H> {
+    /// `http.proactiveAuth`: obtain credentials from the helper *before* the first request, so the
+    /// server never sees an unauthenticated attempt. A `401`-driven retry is what happens without it.
+    ///
+    /// Nothing happens when the URL already carried an identity, when the setting is `none`, or when
+    /// no credential helper was wired up.
+    ///
+    /// `http.emptyAuth=true` wins over it, exactly as `git help config` documents ("If
+    /// `http.emptyAuth` is set to true, this value has no effect"): an empty username and password
+    /// go out on the first request and the credential helper is never consulted. Its other two
+    /// values, `auto` and `false`, differ only for mechanisms that need no username of their own —
+    /// `GSS-Negotiate` and friends, which this backend cannot speak — so both leave the `401`-driven
+    /// credential-helper flow untouched.
+    fn authenticate_proactively(&mut self) -> Result<(), client::Error> {
+        if self.identity.is_some() {
+            return Ok(());
+        }
+        if self.empty_auth == options::EmptyAuth::Always {
+            self.identity = Some(gix_sec::identity::Account {
+                username: String::new(),
+                password: String::new(),
+                oauth_refresh_token: None,
+            });
+            return Ok(());
+        }
+        if self.proactive_auth == options::ProactiveAuth::None {
+            return Ok(());
+        }
+        let Some((action, authenticate)) = self.authenticate.clone() else {
+            return Ok(());
+        };
+        let outcome = authenticate.lock().expect("no panics in other threads")(action)
+            .map_err(|err| client::Error::Http(Error::Detail {
+                description: format!("Could not obtain credentials for proactive authentication: {err}"),
+            }))?;
+        if let Some(outcome) = outcome {
+            self.identity = Some(outcome.identity);
+        }
+        Ok(())
     }
 }
 
@@ -436,6 +545,7 @@ impl<H: Http> blocking_io::Transport for Transport<H> {
         service: Service,
         extra_parameters: &'a [(&'a str, Option<&'a str>)],
     ) -> Result<SetServiceResponse<'_>, client::Error> {
+        self.authenticate_proactively()?;
         let url = append_url(self.url.as_ref(), &format!("info/refs?service={}", service.as_str()));
         let static_headers = [Cow::Borrowed(self.user_agent_header)];
         let mut dynamic_headers = Vec::<Cow<'_, str>>::new();
@@ -659,3 +769,144 @@ pub fn connect<H: Http + Default>(url: gix_url::Url, desired_version: Protocol, 
 
 ///
 pub mod redirect;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::TransportWithoutIO;
+
+    /// An [`Http`] that never performs a request; enough to drive the parts of [`Transport`] that
+    /// decide *what* to send before anything is sent.
+    #[derive(Default)]
+    struct NoHttp;
+
+    impl Http for NoHttp {
+        type Headers = std::io::Cursor<Vec<u8>>;
+        type ResponseBody = std::io::Cursor<Vec<u8>>;
+        type PostBody = Vec<u8>;
+
+        fn get(
+            &mut self,
+            _url: &str,
+            _base_url: &str,
+            _headers: impl IntoIterator<Item = impl AsRef<str>>,
+        ) -> Result<GetResponse<Self::Headers, Self::ResponseBody>, Error> {
+            unreachable!("no request is made in these tests")
+        }
+
+        fn post(
+            &mut self,
+            _url: &str,
+            _base_url: &str,
+            _headers: impl IntoIterator<Item = impl AsRef<str>>,
+            _body: PostBodyDataKind,
+        ) -> Result<PostResponse<Self::Headers, Self::ResponseBody, Self::PostBody>, Error> {
+            unreachable!("no request is made in these tests")
+        }
+
+        fn configure(&mut self, _config: &dyn Any) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+            Ok(())
+        }
+    }
+
+    fn transport() -> Transport<NoHttp> {
+        Transport::new_http(
+            NoHttp,
+            gix_url::parse("https://example.com/repo.git".into()).expect("valid url"),
+            Protocol::V2,
+            false,
+        )
+    }
+
+    /// A credential helper that hands out one fixed identity, and counts how often it ran.
+    fn fixed_identity(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Option<(gix_credentials::helper::Action, Arc<Mutex<options::AuthenticateFn>>)> {
+        let action = gix_credentials::helper::Action::get_for_url("https://example.com/repo.git");
+        let authenticate = move |action: gix_credentials::helper::Action| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match action {
+                gix_credentials::helper::Action::Get(ctx) => Ok(Some(gix_credentials::protocol::Outcome {
+                    identity: gix_sec::identity::Account {
+                        username: "user".into(),
+                        password: "pass".into(),
+                        oauth_refresh_token: None,
+                    },
+                    next: gix_credentials::helper::NextAction::from(ctx),
+                })),
+                _ => Ok(None),
+            }
+        };
+        Some((action, Arc::new(Mutex::new(authenticate)) as Arc<Mutex<options::AuthenticateFn>>))
+    }
+
+    /// Without `http.proactiveAuth` the transport stays anonymous until a `401` forces the issue,
+    /// and the credential helper is never even asked.
+    #[test]
+    fn no_proactive_auth_leaves_the_first_request_anonymous() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut opts = Options::default();
+        opts.authenticate = fixed_identity(calls.clone());
+        let mut transport = transport();
+        transport.configure(&opts).expect("options are accepted");
+        transport.authenticate_proactively().expect("nothing to do");
+        assert!(transport.identity().is_none());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// `http.proactiveAuth=basic` asks the helper before the first request, so the very first
+    /// request already carries an `Authorization` header.
+    #[test]
+    fn proactive_auth_obtains_credentials_up_front() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut opts = Options::default();
+        opts.proactive_auth = options::ProactiveAuth::Basic;
+        opts.authenticate = fixed_identity(calls.clone());
+        let mut transport = transport();
+        transport.configure(&opts).expect("options are accepted");
+        transport.authenticate_proactively().expect("credentials are available");
+        assert_eq!(transport.identity().map(|i| i.username.clone()), Some("user".into()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut headers = Vec::new();
+        transport.add_basic_auth_if_present(&mut headers).expect("https");
+        assert_eq!(headers, vec!["Authorization: Basic dXNlcjpwYXNz"]);
+    }
+
+    /// `http.emptyAuth=true` sends an empty username *and* password and never consults the helper,
+    /// and it wins over `http.proactiveAuth`, which `git help config` says has no effect then.
+    #[test]
+    fn empty_auth_wins_over_proactive_auth_and_skips_the_helper() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut opts = Options::default();
+        opts.empty_auth = options::EmptyAuth::Always;
+        opts.proactive_auth = options::ProactiveAuth::Basic;
+        opts.authenticate = fixed_identity(calls.clone());
+        let mut transport = transport();
+        transport.configure(&opts).expect("options are accepted");
+        transport.authenticate_proactively().expect("no helper needed");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let mut headers = Vec::new();
+        transport.add_basic_auth_if_present(&mut headers).expect("https");
+        // base64(":"), curl's `CURLOPT_USERPWD=":"`.
+        assert_eq!(headers, vec!["Authorization: Basic Og=="]);
+    }
+
+    /// The two values of `http.emptyAuth` that only matter for mechanisms this backend cannot speak
+    /// leave the `401`-driven flow exactly as it was.
+    #[test]
+    fn empty_auth_auto_and_false_change_nothing() {
+        for mode in [options::EmptyAuth::Auto, options::EmptyAuth::Never] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut opts = Options::default();
+            opts.empty_auth = mode;
+            opts.authenticate = fixed_identity(calls.clone());
+            let mut transport = transport();
+            transport.configure(&opts).expect("options are accepted");
+            transport.authenticate_proactively().expect("nothing to do");
+            assert!(transport.identity().is_none(), "{mode:?} stays anonymous");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+}

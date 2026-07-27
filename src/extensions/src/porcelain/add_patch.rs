@@ -381,25 +381,25 @@ impl Default for Options {
 // ---------------------------------------------------------------------------
 
 /// The colors, context widths and input mode the prompt loop runs with.
-struct Config {
+pub(super) struct Config {
     /// Diff context width handed to the child diff, or `-1` for its default.
-    context: i32,
+    pub(super) context: i32,
     /// Inter-hunk context handed to the child diff, or `-1`.
-    interhunk: i32,
+    pub(super) interhunk: i32,
     /// See [`Options::auto_advance`].
-    auto_advance: bool,
+    pub(super) auto_advance: bool,
     /// Whether the *hunk* text should be colored (`color.diff` / `color.ui`).
     use_color_diff: bool,
     /// `color.interactive.header` — the `Split into N hunks.` notice.
-    header_color: String,
+    pub(super) header_color: String,
     /// `color.interactive.help` — the `?` help text.
-    help_color: String,
+    pub(super) help_color: String,
     /// `color.interactive.prompt` — the `(1/3) Stage this hunk...` line.
-    prompt_color: String,
+    pub(super) prompt_color: String,
     /// `color.interactive.error` — every `err()` diagnostic.
-    error_color: String,
+    pub(super) error_color: String,
     /// The reset sequence for the four slots above, or "" when color is off.
-    reset_color_interactive: String,
+    pub(super) reset_color_interactive: String,
     /// `color.diff.frag` — regenerated `@@` headers.
     fraginfo_color: String,
     /// `color.diff.context` (falling back to `color.diff.plain`).
@@ -421,7 +421,7 @@ struct Config {
 
 impl Config {
     /// Port of `interactive_config_init`: config first, then the command line.
-    fn init(repo: &gix::Repository, opts: &Options) -> Result<Self> {
+    pub(super) fn init(repo: &gix::Repository, opts: &Options) -> Result<Self> {
         let snap = repo.config_snapshot();
         let use_color_interactive = color::want_color_stdout(repo, "interactive");
         let use_color_diff = color::want_color_stdout(repo, "diff");
@@ -623,7 +623,7 @@ fn fmt2(fmt: &str, a: &str, b: &str) -> String {
 }
 
 /// git's `color_fprintf`: paint only when the slot is non-empty.
-fn color_print(color: &str, text: &str) {
+pub(super) fn color_print(color: &str, text: &str) {
     let mut out = std::io::stdout();
     if color.is_empty() {
         let _ = out.write_all(text.as_bytes());
@@ -633,7 +633,7 @@ fn color_print(color: &str, text: &str) {
 }
 
 /// git's `color_fprintf_ln`.
-fn color_println(color: &str, text: &str) {
+pub(super) fn color_println(color: &str, text: &str) {
     color_print(color, text);
     let _ = std::io::stdout().write_all(b"\n");
 }
@@ -651,7 +651,7 @@ fn color_println(color: &str, text: &str) {
 /// always a `diff --git` patch and those name paths relative to the top level —
 /// git's `patch->is_toplevel_relative`, which makes its own `apply` ignore the
 /// prefix for exactly these patches.
-fn run_git(
+pub(super) fn run_git(
     args: &[String],
     input: Option<&[u8]>,
     capture: bool,
@@ -2431,11 +2431,25 @@ pub(crate) fn run(
     opts: Options,
     pathspecs: &[String],
 ) -> Result<ExitCode> {
+    Ok(ExitCode::from(run_status(repo, mode, revision, opts, pathspecs)?))
+}
+
+/// [`run`] as its raw status byte, for callers that must branch on failure
+/// rather than propagate it: `git commit`'s `interactive_add()` wraps
+/// `run_add_p()` in `!!` and turns a non-zero result into
+/// `die(_("interactive add failed"))`.
+pub(crate) fn run_status(
+    repo: &gix::Repository,
+    mode: Mode,
+    revision: Option<&str>,
+    opts: Options,
+    pathspecs: &[String],
+) -> Result<u8> {
     let cfg = match Config::init(repo, &opts) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("fatal: {e}");
-            return Ok(ExitCode::from(128));
+            return Ok(128);
         }
     };
     let mut state = State {
@@ -2459,7 +2473,7 @@ pub(crate) fn run(
             eprintln!("error: {msg}");
         }
         // Every caller wraps `run_add_p` in `!!`, so a failure is exit 1.
-        return Ok(ExitCode::from(1));
+        return Ok(1);
     }
 
     let mut binary_count = 0usize;
@@ -2488,5 +2502,5 @@ pub(crate) fn run(
         state.err("Only binary files changed.");
     }
 
-    Ok(ExitCode::SUCCESS)
+    Ok(0)
 }

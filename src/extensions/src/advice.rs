@@ -50,6 +50,22 @@ pub enum Advice {
     PushFetchFirst,
     /// Git is blocked on an editor the user may not have noticed.
     WaitingForEditor,
+    /// A ref name was rejected by `check-ref-format`'s rules.
+    RefSyntax,
+    /// `--set-upstream-to` named an upstream that does not exist.
+    SetUpstreamFailure,
+    /// `git branch -d` refused a branch that is not fully merged.
+    ForceDeleteBranch,
+    /// A DWIM branch name matched more than one remote.
+    CheckoutAmbiguousRemoteBranchName,
+    /// A hookdir script was skipped because it is not executable.
+    IgnoredHook,
+    /// `die_expecting_a_branch()`: `git switch` was given something that is not
+    /// a branch, and `--detach` would have done what the user meant.
+    SuggestDetachingHead,
+    /// A full-length hex object name is also the name of a ref, which is almost
+    /// always a ref created by mistake.
+    ObjectNameWarning,
 }
 
 impl Advice {
@@ -69,6 +85,15 @@ impl Advice {
             Advice::PushNonFFMatching => "advice.pushNonFFMatching",
             Advice::PushFetchFirst => "advice.pushFetchFirst",
             Advice::WaitingForEditor => "advice.waitingForEditor",
+            Advice::RefSyntax => "advice.refSyntax",
+            Advice::SetUpstreamFailure => "advice.setUpstreamFailure",
+            Advice::ForceDeleteBranch => "advice.forceDeleteBranch",
+            Advice::CheckoutAmbiguousRemoteBranchName => {
+                "advice.checkoutAmbiguousRemoteBranchName"
+            }
+            Advice::IgnoredHook => "advice.ignoredHook",
+            Advice::SuggestDetachingHead => "advice.suggestDetachingHead",
+            Advice::ObjectNameWarning => "advice.objectNameWarning",
         }
     }
 
@@ -164,6 +189,28 @@ impl Advice {
         }
         true
     }
+}
+
+/// `parse_remote_branch()`'s ambiguous-DWIM block (`builtin/checkout.c`), shared
+/// by `git checkout` and `git switch` — `cmdname` is the *only* thing git
+/// interpolates. The remote in the prose is the literal `origin` even when the
+/// matches are on other remotes: git is naming the conventional default, not the
+/// remotes it found. git checks `advice_enabled()` here and then calls plain
+/// `advise()`, so no `Disable this message with …` trailer is printed.
+pub fn ambiguous_remote_branch_name(repo: &Repository, cmdname: &str) {
+    Advice::CheckoutAmbiguousRemoteBranchName.advise_plain_in(
+        repo,
+        &format!(
+            "If you meant to check out a remote tracking branch on, e.g. 'origin',\n\
+             you can do so by fully qualifying the name with the --track option:\n\
+             \n\
+             \x20   git {cmdname} --track origin/<name>\n\
+             \n\
+             If you'd like to always have checkouts of an ambiguous <name> prefer\n\
+             one remote, e.g. the 'origin' remote, consider setting\n\
+             checkout.defaultRemote=origin in your config."
+        ),
+    );
 }
 
 /// `git_env_bool(GIT_ADVICE_ENVIRONMENT, 1)`: `GIT_ADVICE` set to a false value

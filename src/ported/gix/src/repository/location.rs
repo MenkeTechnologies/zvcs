@@ -34,8 +34,27 @@ impl crate::Repository {
     }
 
     /// Return the path to the worktree index file, which may or may not exist.
+    ///
+    /// `GIT_INDEX_FILE` overrides it, as it does in git: `setup_git_env()` passes
+    /// `getenv(INDEX_ENVIRONMENT)` into `repo_set_gitdir()`, which stores the value
+    /// verbatim in place of `$GIT_DIR/index` when it is present. The variable is
+    /// honoured whenever it is *set*, an empty value included — git calls `getenv`,
+    /// not a non-empty test, so `GIT_INDEX_FILE=` names the empty path and yields an
+    /// empty index rather than falling back to the repository's own.
+    ///
+    /// A relative value resolves against the top of the working tree, because git
+    /// reads the variable after `setup_git_directory()` has already changed directory
+    /// there; without a working tree it resolves against the current directory, which
+    /// is where git would still be.
     pub fn index_path(&self) -> PathBuf {
-        self.git_dir().join("index")
+        let Some(from_env) = std::env::var_os("GIT_INDEX_FILE") else {
+            return self.git_dir().join("index");
+        };
+        let path = PathBuf::from(from_env);
+        if path.is_absolute() {
+            return path;
+        }
+        self.workdir().unwrap_or_else(|| self.current_dir()).join(path)
     }
 
     /// The path to the `.gitmodules` file in the worktree, if a worktree is available.

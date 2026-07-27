@@ -16,6 +16,12 @@ pub struct Options<'a> {
     /// If `true`, if we fetch from a remote that only offers shallow clones, the operation will fail with an error
     /// instead of writing the shallow boundary to the shallow file.
     pub reject_shallow_remote: bool,
+    /// The object filter-spec of a partial fetch, like `blob:none` or `tree:0`, sent as the `filter <spec>` argument
+    /// of the `fetch` command.
+    ///
+    /// The server has to advertise the `filter` capability for this, and the objects it withholds have to be
+    /// obtainable later from a *promisor remote* - see `git`'s `Documentation/technical/partial-clone.adoc`.
+    pub filter: Option<&'a str>,
 }
 
 /// For use in [`crate::Handshake::prepare_lsrefs_or_extract_refmap()`] and [`fetch`](crate::fetch()).

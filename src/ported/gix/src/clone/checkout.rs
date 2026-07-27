@@ -118,6 +118,13 @@ pub mod main_worktree {
                 })?;
             let mut index = gix_index::File::from_state(index, repo.index_path());
 
+            // git's `check_updates()` collects every blob it is about to write that isn't present and
+            // asks the promisor remote for all of them at once. Skipping this would still produce the
+            // right worktree - each read falls back on the promisor by itself - but at the price of one
+            // fetch per file.
+            #[cfg(feature = "blocking-network-client")]
+            crate::promisor::prefetch(repo, index.entries().iter().map(|entry| entry.id));
+
             let mut opts = repo.checkout_options(gix_worktree::stack::state::attributes::Source::IdMapping)?;
             opts.destination_is_initially_empty = true;
 

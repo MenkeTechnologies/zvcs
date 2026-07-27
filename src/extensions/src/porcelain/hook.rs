@@ -32,8 +32,10 @@
 //!
 //! One known divergence: the `advice.ignoredHook` hint prints the hook path
 //! relative to the current directory when it lies below it, and absolute
-//! otherwise; git derives the same string from its own `git_path()` bookkeeping,
-//! so the two can differ when `git hook` is run from a subdirectory.
+//! otherwise (with the `./` gitoxide prefixes a discovered git dir with
+//! trimmed, so the common case reads `.git/hooks/<event>` as git's does); git
+//! derives the same string from its own `git_path()` bookkeeping, so the two can
+//! still differ when `git hook` is run from a subdirectory.
 
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
@@ -591,13 +593,17 @@ fn hookdir_hook(repo: &gix::Repository, event: &str) -> Result<Option<PathBuf>> 
     if meta.permissions().mode() & 0o111 != 0 {
         return Ok(Some(path));
     }
-    if repo.config_snapshot().boolean("advice.ignoredHook") != Some(false) {
-        let shown = display_path(&path);
-        eprintln!("hint: The '{shown}' hook was ignored because it's not set as executable.");
-        eprintln!(
-            "hint: You can disable this warning with `git config set advice.ignoredHook false`."
-        );
-    }
+    // `hook.c` bakes the disable sentence into the message and calls plain
+    // `advise()`, so there is no `Disable this message with …` trailer here —
+    // but it *is* behind `advice_enabled()`, which `GIT_ADVICE=0` also squelches.
+    let shown = display_path(&path);
+    crate::advice::Advice::IgnoredHook.advise_plain_in(
+        repo,
+        &format!(
+            "The '{shown}' hook was ignored because it's not set as executable.\n\
+             You can disable this warning with `git config set advice.ignoredHook false`."
+        ),
+    );
     Ok(None)
 }
 
@@ -607,9 +613,11 @@ fn display_path(path: &Path) -> String {
     let rel = std::env::current_dir()
         .ok()
         .and_then(|cwd| path.strip_prefix(cwd).ok().map(Path::to_path_buf));
-    rel.unwrap_or_else(|| path.to_path_buf())
-        .display()
-        .to_string()
+    let shown = rel.unwrap_or_else(|| path.to_path_buf()).display().to_string();
+    // gitoxide reports a repository discovered from the current directory as
+    // `./.git`, so a path joined onto it keeps the `./` that git's `git_path()`
+    // never produces: git prints `.git/hooks/pre-commit`.
+    shown.strip_prefix("./").unwrap_or(&shown).to_owned()
 }
 
 /// Build the child process for one hook command, reproducing git's

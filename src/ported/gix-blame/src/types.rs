@@ -205,6 +205,13 @@ pub struct Outcome {
     /// One entry in sequential order, to associate a hunk in the blamed file with the source commit (and its lines)
     /// that introduced it.
     pub entries: Vec<BlameEntry>,
+    /// The same attribution as [`Self::entries`], but neither sorted by line nor coalesced: the
+    /// entries appear in the order the history walk took responsibility for them, which is what
+    /// git's `found_guilty_entry()` callback sees and what `git blame --incremental` streams.
+    ///
+    /// Within one commit the entries are ordered by their first line in the *Blamed File*, which is
+    /// the order git's `origin->suspects` list is kept in by `blame_merge()`.
+    pub uncoalesced_entries: Vec<BlameEntry>,
     /// A buffer with the file content of the *Blamed File*, ready for tokenization.
     pub blob: Vec<u8>,
     /// Additional information about the amount of work performed to produce the blame.

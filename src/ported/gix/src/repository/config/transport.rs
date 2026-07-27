@@ -256,6 +256,43 @@ impl crate::Repository {
                             ))
                         })
                         .transpose()?;
+                    {
+                        // `http.emptyAuth`: authenticate with an empty username and password rather
+                        // than asking the credential helper at all.
+                        let key = "http.emptyAuth";
+                        debug_assert_eq!(key, config::tree::Http::EMPTY_AUTH.logical_name());
+                        let name = config::tree::Http::EMPTY_AUTH.name;
+                        if hc.string(name).is_some() || hc.boolean(name).is_some() {
+                            opts.empty_auth = config::tree::Http::EMPTY_AUTH
+                                .try_into_empty_auth(hc.string(name).unwrap_or_default(), || {
+                                    hc.boolean(name).transpose().with_leniency(lenient)
+                                })
+                                .map_err(config::transport::http::Error::InvalidEmptyAuth)?;
+                        }
+                    }
+
+                    {
+                        // `http.proactiveAuth`: authenticate before the server asks with a `401`.
+                        // The credential cascade is built here, where the repository's helpers are
+                        // reachable, and invoked by the transport before its first request.
+                        let key = "http.proactiveAuth";
+                        debug_assert_eq!(key, config::tree::Http::PROACTIVE_AUTH.logical_name());
+                        opts.proactive_auth = hc
+                            .string(config::tree::Http::PROACTIVE_AUTH.name)
+                            .map(|v| config::tree::Http::PROACTIVE_AUTH.try_into_proactive_auth(v))
+                            .unwrap_or_default();
+                        if opts.proactive_auth != http::options::ProactiveAuth::None {
+                            let (mut cascade, action_with_normalized_url, prompt_opts) = self
+                                .config_snapshot()
+                                .credential_helpers(url.clone())
+                                .map_err(config::transport::http::Error::ConfigureAuthenticate)?;
+                            opts.authenticate = Some((
+                                action_with_normalized_url,
+                                Arc::new(Mutex::new(move |action| cascade.invoke(action, prompt_opts.clone())))
+                                    as Arc<Mutex<http::options::AuthenticateFn>>,
+                            ));
+                        }
+                    }
                     opts.connect_timeout = {
                         let key = "gitoxide.http.connectTimeout";
                         debug_assert_eq!(key, gitoxide::Http::CONNECT_TIMEOUT.logical_name());

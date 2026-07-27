@@ -41,6 +41,9 @@ pub struct Outcome {
     /// Use [`iter_mapping_updates()`][Self::iter_mapping_updates()] to recombine the update information with ref-edits and their
     /// mapping.
     pub updates: Vec<super::Update>,
+    /// `true` if `--atomic` was requested, at least one mapping was rejected, and `edits` was
+    /// therefore left unapplied in its entirety.
+    pub rejected_atomically: bool,
 }
 
 /// Describe the way a ref was updated, with particular focus on how the (peeled) target commit was affected.
@@ -87,6 +90,22 @@ pub enum Mode {
         /// The path(s) to the worktree directory where the branch is checked out.
         worktree_dirs: Vec<PathBuf>,
     },
+}
+
+impl Mode {
+    /// Return `true` if the local ref was left alone because the update couldn't be performed.
+    ///
+    /// These are the cases git reports as `! [rejected]` and exits non-zero for.
+    pub fn is_rejected(&self) -> bool {
+        matches!(
+            self,
+            Mode::RejectedSourceObjectNotFound { .. }
+                | Mode::RejectedTagUpdate
+                | Mode::RejectedNonFastForward
+                | Mode::RejectedToReplaceWithUnborn
+                | Mode::RejectedCurrentlyCheckedOut { .. }
+        )
+    }
 }
 
 impl std::fmt::Display for Mode {

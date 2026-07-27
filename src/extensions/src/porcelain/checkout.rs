@@ -437,6 +437,11 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // detach); fall back to a bare path restore from the index.
     if pre.len() == 1 {
         let spec = pre[0];
+        // `parse_branchname_arg()` resolves through `get_oid_mb()`, so
+        // `get_oid_basic()`'s `core.warnAmbiguousRefs` warning is emitted here,
+        // ahead of anything the checkout itself prints. `--quiet` does not
+        // suppress it — stock warns under `git checkout -q` too.
+        super::rev_parse::warn_ambiguous_refname(&repo, spec, false);
         // A revspec like `HEAD~3` is not a valid ref *name* (`~` is rejected by
         // ref validation), so treat a lookup error as "not a branch" and let the
         // `rev_parse_single` path below resolve and detach-checkout it.
@@ -472,10 +477,8 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                         maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
                         return Ok(code);
                     }
-                    Dwim::Many { count, hint_remote } => {
-                        if crate::advice::enabled("checkoutAmbiguousRemoteBranchName") {
-                            print_ambiguous_remote_hint(&hint_remote);
-                        }
+                    Dwim::Many { count } => {
+                        crate::advice::ambiguous_remote_branch_name(&repo, "checkout");
                         eprintln!(
                             "fatal: '{spec}' matched multiple ({count}) remote tracking branches"
                         );
@@ -827,8 +830,7 @@ fn orphan_checkout(
     let full = format!("refs/heads/{name}");
     if gix::validate::reference::branch_name(BStr::new(full.as_bytes())).is_err() {
         eprintln!("fatal: '{name}' is not a valid branch name");
-        eprintln!("hint: See 'git help check-ref-format'");
-        eprintln!("hint: Disable this message with \"git config set advice.refSyntax false\"");
+        crate::advice::Advice::RefSyntax.advise_in(repo, "See 'git help check-ref-format'");
         return Ok(ExitCode::from(128));
     }
 
@@ -1017,7 +1019,7 @@ enum Dwim {
     /// Exactly one remote has the branch; its short name (`<remote>/<name>`).
     One(String),
     /// More than one remote has it — ambiguous (unless `checkout.defaultRemote`).
-    Many { count: usize, hint_remote: String },
+    Many { count: usize },
     /// No remote has it.
     None,
 }
@@ -1045,28 +1047,9 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
                     return Ok(Dwim::One(format!("{def}/{name}")));
                 }
             }
-            Ok(Dwim::Many {
-                count: n,
-                hint_remote: matches[0].clone(),
-            })
+            Ok(Dwim::Many { count: n })
         }
     }
-}
-
-/// The `advice.checkoutAmbiguousRemoteBranchName` block git prints for an
-/// ambiguous DWIM name, verbatim (git 2.55.0, `builtin/checkout.c`).
-fn print_ambiguous_remote_hint(remote: &str) {
-    eprintln!("hint: If you meant to check out a remote tracking branch on, e.g. '{remote}',");
-    eprintln!("hint: you can do so by fully qualifying the name with the --track option:");
-    eprintln!("hint:");
-    eprintln!("hint:     git checkout --track {remote}/<name>");
-    eprintln!("hint:");
-    eprintln!("hint: If you'd like to always have checkouts of an ambiguous <name> prefer");
-    eprintln!("hint: one remote, e.g. the '{remote}' remote, consider setting");
-    eprintln!("hint: checkout.defaultRemote={remote} in your config.");
-    eprintln!(
-        "hint: Disable this message with \"git config set advice.checkoutAmbiguousRemoteBranchName false\""
-    );
 }
 
 // --- `--pathspec-from-file` ------------------------------------------------

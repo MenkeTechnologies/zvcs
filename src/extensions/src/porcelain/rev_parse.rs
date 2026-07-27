@@ -36,6 +36,8 @@ use anyhow::Result;
 use std::io::Write;
 use std::process::ExitCode;
 
+use crate::advice::Advice;
+
 use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
@@ -251,6 +253,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         let resolved = if arg.is_empty() {
             None
         } else {
+            warn_ambiguous_refname(&repo, arg, o.quiet);
             repo.rev_parse_single(arg.as_str()).ok().map(|id| id.detach())
         };
 
@@ -364,6 +367,116 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
 
     out.flush()?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Port of `ref_rev_parse_rules` + `repo_dwim_ref()`: every full ref name `name`
+/// resolves to, in git's rule order, with symbolic refs already followed (which
+/// is what `refs_resolve_ref_unsafe()` returns). The first element is the ref git
+/// treats as *the* match; the length is git's `refs_found`.
+pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for rule in [
+        name.to_owned(),
+        format!("refs/{name}"),
+        format!("refs/tags/{name}"),
+        format!("refs/heads/{name}"),
+        format!("refs/remotes/{name}"),
+        format!("refs/remotes/{name}/HEAD"),
+    ] {
+        let Ok(Some(r)) = repo.try_find_reference(rule.as_str()) else {
+            continue;
+        };
+        // git resolves each rule with `refs_resolve_ref_unsafe()`, an *exact*
+        // lookup, so `refs_found` counts distinct existing refnames. gitoxide's
+        // `try_find` instead applies a DWIM of its own over `refs/`,
+        // `refs/tags/`, `refs/heads/` and `refs/remotes/`, so several rules would
+        // otherwise report the same underlying ref and inflate the count — which
+        // would make a plain `git rev-parse main` look ambiguous. Keep only the
+        // candidates that named the very ref they found.
+        if r.name().as_bstr() != rule.as_bytes() {
+            continue;
+        }
+        // `repo_dwim_ref` records what `resolve_ref_unsafe` resolved *to*, so a
+        // symbolic `HEAD` contributes the branch it points at.
+        found.push(match r.target() {
+            TargetRef::Symbolic(full) => full.as_bstr().to_string(),
+            TargetRef::Object(_) => r.name().as_bstr().to_string(),
+        });
+    }
+    found
+}
+
+/// `get_oid_basic`'s ambiguity warning (`object-name.c`): once a plain name has
+/// resolved as a ref, warn when `core.warnAmbiguousRefs` (default true) is on and
+/// either more than one of the rev-parse rules matched, or the name *also* reads
+/// as an unambiguous abbreviated object id — the `refs_found > 1 ||
+/// !get_short_oid(…)` disjunction. `--quiet` is git's `GET_OID_QUIETLY`, which
+/// suppresses it.
+///
+/// Only a bare name goes through `repo_dwim_ref`, so anything carrying revision
+/// grammar (`~`, `^`, `:`, `@{`) is left alone here, as in git.
+pub(crate) fn warn_ambiguous_refname(repo: &gix::Repository, arg: &str, quiet: bool) {
+    if arg.contains(['~', '^', ':']) || arg.contains("@{") {
+        return;
+    }
+    if repo.config_snapshot().boolean("core.warnAmbiguousRefs") == Some(false) {
+        return;
+    }
+
+    // `get_oid_basic` splits in two. A *full-length* hex name resolves as the
+    // object and returns immediately, but first checks whether a ref answers to
+    // the same 40 (or 64) characters — which only happens when a ref was created
+    // by accident, hence the paragraph explaining how.
+    let hexsz = repo.object_hash().len_in_hex();
+    if arg.len() == hexsz && arg.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !dwim_ref_matches(repo, arg).is_empty() {
+            eprintln!("warning: refname '{arg}' is ambiguous.");
+            // git prints this one with a bare `fprintf(stderr, "%s\n", …)`, not
+            // through `advise()`, so it carries no `hint: ` prefix and no color.
+            if Advice::ObjectNameWarning.enabled_in(repo) {
+                eprintln!("{OBJECT_NAME_MSG}");
+            }
+        }
+        return;
+    }
+
+    if quiet {
+        return;
+    }
+    let refs_found = dwim_ref_matches(repo, arg).len();
+    if refs_found == 0 {
+        return;
+    }
+    if refs_found > 1 || resolves_as_short_oid(repo, arg) {
+        eprintln!("warning: refname '{arg}' is ambiguous.");
+    }
+}
+
+/// `object_name_msg` in `object-name.c`, verbatim (git 2.55.0).
+const OBJECT_NAME_MSG: &str = "\
+Git normally never creates a ref that ends with 40 hex characters
+because it will be ignored when you just specify 40-hex. These refs
+may be created by mistake. For example,
+
+  git switch -c $br $(git rev-parse ...)
+
+where \"$br\" is somehow empty and a 40-hex ref is created. Please
+examine these refs and maybe delete them. Turn this message off by
+running \"git config set advice.objectNameWarning false\"";
+
+/// `get_short_oid(…, GET_OID_QUIETLY) == 0`: whether `arg` is a hex prefix that
+/// names exactly one object. git's minimum abbreviation is four hex digits.
+fn resolves_as_short_oid(repo: &gix::Repository, arg: &str) -> bool {
+    if arg.len() < 4 || !arg.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    let Ok(prefix) = gix::hash::Prefix::from_hex(arg) else {
+        return false;
+    };
+    // No candidate set: git only needs "does this name exactly one object", and
+    // the early-abort form answers that — `Ok(Some(Err(())))` is the ambiguous
+    // case, which `get_short_oid` also treats as a failure to resolve.
+    matches!(repo.objects.lookup_prefix(prefix, None), Ok(Some(Ok(_))))
 }
 
 /// `die_no_single_rev` in stock git: silent exit 1 under `--quiet`, else fatal.

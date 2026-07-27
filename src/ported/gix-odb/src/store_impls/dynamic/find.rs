@@ -302,6 +302,29 @@ where
     pub(crate) fn clear_cache(&self) {
         self.packed_object_count.borrow_mut().take();
     }
+
+    /// If `id` is not in this store and a promisor hook is installed, ask it for the object and make whatever
+    /// it wrote visible to this handle.
+    ///
+    /// This is the *partial clone* read path: the clone left objects behind on purpose and the first read of
+    /// one of them has to go back to the remote. `git` does the same in `oid_object_info_extended()`, which
+    /// calls `promisor_remote_get_direct()` on a miss and retries the lookup once.
+    ///
+    /// Must be called with no borrow held on `snapshot` or `inflate`, as the hook runs arbitrary code.
+    /// Doing nothing is always a valid outcome; the caller's lookup then simply reports the object missing.
+    fn fetch_from_promisor(&self, id: &gix_hash::oid) {
+        if !self.store.has_promisor() || gix_pack::Find::contains(self, id) {
+            return;
+        }
+        if !self.store.fetch_from_promisor(&[id.to_owned()]) {
+            return;
+        }
+        // The store has folded the new pack into its slot map already. Adopt that state unconditionally
+        // rather than going through `refresh`, which a caller may have turned off precisely because it
+        // expected misses.
+        *self.snapshot.borrow_mut() = self.store.collect_snapshot();
+        self.clear_cache();
+    }
 }
 
 impl<S> gix_pack::Find for super::Handle<S>
@@ -344,6 +367,7 @@ where
         buffer: &'a mut Vec<u8>,
         pack_cache: &mut dyn DecodeEntry,
     ) -> Result<Option<(gix_object::Data<'a>, Option<gix_pack::data::entry::Location>)>, gix_object::find::Error> {
+        self.fetch_from_promisor(id);
         let mut snapshot = self.snapshot.borrow_mut();
         let mut inflate = self.inflate.borrow_mut();
         self.try_find_cached_inner(id, buffer, &mut inflate, pack_cache, &mut snapshot, None)
@@ -505,6 +529,7 @@ where
     S: Deref<Target = super::Store> + Clone,
 {
     fn try_header(&self, id: &gix_hash::oid) -> Result<Option<gix_object::Header>, gix_object::find::Error> {
+        self.fetch_from_promisor(id);
         let mut snapshot = self.snapshot.borrow_mut();
         let mut inflate = self.inflate.borrow_mut();
         self.try_header_inner(id, &mut inflate, &mut snapshot, None)

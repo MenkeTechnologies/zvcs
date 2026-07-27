@@ -127,6 +127,7 @@ where
                         .boolean_filter("clone.rejectShallow", &mut repo.filter_config_section()),
                 )?
                 .unwrap_or(false),
+            filter: self.filter.as_ref().map(gix_protocol::fetch::filter::Filter::as_str),
         };
         let context = gix_protocol::fetch::Context {
             handshake: &mut handshake,
@@ -166,6 +167,8 @@ where
             tags: con.remote.fetch_tags,
             negotiator,
             open_options: repo.options.clone(),
+            restrictions: std::mem::take(&mut self.negotiation),
+            refetch: self.refetch,
         };
 
         let write_pack_options = gix_pack::bundle::write::Options {
@@ -229,7 +232,17 @@ where
             con.remote.fetch_tags,
             self.dry_run,
             self.write_packed_refs,
+            self.atomic,
         )?;
+
+        // git's `fetch-pack.c` calls `write_promisor_file()` whenever a filter was in play, marking the
+        // pack as one that deliberately lacks objects. Everything that later walks for missing objects
+        // (`fsck`, `gc`, `rev-list --missing`) keys off the presence of that file.
+        if let Some((bundle, _filter)) = write_pack_bundle.as_ref().zip(self.filter.as_ref()) {
+            if let Some(index_path) = bundle.index_path.as_deref() {
+                write_promisor_file(index_path, &self.ref_map)?;
+            }
+        }
 
         if let Some(bundle) = write_pack_bundle.as_mut() {
             if !update_refs.edits.is_empty() || bundle.index.num_objects == 0 {
@@ -259,6 +272,29 @@ where
     }
 }
 
+/// Write `<pack>.promisor` next to the pack index at `index_path`, listing the refs this fetch asked for
+/// as `<oid> <ref>` lines - the format `write_promisor_file()` produces in git's `fetch-pack.c`.
+///
+/// A lazy fetch by object id asks for no refs and so leaves the file empty, exactly as git does.
+///
+/// ### Deviation
+///
+/// The lines come out in ref-map order rather than in the order git's `sought` array happens to hold
+/// them. Nothing reads the contents - `is_promisor_object()` only tests that the file exists - so this
+/// only shows up when comparing the files byte for byte.
+fn write_promisor_file(index_path: &std::path::Path, ref_map: &gix_protocol::fetch::RefMap) -> Result<(), Error> {
+    use crate::bstr::ByteSlice;
+
+    let path = index_path.with_extension("promisor");
+    let mut body = String::new();
+    for mapping in &ref_map.mappings {
+        if let Some((name, id)) = mapping.remote.as_name().zip(mapping.remote.as_id()) {
+            body.push_str(&format!("{id} {}\n", name.to_str_lossy()));
+        }
+    }
+    std::fs::write(&path, body).map_err(|err| Error::WritePromisorFile { path, source: err })
+}
+
 struct Negotiate<'a, 'b, 'c> {
     objects: &'a crate::OdbHandle,
     refs: &'a gix_ref::file::Store,
@@ -269,10 +305,21 @@ struct Negotiate<'a, 'b, 'c> {
     tags: gix_protocol::fetch::Tags,
     negotiator: Box<dyn gix_negotiate::Negotiator>,
     open_options: crate::open::Options,
+    restrictions: negotiate::Restrictions,
+    refetch: bool,
 }
 
 impl gix_protocol::fetch::Negotiate for Negotiate<'_, '_, '_> {
     fn mark_complete_and_common_ref(&mut self) -> Result<negotiate::Action, negotiate::Error> {
+        if self.refetch {
+            // git's `--refetch` skips negotiation outright, so nothing is known to be present on our
+            // side and every mapping turns into a `want`. Claiming no target is known also keeps the
+            // "nothing changed" short-circuits from firing, which is the point: a refetch must reach
+            // the remote even when our tracking refs are already up to date.
+            return Ok(negotiate::Action::MustNegotiate {
+                remote_ref_target_known: vec![false; self.ref_map.mappings.len()],
+            });
+        }
         negotiate::mark_complete_and_common_ref(
             &self.objects,
             self.refs,
@@ -295,6 +342,7 @@ impl gix_protocol::fetch::Negotiate for Negotiate<'_, '_, '_> {
             self.ref_map,
             self.shallow,
             negotiate::make_refmapping_ignore_predicate(self.tags, self.ref_map),
+            &self.restrictions,
         )
     }
 
@@ -315,12 +363,26 @@ impl gix_protocol::fetch::Negotiate for Negotiate<'_, '_, '_> {
         arguments: &mut Arguments,
         previous_response: Option<&gix_protocol::fetch::Response>,
     ) -> Result<(negotiate::Round, bool), negotiate::Error> {
+        if self.refetch {
+            // Nothing to offer and nothing left to ask about: the single request carries the wants
+            // and `done`, which is exactly what stock git sends under `--refetch`.
+            return Ok((
+                negotiate::Round {
+                    haves_sent: 0,
+                    in_vain: 0,
+                    haves_to_send: state.haves_to_send,
+                    previous_response_had_at_least_one_in_common: false,
+                },
+                true,
+            ));
+        }
         negotiate::one_round(
             self.negotiator.deref_mut(),
             &mut *self.graph,
             state,
             arguments,
             previous_response,
+            &self.restrictions.always_have,
         )
     }
 }

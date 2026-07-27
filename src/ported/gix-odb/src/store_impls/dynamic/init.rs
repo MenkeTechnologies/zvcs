@@ -149,6 +149,7 @@ impl Store {
             num_handles_stable: Default::default(),
             num_handles_unstable: Default::default(),
             num_disk_state_consolidation: Default::default(),
+            promisor: Default::default(),
         })
     }
 }

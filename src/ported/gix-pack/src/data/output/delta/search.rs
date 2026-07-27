@@ -19,10 +19,10 @@
 //!   re-derive a delta it could copy verbatim. Nothing here copies pack entries,
 //!   so every pair is searched afresh. The output is a valid pack either way;
 //!   the cost is time, not correctness.
-//! * **No preferred bases and no delta islands.** Both exist to steer the search
-//!   using knowledge from outside the object set (what a fetch peer already has,
-//!   and which refs an object is reachable from). Neither is modelled here, so
-//!   `in_same_island()` is always true and no entry is a preferred base.
+//! * **No preferred bases.** They exist to steer the search using knowledge
+//!   from outside the object set — what a fetch peer already has — which nothing
+//!   here models, so no entry is a preferred base. Delta *islands* are modelled;
+//!   see [`Islands`].
 //! * **`max_depth` is always `depth`.** git lowers it via `check_delta_limit()`
 //!   when the object already has delta *children* from a reused pack delta. With
 //!   no reuse, the child network is empty during the search, so the lowering
@@ -129,6 +129,74 @@ pub struct Delta {
     pub data: Option<Vec<u8>>,
 }
 
+/// Which islands each object belongs to; git's `island_marks` in
+/// `delta-islands.c`.
+///
+/// An island is a set of refs — one fork, one namespace, one mirror — that a
+/// pack should be servable from without dragging in objects only reachable from
+/// somewhere else. An object's mark is the set of islands that reach it, and a
+/// delta may only be built against a base at least as widely reachable as its
+/// target; otherwise serving the target would require sending a base the peer
+/// has no reason to have.
+///
+/// An empty table means islands are switched off, which is git's `!island_marks`
+/// and makes every pair eligible again.
+#[derive(Debug, Clone, Default)]
+pub struct Islands {
+    /// Indexed like the `objects` slice given to [`find_deltas()`]. `None` is
+    /// git's "no entry in the hash": an object no island reaches.
+    pub marks: Vec<Option<std::sync::Arc<[u32]>>>,
+}
+
+impl Islands {
+    /// Whether `self` is a subset of `super_`, git's `island_bitmap_is_subset()`.
+    fn is_subset(one: &[u32], other: &[u32]) -> bool {
+        one.iter()
+            .zip(other)
+            .all(|(one, other)| one & other == *one)
+    }
+
+    fn marks_of(&self, at: usize) -> Option<&std::sync::Arc<[u32]>> {
+        self.marks.get(at).and_then(Option::as_ref)
+    }
+
+    /// git's `in_same_island()`: may `trg` be deltified against `src`?
+    ///
+    /// An unmarked target may delta against anything, since nothing serves it
+    /// on its own. An unmarked *base* is refused outright, since a marked
+    /// target would then depend on an object no island guarantees is present.
+    fn in_same_island(&self, trg: usize, src: usize) -> bool {
+        if self.marks.is_empty() {
+            return true;
+        }
+        let Some(trg) = self.marks_of(trg) else { return true };
+        let Some(src) = self.marks_of(src) else { return false };
+        Islands::is_subset(trg, src)
+    }
+
+    /// git's `island_delta_cmp()`: order the more widely reachable object first,
+    /// so that it is already in the window when the narrower one arrives and can
+    /// serve as its base.
+    fn delta_cmp(&self, a: usize, b: usize) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        if self.marks.is_empty() {
+            return Ordering::Equal;
+        }
+        let (a, b) = (self.marks_of(a), self.marks_of(b));
+        if let Some(a_marks) = a {
+            if !b.is_some_and(|b| Islands::is_subset(a_marks, b)) {
+                return Ordering::Less;
+            }
+        }
+        if let Some(b_marks) = b {
+            if !a.is_some_and(|a| Islands::is_subset(b_marks, a)) {
+                return Ordering::Greater;
+            }
+        }
+        Ordering::Equal
+    }
+}
+
 /// git's `pack_name_hash()`: a sortable number built from the last sixteen
 /// non-whitespace characters of a path, so that files with the same extension
 /// and name sort together regardless of the directory they live in.
@@ -163,6 +231,7 @@ fn type_rank(kind: gix_object::Kind) -> u8 {
 /// rather than fatal.
 pub fn find_deltas<S, New, Read>(
     objects: &[Object],
+    islands: &Islands,
     options: &Options,
     mut new_state: New,
     read: Read,
@@ -185,7 +254,7 @@ where
     if list.len() < 2 {
         return out;
     }
-    list.sort_by(|&a, &b| type_size_sort(&objects[a], a, &objects[b], b));
+    list.sort_by(|&a, &b| type_size_sort(&objects[a], a, &objects[b], b, islands));
 
     // `prepare_pack()` passes `window + 1`, so a window of N really means N
     // candidate bases plus the slot holding the object being deltified.
@@ -207,6 +276,7 @@ where
             (Some(segment), Some(state)) => vec![find_deltas_in_segment(
                 objects,
                 segment,
+                islands,
                 options,
                 window,
                 &state,
@@ -224,7 +294,7 @@ where
                     let read = &read;
                     let cache_size = &cache_size;
                     scope.spawn(move || {
-                        find_deltas_in_segment(objects, segment, options, window, &state, read, cache_size)
+                        find_deltas_in_segment(objects, segment, islands, options, window, &state, read, cache_size)
                     })
                 })
                 .collect();
@@ -246,11 +316,12 @@ where
 /// git's `type_size_sort()`: descending type, descending name hash, descending
 /// size, and finally ascending original position so that the newest object of a
 /// tie is tried first as a base.
-fn type_size_sort(a: &Object, a_at: usize, b: &Object, b_at: usize) -> std::cmp::Ordering {
+fn type_size_sort(a: &Object, a_at: usize, b: &Object, b_at: usize, islands: &Islands) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     type_rank(b.kind)
         .cmp(&type_rank(a.kind))
         .then_with(|| b.name_hash.cmp(&a.name_hash))
+        .then_with(|| islands.delta_cmp(a_at, b_at))
         .then_with(|| b.size.cmp(&a.size))
         .then_with(|| match a_at.cmp(&b_at) {
             Ordering::Equal => Ordering::Equal,
@@ -341,6 +412,7 @@ fn two_mut<T>(slice: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
 fn find_deltas_in_segment<S, Read>(
     objects: &[Object],
     list: &[usize],
+    islands: &Islands,
     options: &Options,
     window: usize,
     state: &S,
@@ -385,6 +457,7 @@ where
             }
             let outcome = try_delta(
                 objects,
+                islands,
                 &mut array,
                 idx,
                 other,
@@ -455,6 +528,7 @@ fn delta_cacheable(options: &Options, spent: u64, src_size: u64, trg_size: u64, 
 #[expect(clippy::too_many_arguments)]
 fn try_delta<S, Read>(
     objects: &[Object],
+    islands: &Islands,
     array: &mut [Unpacked],
     trg_slot: usize,
     src_slot: usize,
@@ -506,6 +580,12 @@ where
         return 0;
     }
     if trg_size < src_size / 32 {
+        return 0;
+    }
+
+    // A base outside the target's islands would make serving the target depend
+    // on an object the islands do not promise is there.
+    if !islands.in_same_island(trg_at, src_at) {
         return 0;
     }
 
@@ -612,6 +692,7 @@ mod tests {
     fn search(objects: &[Object], bodies: &[Vec<u8>], options: &Options) -> Vec<Option<super::Delta>> {
         find_deltas(
             objects,
+            &super::Islands::default(),
             options,
             || (),
             |(), oid| {
@@ -719,6 +800,84 @@ mod tests {
         let with: Vec<_> = cached.iter().map(|d| d.as_ref().map(|d| (d.base, d.size))).collect();
         let without: Vec<_> = uncached.iter().map(|d| d.as_ref().map(|d| (d.base, d.size))).collect();
         assert_eq!(with, without, "caching changes memory use, never the chosen deltas");
+    }
+
+    #[test]
+    fn islands_keep_a_delta_from_naming_a_narrower_base() {
+        use std::sync::Arc;
+        let (objects, bodies) = corpus();
+        let options = Options {
+            threads: 1,
+            ..Options::default()
+        };
+
+        // Two islands. The even-numbered objects are reachable from both, the
+        // odd ones only from the first, so an even object may never delta
+        // against an odd one — the odd one is not guaranteed to be present
+        // wherever the even one is served from.
+        let both: Arc<[u32]> = Arc::from(vec![0b11u32]);
+        let one: Arc<[u32]> = Arc::from(vec![0b01u32]);
+        let islands = super::Islands {
+            marks: (0..objects.len())
+                .map(|at| Some(if at % 2 == 0 { both.clone() } else { one.clone() }))
+                .collect(),
+        };
+
+        let unrestricted = search(&objects, &bodies, &options);
+        let restricted = find_deltas(&objects, &islands, &options, || (), |(), oid| {
+            let n = u32::from_be_bytes(oid.as_bytes()[..4].try_into().expect("4 bytes")) as usize;
+            bodies.get(n).cloned()
+        });
+
+        for (at, delta) in restricted.iter().enumerate() {
+            let Some(delta) = delta else { continue };
+            assert!(
+                at % 2 == 1 || delta.base % 2 == 0,
+                "object {at} is in both islands but was deltified against {}, which is in one",
+                delta.base
+            );
+        }
+        assert!(
+            unrestricted.iter().filter(|d| d.is_some()).count() > 0
+                && restricted.iter().filter(|d| d.is_some()).count() > 0,
+            "both runs still find deltas; islands narrow the choice, they do not forbid it"
+        );
+    }
+
+    #[test]
+    fn an_unmarked_object_is_never_a_base_but_can_be_a_target() {
+        use std::sync::Arc;
+        let (objects, bodies) = corpus();
+        let marked: Arc<[u32]> = Arc::from(vec![0b1u32]);
+        // Only the first half is on an island at all.
+        let islands = super::Islands {
+            marks: (0..objects.len())
+                .map(|at| (at < objects.len() / 2).then(|| marked.clone()))
+                .collect(),
+        };
+        let deltas = find_deltas(
+            &objects,
+            &islands,
+            &Options {
+                threads: 1,
+                ..Options::default()
+            },
+            || (),
+            |(), oid| {
+                let n = u32::from_be_bytes(oid.as_bytes()[..4].try_into().expect("4 bytes")) as usize;
+                bodies.get(n).cloned()
+            },
+        );
+        for (at, delta) in deltas.iter().enumerate() {
+            let Some(delta) = delta else { continue };
+            if at < objects.len() / 2 {
+                assert!(
+                    delta.base < objects.len() / 2,
+                    "a marked object at {at} may not rest on the unmarked object {}",
+                    delta.base
+                );
+            }
+        }
     }
 
     #[test]

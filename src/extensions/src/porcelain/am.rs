@@ -1465,8 +1465,13 @@ fn run_am_loop(
         resume = false;
     }
 
-    // `am_destroy`: nothing left to apply, so the session is torn down.
+    // `am_destroy`: nothing left to apply, so the session is torn down, and the
+    // automatic maintenance run the objects just written may have earned fires.
+    // git skips both under `--rebasing`, where the caller owns the housekeeping.
     std::fs::remove_dir_all(state_dir)?;
+    if !ld.rebasing {
+        super::maintenance::run_auto_maintenance(repo, ld.quiet)?;
+    }
     Ok(ExitCode::SUCCESS)
 }
 

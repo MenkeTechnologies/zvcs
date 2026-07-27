@@ -39,9 +39,9 @@
 //!   * untracked embedded git repositories are not auto-converted to submodules
 //!     (git's "adding embedded git repository" path); a *tracked* submodule's
 //!     gitlink IS updated to its current HEAD (see the gitlink pass below).
-//!   * `-i`/`--interactive` (the numbered main menu of `add-interactive.c`) and
-//!     `-e`/`--edit` (diff into an editor, then `apply --recount --cached`) are
-//!     rejected. `-p`/`--patch` IS served, by [`super::add_patch`].
+//!   * `-i`/`--interactive` runs the numbered main menu ([`super::add_interactive`])
+//!     and `-p`/`--patch` the hunk selector ([`super::add_patch`]). `-e`/`--edit`
+//!     (diff into an editor, then `apply --recount --cached`) is rejected.
 //!   * `-U/--unified`, `--inter-hunk-context`, `--[no-]auto-advance` only configure
 //!     the interactive/patch diff. Their values are validated exactly as git's
 //!     `OPT_INTEGER` (bad value ⇒ exit 129) and, without `-p`/`-i`, git's
@@ -243,9 +243,12 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             );
         }
         if !patch_interactive {
-            // `git add -i`'s numbered main menu (`add-interactive.c`) is a
-            // separate machine and is not ported; `-p` is.
-            bail!("interactive mode (-i/--interactive) is not ported");
+            // `git add -i`'s numbered main menu ([`super::add_interactive`]).
+            return Ok(ExitCode::from(super::add_interactive::run_status(
+                &repo,
+                patch_opts.to_interactive(false),
+                &pathspecs,
+            )?));
         }
         return super::add_patch::run(
             &repo,

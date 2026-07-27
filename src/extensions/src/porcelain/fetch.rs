@@ -45,6 +45,14 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 ///   * `-o`/`--server-option <opt>`   → protocol-v2 `server-option=<opt>` line (repeatable)
 ///   * `--refmap <refspec>`           → map the command-line refspecs' results with `<refspec>`
 ///     instead of the remote's configured ones (repeatable; `--refmap=''` stores nowhere)
+///   * `--negotiation-restrict <rev>` (alias `--negotiation-tip`) → seed the `have` walk with only
+///     these commits; the argument may be a rev or a glob on ref names (repeatable)
+///   * `--negotiation-include <rev>`  → send these commits as `have` whatever the algorithm picks
+///     (repeatable); `remote.<name>.negotiationInclude` supplies the default
+///   * `--negotiate-only`             → print the common commits and fetch nothing
+///   * `--atomic`                     → apply every ref update in one transaction, or none of them
+///   * `--refetch`                    → send no `have` at all and refetch as a fresh clone would
+///   * `--auto-maintenance`/`--auto-gc` (on by default) → `maintenance run --auto` on the way out
 ///
 /// Config-supplied defaults (overridden by the matching flag, git precedence
 /// CLI > config > built-in default):
@@ -58,6 +66,7 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 ///   * `fetch.output`             → `compact` abbreviates the `<from> -> <to>` columns
 ///   * `remote.<name>.uploadpack` → default for `--upload-pack`
 ///   * `remote.<name>.serverOption` → default set of `-o`/`--server-option` values
+///   * `remote.<name>.negotiationInclude` → default set of `--negotiation-include` tips
 ///
 /// Command-line refspecs go through git's two-stage match (`get_ref_map` in
 /// `builtin/fetch.c`): the refspecs on the command line select the refs, and
@@ -71,9 +80,7 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 /// header plus one aligned line per changed or pruned ref), or to stdout in the
 /// machine-readable layout under `--porcelain`. Options that require substrate
 /// gitoxide's high-level fetch does not expose are rejected rather than silently
-/// ignored: `--filter`, `--set-upstream`, `--atomic`, `--refetch`,
-/// `--update-shallow`, `--ipv4`/`--ipv6`, the `--negotiation-*` family and
-/// `--auto-maintenance`/`--auto-gc`.
+/// ignored: `--filter`, `--set-upstream`, `--update-shallow` and `--ipv4`/`--ipv6`.
 // The final `take_value!` expansion bumps the `i` cursor that no later arm reads;
 // the write is needed by every other expansion, so it can't be removed.
 #[allow(unused_assignments)]
@@ -288,6 +295,33 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 refmap.push(v);
             }
 
+            // git's `mark_tips()`: with any of these given, only the named commits seed the `have`
+            // walk. `--negotiation-tip` is the older spelling of `--negotiation-restrict` and lands
+            // in the same list.
+            "--negotiation-restrict" | "--negotiation-tip" => {
+                let v = take_value!("--negotiation-restrict");
+                opts.negotiation_restrict.get_or_insert_default().push(v);
+            }
+            // `--negotiation-include`: sent as `have` whatever the algorithm decides.
+            "--negotiation-include" => {
+                let v = take_value!("--negotiation-include");
+                opts.negotiation_include.get_or_insert_default().push(v);
+            }
+            "--negotiate-only" => opts.negotiate_only = true,
+
+            // All-or-nothing ref updates.
+            "--atomic" => opts.atomic = true,
+            "--no-atomic" => opts.atomic = false,
+
+            // Ask for everything, negotiating nothing.
+            "--refetch" => opts.refetch = true,
+            "--no-refetch" => opts.refetch = false,
+
+            // The `git maintenance run --auto` git runs on its way out. Two spellings of one flag,
+            // enabled by default.
+            "--auto-maintenance" | "--auto-gc" => opts.auto_maintenance = true,
+            "--no-auto-maintenance" | "--no-auto-gc" => opts.auto_maintenance = false,
+
             // Options requiring substrate the high-level fetch does not expose.
             "--filter" => {
                 let _ = take_value!("--filter");
@@ -451,6 +485,20 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 })
                 .collect::<Result<_, _>>()?,
         );
+    }
+
+    // git validates `--negotiate-only` before it connects: without tips it would negotiate from every
+    // local ref and print a set nobody asked for, and with submodule recursion there would be no fetch
+    // for the submodules to recurse into.
+    if opts.negotiate_only {
+        if opts.negotiation_restrict.is_none() {
+            eprintln!("fatal: --negotiate-only needs one or more --negotiation-restrict=*");
+            return Ok(ExitCode::from(128));
+        }
+        if recurse == Recurse::Yes {
+            eprintln!("fatal: options '--negotiate-only' and '--recurse-submodules' cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
     }
 
     // Turning the forced-update check off makes the summary silently misreport
@@ -638,6 +686,17 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         failure = true;
     }
 
+    // `--auto-maintenance`/`--auto-gc`, the last thing `cmd_fetch()` does. `run_auto_maintenance()`
+    // decides for itself whether anything is due, from `maintenance.auto`/`gc.auto`.
+    //
+    // Deviation: under `--refetch` git first pushes `maintenance.incremental-repack.auto=-1` into the
+    // child's config so the duplicate objects a refetch leaves behind are consolidated into one pack.
+    // That mechanism is `GIT_CONFIG_PARAMETERS`, which nothing in this build reads, so the hint is
+    // dropped and the child picks its tasks from the repository's own configuration.
+    if opts.auto_maintenance && !opts.dry_run {
+        super::maintenance::run_auto_maintenance(&repo, opts.quiet)?;
+    }
+
     if failure {
         return Ok(ExitCode::FAILURE);
     }
@@ -743,6 +802,20 @@ struct FetchOpts {
     /// The refspecs `--refmap` supplied, already parsed. `None` means no `--refmap` was given at all,
     /// which is what decides whether the configured refspecs act as the opportunistic ones.
     refmap: Option<Vec<gix::refspec::RefSpec>>,
+    /// `--negotiation-restrict`/`--negotiation-tip`, still unresolved. `None` means the flag was never
+    /// given, which is what tells the negotiator to start from every local ref instead.
+    negotiation_restrict: Option<Vec<String>>,
+    /// `--negotiation-include`, still unresolved. `None` defers to `remote.<name>.negotiationInclude`,
+    /// which is per-remote and therefore only known once a remote has been picked.
+    negotiation_include: Option<Vec<String>>,
+    /// `--negotiate-only`: print the common commits the remote acknowledged and fetch nothing.
+    negotiate_only: bool,
+    /// `--atomic`: apply the ref updates as one transaction, or none of them.
+    atomic: bool,
+    /// `--refetch`: ask for everything, sending no `have` at all.
+    refetch: bool,
+    /// `--auto-maintenance`/`--auto-gc`, on by default: run `maintenance run --auto` on the way out.
+    auto_maintenance: bool,
 }
 
 impl Default for FetchOpts {
@@ -770,6 +843,13 @@ impl Default for FetchOpts {
             upload_pack: None,
             server_options: Vec::new(),
             refmap: None,
+            negotiation_restrict: None,
+            negotiation_include: None,
+            negotiate_only: false,
+            atomic: false,
+            refetch: false,
+            // "This is enabled by default."
+            auto_maintenance: true,
         }
     }
 }
@@ -980,6 +1060,94 @@ pub(super) fn upload_pack_program(
 
 /// The protocol-v2 server options to transmit.
 ///
+/// Resolve one `--negotiation-restrict`/`--negotiation-tip`/`--negotiation-include` argument into the
+/// commits it names, appending them to `out`.
+///
+/// This is git's `get_negotiation_tips()`. An argument carrying glob specials is matched against ref
+/// names — with `refs/` prepended when it doesn't start there already, as `for_each_glob_ref_in()`
+/// does — and warns when it matches nothing. Anything else is resolved as a revision; a full object
+/// id that isn't in the database is fatal, while a name that simply doesn't resolve contributes no
+/// tip and no diagnostic.
+fn resolve_negotiation_tip(
+    repo: &gix::Repository,
+    flag: &str,
+    arg: &str,
+    out: &mut Vec<gix::ObjectId>,
+) -> Result<Option<Verdict>> {
+    if arg.contains(['*', '?', '[']) {
+        let pattern = if arg.starts_with("refs/") {
+            arg.to_string()
+        } else {
+            format!("refs/{arg}")
+        };
+        let before = out.len();
+        for r in repo.references()?.all()? {
+            let mut r = r.map_err(anyhow::Error::msg)?;
+            if gix::glob::wildmatch(
+                pattern.as_str().into(),
+                r.name().as_bstr(),
+                gix::glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL,
+            ) {
+                out.push(r.peel_to_id_in_place()?.detach());
+            }
+        }
+        if out.len() == before {
+            eprintln!("warning: ignoring {flag}={arg} because it does not match any refs");
+        }
+        return Ok(None);
+    }
+    match repo.rev_parse_single(arg) {
+        Ok(id) => out.push(id.detach()),
+        Err(_) => {
+            // A fully spelled object id is a promise that the object exists, so git says so and stops
+            // rather than quietly negotiating without it.
+            if arg.len() == repo.object_hash().len_in_hex() && arg.bytes().all(|b| b.is_ascii_hexdigit()) {
+                eprintln!("fatal: the object {arg} does not exist");
+                return Ok(Some(Verdict::Fatal));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve every negotiation tip and include for one remote, honouring
+/// `remote.<name>.negotiationInclude` when `--negotiation-include` wasn't given.
+fn negotiation_restrictions(
+    repo: &gix::Repository,
+    remote_name: Option<&str>,
+    opts: &FetchOpts,
+) -> Result<Result<gix::protocol::fetch::negotiate::Restrictions, Verdict>> {
+    let mut out = gix::protocol::fetch::negotiate::Restrictions::default();
+    if let Some(args) = &opts.negotiation_restrict {
+        let mut tips = Vec::new();
+        for arg in args {
+            if let Some(verdict) = resolve_negotiation_tip(repo, "--negotiation-restrict", arg, &mut tips)? {
+                return Ok(Err(verdict));
+            }
+        }
+        out.tips = Some(tips);
+    }
+    // "If this option is not specified on the command line, then any `remote.<name>.negotiationInclude`
+    // config values for the current remote are used instead."
+    let include: Vec<String> = match &opts.negotiation_include {
+        Some(args) => args.clone(),
+        None => remote_name
+            .map(|name| {
+                repo.config_snapshot()
+                    .strings(&format!("remote.{name}.negotiationInclude"))
+                    .map(|values| values.iter().map(ToString::to_string).collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default(),
+    };
+    for arg in &include {
+        if let Some(verdict) = resolve_negotiation_tip(repo, "--negotiation-include", arg, &mut out.always_have)? {
+            return Ok(Err(verdict));
+        }
+    }
+    Ok(Ok(out))
+}
+
 /// `--server-option` replaces `remote.<name>.serverOption` rather than adding to it, as documented: "These
 /// server options can be overridden by the `--server-option=` command line arguments."
 pub(super) fn server_options_for(
@@ -1183,6 +1351,27 @@ fn fetch_one(
     };
     let server_options = server_options_for(repo, remote_name.as_deref(), &opts.server_options);
 
+    let restrictions = match negotiation_restrictions(repo, remote_name.as_deref(), opts)? {
+        Ok(r) => r,
+        Err(verdict) => return Ok(verdict),
+    };
+
+    // `--negotiate-only` never lists refs and never asks for a pack: it runs the negotiation on its
+    // own and prints the commits the remote acknowledged as common, one per line.
+    if opts.negotiate_only {
+        let common = remote
+            .connect_with_options(gix::remote::Direction::Fetch, connect_options)?
+            .with_server_options(server_options)
+            .negotiate_only(&mut *progress, restrictions)?;
+        let mut out = String::new();
+        for id in common {
+            out.push_str(&id.to_hex().to_string());
+            out.push('\n');
+        }
+        print!("{out}");
+        return Ok(Verdict::Ok);
+    }
+
     let should_interrupt = AtomicBool::new(false);
     let prepared = match remote
         .connect_with_options(gix::remote::Direction::Fetch, connect_options)?
@@ -1210,6 +1399,9 @@ fn fetch_one(
     let outcome = prepared
         .with_dry_run(opts.dry_run)
         .with_shallow(opts.shallow.clone().unwrap_or_default())
+        .with_negotiation_restrictions(restrictions)
+        .with_refetch(opts.refetch)
+        .with_atomic(opts.atomic)
         .with_reflog_message(RefLogMessage::Prefixed {
             action: "fetch".into(),
         })
@@ -1469,9 +1661,14 @@ fn fetch_one(
         return Ok(Verdict::Fatal);
     }
 
+    // `--atomic` aborted the transaction: no ref moved, so nothing may be pruned and no FETCH_HEAD
+    // row may be recorded either. git leaves the file truncated and empty, and still prints the
+    // summary of what it would have done.
+    let atomic_abort = update_refs.rejected_atomically;
+
     // --- prune stale tracking refs ----------------------------------------
     let mut prune_lines: Vec<Line> = Vec::new();
-    if !prune_prefixes.is_empty() {
+    if !prune_prefixes.is_empty() && !atomic_abort {
         // Every local ref the remote still advertises is kept; the rest under a
         // pruned prefix are deleted (git's `prune_refs`).
         let kept: HashSet<BString> = ref_map
@@ -1531,7 +1728,7 @@ fn fetch_one(
         }
     }
 
-    fetch_head.write(&fetch_head_rows)?;
+    fetch_head.write(if atomic_abort { &[] } else { &fetch_head_rows })?;
 
     // --- print the summary ------------------------------------------------
     // Pruned refs are reported first, mirroring git's prune-before-fetch order.

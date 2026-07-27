@@ -163,6 +163,8 @@ usage: git worktree prune [-n] [-v] [--expire <expire>]
 const REPAIR_USAGE: &str = "\
 usage: git worktree repair [<path>...]
 
+    --[no-]relative-paths use relative paths for worktrees
+
 ";
 
 /// Print an optional `error:` line plus a usage block on stderr and exit 129,
@@ -1104,9 +1106,13 @@ fn prune_dups(
 // ---------------------------------------------------------------------------
 
 fn repair(args: &[String]) -> Result<ExitCode> {
-    // The spec's `repair` defines no options (`OPT_END()` only), so every
+    // `repair`'s only option is `OPT_BOOL(0, "relative-paths", …)`; every other
     // dash-prefixed token is an unknown option.
     let mut paths: Vec<&str> = Vec::new();
+    // `use_relative_paths` is a file-scope static seeded from
+    // `worktree.useRelativePaths` by `git_worktree_config()`, which the option
+    // then overrides.
+    let mut relative: Option<bool> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1115,6 +1121,8 @@ fn repair(args: &[String]) -> Result<ExitCode> {
                 print!("{REPAIR_USAGE}");
                 return Ok(ExitCode::from(129));
             }
+            "--relative-paths" => relative = Some(true),
+            "--no-relative-paths" => relative = Some(false),
             "--" => {
                 i += 1;
                 while i < args.len() {
@@ -1140,16 +1148,23 @@ fn repair(args: &[String]) -> Result<ExitCode> {
 
     let repo = gix::discover(".")?;
     let common = repo.common_dir().to_path_buf();
+    // `git_worktree_config()`: `worktree.useRelativePaths` is the default the
+    // `--relative-paths` option overrides.
+    let relative = relative.unwrap_or_else(|| {
+        repo.config_snapshot()
+            .boolean("worktree.useRelativePaths")
+            .unwrap_or(false)
+    });
 
     let mut rc: i32 = 0;
     // git: `p = ac > 0 ? av : {"."}`.
     let targets: Vec<&str> = if paths.is_empty() { vec!["."] } else { paths };
     for p in targets {
-        if let Err(code) = repair_worktree_at_path(&common, Path::new(p), &mut rc) {
+        if let Err(code) = repair_worktree_at_path(&common, Path::new(p), &mut rc, relative) {
             return Ok(code);
         }
     }
-    repair_worktrees(&repo, &common, &mut rc);
+    repair_worktrees(&repo, &common, &mut rc, relative);
 
     Ok(if rc != 0 {
         ExitCode::FAILURE
@@ -1178,22 +1193,109 @@ fn write_gitfile(path: &Path, prefix: &[u8], value: &Path) {
     let _ = std::fs::write(path, body);
 }
 
+/// Port of `write_worktree_linking_files()`: rewrite the pair of files that link
+/// a worktree to its administrative directory — `<wt>/.git` (`gitdir: <repo>`)
+/// and `<repo>/gitdir` (`<wt>/.git`) — either side absolute or relative to the
+/// other, per `worktree.useRelativePaths` / `--relative-paths`.
+///
+/// Relative linking needs the `relativeWorktrees` repository extension, because a
+/// git that does not understand it would resolve the relative gitdir against the
+/// wrong directory; git upgrades the format to 1 and sets the extension before
+/// writing, and so does this.
+fn write_worktree_linking_files(common: &Path, dotgit: &Path, gitdir: &Path, relative: bool) {
+    // `strbuf_strip_suffix` + `strbuf_realpath` on both sides: `path` is the
+    // worktree root, `repo` the administrative directory.
+    let path = strip_suffix(dotgit, "/.git");
+    let path = gix::path::realpath(&path).unwrap_or(path);
+    let repo = strip_suffix(gitdir, "/gitdir");
+    let repo = gix::path::realpath(&repo).unwrap_or(repo);
+
+    if relative {
+        enable_relative_worktrees(common);
+        write_gitfile(gitdir, b"", &relative_path(&path.join(".git"), &repo));
+        write_gitfile(dotgit, b"gitdir: ", &relative_path(&repo, &path));
+    } else {
+        write_gitfile(gitdir, b"", &path.join(".git"));
+        write_gitfile(dotgit, b"gitdir: ", &repo);
+    }
+}
+
+/// `upgrade_repository_format(1)` + `extensions.relativeWorktrees=true`, which
+/// git performs before it first writes a relative link. Both land in the
+/// *common* config, since the extension describes the repository, not a worktree.
+fn enable_relative_worktrees(common: &Path) {
+    use gix::config::{File as ConfigFile, Source};
+
+    let path = common.join("config");
+    let Ok(mut file) = ConfigFile::from_path_no_includes(path.clone(), Source::Local) else {
+        return;
+    };
+    if file.boolean("extensions.relativeWorktrees").ok().flatten() == Some(true) {
+        return;
+    }
+    if file
+        .set_raw_value_by("core", None, "repositoryformatversion", "1")
+        .is_err()
+        || file
+            .set_raw_value_by("extensions", None, "relativeWorktrees", "true")
+            .is_err()
+    {
+        return;
+    }
+    let tmp = path.with_extension("zvcs-tmp");
+    if std::fs::write(&tmp, file.to_bstring()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Remove a trailing `suffix` from a path's bytes (`strbuf_strip_suffix`).
+fn strip_suffix(p: &Path, suffix: &str) -> PathBuf {
+    let bytes = path_bytes(p);
+    let trimmed = match bytes.strip_suffix(suffix.as_bytes()) {
+        Some(rest) => rest,
+        None => &bytes,
+    };
+    gix::path::from_byte_slice(trimmed).to_path_buf()
+}
+
+/// Port of `relative_path()`: `target` expressed relative to the directory
+/// `base`, both already absolute. Components shared with `base` are dropped, each
+/// remaining `base` component becomes a `../`, and a `base` that is not a prefix
+/// of `target` still resolves because every unmatched component contributes one
+/// `../`. git returns `./` when the two are the same path.
+fn relative_path(target: &Path, base: &Path) -> PathBuf {
+    let t: Vec<_> = target.components().collect();
+    let b: Vec<_> = base.components().collect();
+    let shared = t.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let mut out = PathBuf::new();
+    for _ in shared..b.len() {
+        out.push("..");
+    }
+    for c in &t[shared..] {
+        out.push(c);
+    }
+    if out.as_os_str().is_empty() {
+        return PathBuf::from("./");
+    }
+    out
+}
+
 /// Port of `repair_worktrees()`: fix each linked worktree's `.git` gitfile
 /// (skipping the main worktree, git's `worktrees + 1`).
-fn repair_worktrees(repo: &gix::Repository, common: &Path, rc: &mut i32) {
+fn repair_worktrees(repo: &gix::Repository, common: &Path, rc: &mut i32, relative: bool) {
     let Ok(worktrees) = collect(repo, u64::MAX) else {
         return;
     };
     for wt in worktrees.iter().filter(|w| w.is_linked()) {
         if let Some(id) = &wt.id {
-            repair_gitfile(common, id, &wt.path, rc);
+            repair_gitfile(common, id, &wt.path, rc, relative);
         }
     }
 }
 
 /// Port of `repair_gitfile()`: rewrite `<wt>/.git` when it is missing, broken,
 /// or points somewhere other than `realpath(worktrees/<id>)`.
-fn repair_gitfile(common: &Path, id: &str, wt_path: &Path, rc: &mut i32) {
+fn repair_gitfile(common: &Path, id: &str, wt_path: &Path, rc: &mut i32, relative: bool) {
     // A missing checkout can't be repaired.
     if !wt_path.exists() {
         return;
@@ -1215,6 +1317,16 @@ fn repair_gitfile(common: &Path, id: &str, wt_path: &Path, rc: &mut i32) {
         Ok(backlink) => {
             if path_bytes(&backlink) != path_bytes(&repo_dir) {
                 Some(".git file incorrect")
+            } else if relative {
+                // `use_relative_paths == is_absolute_path(dotgit_contents)`.
+                // `dotgit_contents` is what `read_gitfile_gently()` returned,
+                // which is the *resolved* directory and therefore always
+                // absolute — so this arm fires whenever relative linking was
+                // asked for, and never otherwise. That is why stock
+                // `worktree repair --relative-paths` re-reports the same
+                // worktree on every run, while a plain `worktree repair` leaves
+                // an already-relative link alone instead of making it absolute.
+                Some(".git file absolute/relative path mismatch")
             } else {
                 None
             }
@@ -1222,7 +1334,7 @@ fn repair_gitfile(common: &Path, id: &str, wt_path: &Path, rc: &mut i32) {
     };
     if let Some(msg) = repair {
         report(rc, false, wt_path, msg);
-        write_gitfile(&dotgit, b"gitdir: ", &repo_dir);
+        write_worktree_linking_files(common, &dotgit, &repo_dir.join("gitdir"), relative);
     }
 }
 
@@ -1230,7 +1342,12 @@ fn repair_gitfile(common: &Path, id: &str, wt_path: &Path, rc: &mut i32) {
 /// is unreadable or points somewhere other than `realpath(<path>/.git)`. `Err`
 /// carries an exit code for the (rare) fatal case that git reaches via
 /// `strbuf_add_real_path()` on a non-resolvable path argument.
-fn repair_worktree_at_path(common: &Path, path: &Path, rc: &mut i32) -> Result<(), ExitCode> {
+fn repair_worktree_at_path(
+    common: &Path,
+    path: &Path,
+    rc: &mut i32,
+    relative: bool,
+) -> Result<(), ExitCode> {
     // is_main_worktree_path(): git realpaths the argument with die-on-error and
     // compares the `/.git`-stripped result against the common dir.
     let target = match gix::path::realpath(path) {
@@ -1296,8 +1413,23 @@ fn repair_worktree_at_path(common: &Path, path: &Path, rc: &mut i32) -> Result<(
     let gitdir = backlink.join("gitdir");
     let repair: Option<&str> = match std::fs::read(&gitdir) {
         Err(_) => Some("gitdir unreadable"),
+        // Unlike the `.git`-file side, this compares the *raw* recorded bytes
+        // (`strbuf_read_file`), so `use_relative_paths == is_absolute_path(…)`
+        // really does detect a link written the other way round.
+        Ok(old) if relative == gix::path::from_byte_slice(rtrim(&old)).is_absolute() => {
+            Some("gitdir absolute/relative path mismatch")
+        }
         Ok(old) => {
-            if rtrim(&old) != path_bytes(&realdotgit).as_slice() {
+            // A relative recording is resolved against the administrative
+            // directory before it is compared.
+            let recorded = gix::path::from_byte_slice(rtrim(&old)).to_path_buf();
+            let resolved = if recorded.is_absolute() {
+                recorded
+            } else {
+                let joined = backlink.join(&recorded);
+                gix::path::realpath(&joined).unwrap_or(joined)
+            };
+            if path_bytes(&resolved) != path_bytes(&realdotgit) {
                 Some("gitdir incorrect")
             } else {
                 None
@@ -1306,7 +1438,7 @@ fn repair_worktree_at_path(common: &Path, path: &Path, rc: &mut i32) -> Result<(
     };
     if let Some(msg) = repair {
         report(rc, false, &gitdir, msg);
-        write_gitfile(&gitdir, b"", &realdotgit);
+        write_worktree_linking_files(common, &realdotgit, &gitdir, relative);
     }
     Ok(())
 }

@@ -301,6 +301,12 @@ pub fn annotate(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // `--incremental` wins over the porcelain bits, as `cmd_blame` jumps to
+    // cleanup right after `assign_blame()` when it is set.
+    if opts.incremental {
+        return render_incremental(&repo, &outcome, &rel_path, show_root);
+    }
+
     // `-p`/`--porcelain` and `--line-porcelain` render the machine format from
     // the same blame outcome (`builtin/blame.c:emit_porcelain`), so they branch
     // here rather than falling through to the compat renderer below.
@@ -462,15 +468,9 @@ impl Options {
     /// unmodified output under one of these flags would be a wrong answer
     /// dressed as a right one.
     fn unimplementable(&self) -> Option<&'static str> {
-        if self.incremental {
-            // `found_guilty_entry()` streams entries in the order the walk
-            // finds them guilty — a per-commit clustering that has nothing to do
-            // with the line-sorted `Outcome` gix-blame exposes. Reproducing that
-            // order needs the walk's internals, which are not surfaced.
-            return Some("--incremental output");
-        }
         // `-p`/`--porcelain` and `--line-porcelain` are rendered in
-        // `render_porcelain()` from the same `Outcome`, so they are *not*
+        // `render_porcelain()` from the same `Outcome`, and `--incremental` in
+        // `render_incremental()` from its walk-order entries, so they are *not*
         // refused here.
         if self.show_stats {
             // git prints its own walk counters (`num read blob` / `num get
@@ -1091,6 +1091,70 @@ fn render_porcelain(
             out.write_all(&content)?;
             out.write_all(b"\n")?;
         }
+    }
+
+    out.flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `--incremental`: git's `found_guilty_entry()` streams every entry the moment the walk
+/// stops passing it to a parent, which is before `blame_sort_final()` and
+/// `blame_coalesce()` run — so the entries come in walk order and uncoalesced, which is
+/// what [`gix::blame::Outcome::uncoalesced_entries`] holds.
+///
+/// Each entry is a `<40-hex> <src-line> <dst-line> <num-lines>` header, the commit detail
+/// block the first time that commit is seen (git's `emit_one_suspect_detail(suspect, 0)`),
+/// and the path information every time (`write_filename_info`, repeated because one
+/// commit can be responsible for several paths).
+///
+/// A blame that followed a rename is refused for the same reason
+/// [`render_porcelain`] refuses it: the `previous <oid> <path>` line would need
+/// `find_rename`'s parent-path resolution.
+fn render_incremental(
+    repo: &gix::Repository,
+    outcome: &gix::blame::Outcome,
+    rel_path: &str,
+    show_root: bool,
+) -> Result<ExitCode> {
+    if outcome
+        .uncoalesced_entries
+        .iter()
+        .any(|e| e.source_file_name.is_some())
+    {
+        bail!("annotate: incremental output across a rename is not yet ported");
+    }
+
+    let quoted_path = quote_path(rel_path.as_bytes());
+    let mut cache: HashMap<ObjectId, PorcelainInfo> = HashMap::new();
+    let mut shown: HashSet<ObjectId> = HashSet::new();
+
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
+    for entry in &outcome.uncoalesced_entries {
+        let id = entry.commit_id;
+        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(id) {
+            e.insert(build_porcelain_info(
+                repo,
+                id,
+                rel_path,
+                &quoted_path,
+                show_root,
+            )?);
+        }
+        let info = &cache[&id];
+        writeln!(
+            out,
+            "{} {} {} {}",
+            id.to_hex(),
+            entry.start_in_source_file + 1,
+            entry.start_in_blamed_file + 1,
+            entry.len.get()
+        )?;
+        if shown.insert(id) {
+            out.write_all(&info.details)?;
+        }
+        out.write_all(&info.filename_block)?;
     }
 
     out.flush()?;

@@ -95,6 +95,15 @@ struct Opts {
     exclude: Vec<String>,
     /// `-X/--exclude-from <file>` files to read additional exclude patterns from.
     exclude_from: Vec<String>,
+    /// git's `dir.exclude_per_dir`: the name of the per-directory ignore file.
+    ///
+    /// `None` until something sets it, exactly like git's initially-`NULL` field:
+    /// `--exclude-standard` sets `.gitignore` (as part of `setup_standard_excludes`),
+    /// `--exclude-per-directory=<file>` sets `<file>`, and `--no-exclude-per-directory`
+    /// clears it again. Whichever comes last on the command line wins. An empty name is
+    /// git's non-`NULL`-but-unreadable case: no file is consulted, yet it still satisfies
+    /// the `--ignored` guard.
+    exclude_per_directory: Option<String>,
     /// `None` = full object name, `Some(None)` = `core.abbrev`/auto, `Some(Some(n))` = `n` digits.
     abbrev: Option<Option<usize>>,
 }
@@ -243,11 +252,13 @@ fn pathspec_parse_fatal(err: &gix::pathspec::parse::Error, raw: &str) -> Option<
 /// given, so the directory walk hands over every untracked *and* ignored path and
 /// this exclude stack alone classifies them.
 ///
-/// `--exclude-per-directory=<file>` stays rejected: gix's per-directory ignore
-/// stack (`gix_worktree::stack::state::ignore::Ignore::push_directory`) reads a
-/// hard-coded `.gitignore` and never consults its own
-/// `exclude_file_name_for_directories`, and the directory walk behind `-o` does
-/// the same, so a caller-chosen file name cannot be honoured from here.
+/// `--exclude-per-directory=<file>` renames the per-directory ignore file, git's
+/// `dir.exclude_per_dir`, which it *replaces* rather than adds to: with it, no
+/// `.gitignore` is read anywhere. It reads no `info/exclude` or `core.excludesFile`
+/// on its own, so those arrive only with `--exclude-standard`, which itself sets the
+/// per-directory name back to `.gitignore` — whichever of the two comes last on the
+/// command line wins. `--no-exclude-per-directory` clears the name, leaving no
+/// per-directory file at all. A set name also satisfies the `--ignored` guard.
 ///
 /// `--eol` reproduces git's `write_eolinfo`: `i/<eolinfo> w/<eolinfo>
 /// attr/<eolattr>` columns derived from `convert.c`'s text statistics over the
@@ -324,7 +335,26 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             "--exclude-standard" => {
                 opts.exclude_standard = true;
                 opts.exc_given = true;
+                // `setup_standard_excludes` also (re)sets `dir->exclude_per_dir`, so a
+                // `--exclude-per-directory` that came earlier is overridden by it.
+                opts.exclude_per_directory = Some(".gitignore".to_string());
             }
+            // git's `dir.exclude_per_dir`, a plain string option: it replaces `.gitignore`
+            // rather than adding to it, and takes no part in `exc_given` — the `--ignored`
+            // guard accepts it simply by the field being non-`NULL`.
+            "--exclude-per-directory" => match args.get(i + 1) {
+                Some(v) => {
+                    opts.exclude_per_directory = Some(v.clone());
+                    i += 1;
+                }
+                None => {
+                    return Ok(usage_error("option `exclude-per-directory' requires a value"));
+                }
+            },
+            _ if s.starts_with("--exclude-per-directory=") => {
+                opts.exclude_per_directory = Some(s["--exclude-per-directory=".len()..].to_string());
+            }
+            "--no-exclude-per-directory" => opts.exclude_per_directory = None,
             "--full-name" => opts.full_name = true,
             "--abbrev" => opts.abbrev = Some(None),
             "--no-abbrev" => opts.abbrev = None,
@@ -502,7 +532,10 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: ls-files -i must be used with either -o or -c");
         return Ok(ExitCode::from(128));
     }
-    if opts.ignored && !opts.exc_given {
+    // A set `dir.exclude_per_dir` counts as an exclude source here, so
+    // `-i --exclude-per-directory=<file>` is accepted while a following
+    // `--no-exclude-per-directory` makes it fatal again.
+    if opts.ignored && !opts.exc_given && opts.exclude_per_directory.is_none() {
         eprintln!("fatal: ls-files --ignored needs some exclude pattern");
         return Ok(ExitCode::from(128));
     }
@@ -1016,16 +1049,20 @@ fn expand_sparse_index(repo: &gix::Repository, index: &mut gix::index::File) -> 
     Ok(true)
 }
 
-/// The exclude machinery git configures from `-x`, `-X` and `--exclude-standard`.
+/// The exclude machinery git configures from `-x`, `-X`, `--exclude-standard` and
+/// `--exclude-per-directory`.
 ///
 /// Three shapes, mirroring what git consults:
-///   * [`Excludes::Stack`] — the full worktree exclude stack (`info/exclude`,
-///     `core.excludesFile`, per-directory `.gitignore`) with the `-x`/`-X`
-///     patterns layered on top as the highest-priority override group. Built
-///     only when `--exclude-standard` is given.
+///   * [`Excludes::Stack`] — a worktree exclude stack with the `-x`/`-X` patterns
+///     layered on top as the highest-priority override group. Built whenever an
+///     on-disk ignore file is in play, i.e. for `--exclude-standard` (which adds the
+///     `info/exclude` and `core.excludesFile` globals and reads `.gitignore` per
+///     directory) and for `--exclude-per-directory=<file>` (which reads `<file>` per
+///     directory and *no* globals). Given both, the globals come from the former and
+///     the per-directory name from whichever was parsed last.
 ///   * [`Excludes::Overrides`] — just the `-x`/`-X` patterns, matched directly,
 ///     with no on-disk ignore files consulted at all (git's behaviour without
-///     `--exclude-standard`).
+///     `--exclude-standard` and without a per-directory file).
 ///   * [`Excludes::None`] — nothing configured; nothing is ever excluded.
 #[allow(clippy::large_enum_variant)] // boxing would churn every construct/match site
 enum Excludes<'repo> {
@@ -1042,7 +1079,12 @@ enum Excludes<'repo> {
 impl<'repo> Excludes<'repo> {
     fn build(repo: &'repo gix::Repository, index: &gix::index::State, opts: &Opts) -> Result<Self> {
         let has_overrides = !opts.exclude.is_empty() || !opts.exclude_from.is_empty();
-        if !opts.exclude_standard && !has_overrides {
+        // An unset or empty `dir.exclude_per_dir` reads no per-directory file at all.
+        let per_directory = opts
+            .exclude_per_directory
+            .as_deref()
+            .filter(|name| !name.is_empty());
+        if !opts.exclude_standard && !has_overrides && per_directory.is_none() {
             return Ok(Excludes::None);
         }
 
@@ -1067,16 +1109,51 @@ impl<'repo> Excludes<'repo> {
             gix::glob::pattern::Case::Sensitive
         };
 
-        // Without `--exclude-standard` no on-disk ignore file is consulted at all,
-        // so only the command-line patterns can match.
+        let source = gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped;
+
+        // Without `--exclude-standard` no *global* ignore file is consulted, so unless a
+        // per-directory file was named there is nothing on disk left to read and only the
+        // command-line patterns can match.
         if !opts.exclude_standard {
-            return Ok(Excludes::Overrides { search, case });
+            let Some(name) = per_directory else {
+                return Ok(Excludes::Overrides { search, case });
+            };
+            // `--exclude-per-directory` on its own reads neither `info/exclude` nor
+            // `core.excludesFile`, so the stack is assembled with empty globals instead of
+            // going through `Repository::excludes()`, which would load both.
+            let state = gix::worktree::stack::State::IgnoreStack(
+                gix::worktree::stack::state::Ignore::new(
+                    search,
+                    Default::default(),
+                    Some(name.into()),
+                    source,
+                    parse,
+                ),
+            );
+            let id_mappings = state.id_mappings_from_index(index, index.path_backing(), case);
+            let stack = gix::worktree::Stack::new(
+                repo.workdir().unwrap_or_else(|| repo.git_dir()),
+                state,
+                case,
+                Vec::with_capacity(512),
+                id_mappings,
+            );
+            return Ok(Excludes::Stack {
+                stack: gix::AttributeStack::new(stack, repo),
+            });
         }
-        let stack = repo.excludes(
-            index,
-            Some(search),
-            gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
-        )?;
+
+        let mut stack = repo.excludes(index, Some(search), source)?;
+        // `--exclude-standard` assembled the stack around `.gitignore`; a later
+        // `--exclude-per-directory` renames the file it looks for, and a later
+        // `--no-exclude-per-directory` (an empty name) stops it looking for one.
+        if per_directory != Some(".gitignore") {
+            if let gix::worktree::stack::State::IgnoreStack(ignore) = stack.state_mut() {
+                ignore.set_exclude_file_name_for_directories(
+                    opts.exclude_per_directory.as_deref().unwrap_or("").into(),
+                );
+            }
+        }
         Ok(Excludes::Stack { stack })
     }
 

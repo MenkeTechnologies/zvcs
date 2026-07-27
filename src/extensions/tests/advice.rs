@@ -81,6 +81,58 @@ fn branch_ref_syntax_hint_is_gated() {
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
+/// `advise_if_enabled()` appends its `Disable this message with …` trailer only
+/// while the slot is *unconfigured*. Setting `advice.refSyntax=true` keeps the
+/// hint and drops the trailer — a distinction stock git makes and a hand-rolled
+/// `eprintln!` pair cannot, which is what this pins.
+#[test]
+fn ref_syntax_trailer_appears_only_while_the_slot_is_unconfigured() {
+    let (repo, home) = fixture("refsyntaxtrailer");
+    const TRAILER: &str = "Disable this message with \"git config set advice.refSyntax false\"";
+
+    let err = String::from_utf8_lossy(&run(&repo, &home, &["branch", "bad..name"]).stderr).into_owned();
+    assert!(err.contains("check-ref-format"), "hint should show by default:\n{err}");
+    assert!(err.contains(TRAILER), "unconfigured slot must carry the trailer:\n{err}");
+
+    let out = run(&repo, &home, &["-c", "advice.refSyntax=true", "branch", "bad..name"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("check-ref-format"), "explicit true keeps the hint:\n{err}");
+    assert!(!err.contains(TRAILER), "a configured slot must drop the trailer:\n{err}");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// `git switch <not-a-branch>`: `die_expecting_a_branch()` checks
+/// `advice_enabled(ADVICE_SUGGEST_DETACHING_HEAD)` itself and then calls plain
+/// `advise()`, so the hint is gated but never carries the disable trailer. The
+/// fatal line names the ref `repo_dwim_ref()` resolved, not an object id.
+#[test]
+fn suggest_detaching_head_hint_is_gated_and_has_no_trailer() {
+    let (repo, home) = fixture("suggestdetach");
+    write(&repo, "f", "one\n");
+    git(&repo, &["add", "f"]);
+    git(&repo, &["commit", "-qm", "one"]);
+
+    let out = run(&repo, &home, &["switch", "HEAD"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("fatal: a branch is expected, got 'refs/heads/main'"),
+        "HEAD resolves through to the branch it points at:\n{err}"
+    );
+    assert!(err.contains("try again with the --detach option"), "hint shows by default:\n{err}");
+    assert!(
+        !err.contains("Disable this message with"),
+        "plain advise() prints no trailer:\n{err}"
+    );
+
+    let out = run(&repo, &home, &["-c", "advice.suggestDetachingHead=false", "switch", "HEAD"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("fatal: a branch is expected"), "fatal line must remain:\n{err}");
+    assert!(!err.contains("--detach option"), "hint must be suppressed:\n{err}");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
 /// Write `name` with `body` inside `repo`.
 fn write(repo: &Path, name: &str, body: &str) {
     std::fs::write(repo.join(name), body).unwrap();

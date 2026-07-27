@@ -64,6 +64,80 @@ impl RefreshMode {
     }
 }
 
+/// A hook that obtains the objects named by `ids` from a *promisor remote* and places them in this store,
+/// returning `true` if it made progress and the lookup that triggered it should be retried.
+///
+/// This is how a *partial clone* stays usable: the clone deliberately left objects behind, and any read of
+/// one of them has to go back to the remote first. `git` implements the same hook in `promisor-remote.c`,
+/// where a missing object makes `oid_object_info_extended()` call `promisor_remote_get_direct()`.
+///
+/// The hook must not read objects through the store that installed it, as it is called while that store is
+/// resolving a lookup.
+pub type PromisorFetchFn = Box<dyn Fn(&[gix_hash::ObjectId]) -> bool + Send + Sync>;
+
+thread_local! {
+    /// Set while a [`PromisorFetchFn`] runs, so a store consulted *by the fetch itself* reports objects as
+    /// missing instead of recursing into another fetch. `git` gets this for free by running its promisor
+    /// fetch in a subprocess that has `fetch_if_missing` turned off.
+    static PROMISOR_FETCH_IN_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl Store {
+    /// Install `fetch` as the hook consulted when an object is not present locally, unless one is installed
+    /// already, in which case this does nothing.
+    ///
+    /// Every handle of this store, including ones cloned later, observes the hook.
+    pub fn set_promisor(&self, fetch: PromisorFetchFn) {
+        let _keep_the_first_hook = self.promisor.set(fetch);
+    }
+
+    /// Return `true` if a promisor hook is installed, meaning missing objects may still be obtainable.
+    pub fn has_promisor(&self) -> bool {
+        self.promisor.get().is_some()
+    }
+
+    /// Ask the promisor hook for `ids`, returning `true` if it claims to have placed them in this store.
+    ///
+    /// Returns `false` without calling out if no hook is installed or if we are already inside one.
+    ///
+    /// Handles pick the objects up on their next disk refresh; call this ahead of a bulk read to spare
+    /// it one round trip per object, which is what `git`'s `check_updates()` does before a checkout.
+    pub fn fetch_from_promisor(&self, ids: &[gix_hash::ObjectId]) -> bool {
+        let Some(fetch) = self.promisor.get() else {
+            return false;
+        };
+        if ids.is_empty() || PROMISOR_FETCH_IN_PROGRESS.get() {
+            return false;
+        }
+        PROMISOR_FETCH_IN_PROGRESS.set(true);
+        let _reset = ResetPromisorFlagOnDrop;
+        if !fetch(ids) {
+            return false;
+        }
+        // The hook wrote a pack behind the store's back. Fold it into the slot map here, once, so that
+        // every handle - including ones cloned afterwards, as the worktree checkout does per thread -
+        // starts from an index that already knows about it. Leaving this to each handle's own refresh
+        // makes them race, and a handle that loses re-fetches an object that is already on disk.
+        self.consolidate_with_disk_state(
+            false, /* needs init */
+            true,  /* load one new index */
+            self.loose_compression,
+        )
+        .ok();
+        true
+    }
+}
+
+/// Clears [`PROMISOR_FETCH_IN_PROGRESS`] even if the hook unwinds, so one failed fetch doesn't leave every
+/// later lookup in this thread convinced it is nested inside a fetch.
+struct ResetPromisorFlagOnDrop;
+
+impl Drop for ResetPromisorFlagOnDrop {
+    fn drop(&mut self) {
+        PROMISOR_FETCH_IN_PROGRESS.set(false);
+    }
+}
+
 ///
 pub mod find;
 

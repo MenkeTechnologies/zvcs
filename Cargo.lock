@@ -1300,6 +1300,7 @@ name = "gix-pack"
 version = "0.72.0"
 dependencies = [
  "clru",
+ "gix-bitmap",
  "gix-chunk",
  "gix-diff",
  "gix-error",
@@ -2986,6 +2987,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki",
@@ -4214,6 +4216,9 @@ dependencies = [
  "regex",
  "rkyv",
  "rusqlite",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "security-framework-sys",
  "serde_json",
  "unicode-width",

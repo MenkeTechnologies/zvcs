@@ -95,16 +95,27 @@
 //!   already-reachable ones are dropped, with `gpg.minTrustLevel` deciding
 //!   whether git applies its own `TRUST_MARGINAL` floor on top.
 //!
+//! * `-X`/`--strategy-option`: the values are collected raw and handed to
+//!   `merge_apply::StrategyOptions` (a port of merge-ort's `parse_merge_opt`)
+//!   at the point git's `try_merge_strategy()` would parse them — which is why
+//!   `Already up to date.`, a plain fast-forward, `-s ours` and the octopus
+//!   strategy all accept a value the `ort` path would reject. Honoured:
+//!   `ours`, `theirs`, `subtree[=<prefix>]` (a port of `match-trees.c`'s tree
+//!   shifting), `histogram`, `diff-algorithm=<myers|default|minimal|histogram>`,
+//!   `renormalize`, `no-renormalize`, `no-renames`, `find-renames[=<n>]` and
+//!   `rename-threshold=<n>`. An unrecognised value reproduces git's
+//!   `fatal: unknown strategy option: -X<value>`.
+//!
 //! What is refused or deferred rather than faked:
 //!
 //! * `-s recursive`/`resolve`/`subtree`: distinct conflict-resolution engines
 //!   that are not vendored, refused rather than aliased onto `ort`.
-//! * `-X`/`--strategy-option`: the strategy options (`ours`, `theirs`,
-//!   `ignore-space-change`, `diff-algorithm=`, `renormalize`, `find-renames=`)
-//!   have to reach the blob/tree merge itself, and the shared
-//!   `merge_apply::three_way_merge` takes no options — it builds
-//!   `Repository::tree_merge_options()` internally. Accepting `-X` here would
-//!   silently ignore it, so it stays rejected.
+//! * `-Xpatience`/`-Xdiff-algorithm=patience`: the vendored `imara-diff` has no
+//!   patience implementation, and the other algorithms give different merges.
+//! * `-Xignore-space-change`/`-Xignore-all-space`/`-Xignore-space-at-eol`/
+//!   `-Xignore-cr-at-eol`: git gets these from `xdl_recmatch()`'s `XDF_IGNORE_*`
+//!   record hashing; `gix-merge`'s text driver interns whole lines and has no
+//!   equivalent knob, so the flags are rejected instead of silently ignored.
 //! * `--rerere-autoupdate`: rerere's *recording* half is not ported (see
 //!   `rerere.rs`, whose record/forget paths `bail!` rather than guess a conflict
 //!   id without `ll_merge()`), so there is nothing to auto-stage.
@@ -226,6 +237,10 @@ struct Opts {
     quiet: bool,
     cleanup: Cleanup,
     strategy: Strategy,
+    /// `-X`/`--strategy-option` values, kept raw. git stores them in a strvec and
+    /// only runs `parse_merge_opt()` on them from inside `try_merge_strategy()`,
+    /// so a bogus value is diagnosed at merge time, not at parse time.
+    strategy_options: Vec<String>,
     /// `--into-name <name>`: use `<name>` instead of the real target branch when
     /// composing the merge message's ` into <name>` title (a port of git's
     /// `into_name`, which overrides `current_branch` in `fmt_merge_msg`).
@@ -266,6 +281,7 @@ impl Default for Opts {
             quiet: false,
             cleanup: Cleanup::Default,
             strategy: Strategy::Ort,
+            strategy_options: Vec::new(),
             into_name: None,
             log_len: -1,
             branch_desc: false,
@@ -516,6 +532,30 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
                     Ok(s) => opts.strategy = s,
                     Err(code) => return Ok(code),
                 }
+            }
+            // `-X`/`--strategy-option` is git's `OPT_STRVEC`, so every value is
+            // appended and applied in order. The value is only *interpreted* once
+            // the `ort` strategy actually runs (see `strategy_options` above).
+            "-X" | "--strategy-option" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => opts.strategy_options.push(v.clone()),
+                    None => {
+                        // parse-options words the short and long forms differently.
+                        if a == "-X" {
+                            eprintln!("error: switch `X' requires a value");
+                        } else {
+                            eprintln!("error: option `strategy-option' requires a value");
+                        }
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
+            _ if a.starts_with("--strategy-option=") => opts
+                .strategy_options
+                .push(a["--strategy-option=".len()..].to_string()),
+            _ if a.len() > 2 && a.starts_with("-X") && !a.starts_with("--") => {
+                opts.strategy_options.push(a[2..].to_string())
             }
             _ if a.len() > 1 && a.starts_with('-') => {
                 anyhow::bail!("unsupported flag {a}")
@@ -887,6 +927,23 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
+    // `parse_merge_opt()` runs inside `try_merge_strategy()`, which git reaches
+    // only when it really invokes `ort` — so `Already up to date.` and a plain
+    // fast-forward both accept even a bogus `-X` (verified against stock git),
+    // while `--no-ff` over a fast-forwardable history does not.
+    let runs_ort = diverged || opts.ff == Ff::Never;
+    let xopts = if runs_ort {
+        match crate::merge_apply::StrategyOptions::parse(&opts.strategy_options) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("fatal: {e}");
+                return Ok(ExitCode::from(128));
+            }
+        }
+    } else {
+        crate::merge_apply::StrategyOptions::default()
+    };
+
     // From here on we mutate a ref, the index and the worktree. Serialize the
     // whole read-modify-write through the repo coordinator (a no-op if no
     // daemon is running), matching the zsync/zbump write path.
@@ -912,7 +969,12 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // the target against their merge base (an empty tree for unrelated histories).
     // On a clean merge the finish step commits/squashes/records per the options;
     // on conflict we record MERGE_HEAD/MERGE_MSG and stop, exactly as git does.
-    if diverged {
+    //
+    // `--no-ff` over a fast-forwardable history joins this path when `-X` is in
+    // play: git runs the strategy there too, and an option like
+    // `-Xsubtree=<prefix>` reshapes the trees, so the target's tree is no longer
+    // the answer. Without `-X` the shortcut below is kept.
+    if diverged || (opts.ff == Ff::Never && !opts.strategy_options.is_empty()) {
         // `git`'s recursive base for the three-way; the empty tree stands in for an
         // unrelated history (`--allow-unrelated-histories`), which has no base.
         let base_tree = if bases.is_empty() {
@@ -926,7 +988,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             current: Some(BStr::new(b"HEAD")),
             other: Some(BStr::new(spec.as_bytes())),
         };
-        let applied = crate::merge_apply::three_way_merge_verbose(
+        let applied = crate::merge_apply::three_way_merge_with_options(
             &repo,
             base_tree,
             head_tree,
@@ -935,6 +997,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             labels,
             &should_interrupt,
             merge_verbosity(&repo) != 0,
+            &xopts,
         )?;
         let mut index = applied.index;
         index.write(Default::default())?;

@@ -53,6 +53,7 @@ pub async fn fetch<P, T, E>(
         shallow,
         tags,
         reject_shallow_remote,
+        filter,
     }: Options<'_>,
 ) -> Result<Option<Outcome>, Error>
 where
@@ -89,6 +90,14 @@ where
                 });
         }
         arguments.use_include_tag();
+    }
+    // `send_fetch_request()` in git's `fetch-pack.c` writes the `filter` line right after the capability
+    // lines and before the wants, and only if the server advertised `filter`. A server that did not is not
+    // an error there: `transport.c` warns "filtering not recognized by server, ignoring" and fetches
+    // everything, which is what dropping the argument here amounts to. Use
+    // [`filter::is_supported()`](crate::fetch::filter::is_supported()) before the fetch to warn in kind.
+    if let Some(spec) = filter.filter(|_| arguments.can_use_filter()) {
+        arguments.filter(spec);
     }
     let (shallow_commits, mut shallow_lock) = add_shallow_args(&mut arguments, shallow, &shallow_file)?;
 

@@ -14,7 +14,7 @@ impl crate::Repository {
         #[cfg(feature = "attributes")] modules: crate::submodule::ModulesFileStorage,
     ) -> Self {
         setup_objects(&mut objects, &config);
-        crate::Repository {
+        let repo = crate::Repository {
             bufs: Some(RefCell::new(Vec::with_capacity(4))),
             work_tree,
             common_dir,
@@ -27,7 +27,12 @@ impl crate::Repository {
             shallow_commits,
             #[cfg(feature = "attributes")]
             modules,
-        }
+        };
+        // A partial clone is only usable if reading an object it skipped goes back to the remote, so the
+        // object database learns how to do that as soon as the repository that configures it exists.
+        #[cfg(feature = "blocking-network-client")]
+        crate::promisor::install_hook(&repo);
+        repo
     }
 
     /// Convert this instance into a [`ThreadSafeRepository`][crate::ThreadSafeRepository] by dropping all thread-local data.

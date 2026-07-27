@@ -171,6 +171,10 @@ where
             reflog_message: None,
             write_packed_refs: WritePackedRefs::Never,
             shallow: Default::default(),
+            negotiation: Default::default(),
+            refetch: false,
+            atomic: false,
+            filter: None,
         })
     }
 }
@@ -221,6 +225,10 @@ where
     reflog_message: Option<RefLogMessage>,
     write_packed_refs: WritePackedRefs,
     shallow: remote::fetch::Shallow,
+    negotiation: gix_protocol::fetch::negotiate::Restrictions,
+    refetch: bool,
+    atomic: bool,
+    filter: Option<gix_protocol::fetch::filter::Filter>,
 }
 
 /// Builder
@@ -259,6 +267,46 @@ where
         self.inner.shallow = shallow;
         self
     }
+
+    /// Restrict which local commits seed the negotiation, and name commits that are always claimed
+    /// as `have`.
+    ///
+    /// This is git's `--negotiation-restrict`/`--negotiation-tip` and `--negotiation-include`.
+    pub fn with_negotiation_restrictions(
+        mut self,
+        restrictions: gix_protocol::fetch::negotiate::Restrictions,
+    ) -> Self {
+        self.inner.negotiation = restrictions;
+        self
+    }
+
+    /// If enabled, don't negotiate at all and ask for every wanted object as a fresh clone would.
+    ///
+    /// This is git's `--refetch`: no `have` is sent, so the remote has nothing to exclude from the
+    /// pack it builds.
+    pub fn with_refetch(mut self, enabled: bool) -> Self {
+        self.inner.refetch = enabled;
+        self
+    }
+
+    /// If enabled, apply the ref updates in a single all-or-nothing transaction.
+    ///
+    /// This is git's `--atomic`: should any mapping be rejected, no ref is updated at all, and
+    /// [`refs::update::Outcome::rejected_atomically`] says so.
+    pub fn with_atomic(mut self, enabled: bool) -> Self {
+        self.inner.atomic = enabled;
+        self
+    }
+
+    /// Ask the remote to withhold the objects `filter` selects against, making this a *partial* fetch.
+    ///
+    /// This is git's `--filter`. The pack that arrives is marked `.promisor`, recording that it is
+    /// missing objects on purpose, and reading one of those objects later requires the repository to
+    /// have a promisor remote configured - see [`crate::promisor`].
+    pub fn with_filter(mut self, filter: Option<gix_protocol::fetch::filter::Filter>) -> Self {
+        self.inner.filter = filter;
+        self
+    }
 }
 
 /// Builder
@@ -282,6 +330,11 @@ where
 
     pub(crate) fn with_shallow(mut self, shallow: remote::fetch::Shallow) -> Self {
         self.shallow = shallow;
+        self
+    }
+
+    pub(crate) fn with_filter(mut self, filter: Option<gix_protocol::fetch::filter::Filter>) -> Self {
+        self.filter = filter;
         self
     }
 }

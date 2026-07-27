@@ -1229,6 +1229,9 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                     println!("Current branch {branch_name} is up to date.");
                 }
             }
+            // git reaches `finish_rebase()` here too, so the automatic
+            // maintenance run fires on the nothing-to-do path as well.
+            super::maintenance::run_auto_maintenance(&repo, flags & NO_QUIET == 0)?;
             return Ok(ExitCode::SUCCESS);
         } else if flags & NO_QUIET != 0 {
             if branch_name == "HEAD" {
@@ -1562,6 +1565,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     if let Some(oid) = autostash_oid {
         crate::porcelain::stash::apply_autostash(&repo, oid, flags & NO_QUIET == 0)?;
     }
+    super::maintenance::run_auto_maintenance(&repo, flags & NO_QUIET == 0)?;
     // The apply backend's fast-forward finishes silently; only the sequencer
     // announces itself.
     if !apply_backend && flags & NO_QUIET != 0 {
@@ -1979,6 +1983,7 @@ fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
     if let Some(oid) = autostash {
         crate::porcelain::stash::apply_autostash(repo, oid, false)?;
     }
+    super::maintenance::run_auto_maintenance(repo, false)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2331,6 +2336,7 @@ fn replay_picks(
     if let Some(oid) = autostash {
         crate::porcelain::stash::apply_autostash(repo, oid, quiet)?;
     }
+    super::maintenance::run_auto_maintenance(repo, quiet)?;
     if !quiet {
         eprintln!("Successfully rebased and updated {label}.");
     }

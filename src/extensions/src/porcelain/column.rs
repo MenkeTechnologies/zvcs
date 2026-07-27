@@ -396,21 +396,29 @@ fn parse_with_unit(value: &str) -> Option<i64> {
 /// The error string is git's own three-line report, minus the config file and
 /// line number, which gitoxide's value lookup does not surface here.
 fn apply_config(colopts: &mut u32, command: Option<&str>) -> Result<(), String> {
-    let mut keys: Vec<String> = vec!["ui".to_string()];
+    let mut keys: Vec<String> = vec![COLUMN_UI.to_string()];
     if let Some(c) = command {
         // `column.ui` is matched first and returns early, so a `--command=ui`
         // never reaches the second branch.
         if c != "ui" {
-            keys.push(c.to_string());
+            keys.push(format!("column.{c}"));
         }
     }
+    apply_config_keys(colopts, &keys)
+}
 
+/// `column.ui`, always consulted first (`git_column_config`'s first branch).
+const COLUMN_UI: &str = "column.ui";
+
+/// The shared tail of [`apply_config`]: read each full `column.<name>` variable
+/// in `keys` and fold its token list into `colopts`.
+fn apply_config_keys(colopts: &mut u32, keys: &[String]) -> Result<(), String> {
     // git reads config whether or not there is a repository; fall back to the
     // global/system files when discovery fails.
     let values = match gix::discover(".") {
-        Ok(repo) => read_values(repo.config_snapshot().plumbing(), &keys),
+        Ok(repo) => read_values(repo.config_snapshot().plumbing(), keys),
         Err(_) => match gix::config::File::from_globals() {
-            Ok(file) => read_values(&file, &keys),
+            Ok(file) => read_values(&file, keys),
             Err(_) => Vec::new(),
         },
     };
@@ -418,19 +426,19 @@ fn apply_config(colopts: &mut u32, command: Option<&str>) -> Result<(), String> 
     for (key, value) in values {
         if let Err(msg) = parse_config(colopts, &value) {
             return Err(format!(
-                "error: {msg}\nerror: invalid column.{key} mode {value}\n\
-                 fatal: bad config variable 'column.{key}'\n"
+                "error: {msg}\nerror: invalid {key} mode {value}\n\
+                 fatal: bad config variable '{key}'\n"
             ));
         }
     }
     Ok(())
 }
 
-/// Collect every `column.<key>` value, in config order, as `(key, value)`.
+/// Collect every value of each full `column.<name>` key, in config order.
 fn read_values(file: &gix::config::File, keys: &[String]) -> Vec<(String, String)> {
     let mut values = Vec::new();
     for key in keys {
-        if let Some(found) = file.strings(format!("column.{key}").as_str()) {
+        if let Some(found) = file.strings(key.as_str()) {
             for v in found {
                 values.push((key.clone(), v.to_string()));
             }
@@ -805,6 +813,13 @@ pub(crate) fn config_colopts(colopts: &mut u32, command: &str) -> Result<(), Str
     apply_config(colopts, Some(command))
 }
 
+/// [`config_colopts`] keyed by the full `column.<command>` variable instead of the
+/// bare command name, so the configuration this reads is spelled at the call site
+/// rather than assembled here. `key` is looked up verbatim, after `column.ui`.
+pub(crate) fn config_colopts_key(colopts: &mut u32, key: &str) -> Result<(), String> {
+    apply_config_keys(colopts, &[COLUMN_UI.to_string(), key.to_string()])
+}
+
 /// Port of `parseopt_column_callback`: apply one `--column[=<opts>]` / `--no-column`
 /// occurrence. `unset` is the `--no-column` form (git's "never"). A bad `<opts>`
 /// token yields git's `unsupported option '<tok>'` text.
@@ -846,6 +861,20 @@ pub(crate) fn explicitly_enabled(colopts: u32) -> bool {
 /// The value git resets `colopts` to when a conflicting option silently disables
 /// columns (`colopts = 0`).
 pub(crate) const DISABLED: u32 = COL_DISABLED;
+
+/// Port of `builtin/clean.c`'s
+/// `colopts = (colopts & ~COL_ENABLE_MASK) | COL_ENABLED`, whose comment reads
+/// "always enable column display, we only consult column.* about layout strategy
+/// and stuff". `column.clean=never` therefore does *not* turn the table off —
+/// but `column.clean=plain` still switches to one item per line, and
+/// `column.clean=column` still fills down columns instead of across rows.
+pub(crate) fn force_enabled(colopts: u32) -> u32 {
+    (colopts & !COL_ENABLE_MASK) | COL_ENABLED
+}
+
+/// `COL_ENABLED | COL_ROW`, the fixed layout `pretty_print_menus()` builds in a
+/// `local_colopts` of its own — the interactive menus ignore `column.*` entirely.
+pub(crate) const ENABLED_ROW: u32 = COL_ENABLED | COL_ROW;
 
 /// Lay out `list` per `colopts`/`opts` (git's `print_columns`) and return the
 /// bytes. An empty list yields empty output, matching git's early return.

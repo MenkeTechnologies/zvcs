@@ -321,6 +321,9 @@ struct Opts {
     color_when: Option<diff_color::ColorWhen>,
     /// `--ws-error-highlight=<kind>`, seeded from `diff.wsErrorHighlight`.
     ws_error_highlight: u32,
+    /// `--color-moved*` / `--word-diff*` / `--color-words`, resolved against
+    /// `diff.colorMoved` / `diff.colorMovedWS` / `diff.wordRegex` at render time.
+    move_word: diff_color::MoveWordOpts,
     /// `--skip-to=<path>` / `--rotate-to=<path>`: `(is_skip, path)`, last one wins.
     /// git reorders the queued pairs at flush time so output starts at `<path>`; skip
     /// drops everything before it, rotate wraps the earlier pairs to the end. A `<path>`
@@ -439,8 +442,6 @@ fn render_only_option(a: &str) -> bool {
         "-D",
         "-W",
         "--break-rewrites",
-        "--color-moved",
-        "--color-words",
         "--default-prefix",
         "--ext-diff",
         "--full-index",
@@ -453,8 +454,6 @@ fn render_only_option(a: &str) -> bool {
         "--ita-invisible-in-index",
         "--ita-visible-in-index",
         "--minimal",
-        "--no-color-moved",
-        "--no-color-moved-ws",
         "--no-diff-merges",
         "--no-ext-diff",
         "--no-function-context",
@@ -468,7 +467,6 @@ fn render_only_option(a: &str) -> bool {
         "--submodule",
         "--text",
         "--textconv",
-        "--word-diff",
     ];
     // NB: the value-validated options `--color=`, `--word-diff=`, `--ignore-submodules=`,
     // `--submodule=`, `--diff-algorithm=`, `--skip-to=` and `--rotate-to=` are handled by
@@ -477,8 +475,6 @@ fn render_only_option(a: &str) -> bool {
     const WITH_VALUE: &[&str] = &[
         "--anchored=",
         "--break-rewrites=",
-        "--color-moved=",
-        "--color-moved-ws=",
         "--diff-merges=",
         "--dst-prefix=",
         "--inter-hunk-context=",
@@ -486,7 +482,6 @@ fn render_only_option(a: &str) -> bool {
         "--output-indicator-new=",
         "--output-indicator-old=",
         "--src-prefix=",
-        "--word-diff-regex=",
     ];
     if EXACT.contains(&a) || WITH_VALUE.iter().any(|p| a.starts_with(*p)) {
         return true;
@@ -656,6 +651,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         // git's `ws_error_highlight_default`; `diff.wsErrorHighlight` replaces it
         // once the repository is discovered, unless a flag already set it.
         ws_error_highlight: diff_color::WSEH_NEW,
+        move_word: diff_color::MoveWordOpts::default(),
         skip_or_rotate: None,
     };
     // Whether a `--ws-error-highlight` flag was seen, so the config default does
@@ -730,6 +726,16 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         i += 1;
         if after_dashdash {
             paths.push(a.into());
+            continue;
+        }
+        // `--color-moved[=<mode>]`, `--color-moved-ws=<modes>`, `--word-diff[=<mode>]`,
+        // `--word-diff-regex=<re>` and `--color-words[=<re>]`. A bad argument is a
+        // parse-options 129, deferred with its argv index like the other value checks
+        // so an earlier bad revision still wins with git's 128.
+        if let Some(res) = opts.move_word.parse_flag(a, &mut opts.color_when) {
+            if let Err(msg) = res {
+                deferred.get_or_insert((cur, 129, format!("{msg}\n").into_bytes()));
+            }
             continue;
         }
         match a {
@@ -1002,26 +1008,6 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                             129,
                             format!("error: unknown value after ws-error-highlight={}\n", &val[..accepted])
                                 .into_bytes(),
-                        ));
-                    }
-                }
-            }
-            s if s.starts_with("--word-diff=") => {
-                // `diff_opt_word_diff`: `--word-diff=<mode>` accepts only `plain`, `color`,
-                // `porcelain` or `none` (case-sensitively); anything else, empty included,
-                // is exit 129. Bare `--word-diff` means `plain` and is accepted above.
-                let val = &s["--word-diff=".len()..];
-                match val {
-                    "plain" | "color" | "porcelain" => {
-                        // Word diff replaces the line-oriented patch body entirely.
-                        content_altering.get_or_insert_with(|| s.to_owned());
-                    }
-                    "none" => {}
-                    _ => {
-                        deferred.get_or_insert((
-                            cur,
-                            129,
-                            format!("error: bad --word-diff argument: {val}\n").into_bytes(),
                         ));
                     }
                 }
@@ -1399,6 +1385,13 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             diff_color::resolve_color(&repo, opts.color_when),
         );
         let ws_rule = diff_color::whitespace_rule_cfg(&repo);
+        let extra = match opts.move_word.resolve(&repo) {
+            Ok(e) => e,
+            Err(msg) => {
+                eprintln!("{msg}");
+                return Ok(ExitCode::from(128));
+            }
+        };
         let need_analyses = opts.patch || opts.numstat || opts.diffstat || opts.shortstat;
         let analyses: Vec<IdxAnalysis> = if need_analyses {
             deltas
@@ -1453,27 +1446,34 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             if separator {
                 rest.push(b'\n');
             }
-            // Each pair is rendered uncolored, then re-emitted through git's
-            // `fn_out_consume()` chain with that pair's whitespace state.
+            // The whole patch is assembled uncolored, then re-emitted in one pass
+            // through git's `fn_out_consume()` chain with each pair's whitespace
+            // state — `diff_flush_patch_all_file_pairs()`'s ordering, which is what
+            // lets `--color-moved` and `--word-diff` see every pair at once.
             let paint_opts = diff_color::PaintOptions {
                 ws_error_highlight: opts.ws_error_highlight,
                 ..Default::default()
             };
+            let mut plain: Vec<u8> = Vec::new();
+            let mut files: Vec<diff_color::FilePaint> = Vec::new();
             for (d, an) in deltas.iter().zip(&analyses) {
-                let mut section: Vec<u8> = Vec::new();
-                render_patch(&mut section, d, an, &opts);
-                let file = diff_color::FilePaint {
-                    ws_rule,
-                    blank_at_eof: diff_color::check_blank_at_eof(&an.old_data, &an.new_data),
-                };
-                rest.extend_from_slice(&diff_color::colorize_patch(
-                    &section,
-                    &colors,
-                    &paint_opts,
-                    &[file],
-                    file,
-                ));
+                let before = plain.len();
+                render_patch(&mut plain, d, an, &opts);
+                if plain.len() != before {
+                    files.push(diff_color::FilePaint {
+                        ws_rule,
+                        blank_at_eof: diff_color::check_blank_at_eof(&an.old_data, &an.new_data),
+                    });
+                }
             }
+            rest.extend_from_slice(&diff_color::colorize_patch_ex(
+                &plain,
+                &colors,
+                &paint_opts,
+                &files,
+                diff_color::FilePaint::new(ws_rule),
+                &extra,
+            ));
         }
 
         // `diff_line_prefix()` precedes every rendered line of the stat/dirstat/summary/
@@ -1497,65 +1497,12 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
 /// having already written the `die()` text `parse_dirstat_params()` builds.
 fn apply_dirstat(opts: &mut Opts, params: &str) -> Option<ExitCode> {
     let ds = opts.dirstat.get_or_insert_with(DirStat::default);
-    let mut errors = String::new();
-    // An empty list is not split at all, so `--dirstat=` is simply the default.
-    if !params.is_empty() {
-        for p in params.split(',') {
-            match p {
-                "changes" => {
-                    ds.by_line = false;
-                    ds.by_file = false;
-                }
-                "lines" => {
-                    ds.by_line = true;
-                    ds.by_file = false;
-                }
-                "files" => {
-                    ds.by_line = false;
-                    ds.by_file = true;
-                }
-                "noncumulative" => ds.cumulative = false,
-                "cumulative" => ds.cumulative = true,
-                _ => match parse_permille(p) {
-                    Some(permille) => ds.permille = permille,
-                    // git only reaches its `strtoul` when the first byte is a digit;
-                    // anything else is an unknown parameter rather than a bad number.
-                    None if p.as_bytes().first().is_some_and(u8::is_ascii_digit) => {
-                        errors.push_str(&format!("  Failed to parse dirstat cut-off percentage '{p}'\n"));
-                    }
-                    None => errors.push_str(&format!("  Unknown dirstat parameter '{p}'\n")),
-                },
-            }
-        }
-    }
+    let errors = super::diff_files::parse_dirstat_params(params, ds);
     if errors.is_empty() {
         return None;
     }
     eprint!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n");
     Some(ExitCode::from(128))
-}
-
-/// A dirstat cut-off percentage: a whole number plus at most one significant decimal
-/// digit, with any further digits read and discarded, and nothing left over — exactly
-/// what `parse_dirstat_params()`'s `strtoul` walk accepts.
-fn parse_permille(p: &str) -> Option<u32> {
-    let b = p.as_bytes();
-    if !b.first().is_some_and(u8::is_ascii_digit) {
-        return None;
-    }
-    let end = b.iter().position(|c| !c.is_ascii_digit()).unwrap_or(b.len());
-    // git reads this with `strtoul`, which saturates rather than failing; a threshold
-    // that large simply never matches.
-    let whole: u32 = p[..end].parse().unwrap_or(u32::MAX / 10);
-    let mut permille = whole.saturating_mul(10);
-    let mut rest = &b[end..];
-    if rest.first() == Some(&b'.') && rest.get(1).is_some_and(u8::is_ascii_digit) {
-        permille = permille.saturating_add(u32::from(rest[1] - b'0'));
-        rest = &rest[2..];
-        let extra = rest.iter().position(|c| !c.is_ascii_digit()).unwrap_or(rest.len());
-        rest = &rest[extra..];
-    }
-    rest.is_empty().then_some(permille)
 }
 
 /// `show_dirstat()` and `show_dirstat_by_line()`: the damage each path contributes.

@@ -4,6 +4,11 @@ pub mod decode {
     pub type Error = gix_error::Exn<gix_error::ValidationError>;
 }
 
+///
+pub mod write;
+
+pub use write::Builder;
+
 /// Decode `data` as EWAH bitmap.
 pub fn decode(data: &[u8]) -> Result<(Vec, &[u8]), decode::Error> {
     use crate::decode;

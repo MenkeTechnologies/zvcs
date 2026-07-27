@@ -110,6 +110,7 @@ use gix::prelude::ObjectIdExt;
 use regex::bytes::Regex;
 
 use super::diff_color;
+use super::diff_files;
 use super::diffcore_rename;
 
 /// Stock git's `diff-pairs` usage block, byte-for-byte including the trailing blank
@@ -424,6 +425,10 @@ struct Formats {
     stat: bool,
     shortstat: bool,
     summary: bool,
+    /// `DIFF_FORMAT_DIRSTAT` — `--dirstat`/`-X`/`--cumulative`/`--dirstat-by-file`.
+    dirstat: bool,
+    /// `DIFF_FORMAT_CHECKDIFF` — `--check`.
+    check: bool,
     no_output: bool,
 }
 
@@ -438,12 +443,77 @@ impl Formats {
             || self.stat
             || self.shortstat
             || self.summary
+            || self.dirstat
+            || self.check
             || self.no_output
     }
 
     /// Whether one of the per-pair "name" formats runs before the stat block.
     fn name_group(&self) -> bool {
         self.raw || self.name_only || self.name_status
+    }
+
+    /// The clear half of the `OPT_BITOP(..., DIFF_FORMAT_NO_OUTPUT)` entries: every
+    /// format bit git ORs in also drops `-s`. The three `OPT_BIT_F` options
+    /// (`--check`, `--name-only`, `--name-status`) deliberately do not.
+    fn or_patch(&mut self) {
+        self.patch = true;
+        self.no_output = false;
+    }
+    fn or_raw(&mut self) {
+        self.raw = true;
+        self.no_output = false;
+    }
+    fn or_numstat(&mut self) {
+        self.numstat = true;
+        self.no_output = false;
+    }
+    fn or_shortstat(&mut self) {
+        self.shortstat = true;
+        self.no_output = false;
+    }
+    fn or_summary(&mut self) {
+        self.summary = true;
+        self.no_output = false;
+    }
+    /// `diff_opt_stat()` / `diff_opt_compact_summary()` both clear `-s` as well.
+    fn or_stat(&mut self) {
+        self.stat = true;
+        self.no_output = false;
+    }
+    /// `parse_dirstat_opt()` clears `-s` and sets `DIFF_FORMAT_DIRSTAT`.
+    fn or_dirstat(&mut self) {
+        self.dirstat = true;
+        self.no_output = false;
+    }
+
+    /// `OPT_SET_INT('s', "no-patch", &options->output_format, DIFF_FORMAT_NO_OUTPUT)`:
+    /// `-s` *assigns* the format word, so it wipes every bit set before it.
+    fn set_no_output(&mut self) {
+        *self = Formats {
+            no_output: true,
+            ..Formats::default()
+        };
+    }
+
+    /// `diff_setup_done()`'s `check_mask`: the four formats that cannot be combined.
+    fn check_mask_bits(&self) -> u32 {
+        u32::from(self.name_only)
+            + u32::from(self.name_status)
+            + u32::from(self.check)
+            + u32::from(self.no_output)
+    }
+
+    /// `diff_setup_done()`: `--name-only`, `--name-status`, `--check` and `-s` turn
+    /// every other output format off.
+    fn clear_others(&mut self) {
+        self.raw = false;
+        self.numstat = false;
+        self.stat = false;
+        self.shortstat = false;
+        self.dirstat = false;
+        self.summary = false;
+        self.patch = false;
     }
 }
 
@@ -502,6 +572,28 @@ struct Opts {
     color_when: Option<diff_color::ColorWhen>,
     /// `--ws-error-highlight=<kind>`, seeded from `diff.wsErrorHighlight`.
     ws_error_highlight: u32,
+    /// `--dirstat[=<p>]`/`-X[<p>]`/`--cumulative`/`--dirstat-by-file[=<p>]`. Only
+    /// consulted when `formats.dirstat` is on. `diff.dirstat` deliberately does not
+    /// seed it: `builtin/diff-pairs.c` calls `repo_init_revisions()` (which copies
+    /// `default_diff_options`) *before* `repo_config()`, so the config never reaches
+    /// this command's options — it is read only to report its own parse errors.
+    dirstat: diff_files::DirStat,
+    /// `--ignore-submodules[=<when>]`: `all` (and the bare form) drops gitlink pairs
+    /// outright. `none`/`untracked`/`dirty` only concern a worktree comparison, which
+    /// `diff-pairs` never performs, so they leave the pair in place — as in git.
+    ignore_submodules: bool,
+    /// `--submodule[=<format>]` (`parse_submodule_params()`): how a `160000` pair is
+    /// rendered in the patch.
+    submodule_format: SubmoduleFormat,
+}
+
+/// git's `enum diff_submodule_format`, restricted to the one this port renders.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubmoduleFormat {
+    /// `DIFF_SUBMODULE_SHORT` — the `Subproject commit <oid>` line diff, which is
+    /// what a gitlink pair already renders as. `DIFF_SUBMODULE_LOG` and
+    /// `DIFF_SUBMODULE_INLINE_DIFF` are refused at parse time.
+    Short,
 }
 
 /// One raw-format record: a pre-computed file pair.
@@ -601,10 +693,20 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         // git's `ws_error_highlight_default`; `diff.wsErrorHighlight` replaces it
         // once the repository is open, unless a flag already set it.
         ws_error_highlight: diff_color::WSEH_NEW,
+        dirstat: diff_files::DirStat::default(),
+        ignore_submodules: false,
+        submodule_format: SubmoduleFormat::Short,
     };
     // Whether a `--ws-error-highlight` flag was seen, so the config default does not
     // overwrite it (git reads the config first and the command line last).
     let mut wseh_explicit = false;
+    // `--quiet` sets `flags.quick`, which `diff_setup_done()` — not the option parser —
+    // turns into `output_format = DIFF_FORMAT_NO_OUTPUT` plus `exit_with_status`.
+    let mut quick = false;
+    // `--color-moved*` / `--word-diff*` / `--color-words`, layered over
+    // `diff.colorMoved` / `diff.colorMovedWS` / `diff.wordRegex` once the repository
+    // is open.
+    let mut move_word = diff_color::MoveWordOpts::default();
     let mut nul = false;
     // `--output=<file>`: git redirects the whole diff stream into this file.
     let mut output_file: Option<String> = None;
@@ -642,27 +744,77 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
                 }
             }};
         }
+        // `--color-moved[=<mode>]`, `--color-moved-ws=<modes>`, `--word-diff[=<mode>]`,
+        // `--word-diff-regex=<re>` and `--color-words[=<re>]`.
+        if let Some(res) = move_word.parse_flag(s, &mut opts.color_when) {
+            if let Err(msg) = res {
+                eprintln!("{msg}");
+                return Ok(ExitCode::from(129));
+            }
+            i += 1;
+            continue;
+        }
         match s {
             "-h" => {
                 print!("{USAGE}");
                 return Ok(ExitCode::from(129));
             }
             "-z" => nul = true,
-            "-p" | "-u" | "--patch" => opts.formats.patch = true,
-            "-s" | "--no-patch" => opts.formats.no_output = true,
-            "--raw" => opts.formats.raw = true,
+            "-p" | "-u" | "--patch" => opts.formats.or_patch(),
+            "-s" | "--no-patch" => opts.formats.set_no_output(),
+            "--raw" => opts.formats.or_raw(),
             "--name-only" => opts.formats.name_only = true,
             "--name-status" => opts.formats.name_status = true,
-            "--numstat" => opts.formats.numstat = true,
-            "--shortstat" => opts.formats.shortstat = true,
-            "--summary" => opts.formats.summary = true,
-            "--stat" => opts.formats.stat = true,
+            "--numstat" => opts.formats.or_numstat(),
+            "--shortstat" => opts.formats.or_shortstat(),
+            "--summary" => opts.formats.or_summary(),
+            "--stat" => opts.formats.or_stat(),
+            // `--check` (`OPT_BIT_F`, so it does not clear `-s`).
+            "--check" => opts.formats.check = true,
+            // The dirstat family (`diff_opt_dirstat()` → `parse_dirstat_opt()`).
+            // `-X` is a short `PARSE_OPT_OPTARG`, so only the attached `-Xlines` form
+            // carries a value; `--dirstat lines` never consumes the next argument.
+            "--dirstat" | "-X" => {
+                if let Some(c) = apply_dirstat(&mut opts, "") {
+                    return Ok(c);
+                }
+            }
+            _ if s.starts_with("--dirstat=") || (s.starts_with("-X") && s.len() > 2) => {
+                let v = s.strip_prefix("--dirstat=").unwrap_or(&s[2..]).to_string();
+                if let Some(c) = apply_dirstat(&mut opts, &v) {
+                    return Ok(c);
+                }
+            }
+            "--cumulative" => {
+                if let Some(c) = apply_dirstat(&mut opts, "cumulative") {
+                    return Ok(c);
+                }
+            }
+            // `--dirstat-by-file` folds in `files` first and then its own parameters,
+            // so `--dirstat-by-file=lines` really does end up in `lines` mode.
+            "--dirstat-by-file" => {
+                if let Some(c) = apply_dirstat(&mut opts, "files") {
+                    return Ok(c);
+                }
+                if let Some(c) = apply_dirstat(&mut opts, "") {
+                    return Ok(c);
+                }
+            }
+            _ if s.starts_with("--dirstat-by-file=") => {
+                if let Some(c) = apply_dirstat(&mut opts, "files") {
+                    return Ok(c);
+                }
+                let v = s["--dirstat-by-file=".len()..].to_string();
+                if let Some(c) = apply_dirstat(&mut opts, &v) {
+                    return Ok(c);
+                }
+            }
             _ if s.starts_with("--stat=") => {
-                opts.formats.stat = true;
+                opts.formats.or_stat();
                 parse_stat_geometry(&mut opts.stat, &s["--stat=".len()..]);
             }
             "--compact-summary" => {
-                opts.formats.stat = true;
+                opts.formats.or_stat();
                 opts.stat.with_summary = true;
             }
             "--no-compact-summary" => opts.stat.with_summary = false,
@@ -670,7 +822,7 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
             // parse-options accepts both the `--opt=<n>` and the `--opt <n>` spelling.
             "--stat-width" | "--stat-name-width" | "--stat-graph-width" | "--stat-count" => {
                 let v = want_value!(s.len());
-                opts.formats.stat = true;
+                opts.formats.or_stat();
                 let slot = match s {
                     "--stat-width" => &mut opts.stat.width,
                     "--stat-name-width" => &mut opts.stat.name_width,
@@ -680,28 +832,28 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
                 *slot = parse_i64(&v);
             }
             _ if s.starts_with("--stat-width=") => {
-                opts.formats.stat = true;
+                opts.formats.or_stat();
                 opts.stat.width = parse_i64(&s["--stat-width=".len()..]);
             }
             _ if s.starts_with("--stat-name-width=") => {
-                opts.formats.stat = true;
+                opts.formats.or_stat();
                 opts.stat.name_width = parse_i64(&s["--stat-name-width=".len()..]);
             }
             _ if s.starts_with("--stat-graph-width=") => {
-                opts.formats.stat = true;
+                opts.formats.or_stat();
                 opts.stat.graph_width = parse_i64(&s["--stat-graph-width=".len()..]);
             }
             _ if s.starts_with("--stat-count=") => {
-                opts.formats.stat = true;
+                opts.formats.or_stat();
                 opts.stat.count = parse_i64(&s["--stat-count=".len()..]);
             }
             "--patch-with-raw" => {
-                opts.formats.patch = true;
-                opts.formats.raw = true;
+                opts.formats.or_patch();
+                opts.formats.or_raw();
             }
             "--patch-with-stat" => {
-                opts.formats.patch = true;
-                opts.formats.stat = true;
+                opts.formats.or_patch();
+                opts.formats.or_stat();
             }
             "--full-index" => opts.full_index = true,
             "--no-full-index" => opts.full_index = false,
@@ -747,10 +899,9 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
             }
             "--exit-code" => opts.exit_code = true,
             "--no-exit-code" => opts.exit_code = false,
-            "--quiet" => {
-                opts.exit_code = true;
-                opts.formats.no_output = true;
-            }
+            // `--quiet` only raises `flags.quick`; `diff_setup_done()` is what turns
+            // that into `output_format = DIFF_FORMAT_NO_OUTPUT` and `--exit-code`.
+            "--quiet" => quick = true,
             // -R swaps the two prefixes and, per pair, the two sides at render time.
             "-R" => opts.reverse = true,
             // Whitespace comparison flags.
@@ -869,15 +1020,15 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
             _ if s.starts_with("--abbrev=") => {}
             "-U" => {
                 opts.ctx = parse_ctx(&want_value!(s.len()))?;
-                opts.formats.patch = true;
+                opts.formats.or_patch();
             }
             _ if s.starts_with("-U") => {
                 opts.ctx = parse_ctx(&s[2..])?;
-                opts.formats.patch = true;
+                opts.formats.or_patch();
             }
             _ if s.starts_with("--unified=") => {
                 opts.ctx = parse_ctx(&s["--unified=".len()..])?;
-                opts.formats.patch = true;
+                opts.formats.or_patch();
             }
             "--unified" => opts.formats.patch = true,
             // --output-indicator-new / -old / -context: each takes a single character.
@@ -1029,6 +1180,63 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
             // the index (`diff-lib.c`). `diff-pairs` reads its pairs from stdin and never
             // opens the index, so both spellings are inert here, in git as well.
             "--ita-invisible-in-index" | "--ita-visible-in-index" => {}
+            // `--max-depth <n>` (`diff_opt_max_depth()`): a `git_parse_int()` whose only
+            // consumers are `tree-diff.c`'s recursion guards. `diff-pairs` reads its
+            // pairs from stdin and never walks a tree — it dies on a `040000` entry
+            // rather than descending — so the depth itself can never be consulted, in
+            // stock git as well. The parse *is* live: a non-integer errors with 129.
+            "--max-depth" => {
+                let v = want_value!(s.len());
+                if parse_git_int(&v).is_none() {
+                    eprintln!("error: invalid value for '--max-depth': '{v}'");
+                    return Ok(ExitCode::from(129));
+                }
+            }
+            _ if s.starts_with("--max-depth=") => {
+                let v = &s["--max-depth=".len()..];
+                if parse_git_int(v).is_none() {
+                    eprintln!("error: invalid value for '--max-depth': '{v}'");
+                    return Ok(ExitCode::from(129));
+                }
+            }
+            // `--ignore-submodules[=<when>]` (`handle_ignore_submodules_arg()`).
+            "--ignore-submodules" => opts.ignore_submodules = true,
+            _ if s.starts_with("--ignore-submodules=") => {
+                match &s["--ignore-submodules=".len()..] {
+                    "all" => opts.ignore_submodules = true,
+                    // `none`, `untracked` and `dirty` only relax what counts as a
+                    // *modification* of a checked-out submodule, which needs a worktree
+                    // comparison; `diff-pairs` is handed the pair already, so all three
+                    // leave it in the queue.
+                    "none" | "untracked" | "dirty" => opts.ignore_submodules = false,
+                    v => {
+                        eprintln!("fatal: bad --ignore-submodules argument: {v}");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+            }
+            // `--submodule[=<format>]` (`parse_submodule_params()`): the bare form is
+            // `log`, matching `diff_opt_submodule()`'s `arg ? arg : "log"`. Only
+            // `short` — the default `Subproject commit <oid>` line diff — is ported;
+            // `log` and `diff` both open the submodule's own repository, walk it and
+            // (for `diff`) run a second diff inside it, which this port does not do.
+            "--submodule" => bail!(
+                "unsupported flag \"--submodule\" (defaults to =log, which needs the \
+                 submodule's own repository; only --submodule=short is ported)"
+            ),
+            _ if s.starts_with("--submodule=") => {
+                match &s["--submodule=".len()..] {
+                    "short" => opts.submodule_format = SubmoduleFormat::Short,
+                    f @ ("log" | "diff") => bail!(
+                        "unsupported flag \"--submodule={f}\" (needs the submodule's own \
+                         repository; only --submodule=short is ported)"
+                    ),
+                    v => {
+                        eprintln!("error: failed to parse --submodule option parameter: '{v}'");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+            }
             _ => bail!(
                 "unsupported flag {s:?} (ported: -z, -p/-u/--patch, -s/--no-patch, --raw, \
                  --name-only, --name-status, --numstat, --stat[=<w>], --shortstat, --summary, \
@@ -1048,17 +1256,38 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
+    // ---- diff_setup_done() ----
+    // `check_mask`: `--name-only`, `--name-status`, `--check` and `-s` are mutually
+    // exclusive, and any one of them turns every other output format off. `--quiet`
+    // is *not* part of the mask — it only raises `flags.quick`, which is applied
+    // further down, so `--quiet --check` is legal where `-s --check` is not.
+    if opts.formats.check_mask_bits() > 1 {
+        return Ok(fatal(
+            "options '--name-only', '--name-status', '--check', and '-s' cannot be used together",
+        ));
+    }
+    if opts.formats.check_mask_bits() == 1 {
+        opts.formats.clear_others();
+    }
     // `diff_setup_done` runs before the `-z` requirement is checked, so `--follow` wins
     // over the usage error just as it does in stock git.
     if follow {
         return Ok(fatal("--follow requires exactly one pathspec"));
+    }
+    // `flags.quick`: showing the first hit found makes no sense, so the whole output is
+    // dropped and the exit status carries the answer instead.
+    if quick {
+        opts.formats.set_no_output();
+        opts.exit_code = true;
+        opts.rename.detect_rename = 0;
+        opts.rename.find_copies_harder = false;
     }
     if !nul {
         eprintln!("usage: working without -z is not supported");
         return Ok(ExitCode::from(129));
     }
     if !opts.formats.requested() {
-        opts.formats.patch = true;
+        opts.formats.or_patch();
     }
 
     let repo = match gix::discover(".") {
@@ -1073,11 +1302,31 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
             opts.ws_error_highlight = v;
         }
     }
+    // `git_diff_basic_config()`'s `diff.dirstat` arm parses the value and warns about
+    // whatever it could not understand. It cannot change *this* command's behaviour:
+    // `builtin/diff-pairs.c` runs `repo_init_revisions()` — which copies
+    // `default_diff_options` — before `repo_config()`, so the parsed parameters land in
+    // a struct the command has already finished copying from. The warning is the whole
+    // of the observable effect, and it is emitted whether or not `--dirstat` was given.
+    if let Some(v) = repo.config_snapshot().string("diff.dirstat") {
+        let mut ignored = diff_files::DirStat::default();
+        let errors = diff_files::parse_dirstat_params(&v.to_string(), &mut ignored);
+        if !errors.is_empty() {
+            eprint!("warning: Found errors in 'diff.dirstat' config variable:\n{errors}\n");
+        }
+    }
     // `--color[=<when>]` / `--no-color`, falling back to `color.diff` / `diff.color`
     // / `color.ui` and the terminal test.
     let colors =
         diff_color::DiffColors::resolve(&repo, diff_color::resolve_color(&repo, opts.color_when));
     let ws_rule = diff_color::whitespace_rule_cfg(&repo);
+    let extra = match move_word.resolve(&repo) {
+        Ok(e) => e,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return Ok(ExitCode::from(128));
+        }
+    };
 
     // Finalize the pickaxe now that the whole line has been read.
     opts.pickaxe = match finalize_pickaxe(
@@ -1126,6 +1375,8 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
     // `diff_result_code()` prints the rename-limit warnings once, after the whole
     // stream has been written.
     let mut warnings = diffcore_rename::Warnings::default();
+    // `o->flags.check_failed`: sticky across batches, read once by `diff_result_code()`.
+    let mut check_failed = false;
     let mut cursor = 0usize;
 
     // Records are NUL-terminated fields; a zero-length header field closes a batch.
@@ -1137,7 +1388,7 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         cursor += end + 1;
 
         if header.is_empty() {
-            match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, ws_rule, &mut warnings)? {
+            match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed)? {
                 Ok(()) => {}
                 Err(code) => return Ok(code),
             }
@@ -1174,18 +1425,101 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         batch.push(pair);
     }
 
-    match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, ws_rule, &mut warnings)? {
+    match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed)? {
         Ok(()) => {}
         Err(code) => return Ok(code),
     }
     out.flush()?;
     warnings.emit("diff.renameLimit");
 
-    Ok(if opts.exit_code && any_pair {
-        ExitCode::from(1)
+    // `diff_result_code()`: bit 0 is `--exit-code` with changes, bit 1 is `--check`
+    // having reported something. They are independent, so `--check --exit-code` on a
+    // dirty tree exits 3.
+    let mut code = 0u8;
+    if opts.exit_code && any_pair {
+        code |= 0o1;
+    }
+    if opts.formats.check && check_failed {
+        code |= 0o2;
+    }
+    Ok(ExitCode::from(code))
+}
+
+/// `parse_dirstat_opt()` (diff.c:5454): fold one parameter list into the accumulated
+/// `--dirstat` state and turn the format on, or report git's `die()` and its exit code.
+fn apply_dirstat(opts: &mut Opts, params: &str) -> Option<ExitCode> {
+    let errors = diff_files::parse_dirstat_params(params, &mut opts.dirstat);
+    if !errors.is_empty() {
+        eprint!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n");
+        return Some(ExitCode::from(128));
+    }
+    opts.formats.or_dirstat();
+    None
+}
+
+/// `git_parse_int()` → `git_parse_signed()` with an `int` ceiling (config.c): optional
+/// leading blanks, then `strtoimax` in base 0 — so `0x10` is hex and `010` is octal —
+/// then an optional `k`/`m`/`g` unit suffix, then the end of the string. The value must
+/// still fit an `int` after the suffix multiplies it.
+fn parse_git_int(value: &str) -> Option<i32> {
+    let b = value.as_bytes();
+    let mut i = 0usize;
+    // `strtoimax` skips leading whitespace, so `" 3"` parses but `"3 "` does not.
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        i += 1;
+    }
+    let negative = match b.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let (radix, start) = if b[i..].starts_with(b"0x") || b[i..].starts_with(b"0X") {
+        (16u32, i + 2)
+    } else if b.get(i) == Some(&b'0') {
+        (8u32, i)
     } else {
-        ExitCode::SUCCESS
-    })
+        (10u32, i)
+    };
+    i = start;
+    let digits_at = i;
+    let mut magnitude: i64 = 0;
+    while let Some(d) = b.get(i).and_then(|c| (*c as char).to_digit(radix)) {
+        magnitude = magnitude.checked_mul(i64::from(radix))?.checked_add(i64::from(d))?;
+        if magnitude > i64::from(u32::MAX) {
+            return None;
+        }
+        i += 1;
+    }
+    if i == digits_at {
+        return None;
+    }
+    let factor: i64 = match b.get(i) {
+        Some(b'k') | Some(b'K') => {
+            i += 1;
+            1024
+        }
+        Some(b'm') | Some(b'M') => {
+            i += 1;
+            1024 * 1024
+        }
+        Some(b'g') | Some(b'G') => {
+            i += 1;
+            1024 * 1024 * 1024
+        }
+        _ => 1,
+    };
+    if i != b.len() {
+        return None;
+    }
+    let val = magnitude.checked_mul(factor)?;
+    let val = if negative { -val } else { val };
+    i32::try_from(val).ok()
 }
 
 /// Report a git-style fatal error and yield its exit code.
@@ -1544,14 +1878,26 @@ fn flush(
     opts: &Opts,
     base_abbrev: usize,
     colors: &diff_color::DiffColors,
+    extra: &diff_color::ExtraPaint,
     ws_rule: u32,
     warnings: &mut diffcore_rename::Warnings,
+    // `o->flags.check_failed`, accumulated across every batch — `diff_result_code()`
+    // reads it once, after the whole stream has been written.
+    check_failed: &mut bool,
 ) -> Result<std::result::Result<(), ExitCode>> {
     if batch.is_empty() || opts.formats.no_output {
         return Ok(Ok(()));
     }
 
     let mut pairs: Vec<Pair> = batch.to_vec();
+
+    // `diff_queue_change()` refuses to queue a pair whose *both* sides are gitlinks
+    // once the submodule is ignored, so `--ignore-submodules[=all]` drops it before
+    // `diffcore_std()` ever sees it. A gitlink that was only added or only deleted
+    // keeps one non-gitlink (zero) mode and survives.
+    if opts.ignore_submodules {
+        pairs.retain(|p| !(is_gitlink_mode(p.old_mode) && is_gitlink_mode(p.new_mode)));
+    }
 
     // ---- diffcore_std order: break -> rename -> merge-broken -> pickaxe ----
     // `builtin/diff-pairs.c` calls `diffcore_std()` per batch, and only sets
@@ -1656,8 +2002,25 @@ fn flush(
         }
     }
 
+    // ---- --check ----
+    // `DIFF_FORMAT_CHECKDIFF` shares the name/raw loop's slot in `diff_flush()`, and
+    // `diff_setup_done()` guarantees it is the only format left standing.
+    if opts.formats.check {
+        match render_check(&mut buf, repo, cache, &pairs, opts, colors, ws_rule) {
+            Ok(failed) => *check_failed |= failed,
+            Err(code) => {
+                out.write_all(&buf)?;
+                return Ok(Err(code));
+            }
+        }
+    }
+
     // ---- content analyses (numstat/stat/shortstat share these) ----
-    let stats_wanted = opts.formats.numstat || opts.formats.stat || opts.formats.shortstat;
+    // `show_dirstat_by_line()` reads the diffstat, so `--dirstat=lines` pulls the whole
+    // stat computation in even when no stat format was asked for.
+    let dirstat_by_line = opts.formats.dirstat && opts.dirstat.by_line;
+    let stats_wanted =
+        opts.formats.numstat || opts.formats.stat || opts.formats.shortstat || dirstat_by_line;
     if stats_wanted && unresolved {
         out.write_all(&buf)?;
         return Ok(Err(unresolved_fatal()));
@@ -1694,6 +2057,39 @@ fn flush(
         render_shortstat(&mut sub, &files);
         append_prefixed(&mut buf, lp, &sub);
     }
+    // `show_dirstat_by_line()` closes the stat block; it counts *lines*, normalising a
+    // binary file's byte counts at 64 bytes to the line.
+    if dirstat_by_line {
+        let damage: Vec<(BString, u64)> = files
+            .iter()
+            .map(|f| {
+                let d = u64::from(f.added) + u64::from(f.deleted);
+                (
+                    f.new_path.clone(),
+                    if f.binary { d.div_ceil(64) } else { d },
+                )
+            })
+            .collect();
+        let mut sub = Vec::new();
+        diff_files::render_dirstat(&mut sub, damage, &opts.dirstat);
+        append_prefixed(&mut buf, lp, &sub);
+    }
+
+    // ---- --dirstat (the byte-damage modes) ----
+    // `show_dirstat()` sits outside the stat block and, unlike every other format,
+    // never bumps `separator` — so `--dirstat -p` runs the two straight together.
+    if opts.formats.dirstat && !dirstat_by_line {
+        let damage = match dirstat_damage(repo, cache, &pairs, opts) {
+            Ok(d) => d,
+            Err(code) => {
+                out.write_all(&buf)?;
+                return Ok(Err(code));
+            }
+        };
+        let mut sub = Vec::new();
+        diff_files::render_dirstat(&mut sub, damage, &opts.dirstat);
+        append_prefixed(&mut buf, lp, &sub);
+    }
 
     // ---- summary ----
     let summary_shown = opts.formats.summary && !summary_is_empty(&pairs);
@@ -1717,23 +2113,48 @@ fn flush(
             || opts.formats.numstat
             || opts.formats.stat
             || opts.formats.shortstat
+            || dirstat_by_line
             || summary_shown;
         if separator {
             // `DIFF_SYMBOL_SEPARATOR` prints the line prefix ahead of the terminator.
             buf.extend_from_slice(lp);
             buf.push(b'\0');
         }
-        let mut sub = Vec::new();
+        // The whole patch is assembled uncolored first, then re-emitted in one pass
+        // through git's `fn_out_consume()` chain — the ordering
+        // `diff_flush_patch_all_file_pairs()` uses so that move detection and the
+        // word diff both see every file pair.
+        let paint_opts = diff_color::PaintOptions {
+            ws_error_highlight: opts.ws_error_highlight,
+            indicators: (opts.ind_new, opts.ind_old, opts.ind_context),
+            // `diff.suppressBlankEmpty` is not read by this module, so the sign of an
+            // empty context line is always kept, as git's default does.
+            suppress_blank_empty: false,
+        };
+        let mut plain = Vec::new();
+        let mut files: Vec<diff_color::FilePaint> = Vec::new();
+        let mut failed = None;
         for p in &pairs {
             if let Err(code) =
-                render_patch(&mut sub, repo, cache, p, opts, base_abbrev, colors, ws_rule)
+                render_patch(&mut plain, &mut files, repo, cache, p, opts, base_abbrev, ws_rule)
             {
-                append_prefixed(&mut buf, lp, &sub);
-                out.write_all(&buf)?;
-                return Ok(Err(code));
+                failed = Some(code);
+                break;
             }
         }
+        let sub = diff_color::colorize_patch_ex(
+            &plain,
+            colors,
+            &paint_opts,
+            &files,
+            diff_color::FilePaint::new(ws_rule),
+            extra,
+        );
         append_prefixed(&mut buf, lp, &sub);
+        if let Some(code) = failed {
+            out.write_all(&buf)?;
+            return Ok(Err(code));
+        }
     }
 
     out.write_all(&buf)?;
@@ -1919,6 +2340,306 @@ fn is_gitlink(p: &Pair) -> bool {
         || (p.new_valid() && p.new_mode & IFMT == 0o160000)
 }
 
+/// `S_ISGITLINK()`.
+fn is_gitlink_mode(mode: u32) -> bool {
+    mode & IFMT == 0o160000
+}
+
+// ---------------------------------------------------------------------------
+// --dirstat (diff.c `show_dirstat`)
+// ---------------------------------------------------------------------------
+
+/// `show_dirstat()` (diff.c:3366): how much damage each path contributes, in the
+/// "changes" (byte-level) or "files" (one unit apiece) mode. `--dirstat=lines` does
+/// not come through here — it reads the diffstat instead.
+fn dirstat_damage(
+    repo: &gix::Repository,
+    cache: &mut gix::diff::blob::Platform,
+    pairs: &[Pair],
+    opts: &Opts,
+) -> std::result::Result<Vec<(BString, u64)>, ExitCode> {
+    let mut out = Vec::with_capacity(pairs.len());
+    for p in pairs {
+        // Equal object ids mean identical content, so no blob has to be read at all.
+        if p.old_valid() && p.new_valid() && p.old_id == p.new_id {
+            out.push((p.new_path.clone(), 0));
+            continue;
+        }
+        // In `--dirstat-by-file` mode the content is never examined: that the id
+        // changed is the whole signal, and every file contributes equal damage.
+        if opts.dirstat.by_file {
+            out.push((p.new_path.clone(), 1));
+            continue;
+        }
+        let an = analyze(repo, cache, p, opts)?;
+        let damage = if p.old_valid() && p.new_valid() {
+            // `hash_chars()` asks `diff_filespec_is_binary()` about each side on its
+            // own, so the two `is_text` flags are derived separately.
+            let (copied, added) = diff_files::count_changes_sides(
+                &an.old_data,
+                !diffcore_rename::buffer_is_binary(&an.old_data),
+                &an.new_data,
+                !diffcore_rename::buffer_is_binary(&an.new_data),
+            );
+            // Original minus copied is the removed material and `added` is the new
+            // material; both are damage done to the preimage.
+            (an.old_data.len() as u64).saturating_sub(copied) + added
+        } else if p.old_valid() {
+            an.old_data.len() as u64
+        } else if p.new_valid() {
+            an.new_data.len() as u64
+        } else {
+            continue;
+        };
+        // The ids differ, so *something* changed; a zero score is forced to one.
+        out.push((p.new_path.clone(), if damage == 0 { 1 } else { damage }));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// --check (diff.c `builtin_checkdiff` / `checkdiff_consume`, ws.c `ws_check`)
+// ---------------------------------------------------------------------------
+
+/// `whitespace_rule()` (ws.c:82) and `ll_merge_marker_size()`: the per-path
+/// `whitespace` and `conflict-marker-size` gitattributes, over `core.whitespace`.
+struct WsRules<'repo> {
+    /// `whitespace_rule_cfg`, from `core.whitespace`.
+    cfg: u32,
+    /// `None` when no attribute stack could be built (a bare repository), in which
+    /// case every path falls back to `cfg` — which is what an empty attribute set
+    /// yields anyway.
+    stack: Option<gix::AttributeStack<'repo>>,
+    outcome: gix::attrs::search::Outcome,
+}
+
+impl<'repo> WsRules<'repo> {
+    fn new(repo: &'repo gix::Repository, cfg: u32) -> Self {
+        let stack = repo.index_or_empty().ok().and_then(|index| {
+            repo.attributes_only(
+                &index,
+                gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+            )
+            .ok()
+        });
+        WsRules {
+            cfg,
+            stack,
+            outcome: gix::attrs::search::Outcome::default(),
+        }
+    }
+
+    /// The `(whitespace_rule, conflict_marker_size)` pair for `path`.
+    fn at(&mut self, path: &BString) -> (u32, usize) {
+        let Some(stack) = self.stack.as_mut() else {
+            return (self.cfg, diff_files::DEFAULT_CONFLICT_MARKER_SIZE);
+        };
+        let mode = Some(gix::index::entry::Mode::FILE);
+        // The stack only knows an attribute's name once a file declaring it has been
+        // parsed, so descend first, then size the outcome, then match.
+        if stack.at_entry(path.as_bstr(), mode).is_err() {
+            return (self.cfg, diff_files::DEFAULT_CONFLICT_MARKER_SIZE);
+        }
+        self.outcome.initialize_with_selection(
+            stack.attributes_collection(),
+            ["whitespace", "conflict-marker-size"],
+        );
+        let Ok(platform) = stack.at_entry(path.as_bstr(), mode) else {
+            return (self.cfg, diff_files::DEFAULT_CONFLICT_MARKER_SIZE);
+        };
+        platform.matching_attributes(&mut self.outcome);
+
+        let mut rule = self.cfg;
+        let mut marker = diff_files::DEFAULT_CONFLICT_MARKER_SIZE;
+        for m in self.outcome.iter_selected() {
+            match m.assignment.name.as_str() {
+                "whitespace" => {
+                    rule = match m.assignment.state {
+                        // `true` (`whitespace`): every rule that neither loosens an
+                        // error (`cr-at-eol`) nor is excluded by default
+                        // (`tab-in-indent`), keeping the configured tab width.
+                        gix::attrs::StateRef::Set => {
+                            diff_color::ws_tab_width(self.cfg) as u32
+                                | diff_color::WS_TRAILING_SPACE
+                                | diff_color::WS_SPACE_BEFORE_TAB
+                                | diff_color::WS_INDENT_WITH_NON_TAB
+                                | diff_color::WS_BLANK_AT_EOL
+                                | diff_color::WS_BLANK_AT_EOF
+                                | diff_color::WS_INCOMPLETE_LINE
+                        }
+                        // `false` (`-whitespace`): nothing but the tab width.
+                        gix::attrs::StateRef::Unset => diff_color::ws_tab_width(self.cfg) as u32,
+                        gix::attrs::StateRef::Value(v) => {
+                            diff_color::parse_whitespace_rule(&v.as_bstr().to_str_lossy())
+                        }
+                        // Unspecified and `!whitespace` both reset to the config.
+                        gix::attrs::StateRef::Unspecified => self.cfg,
+                    };
+                }
+                "conflict-marker-size" => {
+                    if let gix::attrs::StateRef::Value(v) = m.assignment.state {
+                        if let Ok(n) = v.as_bstr().to_str_lossy().parse::<usize>() {
+                            if n > 0 {
+                                marker = n;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        (rule, marker)
+    }
+}
+
+/// `builtin_checkdiff()` (diff.c:4281) driving `checkdiff_consume()` (diff.c:3555).
+///
+/// Only the *new* side is examined — `--check` reports what the change introduces —
+/// and the diff it walks is its own: `xecfg.ctxlen = 1` with `xpp.flags = 0`, so no
+/// `-w`/`-b`/`-I`/`--ignore-blank-lines`, no indent heuristic and no
+/// `--diff-algorithm` reach it. Returns `o->flags.check_failed`.
+fn render_check(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    cache: &mut gix::diff::blob::Platform,
+    pairs: &[Pair],
+    opts: &Opts,
+    colors: &diff_color::DiffColors,
+    ws_cfg: u32,
+) -> std::result::Result<bool, ExitCode> {
+    let mut failed = false;
+    let mut rules = WsRules::new(repo, ws_cfg);
+    let lp = opts.line_prefix.as_slice();
+    let set = colors.get(diff_color::DiffSlot::New);
+    let ws_color = colors.get(diff_color::DiffSlot::Whitespace);
+    let reset = colors.reset();
+
+    for p in pairs {
+        // `diff_flush_checkdiff()`: an unmodified pair and a tree entry are both skipped.
+        if diff_unmodified_pair(p) {
+            continue;
+        }
+        if (p.old_valid() && p.old_mode & IFMT == 0o040000)
+            || (p.new_valid() && p.new_mode & IFMT == 0o040000)
+        {
+            continue;
+        }
+
+        // `run_checkdiff()`: `other` is the destination path when it differs, and both
+        // the reported name and the attribute path come from it when it exists.
+        let name = &p.new_path;
+        let (mut ws_rule, marker_size) = rules.at(name);
+        // A symlink being an incomplete line is not news.
+        if p.new_valid() && p.new_mode & IFMT == 0o120000 {
+            ws_rule &= !diff_color::WS_INCOMPLETE_LINE;
+        }
+
+        let an = analyze(repo, cache, p, opts)?;
+        // Deliberately only the new side is tested for binaryness.
+        if p.new_valid() && diffcore_rename::buffer_is_binary(&an.new_data) {
+            continue;
+        }
+
+        let before = byte_lines(&an.old_data);
+        let after = byte_lines(&an.new_data);
+        let mut input: InternedInput<Vec<u8>> = InternedInput::default();
+        input.update_before(before.iter().map(|l| l.to_vec()));
+        input.update_after(after.iter().map(|l| l.to_vec()));
+        let mut diff =
+            gix::diff::blob::Diff::compute(gix::diff::blob::Algorithm::Myers, &input);
+        diff.postprocess_no_heuristic(&input);
+
+        // xdiff hands `checkdiff_consume()` whole lines, and the record for a final
+        // line without a terminator arrives with the newline `xdl_emit_diff()` writes
+        // before the `\ No newline at end of file` marker — so `ws_check()` never sees
+        // the missing terminator, and `WS_INCOMPLETE_LINE` is reported by the marker's
+        // own branch instead.
+        let mut last_added_is_final = false;
+        for h in diff.hunks() {
+            let start = h.after.start as usize;
+            for (k, line) in after[start..start + h.after.len()].iter().enumerate() {
+                let lineno = start + k + 1;
+                let mut body: Vec<u8> = (*line).to_vec();
+                if body.last() != Some(&b'\n') {
+                    body.push(b'\n');
+                    last_added_is_final = true;
+                }
+                if diff_files::is_conflict_marker_sized(&body, marker_size) {
+                    failed = true;
+                    out.extend_from_slice(lp);
+                    out.extend_from_slice(name.as_slice());
+                    out.extend_from_slice(format!(":{lineno}: leftover conflict marker\n").as_bytes());
+                }
+                let bad = diff_files::ws_check(&body, ws_rule);
+                if bad == 0 {
+                    continue;
+                }
+                failed = true;
+                out.extend_from_slice(lp);
+                out.extend_from_slice(name.as_slice());
+                out.extend_from_slice(
+                    format!(":{lineno}: {}.\n", diff_files::whitespace_error_string(bad)).as_bytes(),
+                );
+                // `emit_line(o, set, reset, line, 1)` prints the marker, then
+                // `ws_check_emit()` repaints the body around its offending runs.
+                out.extend_from_slice(lp);
+                out.extend_from_slice(set.as_bytes());
+                out.push(b'+');
+                out.extend_from_slice(reset.as_bytes());
+                diff_color::ws_check_emit(out, &body, ws_rule, set, reset, ws_color);
+            }
+        }
+
+        // The `\ No newline at end of file` branch: reported only when the record it
+        // follows was an added one.
+        if ws_rule & diff_color::WS_INCOMPLETE_LINE != 0 && last_added_is_final {
+            failed = true;
+            out.extend_from_slice(lp);
+            out.extend_from_slice(name.as_slice());
+            out.extend_from_slice(
+                format!(
+                    ":{}: {}.\n",
+                    after.len(),
+                    diff_files::whitespace_error_string(diff_color::WS_INCOMPLETE_LINE)
+                )
+                .as_bytes(),
+            );
+        }
+
+        // `check_blank_at_eof()` runs over the whole file rather than the hunk stream,
+        // and — unlike every other line here — git prints it without the line prefix.
+        if ws_rule & diff_color::WS_BLANK_AT_EOF != 0 {
+            let (_, post) = diff_color::check_blank_at_eof(&an.old_data, &an.new_data);
+            if post != 0 {
+                failed = true;
+                out.extend_from_slice(name.as_slice());
+                out.extend_from_slice(
+                    format!(
+                        ":{post}: {}.\n",
+                        diff_files::whitespace_error_string(diff_color::WS_BLANK_AT_EOF)
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+    }
+    Ok(failed)
+}
+
+/// `diff_unmodified_pair()` (diff.c:6505).
+fn diff_unmodified_pair(p: &Pair) -> bool {
+    if p.old_valid() != p.new_valid() {
+        return false;
+    }
+    if !p.old_valid() && !p.new_valid() {
+        return true;
+    }
+    if p.old_mode != p.new_mode || p.old_path != p.new_path {
+        return false;
+    }
+    p.old_id == p.new_id
+}
+
 fn gitlink_counts(p: &Pair) -> (u32, u32) {
     (u32::from(p.new_valid()), u32::from(p.old_valid()))
 }
@@ -2016,8 +2737,20 @@ fn analyze(
         Ok(p) => p,
         Err(_) => return Err(fatal("unable to diff blob pair")),
     };
-    let old_data = prep.old.data.as_slice().unwrap_or_default().to_vec();
-    let new_data = prep.new.data.as_slice().unwrap_or_default().to_vec();
+    // gitoxide hands back only the *size* of content it classified as binary, so those
+    // buffers are read from the object database instead. That is what
+    // `diff_populate_filespec()` does for an oid-valid filespec in any case: the
+    // working-tree conversion it can apply never runs on a path that came from a tree.
+    // Without them `--stat` cannot print `Bin <a> -> <b> bytes`, `--dirstat` cannot
+    // score the damage, and `-a` has nothing to diff.
+    let old_data = match prep.old.data.as_slice() {
+        Some(d) => d.to_vec(),
+        None => read_blob(repo, p.old_id, p.old_valid())?,
+    };
+    let new_data = match prep.new.data.as_slice() {
+        Some(d) => d.to_vec(),
+        None => read_blob(repo, p.new_id, p.new_valid())?,
+    };
 
     match prep.operation {
         Operation::SourceOrDestinationIsBinary => {
@@ -2074,6 +2807,22 @@ fn analyze(
                 hunks,
             })
         }
+    }
+}
+
+/// `diff_populate_filespec()` for a filespec whose object id is known: the blob's
+/// bytes verbatim, or nothing at all when the side does not exist.
+fn read_blob(
+    repo: &gix::Repository,
+    id: ObjectId,
+    valid: bool,
+) -> std::result::Result<Vec<u8>, ExitCode> {
+    if !valid || id.is_null() {
+        return Ok(Vec::new());
+    }
+    match repo.find_object(id) {
+        Ok(o) => Ok(o.data.clone()),
+        Err(_) => Err(fatal(&format!("unable to read {}", id.to_hex()))),
     }
 }
 
@@ -3079,15 +3828,20 @@ fn pprint_rename(a: &[u8], b: &[u8]) -> Vec<u8> {
 
 /// Render one pair as one or two `diff --git` file sections (a type change splits into
 /// a deletion patch followed by a creation patch, exactly as `run_diff()` does).
+///
+/// The bytes land in `out` uncolored and each section's whitespace state is pushed to
+/// `files`; the caller re-emits the whole patch at once, which is what
+/// `diff_flush_patch_all_file_pairs()` does and what lets `--color-moved` see a block
+/// that moved from one file to another.
 #[allow(clippy::too_many_arguments)]
 fn render_patch(
     out: &mut Vec<u8>,
+    files: &mut Vec<diff_color::FilePaint>,
     repo: &gix::Repository,
     cache: &mut gix::diff::blob::Platform,
     p: &Pair,
     opts: &Opts,
     base_abbrev: usize,
-    colors: &diff_color::DiffColors,
     ws_rule: u32,
 ) -> std::result::Result<(), ExitCode> {
     let steps: Vec<Pair> = if p.type_changed() {
@@ -3095,30 +3849,18 @@ fn render_patch(
     } else {
         vec![p.clone()]
     };
-    let paint_opts = diff_color::PaintOptions {
-        ws_error_highlight: opts.ws_error_highlight,
-        indicators: (opts.ind_new, opts.ind_old, opts.ind_context),
-        // `diff.suppressBlankEmpty` is not read by this module, so the sign of an
-        // empty context line is always kept, as git's default does.
-        suppress_blank_empty: false,
-    };
     for step in &steps {
         let an = analyze(repo, cache, step, opts)?;
-        // Each section is assembled uncolored, then re-emitted through git's
-        // `fn_out_consume()` chain with this pair's own whitespace state.
-        let mut section: Vec<u8> = Vec::new();
-        emit_patch(&mut section, repo, step, &an, opts, base_abbrev);
-        let file = diff_color::FilePaint {
-            ws_rule,
-            blank_at_eof: diff_color::check_blank_at_eof(&an.old_data, &an.new_data),
-        };
-        out.extend_from_slice(&diff_color::colorize_patch(
-            &section,
-            colors,
-            &paint_opts,
-            &[file],
-            file,
-        ));
+        let before = out.len();
+        emit_patch(out, repo, step, &an, opts, base_abbrev);
+        // A pair that renders nothing at all contributes no `diff --git` header, so
+        // it must not consume a slot in the per-file state either.
+        if out.len() != before {
+            files.push(diff_color::FilePaint {
+                ws_rule,
+                blank_at_eof: diff_color::check_blank_at_eof(&an.old_data, &an.new_data),
+            });
+        }
     }
     Ok(())
 }

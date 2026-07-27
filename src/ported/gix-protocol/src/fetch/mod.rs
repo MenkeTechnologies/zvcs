@@ -39,6 +39,10 @@ pub mod negotiate;
 
 ///
 #[cfg(feature = "fetch")]
+pub mod filter;
+
+///
+#[cfg(feature = "fetch")]
 pub mod refmap;
 
 mod types;

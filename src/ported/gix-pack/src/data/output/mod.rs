@@ -42,3 +42,6 @@ pub mod bytes;
 
 ///
 pub mod delta;
+
+///
+pub mod bitmap;

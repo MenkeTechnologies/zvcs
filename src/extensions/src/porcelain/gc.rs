@@ -754,9 +754,17 @@ fn write_bundle(
 
     // The pack is built under a temporary name because its final name is its own
     // checksum, which is only known once the last byte is in. This is also how
-    // git writes it.
-    let tmp = pack_dir.join("tmp_pack_zvcs_gc");
+    // git writes it. The name carries the pid because concurrent runs against one
+    // object store are the norm here, and a shared name would have them writing
+    // over each other's bytes before either rename.
+    let tmp = pack_dir.join(format!("tmp_pack_zvcs_gc_{}", std::process::id()));
     std::fs::write(&tmp, &packed.bytes).with_context(|| format!("create {}", tmp.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // git installs pack artifacts read-only; a failure to set the mode is not
+        // fatal there and is not here either.
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444));
+    }
 
     let pack_hash = packed.id;
     let base = format!("pack-{pack_hash}");
@@ -773,9 +781,24 @@ fn write_bundle(
     Ok(Some(base))
 }
 
+/// Install one `.idx`/`.rev`/`.mtimes` beside the pack it belongs to.
+///
+/// Written under a temporary name and renamed into place, as git installs every
+/// pack artifact. The rename is what makes a rerun work: these files are left
+/// `0444` (git's mode, matching [`super::pack_objects`]), and a pack whose object
+/// set has not changed hashes to the name it had last time, so writing straight
+/// to the destination would hit the read-only file a previous run left there and
+/// fail with `EACCES`. A rename replaces its destination whatever its mode is.
 fn write_sidecar(pack_dir: &Path, base: &str, ext: &str, bytes: &[u8]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
     let path = pack_dir.join(format!("{base}.{ext}"));
-    std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))
+    let tmp = pack_dir.join(format!("tmp_{ext}_zvcs_gc_{}", std::process::id()));
+    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    // Set the mode while the file is still under its temporary name: a failure
+    // there is not fatal, exactly as git does not check its own chmod.
+    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444));
+    std::fs::rename(&tmp, &path).with_context(|| format!("install {}", path.display()))
 }
 
 /// A v2 pack index: the `\xfftOc` signature, the 256-entry fan-out, then the

@@ -13,6 +13,7 @@ use gix::objs::{Kind, TreeRefIter};
 use gix::prelude::ObjectIdExt;
 use gix::revision::plumbing::Spec as RevSpec;
 
+use super::filespec::{content_of, count_changed_lines, is_binary};
 use super::line_log;
 use super::log::{DecorateStyle, Decorations, Mailmap};
 
@@ -1905,43 +1906,6 @@ fn emit_text_hunks(out: &mut Vec<u8>, old: &[u8], new: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Total added and removed lines, for `--stat`. Uses the same hunk machinery as
-/// the patch so the two can never disagree about what changed.
-fn count_changed_lines(old: &[u8], new: &[u8]) -> Result<(usize, usize)> {
-    let input = InternedInput::new(old, new);
-    let diff = diff_with_slider_heuristics(Algorithm::Myers, &input);
-    let counter = LineCounter {
-        added: 0,
-        deleted: 0,
-    };
-    Ok(UnifiedDiff::new(&diff, &input, counter, ContextSize::symmetrical(3)).consume()?)
-}
-
-/// Counts changed lines, ignoring context.
-struct LineCounter {
-    added: usize,
-    deleted: usize,
-}
-
-impl ConsumeHunk for LineCounter {
-    type Out = (usize, usize);
-
-    fn consume_hunk(&mut self, _header: HunkHeader, lines: &[(DiffLineKind, &[u8])]) -> std::io::Result<()> {
-        for &(kind, _) in lines {
-            match kind {
-                DiffLineKind::Add => self.added += 1,
-                DiffLineKind::Remove => self.deleted += 1,
-                DiffLineKind::Context => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> (usize, usize) {
-        (self.added, self.deleted)
-    }
-}
-
 /// Writes each hunk in git's unified-diff style: `@@ -a +b @@ <func>` headers with
 /// the git length-1 abbreviation, per-line prefixes, and the no-newline marker.
 struct HunkWriter<'a> {
@@ -2024,16 +1988,6 @@ fn write_range(out: &mut Vec<u8>, start: u32, len: u32) {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// The bytes to diff for an entry: a real blob is read from the object database; a
-/// submodule (commit entry) is rendered as its `Subproject commit <oid>` line.
-fn content_of(repo: &gix::Repository, id: ObjectId, is_submodule: bool) -> Result<Vec<u8>> {
-    if is_submodule {
-        Ok(format!("Subproject commit {}\n", id.to_hex()).into_bytes())
-    } else {
-        Ok(repo.find_object(id)?.detach().data)
-    }
-}
-
 /// Abbreviated object id for the `index` and raw lines. Real objects are
 /// disambiguated against the odb, as git's `diff_unique_abbrev` does; an absent
 /// side is all zeros, and a submodule commit (which this odb does not have) is
@@ -2050,11 +2004,6 @@ fn short_oid(repo: &gix::Repository, id: &ObjectId, plain: bool) -> Result<Strin
         return Ok(id.to_hex_with_len(abbrev).to_string());
     }
     Ok(id.attach(repo).shorten()?.to_string())
-}
-
-/// git's binary heuristic: a NUL byte within the first 8000 bytes.
-fn is_binary(data: &[u8]) -> bool {
-    data.iter().take(8000).any(|&b| b == 0)
 }
 
 /// The path of a change, for stable diff ordering.

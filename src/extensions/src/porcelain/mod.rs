@@ -68,6 +68,7 @@ mod fast_export;
 mod fast_import;
 mod fetch;
 mod fetch_pack;
+pub(crate) mod filespec;
 mod filter_branch;
 mod fmt_merge_msg;
 mod for_each_ref;

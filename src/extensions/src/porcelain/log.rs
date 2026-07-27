@@ -4,13 +4,12 @@ use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 
 use gix::bstr::ByteSlice;
-use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
-use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, InternedInput, UnifiedDiff};
 use gix::prelude::ObjectIdExt;
 use gix::hash::ObjectId;
 use gix::object::tree::diff::ChangeDetached;
 use gix::objs::tree::EntryKind;
 
+use super::filespec::{content_of, count_changed_lines, is_binary};
 use super::line_log;
 
 /// The terminal width git assumes for `--stat` when stdout is not a terminal.
@@ -4304,21 +4303,6 @@ fn type_class(kind: EntryKind) -> u8 {
     }
 }
 
-/// The bytes to diff for an entry: a real blob is read from the object database; a
-/// submodule (commit entry) is rendered as its `Subproject commit <oid>` line.
-fn content_of(repo: &gix::Repository, id: ObjectId, is_submodule: bool) -> Result<Vec<u8>> {
-    if is_submodule {
-        Ok(format!("Subproject commit {}\n", id.to_hex()).into_bytes())
-    } else {
-        Ok(repo.find_object(id)?.detach().data)
-    }
-}
-
-/// git's binary heuristic: a NUL byte within the first 8000 bytes.
-fn is_binary(data: &[u8]) -> bool {
-    data.iter().take(8000).any(|&b| b == 0)
-}
-
 /// The path of a change, for stable diff ordering.
 fn change_path(change: &ChangeDetached) -> &[u8] {
     match change {
@@ -4326,42 +4310,6 @@ fn change_path(change: &ChangeDetached) -> &[u8] {
         | ChangeDetached::Deletion { location, .. }
         | ChangeDetached::Modification { location, .. }
         | ChangeDetached::Rewrite { location, .. } => location,
-    }
-}
-
-/// Total added and removed lines, for `--stat`.
-fn count_changed_lines(old: &[u8], new: &[u8]) -> Result<(usize, usize)> {
-    let input = InternedInput::new(old, new);
-    let diff = diff_with_slider_heuristics(Algorithm::Myers, &input);
-    let counter = LineCounter {
-        added: 0,
-        deleted: 0,
-    };
-    Ok(UnifiedDiff::new(&diff, &input, counter, ContextSize::symmetrical(3)).consume()?)
-}
-
-/// Counts changed lines, ignoring context.
-struct LineCounter {
-    added: usize,
-    deleted: usize,
-}
-
-impl ConsumeHunk for LineCounter {
-    type Out = (usize, usize);
-
-    fn consume_hunk(&mut self, _header: HunkHeader, lines: &[(DiffLineKind, &[u8])]) -> std::io::Result<()> {
-        for &(kind, _) in lines {
-            match kind {
-                DiffLineKind::Add => self.added += 1,
-                DiffLineKind::Remove => self.deleted += 1,
-                DiffLineKind::Context => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> (usize, usize) {
-        (self.added, self.deleted)
     }
 }
 

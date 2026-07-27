@@ -154,6 +154,8 @@ use gix::prelude::ObjectIdExt;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 use gix::revision::walk::Sorting;
+
+use super::filespec;
 use gix::traverse::commit::simple::CommitTimeOrder;
 
 /// git's `DEFAULT_MERGE_LOG_LEN` — how many shortlog entries a valueless
@@ -1103,8 +1105,8 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         if !opts.quiet {
             println!(
                 "Updating {}..{}",
-                local_id.to_hex_with_len(7),
-                target_id.to_hex_with_len(7)
+                local_id.attach(&repo).shorten()?,
+                target_id.attach(&repo).shorten()?
             );
             println!("Fast-forward");
             print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
@@ -1132,8 +1134,8 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     if !opts.quiet {
         println!(
             "Updating {}..{}",
-            local_id.to_hex_with_len(7),
-            target_id.to_hex_with_len(7)
+            local_id.attach(&repo).shorten()?,
+            target_id.attach(&repo).shorten()?
         );
         println!("Fast-forward");
         print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
@@ -2957,16 +2959,17 @@ fn collect(
     let new = repo.find_tree(new_tree)?;
     let mut resource_cache = repo.diff_resource_cache_for_tree_diff()?;
 
-    // Per row: path (for ordering), display name, line counts, and — when the
-    // blob diff declined because a side is binary — the ids whose sizes git
-    // reports instead. Sizes are looked up after the walk so the callback stays
-    // infallible.
+    // Per row: path (for ordering), display name, line counts, and the id of each
+    // side paired with whether that side is a gitlink — needed when the blob diff
+    // declined, either because a side is binary (git reports its size) or because
+    // a side is a submodule (git diffs its `Subproject commit` line). Contents are
+    // looked up after the walk so the callback stays infallible.
     type RawRow = (
         BString,
         String,
         Option<(u64, u64)>,
-        Option<ObjectId>,
-        Option<ObjectId>,
+        Option<(ObjectId, bool)>,
+        Option<(ObjectId, bool)>,
         Option<&'static str>,
     );
     let mut raw: Vec<RawRow> = Vec::new();
@@ -2994,7 +2997,7 @@ fn collect(
                 ));
                 (
                     None,
-                    Some(id.detach()),
+                    Some((id.detach(), entry_mode.is_commit())),
                     compact_comment(None, Some(entry_mode.kind())),
                 )
             }
@@ -3004,7 +3007,7 @@ fn collect(
                     format!("delete mode {:06o} {display}", entry_mode.value()),
                 ));
                 (
-                    Some(id.detach()),
+                    Some((id.detach(), entry_mode.is_commit())),
                     None,
                     compact_comment(Some(entry_mode.kind()), None),
                 )
@@ -3027,8 +3030,8 @@ fn collect(
                     ));
                 }
                 (
-                    Some(previous_id.detach()),
-                    Some(id.detach()),
+                    Some((previous_id.detach(), previous_entry_mode.is_commit())),
+                    Some((id.detach(), entry_mode.is_commit())),
                     compact_comment(Some(previous_entry_mode.kind()), Some(entry_mode.kind())),
                 )
             }
@@ -3040,8 +3043,8 @@ fn collect(
                 id,
                 ..
             } => (
-                Some(source_id.detach()),
-                Some(id.detach()),
+                Some((source_id.detach(), source_entry_mode.is_commit())),
+                Some((id.detach(), entry_mode.is_commit())),
                 compact_comment(Some(source_entry_mode.kind()), Some(entry_mode.kind())),
             ),
         };
@@ -3059,16 +3062,34 @@ fn collect(
     })?;
     drop(platform);
 
-    let blob_size = |id: Option<ObjectId>| -> Result<u64> {
-        match id {
-            // git's `diff_filespec_size` of an invalid filespec is 0.
-            None => Ok(0),
-            Some(id) => Ok(repo.find_object(id)?.data.len() as u64),
+    // What a side diffs as, per `diff_populate_filespec()`: the blob for a real
+    // entry, and for a gitlink the `Subproject commit <oid>` line git substitutes
+    // for an object that lives in the submodule rather than here. An absent side
+    // is empty, which is the 0 `diff_filespec_size` reports for an invalid
+    // filespec.
+    let content = |side: Option<(ObjectId, bool)>| -> Result<Vec<u8>> {
+        match side {
+            None => Ok(Vec::new()),
+            Some((id, is_submodule)) => filespec::content_of(repo, id, is_submodule),
         }
     };
 
     let mut rows: Vec<(BString, StatRow)> = Vec::with_capacity(raw.len());
     for (path, name, counts, old_id, new_id, compact) in raw {
+        // The tree diff has no blob to hand its resource cache for a gitlink, so it
+        // yields no line counts; git diffs the substituted `Subproject commit`
+        // lines, which is what makes a bumped submodule the ` 1 insertion(+), 1
+        // deletion(-)` git reports rather than a lookup of a commit this object
+        // database legitimately does not have.
+        let submodule_side = matches!(old_id, Some((_, true))) || matches!(new_id, Some((_, true)));
+        let counts = match counts {
+            None if submodule_side => {
+                let (added, deleted) =
+                    filespec::count_changed_lines(&content(old_id)?, &content(new_id)?)?;
+                Some((added as u64, deleted as u64))
+            }
+            other => other,
+        };
         let row = match counts {
             Some((added, deleted)) => StatRow {
                 name,
@@ -3079,8 +3100,8 @@ fn collect(
             },
             None => StatRow {
                 name,
-                added: blob_size(new_id)?,
-                deleted: blob_size(old_id)?,
+                added: content(new_id)?.len() as u64,
+                deleted: content(old_id)?.len() as u64,
                 binary: true,
                 compact,
             },

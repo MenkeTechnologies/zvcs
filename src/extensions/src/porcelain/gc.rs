@@ -124,8 +124,8 @@
 //!
 //! `--detach` is accepted and always ignored: this port runs synchronously, so
 //! the work is complete by the time `gc` returns rather than shortly after.
-//! `--quiet` is likewise a no-op, because the progress it suppresses is written
-//! to stderr off a tty, which git already suppresses.
+//! `--quiet` suppresses the progress meters the pack write reports, which git
+//! writes to stderr and only on a terminal; see [`crate::progress`].
 //!
 //! No `gc.pid` lock is taken, so `--force` has nothing to override.
 
@@ -231,6 +231,9 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // `gc.aggressiveDepth`, which is what git's own `--aggressive` forwards to
     // its `repack` child.
     let mut aggressive = false;
+    // `-q`: suppress the progress meters the pack write reports. Progress is on
+    // a terminal only, so a piped or redirected run is quiet either way.
+    let mut quiet = false;
     // `None` until a `--prune` form is seen, so `gc.pruneExpire` can supply the
     // default only when the command line was silent — matching git, where the
     // command line overrides the config.
@@ -266,12 +269,13 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             "--no-cruft" => cruft = Some(false),
             "--aggressive" => aggressive = true,
             "--no-aggressive" => aggressive = false,
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
             // Boolean flags with no effect here, and their `--no-` forms, exactly
             // as listed in USAGE. `--keep-largest-pack` selects which packs to
-            // rewrite, which this port does not vary; `--quiet`/`--detach` are
-            // covered in the module docs.
-            "-q" | "--quiet" | "--no-quiet"
-            | "--detach" | "--no-detach" | "--force" | "--no-force"
+            // rewrite, which this port does not vary; `--detach` is covered in
+            // the module docs.
+            "--detach" | "--no-detach" | "--force" | "--no-force"
             | "--keep-largest-pack"
             // `--no-expire-to` is a valid negation (USAGE spells it `--[no-]expire-to`);
             // `--max-cruft-size` has no `--no-` form, so one is left to error out.
@@ -434,7 +438,11 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         expire_reflogs(&repo)?;
     }
 
-    repack_all(&repo, unreachable, delta_options(&repo, aggressive))?;
+    repack_all(
+        &repo,
+        unreachable,
+        delta_options(&repo, aggressive, crate::progress::enabled(quiet)),
+    )?;
 
     // `repack` has already removed every unreachable object under `Drop`, so the
     // delegate finds nothing left to do; it still runs, because it also sweeps
@@ -490,10 +498,15 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
 /// and `pack.depth`, which is exactly what git's `--aggressive` pushes onto its
 /// `repack` child's argument list — and, like git, a value of zero or less is
 /// dropped rather than forwarded, leaving the `pack.*` value in place.
-fn delta_options(repo: &gix::Repository, aggressive: bool) -> super::pack_objects::WriteOptions {
+fn delta_options(
+    repo: &gix::Repository,
+    aggressive: bool,
+    progress: bool,
+) -> super::pack_objects::WriteOptions {
     let snapshot = repo.config_snapshot();
     let mut options = super::pack_objects::WriteOptions {
         allow_ofs_delta: snapshot.boolean("repack.useDeltaBaseOffset").unwrap_or(true),
+        progress,
         ..super::pack_objects::WriteOptions::default()
     };
     if aggressive {
@@ -564,6 +577,15 @@ fn repack_all(
     let (keep, rest): (Vec<ObjectId>, Vec<ObjectId>) =
         existing.into_iter().partition(|id| reachable.contains(id));
 
+    // The traversal above is what git reports as `Enumerating objects`, ahead of
+    // the counting/compressing/writing meters the pack writer drives.
+    {
+        let mut enumerating =
+            crate::progress::Meter::unknown("Enumerating objects", delta.progress);
+        enumerating.advance(keep.len());
+        enumerating.done();
+    }
+
     // The new pack has to be written before anything is removed: every object in
     // it is read back out of the very packs and loose files being replaced.
     let mut written = Vec::new();
@@ -571,6 +593,16 @@ fn repack_all(
         written.push(base);
     }
     if unreachable == Unreachable::Cruft {
+        // git reports the cruft pass separately. Its second line, `Traversing
+        // cruft objects`, counts a walk out from the cruft tips that has no
+        // counterpart here: `rest` is already the complete unreachable set,
+        // partitioned out of everything the store holds, so there is nothing left
+        // to traverse and no honest number to print for it.
+        let mut enumerating =
+            crate::progress::Meter::unknown("Enumerating cruft objects", delta.progress);
+        enumerating.advance(rest.len());
+        enumerating.done();
+
         let mtimes: HashMap<ObjectId, u32> = rest
             .iter()
             .map(|id| {

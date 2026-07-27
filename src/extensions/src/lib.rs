@@ -24,6 +24,7 @@ pub mod lock;
 pub mod merge_apply;
 pub mod pager;
 pub mod porcelain;
+pub mod progress;
 pub mod rcache;
 pub mod revfilter;
 pub mod superset;

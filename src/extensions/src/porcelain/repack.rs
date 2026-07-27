@@ -132,7 +132,7 @@
 //!     positional, so the positional behaviour is what is implemented.
 //! ```
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -419,7 +419,15 @@ fn execute(st: &State) -> Result<ExitCode> {
         .config_snapshot()
         .boolean("pack.writeReverseIndex")
         .unwrap_or(true);
-    let written = write_pack(&repo, &to_pack, &pack_dir, write_rev)?;
+    // git's repack reports the pack write through its `pack-objects` child, so
+    // the meters appear here on the same terms: a terminal, and no `-q`.
+    let progress = crate::progress::enabled(st.quiet);
+    {
+        let mut enumerating = crate::progress::Meter::unknown("Enumerating objects", progress);
+        enumerating.advance(to_pack.len());
+        enumerating.done();
+    }
+    let written = write_pack(&repo, &to_pack, &pack_dir, write_rev, progress)?;
 
     // With `--filter` git writes a second pack holding the filtered-out objects.
     // Its own object set is empty here — the blob filters remove nothing the
@@ -473,6 +481,7 @@ fn write_pack(
     ids: &[ObjectId],
     pack_dir: &Path,
     write_rev: bool,
+    progress: bool,
 ) -> Result<PathBuf> {
     let allow_ofs_delta = repo
         .config_snapshot()
@@ -483,6 +492,7 @@ fn write_pack(
         ids,
         super::pack_objects::WriteOptions {
             allow_ofs_delta,
+            progress,
             ..super::pack_objects::WriteOptions::default()
         },
     )?;
@@ -492,23 +502,42 @@ fn write_pack(
 
     let kind = repo.object_hash();
     let base = pack_dir.join(format!("pack-{}", packed.id));
-    fs::write(base.with_extension("pack"), &packed.bytes)?;
+    install(&base.with_extension("pack"), &packed.bytes)?;
 
     // Both companions index into the pack in object-id order.
     let mut by_oid = packed.entries.clone();
     by_oid.sort_unstable_by_key(|entry| entry.id);
     let index_path = base.with_extension("idx");
-    fs::write(
+    install(
         &index_path,
-        super::pack_objects::index_file(kind, 2, &packed.id, &by_oid)?,
+        &super::pack_objects::index_file(kind, 2, &packed.id, &by_oid)?,
     )?;
     if write_rev {
-        fs::write(
-            base.with_extension("rev"),
-            super::pack_objects::reverse_index_file(kind, &packed.id, &by_oid)?,
+        install(
+            &base.with_extension("rev"),
+            &super::pack_objects::reverse_index_file(kind, &packed.id, &by_oid)?,
         )?;
     }
     Ok(index_path)
+}
+
+/// Put one pack artifact in place, `0444` and by rename, as git installs them.
+///
+/// The mode is why the rename matters: a pack whose object set has not changed
+/// hashes to the name it already has on disk, so writing straight to that path
+/// would land on the read-only file the last run left and fail with `EACCES`.
+fn install(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("tmp");
+    let tmp = dir.join(format!("tmp_{ext}_zvcs_repack_{}", std::process::id()));
+    fs::write(&tmp, bytes)
+        .with_context(|| format!("unable to write {}", tmp.display()))?;
+    // git does not check its own chmod either, so a filesystem that refuses the
+    // mode is not a failure.
+    let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o444));
+    fs::rename(&tmp, path).with_context(|| format!("unable to rename to {}", path.display()))
 }
 
 /// Write the empty pack, its index and its reverse index into `dir`.

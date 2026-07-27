@@ -335,8 +335,9 @@ struct State {
     delta_base_offset: Option<bool>,
     /// `--filter=<spec>`, as given; see [`apply_filter`].
     filter: Option<String>,
-    /// Whether the end-of-run summary goes to stderr: `-q` and `--progress`
-    /// (and `--all-progress`) are last-one-wins.
+    /// Whether the phase meters and the end-of-run summary go to stderr. Seeded
+    /// from `isatty(2)` in [`parse`], then `-q` and `--progress` (and
+    /// `--all-progress`) override it, last one wins.
     progress: bool,
     /// Non-option arguments; at most one (the base name) is legal.
     positionals: Vec<String>,
@@ -464,6 +465,13 @@ fn execute(st: &State) -> Result<ExitCode> {
     std::io::stdin().read_to_end(&mut stdin).ok();
 
     let counts = collect_counts(&repo, st, &stdin);
+    // git reports the object list it just built as `Enumerating objects`, a
+    // count with no total because the traversal is what decides the total.
+    {
+        let mut enumerating = crate::progress::Meter::unknown("Enumerating objects", st.progress);
+        enumerating.advance(counts.len());
+        enumerating.done();
+    }
 
     // git skips the pack entirely rather than writing an empty one, and says so
     // by writing nothing at all.
@@ -478,13 +486,12 @@ fn execute(st: &State) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
-    let packed = write_pack(&repo, &counts, compression(&repo, st), &delta)?;
+    let packed = write_pack(&repo, &counts, compression(&repo, st), &delta, st.progress)?;
 
     if st.stdout {
         let mut out = std::io::stdout().lock();
         out.write_all(&packed.bytes)?;
         out.flush()?;
-        report_progress(st, packed.entries.len(), packed.deltas);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -581,6 +588,17 @@ fn compression(repo: &gix::Repository, st: &State) -> gix::zlib::Compression {
     }
 }
 
+/// How many threads the delta search will really use, for the line git prints
+/// before it starts one: `pack.threads` when set, otherwise one per logical core
+/// (git's `online_cpus()`). Kept in step with `delta::search`, which resolves
+/// zero the same way.
+fn resolved_threads(configured: usize) -> usize {
+    match configured {
+        0 => std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        n => n,
+    }
+}
+
 /// git's end-of-run summary, which `--progress`/`--all-progress` put on stderr
 /// and `-q` (or the absence of both, stderr not being a terminal here)
 /// suppresses.
@@ -588,8 +606,8 @@ fn compression(repo: &gix::Repository, st: &State) -> gix::zlib::Compression {
 /// The reuse counts are always zero, which is the truth about the pack written
 /// here — nothing is ever copied out of an existing pack — rather than a
 /// stand-in for git's numbers; see the module docs.
-fn report_progress(st: &State, total: usize, deltas: usize) {
-    if st.progress {
+fn report_progress(progress: bool, total: usize, deltas: usize) {
+    if progress {
         eprintln!("Total {total} (delta {deltas}), reused 0 (delta 0), pack-reused 0 (from 0)");
     }
 }
@@ -663,6 +681,9 @@ pub(crate) struct WriteOptions {
     /// Shadows `pack.depth`, as `gc --aggressive` does with
     /// `--depth=<gc.aggressiveDepth>`.
     pub(crate) depth: Option<usize>,
+    /// Report the counting, compressing and writing phases on stderr the way
+    /// git's progress meter does. See [`crate::progress`].
+    pub(crate) progress: bool,
 }
 
 /// Build the pack for `ids` and hand back its bytes together with the per-entry
@@ -687,7 +708,13 @@ pub(crate) fn packed_for(
     if let Some(depth) = options.depth {
         delta.search.depth = depth;
     }
-    write_pack(repo, &counts, compression(repo, &State::default()), &delta)
+    write_pack(
+        repo,
+        &counts,
+        compression(repo, &State::default()),
+        &delta,
+        options.progress,
+    )
 }
 
 /// git's delta-search knobs, resolved the way `cmd_pack_objects` resolves them:
@@ -792,7 +819,9 @@ fn write_pack(
     counts: &[pack::data::output::Count],
     level: gix::zlib::Compression,
     delta: &DeltaConfig,
+    progress: bool,
 ) -> Result<Packed> {
+    use crate::progress::Meter;
     use pack::data::output::delta;
 
     // Entries are encoded before the header is written, because the header
@@ -802,9 +831,14 @@ fn write_pack(
 
     // Phase 1: types and sizes, from the object headers alone. An object whose
     // header cannot be read is dropped here and never reaches the pack.
+    //
+    // This is the pass git reports as `Counting objects`: one step per object in
+    // the set the traversal handed over, whether or not it survives to the pack.
+    let mut counting = Meter::counted("Counting objects", counts.len(), progress);
     let mut objects: Vec<delta::Object> = Vec::with_capacity(counts.len());
     for count in counts {
         use gix::odb::HeaderExt;
+        counting.tick();
         let Ok(header) = repo.objects.header(count.id) else {
             continue;
         };
@@ -815,9 +849,29 @@ fn write_pack(
             name_hash: 0,
         });
     }
+    counting.done();
     assign_name_hashes(repo, &mut objects);
 
-    // Phase 2: the delta search.
+    // Phase 2: the delta search. git announces the thread count first, then
+    // reports the search itself as `Compressing objects`. The search parallelises
+    // internally and reports nothing until it returns, so the meter goes from
+    // nothing to complete in one step — the line git leaves on screen either way.
+    //
+    // Both lines are skipped when no delta can be found at all, which is git's
+    // `if (nr_deltas)` gate: a one-object pack has nothing to deltify against,
+    // and a zero window or depth disables the search. git counts its delta
+    // *candidates* there, which this port does not work out separately, so the
+    // count below is every object handed to the search.
+    let searchable = objects.len() > 1 && delta.search.window > 0 && delta.search.depth > 0;
+    let compressing_progress = progress && searchable;
+    if compressing_progress {
+        eprintln!(
+            "Delta compression using up to {} threads",
+            resolved_threads(delta.search.threads)
+        );
+    }
+    let mut compressing =
+        Meter::counted("Compressing objects", objects.len(), compressing_progress);
     let deltas = delta::find_deltas(
         &objects,
         &delta.search,
@@ -827,13 +881,20 @@ fn write_pack(
             repo.objects.find(id, &mut buf).ok().map(|(object, _)| object.data.to_owned())
         },
     );
+    compressing.advance(objects.len());
+    compressing.done();
 
-    // Phase 3: serialise, base before delta.
+    // Phase 3: serialise, base before delta. `write_entry` recurses into an
+    // object's base first, so the meter counts positions reached rather than
+    // entries appended — the same total, and monotone, which is what the display
+    // needs.
+    let mut writing = Meter::counted("Writing objects", objects.len(), progress);
     let mut body: Vec<u8> = Vec::new();
     let mut entries: Vec<PackedEntry> = Vec::with_capacity(objects.len());
     let mut offsets: Vec<Option<u64>> = vec![None; objects.len()];
     let mut written_deltas = 0usize;
     for at in 0..objects.len() {
+        writing.tick();
         write_entry(
             repo,
             at,
@@ -847,6 +908,10 @@ fn write_pack(
             &mut written_deltas,
         )?;
     }
+    writing.done();
+    // git's closing summary belongs to the pack write itself, so every caller —
+    // `pack-objects` either way it emits, `repack` and `gc` — reports it.
+    report_progress(progress, entries.len(), written_deltas);
 
     let kind = repo.object_hash();
     let mut bytes = Vec::with_capacity(HEADER_LEN as usize + body.len() + kind.len_in_bytes());
@@ -1664,6 +1729,10 @@ fn errno_text(err: &std::io::Error) -> String {
 /// diagnostics verbatim on the first entry it rejects.
 fn parse(args: &[String]) -> Parsed {
     let mut st = State::default();
+    // git's `cmd_pack_objects` starts with progress on and clears it when stderr
+    // is not a terminal, so a run on a terminal reports without being asked and a
+    // piped one stays silent. `-q` and `--progress` then override, last one wins.
+    st.progress = crate::progress::enabled(false);
     let mut end_of_opts = false;
     let mut i = 0;
 

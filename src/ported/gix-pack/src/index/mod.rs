@@ -149,4 +149,7 @@ pub mod verify;
 pub mod write;
 #[cfg(feature = "streaming-input")]
 pub use write::function::write_data_iter_to_stream;
+// `write` itself is gated, so this re-export has to be too — without the gate
+// `gix-pack` fails to build unless a dependent happens to enable the feature.
+#[cfg(feature = "streaming-input")]
 pub use write::reverse::write_reverse_index;

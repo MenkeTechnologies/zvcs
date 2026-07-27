@@ -1,5 +1,14 @@
 use super::{Error, traverse};
 use crate::exact_vec;
+
+/// The placeholder base offset to pass to [`Tree::add_child()`] for an `OBJ_REF_DELTA` entry whose base is expected to
+/// live in the very same pack, but whose offset isn't known yet because it is named by object id.
+///
+/// No real pack offset can ever reach this value, so such a child is parked in `future_child_offsets` until
+/// [`Tree::assign_ref_delta_bases()`] replaces the placeholder with the base's actual offset. This mirrors how
+/// `index-pack.c` keeps `ref_deltas` aside during `parse_pack_objects()` and only links them to their base in
+/// `resolve_deltas()`, once the base object's id has been computed.
+pub(crate) const REF_DELTA_BASE_UNKNOWN: crate::data::Offset = u64::MAX;
 /// An item stored within the [`Tree`] whose data is stored in a pack file, identified by
 /// the offset of its first (`offset`) and last (`next_offset`) bytes.
 ///
@@ -78,6 +87,46 @@ impl<T> Tree<T> {
     /// You can rely on them following the same `children` invariants as they did in the tree
     pub(super) fn take_root_and_child(self) -> (Vec<Item<T>>, Vec<Item<T>>) {
         (self.root_items, self.child_items)
+    }
+
+    /// Return the byte range of every entry added so far, sorted by pack offset, with the last entry ending at
+    /// `pack_entries_end`.
+    ///
+    /// Used to decode entries before the tree is traversed, which is what resolving in-pack ref-deltas requires.
+    pub(crate) fn entry_ranges(&self, pack_entries_end: crate::data::Offset) -> Vec<crate::data::EntryRange> {
+        let mut offsets = Vec::with_capacity(self.num_items());
+        offsets.extend(self.root_items.iter().map(|i| i.offset));
+        offsets.extend(self.child_items.iter().map(|i| i.offset));
+        offsets.sort_unstable();
+        offsets
+            .iter()
+            .zip(offsets.iter().skip(1).chain(std::iter::once(&pack_entries_end)))
+            .map(|(&start, &end)| start..end)
+            .collect()
+    }
+
+    /// Replace the [`REF_DELTA_BASE_UNKNOWN`] placeholder of every deferred child with the base offset that
+    /// `bases_by_child_offset` provides for it.
+    ///
+    /// Returns the pack offset of the first child without a known base, which means its base object is neither in this
+    /// pack nor in the object database.
+    pub(crate) fn assign_ref_delta_bases(
+        &mut self,
+        bases_by_child_offset: &std::collections::HashMap<crate::data::Offset, crate::data::Offset>,
+    ) -> Result<(), crate::data::Offset> {
+        let Tree {
+            child_items,
+            future_child_offsets,
+            ..
+        } = self;
+        for (parent_offset, child_index) in future_child_offsets.iter_mut() {
+            if *parent_offset != REF_DELTA_BASE_UNKNOWN {
+                continue;
+            }
+            let child_offset = child_items[*child_index].offset;
+            *parent_offset = *bases_by_child_offset.get(&child_offset).ok_or(child_offset)?;
+        }
+        Ok(())
     }
 
     pub(super) fn assert_is_incrementing_and_update_next_offset(

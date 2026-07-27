@@ -1377,7 +1377,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             .transpose()?
             .ok_or_else(|| anyhow::anyhow!("unable to determine committer identity"))?;
         let ident = format!("{} <{}>", committer.name, committer.email);
-        append_signoff(&mut buf, &ident);
+        let ignore_footer = ignore_non_trailer(buf.as_bytes());
+        append_signoff(&mut buf, &ident, ignore_footer, false);
     }
 
     // The commented help + status block, and the `-v` diff below the cut line, go
@@ -1436,7 +1437,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         }
         message = std::fs::read_to_string(&msg_path)?;
     }
-    let subject = message.lines().next().unwrap_or("").to_string();
+    // `print_commit_summary()` renders `%s`, which is `format_subject(sb, msg,
+    // " ")` — the *whole* first paragraph folded onto one line, not just its
+    // first line. A subject written across two lines prints as one.
+    let subject = folded_subject(&message);
 
     // `--author="Name <email>"` overrides the author identity. The author *date*
     // is unchanged: HEAD's on an amend (git preserves it), the configured author
@@ -2956,12 +2960,19 @@ fn message_body(msg: &str) -> String {
 }
 
 /// `-s`/`--signoff`: append a `Signed-off-by: <ident>` trailer, a faithful port
-/// of `append_signoff()` (sequencer.c) with `flag == 0` (no dedup). The trailer
-/// is merged into an existing trailer block, or set off by a blank line after a
-/// message body, and is skipped only when it is already the last trailer.
-fn append_signoff(msg: &mut String, ident: &str) {
+/// of `append_signoff()` (sequencer.c). The trailer is merged into an existing
+/// trailer block, or set off by a blank line after a message body, and is
+/// skipped when it is already the last trailer.
+///
+/// `ignore_footer` is the trailing run `commit` keeps below the trailer block
+/// (`ignore_non_trailer()`); `format-patch` passes `0`, because the buffer it
+/// hands over is the message alone.
+///
+/// `dedup` is git's `APPEND_SIGNOFF_DEDUP`: `commit` passes `flag == 0` and so
+/// re-appends a trailer that appears earlier in the block, while `format-patch`
+/// passes the flag and leaves the block alone.
+pub(crate) fn append_signoff(msg: &mut String, ident: &str, ignore_footer: usize, dedup: bool) {
     let sob = format!("Signed-off-by: {ident}\n");
-    let ignore_footer = ignore_non_trailer(msg.as_bytes());
     // strbuf_complete_line: only when there is no trailing footer to preserve.
     if ignore_footer == 0 && !msg.is_empty() && !msg.ends_with('\n') {
         msg.push('\n');
@@ -2993,7 +3004,7 @@ fn append_signoff(msg: &mut String, ident: &str) {
             msg.insert_str(pos, a);
         }
     }
-    if has_footer != 3 {
+    if has_footer != 3 && (!dedup || has_footer != 2) {
         let pos = msg.len() - ignore_footer;
         msg.insert_str(pos, &sob);
     }

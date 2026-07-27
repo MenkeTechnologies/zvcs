@@ -2,6 +2,8 @@ pub use error::Error;
 
 mod error;
 
+mod ref_delta;
+
 pub mod reverse;
 
 pub(crate) struct TreeEntry {
@@ -62,9 +64,9 @@ pub(super) mod function {
 
     use gix_features::progress::{self, Count, Progress, prodash::DynNestedProgress};
 
-    use crate::cache::delta::{Tree, traverse};
+    use crate::cache::delta::{REF_DELTA_BASE_UNKNOWN, Tree, traverse};
 
-    use super::{Error, Outcome, ProgressId, TreeEntry, modify_base};
+    use super::{Error, Outcome, ProgressId, TreeEntry, modify_base, ref_delta};
 
     /// Write information about `entries` as obtained from a pack data file into a pack index file via the `out` stream.
     /// The resolver produced by `make_resolver` must resolve pack entries from the same pack data file that produced the
@@ -82,7 +84,9 @@ pub(super) mod function {
     ///
     /// # Remarks
     ///
-    /// * neither in-pack nor out-of-pack Ref Deltas are supported here, these must have been resolved beforehand.
+    /// * in-pack Ref Deltas are resolved here by reconstructing the pack's objects to learn their ids, the way
+    ///   `index-pack.c` does in `resolve_deltas()`. Out-of-pack Ref Deltas, i.e. thin packs, must have been resolved
+    ///   beforehand as there is no object database to look their bases up in.
     /// * `make_resolver()` will only be called after the iterator stopped returning elements and produces a function that
     ///   provides all bytes belonging to a pack entry writing them to the given mutable output `Vec`.
     ///   It should return `None` if the entry cannot be resolved from the pack that produced the `entries` iterator, causing
@@ -122,6 +126,7 @@ pub(super) mod function {
             root_progress.add_child_with_id("decompressing".into(), ProgressId::DecompressedBytes.into());
         decompressed_progress.init(None, progress::bytes());
         let mut pack_entries_end: u64 = 0;
+        let mut num_ref_deltas = 0usize;
 
         for entry in entries {
             let crate::data::input::Entry {
@@ -153,7 +158,19 @@ pub(super) mod function {
                         },
                     )?;
                 }
-                RefDelta { .. } => return Err(Error::IteratorInvariantNoRefDelta),
+                RefDelta { .. } => {
+                    // The base is named by object id, which nothing knows the offset of until the pack has been
+                    // reconstructed. Park the child under a placeholder base and link it once the walk below found it.
+                    num_ref_deltas += 1;
+                    tree.add_child(
+                        REF_DELTA_BASE_UNKNOWN,
+                        pack_offset,
+                        TreeEntry {
+                            id: object_hash.null(),
+                            crc32,
+                        },
+                    )?;
+                }
                 OfsDelta { base_distance } => {
                     let base_pack_offset =
                         crate::data::entry::Header::verified_base_pack_offset(pack_offset, base_distance).ok_or(
@@ -188,6 +205,19 @@ pub(super) mod function {
         root_progress.inc();
 
         let (resolver, pack) = make_resolver().map_err(gix_hash::io::Error::from)?;
+        if num_ref_deltas != 0 {
+            let bases = ref_delta::resolve_bases(
+                resolver.clone(),
+                &pack,
+                &tree.entry_ranges(pack_entries_end),
+                num_ref_deltas,
+                object_hash,
+                alloc_limit_bytes,
+                should_interrupt,
+            )?;
+            tree.assign_ref_delta_bases(&bases)
+                .map_err(|pack_offset| Error::UnresolvedRefDelta { pack_offset })?;
+        }
         let sorted_pack_offsets_by_oid = {
             let traverse::Outcome { roots, children } = tree.traverse(
                 resolver,

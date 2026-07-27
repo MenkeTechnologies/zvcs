@@ -131,6 +131,7 @@
 //! ```
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -384,17 +385,40 @@ fn execute(st: &State) -> Result<ExitCode> {
     let reachable = super::prune::close_over(&repo, roots);
 
     let existing = super::prune::pack_indices(&repo, &objdir);
-    let mut to_pack: Vec<ObjectId> = reachable
+    let candidates: Vec<ObjectId> = reachable
         .into_iter()
-        .filter(|id| keeps_object(st, id, &repo))
         // Without `-a`/`-A`/`--cruft`, a repack is incremental: anything an
         // existing pack already holds is left where it is.
         .filter(|id| st.all_into_one || !existing.iter().any(|f| f.lookup(*id).is_some()))
         .collect();
+    // `cmd_repack()` passes `--indexed-objects` alongside `--filter`, and
+    // pack-objects unions those back in afterwards: an object the index names
+    // stays in the main pack whatever the spec says. `do_add_index_objects_to_pending()`
+    // skips gitlinks, so this does too.
+    let indexed: HashSet<ObjectId> = repo
+        .index_or_empty()
+        .map(|index| {
+            index
+                .entries()
+                .iter()
+                .filter(|entry| entry.mode != gix::index::entry::Mode::COMMIT)
+                .map(|entry| entry.id)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // `--filter` *splits* the object set, it does not shrink it: what the spec
+    // rejects goes into a second pack of its own. Dropping those objects instead
+    // would destroy them, because `-d` is about to delete the packs they live in
+    // now — `git repack -a -d --filter=blob:none` must leave every blob readable.
+    let (mut to_pack, mut filtered_out): (Vec<ObjectId>, Vec<ObjectId>) = candidates
+        .into_iter()
+        .partition(|id| indexed.contains(id) || keeps_object(st, id, &repo));
     // The pack's entry order is ours to choose; sorting makes a run reproducible.
     to_pack.sort();
+    filtered_out.sort();
 
-    if to_pack.is_empty() {
+    if to_pack.is_empty() && filtered_out.is_empty() {
         // git's own wording, on stdout, exit 0. `-a` repacks unconditionally and
         // so never reaches this, and `-q` suppresses the notice.
         if !st.all_into_one && !st.quiet {
@@ -429,26 +453,40 @@ fn execute(st: &State) -> Result<ExitCode> {
         enumerating.advance(to_pack.len());
         enumerating.done();
     }
-    let written = write_pack(
-        &repo,
-        &to_pack,
-        &pack_dir,
-        write_rev,
-        progress,
-        write_bitmaps(st, &repo),
-    )?;
+    // Everything filtered out is about to be written elsewhere, so a run whose
+    // spec rejects the whole set still has a second pack to produce.
+    let written = if to_pack.is_empty() {
+        PathBuf::new()
+    } else {
+        write_pack(
+            &repo,
+            &to_pack,
+            &pack_dir,
+            write_rev,
+            progress,
+            write_bitmaps(st, &repo),
+        )?
+    };
 
-    // With `--filter` git writes a second pack holding the filtered-out objects.
-    // Its own object set is empty here — the blob filters remove nothing the
-    // index does not put back — but the pack, its index and its reverse index
-    // are written all the same, because their presence is what differs.
+    // With `--filter` git writes a second pack holding the filtered-out objects,
+    // in `--filter-to=<dir>` when given and beside the first one otherwise. The
+    // objects have to travel with it: they are only reachable through this pack
+    // once `-d` removes the ones they came from.
     if st.filter {
         let dir = match &st.filter_to_dir {
             Some(d) => PathBuf::from(d),
             None => pack_dir.clone(),
         };
         fs::create_dir_all(&dir)?;
-        write_empty_pack(repo.object_hash(), &dir, write_rev)?;
+        if filtered_out.is_empty() {
+            // git still writes the pack, its index and its reverse index when the
+            // spec rejected nothing; their presence is what marks a filtered run.
+            write_empty_pack(repo.object_hash(), &dir, write_rev)?;
+        } else {
+            // No bitmap: a bitmap describes a reachability closure, and this pack
+            // is deliberately a fragment of one.
+            write_pack(&repo, &filtered_out, &dir, write_rev, progress, false)?;
+        }
     }
 
     if st.delete_redundant {

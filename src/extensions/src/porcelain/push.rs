@@ -31,8 +31,14 @@ use super::push_proto::{self, Request};
 /// `--mirror`, `--prune`, `--atomic`, `--signed[=<mode>]` and `-o/--push-option`
 /// are negotiated by [`super::push_proto`], which refuses the push when the
 /// receiving end lacks the matching capability rather than downgrading it
-/// silently; inert or already-matched flags (`--thin`, `--receive-pack`,
-/// `-4/-6`, `--verify`, …) are accepted.
+/// silently; inert or already-matched flags (`--thin`, `-4/-6`, `--verify`, …)
+/// are accepted. `--receive-pack=<path>` / `--exec=<path>` (else
+/// `remote.<name>.receivepack`) reaches the transport, which runs it in place of
+/// `git-receive-pack` on the other end.
+///
+/// The response is read as a `side-band-64k` stream whenever the server offers
+/// one, so everything the server and its hooks write comes back as `remote: …`
+/// lines on stderr, colored per `color.remote[.hint|.warning|.success|.error]`.
 ///
 /// `--force-if-includes` is honored for real: alongside a `--force-with-lease`
 /// whose expected value came from a remote-tracking ref, the tip the remote
@@ -133,9 +139,12 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
                 f.follow_tags = false;
                 follow_tags_explicit = true;
             }
-            "--receive-pack" | "--exec" => {
-                let _ = take_value(inline)?;
-            }
+            // `--receive-pack=<path>` and its hidden synonym `--exec`: the program
+            // to run in place of `git-receive-pack` on the other end. git passes it
+            // straight to `git_connect()` for the push direction, so it reaches the
+            // transport rather than the protocol (`connect_setup()`, transport.c:314).
+            "--receive-pack" | "--exec" => f.receive_pack = Some(take_value(inline)?),
+            "--no-receive-pack" | "--no-exec" => f.receive_pack = None,
             "--recurse-submodules" => {
                 f.recurse = parse_recurse(&take_value(inline)?)?;
                 recurse_explicit = true;
@@ -438,12 +447,23 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     } else {
         None
     };
+    // `remote.<name>.receivepack` is the default for `--receive-pack`
+    // (`transport_get`, transport.c:1252-1254: the smart option starts at
+    // `git-receive-pack` and the remote's value replaces it). The flag wins,
+    // because `set_git_option(TRANS_OPT_RECEIVEPACK)` runs afterwards.
+    let receive_pack = f.receive_pack.clone().or_else(|| {
+        repo.config_snapshot()
+            .plumbing()
+            .string_by("remote", Some(remote_name.as_str().into()), "receivepack")
+            .map(|v| v.to_string())
+    });
     let send_opts = push_proto::SendOptions {
         atomic: f.atomic,
         signed: f.signed,
         push_options: f.push_options.clone(),
         delete_scope,
         local_refs,
+        receive_pack,
     };
     let outcome = push_proto::send_pack(&repo, &remote, &requests, f.dry_run, &send_opts)?;
 
@@ -485,6 +505,8 @@ struct Flags {
     /// `--force-if-includes`. Inert unless a lease resolves its expected value
     /// from a remote-tracking ref; see the option-parsing arm for why.
     force_if_includes: bool,
+    /// `--receive-pack`/`--exec`, else `remote.<name>.receivepack`.
+    receive_pack: Option<String>,
     recurse: Recurse,
 }
 
@@ -661,6 +683,7 @@ fn build_requests(
             }
             if let Some(id) = r.try_id() {
                 requests.push(Request {
+                    src: Some(name.clone()),
                     name,
                     new: id.detach(),
                     force: true,
@@ -681,7 +704,7 @@ fn build_requests(
             let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
             if let Some(id) = r.try_id() {
                 let short = short_ref(&name).to_string();
-                requests.push(Request { name: name.clone(), new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None });
+                requests.push(Request { src: Some(name.clone()), name: name.clone(), new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None });
                 upstreams.push((short, name));
             }
         }
@@ -705,7 +728,7 @@ fn build_requests(
             // fetch reporting "would clobber existing tag" because the two sides
             // now name different objects.
             if let Some(id) = r.try_id() {
-                tag_requests.push(Request { name, new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None });
+                tag_requests.push(Request { src: Some(name.clone()), name, new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None });
             }
         }
         // Only `--tags` on its own is complete here; with refspecs alongside, the
@@ -720,6 +743,7 @@ fn build_requests(
         for spec in specs {
             requests.push(Request {
                 name: full_ref_name(spec),
+                src: None,
                 new: null(repo),
                 force: f.force,
                 expected: None,
@@ -813,7 +837,7 @@ fn append_followed_tags(repo: &gix::Repository, requests: &mut Vec<Request>) -> 
         if tips.iter().any(|tip| reachable(repo, peeled, *tip)) {
             // Never forced: a followed tag is an addition, and git refuses to
             // clobber a differing remote tag here just as it does for `--tags`.
-            requests.push(Request { name, new: tag_object, force: false, expected: None, only_if_absent: true, check_reachable: None });
+            requests.push(Request { src: Some(name.clone()), name, new: tag_object, force: false, expected: None, only_if_absent: true, check_reachable: None });
         }
     }
     Ok(())
@@ -872,6 +896,12 @@ fn parse_refspec(
     Ok((
         Request {
             name: dst_full,
+            // `ref->peer_ref`: the local ref the update reads from. A `:dst`
+            // deletion has none, which is why git prints it with no source.
+            // `match_explicit_lhs()` also accepts a `<src>` that is not a ref at
+            // all — a raw object name, or `HEAD` — and `matched_src->name` is
+            // then the text the user wrote, which is what the report shows.
+            src: src_full.or_else(|| (!src.is_empty()).then(|| src.to_string())),
             new,
             force,
             expected: None,
@@ -897,6 +927,7 @@ fn current_branch_request(repo: &gix::Repository, force: bool) -> Result<(Reques
     let name = format!("refs/heads/{branch}");
     Ok((
         Request {
+            src: Some(name.clone()),
             name: name.clone(),
             new,
             force,
@@ -975,7 +1006,11 @@ fn update_tracking_refs(
         if s.result.is_err() {
             continue;
         }
-        let Some(tracking) = tracking_ref_for(remote, &s.name) else {
+        // `transport_update_tracking_ref` (transport.c:612-616) follows the report:
+        // the tracking ref that moves is the one the SERVER named, not the one the
+        // client asked for.
+        let Some(tracking) = tracking_ref_for(remote, s.report_name.as_deref().unwrap_or(&s.name))
+        else {
             continue;
         };
         let Ok(name) = gix::refs::FullName::try_from(tracking.as_str()) else {
@@ -1061,7 +1096,17 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
     let mut rejected: Vec<(&str, &str)> = Vec::new();
     for s in &outcome.statuses {
         let short = |oid: &ObjectId| oid.to_hex_with_len(7).to_string();
-        let src_dst = format!("{} -> {}", short_ref(&s.name), short_ref(&s.name));
+        // `print_ref_status` (transport.c:620): the left side is the LOCAL ref
+        // (`ref->peer_ref`) and the right side is `report->ref_name` when the
+        // server named one — a `proc-receive` hook turns `refs/for/main` into
+        // whatever it really created — else the ref that was asked for. Both are
+        // run through `prettify_refname`.
+        let dst = s.report_name.as_deref().unwrap_or(&s.name);
+        let src_dst = format!(
+            "{} -> {}",
+            short_ref(s.src.as_deref().unwrap_or(&s.name)),
+            short_ref(dst)
+        );
         match &s.result {
             // git lists an unchanged ref only under `-v`; the default block shows
             // just what moved.
@@ -1074,22 +1119,37 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
                 // git names the created ref by its namespace: a branch, a tag, or
                 // — for anything else, notes and remote-tracking refs included,
                 // which `--mirror` pushes — the generic "new reference".
-                let kind = if s.name.starts_with("refs/tags/") {
-                    "[new tag]     "
-                } else if s.name.starts_with("refs/heads/") {
-                    "[new branch]  "
+                let kind = if dst.starts_with("refs/tags/") {
+                    "[new tag]"
+                } else if dst.starts_with("refs/heads/") {
+                    "[new branch]"
                 } else {
                     "[new reference]"
                 };
-                eprintln!(" * {kind}    {src_dst}");
+                // `%-*s` at `transport_summary_width()`, which is
+                // `2 * FALLBACK_DEFAULT_ABBREV + 3` = 17, then one space
+                // (transport.c:647). `[new reference]` is the one summary long
+                // enough for the difference between padding and a fixed run of
+                // spaces to show.
+                eprintln!(" * {kind:<17} {src_dst}");
             }
             Ok(()) if s.new.is_null() => {
-                eprintln!(" - [deleted]         {}", short_ref(&s.name));
+                eprintln!(" - [deleted]         {}", short_ref(dst));
             }
             Ok(()) => {
-                let sep = if s.forced { "..." } else { ".." };
-                let flag = if s.forced { "+" } else { " " };
-                eprintln!("{flag}  {}{sep}{}  {src_dst}", short(&s.old), short(&s.new));
+                // `print_ok_ref_status`: a forced update is `+` with `...` between
+                // the abbreviations and a trailing `(forced update)`; a plain one
+                // is a blank flag with `..` and no trailer. `print_ref_status`
+                // prints the summary as ` %c %-*s ` at `TRANSPORT_SUMMARY_WIDTH`
+                // (`2 * DEFAULT_ABBREV + 3` = 17), which is why the shorter `..`
+                // form ends up one space wider than the `...` one.
+                let (flag, sep, msg) = if s.forced {
+                    ('+', "...", " (forced update)")
+                } else {
+                    (' ', "..", "")
+                };
+                let summary = format!("{}{sep}{}", short(&s.old), short(&s.new));
+                eprintln!(" {flag} {summary:<17} {src_dst}{msg}");
             }
             Err(reason) => {
                 any_failed = true;
@@ -1127,10 +1187,10 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
 /// suppressed by its own `advice.*` slot *and* by the umbrella
 /// `advice.pushUpdateRejected` (which `advice.pushNonFastForward` also gates).
 ///
-/// The two reasons the push protocol here produces are the non-fast-forward
-/// rejection — split by whether the rejected ref is the checked-out branch, as
-/// `transport_push` splits `REJECT_NON_FF_HEAD` from `REJECT_NON_FF_OTHER` — and
-/// "fetch first", for a remote ref pointing at an object we do not have.
+/// The reasons `set_ref_status_for_push()` produces map one-to-one onto the
+/// bits, with the non-fast-forward rejection split by whether the rejected ref is
+/// the checked-out branch, as `transport_push` splits `REJECT_NON_FF_HEAD` from
+/// `REJECT_NON_FF_OTHER`.
 fn advise_rejections(rejected: &[(&str, &str)]) {
     use crate::advice::Advice;
 
@@ -1157,24 +1217,13 @@ fn advise_rejections(rejected: &[(&str, &str)]) {
     let non_ff_other = rejected
         .iter()
         .any(|(n, reason)| *reason == "non-fast-forward" && Some(*n) != head.as_deref());
+    let already_exists = rejected.iter().any(|(_, reason)| *reason == "already exists");
     let fetch_first = rejected.iter().any(|(_, reason)| *reason == "fetch first");
+    let needs_force = rejected.iter().any(|(_, reason)| *reason == "needs force");
     let needs_update =
         rejected.iter().any(|(_, reason)| *reason == "remote ref updated since checkout");
 
-    // `message_advice_ref_needs_update` (builtin/push.c:316-320), the hint for a
-    // `--force-if-includes` rejection. git gates it on its own
-    // `advice.pushRefNeedsUpdate` slot as well as the umbrella
-    // `advice.pushUpdateRejected` checked above; there is no separate slot for it
-    // here yet, so only the umbrella silences it.
-    if needs_update {
-        Advice::PushUpdateRejected.advise_plain_in(
-            &repo,
-            "Updates were rejected because the tip of the remote-tracking branch has\n\
-             been updated since the last checkout. If you want to integrate the\n\
-             remote changes, use 'git pull' before pushing again.\n\
-             See the 'Note about fast-forwards' in 'git push --help' for details.",
-        );
-    } else if non_ff_head {
+    if non_ff_head {
         Advice::PushNonFFCurrent.advise_plain_in(
             &repo,
             "Updates were rejected because the tip of your current branch is behind\n\
@@ -1190,6 +1239,11 @@ fn advise_rejections(rejected: &[(&str, &str)]) {
              before pushing again.\n\
              See the 'Note about fast-forwards' in 'git push --help' for details.",
         );
+    } else if already_exists {
+        Advice::PushAlreadyExists.advise_plain_in(
+            &repo,
+            "Updates were rejected because the tag already exists in the remote.",
+        );
     } else if fetch_first {
         Advice::PushFetchFirst.advise_plain_in(
             &repo,
@@ -1197,6 +1251,23 @@ fn advise_rejections(rejected: &[(&str, &str)]) {
              have locally. This is usually caused by another repository pushing to\n\
              the same ref. If you want to integrate the remote changes, use\n\
              'git pull' before pushing again.\n\
+             See the 'Note about fast-forwards' in 'git push --help' for details.",
+        );
+    } else if needs_force {
+        // `message_advice_ref_needs_force` is the one that ends with a newline;
+        // `vadvise()` stops at the terminator, so it prints no extra blank line.
+        Advice::PushNeedsForce.advise_plain_in(
+            &repo,
+            "You cannot update a remote ref that points at a non-commit object,\n\
+             or update a remote ref to make it point at a non-commit object,\n\
+             without using the '--force' option.\n",
+        );
+    } else if needs_update {
+        Advice::PushRefNeedsUpdate.advise_plain_in(
+            &repo,
+            "Updates were rejected because the tip of the remote-tracking branch has\n\
+             been updated since the last checkout. If you want to integrate the\n\
+             remote changes, use 'git pull' before pushing again.\n\
              See the 'Note about fast-forwards' in 'git push --help' for details.",
         );
     }
@@ -1209,18 +1280,21 @@ fn report_porcelain(outcome: &push_proto::Outcome) -> Result<ExitCode> {
     println!("To {}", outcome.url);
     for s in &outcome.statuses {
         let short = |oid: &ObjectId| oid.to_hex_with_len(7).to_string();
-        let refpair = format!("{0}:{0}", s.name);
+        // `fprintf(stdout, "%c\t%s:%s\t", flag, from->name, to_name)` — the local
+        // ref and the ref the server says it updated, both unshortened.
+        let dst = s.report_name.as_deref().unwrap_or(&s.name);
+        let refpair = format!("{}:{}", s.src.as_deref().unwrap_or(&s.name), dst);
         match &s.result {
             Ok(()) if s.up_to_date => println!("=\t{refpair}\t[up to date]"),
             Ok(()) if s.old.is_null() => {
-                let kind = if s.name.starts_with("refs/tags/") {
+                let kind = if dst.starts_with("refs/tags/") {
                     "[new tag]"
                 } else {
                     "[new branch]"
                 };
                 println!("*\t{refpair}\t{kind}");
             }
-            Ok(()) if s.new.is_null() => println!("-\t:{0}\t[deleted]", s.name),
+            Ok(()) if s.new.is_null() => println!("-\t:{dst}\t[deleted]"),
             Ok(()) => {
                 let flag = if s.forced { "+" } else { " " };
                 let sep = if s.forced { "..." } else { ".." };
@@ -1432,6 +1506,7 @@ fn expand_pattern_refspec(
         }
         out.push(Request {
             name: format!("{dst_prefix}{matched}{dst_suffix}"),
+            src: Some(name.clone()),
             new: id,
             force,
             expected: None,
@@ -1545,6 +1620,7 @@ mod tests {
         let repo = gix::open(dir).expect("open fixture");
         let tip = repo.head_id().expect("head").detach();
         let mut requests = vec![Request {
+            src: Some("refs/heads/main".into()),
             name: "refs/heads/main".into(),
             new: tip,
             force: false,
@@ -1572,6 +1648,7 @@ mod tests {
         let repo = gix::open(&dir).expect("open fixture");
         let tip = repo.head_id().expect("head").detach();
         let mut requests = vec![Request {
+            src: Some("refs/heads/main".into()),
             name: "refs/heads/main".into(),
             new: tip,
             // Even under `--force`, a followed tag must not inherit the force bit.
@@ -1598,6 +1675,7 @@ mod tests {
         let dir = fixture("delete");
         let repo = gix::open(&dir).expect("open fixture");
         let mut requests = vec![Request {
+            src: Some("refs/heads/gone".into()),
             name: "refs/heads/gone".into(),
             new: gix::hash::ObjectId::null(repo.object_hash()),
             force: false,

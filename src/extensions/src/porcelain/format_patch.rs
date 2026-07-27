@@ -31,6 +31,20 @@
 //!     `-k`/`--keep-subject`, `--to`, `--cc`, `--add-header`, `--in-reply-to`,
 //!     `-U`/`--unified`, `-a`/`--text`, `--minimal`,
 //!     `--histogram`, `--diff-algorithm=myers|minimal|histogram`.
+//!   * messaging — `-s`/`--signoff` (a port of `append_signoff()` with its
+//!     trailer-block dedup), `--from[=<ident>]` and `--force-in-body-from` (the
+//!     in-body `From:` `pp_user_info()` emits when the header identity is
+//!     replaced), `--thread[=shallow|deep]` (`Message-ID:` plus the
+//!     `In-Reply-To:`/`References:` chain), `--attach[=<boundary>]` /
+//!     `--inline[=<boundary>]` (the `multipart/mixed` wrapper and the
+//!     `text/x-patch` part `diffopt.stat_sep` hangs the patch off),
+//!     `--notes[=<ref>]`/`--no-notes` (the `Notes:` commentary block, which is
+//!     what collapses the `---` before the diffstat to a bare blank line), and
+//!     `--base=<commit>|auto`/`--no-base` (the `base-commit:` trailer and the
+//!     `prerequisite-patch-id:` list, via a port of `diff_get_patch_id()`).
+//!   * cover letter — `--cover-from-description=<mode>`, `--description-file`
+//!     and the `branch.<name>.description` lookup behind them, plus
+//!     `--commit-list-format=shortlog|modern|log:<fmt>|<fmt>`.
 //!   * alternate diffstat formats — `--stat`, `--summary`, `--numstat`,
 //!     `--shortstat`, and the whole dirstat family (`--dirstat[=<params>]`,
 //!     `-X<params>`, `--dirstat-by-file`, `--cumulative`), selected the way
@@ -74,32 +88,41 @@
 //!     that it never becomes a bogus revision error, but limiting the walk and
 //!     the patch to it is not ported, so a pathspec that reaches a non-empty
 //!     commit list is fatal.
-//!   * threading (its auto-generated `Message-Id` embeds `time(NULL)`, so it
-//!     cannot be reproduced byte-for-byte), MIME attach/inline, signoff,
-//!     `--from`/`--force-in-body-from`, notes, interdiff and range-diff,
-//!     `--ignore-if-in-upstream`, `--compact-summary`,
+//!   * interdiff and range-diff, `--ignore-if-in-upstream`,
+//!     `--compact-summary`, `--encode-email-headers` as a *deferred* spelling,
 //!     whitespace-insensitive diffing, patience diff (imara-diff has Myers,
 //!     MyersMinimal and Histogram only), and rename/copy detection.
+//!   * a glob in `notes.displayRef`/`GIT_NOTES_DISPLAY_REF`/`--notes=<glob>`:
+//!     expanding a pattern over the ref store is not ported, so a pattern is
+//!     refused rather than read as a literal ref name.
 //!
 //! ### Config
 //!
 //! The `format.*` keys read here are the defaults for the options above:
 //! `outputDirectory`, `numbered`, `suffix`, `subjectPrefix`, `signature`,
 //! `signatureFile`, `filenameMaxLength`, `coverLetter`, `to`, `cc`, `headers`,
-//! `encodeEmailHeaders` (the `--[no-]encode-email-headers` default; on), and
-//! `noprefix` (the `--no-prefix` default). `format.mboxrd` has no command-line
-//! spelling at all in format-patch and is read directly. The rest all default an
-//! option in the unported list above — `attach`, `commitListFormat`,
-//! `coverFromDescription`, `forceInBodyFrom`, `from`, `notes`, `signOff`,
-//! `thread`, `useAutoBase` — so none of them is read; `format.pretty` belongs to
-//! `log`/`show`, not here.
+//! `encodeEmailHeaders` (the `--[no-]encode-email-headers` default; on),
+//! `noprefix` (the `--no-prefix` default), `signOff`, `from`,
+//! `forceInBodyFrom`, `thread`, `attach`, `notes`, `coverFromDescription`,
+//! `commitListFormat` and `useAutoBase`. `format.mboxrd` has no command-line
+//! spelling at all in format-patch and is read directly. `format.pretty` belongs
+//! to `log`/`show`, not here. `branch.<name>.description`, `core.notesRef` and
+//! `notes.displayRef` are read through the options that consult them.
+//!
+//! A generated `Message-ID` embeds `time(NULL)` and the committer's address, so
+//! `--thread` output is reproducible only up to that timestamp; everything the
+//! id then feeds — the `In-Reply-To:` target, the `References:` chain and how
+//! shallow and deep threading differ — is byte-identical to git's.
 //!
 //! Known deviations, stated rather than hidden: rename/copy detection is
 //! disabled (as elsewhere in this crate), so a commit that renames a file
 //! renders as a delete plus an add instead of git's `rename from`/`rename to`
 //! and `old => new` stat line. Column widths are computed in Unicode scalar
 //! values, so East-Asian wide characters in a path measure 1 rather than 2. The
-//! cover letter's shortlog does not wrap long subjects at 76 columns. The ERE
+//! cover letter's shortlog does not wrap long subjects at 76 columns.
+//! `append_signoff()`'s trailer-block scan does not consult `trailer.<token>.key`
+//! config, so only git's own generated prefixes can carry a mixed block over the
+//! 25% threshold. The ERE
 //! engine matches over Unicode scalar values decoded from the line (invalid
 //! UTF-8 bytes decode to themselves), where a C library in a `C` locale would
 //! match byte-wise; the two agree for every ASCII pattern. It is also permissive
@@ -177,6 +200,88 @@ enum SigCli {
     Value(String),
 }
 
+/// git's `enum thread_level` — `--thread[=shallow|deep]` / `format.thread`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Thread {
+    Unset,
+    Shallow,
+    Deep,
+}
+
+/// git's `enum cover_from_description` — `--cover-from-description=<mode>` /
+/// `format.coverFromDescription`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoverFrom {
+    None,
+    Message,
+    Subject,
+    Auto,
+}
+
+/// git's `COVER_FROM_AUTO_MAX_SUBJECT_LEN`.
+const COVER_FROM_AUTO_MAX_SUBJECT_LEN: usize = 100;
+
+/// git's `enum auto_base_setting` — `--base=<c>|auto` / `format.useAutoBase`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AutoBase {
+    Never,
+    Always,
+    WhenAble,
+}
+
+/// git's `mime_boundary_leader` (log-tree.c).
+const MIME_BOUNDARY_LEADER: &str = "------------";
+
+/// An `ident_split` reduced to what the mail formats use: the name and the
+/// address, with the timestamp dropped.
+#[derive(Clone)]
+struct Ident {
+    name: String,
+    mail: String,
+}
+
+/// Port of `split_ident_line()` (ident.c) restricted to the name/mail halves:
+/// the name runs to the first `<` with trailing whitespace removed, the address
+/// to the first `>` after it. A line with neither is not an identity at all.
+fn split_ident_line(line: &str) -> Option<Ident> {
+    let b = line.as_bytes();
+    let lt = b.iter().position(|&c| c == b'<')?;
+    let gt = lt + 1 + b[lt + 1..].iter().position(|&c| c == b'>')?;
+    let name_end = b[..lt]
+        .iter()
+        .rposition(|c| !c.is_ascii_whitespace())
+        .map_or(0, |i| i + 1);
+    Some(Ident {
+        name: String::from_utf8_lossy(&b[..name_end]).into_owned(),
+        mail: String::from_utf8_lossy(&b[lt + 1..gt]).into_owned(),
+    })
+}
+
+/// Port of `ident_cmp()` (ident.c): the address decides, the name breaks the
+/// tie. Only equality matters to `use_in_body_from()`.
+fn ident_eq(a: &Ident, b: &Ident) -> bool {
+    a.mail == b.mail && a.name == b.name
+}
+
+/// Which notes trees `--notes`/`--no-notes`/`format.notes` selected, mirroring
+/// git's `struct display_notes_opt`.
+struct NotesOpt {
+    /// `use_default_notes`: -1 until asked for, 1 once `--notes` (no ref) or a
+    /// true `format.notes` turned the default tree on.
+    use_default: i8,
+    /// The `--notes=<ref>` refs, already run through `expand_notes_ref()`.
+    extra_refs: Vec<String>,
+    /// git's `rev.show_notes`.
+    show: bool,
+}
+
+/// The threading state git keeps on `rev_info`: the id of the message being
+/// written and the chain the `References:` header lists.
+struct ThreadState {
+    message_id: Option<String>,
+    refs: Vec<String>,
+}
+
 struct Opts {
     // Output shape.
     to_stdout: bool,
@@ -244,6 +349,41 @@ struct Opts {
     /// `--no-prefix`/`format.noprefix`: drop the `a/`+`b/` path prefixes from
     /// `diff --git`, `---` and `+++`. `--default-prefix` puts them back.
     noprefix: bool,
+
+    // Messaging.
+    /// `-s`/`--signoff`, defaulted by `format.signOff`: append the committer's
+    /// `Signed-off-by:` trailer to the message.
+    signoff: bool,
+    /// `--from[=<ident>]`/`format.from`: the identity the `From:` header names,
+    /// with the commit's own author moved into an in-body `From:` when they
+    /// differ. `None` leaves the author in the header, as git does by default.
+    from: Option<Ident>,
+    /// `--force-in-body-from`/`format.forceInBodyFrom`: emit the in-body
+    /// `From:` even when it repeats the header identity.
+    force_in_body_from: bool,
+    /// `--thread[=shallow|deep]`/`format.thread`: generate `Message-ID:` and
+    /// chain the series with `In-Reply-To:`/`References:`.
+    thread: Thread,
+    /// `--attach`/`--inline`/`format.attach`: the MIME multipart boundary.
+    mime_boundary: Option<String>,
+    /// `--attach`'s `Content-Disposition: attachment` (vs `--inline`'s `inline`).
+    no_inline: bool,
+    /// `--cover-from-description=<mode>`/`format.coverFromDescription`.
+    cover_from: CoverFrom,
+    /// `--description-file=<path>`: the branch description to build the cover
+    /// letter from, in place of `branch.<name>.description`.
+    description_file: Option<String>,
+    /// The branch the series was named by, for `branch.<name>.description`.
+    branch_name: Option<String>,
+    /// `--notes[=<ref>]`/`--no-notes`/`format.notes`.
+    notes: NotesOpt,
+    /// `--base=<commit>|auto`/`--no-base`/`format.useAutoBase`.
+    auto_base: AutoBase,
+    /// The explicit `--base=<commit>` argument, if one was given.
+    base_commit: Option<String>,
+    /// `--commit-list-format=<spec>`/`format.commitListFormat`: how the cover
+    /// letter lists the series. `None` is git's `shortlog` default.
+    commit_list_format: Option<String>,
 
     // Revision selection.
     root: bool,
@@ -348,12 +488,44 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         0
     };
 
+    // `get_base_commit()` + `prepare_bases()` run before anything is written, so
+    // an unusable base is fatal before the first message.
+    let bases = match resolve_bases(&repo, &commits, &opts)? {
+        Ok(b) => b,
+        Err(code) => return Ok(code),
+    };
+    let mut bases_pending = bases.is_some();
+
+    // The notes trees `--notes`/`format.notes` selected, loaded once.
+    let notes_trees = load_display_notes(&repo, &opts)?;
+
     let mut stdout = std::io::stdout().lock();
     let mut buffered: Vec<u8> = Vec::new();
 
+    let mut th = ThreadState {
+        message_id: None,
+        refs: opts.in_reply_to.iter().cloned().collect(),
+    };
+
     if opts.cover_letter {
+        if opts.thread != Thread::Unset {
+            th.message_id = Some(gen_message_id(&repo, "cover")?);
+        }
         let mut msg: Vec<u8> = Vec::new();
-        render_cover_letter(&repo, &commits, printed_total, &opts, &mut msg)?;
+        // A bad `--commit-list-format` is only caught once the cover letter's
+        // headers are already written, so the partial message is emitted first.
+        if let Err(code) = render_cover_letter(&repo, &commits, printed_total, &opts, &th, &mut msg)?
+        {
+            emit_message(&mut buffered, &msg, cover_filename(&opts), &opts)?;
+            stdout.write_all(&buffered)?;
+            stdout.flush()?;
+            return Ok(code);
+        }
+        if let Some(b) = &bases {
+            print_bases(&mut msg, b);
+            bases_pending = false;
+        }
+        write_signature(&mut msg, &opts);
         emit_message(&mut buffered, &msg, cover_filename(&opts), &opts)?;
     }
 
@@ -361,8 +533,46 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         let commit = repo.find_object(*id)?.try_into_commit()?;
         let nr = idx + opts.start_number;
 
+        // Port of the threading block in `cmd_format_patch()`: deep threading
+        // chains every mail onto the previous one, shallow threading keeps
+        // replying to whatever the chain already starts with.
+        if opts.thread != Thread::Unset {
+            if let Some(mid) = th.message_id.take() {
+                let shallow_reuses_head = opts.thread == Thread::Shallow
+                    && !th.refs.is_empty()
+                    && (!opts.cover_letter || nr > 1);
+                if !shallow_reuses_head {
+                    th.refs.push(mid);
+                }
+            }
+            th.message_id = Some(gen_message_id(&repo, &id.to_hex().to_string())?);
+        }
+
         let mut msg: Vec<u8> = Vec::new();
-        render_message(&repo, &commit, nr, printed_total, &opts, &mut msg)?;
+        render_message(
+            &repo,
+            &commit,
+            nr,
+            printed_total,
+            &opts,
+            &th,
+            &notes_trees,
+            &mut msg,
+        )?;
+        if bases_pending {
+            if let Some(b) = &bases {
+                print_bases(&mut msg, b);
+                bases_pending = false;
+            }
+        }
+        // With `--attach`/`--inline` the trailing MIME boundary replaces the
+        // `-- \n<version>` signature entirely.
+        match &opts.mime_boundary {
+            Some(b) => {
+                write!(msg, "\n--{MIME_BOUNDARY_LEADER}{b}--\n\n\n")?;
+            }
+            None => write_signature(&mut msg, &opts),
+        }
 
         // git puts one extra blank line between patches in the mbox stream; the
         // cover letter is not separated that way.
@@ -430,12 +640,6 @@ const NO_OP: &[&str] = &[
     "--no-ext-diff",
     "--progress",
     "--no-progress",
-    "--no-signoff",
-    "--no-attach",
-    "--no-thread",
-    "--no-notes",
-    "--no-base",
-    "--no-force-in-body-from",
     "--no-relative",
     "--ita-invisible-in-index",
     "--binary",
@@ -444,21 +648,9 @@ const NO_OP: &[&str] = &[
 /// Flags git accepts that this module has not ported. Matched as `--flag` or
 /// `--flag=<value>`; see the module header for what each of them would change.
 const DEFERRED: &[&str] = &[
-    "-s",
-    "--signoff",
-    "--attach",
-    "--inline",
-    "--thread",
-    "--from",
-    "--force-in-body-from",
     "--encode-email-headers",
-    "--notes",
-    "--base",
     "--interdiff",
     "--creation-factor",
-    "--description-file",
-    "--cover-from-description",
-    "--commit-list-format",
     "--always",
     "--ignore-if-in-upstream",
     "--compact-summary",
@@ -520,6 +712,33 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             .collect::<Vec<String>>()
     };
 
+    // `format.from` resolves to an identity right away, because a value that is
+    // neither a boolean nor a parsable ident line is fatal (exit 128).
+    let cfg_from = match cfg_str("format.from") {
+        Some(v) => match maybe_bool(&v) {
+            Some(true) => Some(committer_ident(repo)?),
+            Some(false) => None,
+            None => match split_ident_line(&v) {
+                Some(id) => Some(id),
+                None => return Ok(Parsed::Exit(fatal(&format!("invalid ident line: {v}")))),
+            },
+        },
+        // A valueless `[format] from` is the implicit-true boolean.
+        None if snap.boolean("format.from") == Some(true) => Some(committer_ident(repo)?),
+        None => None,
+    };
+    let cfg_cover_from = match cfg_str("format.coverFromDescription") {
+        Some(v) => match parse_cover_from_description(&v) {
+            Some(m) => m,
+            None => {
+                return Ok(Parsed::Exit(fatal(&format!(
+                    "{v}: invalid cover from description mode"
+                ))))
+            }
+        },
+        None => CoverFrom::Message,
+    };
+
     let mut o = Opts {
         to_stdout: false,
         outdir: cfg_str("format.outputDirectory"),
@@ -562,6 +781,73 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         encode_email_headers: snap.boolean("format.encodeEmailHeaders").unwrap_or(true),
         mboxrd: snap.boolean("format.mboxrd") == Some(true),
         noprefix: snap.boolean("format.noprefix") == Some(true),
+        signoff: snap.boolean("format.signOff") == Some(true),
+        from: cfg_from,
+        force_in_body_from: snap.boolean("format.forceInBodyFrom") == Some(true),
+        thread: match cfg_str("format.thread") {
+            Some(v) if v.eq_ignore_ascii_case("deep") => Thread::Deep,
+            Some(v) if v.eq_ignore_ascii_case("shallow") => Thread::Shallow,
+            Some(v) => match maybe_bool(&v) {
+                Some(true) => Thread::Shallow,
+                _ => Thread::Unset,
+            },
+            None if snap.boolean("format.thread") == Some(true) => Thread::Shallow,
+            None => Thread::Unset,
+        },
+        // `format.attach`: a value is the boundary, an empty value turns it off,
+        // and a valueless key means the version string.
+        mime_boundary: match cfg_str("format.attach") {
+            Some(v) if v.is_empty() => None,
+            Some(v) => Some(v),
+            None if snap.plumbing().string("format.attach").is_some() => {
+                Some(SIGNATURE_VERSION.to_owned())
+            }
+            None => None,
+        },
+        no_inline: snap.plumbing().string("format.attach").is_some(),
+        cover_from: cfg_cover_from,
+        description_file: None,
+        branch_name: None,
+        notes: match cfg_str("format.notes") {
+            Some(v) => match maybe_bool(&v) {
+                Some(true) => NotesOpt {
+                    use_default: 1,
+                    extra_refs: Vec::new(),
+                    show: true,
+                },
+                Some(false) => NotesOpt {
+                    use_default: -1,
+                    extra_refs: Vec::new(),
+                    show: false,
+                },
+                None => NotesOpt {
+                    use_default: -1,
+                    extra_refs: vec![expand_notes_ref(&v)],
+                    show: true,
+                },
+            },
+            None if snap.boolean("format.notes") == Some(true) => NotesOpt {
+                use_default: 1,
+                extra_refs: Vec::new(),
+                show: true,
+            },
+            None => NotesOpt {
+                use_default: -1,
+                extra_refs: Vec::new(),
+                show: false,
+            },
+        },
+        auto_base: match cfg_str("format.useAutoBase") {
+            Some(v) if v.eq_ignore_ascii_case("whenAble") => AutoBase::WhenAble,
+            Some(v) => match maybe_bool(&v) {
+                Some(true) => AutoBase::Always,
+                _ => AutoBase::Never,
+            },
+            None if snap.boolean("format.useAutoBase") == Some(true) => AutoBase::Always,
+            None => AutoBase::Never,
+        },
+        base_commit: None,
+        commit_list_format: cfg_str("format.commitListFormat"),
         root: false,
         max_count: None,
         skip: 0,
@@ -594,6 +880,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     // `--subject-prefix`/`--rfc` is given, and later `die()`s if `-k` is also
     // set. Track only that it was given, not its value.
     let mut subject_prefix_given = false;
+    // `--commit-list-format` implies a cover letter, but only when the caller
+    // did not spell `--cover-letter`/`--no-cover-letter` out.
+    let mut commit_list_format_given = false;
+    let mut cover_letter_given = false;
     while i < args.len() {
         let a = args[i].as_str();
         if pathspec_mode {
@@ -668,8 +958,14 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 i += 1;
                 o.name_max = parse_num(&value_at(args, i, a)?)?;
             }
-            "--cover-letter" => o.cover_letter = true,
-            "--no-cover-letter" => o.cover_letter = false,
+            "--cover-letter" => {
+                o.cover_letter = true;
+                cover_letter_given = true;
+            }
+            "--no-cover-letter" => {
+                o.cover_letter = false;
+                cover_letter_given = true;
+            }
             "-k" | "--keep-subject" => o.keep_subject = true,
             "--to" => {
                 i += 1;
@@ -713,6 +1009,93 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "--rfc" => {
                 o.subject_prefix = "RFC PATCH".to_owned();
                 subject_prefix_given = true;
+            }
+            "-s" | "--signoff" => o.signoff = true,
+            "--no-signoff" => o.signoff = false,
+            "--force-in-body-from" => o.force_in_body_from = true,
+            "--no-force-in-body-from" => o.force_in_body_from = false,
+            // `--from` takes an *optional* value, so only the attached form
+            // carries one; a bare `--from` means the committer identity.
+            "--from" => o.from = Some(committer_ident(repo)?),
+            "--no-from" => o.from = None,
+            s if s.starts_with("--from=") => match split_ident_line(&s["--from=".len()..]) {
+                Some(id) => o.from = Some(id),
+                None => {
+                    return Ok(Parsed::Exit(fatal(&format!(
+                        "invalid ident line: {}",
+                        &s["--from=".len()..]
+                    ))))
+                }
+            },
+            "--thread" => o.thread = Thread::Shallow,
+            "--no-thread" => o.thread = Thread::Unset,
+            // `--attach`/`--inline` differ only in the `Content-Disposition:`
+            // they give the patch part; both default the boundary to git's
+            // version string.
+            "--attach" => {
+                o.mime_boundary = Some(SIGNATURE_VERSION.to_owned());
+                o.no_inline = true;
+            }
+            s if s.starts_with("--attach=") => {
+                o.mime_boundary = Some(s["--attach=".len()..].to_owned());
+                o.no_inline = true;
+            }
+            "--no-attach" => {
+                o.mime_boundary = None;
+                o.no_inline = false;
+            }
+            "--inline" => {
+                o.mime_boundary = Some(SIGNATURE_VERSION.to_owned());
+                o.no_inline = false;
+            }
+            s if s.starts_with("--inline=") => {
+                o.mime_boundary = Some(s["--inline=".len()..].to_owned());
+                o.no_inline = false;
+            }
+            "--cover-from-description" => {
+                i += 1;
+                cover_from_desc = Some(value_at(args, i, a)?);
+            }
+            "--description-file" => {
+                i += 1;
+                o.description_file = Some(value_at(args, i, a)?);
+            }
+            s if s.starts_with("--description-file=") => {
+                o.description_file = Some(s["--description-file=".len()..].to_owned());
+            }
+            "--commit-list-format" => {
+                i += 1;
+                o.commit_list_format = Some(value_at(args, i, a)?);
+                commit_list_format_given = true;
+            }
+            s if s.starts_with("--commit-list-format=") => {
+                o.commit_list_format = Some(s["--commit-list-format=".len()..].to_owned());
+                commit_list_format_given = true;
+            }
+            // `--notes` takes an optional ref; `--no-notes` clears everything.
+            "--notes" => {
+                o.notes.use_default = 1;
+                o.notes.show = true;
+            }
+            s if s.starts_with("--notes=") => {
+                o.notes.extra_refs.push(expand_notes_ref(&s["--notes=".len()..]));
+                o.notes.show = true;
+            }
+            "--no-notes" => {
+                o.notes.use_default = -1;
+                o.notes.extra_refs.clear();
+                o.notes.show = false;
+            }
+            // `--base` is git's `base_callback`: `auto` switches on the
+            // upstream-derived base, any other value names the base itself.
+            "--base" => {
+                i += 1;
+                set_base(&mut o, &value_at(args, i, a)?);
+            }
+            s if s.starts_with("--base=") => set_base(&mut o, &s["--base=".len()..]),
+            "--no-base" => {
+                o.auto_base = AutoBase::Never;
+                o.base_commit = None;
             }
             "--reverse" => o.reverse = true,
             "--no-merges" => o.max_parents = Some(1),
@@ -814,7 +1197,8 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 }
             }
             s if s.starts_with("--thread=") => match &s["--thread=".len()..] {
-                "shallow" | "deep" => o.deferred.push(a.to_owned()),
+                "shallow" => o.thread = Thread::Shallow,
+                "deep" => o.thread = Thread::Deep,
                 // git rejects the value with a bare usage exit and no message.
                 _ => return Ok(Parsed::Exit(ExitCode::from(129))),
             },
@@ -1007,14 +1391,11 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     // `--cover-from-description=<mode>` is validated only now, after the whole
     // command line has been parsed (git keeps it as a raw string and calls
     // `parse_cover_from_description()` once). An unrecognised mode is `die()`
-    // (exit 128); the recognised modes only reshape the cover letter, which is
-    // not ported, so they are deferred and become fatal iff a patch is emitted.
+    // (exit 128).
     if let Some(v) = cover_from_desc {
-        match v.as_str() {
-            "default" | "message" | "subject" | "auto" | "none" => {
-                o.deferred.push(format!("--cover-from-description={v}"));
-            }
-            _ => {
+        match parse_cover_from_description(&v) {
+            Some(m) => o.cover_from = m,
+            None => {
                 return Ok(Parsed::Exit(fatal(&format!(
                     "{v}: invalid cover from description mode"
                 ))))
@@ -1038,6 +1419,15 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         }
     }
 
+    // `--commit-list-format` on the command line implies `--cover-letter` when
+    // the caller did not decide for themselves; `format.commitListFormat` does
+    // not, because git only consults it after that check.
+    if commit_list_format_given && !cover_letter_given {
+        o.cover_letter = true;
+    }
+
+    o.branch_name = find_branch_name(repo, &o);
+
     // builtin/log.c: the stat+summary block is format-patch's default, but only
     // when the caller asked for no output format of its own — that is what makes
     // `--numstat` (and friends) *replace* it rather than add to it.
@@ -1046,6 +1436,132 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     }
 
     Ok(Parsed::Ready(Box::new(o)))
+}
+
+/// Port of `git_parse_maybe_bool()` (config.c): the words git accepts as
+/// booleans, case-insensitively. `None` means "this is not a boolean", which is
+/// what makes `format.from`/`format.notes` take a value instead.
+fn maybe_bool(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" => Some(true),
+        "false" | "no" | "off" | "" => Some(false),
+        s => s.parse::<i64>().ok().map(|n| n != 0),
+    }
+}
+
+/// git's `git_committer_info(IDENT_NO_DATE)` reduced to name and address — the
+/// identity `--from` and `format.from` fall back to.
+fn committer_ident(repo: &gix::Repository) -> Result<Ident> {
+    let sig = repo
+        .committer()
+        .transpose()?
+        .ok_or_else(|| anyhow!("unable to auto-detect email address"))?;
+    Ok(Ident {
+        name: sig.name.to_str()?.to_owned(),
+        mail: sig.email.to_str()?.to_owned(),
+    })
+}
+
+/// Port of `parse_cover_from_description()` (builtin/log.c).
+fn parse_cover_from_description(arg: &str) -> Option<CoverFrom> {
+    match arg {
+        "default" | "message" => Some(CoverFrom::Message),
+        "none" => Some(CoverFrom::None),
+        "subject" => Some(CoverFrom::Subject),
+        "auto" => Some(CoverFrom::Auto),
+        _ => None,
+    }
+}
+
+/// Port of `expand_notes_ref()` (notes.c).
+fn expand_notes_ref(name: &str) -> String {
+    if name.starts_with("refs/notes/") {
+        name.to_owned()
+    } else if name.starts_with("notes/") {
+        format!("refs/{name}")
+    } else {
+        format!("refs/notes/{name}")
+    }
+}
+
+/// Port of `base_callback()` (builtin/log.c).
+fn set_base(o: &mut Opts, arg: &str) {
+    if arg == "auto" {
+        o.auto_base = AutoBase::Always;
+        o.base_commit = None;
+    } else {
+        o.auto_base = AutoBase::Never;
+        o.base_commit = Some(arg.to_owned());
+    }
+}
+
+/// The branch whose `branch.<name>.description` the cover letter may quote.
+///
+/// Port of `cmd_format_patch()`'s `check_head` shortcut plus `find_branch_name()`
+/// (builtin/log.c): a command line that walks HEAD implicitly — the bare
+/// `<since>` shorthand, an explicit `HEAD`, or no revision at all — names the
+/// current branch; otherwise the single *interesting* revision argument names a
+/// branch iff it resolves to `refs/heads/<name>` at that exact tip.
+fn find_branch_name(repo: &gix::Repository, o: &Opts) -> Option<String> {
+    // Each argument contributes one pending object, except a range, which
+    // contributes both of its sides.
+    let mut cmdline: Vec<(&str, bool)> = Vec::new();
+    for spec in &o.revs {
+        if let Some((l, r)) = spec.split_once("...") {
+            cmdline.push((l, false));
+            cmdline.push((r, false));
+        } else if let Some((l, r)) = spec.split_once("..") {
+            cmdline.push((l, true));
+            cmdline.push((r, false));
+        } else if let Some(rest) = spec.strip_prefix('^') {
+            cmdline.push((rest, true));
+        } else {
+            cmdline.push((spec, false));
+        }
+    }
+    if cmdline.is_empty() {
+        cmdline.push(("HEAD", false));
+    }
+
+    let head_branch = || {
+        repo.head_ref()
+            .ok()
+            .flatten()
+            .and_then(|r| r.name().as_bstr().to_str().ok().map(str::to_owned))
+            .and_then(|n| n.strip_prefix("refs/heads/").map(str::to_owned))
+            .or_else(|| Some(String::new()))
+    };
+    if cmdline.len() == 1 && !cmdline[0].1 {
+        if o.max_count.is_none() && !o.root {
+            // The `<since>` shorthand adds HEAD itself.
+            return head_branch();
+        }
+        if cmdline[0].0 == "HEAD" {
+            return head_branch();
+        }
+    }
+
+    let mut interesting = cmdline.iter().filter(|(_, hidden)| !*hidden);
+    let (name, _) = interesting.next()?;
+    if interesting.next().is_some() {
+        return None;
+    }
+    // `repo_dwim_ref()` hands back the ref name a symref *resolves to*, so a
+    // plain `HEAD` on the command line still names the branch it points at.
+    let mut r = repo.find_reference(*name).ok()?;
+    while let Some(Ok(next)) = r.follow() {
+        r = next;
+    }
+    let branch = r
+        .name()
+        .as_bstr()
+        .to_str()
+        .ok()?
+        .strip_prefix("refs/heads/")?
+        .to_owned();
+    let tip = repo.rev_parse_single(BStr::new(*name)).ok()?;
+    let head = r.into_fully_peeled_id().ok()?;
+    (head.detach() == tip.detach()).then_some(branch)
 }
 
 /// Port of `parse_dirstat_params()` (diff.c), plus `parse_dirstat_opt()`'s
@@ -1802,35 +2318,65 @@ fn sanitize_subject(out: &mut String, msg: &[u8]) {
 /// Render one complete mail message: magic `From` line, headers, body, and —
 /// when the commit changes anything — the three-dash separator, stat/summary
 /// block and patch, followed by the signature.
+#[allow(clippy::too_many_arguments)]
 fn render_message(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     nr: usize,
     total: usize,
     opts: &Opts,
+    th: &ThreadState,
+    notes_trees: &[NotesTree],
     out: &mut Vec<u8>,
 ) -> Result<()> {
     write_from_line(out, commit.id, opts)?;
+    write_message_ids(out, th)?;
 
     // Headers and body are built in one buffer because git's wrapping and the
     // final `strbuf_rtrim` both depend on what is already in it.
     let mut sb = String::new();
     let raw = commit.message_raw()?;
-    let need_8bit = raw.iter().any(|&b| b >= 0x80);
 
     let author = commit.author()?;
-    let author_name = author.name.to_str().map_err(|_| {
-        anyhow!("author name is not valid UTF-8; RFC2047 encoding needs a known charset")
-    })?;
-    let author_mail = author.email.to_str().map_err(|_| {
-        anyhow!("author email is not valid UTF-8; RFC2047 encoding needs a known charset")
-    })?;
-    let date = author
+    let author = Ident {
+        name: author
+            .name
+            .to_str()
+            .map_err(|_| {
+                anyhow!("author name is not valid UTF-8; RFC2047 encoding needs a known charset")
+            })?
+            .to_owned(),
+        mail: author
+            .email
+            .to_str()
+            .map_err(|_| {
+                anyhow!("author email is not valid UTF-8; RFC2047 encoding needs a known charset")
+            })?
+            .to_owned(),
+    };
+    let date = commit
+        .author()?
         .time()?
         .format(gix::date::time::format::GIT_RFC2822)?;
-    // `--in-reply-to` puts its headers ahead of everything, so it goes in first.
-    write_in_reply_to(&mut sb, opts);
-    write_identity_headers(&mut sb, author_name, author_mail, &date, opts.encode_email_headers);
+
+    // `--from`: the header names the given identity and the commit's own author
+    // moves into an in-body `From:`, unless the two already agree (git's
+    // `use_in_body_from()`, which `--force-in-body-from` short-circuits).
+    let (header_ident, in_body_from) = match &opts.from {
+        Some(from) if opts.force_in_body_from || !ident_eq(from, &author) => (
+            from,
+            Some(format!("From: {} <{}>\n", author.name, author.mail)),
+        ),
+        Some(from) => (from, None),
+        None => (&author, None),
+    };
+    write_identity_headers(
+        &mut sb,
+        &header_ident.name,
+        &header_ident.mail,
+        &date,
+        opts.encode_email_headers,
+    );
 
     // Subject: — the first paragraph, folded onto one logical line, unless
     // `-k`/`--keep-subject` asked for the raw first paragraph (newlines and all).
@@ -1850,14 +2396,35 @@ fn render_message(
     };
     write_subject(&mut sb, &title, nr, total, opts);
 
+    // git's `need_8bit_cte`: `-1` (never) under `--attach`/`--inline`, since the
+    // multipart block declares the encoding itself; otherwise the committer
+    // identity decides it when `--signoff` will append their trailer, and
+    // failing that any non-ASCII byte in the message or the in-body headers.
+    let signoff_needs_8bit = opts.signoff && {
+        let c = committer_ident(repo)?;
+        non_ascii(&c.name) || non_ascii(&c.mail)
+    };
+    let need_8bit = opts.mime_boundary.is_none()
+        && (signoff_needs_8bit
+            || raw.iter().any(|&b| b >= 0x80)
+            || in_body_from.as_deref().is_some_and(non_ascii));
     if need_8bit {
         sb.push_str("MIME-Version: 1.0\n");
         sb.push_str(&format!("Content-Type: text/plain; charset={ENCODING}\n"));
         sb.push_str("Content-Transfer-Encoding: 8bit\n");
     }
-    // `--add-header`, then `To:`/`Cc:`, follow the identity/MIME headers.
+    // `--add-header`, then `To:`/`Cc:`, follow the identity/MIME headers, and
+    // the multipart preamble follows those (git builds one `extra_headers`
+    // strbuf in that order).
     write_extra_headers(&mut sb, opts);
+    write_mime_preamble(&mut sb, opts);
     sb.push('\n');
+    // The in-body `From:` sits at the very top of the body, set off by a blank
+    // line, and is not part of what `--signoff` treats as the message.
+    if let Some(h) = &in_body_from {
+        sb.push_str(h);
+        sb.push('\n');
+    }
 
     // Body — the remaining paragraphs, right-trimmed line by line.
     let beginning_of_body = sb.len();
@@ -1874,6 +2441,28 @@ fn render_message(
     sb.push('\n');
     if sb.len() <= beginning_of_body {
         sb.push('\n');
+    }
+    // `rev.add_signoff` runs `append_signoff()` over the whole pretty-printed
+    // message — headers included, since that is the buffer git hands it — with
+    // `APPEND_SIGNOFF_DEDUP`, so a trailer block that already carries this
+    // `Signed-off-by:` anywhere is left alone.
+    if opts.signoff {
+        let c = committer_ident(repo)?;
+        super::commit::append_signoff(&mut sb, &format!("{} <{}>", c.name, c.mail), 0, true);
+    }
+
+    // Notes open their own commentary block, which is what makes the `---` line
+    // before the diffstat collapse to a bare blank line.
+    let mut shown_dashes = false;
+    let notes = format_display_notes(repo, notes_trees, commit.id)?;
+    if !notes.is_empty() {
+        sb.push_str("---\n");
+        shown_dashes = true;
+        sb.push_str(
+            notes
+                .to_str()
+                .map_err(|_| anyhow!("note is not valid UTF-8"))?,
+        );
     }
     out.extend_from_slice(sb.as_bytes());
 
@@ -1894,12 +2483,75 @@ fn render_message(
             stats.push(emit_change(repo, &mut patch, change, abbrev, opts)?);
         }
 
-        emit_stat_blocks(repo, out, &changes, &stats, opts)?;
+        let stat_sep = mime_stat_sep(commit, nr, opts)?;
+        emit_stat_blocks(
+            repo,
+            out,
+            &changes,
+            &stats,
+            opts,
+            shown_dashes,
+            stat_sep.as_deref(),
+        )?;
         out.extend_from_slice(&patch);
     }
-
-    write_signature(out, opts);
     Ok(())
+}
+
+/// True when any byte is outside 7-bit ASCII — git's `has_non_ascii()`.
+fn non_ascii(s: &str) -> bool {
+    s.bytes().any(|b| b >= 0x80)
+}
+
+/// `Message-ID:` and the `In-Reply-To:`/`References:` chain, in the order
+/// `log_write_email_headers()` prints them: straight after the mbox `From` line
+/// and ahead of the pretty-printed identity headers.
+fn write_message_ids(out: &mut Vec<u8>, th: &ThreadState) -> Result<()> {
+    if let Some(id) = &th.message_id {
+        writeln!(out, "Message-ID: <{id}>")?;
+    }
+    if let Some(last) = th.refs.last() {
+        writeln!(out, "In-Reply-To: <{last}>")?;
+        for (i, r) in th.refs.iter().enumerate() {
+            let lead = if i > 0 { "\t" } else { "References: " };
+            writeln!(out, "{lead}<{r}>")?;
+        }
+    }
+    Ok(())
+}
+
+/// The `multipart/mixed` header block and its first (text) part, appended to the
+/// extra headers exactly as `log_write_email_headers()` builds it. The cover
+/// letter is written with `maybe_multipart = 0`, so it never gets this.
+fn write_mime_preamble(sb: &mut String, opts: &Opts) {
+    let Some(b) = &opts.mime_boundary else {
+        return;
+    };
+    sb.push_str(&format!(
+        "MIME-Version: 1.0\n\
+         Content-Type: multipart/mixed; boundary=\"{MIME_BOUNDARY_LEADER}{b}\"\n\
+         \n\
+         This is a multi-part message in MIME format.\n\
+         --{MIME_BOUNDARY_LEADER}{b}\n\
+         Content-Type: text/plain; charset=UTF-8; format=fixed\n\
+         Content-Transfer-Encoding: 8bit\n\n"
+    ));
+}
+
+/// git's `diffopt.stat_sep` under `--attach`/`--inline`: the MIME part that
+/// carries the patch, emitted after the diffstat instead of a plain blank line.
+fn mime_stat_sep(commit: &gix::Commit<'_>, nr: usize, opts: &Opts) -> Result<Option<String>> {
+    let Some(b) = &opts.mime_boundary else {
+        return Ok(None);
+    };
+    let name = patch_filename(commit, nr, opts)?;
+    let disposition = if opts.no_inline { "attachment" } else { "inline" };
+    Ok(Some(format!(
+        "\n--{MIME_BOUNDARY_LEADER}{b}\n\
+         Content-Type: text/x-patch; name=\"{name}\"\n\
+         Content-Transfer-Encoding: 8bit\n\
+         Content-Disposition: {disposition}; filename=\"{name}\"\n\n"
+    )))
 }
 
 /// Everything git prints between the commit message and the patch.
@@ -1917,8 +2569,10 @@ fn emit_stat_blocks(
     changes: &[ChangeDetached],
     stats: &[StatEntry],
     opts: &Opts,
+    shown_dashes: bool,
+    stat_sep: Option<&str>,
 ) -> Result<()> {
-    if opts.output_format & FMT_DIFFSTAT != 0 {
+    if !shown_dashes && opts.output_format & FMT_DIFFSTAT != 0 {
         out.extend_from_slice(b"---");
     }
     out.push(b'\n');
@@ -1951,6 +2605,12 @@ fn emit_stat_blocks(
 
     if separator {
         out.push(b'\n');
+        // `--attach`/`--inline` hang the patch off its own MIME part, announced
+        // here; with no stat block at all git never emits it and the patch stays
+        // inside the first (text) part.
+        if let Some(sep) = stat_sep {
+            out.extend_from_slice(sep.as_bytes());
+        }
     }
     Ok(())
 }
@@ -1966,8 +2626,9 @@ fn render_cover_letter(
     commits: &[ObjectId],
     total: usize,
     opts: &Opts,
+    th: &ThreadState,
     out: &mut Vec<u8>,
-) -> Result<()> {
+) -> Result<std::result::Result<(), ExitCode>> {
     // The series is oldest-first unless `--reverse` flipped it; either way the
     // newest commit is the one without a descendant inside the series.
     let newest = if opts.reverse {
@@ -1976,47 +2637,81 @@ fn render_cover_letter(
         *commits.last().expect("a non-empty series")
     };
     write_from_line(out, newest, opts)?;
+    write_message_ids(out, th)?;
 
     let mut sb = String::new();
-    let (name, mail, date) = match repo.committer().transpose()? {
-        Some(sig) => (
-            sig.name.to_str()?.to_owned(),
-            sig.email.to_str()?.to_owned(),
-            sig.time()?.format(gix::date::time::format::GIT_RFC2822)?,
+    // `make_cover_letter()` writes `cfg->from ? cfg->from : git_committer_info(0)`
+    // through `pp_user_info()`. An identity from `--from`/`format.from` carries
+    // no timestamp, so its `Date:` is the epoch — git's own behaviour, since
+    // `show_ident_date()` sees an unset date field.
+    let (name, mail, date) = match &opts.from {
+        Some(from) => (
+            from.name.clone(),
+            from.mail.clone(),
+            gix::date::Time::new(0, 0).format(gix::date::time::format::GIT_RFC2822)?,
         ),
-        // No committer identity configured: fall back to the series' author so
-        // the cover letter is still a well-formed message.
-        None => {
-            let commit = repo.find_object(newest)?.try_into_commit()?;
-            let author = commit.author()?;
-            (
-                author.name.to_str()?.to_owned(),
-                author.email.to_str()?.to_owned(),
-                author.time()?.format(gix::date::time::format::GIT_RFC2822)?,
-            )
-        }
+        None => match repo.committer().transpose()? {
+            Some(sig) => (
+                sig.name.to_str()?.to_owned(),
+                sig.email.to_str()?.to_owned(),
+                sig.time()?.format(gix::date::time::format::GIT_RFC2822)?,
+            ),
+            // No committer identity configured: fall back to the series' author
+            // so the cover letter is still a well-formed message.
+            None => {
+                let commit = repo.find_object(newest)?.try_into_commit()?;
+                let author = commit.author()?;
+                (
+                    author.name.to_str()?.to_owned(),
+                    author.email.to_str()?.to_owned(),
+                    author.time()?.format(gix::date::time::format::GIT_RFC2822)?,
+                )
+            }
+        },
     };
-    write_in_reply_to(&mut sb, opts);
     write_identity_headers(&mut sb, &name, &mail, &date, opts.encode_email_headers);
-    write_subject(&mut sb, COVER_SUBJECT, 0, total, opts);
-    // `make_cover_letter()` seeds `pp_title_line()` with
-    // `need_8bit_cte = has_non_ascii(committer)`: the cover letter carries no
-    // commit message, so it is the *identity* alone that decides whether the
-    // 8-bit MIME block is emitted — and it is emitted whether or not the header
-    // itself was Q-encoded.
-    if name.bytes().chain(mail.bytes()).any(|b| b >= 0x80) {
+
+    // `prepare_cover_text()`: the branch description, if there is one and
+    // `--cover-from-description` did not switch it off, supplies the subject
+    // and/or the blurb.
+    let description = read_cover_description(repo, opts)?;
+    let (subject, blurb) = cover_text(&description, opts);
+    write_subject(&mut sb, &subject, 0, total, opts);
+    // `make_cover_letter()` decides `need_8bit_cte` by scanning the *raw commit
+    // buffers* of the whole series — the cover letter carries no message of its
+    // own, so a non-ASCII byte anywhere in the series (identity lines included)
+    // is what turns the 8-bit MIME block on, whether or not any header was
+    // Q-encoded.
+    let mut need_8bit = false;
+    for id in commits {
+        let commit = repo.find_object(*id)?.try_into_commit()?;
+        if commit.data.iter().any(|&b| b >= 0x80) {
+            need_8bit = true;
+            break;
+        }
+    }
+    if need_8bit {
         sb.push_str("MIME-Version: 1.0\n");
         sb.push_str(&format!("Content-Type: text/plain; charset={ENCODING}\n"));
         sb.push_str("Content-Transfer-Encoding: 8bit\n");
     }
+    // The cover letter is written with `maybe_multipart = 0`, so it never gets
+    // the `--attach`/`--inline` preamble the patches do.
     write_extra_headers(&mut sb, opts);
     sb.push('\n');
-    sb.push_str(COVER_BLURB);
-    sb.push_str("\n\n");
+    let mut body: Vec<u8> = Vec::new();
+    pp_remainder(&blurb, &mut body);
+    sb.push_str(
+        body.to_str()
+            .map_err(|_| anyhow!("branch description is not valid UTF-8"))?,
+    );
+    // `fprintf(file, "%s\n", sb.buf)` — one more newline closes the header+blurb.
+    sb.push('\n');
     out.extend_from_slice(sb.as_bytes());
 
-    emit_shortlog(repo, commits, out)?;
-    out.push(b'\n');
+    if let Err(code) = emit_commit_list(repo, commits, opts, out)? {
+        return Ok(Err(code));
+    }
 
     // The range's combined diffstat needs a base to diff against, which a root
     // commit does not have; git omits the block in that case.
@@ -2047,8 +2742,123 @@ fn render_cover_letter(
             out.push(b'\n');
         }
     }
+    Ok(Ok(()))
+}
 
-    write_signature(out, opts);
+/// Port of `prepare_cover_text()` (builtin/log.c): read the branch description
+/// that `--cover-from-description` will draw the subject and blurb from.
+///
+/// `--description-file` wins over `branch.<name>.description`, and
+/// `--cover-from-description=none` skips the lookup entirely.
+fn read_cover_description(repo: &gix::Repository, opts: &Opts) -> Result<Vec<u8>> {
+    if opts.cover_from == CoverFrom::None {
+        return Ok(Vec::new());
+    }
+    if let Some(path) = opts.description_file.as_deref().filter(|p| !p.is_empty()) {
+        return std::fs::read(path)
+            .map_err(|e| anyhow!("unable to read branch description file '{path}': {e}"));
+    }
+    let Some(branch) = opts.branch_name.as_deref().filter(|b| !b.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let key = format!("branch.{branch}.description");
+    Ok(repo
+        .config_snapshot()
+        .string(&key)
+        .map(|v| v.to_vec())
+        .unwrap_or_default())
+}
+
+/// The subject and blurb `prepare_cover_text()` settles on for the given mode.
+fn cover_text(description: &[u8], opts: &Opts) -> (String, Vec<u8>) {
+    let default = (COVER_SUBJECT.to_owned(), COVER_BLURB.as_bytes().to_vec());
+    if opts.cover_from == CoverFrom::None || description.is_empty() {
+        return default;
+    }
+    let (subject, rest) = format_subject(description);
+    // `message` keeps the placeholder subject and uses the whole description as
+    // the blurb; `subject` splits it; `auto` splits it only when the first
+    // paragraph is short enough to read as a subject line.
+    let split = match opts.cover_from {
+        CoverFrom::Subject => true,
+        CoverFrom::Auto => subject.len() <= COVER_FROM_AUTO_MAX_SUBJECT_LEN,
+        _ => false,
+    };
+    if !split {
+        return (default.0, description.to_vec());
+    }
+    match String::from_utf8(subject) {
+        Ok(s) => (s, rest.to_vec()),
+        Err(_) => default,
+    }
+}
+
+/// Port of `make_cover_letter()`'s commit-list dispatch: `shortlog` (the
+/// default), `modern`, a `log:<format>` prefix, or any bare format string that
+/// contains a `%`. Anything else is `die("'%s' is not a valid format string")`.
+fn emit_commit_list(
+    repo: &gix::Repository,
+    commits: &[ObjectId],
+    opts: &Opts,
+    out: &mut Vec<u8>,
+) -> Result<std::result::Result<(), ExitCode>> {
+    let fmt = opts.commit_list_format.as_deref().unwrap_or("shortlog");
+    if let Some(rest) = fmt.strip_prefix("log:") {
+        generate_commit_list(repo, commits, rest, out)?;
+        return Ok(Ok(()));
+    }
+    match fmt {
+        "shortlog" => {
+            emit_shortlog(repo, commits, out)?;
+            out.push(b'\n');
+        }
+        // git spells the built-in `modern` layout as a format string, so it
+        // wraps at the mail width and numbers each entry within the series.
+        "modern" => {
+            let n = commits.len();
+            for (i, id) in commits.iter().enumerate() {
+                let commit = repo.find_object(*id)?.try_into_commit()?;
+                let (subject, _) = format_subject(skip_blank_lines(commit.message_raw()?));
+                let line = format!(
+                    "[{}/{n}] {}",
+                    i + 1,
+                    subject
+                        .to_str()
+                        .map_err(|_| anyhow!("commit subject is not valid UTF-8"))?
+                );
+                let mut wrapped = String::new();
+                wrap_text(&mut wrapped, &line, 0, 0, MAIL_DEFAULT_WRAP);
+                out.extend_from_slice(wrapped.as_bytes());
+                out.push(b'\n');
+            }
+            out.push(b'\n');
+        }
+        f if f.contains('%') => generate_commit_list(repo, commits, f, out)?,
+        // git validates the spec only here, after the cover letter's headers and
+        // blurb have already been written, so the partial message is kept.
+        f => return Ok(Err(fatal(&format!("'{f}' is not a valid format string")))),
+    }
+    Ok(Ok(()))
+}
+
+/// Port of `generate_commit_list_cover()` (builtin/log.c): one line per commit,
+/// oldest first, rendered through a `--pretty=format:` string.
+///
+/// git runs this with a zeroed `pretty_print_context`, so the abbreviating
+/// placeholders answer with full object names — which is what `log`'s shared
+/// `format_commit()` reproduces.
+fn generate_commit_list(
+    repo: &gix::Repository,
+    commits: &[ObjectId],
+    fmt: &str,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    for id in commits {
+        let commit = repo.find_object(*id)?.try_into_commit()?;
+        out.extend_from_slice(&super::log::format_commit(repo, &commit, fmt)?);
+        out.push(b'\n');
+    }
+    out.push(b'\n');
     Ok(())
 }
 
@@ -2179,16 +2989,6 @@ fn is_mboxrd_from(line: &[u8]) -> bool {
     rest.starts_with(b"From ")
 }
 
-/// `In-Reply-To:`/`References:` for `--in-reply-to`, emitted ahead of `From:` on
-/// every message and the cover. Without `--thread` (unported) git sets both to
-/// the same cleaned id on each message, which is what is reproduced here.
-fn write_in_reply_to(sb: &mut String, opts: &Opts) {
-    if let Some(id) = &opts.in_reply_to {
-        sb.push_str(&format!("In-Reply-To: <{id}>\n"));
-        sb.push_str(&format!("References: <{id}>\n"));
-    }
-}
-
 /// `--add-header` lines (verbatim), then the `To:` and `Cc:` recipient lists,
 /// emitted after the identity/MIME headers and before the blank line that ends
 /// the header block. Each recipient list is folded one entry per continuation
@@ -2217,6 +3017,487 @@ fn write_recipient_list(sb: &mut String, name: &str, list: &[String]) {
         sb.push_str(value);
     }
     sb.push('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Threading, notes and base info
+// ---------------------------------------------------------------------------
+
+/// Port of `gen_message_id()` (builtin/log.c): `<base>.<epoch>.git.<committer
+/// e-mail>`.
+///
+/// The timestamp is `time(NULL)` at the moment the id is minted, so a generated
+/// `Message-ID` is by construction not reproducible across runs — git's own ids
+/// differ between two invocations a second apart.
+fn gen_message_id(repo: &gix::Repository, base: &str) -> Result<String> {
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    Ok(format!("{base}.{epoch}.git.{}", committer_ident(repo)?.mail))
+}
+
+/// One loaded notes tree, with the ref it came from (which names the block).
+struct NotesTree {
+    ref_name: String,
+    notes: super::notes::Notes,
+}
+
+/// Port of `load_display_notes()` (notes.c) for the refs `--notes`/`--no-notes`/
+/// `format.notes` selected.
+///
+/// The default tree is consulted when `--notes` was given without a ref (or
+/// nothing narrowed the selection), and only then are `GIT_NOTES_DISPLAY_REF`
+/// and `notes.displayRef` added — an explicit `--notes=<ref>` suppresses both.
+fn load_display_notes(repo: &gix::Repository, opts: &Opts) -> Result<Vec<NotesTree>> {
+    if !opts.notes.show {
+        return Ok(Vec::new());
+    }
+    let mut refs: Vec<String> = Vec::new();
+    // Port of `string_list_add_refs_by_glob()`: a name that resolves to nothing
+    // is warned about but still listed, and duplicates are dropped.
+    let add_by_glob = |refs: &mut Vec<String>, name: &str| -> Result<()> {
+        if name.contains(['*', '?', '[']) {
+            bail!("glob notes ref {name:?} is not supported");
+        }
+        if repo.rev_parse_single(BStr::new(name)).is_err() {
+            eprintln!("warning: notes ref {name} is invalid");
+        }
+        if !refs.iter().any(|r| r == name) {
+            refs.push(name.to_owned());
+        }
+        Ok(())
+    };
+    if opts.notes.use_default > 0
+        || (opts.notes.use_default == -1 && opts.notes.extra_refs.is_empty())
+    {
+        refs.push(super::notes::resolve_notes_ref(repo, None));
+        match std::env::var("GIT_NOTES_DISPLAY_REF") {
+            Ok(v) => {
+                for name in v.split(':').filter(|s| !s.is_empty()) {
+                    add_by_glob(&mut refs, name)?;
+                }
+            }
+            Err(_) => {
+                for v in repo
+                    .config_snapshot()
+                    .plumbing()
+                    .values::<gix::bstr::BString>("notes.displayRef")
+                    .unwrap_or_default()
+                {
+                    add_by_glob(&mut refs, v.to_str()?)?;
+                }
+            }
+        }
+    }
+    for r in &opts.notes.extra_refs {
+        add_by_glob(&mut refs, r)?;
+    }
+
+    let mut trees = Vec::new();
+    for r in refs {
+        let (notes, _) = super::notes::load(repo, &r)?;
+        trees.push(NotesTree {
+            ref_name: r,
+            notes,
+        });
+    }
+    Ok(trees)
+}
+
+/// git's `GIT_NOTES_DEFAULT_REF`.
+const NOTES_DEFAULT_REF: &str = "refs/notes/commits";
+
+/// Port of `format_display_notes()`/`format_note()` (notes.c) for the non-raw
+/// (mail) case: a `Notes[ (<ref>)]:` header and the note indented four spaces.
+fn format_display_notes(
+    repo: &gix::Repository,
+    trees: &[NotesTree],
+    object: ObjectId,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for t in trees {
+        let Some(note_id) = t.notes.map.get(&object) else {
+            continue;
+        };
+        let Ok(blob) = repo.find_object(*note_id) else {
+            continue;
+        };
+        if blob.kind != gix::object::Kind::Blob {
+            continue;
+        }
+        let mut msg = blob.data.as_slice();
+        // "we will end the annotation by a newline anyway"
+        if msg.last() == Some(&b'\n') {
+            msg = &msg[..msg.len() - 1];
+        }
+        let label = t.ref_name.as_str();
+        if label == NOTES_DEFAULT_REF {
+            out.extend_from_slice(b"\nNotes:\n");
+        } else {
+            let short = label
+                .strip_prefix("refs/")
+                .unwrap_or(label)
+                .to_owned();
+            let short = short.strip_prefix("notes/").unwrap_or(&short);
+            write!(out, "\nNotes ({short}):\n")?;
+        }
+        for line in msg.split(|&b| b == b'\n') {
+            out.extend_from_slice(b"    ");
+            out.extend_from_slice(line);
+            out.push(b'\n');
+        }
+    }
+    Ok(out)
+}
+
+/// The `base-commit:`/`prerequisite-patch-id:` trailer block, as
+/// `struct base_tree_info` holds it.
+struct Bases {
+    base: ObjectId,
+    /// Patch ids in collection order; `print_bases()` emits them reversed.
+    patch_ids: Vec<ObjectId>,
+}
+
+/// Port of `get_base_commit()` + `prepare_bases()` (builtin/log.c).
+///
+/// The `Err(ExitCode)` arm carries git's own `die()` message, already on stderr;
+/// `Ok(None)` is "no base information was requested", which is also what
+/// `format.useAutoBase=whenAble` degrades to when no base can be derived.
+#[allow(clippy::type_complexity)]
+fn resolve_bases(
+    repo: &gix::Repository,
+    commits: &[ObjectId],
+    opts: &Opts,
+) -> Result<std::result::Result<Option<Bases>, ExitCode>> {
+    let (auto_select, die_on_failure) = match opts.auto_base {
+        AutoBase::Never => match &opts.base_commit {
+            Some(_) => (false, true),
+            None => return Ok(Ok(None)),
+        },
+        AutoBase::Always => (true, true),
+        AutoBase::WhenAble => (true, false),
+    };
+    // `die_on_failure` decides whether an underivable base is fatal or silently
+    // drops the whole block.
+    macro_rules! give_up {
+        ($msg:expr) => {
+            return Ok(if die_on_failure {
+                Err(fatal($msg))
+            } else {
+                Ok(None)
+            })
+        };
+    }
+
+    let base = if !auto_select {
+        let spec = opts.base_commit.as_deref().expect("a base was given");
+        match repo
+            .rev_parse_single(BStr::new(spec))
+            .ok()
+            .and_then(|id| id.object().ok())
+            .and_then(|o| o.peel_to_commit().ok())
+        {
+            Some(c) => c.id,
+            None => return Ok(Err(fatal(&format!("unknown commit {spec}")))),
+        }
+    } else {
+        let upstream = repo
+            .head_ref()?
+            .map(|r| r.name().to_owned())
+            .and_then(|name| repo.branch_remote_tracking_ref_name(name.as_ref(), gix::remote::Direction::Fetch).and_then(|r| r.ok()));
+        let Some(upstream) = upstream else {
+            give_up!(
+                "failed to get upstream, if you want to record base commit automatically,\n\
+                 please use git branch --set-upstream-to to track a remote branch.\n\
+                 Or you could specify base commit by --base=<base-commit-id> manually"
+            );
+        };
+        let Some(tip) = repo
+            .find_reference(upstream.as_ref())
+            .ok()
+            .and_then(|mut r| r.peel_to_id().ok())
+            .map(|id| id.detach())
+        else {
+            give_up!(&format!("failed to resolve '{upstream}' as a valid ref"));
+        };
+        // "There should be one and only one merge base."
+        let mut bases = repo.merge_bases_many(tip, commits)?;
+        if bases.len() != 1 {
+            give_up!("could not find exact merge base");
+        }
+        bases.pop().expect("exactly one merge base").detach()
+    };
+
+    // Reduce the series to a single merge base, pairwise, the way git does.
+    let mut rev: Vec<ObjectId> = commits.to_vec();
+    while rev.len() > 1 {
+        let mut next = Vec::with_capacity(rev.len().div_ceil(2));
+        for pair in rev.chunks(2) {
+            if pair.len() == 1 {
+                next.push(pair[0]);
+                continue;
+            }
+            let mut mb = repo.merge_bases_many(pair[0], &pair[1..2])?;
+            if mb.len() != 1 {
+                give_up!("failed to find exact merge base");
+            }
+            next.push(mb.pop().expect("exactly one merge base").detach());
+        }
+        rev = next;
+    }
+    let tip = rev[0];
+    let is_ancestor = repo
+        .merge_bases_many(base, &[tip])?
+        .iter()
+        .any(|b| b.detach() == base);
+    if !is_ancestor {
+        give_up!("base commit should be the ancestor of revision list");
+    }
+    if commits.contains(&base) {
+        give_up!("base commit shouldn't be in revision list");
+    }
+
+    // `prepare_bases()`: every non-merge commit between the base and the series
+    // that is not itself part of the series is a prerequisite.
+    let in_series: std::collections::HashSet<ObjectId> = commits.iter().copied().collect();
+    let mut patch_ids = Vec::new();
+    for info in repo
+        .rev_walk(commits.iter().copied())
+        .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst))
+        .with_hidden(Some(base))
+        .all()?
+    {
+        let info = info?;
+        if in_series.contains(&info.id) {
+            continue;
+        }
+        let commit = repo.find_object(info.id)?.try_into_commit()?;
+        if commit.parent_ids().count() > 1 {
+            continue;
+        }
+        patch_ids.push(commit_patch_id(repo, &commit)?);
+    }
+    Ok(Ok(Some(Bases { base, patch_ids })))
+}
+
+/// Port of `print_bases()` (builtin/log.c). Emitted once per series, on the
+/// cover letter when there is one and otherwise on the first patch.
+fn print_bases(out: &mut Vec<u8>, bases: &Bases) {
+    out.extend_from_slice(format!("\nbase-commit: {}\n", bases.base).as_bytes());
+    for id in bases.patch_ids.iter().rev() {
+        out.extend_from_slice(format!("prerequisite-patch-id: {id}\n").as_bytes());
+    }
+}
+
+/// Port of `commit_patch_id()` (patch-ids.c) plus `diff_get_patch_id()`
+/// (diff.c) in its unstable form — the one `prepare_bases()` asks for.
+///
+/// The hash is fed a canonical, header-only rendering of each file pair
+/// (`diff--git`, `a/`+`b/` paths with whitespace removed, mode words) followed
+/// by the raw diff lines, and each file's digest is folded into the running
+/// result with `flush_one_hunk()`'s carrying byte-wise sum.
+fn commit_patch_id(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<ObjectId> {
+    let kind = repo.object_hash();
+    let new_tree = commit.tree()?;
+    let old_tree = match commit.parent_ids().next() {
+        Some(pid) => Some(pid.object()?.try_into_commit()?.tree()?),
+        None => None,
+    };
+    let changes = tree_changes(repo, old_tree.as_ref(), Some(&new_tree))?;
+
+    let mut result = vec![0u8; kind.len_in_bytes()];
+    let mut ctx = gix::hash::hasher(kind);
+    for change in &changes {
+        let path = change_path(change);
+        let one = remove_space(path);
+        let two = one.clone();
+        let (old_id, new_id, old_mode, new_mode) = pair_info(change);
+
+        ctx.update(b"diff--git");
+        ctx.update(b"a/");
+        ctx.update(&one);
+        ctx.update(b"b/");
+        ctx.update(&two);
+
+        if old_mode == 0 {
+            ctx.update(b"newfilemode");
+            ctx.update(format!("{new_mode:06o}").as_bytes());
+        } else if new_mode == 0 {
+            ctx.update(b"deletedfilemode");
+            ctx.update(format!("{old_mode:06o}").as_bytes());
+        } else if old_mode != new_mode {
+            ctx.update(b"oldmode");
+            ctx.update(format!("{old_mode:06o}").as_bytes());
+            ctx.update(b"newmode");
+            ctx.update(format!("{new_mode:06o}").as_bytes());
+        }
+
+        let old_content = match old_id {
+            Some((id, is_sub)) => content_of(repo, id, is_sub)?,
+            None => Vec::new(),
+        };
+        let new_content = match new_id {
+            Some((id, is_sub)) => content_of(repo, id, is_sub)?,
+            None => Vec::new(),
+        };
+        if is_binary(&old_content) || is_binary(&new_content) {
+            // A binary pair contributes its two object names instead of a diff.
+            let hex = |o: Option<(ObjectId, bool)>| {
+                o.map_or_else(|| ObjectId::null(kind), |(id, _)| id)
+                    .to_hex()
+                    .to_string()
+            };
+            ctx.update(hex(old_id).as_bytes());
+            ctx.update(hex(new_id).as_bytes());
+        } else {
+            if old_mode == 0 {
+                ctx.update(b"---/dev/null");
+                ctx.update(b"+++b/");
+                ctx.update(&two);
+            } else if new_mode == 0 {
+                ctx.update(b"---a/");
+                ctx.update(&one);
+                ctx.update(b"+++/dev/null");
+            } else {
+                ctx.update(b"---a/");
+                ctx.update(&one);
+                ctx.update(b"+++b/");
+                ctx.update(&two);
+            }
+            let input = InternedInput::new(old_content.as_slice(), new_content.as_slice());
+            // `xecfg.ctxlen = 3`, `xecfg.flags = XDL_EMIT_NO_HUNK_HDR`, and
+            // Myers regardless of `--diff-algorithm`, because `prepare_bases()`
+            // builds its own `diff_options`.
+            //
+            // git passes `xpp.flags = 0` here, i.e. `xdl_change_compact()`
+            // without the indent heuristic, where the rendered patch uses it.
+            // imara-diff exposes only the one post-processing pass, so an input
+            // whose hunks the two compactions place differently would hash
+            // differently; no such input turned up in differential testing.
+            let diff = diff_with_slider_heuristics(Algorithm::Myers, &input);
+            UnifiedDiff::new(
+                &diff,
+                &input,
+                PatchIdWriter { ctx: &mut ctx },
+                ContextSize::symmetrical(3),
+            )
+            .consume()?;
+        }
+        flush_one_hunk(&mut result, &mut ctx, kind);
+    }
+    Ok(ObjectId::from_bytes_or_panic(&result))
+}
+
+/// Hashes the diff body the way `patch_id_consume()` does: every line with its
+/// `+`/`-`/` ` prefix and a newline, and no hunk headers
+/// (`XDL_EMIT_NO_HUNK_HDR`) or `\ No newline` markers.
+struct PatchIdWriter<'a> {
+    ctx: &'a mut gix::hash::Hasher,
+}
+impl ConsumeHunk for PatchIdWriter<'_> {
+    type Out = ();
+
+    fn consume_hunk(
+        &mut self,
+        _header: HunkHeader,
+        lines: &[(DiffLineKind, &[u8])],
+    ) -> std::io::Result<()> {
+        for &(kind, content) in lines {
+            let mut line = Vec::with_capacity(content.len() + 2);
+            line.push(match kind {
+                DiffLineKind::Context => b' ',
+                DiffLineKind::Add => b'+',
+                DiffLineKind::Remove => b'-',
+            });
+            line.extend_from_slice(content);
+            // xdiff's incomplete-line record still ends the hashed line with a
+            // newline; only the `\ No newline` marker itself is skipped.
+            if !content.ends_with(b"\n") {
+                line.push(b'\n');
+            }
+            // `patch_id_consume()` strips whitespace before hashing, which is
+            // what makes a patch id insensitive to indentation-only rewrites.
+            self.ctx.update(&remove_space(&line));
+        }
+        Ok(())
+    }
+
+    fn finish(self) {}
+}
+
+/// Port of `flush_one_hunk()` (diff.c): fold this file's digest into the
+/// running result as a byte-wise sum with carry, and restart the context.
+fn flush_one_hunk(result: &mut [u8], ctx: &mut gix::hash::Hasher, kind: gix::hash::Kind) {
+    let digest = std::mem::replace(ctx, gix::hash::hasher(kind)).try_finalize();
+    let digest = digest.expect("a hash context always finalizes").as_slice().to_vec();
+    let mut carry: u16 = 0;
+    for i in 0..result.len() {
+        carry += u16::from(result[i]) + u16::from(digest[i]);
+        result[i] = carry as u8;
+        carry >>= 8;
+    }
+}
+
+/// The `(pre-image, post-image, old mode, new mode)` of one change, in the
+/// shape `diff_get_patch_id()` reads a `diff_filepair` — a missing side is mode
+/// `0`, which is how git spells creation and deletion there.
+#[allow(clippy::type_complexity)]
+fn pair_info(
+    change: &ChangeDetached,
+) -> (
+    Option<(ObjectId, bool)>,
+    Option<(ObjectId, bool)>,
+    u32,
+    u32,
+) {
+    match change {
+        ChangeDetached::Addition {
+            entry_mode, id, ..
+        } => (
+            None,
+            Some((*id, entry_mode.is_commit())),
+            0,
+            entry_mode.value().into(),
+        ),
+        ChangeDetached::Deletion {
+            entry_mode, id, ..
+        } => (
+            Some((*id, entry_mode.is_commit())),
+            None,
+            entry_mode.value().into(),
+            0,
+        ),
+        ChangeDetached::Modification {
+            previous_entry_mode,
+            previous_id,
+            entry_mode,
+            id,
+            ..
+        } => (
+            Some((*previous_id, previous_entry_mode.is_commit())),
+            Some((*id, entry_mode.is_commit())),
+            previous_entry_mode.value().into(),
+            entry_mode.value().into(),
+        ),
+        // Never produced: rewrite tracking is off via Options::default().
+        ChangeDetached::Rewrite { .. } => (None, None, 0, 0),
+    }
+}
+
+/// git's `buffer_is_binary()`: a NUL in the first 8000 bytes.
+fn is_binary(content: &[u8]) -> bool {
+    content[..content.len().min(8000)].contains(&0)
+}
+
+/// Port of `remove_space()` (diff.c): git's own `isspace` class removed from a
+/// path before it is hashed.
+/// git's `isspace` is `sane_ctype`'s `GIT_SPACE`, which covers only space, tab,
+/// newline and carriage return — vertical tab and form feed are *kept*.
+fn remove_space(path: &[u8]) -> Vec<u8> {
+    path.iter()
+        .copied()
+        .filter(|c| !matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
+        .collect()
 }
 
 fn write_signature(out: &mut Vec<u8>, opts: &Opts) {

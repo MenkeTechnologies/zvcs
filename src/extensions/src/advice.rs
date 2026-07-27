@@ -51,6 +51,15 @@ pub enum Advice {
     PushNonFFMatching,
     /// The remote ref points at an object this repository does not have.
     PushFetchFirst,
+    /// The rejected ref is under `refs/tags/` and the remote already has it, so
+    /// the update would clobber an existing tag.
+    PushAlreadyExists,
+    /// Either side of the rejected update is not a commit, so no fast-forward
+    /// question can even be asked (`REF_STATUS_REJECT_NEEDS_FORCE`).
+    PushNeedsForce,
+    /// `--force-if-includes` found the remote-tracking ref moved since this
+    /// checkout last saw it (`REF_STATUS_REJECT_REMOTE_UPDATED`).
+    PushRefNeedsUpdate,
     /// Git is blocked on an editor the user may not have noticed.
     WaitingForEditor,
     /// A ref name was rejected by `check-ref-format`'s rules.
@@ -84,6 +93,20 @@ pub enum Advice {
     /// `git status` spent long enough computing the ahead/behind counts to be
     /// worth pointing at `--no-ahead-behind`.
     StatusAheadBehindWarning,
+    /// `die_ff_impossible()`: `--ff-only` was asked for over histories that have
+    /// diverged, so no fast-forward exists.
+    Diverging,
+    /// `setup_tracking()` found more than one remote whose fetch refspecs map
+    /// into the same remote-tracking ref, so the upstream cannot be decided.
+    AmbiguousFetchRefspec,
+    /// An interactive-rebase todo line was rejected — `check_merge_commit_insn`'s
+    /// "that instruction does not take a merge commit".
+    RebaseTodoError,
+    /// `store_updated_refs()`'s note that the forced-update check is switched off,
+    /// so the fetch summary cannot flag rewritten branches. Unlike its neighbours
+    /// this one gates a `warning()`, not an `advise()` — no `hint: ` prefix, no
+    /// `Disable this message with …` trailer.
+    FetchShowForcedUpdates,
 }
 
 impl Advice {
@@ -103,6 +126,9 @@ impl Advice {
             Advice::PushNonFFCurrent => "advice.pushNonFFCurrent",
             Advice::PushNonFFMatching => "advice.pushNonFFMatching",
             Advice::PushFetchFirst => "advice.pushFetchFirst",
+            Advice::PushAlreadyExists => "advice.pushAlreadyExists",
+            Advice::PushNeedsForce => "advice.pushNeedsForce",
+            Advice::PushRefNeedsUpdate => "advice.pushRefNeedsUpdate",
             Advice::WaitingForEditor => "advice.waitingForEditor",
             Advice::RefSyntax => "advice.refSyntax",
             Advice::SetUpstreamFailure => "advice.setUpstreamFailure",
@@ -118,6 +144,10 @@ impl Advice {
             Advice::ResetNoRefresh => "advice.resetNoRefresh",
             Advice::StatusUoption => "advice.statusUoption",
             Advice::StatusAheadBehindWarning => "advice.statusAheadBehindWarning",
+            Advice::Diverging => "advice.diverging",
+            Advice::AmbiguousFetchRefspec => "advice.ambiguousFetchRefspec",
+            Advice::RebaseTodoError => "advice.rebaseTodoError",
+            Advice::FetchShowForcedUpdates => "advice.fetchShowForcedUpdates",
         }
     }
 
@@ -200,17 +230,23 @@ impl Advice {
     /// `advise_if_enabled()`: [`Advice::advise`] against an open repository,
     /// followed by the `Disable this message with …` line git appends when the
     /// slot has never been configured.
+    ///
+    /// `vadvise()` appends that trailer to the *same* buffer it then splits into
+    /// `hint:` lines, so a body already ending in a newline gets a blank `hint:`
+    /// between it and the trailer while one that does not gets none. Building the
+    /// buffer the same way is what keeps both shapes right.
     pub fn advise_in(self, repo: &Repository, body: &str) -> bool {
         if !self.enabled_in(repo) {
             return false;
         }
-        print_hint(body);
+        let mut buf = body.to_string();
         if self.unconfigured_in(repo) {
-            print_hint(&format!(
-                "Disable this message with \"git config set {} false\"",
+            buf.push_str(&format!(
+                "\nDisable this message with \"git config set {} false\"",
                 self.key()
             ));
         }
+        print_hint(&buf);
         true
     }
 }
@@ -234,6 +270,25 @@ pub fn ambiguous_remote_branch_name(repo: &Repository, cmdname: &str) {
              one remote, e.g. the 'origin' remote, consider setting\n\
              checkout.defaultRemote=origin in your config."
         ),
+    );
+}
+
+/// Port of `die_ff_impossible()` (`advice.c`), minus the `die()`: the hint git
+/// prints when `--ff-only` was asked for over histories that have diverged, so
+/// there is no fast-forward to take. `advise_if_enabled()`, so an unconfigured
+/// slot also gets the `Disable this message with …` trailer. The caller prints
+/// `fatal: Not possible to fast-forward, aborting.` and exits 128, which is what
+/// the `die()` this helper is split out of does.
+pub fn ff_impossible(repo: &Repository) {
+    Advice::Diverging.advise_in(
+        repo,
+        "Diverging branches can't be fast-forwarded, you need to either:\n\
+         \n\
+         \tgit merge --no-ff\n\
+         \n\
+         or:\n\
+         \n\
+         \tgit rebase\n",
     );
 }
 
@@ -282,6 +337,13 @@ fn globally_enabled() -> bool {
 pub(crate) fn print_hint(body: &str) {
     let color = hint_color();
     let reset = if color.is_empty() { "" } else { "\x1b[m" };
+    // `for (cp = buf.buf; *cp; cp = np)`: the walk stops at the terminator, so a
+    // body ending in a newline emits no line for what follows it — and an empty
+    // body emits nothing at all.
+    if body.is_empty() {
+        return;
+    }
+    let body = body.strip_suffix('\n').unwrap_or(body);
     for line in body.split('\n') {
         if line.is_empty() {
             eprintln!("{color}hint:{reset}");

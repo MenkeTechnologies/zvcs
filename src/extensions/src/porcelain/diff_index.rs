@@ -159,7 +159,7 @@ use std::process::ExitCode;
 
 use gix::bstr::{BString, ByteSlice};
 use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
-use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, Diff, InternedInput, UnifiedDiff};
+use gix::diff::blob::{Algorithm, Diff, InternedInput, UnifiedDiff};
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
 use regex::bytes::Regex;
@@ -292,6 +292,11 @@ struct Opts {
     patch: bool,
     /// `-U<n>`/`--unified=<n>`: unified-diff context, git's default of 3.
     ctx: u32,
+    /// `XDF_INDENT_HEURISTIC`: where a hunk that can slide freely finally lands.
+    /// `git_diff_heuristic_config()` runs from `git_diff_basic_config()`, so
+    /// `diff.indentHeuristic` reaches plumbing too, and `--[no-]indent-heuristic`
+    /// overrides it.
+    indent_heuristic: bool,
     /// `--numstat`: the `<added>\t<deleted>\t<path>` machine listing.
     numstat: bool,
     /// `--stat[=…]`/`--compact-summary`: the human diffstat.
@@ -449,7 +454,6 @@ fn render_only_option(a: &str) -> bool {
         "--histogram",
         "--ignore-blank-lines",
         "--ignore-submodules",
-        "--indent-heuristic",
         "--irreversible-delete",
         "--ita-invisible-in-index",
         "--ita-visible-in-index",
@@ -457,7 +461,6 @@ fn render_only_option(a: &str) -> bool {
         "--no-diff-merges",
         "--no-ext-diff",
         "--no-function-context",
-        "--no-indent-heuristic",
         "--no-prefix",
         "--no-rename-empty",
         "--no-renames",
@@ -636,6 +639,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         detect_rename: false,
         patch: false,
         ctx: 3,
+        indent_heuristic: true,
         numstat: false,
         diffstat: false,
         shortstat: false,
@@ -657,6 +661,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     // Whether a `--ws-error-highlight` flag was seen, so the config default does
     // not overwrite it (git reads the config first and the flag last).
     let mut wseh_explicit = false;
+    let mut ih_explicit = false;
     let mut quiet = false;
     let mut merge_base = false;
     // `--raw` given explicitly, which is what makes git print the pair listing
@@ -912,6 +917,15 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             // content-altering refusal below.
             "--full-index" => opts.full_index = true,
             "-D" | "--irreversible-delete" => opts.irreversible_delete = true,
+            // `XDF_INDENT_HEURISTIC`: where a hunk that can slide freely finally lands.
+            "--indent-heuristic" => {
+                opts.indent_heuristic = true;
+                ih_explicit = true;
+            }
+            "--no-indent-heuristic" => {
+                opts.indent_heuristic = false;
+                ih_explicit = true;
+            }
             "--no-prefix" => {
                 opts.src_prefix = String::new();
                 opts.dst_prefix = String::new();
@@ -1183,6 +1197,9 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             opts.ws_error_highlight = v;
         }
     }
+    if !ih_explicit {
+        opts.indent_heuristic = super::diff_pairs::indent_heuristic_default(&repo);
+    }
 
     // git's `setup_revisions`: each positional before `--` is tried as a revision.
     // The first that resolves is the tree-ish; a further one that also resolves is
@@ -1434,9 +1451,25 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         };
         let need_analyses = opts.patch || opts.numstat || opts.diffstat || opts.shortstat;
         let analyses: Vec<IdxAnalysis> = if need_analyses {
+            // `diff_filespec_load_driver()`: the `diff=<driver>` attribute plus that
+            // driver's `diff.<name>.binary`, resolved once for the whole batch because
+            // the attribute stack is what makes the lookup expensive.
+            let mut tc = super::cat_file::Textconv::new(&repo).ok();
+            let driver_binary: Vec<Option<bool>> = deltas
+                .iter()
+                .map(|d| {
+                    let name = tc.as_mut()?.driver_name(d.path.as_ref()).ok().flatten()?;
+                    let raw = super::cat_file::diff_driver_config(&repo, &name, "binary")?;
+                    // `git_config_bool()` on the driver's `binary` key.
+                    gix::config::Boolean::try_from(gix::bstr::BStr::new(raw.as_bytes()))
+                        .ok()
+                        .map(|b| b.0)
+                })
+                .collect();
             deltas
                 .iter()
-                .map(|d| analyze_index_delta(&repo, workdir.as_deref(), d, &opts))
+                .zip(&driver_binary)
+                .map(|(d, db)| analyze_index_delta(&repo, workdir.as_deref(), d, &opts, *db))
                 .collect::<Result<_>>()?
         } else {
             Vec::new()
@@ -1496,9 +1529,17 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             };
             let mut plain: Vec<u8> = Vec::new();
             let mut files: Vec<diff_color::FilePaint> = Vec::new();
+            // `fill_metainfo()`'s abbreviation length: the full hash under `--full-index`,
+            // otherwise `DEFAULT_ABBREV`, which `core.abbrev` sets.
+            let hexsz = repo.object_hash().len_in_hex();
+            let patch_abbrev = if opts.full_index {
+                hexsz
+            } else {
+                crate::abbrev::configured_abbrev(&repo, hexsz)
+            };
             for (d, an) in deltas.iter().zip(&analyses) {
                 let before = plain.len();
-                render_patch(&mut plain, d, an, &opts);
+                render_patch(&mut plain, d, an, &opts, patch_abbrev);
                 if plain.len() != before {
                     files.push(diff_color::FilePaint {
                         ws_rule,
@@ -2402,6 +2443,9 @@ fn analyze_index_delta(
     workdir: Option<&Path>,
     d: &Delta,
     opts: &Opts,
+    // `one->driver->binary`: `Some` only when the path's `diff=<driver>` attribute names
+    // a driver that configures `diff.<name>.binary`.
+    driver_binary: Option<bool>,
 ) -> Result<IdxAnalysis> {
     if d.unmerged {
         return Ok(IdxAnalysis {
@@ -2418,8 +2462,16 @@ fn analyze_index_delta(
     let new_data = content_of(repo, workdir, d.dst_mode, d.dst_id, &d.path)?.unwrap_or_default();
 
     // `diff_filespec_is_binary()`: a diff is binary if either present side is binary.
-    let binary = (d.src_mode != 0 && buffer_is_binary(&old_data))
-        || (d.dst_mode != 0 && buffer_is_binary(&new_data));
+    // The path's `diff=<driver>` attribute is consulted first — when that driver sets
+    // `diff.<name>.binary`, `one->driver->binary != -1` and the verdict is taken from
+    // it verbatim; only an unset (`-1`) driver setting falls through to the NUL sniff.
+    let binary = match driver_binary {
+        Some(v) => v,
+        None => {
+            (d.src_mode != 0 && buffer_is_binary(&old_data))
+                || (d.dst_mode != 0 && buffer_is_binary(&new_data))
+        }
+    };
     if binary {
         return Ok(IdxAnalysis {
             added: 0,
@@ -2438,7 +2490,15 @@ fn analyze_index_delta(
     input.update_before(before.iter().map(|l| if fold { fold_line(l, opts.ws) } else { l.to_vec() }));
     input.update_after(after.iter().map(|l| if fold { fold_line(l, opts.ws) } else { l.to_vec() }));
 
-    let diff = diff_with_slider_heuristics(Algorithm::Myers, &input);
+    // `xdl_change_compact()` scores `xdf->recs[i]->ptr`, the *original* record, so the
+    // indents come from `before`/`after` rather than the whitespace-folded interner.
+    let diff = super::diff_pairs::compute_compacted(
+        Algorithm::Myers,
+        &input,
+        &before,
+        &after,
+        opts.indent_heuristic,
+    );
     // `xdl_mark_ignorable_regex()`: a change group whose every removed and added line
     // matches the `-I` pattern contributes nothing to the counts.
     let (added, deleted) = match &opts.ignore_lines {
@@ -2464,6 +2524,9 @@ fn analyze_index_delta(
             buf: Vec::new(),
             before: &before,
             after: &after,
+            // No hunk has been emitted yet, so nothing bounds the first search.
+            func_prev: -1,
+            func_text: Vec::new(),
         };
         Some(UnifiedDiff::new(&diff, &input, sink, ContextSize::symmetrical(opts.ctx)).consume()?)
     } else {
@@ -2884,7 +2947,11 @@ fn mode_str(mode: u32) -> String {
 // ---------------------------------------------------------------------------
 
 /// Render one delta as a `git diff` file section into `out` (`builtin_diff()`).
-fn render_patch(out: &mut Vec<u8>, d: &Delta, an: &IdxAnalysis, opts: &Opts) {
+///
+/// `hlen` is the `index` line hex width `fill_metainfo()` uses:
+/// `o->flags.full_index ? the_hash_algo->hexsz : DEFAULT_ABBREV`, and `DEFAULT_ABBREV`
+/// is what `core.abbrev` sets -- not a hardcoded 7.
+fn render_patch(out: &mut Vec<u8>, d: &Delta, an: &IdxAnalysis, opts: &Opts, hlen: usize) {
     if d.unmerged {
         out.extend_from_slice(b"* Unmerged path ");
         out.extend_from_slice(display_path(&d.path, opts).as_ref());
@@ -2900,9 +2967,6 @@ fn render_patch(out: &mut Vec<u8>, d: &Delta, an: &IdxAnalysis, opts: &Opts) {
         (&opts.src_prefix, &opts.dst_prefix)
     };
 
-    // `--full-index` shows the whole object name; otherwise git abbreviates to 7.
-    let hexsz = d.src_id.kind().len_in_hex();
-    let hlen = if opts.full_index { hexsz } else { 7 };
     let old_hash = if d.old_valid() {
         d.src_id.to_hex_with_len(hlen).to_string()
     } else {
@@ -3118,26 +3182,56 @@ struct PatchSink<'a> {
     buf: Vec<u8>,
     before: &'a [&'a [u8]],
     after: &'a [&'a [u8]],
+    /// git's `funclineprev`: the line the previous hunk's search started from, and the
+    /// limit for the next one, so a heading is never scanned for twice.
+    func_prev: i64,
+    /// git's `func_line`, which lives across the whole file rather than one hunk. A
+    /// search that finds nothing leaves it alone, so a hunk deep inside a long function
+    /// keeps the heading found for the hunk above it.
+    func_text: Vec<u8>,
 }
 
 impl ConsumeHunk for PatchSink<'_> {
     type Out = Vec<u8>;
 
     fn consume_hunk(&mut self, header: HunkHeader, lines: &[(DiffLineKind, &[u8])]) -> std::io::Result<()> {
-        self.buf.extend_from_slice(b"@@ -");
-        self.buf
-            .extend_from_slice(fmt_range(header.before_hunk_start, header.before_hunk_len).as_bytes());
-        self.buf.extend_from_slice(b" +");
-        self.buf
-            .extend_from_slice(fmt_range(header.after_hunk_start, header.after_hunk_len).as_bytes());
-        self.buf.extend_from_slice(b" @@\n");
+        let mut hdr: Vec<u8> = Vec::with_capacity(super::diff::HUNK_HDR_MAX);
+        hdr.extend_from_slice(b"@@ -");
+        hdr.extend_from_slice(fmt_range(header.before_hunk_start, header.before_hunk_len).as_bytes());
+        hdr.extend_from_slice(b" +");
+        hdr.extend_from_slice(fmt_range(header.after_hunk_start, header.after_hunk_len).as_bytes());
+        hdr.extend_from_slice(b" @@");
+
+        // `XDL_EMIT_FUNCNAMES`: the nearest qualifying line at or above the hunk's first
+        // pre-image line, searched no further back than the previous hunk's own starting
+        // point. `before_hunk_start` is 1-based and git's `s1` is the 0-based index of
+        // that same line.
+        let s1 = header.before_hunk_start as i64 - 1;
+        if let Some(func) = super::diff::func_line(self.before, s1 - 1, self.func_prev) {
+            self.func_text = func.to_vec();
+        }
+        self.func_prev = s1 - 1;
+        if !self.func_text.is_empty() {
+            // git clips the heading to what remains of its 128-byte header buffer,
+            // reserving one byte for the newline.
+            let room = super::diff::HUNK_HDR_MAX.saturating_sub(hdr.len() + 2);
+            hdr.push(b' ');
+            hdr.extend_from_slice(&self.func_text[..self.func_text.len().min(room)]);
+        }
+        hdr.push(b'\n');
+        self.buf.extend_from_slice(&hdr);
 
         let mut bi = header.before_hunk_start.saturating_sub(1) as usize;
         let mut ai = header.after_hunk_start.saturating_sub(1) as usize;
         for (kind, fallback) in lines {
             let (marker, content): (u8, &[u8]) = match kind {
+                // `xdl_emit_diff()` emits every context record from `xe->xdf2`, the
+                // *post-image*: all three context loops call
+                // `xdl_emit_record(&xe->xdf2, s2, " ", ecb)`. The two sides only
+                // differ here when the comparison called unequal bytes equal, which
+                // is exactly what `-w`/`-b`/`--ignore-space-at-eol` do.
                 DiffLineKind::Context => {
-                    let c = self.before.get(bi).copied().unwrap_or(*fallback);
+                    let c = self.after.get(ai).copied().unwrap_or(*fallback);
                     bi += 1;
                     ai += 1;
                     (b' ', c)

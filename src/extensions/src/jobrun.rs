@@ -79,6 +79,13 @@ fn run(exe: &Path, cwd: &Path, args: &[String], env: &[(String, String)], cancel
     let mut cmd = Command::new(exe);
     cmd.args(args)
         .current_dir(cwd)
+        // This child IS the job. Re-queueing it would spin the ledger forever and,
+        // worse, return exit 0 to the step below so a `commit` job records `done`
+        // with nothing committed. `ZVCS_QUEUED` makes the child block on the lane
+        // instead. `queue_verb` already stamps this on its own exec specs; setting
+        // it here covers every OTHER spec kind (`commit`, `push`, …), which used to
+        // spawn `add`/`commit`/`push` children with a clean environment.
+        .env("ZVCS_QUEUED", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     // Apply the submitter's carried identity env so the async commit is attributed

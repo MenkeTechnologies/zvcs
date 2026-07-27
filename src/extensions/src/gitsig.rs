@@ -134,10 +134,11 @@ pub fn evaluate(raw: &[u8]) -> (GStatus, String) {
     }
 }
 
-/// Verify a `(signature, payload)` pair via the same tools git uses.
+/// Verify a `(signature, payload)` pair via the same tools git uses, reporting
+/// the `%G?` character.
 pub fn verify(sig: &[u8], payload: &[u8]) -> (GStatus, String) {
     let check = verify_full(sig, payload);
-    (check.status, check.key)
+    (check.pretty_status(), check.key)
 }
 
 /// git's `enum signature_trust_level`, in the same order — the scale
@@ -155,7 +156,10 @@ pub enum Trust {
 
 /// git's `struct signature_check`, reduced to the fields this crate reads.
 pub struct SigCheck {
-    /// `sigc->result`, the `%G?` character.
+    /// `sigc->result` — `G`/`B`/`E`/`N` as the backend reported it. This is the
+    /// raw verdict, NOT the `%G?` character: git never stores `U` here, it derives
+    /// it from the trust level at format time (see [`SigCheck::pretty_status`]).
+    /// `GIT_PUSH_CERT_STATUS` and `verify_merge_signature` read this field.
     pub status: GStatus,
     /// `sigc->key` — the signing key's long id.
     pub key: String,
@@ -165,6 +169,21 @@ pub struct SigCheck {
     pub signer: String,
     /// `sigc->trust_level`, from the `TRUST_*` status line.
     pub trust: Trust,
+}
+
+impl SigCheck {
+    /// The `%G?` character, which is `sigc->result` with one substitution: a good
+    /// signature whose trust level is undefined or never prints `U` instead of `G`
+    /// (pretty.c's `'G'` case). The fold lives here rather than in
+    /// [`status`][Self::status] because git's `sigc->result` never holds `U` — a
+    /// good signature by an untrusted or unknown key is still a good signature,
+    /// which is what `GIT_PUSH_CERT_STATUS` reports.
+    pub fn pretty_status(&self) -> GStatus {
+        match self.status {
+            GStatus::Good if self.trust < Trust::Marginal => GStatus::GoodUnknown,
+            other => other,
+        }
+    }
 }
 
 /// [`evaluate`] with git's full `signature_check` result — the signer name and
@@ -424,13 +443,11 @@ fn parse_ssh_output(out: &[u8]) -> SigCheck {
     // also what git reports as the key (`%GK`).
     match rest.find("key ").map(|at| rest[at + 4..].to_string()) {
         Some(key) => SigCheck {
-            // `pretty.c`'s `%G?`: a good signature whose trust is undefined or
-            // never prints `U`, which is what `GoodUnknown` carries here.
-            status: if trust >= Trust::Marginal {
-                GStatus::Good
-            } else {
-                GStatus::GoodUnknown
-            },
+            // Both branches set `sigc->result = 'G'` (gpg-interface.c:434, :439);
+            // only the trust level differs — `TRUST_FULLY` for a known principal,
+            // `TRUST_UNDEFINED` for a valid signature by an unknown key. Folding
+            // the latter into `U` here would be reading `%G?` back into the result.
+            status: GStatus::Good,
             key,
             signer,
             trust,
@@ -514,7 +531,7 @@ fn strftime_local(seconds: i64) -> String {
 fn parse_gpg_status(status: &[u8]) -> (GStatus, String) {
     let text = String::from_utf8_lossy(status);
     let (mut good, mut bad, mut errsig) = (false, false, false);
-    let (mut exp, mut expkey, mut revkey, mut trusted) = (false, false, false, false);
+    let (mut exp, mut expkey, mut revkey) = (false, false, false);
     let mut key = String::new();
     for line in text.lines() {
         let l = line.strip_prefix("[GNUPG:] ").unwrap_or(line);
@@ -540,7 +557,6 @@ fn parse_gpg_status(status: &[u8]) -> (GStatus, String) {
             Some("EXPSIG") => exp = true,
             Some("EXPKEYSIG") => expkey = true,
             Some("REVKEYSIG") => revkey = true,
-            Some("TRUST_ULTIMATE") | Some("TRUST_FULLY") => trusted = true,
             _ => {}
         }
     }
@@ -556,7 +572,10 @@ fn parse_gpg_status(status: &[u8]) -> (GStatus, String) {
     } else if exp {
         GStatus::Expired
     } else if good {
-        if trusted { GStatus::Good } else { GStatus::GoodUnknown }
+        // `sigc->result = 'G'` on GOODSIG, whatever the trust level: git's
+        // `parse_gpg_status()` never writes `U` here. The `%G?` fold to `U` for an
+        // untrusted key happens in [`SigCheck::pretty_status`].
+        GStatus::Good
     } else if errsig {
         GStatus::CannotCheck
     } else {
@@ -651,6 +670,258 @@ pub fn sign(payload: &[u8], program: &str, key: Option<&str>) -> Result<Vec<u8>,
     Ok(out.stdout)
 }
 
+// ---------------------------------------------------------------------------
+// signing (git's `gpg_format` table, `get_signing_key[_id]` and `sign_buffer`)
+// ---------------------------------------------------------------------------
+
+/// git's `gpg_format[]` table (gpg-interface.c:93-124), selected by `gpg.format`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SigFormat {
+    /// `openpgp` — the default; signs with `gpg`.
+    OpenPgp,
+    /// `x509` — signs with `gpgsm`, otherwise identical to `openpgp`.
+    X509,
+    /// `ssh` — signs with `ssh-keygen -Y sign`.
+    Ssh,
+}
+
+impl SigFormat {
+    /// `get_format_by_name()`. `None` is git's "invalid value for gpg.format".
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "openpgp" => Some(SigFormat::OpenPgp),
+            "x509" => Some(SigFormat::X509),
+            "ssh" => Some(SigFormat::Ssh),
+            _ => None,
+        }
+    }
+
+    /// The table's built-in `.program`, which `gpg.program` / `gpg.ssh.program`
+    /// override.
+    fn default_program(self) -> &'static str {
+        match self {
+            SigFormat::OpenPgp => "gpg",
+            SigFormat::X509 => "gpgsm",
+            SigFormat::Ssh => "ssh-keygen",
+        }
+    }
+}
+
+/// The resolved signing backend for a repository: git's `use_format` plus the
+/// `configured_signing_key` and program that `gpg_interface_config()` fills in.
+///
+/// This is what every caller that needs a signature should go through: signing
+/// with `gpg` while `gpg.format = ssh` is configured produces
+/// `gpg: skipped …: No secret key` instead of a signature.
+pub struct Signer {
+    /// `use_format`.
+    pub format: SigFormat,
+    /// The program to exec: `gpg.program` for openpgp/x509, `gpg.ssh.program`
+    /// for ssh, else the format's built-in default.
+    pub program: String,
+    /// `configured_signing_key` — `user.signingKey`, unset when absent.
+    pub key: Option<String>,
+    /// The committer ident (`Name <email>`), git's `get_signing_key()` fallback
+    /// for openpgp/x509 when `user.signingKey` is unset.
+    committer: Option<String>,
+}
+
+impl Signer {
+    /// Read `gpg.format`, the program and `user.signingKey` out of `repo`.
+    ///
+    /// An unrecognized `gpg.format` is git's `die("invalid value for '%s': '%s'")`;
+    /// here it falls back to the default format, and the caller's `sign()` reports
+    /// whatever the resulting program says.
+    pub fn resolve(repo: &gix::Repository) -> Self {
+        let snap = repo.config_snapshot();
+        let format = snap
+            .string("gpg.format")
+            .and_then(|v| SigFormat::from_name(&v.to_string()))
+            .unwrap_or(SigFormat::OpenPgp);
+        let program_key = match format {
+            SigFormat::Ssh => "gpg.ssh.program",
+            _ => "gpg.program",
+        };
+        let committer = repo.committer().transpose().ok().flatten().map(|c| {
+            // `git_committer_info(IDENT_STRICT | IDENT_NO_DATE)`: name and email only.
+            format!("{} <{}>", c.name, c.email)
+        });
+        Signer {
+            format,
+            program: snap
+                .string(program_key)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| format.default_program().to_string()),
+            key: snap.string("user.signingKey").map(|v| v.to_string()),
+            committer,
+        }
+    }
+
+    /// `get_signing_key()`: `user.signingKey` when set, else — for openpgp/x509 —
+    /// the committer ident. The ssh backend has no committer fallback; its
+    /// `get_default_key` runs `gpg.ssh.defaultKeyCommand`, and without either git
+    /// dies with "user.signingKey needs to be set for ssh signing".
+    pub fn signing_key(&self) -> Result<String, String> {
+        if let Some(key) = &self.key {
+            return Ok(key.clone());
+        }
+        match self.format {
+            SigFormat::Ssh => {
+                Err("user.signingKey needs to be set for ssh signing".to_string())
+            }
+            _ => self
+                .committer
+                .clone()
+                .ok_or_else(|| "no committer identity to sign with".to_string()),
+        }
+    }
+
+    /// `get_signing_key_id()` (gpg-interface.c:938): a textual but unique name for
+    /// the signing key. openpgp/x509 have only the key id itself; the ssh backend
+    /// turns the key (a file, or a literal `key::`/`ssh-…` blob) into its
+    /// `ssh-keygen -lf` fingerprint.
+    pub fn signing_key_id(&self) -> Result<String, String> {
+        let key = self.signing_key()?;
+        match self.format {
+            SigFormat::Ssh => ssh_key_fingerprint(&key),
+            _ => Ok(key),
+        }
+    }
+
+    /// `sign_buffer()`: dispatch to the format's signer and return the detached
+    /// signature — armored for openpgp/x509, an `SSH SIGNATURE` block for ssh.
+    pub fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let key = self.signing_key()?;
+        match self.format {
+            SigFormat::Ssh => sign_buffer_ssh(payload, &self.program, &key),
+            _ => sign(payload, &self.program, Some(&key)),
+        }
+    }
+}
+
+/// `is_literal_ssh_key()` (gpg-interface.c:817): a `key::`-prefixed or bare
+/// `ssh-…` value is the key itself rather than a path to it. Returns the key with
+/// the prefix stripped.
+fn literal_ssh_key(value: &str) -> Option<&str> {
+    if let Some(rest) = value.strip_prefix("key::") {
+        return Some(rest);
+    }
+    value.starts_with("ssh-").then_some(value)
+}
+
+/// `get_ssh_key_fingerprint()` (gpg-interface.c:828): `ssh-keygen -lf` on the key,
+/// whose output is `<bits> <fingerprint> <comment> (<type>)`; the fingerprint is
+/// the second field.
+fn ssh_key_fingerprint(signing_key: &str) -> Result<String, String> {
+    let os = std::ffi::OsStr::new;
+    let out = match literal_ssh_key(signing_key) {
+        Some(literal) => run_with_stdin("ssh-keygen", &[os("-lf"), os("-")], literal.as_bytes()),
+        None => run_with_stdin("ssh-keygen", &[os("-lf"), os(signing_key)], &[]),
+    };
+    let out = out.ok_or_else(|| format!("failed to get the ssh fingerprint for key '{signing_key}'"))?;
+    if !out.status.success() {
+        return Err(format!("failed to get the ssh fingerprint for key '{signing_key}'"));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .nth(1)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("failed to get the ssh fingerprint for key {signing_key}"))
+}
+
+/// `sign_buffer_ssh()` (gpg-interface.c:1058): write the payload to a temp file,
+/// run `<program> -Y sign -n git -f <key> [-U] <file>`, and read back the
+/// `<file>.sig` the signer leaves next to it.
+///
+/// `-U` marks the key file as holding a *public* key, which is what a literal
+/// `key::`/`ssh-…` value expands to; without it `ssh-keygen` expects a private key.
+fn sign_buffer_ssh(payload: &[u8], program: &str, signing_key: &str) -> Result<Vec<u8>, String> {
+    if signing_key.is_empty() {
+        return Err("user.signingKey needs to be set for ssh signing".to_string());
+    }
+    let literal = literal_ssh_key(signing_key);
+    let key_file = match literal {
+        Some(key) => Some(
+            write_temp("sshkey", key.as_bytes())
+                .ok_or_else(|| "could not create temporary file".to_string())?,
+        ),
+        None => None,
+    };
+    let key_path: PathBuf = match (&key_file, literal) {
+        (Some(path), _) => path.clone(),
+        // `interpolate_path(signing_key, 1)`: a plain path, `~` expanded.
+        (None, _) => PathBuf::from(shellexpand_tilde(signing_key)),
+    };
+
+    let buffer_file = match write_temp("sshbuf", payload) {
+        Some(p) => p,
+        None => {
+            if let Some(k) = &key_file {
+                let _ = std::fs::remove_file(k);
+            }
+            return Err("could not create temporary file".to_string());
+        }
+    };
+    let sig_path = {
+        let mut p = buffer_file.clone().into_os_string();
+        p.push(".sig");
+        PathBuf::from(p)
+    };
+
+    let os = std::ffi::OsStr::new;
+    let mut args: Vec<&std::ffi::OsStr> = vec![
+        os("-Y"),
+        os("sign"),
+        os("-n"),
+        os("git"),
+        os("-f"),
+        key_path.as_os_str(),
+    ];
+    if literal.is_some() {
+        args.push(os("-U"));
+    }
+    args.push(buffer_file.as_os_str());
+
+    let result = match run_with_stdin(program, &args, &[]) {
+        None => Err(format!("could not run {program}")),
+        Some(out) if !out.status.success() => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if stderr.contains("usage:") {
+                Err("ssh-keygen -Y sign is needed for ssh signing (available in openssh version 8.2p1+)"
+                    .to_string())
+            } else {
+                Err(stderr.trim().to_string())
+            }
+        }
+        Some(_) => std::fs::read(&sig_path).map_err(|e| {
+            format!("failed reading ssh signing data buffer from '{}': {e}", sig_path.display())
+        }),
+    };
+
+    if let Some(k) = &key_file {
+        let _ = std::fs::remove_file(k);
+    }
+    let _ = std::fs::remove_file(&buffer_file);
+    let _ = std::fs::remove_file(&sig_path);
+    result
+}
+
+/// `interpolate_path()`'s leading-`~` expansion, the only part a signing-key path
+/// can use.
+fn shellexpand_tilde(path: &str) -> String {
+    let Some(rest) = path.strip_prefix('~') else {
+        return path.to_owned();
+    };
+    if !rest.is_empty() && !rest.starts_with('/') {
+        // `~user/…` needs a passwd lookup git does and this does not; leave it be.
+        return path.to_owned();
+    }
+    match std::env::var("HOME") {
+        Ok(home) => format!("{home}{rest}"),
+        Err(_) => path.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,9 +993,6 @@ mod tests {
         );
         assert_eq!(s, GStatus::Good);
         assert_eq!(k, "DEADBEEF");
-        // Good but untrusted → U.
-        let (s, _) = parse_gpg_status(b"[GNUPG:] GOODSIG DEADBEEF n\n[GNUPG:] TRUST_UNDEFINED\n");
-        assert_eq!(s, GStatus::GoodUnknown);
         // Bad wins over everything.
         let (s, _) = parse_gpg_status(b"[GNUPG:] BADSIG DEADBEEF n\n");
         assert_eq!(s, GStatus::Bad);
@@ -733,5 +1001,39 @@ mod tests {
         assert_eq!(s, GStatus::Revoked);
         // Nothing conclusive → E.
         assert_eq!(parse_gpg_status(b"[GNUPG:] NODATA 1\n").0, GStatus::CannotCheck);
+    }
+
+    /// git keeps `sigc->result` and the `%G?` character apart: a good signature by
+    /// a key of unknown validity stays `'G'` in the result (which is what
+    /// `GIT_PUSH_CERT_STATUS` and `verify_merge_signature` read) and only *prints*
+    /// as `U`. Folding the two together made a signed push report `U` where stock
+    /// git reports `G`.
+    #[test]
+    fn untrusted_good_signature_is_g_in_the_result_and_u_in_pretty() {
+        let untrusted =
+            parse_gpg_status_full(b"[GNUPG:] GOODSIG DEADBEEF Some One\n[GNUPG:] TRUST_UNDEFINED 0\n");
+        assert_eq!(untrusted.status, GStatus::Good, "sigc->result is 'G'");
+        assert_eq!(untrusted.trust, Trust::Undefined);
+        assert_eq!(untrusted.pretty_status().code(), 'U', "%G? folds it to 'U'");
+
+        let trusted =
+            parse_gpg_status_full(b"[GNUPG:] GOODSIG DEADBEEF Some One\n[GNUPG:] TRUST_ULTIMATE 0\n");
+        assert_eq!(trusted.status, GStatus::Good);
+        assert_eq!(trusted.pretty_status().code(), 'G');
+
+        // The ssh backend has the same split: a valid signature by a key no
+        // allowed-signers entry claims is 'G' with TRUST_UNDEFINED
+        // (gpg-interface.c:437-440), not a weaker result.
+        let unknown_key = parse_ssh_output(b"Good \"git\" signature with RSA key SHA256:abc\n");
+        assert_eq!(unknown_key.status, GStatus::Good);
+        assert_eq!(unknown_key.trust, Trust::Undefined);
+        assert_eq!(unknown_key.key, "SHA256:abc");
+        assert_eq!(unknown_key.pretty_status().code(), 'U');
+
+        let known = parse_ssh_output(b"Good \"git\" signature for a@b with RSA key SHA256:abc\n");
+        assert_eq!(known.status, GStatus::Good);
+        assert_eq!(known.trust, Trust::Fully);
+        assert_eq!(known.signer, "a@b");
+        assert_eq!(known.pretty_status().code(), 'G');
     }
 }

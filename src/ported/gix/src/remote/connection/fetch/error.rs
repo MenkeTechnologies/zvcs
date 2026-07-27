@@ -43,6 +43,14 @@ pub enum Error {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
+    #[error("Could not check whether the objects the remote sent are connected")]
+    CheckConnected(#[from] super::connected::Error),
+    /// The remote's answer left out objects the refs it offered need, so no ref may be stored.
+    ///
+    /// git's `store_updated_refs()` turns this into `error: <url> did not send all necessary
+    /// objects` and abandons the fetch before its ref transaction.
+    #[error("did not send all necessary objects")]
+    NotConnected,
 }
 
 impl gix_protocol::transport::IsSpuriousError for Error {

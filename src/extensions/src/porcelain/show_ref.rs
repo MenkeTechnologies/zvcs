@@ -152,7 +152,10 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
         return die_incompatible(enabled[0], enabled[1]);
     }
 
-    let repo = gix::discover(".")?;
+    // `$GIT_DIR` (which `git --git-dir=<path>` sets) names the repository outright
+    // and wins over upwards discovery; without honouring it, `git --git-dir=<other>
+    // show-ref` lists the refs of the repository the shell happens to be in.
+    let repo = gix::discover_with_environment_overrides(".")?;
 
     if exclude_existing {
         return run_exclude_existing(&repo, exclude_pattern.as_deref());

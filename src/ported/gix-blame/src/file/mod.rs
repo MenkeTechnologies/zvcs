@@ -7,7 +7,6 @@ use crate::{
     types::{BlameEntry, Change, Either, LineRange, Offset, PathTable, Suspect, UnblamedHunk},
 };
 
-pub(super) mod compact;
 pub(super) mod fingerprint;
 pub(super) mod copied;
 pub(super) mod moved;

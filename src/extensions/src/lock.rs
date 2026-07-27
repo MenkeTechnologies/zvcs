@@ -62,7 +62,13 @@ pub enum TryLock {
     Held(RepoLock),
     /// The lane is contended (another writer holds it); the caller should queue
     /// its work as a job rather than block.
-    Busy,
+    Busy {
+        /// Whether the daemon told us WHO holds the lane. `false` means the
+        /// coordinator predates the `HOLDER` query, so we could not rule out that
+        /// the holder is this process's own ancestor — and a caller that must not
+        /// queue therefore cannot safely block either.
+        owner_resolved: bool,
+    },
     /// No daemon reachable — proceed unserialized, exactly as [`RepoLock::acquire`].
     NoDaemon,
 }
@@ -83,21 +89,8 @@ impl RepoLock {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        // Single machine-wide daemon; the repo is identified by its git-dir so
-        // the daemon serializes each repo on its own lane. Canonicalize so every
-        // caller for the same repo produces the same lane key; on failure still
-        // produce an ABSOLUTE key — a relative fallback could put a concurrent
-        // caller of the same repo on a different lane (two lanes = two writers).
         let sock = crate::superset::zdaemon::socket_path();
-        let repo = git_dir.canonicalize().unwrap_or_else(|_| {
-            if git_dir.is_absolute() {
-                git_dir.to_path_buf()
-            } else {
-                std::env::current_dir()
-                    .map(|c| c.join(git_dir))
-                    .unwrap_or_else(|_| git_dir.to_path_buf())
-            }
-        });
+        let repo = lane_key(git_dir);
 
         // Reentrancy: if this thread already holds this repo, hand back a no-op
         // guard. A nested acquire that went to the daemon would queue behind the
@@ -115,6 +108,24 @@ impl RepoLock {
             Ok(s) => s,
             Err(_) => return Self::unlocked(id, repo),
         };
+        // Read on a clone so the original stream stays open for the whole
+        // critical section — closing it is what signals RELEASE/auto-release.
+        let reader_half = match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => return Self::unlocked(id, repo),
+        };
+        let mut reader = BufReader::new(reader_half);
+
+        // Cross-process reentrancy. `HELD` above only covers this thread; a `git`
+        // CHILD of a `git` parent that holds this lane is a different process and
+        // would enqueue behind a parent that is blocked waiting on the child —
+        // deadlock. Ask the daemon who holds the lane and, if it is one of our own
+        // ancestors, hand back a no-op guard: the ancestor's hold already excludes
+        // every other writer for as long as we run inside it.
+        if matches!(lane_owner(&mut stream, &mut reader, &repo), LaneOwner::Ancestor) {
+            return Self::unlocked(id, repo);
+        }
+
         if stream
             .write_all(format!("ACQUIRE {id} {}\n", repo.display()).as_bytes())
             .is_err()
@@ -124,13 +135,6 @@ impl RepoLock {
         }
 
         // Block until the daemon answers `GRANTED` (our turn at the FIFO head).
-        // Read on a clone so the original stream stays open for the whole
-        // critical section — closing it is what signals RELEASE/auto-release.
-        let reader_half = match stream.try_clone() {
-            Ok(s) => s,
-            Err(_) => return Self::unlocked(id, repo),
-        };
-        let mut reader = BufReader::new(reader_half);
         let mut line = String::new();
         match reader.read_line(&mut line) {
             Ok(n) if n > 0 && line.trim() == "GRANTED" => Self {
@@ -151,13 +155,7 @@ impl RepoLock {
     pub fn try_acquire(git_dir: &Path) -> TryLock {
         let id = format!("{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
         let sock = crate::superset::zdaemon::socket_path();
-        let repo = git_dir.canonicalize().unwrap_or_else(|_| {
-            if git_dir.is_absolute() {
-                git_dir.to_path_buf()
-            } else {
-                std::env::current_dir().map(|c| c.join(git_dir)).unwrap_or_else(|_| git_dir.to_path_buf())
-            }
-        });
+        let repo = lane_key(git_dir);
 
         // Reentrant: this thread already holds it — hand back a no-op held guard.
         if HELD.with(|h| h.borrow().contains(&repo)) {
@@ -168,16 +166,33 @@ impl RepoLock {
             Ok(s) => s,
             Err(_) => return TryLock::NoDaemon,
         };
-        if stream.write_all(format!("TRYACQUIRE {id} {}\n", repo.display()).as_bytes()).is_err()
-            || stream.flush().is_err()
-        {
-            return TryLock::NoDaemon;
-        }
         let reader_half = match stream.try_clone() {
             Ok(s) => s,
             Err(_) => return TryLock::NoDaemon,
         };
         let mut reader = BufReader::new(reader_half);
+
+        // Same cross-process reentrancy as `acquire`, and the more important half:
+        // without it a `git` child of a lane-holding `git` parent reads `BUSY`,
+        // QUEUES ITSELF AS A JOB and exits 0, so the parent sees success on work
+        // that never ran. An ancestor holding the lane is not contention.
+        let owner = lane_owner(&mut stream, &mut reader, &repo);
+        if matches!(owner, LaneOwner::Ancestor) {
+            // Register the lane the way a granted acquire does, so the nested
+            // `acquire` the porcelain makes a moment later takes the thread-local
+            // shortcut instead of probing the daemon again.
+            HELD.with(|h| {
+                h.borrow_mut().insert(repo.clone());
+            });
+            return TryLock::Held(Self::unlocked(id, repo));
+        }
+        let owner_resolved = !matches!(owner, LaneOwner::Unknown);
+
+        if stream.write_all(format!("TRYACQUIRE {id} {}\n", repo.display()).as_bytes()).is_err()
+            || stream.flush().is_err()
+        {
+            return TryLock::NoDaemon;
+        }
         let mut line = String::new();
         match reader.read_line(&mut line) {
             Ok(n) if n > 0 && line.trim() == "GRANTED" => {
@@ -191,7 +206,7 @@ impl RepoLock {
                     _not_send: std::marker::PhantomData,
                 })
             }
-            Ok(n) if n > 0 && line.trim() == "BUSY" => TryLock::Busy,
+            Ok(n) if n > 0 && line.trim() == "BUSY" => TryLock::Busy { owner_resolved },
             _ => TryLock::NoDaemon,
         }
     }
@@ -205,6 +220,93 @@ impl RepoLock {
     /// Whether this guard is backed by a live daemon (vs. the no-op fallback).
     pub fn is_held(&self) -> bool {
         self.stream.is_some()
+    }
+}
+
+/// The daemon lane key for `git_dir`.
+///
+/// Single machine-wide daemon; the repo is identified by its git-dir, so the key
+/// has to be the SAME string for every caller that means the same repository —
+/// two spellings are two lanes, which is two concurrent writers.
+///
+/// `canonicalize` alone is not enough because it fails on a path that does not
+/// exist YET, and `clone` takes the lane on `<dst>/.git` before creating it. On
+/// macOS that produced a real split: the parent keyed the raw
+/// `/tmp/x/.git` while every later caller keyed the resolved
+/// `/private/tmp/x/.git`, so the two never contended — which is why
+/// `clone --recurse-submodules` swallowed its `submodule update` child on some
+/// paths and not others, and read as "intermittent".
+///
+/// So: canonicalize the deepest ancestor that DOES exist and re-attach the
+/// missing tail. A path canonicalized before and after creation then agrees.
+fn lane_key(git_dir: &Path) -> PathBuf {
+    let abs = if git_dir.is_absolute() {
+        git_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|c| c.join(git_dir))
+            .unwrap_or_else(|_| git_dir.to_path_buf())
+    };
+    if let Ok(real) = abs.canonicalize() {
+        return real;
+    }
+    let mut missing_tail = Vec::new();
+    let mut cursor = abs.as_path();
+    while let (Some(parent), Some(name)) = (cursor.parent(), cursor.file_name()) {
+        missing_tail.push(name.to_os_string());
+        if let Ok(real_parent) = parent.canonicalize() {
+            let mut key = real_parent;
+            key.extend(missing_tail.iter().rev());
+            return key;
+        }
+        cursor = parent;
+    }
+    abs
+}
+
+/// Who owns a repo's lane, relative to the asking process.
+enum LaneOwner {
+    /// One of this process's own ancestors — we are running INSIDE its critical
+    /// section, so the lane is effectively ours and must not be waited on.
+    Ancestor,
+    /// Free, or held by someone unrelated. Contend for it normally.
+    Other,
+    /// The daemon would not say. Notably a coordinator predating the `HOLDER`
+    /// query: we cannot rule out that the holder is our own ancestor, so neither
+    /// waiting nor queueing is provably safe.
+    Unknown,
+}
+
+/// Ask the daemon who holds `repo`'s lane.
+///
+/// Sent on the connection the caller is about to `ACQUIRE`/`TRYACQUIRE` on, so
+/// the probe costs one extra write+read on an open socket rather than a second
+/// connect, and only ever on a path that was already going to talk to the daemon.
+///
+/// An older daemon answers `ERR unknown verb "HOLDER"` and leaves the connection
+/// open, so the caller's real request still goes through on the same stream —
+/// the probe is safe to send at a coordinator of any vintage.
+fn lane_owner(stream: &mut UnixStream, reader: &mut BufReader<UnixStream>, repo: &Path) -> LaneOwner {
+    if stream.write_all(format!("HOLDER {}\n", repo.display()).as_bytes()).is_err()
+        || stream.flush().is_err()
+    {
+        return LaneOwner::Unknown;
+    }
+    let mut line = String::new();
+    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+        return LaneOwner::Unknown;
+    }
+    let Some(holder) = line.trim().strip_prefix("holder=") else {
+        return LaneOwner::Unknown; // `ERR …` from a daemon that predates this verb
+    };
+    if holder == "none" {
+        return LaneOwner::Other; // nobody holds it; whoever takes it next is not us
+    }
+    // The client id is `<pid>-<seq>`; the pid is all we need.
+    match holder.split('-').next().and_then(|p| p.parse::<i64>().ok()) {
+        Some(pid) if crate::superset::zppid::is_ancestor(pid) => LaneOwner::Ancestor,
+        Some(_) => LaneOwner::Other,
+        None => LaneOwner::Unknown,
     }
 }
 

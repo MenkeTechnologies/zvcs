@@ -59,6 +59,17 @@ enum Cmd {
         id: String,
         stream: UnixStream,
     },
+    /// Report the current holder of ONE repo's lane (`holder=<client-id|none>`)
+    /// without touching it. Backs cross-process lane reentrancy: a `git` child
+    /// spawned by a `git` parent that already holds the lane has to recognize
+    /// its own ancestor as the holder, or it would either block forever behind a
+    /// parent that is waiting on it or queue itself as a job and exit 0 having
+    /// done nothing. The client id embeds the holder's pid (`<pid>-<seq>`), which
+    /// is all the caller needs to walk its own ancestry.
+    Holder {
+        repo: PathBuf,
+        stream: UnixStream,
+    },
     Release {
         repo: PathBuf,
         id: String,
@@ -567,6 +578,14 @@ fn worker_loop(rx: Receiver<Cmd>, sock_path: PathBuf) {
                     }
                 }
             }
+            Cmd::Holder { repo, stream } => {
+                // Read-only: never creates a lane, never changes one.
+                let holder = lanes
+                    .get(&repo)
+                    .and_then(|l| l.holder.clone())
+                    .unwrap_or_else(|| "none".to_string());
+                reply(&stream, &format!("holder={holder}"));
+            }
             Cmd::Release { repo, id } => {
                 if let Some(lane) = lanes.get_mut(&repo) {
                     if lane.holder.as_deref() == Some(id.as_str()) {
@@ -661,6 +680,18 @@ fn conn_loop(stream: &UnixStream, tx: &Sender<Cmd>, held: &mut Vec<(PathBuf, Str
                     return;
                 }
             }
+            Req::Holder { repo } => {
+                // NOT single-shot: the client asks this on the same connection it
+                // is about to ACQUIRE/TRYACQUIRE on, so the reentrancy probe costs
+                // one extra write+read rather than a second connect.
+                let s = match stream.try_clone() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                if tx.send(Cmd::Holder { repo, stream: s }).is_err() {
+                    return;
+                }
+            }
             Req::Release { id: wire_id } => {
                 // Release the (repo, id) this connection actually acquired — not
                 // blindly the id echoed on the wire — so an explicit RELEASE
@@ -720,6 +751,7 @@ fn conn_loop(stream: &UnixStream, tx: &Sender<Cmd>, held: &mut Vec<(PathBuf, Str
 enum Req {
     Acquire { id: String, repo: PathBuf },
     TryAcquire { id: String, repo: PathBuf },
+    Holder { repo: PathBuf },
     Release { id: String },
     Submit(String),
     JobStop(i64),
@@ -749,6 +781,17 @@ fn parse(line: &str) -> Req {
                     id: id.to_string(),
                     repo: PathBuf::from(repo),
                 }
+            }
+        }
+        // `HOLDER <git-dir>` — read-only lane query. An OLDER daemon answers
+        // `ERR unknown verb "HOLDER"` and keeps the connection open, which the
+        // client reads as "holder unknown" and falls back to today's behavior, so
+        // the probe is safe to send at a daemon of any vintage.
+        "HOLDER" => {
+            if rest.is_empty() {
+                Req::Err("HOLDER needs a <git-dir>".into())
+            } else {
+                Req::Holder { repo: PathBuf::from(rest) }
             }
         }
         "RELEASE" => {

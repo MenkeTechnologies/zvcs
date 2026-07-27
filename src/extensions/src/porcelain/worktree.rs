@@ -1263,7 +1263,7 @@ fn strip_suffix(p: &Path, suffix: &str) -> PathBuf {
 /// remaining `base` component becomes a `../`, and a `base` that is not a prefix
 /// of `target` still resolves because every unmatched component contributes one
 /// `../`. git returns `./` when the two are the same path.
-fn relative_path(target: &Path, base: &Path) -> PathBuf {
+pub(super) fn relative_path(target: &Path, base: &Path) -> PathBuf {
     let t: Vec<_> = target.components().collect();
     let b: Vec<_> = base.components().collect();
     let shared = t.iter().zip(&b).take_while(|(x, y)| x == y).count();

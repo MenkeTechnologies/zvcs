@@ -51,6 +51,10 @@ pub struct SpawnProcessOnDemand {
     /// git passes this through to the other end verbatim (`get_upload_pack()` feeding `git_connect()`), which is
     /// why it is a plain string rather than a path: over ssh it is a command line for the remote shell.
     upload_pack: Option<BString>,
+    /// The program to run in place of `git-receive-pack`, from `--receive-pack`/`--exec` or
+    /// `remote.<name>.receivepack`. git keeps this apart from the upload-pack override and hands
+    /// `git_connect()` whichever one matches the direction (`connect_setup()`, transport.c:310-317).
+    receive_pack: Option<BString>,
     /// The environment variables to set in the invoked command.
     envs: Vec<(&'static str, String)>,
     ssh_disallow_shell: bool,
@@ -71,6 +75,7 @@ impl SpawnProcessOnDemand {
         version: Protocol,
         trace: bool,
         upload_pack: Option<BString>,
+        receive_pack: Option<BString>,
         ssh_address_family: Option<crate::AddressFamily>,
     ) -> SpawnProcessOnDemand {
         SpawnProcessOnDemand {
@@ -78,6 +83,7 @@ impl SpawnProcessOnDemand {
             path,
             ssh_cmd: Some((program.into(), ssh_kind)),
             upload_pack,
+            receive_pack,
             envs: Default::default(),
             ssh_disallow_shell,
             ssh_address_family,
@@ -93,6 +99,7 @@ impl SpawnProcessOnDemand {
         version: Protocol,
         trace: bool,
         upload_pack: Option<BString>,
+        receive_pack: Option<BString>,
     ) -> SpawnProcessOnDemand {
         SpawnProcessOnDemand {
             url: gix_url::Url::from_parts(gix_url::Scheme::File, None, None, None, None, path.clone(), true)
@@ -100,6 +107,7 @@ impl SpawnProcessOnDemand {
             path,
             ssh_cmd: None,
             upload_pack,
+            receive_pack,
             envs: if version != Protocol::V1 {
                 vec![("GIT_PROTOCOL", format!("version={}", version as usize))]
             } else {
@@ -114,14 +122,26 @@ impl SpawnProcessOnDemand {
         }
     }
 
+    /// The caller's override for the program that runs `service`, if any.
+    ///
+    /// git keeps the two directions apart — `--upload-pack`/`remote.<name>.uploadpack` on one side,
+    /// `--receive-pack`/`--exec`/`remote.<name>.receivepack` on the other — and `connect_setup()`
+    /// hands `git_connect()` whichever matches the direction being connected (transport.c:310-317).
+    fn service_program_override(&self, service: Service) -> Option<&BString> {
+        match service {
+            Service::UploadPack => self.upload_pack.as_ref(),
+            Service::ReceivePack => self.receive_pack.as_ref(),
+        }
+    }
+
     /// The program that runs `service` on the other end.
     ///
-    /// This is `git-upload-pack`/`git-receive-pack` unless `--upload-pack` (or `remote.<name>.uploadpack`)
-    /// named a different one, which git only ever substitutes for the upload-pack side.
+    /// This is `git-upload-pack`/`git-receive-pack` unless an override for that direction named a
+    /// different one.
     fn service_program(&self, service: Service) -> Cow<'_, BStr> {
-        match (&self.upload_pack, service) {
-            (Some(program), Service::UploadPack) => Cow::Borrowed(program.as_ref()),
-            _ => Cow::Borrowed(service.as_str().into()),
+        match self.service_program_override(service) {
+            Some(program) => Cow::Borrowed(program.as_ref()),
+            None => Cow::Borrowed(service.as_str().into()),
         }
     }
 
@@ -147,11 +167,11 @@ impl SpawnProcessOnDemand {
             ),
             None => {
                 // git runs the local service through a shell (`conn->use_shell = 1` in `git_connect()`),
-                // which is what lets `--upload-pack` name a whole command line rather than just a program.
-                // Only do so when there is an override: the plain `git-upload-pack` invocation is a bare
-                // program name and gains nothing from a shell.
+                // which is what lets `--upload-pack`/`--receive-pack` name a whole command line rather
+                // than just a program. Only do so when there is an override: the plain
+                // `git-upload-pack` invocation is a bare program name and gains nothing from a shell.
                 let mut cmd = gix_command::prepare(&program).stderr(Stdio::null());
-                if self.upload_pack.is_some() {
+                if self.service_program_override(service).is_some() {
                     cmd = cmd.command_may_be_shell_script();
                 }
                 (cmd, None, program.clone())
@@ -228,10 +248,16 @@ impl client::TransportWithoutIO for SpawnProcessOnDemand {
 impl Drop for SpawnProcessOnDemand {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            // The child process (e.g. `ssh`) may still be running at this point, so kill it before joining/waiting.
-            // In the happy-path case, it should have already exited gracefully, but in error cases or if the user
-            // interrupted the operation, it will likely still be running.
-            child.kill().ok();
+            // git's `disconnect_git()` (transport.c:976-986): close both ends of the pipe, then
+            // `finish_connect()` waits for the child. Dropping the connection is what closes them
+            // here — it owns the child's stdin, and closing that is the EOF the service is waiting
+            // for, so the child finishes on its own and the wait returns promptly. Anything still
+            // writing on the other side gets EPIPE from the closed stdout and stops the same way.
+            //
+            // Killing the child instead cuts the service off mid-run. For `git-receive-pack` that
+            // means its `post-receive` and `post-update` hooks — which run *after* the report-status
+            // the client has already read — are never reached.
+            drop(self.connection.take());
             child.wait().ok();
         }
     }
@@ -330,11 +356,11 @@ impl client::blocking_io::Transport for SpawnProcessOnDemand {
         gix_features::trace::debug!(command = ?cmd, "gix_transport::SpawnProcessOnDemand");
         let mut child = match cmd.spawn() {
             Ok(child) => child,
-            // An explicit `--upload-pack` program names exactly what to run, so a missing one is reported
-            // rather than quietly replaced by git's own `upload-pack`.
+            // An explicit `--upload-pack`/`--receive-pack` program names exactly what to run, so a
+            // missing one is reported rather than quietly replaced by git's own service program.
             Err(err)
                 if ssh_kind.is_none()
-                    && self.upload_pack.is_none()
+                    && self.service_program_override(service).is_none()
                     && err.kind() == std::io::ErrorKind::NotFound =>
             {
                 // The service program wasn't found in `PATH`, but as `git` itself can be found,
@@ -398,23 +424,27 @@ pub fn connect(
     desired_version: Protocol,
     trace: bool,
 ) -> Result<SpawnProcessOnDemand, std::convert::Infallible> {
-    connect_with_program(path, desired_version, trace, None)
+    connect_with_program(path, desired_version, trace, None, None)
 }
 
-/// Like [`connect()`], but run `upload_pack` instead of `git-upload-pack` on the other end.
+/// Like [`connect()`], but run `upload_pack`/`receive_pack` instead of `git-upload-pack`/
+/// `git-receive-pack` on the other end.
 ///
-/// This is git's `--upload-pack <path>` and `remote.<name>.uploadpack`.
+/// These are git's `--upload-pack <path>` / `remote.<name>.uploadpack` and `--receive-pack <path>`
+/// (a.k.a. `--exec`) / `remote.<name>.receivepack`.
 pub fn connect_with_program(
     path: impl Into<BString>,
     desired_version: Protocol,
     trace: bool,
     upload_pack: Option<BString>,
+    receive_pack: Option<BString>,
 ) -> Result<SpawnProcessOnDemand, std::convert::Infallible> {
     Ok(SpawnProcessOnDemand::new_local(
         path.into(),
         desired_version,
         trace,
         upload_pack,
+        receive_pack,
     ))
 }
 
@@ -425,7 +455,7 @@ mod tests {
 
         #[test]
         fn fallback_command_prefers_the_core_dir_program_and_can_always_run_git_itself() {
-            let transport = SpawnProcessOnDemand::new_local("/repo/path".into(), Protocol::V2, false, None);
+            let transport = SpawnProcessOnDemand::new_local("/repo/path".into(), Protocol::V2, false, None, None);
             let (cmd, name) = transport.prepare_fallback_command(Service::UploadPack);
 
             assert!(!cmd.use_shell, "a shell is never used to run the local service program");

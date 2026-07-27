@@ -13,9 +13,11 @@ use crate::{
         tree::{Clone, Fetch},
     },
     remote::{
-        connection::fetch::{PrepareDetached, config},
+        connection::fetch::{PrepareDetached, config, connected},
         fetch,
-        fetch::{Error, Outcome, Prepare, RefLogMessage, Status, negotiate::Algorithm, outcome, refs, shallow},
+        fetch::{
+            Error, Outcome, Prepare, RefLogMessage, Status, negotiate::Algorithm, outcome, refs, shallow,
+        },
     },
 };
 
@@ -259,6 +261,37 @@ where
             rejected_shallow.reverse();
         }
 
+        // git's `fetch-pack.c` calls `write_promisor_file()` whenever a filter was in play, marking the
+        // pack as one that deliberately lacks objects. Everything that later walks for missing objects
+        // (`fsck`, `gc`, `rev-list --missing`) keys off the presence of that file - and so does the
+        // connectivity check right below, which is why index-pack is told `--promisor` before it runs.
+        if let Some((bundle, _filter)) = write_pack_bundle.as_ref().zip(self.filter.as_ref()) {
+            if let Some(index_path) = bundle.index_path.as_deref() {
+                write_promisor_file(index_path, &self.ref_map)?;
+            }
+        }
+
+        // git's `store_updated_refs()` opens with `check_connected()` over the very ref map it is
+        // about to store, and abandons the whole fetch if the walk fails - which is what keeps a
+        // short pack from leaving refs pointing at objects nobody has. Rejected shallow refs are
+        // already out of `mappings`, matching `iterate_ref_map()` skipping `REF_STATUS_REJECT_SHALLOW`.
+        // A dry run never wrote the pack, so there is nothing to be connected to.
+        if matches!(self.dry_run, fetch::DryRun::No) {
+            let tips: Vec<_> = self
+                .ref_map
+                .mappings
+                .iter()
+                .filter_map(|m| m.remote.as_id().map(ToOwned::to_owned))
+                .collect();
+            let options = connected::Options {
+                from_promisor: self.filter.is_some(),
+                ..Default::default()
+            };
+            if !connected::check_connected(repo, &tips, options)? {
+                return Err(Error::NotConnected);
+            }
+        }
+
         let update_refs = refs::update(
             repo,
             self.reflog_message
@@ -272,15 +305,6 @@ where
             self.write_packed_refs,
             self.atomic,
         )?;
-
-        // git's `fetch-pack.c` calls `write_promisor_file()` whenever a filter was in play, marking the
-        // pack as one that deliberately lacks objects. Everything that later walks for missing objects
-        // (`fsck`, `gc`, `rev-list --missing`) keys off the presence of that file.
-        if let Some((bundle, _filter)) = write_pack_bundle.as_ref().zip(self.filter.as_ref()) {
-            if let Some(index_path) = bundle.index_path.as_deref() {
-                write_promisor_file(index_path, &self.ref_map)?;
-            }
-        }
 
         if let Some(bundle) = write_pack_bundle.as_mut() {
             if !update_refs.edits.is_empty() || bundle.index.num_objects == 0 {

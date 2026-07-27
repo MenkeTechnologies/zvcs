@@ -391,6 +391,27 @@ const LOCK_VERBS: &[&str] = &[
     "zbump", "zsync",
 ];
 
+/// Whether deferring this command to the job queue could silently swallow work
+/// somebody is synchronously waiting for.
+///
+/// Queueing is a fair-scheduling feature for a command a HUMAN (or an agent)
+/// typed: `zvcs: queued job #N`, exit 0, the work lands shortly after. It is a
+/// correctness bug for a command another `git` process spawned as a child and is
+/// blocked on — hooks, `add -p`'s `apply`, `clone --recurse-submodules`'s
+/// `submodule update`, `subtree`'s and `am`'s re-execs, `filter-branch`'s
+/// filters. Those parents read exit 0 as "it worked".
+///
+/// Answers `true` when an ancestor is a `git`/`zvcs` process, and also when the
+/// platform will not report our ancestry at all: blocking on a contended lane is
+/// never a wrong answer, whereas queueing can be. `ZVCS_NO_QUEUE` forces `true`
+/// for callers this cannot see (a child across an ssh or container boundary).
+fn queueing_would_swallow_work() -> bool {
+    if std::env::var_os("ZVCS_NO_QUEUE").is_some() {
+        return true;
+    }
+    superset::zppid::git_ancestor().unwrap_or(true)
+}
+
 pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // Fleet command log: record this invocation when `git zcommands` has turned
     // logging on. A single `stat` (no work) when it is off, so the hot path pays
@@ -457,9 +478,14 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     ) && args.iter().any(|a| {
         a == "-p"
             || a == "--patch"
-            // `-i`/`--interactive` only reaches the hunk selector from `add`
-            // (`git commit -i` is `--include`, `git am -i` is unrelated).
+            // `-i`/`--interactive` only reaches the hunk selector from `add` and
+            // `commit`; SHORT `-i` is `--include` for `commit` and unrelated for
+            // `am`, so only `add`/`stage` may spell it that way. `commit
+            // --interactive` was missing here while `commit.rs` already skipped its
+            // own lock for it, so dispatch held the lane across the selector — the
+            // exact position the `commit -p` fix was meant to vacate.
             || (matches!(sub, "add" | "stage") && (a == "-i" || a == "--interactive"))
+            || (sub == "commit" && a == "--interactive")
     });
     let is_lock_verb = LOCK_VERBS.contains(&sub) && !is_help && !is_interactive_patch;
     let queued_rerun = std::env::var_os("ZVCS_QUEUED").is_some();
@@ -467,7 +493,34 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         match gix::discover(".") {
             Ok(repo) => match crate::lock::RepoLock::try_acquire(repo.git_dir()) {
                 crate::lock::TryLock::Held(g) => Some(g),
-                crate::lock::TryLock::Busy => return crate::superset::queue::queue_verb(sub, args),
+                crate::lock::TryLock::Busy { owner_resolved } if queueing_would_swallow_work() => {
+                    // We are a synchronous child of another `git` process, which
+                    // is blocked waiting for our EFFECT. Becoming a job here would
+                    // print `queued job #N`, exit 0, and hand the parent a success
+                    // it did not earn — the wrong-answer-with-success-status shape
+                    // that swallowed `commit -p`'s hunks and `clone
+                    // --recurse-submodules`'s submodules. Block on the lane instead
+                    // and do the real work; `acquire` returns a no-op guard at once
+                    // when the holder is one of our own ancestors, so the parent's
+                    // own hold cannot deadlock us.
+                    if !owner_resolved {
+                        // …unless the coordinator cannot name the holder, in which
+                        // case that ancestor check is unavailable and waiting could
+                        // be waiting on our own parent, forever. Fail, loudly and
+                        // non-zero: a caller that is blocked on us must not read
+                        // this as success, and must not read it as a hang either.
+                        eprintln!(
+                            "zvcs: {sub}: repo lane is busy and the coordinator cannot name its holder \
+                             (it predates the lane-owner query); refusing to defer a command another \
+                             git process is waiting on. Restart it: git zdaemon restart"
+                        );
+                        return Ok(ExitCode::from(1));
+                    }
+                    Some(crate::lock::RepoLock::acquire(repo.git_dir()))
+                }
+                crate::lock::TryLock::Busy { .. } => {
+                    return crate::superset::queue::queue_verb(sub, args)
+                }
                 crate::lock::TryLock::NoDaemon => None,
             },
             Err(_) => None,

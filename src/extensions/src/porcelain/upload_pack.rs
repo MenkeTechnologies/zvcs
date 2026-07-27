@@ -1225,6 +1225,10 @@ struct V2Config {
     session_id: Option<String>,
     /// `transfer.advertiseObjectInfo` — advertise and serve `object-info`.
     object_info: bool,
+    /// The `<pr-info>` of the `promisor-remote` capability, from
+    /// `promisor.advertise` and `promisor.sendFields` (`promisor_remote_info()`).
+    /// `None` withholds the capability entirely, which is git's default.
+    promisor_info: Option<String>,
     /// The repository's hash algorithm, which the client must agree with.
     object_format: String,
 }
@@ -1249,6 +1253,7 @@ impl V2Config {
                 .unwrap_or(false)
                 .then(|| crate::trace2::session_id().to_owned()),
             object_info: config.boolean("transfer.advertiseObjectInfo").unwrap_or(false),
+            promisor_info: gix::promisor::remote_info(repo),
             object_format: repo.object_hash().to_string(),
         }
     }
@@ -1290,6 +1295,11 @@ fn v2_advertisement(repo: &gix::Repository) -> Result<Vec<u8>> {
     }
     if cfg.object_info {
         pkt_line(&mut out, b"object-info\n");
+    }
+    // Last in git's `capabilities[]` table (serve.c:180-183), after the
+    // `bundle-uri` entry this server does not carry.
+    if let Some(info) = &cfg.promisor_info {
+        pkt_line(&mut out, format!("promisor-remote={info}\n").as_bytes());
     }
     flush_pkt(&mut out);
     Ok(out)
@@ -1371,7 +1381,7 @@ fn process_request(
                         "object-info" if cfg.object_info => V2Command::ObjectInfo,
                         _ => die!("invalid command '{name}'"),
                     });
-                } else if !receive_client_capability(cfg, &key, &mut client_hash) {
+                } else if !receive_client_capability(repo, cfg, &key, &mut client_hash) {
                     die!("unknown capability '{key}'");
                 }
                 seen_capability_or_command = true;
@@ -1416,7 +1426,23 @@ fn process_request(
 /// `server-option` carry no server-side effect; `object-format` picks the hash
 /// the client will be held to; `session-id` is only accepted when it was
 /// advertised.
-fn receive_client_capability(cfg: &V2Config, key: &str, client_hash: &mut String) -> bool {
+///
+/// `promisor-remote` is likewise only accepted when it was advertised, and its
+/// value — the `;`-joined names the client picked out of the advertisement — is
+/// handed to `mark_promisor_remotes_as_accepted()`, which warns about every name
+/// that is not one of this repository's promisor remotes. What git does with the
+/// accepted set afterwards is pass `--missing=allow-promisor` to the
+/// `pack-objects` child (upload-pack.c:338), which stops that child dying on an
+/// object the repository does not have. This server spawns no such child: it
+/// builds the pack in process from `push_proto::reachable_objects`, which drops
+/// a tip it cannot find and falls back rather than failing, so there is no
+/// second knob for the accepted set to turn.
+fn receive_client_capability(
+    repo: &gix::Repository,
+    cfg: &V2Config,
+    key: &str,
+    client_hash: &mut String,
+) -> bool {
     let (name, value) = match key.split_once('=') {
         Some((n, v)) => (n, Some(v)),
         None => (key, None),
@@ -1432,6 +1458,19 @@ fn receive_client_capability(cfg: &V2Config, key: &str, client_hash: &mut String
         // git logs the client's id via trace2; there is nothing else to do with
         // it, and it is refused outright when `transfer.advertiseSID` is off.
         "session-id" => cfg.session_id.is_some(),
+        // Unlike `session-id`, this one is *not* gated on having advertised it:
+        // `receive_client_capability()` admits a capability whose
+        // `advertise(r, NULL)` returns non-zero, and `promisor_remote_advertise()`
+        // returns 1 unconditionally when asked with a NULL buffer (serve.c:33-44) —
+        // it only consults `promisor.advertise` when actually building the value.
+        // Verified against stock 2.55.0, which answers a `promisor-remote=` sent to
+        // a server with `promisor.advertise=false` normally rather than dying.
+        "promisor-remote" => {
+            if let Some(names) = value {
+                gix::promisor::accept_reply(repo, names);
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -2002,6 +2041,7 @@ mod tests {
             sideband_all: false,
             session_id: None,
             object_info: false,
+            promisor_info: None,
             object_format: "sha1".into(),
         };
         assert_eq!(base.fetch_values(), "wait-for-done");

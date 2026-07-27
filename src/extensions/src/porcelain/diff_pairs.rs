@@ -72,8 +72,42 @@
 //!   `--stat`/`--numstat` keep counting the raw blobs and a raw-binary path still
 //!   reports `Bin <a> -> <b> bytes` while its patch shows hunks; `--check` and the
 //!   pickaxe read the raw blobs for the same reason
-//! * `--no-ext-diff`, which asks for the state plumbing is already in — no
-//!   `diff.<driver>.command` is ever run
+//! * `--ext-diff` / `--no-ext-diff` (`o->flags.allow_external`, off by default for
+//!   plumbing). With the flag on, a pair whose path selects a `diff.<driver>.command`
+//!   — or, failing that, `GIT_EXTERNAL_DIFF` — is handed to that program instead of
+//!   being diffed internally, following `run_external_diff()`'s protocol exactly:
+//!   `<cmd> <path> <old-temp> <old-hex> <old-mode> <new-temp> <new-hex> <new-mode>`
+//!   with `<new-path>` and the uncoloured `fill_metainfo()` block appended for a
+//!   rename or copy, `GIT_DIFF_PATH_COUNTER`/`GIT_DIFF_PATH_TOTAL` in the child's
+//!   environment, and `use_shell` argument handling. Each existing side is inflated
+//!   into its own `git-blob-XXXXXX` directory under its basename and passed through
+//!   the checkout filters, as `prep_temp_blob()` does; the worktree file is never
+//!   borrowed, because `builtin/diff-pairs.c` never reads the index and
+//!   `reuse_worktree_file()` therefore always declines. The driver's stdout becomes
+//!   the patch for that pair verbatim — never re-coloured, never given
+//!   `--line-prefix`. `GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE` and
+//!   `diff.<driver>.trustExitCode` select which exit statuses mean "no change";
+//!   without them any non-zero status is `external diff died, stopping at <path>`
+//!   (exit 128). `diff.external` is deliberately *not* read: it is parsed by
+//!   `git_diff_ui_config()` and `builtin/diff-pairs.c` registers
+//!   `git_diff_basic_config()`, so stock git ignores it here too.
+//! * `--ext-diff --exit-code` turns on `diff_from_contents`, so the status reports
+//!   what the rendering pass found rather than what was queued — a trusted driver
+//!   that answers "equal" for every pair brings the exit code back to 0. That also
+//!   brings in `diff_flush_patch_quietly()`: the raw/name loop drops a pair the probe
+//!   calls unchanged, and `-s`/`--quiet` render each pair with the output nulled and
+//!   stop at the first change
+//! * `--submodule[=<format>]`: `short` (the `Subproject commit <oid>` line diff a
+//!   gitlink pair renders as by default) and `log` — the bare `--submodule` — which
+//!   opens the submodule's own repository and prints
+//!   `Submodule <path> <a><..|...><b>[ (rewind)]:` followed by the
+//!   `--left-right --first-parent` commit list, `  < <subject>` for the left side and
+//!   `  > <subject>` for the right. The `..`/`...` choice, the `(rewind)` suffix and
+//!   the `(new submodule)` / `(submodule deleted)` / `(commits not present)` /
+//!   `(corrupt repository)` messages all follow `show_submodule_header()`, including
+//!   its quirk that a pair whose two commits are *both* unreadable still prints `..`
+//!   (`merge_bases_many()`'s `one == twos[i]` short-circuit compares two NULL
+//!   pointers). An unchanged gitlink prints nothing at all.
 //! * `--exit-code`, `--quiet` (implies `-s` and `--exit-code`)
 //! * `--abbrev[=<n>]` — accepted and ignored, which is what stock git does here.
 //!   `core.abbrev` itself *is* honoured.
@@ -89,27 +123,32 @@
 //! * `--binary`: the `GIT binary patch` payload is a base85-armoured *deflate* stream,
 //!   and parity means byte-identical output. The only deflate in this tree is `zlib-rs`
 //!   (through `gix-zlib`), which is not stream-compatible with the zlib git links
-//!   against at the level git uses. Measured on a 191544-byte blob: git's loose object
-//!   at `zlib_compression_level` (the `Z_BEST_SPEED` default `--binary` also uses) is
-//!   40832 bytes and byte-identical to `zlib.compress(raw, 1)`; `zlib-rs` at the same
-//!   nominal level produces 60060 bytes, diverging from the third byte. At level 6 it
-//!   is 27783 against zlib's 27989; only at level 9 do the two agree byte for byte.
-//!   Emitting a *valid* binary patch is easy and emitting git's is not, so this bails
-//!   rather than printing a payload that differs from stock on every input.
+//!   against. Measured by writing the same 191544-byte blob with `hash-object
+//!   --no-filters -w` under both binaries at three `core.compression` settings — the
+//!   same `git_deflate_init(&stream, cfg->zlib_compression_level)` call `--binary`
+//!   makes, whose default is `Z_BEST_SPEED`:
+//!
+//!   | level | stock | this tree | `zlib.compress` | stock == zlib |
+//!   |---|---|---|---|---|
+//!   | 1 (the `--binary` default) | 65258 | 86833 | 65258 | yes |
+//!   | 6 | 48777 | 51638 | 48777 | yes |
+//!   | 9 | 49034 | 49037 | 49034 | yes |
+//!
+//!   Stock's object is byte-identical to zlib's output at every level and this tree's
+//!   is identical at none of them, diverging at byte 3 (level 1), 4 (level 6) and 1472
+//!   (level 9). Byte-exact `--binary` therefore needs either a faithful port of
+//!   zlib's `deflate.c`/`trees.c` or a link against C zlib; emitting a *valid* binary
+//!   patch is easy and emitting git's is not, so this bails rather than printing a
+//!   payload that differs from stock on every input.
 //! * `--anchored=<text>`: git's own documentation states it "uses the "patience diff"
 //!   algorithm internally", and the vendored `gix-imara-diff` ships only `myers.rs` and
 //!   `histogram.rs`. Same floor as `--patience` below.
 //! * `--patience` / `--diff-algorithm=patience`: imara-diff has no patience variant, so
 //!   these bail rather than silently substituting Myers (the same floor `git diff` hits).
-//! * `--ext-diff`: honouring it means *running* `diff.<driver>.command` with git's
-//!   argument protocol (name, then a temp file / hex / mode triple per side), and the
-//!   driver's own stdout — which normally names those temp files — becomes the patch.
-//!   The negative form `--no-ext-diff` is accepted, since it asks for what already
-//!   happens.
-//! * `--submodule` and `--submodule=log` / `--submodule=diff`: both open the submodule's
-//!   own repository, walk it and (for `diff`) run a second diff inside it. Only
-//!   `--submodule=short`, the `Subproject commit <oid>` line diff a gitlink pair already
-//!   renders as, is ported.
+//! * `--submodule=diff`: `show_submodule_inline_diff()` starts a whole second
+//!   `git diff --submodule=diff --color=<when> --src-prefix=… --dst-prefix=… <a> <b>`
+//!   inside the submodule and pipes its stdout through, which this port does not do.
+//!   `--submodule=short` and `--submodule=log` are both covered above.
 //! * `--find-copies-harder` is parsed and fed to `diffcore_rename`, but a `diff-pairs`
 //!   batch only ever contains the pairs stdin listed: git supplies the unmodified pairs
 //!   the option needs from a tree walk, and there is none here, so it behaves as plain
@@ -118,9 +157,9 @@
 //!   only steer a diff computed against the index, which this command never reads.
 //! * `--follow` is fatal (`--follow requires exactly one pathspec`), matching git — the
 //!   command takes no pathspec, so the option can never be satisfied.
-//! * `gitattributes` diff drivers: a driver's `textconv` is honoured under `--textconv`,
-//!   but its `command` (see `--ext-diff` above) and its custom `funcname` pattern are
-//!   not, so hunk headers use git's built-in `def_ff` heuristic only.
+//! * `gitattributes` diff drivers: a driver's `textconv` is honoured under `--textconv`
+//!   and its `command` under `--ext-diff`, but its custom `funcname` pattern is not, so
+//!   hunk headers use git's built-in `def_ff` heuristic only.
 //! * `--stat`/`--summary` file names are not C-quoted, so a path containing a byte that
 //!   git would escape is emitted verbatim.
 
@@ -131,7 +170,7 @@ use std::process::ExitCode;
 
 use gix::bstr::{BString, ByteSlice};
 use gix::diff::blob::platform::prepare_diff::Operation;
-use gix::diff::blob::{diff_with_slider_heuristics, InternedInput, ResourceKind};
+use gix::diff::blob::{InternedInput, ResourceKind};
 use gix::hash::ObjectId;
 use gix::objs::tree::EntryKind;
 use gix::prelude::ObjectIdExt;
@@ -610,18 +649,28 @@ struct Opts {
     /// outright. `none`/`untracked`/`dirty` only concern a worktree comparison, which
     /// `diff-pairs` never performs, so they leave the pair in place — as in git.
     ignore_submodules: bool,
+    /// `o->flags.override_submodule_config`, raised by *any* form of
+    /// `--ignore-submodules`. It stops `is_submodule_ignored()` from consulting
+    /// `.gitmodules`, which is the only thing that ever reads the index here.
+    ignore_submodules_set: bool,
     /// `--submodule[=<format>]` (`parse_submodule_params()`): how a `160000` pair is
     /// rendered in the patch.
     submodule_format: SubmoduleFormat,
+    /// `--ext-diff` / `--no-ext-diff` (`o->flags.allow_external`). Off by default:
+    /// `diff_setup()` only turns external drivers on for the porcelain commands.
+    allow_external: bool,
 }
 
-/// git's `enum diff_submodule_format`, restricted to the one this port renders.
+/// git's `enum diff_submodule_format`, restricted to the two this port renders.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SubmoduleFormat {
     /// `DIFF_SUBMODULE_SHORT` — the `Subproject commit <oid>` line diff, which is
-    /// what a gitlink pair already renders as. `DIFF_SUBMODULE_LOG` and
-    /// `DIFF_SUBMODULE_INLINE_DIFF` are refused at parse time.
+    /// what a gitlink pair already renders as.
     Short,
+    /// `DIFF_SUBMODULE_LOG` — the `Submodule <path> <a>..<b>:` header and the
+    /// `--left-right --first-parent` commit list beneath it. This is what the bare
+    /// `--submodule` selects. `DIFF_SUBMODULE_INLINE_DIFF` is refused at parse time.
+    Log,
 }
 
 /// `--textconv`'s resolved driver machinery, shared by every pair in a batch, or
@@ -736,7 +785,9 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         ws_error_highlight: diff_color::WSEH_NEW,
         dirstat: diff_files::DirStat::default(),
         ignore_submodules: false,
+        ignore_submodules_set: false,
         submodule_format: SubmoduleFormat::Short,
+        allow_external: false,
     };
     // Whether a `--ws-error-highlight` flag was seen, so the config default does not
     // overwrite it (git reads the config first and the command line last).
@@ -1257,8 +1308,12 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
                 }
             }
             // `--ignore-submodules[=<when>]` (`handle_ignore_submodules_arg()`).
-            "--ignore-submodules" => opts.ignore_submodules = true,
+            "--ignore-submodules" => {
+                opts.ignore_submodules = true;
+                opts.ignore_submodules_set = true;
+            }
             _ if s.starts_with("--ignore-submodules=") => {
+                opts.ignore_submodules_set = true;
                 match &s["--ignore-submodules=".len()..] {
                     "all" => opts.ignore_submodules = true,
                     // `none`, `untracked` and `dirty` only relax what counts as a
@@ -1278,29 +1333,22 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
             // program is ever consulted.
             "--textconv" => allow_textconv = true,
             "--no-textconv" => allow_textconv = false,
-            // `--no-ext-diff` (`DIFF_OPT_ALLOW_EXTERNAL` off) asks for the state this
-            // command is already in: `diff_setup()` leaves external drivers off for
-            // plumbing, and nothing here ever runs a `diff.<driver>.command`. Its
-            // positive form is refused below, since honouring *that* means running the
-            // driver. Verified against stock: `diff-pairs -p` and `diff-pairs -p
-            // --no-ext-diff` print the same internal patch for a path whose `diff`
-            // attribute names a driver with a `command`.
-            "--no-ext-diff" => {}
+            // `--ext-diff` / `--no-ext-diff` (`o->flags.allow_external`). Off by
+            // default: `diff_setup()` leaves external drivers off for plumbing, so
+            // `--no-ext-diff` asks for the state this command starts in.
+            "--ext-diff" => opts.allow_external = true,
+            "--no-ext-diff" => opts.allow_external = false,
             // `--submodule[=<format>]` (`parse_submodule_params()`): the bare form is
-            // `log`, matching `diff_opt_submodule()`'s `arg ? arg : "log"`. Only
-            // `short` — the default `Subproject commit <oid>` line diff — is ported;
-            // `log` and `diff` both open the submodule's own repository, walk it and
-            // (for `diff`) run a second diff inside it, which this port does not do.
-            "--submodule" => bail!(
-                "unsupported flag \"--submodule\" (defaults to =log, which needs the \
-                 submodule's own repository; only --submodule=short is ported)"
-            ),
+            // `log`, matching `diff_opt_submodule()`'s `arg ? arg : "log"`. `diff`
+            // runs a second `git diff` inside the submodule and is not ported.
+            "--submodule" => opts.submodule_format = SubmoduleFormat::Log,
             _ if s.starts_with("--submodule=") => {
                 match &s["--submodule=".len()..] {
                     "short" => opts.submodule_format = SubmoduleFormat::Short,
-                    f @ ("log" | "diff") => bail!(
-                        "unsupported flag \"--submodule={f}\" (needs the submodule's own \
-                         repository; only --submodule=short is ported)"
+                    "log" => opts.submodule_format = SubmoduleFormat::Log,
+                    "diff" => bail!(
+                        "unsupported flag \"--submodule=diff\" (runs a second `git diff` \
+                         inside the submodule; --submodule=short and --submodule=log are ported)"
                     ),
                     v => {
                         eprintln!("error: failed to parse --submodule option parameter: '{v}'");
@@ -1321,6 +1369,8 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
                  --no-renames, --indent-heuristic/--no-indent-heuristic, \
                  --output-indicator-new/-old/-context=<char>, \
                  -a/--text, --minimal/--histogram/--diff-algorithm=<myers|minimal|histogram>, \
+                 --textconv/--no-textconv, --ext-diff/--no-ext-diff, \
+                 --ignore-submodules[=<when>], --submodule[=short|log], \
                  --exit-code, --quiet, --abbrev[=<n>], -h)"
             ),
         }
@@ -1373,10 +1423,11 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
             opts.ws_error_highlight = v;
         }
     }
-    // `--textconv`: the gitattributes stack and filter pipeline `userdiff_find_by_path()`
-    // and `prep_temp_blob()` need. Built once for the whole stream, as git builds its
-    // attribute check once and reuses it for every filespec.
-    let textconv = if allow_textconv {
+    // The gitattributes stack and filter pipeline `userdiff_find_by_path()` and
+    // `prep_temp_blob()` need, built once for the whole stream as git builds its
+    // attribute check once and reuses it for every filespec. `--textconv` and
+    // `--ext-diff` both drive it, so one instance serves both.
+    let drivers = if allow_textconv || opts.allow_external {
         match super::cat_file::Textconv::new(&repo) {
             Ok(t) => Some(std::cell::RefCell::new(t)),
             Err(e) => return Ok(fatal(&e.to_string())),
@@ -1384,6 +1435,7 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
     } else {
         None
     };
+    let textconv = if allow_textconv { drivers.as_ref() } else { None };
     // `git_diff_basic_config()`'s `diff.dirstat` arm parses the value and warns about
     // whatever it could not understand. It cannot change *this* command's behaviour:
     // `builtin/diff-pairs.c` runs `repo_init_revisions()` — which copies
@@ -1402,12 +1454,34 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
     let colors =
         diff_color::DiffColors::resolve(&repo, diff_color::resolve_color(&repo, opts.color_when));
     let ws_rule = diff_color::whitespace_rule_cfg(&repo);
-    let extra = match move_word.resolve(&repo) {
+    let mut extra = match move_word.resolve(&repo) {
         Ok(e) => e,
         Err(msg) => {
             eprintln!("{msg}");
             return Ok(ExitCode::from(128));
         }
+    };
+    // `external_diff()` (diff.c:558) and `diff_setup_done()`'s two consequences of it:
+    // a `GIT_EXTERNAL_DIFF` that is allowed to run turns `--color-moved` off, since
+    // move detection needs the symbol stream the driver's output never enters.
+    let ext_env = match external_diff_env() {
+        Ok(e) => e,
+        Err(code) => return Ok(code),
+    };
+    let ext = match (opts.allow_external, drivers.as_ref()) {
+        (true, Some(d)) => {
+            if ext_env.is_some() {
+                extra.color_moved = None;
+            }
+            Some(ExtCtx {
+                drivers: d,
+                env: ext_env,
+                counter: std::cell::Cell::new(0),
+                index_read: std::cell::Cell::new(false),
+                index: std::cell::OnceCell::new(),
+            })
+        }
+        _ => None,
     };
 
     // Finalize the pickaxe now that the whole line has been read.
@@ -1459,6 +1533,8 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
     let mut warnings = diffcore_rename::Warnings::default();
     // `o->flags.check_failed`: sticky across batches, read once by `diff_result_code()`.
     let mut check_failed = false;
+    // `o->found_changes`: only consulted when `diff_from_contents` is on.
+    let mut found_changes = false;
     let mut cursor = 0usize;
 
     // Records are NUL-terminated fields; a zero-length header field closes a batch.
@@ -1470,7 +1546,7 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         cursor += end + 1;
 
         if header.is_empty() {
-            match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv.as_ref())? {
+            match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv, ext.as_ref(), &mut found_changes)? {
                 Ok(()) => {}
                 Err(code) => return Ok(code),
             }
@@ -1504,10 +1580,15 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         pair.old_path = old_path;
         pair.new_path = new_path;
         any_pair = true;
+        if let Some(ctx) = ext.as_ref() {
+            if queues_read_index(&pair, opts.ignore_submodules_set) {
+                ctx.index_read.set(true);
+            }
+        }
         batch.push(pair);
     }
 
-    match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv.as_ref())? {
+    match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv, ext.as_ref(), &mut found_changes)? {
         Ok(()) => {}
         Err(code) => return Ok(code),
     }
@@ -1518,7 +1599,16 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
     // having reported something. They are independent, so `--check --exit-code` on a
     // dirty tree exits 3.
     let mut code = 0u8;
-    if opts.exit_code && any_pair {
+    // `diff_flush()`'s tail: with `diff_from_contents` on, `has_changes` is replaced
+    // by what the rendering pass found, so an external driver that reports "equal"
+    // can bring the status back to 0. Without `--ext-diff` the queue-time
+    // `has_changes` stands, exactly as `diff_queue_change()` set it.
+    let changed = if opts.allow_external && opts.exit_code {
+        found_changes
+    } else {
+        any_pair
+    };
+    if opts.exit_code && changed {
         code |= 0o1;
     }
     if opts.formats.check && check_failed {
@@ -1958,8 +2048,22 @@ fn flush(
     // reads it once, after the whole stream has been written.
     check_failed: &mut bool,
     tc: TextconvRef<'_, '_>,
+    ext: Option<&ExtCtx<'_, '_>>,
+    // `o->found_changes`, accumulated across every batch. Only consulted when
+    // `diff_from_contents` is on, which for this command means `--ext-diff
+    // --exit-code`.
+    found_changes: &mut bool,
 ) -> Result<std::result::Result<(), ExitCode>> {
-    if batch.is_empty() || opts.formats.no_output {
+    // `diff_from_contents` (diff_setup_done, diff.c:5359): with an external diff
+    // allowed, the driver may declare non-identical contents equal, so the exit
+    // status has to come from the rendering pass instead of from the queue.
+    let from_contents = opts.allow_external && opts.exit_code;
+    if batch.is_empty() {
+        return Ok(Ok(()));
+    }
+    // `diff_flush()` still walks the queue with no output format when it has to
+    // answer `--exit-code` from the contents.
+    if opts.formats.no_output && !from_contents {
         return Ok(Ok(()));
     }
 
@@ -2063,6 +2167,39 @@ fn flush(
     let unresolved = pairs.iter().any(|p| p.unresolved);
     let unresolved_fatal = || fatal("internal error in diff-resolve-rename-copy");
 
+    // `diff_flush()`'s raw/name/check loop consults `diff_flush_patch_quietly()` when
+    // the exit status has to come from the contents, and drops every pair the probe
+    // reports unchanged. The probe renders the pair a second time — with `--raw -p`
+    // git runs an external driver once per loop, and so does this.
+    let probed: Option<Vec<Pair>> =
+        if from_contents && (opts.formats.name_group() || opts.formats.check) {
+            let mut keep = Vec::with_capacity(pairs.len());
+            for p in &pairs {
+                match pair_found_changes(
+                    repo,
+                    cache,
+                    p,
+                    opts,
+                    base_abbrev,
+                    tc,
+                    ext,
+                    pairs.len(),
+                ) {
+                    Ok(hit) => {
+                        *found_changes |= hit;
+                        if hit {
+                            keep.push(p.clone());
+                        }
+                    }
+                    Err(code) => return Ok(Err(code)),
+                }
+            }
+            Some(keep)
+        } else {
+            None
+        };
+    let shown: &[Pair] = probed.as_deref().unwrap_or(&pairs);
+
     // ---- name/raw group ----
     // These records are NUL-terminated and carry a NUL between their own fields, so the
     // line prefix is written once per record rather than once per NUL.
@@ -2070,7 +2207,7 @@ fn flush(
         if unresolved {
             return Ok(Err(unresolved_fatal()));
         }
-        for p in &pairs {
+        for p in shown {
             buf.extend_from_slice(lp);
             render_name(&mut buf, p, &opts.formats);
         }
@@ -2080,7 +2217,7 @@ fn flush(
     // `DIFF_FORMAT_CHECKDIFF` shares the name/raw loop's slot in `diff_flush()`, and
     // `diff_setup_done()` guarantees it is the only format left standing.
     if opts.formats.check {
-        match render_check(&mut buf, repo, cache, &pairs, opts, colors, ws_rule, tc) {
+        match render_check(&mut buf, repo, cache, shown, opts, colors, ws_rule, tc) {
             Ok(failed) => *check_failed |= failed,
             Err(code) => {
                 out.write_all(&buf)?;
@@ -2205,29 +2342,68 @@ fn flush(
             // empty context line is always kept, as git's default does.
             suppress_blank_empty: false,
         };
-        let mut plain = Vec::new();
-        let mut files: Vec<diff_color::FilePaint> = Vec::new();
+        let mut sink = PatchSink {
+            out: Vec::new(),
+            plain: Vec::new(),
+            files: Vec::new(),
+            colors,
+            paint: paint_opts,
+            extra,
+            ws_rule,
+            lp,
+        };
         let mut failed = None;
         for p in &pairs {
-            if let Err(code) =
-                render_patch(&mut plain, &mut files, repo, cache, p, opts, base_abbrev, ws_rule, tc)
-            {
+            if let Err(code) = render_patch(
+                &mut sink,
+                repo,
+                cache,
+                p,
+                opts,
+                base_abbrev,
+                ws_rule,
+                tc,
+                ext,
+                pairs.len(),
+                found_changes,
+            ) {
                 failed = Some(code);
                 break;
             }
         }
-        let sub = diff_color::colorize_patch_ex(
-            &plain,
-            colors,
-            &paint_opts,
-            &files,
-            diff_color::FilePaint::new(ws_rule),
-            extra,
-        );
-        append_prefixed(&mut buf, lp, &sub);
+        buf.extend_from_slice(&sink.finish());
         if let Some(code) = failed {
             out.write_all(&buf)?;
             return Ok(Err(code));
+        }
+    }
+
+    // ---- the `DIFF_FORMAT_NO_OUTPUT` probe ----
+    // `diff_flush()`'s last block: with nothing to print but a contents-derived exit
+    // status to produce, git renders each pair quietly and stops at the first change.
+    if opts.formats.no_output && from_contents {
+        for p in &pairs {
+            match pair_found_changes(
+                repo,
+                cache,
+                p,
+                opts,
+                base_abbrev,
+                tc,
+                ext,
+                pairs.len(),
+            ) {
+                Ok(hit) => *found_changes |= hit,
+                Err(code) => {
+                    out.write_all(&buf)?;
+                    return Ok(Err(code));
+                }
+            }
+            // The break is tested after the probe, so the first pair of a batch is
+            // always rendered even when an earlier batch already found a change.
+            if *found_changes {
+                break;
+            }
         }
     }
 
@@ -2401,6 +2577,805 @@ fn render_name(out: &mut Vec<u8>, p: &Pair, f: &Formats) {
     if two_paths {
         out.extend_from_slice(&p.new_path);
         out.push(b'\0');
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --ext-diff (diff.c `external_diff`, `prepare_temp_file`, `run_external_diff`)
+// ---------------------------------------------------------------------------
+
+/// git's `struct external_diff`: the command line to run, plus whether its exit
+/// status carries the "were there changes" answer.
+#[derive(Clone)]
+struct ExternalDiff {
+    cmd: String,
+    trust_exit_code: bool,
+}
+
+/// The gitattributes stack + filter pipeline `userdiff_find_by_path()` and
+/// `prep_temp_blob()` share. One instance serves both `--textconv` and `--ext-diff`.
+type Drivers<'a, 'repo> = &'a std::cell::RefCell<super::cat_file::Textconv<'repo>>;
+
+/// The `--ext-diff` state the whole stream shares. Present only when the flag was
+/// given; `env` may still be `None`, in which case only a path whose `diff`
+/// attribute names a driver with a `command` reaches an external program.
+struct ExtCtx<'a, 'repo> {
+    drivers: Drivers<'a, 'repo>,
+    /// `external_diff()`. Its *presence* — not just its use on some path — is what
+    /// suppresses `run_diff()`'s file/symlink split and `--color-moved`.
+    env: Option<ExternalDiff>,
+    /// `o->diff_path_counter`: set to zero by `diff_setup_done()` and never reset,
+    /// so it counts external invocations across every batch.
+    counter: std::cell::Cell<u32>,
+    /// Whether `r->index` has been populated, which decides whether
+    /// `reuse_worktree_file()` can borrow a worktree file at all. See
+    /// [`queues_read_index`].
+    index_read: std::cell::Cell<bool>,
+    /// The worktree index, opened the first time it is needed.
+    index: std::cell::OnceCell<Option<WorktreeIndex>>,
+}
+
+/// The worktree index plus the `core.trustCtime` / `core.checkStat` knobs
+/// `ie_match_stat()` obeys.
+struct WorktreeIndex {
+    state: gix::worktree::IndexPersistedOrInMemory,
+    stat: gix::index::entry::stat::Options,
+    workdir: std::path::PathBuf,
+}
+
+impl ExtCtx<'_, '_> {
+    /// `reuse_worktree_file()` (diff.c:4388): whether the file checked out at `path`
+    /// is known to hold exactly `oid`, so `prepare_temp_file()` can hand the driver
+    /// the worktree path instead of inflating a temporary copy.
+    ///
+    /// The `if (!istate->cache) return 0` guard comes first: with no index read
+    /// nothing is ever reused. `want_file` is 1 for this caller, which skips both
+    /// the pack and the `would_convert_to_git()` shortcuts.
+    fn reuse_worktree_file(&self, repo: &gix::Repository, path: &BString, oid: &ObjectId) -> bool {
+        if !self.index_read.get() {
+            return false;
+        }
+        let idx = self
+            .index
+            .get_or_init(|| {
+                let state = repo.index_or_load_from_head().ok()?;
+                Some(WorktreeIndex {
+                    state,
+                    stat: repo.stat_options().ok()?,
+                    workdir: repo.workdir()?.to_path_buf(),
+                })
+            })
+            .as_ref();
+        let Some(idx) = idx else {
+            return false;
+        };
+        let Some(entry) = idx.state.entry_by_path(path.as_bstr()) else {
+            return false;
+        };
+        // "This is not the sha1 we are looking for, or unreusable because it is not
+        // a regular file."
+        if entry.id != *oid
+            || !matches!(
+                entry.mode,
+                gix::index::entry::Mode::FILE | gix::index::entry::Mode::FILE_EXECUTABLE
+            )
+        {
+            return false;
+        }
+        // `CE_VALID` ("assume unchanged") and skip-worktree both mean the worktree
+        // is not guaranteed to hold the entry's content.
+        if entry
+            .flags
+            .intersects(gix::index::entry::Flags::ASSUME_VALID | gix::index::entry::Flags::SKIP_WORKTREE)
+        {
+            return false;
+        }
+        // `ce_uptodate()` is an in-core marker that a fresh `repo_read_index()` never
+        // sets, so the answer always comes from `lstat()` + `ie_match_stat()`.
+        let full = idx.workdir.join(gix::path::from_bstr(path.as_bstr()).as_ref());
+        let Ok(meta) = gix::index::fs::Metadata::from_path_no_follow(&full) else {
+            return false;
+        };
+        let Ok(stat) = gix::index::entry::Stat::from_fs(&meta) else {
+            return false;
+        };
+        entry.stat.matches(&stat, idx.stat)
+    }
+}
+
+/// Whether queueing this pair makes git read the index.
+///
+/// `diff_queue_change()` and `diff_queue_addremove()` run `is_submodule_ignored()`
+/// on a gitlink, which reaches `submodule_from_path()` → `repo_read_gitmodules()` →
+/// `repo_read_index()`. Nothing else in `builtin/diff-pairs.c` reads the index, so a
+/// batch without a gitlink leaves `istate->cache` NULL and `reuse_worktree_file()`
+/// declines every path. `--ignore-submodules[=<when>]` sets
+/// `override_submodule_config`, which skips the lookup and therefore the read.
+/// A rename or copy is queued by `diff_queue()` directly and never consults it.
+fn queues_read_index(p: &Pair, overridden: bool) -> bool {
+    if overridden {
+        return false;
+    }
+    match p.kind() {
+        b'A' => is_gitlink_mode(p.new_mode),
+        b'D' => is_gitlink_mode(p.old_mode),
+        b'M' | b'T' => is_gitlink_mode(p.old_mode) && is_gitlink_mode(p.new_mode),
+        _ => false,
+    }
+}
+
+/// The patch stream as it is assembled.
+///
+/// Internally produced sections are collected uncoloured and re-emitted in one pass
+/// through `fn_out_consume()`'s colour chain, then given `--line-prefix`. An external
+/// driver's stdout goes in exactly as the child wrote it: git hands the child its own
+/// output descriptor, so neither the colouriser nor the line prefix ever touches it.
+struct PatchSink<'a> {
+    /// Finished bytes: coloured and prefixed sections interleaved with spliced ones.
+    out: Vec<u8>,
+    /// The uncoloured patch text accumulated since the last splice.
+    plain: Vec<u8>,
+    /// Per-file-pair paint state for the pending `plain` section.
+    files: Vec<diff_color::FilePaint>,
+    colors: &'a diff_color::DiffColors,
+    paint: diff_color::PaintOptions,
+    extra: &'a diff_color::ExtraPaint,
+    ws_rule: u32,
+    lp: &'a [u8],
+}
+
+impl PatchSink<'_> {
+    /// Close the pending internal section, colouring and prefixing it.
+    fn flush_plain(&mut self) {
+        if self.plain.is_empty() {
+            return;
+        }
+        let sub = diff_color::colorize_patch_ex(
+            &self.plain,
+            self.colors,
+            &self.paint,
+            &self.files,
+            diff_color::FilePaint::new(self.ws_rule),
+            self.extra,
+        );
+        append_prefixed(&mut self.out, self.lp, &sub);
+        self.plain.clear();
+        self.files.clear();
+    }
+
+    /// Splice an external driver's stdout in verbatim.
+    fn splice(&mut self, bytes: &[u8]) {
+        self.flush_plain();
+        self.out.extend_from_slice(bytes);
+    }
+
+    /// Append lines that carry their own colouring — `--submodule=log`'s summary,
+    /// whose `emit_line()` calls paint each line themselves — but still take
+    /// `--line-prefix`.
+    fn prefixed(&mut self, bytes: &[u8]) {
+        self.flush_plain();
+        append_prefixed(&mut self.out, self.lp, bytes);
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        self.flush_plain();
+        self.out
+    }
+}
+
+/// `external_diff()` (diff.c:558), restricted to what this command can observe.
+///
+/// The configuration half — `diff.external` and `diff.trustExitCode` — is parsed by
+/// `git_diff_ui_config()`, and `builtin/diff-pairs.c` registers
+/// `git_diff_basic_config()` instead, so `diff-pairs` never reads it. Verified
+/// against stock git 2.55.0: `git -c diff.external=<prog> diff-pairs -z --ext-diff`
+/// still prints the internal patch. Only the environment reaches here.
+fn external_diff_env() -> std::result::Result<Option<ExternalDiff>, ExitCode> {
+    let Some(cmd) = std::env::var_os("GIT_EXTERNAL_DIFF") else {
+        return Ok(None);
+    };
+    // `xstrdup_or_null()` keeps an empty value, so an empty variable still selects
+    // an (unrunnable) external diff rather than falling back to the built-in one.
+    Ok(Some(ExternalDiff {
+        cmd: cmd.to_string_lossy().into_owned(),
+        trust_exit_code: git_env_bool("GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE", false)?,
+    }))
+}
+
+/// `git_env_bool()` + `git_parse_maybe_bool()`: an unset variable takes the default,
+/// `true`/`yes`/`on`/a non-zero integer are true, `false`/`no`/`off`/`0`/empty are
+/// false, and anything else is fatal.
+fn git_env_bool(key: &str, def: bool) -> std::result::Result<bool, ExitCode> {
+    let Some(raw) = std::env::var_os(key) else {
+        return Ok(def);
+    };
+    let v = raw.to_string_lossy().into_owned();
+    if v.is_empty() {
+        return Ok(false);
+    }
+    if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("on")
+    {
+        return Ok(true);
+    }
+    if v.eq_ignore_ascii_case("false")
+        || v.eq_ignore_ascii_case("no")
+        || v.eq_ignore_ascii_case("off")
+    {
+        return Ok(false);
+    }
+    match v.parse::<i64>() {
+        Ok(n) => Ok(n != 0),
+        Err(_) => Err(fatal(&format!(
+            "bad boolean environment value '{v}' for '{key}'"
+        ))),
+    }
+}
+
+/// `run_diff_cmd()`'s driver override: with `allow_external` on, a path whose `diff`
+/// gitattribute names a driver that configures `diff.<name>.command` uses that
+/// driver in preference to `GIT_EXTERNAL_DIFF`.
+fn external_for_path(
+    repo: &gix::Repository,
+    drivers: Drivers<'_, '_>,
+    path: &gix::bstr::BStr,
+    env: Option<&ExternalDiff>,
+) -> std::result::Result<Option<ExternalDiff>, ExitCode> {
+    let name = match drivers.borrow_mut().driver_name(path) {
+        Ok(n) => n,
+        Err(e) => return Err(fatal(&e.to_string())),
+    };
+    if let Some(name) = name {
+        if let Some(cmd) = super::cat_file::diff_driver_config(repo, &name, "command") {
+            let trust = super::cat_file::diff_driver_config(repo, &name, "trustexitcode")
+                .map(|v| {
+                    let v = v.trim();
+                    !(v.is_empty()
+                        || v.eq_ignore_ascii_case("false")
+                        || v.eq_ignore_ascii_case("no")
+                        || v.eq_ignore_ascii_case("off")
+                        || v == "0")
+                })
+                .unwrap_or(false);
+            return Ok(Some(ExternalDiff {
+                cmd,
+                trust_exit_code: trust,
+            }));
+        }
+    }
+    Ok(env.cloned())
+}
+
+/// One side of the argument triple `run_external_diff()` hands the driver.
+struct TempSide {
+    /// The private directory holding the temporary file, removed once the driver
+    /// has run. `None` for the `/dev/null` placeholder, which owns nothing.
+    dir: Option<std::path::PathBuf>,
+    name: std::ffi::OsString,
+    hex: String,
+    mode: String,
+}
+
+/// `prepare_temp_file()` (diff.c:4698).
+///
+/// A missing side becomes the `/dev/null` `.`/`.` triple. An existing one is
+/// normally inflated into a temporary file of its own, except when
+/// `reuse_worktree_file()` confirms the checked-out file already holds exactly that
+/// object — then the driver is handed the worktree path itself, with the pair's own
+/// mode rather than the index entry's. Gitlinks never take that branch.
+fn prepare_temp_file(
+    repo: &gix::Repository,
+    drivers: Drivers<'_, '_>,
+    ctx: &ExtCtx<'_, '_>,
+    path: &BString,
+    id: &ObjectId,
+    mode: u32,
+    valid: bool,
+) -> std::result::Result<TempSide, ExitCode> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if !valid {
+        return Ok(TempSide {
+            dir: None,
+            name: std::ffi::OsString::from("/dev/null"),
+            hex: ".".to_string(),
+            mode: ".".to_string(),
+        });
+    }
+    if !is_gitlink_mode(mode) && ctx.reuse_worktree_file(repo, path, id) {
+        return Ok(TempSide {
+            dir: None,
+            name: std::ffi::OsStr::from_bytes(path).to_os_string(),
+            hex: id.to_hex().to_string(),
+            mode: format!("{mode:06o}"),
+        });
+    }
+    // `diff_populate_filespec()` synthesises a gitlink's content rather than looking
+    // it up, which is why a submodule pair reaches the driver as one text line.
+    let data = if is_gitlink_mode(mode) {
+        format!("Subproject commit {}\n", id.to_hex()).into_bytes()
+    } else {
+        read_blob(repo, *id, true)?
+    };
+    let dir = match super::cat_file::temp_blob_dir() {
+        Ok(d) => d,
+        Err(e) => return Err(fatal(&e.to_string())),
+    };
+    let file = match drivers
+        .borrow_mut()
+        .prep_temp_blob(&dir, path.as_bstr(), &data)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(fatal(&format!("unable to write temp-file: {e}")));
+        }
+    };
+    Ok(TempSide {
+        dir: Some(dir),
+        name: file.into_os_string(),
+        hex: id.to_hex().to_string(),
+        mode: format!("{mode:06o}"),
+    })
+}
+
+/// `fill_metainfo()` (diff.c:4858) as an external driver receives it: git always
+/// builds this copy with `GIT_COLOR_NEVER`, and the mode lines (`new file mode`,
+/// `deleted file mode`, `old mode`/`new mode`) are *not* part of it — `builtin_diff()`
+/// writes those itself — so an addition or a deletion carries nothing but the
+/// `index` line.
+fn external_xfrm_msg(
+    repo: &gix::Repository,
+    p: &Pair,
+    opts: &Opts,
+    base_abbrev: usize,
+) -> Vec<u8> {
+    let mut msg = Vec::new();
+    match p.kind() {
+        k @ (b'C' | b'R') => {
+            let verb = if k == b'C' { "copy" } else { "rename" };
+            msg.extend_from_slice(format!("similarity index {}%\n", p.score()).as_bytes());
+            msg.extend_from_slice(format!("{verb} from ").as_bytes());
+            msg.extend_from_slice(&p.old_path);
+            msg.extend_from_slice(format!("\n{verb} to ").as_bytes());
+            msg.extend_from_slice(&p.new_path);
+            msg.push(b'\n');
+        }
+        b'M' if p.score() != 0 => {
+            msg.extend_from_slice(format!("dissimilarity index {}%\n", p.score()).as_bytes());
+        }
+        _ => {}
+    }
+    if p.old_id != p.new_id {
+        msg.extend_from_slice(b"index ");
+        msg.extend_from_slice(oid_text(repo, &p.old_id, base_abbrev, opts.full_index).as_bytes());
+        msg.extend_from_slice(b"..");
+        msg.extend_from_slice(oid_text(repo, &p.new_id, base_abbrev, opts.full_index).as_bytes());
+        if p.old_valid() && p.new_valid() && p.old_mode == p.new_mode {
+            msg.extend_from_slice(format!(" {:06o}", p.new_mode).as_bytes());
+        }
+        msg.push(b'\n');
+    }
+    msg
+}
+
+/// Whatever the driver wrote, and whether git counted the pair as changed.
+struct ExtRun {
+    stdout: Vec<u8>,
+    found_changes: bool,
+    /// `die(_("external diff died, stopping at %s"))`. Raised by the caller only
+    /// *after* `stdout` has been passed on: git's child writes straight to the
+    /// output descriptor, so everything it printed before failing is already out.
+    died: Option<String>,
+}
+
+/// `run_external_diff()` (diff.c:4777).
+///
+/// The driver's stdout *is* the patch for this pair: git hands the child its own
+/// output descriptor, so the bytes are never re-coloured and never carry
+/// `--line-prefix`. Capturing them through a pipe and splicing them into the stream
+/// puts the same bytes in the same order — git's own `fflush(NULL)` before forking
+/// exists to guarantee exactly that ordering.
+#[allow(clippy::too_many_arguments)]
+fn run_external_diff(
+    pgm: &ExternalDiff,
+    repo: &gix::Repository,
+    ctx: &ExtCtx<'_, '_>,
+    p: &Pair,
+    opts: &Opts,
+    base_abbrev: usize,
+    total: usize,
+    // `o->file`: `false` is git's quiet probe (`diff_flush_patch_quietly()`), which
+    // nulls the file pointer so nothing is written.
+    want_output: bool,
+) -> std::result::Result<ExtRun, ExitCode> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // "If we don't need to show the diff and the external diff program lacks the
+    // ability to tell us whether it's empty then we consider it non-empty without
+    // even asking" — the driver is not run at all.
+    if !pgm.trust_exit_code && !want_output {
+        return Ok(ExtRun {
+            stdout: Vec::new(),
+            found_changes: true,
+            died: None,
+        });
+    }
+
+    let name = p.old_path.clone();
+    let other = (p.old_path != p.new_path).then(|| p.new_path.clone());
+
+    let one = prepare_temp_file(
+        repo,
+        ctx.drivers,
+        ctx,
+        &p.old_path,
+        &p.old_id,
+        p.old_mode,
+        p.old_valid(),
+    )?;
+    let two = match prepare_temp_file(
+        repo,
+        ctx.drivers,
+        ctx,
+        &p.new_path,
+        &p.new_id,
+        p.new_mode,
+        p.new_valid(),
+    ) {
+        Ok(t) => t,
+        Err(code) => {
+            if let Some(d) = &one.dir {
+                let _ = std::fs::remove_dir_all(d);
+            }
+            return Err(code);
+        }
+    };
+
+    let mut cmd = super::cat_file::shell_command(&pgm.cmd);
+    cmd.arg(std::ffi::OsStr::from_bytes(&name));
+    cmd.arg(&one.name).arg(&one.hex).arg(&one.mode);
+    cmd.arg(&two.name).arg(&two.hex).arg(&two.mode);
+    if let Some(other) = &other {
+        cmd.arg(std::ffi::OsStr::from_bytes(other));
+        let xfrm = external_xfrm_msg(repo, p, opts, base_abbrev);
+        if !xfrm.is_empty() {
+            cmd.arg(std::ffi::OsStr::from_bytes(&xfrm));
+        }
+    }
+    ctx.counter.set(ctx.counter.get() + 1);
+    cmd.env("GIT_DIFF_PATH_COUNTER", ctx.counter.get().to_string());
+    cmd.env("GIT_DIFF_PATH_TOTAL", total.to_string());
+    cmd.stdout(if want_output {
+        std::process::Stdio::piped()
+    } else {
+        // `cmd.no_stdout = 1` opens /dev/null for the child.
+        std::process::Stdio::null()
+    });
+
+    let spawned = cmd.spawn().and_then(|child| child.wait_with_output());
+    for dir in [one.dir, two.dir].into_iter().flatten() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    let died = format!("external diff died, stopping at {}", name.to_str_lossy());
+    let (rc, stdout) = match spawned {
+        Ok(o) => (o.status.code().unwrap_or(-1), o.stdout),
+        Err(e) => {
+            // `prepare_cmd()` resolves a name with no directory separator through
+            // `$PATH` and reports its own failure; a path that reaches `execve()`
+            // fails inside the child instead, which `child_err_spew()` reports with
+            // the die routine.
+            if pgm.cmd.contains('/') {
+                eprintln!("fatal: cannot exec '{}': {}", pgm.cmd, io_reason(&e));
+            } else {
+                eprintln!("error: cannot run {}: {}", pgm.cmd, io_reason(&e));
+            }
+            return Ok(ExtRun {
+                stdout: Vec::new(),
+                found_changes: false,
+                died: Some(died),
+            });
+        }
+    };
+
+    let (found_changes, died) = match (pgm.trust_exit_code, rc) {
+        (false, 0) => (true, None),
+        (true, 0) => (false, None),
+        (true, 1) => (true, None),
+        _ => (false, Some(died)),
+    };
+    Ok(ExtRun {
+        stdout,
+        found_changes,
+        died,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// --submodule=log (submodule.c `show_submodule_diff_summary`)
+// ---------------------------------------------------------------------------
+
+/// `open_submodule()` (submodule.c:508) + `submodule_to_gitdir()`: `<path>/.git`
+/// first — resolving a gitfile — and the superproject's `.git/modules/<name>` for an
+/// absorbed submodule. `None` when the submodule is not present at all.
+fn open_submodule(repo: &gix::Repository, path: &BString) -> Option<gix::Repository> {
+    if let Some(workdir) = repo.workdir() {
+        let dot_git = workdir
+            .join(gix::path::from_bstr(path.as_bstr()).as_ref())
+            .join(".git");
+        if dot_git.exists() {
+            if let Ok(sub) = gix::open(&dot_git) {
+                return Some(sub);
+            }
+        }
+    }
+    let name = repo
+        .submodules()
+        .ok()
+        .flatten()?
+        .find(|m| m.path().map(|p| p == *path).unwrap_or(false))?
+        .name()
+        .to_owned();
+    let dir = repo
+        .common_dir()
+        .join("modules")
+        .join(gix::path::from_bstr(name.as_bstr()).as_ref());
+    gix::open(dir).ok()
+}
+
+/// `lookup_commit_reference()`: peel `id` to a commit inside `sub`, or `None` when it
+/// is the null id or simply absent from that repository.
+fn lookup_commit_reference(sub: &gix::Repository, id: &ObjectId) -> Option<ObjectId> {
+    if id.is_null() {
+        return None;
+    }
+    let object = sub.find_object(*id).ok()?;
+    Some(object.peel_to_kind(gix::object::Kind::Commit).ok()?.id)
+}
+
+/// One commit in the symmetric-difference walk, with the side it came from.
+#[derive(Clone, Copy)]
+struct SubCommit {
+    id: ObjectId,
+    /// `SYMMETRIC_LEFT`: `get_revision_mark()` prints `<` for it and `>` otherwise.
+    left: bool,
+    seconds: i64,
+}
+
+/// `commit_list_insert_by_date()`: newest first, an equal date landing after the
+/// entries already holding it.
+fn insert_by_date(list: &mut Vec<SubCommit>, item: SubCommit) {
+    let at = list
+        .iter()
+        .position(|e| e.seconds < item.seconds)
+        .unwrap_or(list.len());
+    list.insert(at, item);
+}
+
+/// `prepare_submodule_diff_summary()` (submodule.c:451) and the `limit_list()` pass
+/// behind it: a `--left-right --first-parent` walk between the two commits with the
+/// merge bases marked uninteresting.
+///
+/// `mark_parents_uninteresting()` marks each merge base's whole ancestry over *every*
+/// parent — `exclude_first_parent_only` is not set here — and `limit_list()` keeps
+/// none of it. `first_parent_only` then makes each side linear, so what is left is a
+/// date-ordered merge of two chains: pop the newest entry, print it, and queue its
+/// first parent with the same `SYMMETRIC_LEFT` flag.
+fn submodule_walk(
+    sub: &gix::Repository,
+    left: ObjectId,
+    right: ObjectId,
+    bases: &[ObjectId],
+) -> Vec<SubCommit> {
+    let mut uninteresting: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+    let mut stack: Vec<ObjectId> = bases.to_vec();
+    while let Some(id) = stack.pop() {
+        if !uninteresting.insert(id) {
+            continue;
+        }
+        if let Ok(commit) = sub.find_commit(id) {
+            stack.extend(commit.parent_ids().map(|p| p.detach()));
+        }
+    }
+
+    let seconds = |id: &ObjectId| -> i64 {
+        sub.find_commit(*id)
+            .ok()
+            .and_then(|c| c.time().ok().map(|t| t.seconds))
+            .unwrap_or(0)
+    };
+    let mut list: Vec<SubCommit> = Vec::new();
+    // The `SEEN` flag: a commit enters the list exactly once, keeping the side it was
+    // first reached from.
+    let mut seen: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+    let push = |list: &mut Vec<SubCommit>,
+                seen: &mut std::collections::HashSet<ObjectId>,
+                id: ObjectId,
+                left: bool| {
+        if !seen.insert(id) {
+            return;
+        }
+        insert_by_date(
+            list,
+            SubCommit {
+                id,
+                left,
+                seconds: seconds(&id),
+            },
+        );
+    };
+    push(&mut list, &mut seen, left, true);
+    push(&mut list, &mut seen, right, false);
+
+    let mut out = Vec::new();
+    while !list.is_empty() {
+        let e = list.remove(0);
+        if uninteresting.contains(&e.id) {
+            // Everything above it is uninteresting too, so the branch ends here.
+            continue;
+        }
+        out.push(e);
+        // `add_parents_to_list()` stops after the first parent under
+        // `first_parent_only`.
+        if let Some(parent) = sub
+            .find_commit(e.id)
+            .ok()
+            .and_then(|c| c.parent_ids().next())
+        {
+            push(&mut list, &mut seen, parent.detach(), e.left);
+        }
+    }
+    out
+}
+
+/// `show_submodule_diff_summary()` (submodule.c:614), preceded by the
+/// `show_submodule_header()` it shares with the inline-diff format.
+///
+/// The lines are written with their colours already applied, since `emit_line()`
+/// paints the header with nothing and the two commit markers with `DIFF_FILE_OLD`
+/// (the left side) and `DIFF_FILE_NEW` (the right). The caller supplies
+/// `--line-prefix`.
+fn show_submodule_diff_summary(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    p: &Pair,
+    base_abbrev: usize,
+    colors: &diff_color::DiffColors,
+) {
+    let path = &p.old_path;
+    let (one, two) = (&p.old_id, &p.new_id);
+    let sub = open_submodule(repo, path);
+
+    let mut message: Option<&str> = if one.is_null() {
+        Some("(new submodule)")
+    } else if two.is_null() {
+        Some("(submodule deleted)")
+    } else {
+        None
+    };
+    let mut left = None;
+    let mut right = None;
+    let mut bases: Vec<ObjectId> = Vec::new();
+    let mut fast_forward = false;
+    let mut fast_backward = false;
+
+    if let Some(sub) = &sub {
+        left = lookup_commit_reference(sub, one);
+        right = lookup_commit_reference(sub, two);
+        // "Warn about missing commits in the submodule project, but only if they
+        // aren't null."
+        if (!one.is_null() && left.is_none()) || (!two.is_null() && right.is_none()) {
+            message = Some("(commits not present)");
+        }
+        // `merge_bases_many()` answers with an empty list, not an error, whenever
+        // one side is absent.
+        match (left, right) {
+            // Its `one == twos[i]` short-circuit compares the two commit *pointers*,
+            // so with both sides unreadable the NULLs match: the base list becomes
+            // `{NULL}`, its head equals `left`, and the header prints `..` rather
+            // than `...`.
+            (None, None) => fast_forward = true,
+            (Some(l), Some(r)) if l == r => bases.push(l),
+            (Some(l), Some(r)) => match repo_merge_bases(sub, l, r) {
+                Ok(b) => bases = b,
+                Err(()) => {
+                    message = Some("(corrupt repository)");
+                    emit_submodule_header(out, repo, path, one, two, base_abbrev, message, false, false);
+                    return;
+                }
+            },
+            _ => {}
+        }
+        if let Some(first) = bases.first() {
+            if Some(*first) == left {
+                fast_forward = true;
+            } else if Some(*first) == right {
+                fast_backward = true;
+            }
+        }
+        // An unchanged gitlink prints nothing at all — not even the header.
+        if one == two {
+            return;
+        }
+    } else if message.is_none() {
+        message = Some("(commits not present)");
+    }
+
+    emit_submodule_header(
+        out,
+        repo,
+        path,
+        one,
+        two,
+        base_abbrev,
+        message,
+        fast_forward,
+        fast_backward,
+    );
+
+    // "If we don't have both a left and a right pointer, there is no reason to try
+    // and display a summary."
+    let (Some(sub), Some(l), Some(r)) = (&sub, left, right) else {
+        return;
+    };
+    for c in submodule_walk(sub, l, r, &bases) {
+        let mut line = b"  ".to_vec();
+        line.push(if c.left { b'<' } else { b'>' });
+        line.push(b' ');
+        line.extend_from_slice(&super::cherry::subject_of(sub, c.id).unwrap_or_default());
+        let slot = if c.left {
+            diff_color::DiffSlot::Old
+        } else {
+            diff_color::DiffSlot::New
+        };
+        diff_color::paint(out, colors, slot, &line);
+        out.push(b'\n');
+    }
+}
+
+/// `repo_get_merge_bases()`, reduced to the shape this caller needs: every merge
+/// base, or `Err` for the "(corrupt repository)" report.
+fn repo_merge_bases(
+    sub: &gix::Repository,
+    left: ObjectId,
+    right: ObjectId,
+) -> std::result::Result<Vec<ObjectId>, ()> {
+    match sub.merge_bases_many(left, &[right]) {
+        Ok(ids) => Ok(ids.into_iter().map(|id| id.detach()).collect()),
+        Err(_) => Err(()),
+    }
+}
+
+/// `show_submodule_header()`'s `output_header:` block (submodule.c:598).
+#[allow(clippy::too_many_arguments)]
+fn emit_submodule_header(
+    out: &mut Vec<u8>,
+    repo: &gix::Repository,
+    path: &BString,
+    one: &ObjectId,
+    two: &ObjectId,
+    base_abbrev: usize,
+    message: Option<&str>,
+    fast_forward: bool,
+    fast_backward: bool,
+) {
+    out.extend_from_slice(b"Submodule ");
+    out.extend_from_slice(path);
+    out.push(b' ');
+    // `strbuf_add_unique_abbrev()` shortens against the *superproject's* object
+    // store, where a submodule commit is normally absent — so this is the plain
+    // `DEFAULT_ABBREV`-wide prefix.
+    out.extend_from_slice(oid_text(repo, one, base_abbrev, false).as_bytes());
+    out.extend_from_slice(if fast_backward || fast_forward {
+        &b".."[..]
+    } else {
+        &b"..."[..]
+    });
+    out.extend_from_slice(oid_text(repo, two, base_abbrev, false).as_bytes());
+    match message {
+        Some(m) => out.extend_from_slice(format!(" {m}\n").as_bytes()),
+        None if fast_backward => out.extend_from_slice(b" (rewind):\n"),
+        None => out.extend_from_slice(b":\n"),
     }
 }
 
@@ -3065,6 +4040,81 @@ fn emit_rewrite_lines(out: &mut Vec<u8>, prefix: u8, data: &[u8]) {
     }
 }
 
+/// `diff.indentHeuristic`, git's `diff_indent_heuristic` (default on).
+///
+/// `git_diff_heuristic_config()` is called from `git_diff_basic_config()`, not from the
+/// UI config, so the plumbing commands read it as well as `git diff`.
+pub(crate) fn indent_heuristic_default(repo: &gix::Repository) -> bool {
+    repo.config_snapshot()
+        .boolean("diff.indentHeuristic")
+        .unwrap_or(true)
+}
+
+/// `xdl_do_diff()` followed by `xdl_change_compact()`: build the change script from the
+/// interned (and, under `-w`/`-b`/`--ignore-space-at-eol`/`--ignore-cr-at-eol`,
+/// whitespace-normalized) tokens, then slide each group with the indent heuristic
+/// scoring the **original** records.
+///
+/// git keeps the two apart. `xdl_recmatch()` honours `XDF_IGNORE_WHITESPACE*` when it
+/// decides whether two records are equal, but `xdl_change_compact()`'s `get_indent()`
+/// reads `xdf->recs[i]->ptr` — the unmodified line as it appears in the file. Handing
+/// `postprocess_lines()` the normalized interner instead measures stripped lines, so
+/// under `-w` every record scores as unindented, `group_slide_down()` finds no reason
+/// to prefer one landing spot over another, and the hunk stops where the raw edit
+/// script left it. That is the whole `-w` divergence.
+///
+/// `postprocess_with` runs the pre-image pass with `tokens = input.before` and the
+/// post-image pass with `tokens = input.after`, handing the slice straight through to
+/// the heuristic, so the slice's address says which side is being scored. The scorer
+/// itself only ever reaches `tokens[i]` through the indent closure, so a synthetic
+/// identity sequence lets the crate's own `IndentHeuristic` score *positions* while
+/// the real tokens keep driving the equality tests in `slide_up`/`slide_down`.
+pub(crate) fn compute_compacted(
+    algorithm: gix::diff::blob::Algorithm,
+    input: &InternedInput<Vec<u8>>,
+    before: &[&[u8]],
+    after: &[&[u8]],
+    indent_heuristic: bool,
+) -> gix::diff::blob::Diff {
+    use gix::diff::blob::{IndentHeuristic, IndentLevel, SliderHeuristic, Token};
+
+    let mut diff = gix::diff::blob::Diff::compute(algorithm, input);
+    if !indent_heuristic {
+        diff.postprocess_no_heuristic(input);
+        return diff;
+    }
+    // `get_indent()`: spaces count one, tabs round up to the next multiple of eight,
+    // an all-whitespace line is blank.
+    let indents = |lines: &[&[u8]]| -> Vec<IndentLevel> {
+        lines
+            .iter()
+            .map(|l| IndentLevel::for_ascii_line(l.iter().copied(), 8))
+            .collect()
+    };
+    let (indent_before, indent_after) = (indents(before), indents(after));
+    let before_ptr = input.before.as_ptr();
+    let synth: Vec<Token> = (0..input.before.len().max(input.after.len()) as u32)
+        .map(Token)
+        .collect();
+    diff.postprocess_with(
+        &input.before,
+        &input.after,
+        |tokens: &[Token], hunk: std::ops::Range<u32>, earliest_end: u32| {
+            let side = if std::ptr::eq(tokens.as_ptr(), before_ptr) {
+                &indent_before
+            } else {
+                &indent_after
+            };
+            IndentHeuristic::new(|t: Token| side[t.0 as usize]).best_slider_end(
+                &synth[..tokens.len()],
+                hunk,
+                earliest_end,
+            )
+        },
+    );
+    diff
+}
+
 /// The text half of [`analyze`]: intern the two blobs (under the active whitespace
 /// rules), diff them with `algorithm`, and return `(additions, removals, rendered
 /// hunks)`. Shared by the normal `InternalDiff` path and the `-a`/`--text` path that
@@ -3081,15 +4131,10 @@ fn text_analysis(
     input.update_before(before.iter().map(|l| normalize(l, opts.ws)));
     input.update_after(after.iter().map(|l| normalize(l, opts.ws)));
 
-    // `--indent-heuristic` (git's default) runs imara-diff's slider post-processing;
-    // `--no-indent-heuristic` runs the plain one, matching `XDF_INDENT_HEURISTIC` off.
-    let diff = if opts.indent_heuristic {
-        diff_with_slider_heuristics(algorithm, &input)
-    } else {
-        let mut d = gix::diff::blob::Diff::compute(algorithm, &input);
-        d.postprocess_no_heuristic(&input);
-        d
-    };
+    // `--indent-heuristic` (git's default) runs the slider post-processing over the
+    // original records; `--no-indent-heuristic` runs the plain one, matching
+    // `XDF_INDENT_HEURISTIC` off.
+    let diff = compute_compacted(algorithm, &input, &before, &after, opts.indent_heuristic);
     // The change script, in `xdchange_t` shape, with the `ignore` bit that
     // `xdl_mark_ignorable_lines` (`--ignore-blank-lines`) and `xdl_mark_ignorable_regex`
     // (`-I<re>`) set on a change whose every pre- and post-image record is ignorable.
@@ -4001,8 +5046,7 @@ fn pprint_rename(a: &[u8], b: &[u8]) -> Vec<u8> {
 /// that moved from one file to another.
 #[allow(clippy::too_many_arguments)]
 fn render_patch(
-    out: &mut Vec<u8>,
-    files: &mut Vec<diff_color::FilePaint>,
+    sink: &mut PatchSink<'_>,
     repo: &gix::Repository,
     cache: &mut gix::diff::blob::Platform,
     p: &Pair,
@@ -4010,19 +5054,64 @@ fn render_patch(
     base_abbrev: usize,
     ws_rule: u32,
     tc: TextconvRef<'_, '_>,
+    ext: Option<&ExtCtx<'_, '_>>,
+    total: usize,
+    found_changes: &mut bool,
 ) -> std::result::Result<(), ExitCode> {
-    let steps: Vec<Pair> = if p.type_changed() {
+    // `diff_flush_patch()` drops a pair whose two sides are identical in every
+    // respect before `run_diff()` ever sees it.
+    if diff_unmodified_pair(p) {
+        return Ok(());
+    }
+    // `run_diff()` splits a file/symlink type change into a deletion followed by a
+    // creation, but only `if (!pgm)` — with a `GIT_EXTERNAL_DIFF` in play the pair
+    // goes to the driver whole. A driver reached through the path's `diff`
+    // attribute does not suppress the split: `run_diff()` tests the environment
+    // program, and each half re-resolves the attribute afterwards.
+    let split = p.type_changed() && ext.is_none_or(|e| e.env.is_none());
+    let steps: Vec<Pair> = if split {
         vec![as_deletion(p), as_creation(p)]
     } else {
         vec![p.clone()]
     };
     for step in &steps {
+        if let Some(ctx) = ext {
+            let pgm =
+                external_for_path(repo, ctx.drivers, step.old_path.as_bstr(), ctx.env.as_ref())?;
+            if let Some(pgm) = pgm {
+                let run = run_external_diff(
+                    &pgm, repo, ctx, step, opts, base_abbrev, total, true,
+                )?;
+                *found_changes |= run.found_changes;
+                sink.splice(&run.stdout);
+                if let Some(msg) = run.died {
+                    return Err(fatal(&msg));
+                }
+                continue;
+            }
+        }
+        // `builtin_diff()`'s first branch: with `--submodule=log`, a pair whose two
+        // sides are each either absent or a gitlink is rendered from the submodule's
+        // own history instead of as a blob diff, and always counts as a change.
+        if opts.submodule_format == SubmoduleFormat::Log
+            && (step.old_mode == 0 || is_gitlink_mode(step.old_mode))
+            && (step.new_mode == 0 || is_gitlink_mode(step.new_mode))
+        {
+            let mut lines = Vec::new();
+            show_submodule_diff_summary(&mut lines, repo, step, base_abbrev, sink.colors);
+            sink.prefixed(&lines);
+            *found_changes = true;
+            continue;
+        }
         let an = analyze(repo, cache, step, opts, tc)?;
-        let before = out.len();
-        emit_patch(out, repo, step, &an, opts, base_abbrev);
+        let before = sink.plain.len();
+        emit_patch(&mut sink.plain, repo, step, &an, opts, base_abbrev);
         // A pair that renders nothing at all contributes no `diff --git` header, so
         // it must not consume a slot in the per-file state either.
-        if out.len() != before {
+        if sink.plain.len() != before {
+            // Every `builtin_diff()` arm that writes a header also sets
+            // `o->found_changes`, so having written anything is the answer.
+            *found_changes = true;
             // `builtin_diff()` runs `check_blank_at_eof()` on `mf1`/`mf2` — the buffers
             // it just filled — so under `--textconv` the converted text is what decides
             // whether a trailing blank line is newly added.
@@ -4030,13 +5119,72 @@ fn render_patch(
                 Some((o, n)) => (o.as_slice(), n.as_slice()),
                 None => (an.old_data.as_slice(), an.new_data.as_slice()),
             };
-            files.push(diff_color::FilePaint {
+            sink.files.push(diff_color::FilePaint {
                 ws_rule,
                 blank_at_eof: diff_color::check_blank_at_eof(bof_old, bof_new),
             });
         }
     }
+    // `run_diff_cmd()` counts a copy or a rename as a change whatever the bodies did.
+    if matches!(p.kind(), b'C' | b'R') {
+        *found_changes = true;
+    }
     Ok(())
+}
+
+/// `diff_flush_patch_quietly()` (diff.c:6566): render the pair with `o->file` nulled
+/// and report only whether anything was found. Nothing is written, so an external
+/// driver either runs with its stdout on `/dev/null` (when its exit status is
+/// trusted) or is skipped outright.
+#[allow(clippy::too_many_arguments)]
+fn pair_found_changes(
+    repo: &gix::Repository,
+    cache: &mut gix::diff::blob::Platform,
+    p: &Pair,
+    opts: &Opts,
+    base_abbrev: usize,
+    tc: TextconvRef<'_, '_>,
+    ext: Option<&ExtCtx<'_, '_>>,
+    total: usize,
+) -> std::result::Result<bool, ExitCode> {
+    if diff_unmodified_pair(p) {
+        return Ok(false);
+    }
+    let split = p.type_changed() && ext.is_none_or(|e| e.env.is_none());
+    let steps: Vec<Pair> = if split {
+        vec![as_deletion(p), as_creation(p)]
+    } else {
+        vec![p.clone()]
+    };
+    let mut found = matches!(p.kind(), b'C' | b'R');
+    for step in &steps {
+        if let Some(ctx) = ext {
+            let pgm =
+                external_for_path(repo, ctx.drivers, step.old_path.as_bstr(), ctx.env.as_ref())?;
+            if let Some(pgm) = pgm {
+                let run = run_external_diff(
+                    &pgm, repo, ctx, step, opts, base_abbrev, total, false,
+                )?;
+                found |= run.found_changes;
+                if let Some(msg) = run.died {
+                    return Err(fatal(&msg));
+                }
+                continue;
+            }
+        }
+        if opts.submodule_format == SubmoduleFormat::Log
+            && (step.old_mode == 0 || is_gitlink_mode(step.old_mode))
+            && (step.new_mode == 0 || is_gitlink_mode(step.new_mode))
+        {
+            found = true;
+            continue;
+        }
+        let an = analyze(repo, cache, step, opts, tc)?;
+        let mut scratch = Vec::new();
+        emit_patch(&mut scratch, repo, step, &an, opts, base_abbrev);
+        found |= !scratch.is_empty();
+    }
+    Ok(found)
 }
 
 /// Emit a single file section for `p` using its precomputed [`Analysis`].

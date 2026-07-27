@@ -22,7 +22,9 @@
 //! patch and the stat graph are painted from the `color.diff.*` slots, with git's
 //! `ws.c` whitespace-error markup driven by `core.whitespace`),
 //! `--patch-with-raw`, `--patch-with-stat`, `--exit-code`, `--quiet`,
-//! `--minimal`/`--diff-algorithm=<myers|minimal|histogram>`, and
+//! `--minimal`/`--diff-algorithm=<myers|minimal|histogram>`,
+//! `--indent-heuristic`/`--no-indent-heuristic` (with the `diff.indentHeuristic`
+//! default), `-O<file>` (with the `diff.orderFile` default), and
 //! merge-base ranges `<a>...<b>` (diffed as `merge-base(a,b)` against `b`).
 //! Submodule/gitlink (`160000`) changes render as the short-format
 //! `Subproject commit <oid>` diff for tree/tree and `--cached` pairs.
@@ -83,6 +85,7 @@ use gix::hash::ObjectId;
 use gix::objs::tree::EntryKind;
 
 use super::diff_color;
+use super::diff_files;
 use super::diffcore_rename;
 
 // ---------------------------------------------------------------------------
@@ -256,6 +259,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut compact_summary = false;
     let mut diff_filter: Option<Vec<u8>> = None;
     let mut algorithm: Option<gix::diff::blob::Algorithm> = None;
+    // `XDF_INDENT_HEURISTIC`, on unless `diff.indentHeuristic` or
+    // `--no-indent-heuristic` turns it off (`git_diff_basic_config()` sets
+    // `diff_indent_heuristic`, whose default is 1).
+    let mut indent_heuristic = true;
+    // `-O<file>` / `diff.orderFile` (`diffcore_order`): the queue is reordered so the
+    // paths matching an earlier pattern in the file come first.
+    let mut order_file: Option<String> = None;
     // Default resolved from `core.abbrev` after repo discovery (see below);
     // `7` is only a placeholder until then. `--abbrev[=<n>]` overrides explicitly.
     let mut abbrev: usize = 7;
@@ -334,6 +344,17 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         if let Some(name) = snap.string("diff.algorithm") {
             config_algorithm = Some(parse_config_algorithm(name.as_ref())?);
         }
+        // `diff.indentHeuristic` (`git_diff_basic_config()`): the default landing spot
+        // for a slidable hunk. A command-line `--[no-]indent-heuristic` overrides it.
+        if let Some(b) = snap.boolean("diff.indentHeuristic") {
+            indent_heuristic = b;
+        }
+        // `diff.orderFile` (`git_diff_ui_config()`): `diff_setup()` seeds
+        // `options->orderfile` from it before parse-options runs, so a `-O<file>`
+        // on the command line simply overwrites it below.
+        if let Some(p) = snap.string("diff.orderFile") {
+            order_file = Some(p.to_str_lossy().into_owned());
+        }
         // `diff.statNameWidth`/`diff.statGraphWidth` cap the `--stat` name/graph
         // columns (`git_diff_ui_config()` -> `diff_stat_name_width` /
         // `diff_stat_graph_width`). Only a positive limit has any effect in
@@ -393,6 +414,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         return Ok(ExitCode::from(129));
                     }
                 }
+            } else if flag == "-O" {
+                order_file = Some(a.clone());
             } else if let Some(Err(msg)) =
                 move_word.parse_flag(&format!("{flag}={a}"), &mut color_when)
             {
@@ -484,8 +507,16 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // The remaining entries are believed to match zvcs's default behavior, but
             // that has not been measured flag by flag — treat them as unverified.
             "--ignore-blank-lines" | "--ignore-cr-at-eol" | "--text" | "-a"
-            | "--indent-heuristic" | "--no-ext-diff" | "--ext-diff" | "--textconv"
+            | "--no-ext-diff" | "--ext-diff" | "--textconv"
             | "--no-textconv" | "--ita-invisible-in-index" | "--ita-visible-in-index" => {}
+            // `XDF_INDENT_HEURISTIC` (`OPT_BIT` on `xdl_opts`): where a hunk that can
+            // slide freely finally lands.
+            "--indent-heuristic" => indent_heuristic = true,
+            "--no-indent-heuristic" => indent_heuristic = false,
+            // `-O<file>` (`OPT_FILENAME('O', ...)`): the value may be glued on or be
+            // the next argument, and the last one on the line wins.
+            "-O" => pending_value = Some(a.to_string()),
+            s if s.starts_with("-O") => order_file = Some(s["-O".len()..].to_owned()),
             // `--color[=<when>]` / `--no-color` (`OPT_COLOR_FLAG`).
             "--color" => color_when = Some(diff_color::ColorWhen::Always),
             "--no-color" => color_when = Some(diff_color::ColorWhen::Never),
@@ -878,6 +909,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
 
     deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
 
+    // `-O<file>` / `diff.orderFile` (`diffcore_order`): stably reorder the queue so
+    // pairs whose path matches an earlier pattern in the order file come first. git
+    // runs it last in `diffcore_std()`, after rename detection and `--diff-filter`.
+    if let Some(of) = &order_file {
+        let order = diff_files::read_order_file(of);
+        deltas.sort_by_cached_key(|d| diff_files::match_order(&order, d.path.as_slice()));
+    }
+
     // ---- analyze every delta once -----------------------------------------
     // `--quiet`/`-s` produce no output, so the patch bodies are never needed.
     let workdir = repo.workdir().map(|p| p.to_owned());
@@ -896,6 +935,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             &deltas,
             ctx,
             ws,
+            indent_heuristic,
             hash_kind,
             workdir.as_deref(),
             want_patch,
@@ -1997,6 +2037,7 @@ fn commit_patch_with(
             delta,
             ctx,
             Whitespace::Keep,
+            true,
             hash_kind,
             None,
             true,
@@ -2041,6 +2082,7 @@ pub(crate) fn line_range_patch(
             &delta,
             ctx,
             Whitespace::Keep,
+            true,
             hash_kind,
             None,
             true,
@@ -2091,6 +2133,7 @@ fn analyze_all(
     deltas: &[Delta],
     ctx: u32,
     ws: Whitespace,
+    indent_heuristic: bool,
     hash_kind: gix::hash::Kind,
     workdir: Option<&std::path::Path>,
     want_patch: bool,
@@ -2112,6 +2155,7 @@ fn analyze_all(
                     d,
                     ctx,
                     ws,
+                    indent_heuristic,
                     hash_kind,
                     workdir,
                     want_patch,
@@ -2152,6 +2196,7 @@ fn analyze_all(
                         delta,
                         ctx,
                         ws,
+                        indent_heuristic,
                         hash_kind,
                         workdir,
                         want_patch,
@@ -2190,6 +2235,8 @@ fn analyze(
     delta: &Delta,
     ctx: u32,
     ws: Whitespace,
+    // `XDF_INDENT_HEURISTIC`: run the slider post-processing pass.
+    indent_heuristic: bool,
     hash_kind: gix::hash::Kind,
     workdir: Option<&std::path::Path>,
     want_patch: bool,
@@ -2311,7 +2358,10 @@ fn analyze(
             input.update_before(before.iter().map(|l| normalize(l, ws)));
             input.update_after(after.iter().map(|l| normalize(l, ws)));
 
-            let diff = diff_with_slider_heuristics(algorithm, &input);
+            // `xdl_change_compact()` measures `xdf->recs[i]->ptr`, the *original*
+            // record, not the whitespace-normalized token the comparison used.
+            let diff =
+                super::diff_pairs::compute_compacted(algorithm, &input, &before, &after, indent_heuristic);
             let added = diff.count_additions();
             let deleted = diff.count_removals();
             let hunks = if want_patch && (added != 0 || deleted != 0) {
@@ -3980,7 +4030,7 @@ pub(crate) fn def_ff(rec: &[u8], sz: usize) -> Option<&[u8]> {
 const FUNC_LINE_MAX: usize = 80;
 /// git formats a hunk header into a 128-byte buffer and clips the heading to
 /// whatever is left in it, so a long line number range shortens the heading.
-const HUNK_HDR_MAX: usize = 128;
+pub(crate) const HUNK_HDR_MAX: usize = 128;
 
 /// git's `get_func_line`: walk the pre-image from `start` toward `limit`
 /// looking for a line that reads as a section heading. The direction follows
@@ -4038,8 +4088,13 @@ impl ConsumeHunk for PatchSink<'_> {
         let mut ai = header.after_hunk_start.saturating_sub(1) as usize;
         for (kind, fallback) in lines {
             let (marker, content): (u8, &[u8]) = match kind {
+                // `xdl_emit_diff()` emits every context record from `xe->xdf2`, the
+                // *post-image* — all three context loops (pre, inter-change and post)
+                // call `xdl_emit_record(&xe->xdf2, s2, " ", ecb)`. It only matters when
+                // the two sides hold different bytes for a record the comparison called
+                // equal, which is exactly what `-w`/`-b`/`--ignore-space-at-eol` do.
                 DiffLineKind::Context => {
-                    let c = self.before.get(bi).copied().unwrap_or(*fallback);
+                    let c = self.after.get(ai).copied().unwrap_or(*fallback);
                     bi += 1;
                     ai += 1;
                     (b' ', c)

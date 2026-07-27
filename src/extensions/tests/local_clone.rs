@@ -84,6 +84,80 @@ fn clone_and_fetch_from_local_remote() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Three shapes that only show up once a remote is actually talked to, all pinned against stock
+/// git 2.55.0's behaviour:
+///
+/// * `refs/remotes/origin/HEAD` is written by `update_remote_refs()` with `refs_update_symref()`, so
+///   it is a *symbolic* ref to the tracking branch. Written as a copy of the object id instead, a
+///   clone's `origin/HEAD` would stay pinned to the commit it was cloned at forever.
+/// * `get_fetch_map()` dies with `couldn't find remote ref <src>` (exit 128) when an exact refspec
+///   names a ref the remote does not have — not a refspec-matching summary at the end.
+/// * `<repository>` may be a plain path with no `remote.<name>` section behind it, in which case the
+///   pull integrates `FETCH_HEAD`; there is no `refs/remotes/<path>/<branch>` to look for.
+#[test]
+fn remote_head_is_symbolic_and_url_remotes_work() {
+    let root = std::env::temp_dir().join(format!("zvcs-remotehead-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    let bindir = root.join("bin");
+    let src = root.join("src");
+    let dst = root.join("dst");
+    for d in [&home, &bindir, &src] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    for name in ["git", "git-upload-pack", "git-receive-pack"] {
+        std::os::unix::fs::symlink(BIN, bindir.join(name)).unwrap();
+    }
+
+    run(&src, &home, &bindir, &["init", "-q", "-b", "main"]);
+    run(&src, &home, &bindir, &["config", "user.email", "t@e.co"]);
+    run(&src, &home, &bindir, &["config", "user.name", "t"]);
+    for m in ["c0", "c1"] {
+        std::fs::write(src.join("f"), format!("{m}\n")).unwrap();
+        run(&src, &home, &bindir, &["add", "f"]);
+        run(&src, &home, &bindir, &["commit", "-q", "-m", m]);
+    }
+
+    let out = run(&root, &home, &bindir, &["clone", "-q", src.to_str().unwrap(), dst.to_str().unwrap()]);
+    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout(&dst, &home, &bindir, &["symbolic-ref", "refs/remotes/origin/HEAD"]),
+        "refs/remotes/origin/main",
+        "clone must write refs/remotes/origin/HEAD as a symref, not as the object it resolved to"
+    );
+
+    let missing = run(&dst, &home, &bindir, &["fetch", "origin", "no-such-branch"]);
+    assert_eq!(missing.status.code(), Some(128), "a missing exact refspec is a fatal, not a rejection");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("fatal: couldn't find remote ref no-such-branch"),
+        "unexpected diagnostic: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+
+    // Rewind the clone, then pull the upstream back in by *path* — no remote name involved.
+    std::fs::write(src.join("f"), "c2\n").unwrap();
+    run(&src, &home, &bindir, &["add", "f"]);
+    run(&src, &home, &bindir, &["commit", "-q", "-m", "c2"]);
+    let src_head = stdout(&src, &home, &bindir, &["rev-parse", "HEAD"]);
+    run(&dst, &home, &bindir, &["reset", "-q", "--hard", "HEAD~1"]);
+    run(&dst, &home, &bindir, &["config", "user.email", "t@e.co"]);
+    run(&dst, &home, &bindir, &["config", "user.name", "t"]);
+
+    let pull = run(&dst, &home, &bindir, &["pull", src.to_str().unwrap(), "main"]);
+    assert!(
+        pull.status.success(),
+        "pull from a URL failed: {}",
+        String::from_utf8_lossy(&pull.stderr)
+    );
+    assert_eq!(
+        stdout(&dst, &home, &bindir, &["rev-parse", "HEAD"]),
+        src_head,
+        "pull <path> <branch> must fast-forward to the fetched tip"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn exec_path_reports_the_shadow_bindir() {
     let home = std::env::temp_dir().join(format!("zvcs-execpath-{}", std::process::id()));

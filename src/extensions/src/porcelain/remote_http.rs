@@ -52,13 +52,29 @@
 //!     updates refs as part of `receive()`; there is no oid-list entry point,
 //!     and none of the `option depth` / `deepen-*` / `filter` state this loop
 //!     records can be handed to it.
+//!   * **`get <url> <path>`** — `parse_get()` plus `http.c`'s
+//!     `http_get_file()`, which is what `git clone --bundle-uri=https://…`
+//!     routes its download through. The argument splits on the *first* space
+//!     and a missing space is
+//!     `fatal: protocol error: expected '<url> <path>', missing space`; the
+//!     body lands in `<path>.temp` opened for append, so an interrupted
+//!     download resumes with a `Range: bytes=<len>-` request exactly as
+//!     `http_opt_request_remainder()` sets `CURLOPT_RANGE`; on success the
+//!     temporary is renamed over `<path>` (`finalize_object_file()`), and the
+//!     response block is the single empty line git prints. A failed download
+//!     is `fatal: failed to download file at URL '<url>'` with exit 128, and an
+//!     unopenable temporary prints `error: Unable to open local file <path>`.
+//!     The whole `http.*` family applies, because the request is issued through
+//!     the same `reqwest` client the smart transport uses, configured from
+//!     `Repository::transport_options()`.
+//!
+//! Not ported — these bail rather than fabricating a response the caller would
+//! act on:
+//!
 //!   * **`stateless-connect`** — requires proxying raw pkt-lines between stdin
 //!     and stdout across a series of HTTP POSTs. `gix-transport`'s HTTP client
 //!     exposes a typed `RequestWriter`/`ExtendedBufRead` request-response pair,
 //!     not a duplex byte channel that can be bridged to the process's stdio.
-//!   * **`get <url> <path>`** — a plain authenticated HTTP download to a file
-//!     (used for bundle-uri). `gix-transport`'s HTTP layer is private to the
-//!     git services and exposes no general GET-to-file API.
 //!
 //! (`check-connectivity` and `object-format` are advertised capabilities, not
 //! commands — they announce that `option check-connectivity` / `option
@@ -73,11 +89,13 @@
 //! `reqwest` error text where libcurl's would be.
 
 use anyhow::{bail, Result};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, ByteSlice};
 use gix::protocol::handshake::Ref;
+use gix::protocol::transport::client::blocking_io::http::{reqwest::Remote, Http};
 
 /// `error()`'s prefix plus remote-curl's own tag, used on both failure paths.
 const USAGE: &str = "error: remote-curl: usage: git remote-curl <remote> [<url>]";
@@ -183,11 +201,10 @@ pub fn remote_http(args: &[String]) -> Result<ExitCode> {
                  POSTs; gix-transport's HTTP client is a typed request/response pair, not a duplex \
                  byte channel"
             );
-        } else if strip_prefix(&line, b"get ").is_some() {
-            bail!(
-                "'get' needs an authenticated HTTP download to a file; gix-transport's HTTP layer \
-                 is private to the git services and exposes no general GET API"
-            );
+        } else if let Some(arg) = strip_prefix(&line, b"get ") {
+            if let Some(code) = parse_get(arg)? {
+                return Ok(code);
+            }
         } else {
             // `error("remote-curl: unknown command '%s' from git", buf.buf)`.
             eprintln!("error: remote-curl: unknown command '{cmd}' from git");
@@ -200,6 +217,104 @@ pub fn remote_http(args: &[String]) -> Result<ExitCode> {
 /// with at least one character of scheme before it.
 fn has_scheme(url: &str) -> bool {
     matches!(url.find("://"), Some(at) if at > 0)
+}
+
+/// `parse_get()`: split `<url> <path>` on the first space, download, then print
+/// the empty line that terminates the command's response block.
+///
+/// Returns `Some(code)` for git's two `die()` paths and `None` to keep the
+/// command loop running, matching how `list` reports its outcome.
+pub(super) fn parse_get(arg: &BStr) -> Result<Option<ExitCode>> {
+    // `space = strchr(arg, ' '); if (!space) die(...)`.
+    let Some(space) = arg.find_byte(b' ') else {
+        eprintln!("fatal: protocol error: expected '<url> <path>', missing space");
+        return Ok(Some(ExitCode::from(128)));
+    };
+    let (url, path) = (&arg[..space], &arg[space + 1..]);
+
+    // Both halves reach libcurl and the filesystem as C strings; a non-UTF-8
+    // spelling has no path through `reqwest`'s `Url` or `Path` on any platform
+    // this builds for, and git's own failure for an unusable URL is the same
+    // `die()` below.
+    let (Ok(url), Ok(path)) = (url.to_str(), path.to_str()) else {
+        eprintln!("fatal: failed to download file at URL '{}'", url.to_str_lossy());
+        return Ok(Some(ExitCode::from(128)));
+    };
+
+    if http_get_file(url, Path::new(path)).is_err() {
+        eprintln!("fatal: failed to download file at URL '{url}'");
+        return Ok(Some(ExitCode::from(128)));
+    }
+
+    println!();
+    std::io::stdout().flush()?;
+    Ok(None)
+}
+
+/// `http.c`'s `http_get_file()`: download `url` into `filename` by way of a
+/// `<filename>.temp` staging file that a later run can resume from.
+///
+/// The request is issued through the same `reqwest` client the smart transport
+/// uses, configured from the repository's `http.*` settings, so proxy, TLS,
+/// timeout, redirect and extra-header configuration all apply here as they do
+/// to a fetch. Outside a repository the client keeps its defaults, which is the
+/// closest reachable analogue of git reading only its system/global config.
+///
+/// Server authentication is the one part of `http_request_recoverable()` that
+/// is not reproduced: a `401` fails the download instead of consulting the
+/// credential helper and retrying. The credential plumbing lives on
+/// `gix-transport`'s service-level `Transport`, not on the raw client this
+/// needs, so a bundle URI behind HTTP auth is out of reach here.
+fn http_get_file(url: &str, filename: &Path) -> Result<(), ()> {
+    // `strbuf_addf(&tmpfile, "%s.temp", filename)`.
+    let mut tmpfile = PathBuf::from(filename).into_os_string();
+    tmpfile.push(".temp");
+    let tmpfile = PathBuf::from(tmpfile);
+
+    // `fopen(tmpfile.buf, "a")`: append, creating on demand.
+    let mut file = match std::fs::OpenOptions::new().append(true).create(true).open(&tmpfile) {
+        Ok(file) => file,
+        Err(_) => {
+            eprintln!("error: Unable to open local file {}", tmpfile.display());
+            return Err(());
+        }
+    };
+
+    // `off_t posn = ftello(result)` — a file opened for append starts at its end,
+    // so a leftover temporary from an interrupted download is resumed rather than
+    // restarted.
+    let posn = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+    let mut http = Remote::default();
+    if let Ok(repo) = gix::discover(".") {
+        if let Ok(Some(options)) = repo.transport_options(url, None) {
+            http.configure(&*options).ok();
+        }
+    }
+
+    // `http_opt_request_remainder()` sets `CURLOPT_RANGE` to `<posn>-`, which
+    // curl sends as a byte range.
+    let mut headers: Vec<String> = Vec::new();
+    if posn > 0 {
+        headers.push(format!("Range: bytes={posn}-"));
+    }
+
+    // The base URL is the request URL itself: there is no service tail to swap
+    // out when a redirect moves the request, unlike the smart transport's
+    // `info/refs?service=…`.
+    let mut response = http.get(url, url, headers.iter().map(String::as_str)).map_err(|_| ())?;
+
+    // The headers must be drained before the body: the backend writes them into a
+    // zero-capacity pipe and reports a non-success status as an error on it.
+    let mut header_block = Vec::new();
+    response.headers.read_to_end(&mut header_block).map_err(|_| ())?;
+
+    std::io::copy(&mut response.body, &mut file).map_err(|_| ())?;
+    drop(file);
+
+    // `finalize_object_file()`, whose reachable effect here is moving the
+    // completed temporary into place.
+    std::fs::rename(&tmpfile, filename).map_err(|_| ())
 }
 
 /// `skip_prefix()` on a byte line.

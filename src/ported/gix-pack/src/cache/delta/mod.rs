@@ -23,3 +23,4 @@ pub mod from_offsets;
 mod tree;
 
 pub use tree::{Item, Tree};
+pub(crate) use tree::REF_DELTA_BASE_UNKNOWN;

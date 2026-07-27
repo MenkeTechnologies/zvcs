@@ -37,6 +37,7 @@ pub(crate) mod function {
                         options.version,
                         options.trace,
                         options.upload_pack,
+                        options.receive_pack,
                     )
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
                 )
@@ -51,6 +52,7 @@ pub(crate) mod function {
                     ssh,
                     options.trace,
                     options.upload_pack,
+                    options.receive_pack,
                 )
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
             }),

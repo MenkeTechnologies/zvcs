@@ -554,7 +554,7 @@ fn format_id(repo: &gix::Repository, id: ObjectId, abbrev: Abbrev, hexsz: usize)
 
 /// `pp_commit_easy(CMIT_FMT_ONELINE, ...)`: the first paragraph of the message
 /// joined into one line with spaces, then right-trimmed.
-fn subject_of(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>> {
+pub(crate) fn subject_of(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>> {
     let commit = repo.find_commit(id)?;
     let message = commit.message_raw()?.to_vec();
     let mut subject = format_subject(skip_blank_lines(&message));

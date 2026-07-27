@@ -353,6 +353,10 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     let mut root = false;
     let mut reschedule_failed_exec: i32 = -1;
     let mut reapply_cherry_picks: i32 = -1;
+    // `opts.allow_rerere_auto` — `RERERE_AUTOUPDATE` / `RERERE_NOAUTOUPDATE` /
+    // unset, which `repo_rerere()` maps to "stage the replay" / "leave it in the
+    // worktree" / "ask `rerere.autoupdate`".
+    let mut rerere_autoupdate: Option<bool> = None;
     // `options.gpg_sign_opt` — set by `-S`/`--gpg-sign[=<key-id>]`, cleared by
     // `--no-gpg-sign`, and seeded from `commit.gpgSign` below.
     let mut gpg_sign: i32 = -1;
@@ -599,16 +603,12 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                     noarg!();
                     preserve_merges = true;
                 }
+                // `OPT_RERERE_AUTOUPDATE(&opts.allow_rerere_auto)`: the flag
+                // `do_pick_commit()` hands to `repo_rerere(r,
+                // opts->allow_rerere_auto)` when a pick conflicts.
                 "rerere-autoupdate" => {
                     noarg!();
-                    // Parsed, and deliberately without effect: it selects
-                    // between `rerere` and `rerere --no-autoupdate` at the
-                    // `repo_rerere(r, opts->allow_rerere_auto)` call
-                    // `do_pick_commit()` makes when a pick conflicts, and the
-                    // sequencer here does not run rerere at that point at all.
-                    // Wiring the flag before the call site exists would be a
-                    // switch over a thing that never happens; the missing piece
-                    // is the rerere call, tracked with `porcelain::rerere`.
+                    rerere_autoupdate = Some(!unset);
                 }
                 "empty" => {
                     let v = value!();
@@ -1507,6 +1507,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 quiet: flags & NO_QUIET == 0,
                 verbose: flags & VERBOSE != 0,
                 reschedule_failed_exec: reschedule,
+                rerere_autoupdate,
             },
             onto_spec: &onto_spec,
             upstream: upstream_oid,
@@ -1967,6 +1968,12 @@ struct RebaseState {
     /// that exits non-zero is put back at the head of the todo list instead of
     /// being consumed, so `--continue` retries it.
     reschedule_failed_exec: bool,
+    /// `opts.allow_rerere_auto` — what [`Sequencer::stop_for_conflict`] passes to
+    /// `repo_rerere()`. `Some(true)` stages a replayed resolution, `Some(false)`
+    /// leaves it unstaged, `None` defers to `rerere.autoupdate`. git records it
+    /// as the one-liner `$state_dir/allow_rerere_autoupdate`, holding the flag
+    /// as spelled, and writes no file at all when it was never given.
+    rerere_autoupdate: Option<bool>,
 }
 
 fn rebase_merge_dir(repo: &gix::Repository) -> std::path::PathBuf {
@@ -1997,6 +2004,19 @@ fn write_basic_state(repo: &gix::Repository, st: &RebaseState) -> Result<()> {
     marker(&dir, "verbose", st.verbose)?;
     marker(&dir, "reschedule-failed-exec", st.reschedule_failed_exec)?;
     marker(&dir, "no-reschedule-failed-exec", !st.reschedule_failed_exec)?;
+    match st.rerere_autoupdate {
+        Some(true) => std::fs::write(
+            dir.join("allow_rerere_autoupdate"),
+            b"--rerere-autoupdate\n",
+        )?,
+        Some(false) => std::fs::write(
+            dir.join("allow_rerere_autoupdate"),
+            b"--no-rerere-autoupdate\n",
+        )?,
+        None => {
+            let _ = std::fs::remove_file(dir.join("allow_rerere_autoupdate"));
+        }
+    }
     Ok(())
 }
 
@@ -2030,6 +2050,13 @@ fn read_basic_state(repo: &gix::Repository) -> Result<RebaseState> {
         quiet: dir.join("quiet").exists(),
         verbose: dir.join("verbose").exists(),
         reschedule_failed_exec: dir.join("reschedule-failed-exec").exists(),
+        // `read_oneliner(…, READ_ONELINER_SKIP_IF_EMPTY)` followed by an exact
+        // match on the flag as spelled: anything else leaves the option unset.
+        rerere_autoupdate: match read("allow_rerere_autoupdate").as_deref() {
+            Ok("--rerere-autoupdate") => Some(true),
+            Ok("--no-rerere-autoupdate") => Some(false),
+            _ => None,
+        },
     })
 }
 
@@ -3307,6 +3334,14 @@ impl<'r> Sequencer<'r> {
                 "To abort and get back to the state before \"git rebase\", run \"git rebase --abort\".",
             ),
         );
+        // `repo_rerere(r, opts->allow_rerere_auto)` — `do_pick_commit()` runs it
+        // between `print_advice()` and the `error_with_patch()` line below, so a
+        // conflict a previous run already resolved is replayed into the worktree
+        // (and staged under `--rerere-autoupdate`/`rerere.autoupdate`) and a new
+        // one has its preimage recorded. The index is on disk by now — the pick
+        // wrote it before reaching here — and rerere reopens it, so a staged
+        // replay lands in the file `--continue` will read.
+        super::rerere::repo_rerere(self.repo, self.st.rerere_autoupdate)?;
         // `error_with_patch()` reports the *todo line's* argument, not the
         // commit's subject: with `rebase.instructionFormat` in play the two
         // differ, and this is the one that shows what the sheet said.

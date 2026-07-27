@@ -8,6 +8,7 @@ Cargo.toml	upstream	modified	af703a238ed9f159d5c41e2bd5e86e0cc2031cf0	git cat-fi
 Cargo.toml.orig	generated	generated	-	-
 LICENSE	upstream	unchanged	16fe87b06e802f094b3fbb0894b137bca2b16ef1	git cat-file -p 32d1e45d3df061e6ccba6db7fdce92db29e345d8:LICENSE
 README.md	upstream	modified	b1e722e2d0731797b708b56369ed8f1fbd742f09	git cat-file -p 32d1e45d3df061e6ccba6db7fdce92db29e345d8:README.md
+src/compact.rs	local-only	local-only	-	-
 src/histogram.rs	upstream	modified	ff2cb0e341d18c28931e01fba01674f071827f2b	git cat-file -p 32d1e45d3df061e6ccba6db7fdce92db29e345d8:src/histogram.rs
 src/histogram/lcs.rs	upstream	modified	5a86e13fa324a589d9bc4ffb8ac38824a619ed18	git cat-file -p 32d1e45d3df061e6ccba6db7fdce92db29e345d8:src/histogram/lcs.rs
 src/histogram/list_pool.rs	upstream	modified	0f014216ac53750764a816b39929b892aa75097f	git cat-file -p 32d1e45d3df061e6ccba6db7fdce92db29e345d8:src/histogram/list_pool.rs

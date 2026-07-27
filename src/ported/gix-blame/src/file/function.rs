@@ -9,7 +9,9 @@ use gix_object::{
 use gix_traverse::commit::find as find_commit;
 use smallvec::SmallVec;
 
-use super::{Change, UnblamedHunk, compact, copied, moved, process_changes, process_ignored_changes};
+use gix_diff::blob::compact;
+
+use super::{Change, UnblamedHunk, copied, moved, process_changes, process_ignored_changes};
 use crate::{
     BlameEntry, Error, Options, Outcome, Statistics,
     types::{BlamePathEntry, PathTable, Suspect},

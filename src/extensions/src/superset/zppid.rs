@@ -20,6 +20,7 @@
 //! a no-op `commit` (nothing staged) or a rejected merge counts nothing.
 
 use anyhow::Result;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 /// Verbs that can add a commit to the current branch. A successful invocation of
@@ -69,14 +70,24 @@ fn proc_row(pid: i64) -> Option<(i64, String, bool)> {
     Some((ppid, argv0, is_wrapper))
 }
 
+/// Linux: just the parent pid, no argv. `/proc/<pid>/stat` field 4, scanned past
+/// the comm field's closing `)` because comm may itself contain spaces and
+/// parentheses.
+///
+/// Split out from [`proc_parent_and_argv`] because the ancestry walk — which runs
+/// on every daemon-backed lock acquisition — never looks at argv, and reading it
+/// costs a second file (a 4 KiB `sysctl` buffer on macOS) per hop.
+#[cfg(target_os = "linux")]
+fn proc_ppid(pid: i64) -> Option<i64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// Parent pid and argv of `pid` through the platform's process-info syscall.
 #[cfg(target_os = "linux")]
 fn proc_parent_and_argv(pid: i64) -> Option<(i64, Vec<String>)> {
-    // `/proc/<pid>/stat`: field 4 is the ppid, but the comm field (2) may itself
-    // contain spaces and parentheses, so the scan starts after its closing `)`.
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = &stat[stat.rfind(')')? + 1..];
-    let ppid: i64 = rest.split_whitespace().nth(1)?.parse().ok()?;
+    let ppid = proc_ppid(pid)?;
     // `/proc/<pid>/cmdline` is NUL-separated argv.
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
     let argv: Vec<String> = raw
@@ -87,16 +98,28 @@ fn proc_parent_and_argv(pid: i64) -> Option<(i64, Vec<String>)> {
     Some((ppid, argv))
 }
 
-/// macOS/BSD: `sysctl(KERN_PROC_PID)` for the parent, `KERN_PROCARGS2` for argv.
-/// Both are plain syscalls; neither allocates a process.
+/// macOS/BSD: `proc_pidinfo` for the parent, `KERN_PROCARGS2` for argv. Both are
+/// plain syscalls; neither allocates a process.
 #[cfg(not(target_os = "linux"))]
 fn proc_parent_and_argv(pid: i64) -> Option<(i64, Vec<String>)> {
+    Some((proc_ppid(pid)?, proc_argv(pid)))
+}
+
+/// macOS/BSD: just the parent pid, no argv.
+#[cfg(not(target_os = "linux"))]
+fn proc_ppid(pid: i64) -> Option<i64> {
     // `proc_pidinfo(PROC_PIDTBSDINFO)` carries the parent pid at a fixed offset
-    // in `proc_bsdinfo` (pbi_ppid, the 4th u32). Read as raw bytes rather than
-    // transcribing the whole struct — libc does not export it on this target,
-    // and the offset is part of the stable ABI `lsof` itself relies on.
+    // in `proc_bsdinfo`. Read as raw bytes rather than transcribing the whole
+    // struct — libc does not export it on this target, and the offset is part of
+    // the stable ABI `lsof` itself relies on.
+    //
+    // `pbi_ppid` is the FIFTH u32, at byte 16: the struct opens
+    // `pbi_flags`(0), `pbi_status`(4), `pbi_xstatus`(8), `pbi_pid`(12),
+    // `pbi_ppid`(16). Byte 12 — which this read for a while — is the process's
+    // OWN pid, so every ancestry walk terminated instantly on `ppid == pid` and
+    // silently reported no ancestors at all.
     const PROC_PIDTBSDINFO: libc::c_int = 3;
-    const PBI_PPID_OFFSET: usize = 12;
+    const PBI_PPID_OFFSET: usize = 16;
     unsafe extern "C" {
         fn proc_pidinfo(
             pid: libc::c_int,
@@ -119,13 +142,12 @@ fn proc_parent_and_argv(pid: i64) -> Option<(i64, Vec<String>)> {
     if rc <= 0 {
         return None;
     }
-    let ppid = u32::from_ne_bytes([
+    Some(u32::from_ne_bytes([
         buf[PBI_PPID_OFFSET],
         buf[PBI_PPID_OFFSET + 1],
         buf[PBI_PPID_OFFSET + 2],
         buf[PBI_PPID_OFFSET + 3],
-    ]) as i64;
-    Some((ppid, proc_argv(pid)))
+    ]) as i64)
 }
 
 /// argv of `pid` via `sysctl(KERN_PROCARGS2)`, whose buffer is
@@ -330,6 +352,129 @@ pub fn is_alive(pid: i64) -> bool {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// How far up the process tree the ancestry probes walk before giving up. Deep
+/// enough for `clone → submodule update → submodule update → apply` plus the
+/// shells in between, shallow enough that a cycle in a corrupt process table
+/// cannot spin.
+const MAX_ANCESTOR_HOPS: usize = 64;
+
+/// The current process's ancestor pids, nearest first. Stops at pid 1 / an
+/// unreadable process, so the list is only ever as long as the platform will
+/// actually report.
+fn ancestry() -> Vec<i64> {
+    let mut out = Vec::new();
+    let mut pid = std::process::id() as i64;
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        let Some(ppid) = proc_ppid(pid) else {
+            break;
+        };
+        // pid 1 is launchd/init — an ancestor of everything and never informative.
+        if ppid <= 1 || ppid == pid {
+            break;
+        }
+        out.push(ppid);
+        pid = ppid;
+    }
+    out
+}
+
+
+/// The on-disk executable a process is running, or `None` if it cannot be read.
+///
+/// Deliberately NOT argv[0]: argv is what the parent chose to pass and, on this
+/// platform, `sysctl(KERN_PROCARGS2)` returns nothing at all for processes other
+/// than the caller — so identifying an ancestor by its argv silently identified
+/// nothing. The executable path comes from a different syscall that does answer
+/// for same-uid processes, and cannot be spoofed by an odd argv[0].
+fn proc_exe_path(pid: i64) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
+        unsafe extern "C" {
+            fn proc_pidpath(pid: libc::c_int, buffer: *mut libc::c_void, buffersize: u32) -> libc::c_int;
+        }
+        let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
+        let n = unsafe {
+            proc_pidpath(
+                pid as libc::c_int,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                PROC_PIDPATHINFO_MAXSIZE as u32,
+            )
+        };
+        if n <= 0 {
+            return None;
+        }
+        buf.truncate(n as usize);
+        Some(PathBuf::from(String::from_utf8_lossy(&buf).into_owned()))
+    }
+}
+
+/// Whether `pid` is a STRICT ancestor of this process (parent, grandparent, …).
+///
+/// This is what makes the repo lane reentrant across a process boundary. A `git`
+/// child spawned by a `git` parent that already holds the lane must recognize the
+/// holder as its own ancestor: the ancestor is blocked waiting on this child, so
+/// it cannot release, and treating the lane as free for the duration of the child
+/// is exactly the mutual exclusion the ancestor already established.
+///
+/// The current process is deliberately NOT a match — a second thread of this same
+/// process holding the lane must still serialize through the daemon, which is what
+/// [`crate::lock`]'s thread-local reentrancy set already governs.
+///
+/// Pid reuse cannot produce a false positive here: the walk only ever compares
+/// against pids that are live ancestors *right now*, resolved from the platform's
+/// own process table rather than from anything the holder told us.
+pub fn is_ancestor(pid: i64) -> bool {
+    pid > 1 && ancestry().contains(&pid)
+}
+
+/// Whether this process was spawned (directly or through intermediate shells) by
+/// another `git`/`zvcs` process — `Some(true)`/`Some(false)` — or `None` when the
+/// platform would not report our own ancestry at all.
+///
+/// A synchronous child of a `git` parent must never be turned into a background
+/// job: the parent is waiting for the child's EFFECT, and a queued job returns
+/// exit 0 having done nothing, so the parent reports success on work that never
+/// happened. Callers treat `None` the same as `Some(true)` — blocking on a lane is
+/// never a wrong answer, whereas queueing can be.
+pub fn git_ancestor() -> Option<bool> {
+    let chain = ancestry();
+    if chain.is_empty() {
+        return None; // ancestry unavailable — caller must assume the unsafe case
+    }
+    let self_exe = std::env::current_exe().ok();
+    let mut any_readable = false;
+    let mut found = false;
+    for pid in chain {
+        let Some(exe) = proc_exe_path(pid) else {
+            continue; // a process we may not inspect; keep walking
+        };
+        any_readable = true;
+        if Some(&exe) == self_exe.as_ref() {
+            found = true;
+            break;
+        }
+        if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
+            // `git` covers the shadow binary under its install name and stock git
+            // alike — a stock-git parent waiting on a zvcs child is the same hazard.
+            if name == "git" || name == "zvcs" {
+                found = true;
+                break;
+            }
+        }
+    }
+    // Not one ancestor's executable was readable: we learned nothing, and
+    // "learned nothing" must not read as "safe to defer".
+    if !any_readable {
+        return None;
+    }
+    Some(found)
 }
 
 /// Replace a leading `$HOME` with `~` for compact display.

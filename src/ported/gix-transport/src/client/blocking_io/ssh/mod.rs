@@ -116,12 +116,14 @@ pub fn connect(
     options: connect::Options,
     trace: bool,
 ) -> Result<SpawnProcessOnDemand, Error> {
-    connect_with_program(url, desired_version, options, trace, None)
+    connect_with_program(url, desired_version, options, trace, None, None)
 }
 
-/// Like [`connect()`], but run `upload_pack` instead of `git-upload-pack` on the remote.
+/// Like [`connect()`], but run `upload_pack`/`receive_pack` instead of `git-upload-pack`/
+/// `git-receive-pack` on the remote.
 ///
-/// This is git's `--upload-pack <path>` and `remote.<name>.uploadpack`.
+/// These are git's `--upload-pack <path>` / `remote.<name>.uploadpack` and `--receive-pack <path>`
+/// (a.k.a. `--exec`) / `remote.<name>.receivepack`.
 #[expect(
     clippy::result_large_err,
     reason = "will be removed once `gix-error` is used consistently"
@@ -132,6 +134,7 @@ pub fn connect_with_program(
     options: connect::Options,
     trace: bool,
     upload_pack: Option<bstr::BString>,
+    receive_pack: Option<bstr::BString>,
 ) -> Result<SpawnProcessOnDemand, Error> {
     if url.scheme != gix_url::Scheme::Ssh || url.host().is_none() {
         return Err(Error::UnsupportedScheme(url));
@@ -148,6 +151,7 @@ pub fn connect_with_program(
         desired_version,
         trace,
         upload_pack,
+        receive_pack,
         options.address_family,
     ))
 }

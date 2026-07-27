@@ -61,6 +61,13 @@ pub struct Options {
     /// Only `file://`/local and `ssh://` transports spawn the service themselves and can honour it, which is
     /// exactly where git applies it too.
     pub upload_pack: Option<crate::bstr::BString>,
+    /// The program to run in place of `git-receive-pack` on the other end, from git's
+    /// `--receive-pack <path>` (a.k.a. `--exec`) or `remote.<name>.receivepack`.
+    ///
+    /// git keeps the two directions apart and passes `git_connect()` whichever matches the one being
+    /// connected (`connect_setup()`, transport.c:310-317). As with `upload_pack`, only `file://`/local
+    /// and `ssh://` spawn the service themselves and can honour it.
+    pub receive_pack: Option<crate::bstr::BString>,
     /// Restrict the connection to one IP address family, from git's `--ipv4`/`--ipv6`.
     ///
     /// This is git's `transport_family`: it narrows address resolution for `git://` and `http(s)://`
@@ -129,6 +136,7 @@ impl<'repo> Remote<'repo> {
                     .unwrap_or_default(),
                 trace: self.repo.config.trace_packet(),
                 upload_pack: options.upload_pack,
+                receive_pack: options.receive_pack,
                 address_family: options.address_family,
             },
         )

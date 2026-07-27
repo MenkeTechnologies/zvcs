@@ -167,7 +167,12 @@ const UNIMPLEMENTED_PREFIX: &[&str] = &[
 ];
 
 pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
-    let repo = match gix::discover(".") {
+    // `setup_git_directory()` looks at `$GIT_DIR` before it walks upwards, so
+    // `git --git-dir=<path> rev-parse <rev>` resolves against THAT repository.
+    // Plain discovery ignores the variable and silently answers about whatever
+    // repository the current directory happens to sit in — a wrong object id
+    // rather than an error.
+    let repo = match gix::discover_with_environment_overrides(".") {
         Ok(repo) => repo,
         Err(_) => {
             eprintln!("fatal: not a git repository (or any of the parent directories): .git");

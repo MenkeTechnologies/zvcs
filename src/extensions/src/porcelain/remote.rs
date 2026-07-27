@@ -1591,7 +1591,7 @@ fn query_ref_map(repo: &gix::Repository, name: &str) -> Result<gix::remote::fetc
         // `git remote` has no `--ipv4`/`--ipv6`.
         gix::remote::connect::Options {
             upload_pack,
-            address_family: None,
+            ..Default::default()
         },
     )?;
     let (map, _handshake) = connection.ref_map(

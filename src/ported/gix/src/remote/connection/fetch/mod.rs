@@ -212,6 +212,7 @@ where
 }
 
 mod config;
+pub mod connected;
 mod receive_pack;
 ///
 #[path = "update_refs/mod.rs"]

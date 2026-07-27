@@ -1450,6 +1450,9 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // Decide tracking before touching the ref: git dies (without creating the
     // branch) if `--track` was explicit but the start-point is not a branch.
     let start_ref_bstr = start_ref.as_ref().map(|b| b.as_bstr());
+    if let Some(code) = ambiguous_tracking(repo, start_ref_bstr, o.track)? {
+        return Ok(code);
+    }
     let upstream = tracking_upstream(repo, start_ref_bstr, o.track, name);
     if matches!(o.track, Track::Direct | Track::Inherit) && upstream.is_none() {
         return fatal(format!(
@@ -1484,6 +1487,102 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// `setup_tracking()`'s `for_each_remote(find_tracked_branch)` pass (branch.c):
+/// before deciding an upstream, git asks which remotes' *fetch* refspecs map
+/// onto the start-point ref. Two or more is a configuration error it refuses to
+/// guess through — it dies naming the remotes, without creating the branch, and
+/// the list of them is the `advice.ambiguousFetchRefspec` hint.
+///
+/// Returns `Some(128)` when the caller must stop. The scan is skipped exactly
+/// where git skips it: with `--no-track`, for a start-point that is not a ref,
+/// for `--track=inherit` (which reads the start branch's own upstream instead of
+/// consulting remotes), and when `branch.autoSetupMerge=false` left git's
+/// `track` at `BRANCH_TRACK_NEVER` — but an explicit `--track` overrides that
+/// last one, and even `branch.autoSetupMerge=simple` reaches the check before it
+/// gets to compare names.
+fn ambiguous_tracking(
+    repo: &gix::Repository,
+    start_ref: Option<&BStr>,
+    track: Track,
+) -> Result<Option<ExitCode>> {
+    if track == Track::No {
+        return Ok(None);
+    }
+    let Some(orig_ref) = start_ref else { return Ok(None) };
+    let snap = repo.config_snapshot();
+    let mode = snap
+        .string("branch.autoSetupMerge")
+        .map(|v| v.to_str_lossy().to_ascii_lowercase());
+    let mode = mode.as_deref();
+    let explicit = matches!(track, Track::Direct | Track::Inherit);
+    if track == Track::Inherit || mode == Some("inherit") {
+        return Ok(None);
+    }
+    if !explicit && matches!(mode, Some("false" | "no" | "off" | "0")) {
+        return Ok(None);
+    }
+
+    let matches = remotes_fetching_into(repo, orig_ref);
+    if matches.len() < 2 {
+        return Ok(None);
+    }
+    eprintln!("fatal: not tracking: ambiguous information for ref '{orig_ref}'");
+    let mut listed = String::new();
+    for name in &matches {
+        listed.push_str(&format!("  {name}\n"));
+    }
+    crate::advice::Advice::AmbiguousFetchRefspec.advise_plain_in(
+        repo,
+        &format!(
+            "There are multiple remotes whose fetch refspecs map to the remote\n\
+             tracking ref '{orig_ref}':\n\
+             {listed}\n\
+             This is typically a configuration error.\n\
+             \n\
+             To support setting up tracking branches, ensure that\n\
+             different remotes' fetch refspecs map into different\n\
+             tracking namespaces."
+        ),
+    );
+    Ok(Some(ExitCode::from(128)))
+}
+
+/// `find_tracked_branch()` reduced to what the ambiguity check needs: the names
+/// of the remotes with a fetch refspec whose destination covers `name`. Mirrors
+/// `refspec_find_match()`'s dst-side lookup — refspecs with no destination and
+/// negative (`^`) ones are skipped, and a destination containing `*` matches by
+/// prefix and suffix (`match_name_with_pattern`).
+fn remotes_fetching_into(repo: &gix::Repository, name: &BStr) -> Vec<String> {
+    let needle: &[u8] = name.as_ref();
+    let mut hits = Vec::new();
+    for remote_name in repo.remote_names() {
+        let Ok(remote) = repo.find_remote(&*remote_name) else { continue };
+        let covered = remote.refspecs(gix::remote::Direction::Fetch).iter().any(|spec| {
+            let gix::refspec::Instruction::Fetch(gix::refspec::instruction::Fetch::AndUpdate {
+                dst,
+                ..
+            }) = spec.to_ref().instruction()
+            else {
+                return false;
+            };
+            let dst: &[u8] = dst.as_ref();
+            match dst.iter().position(|&b| b == b'*') {
+                Some(star) => {
+                    let (prefix, suffix) = (&dst[..star], &dst[star + 1..]);
+                    needle.len() >= prefix.len() + suffix.len()
+                        && needle.starts_with(prefix)
+                        && needle.ends_with(suffix)
+                }
+                None => dst == needle,
+            }
+        });
+        if covered {
+            hits.push(remote_name.to_str_lossy().into_owned());
+        }
+    }
+    hits
 }
 
 /// The upstream a branch should track: `(remote, merge_ref, short)`. Auto-set

@@ -157,6 +157,7 @@ pub use intern::{InternedInput, Interner, Token, TokenSource};
 #[cfg(feature = "unified_diff")]
 pub use unified_diff::{BasicLineDiffPrinter, UnifiedDiff, UnifiedDiffConfig, UnifiedDiffPrinter};
 
+pub mod compact;
 mod histogram;
 mod intern;
 mod myers;

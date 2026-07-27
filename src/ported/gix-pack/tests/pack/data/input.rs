@@ -181,22 +181,29 @@ mod lookup_ref_delta_objects {
         validate_pack_offsets(&actual);
     }
 
+    /// A base that isn't in the object database means the pack isn't thin after all and names the base by id from
+    /// within itself. This iterator can't tell, as it never learns the id of the entries it streams, so it hands the
+    /// ref-delta on untouched and leaves resolving it to the index writer, which does know every object's id.
     #[test]
-    fn lookup_errors_trigger_a_fuse_and_stop_iteration() {
-        let input = vec![entry(delta_ref(gix_hash::Kind::Sha1.null()), D_A), entry(base(), D_B)];
+    fn a_base_missing_from_the_odb_leaves_the_ref_delta_untouched() {
+        let missing = gix_hash::Kind::Sha1.null();
+        let input = compute_offsets(vec![entry(delta_ref(missing), D_A), entry(base(), D_B)]);
+        let expected = input.clone();
         let calls = AtomicUsize::default();
         let db = FindData::new(None, &calls);
-        let mut result =
-            LookupRefDeltaObjectsIter::new(into_results_iter(input), &db, gix_zlib::Compression::BEST_SPEED)
-                .collect::<Vec<_>>();
+        let actual = LookupRefDeltaObjectsIter::new(into_results_iter(input), &db, gix_zlib::Compression::BEST_SPEED)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("an unknown base is not an error here");
+
         assert_eq!(calls.load(Ordering::Relaxed), 1, "it tries to lookup the object");
-        assert_eq!(result.len(), 1, "the error stops iteration");
-        assert!(matches!(
-            result.pop().expect("one"),
-            Err(input::Error::NotFound {
-                object_id
-            }) if object_id == gix_hash::Kind::Sha1.null()
-        ));
+        assert_eq!(actual.len(), 2, "iteration continues past the unresolvable ref-delta");
+        assert_eq!(
+            actual[0].header,
+            delta_ref(missing),
+            "the ref-delta keeps its header so the index writer still sees which base it wants"
+        );
+        assert_eq!(actual, expected, "nothing was inserted, so no offset had to shift");
+        validate_pack_offsets(&actual);
     }
 
     #[test]

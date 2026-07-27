@@ -107,7 +107,7 @@ use gix::bstr::{BString, ByteSlice};
 use gix::diff::blob::pipeline::{Mode, WorktreeRoots};
 use gix::diff::blob::platform::prepare_diff::Operation;
 use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
-use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, InternedInput, ResourceKind, UnifiedDiff};
+use gix::diff::blob::{Algorithm, InternedInput, ResourceKind, UnifiedDiff};
 use gix::hash::ObjectId;
 use gix::objs::tree::EntryKind;
 use gix::prelude::ObjectIdExt;
@@ -451,6 +451,10 @@ struct Opts {
     merges_need_diff: bool,
     /// `--full-index`: the combined header prints full object ids.
     full_index: bool,
+    /// A non-zero `--inter-hunk-context=<n>`: recorded rather than applied, because the
+    /// unified writer cannot merge hunks the way `xdl_get_hunk` does. A patch refuses
+    /// rather than printing the wrong hunk split; every other format is unaffected.
+    inter_hunk_ctx: Option<String>,
     /// `--diff-algorithm=`/`--minimal`/`--histogram`: the xdiff algorithm the CLI
     /// selected. `None` leaves gix on the repo's `diff.algorithm` config default
     /// (git precedence: an explicit CLI flag overrides config). `patience` has no
@@ -462,6 +466,11 @@ struct Opts {
     /// bails with this flag rather than silently substituting Myers. Cleared when a
     /// later renderable algorithm flag wins, so last-one-on-the-line semantics hold.
     patience_spelling: Option<String>,
+    /// `XDF_INDENT_HEURISTIC`: where a hunk that can slide freely finally lands.
+    /// `git_diff_heuristic_config()` runs from `git_diff_basic_config()`, so
+    /// `diff.indentHeuristic` reaches plumbing too, and
+    /// `--[no-]indent-heuristic` overrides it.
+    indent_heuristic: bool,
 }
 
 impl Opts {
@@ -797,8 +806,10 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         explicit_stage: false,
         merges_need_diff: false,
         full_index: false,
+        inter_hunk_ctx: None,
         algorithm: None,
         patience_spelling: None,
+        indent_heuristic: super::diff_pairs::indent_heuristic_default(repo),
     };
     let mut quiet = false;
     let mut paths: Vec<BString> = Vec::new();
@@ -977,6 +988,14 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         }
     }
 
+    // `--inter-hunk-context=<n>` only reshapes the patch body, so the stat family and
+    // the raw listing stay valid with it.
+    if opts.fmt & F_PATCH != 0 {
+        if let Some(flag) = opts.inter_hunk_ctx.take() {
+            return Ok(Parsed::Unsupported(flag));
+        }
+    }
+
     // `patience` has no imara-diff equivalent, so any format that consumes the xdiff
     // line diff — the patch, the line-counting stats, `--check`, and `--dirstat=lines`
     // — would silently fall back to Myers and print a diff git did not ask for. Bail
@@ -1019,8 +1038,6 @@ enum Flag {
 /// Options that only configure how a *patch* is rendered in ways this module
 /// already matches, or whose effect is unreachable for `diff-files`.
 const ACCEPTED_NOOP: &[&str] = &[
-    "--indent-heuristic",
-    "--no-indent-heuristic",
     "--submodule",
     // Colored *moves* are not detected by this port; the flag is left in the
     // unsupported list below rather than silently accepted.
@@ -1055,9 +1072,6 @@ const ACCEPTED_NOOP: &[&str] = &[
 /// Prefixes of valued options in the same category as [`ACCEPTED_NOOP`].
 const ACCEPTED_NOOP_VALUED: &[&str] = &[
     "--anchored=",
-    // gix's unified writer has no inter-hunk-context or function-context knob;
-    // both only matter for files big enough to produce adjacent hunks.
-    "--inter-hunk-context=",
     "--submodule=",
     "--diff-merges=",
     "-l",
@@ -1188,6 +1202,9 @@ fn classify(s: &str, opts: &mut Opts, quiet: &mut bool) -> Result<Flag, Fatal> {
             opts.algorithm = None;
             opts.patience_spelling = Some("--patience".to_owned());
         }
+        // `XDF_INDENT_HEURISTIC`: where a hunk that can slide freely finally lands.
+        "--indent-heuristic" => opts.indent_heuristic = true,
+        "--no-indent-heuristic" => opts.indent_heuristic = false,
         "--relative" => opts.relative = Relative::Cwd,
         "--no-relative" => opts.relative = Relative::No,
         "--ignore-submodules" => {
@@ -1404,10 +1421,16 @@ fn classify_valued(s: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
             Err(Fatal::NotAnInteger(v.to_owned()))
         };
     }
-    // `--inter-hunk-context=<n>` is an `OPT_MAGNITUDE`: gix has no such knob, so the
-    // value is a no-op, but git still validates it (and rejects a bad one at 129).
+    // `--inter-hunk-context=<n>` is an `OPT_MAGNITUDE` (`xecfg.interhunkctxlen`): two
+    // change groups closer than `2 * ctxlen + interhunk` records land in one hunk.
+    // gix's unified writer has no such knob, so a non-zero value would silently split
+    // hunks git merges. git validates the number first and rejects a bad one at 129,
+    // so that check still runs; a zero is git's own default and changes nothing.
     if let Some(v) = s.strip_prefix("--inter-hunk-context=") {
         validate_magnitude(v, "inter-hunk-context")?;
+        if v.parse::<u64>().is_ok_and(|n| n > 0) {
+            opts.inter_hunk_ctx = Some(s.to_owned());
+        }
         return Ok(Flag::Handled);
     }
     // `--ws-error-highlight=<kinds>`: a comma list drawn from old/new/context/all/
@@ -1829,9 +1852,17 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             count_occurrences_of(&combined_patch, b"\ndiff --cc ") + usize::from(combined_patch.starts_with(b"diff --cc "));
         let mut files: Vec<diff_color::FilePaint> =
             vec![diff_color::FilePaint::new(ws_rule); combined_sections];
+        // `fill_metainfo()`'s abbreviation length: the full hash under `--full-index`,
+        // otherwise `DEFAULT_ABBREV`, which `core.abbrev` sets.
+        let hexsz = repo.object_hash().len_in_hex();
+        let patch_abbrev = if opts.full_index {
+            hexsz
+        } else {
+            crate::abbrev::configured_abbrev(repo, hexsz)
+        };
         for (d, an) in deltas.iter().zip(&analyses) {
             let before = plain.len();
-            render_patch(&mut plain, d, an, &opts);
+            render_patch(&mut plain, d, an, &opts, patch_abbrev);
             if plain.len() != before {
                 files.push(diff_color::FilePaint {
                     ws_rule,
@@ -2076,7 +2107,7 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> usize {
 /// `prepare_order()`: read the order file into a list of glob patterns. Blank lines
 /// and lines beginning with `#` are skipped; a leading `\#` is an escaped literal `#`.
 /// git silently proceeds with no patterns when the file cannot be read.
-fn read_order_file(path: &str) -> Vec<Vec<u8>> {
+pub(crate) fn read_order_file(path: &str) -> Vec<Vec<u8>> {
     let data = std::fs::read(path).unwrap_or_default();
     let mut order = Vec::new();
     for line in data.split(|&b| b == b'\n') {
@@ -2092,7 +2123,7 @@ fn read_order_file(path: &str) -> Vec<Vec<u8>> {
 /// `match_order()`: the index of the first order-file pattern that matches `path`,
 /// or `order.len()` when none does. git matches the full path, then repeatedly strips
 /// the trailing `/component` and retries so a pattern can name a parent directory.
-fn match_order(order: &[Vec<u8>], path: &[u8]) -> usize {
+pub(crate) fn match_order(order: &[Vec<u8>], path: &[u8]) -> usize {
     use gix::glob::wildmatch::Mode;
     for (i, pat) in order.iter().enumerate() {
         let mut p = path;
@@ -2542,8 +2573,16 @@ fn analyze(
 
             // An explicit `--diff-algorithm=`/`--minimal`/`--histogram` on the command
             // line overrides the `diff.algorithm` config default gix resolved into
-            // `algorithm` (git precedence: flag beats config).
-            let diff = diff_with_slider_heuristics(opts.algorithm.unwrap_or(algorithm), &input);
+            // `algorithm` (git precedence: flag beats config). `xdl_change_compact()`
+            // scores `xdf->recs[i]->ptr`, the *original* record, so the indents come
+            // from `before`/`after` rather than the normalized interner.
+            let diff = super::diff_pairs::compute_compacted(
+                opts.algorithm.unwrap_or(algorithm),
+                &input,
+                &before,
+                &after,
+                opts.indent_heuristic,
+            );
             // `xdl_mark_ignorable_regex()`: a change group whose every removed and
             // added line matches an `-I` pattern contributes nothing.
             let (added, deleted) = if opts.ignore_lines.is_empty() {
@@ -2573,6 +2612,9 @@ fn analyze(
                     buf: Vec::new(),
                     before: &before,
                     after: &after,
+                    // No hunk has been emitted yet, so nothing bounds the first search.
+                    func_prev: -1,
+                    func_text: Vec::new(),
                 };
                 Some(
                     UnifiedDiff::new(&diff, &input, sink, ContextSize::symmetrical(opts.ctx))
@@ -3614,7 +3656,11 @@ fn check_blank_at_eof(old: &[u8], new_lines: &[&[u8]]) -> Option<usize> {
 // ---------------------------------------------------------------------------
 
 /// Render one delta as a `git diff` file section into `out`.
-fn render_patch(out: &mut Vec<u8>, d: &Delta, an: &Analysis, opts: &Opts) {
+///
+/// `hlen` is the `index` line's hex width: `fill_metainfo()` abbreviates with
+/// `o->flags.full_index ? the_hash_algo->hexsz : DEFAULT_ABBREV`, and `DEFAULT_ABBREV`
+/// is what `core.abbrev` sets — not a hardcoded 7.
+fn render_patch(out: &mut Vec<u8>, d: &Delta, an: &Analysis, opts: &Opts, hlen: usize) {
     if d.unmerged {
         out.extend_from_slice(b"* Unmerged path ");
         out.extend_from_slice(d.path.as_ref());
@@ -3630,14 +3676,14 @@ fn render_patch(out: &mut Vec<u8>, d: &Delta, an: &Analysis, opts: &Opts) {
     };
 
     let old_hash = if d.old_valid() {
-        an.src_id.to_hex_with_len(7).to_string()
+        an.src_id.to_hex_with_len(hlen).to_string()
     } else {
-        "0000000".to_string()
+        "0".repeat(hlen)
     };
     let new_hash = if d.new_valid() {
-        an.dst_id.to_hex_with_len(7).to_string()
+        an.dst_id.to_hex_with_len(hlen).to_string()
     } else {
-        "0000000".to_string()
+        "0".repeat(hlen)
     };
     let content_differs = old_hash != new_hash;
 
@@ -3821,6 +3867,7 @@ fn combine_diff_parent(
     cnt: usize,
     n: usize,
     ws: Whitespace,
+    indent_heuristic: bool,
 ) {
     let before = byte_lines(parent);
     let after = byte_lines(result);
@@ -3828,8 +3875,14 @@ fn combine_diff_parent(
     input.update_before(before.iter().map(|l| normalize(l, ws)));
     input.update_after(after.iter().map(|l| normalize(l, ws)));
     // git's combined diff runs xdiff with `xpp.flags = opt->xdl_opts`; Myers is
-    // git's default algorithm.
-    let diff = diff_with_slider_heuristics(Algorithm::Myers, &input);
+    // git's default algorithm. `xdl_change_compact()` measures the original records.
+    let diff = super::diff_pairs::compute_compacted(
+        Algorithm::Myers,
+        &input,
+        &before,
+        &after,
+        indent_heuristic,
+    );
     let nmask = 1u64 << n;
 
     // With zero context every hunk is one raw change group. git hangs all of a
@@ -4430,7 +4483,15 @@ fn render_combined_patch(
             }
         }
         if !reused {
-            combine_diff_parent(&parents[n], &result, &mut sline, cnt, n, opts.ws);
+            combine_diff_parent(
+                &parents[n],
+                &result,
+                &mut sline,
+                cnt,
+                n,
+                opts.ws,
+                opts.indent_heuristic,
+            );
         }
     }
 
@@ -4626,6 +4687,13 @@ struct PatchSink<'a> {
     buf: Vec<u8>,
     before: &'a [&'a [u8]],
     after: &'a [&'a [u8]],
+    /// git's `funclineprev`: the line the previous hunk's search started from, and the
+    /// limit for the next one, so a heading is never scanned for twice.
+    func_prev: i64,
+    /// git's `func_line`, which lives across the whole file rather than one hunk. A
+    /// search that finds nothing leaves it alone, so a hunk deep inside a long function
+    /// keeps the heading found for the hunk above it.
+    func_text: Vec<u8>,
 }
 
 impl ConsumeHunk for PatchSink<'_> {
@@ -4636,21 +4704,43 @@ impl ConsumeHunk for PatchSink<'_> {
         header: HunkHeader,
         lines: &[(DiffLineKind, &[u8])],
     ) -> std::io::Result<()> {
-        self.buf.extend_from_slice(b"@@ -");
-        self.buf.extend_from_slice(
-            fmt_range(header.before_hunk_start, header.before_hunk_len).as_bytes(),
-        );
-        self.buf.extend_from_slice(b" +");
-        self.buf
-            .extend_from_slice(fmt_range(header.after_hunk_start, header.after_hunk_len).as_bytes());
-        self.buf.extend_from_slice(b" @@\n");
+        let mut hdr: Vec<u8> = Vec::with_capacity(super::diff::HUNK_HDR_MAX);
+        hdr.extend_from_slice(b"@@ -");
+        hdr.extend_from_slice(fmt_range(header.before_hunk_start, header.before_hunk_len).as_bytes());
+        hdr.extend_from_slice(b" +");
+        hdr.extend_from_slice(fmt_range(header.after_hunk_start, header.after_hunk_len).as_bytes());
+        hdr.extend_from_slice(b" @@");
+
+        // `XDL_EMIT_FUNCNAMES`: the nearest qualifying line at or above the hunk's first
+        // pre-image line, searched no further back than the previous hunk's own starting
+        // point. `before_hunk_start` is 1-based and git's `s1` is the 0-based index of
+        // that same line.
+        let s1 = header.before_hunk_start as i64 - 1;
+        if let Some(func) = super::diff::func_line(self.before, s1 - 1, self.func_prev) {
+            self.func_text = func.to_vec();
+        }
+        self.func_prev = s1 - 1;
+        if !self.func_text.is_empty() {
+            // git clips the heading to what remains of its 128-byte header buffer,
+            // reserving one byte for the newline.
+            let room = super::diff::HUNK_HDR_MAX.saturating_sub(hdr.len() + 2);
+            hdr.push(b' ');
+            hdr.extend_from_slice(&self.func_text[..self.func_text.len().min(room)]);
+        }
+        hdr.push(b'\n');
+        self.buf.extend_from_slice(&hdr);
 
         let mut bi = header.before_hunk_start.saturating_sub(1) as usize;
         let mut ai = header.after_hunk_start.saturating_sub(1) as usize;
         for (kind, fallback) in lines {
             let (marker, content): (u8, &[u8]) = match kind {
+                // `xdl_emit_diff()` emits every context record from `xe->xdf2`, the
+                // *post-image*: all three context loops call
+                // `xdl_emit_record(&xe->xdf2, s2, " ", ecb)`. The two sides only
+                // differ here when the comparison called unequal bytes equal, which
+                // is exactly what `-w`/`-b`/`--ignore-space-at-eol` do.
                 DiffLineKind::Context => {
-                    let c = self.before.get(bi).copied().unwrap_or(*fallback);
+                    let c = self.after.get(ai).copied().unwrap_or(*fallback);
                     bi += 1;
                     ai += 1;
                     (b' ', c)

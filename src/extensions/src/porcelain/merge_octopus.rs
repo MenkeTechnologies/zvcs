@@ -85,6 +85,7 @@ use std::sync::atomic::AtomicBool;
 
 use gix::bstr::{BStr, BString};
 use gix::hash::ObjectId;
+use gix::prelude::ObjectIdExt;
 use gix::Repository;
 
 /// `git-sh-setup`'s `$LONG_USAGE` for a script that sets neither `USAGE` nor
@@ -223,8 +224,11 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
             // three-way whose base equals ours (`mrt == tree($MRC)` here), so the
             // shared engine yields exactly `$SHA1`'s tree, conflict-free, and
             // updates the worktree — the two-tree merge's observable result.
+            // A two-tree read-tree never conflicts, so this label is never
+            // rendered; it is merge-ort's single-base name for the sole base.
+            let ancestor = common[0].attach(&repo).shorten_or_id().to_string();
             let labels = gix::merge::blob::builtin_driver::text::Labels {
-                ancestor: Some(BStr::new(b"merged common ancestors")),
+                ancestor: Some(BStr::new(ancestor.as_bytes())),
                 current: Some(BStr::new(b"HEAD")),
                 other: Some(BStr::new(pretty.as_bytes())),
             };
@@ -269,8 +273,19 @@ pub fn merge_octopus(args: &[String]) -> Result<ExitCode> {
         // `read-tree -u -m --aggressive $common $MRT $SHA1` followed, on unmerged
         // entries, by `merge-index -o git-merge-one-file -a`: both via the shared
         // octopus engine, which also emits git's `Auto-merging`/`CONFLICT` lines.
+        // `merge_ort_internal()`'s ancestor name: `merged common ancestors` only
+        // when several bases were folded together, otherwise the sole base's
+        // abbreviated id. The shell script shows neither — `git merge-one-file`
+        // runs `git merge-file` with no `-L`, so its `diff3` markers carry the
+        // run's `.merge_file_XXXXXX` temporary names — and this driver renders
+        // merge-ort conflicts, per the divergence noted at the top of the file.
+        let ancestor = if common.len() > 1 {
+            "merged common ancestors".to_string()
+        } else {
+            common[0].attach(&repo).shorten_or_id().to_string()
+        };
         let labels = gix::merge::blob::builtin_driver::text::Labels {
-            ancestor: Some(BStr::new(b"merged common ancestors")),
+            ancestor: Some(BStr::new(ancestor.as_bytes())),
             current: Some(BStr::new(b"HEAD")),
             other: Some(BStr::new(pretty.as_bytes())),
         };

@@ -48,6 +48,7 @@ use gix::remote::fetch::{Shallow, Tags};
 ///     the recursive `submodule update`, which otherwise reads `submodule.fetchJobs`)
 ///   * `-4`/`--ipv4`, `-6`/`--ipv6`  → restrict the transport to one address family
 ///   * `--remote-submodules`         → submodules track their remote branch
+///   * `--shallow-submodules`        → each submodule is cloned with `--depth=1`
 ///
 /// `init.defaultSubmodulePathConfig` is honored here as it is in `git init`.
 ///
@@ -122,6 +123,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // as `submodule.active` in the new repository the way git does.
     let mut submodule_pathspecs: Vec<String> = Vec::new();
     let mut remote_submodules = false;
+    // `--shallow-submodules` / `--no-shallow-submodules`, git's `OPT_BOOL`
+    // `option_shallow_submodules`. Only the `== 1` case adds `--depth=1` to the
+    // recursive `submodule update`; the negation just cancels a prior one.
+    let mut shallow_submodules = false;
     let mut no_checkout = false;
     let mut origin: Option<String> = None;
     let mut branch: Option<String> = None;
@@ -330,6 +335,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // port implements, so it is passed straight through to that update.
             "--remote-submodules" => remote_submodules = true,
             "--no-remote-submodules" => remote_submodules = false,
+            // `--shallow-submodules`: `git submodule update` gets `--depth=1`, so
+            // every submodule this clone recurses into is truncated to one commit.
+            "--shallow-submodules" => shallow_submodules = true,
+            "--no-shallow-submodules" => shallow_submodules = false,
             // git's attached short-option forms (`-o<name>`, `-b<name>`,
             // `-c<key>=<value>` in the synopsis). Checked after the exact matches
             // so the detached forms above still win.
@@ -467,11 +476,14 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     let should_interrupt = AtomicBool::new(false);
 
     // git prints the "Cloning into ..." banner before any progress; keep it above
-    // the live renderer so the two don't overdraw each other.
-    if bare {
-        eprintln!("Cloning into bare repository '{dir}'...");
-    } else {
-        eprintln!("Cloning into '{dir}'...");
+    // the live renderer so the two don't overdraw each other. `0 <= option_verbosity`
+    // (clone.c:1134) is what `-q` switches off.
+    if !quiet {
+        if bare {
+            eprintln!("Cloning into bare repository '{dir}'...");
+        } else {
+            eprintln!("Cloning into '{dir}'...");
+        }
     }
 
     // Build the clone platform. This already lays the repository down on disk, so
@@ -597,6 +609,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         prepare = prepare.with_connect_options(gix::remote::connect::Options {
             upload_pack: upload_pack.as_deref().map(Into::into),
             address_family,
+            // `git clone` never connects for push.
+            receive_pack: None,
         });
     }
     if !server_options.is_empty() {
@@ -618,6 +632,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         let probe_connect = gix::remote::connect::Options {
             upload_pack: upload_pack.as_deref().map(Into::into),
             address_family,
+            // `git clone` never connects for push.
+            receive_pack: None,
         };
         let probe_server_options = server_options.clone();
         prepare = prepare.configure_remote(move |r| {
@@ -744,11 +760,22 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // filter was ignored, so the warning is emitted from what the handshake advertised.
     let mut filter_supported = true;
 
+    // git's `remote_head_points_at`: the branch the remote's `HEAD` names, which
+    // `update_remote_refs()` makes `refs/remotes/<name>/HEAD` a symbolic ref to.
+    let mut remote_head_branch: Option<String> = None;
+
     // Run the clone, capturing the result so the renderer is always torn down
     // (cursor restored, thread joined) before any error is propagated.
     let result = (|| -> Result<()> {
         // git's `transport.c` warns as soon as it has the capability list and then transfers
         // everything, leaving the promisor configuration in place regardless.
+        // `guess_remote_head()`, shared with `git remote set-head` and the fetch path. Anything but a
+        // single answer leaves the remote's `HEAD` undetermined, which git treats as nothing to link.
+        let mut note_remote_head = |ref_map: &gix::remote::fetch::RefMap| {
+            if let [head] = super::remote::remote_head_names(ref_map).as_slice() {
+                remote_head_branch = Some(head.clone());
+            }
+        };
         let mut note_filter_support = |handshake: &gix::protocol::Handshake| {
             filter_supported = gix::protocol::fetch::filter::is_supported(
                 handshake.server_protocol_version,
@@ -762,17 +789,22 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // A bare clone never checks out a worktree; `--no-checkout` likewise
             // fetches the pack and writes the refs/`HEAD` but leaves the worktree
             // (and index) empty. Fetching is the whole job in both cases.
-            let (_repo, outcome) = prepare.fetch_only(op.add_child("fetch"), &should_interrupt)?;
+            let (_repo, outcome) = prepare
+                .fetch_only(op.add_child("fetch"), &should_interrupt)
+                .map_err(short_pack)?;
             remote_advertised_tracking_refs = outcome
                 .ref_map
                 .remote_refs
                 .iter()
                 .any(|r| r.unpack().0.starts_with(b"refs/remotes/"));
+            note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
         } else {
             // `git clone 'url'...`
-            let (mut checkout, outcome) =
-                prepare.fetch_then_checkout(op.add_child("fetch"), &should_interrupt)?;
+            let (mut checkout, outcome) = prepare
+                .fetch_then_checkout(op.add_child("fetch"), &should_interrupt)
+                .map_err(short_pack)?;
+            note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
             // Check out the branch `HEAD` points to. This is a no-op for an empty
             // remote, leaving an empty repository exactly like git does.
@@ -838,6 +870,16 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     };
     if drop_head_tracking {
         remove_remote_tracking_head(&git_dir)?;
+    } else if !bare {
+        // `update_remote_refs()` writes `refs/remotes/<name>/HEAD` with `refs_update_symref()`,
+        // pointing at the *tracking ref* of the branch the remote's `HEAD` names — not at its object
+        // id. That is what lets a clone's `origin/HEAD` keep following `origin/<default>` as later
+        // fetches move it. gitoxide's implicit `HEAD:refs/remotes/<name>/HEAD` mapping resolves the
+        // symref to the object instead (`new_value_by_remote()` in `update_refs`), so it is relinked
+        // here. git writes nothing at all for a bare clone, which the branch above already handles.
+        if let Some(branch) = remote_head_branch.as_deref() {
+            link_remote_tracking_head(&git_dir, branch)?;
+        }
     }
 
     // `init.defaultSubmodulePathConfig=true` opts every new repository into the
@@ -877,16 +919,27 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // updates each submodule to its remote-tracking branch instead of the
     // superproject's recorded commit.
     if recurse_submodules && !bare && !no_checkout {
-        let mut sub: Vec<String> = ["submodule", "update", "--init", "--recursive"]
+        let mut sub: Vec<String> = ["submodule", "update", "--require-init", "--recursive"]
             .iter()
             .map(ToString::to_string)
             .collect();
+        // git's order (clone.c:707-741): `--depth=1`, then the job count, then
+        // `--quiet`, then `--remote --no-fetch`.
+        if shallow_submodules {
+            sub.push("--depth=1".into());
+        }
         // `max_jobs != -1` is the only thing that makes git forward the count.
         if let Some(j) = &jobs {
             sub.push(format!("--jobs={j}"));
         }
+        if quiet {
+            sub.push("--quiet".into());
+        }
+        // A submodule that is to follow its remote branch has nothing to gain from
+        // the fetch `update` would otherwise run, since the clone just did one.
         if remote_submodules {
             sub.push("--remote".into());
+            sub.push("--no-fetch".into());
         }
         let sub: Vec<&str> = sub.iter().map(String::as_str).collect();
         let code = run_self(&dir, &sub)?;
@@ -1231,6 +1284,72 @@ fn remove_remote_tracking_head(git_dir: &Path) -> Result<()> {
     // A deleted loose ref leaves its directories behind; git's clone never creates
     // them at all, so prune the empty ones back to (and excluding) `refs/`.
     prune_empty_dirs(&git_dir.join("refs").join("remotes"));
+    Ok(())
+}
+
+/// Give the post-fetch connectivity check the wording `update_remote_refs()` uses on the clone side.
+///
+/// git's fetch says `<url> did not send all necessary objects`; its clone, which has no display state
+/// to name the URL from yet, says `remote did not send all necessary objects` and takes the whole
+/// clone directory down with it.
+fn short_pack(err: gix::clone::fetch::Error) -> anyhow::Error {
+    match err {
+        gix::clone::fetch::Error::Fetch(gix::remote::fetch::Error::NotConnected) => {
+            anyhow::anyhow!("remote did not send all necessary objects")
+        }
+        other => other.into(),
+    }
+}
+
+/// Turn the `refs/remotes/<name>/HEAD` a clone just wrote into a symbolic ref to
+/// `refs/remotes/<name>/<branch>`, as `update_remote_refs()` does with `refs_update_symref()`.
+///
+/// The tracking ref has to be there: git derives the symref from `remote_head_points_at->peer_ref`,
+/// which by construction is one of the refs the clone stored. When it is not — a `--branch` clone of
+/// a tag, say — there is nothing to point at and the ref is left as the object it already names.
+fn link_remote_tracking_head(git_dir: &Path, branch: &str) -> Result<()> {
+    let repo = match gix::open(git_dir) {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+    let names: Vec<gix::refs::FullName> = repo
+        .references()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .prefixed("refs/remotes/")
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .filter_map(Result::ok)
+        .map(|r| r.name().to_owned())
+        .filter(|n| n.as_bstr().ends_with(b"/HEAD"))
+        .collect();
+    for name in names {
+        let Some(remote) = name
+            .as_bstr()
+            .to_str()
+            .ok()
+            .and_then(|n| n.strip_prefix("refs/remotes/"))
+            .and_then(|n| n.strip_suffix("/HEAD"))
+        else {
+            continue;
+        };
+        let target = format!("refs/remotes/{remote}/{branch}");
+        if repo.try_find_reference(target.as_str())?.is_none() {
+            continue;
+        }
+        repo.edit_reference(gix::refs::transaction::RefEdit {
+            change: gix::refs::transaction::Change::Update {
+                log: gix::refs::transaction::LogChange {
+                    mode: gix::refs::transaction::RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: "clone: from remote".into(),
+                },
+                expected: gix::refs::transaction::PreviousValue::Any,
+                new: gix::refs::Target::Symbolic(gix::refs::FullName::try_from(target.as_str())?),
+            },
+            name,
+            deref: false,
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     Ok(())
 }
 

@@ -11,8 +11,6 @@ pub struct LookupRefDeltaObjectsIter<I, Find> {
     compression: gix_zlib::Compression,
     /// The cached delta to provide next time we are called, it's the delta to go with the base we just resolved in its place.
     next_delta: Option<input::Entry>,
-    /// Fuse to stop iteration after first missing object.
-    error: bool,
     /// The overall pack-offset we accumulated thus far. Each inserted entry offsets all following
     /// objects by its length. We need to determine exactly where the object was inserted to see if its affected at all.
     inserted_entry_length_at_offset: Vec<Change>,
@@ -33,7 +31,6 @@ where
             inner: iter,
             lookup,
             compression,
-            error: false,
             inserted_entry_length_at_offset: Vec::new(),
             inserted_entries_length_in_bytes: 0,
             next_delta: None,
@@ -84,9 +81,6 @@ where
     type Item = Result<input::Entry, input::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.error {
-            return None;
-        }
         if let Some(delta) = self.next_delta.take() {
             return Some(Ok(delta));
         }
@@ -95,6 +89,7 @@ where
                 Header::RefDelta { base_id } => {
                     match self.inserted_entry_length_at_offset.iter().rfind(|e| e.oid == base_id) {
                         None => {
+                            let shifted_pack_offset = self.shifted_pack_offset(entry.pack_offset);
                             let base_entry = match self.lookup.try_find(&base_id, &mut self.buf).ok()? {
                                 Some(obj) => {
                                     let current_pack_offset = entry.pack_offset;
@@ -112,8 +107,11 @@ where
                                     entry
                                 }
                                 None => {
-                                    self.error = true;
-                                    return Some(Err(input::Error::NotFound { object_id: base_id }));
+                                    // Not a thin-pack base then, so the base has to be in this very pack, named by id.
+                                    // Pass the ref-delta on unchanged and let the index writer link it to its base once
+                                    // the pack has been reconstructed, the way `index-pack.c` resolves `ref_deltas`.
+                                    entry.pack_offset = shifted_pack_offset;
+                                    return Some(Ok(entry));
                                 }
                             };
 

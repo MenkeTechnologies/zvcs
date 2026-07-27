@@ -202,7 +202,7 @@ fn top_usage(msg: &str) -> Result<ExitCode> {
 /// then `GIT_NOTES_REF`, then `core.notesRef`, then `refs/notes/commits`. Only
 /// the `--ref` value is expanded — git passes it through `expand_notes_ref()`
 /// before exporting it, and takes the environment and config values verbatim.
-fn resolve_notes_ref(repo: &gix::Repository, override_ref: Option<&str>) -> String {
+pub(crate) fn resolve_notes_ref(repo: &gix::Repository, override_ref: Option<&str>) -> String {
     if let Some(r) = override_ref {
         return expand_notes_ref(r);
     }
@@ -236,15 +236,15 @@ fn expand_notes_ref(name: &str) -> String {
 
 /// The loaded contents of a notes tree: the note mapping plus any entries that
 /// do not follow the note naming convention, which git preserves verbatim.
-struct Notes {
+pub(crate) struct Notes {
     /// annotated object id → note blob id, ordered as git emits them.
-    map: BTreeMap<ObjectId, ObjectId>,
+    pub(crate) map: BTreeMap<ObjectId, ObjectId>,
     /// (full path, mode, id) for entries that are not notes, sorted by path.
     non_notes: Vec<(BString, EntryMode, ObjectId)>,
 }
 
 /// Read the notes ref and load the tree it points at (empty when unborn).
-fn load(repo: &gix::Repository, notes_ref: &str) -> Result<(Notes, Option<ObjectId>)> {
+pub(crate) fn load(repo: &gix::Repository, notes_ref: &str) -> Result<(Notes, Option<ObjectId>)> {
     let tip = match repo.try_find_reference(notes_ref) {
         Ok(Some(r)) => Some(r.into_fully_peeled_id()?.detach()),
         Ok(None) => None,

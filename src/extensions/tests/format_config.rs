@@ -182,3 +182,199 @@ fn format_signature_file_invalid_errors() {
 
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
+
+/// `format.signOff` defaults `-s`, and `--no-signoff` turns it back off. The
+/// trailer names the committer identity and is separated from the subject by a
+/// blank line (`append_signoff()` with an empty body).
+#[test]
+fn format_signoff_config_and_override() {
+    let (repo, home) = fixture("signoff");
+    git(&repo, &["config", "format.signOff", "true"]);
+
+    let out = fmt(&repo, &home, &[]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("first change\n\nSigned-off-by: t <t@e.x>\n---\n"),
+        "config signoff trailer:\n{s}"
+    );
+
+    let out = fmt(&repo, &home, &["--no-signoff"]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(!s.contains("Signed-off-by"), "--no-signoff wins:\n{s}");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// `format.from` replaces the `From:` header and pushes the commit's author into
+/// an in-body `From:`; a boolean `true` means the committer identity. When the
+/// two identities already agree the in-body header is dropped unless
+/// `format.forceInBodyFrom` asks for it.
+#[test]
+fn format_from_and_force_in_body_from_config() {
+    let (repo, home) = fixture("from");
+    git(&repo, &["config", "format.from", "Relay <relay@x.y>"]);
+
+    let out = fmt(&repo, &home, &[]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(line_with(&s, "From: R"), Some("From: Relay <relay@x.y>"));
+    assert!(
+        s.contains("first change\n\nFrom: t <t@e.x>\n"),
+        "author moved in-body:\n{s}"
+    );
+
+    // A boolean `true` is the committer identity, which here *is* the author, so
+    // no in-body header is emitted.
+    git(&repo, &["config", "format.from", "true"]);
+    let out = fmt(&repo, &home, &[]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(line_with(&s, "From:"), Some("From: t <t@e.x>"));
+    assert_eq!(s.matches("From: t <t@e.x>").count(), 1, "no in-body From:\n{s}");
+
+    git(&repo, &["config", "format.forceInBodyFrom", "true"]);
+    let out = fmt(&repo, &home, &[]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        s.matches("From: t <t@e.x>").count(),
+        2,
+        "forceInBodyFrom repeats the identity in-body:\n{s}"
+    );
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// `format.thread` mints a `Message-ID:`; `--no-thread` suppresses it. The id
+/// embeds `time(NULL)`, so only its shape is pinned.
+#[test]
+fn format_thread_config_and_override() {
+    let (repo, home) = fixture("thread");
+    git(&repo, &["config", "format.thread", "deep"]);
+
+    let out = fmt(&repo, &home, &[]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    let id = line_with(&s, "Message-ID:").expect("threading mints a Message-ID");
+    assert!(id.ends_with(".git.t@e.x>"), "id carries the committer mail: {id}");
+
+    let out = fmt(&repo, &home, &["--no-thread"]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(!s.contains("Message-ID:"), "--no-thread wins:\n{s}");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// `format.attach` names the MIME boundary and selects `attachment` disposition;
+/// `--inline` keeps the boundary but switches the disposition, and `--no-attach`
+/// drops the multipart wrapper entirely.
+#[test]
+fn format_attach_config_and_override() {
+    let (repo, home) = fixture("attach");
+    git(&repo, &["config", "format.attach", "BND"]);
+
+    let out = fmt(&repo, &home, &[]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("Content-Type: multipart/mixed; boundary=\"------------BND\"\n"),
+        "config boundary:\n{s}"
+    );
+    assert!(s.contains("Content-Disposition: attachment;"), "attachment:\n{s}");
+    assert!(s.ends_with("\n--------------BND--\n\n\n"), "closing boundary:\n{s}");
+
+    let out = fmt(&repo, &home, &["--inline"]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("Content-Disposition: inline;"), "--inline:\n{s}");
+
+    let out = fmt(&repo, &home, &["--no-attach"]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(!s.contains("multipart/mixed"), "--no-attach wins:\n{s}");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// `format.notes` selects the notes tree whose `Notes:` block is appended to the
+/// message; a ref value narrows it to that ref and labels the block with it.
+#[test]
+fn format_notes_config_and_override() {
+    let (repo, home) = fixture("notes");
+    git(&repo, &["notes", "add", "-m", "default note", "HEAD"]);
+    git(&repo, &["notes", "--ref=side", "add", "-m", "side note", "HEAD"]);
+
+    git(&repo, &["config", "format.notes", "true"]);
+    let out = fmt(&repo, &home, &[]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("---\n\nNotes:\n    default note\n"), "default tree:\n{s}");
+
+    git(&repo, &["config", "format.notes", "side"]);
+    let out = fmt(&repo, &home, &[]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("---\n\nNotes (side):\n    side note\n"), "named tree:\n{s}");
+    assert!(!s.contains("default note"), "explicit ref suppresses default:\n{s}");
+
+    let out = fmt(&repo, &home, &["--no-notes"]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(!s.contains("Notes"), "--no-notes wins:\n{s}");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// `format.coverFromDescription` decides how `branch.<name>.description` feeds
+/// the cover letter, and `format.commitListFormat` replaces the shortlog.
+#[test]
+fn format_cover_from_description_and_commit_list_format() {
+    let (repo, home) = fixture("cover");
+    git(&repo, &["config", "branch.main.description", "Desc subject\n\nDesc body.\n"]);
+
+    // The default (`message`) keeps the placeholder subject and uses the whole
+    // description as the blurb.
+    let out = fmt(&repo, &home, &["--cover-letter"]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("[PATCH 0/1] *** SUBJECT HERE ***"), "placeholder kept:\n{s}");
+    assert!(s.contains("\nDesc subject\n\nDesc body.\n"), "description as blurb:\n{s}");
+
+    git(&repo, &["config", "format.coverFromDescription", "subject"]);
+    let out = fmt(&repo, &home, &["--cover-letter"]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("[PATCH 0/1] Desc subject"), "subject taken over:\n{s}");
+    assert!(!s.contains("*** BLURB HERE ***"), "blurb replaced:\n{s}");
+
+    git(&repo, &["config", "format.coverFromDescription", "none"]);
+    let out = fmt(&repo, &home, &["--cover-letter"]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("*** BLURB HERE ***"), "description ignored:\n{s}");
+
+    git(&repo, &["config", "format.commitListFormat", "modern"]);
+    let out = fmt(&repo, &home, &["--cover-letter"]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("\n[1/1] first change\n"), "modern commit list:\n{s}");
+    assert!(!s.contains("t (1):"), "shortlog replaced:\n{s}");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// `format.useAutoBase=whenAble` degrades silently when no upstream can supply a
+/// base, while `true` makes the same situation fatal — the two halves of git's
+/// `die_on_failure` in `get_base_commit()`.
+#[test]
+fn format_use_auto_base_config() {
+    let (repo, home) = fixture("autobase");
+
+    git(&repo, &["config", "format.useAutoBase", "whenAble"]);
+    let out = fmt(&repo, &home, &[]);
+    assert_eq!(out.status.code(), Some(0), "whenAble tolerates no upstream");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(!s.contains("base-commit:"), "no base recorded:\n{s}");
+
+    git(&repo, &["config", "format.useAutoBase", "true"]);
+    let out = fmt(&repo, &home, &[]);
+    assert_eq!(out.status.code(), Some(128), "true is fatal without an upstream");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("fatal: failed to get upstream"), "git's message:\n{err}");
+
+    // An explicit --base wins over the config and records the trailer.
+    git(&repo, &["config", "format.useAutoBase", "false"]);
+    std::fs::write(repo.join("f"), "b\n").unwrap();
+    git(&repo, &["commit", "-q", "-am", "second change"]);
+    let out = fmt(&repo, &home, &["--base=HEAD~1"]);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("\nbase-commit: "), "explicit base recorded:\n{s}");
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}

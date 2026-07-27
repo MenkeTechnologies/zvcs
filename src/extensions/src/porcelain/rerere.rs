@@ -17,14 +17,6 @@
 //! `merge()`. That runs on `gix-merge`'s text driver here, the same driver
 //! behind every other three-way merge in this build (see `merge_apply.rs`), so
 //! a replay lands exactly where `git merge` would have left the file.
-//!
-//! That shared driver is also the one place a replay can diverge from stock.
-//! `xdl_merge()` folds two changed regions that touch — no unchanged line
-//! between them — into a single conflict; the vendored text driver resolves
-//! them independently. So where the conflict being replayed sits directly
-//! against context the resolution also moved, stock records a *new variant*
-//! while this build replays the old one. The divergence is the driver's, not
-//! rerere's: `git merge-file` on the same three images shows it too.
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -215,7 +207,7 @@ fn cmd_remaining(repo: &gix::Repository) -> Result<ExitCode> {
     }
     let mut entries = read_rr(repo)?;
 
-    let index = repo.open_index().context("index file corrupt")?;
+    let index = read_index(repo)?;
     let mut resolved: Vec<BString> = Vec::new();
 
     let mut i = 0usize;
@@ -371,7 +363,7 @@ fn cmd_forget(repo: &gix::Repository, paths: &[&str]) -> Result<ExitCode> {
     }
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    let index = repo.open_index().context("index file corrupt")?;
+    let index = read_index(repo)?;
     let mut rr = read_rr(repo)?;
     let mut dirs = RrDirs::default();
     let rr_cache = rr_cache_dir(repo);
@@ -522,7 +514,7 @@ fn do_plain_rerere(
     dirs: &mut RrDirs,
     autoupdate: bool,
 ) -> Result<()> {
-    let index = repo.open_index().context("index file corrupt")?;
+    let index = read_index(repo)?;
     let rr_cache = rr_cache_dir(repo);
     let mut update: Vec<BString> = Vec::new();
 
@@ -742,7 +734,7 @@ fn try_merge(id_dir: &Path, variant: i32, cur: &[u8]) -> Option<Vec<u8>> {
 /// `update_paths()`: stage each replayed resolution at stage #0, replacing the
 /// unmerged entries the merge left behind.
 fn update_paths(repo: &gix::Repository, update: &[BString]) -> Result<()> {
-    let mut index = repo.open_index().context("index file corrupt")?;
+    let mut index = read_index(repo)?;
 
     for path in update {
         let Some(abs) = repo.workdir_path(path) else {
@@ -1392,6 +1384,27 @@ impl ConsumeHunk for HunkWriter<'_> {
     }
 
     fn finish(self) {}
+}
+
+/// `repo_read_index()`: the index every entry point here reads through.
+///
+/// git reaches the cache with `repo_read_index(r)`, which reports "no index
+/// file" as an index with zero entries rather than as an error — so `git rerere`
+/// in a repository that has never staged anything (a fresh `init`, or a
+/// `commit --allow-empty` before the first `add`) finds no conflicted paths and
+/// returns quietly. `gix`'s `open_index()` fails on the missing file instead, so
+/// the empty state is substituted here.
+///
+/// `open_index`'s `Err` variant is large; boxing it would churn every call site.
+#[allow(clippy::result_large_err)]
+fn read_index(repo: &gix::Repository) -> Result<gix::index::File> {
+    if repo.index_path().exists() {
+        return repo.open_index().context("index file corrupt");
+    }
+    Ok(gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    ))
 }
 
 /// git omits the `,len` field when the hunk spans exactly one line.

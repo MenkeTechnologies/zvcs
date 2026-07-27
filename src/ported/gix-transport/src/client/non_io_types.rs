@@ -49,6 +49,14 @@ pub(crate) mod connect {
         /// Only the transports that spawn the service themselves honour it, which is `file://`/local paths and
         /// `ssh://` — the same ones git passes it to.
         pub upload_pack: Option<bstr::BString>,
+        /// The program to run in place of `git-receive-pack` on the other end, from git's
+        /// `--receive-pack <path>` (a.k.a. `--exec`) or `remote.<name>.receivepack`.
+        ///
+        /// git keeps this apart from [`upload_pack`][Self::upload_pack] and picks whichever one
+        /// matches the direction being connected (`connect_setup()`, transport.c:310-317). Like it,
+        /// only the transports that spawn the service themselves — `file://`/local paths and
+        /// `ssh://` — can honour it.
+        pub receive_pack: Option<bstr::BString>,
         /// Restrict connections to one IP address family, from git's `--ipv4`/`--ipv6`.
         ///
         /// `git://` narrows address resolution, `ssh://` passes `-4`/`-6` to the ssh program, and

@@ -181,6 +181,110 @@ mod write_to_directory {
         Ok(())
     }
 
+    /// A pack whose deltas name their base by object id rather than by offset is what `pack-objects` emits without
+    /// `--delta-base-offset`, and `git index-pack` accepts it. Consuming one used to fail outright, which meant a clone
+    /// from a server that emits `OBJ_REF_DELTA` could not be indexed. The chain here is deliberately two deep so that
+    /// the second delta's base is itself a ref-delta, whose id is only known once the first delta has been applied.
+    #[test]
+    fn chained_in_pack_ref_deltas() -> Result<(), Box<dyn std::error::Error>> {
+        let base = b"the quick brown fox jumps over the lazy dog, and does so repeatedly".to_vec();
+        let one = [base.clone(), b"-one".to_vec()].concat();
+        let two = [one.clone(), b"-two".to_vec()].concat();
+        let id = |data: &[u8]| gix_hash::ObjectId::from(gix_object::compute_hash(gix_hash::Kind::Sha1, gix_object::Kind::Blob, data).expect("hashing blobs never fails"));
+
+        let mut pack = pack_header(3);
+        append_entry(&mut pack, pack::data::entry::Header::Blob, base.len() as u64, &base);
+        append_entry(
+            &mut pack,
+            pack::data::entry::Header::RefDelta { base_id: id(&base) },
+            0,
+            &append_delta(&base, b"-one"),
+        );
+        append_entry(
+            &mut pack,
+            pack::data::entry::Header::RefDelta { base_id: id(&one) },
+            0,
+            &append_delta(&one, b"-two"),
+        );
+        seal_pack(&mut pack);
+
+        let dir = TempDir::new()?;
+        static SHOULD_INTERRUPT: AtomicBool = AtomicBool::new(false);
+        let outcome = pack::Bundle::write_to_directory(
+            &mut pack.as_slice(),
+            Some(dir.path()),
+            &mut progress::Discard,
+            &SHOULD_INTERRUPT,
+            // An empty object database, so nothing can be mistaken for a thin-pack base.
+            Some(gix_object::find::Never),
+            pack::bundle::write::Options {
+                thread_limit: Some(1),
+                iteration_mode: pack::data::input::Mode::Verify,
+                index_version: pack::index::Version::V2,
+                object_hash: gix_hash::Kind::Sha1,
+                alloc_limit_bytes: None,
+                compression: gix_zlib::Compression::BEST_SPEED,
+            },
+        )?;
+        assert_eq!(outcome.index.num_objects, 3, "no entry was dropped or duplicated");
+
+        let bundle = pack::Bundle::at(outcome.index_path.expect("written to a directory"), gix_hash::Kind::Sha1)?;
+        for expected in [&base, &one, &two] {
+            let mut buf = Vec::new();
+            let (obj, _) = bundle
+                .find(
+                    &id(expected),
+                    &mut buf,
+                    &mut gix_zlib::Inflate::default(),
+                    &mut pack::cache::Never,
+                )?
+                .expect("every object of the pack is indexed under its own id");
+            assert_eq!(obj.kind, gix_object::Kind::Blob, "deltas inherit the base object's type");
+            assert_eq!(obj.data, expected.as_slice(), "the delta chain was applied correctly");
+        }
+        Ok(())
+    }
+
+    fn pack_header(num_objects: u32) -> Vec<u8> {
+        let mut out = b"PACK".to_vec();
+        out.extend(2u32.to_be_bytes());
+        out.extend(num_objects.to_be_bytes());
+        out
+    }
+
+    fn seal_pack(pack: &mut Vec<u8>) {
+        let mut hasher = gix_hash::hasher(gix_hash::Kind::Sha1);
+        hasher.update(pack);
+        pack.extend(hasher.try_finalize().expect("hashing in memory never fails").as_slice());
+    }
+
+    fn append_entry(pack: &mut Vec<u8>, header: pack::data::entry::Header, decompressed_size: u64, payload: &[u8]) {
+        let decompressed_size = if decompressed_size == 0 {
+            payload.len() as u64
+        } else {
+            decompressed_size
+        };
+        header
+            .write_to(decompressed_size, pack)
+            .expect("writing an entry header to memory succeeds");
+        let mut deflate = gix_zlib::stream::deflate::Write::new(Vec::new(), gix_zlib::Compression::BEST_SPEED);
+        std::io::Write::write_all(&mut deflate, payload).expect("deflating to memory succeeds");
+        std::io::Write::flush(&mut deflate).expect("flushing the deflater succeeds");
+        pack.extend(deflate.into_inner());
+    }
+
+    /// A delta that copies all of `base` and then inserts `suffix`, the smallest shape that still reads from its base.
+    fn append_delta(base: &[u8], suffix: &[u8]) -> Vec<u8> {
+        assert!(base.len() < 256 && suffix.len() < 128, "keeps the encoding to one byte per field");
+        let mut out = vec![base.len() as u8, (base.len() + suffix.len()) as u8];
+        // copy from base: offset and size are one byte each, both present.
+        out.extend([0b1001_0001, 0, base.len() as u8]);
+        // insert the literal suffix.
+        out.push(suffix.len() as u8);
+        out.extend(suffix);
+        out
+    }
+
     fn file_name(entry: &fs::DirEntry) -> String {
         entry.path().file_name().unwrap().to_str().unwrap().to_owned()
     }

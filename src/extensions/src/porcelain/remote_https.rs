@@ -22,6 +22,12 @@
 //!     where the real ref exchange moves into `stateless-connect`.
 //!   * unknown commands — `error: remote-curl: unknown command '<cmd>' from git`
 //!     with exit 1.
+//!   * `get <url> <path>` — the bundle-URI download, and the command
+//!     `git clone --bundle-uri=https://…` actually spawns this helper for. The
+//!     implementation is shared with the `remote-http` port rather than
+//!     duplicated: see [`super::remote_http::parse_get`], which carries
+//!     `parse_get()` and `http_get_file()` including the `<path>.temp` staging
+//!     file, its `Range:` resume and the whole `http.*` configuration.
 //!
 //! Not covered, and bailing rather than emitting plausible-looking wire data:
 //!   * `push` and `list for-push` — the vendored gitoxide crates implement no
@@ -34,7 +40,6 @@
 //!   * `stateless-connect` — a raw pkt-line proxy between git and the server
 //!     across multiple stateless HTTP round trips; the vendored transport
 //!     exposes no such passthrough.
-//!   * `get` — bundle-URI download, absent from the vendored crates.
 
 use anyhow::{bail, Result};
 use std::io::{BufRead, Write};
@@ -141,8 +146,13 @@ pub fn remote_https(args: &[String]) -> Result<ExitCode> {
                 "'stateless-connect' needs a raw pkt-line passthrough over the HTTP \
                  transport, which gix-transport does not expose ({PORTED})"
             );
-        } else if line == "get" || line.starts_with("get ") {
-            bail!("'get' needs bundle-URI download support, absent from the vendored gitoxide crates ({PORTED})");
+        } else if let Some(arg) = line.strip_prefix("get ") {
+            // `skip_prefix(buf.buf, "get ", &arg)` — the trailing space is part of
+            // the match, so a bare `get` falls through to the unknown-command arm
+            // exactly as it does in stock git.
+            if let Some(code) = super::remote_http::parse_get(BStr::new(arg))? {
+                return Ok(code);
+            }
         } else {
             eprintln!("error: remote-curl: unknown command '{line}' from git");
             return Ok(ExitCode::from(1));

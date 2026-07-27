@@ -1191,11 +1191,10 @@ enum UpdateStrategy {
     Rebase,
 }
 
-/// The flags of `git submodule update` this port honors. The clone/fetch-shaping
-/// flags (`--depth`, `--reference`, `--recommend-shallow`, `--single-branch`,
-/// `--filter`, …) still bail in `update` before any repository is touched, so they
-/// never reach here.
-#[derive(Clone, Copy)]
+/// The flags of `git submodule update` this port honors. `--filter` (the
+/// partial-clone shaping flag) still bails in `update` before any repository is
+/// touched, so it never reaches here.
+#[derive(Clone)]
 struct UpdateOpts {
     quiet: bool,
     init: bool,
@@ -1214,6 +1213,27 @@ struct UpdateOpts {
     /// starts at 1; `.gitmodules`' then the repository's `submodule.fetchJobs` raise it,
     /// and `-j`/`--jobs` overrides both.
     jobs: usize,
+    /// `--depth <n>`, git's `update_data->depth`: the shallow depth a missing
+    /// submodule is cloned at. `0`/`None` is unset.
+    depth: Option<u32>,
+    /// `--recommend-shallow` / `--no-recommend-shallow`, git's tri-state
+    /// `recommend_shallow` whose `UPDATE_DATA_INIT` value is `-1`. Since `-1` is
+    /// truthy in C, only an explicit `--no-recommend-shallow` switches it off; when
+    /// it is on, a submodule whose `.gitmodules` carries `shallow = true` is cloned
+    /// with `--depth=1` *ahead of* an explicit `--depth`
+    /// (`prepare_to_clone_next_submodule`, submodule--helper.c:2349-2352).
+    recommend_shallow: Option<bool>,
+    /// `--reference <repo>`, repeatable: reference repositories forwarded to the
+    /// submodule's clone as `--reference`.
+    references: Vec<String>,
+    /// `--dissociate`: forwarded to the submodule's clone.
+    dissociate: bool,
+    /// `--single-branch` / `--no-single-branch`, git's tri-state `single_branch`
+    /// (`-1` forwards nothing).
+    single_branch: Option<bool>,
+    /// `--require-init`: refuse to clone into a worktree directory that is not
+    /// empty, and refuse to keep one that gained anything besides `.git`.
+    require_init: bool,
 }
 
 fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
@@ -1227,6 +1247,12 @@ fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
         update_default: None,
         // `UPDATE_DATA_INIT`'s `.max_jobs = 1`, before the config below raises it.
         jobs: 1,
+        depth: None,
+        recommend_shallow: None,
+        references: Vec::new(),
+        dissociate: false,
+        single_branch: None,
+        require_init: false,
     };
     let mut patterns: Vec<BString> = Vec::new();
     let mut no_more_opts = false;
@@ -1274,20 +1300,37 @@ fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
                 opts.jobs = parse_jobs("-j", &s[2..])?;
                 jobs_from_cli = true;
             }
-            // Clone-shaping options that need machinery this port does not carry —
-            // the re-executed `git clone` cannot express them, so bail honestly.
-            "--reference" | "--dissociate" => bail!(
-                "`submodule update {a}` only affects cloning of missing submodules, which is not ported"
-            ),
-            s if s.starts_with("--reference=") => bail!(
-                "`submodule update --reference` only affects cloning of missing submodules, which is not ported"
-            ),
-            "--depth" | "--recommend-shallow" | "--no-recommend-shallow" | "--single-branch"
-            | "--no-single-branch" | "--require-init" => bail!(
-                "`submodule update {a}` shapes the clone/fetch, which is not ported"
-            ),
-            s if s.starts_with("--depth=") || s.starts_with("--filter=") => bail!(
-                "`submodule update {s}` shapes the clone/fetch, which is not ported"
+            // The clone-shaping options, all of which `clone_submodule` forwards to
+            // the `git clone` it runs for a missing submodule.
+            "--reference" => {
+                let Some(v) = args.get(i + 1) else {
+                    return usage_exit();
+                };
+                opts.references.push(v.clone());
+                i += 1;
+            }
+            s if s.starts_with("--reference=") => {
+                opts.references.push(s["--reference=".len()..].to_owned());
+            }
+            "--dissociate" => opts.dissociate = true,
+            "--no-dissociate" => opts.dissociate = false,
+            "--depth" => {
+                let Some(v) = args.get(i + 1) else {
+                    return usage_exit();
+                };
+                opts.depth = parse_depth(v)?;
+                i += 1;
+            }
+            s if s.starts_with("--depth=") => opts.depth = parse_depth(&s["--depth=".len()..])?,
+            "--recommend-shallow" => opts.recommend_shallow = Some(true),
+            "--no-recommend-shallow" => opts.recommend_shallow = Some(false),
+            "--single-branch" => opts.single_branch = Some(true),
+            "--no-single-branch" => opts.single_branch = Some(false),
+            "--require-init" => opts.require_init = true,
+            // Partial clone still needs machinery this port does not carry, so it
+            // bails rather than clone a submodule without the filter it asked for.
+            s if s.starts_with("--filter=") => bail!(
+                "`submodule update {s}` shapes the partial-clone fetch, which is not ported"
             ),
             "--filter" => bail!(
                 "`submodule update --filter` shapes the partial-clone fetch, which is not ported"
@@ -1301,6 +1344,13 @@ fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
             }
         }
         i += 1;
+    }
+
+    // `module_update`: `--require-init` turns the registration pass on by itself
+    // (submodule--helper.c:3049-3050), which is why `git clone --recurse-submodules`
+    // never passes `--init` alongside it.
+    if opts.require_init {
+        opts.init = true;
     }
 
     if let Some(code) = reject_empty_pathspec(&patterns) {
@@ -1319,7 +1369,7 @@ fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
     let prefix = repo_prefix(&repo)?;
     // `warn_if_uninitialized` is set only when a pathspec was given.
     let warn = !patterns.is_empty();
-    let code = update_repo(repo, &patterns, opts, None, prefix.as_ref(), warn)?;
+    let code = update_repo(repo, &patterns, &opts, None, prefix.as_ref(), warn)?;
     Ok(ExitCode::from(code))
 }
 
@@ -1336,7 +1386,7 @@ fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
 fn update_repo(
     repo: gix::Repository,
     patterns: &[BString],
-    opts: UpdateOpts,
+    opts: &UpdateOpts,
     super_prefix: Option<&str>,
     prefix: Option<&BString>,
     warn: bool,
@@ -1404,17 +1454,18 @@ fn update_repo(
 
         // git's `prepare_to_clone_next_submodule` treats a missing `<path>/.git` as
         // "needs cloning"; a just-cloned submodule then gets `suboid = null` and a
-        // forced checkout of the recorded commit.
-        let sm_dir = workdir.join(&*gix::path::from_bstr(entry.path.as_bstr()));
+        // forced checkout of the recorded commit. git's `clone_data_path` is the
+        // absolute `<worktree>/<path>`, and it reaches the clone child verbatim —
+        // so the "Cloning into '…'" line names an absolute path.
+        let sm_dir = absolute(&workdir.join(&*gix::path::from_bstr(entry.path.as_bstr())));
+        let sub_name = sub.name().to_owned();
         let clone_url = if sm_dir.join(".git").exists() {
             None
         } else {
-            let sub_name = sub.name().to_owned();
-            let sub_name = sub_name.as_bstr();
             // git reads `submodule.<name>.url` from config (an `init`/`update --init`
             // pass writes it there), falling back to a relative `.gitmodules` url via
             // `resolve_relative_url` — which is not ported, so a `./`/`../` url bails.
-            let url = repo.config_snapshot().string(key(sub_name, "url"));
+            let url = repo.config_snapshot().string(key(sub_name.as_bstr(), "url"));
             let Some(url) = url else {
                 bail!(
                     "submodule '{display}' has no registered `submodule.{sub_name}.url`; run `submodule init` (or `update --init`) first"
@@ -1433,6 +1484,13 @@ fn update_repo(
             entry,
             display,
             sm_dir,
+            // `clone_submodule_sm_gitdir()`: the repository itself lives outside the
+            // worktree, under the superproject's `modules/` directory.
+            sm_gitdir: submodule_name_to_gitdir(&repo, sub_name.as_bstr())?,
+            // `sub->recommend_shallow`, i.e. `submodule.<name>.shallow` in
+            // `.gitmodules`; git only honours the `== 1` case.
+            recommend_shallow: sub.shallow()?.unwrap_or(false),
+            sub_name,
             cfg_strategy,
             clone_url,
         });
@@ -1441,7 +1499,8 @@ fn update_repo(
     // Phase one: the clones, `opts.jobs` at a time. git buffers each child's output and
     // replays it in task order once the phase is over ("We saved the output and put it out
     // all at once now"), which is what keeps the transcript identical at any job count.
-    if let Some(code) = clone_submodules_in_parallel(&plans, &workdir, &opts)? {
+    let alternates = AlternateSetup::from_repo(&repo);
+    if let Some(code) = clone_submodules_in_parallel(&plans, &workdir, &alternates, opts)? {
         return Ok(code);
     }
 
@@ -1452,6 +1511,7 @@ fn update_repo(
             sm_dir,
             cfg_strategy,
             clone_url,
+            ..
         } = plan;
         let (display, sm_dir, cfg_strategy) = (display.as_str(), sm_dir.as_path(), cfg_strategy.clone());
         let just_cloned = clone_url.is_some();
@@ -1515,7 +1575,7 @@ fn update_repo(
         let subforce = suboid.is_none() || opts.force;
         if Some(oid) != suboid || opts.force {
             let code =
-                run_update_procedure(&sub_repo, sm_dir, &oid, &opts, display, strategy, subforce)?;
+                run_update_procedure(&sub_repo, sm_dir, &oid, opts, display, strategy, subforce)?;
             if code != 0 {
                 return Ok(code);
             }
@@ -1546,6 +1606,16 @@ fn parse_jobs(flag: &str, value: &str) -> Result<usize> {
         bail!("you must provide a non-zero number of processes");
     }
     Ok(n as usize)
+}
+
+/// `OPT_INTEGER`'s value for `--depth`. git stores it in an `int` and only tests
+/// `depth > 0` before forwarding it, so `0` and a negative value both mean "no
+/// `--depth` on the child" rather than an error.
+fn parse_depth(value: &str) -> Result<Option<u32>> {
+    let n: i64 = value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--depth expects a numerical value"))?;
+    Ok(u32::try_from(n).ok().filter(|n| *n > 0))
 }
 
 /// `parse_submodule_fetchjobs()`: a negative count is fatal and `0` means one job per CPU.
@@ -1584,7 +1654,16 @@ fn submodule_fetch_jobs(repo: &gix::Repository) -> Result<Option<usize>> {
 struct Plan<'a> {
     entry: &'a Entry,
     display: String,
+    /// The absolute `<worktree>/<path>` — git's `clone_data_path`.
     sm_dir: std::path::PathBuf,
+    /// The absolute `<git-dir>/modules/<name>` this submodule's repository lives in,
+    /// git's `sm_gitdir`.
+    sm_gitdir: std::path::PathBuf,
+    /// The submodule's `.gitmodules` name, which is what `modules/` is keyed by and
+    /// what the alternate computation needs.
+    sub_name: BString,
+    /// `submodule.<name>.shallow` in `.gitmodules`, git's `sub->recommend_shallow`.
+    recommend_shallow: bool,
     cfg_strategy: gix::submodule::config::Update,
     /// `submodule.<name>.url` when `<path>/.git` is missing and a clone has to run first.
     clone_url: Option<BString>,
@@ -1595,11 +1674,16 @@ struct Plan<'a> {
 ///
 /// Each child's output is captured and replayed in task order once the phase is over, which is
 /// what git means by "We saved the output and put it out all at once now" — the transcript is
-/// then the same at any job count. Returns the exit code of the first failing clone in task
-/// order, which stops the caller before any checkout runs (git's `quickstop`).
+/// then the same at any job count.
+///
+/// A clone that fails is retried once — git's `update_clone_task_finished` appends the failed
+/// entry to `failed_clones`, which `update_clone_get_next_task` then serves "as an extension of
+/// the entry list". Only a second failure sets `quickstop`, and `module_update` turns that into
+/// exit code 1 whatever the child's own status was.
 fn clone_submodules_in_parallel(
     plans: &[Plan<'_>],
     toplevel: &std::path::Path,
+    alternates: &AlternateSetup,
     opts: &UpdateOpts,
 ) -> Result<Option<u8>> {
     let tasks: Vec<&Plan<'_>> = plans.iter().filter(|p| p.clone_url.is_some()).collect();
@@ -1607,37 +1691,63 @@ fn clone_submodules_in_parallel(
         return Ok(None);
     }
 
-    let mut results: Vec<Option<Result<CloneOutput>>> = (0..tasks.len()).map(|_| None).collect();
+    let mut retry: Vec<&Plan<'_>> = Vec::new();
+    for (task, out) in tasks.iter().zip(clone_batch(&tasks, toplevel, alternates, opts)?) {
+        replay(&out)?;
+        if out.code != 0 {
+            eprintln!("Failed to clone '{}'. Retry scheduled", task.entry.path);
+            retry.push(task);
+        }
+    }
+    if retry.is_empty() {
+        return Ok(None);
+    }
+
+    for (task, out) in retry.iter().zip(clone_batch(&retry, toplevel, alternates, opts)?) {
+        replay(&out)?;
+        if out.code != 0 {
+            eprintln!("Failed to clone '{}' a second time, aborting", task.entry.path);
+            return Ok(Some(1));
+        }
+    }
+    Ok(None)
+}
+
+/// One `run_processes_parallel` pass over `tasks`, `opts.jobs` at a time, with every
+/// child's output buffered so the replay can run in task order.
+fn clone_batch(
+    tasks: &[&Plan<'_>],
+    toplevel: &std::path::Path,
+    alternates: &AlternateSetup,
+    opts: &UpdateOpts,
+) -> Result<Vec<CloneOutput>> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let workers = opts.jobs.min(tasks.len()).max(1);
     let slots: Vec<std::sync::Mutex<Option<Result<CloneOutput>>>> =
         (0..tasks.len()).map(|_| std::sync::Mutex::new(None)).collect();
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            let (next, tasks, slots) = (&next, &tasks, &slots);
+            let (next, slots) = (&next, &slots);
             scope.spawn(move || loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(task) = tasks.get(i) else { break };
                 let url = task.clone_url.as_ref().expect("filtered to cloning tasks");
                 *slots[i].lock().expect("no panic while cloning") =
-                    Some(clone_submodule(url, &task.sm_dir, toplevel, opts.quiet));
+                    Some(clone_submodule(task, url, toplevel, alternates, opts));
             });
         }
     });
-    for (slot, out) in slots.into_iter().zip(results.iter_mut()) {
-        *out = slot.into_inner().expect("no panic while cloning");
-    }
+    slots
+        .into_iter()
+        .map(|slot| slot.into_inner().expect("no panic while cloning").expect("every task was claimed"))
+        .collect()
+}
 
-    let mut first_failure = None;
-    for out in results {
-        let out = out.expect("every task was claimed by a worker")?;
-        std::io::Write::write_all(&mut std::io::stdout(), &out.stdout)?;
-        std::io::Write::write_all(&mut std::io::stderr(), &out.stderr)?;
-        if out.code != 0 && first_failure.is_none() {
-            first_failure = Some(out.code);
-        }
-    }
-    Ok(first_failure)
+/// Write one buffered child's streams out on this process's own.
+fn replay(out: &CloneOutput) -> Result<()> {
+    std::io::Write::write_all(&mut std::io::stdout(), &out.stdout)?;
+    std::io::Write::write_all(&mut std::io::stderr(), &out.stderr)?;
+    Ok(())
 }
 
 /// What one buffered `clone` child produced.
@@ -1825,38 +1935,392 @@ fn run_update_command(
     Ok(0)
 }
 
-/// git's `clone_submodule`, approximated by re-executing the ported `git clone
-/// [--quiet] <url> <path>` from the superproject worktree with a clean repository
-/// env. Returns the child's exit code (0 on success). This yields an embedded
-/// `<path>/.git` rather than git's separate `.git/modules/<name>` gitdir, and
-/// carries none of the clone-shaping flags (`--depth`/`--reference`/…) — those
-/// stay floored in `update`'s parser.
+/// git's `clone_submodule` (submodule--helper.c:1899-2032), by re-executing the
+/// ported `git clone … --separate-git-dir <sm_gitdir> -- <url> <path>` with a clean
+/// repository env, then wiring the two halves together.
+///
+/// git also passes `--no-checkout` here and leaves populating the worktree to the
+/// `git checkout -f <oid>` that `run_update_command` runs next. This port does not:
+/// its `checkout` cannot populate a worktree from the absent index a `--no-checkout`
+/// clone leaves behind, so the clone checks out the remote's branch tip and the
+/// later `checkout -f` moves it to the recorded commit. Same end state, one extra
+/// worktree write.
+///
+/// The repository lands in the superproject's `modules/<name>`, never inside the
+/// worktree: `<path>/.git` is a `gitdir:` *file* pointing at it and the gitdir's
+/// `core.worktree` points back. That is what makes a submodule survive its
+/// worktree being deleted, and it is what `submodule.alternateLocation` needs in
+/// order to have anything to compute an alternate from.
+///
+/// When `sm_gitdir` already exists there is nothing to clone — git only clears the
+/// stale index and re-connects, so a `deinit`ed submodule comes back without a
+/// second transfer.
+///
+/// Returns the child's exit code (0 on success).
 fn clone_submodule(
+    plan: &Plan<'_>,
     url: &BString,
-    sm_dir: &std::path::Path,
     toplevel: &std::path::Path,
-    quiet: bool,
+    alternates: &AlternateSetup,
+    opts: &UpdateOpts,
 ) -> Result<CloneOutput> {
-    let exe = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("clone");
-    if quiet {
-        cmd.arg("--quiet");
+    let (sm_dir, sm_gitdir) = (plan.sm_dir.as_path(), plan.sm_gitdir.as_path());
+    let mut out = CloneOutput { code: 0, stdout: Vec::new(), stderr: Vec::new() };
+
+    if !sm_gitdir.exists() {
+        // `require_init && !is_empty_dir(path)` — refuse before any transfer runs.
+        if opts.require_init && !is_empty_dir(sm_dir) {
+            out.stderr = format!("fatal: directory not empty: '{}'\n", sm_dir.display()).into_bytes();
+            out.code = 128;
+            return Ok(out);
+        }
+        if let Some(parent) = sm_gitdir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // `prepare_possible_alternates()` runs *before* the clone, because what it
+        // computes are `--reference` arguments for it.
+        let mut references = opts.references.clone();
+        if let Err(err) = prepare_possible_alternates(alternates, plan.sub_name.as_bstr(), &mut references, &mut out)
+        {
+            out.stderr.extend_from_slice(err.as_bytes());
+            out.code = 128;
+            return Ok(out);
+        }
+
+        let exe = std::env::current_exe()?;
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("clone");
+        if opts.quiet {
+            cmd.arg("--quiet");
+        }
+        // `recommend_shallow && sub->recommend_shallow == 1` wins over `--depth`.
+        if opts.recommend_shallow != Some(false) && plan.recommend_shallow {
+            cmd.arg("--depth=1");
+        } else if let Some(depth) = opts.depth {
+            cmd.arg(format!("--depth={depth}"));
+        }
+        for reference in &references {
+            cmd.arg("--reference").arg(reference);
+        }
+        if opts.dissociate {
+            cmd.arg("--dissociate");
+        }
+        cmd.arg("--separate-git-dir").arg(sm_gitdir);
+        match opts.single_branch {
+            Some(true) => {
+                cmd.arg("--single-branch");
+            }
+            Some(false) => {
+                cmd.arg("--no-single-branch");
+            }
+            None => {}
+        }
+        cmd.arg("--").arg(url.to_str_lossy().as_ref()).arg(sm_dir);
+        cmd.current_dir(toplevel)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_PREFIX");
+        // Buffered rather than inherited: `run_processes_parallel` pipes every child so the
+        // transcript stays in task order no matter how many run at once.
+        let child = cmd.output()?;
+        out.stdout.extend_from_slice(&child.stdout);
+        out.stderr.extend_from_slice(&child.stderr);
+        let code = child_code(child.status);
+        if code != 0 {
+            out.stderr.extend_from_slice(
+                format!(
+                    "fatal: clone of '{}' into submodule path '{}' failed\n",
+                    url.to_str_lossy(),
+                    sm_dir.display()
+                )
+                .as_bytes(),
+            );
+            out.code = 128;
+            return Ok(out);
+        }
+
+        // git's racy re-check here — `dir_contains_only_dotgit()`, guarding against a
+        // parallel process filling the worktree while the clone ran — is not ported,
+        // because it presumes the `--no-checkout` above: this clone leaves a checked
+        // out worktree, so the check could only ever fail. The half of `--require-init`
+        // that decides anything, the empty-directory test before the transfer, is above.
+    } else {
+        if opts.require_init && !is_empty_dir(sm_dir) {
+            out.stderr = format!("fatal: directory not empty: '{}'\n", sm_dir.display()).into_bytes();
+            out.code = 128;
+            return Ok(out);
+        }
+        std::fs::create_dir_all(sm_dir)?;
+        // The index describes a worktree that the `git checkout -f <oid>` in
+        // `run_update_command` is about to rebuild, so it is stale by construction.
+        let _ = std::fs::remove_file(sm_gitdir.join("index"));
     }
-    cmd.arg(url.to_str_lossy().as_ref()).arg(sm_dir);
-    cmd.current_dir(toplevel)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_PREFIX");
-    // Buffered rather than inherited: `run_processes_parallel` pipes every child so the
-    // transcript stays in task order no matter how many run at once.
-    let out = cmd.output()?;
-    Ok(CloneOutput {
-        code: child_code(out.status),
-        stdout: out.stdout,
-        stderr: out.stderr,
+
+    connect_work_tree_and_git_dir(sm_dir, sm_gitdir)?;
+
+    // The two keys are copied into the submodule's own config so that a *recursive*
+    // update below this one resolves its alternates the same way.
+    let sub_config = sm_gitdir.join("config");
+    if let Some(location) = &alternates.location {
+        set_config_value(&sub_config, "submodule.alternateLocation", location)?;
+    }
+    if let Some(strategy) = &alternates.error_strategy {
+        set_config_value(&sub_config, "submodule.alternateErrorStrategy", strategy)?;
+    }
+
+    Ok(out)
+}
+
+/// `connect_work_tree_and_git_dir()` (dir.c:4108-4146) without the nested recursion:
+/// write the worktree's `.git` gitfile and the gitdir's `core.worktree`, both as
+/// paths relative to each other so the pair can be moved as a unit.
+fn connect_work_tree_and_git_dir(work_tree: &std::path::Path, git_dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(work_tree)?;
+    std::fs::create_dir_all(git_dir)?;
+    // `real_pathdup()` on both sides: the relative path between them is only
+    // meaningful once symlinks are out of the way.
+    let real_git_dir = std::fs::canonicalize(git_dir)?;
+    let real_work_tree = std::fs::canonicalize(work_tree)?;
+    std::fs::write(
+        work_tree.join(".git"),
+        format!(
+            "gitdir: {}\n",
+            super::worktree::relative_path(&real_git_dir, &real_work_tree).display()
+        ),
+    )?;
+    set_config_value(
+        &git_dir.join("config"),
+        "core.worktree",
+        &super::worktree::relative_path(&real_work_tree, &real_git_dir)
+            .to_string_lossy(),
+    )
+}
+
+/// `repo_config_set_in_file()` for one `<section>.<key>` in a specific config file.
+fn set_config_value(path: &std::path::Path, key: &str, value: &str) -> Result<()> {
+    let mut file = match gix::config::File::from_path_no_includes(path.to_owned(), gix::config::Source::Local) {
+        Ok(file) => file,
+        Err(_) => gix::config::File::new(gix::config::file::Metadata::from(gix::config::Source::Local)),
+    };
+    let (section, name) = key.split_once('.').expect("every key here is `<section>.<name>`");
+    file.set_raw_value_by(section, None, name, value)?;
+    std::fs::write(path, file.to_bstring())?;
+    Ok(())
+}
+
+/// The two `submodule.alternate*` keys plus the superproject's own alternate object
+/// directories — everything `prepare_possible_alternates()` reads, gathered once in
+/// the serial planning pass so the parallel clone phase needs no repository handle.
+struct AlternateSetup {
+    /// `submodule.alternateLocation`. `None` means the whole feature is off.
+    location: Option<String>,
+    /// `submodule.alternateErrorStrategy`; git defaults it to `die`.
+    error_strategy: Option<String>,
+    /// The superproject's `objects/info/alternates` entries, absolute — git's
+    /// `odb_for_each_alternate()` list.
+    super_alternates: Vec<std::path::PathBuf>,
+}
+
+impl AlternateSetup {
+    fn from_repo(repo: &gix::Repository) -> Self {
+        let config = repo.config_snapshot();
+        let string = |key: &str| config.string(key).map(|v| v.to_str_lossy().into_owned());
+        let objects = repo.common_dir().join("objects");
+        let mut super_alternates = Vec::new();
+        if let Ok(text) = std::fs::read_to_string(objects.join("info").join("alternates")) {
+            for line in text.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {
+                let path = std::path::Path::new(line);
+                super_alternates.push(if path.is_absolute() {
+                    path.to_owned()
+                } else {
+                    objects.join(path)
+                });
+            }
+        }
+        AlternateSetup {
+            location: string("submodule.alternateLocation"),
+            error_strategy: string("submodule.alternateErrorStrategy"),
+            super_alternates,
+        }
+    }
+}
+
+/// `prepare_possible_alternates()` (submodule--helper.c:1827-1863) plus the
+/// `add_possible_reference_from_superproject()` it drives.
+///
+/// With `submodule.alternateLocation = superproject`, every alternate the
+/// superproject borrows objects from is assumed to be a repository laid out the
+/// same way, so `<that gitdir>/modules/<name>/` is where *its* copy of this
+/// submodule would be — and if that is a usable repository it is added as a
+/// `--reference` for the clone. `submodule.alternateErrorStrategy` decides what an
+/// unusable one costs: `die` (the default) aborts the clone, `info` reports it and
+/// carries on, `ignore` says nothing.
+///
+/// `Err` carries the message of a fatal, which the caller turns into exit code 128.
+fn prepare_possible_alternates(
+    setup: &AlternateSetup,
+    sm_name: &BStr,
+    references: &mut Vec<String>,
+    out: &mut CloneOutput,
+) -> std::result::Result<(), String> {
+    let Some(location) = setup.location.as_deref() else {
+        return Ok(());
+    };
+    let strategy = setup.error_strategy.as_deref().unwrap_or("die");
+    if !matches!(strategy, "die" | "info" | "ignore") {
+        return Err(format!(
+            "fatal: Value '{strategy}' for submodule.alternateErrorStrategy is not recognized\n"
+        ));
+    }
+    match location {
+        "no" => return Ok(()),
+        "superproject" => {}
+        other => {
+            return Err(format!(
+                "fatal: Value '{other}' for submodule.alternateLocation is not recognized\n"
+            ))
+        }
+    }
+
+    for alternate in &setup.super_alternates {
+        // "If the alternate object store is another repository, try the standard
+        // layout with .git/(modules/<name>)+/objects".
+        let Some(gitdir) = alternate.parent().filter(|_| alternate.file_name() == Some("objects".as_ref())) else {
+            continue;
+        };
+        // The trailing `/` is git's: "We need to end the new path with '/' to mark
+        // it as a dir, otherwise a submodule name containing '/' will be broken as
+        // the last part of a missing submodule reference would be taken as a file
+        // name." It is part of the string that reaches `--reference` and the
+        // messages below, so it is built in rather than added at use.
+        let candidate = format!(
+            "{}/",
+            gitdir
+                .join("modules")
+                .join(gix::path::from_bstr(sm_name).as_ref())
+                .display()
+        );
+        match compute_alternate_path(std::path::Path::new(&candidate)) {
+            Ok(()) => references.push(candidate),
+            Err(err) => match strategy {
+                "die" => {
+                    return Err(format!(
+                        "{ALTERNATE_ERROR_ADVICE}fatal: submodule '{sm_name}' cannot add alternate: {err}\n"
+                    ))
+                }
+                "info" => out
+                    .stderr
+                    .extend_from_slice(format!("submodule '{sm_name}' cannot add alternate: {err}\n").as_bytes()),
+                _ => {}
+            },
+        }
+    }
+    Ok(())
+}
+
+/// git's `alternate_error_advice`, printed by the `die` strategy before the fatal.
+///
+/// git gates it on `advice.submoduleAlternateErrorStrategyDie`, but the advice is
+/// read inside the `submodule--helper clone` child, which does not see the
+/// superproject's advice configuration — stock 2.55.0 prints these four lines even
+/// with the key set to `false`, so they are unconditional here too.
+const ALTERNATE_ERROR_ADVICE: &str = "hint: An alternate computed from a superproject's alternate is invalid.\n\
+     hint: To allow Git to clone without an alternate in such a case, set\n\
+     hint: submodule.alternateErrorStrategy to 'info' or, equivalently, clone with\n\
+     hint: '--reference-if-able' instead of '--reference'.\n";
+
+/// `compute_alternate_path()` (odb.c:274-338) reduced to its verdict: whether `path`
+/// names a repository whose objects may be borrowed, and the message when it does not.
+///
+/// git returns the resolved gitdir; here only the four rejections matter, because
+/// `add_possible_reference_from_superproject()` hands the *candidate* path — not the
+/// resolved one — to `--reference`.
+fn compute_alternate_path(path: &std::path::Path) -> std::result::Result<(), String> {
+    let Ok(ref_git) = std::fs::canonicalize(path) else {
+        return Err(format!("path '{}' does not exist", path.display()));
+    };
+    // `read_gitfile()`: a `.git` *file* redirects to the real repository.
+    let redirect = read_gitfile(&ref_git).or_else(|| read_gitfile(&ref_git.join(".git")));
+    let ref_git = match redirect {
+        Some(repo) => repo,
+        None if ref_git.join(".git").join("objects").is_dir() => ref_git.join(".git"),
+        None if !ref_git.join("objects").is_dir() => {
+            return Err(if ref_git.join("commondir").exists() {
+                format!(
+                    "reference repository '{}' as a linked checkout is not supported yet.",
+                    path.display()
+                )
+            } else {
+                format!("reference repository '{}' is not a local repository.", path.display())
+            })
+        }
+        None => ref_git,
+    };
+    if ref_git.join("shallow").exists() {
+        return Err(format!("reference repository '{}' is shallow", path.display()));
+    }
+    if ref_git.join("info").join("grafts").exists() {
+        return Err(format!("reference repository '{}' is grafted", path.display()));
+    }
+    Ok(())
+}
+
+/// `read_gitfile()`: the path a `gitdir: <path>` file points at, resolved against
+/// the file's own directory when it is relative.
+fn read_gitfile(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let target = text.strip_prefix("gitdir: ")?.trim_end();
+    let target = std::path::Path::new(target);
+    Some(if target.is_absolute() {
+        target.to_owned()
+    } else {
+        path.parent()?.join(target)
     })
+}
+
+/// `is_empty_dir()`: a path that is not a directory, or is one with no entries.
+/// A missing directory counts as empty, which is what git's `!stat(path)` guard
+/// arranges by never reaching the check.
+fn is_empty_dir(path: &std::path::Path) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(_) => true,
+    }
+}
+
+/// `submodule_name_to_gitdir()` (submodule.c:2736-2768): `<git-dir>/modules/<name>`,
+/// absolute. `modules` is on git's `common_list`, so every linked worktree of a
+/// superproject shares one copy of each submodule.
+///
+/// The `extensions.submodulePathConfig` spelling — `submodule.<name>.gitdir`, plus
+/// the containment check `validate_submodule_git_dir()` runs over the result — is
+/// not ported, and is refused here rather than silently resolved to the plain path
+/// it deliberately replaces.
+fn submodule_name_to_gitdir(repo: &gix::Repository, name: &BStr) -> Result<std::path::PathBuf> {
+    if repo
+        .config_snapshot()
+        .boolean("extensions.submodulePathConfig")
+        .unwrap_or(false)
+    {
+        bail!(
+            "extensions.submodulePathConfig is enabled: resolving `submodule.{name}.gitdir` and \
+             git's validate_submodule_git_dir containment check are not ported"
+        );
+    }
+    Ok(absolute(
+        &repo
+            .common_dir()
+            .join("modules")
+            .join(gix::path::from_bstr(name).as_ref()),
+    ))
+}
+
+/// `absolute_pathdup()`: `path` made absolute without resolving symlinks, which is
+/// what keeps `/tmp` from turning into `/private/tmp` in the paths git prints.
+fn absolute(path: &std::path::Path) -> std::path::PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_owned())
 }
 
 /// git's `update_submodule` `--remote` block: resolve the tip of the submodule's
@@ -1870,7 +2334,7 @@ fn resolve_remote_oid(
     sub: &gix::Submodule,
     entry: &Entry,
     sm_dir: &std::path::Path,
-    opts: UpdateOpts,
+    opts: &UpdateOpts,
 ) -> Result<std::result::Result<ObjectId, u8>> {
     let remote_name = default_remote(sub_repo)?;
     let branch = match remote_submodule_branch(super_repo, sub)? {

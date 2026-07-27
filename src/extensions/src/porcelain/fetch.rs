@@ -598,7 +598,10 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // rewritten branches as fast-forwards, so git says so once per invocation —
     // before any fetching, and regardless of `-q` or of whether anything is
     // fetched at all.
-    if !opts.show_forced_updates {
+    // `advice_enabled(ADVICE_FETCH_SHOW_FORCED_UPDATES)` wraps both halves of
+    // this report in `store_updated_refs()` — the "check disabled" note here and
+    // the "it took N seconds" one that is not ported.
+    if !opts.show_forced_updates && crate::advice::Advice::FetchShowForcedUpdates.enabled_in(&repo) {
         eprintln!(
             "warning: fetch normally indicates which branches had a forced update,\n\
              but that check has been disabled; to re-enable, use '--show-forced-updates'\n\
@@ -794,6 +797,37 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The source of the first refspec that had to match a remote ref and did not, as
+/// `get_fetch_map()` reports it.
+///
+/// Only exact sources qualify: a pattern is allowed to match nothing, an object ID is not looked up
+/// among the refs at all, and the opportunistic second-stage refspecs are the ones git passes
+/// `missing_ok = 1`. An empty source is git's shorthand for `HEAD`.
+fn missing_remote_ref(map: &gix::remote::fetch::RefMap) -> Option<String> {
+    map.refspecs.iter().enumerate().find_map(|(index, spec)| {
+        let src = match spec.to_ref().instruction() {
+            gix::refspec::Instruction::Fetch(
+                gix::refspec::instruction::Fetch::Only { src }
+                | gix::refspec::instruction::Fetch::AndUpdate { src, .. },
+            ) => src,
+            _ => return None,
+        };
+        if src.find_byteset(b"*?[]\\").is_some() || gix::ObjectId::from_hex(src).is_ok() {
+            return None;
+        }
+        let matched = map.mappings.iter().any(|mapping| {
+            matches!(mapping.spec_index, gix::protocol::fetch::refmap::SpecIndex::ExplicitInRemote(i) if i == index)
+        });
+        (!matched).then(|| {
+            if src.is_empty() {
+                "HEAD".to_string()
+            } else {
+                src.to_string()
+            }
+        })
+    })
 }
 
 /// What one remote's fetch produced, beyond the objects themselves.
@@ -1518,6 +1552,8 @@ fn fetch_one(
     let connect_options = gix::remote::connect::Options {
         upload_pack: upload_pack_program(repo, remote_name.as_deref(), opts.upload_pack.as_deref()),
         address_family: opts.address_family,
+        // `git fetch` never connects for push.
+        receive_pack: None,
     };
     let server_options = server_options_for(repo, remote_name.as_deref(), &opts.server_options);
 
@@ -1566,6 +1602,15 @@ fn fetch_one(
         }
         Err(e) => return Err(e.into()),
     };
+
+    // `get_fetch_map()` in `remote.c` is called with `missing_ok == 0` for every refspec that came
+    // from the command line or from `remote.<name>.fetch`, so a refspec that names one exact ref the
+    // remote does not have is a `fatal:` before a single object moves - not a summary at the end.
+    if let Some(missing) = missing_remote_ref(prepared.ref_map()) {
+        eprintln!("fatal: couldn't find remote ref {missing}");
+        return Ok(Verdict::Fatal);
+    }
+
     let outcome = prepared
         .with_dry_run(opts.dry_run)
         .with_shallow(opts.shallow.clone().unwrap_or_default())
@@ -1580,7 +1625,19 @@ fn fetch_one(
         .with_reflog_message(RefLogMessage::Prefixed {
             action: "fetch".into(),
         })
-        .receive(&mut *progress, &should_interrupt)?;
+        .receive(&mut *progress, &should_interrupt);
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        // The post-fetch connectivity check (`connected.c`) said the pack was short of what the
+        // offered refs need. git's `store_updated_refs()` reports it against the remote's URL and
+        // gives up on this remote without storing a single ref, which is a plain `error()` and so
+        // exit code 1 rather than a `fatal:`.
+        Err(gix::remote::fetch::Error::NotConnected) => {
+            eprintln!("error: {url} did not send all necessary objects");
+            return Ok(Verdict::Rejected);
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     // Refs the remote could only offer by making us adopt one of its shallow roots. git leaves
     // them out of both the summary and FETCH_HEAD and warns about each, naming the local

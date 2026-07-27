@@ -13,6 +13,10 @@
 //! which a server offers the promisor remotes *it* uses and the client says which of them it will use
 //! itself. That is `promisor_remote_reply()` and the `filter_promisor_remote()` it drives, and it is
 //! what `promisor.acceptFromServer`, `promisor.checkFields` and `promisor.storeFields` govern.
+//!
+//! [`remote_info()`] and [`accept_reply()`] are the server half of that same capability -
+//! `promisor_remote_info()` and `mark_promisor_remotes_as_accepted()` - governed by
+//! `promisor.advertise` and `promisor.sendFields`.
 
 use crate::bstr::ByteSlice;
 
@@ -343,13 +347,17 @@ fn allow_unsanitized(byte: u8) -> bool {
 }
 
 /// `strbuf_addstr_urlencode(sb, s, allow_unsanitized)`.
+///
+/// git's escape is `"%%%02x"` (strbuf.c:839) - lowercase hex. The case is on the wire,
+/// so a server comparing an advertised value against what a client echoes back sees a
+/// mismatch if it is spelled any other way.
 fn urlencode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.as_bytes() {
         if allow_unsanitized(*byte) {
             out.push(*byte as char);
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            out.push_str(&format!("%{byte:02x}"));
         }
     }
     out
@@ -685,16 +693,79 @@ pub fn capability_reply(repo: &crate::Repository, info: &str) -> Option<String> 
     })
 }
 
+/// `promisor_remote_info()`: the `<pr-info>` value a server advertises for the `promisor-remote`
+/// capability, or `None` when it advertises nothing.
+///
+/// `promisor.advertise` gates the whole thing and defaults to off, so a server that was never
+/// configured for it never leaks the names or URLs of its own promisor remotes. `promisor.sendFields`
+/// names the *optional* fields to include on top of the mandatory `name=` and `url=`; the two are the
+/// only configuration this reads, which is why a server can advertise a remote without also
+/// advertising the filter it uses.
+///
+/// The encoding is one `,`-separated group per remote, groups joined with `;`, every value
+/// [`urlencode()`]d so those two separators cannot appear inside a value.
+pub fn remote_info(repo: &crate::Repository) -> Option<String> {
+    let advertise = repo.config.resolved.boolean("promisor.advertise").ok().flatten();
+    if !advertise.unwrap_or(false) {
+        return None;
+    }
+
+    let sent = fields_from_config(repo, "promisor.sendFields");
+    let config_info = config_info_list(repo, &sent);
+    if config_info.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    for info in &config_info {
+        if !out.is_empty() {
+            out.push(';');
+        }
+        out.push_str(&format!("{FIELD_NAME}={}", urlencode(&info.name)));
+        out.push_str(&format!(",{FIELD_URL}={}", urlencode(&info.url)));
+        if let Some(filter) = &info.filter {
+            out.push_str(&format!(",{FIELD_FILTER}={}", urlencode(filter)));
+        }
+        if let Some(token) = &info.token {
+            out.push_str(&format!(",{FIELD_TOKEN}={}", urlencode(token)));
+        }
+    }
+    Some(out)
+}
+
+/// `mark_promisor_remotes_as_accepted()`: the names a client picked out of [`remote_info()`].
+///
+/// The reply is the `;`-joined, urlencoded list the client built in [`capability_reply()`]. A name
+/// that is not one of this repository's promisor remotes is reported with git's warning and dropped -
+/// git keeps serving the request either way, so this returns the accepted subset rather than failing.
+pub fn accept_reply(repo: &crate::Repository, remotes: &str) -> Vec<String> {
+    let known = self::remotes(repo);
+    remotes
+        .split(';')
+        .map(percent_decode)
+        .filter(|name| {
+            let found = known.iter().any(|remote| remote.name == *name);
+            if !found {
+                eprintln!("warning: accepted promisor remote '{name}' not found");
+            }
+            found
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod capability_tests {
     use super::{percent_decode, urlencode};
 
     /// The three separators the protocol reserves have to survive a round trip, which is the whole
     /// point of `allow_unsanitized()` refusing them.
+    ///
+    /// The hex is lowercase because git's is: stock 2.55.0 advertises
+    /// `url=u%2cr%3bl%252` for a `remote.<name>.url` of `u,r;l%2`.
     #[test]
     fn separators_round_trip() {
         let raw = "a,b;c%d e";
-        assert_eq!(urlencode(raw), "a%2Cb%3Bc%25d%20e");
+        assert_eq!(urlencode(raw), "a%2cb%3bc%25d%20e");
         assert_eq!(percent_decode(&urlencode(raw)), raw);
     }
 

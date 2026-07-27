@@ -81,6 +81,18 @@
 //! Whitespace-error warnings (git's default `--whitespace=warn`) are not
 //! emitted; they go to stderr only and never alter the applied content.
 //!
+//! A fragment that `parse_fragment()` rejects — a header the `@@ -a,b +c,d @@`
+//! grammar does not accept, a body that runs out before the header's counts are
+//! satisfied, or a body of nothing but context (`!deleted && !added`, which
+//! `--recount` exempts) — reproduces git's `error: corrupt patch at <file>:<line>`
+//! and exit 128, with the line counted within the input file it came from.
+//! One shape is still reported under that message rather than git's own:
+//! `parse_single_patch()` only enters the fragment loop on a literal `@@ -`, so a
+//! header line like `@@ bogus @@` leaves the patch with no fragments at all and
+//! git falls through to `patch with only garbage at <file>:<line>` (the check
+//! guarded by `state->apply || state->check` and `metadata_changes()`). The exit
+//! code is the same 128; the wording is not.
+//!
 //! Config: `apply.whitespace` is read as the default `--whitespace` action, the
 //! same as git — the command line overrides it. A `warn`/`nowarn` default is the
 //! same no-op; a `fix`/`strip`/`error`/`error-all` default is deferred to the
@@ -573,16 +585,26 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
 
     // ---- read the patch text ------------------------------------------------
     let mut buf: Vec<u8> = Vec::new();
+    // Where each input's first line lands in `buf`, so a parse error can name
+    // the file and the line within it the way `state->patch_input_file` and a
+    // per-file `state->linenr` do.
+    let mut spans: Vec<(String, usize)> = Vec::new();
     if sources.is_empty() {
+        spans.push(("<stdin>".to_string(), 0));
         std::io::stdin().read_to_end(&mut buf)?;
     } else {
         for src in &sources {
+            let first_line = buf.iter().filter(|&&b| b == b'\n').count();
             if src == "-" {
+                spans.push(("<stdin>".to_string(), first_line));
                 std::io::stdin().read_to_end(&mut buf)?;
                 continue;
             }
             match std::fs::read(src) {
-                Ok(b) => buf.extend_from_slice(&b),
+                Ok(b) => {
+                    spans.push((src.clone(), first_line));
+                    buf.extend_from_slice(&b);
+                }
                 Err(e) => {
                     err(
                         o.quiet,
@@ -594,7 +616,18 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let mut patches = parse_patches(&split_lines(&buf), o.strip, o.recount)?;
+    let spans = InputSpans { spans };
+    let mut patches = match parse_patches(&split_lines(&buf), o.strip, o.recount, &spans) {
+        Ok(p) => p,
+        // apply.c reports a corrupt fragment through `error()` and unwinds to
+        // `git apply`'s exit 128, rather than dying with the crate's usual
+        // `zvcs: apply: …` prefix and exit 1.
+        Err(e) => {
+            let corrupt = e.downcast::<CorruptPatch>()?;
+            err(o.quiet, &format!("error: {corrupt}"));
+            return Ok(ExitCode::from(128));
+        }
+    };
     if patches.is_empty() {
         if o.allow_empty {
             return Ok(ExitCode::SUCCESS);
@@ -1195,6 +1228,56 @@ fn matches_at(
 // patch parsing
 // ---------------------------------------------------------------------------
 
+/// `error(_("corrupt patch at %s:%d"))` — every `return -1` out of apply.c's
+/// `parse_fragment()` surfaces as this one message, naming the patch input and
+/// the line the parser had reached, and leaves `git apply` exiting 128.
+///
+/// Carried as its own error type so the entry point can tell it from the
+/// generic failures that share the parse path and reproduce git's wording and
+/// exit code instead of the crate-wide `zvcs: apply: …` form.
+#[derive(Debug)]
+struct CorruptPatch(String);
+
+impl std::fmt::Display for CorruptPatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "corrupt patch at {}", self.0)
+    }
+}
+
+impl std::error::Error for CorruptPatch {}
+
+/// `apply_state.patch_input_file` + `apply_state.linenr`.
+///
+/// git parses each `<patch>` argument on its own, resetting `linenr` per file,
+/// so `corrupt patch at <file>:<line>` names the file the hunk came from and the
+/// line within *that* file. The inputs are concatenated into one buffer here, so
+/// this records the line each one started at and maps back.
+struct InputSpans {
+    /// `(name, index of the input's first line in the concatenated buffer)`,
+    /// in the order the inputs were read.
+    spans: Vec<(String, usize)>,
+}
+
+impl InputSpans {
+    /// [`CorruptPatch`] for the (0-based) line `idx`, in the input that the
+    /// (0-based) line `anchor` belongs to.
+    ///
+    /// The two differ when a fragment's body runs past the end of its own input:
+    /// git, parsing one file at a time, simply runs out of bytes and reports the
+    /// line one past that file's last, so the input is chosen by where the
+    /// fragment *started* rather than by where the scan stopped.
+    fn corrupt_at(&self, anchor: usize, idx: usize) -> anyhow::Error {
+        let (name, start) = self
+            .spans
+            .iter()
+            .rev()
+            .find(|(_, start)| *start <= anchor)
+            .map(|(name, start)| (name.as_str(), *start))
+            .unwrap_or(("<stdin>", 0));
+        anyhow::Error::new(CorruptPatch(format!("{name}:{}", idx - start + 1)))
+    }
+}
+
 /// Split `buf` into lines that keep their trailing newline; a final line without
 /// one is kept as-is.
 fn split_lines(buf: &[u8]) -> Vec<&[u8]> {
@@ -1220,19 +1303,24 @@ fn txt(line: &[u8]) -> String {
 
 /// Scan the whole input for patch headers, skipping any surrounding prose
 /// (commit messages, mail headers) as git does.
-fn parse_patches(lines: &[&[u8]], strip: usize, recount: bool) -> Result<Vec<Patch>> {
+fn parse_patches(
+    lines: &[&[u8]],
+    strip: usize,
+    recount: bool,
+    spans: &InputSpans,
+) -> Result<Vec<Patch>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let l = txt(lines[i]);
         if l.starts_with("diff --git ") {
-            let (p, next) = parse_one(lines, i, strip, true, recount)?;
+            let (p, next) = parse_one(lines, i, strip, true, recount, spans)?;
             i = next;
             out.push(p);
         } else if l.starts_with("--- ")
             && lines.get(i + 1).map(|n| txt(n).starts_with("+++ ")) == Some(true)
         {
-            let (p, next) = parse_one(lines, i, strip, false, recount)?;
+            let (p, next) = parse_one(lines, i, strip, false, recount, spans)?;
             i = next;
             out.push(p);
         } else {
@@ -1250,6 +1338,7 @@ fn parse_one(
     strip: usize,
     git_style: bool,
     recount: bool,
+    spans: &InputSpans,
 ) -> Result<(Patch, usize)> {
     let mut p = Patch {
         old_name: None,
@@ -1334,7 +1423,7 @@ fn parse_one(
     }
 
     while i < lines.len() && txt(lines[i]).starts_with("@@ ") {
-        let (h, added, deleted, next) = parse_hunk(lines, i, recount)?;
+        let (h, added, deleted, next) = parse_hunk(lines, i, recount, spans)?;
         p.added += added;
         p.deleted += deleted;
         p.hunks.push(h);
@@ -1374,10 +1463,13 @@ fn parse_hunk(
     lines: &[&[u8]],
     start: usize,
     recount: bool,
+    spans: &InputSpans,
 ) -> Result<(Hunk, usize, usize, usize)> {
     let header = txt(lines[start]);
+    // `parse_fragment_header()` failing is `parse_fragment()` returning -1 while
+    // `state->linenr` still points at the `@@` line.
     let (old_pos, mut old_rem, new_pos, mut new_rem) =
-        hunk_range(&header).ok_or_else(|| anyhow::anyhow!("corrupt hunk header {header:?}"))?;
+        hunk_range(&header).ok_or_else(|| spans.corrupt_at(start, start))?;
 
     let mut h = Hunk {
         old_pos,
@@ -1447,8 +1539,21 @@ fn parse_hunk(
         i += 1;
     }
 
+    // `if (oldlines || newlines) return -1;` — the body ran out (or hit a line
+    // that is not a body line) before the header's counts were satisfied.
+    // `state->linenr` has been advanced past every line consumed, so the line
+    // reported is the one that stopped the scan, or the first line past the
+    // input when it simply ended.
     if !recount && (old_rem != 0 || new_rem != 0) {
-        bail!("corrupt patch: truncated hunk {header:?}");
+        return Err(spans.corrupt_at(start, i));
+    }
+    // `if (!patch->recount && !deleted && !added) return -1;` — a fragment that
+    // is nothing but context changes nothing, so git calls the patch corrupt
+    // rather than silently applying a no-op. `--recount` exempts it: the counts
+    // are then derived from the body, and an all-context body is how a hunk
+    // whose `+`/`-` lines were mangled in transit still reaches `recount_diff`.
+    if !recount && added == 0 && deleted == 0 {
+        return Err(spans.corrupt_at(start, i));
     }
     // The fragment's verbatim bytes (header through the last consumed body line),
     // re-emitted unchanged into a *.rej file when the hunk is rejected.

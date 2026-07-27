@@ -8,8 +8,10 @@ pub enum Error {
     PackEntryDecode(#[from] crate::data::input::Error),
     #[error("Indices of type {} cannot be written, only {} are supported", *.0 as usize, crate::index::Version::default() as usize)]
     Unsupported(crate::index::Version),
-    #[error("Ref delta objects are not supported as there is no way to look them up. Resolve them beforehand.")]
-    IteratorInvariantNoRefDelta,
+    #[error(
+        "The ref-delta at pack offset {pack_offset} names a base object that is neither in the pack nor in the object database"
+    )]
+    UnresolvedRefDelta { pack_offset: u64 },
     #[error("The iterator failed to set a trailing hash over all prior pack entries in the last provided entry")]
     IteratorInvariantTrailer,
     #[error("Only u32::MAX objects can be stored in a pack, found {0}")]

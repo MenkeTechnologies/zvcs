@@ -21,19 +21,21 @@
 //! # Deliberate scope
 //!
 //! Faithful to the common `git push over https` path: create, fast-forward and
-//! forced ref updates, deletes, and `report-status` / `report-status-v2`. Not
-//! ported (git only sends these when explicitly asked, and each needs substrate
-//! that does not exist in the vendored crates): shallow grafts and the
-//! `side-band-64k` progress demultiplexer — neither is requested, so the server
-//! replies with a plain `report-status` stream. Push certificates (`--signed`),
-//! `--atomic` and `push-options` ARE negotiated here, each refused when the
-//! server does not advertise the capability rather than silently downgraded. The pack is complete but undeltified (see
-//! [`super::pack_objects`]); a non-thin pack is valid for receive-pack, `--thin`
-//! is only a size optimization.
+//! forced ref updates, deletes, and `report-status` / `report-status-v2`.
+//! `side-band-64k` is requested whenever the server advertises it and the
+//! multiplexed stream is demultiplexed here (git's `sideband_demux` /
+//! `demultiplex_sideband`), which is what puts the server's and its hooks'
+//! `remote: …` lines on stderr and keeps the connection open until the server's
+//! closing flush — the one it writes only after `post-receive` and `post-update`
+//! have run. Push certificates (`--signed`), `--atomic` and `push-options` ARE
+//! negotiated here, each refused when the server does not advertise the
+//! capability rather than silently downgraded. Not ported: shallow grafts. The
+//! pack is complete but undeltified (see [`super::pack_objects`]); a non-thin
+//! pack is valid for receive-pack, `--thin` is only a size optimization.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use gix::hash::ObjectId;
 use gix::odb::pack;
@@ -50,6 +52,11 @@ use gix::remote::Direction;
 pub struct Request {
     /// Full remote ref name, e.g. `refs/heads/main`.
     pub name: String,
+    /// The full name of the LOCAL ref this update comes from — git's
+    /// `ref->peer_ref->name`, which is the left-hand side of the `<from> -> <to>`
+    /// the status block prints. `None` for a deletion, which git prints with no
+    /// source at all (`print_ref_status(..., from = NULL, ...)`, transport.c:691).
+    pub src: Option<String>,
     /// The object id to push (null oid = delete).
     pub new: ObjectId,
     /// Whether a non-fast-forward update is permitted.
@@ -106,6 +113,10 @@ pub struct SendOptions {
     pub local_refs: HashSet<String>,
     /// `--signed`: send a push certificate signed with gpg.
     pub signed: Signed,
+    /// `--receive-pack=<path>` / `--exec=<path>`, else `remote.<name>.receivepack`:
+    /// the program to run in place of `git-receive-pack` on the other end. git
+    /// hands it to `git_connect()` for a push (`connect_setup()`, transport.c:314).
+    pub receive_pack: Option<String>,
 }
 
 /// `--signed=<mode>` — git's `SEND_PACK_PUSH_CERT_*`.
@@ -123,10 +134,20 @@ pub enum Signed {
 
 /// The server's per-ref verdict, from `report-status`.
 pub struct RefStatus {
+    /// The ref the push asked to update — git's `ref->name`.
     pub name: String,
-    /// The remote's value before the update (null if the ref was created).
+    /// The local ref this update came from ([`Request::src`]).
+    pub src: Option<String>,
+    /// `option refname <name>` from `report-status-v2`: the ref that really moved,
+    /// which a `proc-receive` hook can make different from [`name`][Self::name].
+    /// git prefers it over `ref->name` everywhere it names the destination
+    /// (`print_ref_status`, `print_ok_ref_status`, `transport_update_tracking_ref`).
+    pub report_name: Option<String>,
+    /// The remote's value before the update (null if the ref was created), after
+    /// any `option old-oid` override.
     pub old: ObjectId,
-    /// The value we asked it to take (null for a delete).
+    /// The value we asked it to take (null for a delete), after any
+    /// `option new-oid` override.
     pub new: ObjectId,
     /// `Ok(())` on `ok`, `Err(reason)` on `ng` or a locally-rejected update.
     pub result: Result<(), String>,
@@ -188,6 +209,13 @@ fn push_cert_payload(
 /// signed bytes, and so is the trailing newline of every command — a certificate
 /// the server cannot verify byte-for-byte is worse than no certificate, so
 /// nothing here is reformatted on the way out.
+///
+/// The `pusher` line names the SIGNING KEY, not the committer:
+/// `generate_push_cert` writes `get_signing_key_id()` followed by `datestamp()`
+/// (send-pack.c:368-370). For openpgp/x509 that is `user.signingKey` when set and
+/// the committer ident otherwise; for `gpg.format = ssh` it is the key's
+/// `ssh-keygen -lf` fingerprint. A receiving `git receive-pack` records the line
+/// verbatim, so getting it wrong misattributes every signed push.
 fn build_push_cert(
     repo: &gix::Repository,
     url: &str,
@@ -195,30 +223,54 @@ fn build_push_cert(
     commands: &[(ObjectId, ObjectId, String)],
     push_options: &[String],
 ) -> Result<Vec<u8>> {
-    let committer = repo
-        .committer()
-        .transpose()?
-        .ok_or_else(|| anyhow!("cannot sign a push without a committer identity"))?;
+    let signer = crate::gitsig::Signer::resolve(repo);
+    let key_id = signer
+        .signing_key_id()
+        .map_err(|e| anyhow!("cannot sign the push certificate: {e}"))?;
+    // `datestamp()` (date.c): the current time and this machine's UTC offset, in
+    // the same `<seconds> <+hhmm>` shape an ident carries.
     let cert = push_cert_payload(
-        &format!("{} <{}> {}", committer.name, committer.email, committer.time),
+        &format!("{key_id} {}", datestamp()),
         url,
         nonce,
         commands,
         push_options,
     );
 
-    let snap = repo.config_snapshot();
-    let program = snap
-        .string("gpg.program")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "gpg".to_string());
-    let key = snap.string("user.signingKey").map(|v| v.to_string());
-    let signature = crate::gitsig::sign(cert.as_bytes(), &program, key.as_deref())
-        .map_err(|e| anyhow!("gpg failed to sign the push certificate: {e}"))?;
+    let signature = signer
+        .sign(cert.as_bytes())
+        .map_err(|e| anyhow!("failed to sign the push certificate: {e}"))?;
 
     let mut out = cert.into_bytes();
     out.extend_from_slice(&signature);
     Ok(out)
+}
+
+/// git's `datestamp()` (date.c): `<seconds-since-epoch> <+hhmm>` for right now,
+/// with this machine's local UTC offset — the second half of the certificate's
+/// `pusher` line.
+fn datestamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let offset_minutes = local_utc_offset_seconds(now) / 60;
+    let sign = if offset_minutes < 0 { '-' } else { '+' };
+    let abs = offset_minutes.abs();
+    format!("{now} {sign}{:02}{:02}", abs / 60, abs % 60)
+}
+
+/// `local_time_tzoffset()` (date.c): this machine's offset from UTC at `time`,
+/// in seconds, as `localtime_r` reports it.
+fn local_utc_offset_seconds(time: i64) -> i64 {
+    let t = time as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `localtime_r` reads `t` and writes `tm`, both live locals of the
+    // right types, and is reentrant.
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return 0;
+    }
+    tm.tm_gmtoff as i64
 }
 
 /// Push `requests` to `remote` over receive-pack, returning each ref's verdict.
@@ -243,8 +295,17 @@ pub fn send_pack(
 
     // Open the push transport and run the receive-pack handshake (the GET ref
     // advertisement), authenticating through the repository's credential helper
-    // exactly as gitoxide's fetch does.
-    let mut connection = remote.connect(Direction::Push)?;
+    // exactly as gitoxide's fetch does. `--receive-pack`/`remote.<name>.receivepack`
+    // has to be handed to the connect, not to the handshake: it names the program
+    // the other end runs, which only exists as a choice while the connection is
+    // being made (`connect_setup()`, transport.c:310-317).
+    let mut connection = remote.connect_with_options(
+        Direction::Push,
+        gix::remote::connect::Options {
+            receive_pack: opts.receive_pack.as_deref().map(Into::into),
+            ..Default::default()
+        },
+    )?;
     let mut authenticate = connection.configured_credentials_for_current_url();
     let transport = connection.transport_mut();
     // Apply the repository's transport configuration (user agent, http.* options)
@@ -275,9 +336,8 @@ pub fn send_pack(
     }
 
     // git's capability selection (send-pack.c, "Does the other end support…"):
-    // prefer report-status-v2, fall back to report-status; advertise the hash
-    // algorithm and agent. side-band-64k is deliberately not requested, so the
-    // report comes back as a plain pkt-line stream.
+    // prefer report-status-v2, fall back to report-status; request side-band-64k
+    // whenever it is offered; advertise the hash algorithm and agent.
     let caps = &handshake.capabilities;
     let status_report = if caps.contains("report-status-v2") {
         Some(2u8)
@@ -288,12 +348,20 @@ pub fn send_pack(
     };
     let allow_deleting_refs = caps.contains("delete-refs");
     let object_format_supported = caps.contains("object-format");
+    // `if (server_supports("side-band-64k")) use_sideband = 1;` (send-pack.c:573).
+    // git asks for it unconditionally, and it is what carries every `remote:` line
+    // back — including everything the server's hooks wrote — and what keeps the
+    // conversation open until the server's own closing flush.
+    let use_sideband = caps.contains("side-band-64k");
 
     let mut cap_buf = String::new();
     match status_report {
         Some(2) => cap_buf.push_str(" report-status-v2"),
         Some(1) => cap_buf.push_str(" report-status"),
         _ => {}
+    }
+    if use_sideband {
+        cap_buf.push_str(" side-band-64k");
     }
     if object_format_supported {
         cap_buf.push_str(&format!(" object-format={}", repo.object_hash()));
@@ -341,6 +409,7 @@ pub fn send_pack(
     // never put on the wire (send-pack.c `check_to_send_update`).
     struct Wire {
         name: String,
+        src: Option<String>,
         old: ObjectId,
         new: ObjectId,
         forced: bool,
@@ -363,6 +432,8 @@ pub fn send_pack(
 
         let reject = |reason: &str| RefStatus {
             name: req.name.clone(),
+            src: req.src.clone(),
+            report_name: None,
             old,
             new: req.new,
             result: Err(reason.to_owned()),
@@ -378,6 +449,8 @@ pub fn send_pack(
             // Nothing to do — git reports this ref up to date and sends no command.
             statuses.push(RefStatus {
                 name: req.name.clone(),
+                src: req.src.clone(),
+                report_name: None,
                 old: remote_current,
                 new: req.new,
                 result: Ok(()),
@@ -409,29 +482,45 @@ pub fn send_pack(
             }
         }
 
-        // Fast-forward check: unless forced or creating/deleting, the new tip must
-        // be a descendant of the old one. If we do not even have the old commit
-        // locally, we cannot prove it — git rejects with "fetch first". A lease
-        // (`--force-with-lease`) skips this and defers to the server's CAS.
-        if !deletion && remote_current != null && !force {
-            match is_fast_forward(repo, remote_current, req.new) {
-                Some(true) => {}
-                Some(false) => {
-                    statuses.push(reject("non-fast-forward"));
-                    continue;
-                }
-                None => {
-                    statuses.push(reject("fetch first"));
-                    continue;
-                }
+        // `set_ref_status_for_push()`'s "must fast-forward" ladder
+        // (remote.c:1734-1745), in git's order — the first rung that fires is the
+        // rejection, and each maps to the summary `print_ref_status()` prints for
+        // that `REF_STATUS_REJECT_*` (transport.c:752-772). Creating a ref and
+        // deleting one are never rejected here.
+        let reject_reason = if deletion || remote_current == null {
+            None
+        } else if req.name.starts_with("refs/tags/") {
+            // A tag the remote already has: overwriting it is never a
+            // fast-forward question, it is a clobber.
+            Some("already exists")
+        } else if repo.find_object(remote_current).is_err() {
+            // We do not have what the remote is on, so we cannot prove anything
+            // about it — `odb_has_object()` fails before the commit lookups.
+            Some("fetch first")
+        } else if !peels_to_commit(repo, remote_current) || !peels_to_commit(repo, req.new) {
+            // `lookup_commit_reference_gently()` on either side: with a non-commit
+            // involved there is no ancestry to test.
+            Some("needs force")
+        } else if is_fast_forward(repo, remote_current, req.new) != Some(true) {
+            Some("non-fast-forward")
+        } else {
+            None
+        };
+        // "`--force` will defeat any rejection implemented by the rules above"
+        // (remote.c:1747-1753) — it only records that the update was forced, which
+        // is the leading `+` in the report.
+        match reject_reason {
+            Some(reason) if !force => {
+                statuses.push(reject(reason));
+                continue;
             }
-        } else if !deletion && remote_current != null && force {
-            // Forced past a non-descendant is flagged with a leading '+' in output.
-            forced |= is_fast_forward(repo, remote_current, req.new) == Some(false);
+            Some(_) => forced = true,
+            None => {}
         }
 
         wire.push(Wire {
             name: req.name.clone(),
+            src: req.src.clone(),
             old,
             new: req.new,
             forced,
@@ -445,6 +534,8 @@ pub fn send_pack(
         for w in &wire {
             statuses.push(RefStatus {
                 name: w.name.clone(),
+                src: w.src.clone(),
+                report_name: None,
                 old: w.old,
                 new: w.new,
                 result: Ok(()),
@@ -483,6 +574,8 @@ pub fn send_pack(
             if !allow_deleting_refs {
                 statuses.push(RefStatus {
                     name: name.clone(),
+                    src: None,
+                    report_name: None,
                     old: *old,
                     new: null,
                     result: Err("remote does not support deleting refs".to_owned()),
@@ -496,6 +589,7 @@ pub fn send_pack(
             // too would report the deletion twice.
             wire.push(Wire {
                 name: name.clone(),
+                src: None,
                 old: *old,
                 new: null,
                 forced: true,
@@ -593,14 +687,31 @@ pub fn send_pack(
     writer.flush()?;
     drop(writer);
 
+    // Read the response. With `side-band-64k` the whole stream is multiplexed:
+    // band 1 carries the report-status pkt-lines, bands 2 and 3 carry everything
+    // the server and its hooks wrote, and the closing flush comes only after
+    // `post-receive` and `post-update` have run. git forks `sideband_demux`
+    // (send-pack.c:284) so the two arrive in parallel and then joins it with
+    // `finish_async()` before printing the status block; draining the stream here
+    // and parsing the primary band afterwards is the same sequence, because the
+    // server writes the entire report before those hooks start and the client has
+    // nothing to say in between.
+    let report_lines: Vec<String> = if use_sideband {
+        pkt_lines(&demultiplex_sideband(repo, &mut reader)?)
+    } else {
+        read_pkt_lines(&mut reader)?
+    };
+
     // Parse report-status (send-pack.c `receive_status`). The first line is the
-    // unpack status; each following `ok`/`ng <ref>` updates that ref's verdict.
+    // unpack status; each following `ok`/`ng <ref>` updates that ref's verdict, and
+    // under `report-status-v2` an `ok` may be followed by `option` lines describing
+    // what the server actually did.
     let unpack;
-    let mut remote_status: HashMap<String, Result<(), String>> = HashMap::new();
+    let mut remote_status: HashMap<String, RemoteVerdict> = HashMap::new();
     if status_report.is_some() {
-        let mut line = String::new();
+        let mut lines = report_lines.into_iter();
         // First pkt-line: "unpack ok" or "unpack <error>".
-        match read_pkt_text(&mut reader, &mut line)? {
+        match lines.next() {
             Some(text) => {
                 let text = text.trim_end();
                 unpack = match text.strip_prefix("unpack ") {
@@ -611,42 +722,99 @@ pub fn send_pack(
             }
             None => bail!("unexpected flush packet while reading remote unpack status"),
         }
-        // Following lines: "ok <ref>" / "ng <ref> <reason>" (report-status-v2 adds
-        // "option …" lines after an "ok", which carry no pass/fail signal here).
-        loop {
-            line.clear();
-            let Some(text) = read_pkt_text(&mut reader, &mut line)? else {
-                break;
-            };
+        // `hint`, the ref the `option` lines that follow belong to.
+        let mut hint: Option<String> = None;
+        let mut new_report = false;
+        for text in lines {
             let text = text.trim_end();
-            if let Some(rest) = text.strip_prefix("ok ") {
-                remote_status.insert(rest.to_owned(), Ok(()));
-            } else if let Some(rest) = text.strip_prefix("ng ") {
-                let (name, reason) = rest.split_once(' ').unwrap_or((rest, "failed"));
-                remote_status.insert(name.to_owned(), Err(reason.to_owned()));
+            let Some((head, rest)) = text.split_once(' ') else {
+                continue;
+            };
+            if head == "option" {
+                // `'option' without a matching 'ok/ng' directive` — git errors and
+                // keeps reading, which is what skipping does here.
+                let Some(name) = hint.as_ref() else { continue };
+                let Some(verdict) = remote_status.get_mut(name) else { continue };
+                if verdict.result.is_err() {
+                    continue;
+                }
+                if new_report {
+                    verdict.reports.push(PushReport::default());
+                    new_report = false;
+                }
+                let Some(report) = verdict.reports.last_mut() else { continue };
+                let (key, val) = rest.split_once(' ').unwrap_or((rest, ""));
+                match key {
+                    "refname" => report.ref_name = Some(val.to_owned()),
+                    "old-oid" => report.old = ObjectId::from_hex(val.as_bytes()).ok(),
+                    "new-oid" => report.new = ObjectId::from_hex(val.as_bytes()).ok(),
+                    "forced-update" => report.forced_update = true,
+                    _ => {}
+                }
+                continue;
             }
-            // "option …" and anything else: ignored for status purposes.
+            new_report = false;
+            let (name, extra) = rest.split_once(' ').unwrap_or((rest, ""));
+            match head {
+                "ok" => {
+                    hint = Some(name.to_owned());
+                    // Every `ok <ref>` opens a fresh report slot: a proc-receive
+                    // hook reports one per ref it created, all under the one ref
+                    // the client asked for.
+                    remote_status
+                        .entry(name.to_owned())
+                        .or_default()
+                        .result = Ok(());
+                    new_report = true;
+                }
+                "ng" => {
+                    hint = Some(name.to_owned());
+                    let reason = if extra.is_empty() { "failed" } else { extra };
+                    remote_status.entry(name.to_owned()).or_default().result =
+                        Err(reason.to_owned());
+                }
+                _ => {}
+            }
         }
     } else {
         unpack = Ok(());
     }
 
     // Fold the server verdicts into the per-ref statuses. With no report-status
-    // capability, git optimistically marks everything ok.
+    // capability, git optimistically marks everything ok. A ref the server
+    // reported through `option refname` produces one status per report, exactly as
+    // `print_one_push_report` prints one line per `ref_push_report`.
     for w in &wire {
-        let result = match remote_status.get(&w.name) {
-            Some(r) => r.clone(),
-            None if status_report.is_none() => Ok(()),
-            None => Err("remote end did not report status".into()),
+        let (result, reports) = match remote_status.remove(&w.name) {
+            Some(v) => (v.result, v.reports),
+            None if status_report.is_none() => (Ok(()), Vec::new()),
+            None => (Err("remote end did not report status".into()), Vec::new()),
         };
-        statuses.push(RefStatus {
-            name: w.name.clone(),
-            old: w.old,
-            new: w.new,
-            result,
-            forced: w.forced,
-            up_to_date: false,
-        });
+        if reports.is_empty() {
+            statuses.push(RefStatus {
+                name: w.name.clone(),
+                src: w.src.clone(),
+                report_name: None,
+                old: w.old,
+                new: w.new,
+                result,
+                forced: w.forced,
+                up_to_date: false,
+            });
+            continue;
+        }
+        for report in reports {
+            statuses.push(RefStatus {
+                name: w.name.clone(),
+                src: w.src.clone(),
+                report_name: report.ref_name,
+                old: report.old.unwrap_or(w.old),
+                new: report.new.unwrap_or(w.new),
+                result: result.clone(),
+                forced: w.forced || report.forced_update,
+                up_to_date: false,
+            });
+        }
     }
 
     Ok(Outcome {
@@ -656,24 +824,406 @@ pub fn send_pack(
     })
 }
 
-/// Read one pkt-line of text into `line`, returning `Some(&line)` for a data
-/// line or `None` at a flush / end of stream. Ports the `packet_reader_read`
-/// loop's `PACKET_READ_NORMAL` handling.
-fn read_pkt_text<'a>(
-    reader: &mut Box<dyn ExtendedBufRead<'_> + Unpin + '_>,
-    line: &'a mut String,
-) -> Result<Option<&'a str>> {
-    match reader.readline() {
-        None => Ok(None),
-        Some(Ok(Ok(PacketLineRef::Data(data)))) => {
-            *line = String::from_utf8_lossy(data).into_owned();
-            Ok(Some(line.as_str()))
+/// One `ref_push_report` (remote.h): what the server says it actually did with a
+/// ref, which a `proc-receive` hook can make differ from what the client asked for.
+#[derive(Default)]
+struct PushReport {
+    /// `option refname <name>`.
+    ref_name: Option<String>,
+    /// `option old-oid <oid>`.
+    old: Option<ObjectId>,
+    /// `option new-oid <oid>`.
+    new: Option<ObjectId>,
+    /// `option forced-update`.
+    forced_update: bool,
+}
+
+/// The server's verdict for one ref plus the `report-status-v2` reports attached
+/// to it — `hint->status`/`hint->remote_status` and the `hint->report` chain.
+struct RemoteVerdict {
+    result: Result<(), String>,
+    reports: Vec<PushReport>,
+}
+
+impl Default for RemoteVerdict {
+    fn default() -> Self {
+        RemoteVerdict {
+            result: Ok(()),
+            reports: Vec::new(),
         }
-        // Flush / delimiter / response-end all terminate the report.
-        Some(Ok(Ok(_))) => Ok(None),
-        Some(Ok(Err(e))) => Err(anyhow!("malformed packet line from remote: {e}")),
-        Some(Err(e)) => Err(anyhow!("error reading from remote: {e}")),
     }
+}
+
+/// Read every pkt-line of the response up to the first flush, as text. Ports the
+/// `packet_reader_read` loop's `PACKET_READ_NORMAL` handling for the plain
+/// (non-multiplexed) stream a server without `side-band-64k` sends.
+fn read_pkt_lines(reader: &mut Box<dyn ExtendedBufRead<'_> + Unpin + '_>) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    loop {
+        match reader.readline() {
+            None => break,
+            Some(Ok(Ok(PacketLineRef::Data(data)))) => {
+                lines.push(String::from_utf8_lossy(data).into_owned());
+            }
+            // Flush / delimiter / response-end all terminate the report.
+            Some(Ok(Ok(_))) => break,
+            Some(Ok(Err(e))) => bail!("malformed packet line from remote: {e}"),
+            Some(Err(e)) => bail!("error reading from remote: {e}"),
+        }
+    }
+    Ok(lines)
+}
+
+/// Split a buffer of pkt-lines into their payloads as text, stopping at the first
+/// flush/delim. This is what the demultiplexed band-1 stream is: the server
+/// chunks the report across side-band packets with no regard for pkt-line
+/// boundaries, so the framing can only be read back once the band is reassembled.
+fn pkt_lines(buf: &[u8]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut i = 0;
+    while i + 4 <= buf.len() {
+        let Ok(hex) = std::str::from_utf8(&buf[i..i + 4]) else { break };
+        let Ok(len) = usize::from_str_radix(hex, 16) else { break };
+        // 0000/0001/0002 are flush, delim and response-end; all end the report.
+        if len < 4 {
+            break;
+        }
+        if i + len > buf.len() {
+            break;
+        }
+        lines.push(String::from_utf8_lossy(&buf[i + 4..i + len]).into_owned());
+        i += len;
+    }
+    lines
+}
+
+/// `recv_sideband()` (pkt-line.c) driving `demultiplex_sideband()` (sideband.c:301):
+/// read the multiplexed response to its closing flush, writing band 2 (progress)
+/// and band 3 (error) to stderr as `remote: …` lines and returning the band-1
+/// payload, which is the primary stream — here, the `report-status` pkt-lines.
+///
+/// Reading to that flush is also what keeps the connection alive long enough for
+/// the server to finish: `receive-pack` writes it as the very last byte of the
+/// session, after `post-receive` and `post-update` have run.
+fn demultiplex_sideband(
+    repo: &gix::Repository,
+    reader: &mut Box<dyn ExtendedBufRead<'_> + Unpin + '_>,
+) -> Result<Vec<u8>> {
+    let mut sideband = Sideband::new(repo);
+    let mut primary: Vec<u8> = Vec::new();
+    loop {
+        match reader.readline() {
+            // EOF without a flush: `PACKET_READ_EOF` — git reports the disconnect
+            // and stops.
+            None => {
+                sideband.finish();
+                break;
+            }
+            Some(Ok(Ok(PacketLineRef::Data(data)))) => match data.split_first() {
+                Some((3, text)) => sideband.remote_error(text),
+                Some((2, text)) => sideband.progress(text),
+                Some((1, payload)) => primary.extend_from_slice(payload),
+                // `protocol error: missing sideband designator` / `bad band #n`.
+                _ => {
+                    sideband.finish();
+                    bail!("protocol error: bad side-band packet from remote");
+                }
+            },
+            // The flush that ends the multiplexed stream — `SIDEBAND_FLUSH`.
+            Some(Ok(Ok(_))) => {
+                sideband.finish();
+                break;
+            }
+            Some(Ok(Err(e))) => {
+                sideband.finish();
+                bail!("malformed packet line from remote: {e}");
+            }
+            Some(Err(e)) => {
+                sideband.finish();
+                bail!("error reading from remote: {e}");
+            }
+        }
+    }
+    Ok(primary)
+}
+
+/// The state `demultiplex_sideband()` keeps between packets: the `remote: `
+/// prefix and clear-to-eol suffix it picked once from stderr's terminal-ness, the
+/// `scratch` buffer holding a line that straddles a packet boundary, and the
+/// colors `maybe_colorize_sideband()` paints keywords with.
+struct Sideband {
+    /// `prefix` — `"\033[K" "remote: "` on a real terminal, plain `"remote: "` otherwise.
+    prefix: &'static str,
+    /// `suffix` — empty on a terminal (the ANSI prefix already clears the line),
+    /// `DUMB_SUFFIX`'s eight spaces otherwise.
+    suffix: &'static str,
+    /// The partial line carried over from the previous packet.
+    scratch: String,
+    colors: SidebandColors,
+}
+
+/// `keywords[]` (sideband.c:23) as resolved SGR sequences, plus whether to use
+/// them at all.
+struct SidebandColors {
+    /// `want_color_stderr(use_sideband_colors())`.
+    enabled: bool,
+    /// `color.remote.hint`, default yellow.
+    hint: String,
+    /// `color.remote.warning`, default bold yellow.
+    warning: String,
+    /// `color.remote.success`, default bold green.
+    success: String,
+    /// `color.remote.error`, default bold red.
+    error: String,
+}
+
+impl SidebandColors {
+    /// `use_sideband_colors()` (sideband.c:110): `color.remote`, falling back to
+    /// `color.ui` and then to `auto`, with `auto` decided by stderr. Note this is
+    /// the one diagnostics slot that DOES consult `color.ui`.
+    fn resolve(repo: &gix::Repository) -> Self {
+        let snapshot = repo.config_snapshot();
+        let raw = snapshot
+            .string("color.remote")
+            .or_else(|| snapshot.string("color.ui"))
+            .map(|v| v.to_string());
+        let enabled = match raw.as_deref() {
+            Some(v) if v.eq_ignore_ascii_case("always") => true,
+            Some(v) if v.eq_ignore_ascii_case("never") => false,
+            // Everything else runs through `git_config_bool`: true means `auto`,
+            // false means off. An unset key is `auto` too.
+            Some(v) if !boolean_value(v) => false,
+            _ => std::io::stderr().is_terminal() && !terminal_is_dumb(),
+        };
+        let slot = |key: &str, default_spec: &str| {
+            super::color::slot(&snapshot, &format!("color.remote.{key}"), default_spec)
+        };
+        SidebandColors {
+            enabled,
+            hint: slot("hint", "yellow"),
+            warning: slot("warning", "bold yellow"),
+            success: slot("success", "bold green"),
+            error: slot("error", "bold red"),
+        }
+    }
+
+    /// The keyword table in git's order, which is also the order it matches in.
+    fn keywords(&self) -> [(&'static str, &str); 4] {
+        [
+            ("hint", self.hint.as_str()),
+            ("warning", self.warning.as_str()),
+            ("success", self.success.as_str()),
+            ("error", self.error.as_str()),
+        ]
+    }
+}
+
+/// git's `git_config_bool` for a non-`always`/`never` color value.
+fn boolean_value(v: &str) -> bool {
+    if v.is_empty() {
+        return false;
+    }
+    for t in ["true", "yes", "on", "auto"] {
+        if v.eq_ignore_ascii_case(t) {
+            return true;
+        }
+    }
+    for f in ["false", "no", "off"] {
+        if v.eq_ignore_ascii_case(f) {
+            return false;
+        }
+    }
+    v.parse::<i64>().map(|n| n != 0).unwrap_or(false)
+}
+
+/// git's `is_terminal_dumb`.
+fn terminal_is_dumb() -> bool {
+    match std::env::var("TERM") {
+        Ok(term) => term == "dumb",
+        Err(_) => true,
+    }
+}
+
+impl Sideband {
+    fn new(repo: &gix::Repository) -> Self {
+        // `if (isatty(2) && !is_terminal_dumb())` — decided once per process in git,
+        // and once per demultiplexed stream here.
+        let tty = std::io::stderr().is_terminal() && !terminal_is_dumb();
+        Sideband {
+            prefix: if tty { "\x1b[Kremote: " } else { "remote: " },
+            suffix: if tty { "" } else { "        " },
+            scratch: String::new(),
+            colors: SidebandColors::resolve(repo),
+        }
+    }
+
+    /// `case 3:` — a remote error. git prints the whole packet as one `remote: `
+    /// line; there is no line splitting on this band.
+    fn remote_error(&mut self, text: &[u8]) {
+        if !self.scratch.is_empty() {
+            self.scratch.push('\n');
+        }
+        self.scratch.push_str(self.prefix);
+        let text = String::from_utf8_lossy(text);
+        let colored = self.colorize(text.trim_end_matches(['\n', '\r']));
+        self.scratch.push_str(&colored);
+        self.flush_scratch(true);
+    }
+
+    /// `case 2:` — progress text. Split on `\n`/`\r`, prefix each complete line,
+    /// append the clear-to-eol suffix to the nonempty ones, and write it out as
+    /// soon as it is complete so a hook's output appears while it is still running.
+    /// A trailing partial line stays in `scratch` for the next packet.
+    fn progress(&mut self, text: &[u8]) {
+        let text = String::from_utf8_lossy(text);
+        let mut rest = text.as_ref();
+        while let Some(at) = rest.find(['\n', '\r']) {
+            let (line, tail) = rest.split_at(at);
+            let brk = tail.as_bytes()[0] as char;
+            rest = &tail[1..];
+
+            // A packet boundary in the middle of a line leaves `scratch` nonempty;
+            // a leading break then needs the clear-to-eol to wipe what is already
+            // on that terminal line.
+            if !self.scratch.is_empty() && line.is_empty() {
+                self.scratch.push_str(self.suffix);
+            }
+            if self.scratch.is_empty() {
+                self.scratch.push_str(self.prefix);
+            }
+            // An empty line keeps no suffix: a lone `\n` after a run of `\r`
+            // progress updates must not wipe the final status it just drew.
+            if !line.is_empty() {
+                let colored = self.colorize(line);
+                self.scratch.push_str(&colored);
+                self.scratch.push_str(self.suffix);
+            }
+            self.scratch.push(brk);
+            self.flush_scratch(false);
+        }
+        if !rest.is_empty() {
+            if self.scratch.is_empty() {
+                self.scratch.push_str(self.prefix);
+            }
+            let colored = self.colorize(rest);
+            self.scratch.push_str(&colored);
+        }
+    }
+
+    /// The `cleanup:` tail of `demultiplex_sideband()`: whatever is still buffered
+    /// gets a newline and goes out.
+    fn finish(&mut self) {
+        if !self.scratch.is_empty() {
+            self.scratch.push('\n');
+            self.flush_scratch(false);
+        }
+    }
+
+    /// `write_in_full(2, …)` — one write per line so the output interleaves
+    /// atomically with anything else writing to the same stderr.
+    fn flush_scratch(&mut self, add_newline: bool) {
+        if add_newline {
+            self.scratch.push('\n');
+        }
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_all(self.scratch.as_bytes());
+        let _ = err.flush();
+        self.scratch.clear();
+    }
+
+    /// `maybe_colorize_sideband()` (sideband.c:254): with color off, sanitize and
+    /// return; otherwise pass leading whitespace through, paint the first keyword
+    /// if the line starts with one, and sanitize the rest.
+    fn colorize(&self, line: &str) -> String {
+        if !self.colors.enabled {
+            return sanitize_control_characters(line);
+        }
+        let mut out = String::new();
+        let ws = line.len() - line.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']).len();
+        out.push_str(&line[..ws]);
+        let mut rest = &line[ws..];
+        for (keyword, color) in self.colors.keywords() {
+            if rest.len() < keyword.len() {
+                continue;
+            }
+            let (head, tail) = rest.split_at(keyword.len());
+            // Matched case-insensitively so servers using any spelling are colored,
+            // but only as a whole word — "successful" stays unpainted.
+            if head.eq_ignore_ascii_case(keyword)
+                && !tail.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+            {
+                out.push_str(color);
+                out.push_str(head);
+                out.push_str("\x1b[m");
+                rest = tail;
+                break;
+            }
+        }
+        out.push_str(&sanitize_control_characters(rest));
+        out
+    }
+}
+
+/// `strbuf_add_sanitized()` (sideband.c:220) at its default
+/// `sideband.allowControlCharacters` setting, which permits ANSI *color*
+/// sequences and renders every other control character as `^X`. A server that
+/// echoes attacker-controlled text must not be able to drive the pusher's
+/// terminal.
+fn sanitize_control_characters(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !b.is_ascii_control() || b == b'\t' || b == b'\n' {
+            // Multi-byte UTF-8 continues here too: only ASCII controls are escaped.
+            let ch_len = utf8_len(b);
+            match std::str::from_utf8(&bytes[i..(i + ch_len).min(bytes.len())]) {
+                Ok(text) => out.push_str(text),
+                Err(_) => out.push(char::REPLACEMENT_CHARACTER),
+            }
+            i += ch_len;
+            continue;
+        }
+        if let Some(len) = ansi_color_sequence_len(&bytes[i..]) {
+            out.push_str(&src[i..i + len]);
+            i += len;
+            continue;
+        }
+        out.push('^');
+        out.push(if b == 0x7f { '?' } else { (0x40 + b) as char });
+        i += 1;
+    }
+    out
+}
+
+/// The byte length of the UTF-8 character starting with `b`.
+fn utf8_len(b: u8) -> usize {
+    match b {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
+    }
+}
+
+/// `handle_ansi_sequence()` (sideband.c:157) for the default
+/// `ALLOW_ANSI_COLOR_SEQUENCES`: `ESC [ [<n> [; <n>]*] m` and nothing else.
+/// Returns the sequence's length including the terminating `m`.
+fn ansi_color_sequence_len(src: &[u8]) -> Option<usize> {
+    if src.len() < 3 || src[0] != 0x1b || src[1] != b'[' {
+        return None;
+    }
+    for (i, b) in src.iter().enumerate().skip(2) {
+        if *b == b'm' {
+            return Some(i + 1);
+        }
+        if !b.is_ascii_digit() && *b != b';' {
+            return None;
+        }
+    }
+    None
 }
 
 /// `is_reachable_in_reflog()` (remote.c:2752) — whether this checkout has ever
@@ -753,6 +1303,15 @@ fn is_reachable_in_reflog(
 /// Whether `new` is a descendant of `old` (a fast-forward). `None` when `old` is
 /// not present locally, so descendancy cannot be decided — git treats that as
 /// "fetch first".
+/// `lookup_commit_reference_gently(oid, 1)`: whether the object is a commit, or a
+/// tag chain ending at one. Anything else (a tree, a blob, a missing object) is
+/// what makes an update need `--force`.
+fn peels_to_commit(repo: &gix::Repository, id: ObjectId) -> bool {
+    repo.find_object(id)
+        .ok()
+        .is_some_and(|o| o.peel_to_kind(gix::objs::Kind::Commit).is_ok())
+}
+
 fn is_fast_forward(repo: &gix::Repository, old: ObjectId, new: ObjectId) -> Option<bool> {
     if repo.find_object(old).is_err() {
         return None;
@@ -828,6 +1387,86 @@ fn agent() -> String {
     format!("git/{}", env!("CARGO_PKG_VERSION"))
 }
 
+
+#[cfg(test)]
+mod sideband_tests {
+    use super::*;
+
+    /// git's default keyword table, so a test does not need a repository to read
+    /// `color.remote.*` from.
+    fn colors(enabled: bool) -> SidebandColors {
+        SidebandColors {
+            enabled,
+            hint: "\x1b[33m".into(),
+            warning: "\x1b[1;33m".into(),
+            success: "\x1b[1;32m".into(),
+            error: "\x1b[1;31m".into(),
+        }
+    }
+
+    fn sideband(enabled: bool) -> Sideband {
+        Sideband {
+            prefix: "remote: ",
+            suffix: "        ",
+            scratch: String::new(),
+            colors: colors(enabled),
+        }
+    }
+
+    /// The band-1 stream is a pkt-line stream that the server chunked at
+    /// side-band packet boundaries, so its framing can only be read once the band
+    /// is reassembled — splitting the side-band packets themselves would lose the
+    /// report whenever it crossed a boundary.
+    #[test]
+    fn primary_band_is_reframed_as_pkt_lines_and_stops_at_the_flush() {
+        let buf = b"000eunpack ok\n0017ok refs/heads/main\n0000001bng refs/heads/x reason\n";
+        assert_eq!(
+            pkt_lines(buf),
+            vec!["unpack ok\n".to_string(), "ok refs/heads/main\n".to_string()],
+            "the flush ends the report; anything after it is not part of it"
+        );
+        // A truncated final packet is dropped rather than half-parsed.
+        assert_eq!(pkt_lines(b"000eunpack ok\n0017ok refs/he"), vec!["unpack ok\n".to_string()]);
+        assert!(pkt_lines(b"0000").is_empty());
+    }
+
+    /// `maybe_colorize_sideband` paints only a leading keyword, only as a whole
+    /// word, and only after any leading whitespace — a server that says
+    /// "successful" must not come out red.
+    #[test]
+    fn only_a_whole_leading_keyword_is_colored() {
+        let sb = sideband(true);
+        assert_eq!(sb.colorize("warning: x"), "\x1b[1;33mwarning\x1b[m: x");
+        assert_eq!(sb.colorize("ERROR: x"), "\x1b[1;31mERROR\x1b[m: x", "matched case-insensitively");
+        assert_eq!(sb.colorize("  hint: x"), "  \x1b[33mhint\x1b[m: x", "leading space is not painted");
+        assert_eq!(sb.colorize("successful: x"), "successful: x", "only whole words match");
+        assert_eq!(sb.colorize("a warning: x"), "a warning: x", "only a LEADING keyword matches");
+        assert_eq!(sb.colorize("success"), "\x1b[1;32msuccess\x1b[m", "a bare keyword still matches");
+        // With color off the text is only sanitized.
+        assert_eq!(sideband(false).colorize("warning: x"), "warning: x");
+    }
+
+    /// `strbuf_add_sanitized`: a remote can put arbitrary bytes on band 2, so
+    /// everything but tab, newline and an ANSI *color* sequence is escaped before
+    /// it reaches the pusher's terminal.
+    #[test]
+    fn control_characters_are_escaped_but_color_sequences_survive() {
+        assert_eq!(sanitize_control_characters("bel\x07l"), "bel^Gl");
+        assert_eq!(sanitize_control_characters("a\tb\nc"), "a\tb\nc", "tab and newline pass through");
+        assert_eq!(
+            sanitize_control_characters("\x1b[31mred\x1b[m"),
+            "\x1b[31mred\x1b[m",
+            "SGR sequences are the one control sequence git still allows"
+        );
+        assert_eq!(
+            sanitize_control_characters("\x1b[2Jwipe"),
+            "^[[2Jwipe",
+            "cursor/erase sequences are not: a hook must not be able to clear the screen"
+        );
+        assert_eq!(sanitize_control_characters("del\x7f"), "del^?");
+        assert_eq!(sanitize_control_characters("héllo ✓"), "héllo ✓", "non-ASCII is not an escape");
+    }
+}
 
 #[cfg(test)]
 mod push_cert_tests {

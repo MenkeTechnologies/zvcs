@@ -326,10 +326,20 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let rebasing = rebase_mode != RebaseMode::Disabled;
 
     // Resolve which remote-tracking ref the fetched upstream lands at.
-    let target_ref = if positionals.len() >= 2 {
+    // `<repository>` may just as well be a URL, and then there is no `remote.<name>` section and
+    // nothing under `refs/remotes/` for the fetch to have updated. git never depends on one:
+    // `cmd_pull()` collects its merge heads from `FETCH_HEAD`, which the fetch has just written for
+    // exactly the refs that were asked for. Only a configured remote gets the tracking-ref
+    // treatment, because that is the one whose name a tracking ref can be built from.
+    let named_remote = positionals
+        .first()
+        .is_some_and(|name| repo.remote_names().iter().any(|known| known == name));
+    let target_ref = if positionals.len() >= 2 && named_remote {
         // Explicit `<remote> <branch>`: after a default-refspec fetch the branch
         // lands at refs/remotes/<remote>/<branch>.
         format!("refs/remotes/{}/{}", positionals[0], positionals[1])
+    } else if positionals.len() >= 2 {
+        "FETCH_HEAD".to_string()
     } else {
         // No explicit branch: derive the tracking ref from the current branch's
         // upstream configuration (branch.<name>.remote / .merge).
@@ -452,9 +462,19 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         return Ok(fetch_code);
     }
 
+    // `cmd_pull()` is `if (run_fetch(...)) return 1;` - a fetch that failed ends the pull right
+    // there, with 1 whatever the fetch itself exited with, and no integration step is attempted.
+    if fetch_code != ExitCode::SUCCESS {
+        return Ok(ExitCode::FAILURE);
+    }
+
     // The upstream ref must now exist locally; if the fetch produced no such
     // tracking ref the requested branch does not exist on the remote.
-    if repo.try_find_reference(target_ref.as_str())?.is_none() {
+    // `FETCH_HEAD` is a file of candidate lines rather than a reference, so it is looked up the way
+    // `parse_fetch()` reaches it - by resolving the name.
+    if repo.try_find_reference(target_ref.as_str())?.is_none()
+        && repo.rev_parse_single(target_ref.as_str()).is_err()
+    {
         bail!("couldn't find remote ref {target_ref}");
     }
 

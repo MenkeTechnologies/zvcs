@@ -10,7 +10,9 @@ use std::ops::Range;
 use gix_hash::ObjectId;
 use gix_object::FindExt;
 
-use super::{compact, function::strip_whitespace_per_line, function::tokens_for_diffing};
+use gix_diff::blob::compact;
+
+use super::{function::strip_whitespace_per_line, function::tokens_for_diffing};
 use crate::{Error, Statistics, types::{Suspect, UnblamedHunk}};
 
 /// One parent's contribution to `sg_origin[]` in git's `pass_blame()`: the origin — the parent

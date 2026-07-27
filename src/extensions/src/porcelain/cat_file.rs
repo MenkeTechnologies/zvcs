@@ -656,10 +656,14 @@ fn resolve_transform_spec(
 // ---- textconv --------------------------------------------------------------
 
 /// git's textconv machinery — `userdiff_find_by_path()` (userdiff.c) plus
-/// `fill_textconv()`/`run_textconv()` (diff.c) — reduced to what `cat-file` asks
-/// of it: map a path to the driver named by its `diff` gitattribute, look up that
-/// driver's `diff.<name>.textconv` program, and run it over the blob's
-/// checked-out content.
+/// `fill_textconv()`/`run_textconv()` (diff.c): map a path to the driver named by
+/// its `diff` gitattribute, look up that driver's `diff.<name>.textconv` program,
+/// and run it over the blob's checked-out content.
+///
+/// The two halves are also useful on their own, and `diff-pairs` drives them
+/// separately for `--ext-diff`: [`Textconv::driver_name`] answers the attribute
+/// lookup and [`Textconv::prep_temp_blob`] materialises a side for the external
+/// diff program.
 pub(crate) struct Textconv<'repo> {
     repo: &'repo gix::Repository,
     /// The gitattributes stack in git's default check-in direction (worktree
@@ -704,11 +708,11 @@ impl<'repo> Textconv<'repo> {
         })
     }
 
-    /// `userdiff_find_by_path()` + `userdiff_get_textconv()`: the `diff` attribute
-    /// must carry a driver *name* — the boolean forms (`diff` / `-diff`) select
-    /// git's built-in true/false drivers, which have no textconv — and that
-    /// driver must configure `diff.<name>.textconv`.
-    fn program(&mut self, path: &BStr) -> Result<Option<String>> {
+    /// `userdiff_find_by_path()`: the name of the driver the path's `diff`
+    /// gitattribute selects. The boolean forms (`diff` / `-diff`) pick git's
+    /// built-in true/false drivers, which carry no user configuration at all, so
+    /// they answer `None` here just as an unset attribute does.
+    pub(crate) fn driver_name(&mut self, path: &BStr) -> Result<Option<String>> {
         // `<rev>:` names the root tree with an empty path; no pattern matches it,
         // so no driver applies.
         if path.is_empty() {
@@ -729,8 +733,17 @@ impl<'repo> Textconv<'repo> {
         let gix::attrs::StateRef::Value(value) = m.assignment.state else {
             return Ok(None);
         };
-        let name = value.as_bstr().to_str_lossy().into_owned();
-        Ok(diff_driver_textconv(self.repo, &name))
+        Ok(Some(value.as_bstr().to_str_lossy().into_owned()))
+    }
+
+    /// `userdiff_find_by_path()` + `userdiff_get_textconv()`: the `diff` attribute
+    /// must carry a driver *name*, and that driver must configure
+    /// `diff.<name>.textconv`.
+    fn program(&mut self, path: &BStr) -> Result<Option<String>> {
+        let Some(name) = self.driver_name(path)? else {
+            return Ok(None);
+        };
+        Ok(diff_driver_config(self.repo, &name, "textconv"))
     }
 
     /// `textconv_object()`: run the path's textconv program over `blob`, or report
@@ -751,6 +764,26 @@ impl<'repo> Textconv<'repo> {
     /// started or exited non-zero, which is git's NULL return.
     fn run(&mut self, program: &str, path: &BStr, blob: &[u8]) -> Result<Option<Vec<u8>>> {
         let dir = temp_blob_dir()?;
+        let file = self.prep_temp_blob(&dir, path, blob)?;
+
+        let output = shell_command(program).arg(&file).output();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        match output {
+            Ok(o) if o.status.success() => Ok(Some(o.stdout)),
+            _ => Ok(None),
+        }
+    }
+
+    /// `prep_temp_blob()` (diff.c): write `blob`'s *worktree* form into `dir` under
+    /// `path`'s basename — the name the program is handed — so a path with
+    /// smudge/eol/ident filters reaches the program checked out.
+    pub(crate) fn prep_temp_blob(
+        &mut self,
+        dir: &std::path::Path,
+        path: &BStr,
+        blob: &[u8],
+    ) -> Result<std::path::PathBuf> {
         let base = path
             .rsplit(|&b| b == b'/')
             .find(|c| !c.is_empty())
@@ -758,9 +791,6 @@ impl<'repo> Textconv<'repo> {
         let file = dir.join(std::ffi::OsString::from(
             String::from_utf8_lossy(base).into_owned(),
         ));
-
-        // `prep_temp_blob()` runs `convert_to_working_tree()` before writing, so a
-        // path with smudge/eol/ident filters reaches the program checked out.
         let mut converted = self.pipeline.convert_to_worktree(
             blob,
             path,
@@ -770,20 +800,17 @@ impl<'repo> Textconv<'repo> {
         std::io::copy(&mut converted, &mut handle)?;
         drop(converted);
         drop(handle);
-
-        let output = textconv_command(program, &file).output();
-        let _ = std::fs::remove_dir_all(&dir);
-
-        match output {
-            Ok(o) if o.status.success() => Ok(Some(o.stdout)),
-            _ => Ok(None),
-        }
+        Ok(file)
     }
 }
 
-/// `diff.<name>.textconv` from the merged configuration, last definition winning.
+/// `diff.<name>.<key>` from the merged configuration, last definition winning.
 /// Subsection names are compared byte for byte, as git compares them.
-fn diff_driver_textconv(repo: &gix::Repository, name: &str) -> Option<String> {
+pub(crate) fn diff_driver_config(
+    repo: &gix::Repository,
+    name: &str,
+    key: &str,
+) -> Option<String> {
     let snapshot = repo.config_snapshot();
     let mut winner: Option<String> = None;
     for section in snapshot.sections() {
@@ -794,34 +821,33 @@ fn diff_driver_textconv(repo: &gix::Repository, name: &str) -> Option<String> {
         if header.subsection_name() != Some(BStr::new(name.as_bytes())) {
             continue;
         }
-        if let Some(v) = section.body().value("textconv") {
+        if let Some(v) = section.body().value(key) {
             winner = Some(v.to_str_lossy().into_owned());
         }
     }
     winner
 }
 
-/// `run_textconv()` builds the child with `use_shell`, so git's
-/// `prepare_shell_cmd()` decides the shape: a command carrying any shell
-/// metacharacter is run as `sh -c '<cmd> "$@"' <cmd> <file>`, and a bare program
-/// name is executed directly with the file as its only argument.
-fn textconv_command(program: &str, file: &std::path::Path) -> std::process::Command {
+/// `run_textconv()` and `run_external_diff()` both build their child with
+/// `use_shell`, so git's `prepare_shell_cmd()` decides the shape: a command
+/// carrying any shell metacharacter is run as `sh -c '<cmd> "$@"' <cmd> <args…>`,
+/// and a bare program name is executed directly with the arguments appended.
+/// Callers push the arguments; both call sites always have at least one, so the
+/// argument-less `sh -c '<cmd>'` branch is unreachable here.
+pub(crate) fn shell_command(program: &str) -> std::process::Command {
     const SHELL_META: &[u8] = b"|&;<>()$`\\\"' \t\n*?[#~=%";
     if program.bytes().any(|b| SHELL_META.contains(&b)) {
         let mut cmd = std::process::Command::new("/bin/sh");
         cmd.arg("-c").arg(format!("{program} \"$@\"")).arg(program);
-        cmd.arg(file);
         cmd
     } else {
-        let mut cmd = std::process::Command::new(program);
-        cmd.arg(file);
-        cmd
+        std::process::Command::new(program)
     }
 }
 
 /// `mks_tempfile_ts()`'s directory: a fresh `git-blob-XXXXXX` under `TMPDIR`, so
 /// the blob can keep its own basename inside it.
-fn temp_blob_dir() -> Result<std::path::PathBuf> {
+pub(crate) fn temp_blob_dir() -> Result<std::path::PathBuf> {
     let base = std::env::temp_dir();
     for attempt in 0..64u32 {
         let stamp = std::time::SystemTime::now()

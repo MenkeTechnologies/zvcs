@@ -1,11 +1,16 @@
 //! Port of git's change compaction, `xdiff/xdiffi.c` 390-1000 and `xdl_fall_back_diff()`
 //! (`xdiff/xutils.c` 453-479), git 2.55.0.
 //!
-//! `gix_diff::blob::Diff::compute` produces the raw edit script; which of several equally minimal
-//! placements a slider ends up in is decided afterwards, by `xdl_change_compact()` in git and by
-//! `Diff::postprocess_lines` in `imara-diff`. The two disagree, and blame reads that placement
-//! directly: the commit a line is attributed to *is* the boundary the slider settled on. So blame
-//! computes the diff without `imara-diff`'s postprocessing and compacts the edit script here.
+//! [`Diff::compute`] produces the raw edit script; which of several equally minimal placements a
+//! slider ends up in is decided afterwards. This module is the direct port of the decision git
+//! makes, `xdl_change_compact()`, and it is what every consumer that has to agree with git
+//! line-for-line uses — notably `gix-blame`, where the commit a line is attributed to *is* the
+//! boundary the slider settled on.
+//!
+//! It differs from [`Diff::postprocess_lines`] in taking the indentation of the *original* lines
+//! as an explicit argument rather than deriving it from the interned tokens: under `-w` the tokens
+//! that are compared are whitespace-stripped, while git's `get_indent()` measures the unstripped
+//! record (`xdf->recs[i]->ptr`).
 //!
 //! `git blame` always passes `XDF_INDENT_HEURISTIC` — `builtin/blame.c:1036` ORs it in from
 //! `revs.diffopt.xdl_opts`, where `diff.indentHeuristic` puts it by default — so the heuristic is
@@ -13,7 +18,8 @@
 
 use std::ops::Range;
 
-use gix_diff::blob::{Algorithm, Diff, Token};
+use crate::intern::Token;
+use crate::{Algorithm, Diff};
 
 /// If a line is indented more than this, [`get_indent`] just returns this value.
 const MAX_INDENT: i32 = 200;
@@ -78,12 +84,9 @@ fn get_indent(line: &[u8]) -> i32 {
 /// Under `-w` the tokens that are *compared* are whitespace-stripped, but git measures the
 /// indentation of the original record (`xdf->recs[i]->ptr`), so this is computed from the
 /// unstripped blob.
-pub(super) fn line_indents(data: &[u8]) -> Vec<i32> {
-    use gix_diff::blob::TokenSource;
-    super::function::tokens_for_diffing(data)
-        .tokenize()
-        .map(get_indent)
-        .collect()
+pub fn line_indents(data: &[u8]) -> Vec<i32> {
+    use crate::intern::TokenSource;
+    crate::sources::byte_lines(data).tokenize().map(get_indent).collect()
 }
 
 /// `struct split_measurement`: what a hypothetical split above a line looks like.
@@ -290,7 +293,7 @@ fn group_slide_up(changed: &mut [bool], recs: &[Token], g: &mut Group) -> bool {
 }
 
 /// The two sides of an edit script, as git's `xdfenv_t` holds them: one flag per line of each file.
-pub(super) struct Changed {
+pub struct Changed {
     /// One entry per line of the *before* file, `true` where the line was removed.
     pub removed: Vec<bool>,
     /// One entry per line of the *after* file, `true` where the line was added.
@@ -343,7 +346,7 @@ struct Sides<'a> {
 /// git compacts the *before* file first and the *after* file second (`xdiff/xdiffi.c:1098-1099`);
 /// each pass reads and, on the histogram fall-back, writes the other file's flags, so the order is
 /// part of the result.
-pub(super) fn change_compact(
+pub fn change_compact(
     diff: &Diff,
     algorithm: Algorithm,
     before: &[Token],

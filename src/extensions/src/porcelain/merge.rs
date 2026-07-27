@@ -85,11 +85,17 @@
 //! * `--into-name <name>`: a port of git's `into_name` — override the merge
 //!   message's destination (the ` into <name>` title and the
 //!   `merge.suppressDest` test), rather than the real current branch.
-//! * The default-matching negations `--no-rerere-autoupdate`, `--no-strategy`
-//!   (git's `option_parse_strategy` no-ops on `unset`), and
-//!   `--overwrite-ignore`, accepted as no-ops: each names behaviour this build
-//!   already performs (no rerere, ignored files overwritten), so passing them
-//!   reproduces stock git rather than erroring.
+//! * `--rerere-autoupdate` / `--no-rerere-autoupdate`: git's
+//!   `OPT_RERERE_AUTOUPDATE`, handed to the `repo_rerere()` that
+//!   `suggest_conflicts()` runs once the conflicted index is written. Set stages
+//!   a replayed resolution (`Staged '<path>' using previous resolution.`), unset
+//!   leaves it in the worktree (`Resolved …`), and neither defers to
+//!   `rerere.autoupdate`.
+//! * The default-matching negations `--no-strategy` (git's
+//!   `option_parse_strategy` no-ops on `unset`) and `--overwrite-ignore`,
+//!   accepted as no-ops: each names behaviour this build already performs
+//!   (ignored files overwritten), so passing them reproduces stock git rather
+//!   than erroring.
 //! * `--[no-]verify-signatures` and `merge.verifySignatures`: a port of
 //!   `verify_merge_signature()`, run over the heads left after the
 //!   already-reachable ones are dropped, with `gpg.minTrustLevel` deciding
@@ -116,9 +122,6 @@
 //!   `-Xignore-cr-at-eol`: git gets these from `xdl_recmatch()`'s `XDF_IGNORE_*`
 //!   record hashing; `gix-merge`'s text driver interns whole lines and has no
 //!   equivalent knob, so the flags are rejected instead of silently ignored.
-//! * `--rerere-autoupdate`: rerere's *recording* half is not ported (see
-//!   `rerere.rs`, whose record/forget paths `bail!` rather than guess a conflict
-//!   id without `ll_merge()`), so there is nothing to auto-stage.
 //! * `--no-overwrite-ignore`: needs gitignore-aware checkout.
 //!
 //! Known fidelity gaps, stated rather than hidden: the diffstat is computed
@@ -933,6 +936,9 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // Fast-forwardable exactly when HEAD is one of the merge bases.
     let diverged = !bases.iter().any(|b| b.detach() == local_id);
     if diverged && opts.ff == Ff::Only {
+        // `die_ff_impossible()` (advice.c): the `advice.diverging` hint comes
+        // first, then the `die()`.
+        crate::advice::ff_impossible(&repo);
         eprintln!("fatal: Not possible to fast-forward, aborting.");
         return Ok(ExitCode::from(128));
     }
@@ -987,14 +993,30 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     if diverged || (opts.ff == Ff::Never && !opts.strategy_options.is_empty()) {
         // `git`'s recursive base for the three-way; the empty tree stands in for an
         // unrelated history (`--allow-unrelated-histories`), which has no base.
-        let base_tree = if bases.is_empty() {
-            gix::ObjectId::empty_tree(repo.object_hash())
+        //
+        // `merge_ort_internal()` names that base in the same breath, and the name
+        // is what a `diff3`/`zdiff3` conflict prints on its `|||||||` line: with
+        // no base at all it is the literal `empty tree`; with several bases —
+        // which git folds into one virtual commit — `merged common ancestors`;
+        // and with exactly one base the base's own abbreviated id
+        // (`strbuf_add_unique_abbrev(…, DEFAULT_ABBREV)`), which is the common
+        // case and the one a two-branch merge always hits.
+        let (base_tree, ancestor) = if bases.is_empty() {
+            (
+                gix::ObjectId::empty_tree(repo.object_hash()),
+                "empty tree".to_string(),
+            )
         } else {
             let base = repo.merge_base(local_id, target_id)?.detach();
-            repo.find_object(base)?.peel_to_tree()?.id
+            let ancestor = if bases.len() > 1 {
+                "merged common ancestors".to_string()
+            } else {
+                base.attach(&repo).shorten_or_id().to_string()
+            };
+            (repo.find_object(base)?.peel_to_tree()?.id, ancestor)
         };
         let labels = gix::merge::blob::builtin_driver::text::Labels {
-            ancestor: Some(BStr::new(b"merged common ancestors")),
+            ancestor: Some(BStr::new(ancestor.as_bytes())),
             current: Some(BStr::new(b"HEAD")),
             other: Some(BStr::new(spec.as_bytes())),
         };
@@ -1368,11 +1390,9 @@ fn do_octopus(
     let should_interrupt = AtomicBool::new(false);
 
     for (spec, head_id) in &heads {
-        let common = if mrc.len() == 1 {
-            repo.merge_base(mrc[0], *head_id)?.detach()
-        } else {
-            repo.merge_base(local_id, *head_id)?.detach()
-        };
+        let tip = if mrc.len() == 1 { mrc[0] } else { local_id };
+        let all_bases = repo.merge_bases_many(tip, &[*head_id])?;
+        let common = repo.merge_base(tip, *head_id)?.detach();
         if common == *head_id {
             if !opts.quiet {
                 println!("Already up to date with {spec}");
@@ -1392,8 +1412,21 @@ fn do_octopus(
         }
 
         let base_tree = repo.find_object(common)?.peel_to_tree()?.id;
+        // `merge_ort_internal()`'s ancestor name again — see the recursive path
+        // above. Stock's octopus never reaches a rendering that shows it: it
+        // resolves unmerged paths through `git merge-index -o git-merge-one-file`,
+        // whose `git merge-file "$src1" "$orig" "$src2"` passes no `-L`, so a
+        // `diff3` conflict there is labelled with the run's `.merge_file_XXXXXX`
+        // temporary names. This driver renders merge-ort conflicts (the
+        // divergence `merge_octopus.rs` documents), so it names the base the way
+        // merge-ort does.
+        let ancestor = if all_bases.len() > 1 {
+            "merged common ancestors".to_string()
+        } else {
+            common.attach(repo).shorten_or_id().to_string()
+        };
         let labels = gix::merge::blob::builtin_driver::text::Labels {
-            ancestor: Some(BStr::new(b"merged common ancestors")),
+            ancestor: Some(BStr::new(ancestor.as_bytes())),
             current: Some(BStr::new(b"HEAD")),
             other: Some(BStr::new(spec.as_bytes())),
         };

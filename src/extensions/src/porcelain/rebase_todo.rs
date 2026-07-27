@@ -219,8 +219,14 @@ impl List {
             };
             let item = match parse_insn_line(repo, comment.as_bytes(), line) {
                 Ok(item) => item,
-                Err(msg) => {
-                    eprintln!("error: {msg}");
+                Err(e) => {
+                    // `check_merge_commit_insn()` prints its `error()` and then its
+                    // `advise_if_enabled(ADVICE_REBASE_TODO_ERROR, …)` before
+                    // `todo_list_parse_insn_buffer()` adds the `invalid line N:` line.
+                    eprintln!("error: {}", e.msg);
+                    if let Some(body) = e.advice {
+                        crate::advice::Advice::RebaseTodoError.advise_in(repo, body);
+                    }
                     eprintln!(
                         "error: invalid line {}: {}",
                         n + 1,
@@ -302,9 +308,28 @@ impl List {
     }
 }
 
-/// `parse_insn_line()`. The `Err` payload is the text git passes to `error()`
-/// before the caller's `invalid line N:` follow-up.
-fn parse_insn_line(repo: &gix::Repository, comment: &[u8], line: &[u8]) -> Result<Item, String> {
+/// A rejected todo line: the text git passes to `error()` before the caller's
+/// `invalid line N:` follow-up, plus the `advice.rebaseTodoError` body that
+/// `check_merge_commit_insn()` pairs with the three instructions for which git
+/// can name the instruction to use instead. Every other rejection carries none,
+/// which is why `From<String>` leaves `advice` empty.
+pub(crate) struct InsnError {
+    msg: String,
+    advice: Option<&'static str>,
+}
+
+impl From<String> for InsnError {
+    fn from(msg: String) -> Self {
+        Self { msg, advice: None }
+    }
+}
+
+/// `parse_insn_line()`.
+fn parse_insn_line(
+    repo: &gix::Repository,
+    comment: &[u8],
+    line: &[u8],
+) -> Result<Item, InsnError> {
     // left-trim
     let bol = &line[line.iter().take_while(|b| matches!(b, b' ' | b'\t')).count()..];
 
@@ -329,7 +354,7 @@ fn parse_insn_line(repo: &gix::Repository, comment: &[u8], line: &[u8]) -> Resul
             .copied()
             .take_while(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
             .collect();
-        return Err(format!("invalid command '{}'", word.as_bstr().to_str_lossy()));
+        return Err(format!("invalid command '{}'", word.as_bstr().to_str_lossy()).into());
     };
 
     // Eat up extra spaces/tabs before the object name; whether there were any
@@ -346,13 +371,14 @@ fn parse_insn_line(repo: &gix::Repository, comment: &[u8], line: &[u8]) -> Resul
                 "{} does not accept arguments: '{}'",
                 cmd.name(),
                 rest.as_bstr().to_str_lossy()
-            ));
+            )
+            .into());
         }
         return Ok(item);
     }
 
     if padding == 0 {
-        return Err(format!("missing arguments for {}", cmd.name()));
+        return Err(format!("missing arguments for {}", cmd.name()).into());
     }
 
     if matches!(cmd, Cmd::Exec | Cmd::Label | Cmd::Reset | Cmd::UpdateRef) {
@@ -406,13 +432,34 @@ fn parse_insn_line(repo: &gix::Repository, comment: &[u8], line: &[u8]) -> Resul
         .map(|c| c.parent_ids().count() > 1)
         .unwrap_or(false);
     if is_merge_commit {
-        match cmd {
-            Cmd::Merge | Cmd::Drop => {}
+        // `pick`, `reword` and `edit` each get their own `advice.rebaseTodoError`
+        // body naming the `merge` form that would have worked; `fixup`/`squash`
+        // get the bare error, and `merge`/`drop` are fine.
+        let advice = match cmd {
+            Cmd::Merge | Cmd::Drop => return Ok(item),
             Cmd::Fixup | Cmd::Squash => {
-                return Err("cannot squash merge commit into another commit".to_string())
+                return Err("cannot squash merge commit into another commit".to_string().into())
             }
-            _ => return Err(format!("'{}' does not accept merge commits", cmd.name())),
-        }
+            Cmd::Reword => {
+                "'reword' does not take a merge commit. If you wanted to\n\
+                 replay the merge and reword the commit message, use\n\
+                 'merge -c' on the commit"
+            }
+            Cmd::Edit => {
+                "'edit' does not take a merge commit. If you wanted to\n\
+                 replay the merge, use 'merge -C' on the commit, and then\n\
+                 'break' to give the control back to you so that you can\n\
+                 do 'git commit --amend && git rebase --continue'."
+            }
+            _ => {
+                "'pick' does not take a merge commit. If you wanted to\n\
+                 replay the merge, use 'merge -C' on the commit."
+            }
+        };
+        return Err(InsnError {
+            msg: format!("'{}' does not accept merge commits", cmd.name()),
+            advice: Some(advice),
+        });
     }
     Ok(item)
 }

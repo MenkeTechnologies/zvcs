@@ -73,8 +73,26 @@ fn zvcs(repo: &Path, home: &Path, extra: &[&str]) -> Output {
     run_repack(BIN, repo, home, extra)
 }
 
+/// The system `git`, by absolute path.
+///
+/// Not `"git"`: this repository installs a shadow named `git` early on `PATH`,
+/// so resolving the name compares the port against itself and the comparison
+/// silently stops being one. `ZVCS_TEST_GIT` overrides for a system git that
+/// lives somewhere else.
+fn system_git() -> String {
+    if let Ok(path) = std::env::var("ZVCS_TEST_GIT") {
+        return path;
+    }
+    for candidate in ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"] {
+        if Path::new(candidate).is_file() {
+            return candidate.to_string();
+        }
+    }
+    panic!("no system git found; set ZVCS_TEST_GIT to one");
+}
+
 fn real(repo: &Path, home: &Path, extra: &[&str]) -> Output {
-    run_repack("git", repo, home, extra)
+    run_repack(&system_git(), repo, home, extra)
 }
 
 fn info_packs_present(repo: &Path) -> bool {

@@ -570,7 +570,10 @@ fn run_tasks(
             "gc" => delegate(super::gc::gc(&strings(&["gc"]))),
             "rerere-gc" => {
                 !repo.git_dir().join("rr-cache").is_dir()
-                    || delegate(super::rerere::rerere(&strings(&["rerere", "gc"])))
+                    // Unlike `repack` and `gc` above, `rerere()` takes the verb's
+                    // arguments only; a leading "rerere" reads as an unknown
+                    // subcommand and prints the usage block.
+                    || delegate(super::rerere::rerere(&strings(&["gc"])))
             }
             // See the "two tasks that do nothing" section above.
             "commit-graph" | "worktree-prune" => true,

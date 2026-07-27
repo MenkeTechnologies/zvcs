@@ -452,7 +452,10 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // disabled, but a repository with rerere on and no `rr-cache` yet would hit
     // the delegate's `read_dir` error path, which git does not have.
     if repo.git_dir().join("rr-cache").is_dir() {
-        super::rerere::rerere(&["rerere".to_string(), "gc".to_string()])?;
+        // `rerere()` is handed the arguments the verb was dispatched with, so the
+        // verb itself is not one of them: a leading "rerere" reads as an unknown
+        // subcommand and prints the usage block instead of collecting anything.
+        super::rerere::rerere(&["gc".to_string()])?;
     }
 
     // `gc.writeCommitGraph` defaults to true.

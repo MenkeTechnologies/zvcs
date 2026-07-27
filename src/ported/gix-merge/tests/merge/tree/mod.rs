@@ -10,6 +10,37 @@ use gix_worktree::stack::state::attributes;
 
 use crate::tree::baseline::Deviation;
 
+/// Cases whose recorded deviating tree is stale in its *content*: the ported
+/// `xdl_merge()` now produces exactly the merged blob git itself produces, so the
+/// recorded tree can no longer serve as the expectation.
+///
+/// `added-file-changed-content-and-mode` is an add/add over an empty base. Against git
+/// 2.55.0, both
+/// `git merge-file -p -L A -L base -L B <ours> </dev/null <theirs>` and
+/// `git merge-tree A B` produce the two conflicting regions pinned below, byte for byte;
+/// the recorded tree holds the single whole-file conflict the pre-port driver made.
+///
+/// Git's tree cannot be used directly as the expectation: the executable bit still
+/// deviates — the fixture message's "we improve on executable bit handling" — and the
+/// reversed variant keeps our side order where git swaps it. So the whole tree is
+/// pinned, which fails loudly on any change to either.
+const GRADUATED_DEVIATIONS: &[(&str, &str)] = &[
+    (
+        "added-file-changed-content-and-mode-A-B",
+        ADD_ADD_MODE_AND_CONTENT_TREE,
+    ),
+    (
+        "added-file-changed-content-and-mode-A-B-reversed",
+        ADD_ADD_MODE_AND_CONTENT_TREE,
+    ),
+];
+
+const ADD_ADD_MODE_AND_CONTENT_TREE: &str = r#"bf43c01
+├── a:fd269b6 
+│   └── x.f:100644:4406528 "original\n1\n2\n3\n4\n5\n"
+└── new:100755:b8d395f "<<<<<<< A\n=======\noriginal\n>>>>>>> B\n1\n2\n3\n4\n5\n<<<<<<< A\n=======\n6\n>>>>>>> B\n"
+"#;
+
 /// ### How to add a new baseline test
 ///
 /// 1. Add it to the `tree_baseline.sh` script and don't forget to call the
@@ -74,6 +105,22 @@ fn run_baseline() -> crate::Result {
 
         let actual_id = actual.tree.write(|tree| odb.write(tree))?;
         match &deviation {
+            Some(_)
+                if GRADUATED_DEVIATIONS
+                    .iter()
+                    .any(|(name, _)| *name == case_name.as_str()) =>
+            {
+                let expected = GRADUATED_DEVIATIONS
+                    .iter()
+                    .find_map(|(name, tree)| (*name == case_name.as_str()).then_some(*tree))
+                    .expect("just matched");
+                pretty_assertions::assert_str_eq!(
+                    baseline::visualize_tree(&actual_id, &odb, None).to_string().trim_end(),
+                    expected.trim_end(),
+                    "{case_name}: the content merge no longer matches what git 2.55.0 produces\n{:#?}",
+                    actual.conflicts
+                );
+            }
             None => {
                 if actual_id != merge_info.merged_tree {
                     baseline::show_diff_and_fail(&case_name, actual_id, &actual, &merge_info, &odb);

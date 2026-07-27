@@ -2,17 +2,14 @@
 
 use std::{num::NonZeroU32, ops::Range};
 
-use gix_hash::ObjectId;
-
-use gix_object::bstr::BString;
-
 use crate::{
     file::fingerprint::{Fingerprint, LineTracker, are_lines_adjacent, guess_line_blames, line_fingerprints},
-    types::{BlameEntry, Change, Either, LineRange, Offset, UnblamedHunk},
+    types::{BlameEntry, Change, Either, LineRange, Offset, PathTable, Suspect, UnblamedHunk},
 };
 
 pub(super) mod compact;
 pub(super) mod fingerprint;
+pub(super) mod copied;
 pub(super) mod moved;
 pub(super) mod function;
 
@@ -25,8 +22,8 @@ pub(super) mod function;
 fn process_change(
     new_hunks_to_blame: &mut Vec<UnblamedHunk>,
     offset: &mut Offset,
-    suspect: ObjectId,
-    parent: ObjectId,
+    suspect: Suspect,
+    parent: Suspect,
     hunk: Option<UnblamedHunk>,
     change: Option<Change>,
 ) -> (Option<UnblamedHunk>, Option<Change>) {
@@ -338,8 +335,8 @@ fn process_change(
 fn process_changes(
     hunks_to_blame: Vec<UnblamedHunk>,
     changes: Vec<Change>,
-    suspect: ObjectId,
-    parent: ObjectId,
+    suspect: Suspect,
+    parent: Suspect,
 ) -> Vec<UnblamedHunk> {
     let mut new_hunks_to_blame = Vec::new();
 
@@ -415,11 +412,10 @@ fn diff_chunks(changes: &[Change]) -> Vec<DiffChunk> {
 /// `ignored`; a run that matched nothing stays with the target and is marked `unblamable`.
 fn ignore_blame_entry(
     hunk: UnblamedHunk,
-    suspect: ObjectId,
-    parent: ObjectId,
+    suspect: Suspect,
+    parent: Suspect,
     tlno: u32,
     line_blames: &[LineTracker],
-    source_file_name: Option<&BString>,
     out: &mut Vec<UnblamedHunk>,
 ) {
     let Some(range) = hunk.get_range(&suspect).cloned() else {
@@ -454,14 +450,11 @@ fn ignore_blame_entry(
         let tracker = line_blames[base + i];
         if tracker.is_parent {
             this.ignored = true;
+            // `parent` carries the path the *Source File* has in the parent, so a hunk handed over
+            // here is renamed across a rewrite exactly as the ordinary pass renames one.
             if let Some(entry) = this.suspects.iter_mut().find(|entry| entry.0 == suspect) {
                 entry.0 = parent;
                 entry.1 = tracker.s_lno..tracker.s_lno + run as u32;
-            }
-            // The ordinary pass renames the *Source File* for the hunks it passes across a rewrite;
-            // the hunks handed over here need the same treatment.
-            if let Some(name) = source_file_name {
-                this.source_file_name = Some(name.clone());
             }
         } else {
             // `s_lno` is already in the target's address space, so the range stays as it is.
@@ -490,11 +483,10 @@ fn ignore_blame_entry(
 pub(super) fn process_ignored_changes(
     mut hunks_to_blame: Vec<UnblamedHunk>,
     changes: &[Change],
-    suspect: ObjectId,
-    parent: ObjectId,
+    suspect: Suspect,
+    parent: Suspect,
     parent_blob: &[u8],
     target_blob: &[u8],
-    source_file_name: Option<&BString>,
 ) -> Vec<UnblamedHunk> {
     if !hunks_to_blame.iter().any(|hunk| hunk.has_suspect(&suspect)) {
         return hunks_to_blame;
@@ -531,7 +523,6 @@ pub(super) fn process_ignored_changes(
                         parent,
                         chunk.tlno,
                         &line_blames,
-                        source_file_name,
                         &mut out,
                     );
                 }
@@ -546,14 +537,14 @@ pub(super) fn process_ignored_changes(
 }
 
 impl UnblamedHunk {
-    fn shift_by(mut self, suspect: ObjectId, offset: Offset) -> Self {
+    fn shift_by(mut self, suspect: Suspect, offset: Offset) -> Self {
         if let Some(entry) = self.suspects.iter_mut().find(|entry| entry.0 == suspect) {
             entry.1 = entry.1.shift_by(offset);
         }
         self
     }
 
-    fn split_at(self, suspect: ObjectId, line_number_in_destination: u32) -> Either<Self, (Self, Self)> {
+    fn split_at(self, suspect: Suspect, line_number_in_destination: u32) -> Either<Self, (Self, Self)> {
         match self.get_range(&suspect) {
             None => Either::Left(self),
             Some(range_in_suspect) => {
@@ -578,7 +569,6 @@ impl UnblamedHunk {
                         range_in_blamed_file: self.range_in_blamed_file.start
                             ..(self.range_in_blamed_file.start + split_at_from_start),
                         suspects: new_suspects_before.collect(),
-                        source_file_name: self.source_file_name.clone(),
                         ignored: self.ignored,
                         unblamable: self.unblamable,
                     };
@@ -586,7 +576,6 @@ impl UnblamedHunk {
                         range_in_blamed_file: (self.range_in_blamed_file.start + split_at_from_start)
                             ..(self.range_in_blamed_file.end),
                         suspects: new_suspects_after.collect(),
-                        source_file_name: self.source_file_name,
                         ignored: self.ignored,
                         unblamable: self.unblamable,
                     };
@@ -601,7 +590,7 @@ impl UnblamedHunk {
 
     /// This is like [`Self::pass_blame()`], but easier to use in places where the 'passing' is
     /// done 'inline'.
-    fn passed_blame(mut self, from: ObjectId, to: ObjectId) -> Self {
+    fn passed_blame(mut self, from: Suspect, to: Suspect) -> Self {
         if let Some(entry) = self.suspects.iter_mut().find(|entry| entry.0 == from) {
             entry.0 = to;
         }
@@ -609,34 +598,34 @@ impl UnblamedHunk {
     }
 
     /// Transfer all ranges from the commit at `from` to the commit at `to`.
-    fn pass_blame(&mut self, from: ObjectId, to: ObjectId) {
+    fn pass_blame(&mut self, from: Suspect, to: Suspect) {
         if let Some(entry) = self.suspects.iter_mut().find(|entry| entry.0 == from) {
             entry.0 = to;
         }
     }
 
-    fn clone_blame(&mut self, from: ObjectId, to: ObjectId) {
+    fn clone_blame(&mut self, from: Suspect, to: Suspect) {
         if let Some(range_in_suspect) = self.get_range(&from) {
             self.suspects.push((to, range_in_suspect.clone()));
         }
     }
 
-    fn remove_blame(&mut self, suspect: ObjectId) {
+    fn remove_blame(&mut self, suspect: Suspect) {
         self.suspects.retain(|entry| entry.0 != suspect);
     }
 }
 
 impl BlameEntry {
     /// Create an offset from a portion of the *Blamed File*.
-    fn from_unblamed_hunk(unblamed_hunk: &UnblamedHunk, commit_id: ObjectId) -> Option<Self> {
-        let range_in_source_file = unblamed_hunk.get_range(&commit_id)?;
+    fn from_unblamed_hunk(unblamed_hunk: &UnblamedHunk, suspect: Suspect, paths: &PathTable) -> Option<Self> {
+        let range_in_source_file = unblamed_hunk.get_range(&suspect)?;
 
         Some(Self {
             start_in_blamed_file: unblamed_hunk.range_in_blamed_file.start,
             start_in_source_file: range_in_source_file.start,
             len: force_non_zero(range_in_source_file.len() as u32),
-            commit_id,
-            source_file_name: unblamed_hunk.source_file_name.clone(),
+            commit_id: suspect.commit_id,
+            source_file_name: paths.source_file_name(suspect.path),
             ignored: unblamed_hunk.ignored,
             unblamable: unblamed_hunk.unblamable,
         })

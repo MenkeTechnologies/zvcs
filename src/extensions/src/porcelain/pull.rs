@@ -42,7 +42,7 @@
 //! `--signoff` are honored on the *rebase* path), `--rebase=interactive`
 //! (interactive todo editing needs a TTY editor loop), `--autostash` over a
 //! dirty tree on the merge path (needs a 3-way stash apply the stash port lacks),
-//! `--set-upstream`, `--update-shallow` (see [`fetch`](super::fetch)), and
+//! `--set-upstream`, and
 //! `--gpg-sign`/`-S`/`--verify-signatures` (GPG is not vendored).
 //!
 //! The diffstat selectors `-n`, `--stat`/`--no-stat`, `--summary`/`--no-summary`
@@ -129,6 +129,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let mut f_tags = false;
     let mut f_prune = false;
     let mut f_unshallow = false;
+    let mut f_update_shallow = false;
     let mut f_depth: Option<String> = None;
     let mut f_deepen: Option<String> = None;
     let mut f_shallow_since: Option<String> = None;
@@ -217,6 +218,8 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "-t" | "--tags" => f_tags = true,
             "-p" | "--prune" => f_prune = true,
             "--unshallow" => f_unshallow = true,
+            "--update-shallow" => f_update_shallow = true,
+            "--no-update-shallow" => f_update_shallow = false,
             "--depth" => f_depth = Some(take_value!("depth")),
             "--deepen" => f_deepen = Some(take_value!("deepen")),
             "--shallow-since" => f_shallow_since = Some(take_value!("shallow-since")),
@@ -357,6 +360,9 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     }
     if f_prune {
         fetch_args.push("--prune".into());
+    }
+    if f_update_shallow {
+        fetch_args.push("--update-shallow".into());
     }
     if f_unshallow {
         fetch_args.push("--unshallow".into());

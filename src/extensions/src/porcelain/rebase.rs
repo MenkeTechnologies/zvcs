@@ -59,30 +59,52 @@
 //!   stderr for the merge backend, the `rebase (pick)` reflog entries, and the
 //!   branch landing on the rewritten tip.
 //!
-//! ### Genuine picks
+//! ### The sequencer
 //!
-//! A replay where `<onto>` is *not* already `<head>`'s ancestor is a genuine
-//! pick: each commit is cherry-picked with a real three-way merge (its tree
-//! against the growing tip over the commit's first parent) via
-//! [`crate::merge_apply`]. Clean picks reproduce git's rebased tree byte-for-byte;
-//! a conflict stops the rebase with `CONFLICT`/`could not apply` and the
-//! conflicted worktree/index in place, recoverable with `git reset --hard
-//! ORIG_HEAD`.
+//! Every other merge-backend replay runs through the instruction sheet, exactly
+//! as git does: `run_specific_rebase()` does not branch on `-i`, it forces
+//! `GIT_SEQUENCE_EDITOR=:` when `-i` was absent and then runs the sequencer for
+//! both. So `git rebase <upstream>` and `git rebase -i <upstream>` share one
+//! path here too — [`sequencer_rebase`] builds the sheet
+//! ([`super::rebase_todo::make_script`]), applies `--autosquash` and `--exec`,
+//! hands it to the sequence editor when `-i` asked for one, and then
+//! [`Sequencer::run`] executes it.
+//!
+//! Implemented instructions: `pick`, `reword`, `edit`, `squash`, `fixup`
+//! (including `-C`/`-c`), `exec`, `break`, `drop`, `noop` and comments, with
+//! `--continue` / `--skip` / `--abort` / `--edit-todo` / `--show-current-patch`
+//! over `.git/rebase-merge`. Each pick is a real three-way merge (the commit's
+//! tree against the growing tip over its first parent) via
+//! [`crate::merge_apply`]; a conflict stops the rebase with
+//! `CONFLICT`/`could not apply` and leaves the conflicted worktree and index in
+//! place.
+//!
+//! `label`, `reset`, `merge` and `update-ref` parse and round-trip through
+//! `--edit-todo`, but executing one is refused with a message naming the reason
+//! (a refused instruction leaves the rebase resumable, so `--abort` still
+//! works). They need the merge-topology rebuild `make_script_with_merges()`
+//! drives, which is also what `rebase.maxLabelLength` sizes — the one
+//! `rebase.*` key still without a reader.
 //!
 //! ### What is NOT ported, and why
 //!
-//! * **No patch-id equivalence.** Default `git rebase` *drops* a to-be-rebased
-//!   commit whose patch is already in `<upstream>` (`warning: skipped previously
-//!   applied commit <abbrev>`). Deciding that needs a patch-id per commit; nothing
-//!   vendored computes one, so such commits are re-picked (they usually merge to a
-//!   no-op) rather than dropped.
+//! * **No patch-id equivalence.** `sequencer_make_script()` sets
+//!   `revs.cherry_mark`, which drops a to-be-rebased commit whose patch is
+//!   already in `<upstream>` *before* the sheet is written, announcing it with
+//!   `warning: skipped previously applied commit <abbrev>`. Deciding that needs
+//!   a patch id per commit and nothing vendored computes one, so such a commit
+//!   stays in the sheet and is instead dropped where its pick turns out to
+//!   change nothing — same wording, but at the pick rather than up front, and
+//!   with no `use --reapply-cherry-picks` advice.
 //! * `-v`/`--verbose` past the up-to-date exit. `-v` prints the upstream diffstat
 //!   *and* a second, post-replay diffstat the sequencer emits in verbose mode;
 //!   only the first is ported, so `-v` is rejected with a message naming the
 //!   reason rather than emitting half of git's output. Plain `--stat` (and
 //!   `rebase.stat=true`, which sets the same bit and nothing else) is ported.
-//! * `--edit-todo` (interactive todo editing) and `--exec`. Each is rejected with
-//!   a message naming the reason; none is silently ignored.
+//! * `--rebase-merges` / `--update-refs`, and the `label`/`reset`/`merge`/
+//!   `update-ref` instructions they generate. Both still select the merge
+//!   backend and still raise git's apply-backend incompatibility errors; what is
+//!   missing is `make_script_with_merges()` and the four executors.
 //!
 //! ### `--root`
 //!
@@ -99,11 +121,20 @@
 //!
 //! ### Config
 //!
+//! Read here as the defaults their command-line options override:
 //! `rebase.backend`, `rebase.autoStash`, `rebase.forkPoint` (false ⇒
-//! `--no-fork-point`) and `rebase.stat` (true ⇒ `--stat`) are read as the
-//! defaults their command-line options override. The remaining `rebase.*` keys
-//! all default behavior that lives behind an unported feature — see
-//! `tests/rebase_config.rs` for which, and why wiring them would diverge.
+//! `--no-fork-point`), `rebase.stat` (true ⇒ `--stat`), `rebase.autoSquash`
+//! (only under an explicit `-i`, matching `cmd_rebase()`),
+//! `rebase.rescheduleFailedExec`, `rebase.rebaseMerges` and `rebase.updateRefs`
+//! (both of which raise git's apply-backend incompatibility errors).
+//!
+//! Read by the instruction sheet in [`super::rebase_todo`]:
+//! `rebase.instructionFormat` (the oneline on each line),
+//! `rebase.abbreviateCommands` (one-letter spellings) and
+//! `rebase.missingCommitsCheck` (what happens when the user deletes a line).
+//!
+//! `rebase.maxLabelLength` has no reader: it sizes the labels
+//! `make_script_with_merges()` mints, and `--rebase-merges` is not ported.
 //!
 //! `--signoff`/`--trailer` are *not* refused up front, and *not* refused at all
 //! when the todo is empty: like git they only set `REBASE_FORCE`, so an
@@ -123,6 +154,8 @@ use gix::hash::ObjectId;
 use gix::index::entry::{Mode, Stat};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
+
+use super::rebase_todo as todo;
 
 /// git's `builtin/rebase.c` usage block, reproduced verbatim (git 2.55.0) so the
 /// `-h` and unknown-option paths are byte-identical.
@@ -305,6 +338,10 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     let mut ignore_whitespace = false;
     let mut preserve_merges = false;
     let mut empty_set = false;
+    // `options.keep_empty`, which `REBASE_OPTIONS_INIT` starts at 1: a commit
+    // that changes nothing is listed in the instruction sheet (tagged
+    // ` # empty`) unless `--no-keep-empty` drops it.
+    let mut keep_empty = true;
     let mut autosquash: i32 = -1;
     let mut update_refs: i32 = -1;
     let mut autostash = false;
@@ -316,6 +353,9 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     let mut root = false;
     let mut reschedule_failed_exec: i32 = -1;
     let mut reapply_cherry_picks: i32 = -1;
+    // `options.gpg_sign_opt` — set by `-S`/`--gpg-sign[=<key-id>]`, cleared by
+    // `--no-gpg-sign`, and seeded from `commit.gpgSign` below.
+    let mut gpg_sign: i32 = -1;
 
     // git reads the repository (and the in-progress state dirs, which seed the
     // backend) before `parse_options` runs.
@@ -561,8 +601,14 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 }
                 "rerere-autoupdate" => {
                     noarg!();
-                    // Only consulted while resolving a conflict during replay,
-                    // which never happens on the paths this module completes.
+                    // Parsed, and deliberately without effect: it selects
+                    // between `rerere` and `rerere --no-autoupdate` at the
+                    // `repo_rerere(r, opts->allow_rerere_auto)` call
+                    // `do_pick_commit()` makes when a pick conflicts, and the
+                    // sequencer here does not run rerere at that point at all.
+                    // Wiring the flag before the call site exists would be a
+                    // switch over a thing that never happens; the missing piece
+                    // is the rerere call, tracked with `porcelain::rerere`.
                 }
                 "empty" => {
                     let v = value!();
@@ -577,12 +623,12 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                     }
                     empty_set = true;
                 }
-                // `--keep-empty` only changes which commits the sequencer picks,
-                // so beyond selecting the merge backend it has no effect on a
-                // range that picks nothing.
+                // `--keep-empty` decides whether a commit that changes nothing
+                // gets a line in the instruction sheet.
                 "keep-empty" => {
                     noarg!();
                     try_imply!(ty, if unset { "--no-keep-empty" } else { "--keep-empty" });
+                    keep_empty = !unset;
                 }
                 "autosquash" => {
                     noarg!();
@@ -592,10 +638,11 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                     noarg!();
                     update_refs = i32::from(!unset);
                 }
-                // Accepted, and genuinely a no-op on the paths this module
-                // completes: a range that picks nothing produces no commit to
-                // sign.
-                "gpg-sign" => {}
+                // `-S`/`--gpg-sign[=<key-id>]` asks for signed replays; `--no-gpg-sign`
+                // (and the absence of both) does not. Only the affirmative form is
+                // refused, and only where a commit would actually be created — an
+                // up-to-date `git rebase -S <upstream>` signs nothing and completes.
+                "gpg-sign" => gpg_sign = i32::from(!unset),
                 "autostash" => {
                     noarg!();
                     autostash = !unset;
@@ -727,7 +774,10 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                     break;
                 }
                 // Optional-argument shorts consume only an attached value.
-                'S' => break,
+                'S' => {
+                    gpg_sign = 1;
+                    break;
+                }
                 'r' => {
                     rebase_merges = 1;
                     if !rest.is_empty() {
@@ -810,9 +860,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             ModeOption::Quit => rebase_quit(&repo),
             ModeOption::Continue => rebase_continue(&repo, false),
             ModeOption::Skip => rebase_continue(&repo, true),
-            ModeOption::EditTodo => {
-                bail!("unsupported flag \"--edit-todo\" (interactive todo editing is not ported)")
-            }
+            ModeOption::EditTodo => rebase_edit_todo(&repo),
             ModeOption::ShowCurrentPatch => rebase_show_current_patch(&repo),
         };
     }
@@ -965,8 +1013,16 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     if rebase_merges == 1 {
         try_imply!(ty, "--rebase-merges");
     }
+    // `--autosquash` implies the merge backend; without it on the command line,
+    // `rebase.autoSquash` supplies the default — but only under an explicit
+    // `-i`, since a non-interactive rebase must not silently reorder commits.
     if autosquash == 1 {
         try_imply!(ty, "--autosquash");
+    } else if autosquash == -1 {
+        autosquash = i32::from(
+            repo.config_snapshot().boolean("rebase.autoSquash") == Some(true)
+                && flags & INTERACTIVE_EXPLICIT != 0,
+        );
     }
 
     if ty == Backend::Unspecified {
@@ -1289,12 +1345,29 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     if let Some(fp) = fork_point_oid {
         hidden.push(fp);
     }
-    let mut todo: Vec<ObjectId> = Vec::new();
+    let mut replay_range: Vec<ObjectId> = Vec::new();
     for info in repo.rev_walk([head_oid]).with_hidden(hidden).all()? {
-        todo.push(info?.id);
+        replay_range.push(info?.id);
     }
 
     let apply_backend = ty == Backend::Apply;
+
+    // `git_rebase_config()` seeds `options.gpg_sign_opt` from `commit.gpgSign`,
+    // which `-S`/`--no-gpg-sign` then overrides. Signing a replayed commit is
+    // not ported, so a rebase that asks for it and would actually create a
+    // commit is refused rather than silently producing unsigned commits; a
+    // replay that creates nothing is unaffected, exactly as under git.
+    let gpg_sign_on = if gpg_sign >= 0 {
+        gpg_sign == 1
+    } else {
+        repo.config_snapshot().boolean("commit.gpgSign") == Some(true)
+    };
+    let refuse_gpg_sign = || -> anyhow::Error {
+        anyhow!(
+            "unsupported flag \"--gpg-sign\" (signing replayed commits is not ported; \
+             pass --no-gpg-sign, or unset commit.gpgSign, to rebase without signatures)"
+        )
+    };
 
     // `can_fast_forward()` holding over a *non-empty* range is the one shape in
     // which a replay is exactly a re-commit rather than a merge: `<onto>` is the
@@ -1310,7 +1383,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     //
     // Reaching this with `can_ff` set implies `REBASE_FORCE` is set: without it
     // the up-to-date exit above already returned.
-    let exact_replay = allow_preemptive_ff && can_ff && !todo.is_empty();
+    let exact_replay = allow_preemptive_ff && can_ff && !replay_range.is_empty();
 
     // Resolve every step before anything is written, so a refusal below still
     // leaves the repository untouched.
@@ -1336,6 +1409,9 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         // noop / fast-forward finishes below) signs nothing, so it needs no guard;
         // that is why `git rebase --signoff HEAD` is accepted and only a non-empty
         // range is refused here.
+        if gpg_sign_on {
+            return Err(refuse_gpg_sign());
+        }
         if signoff {
             bail!("unsupported flag \"--signoff\" (rewriting commit messages requires commit replay)");
         }
@@ -1361,18 +1437,12 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             bail!(
                 "replaying {} commit(s) with the apply backend needs `git am`-style patch \
                  application, which is not ported",
-                todo.len()
+                replay_range.len()
             );
         }
     }
     // Genuine picks (a real three-way merge per commit) are replayed in the finish
     // below via [`crate::merge_apply`]; no refusal here anymore.
-
-    if !exec.is_empty() {
-        // Reachable only with an empty todo list, where git appends no exec
-        // lines at all — but saying so is cheaper than proving it per case.
-        bail!("unsupported flag \"--exec\" (exec lines run inside the sequencer)");
-    }
 
     // --- the finish --------------------------------------------------------
     // Serialize the whole read-modify-write through the repo coordinator (a
@@ -1399,6 +1469,55 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // first because `index_or_load_from_head` would otherwise fall back to the
     // *new* HEAD if a repository happened to have no index file on disk.
     let old_index = repo.index_or_load_from_head()?.into_owned();
+
+    // --- the merge backend: the instruction sheet --------------------------
+    //
+    // Every merge-backend rebase runs through the sequencer, not only `-i`:
+    // `run_specific_rebase()` forces `GIT_SEQUENCE_EDITOR=:` when `-i` was not
+    // given rather than taking a different path, so the todo list is built,
+    // (not) edited and executed either way. Only the exact-replay shape above
+    // and the apply backend bypass it.
+    if !apply_backend && !exact_replay && !replay_range.is_empty() {
+        if gpg_sign_on {
+            return Err(refuse_gpg_sign());
+        }
+        let head_name = match &branch {
+            Some(b) => b.as_bstr().to_string(),
+            None => "detached HEAD".to_string(),
+        };
+        // `rebase.rescheduleFailedExec` is the default the command line
+        // overrides; the command line already `die()`d if it needed the merge
+        // backend and did not have it.
+        let reschedule = if reschedule_failed_exec >= 0 {
+            reschedule_failed_exec == 1
+        } else {
+            repo.config_snapshot().boolean("rebase.rescheduleFailedExec") == Some(true)
+        };
+        return sequencer_rebase(SequencerStart {
+            repo: &repo,
+            // `revs.reverse = 1`: the instruction sheet is oldest first, while
+            // the walk above yields newest first.
+            range: replay_range.iter().rev().copied().collect(),
+            state: RebaseState {
+                head_name,
+                onto: onto_oid,
+                orig_head: head_oid,
+                squash_onto,
+                allow_ff: flags & FORCE == 0,
+                quiet: flags & NO_QUIET == 0,
+                verbose: flags & VERBOSE != 0,
+                reschedule_failed_exec: reschedule,
+            },
+            onto_spec: &onto_spec,
+            upstream: upstream_oid,
+            exec: &exec,
+            autosquash: autosquash == 1,
+            keep_empty,
+            interactive: flags & INTERACTIVE_EXPLICIT != 0,
+            autostash: autostash_oid,
+            old_index: &old_index,
+        });
+    }
 
     if apply_backend && flags & NO_QUIET != 0 {
         println!("First, rewinding head to replay your work on top of it...");
@@ -1500,26 +1619,6 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             )?;
             tip = new;
         }
-    } else if !todo.is_empty() && !apply_backend {
-        // Genuine picks replayed with a three-way merge each; resumable via the
-        // .git/rebase-merge state on conflict (--continue/--skip/--abort).
-        let committer = repo
-            .committer()
-            .ok_or_else(|| anyhow!("committer identity is not configured"))??
-            .to_owned()?;
-        let picks: Vec<ObjectId> = todo.iter().rev().copied().collect();
-        let head_name = branch
-            .as_ref()
-            .map(|b| b.as_bstr().to_string())
-            .unwrap_or_else(|| "detached HEAD".to_string());
-        // `opts.allow_ff = !(options->flags & REBASE_FORCE)`: without `-f`/`--no-ff`
-        // a pick whose parent is already the tip is fast-forwarded to rather than
-        // re-committed, so its commit id survives the rebase.
-        return replay_picks(
-            &repo, onto_oid, &picks, head_name, onto_oid, head_oid, &committer,
-            &should_interrupt, autostash_oid, flags & FORCE == 0, squash_onto,
-            flags & NO_QUIET == 0,
-        );
     } else if apply_backend {
         println!("Fast-forwarded {branch_name} to {onto_spec}.");
     } else if flags & FORCE != 0 && flags & NO_QUIET != 0 {
@@ -1837,17 +1936,18 @@ fn full_name(name: &str) -> Result<FullName> {
 
 /// Point `HEAD` at `target` (an object for a detached `HEAD`, a ref to attach
 /// it), writing `message` to the `HEAD` reflog.
-/// The `.git/rebase-merge` state a stopped merge-backend rebase leaves behind for
-/// `--continue` / `--skip` / `--abort`.
+/// The `.git/rebase-merge` state a merge-backend rebase carries, written by
+/// `write_basic_state()` (sequencer.c) before the first instruction runs and
+/// read back by `read_populate_opts()` on `--continue` / `--skip` / `--abort`.
+///
+/// The instruction stream itself is *not* part of this struct: it lives in
+/// `git-rebase-todo` (what is left to do) and `done` (what has been done), and
+/// is parsed by [`super::rebase_todo::List::parse`].
 struct RebaseState {
     /// Full name of the branch being rebased (`refs/heads/…`) or `detached HEAD`.
     head_name: String,
     onto: ObjectId,
     orig_head: ObjectId,
-    /// Picks not yet applied, oldest first.
-    todo: Vec<ObjectId>,
-    /// The commit whose pick stopped on a conflict.
-    stopped: ObjectId,
     /// `--root` without `--onto`: the synthesized empty root commit standing in
     /// as `<onto>`. A pick made while the tip still *is* that commit becomes a
     /// new root commit rather than its child. git records the same value in
@@ -1861,44 +1961,57 @@ struct RebaseState {
     /// `Successfully rebased …` summary. git records the same thing as the
     /// presence of `$state_dir/quiet`.
     quiet: bool,
+    /// `-v`/`--verbose`: the progress line ends in `\n` rather than `\r`.
+    verbose: bool,
+    /// `--reschedule-failed-exec` / `rebase.rescheduleFailedExec`: an `exec`
+    /// that exits non-zero is put back at the head of the todo list instead of
+    /// being consumed, so `--continue` retries it.
+    reschedule_failed_exec: bool,
 }
 
 fn rebase_merge_dir(repo: &gix::Repository) -> std::path::PathBuf {
     repo.git_dir().join("rebase-merge")
 }
 
-/// Persist [`RebaseState`] into `.git/rebase-merge`, in git's file layout.
-fn write_rebase_state(repo: &gix::Repository, st: &RebaseState) -> Result<()> {
+/// `write_basic_state()` — the option state the sequencer needs to resume.
+///
+/// The `interactive` marker is written unconditionally because every
+/// merge-backend rebase runs through the sequencer (`run_specific_rebase()`
+/// forces `GIT_SEQUENCE_EDITOR=:` when `-i` was not given, rather than taking a
+/// different code path), and `init_basic_state()` writes it for all of them.
+fn write_basic_state(repo: &gix::Repository, st: &RebaseState) -> Result<()> {
     let dir = rebase_merge_dir(repo);
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("head-name"), format!("{}\n", st.head_name))?;
     std::fs::write(dir.join("onto"), format!("{}\n", st.onto))?;
     std::fs::write(dir.join("orig-head"), format!("{}\n", st.orig_head))?;
     std::fs::write(dir.join("interactive"), b"")?;
-    std::fs::write(dir.join("stopped-sha"), format!("{}\n", st.stopped))?;
     match st.squash_onto {
         Some(oid) => std::fs::write(dir.join("squash-onto"), format!("{oid}\n"))?,
         None => {
             let _ = std::fs::remove_file(dir.join("squash-onto"));
         }
     }
-    if st.allow_ff {
-        let _ = std::fs::remove_file(dir.join("no-ff"));
-    } else {
-        std::fs::write(dir.join("no-ff"), b"")?;
-    }
-    if st.quiet {
-        std::fs::write(dir.join("quiet"), b"")?;
-    } else {
-        let _ = std::fs::remove_file(dir.join("quiet"));
-    }
-    let todo: String = st.todo.iter().map(|o| format!("pick {o}\n")).collect();
-    std::fs::write(dir.join("git-rebase-todo"), todo)?;
+    marker(&dir, "no-ff", !st.allow_ff)?;
+    marker(&dir, "quiet", st.quiet)?;
+    marker(&dir, "verbose", st.verbose)?;
+    marker(&dir, "reschedule-failed-exec", st.reschedule_failed_exec)?;
+    marker(&dir, "no-reschedule-failed-exec", !st.reschedule_failed_exec)?;
     Ok(())
 }
 
-/// Read back the `.git/rebase-merge` state written by [`write_rebase_state`].
-fn read_rebase_state(repo: &gix::Repository) -> Result<RebaseState> {
+/// git records a boolean option as the presence or absence of an empty file.
+fn marker(dir: &std::path::Path, name: &str, on: bool) -> Result<()> {
+    if on {
+        std::fs::write(dir.join(name), b"")?;
+    } else {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    Ok(())
+}
+
+/// `read_populate_opts()` — read back what [`write_basic_state`] wrote.
+fn read_basic_state(repo: &gix::Repository) -> Result<RebaseState> {
     let dir = rebase_merge_dir(repo);
     let read = |f: &str| -> Result<String> {
         Ok(std::fs::read_to_string(dir.join(f))
@@ -1906,38 +2019,30 @@ fn read_rebase_state(repo: &gix::Repository) -> Result<RebaseState> {
             .trim()
             .to_string())
     };
-    let head_name = read("head-name")?;
-    let onto = ObjectId::from_hex(read("onto")?.as_bytes())?;
-    let orig_head = ObjectId::from_hex(read("orig-head")?.as_bytes())?;
-    let stopped = read("stopped-sha")
-        .ok()
-        .and_then(|s| ObjectId::from_hex(s.as_bytes()).ok())
-        .unwrap_or_else(|| ObjectId::null(repo.object_hash()));
-    let todo = std::fs::read_to_string(dir.join("git-rebase-todo"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("pick "))
-        .filter_map(|rest| ObjectId::from_hex(rest.split_whitespace().next()?.as_bytes()).ok())
-        .collect();
-    let squash_onto = read("squash-onto")
-        .ok()
-        .and_then(|s| ObjectId::from_hex(s.as_bytes()).ok());
-    let allow_ff = !dir.join("no-ff").exists();
-    let quiet = dir.join("quiet").exists();
     Ok(RebaseState {
-        head_name,
-        onto,
-        orig_head,
-        todo,
-        stopped,
-        squash_onto,
-        allow_ff,
-        quiet,
+        head_name: read("head-name")?,
+        onto: ObjectId::from_hex(read("onto")?.as_bytes())?,
+        orig_head: ObjectId::from_hex(read("orig-head")?.as_bytes())?,
+        squash_onto: read("squash-onto")
+            .ok()
+            .and_then(|s| ObjectId::from_hex(s.as_bytes()).ok()),
+        allow_ff: !dir.join("no-ff").exists(),
+        quiet: dir.join("quiet").exists(),
+        verbose: dir.join("verbose").exists(),
+        reschedule_failed_exec: dir.join("reschedule-failed-exec").exists(),
     })
 }
 
+/// The commit a stopped rebase was applying (`$state_dir/stopped-sha`), or
+/// `None` when the rebase stopped somewhere that names no commit (`break`, a
+/// failed `exec`).
+fn read_stopped_sha(repo: &gix::Repository) -> Option<ObjectId> {
+    let raw = std::fs::read_to_string(rebase_merge_dir(repo).join("stopped-sha")).ok()?;
+    ObjectId::from_hex(raw.trim().as_bytes()).ok()
+}
+
 /// The autostash commit a stopped `--autostash` rebase saved in its state dir,
-/// if any. Written by [`replay_picks`] on a conflict-stop, consumed by
+/// if any. Written by [`Sequencer::stop_for_conflict`] on a conflict-stop, consumed by
 /// `--continue`/`--abort` to re-apply the user's changes once the rebase ends.
 fn read_autostash(repo: &gix::Repository) -> Option<ObjectId> {
     let raw = std::fs::read_to_string(rebase_merge_dir(repo).join("autostash")).ok()?;
@@ -1947,7 +2052,7 @@ fn read_autostash(repo: &gix::Repository) -> Option<ObjectId> {
 /// `git rebase --abort`: restore the worktree, index and branch to `orig-head`,
 /// re-attach `HEAD`, and drop the state directory.
 fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
-    let st = read_rebase_state(repo)?;
+    let st = read_basic_state(repo)?;
     let should_interrupt = AtomicBool::new(false);
     let old_index = repo.index_or_load_from_head()?.into_owned();
     let orig_tree = repo.find_commit(st.orig_head)?.tree_id()?.detach();
@@ -2047,17 +2152,19 @@ fn restore_worktree_to_tree(
 /// `builtin/rebase.c`'s `ACTION_SHOW_CURRENT_PATCH` runs `git show REBASE_HEAD --`
 /// (rebase.c:354-361). `REBASE_HEAD` names the commit whose pick stopped on a
 /// conflict — the same commit this module records as `stopped-sha` in the
-/// `.git/rebase-merge` state ([`RebaseState::stopped`]). `git show` prints the
+/// `.git/rebase-merge` state ([`read_stopped_sha`]). `git show` prints the
 /// resolved commit's full object id on its `commit <oid>` line rather than the ref
 /// spelling, so showing the stopped id directly is byte-for-byte what `git show
 /// REBASE_HEAD --` emits. The trailing `--` reproduces git's empty pathspec.
 ///
-/// Only reached for a merge-backend in-progress rebase: the caller bails out of the
-/// apply-backend (`git am`) state before this arm, and requires a rebase to be in
-/// progress at all, so [`read_rebase_state`] always has a `stopped-sha` to read.
+/// A rebase stopped at a `break` or a failed `exec` names no commit, which is
+/// exactly the case where `REBASE_HEAD` does not resolve either.
 fn rebase_show_current_patch(repo: &gix::Repository) -> Result<ExitCode> {
-    let st = read_rebase_state(repo)?;
-    super::show(&[st.stopped.to_string(), "--".to_string()])
+    let Some(stopped) = read_stopped_sha(repo) else {
+        eprintln!("fatal: No rebase in progress?");
+        return Ok(ExitCode::from(128));
+    };
+    super::show(&[stopped.to_string(), "--".to_string()])
 }
 
 /// `git rebase --quit`: drop the state directory and leave `HEAD` where it is.
@@ -2066,121 +2173,734 @@ fn rebase_quit(repo: &gix::Repository) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `git rebase --continue` / `--skip`: commit the staged resolution of the stopped
-/// commit (`--continue`) or drop it (`--skip`), then replay the remaining picks.
-fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
-    let st = read_rebase_state(repo)?;
+
+/// Everything `do_interactive_rebase()` carries into `complete_action()`.
+struct SequencerStart<'a> {
+    repo: &'a gix::Repository,
+    /// The replay range, oldest first.
+    range: Vec<ObjectId>,
+    state: RebaseState,
+    /// The `<onto>` spelling that goes into the `rebase (start): checkout <…>`
+    /// reflog entry.
+    /// `options.upstream` — `None` under `--root`, which is what makes
+    /// `get_revision_ranges()` print the head alone rather than a range.
+    upstream: Option<ObjectId>,
+    onto_spec: &'a str,
+    exec: &'a [String],
+    autosquash: bool,
+    keep_empty: bool,
+    /// `REBASE_INTERACTIVE_EXPLICIT`. Without it `run_specific_rebase()` forces
+    /// `GIT_SEQUENCE_EDITOR=:`, i.e. the sheet is used exactly as generated.
+    interactive: bool,
+    autostash: Option<ObjectId>,
+    old_index: &'a gix::index::File,
+}
+
+/// `do_interactive_rebase()` followed by `complete_action()`: build the
+/// instruction sheet, let the user edit it, then execute it.
+fn sequencer_rebase(start: SequencerStart<'_>) -> Result<ExitCode> {
+    let repo = start.repo;
+    let dir = rebase_merge_dir(repo);
+    let abbreviate = repo
+        .config_snapshot()
+        .boolean("rebase.abbreviateCommands")
+        == Some(true);
+
+    // `sequencer_make_script()`.
+    let script = todo::make_script(repo, &start.range, start.keep_empty, abbreviate)?;
+
+    // `init_basic_state()`: the state directory exists before the editor runs,
+    // so an interrupted edit is still an in-progress rebase.
+    write_basic_state(repo, &start.state)?;
+    if let Some(oid) = start.autostash {
+        std::fs::write(dir.join("autostash"), format!("{oid}\n"))?;
+    }
+
+    let (mut list, ok) = todo::List::parse(repo, &script, false);
+    if !ok {
+        bail!("generated an unusable todo list");
+    }
+
+    // `complete_action()`.
+    if list.items.is_empty() {
+        list.items.push(todo::Item::new(todo::Cmd::Noop));
+    }
+    if start.autosquash {
+        todo::rearrange_squash(repo, &mut list)?;
+    }
+    todo::add_exec_commands(&mut list, start.exec);
+    if list.count_commands() == 0 {
+        finish_early(repo, start.autostash)?;
+        eprintln!("error: nothing to do");
+        return Ok(ExitCode::from(1));
+    }
+
+    let short_range = short_revisions(repo, start.upstream, start.state.orig_head);
+    let short_onto = todo::short_name(repo, start.state.onto);
+    let mut new_list = match edit_todo_list(
+        repo,
+        &list,
+        Some(&short_range),
+        Some(&short_onto),
+        start.interactive,
+        abbreviate,
+    )? {
+        EditOutcome::Ok(new) => new,
+        EditOutcome::NothingToDo => {
+            finish_early(repo, start.autostash)?;
+            eprintln!("error: nothing to do");
+            return Ok(ExitCode::from(1));
+        }
+        EditOutcome::Rejected => {
+            // git's `res == -4`: the sheet is unusable, but the rebase is
+            // already checked out at `<onto>` so the user can fix it with
+            // `--edit-todo`. Checking out first keeps the two in step.
+            checkout_onto(repo, &start)?;
+            return Ok(ExitCode::from(1));
+        }
+    };
+
+    // `skip_unnecessary_picks()`: with `allow_ff`, the leading picks that would
+    // land on the parent they already have are moved to `done` and the rebase
+    // starts from the last of them instead of `<onto>`.
+    let mut base = start.state.onto;
+    if start.state.allow_ff {
+        skip_unnecessary_picks(repo, &mut new_list, &mut base)?;
+    }
+    std::fs::write(
+        dir.join("git-rebase-todo"),
+        new_list.to_bytes(repo, None, 0),
+    )?;
+
+    // `checkout_onto()`: ORIG_HEAD, then detach `HEAD` at the base and move the
+    // worktree onto its tree.
+    let onto_label = if base == start.state.onto {
+        start.onto_spec.to_string()
+    } else {
+        base.to_string()
+    };
+    write_orig_head(repo, start.state.orig_head)?;
+    set_head(
+        repo,
+        Target::Object(base),
+        &format!("rebase (start): checkout {onto_label}"),
+    )?;
     let should_interrupt = AtomicBool::new(false);
-    let committer = repo
-        .committer()
-        .ok_or_else(|| anyhow!("committer identity is not configured"))??
-        .to_owned()?;
-    let mut tip = repo
-        .head_id()
-        .map_err(|_| anyhow!("HEAD does not point to a commit"))?
-        .detach();
+    update_clean_worktree(repo, start.old_index, base, &should_interrupt)?;
+
+    let mut seq = Sequencer::new(repo, start.state)?;
+    seq.autostash = start.autostash;
+    seq.run(new_list, 0)
+}
+
+/// `git rebase --edit-todo`: re-open the instruction sheet of a rebase that is
+/// already in progress.
+fn rebase_edit_todo(repo: &gix::Repository) -> Result<ExitCode> {
+    let dir = rebase_merge_dir(repo);
+    let abbreviate = repo
+        .config_snapshot()
+        .boolean("rebase.abbreviateCommands")
+        == Some(true);
+    let raw = std::fs::read(dir.join("git-rebase-todo"))
+        .map_err(|e| anyhow!("could not read '{}'. {e}", dir.join("git-rebase-todo").display()))?;
+    // `strbuf_stripspace(&todo_list.buf, comment_line_str)` — the help block
+    // from the previous round is dropped before it is shown again.
+    let comment = todo::comment_prefix(repo);
+    let stripped = super::stripspace::strip_space(&raw, Some(comment.as_bytes()));
+    let (list, _) = todo::List::parse(repo, &stripped, dir.join("done").exists());
+    match edit_todo_list(repo, &list, None, None, true, abbreviate)? {
+        EditOutcome::Ok(new) => {
+            std::fs::write(dir.join("git-rebase-todo"), new.to_bytes(repo, None, 0))?;
+            Ok(ExitCode::SUCCESS)
+        }
+        EditOutcome::NothingToDo => Ok(ExitCode::SUCCESS),
+        EditOutcome::Rejected => Ok(ExitCode::from(1)),
+    }
+}
+
+/// What the editor round-trip produced.
+enum EditOutcome {
+    Ok(todo::List),
+    /// The user emptied the sheet on the initial edit: git aborts the rebase.
+    NothingToDo,
+    /// The sheet does not parse, or dropped commits under
+    /// `rebase.missingCommitsCheck=error`.
+    Rejected,
+}
+
+/// `edit_todo_list()`: write the sheet with its help block, hand it to the
+/// sequence editor, read it back, strip the comments, parse it, and compare it
+/// against the backup for accidentally dropped commits.
+fn edit_todo_list(
+    repo: &gix::Repository,
+    list: &todo::List,
+    revisions: Option<&str>,
+    onto: Option<&str>,
+    interactive: bool,
+    abbreviate: bool,
+) -> Result<EditOutcome> {
+    let dir = rebase_merge_dir(repo);
+    let initial = revisions.is_some() && onto.is_some();
+    let flags = todo::SHORTEN_IDS | if abbreviate { todo::ABBREVIATE_CMDS } else { 0 };
+
+    let mut shown = list.to_bytes(repo, None, flags);
+    todo::append_help(repo, &mut shown, list.count_commands(), revisions, onto);
+    let todo_path = dir.join("git-rebase-todo");
+    std::fs::write(&todo_path, &shown)?;
+
+    // The backup keeps full object ids, so `todo_list_check()` compares commits
+    // rather than abbreviations.
+    let mut backup = list.to_bytes(repo, None, flags & !todo::SHORTEN_IDS);
+    todo::append_help(repo, &mut backup, list.count_commands(), revisions, onto);
+    std::fs::write(dir.join("git-rebase-todo.backup"), &backup)?;
+
+    // Without an explicit `-i`, `run_specific_rebase()` sets the sequence editor
+    // to `:` — the sheet comes back exactly as written.
+    if interactive {
+        todo::launch_sequence_editor(repo, &todo_path)?;
+    }
+
+    let comment = todo::comment_prefix(repo);
+    let edited = std::fs::read(&todo_path)?;
+    let stripped = super::stripspace::strip_space(&edited, Some(comment.as_bytes()));
+    if initial && stripped.is_empty() {
+        return Ok(EditOutcome::NothingToDo);
+    }
+    let (new, ok) = todo::List::parse(repo, &stripped, dir.join("done").exists());
+    if !ok {
+        eprint!("{}", todo::EDIT_TODO_ADVICE);
+        return Ok(EditOutcome::Rejected);
+    }
+    if todo::check(repo, list, &new) {
+        std::fs::write(dir.join("dropped"), b"")?;
+        return Ok(EditOutcome::Rejected);
+    }
+    let _ = std::fs::remove_file(dir.join("dropped"));
+    Ok(EditOutcome::Ok(new))
+}
+
+/// `apply_autostash(); sequencer_remove_state();` — the teardown git runs when
+/// it decides there is nothing to do after all, before the rebase has moved
+/// anything.
+fn finish_early(repo: &gix::Repository, autostash: Option<ObjectId>) -> Result<()> {
+    let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
+    if let Some(oid) = autostash {
+        crate::porcelain::stash::apply_autostash(repo, oid, false)?;
+    }
+    Ok(())
+}
+
+/// `checkout_onto()` on the `res == -4` path: the sheet was rejected, but the
+/// state directory stays so `--edit-todo` can fix it, and `HEAD` is detached at
+/// `<onto>` so the two agree.
+fn checkout_onto(repo: &gix::Repository, start: &SequencerStart<'_>) -> Result<()> {
+    write_orig_head(repo, start.state.orig_head)?;
+    set_head(
+        repo,
+        Target::Object(start.state.onto),
+        &format!("rebase (start): checkout {}", start.onto_spec),
+    )?;
+    let should_interrupt = AtomicBool::new(false);
+    update_clean_worktree(repo, start.old_index, start.state.onto, &should_interrupt)
+}
+
+/// git writes `ORIG_HEAD` only once it commits to actually rebasing. It is a
+/// pseudo-ref, so no reflog is created for it (gix applies git's own
+/// `should_autocreate_reflog` rule).
+fn write_orig_head(repo: &gix::Repository, head: ObjectId) -> Result<()> {
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: "rebase".into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(head),
+        },
+        name: full_name("ORIG_HEAD")?,
+        deref: false,
+    })?;
+    Ok(())
+}
+
+/// `get_revision_ranges()`'s `shortrevisions`: `<short upstream>..<short head>`,
+/// or just the short head when there is no upstream — the `--root` shape, where
+/// `<onto>` stands in as the base and git prints the head alone.
+fn short_revisions(repo: &gix::Repository, upstream: Option<ObjectId>, head: ObjectId) -> String {
+    let short_head = todo::short_name(repo, head);
+    match upstream {
+        Some(b) => format!("{}..{short_head}", todo::short_name(repo, b)),
+        None => short_head,
+    }
+}
+/// `git rebase --continue` / `--skip`.
+///
+/// `sequencer_continue()`: read the state and the remaining instruction stream,
+/// conclude whatever the rebase stopped in the middle of
+/// (`commit_staged_changes()`), then hand back to the instruction loop.
+///
+/// `--skip` is git's `ACTION_SKIP`, which throws the half-applied work away
+/// (`reset --hard HEAD`) before doing the same thing; the instruction that
+/// stopped has already been moved to `done` by `save_todo()`, so dropping it is
+/// exactly "do not commit what is staged".
+fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
+    let st = read_basic_state(repo)?;
+    let dir = rebase_merge_dir(repo);
+    let (list, parsed_ok) = todo::List::parse(
+        repo,
+        &std::fs::read(dir.join("git-rebase-todo")).unwrap_or_default(),
+        dir.join("done").exists(),
+    );
+    if !parsed_ok {
+        eprintln!("error: please fix this using 'git rebase --edit-todo'.");
+        return Ok(ExitCode::from(1));
+    }
+
+    let mut seq = Sequencer::new(repo, st)?;
+    seq.load_fixup_state()?;
 
     if skip {
-        // Discard the stopped commit: reset the worktree/index back to the tip.
+        // Discard the stopped instruction's half-applied work: restore the
+        // worktree and index to the tip the rebase had reached.
         let old = repo.index_or_load_from_head()?.into_owned();
+        let tip = repo.head_id()?.detach();
         let tip_tree = repo.find_commit(tip)?.tree_id()?.detach();
-        update_clean_worktree(repo, &old, tip_tree, &should_interrupt)?;
-    } else {
-        // Commit the user's resolution from the current (staged) index.
-        let index = repo.index()?;
+        restore_worktree_to_tree(repo, &old, tip_tree, &seq.should_interrupt)?;
+        // A skipped fixup/squash leaves the chain's message state stale; git
+        // rebuilds it in `commit_staged_changes()`. Dropping the whole chain is
+        // the same thing whenever the skipped instruction was the only member.
+        let _ = std::fs::remove_file(dir.join("stopped-sha"));
+    } else if let Some(code) = seq.commit_staged_changes()? {
+        return Ok(code);
+    }
+
+    seq.refresh_index()?;
+    seq.run(list, 0)
+}
+
+/// `commit_staged_changes()`'s half that matters here: turn what the user
+/// staged into the commit the stopped instruction was going to make.
+///
+/// Returns `Some(exit_code)` when the rebase must stop again (unstaged changes,
+/// or an unresolved index), and `None` when it may proceed.
+impl Sequencer<'_> {
+    fn commit_staged_changes(&mut self) -> Result<Option<ExitCode>> {
+        let repo = self.repo;
+        let dir = rebase_merge_dir(repo);
+        let index = repo.index_or_load_from_head()?.into_owned();
         if index.entries().iter().any(|e| e.stage_raw() != 0) {
             eprintln!("error: you must edit all merge conflicts and then");
             eprintln!("mark them as resolved using git add");
-            return Ok(ExitCode::from(1));
+            return Ok(Some(ExitCode::from(1)));
         }
-        let tree = tree_from_index(repo, &index)?;
-        let stopped = repo.find_commit(st.stopped)?;
-        let message: BString = stopped.message_raw()?.to_owned();
-        let author = stopped.author()?.to_owned()?;
-        // Same `CREATE_ROOT_COMMIT` rule as [`replay_picks`]: a `--root` rebase
-        // whose *first* pick is the one that stopped resumes into a root commit.
-        let parents = if Some(tip) == st.squash_onto {
-            Default::default()
-        } else {
-            std::iter::once(tip).collect()
-        };
-        let new = repo
-            .write_object(&gix::objs::Commit {
-                message: message.clone(),
-                tree,
-                author,
-                committer: committer.clone(),
-                encoding: None,
-                parents,
-                extra_headers: Default::default(),
-            })?
-            .detach();
-        set_head(
-            repo,
-            Target::Object(new),
-            &gix::reference::log::message("rebase (continue)", message.as_bstr(), 1).to_string(),
-        )?;
-        tip = new;
-    }
+        let (unstaged, _staged, _conflicts) = dirty_state(repo)?;
+        if unstaged {
+            eprintln!("error: cannot rebase: You have unstaged changes.");
+            eprintln!("error: Please commit or stash them.");
+            return Ok(Some(ExitCode::from(1)));
+        }
 
-    replay_picks(
-        repo,
-        tip,
-        &st.todo,
-        st.head_name,
-        st.onto,
-        st.orig_head,
-        &committer,
-        &should_interrupt,
-        // Carry any autostash the stopped rebase saved through to its conclusion.
-        read_autostash(repo),
-        st.allow_ff,
-        st.squash_onto,
-        st.quiet,
-    )
+        let tree = tree_from_index(repo, &index)?;
+        let head = repo.head_id()?.detach();
+        let head_commit = repo.find_commit(head)?;
+        // `is_clean`: the index already matches HEAD, so the instruction that
+        // stopped left nothing to commit (an `edit`/`break` stop the user did
+        // not amend, or a conflict resolved back to the tip).
+        let is_clean = head_commit.tree_id()?.detach() == tree;
+        let amend = dir.join("amend").exists();
+
+        let message = std::fs::read(dir.join("message")).ok();
+        // `if (is_clean) { … if (!final_fixup) { ret = 0; goto out; } }`: an
+        // index that already matches `HEAD` has nothing to commit, whatever the
+        // `amend` marker says — an `edit` stop the user amended (or did not
+        // touch at all) lands here and just carries on.
+        //
+        // git's one exception is `final_fixup`, which it reaches only after
+        // *skipping* the last member of a fixup chain; that re-clean-up is not
+        // modelled here, so a `--skip` of a final `squash` leaves the melded
+        // message with its comment block rather than re-running the editor.
+        if is_clean {
+            let _ = std::fs::remove_file(dir.join("message"));
+            let _ = std::fs::remove_file(dir.join("stopped-sha"));
+            let _ = std::fs::remove_file(dir.join("amend"));
+            return Ok(None);
+        }
+
+        // `run_git_commit(rebase_path_message(), …, ALLOW_EMPTY | EDIT_MSG
+        // [| AMEND_MSG])`: git re-enters `git commit` here, which is what makes
+        // `--continue` open the message in the editor.
+        let mut args: Vec<String> = vec!["-n".into(), "--no-gpg-sign".into()];
+        if amend {
+            args.push("--amend".into());
+        }
+        let msg_path = dir.join("message");
+        if message.is_some() {
+            args.push("-F".into());
+            args.push(msg_path.display().to_string());
+        }
+        args.push("-e".into());
+        args.push("--allow-empty".into());
+        // The author of the commit being replayed, saved by `write_author_script`
+        // when the instruction started, survives the interruption.
+        let env = self.author_env();
+        let code = self.run_commit(&args, env)?;
+        if code != 0 {
+            return Ok(Some(ExitCode::from(code as u8)));
+        }
+        let _ = std::fs::remove_file(dir.join("message"));
+        let _ = std::fs::remove_file(dir.join("amend"));
+        let _ = std::fs::remove_file(dir.join("stopped-sha"));
+        if self.fixup_count > 0 {
+            let _ = std::fs::remove_file(dir.join("message-fixup"));
+            let _ = std::fs::remove_file(dir.join("message-squash"));
+            let _ = std::fs::remove_file(dir.join("current-fixups"));
+            self.fixups.clear();
+            self.fixup_count = 0;
+        }
+        Ok(None)
+    }
 }
 
-/// Cherry-pick `picks` (oldest first) onto `tip` with a three-way merge each,
-/// then finish the rebase (re-point the branch, re-attach `HEAD`, drop the state
-/// directory). On a conflict it records `.git/rebase-merge` state and stops with
-/// exit 1. Shared by the initial rebase and `--continue`/`--skip`.
-#[allow(clippy::too_many_arguments)]
-fn replay_picks(
-    repo: &gix::Repository,
-    mut tip: ObjectId,
-    picks: &[ObjectId],
-    head_name: String,
-    onto: ObjectId,
-    orig_head: ObjectId,
-    committer: &gix::actor::Signature,
-    should_interrupt: &AtomicBool,
+/// The instruction executor — git's `pick_commits()` and the `do_*()` helpers
+/// it dispatches to.
+///
+/// One instance owns everything an instruction needs: the repository, the
+/// resumable state, the growing index, and the fixup-chain bookkeeping
+/// (`replay_ctx`'s `current_fixups` / `current_fixup_count`).
+struct Sequencer<'r> {
+    repo: &'r gix::Repository,
+    st: RebaseState,
+    committer: gix::actor::Signature,
+    should_interrupt: AtomicBool,
+    /// The autostash to re-apply when the rebase concludes, if any. Carried in
+    /// `$state_dir/autostash` across interruptions.
     autostash: Option<ObjectId>,
-    allow_ff: bool,
-    squash_onto: Option<ObjectId>,
-    quiet: bool,
-) -> Result<ExitCode> {
-    let empty_tree = ObjectId::empty_tree(repo.object_hash());
-    let mut cur_index = repo.index_from_tree(&repo.find_commit(tip)?.tree_id()?.detach())?;
-    let total = picks.len();
+    /// The index the next three-way merge starts from — the tip's tree plus any
+    /// stat data carried over, so a completed rebase leaves a cheap `status`.
+    index: gix::index::File,
+    /// `todo_list->done_nr` / `total_nr`, the two numbers in `Rebasing (n/m)`.
+    done_nr: usize,
+    total_nr: usize,
+    /// `ctx->current_fixup_count` — how many messages the running squash chain
+    /// has already melded.
+    fixup_count: usize,
+    /// `ctx->current_fixups` — the chain itself, one `<command> <oid>` per line,
+    /// mirrored into `$state_dir/current-fixups`.
+    fixups: Vec<String>,
+}
 
-    for (n, oid) in picks.iter().enumerate() {
-        if !quiet {
-            eprint!("Rebasing ({}/{total})\r", n + 1);
+/// What one instruction did.
+enum Step {
+    /// Move on to the next instruction.
+    Next,
+    /// Stop, leaving the rebase resumable, with this exit code.
+    Stop(u8),
+}
+
+impl<'r> Sequencer<'r> {
+    fn new(repo: &'r gix::Repository, st: RebaseState) -> Result<Self> {
+        let committer = repo
+            .committer()
+            .ok_or_else(|| anyhow!("committer identity is not configured"))??
+            .to_owned()?;
+        let index = repo.index_or_load_from_head()?.into_owned();
+        Ok(Sequencer {
+            repo,
+            st,
+            committer,
+            should_interrupt: AtomicBool::new(false),
+            autostash: read_autostash(repo),
+            index,
+            done_nr: 0,
+            total_nr: 0,
+            fixup_count: 0,
+            fixups: Vec::new(),
+        })
+    }
+
+    fn dir(&self) -> std::path::PathBuf {
+        rebase_merge_dir(self.repo)
+    }
+
+    /// Re-derive the working index from `HEAD` — used after anything that moved
+    /// `HEAD` or the worktree outside the merge machinery (`exec`, `--continue`).
+    fn refresh_index(&mut self) -> Result<()> {
+        self.index = self.repo.index_or_load_from_head()?.into_owned();
+        Ok(())
+    }
+
+    /// Read `$state_dir/current-fixups` back into `ctx->current_fixups`.
+    fn load_fixup_state(&mut self) -> Result<()> {
+        let raw = std::fs::read_to_string(self.dir().join("current-fixups")).unwrap_or_default();
+        self.fixups = raw.lines().map(str::to_string).collect();
+        self.fixup_count = self.fixups.len();
+        Ok(())
+    }
+
+    /// `read_populate_todo()`'s progress accounting: `done_nr` is how many
+    /// instructions the `done` file records, `total_nr` that plus what is left.
+    fn count_progress(&mut self, list: &todo::List) -> Result<()> {
+        let done = std::fs::read(self.dir().join("done")).unwrap_or_default();
+        let (done_list, _) = todo::List::parse(self.repo, &done, true);
+        self.done_nr = done_list.count_commands();
+        self.total_nr = self.done_nr + list.count_commands();
+        std::fs::write(self.dir().join("end"), format!("{}\n", self.total_nr))?;
+        Ok(())
+    }
+
+    /// `save_todo()`: `git-rebase-todo` keeps everything *after* the instruction
+    /// about to run, which is appended to `done` instead. That split is what
+    /// makes a stop resumable — `--continue` concludes the instruction in `done`
+    /// and then runs the file from the top.
+    fn save_todo(&self, list: &todo::List, next: usize) -> Result<()> {
+        let dir = self.dir();
+        let rest = todo::List { items: list.items[next.min(list.items.len())..].to_vec() };
+        std::fs::write(dir.join("git-rebase-todo"), rest.to_bytes(self.repo, None, 0))?;
+        if next > 0 {
+            let one = todo::List { items: vec![list.items[next - 1].clone()] };
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("done"))?;
+            std::io::Write::write_all(&mut f, &one.to_bytes(self.repo, None, 0))?;
         }
-        let commit = repo.find_commit(*oid)?;
+        Ok(())
+    }
+
+    /// `pick_commits()` — run the instruction stream from `start`.
+    fn run(&mut self, list: todo::List, start: usize) -> Result<ExitCode> {
+        self.count_progress(&list)?;
+        let dir = self.dir();
+        for f in ["message", "stopped-sha", "amend", "patch"] {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
+
+        let mut i = start;
+        while i < list.items.len() {
+            let item = list.items[i].clone();
+            self.save_todo(&list, i + 1)?;
+            let _ = std::fs::remove_file(dir.join("author-script"));
+
+            if item.cmd != todo::Cmd::Comment {
+                self.done_nr += 1;
+                std::fs::write(dir.join("msgnum"), format!("{}\n", self.done_nr))?;
+                if !self.st.quiet {
+                    eprint!(
+                        "Rebasing ({}/{}){}",
+                        self.done_nr,
+                        self.total_nr,
+                        if self.st.verbose { "\n" } else { "\r" }
+                    );
+                }
+            }
+
+            let step = match item.cmd {
+                todo::Cmd::Break => {
+                    self.term_clear_line();
+                    self.stopped_at_head()?;
+                    return Ok(ExitCode::SUCCESS);
+                }
+                // `item->command <= TODO_SQUASH`, minus `revert`, which only
+                // `git revert` ever writes into an instruction sheet.
+                todo::Cmd::Pick
+                | todo::Cmd::Edit
+                | todo::Cmd::Reword
+                | todo::Cmd::Fixup
+                | todo::Cmd::Squash => {
+                    // `is_final_fixup()`: the last member of a fixup/squash
+                    // chain is the one that cleans the combined message up.
+                    let next_is_fixup = list
+                        .items
+                        .get(i + 1)
+                        .is_some_and(|n| n.cmd.is_fixup());
+                    let final_fixup = item.cmd.is_fixup() && !next_is_fixup;
+                    self.pick_one_commit(&item, final_fixup)?
+                }
+                todo::Cmd::Exec => self.do_exec(&item)?,
+                todo::Cmd::Noop | todo::Cmd::Drop | todo::Cmd::Comment => Step::Next,
+                todo::Cmd::Label | todo::Cmd::Reset | todo::Cmd::Merge => {
+                    self.term_clear_line();
+                    bail!(
+                        "unsupported todo command {:?} (`label`/`reset`/`merge` rebuild a merge \
+                         topology, which is not ported; the rebase is still resumable with \
+                         `git rebase --abort`)",
+                        item.cmd.name()
+                    )
+                }
+                todo::Cmd::UpdateRef => {
+                    self.term_clear_line();
+                    bail!(
+                        "unsupported todo command \"update-ref\" (refs pointing into the rebased \
+                         range are not tracked; the rebase is still resumable with \
+                         `git rebase --abort`)"
+                    )
+                }
+                todo::Cmd::Invalid => {
+                    self.term_clear_line();
+                    eprintln!("error: please fix this using 'git rebase --edit-todo'.");
+                    return Ok(ExitCode::from(1));
+                }
+                todo::Cmd::Revert => {
+                    self.term_clear_line();
+                    bail!("unsupported todo command \"revert\" (only `git revert` produces it)")
+                }
+            };
+            match step {
+                Step::Next => i += 1,
+                Step::Stop(code) => {
+                    return Ok(if code == 0 {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(code)
+                    })
+                }
+            }
+        }
+        self.finish()
+    }
+
+    /// `term_clear_line()` (pager.c): wipe the `Rebasing (n/m)\r` progress line
+    /// before printing anything that must stay on screen.
+    ///
+    /// A redirected stderr never carried the progress line's `\r` anywhere
+    /// visible, so git returns immediately rather than injecting an escape
+    /// sequence into a log; that early return is why a scripted rebase's stderr
+    /// is free of control bytes. A dumb terminal, which has no erase sequence,
+    /// gets a line's worth of spaces instead.
+    fn term_clear_line(&self) {
+        if self.st.quiet || self.st.verbose {
+            return;
+        }
+        if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            return;
+        }
+        if std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true) {
+            eprint!("\r{:80}\r", "");
+        } else {
+            eprint!("\r\x1b[K");
+        }
+    }
+
+    /// `stopped_at_head()` — what `break` reports.
+    ///
+    /// The name printed is `get_message()`'s `label`: `<abbrev> (<subject>)`,
+    /// not the subject alone.
+    fn stopped_at_head(&self) -> Result<()> {
+        let head = self.repo.head_id()?.detach();
+        let commit = self.repo.find_commit(head)?;
+        let subject = first_line(commit.message_raw()?);
+        eprintln!(
+            "Stopped at {} ({})",
+            todo::short_name(self.repo, head),
+            subject.to_str_lossy()
+        );
+        Ok(())
+    }
+
+    /// `do_exec()` — run the rest of the line through the shell.
+    fn do_exec(&mut self, item: &todo::Item) -> Result<Step> {
+        let command = item.arg.to_str_lossy().into_owned();
+        self.term_clear_line();
+        if !self.st.quiet {
+            eprintln!("Executing: {command}");
+        }
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .env_remove("GIT_CHERRY_PICK_HELP")
+            .status()
+            .map_err(|e| anyhow!("cannot run 'sh -c': {e}"))?;
+        self.refresh_index()?;
+        let (unstaged, staged, _) = dirty_state(self.repo)?;
+        let dirty = unstaged || staged;
+        let mut failed = !status.success();
+        if failed {
+            eprintln!(
+                "warning: execution failed: {command}\n{}You can fix the problem, and then run\n\n  git rebase --continue\n\n",
+                if dirty {
+                    "and made changes to the index and/or the working tree.\n"
+                } else {
+                    ""
+                }
+            );
+        } else if dirty {
+            eprintln!(
+                "warning: execution succeeded: {command}\nbut left changes to the index and/or the working tree.\nCommit or stash your changes, and then run\n\n  git rebase --continue\n\n"
+            );
+            failed = true;
+        }
+        if !failed {
+            return Ok(Step::Next);
+        }
+        if self.st.reschedule_failed_exec {
+            // Put the instruction back so `--continue` retries it, then say so.
+            // `advise(rescheduled_advice, …)` quotes the *whole* todo line, not
+            // just the command, which is what the user would have to edit.
+            self.reschedule(item)?;
+            let line = todo::List { items: vec![item.clone()] }.to_bytes(self.repo, None, 0);
+            crate::advice::print_hint(&format!(
+                "Could not execute the todo command\n\n    {}\n\n\
+                 It has been rescheduled; To edit the command before continuing, please\n\
+                 edit the todo list first:\n\n    git rebase --edit-todo\n    git rebase --continue",
+                line.as_bstr().trim_end().to_str_lossy(),
+            ));
+        }
+        Ok(Step::Stop(1))
+    }
+
+    /// Put `item` back at the head of `git-rebase-todo` — git's `reschedule`
+    /// path, which re-runs `save_todo()` with the current index rather than the
+    /// next one.
+    fn reschedule(&self, item: &todo::Item) -> Result<()> {
+        let path = self.dir().join("git-rebase-todo");
+        let rest = std::fs::read(&path).unwrap_or_default();
+        let mut out = todo::List { items: vec![item.clone()] }.to_bytes(self.repo, None, 0);
+        out.extend_from_slice(&rest);
+        std::fs::write(path, out)?;
+        Ok(())
+    }
+
+    /// `pick_one_commit()` → `do_pick_commit()`: `pick`, `reword`, `edit`,
+    /// `squash` and `fixup`, which differ only in what happens once the picked
+    /// tree is in place.
+    fn pick_one_commit(&mut self, item: &todo::Item, final_fixup: bool) -> Result<Step> {
+        let repo = self.repo;
+        let oid = item
+            .commit
+            .ok_or_else(|| anyhow!("{} without a commit", item.cmd.name()))?;
+        let commit = repo.find_commit(oid)?;
         let message: BString = commit.message_raw()?.to_owned();
-        let subject: BString = match message.find_byte(b'\n') {
-            Some(p) => message[..p].as_bstr().to_owned(),
-            None => message.clone(),
+        let subject = first_line(message.as_bstr());
+        let short = todo::short_name(repo, oid);
+        let head = repo.head_id()?.detach();
+
+        // `CREATE_ROOT_COMMIT`: while the tip is still the stand-in `<onto>` that
+        // `--root` without `--onto` minted, a pick becomes a new *root* commit
+        // rather than that stand-in's child.
+        let create_root = item.cmd.is_pick_or_similar() && Some(head) == self.st.squash_onto;
+        if create_root && item.cmd.is_fixup() {
+            bail!("cannot fixup root commit");
+        }
+
+        let parent = commit.parent_ids().next().map(|p| p.detach());
+        let base_tree = match parent {
+            Some(p) => repo.find_commit(p)?.tree_id()?.detach(),
+            None => ObjectId::empty_tree(repo.object_hash()),
         };
+        let head_tree = repo.find_commit(head)?.tree_id()?.detach();
         let ctree = commit.tree_id()?.detach();
-        let base_tree = match commit.parent_ids().next() {
-            Some(p) => repo.find_commit(p.detach())?.tree_id()?.detach(),
-            None => empty_tree,
-        };
-        let tip_tree = repo.find_commit(tip)?.tree_id()?.detach();
-        let short = oid.to_hex_with_len(7).to_string();
-        let other_label = format!("{short} ({subject})", subject = subject.to_str_lossy());
+
+        // `do_pick_commit()`'s fast-forward arm: with `opts->allow_ff` (no
+        // `-f`/`--no-ff`), a non-fixup pick that would land on the very parent it
+        // already has is not re-committed — `HEAD` moves straight to the existing
+        // commit and the reflog records `rebase: fast-forward`, so the commit id
+        // survives the rebase.
+        //
+        // The three-way merge still runs first: it is what keeps the worktree and
+        // index in step, and with `base == ours` the merged tree is exactly the
+        // picked commit's tree, so it changes no content.
+        let other_label = format!("{short} ({})", subject.to_str_lossy());
         let labels = gix::merge::blob::builtin_driver::text::Labels {
             ancestor: Some(BStr::new(b"HEAD")),
             current: Some(BStr::new(b"HEAD")),
@@ -2189,103 +2909,76 @@ fn replay_picks(
         let applied = crate::merge_apply::three_way_merge(
             repo,
             base_tree,
-            tip_tree,
+            head_tree,
             ctree,
-            &cur_index,
+            &self.index,
             labels,
-            should_interrupt,
+            &self.should_interrupt,
         )?;
-        cur_index = applied.index;
-        cur_index.write(Default::default())?;
+        self.index = applied.index;
+        self.index.write(Default::default())?;
 
         if !applied.conflicts.is_empty() {
-            let remaining: Vec<ObjectId> = picks[n + 1..].to_vec();
-            write_rebase_state(
-                repo,
-                &RebaseState {
-                    head_name,
-                    onto,
-                    orig_head,
-                    todo: remaining,
-                    stopped: *oid,
-                    squash_onto,
-                    allow_ff,
-                    quiet,
-                },
-            )?;
-            // The rebase stopped for conflicts; hand the autostash to the
-            // in-progress state so `--continue`/`--abort` re-applies it once the
-            // rebase actually concludes (git's `$state_dir/autostash`).
-            if let Some(oid) = autostash {
-                let _ = std::fs::write(
-                    rebase_merge_dir(repo).join("autostash"),
-                    format!("{oid}\n"),
-                );
-            }
-            eprintln!("error: could not apply {short}... {}", subject.to_str_lossy());
-            eprintln!("hint: Resolve all conflicts manually, mark them as resolved with");
-            eprintln!(
-                "hint: \"git add/rm <conflicted_files>\", then run \"git rebase --continue\"."
-            );
-            eprintln!("hint: You can instead skip this commit: run \"git rebase --skip\".");
-            eprintln!(
-                "hint: To abort and get back to the state before \"git rebase\", run \"git rebase --abort\"."
-            );
-            eprintln!("Could not apply {short}... {}", subject.to_str_lossy());
-            return Ok(ExitCode::from(1));
+            return self.stop_for_conflict(item, oid, &short, &subject, &message);
         }
 
-        // `do_pick_commit()`'s fast-forward arm: with `allow_ff` (i.e. no
-        // `-f`/`--no-ff`) a pick that would land on the very parent it already
-        // has is not re-committed at all — `HEAD` is moved straight to the
-        // existing commit and the reflog records `rebase: fast-forward`. Under
-        // `--root` without `--onto` the same arm applies to a root commit while
-        // the tip is still the synthesized stand-in, which git treats as unborn.
-        // That is what makes a plain `git rebase --root` over an already-rooted
-        // linear history leave every commit id untouched.
-        //
-        // The three-way merge above still ran, and that is what keeps the
-        // worktree and index in step; it is a no-op on content here, because
-        // `base == ours` makes the merged tree exactly the picked commit's tree.
-        let parent = commit.parent_ids().next().map(|p| p.detach());
-        let fast_forward = allow_ff
+        let fast_forward = self.st.allow_ff
+            && !item.cmd.is_fixup()
             && match parent {
-                Some(p) => p == tip,
-                None => Some(tip) == squash_onto,
+                Some(p) => p == head,
+                None => create_root,
             };
         if fast_forward {
-            set_head(repo, Target::Object(*oid), "rebase: fast-forward")?;
-            tip = *oid;
-            continue;
+            write_author_script(repo, &commit)?;
+            set_head(repo, Target::Object(oid), "rebase: fast-forward")?;
+            if item.cmd == todo::Cmd::Reword {
+                return self.reword();
+            }
+            if item.cmd == todo::Cmd::Edit {
+                return self.stop_for_edit(oid, &short, item);
+            }
+            return Ok(Step::Next);
         }
 
-        // A pick whose changes are already present merges to no tree change — this
-        // is the observable result of git's patch-id equivalence, which drops a
-        // commit already applied upstream. git drops such a pick rather than
-        // recording an empty commit; so do we.
-        if applied.tree_id == tip_tree {
-            eprintln!(
-                "warning: skipped previously applied commit {short}"
-            );
-            continue;
+        // `allow_empty()`: a pick that leaves the index unchanged is either a
+        // commit that was *already* empty — which `opts->allow_empty` (always on
+        // for rebase) keeps, so `--keep-empty` round-trips an empty commit — or
+        // a commit whose patch turned out to be already present.
+        //
+        // The second case is where this port diverges: git never sees it,
+        // because `sequencer_make_script()`'s `cherry_mark` drops a
+        // patch-equivalent commit before the sheet is written (with
+        // `warning: skipped previously applied commit <abbrev>` up front).
+        // Nothing vendored computes a patch id, so the commit reaches the pick
+        // loop instead and is dropped here, with git's own wording but at the
+        // point of the pick rather than before the run.
+        if !item.cmd.is_fixup() && applied.tree_id == head_tree {
+            let originally_empty = todo::is_original_commit_empty(repo, &commit)?;
+            if !originally_empty {
+                self.term_clear_line();
+                eprintln!("warning: skipped previously applied commit {short}");
+                return Ok(Step::Next);
+            }
         }
 
-        // `CREATE_ROOT_COMMIT`: while the tip is still the synthesized stand-in
-        // `<onto>` that `--root` without `--onto` minted, the pick becomes a new
-        // *root* commit instead of that stand-in's child, so the rebased history
-        // keeps exactly one root.
+        write_author_script(repo, &commit)?;
+
+        if item.cmd.is_fixup() {
+            return self.commit_fixup(item, &commit, applied.tree_id, final_fixup);
+        }
+
         let author = commit.author()?.to_owned()?;
-        let parents = if Some(tip) == squash_onto {
+        let parents = if create_root {
             Default::default()
         } else {
-            std::iter::once(tip).collect()
+            std::iter::once(head).collect()
         };
         let new = repo
             .write_object(&gix::objs::Commit {
                 message: message.clone(),
                 tree: applied.tree_id,
                 author,
-                committer: committer.clone(),
+                committer: self.committer.clone(),
                 encoding: None,
                 parents,
                 extra_headers: Default::default(),
@@ -2294,53 +2987,502 @@ fn replay_picks(
         set_head(
             repo,
             Target::Object(new),
-            &gix::reference::log::message("rebase (pick)", message.as_bstr(), 1).to_string(),
+            &gix::reference::log::message(
+                &format!("rebase ({})", item.cmd.name()),
+                message.as_bstr(),
+                1,
+            )
+            .to_string(),
         )?;
-        tip = new;
+
+        match item.cmd {
+            todo::Cmd::Reword => self.reword(),
+            todo::Cmd::Edit => self.stop_for_edit(new, &short, item),
+            _ => Ok(Step::Next),
+        }
     }
 
-    // Finish: re-point the branch at the new tip and re-attach HEAD, then drop the
-    // state directory.
-    //
-    // git's `head_name` here is the *full* refname, and both the reflog message
-    // and the `Successfully rebased and updated <…>.` line quote it verbatim —
-    // `refs/heads/topic`, not `topic`.
-    let label = if head_name != "detached HEAD" {
-        let name = full_name(&head_name)?;
-        let label = name.as_bstr().to_string();
-        repo.edit_reference(RefEdit {
-            change: Change::Update {
-                log: LogChange {
-                    mode: RefLog::AndReference,
-                    force_create_reflog: false,
-                    message: format!("rebase (finish): {} onto {onto}", name.as_bstr()).into(),
+    /// `reword`: amend the commit just made, with the editor open on its
+    /// message. git reaches this through `run_git_commit(NULL, …, EDIT_MSG |
+    /// VERIFY_MSG | AMEND_MSG | ALLOW_EMPTY)`, i.e. a real `git commit --amend`.
+    fn reword(&mut self) -> Result<Step> {
+        self.term_clear_line();
+        let args: Vec<String> = vec![
+            "--amend".into(),
+            "--no-gpg-sign".into(),
+            "-e".into(),
+            "--allow-empty".into(),
+        ];
+        let env = self.author_env();
+        let code = self.run_commit(&args, env)?;
+        self.refresh_index()?;
+        if code != 0 {
+            return Ok(Step::Stop(code as u8));
+        }
+        Ok(Step::Next)
+    }
+
+    /// `edit`: the pick landed, now hand control back to the user.
+    ///
+    /// `pick_one_commit()` prints `Stopped at <short>...  <subject>` and then
+    /// `error_with_patch(…, exit_code = 0, to_amend = 1)`, which records the
+    /// `amend` marker `--continue` needs and returns 0 — an `edit` stop is a
+    /// success, not a failure.
+    fn stop_for_edit(&mut self, at: ObjectId, short: &str, item: &todo::Item) -> Result<Step> {
+        self.term_clear_line();
+        eprintln!("Stopped at {short}...  {}", item.arg.to_str_lossy());
+        let dir = self.dir();
+        std::fs::write(dir.join("stopped-sha"), format!("{at}\n"))?;
+        std::fs::write(dir.join("amend"), format!("{}\n", self.repo.head_id()?.detach()))?;
+        eprintln!(
+            "You can amend the commit now, with\n\n  git commit --amend \n\n\
+             Once you are satisfied with your changes, run\n\n  git rebase --continue"
+        );
+        Ok(Step::Stop(0))
+    }
+
+    /// `squash` / `fixup`: meld the picked tree into the commit already at
+    /// `HEAD` by amending it, with the combined message
+    /// [`update_squash_messages`](Self::update_squash_messages) built.
+    fn commit_fixup(
+        &mut self,
+        item: &todo::Item,
+        commit: &gix::Commit<'_>,
+        tree: ObjectId,
+        final_fixup: bool,
+    ) -> Result<Step> {
+        let repo = self.repo;
+        let dir = self.dir();
+        self.update_squash_messages(item, commit)?;
+
+        let head = repo.head_id()?.detach();
+        let head_commit = repo.find_commit(head)?;
+        // `AMEND_MSG`: the new commit takes HEAD's parents and HEAD's author.
+        let parents: Vec<ObjectId> = head_commit.parent_ids().map(|p| p.detach()).collect();
+        let author = head_commit.author()?.to_owned()?;
+
+        if !final_fixup {
+            // Mid-chain: no editor, the message is the running combination.
+            let message = std::fs::read(dir.join("message-squash"))?;
+            let cleaned = super::stripspace::strip_space(&message, None);
+            let new = repo
+                .write_object(&gix::objs::Commit {
+                    message: cleaned.into(),
+                    tree,
+                    author,
+                    committer: self.committer.clone(),
+                    encoding: None,
+                    parents: parents.into_iter().collect(),
+                    extra_headers: Default::default(),
+                })?
+                .detach();
+            set_head(repo, Target::Object(new), "rebase (fixup)")?;
+            return Ok(Step::Next);
+        }
+
+        // The last instruction of the chain. `do_pick_commit()` picks the
+        // message file: a `fixup`-only chain keeps the first commit's message
+        // (`message-fixup`) and never opens an editor; anything with a `squash`
+        // in it copies the combined message to `.git/SQUASH_MSG` and sets
+        // `EDIT_MSG`, so `git commit` opens it.
+        let fixup_msg = dir.join("message-fixup");
+        if fixup_msg.exists() {
+            let message = std::fs::read(&fixup_msg)?;
+            let cleaned = super::stripspace::strip_space(&message, None);
+            let new = repo
+                .write_object(&gix::objs::Commit {
+                    message: cleaned.into(),
+                    tree,
+                    author,
+                    committer: self.committer.clone(),
+                    encoding: None,
+                    parents: parents.into_iter().collect(),
+                    extra_headers: Default::default(),
+                })?
+                .detach();
+            set_head(repo, Target::Object(new), "rebase (fixup)")?;
+        } else {
+            let squash_msg = repo.git_dir().join("SQUASH_MSG");
+            std::fs::copy(dir.join("message-squash"), &squash_msg)?;
+            let _ = std::fs::remove_file(repo.git_dir().join("MERGE_MSG"));
+            self.term_clear_line();
+            let args: Vec<String> = vec![
+                "-n".into(),
+                "--amend".into(),
+                "--no-gpg-sign".into(),
+                "-F".into(),
+                squash_msg.display().to_string(),
+                "-e".into(),
+                "--allow-empty".into(),
+            ];
+            let env = self.author_env();
+            let code = self.run_commit(&args, env)?;
+            self.refresh_index()?;
+            if code != 0 {
+                return Ok(Step::Stop(code as u8));
+            }
+        }
+        for f in ["message-fixup", "message-squash", "current-fixups"] {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
+        self.fixups.clear();
+        self.fixup_count = 0;
+        Ok(Step::Next)
+    }
+
+    /// `update_squash_messages()` — build `$state_dir/message-squash`, the
+    /// running combination of every message the chain has melded so far.
+    ///
+    /// The first member of a chain seeds the file from `HEAD`'s message under a
+    /// `# This is a combination of 2 commits.` header; each later member appends
+    /// its own under `# This is the commit message #N:`. A `fixup` contributes
+    /// its message *commented out* (`will be skipped`), which is what makes the
+    /// combined message drop it once `git commit`'s cleanup strips comments.
+    ///
+    /// `fixup -C` (`amend!`) replaces rather than appends: it writes
+    /// `message-fixup` so the chain's final commit takes this message alone.
+    fn update_squash_messages(
+        &mut self,
+        item: &todo::Item,
+        commit: &gix::Commit<'_>,
+    ) -> Result<()> {
+        let repo = self.repo;
+        let dir = self.dir();
+        let comment = todo::comment_prefix(repo);
+        let is_squash = item.cmd == todo::Cmd::Squash;
+        // `is_fixup_flag()`: a `fixup -C`/`-c` behaves like a squash as far as
+        // the message is concerned — it contributes a real message, not a
+        // commented-out one.
+        let replaces = item.cmd == todo::Cmd::Fixup
+            && item.flags & (todo::REPLACE_FIXUP_MSG | todo::EDIT_FIXUP_MSG) != 0;
+        let body = commit.message_raw()?.to_owned();
+
+        let mut buf: Vec<u8> = Vec::new();
+        if self.fixup_count > 0 {
+            let existing = std::fs::read(dir.join("message-squash"))
+                .map_err(|e| anyhow!("could not read '{}': {e}", dir.join("message-squash").display()))?;
+            // Replace the leading `# This is a combination of N commits.` header
+            // with the new count.
+            let rest = match existing.iter().position(|&b| b == b'\n') {
+                Some(p) if existing.starts_with(comment.as_bytes()) => &existing[p..],
+                _ => &existing[..],
+            };
+            buf.extend_from_slice(
+                format!(
+                    "{comment} This is a combination of {} commits.",
+                    self.fixup_count + 2
+                )
+                .as_bytes(),
+            );
+            buf.extend_from_slice(rest);
+        } else {
+            let head = repo.head_id()?.detach();
+            let head_message = repo.find_commit(head)?.message_raw()?.to_owned();
+            if item.cmd == todo::Cmd::Fixup && item.flags == 0 {
+                // A plain `fixup` keeps only the previous commit's message; git
+                // stashes it now so the chain's end can use it without the
+                // editor.
+                std::fs::write(dir.join("message-fixup"), &head_message)?;
+            }
+            buf.extend_from_slice(
+                format!("{comment} This is a combination of 2 commits.\n{comment} ").as_bytes(),
+            );
+            buf.extend_from_slice(if replaces {
+                b"The 1st commit message will be skipped:".as_slice()
+            } else {
+                b"This is the 1st commit message:".as_slice()
+            });
+            buf.extend_from_slice(b"\n\n");
+            if replaces {
+                buf.extend_from_slice(&super::stripspace::comment_lines(
+                    &head_message,
+                    comment.as_bytes(),
+                ));
+            } else {
+                buf.extend_from_slice(&head_message);
+            }
+        }
+
+        if is_squash || replaces {
+            // `append_squash_message()`.
+            //
+            // A melded commit whose own subject is `squash!`/`fixup!`/`amend!`
+            // contributes that subject *commented out*: the marker named the
+            // target and has no business surviving into the combined message.
+            // Only the subject is commented; the body below it is kept.
+            let commented_len = if body.starts_with(b"amend!")
+                || ((is_squash || self.seen_squash())
+                    && (body.starts_with(b"squash!") || body.starts_with(b"fixup!")))
+            {
+                todo::commit_subject_length(&body)
+            } else {
+                0
+            };
+            self.fixup_count += 1;
+            buf.extend_from_slice(
+                format!(
+                    "\n{comment} This is the commit message #{}:\n\n",
+                    self.fixup_count + 1
+                )
+                .as_bytes(),
+            );
+            buf.extend_from_slice(&super::stripspace::comment_lines(
+                &body[..commented_len],
+                comment.as_bytes(),
+            ));
+            let rest = &body[commented_len..];
+            buf.extend_from_slice(rest);
+            if replaces && !self.seen_squash() {
+                // `fixup -C` outside a squash chain replaces the message
+                // outright; the chain's end takes this alone, minus the blank
+                // lines the commented-out subject left behind.
+                std::fs::write(dir.join("message-fixup"), todo::skip_blank_lines(rest))?;
+            } else {
+                let _ = std::fs::remove_file(dir.join("message-fixup"));
+            }
+        } else {
+            self.fixup_count += 1;
+            buf.extend_from_slice(
+                format!(
+                    "\n{comment} The commit message #{} will be skipped:\n\n",
+                    self.fixup_count + 1
+                )
+                .as_bytes(),
+            );
+            buf.extend_from_slice(&super::stripspace::comment_lines(
+                &body,
+                comment.as_bytes(),
+            ));
+        }
+
+        std::fs::write(dir.join("message-squash"), &buf)?;
+        self.fixups.push(format!(
+            "{} {}",
+            item.cmd.name(),
+            item.commit.expect("fixup names a commit")
+        ));
+        std::fs::write(dir.join("current-fixups"), self.fixups.join("\n"))?;
+        Ok(())
+    }
+
+    /// `seen_squash()`: does the running chain contain a `squash`?
+    fn seen_squash(&self) -> bool {
+        self.fixups.iter().any(|l| l.starts_with("squash"))
+    }
+
+    /// `make_patch()` + `error_with_patch()`: record everything `--continue`
+    /// and `--show-current-patch` need, then report the conflict.
+    fn stop_for_conflict(
+        &mut self,
+        item: &todo::Item,
+        oid: ObjectId,
+        short: &str,
+        subject: &BString,
+        message: &BString,
+    ) -> Result<Step> {
+        let dir = self.dir();
+        std::fs::write(dir.join("stopped-sha"), format!("{oid}\n"))?;
+        // The message `--continue` will commit. A conflicted fixup/squash
+        // commits the running combination instead of the picked commit's own
+        // message (`error_failed_squash()`).
+        if item.cmd.is_fixup() && dir.join("message-squash").exists() {
+            std::fs::copy(dir.join("message-squash"), dir.join("message"))?;
+        } else {
+            std::fs::write(dir.join("message"), message)?;
+        }
+        if let Some(oid) = self.autostash {
+            let _ = std::fs::write(dir.join("autostash"), format!("{oid}\n"));
+        }
+        self.term_clear_line();
+        eprintln!("error: could not apply {short}... {}", subject.to_str_lossy());
+        // `print_advice()`: the sequencer's `rebase_resolvemsg`, gated on
+        // `advice.mergeConflict` and carrying the `Disable this message with …`
+        // trailer while that key is unset.
+        crate::advice::Advice::MergeConflict.advise_in(
+            self.repo,
+            concat!(
+                "Resolve all conflicts manually, mark them as resolved with\n",
+                "\"git add/rm <conflicted_files>\", then run \"git rebase --continue\".\n",
+                "You can instead skip this commit: run \"git rebase --skip\".\n",
+                "To abort and get back to the state before \"git rebase\", run \"git rebase --abort\".",
+            ),
+        );
+        // `error_with_patch()` reports the *todo line's* argument, not the
+        // commit's subject: with `rebase.instructionFormat` in play the two
+        // differ, and this is the one that shows what the sheet said.
+        eprintln!("Could not apply {short}... {}", item.arg.to_str_lossy());
+        Ok(Step::Stop(1))
+    }
+
+    /// The `GIT_AUTHOR_*` environment `read_env_script()` reconstructs from
+    /// `$state_dir/author-script`, so a commit made by `git commit` on
+    /// `--continue` keeps the replayed commit's author.
+    fn author_env(&self) -> Vec<(String, String)> {
+        let raw = match std::fs::read_to_string(self.dir().join("author-script")) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let mut env = Vec::new();
+        for line in raw.lines() {
+            let Some((key, value)) = line.split_once('=') else { continue };
+            if !key.starts_with("GIT_AUTHOR_") {
+                continue;
+            }
+            // `parse_key_value_squoted()`: the value is sq-quoted.
+            let value = value.trim_matches('\'').replace("'\\''", "'");
+            env.push((key.to_string(), value));
+        }
+        env
+    }
+
+    /// `run_git_commit()` — git re-enters `git commit` for every path that needs
+    /// the message editor or `--amend`'s bookkeeping, so this does too.
+    fn run_commit(&self, args: &[String], env: Vec<(String, String)>) -> Result<i32> {
+        let restore: Vec<(String, Option<String>)> = env
+            .iter()
+            .map(|(k, _)| (k.clone(), std::env::var(k).ok()))
+            .collect();
+        for (k, v) in &env {
+            // SAFETY: the sequencer is single-threaded here — the merge machinery
+            // has finished and no worker holds the environment.
+            unsafe { std::env::set_var(k, v) };
+        }
+        let out = super::commit::commit(args);
+        for (k, v) in restore {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+        let code = out?;
+        // `ExitCode` is opaque; the only thing the caller needs is success.
+        Ok(if format!("{code:?}") == format!("{:?}", ExitCode::SUCCESS) { 0 } else { 1 })
+    }
+
+    /// `pick_commits()`'s tail: re-point the branch at the new tip, re-attach
+    /// `HEAD`, re-apply the autostash and drop the state directory.
+    fn finish(&mut self) -> Result<ExitCode> {
+        let repo = self.repo;
+        let tip = repo.head_id()?.detach();
+        let label = if self.st.head_name != "detached HEAD" {
+            let name = full_name(&self.st.head_name)?;
+            let label = name.as_bstr().to_string();
+            repo.edit_reference(RefEdit {
+                change: Change::Update {
+                    log: LogChange {
+                        mode: RefLog::AndReference,
+                        force_create_reflog: false,
+                        message: format!(
+                            "rebase (finish): {} onto {}",
+                            name.as_bstr(),
+                            self.st.onto
+                        )
+                        .into(),
+                    },
+                    expected: PreviousValue::MustExistAndMatch(Target::Object(self.st.orig_head)),
+                    new: Target::Object(tip),
                 },
-                expected: PreviousValue::MustExistAndMatch(Target::Object(orig_head)),
-                new: Target::Object(tip),
-            },
-            name: name.clone(),
-            deref: false,
-        })?;
-        set_head(
-            repo,
-            Target::Symbolic(name),
-            &format!("rebase (finish): returning to {label}"),
+                name: name.clone(),
+                deref: false,
+            })?;
+            set_head(
+                repo,
+                Target::Symbolic(name),
+                &format!("rebase (finish): returning to {label}"),
+            )?;
+            label
+        } else {
+            "detached HEAD".to_string()
+        };
+        let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
+        if let Some(oid) = self.autostash {
+            crate::porcelain::stash::apply_autostash(repo, oid, self.st.quiet)?;
+        }
+        super::maintenance::run_auto_maintenance(repo, self.st.quiet)?;
+        if !self.st.quiet {
+            self.term_clear_line();
+            eprintln!("Successfully rebased and updated {label}.");
+        }
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// `write_author_script()`: the replayed commit's author, in the sq-quoted
+/// `KEY='value'` form `read_env_script()` reads back, so an interrupted
+/// instruction can be concluded by `git commit` without losing the author.
+fn write_author_script(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<()> {
+    let author = commit.author()?;
+    let sq = |v: &BStr| format!("'{}'", v.to_str_lossy().replace('\'', "'\\''"));
+    let time = author.time().unwrap_or_default();
+    // `GIT_AUTHOR_DATE='@<seconds> <+-HHMM>'` — git's "raw" date spelling, the
+    // one form `parse_date()` round-trips without a timezone database.
+    let (sign, off) = if time.offset < 0 { ('-', -time.offset) } else { ('+', time.offset) };
+    let body = format!(
+        "GIT_AUTHOR_NAME={}\nGIT_AUTHOR_EMAIL={}\nGIT_AUTHOR_DATE='@{} {sign}{:02}{:02}'\n",
+        sq(author.name),
+        sq(author.email),
+        time.seconds,
+        off / 3600,
+        (off % 3600) / 60,
+    );
+    std::fs::write(rebase_merge_dir(repo).join("author-script"), body)?;
+    Ok(())
+}
+
+/// The first line of a commit message — git's `find_commit_subject()` for the
+/// purpose of the one-line reports the sequencer prints.
+fn first_line(message: &BStr) -> BString {
+    match message.find_byte(b'\n') {
+        Some(p) => message[..p].as_bstr().to_owned(),
+        None => message.to_owned(),
+    }
+}
+
+/// `skip_unnecessary_picks()` — drop the leading picks whose parent is already
+/// the base, recording them in `done` so the progress numbers stay honest.
+///
+/// Returns the base the surviving instructions start from: a run of picks that
+/// would each land on the parent they already have is exactly the range that is
+/// already in place, so the rebase starts at the last of them instead of
+/// re-picking it.
+fn skip_unnecessary_picks(
+    repo: &gix::Repository,
+    list: &mut todo::List,
+    base: &mut ObjectId,
+) -> Result<()> {
+    let mut i = 0;
+    while i < list.items.len() {
+        let item = &list.items[i];
+        if item.cmd.is_noop() {
+            i += 1;
+            continue;
+        }
+        if item.cmd != todo::Cmd::Pick {
+            break;
+        }
+        let Some(oid) = item.commit else { break };
+        let commit = repo.find_commit(oid)?;
+        let mut parents = commit.parent_ids();
+        let Some(parent) = parents.next() else { break };
+        if parents.next().is_some() {
+            break; // merge commit
+        }
+        if parent.detach() != *base {
+            break;
+        }
+        *base = oid;
+        i += 1;
+    }
+    if i > 0 {
+        std::fs::write(
+            rebase_merge_dir(repo).join("done"),
+            list.to_bytes(repo, Some(i), 0),
         )?;
-        label
-    } else {
-        "detached HEAD".to_string()
-    };
-    let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
-    // The replay completed; re-apply the autostash onto the new tip before the
-    // summary line, matching git's finish_rebase ordering.
-    if let Some(oid) = autostash {
-        crate::porcelain::stash::apply_autostash(repo, oid, quiet)?;
+        list.items.drain(..i);
     }
-    super::maintenance::run_auto_maintenance(repo, quiet)?;
-    if !quiet {
-        eprintln!("Successfully rebased and updated {label}.");
-    }
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
 /// Write a tree object capturing the stage-0 entries of `index`.

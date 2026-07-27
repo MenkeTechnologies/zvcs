@@ -36,6 +36,8 @@ pub enum Error {
     RejectShallowRemoteConfig(#[from] config::boolean::Error),
     #[error(transparent)]
     NegotiationAlgorithmConfig(#[from] config::key::GenericErrorWithValue),
+    #[error("Could not decide what to do with the shallow boundary the remote sent")]
+    UpdateShallow(#[from] super::shallow::Error),
     #[error("Failed to mark the pack of a partial fetch as promisor at \"{}\"", path.display())]
     WritePromisorFile {
         path: std::path::PathBuf,

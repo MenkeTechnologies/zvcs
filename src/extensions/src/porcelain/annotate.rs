@@ -247,10 +247,16 @@ pub fn annotate(args: &[String]) -> Result<ExitCode> {
         since: None,
         rewrites: Some(gix::diff::Rewrites::default()),
         ignore_whitespace: opts.ignore_whitespace,
-        detect_moved: opts.detect_moved,
+        // `blame_copy_callback` sets `PICKAXE_BLAME_MOVE` alongside the copy bits, so any `-C`
+        // turns `-M` on too.
+        detect_moved: opts.detect_moved.or_else(|| {
+            opts.detect_copied()
+                .map(|_| super::blame::BLAME_DEFAULT_MOVE_SCORE)
+        }),
         // `git annotate` has no `--ignore-rev`; it is `git blame -c` with the same
         // option set minus the blame-only flags.
         ignore_revs: Default::default(),
+        detect_copied: opts.detect_copied(),
     };
 
     let outcome = match repo.blame_file(rel_path.as_bytes().as_bstr(), suspect, blame_options) {
@@ -460,12 +466,27 @@ struct Options {
     /// `-M[<score>]`: the value is git's `sb->move_score` (`BLAME_DEFAULT_MOVE_SCORE` for a
     /// bare `-M`).
     detect_moved: Option<u32>,
-    find_copies: bool,
+    /// How many `-C`s were given, i.e. which of git's `PICKAXE_BLAME_COPY*` bits are set.
+    copy_levels: u32,
+    /// A non-zero `-C<score>`, which overrides `BLAME_DEFAULT_COPY_SCORE`.
+    copy_score: Option<u32>,
     contents: Option<String>,
     revs_file: Option<String>,
 }
 
 impl Options {
+    /// git's `PICKAXE_BLAME_COPY*` bits and `sb->copy_score`, as `blame_copy_callback()` builds
+    /// them up from the `-C`s on the command line.
+    fn detect_copied(&self) -> Option<gix::blame::CopyDetection> {
+        (self.copy_levels > 0).then(|| gix::blame::CopyDetection {
+            score: self
+                .copy_score
+                .unwrap_or(super::blame::BLAME_DEFAULT_COPY_SCORE),
+            harder: self.copy_levels >= 2,
+            hardest: self.copy_levels >= 3,
+        })
+    }
+
     /// The option, if any, that would change stdout but cannot be reproduced on
     /// top of `gix-blame`. Named rather than silently ignored: emitting the
     /// unmodified output under one of these flags would be a wrong answer
@@ -486,9 +507,6 @@ impl Options {
         }
         if self.revs_file.is_some() {
             return Some("-S <revs-file>");
-        }
-        if self.find_copies {
-            return Some("-C line-copy detection");
         }
         if self.reverse {
             // Reachable only with an explicit rev; the range-less form is a
@@ -521,7 +539,8 @@ impl Options {
             show_stats: false,
             ignore_whitespace: false,
             detect_moved: None,
-            find_copies: false,
+            copy_levels: 0,
+            copy_score: None,
             contents: None,
             revs_file: None,
         };
@@ -614,10 +633,14 @@ impl Options {
                 "--no-contents" => o.contents = None,
                 "-S" => o.revs_file = Some(value!(i)),
 
-                // `-M`/`-C` take an optional attached score; `-C` repeats to
-                // widen the search (`-CC`, `-CCC`).
+                // `-M`/`-C` take an optional attached score; a further `-C` widens the search.
                 _ if is_move_or_copy(a, b'M') => o.detect_moved = Some(move_score(a)),
-                _ if is_move_or_copy(a, b'C') => o.find_copies = true,
+                _ if is_move_or_copy(a, b'C') => {
+                    o.copy_levels += 1;
+                    if let Some(score) = copy_score(a) {
+                        o.copy_score = Some(score);
+                    }
+                }
 
                 _ if a.starts_with("-L") => {
                     let spec = a[2..].to_string();
@@ -695,26 +718,38 @@ fn parse_diff_algorithm(name: &str) -> Option<gix::diff::blob::Algorithm> {
     }
 }
 
-/// `-M[<score>]` / `-C[<score>]`, where `-C` may repeat to widen the search.
-/// `blame_move_callback`'s optional attached score: `parse_score()` for the digits after `-M`,
-/// or `BLAME_DEFAULT_MOVE_SCORE` when there are none.
+/// `-M[<score>]` / `-C[<score>]`, whose optional score is an *attached* argument.
+///
+/// `parse_score()` is `strtoul` over the whole argument, so anything it cannot consume entirely —
+/// including the second `C` of `-CC` — yields 0, and git leaves the default in place for a 0.
+/// This is why `-CC` is one `-C` with the unparsable score `"C"` rather than two, which was
+/// verified against git 2.55.0 rather than assumed:
+///
+/// ```text
+/// $ git blame -C -C new.txt | head -2 | tail -1
+/// ^b0ffc34316 src.txt (t 2026-07-27 01:28:49 -0400 2) function alpha …
+/// $ git blame -CC new.txt | head -2 | tail -1
+/// 34e734628e7 (t 2026-07-27 01:28:49 -0400 2) function alpha …
+/// ```
 fn move_score(arg: &str) -> u32 {
     arg[2..]
         .parse::<u32>()
+        .ok()
+        .filter(|&score| score != 0)
         .unwrap_or(super::blame::BLAME_DEFAULT_MOVE_SCORE)
 }
 
+/// The `<score>` of a `-C<score>`, or `None` when there is none or git's `parse_score()` would
+/// read it as 0 and keep `BLAME_DEFAULT_COPY_SCORE`.
+fn copy_score(arg: &str) -> Option<u32> {
+    arg[2..].parse::<u32>().ok().filter(|&score| score != 0)
+}
+
+/// Whether `arg` is `-<letter>` with an optional attached score, which parse-options hands to the
+/// option's callback whole.
 fn is_move_or_copy(arg: &str, letter: u8) -> bool {
     let bytes = arg.as_bytes();
-    if bytes.len() < 2 || bytes[0] != b'-' || bytes[1] != letter {
-        return false;
-    }
-    let mut rest = &bytes[2..];
-    // `-CC`, `-CCC`: repeated letters before an optional score.
-    while rest.first() == Some(&letter) {
-        rest = &rest[1..];
-    }
-    rest.iter().all(u8::is_ascii_digit)
+    bytes.len() >= 2 && bytes[0] == b'-' && bytes[1] == letter
 }
 
 /// Whether a `-L` spec is *syntactically* acceptable to `parse_options()`.

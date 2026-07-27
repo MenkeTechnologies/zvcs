@@ -641,7 +641,9 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
         let mut head_index = repo.index_from_tree(&ours)?;
         head_index.write(Default::default())?;
         if !quiet {
-            println!("Applied autostash.");
+            // `apply_save_autostash_oid()` reports this on **stderr**, alongside
+            // every other line the autostash machinery prints.
+            eprintln!("Applied autostash.");
         }
     } else {
         // Keep the conflicted index (stages 1/2/3) so the user can resolve, exactly

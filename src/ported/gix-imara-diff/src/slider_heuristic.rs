@@ -195,6 +195,11 @@ pub struct Indents {
     leading_blanks: u8,
     /// The number of blank lines after the line following the current position.
     trailing_blanks: u8,
+    /// Whether the split sits past the last line, git's `split_measurement::end_of_file`.
+    /// It cannot be inferred from `next_indent`/`trailing_blanks`: a split directly above a
+    /// final non-blank line has no line after the one it precedes either, but it is not at
+    /// the end of the file and git does not charge it `END_OF_FILE_PENALTY`.
+    end_of_file: bool,
 }
 
 /// Maximum number of consecutive blank lines to consider when computing indentation context.
@@ -219,11 +224,12 @@ impl Indents {
                 }
             })
             .unwrap_or((token_idx, IndentLevel::BLANK));
-        let at_eof = token_idx == tokens.len();
+        let at_eof = token_idx >= tokens.len();
         let (trailing_blank_lines, indent_next_line) = if at_eof {
             (0, IndentLevel::BLANK)
         } else {
-            tokens[token_idx + 1..]
+            let following = &tokens[token_idx + 1..];
+            following
                 .iter()
                 .enumerate()
                 .find_map(|(i, &token)| {
@@ -238,7 +244,11 @@ impl Indents {
                         }
                     }
                 })
-                .unwrap_or((token_idx, IndentLevel::BLANK))
+                // Every following line was blank, so git's `post_blank` ends up as the number
+                // of lines the loop walked -- that is the length of this iterator, not
+                // `token_idx`, which counts the lines on the *other* side of the split and
+                // would truncate on the `as u8` below.
+                .unwrap_or((following.len(), IndentLevel::BLANK))
         };
         let indent = tokens
             .get(token_idx)
@@ -249,6 +259,7 @@ impl Indents {
             next_indent: indent_next_line,
             leading_blanks: leading_blank_lines as u8,
             trailing_blanks: trailing_blank_lines as u8,
+            end_of_file: at_eof,
         }
     }
 
@@ -257,7 +268,7 @@ impl Indents {
         if self.prev_indent == IndentLevel::BLANK && self.leading_blanks == 0 {
             penalty += START_OF_FILE_PENALTY;
         }
-        if self.next_indent == IndentLevel::BLANK && self.trailing_blanks == 0 {
+        if self.end_of_file {
             penalty += END_OF_FILE_PENALTY;
         }
 
@@ -272,20 +283,22 @@ impl Indents {
         if indent != IndentLevel::BLANK && self.prev_indent != IndentLevel::BLANK {
             match indent.0.cmp(&self.prev_indent.0) {
                 Ordering::Equal => {}
-                // self.next_indent != IndentLevel::BLANK follows for free here
-                // since indent != BLANK and therefore self.next_indent <= indent < BLANK
-                Ordering::Less if self.next_indent.0 <= indent.0 => {
-                    penalty += if total_blank_lines != 0 {
-                        RELATIVE_DEDENT_WITH_BLANK_PENALTY
-                    } else {
-                        RELATIVE_DEDENT_PENALTY
-                    }
-                }
-                Ordering::Less => {
+                // C: `if (m->post_indent != -1 && m->post_indent > indent)`. A blank (or
+                // absent) following line is *not* an outdent -- git falls through to the
+                // dedent branch for it. Comparing `next_indent.0 > indent.0` alone would
+                // misclassify it, because BLANK is encoded as the largest indent there is.
+                Ordering::Less if self.next_indent != IndentLevel::BLANK && self.next_indent.0 > indent.0 => {
                     penalty += if total_blank_lines != 0 {
                         RELATIVE_OUTDENT_WITH_BLANK_PENALTY
                     } else {
                         RELATIVE_OUTDENT_PENALTY
+                    }
+                }
+                Ordering::Less => {
+                    penalty += if total_blank_lines != 0 {
+                        RELATIVE_DEDENT_WITH_BLANK_PENALTY
+                    } else {
+                        RELATIVE_DEDENT_PENALTY
                     }
                 }
                 Ordering::Greater => {

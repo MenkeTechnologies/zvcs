@@ -80,7 +80,12 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 /// header plus one aligned line per changed or pruned ref), or to stdout in the
 /// machine-readable layout under `--porcelain`. Options that require substrate
 /// gitoxide's high-level fetch does not expose are rejected rather than silently
-/// ignored: `--filter`, `--set-upstream` and `--update-shallow`.
+/// ignored: `--filter` and `--set-upstream`.
+///
+/// When the remote is itself shallow it offers refs that reach shallow roots we don't have.
+/// Adopting those roots would rewrite `.git/shallow`, so by default each such ref is left
+/// alone and warned about, exactly as git's `update_shallow()` decides; `--update-shallow`
+/// takes the roots the fetched refs actually need and adds them to the boundary instead.
 ///
 /// `-4`/`--ipv4` and `-6`/`--ipv6` are git's `transport_family`: they restrict address
 /// resolution for `git://` and `http(s)://` and become `ssh`'s `-4`/`-6`, and are forwarded
@@ -162,8 +167,14 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             "-t" | "--tags" => opts.tags = Some(Tags::All),
             // git: `-n` is the short form of `--no-tags`, not `--dry-run`.
             "-n" | "--no-tags" => opts.tags = Some(Tags::None),
-            "-p" | "--prune" => opts.prune = Some(true),
-            "-P" | "--prune-tags" => opts.prune_tags = Some(true),
+            "-p" | "--prune" => {
+                opts.prune = Some(true);
+                opts.prune_from_cli = true;
+            }
+            "-P" | "--prune-tags" => {
+                opts.prune_tags = Some(true);
+                opts.prune_tags_from_cli = true;
+            }
             "-f" | "--force" => opts.force = true,
             // Negations git's parse-options accepts for the `--[no-]…` booleans:
             // resetting each flag to its default (git clears the corresponding bit).
@@ -172,10 +183,21 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             "--no-dry-run" => opts.dry_run = false,
             "--no-all" => all_flag = Some(false),
             "--no-multiple" => multiple = false,
-            "--no-prune" => opts.prune = Some(false),
-            "--no-prune-tags" => opts.prune_tags = Some(false),
+            "--no-prune" => {
+                opts.prune = Some(false);
+                opts.prune_from_cli = true;
+            }
+            "--no-prune-tags" => {
+                opts.prune_tags = Some(false);
+                opts.prune_tags_from_cli = true;
+            }
             "--no-force" => opts.force = false,
             "--unshallow" => opts.shallow = Some(Shallow::undo()),
+
+            // Accept the new shallow roots a shallow remote asks us to adopt instead of
+            // rejecting the refs that need them - git's `--update-shallow`.
+            "--update-shallow" => opts.update_shallow = true,
+            "--no-update-shallow" => opts.update_shallow = false,
 
             // Machine-readable output: the per-ref rows go to stdout as
             // `<flag> <old-object-id> <new-object-id> <local-reference>` and the
@@ -445,6 +467,54 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             None => 1,
         };
     }
+
+    // `fetch.negotiationAlgorithm` selects the negotiator gitoxide builds in
+    // `receive_pack` (`gix/src/remote/connection/fetch/receive_pack.rs:140`),
+    // which honors `noop`, `skipping` and `consecutive`/`default`. gitoxide
+    // treats an unrecognized value leniently and silently falls back to
+    // `consecutive`; git validates it up front in `prepare_repo_settings()`
+    // (`repo-settings.c`) and dies, so validate it here to the same effect —
+    // matching git's case-insensitive comparison, which gitoxide's own parser
+    // does not do.
+    if let Some(algo) = repo
+        .config_snapshot()
+        .string("fetch.negotiationAlgorithm")
+        .map(|v| v.to_string())
+    {
+        if !["skipping", "noop", "consecutive", "default"]
+            .iter()
+            .any(|k| algo.eq_ignore_ascii_case(k))
+        {
+            eprintln!("fatal: unknown fetch negotiation algorithm '{algo}'");
+            return Ok(ExitCode::from(128));
+        }
+    }
+
+    // `fetch.bundleURI`: a bundle provider to bootstrap from before talking to
+    // the remote. git reads it here, in `cmd_fetch`, and only warns when the
+    // download fails — "the remote Git server is the ultimate source of truth,
+    // not the bundle URI" (Documentation/technical/bundle-uri.adoc).
+    //
+    // `git clone --bundle-uri` writes this key when the list it fetched
+    // advertised `bundle.heuristic`, which is what makes the incremental case
+    // cheap: `fetch_bundle_uri` then reads `fetch.bundleCreationToken` and skips
+    // every bundle the repository already has.
+    let bundle_uri = repo
+        .config_snapshot()
+        .string("fetch.bundleURI")
+        .map(|v| v.to_string());
+    if let Some(uri) = bundle_uri.as_deref() {
+        let (failed, _has_heuristic) = super::bundle::uri::fetch_bundle_uri(&repo, uri);
+        if failed {
+            eprintln!("warning: failed to fetch bundles from '{uri}'");
+        }
+        // The bundles landed as new packs and new `refs/bundles/*` tips. This
+        // handle's object database was opened before they existed, so the
+        // negotiation below would look up a `refs/bundles/*` tip and not find
+        // it; re-open so the fetch sees exactly what is on disk.
+        repo = gix::discover(".")?;
+    }
+
     let all = all_flag.unwrap_or(false);
 
     // Every refspec git accepts on the command line, from `--stdin` or via `--refmap` goes through
@@ -505,7 +575,16 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // local ref and print a set nobody asked for, and with submodule recursion there would be no fetch
     // for the submodules to recurse into.
     if opts.negotiate_only {
-        if opts.negotiation_restrict.is_none() {
+        // The check is on the tips the transport ends up with, which `set_transport_options()` also
+        // fills from `remote.<name>.negotiationRestrict`, so a configured remote can satisfy it alone.
+        let configured_tips = {
+            let name = repo
+                .find_fetch_remote(positionals.first().map(|s| BStr::new(*s)))
+                .ok()
+                .and_then(|remote| remote.name().map(|n| n.as_bstr().to_string()));
+            !negotiation_restrict_config(&repo, name.as_deref()).is_empty()
+        };
+        if opts.negotiation_restrict.is_none() && !configured_tips {
             eprintln!("fatal: --negotiate-only needs one or more --negotiation-restrict=*");
             return Ok(ExitCode::from(128));
         }
@@ -787,8 +866,19 @@ struct FetchOpts {
     // dispatch, so `Some(true)` here means "prune" regardless of origin.
     prune: Option<bool>,
     prune_tags: Option<bool>,
+    /// Whether `prune`/`prune_tags` above came from the command line rather than from
+    /// `fetch.prune`/`fetch.pruneTags`.
+    ///
+    /// git keeps the distinction because `remote.<name>.prune`/`remote.<name>.pruneTags` sit
+    /// *between* the two (`do_fetch()`: command line, then `remote->prune`, then
+    /// `config->prune`), and the remote is only known once a fetch is under way.
+    prune_from_cli: bool,
+    prune_tags_from_cli: bool,
     tags: Option<Tags>,
     shallow: Option<Shallow>,
+    /// `--update-shallow`: let a shallow remote add roots to `.git/shallow` rather than
+    /// rejecting the refs that would need them.
+    update_shallow: bool,
     /// `--porcelain`: rows go to stdout in the machine-readable layout.
     porcelain: bool,
     /// `--write-fetch-head` (git's default) / `--no-write-fetch-head`.
@@ -843,8 +933,11 @@ impl Default for FetchOpts {
             force: false,
             prune: None,
             prune_tags: None,
+            prune_from_cli: false,
+            prune_tags_from_cli: false,
             tags: None,
             shallow: None,
+            update_shallow: false,
             porcelain: false,
             // git writes FETCH_HEAD unless `--no-write-fetch-head` is given.
             write_fetch_head: true,
@@ -1135,9 +1228,15 @@ fn negotiation_restrictions(
     opts: &FetchOpts,
 ) -> Result<Result<gix::protocol::fetch::negotiate::Restrictions, Verdict>> {
     let mut out = gix::protocol::fetch::negotiate::Restrictions::default();
-    if let Some(args) = &opts.negotiation_restrict {
+    // `set_transport_options()` falls back on `remote.<name>.negotiationRestrict` when the command line
+    // named no tip, and reports the same diagnostics under the config key's name.
+    let restrict: Vec<String> = match &opts.negotiation_restrict {
+        Some(args) => args.clone(),
+        None => negotiation_restrict_config(repo, remote_name),
+    };
+    if !restrict.is_empty() {
         let mut tips = Vec::new();
-        for arg in args {
+        for arg in &restrict {
             if let Some(verdict) = resolve_negotiation_tip(repo, "--negotiation-restrict", arg, &mut tips)? {
                 return Ok(Err(verdict));
             }
@@ -1163,6 +1262,29 @@ fn negotiation_restrictions(
         }
     }
     Ok(Ok(out))
+}
+
+/// `remote.<name>.negotiationRestrict`, the per-remote default for `--negotiation-restrict`.
+///
+/// It is a `parse_transport_option()` list, like `remote.<name>.serverOption`: repeatable, and a blank
+/// value in a higher-priority file discards everything inherited so far.
+pub(super) fn negotiation_restrict_config(repo: &gix::Repository, remote_name: Option<&str>) -> Vec<String> {
+    let Some(name) = remote_name else {
+        return Vec::new();
+    };
+    repo.config_snapshot()
+        .strings(&format!("remote.{name}.negotiationRestrict"))
+        .map(|values| {
+            values.into_iter().fold(Vec::new(), |mut acc, value| {
+                if value.is_empty() {
+                    acc.clear();
+                } else {
+                    acc.push(value.to_string());
+                }
+                acc
+            })
+        })
+        .unwrap_or_default()
 }
 
 /// `--server-option` replaces `remote.<name>.serverOption` rather than adding to it, as documented: "These
@@ -1210,6 +1332,27 @@ fn fetch_one(
     let mut remote = repo.find_fetch_remote(name_or_url)?;
     let remote_name = remote.name().map(|n| n.as_bstr().to_string());
 
+    // `do_fetch()` resolves pruning only once the remote is in hand, because
+    // `remote.<name>.prune`/`remote.<name>.pruneTags` sit between the command line and
+    // `fetch.prune`/`fetch.pruneTags`. `opts` already carries the outer two levels collapsed,
+    // so the remote layer only applies when the command line was silent.
+    let prune = if opts.prune_from_cli {
+        opts.prune
+    } else {
+        remote_name
+            .as_deref()
+            .and_then(|name| repo.config_snapshot().boolean(&format!("remote.{name}.prune")))
+            .or(opts.prune)
+    };
+    let prune_tags = if opts.prune_tags_from_cli {
+        opts.prune_tags
+    } else {
+        remote_name
+            .as_deref()
+            .and_then(|name| repo.config_snapshot().boolean(&format!("remote.{name}.pruneTags")))
+            .or(opts.prune_tags)
+    };
+
     // `transfer.credentialsInUrl` is checked before any connection is opened,
     // where git checks it.
     if credentials_in_url(repo, remote.url(gix::remote::Direction::Fetch)) == Verdict::Fatal {
@@ -1219,6 +1362,7 @@ fn fetch_one(
     // The configured fetch refspecs, captured before command-line refspecs replace them: with explicit
     // refspecs they become git's *opportunistic* second stage, mapping the refs the command line selected onto
     // the tracking refs they would normally land in (`get_ref_map` in `builtin/fetch.c`).
+    let has_configured_refspecs = !remote.refspecs(gix::remote::Direction::Fetch).is_empty();
     let configured_refspecs: Vec<gix::refspec::RefSpec> = remote
         .refspecs(gix::remote::Direction::Fetch)
         .iter()
@@ -1287,7 +1431,7 @@ fn fetch_one(
     // Destination prefixes to prune (glob refspec destinations only), captured
     // before the remote is consumed by `connect`.
     let mut prune_prefixes: Vec<Vec<u8>> = Vec::new();
-    if opts.prune == Some(true) {
+    if prune == Some(true) {
         for s in remote.refspecs(gix::remote::Direction::Fetch) {
             if let Some(dst) = s.to_ref().destination() {
                 let dst: &[u8] = dst.as_ref();
@@ -1297,7 +1441,7 @@ fn fetch_one(
             }
         }
         // `-P` adds the tags refspec, so its destination joins the prune set.
-        if opts.prune_tags == Some(true) {
+        if prune_tags == Some(true) {
             prune_prefixes.push(b"refs/tags/".to_vec());
         }
         prune_prefixes.sort();
@@ -1307,7 +1451,7 @@ fn fetch_one(
     // `-P` fetches all tags via an implicit refspec so pruning has the full
     // remote tag set to diff against, without persisting the spec to config.
     let mut extra_refspecs = Vec::new();
-    if opts.prune_tags == Some(true) {
+    if prune_tags == Some(true) {
         extra_refspecs.push(
             gix::refspec::parse(
                 "refs/tags/*:refs/tags/*".into(),
@@ -1349,9 +1493,17 @@ fn fetch_one(
             .collect();
     }
 
+    // `do_set_head` also decides whether the advertisement has to include `HEAD`: git pushes the
+    // literal prefix onto the ls-refs list so `set_head()` has something to guess from.
+    // `remote.<name>.followRemoteHEAD` is parsed once, as git parses it once into `struct remote`.
+    let follow_head = remote_name.as_deref().map(|name| follow_remote_head(repo, name));
+    let want_head = !explicit_refspecs
+        && has_configured_refspecs
+        && follow_head.as_ref().is_some_and(|mode| *mode != FollowRemoteHead::Never);
     let map_options = gix::remote::ref_map::Options {
         extra_refspecs,
         opportunistic_refspecs,
+        extra_ref_prefixes: if want_head { vec![BString::from("HEAD")] } else { Vec::new() },
         ..Default::default()
     };
 
@@ -1417,6 +1569,11 @@ fn fetch_one(
     let outcome = prepared
         .with_dry_run(opts.dry_run)
         .with_shallow(opts.shallow.clone().unwrap_or_default())
+        .with_shallow_update(if opts.update_shallow {
+            gix::remote::fetch::ShallowUpdate::Update
+        } else {
+            gix::remote::fetch::ShallowUpdate::Reject
+        })
         .with_negotiation_restrictions(restrictions)
         .with_refetch(opts.refetch)
         .with_atomic(opts.atomic)
@@ -1424,6 +1581,19 @@ fn fetch_one(
             action: "fetch".into(),
         })
         .receive(&mut *progress, &should_interrupt)?;
+
+    // Refs the remote could only offer by making us adopt one of its shallow roots. git leaves
+    // them out of both the summary and FETCH_HEAD and warns about each, naming the local
+    // tracking ref when there is one and the remote ref otherwise.
+    for mapping in &outcome.rejected_shallow {
+        let name = mapping
+            .local
+            .as_ref()
+            .map(ToString::to_string)
+            .or_else(|| mapping.remote.as_name().map(ToString::to_string))
+            .unwrap_or_default();
+        eprintln!("warning: rejected {name} because shallow roots are not allowed to be updated");
+    }
 
     // Both status variants carry the ref-update outcome; the ref_map ties each
     // update back to its remote/local mapping.
@@ -1800,7 +1970,170 @@ fn fetch_one(
         }
     }
 
+    // git's `do_set_head`: only a refspec-less fetch of a configured remote follows the remote's
+    // `HEAD`, and only when `remote.<name>.followRemoteHEAD` is not `never`.
+    if !opts.dry_run && !explicit_refspecs && has_configured_refspecs {
+        if let Some(name) = remote_name.as_deref() {
+            set_head_from_remote(repo, name, follow_head.unwrap_or(FollowRemoteHead::Create), ref_map, opts)?;
+        }
+    }
+
     Ok(if rejected { Verdict::Rejected } else { Verdict::Ok })
+}
+
+/// `remote.<name>.followRemoteHEAD`, git's `enum follow_remote_head_settings`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FollowRemoteHead {
+    /// Never create or move `refs/remotes/<name>/HEAD`.
+    Never,
+    /// Create it when absent, never move an existing one. git's default.
+    Create,
+    /// Like `create`, plus a message when the remote's `HEAD` differs from ours. The payload is
+    /// `warn-if-not-<branch>`'s branch, for which the message is suppressed.
+    Warn(Option<String>),
+    /// Silently update it to whatever the remote says.
+    Always,
+}
+
+/// Read `remote.<name>.followRemoteHEAD`; an unrecognized value is a warning and leaves the default.
+fn follow_remote_head(repo: &gix::Repository, remote_name: &str) -> FollowRemoteHead {
+    let Some(value) = repo
+        .config_snapshot()
+        .string(&format!("remote.{remote_name}.followRemoteHEAD"))
+        .map(|v| v.to_string())
+    else {
+        return FollowRemoteHead::Create;
+    };
+    match value.as_str() {
+        "never" => FollowRemoteHead::Never,
+        "create" => FollowRemoteHead::Create,
+        "warn" => FollowRemoteHead::Warn(None),
+        "always" => FollowRemoteHead::Always,
+        other => match other.strip_prefix("warn-if-not-") {
+            Some(branch) => FollowRemoteHead::Warn(Some(branch.to_owned())),
+            None => {
+                eprintln!("warning: unrecognized followRemoteHEAD value '{value}' ignored");
+                FollowRemoteHead::Create
+            }
+        },
+    }
+}
+
+/// Port of git's `set_head()`: point `refs/remotes/<name>/HEAD` at the branch the remote's `HEAD`
+/// names, under the policy `remote.<name>.followRemoteHEAD` sets.
+///
+/// git ignores every failure here ("way too many cases where this can go wrong"), so an
+/// undeterminable or unadvertised `HEAD` simply leaves the ref alone.
+fn set_head_from_remote(
+    repo: &gix::Repository,
+    remote_name: &str,
+    follow: FollowRemoteHead,
+    ref_map: &gix::remote::fetch::RefMap,
+    opts: &FetchOpts,
+) -> Result<()> {
+    if follow == FollowRemoteHead::Never {
+        return Ok(());
+    }
+    let heads = super::remote::remote_head_names(ref_map);
+    // Zero or several candidates leave `HEAD` undetermined, which git treats as nothing to do.
+    let [head_name] = heads.as_slice() else {
+        return Ok(());
+    };
+
+    // A bare mirror keeps its own `HEAD` in step instead of a tracking `HEAD`.
+    let bare_mirror = repo.worktree().is_none()
+        && repo
+            .config_snapshot()
+            .boolean(&format!("remote.{remote_name}.mirror"))
+            .unwrap_or(false);
+    let (head_ref, target) = if bare_mirror {
+        ("HEAD".to_string(), format!("refs/heads/{head_name}"))
+    } else {
+        (
+            format!("refs/remotes/{remote_name}/HEAD"),
+            format!("refs/remotes/{remote_name}/{head_name}"),
+        )
+    };
+    if !bare_mirror && repo.try_find_reference(target.as_str())?.is_none() {
+        return Ok(());
+    }
+
+    // `create_only` is what makes `create` and `warn` leave an existing `HEAD` where it is; only
+    // `always` (and a bare mirror) rewrites it.
+    let create_only = follow != FollowRemoteHead::Always && !bare_mirror;
+    let (previous, was_detached) = super::remote::symref_prev(repo, head_ref.as_str())?;
+    if !(create_only && previous.is_some()) {
+        repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: "fetch".into(),
+                },
+                expected: PreviousValue::Any,
+                new: Target::Symbolic(full_ref_name(&target)?),
+            },
+            name: full_ref_name(&head_ref)?,
+            deref: false,
+        })?;
+    }
+
+    // `report_set_head()`, gated on `verbosity >= 0` exactly as git gates it.
+    if let (FollowRemoteHead::Warn(no_warn_branch), false) = (&follow, opts.quiet) {
+        if no_warn_branch.as_deref() != Some(head_name.as_str()) {
+            report_set_head_warn(remote_name, head_name, previous.as_deref(), was_detached);
+        }
+    }
+    Ok(())
+}
+
+/// git's `report_set_head()` plus the `advice.fetchSetHeadWarn` hint it ends with.
+fn report_set_head_warn(remote: &str, head_name: &str, previous: Option<&str>, was_detached: bool) {
+    let prefix = format!("refs/remotes/{remote}/");
+    let tracked = previous.and_then(|p| p.strip_prefix(prefix.as_str()));
+    match tracked {
+        Some(prev_head) if prev_head != head_name => {
+            println!("'HEAD' at '{remote}' is '{head_name}', but we have '{prev_head}' locally.");
+        }
+        _ if was_detached && previous.is_some_and(|p| !p.is_empty()) => {
+            let previous = previous.unwrap_or_default();
+            println!(
+                "'HEAD' at '{remote}' is '{head_name}', but we have a detached HEAD pointing to '{previous}' locally."
+            );
+        }
+        _ => return,
+    }
+    if !crate::advice::enabled("fetchRemoteHEADWarn") {
+        return;
+    }
+    let mut lines = vec![
+        format!("Run 'git remote set-head {remote} {head_name}' to follow the change, or set"),
+        format!("'remote.{remote}.followRemoteHEAD' configuration option to a different value"),
+        "if you do not want to see this message. Specifically running".to_string(),
+        format!("'git config set remote.{remote}.followRemoteHEAD warn-if-not-branch-{head_name}'"),
+        "will disable the warning until the remote changes HEAD to something else.".to_string(),
+    ];
+    // `advise_if_enabled()`'s trailer, which git appends only while the slot is unconfigured.
+    let unconfigured = gix::discover(".")
+        .map(|repo| {
+            repo.config_snapshot()
+                .boolean("advice.fetchRemoteHEADWarn")
+                .is_none()
+        })
+        .unwrap_or(true);
+    if unconfigured {
+        lines.push(
+            "Disable this message with \"git config set advice.fetchRemoteHEADWarn false\"".to_string(),
+        );
+    }
+    for line in lines {
+        eprintln!("hint: {line}");
+    }
+}
+
+/// Validate a full ref name the way the ref edits in this module need it.
+fn full_ref_name(name: &str) -> Result<FullName> {
+    Ok(gix::refs::FullName::try_from(BString::from(name))?)
 }
 
 /// Apply the update gitoxide refused because the destination is checked out in a

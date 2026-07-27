@@ -15,7 +15,7 @@ use crate::{
     remote::{
         connection::fetch::{PrepareDetached, config},
         fetch,
-        fetch::{Error, Outcome, Prepare, RefLogMessage, Status, negotiate::Algorithm, outcome, refs},
+        fetch::{Error, Outcome, Prepare, RefLogMessage, Status, negotiate::Algorithm, outcome, refs, shallow},
     },
 };
 
@@ -210,6 +210,22 @@ where
             fetch_options,
         )
         .await?;
+        // The `shallow <oid>` lines the remote sent without us having asked for a depth change. They
+        // are what git's `receive_shallow_info()` collects into `shallow_info`, and the input to the
+        // `update_shallow()` decision below.
+        let remote_shallow: Vec<gix_hash::ObjectId> = res
+            .as_ref()
+            .map(|v| {
+                v.last_response
+                    .shallow_updates()
+                    .iter()
+                    .filter_map(|update| match update {
+                        gix_protocol::fetch::response::ShallowUpdate::Shallow(id) => Some(*id),
+                        gix_protocol::fetch::response::ShallowUpdate::Unshallow(_) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let negotiate = res.map(|v| outcome::Negotiate {
             graph: graph.detach(),
             rounds: v.negotiate.rounds,
@@ -219,6 +235,28 @@ where
             gix_protocol::indicate_end_of_interaction(&mut con.transport.inner, con.trace)
                 .await
                 .ok();
+        }
+
+        // git runs `update_shallow()` right after the pack was indexed and before any ref is
+        // touched: only then is it known which of the remote's shallow roots the pack actually
+        // brought along, and hence which of the fetched refs may be updated at all. A fetch that
+        // asked for a depth of its own took the early return there, as its boundary was already
+        // settled while negotiating.
+        let mut rejected_shallow = Vec::new();
+        if !remote_shallow.is_empty() && matches!(self.shallow, gix_protocol::fetch::Shallow::NoChange) {
+            let ref_tips: Vec<_> = self
+                .ref_map
+                .mappings
+                .iter()
+                .map(|m| m.remote.as_id().map_or_else(|| repo.object_hash().null(), ToOwned::to_owned))
+                .collect();
+            let outcome = shallow::update(repo, self.shallow_update, remote_shallow, &ref_tips)?;
+            // git skips rejected refs both when reporting updates and when writing `FETCH_HEAD`, so
+            // they leave the ref map entirely and are handed to the caller to warn about.
+            for index in outcome.rejected.into_iter().rev() {
+                rejected_shallow.push(self.ref_map.mappings.remove(index));
+            }
+            rejected_shallow.reverse();
         }
 
         let update_refs = refs::update(
@@ -254,6 +292,7 @@ where
 
         let out = Outcome {
             handshake,
+            rejected_shallow,
             ref_map: std::mem::take(&mut self.ref_map),
             status: match write_pack_bundle {
                 Some(write_pack_bundle) => Status::Change {

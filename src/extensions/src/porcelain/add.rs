@@ -19,10 +19,10 @@
 //!   * `git add <submodule>` — stage a moved submodule's current HEAD as the
 //!     parent gitlink (mode 160000), the same way stock git does; no
 //!     fast-forward gate and no commit (that is `git zbump`)
+//!   * `git add <dir>` where `<dir>` is itself a git repository — records a
+//!     gitlink to its current HEAD and warns (`advice.addEmbeddedRepo`)
 //!   * flags `-f/--force`, `-n/--dry-run`, `-v/--verbose`, `--sparse`, `--`, and
-//!     `--warn-embedded-repo`/`--no-warn-embedded-repo` (accepted no-op: the
-//!     embedded-repo warning is moot since untracked embedded repos are never
-//!     staged here — only *tracked* submodule gitlinks are updated)
+//!     `--warn-embedded-repo`/`--no-warn-embedded-repo` (mutes that warning)
 //! ```
 //!
 //! For each matched worktree file the blob is hashed into the object database and
@@ -36,9 +36,8 @@
 //!   * `.gitattributes` content filters (autocrlf, `clean`/`smudge`) are NOT
 //!     applied — the blob is the verbatim worktree bytes. `--renormalize` therefore
 //!     re-stages current bytes without re-running EOL filters.
-//!   * untracked embedded git repositories are not auto-converted to submodules
-//!     (git's "adding embedded git repository" path); a *tracked* submodule's
-//!     gitlink IS updated to its current HEAD (see the gitlink pass below).
+//!   * an embedded git repository is staged as a gitlink but is not registered in
+//!     `.gitmodules` — the same as stock git, which only warns.
 //!   * `-i`/`--interactive` runs the numbered main menu ([`super::add_interactive`])
 //!     and `-p`/`--patch` the hunk selector ([`super::add_patch`]). `-e`/`--edit`
 //!     (diff into an editor, then `apply --recount --cached`) is rejected.
@@ -83,6 +82,9 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             .unwrap_or(false)
     };
     let mut ignore_missing = false;
+    // `warn_on_embedded_repo` (builtin/add.c): on by default, cleared by the
+    // hidden `--no-warn-embedded-repo`.
+    let mut warn_embedded = true;
     // `--no-all`/`--ignore-removal`: stage adds+mods but not worktree deletions.
     let mut no_removal = false;
     // Some(true) => `--chmod=+x`, Some(false) => `--chmod=-x`.
@@ -146,14 +148,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             "--no-renormalize" => renormalize = false,
             "--sparse" | "--no-sparse" => { /* no sparse-checkout cone here: accept and ignore */ }
             // `--warn-embedded-repo`/`--no-warn-embedded-repo` (hidden in git,
-            // builtin/add.c:393 `OPT_HIDDEN_BOOL`, default on) only toggles the
-            // `adding embedded git repository:` warning that git's
-            // `check_embedded_repo` emits when a matched worktree directory is
-            // itself a git repo. This port never stages gitlinks/embedded repos
-            // (the walk keeps only File/Symlink entries), so no such warning is
-            // ever produced and both toggles are accepted no-ops — matching git's
-            // exit-0 accept for the non-embedded-repo case.
-            "--warn-embedded-repo" | "--no-warn-embedded-repo" => {}
+            // an `OPT_HIDDEN_BOOL` over `warn_on_embedded_repo`, default on) mutes
+            // the `adding embedded git repository:` warning and its advice; the
+            // gitlink is staged either way.
+            "--warn-embedded-repo" => warn_embedded = true,
+            "--no-warn-embedded-repo" => warn_embedded = false,
             "--ignore-errors" => ignore_errors = true,
             "--no-ignore-errors" => ignore_errors = false,
             "--ignore-missing" => ignore_missing = true,
@@ -372,25 +371,62 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // Paths that could not be read, paired with the OS error text git reports
     // (only surfaced for a real add). git prints `open("<p>"): <strerror>`.
     let mut read_errors: Vec<(BString, String)> = Vec::new();
+    // Embedded repositories whose HEAD is unborn: git cannot record a gitlink for
+    // them and reports each one before failing the whole add.
+    let mut headless_repos: Vec<BString> = Vec::new();
+    // `check_embedded_repo`'s `adviced_on_embedded_repo`: the warning is printed
+    // per repository, the advice at most once per invocation.
+    let mut embedded_advised = false;
 
     for item in iter.by_ref() {
         let entry = item?.entry;
+        let path = entry.rela_path;
+        let already_tracked = existing.contains(&path);
+        // Ignore semantics: an ignored path is only staged if forced or already
+        // tracked. Tracked/untracked (non-ignored) paths are always eligible.
+        let ignored_here =
+            matches!(entry.status, gix::dir::entry::Status::Ignored(_)) && !force && !already_tracked;
+
         // Only regular files and symlinks are stageable *content* here; skip
-        // directories and anything untrackable. Submodule repositories
-        // (`Kind::Repository`) are staged as gitlinks in the dedicated index-driven
-        // pass after this loop, not as blobs.
+        // directories and anything untrackable. A directory that is itself a git
+        // repository is staged as a gitlink instead — an untracked one right here
+        // (git's `check_embedded_repo` path), a tracked one in the index-driven
+        // pass after this loop.
         match entry.disk_kind {
             Some(gix::dir::entry::Kind::File) | Some(gix::dir::entry::Kind::Symlink) => {}
+            Some(gix::dir::entry::Kind::Repository) => {
+                if already_tracked || ignored_here || tracked_only {
+                    continue;
+                }
+                let Some(abs) = repo.workdir_path(&path) else { continue };
+                // `add_file_to_index` resolves the embedded repository's HEAD into
+                // the gitlink; an unborn HEAD has nothing to record and is the
+                // `does not have a commit checked out` failure.
+                let Some(head) = gix::open(&abs)
+                    .ok()
+                    .and_then(|sub| sub.head_id().ok().map(|h| h.detach()))
+                else {
+                    headless_repos.push(path);
+                    continue;
+                };
+                warn_embedded_repo(&path, warn_embedded, &repo, &mut embedded_advised);
+                let stat = gix::index::fs::Metadata::from_path_no_follow(&abs)
+                    .ok()
+                    .and_then(|md| Stat::from_fs(&md).ok())
+                    .unwrap_or_default();
+                staged.push(Staged {
+                    path,
+                    id: head,
+                    mode: Mode::COMMIT,
+                    stat,
+                    was_tracked: false,
+                });
+                continue;
+            }
             _ => continue,
         }
 
-        let path = entry.rela_path;
-        let already_tracked = existing.contains(&path);
-
-        // Ignore semantics: an ignored path is only staged if forced or already
-        // tracked. Tracked/untracked (non-ignored) paths are always eligible.
-        if matches!(entry.status, gix::dir::entry::Status::Ignored(_)) && !force && !already_tracked
-        {
+        if ignored_here {
             continue;
         }
         // `-u/--update`, `--refresh`, `--renormalize` restage tracked paths only.
@@ -557,8 +593,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         let matched_staged = path_is_or_under(staged_set.iter(), p);
         let matched_tracked = path_is_or_under(existing.iter(), p);
         let matched_deleted = path_is_or_under(deletion_set.iter().copied(), p);
+        // An embedded repository whose HEAD is unborn matched the pathspec — it
+        // just could not be indexed — so it is not a "did not match" case.
+        let matched_headless = path_is_or_under(headless_repos.iter(), p);
 
-        if matched_staged || matched_tracked || matched_deleted {
+        if matched_staged || matched_tracked || matched_deleted || matched_headless {
             continue;
         }
         if tracked_only {
@@ -610,9 +649,15 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // `--ignore-errors`: a real add reports unreadable files and, if any occurred
-    // without `--ignore-errors`, aborts before touching the index.
-    if !read_errors.is_empty() && !dry_run {
+    // `--ignore-errors`: a real add reports the paths it could not index and, if
+    // any occurred without `--ignore-errors`, aborts before touching the index.
+    // An embedded repository with an unborn HEAD is one of those paths; git names
+    // it with the trailing slash the directory walk carries.
+    if !(read_errors.is_empty() && headless_repos.is_empty()) && !dry_run {
+        for p in &headless_repos {
+            eprintln!("error: '{p}/' does not have a commit checked out");
+            eprintln!("error: unable to index file '{p}/'");
+        }
         for (p, msg) in &read_errors {
             eprintln!("error: open(\"{p}\"): {msg}");
             eprintln!("error: unable to index file '{p}'");
@@ -655,7 +700,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     };
 
     if staged.is_empty() && deletions.is_empty() {
-        return Ok(finish_code(&read_errors, ignore_errors, dry_run));
+        return Ok(finish_code(
+            !read_errors.is_empty() || !headless_repos.is_empty(),
+            ignore_errors,
+            dry_run,
+        ));
     }
 
     // --- dry run: report only, never touch the index ------------------------
@@ -663,7 +712,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         for line in &report {
             println!("{line}");
         }
-        return Ok(finish_code(&read_errors, ignore_errors, dry_run));
+        return Ok(finish_code(
+            !read_errors.is_empty() || !headless_repos.is_empty(),
+            ignore_errors,
+            dry_run,
+        ));
     }
 
     // --- write path: serialize the read-modify-write through the coordinator.
@@ -713,7 +766,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                 println!("{line}");
             }
         }
-        return Ok(finish_code(&read_errors, ignore_errors, dry_run));
+        return Ok(finish_code(
+            !read_errors.is_empty() || !headless_repos.is_empty(),
+            ignore_errors,
+            dry_run,
+        ));
     }
 
     // Drop every prior version (any stage) of a staged path and every deletion,
@@ -743,7 +800,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    Ok(finish_code(&read_errors, ignore_errors, dry_run))
+    Ok(finish_code(
+            !read_errors.is_empty() || !headless_repos.is_empty(),
+            ignore_errors,
+            dry_run,
+        ))
 }
 
 /// Record a `stage` event in the live feed (`git zevents`/`ztail`) after a
@@ -767,12 +828,53 @@ pub(crate) fn record_stage_event(repo: &gix::Repository, count: usize) {
 
 /// The overall exit code: git returns 1 from a real add when `--ignore-errors`
 /// let it skip at least one unreadable file, else success.
-fn finish_code(read_errors: &[(BString, String)], ignore_errors: bool, dry_run: bool) -> ExitCode {
-    if ignore_errors && !dry_run && !read_errors.is_empty() {
+fn finish_code(had_errors: bool, ignore_errors: bool, dry_run: bool) -> ExitCode {
+    if ignore_errors && !dry_run && had_errors {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Port of `check_embedded_repo()` (builtin/add.c): staging a directory that is
+/// itself a git repository records a gitlink, so the outer repository ends up
+/// pointing at a commit nobody can fetch. git warns about every such path and,
+/// through `advise_if_enabled(ADVICE_ADD_EMBEDDED_REPO, …)`, explains the two
+/// ways out at most once per invocation — which is what `advised` tracks.
+///
+/// `--no-warn-embedded-repo` clears `warn`, silencing both.
+fn warn_embedded_repo(
+    path: &BString,
+    warn: bool,
+    repo: &gix::Repository,
+    advised: &mut bool,
+) {
+    if !warn {
+        return;
+    }
+    eprintln!("warning: adding embedded git repository: {path}");
+    if *advised {
+        return;
+    }
+    *advised = true;
+    crate::advice::Advice::AddEmbeddedRepo.advise_in(
+        repo,
+        &format!(
+            "You've added another git repository inside your current repository.\n\
+             Clones of the outer repository will not contain the contents of\n\
+             the embedded repository and will not know how to obtain it.\n\
+             If you meant to add a submodule, use:\n\
+             \n\
+             \tgit submodule add <url> {path}\n\
+             \n\
+             If you added this path by mistake, you can remove it from the\n\
+             index with:\n\
+             \n\
+             \tgit rm --cached {path}\n\
+             \n\
+             See \"git help submodule\" for more information."
+        ),
+    );
 }
 
 /// The `strerror`-equivalent text git prints for a failed `open()`, e.g.
@@ -835,8 +937,17 @@ fn read_pathspec_file(src: &str, nul: bool) -> Result<Vec<String>> {
 
 /// Return `true` if any path in `iter` equals `p` or lives under the directory
 /// `p` (i.e. starts with `p` + `/`), the way a directory pathspec matches.
+///
+/// Index paths are normalized — no `./`, no trailing `/` — while a pathspec the
+/// user typed may carry either, so `p` is normalized the same way before
+/// comparing. Without that, `git add d/` matched nothing and was reported as a
+/// gitignored path.
 fn path_is_or_under<'a>(mut iter: impl Iterator<Item = &'a BString>, p: &str) -> bool {
-    let pb = p.as_bytes();
+    let mut p = p;
+    while let Some(rest) = p.strip_prefix("./") {
+        p = rest;
+    }
+    let pb = p.trim_end_matches('/').as_bytes();
     let mut prefix = pb.to_vec();
     prefix.push(b'/');
     iter.any(|x| x.as_slice() == pb || x.as_slice().starts_with(&prefix))

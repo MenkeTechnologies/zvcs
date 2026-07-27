@@ -18,6 +18,10 @@ use crate::{
 mod error;
 pub use error::Error;
 
+///
+pub mod shallow;
+pub use shallow::Mode as ShallowUpdate;
+
 use crate::remote::fetch::WritePackedRefs;
 
 /// The way reflog messages should be composed whenever a ref is written with recent objects from a remote.
@@ -81,6 +85,13 @@ pub struct Outcome {
     pub handshake: gix_protocol::Handshake,
     /// The status of the operation to indicate what happened.
     pub status: Status,
+    /// The mappings that were dropped because updating them would have required adopting a new
+    /// shallow root, git's `REF_STATUS_REJECT_SHALLOW`.
+    ///
+    /// They are not part of [`ref_map`](Self::ref_map) anymore, matching how git skips such refs
+    /// when reporting updates and when writing `FETCH_HEAD`. Callers are expected to warn about
+    /// each of them, as `git fetch` does.
+    pub rejected_shallow: Vec<gix_protocol::fetch::refmap::Mapping>,
 }
 
 /// Additional types related to the outcome of a fetch operation.
@@ -175,6 +186,7 @@ where
             refetch: false,
             atomic: false,
             filter: None,
+            shallow_update: shallow::Mode::Reject,
         })
     }
 }
@@ -229,6 +241,7 @@ where
     refetch: bool,
     atomic: bool,
     filter: Option<gix_protocol::fetch::filter::Filter>,
+    shallow_update: shallow::Mode,
 }
 
 /// Builder
@@ -236,6 +249,17 @@ impl<T> Prepare<'_, '_, T>
 where
     T: Transport,
 {
+    /// Control what happens when the remote turns out to be shallow itself and asks us to adopt new
+    /// shallow roots, the decision git makes in `update_shallow()` of `fetch-pack.c`.
+    ///
+    /// The default is [`ShallowUpdate::Reject`], which leaves `.git/shallow` alone and refuses to
+    /// update the refs that would depend on a new root, exactly as `git fetch` does without
+    /// `--update-shallow`.
+    pub fn with_shallow_update(mut self, mode: ShallowUpdate) -> Self {
+        self.inner.shallow_update = mode;
+        self
+    }
+
     /// If dry run is enabled, no change to the repository will be made.
     ///
     /// This works by not actually fetching the pack after negotiating it, nor will refs be updated.
@@ -330,6 +354,11 @@ where
 
     pub(crate) fn with_shallow(mut self, shallow: remote::fetch::Shallow) -> Self {
         self.shallow = shallow;
+        self
+    }
+
+    pub(crate) fn with_shallow_update(mut self, mode: ShallowUpdate) -> Self {
+        self.shallow_update = mode;
         self
     }
 

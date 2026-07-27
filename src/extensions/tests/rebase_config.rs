@@ -1,41 +1,28 @@
-//! `git rebase` and its config keys — a regression guard for the ones that are
-//! *not* ported, and why.
+//! `git rebase`'s config keys on the paths that replay *nothing* — the
+//! up-to-date exit and the forced exact replay of an already-based range.
 //!
-//! `git help --config` lists these `rebase.*` keys beyond `rebase.backend`
-//! (already read in `porcelain::rebase`): `rebase.stat`, `rebase.autoStash`,
-//! `rebase.autoSquash`, `rebase.abbreviateCommands`, `rebase.missingCommitsCheck`
-//! and `rebase.forkPoint`. Every one of them defaults a behavior that lives on a
-//! path this port explicitly refuses, so none is mappable:
+//! Those two paths run before the sequencer and are where a mis-wired key does
+//! the most damage, because none of them should change anything there: git
+//! prints no upstream diffstat when nothing changed upstream, has no dirty tree
+//! to autostash, and has no instruction sheet to abbreviate or reorder. These
+//! tests pin that non-effect against the system `git`, byte for byte, with each
+//! key set to either value.
 //!
-//! * `rebase.stat` (git default: false) is the default for `--stat`/`--no-stat`,
-//!   the upstream diffstat. `porcelain::rebase` refuses `--stat` up front (the
-//!   diffstat is not ported), and git only prints it when a *divergent* range is
-//!   actually replayed — the three-way-merge path this port also refuses. On
-//!   every path it completes (up-to-date exit, forced exact replay, `--no-ff`
-//!   noop) git prints no diffstat because nothing changed upstream, so the config
-//!   has no observable effect.
-//! * `rebase.autoSquash` (per git-config(1)) enables `--autosquash` "by default
-//!   **for interactive mode**". It does *not* imply the merge backend or disable
-//!   the preemptive fast-forward the way the command-line `--autosquash` does —
-//!   `git -c rebase.autosquash=true rebase <up-to-date>` prints
-//!   `Current branch <b> is up to date.`, identical to a plain rebase, whereas
-//!   `git rebase --autosquash <up-to-date>` prints `Successfully rebased...`.
-//!   Interactive rebase is not ported, so the config has no observable effect on
-//!   any completed path — and wiring it to this port's `autosquash` variable
-//!   (which *does* drive `imply_merge`/`allow_preemptive_ff`) would diverge from
-//!   git.
-//! * `rebase.autoStash` only matters against a dirty worktree (writing a stash
-//!   commit), which this port refuses; on a clean tree neither git nor this port
-//!   does anything with it.
-//! * `rebase.forkPoint` only sets `--no-fork-point` when false; the `--fork-point`
-//!   (true) side needs the upstream reflog walk this port refuses.
-//! * `rebase.abbreviateCommands`/`rebase.missingCommitsCheck` govern the
-//!   interactive todo list, which is not ported.
+//! One key needs its own case. `rebase.autoSquash` (per git-config(1)) enables
+//! `--autosquash` "by default **for interactive mode**", and unlike the
+//! command-line flag it must *not* imply the merge backend or disable the
+//! preemptive fast-forward — `cmd_rebase()` resolves the config only after
+//! `allow_preemptive_ff` has been decided. So
+//! `git -c rebase.autosquash=true rebase <up-to-date>` prints
+//! `Current branch <b> is up to date.` while
+//! `git rebase --autosquash <up-to-date>` prints `Successfully rebased…`, and
+//! [`rebase_autosquash_config_keeps_preemptive_fast_forward`] is the guard
+//! against collapsing the two.
 //!
-//! These tests pin that non-effect: on the paths `porcelain::rebase` completes,
-//! this binary matches the system `git` (2.55.0) byte for byte under every one of
-//! those keys set to either value. That is the guard against a future change
-//! wiring one of them into a variable it must not touch.
+//! What these keys *do* once a sheet exists — `rebase.autoSquash`,
+//! `rebase.abbreviateCommands`, `rebase.instructionFormat`,
+//! `rebase.missingCommitsCheck` and `rebase.rescheduleFailedExec` — is covered
+//! in `rebase_interactive.rs`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

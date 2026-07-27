@@ -7,6 +7,7 @@ use gix_features::progress::DynNestedProgress;
 
 use crate::fetch::{
     Arguments, Context, Error, Negotiate, NegotiateOutcome, Options, Outcome, ProgressId, Shallow, Tags, negotiate,
+    response::ShallowUpdate,
 };
 #[cfg(feature = "async-client")]
 use crate::transport::client::async_io::{ExtendedBufRead, HandleProgress, Transport};
@@ -159,11 +160,24 @@ where
 
             let mut previous_response = previous_response.expect("knowledge of a pack means a response was received");
             previous_response.append_v1_shallow_updates(v1_shallow_updates);
-            if !previous_response.shallow_updates().is_empty() && shallow_lock.is_none() {
-                if reject_shallow_remote {
+            // `receive_shallow_info()` in git's `fetch-pack.c` splits the boundary lines two ways.
+            // An `unshallow` line always means our own depth settings caused the change, so it is
+            // written out even when no depth was asked for - git sets `args->deepen = 1` for it.
+            // Plain `shallow` lines without a depth request instead mean the *remote* is shallow and
+            // wants us to adopt new roots; git refuses to do that here and leaves the decision to
+            // `update_shallow()`, which runs once the pack is indexed and only rewrites
+            // `.git/shallow` when cloning or when `--update-shallow` was given. Those updates are
+            // therefore reported through [`Outcome::last_response`] rather than written.
+            let unshallow_received = previous_response
+                .shallow_updates()
+                .iter()
+                .any(|update| matches!(update, ShallowUpdate::Unshallow(_)));
+            if shallow_lock.is_none() && !previous_response.shallow_updates().is_empty() {
+                if unshallow_received {
+                    shallow_lock = acquire_shallow_lock(&shallow_file).map(Some)?;
+                } else if reject_shallow_remote {
                     return Err(Error::RejectShallowRemote);
                 }
-                shallow_lock = acquire_shallow_lock(&shallow_file).map(Some)?;
             }
 
             #[cfg(feature = "async-client")]

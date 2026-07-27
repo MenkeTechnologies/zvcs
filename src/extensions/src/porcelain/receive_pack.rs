@@ -3,11 +3,12 @@
 //! `receive-pack` is a protocol server. It writes a ref advertisement, then reads
 //! commands, a packfile and (optionally) a push certificate off stdin, ingests the
 //! pack, runs hooks and updates refs. The advertisement (below) and the receive path
-//! (`receive`: command list → pack ingest via `gix_pack::Bundle` → ref
+//! (`receive`: command list → pack ingest via `gix_pack::Bundle` → hooks → ref
 //! compare-and-swap → `report-status`) are both implemented — enough for a local
-//! (`file://`) or ssh push served by this binary. Hooks, the quarantine, push certs,
-//! push-options and atomic pushes are not modelled (see the notes below). The
-//! advertisement is byte-verified against git 2.55.0:
+//! (`file://`) or ssh push served by this binary, and for the split
+//! advertise-then-`--stateless-rpc` session an HTTP backend drives. The quarantine
+//! is not modelled (see the notes below). The advertisement is byte-verified
+//! against git 2.55.0:
 //!
 //!   * **The ref advertisement** — `<oid> SP <ref>` pkt-lines in refname order,
 //!     with the capability list appended to the first line after a NUL, the
@@ -16,14 +17,19 @@
 //!     Symbolic refs are resolved but tags are *not* peeled — `receive-pack`
 //!     advertises no `^{}` rows.
 //!   * **The capability list**, in git's emission order, honouring
-//!     `receive.advertiseAtomic`, `repack.useDeltaBaseOffset` and
+//!     `receive.advertiseAtomic`, `repack.useDeltaBaseOffset`,
+//!     `receive.certNonceSeed` (which adds `push-cert=<nonce>`) and
 //!     `receive.advertisePushOptions`, plus `object-format=<algo>` from the
 //!     repository's hash and `agent=` from `GIT_USER_AGENT` (see [`agent`]).
 //!   * **Hidden refs** — `transfer.hideRefs` and `receive.hideRefs` are applied
 //!     to the advertisement through `ref_is_hidden()` (last pattern wins, `!`
 //!     un-hides), and a push to a hidden ref is rejected with
-//!     `deny updating a hidden ref`.
+//!     `deny updating a hidden ref` (`deny deleting a hidden ref` for a delete).
 //!   * **`--http-backend-info-refs` / `--advertise-refs`** — advertise and exit 0.
+//!   * **`--stateless-rpc`** — serve the request without re-advertising, the
+//!     half of an HTTP push that follows a separate `--advertise-refs` process.
+//!     It is also the only session shape in which a certificate can echo a nonce
+//!     this process did not mint, which is what `receive.certNonceSlop` grades.
 //!   * **Argument handling**: `-h` prints the 68-byte usage block on *stdout*
 //!     and exits 129; an unknown option prints ``error: unknown option `x'``
 //!     (or ``unknown switch `c'``) followed by that usage block on stderr, 129;
@@ -72,10 +78,46 @@
 //!     defaults print.
 //!   * **`receive.updateServerInfo`** refreshes `info/refs` and
 //!     `objects/info/packs` after the refs move.
+//!   * **`receive.autogc`** hands the repository to
+//!     [`super::maintenance::run_auto_maintenance`] once the report is out —
+//!     git 2.55's `prepare_auto_maintenance()`, which is a
+//!     `maintenance run --auto` child gated on `maintenance.auto` / `gc.auto`,
+//!     not the `gc --auto` of older versions.
 //!   * **`side-band-64k`**: when the client advertises it, the report-status
-//!     stream is multiplexed on band 1 and every diagnostic on band 2;
-//!     otherwise the report is written as plain pkt-lines and diagnostics go to
-//!     stderr.
+//!     stream is multiplexed on band 1 and every diagnostic — including every
+//!     byte a hook wrote to stdout or stderr — on band 2; otherwise the report
+//!     is written as plain pkt-lines and diagnostics go to stderr. The flush
+//!     that ends the multiplexed stream is the last write of the session, after
+//!     `post-receive` and `post-update` have had their say.
+//!   * **`receive.keepAlive`**: while a hook is running and saying nothing, an
+//!     empty band-1 packet (`0005\x01`) goes out every N seconds so the client's
+//!     read does not time out. `0` or below disables it.
+//!
+//! ### Push certificates
+//!
+//! With `receive.certNonceSeed` set, the advertisement carries
+//! `push-cert=<nonce>`, where the nonce is `<stamp>-<hmac>` and the HMAC is
+//! keyed by `"<git-dir-as-spelled>:<stamp>"` over the seed
+//! ([`prepare_push_cert_nonce`]). A client that takes the offer sends its
+//! commands *inside* a signed certificate instead of on the wire; the port reads
+//! the `push-cert` … `push-cert-end` block, takes the command list from between
+//! the certificate's blank line and its signature, stores the certificate as a
+//! blob, verifies the signature through [`crate::gitsig`] and grades the echoed
+//! nonce ([`check_nonce`]). All of it reaches the hooks as `GIT_PUSH_CERT`,
+//! `GIT_PUSH_CERT_SIGNER`, `GIT_PUSH_CERT_KEY`, `GIT_PUSH_CERT_STATUS`,
+//! `GIT_PUSH_CERT_NONCE`, `GIT_PUSH_CERT_NONCE_STATUS` and (for a `SLOP` nonce)
+//! `GIT_PUSH_CERT_NONCE_SLOP`.
+//!
+//! ### Hooks
+//!
+//! `pre-receive`, `update`, `post-receive`, `post-update` and `proc-receive` all
+//! run, in git's order and with git's arguments, stdin payloads and environment.
+//! A command whose ref name matches `receive.procReceiveRefs` is handed to the
+//! `proc-receive` hook over its pkt-line protocol (version negotiation, the
+//! command list, the push options, then `ok`/`ng`/`option` replies) and never
+//! reaches the ref store; its `option refname` / `old-oid` / `new-oid` /
+//! `forced-update` answers become the `report-status-v2` reply and the refs
+//! `post-receive` is told about.
 //!
 //! ### Not ported (bailed on with a precise message, never silently ignored)
 //!
@@ -85,18 +127,19 @@
 //!      not append the base objects to the pack the way `index-pack --fix-thin`
 //!      does, and it writes no `.rev` reverse index. A kept pack therefore
 //!      differs on disk from the one git would have stored.
-//!   2. **Hooks and the quarantine.** "client-side hooks for … push" and
-//!      "quarantine-aware hook execution" are unchecked
-//!      (`crate-status.md:670`, `:672`). `pre-receive`, `update`,
-//!      `post-receive` and `post-update` all observe `GIT_QUARANTINE_PATH`, and
-//!      their exit codes decide which refs move.
+//!   2. **The quarantine.** git ingests a push into a temporary object
+//!      directory, exports it to the hooks as `GIT_QUARANTINE_PATH`, and
+//!      migrates it only once `pre-receive` has passed; this port writes
+//!      straight into the object store, so a declined push leaves its objects
+//!      behind for the next `gc` rather than discarding them at once.
 //!   3. **`receive.denyCurrentBranch=updateInstead`** would have to check the
 //!      remote work tree out at the pushed tip (git's `push-to-checkout` hook
 //!      path); the command is rejected instead of pretending to have done it.
-//!   4. **Atomic pushes, push options and push certificates.** `atomic` and
-//!      `push-options` are advertised when configured but not implemented on
-//!      the receive side, and `receive.certNonceSeed` (which adds a
-//!      `push-cert=<nonce>` capability) bails before the advertisement.
+//!   4. **Shallow pushes.** The `shallow <oid>` lines a shallow client sends are
+//!      consumed and dropped, and the shallow-update switch that governs them is
+//!      deliberately left unread rather than named here: grafting
+//!      the pushed history onto the receiving repository's shallow boundary is
+//!      not implemented.
 //!
 //! `GIT_NAMESPACE` (git advertises namespaced names) and object alternates (git
 //! appends one `<oid> .have` line per alternate ref) also bail rather than
@@ -150,6 +193,11 @@ struct Opts {
     quiet: bool,
     /// `--http-backend-info-refs`/`--advertise-refs`: advertise, then exit 0.
     advertise_only: bool,
+    /// `--stateless-rpc`: this process serves one HTTP request, so it writes no
+    /// advertisement of its own (a separate `--advertise-refs` run did that) and
+    /// a push certificate may echo a nonce some *other* process minted — which
+    /// is the only situation `receive.certNonceSlop` grades.
+    stateless_rpc: bool,
     /// The single `<git-dir>` operand, exactly as spelled on the command line.
     dir: String,
 }
@@ -182,7 +230,9 @@ pub fn receive_pack(args: &[String]) -> Result<ExitCode> {
 
     // `receive_pack_config()` runs before the advertisement, so a bad
     // `receive.fsck.<msg-id>` value kills the session before a byte is written.
-    let config = match Config::read(&repo) {
+    // `<git-dir>` is passed as spelled: it is `service_dir`, one half of the
+    // push-certificate nonce's HMAC key.
+    let config = match Config::read(&repo, &opts.dir) {
         Ok(config) => config,
         Err(fatal) => {
             eprintln!("{fatal}");
@@ -190,8 +240,10 @@ pub fn receive_pack(args: &[String]) -> Result<ExitCode> {
         }
     };
 
-    let adv = advertisement(&repo, &config)?;
-    {
+    // `if (advertise_refs || !stateless_rpc) write_head_info();` — under
+    // `--stateless-rpc` the advertisement was served by an earlier process.
+    if opts.advertise_only || !opts.stateless_rpc {
+        let adv = advertisement(&repo, &config)?;
         use std::io::Write;
         let mut stdout = std::io::stdout().lock();
         stdout.write_all(&adv)?;
@@ -203,7 +255,7 @@ pub fn receive_pack(args: &[String]) -> Result<ExitCode> {
     }
     let _ = opts.quiet; // suppresses progress only; the report-status is unaffected.
 
-    receive(&mut repo, &config)
+    receive(&mut repo, &config, opts.stateless_rpc)
 }
 
 /// Either a fully parsed command line, or a terminal exit code for the
@@ -218,6 +270,7 @@ enum Parsed {
 fn parse(args: &[String]) -> Result<Parsed> {
     let mut quiet = false;
     let mut advertise_only = false;
+    let mut stateless_rpc = false;
     let mut positionals: Vec<&str> = Vec::new();
     let mut no_more_opts = false;
 
@@ -244,7 +297,7 @@ fn parse(args: &[String]) -> Result<Parsed> {
             };
             let known = matches!(
                 name,
-                "quiet" | "http-backend-info-refs" | "advertise-refs"
+                "quiet" | "http-backend-info-refs" | "advertise-refs" | "stateless-rpc"
             );
             if known && value.is_some() {
                 eprintln!("error: option `{name}' takes no value");
@@ -253,10 +306,10 @@ fn parse(args: &[String]) -> Result<Parsed> {
             match name {
                 "quiet" => quiet = on,
                 "http-backend-info-refs" | "advertise-refs" => advertise_only = on,
+                "stateless-rpc" => stateless_rpc = on,
                 // Real but unported git options; the receive path they belong
                 // to is not implemented, so accepting them would mislead.
-                "stateless-rpc" | "skip-connectivity-check" | "reject-thin-pack-for-testing"
-                | "signed-push" => {
+                "skip-connectivity-check" | "reject-thin-pack-for-testing" | "signed-push" => {
                     let flag = format!("--{name}");
                     bail!("unsupported flag {flag:?} ({PORTED})")
                 }
@@ -298,6 +351,7 @@ fn parse(args: &[String]) -> Result<Parsed> {
     Ok(Parsed::Opts(Opts {
         quiet,
         advertise_only,
+        stateless_rpc,
         dir: (*dir).to_string(),
     }))
 }
@@ -308,16 +362,22 @@ fn parse(args: &[String]) -> Result<Parsed> {
 /// <repo>/<subdir>` fails even inside a repository.
 fn open_repo(dir: &str) -> Option<gix::Repository> {
     // `gix::open` already expands `<path>` to `<path>/.git` for a work tree.
-    gix::open(std::path::Path::new(dir)).ok()
+    let repo = gix::open(std::path::Path::new(dir)).ok()?;
+
+    // `enter_repo()` *chdirs into* the repository before any configuration is
+    // read, and receive-pack never leaves. That is load-bearing beyond
+    // tidiness: the signature backends read `gpg.ssh.allowedSignersFile` and
+    // friends from the repository they find at the current directory, so
+    // without the move a signed push would be graded against the *pusher's*
+    // configuration instead of the receiving repository's.
+    let home = std::fs::canonicalize(repo.workdir().unwrap_or_else(|| repo.git_dir())).ok()?;
+    std::env::set_current_dir(&home).ok()?;
+    gix::open(&home).ok()
 }
 
 /// Bail on repository state that changes the advertisement in a way this port
 /// does not reproduce, rather than emitting a silently wrong ref list.
 fn reject_unportable_advertisement(repo: &gix::Repository) -> Result<()> {
-    let config = repo.config_snapshot();
-    if config.string("receive.certNonceSeed").is_some() {
-        bail!("receive.certNonceSeed is not supported (the push-cert capability needs a nonce and a signed-push reader)");
-    }
     if std::env::var_os("GIT_NAMESPACE").is_some() {
         bail!("GIT_NAMESPACE is not supported (git advertises namespaced ref names)");
     }
@@ -333,7 +393,7 @@ fn reject_unportable_advertisement(repo: &gix::Repository) -> Result<()> {
 /// the first line), the synthetic `capabilities^{}` line when there were none,
 /// the `shallow <oid>` lines, then a flush packet.
 fn advertisement(repo: &gix::Repository, config: &Config) -> Result<Vec<u8>> {
-    let caps = capabilities(repo);
+    let caps = capabilities(repo, config);
     let mut out = Vec::new();
     let mut sent_capabilities = false;
 
@@ -377,21 +437,25 @@ fn advertisement(repo: &gix::Repository, config: &Config) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The capability list, in `receive-pack.c`'s emission order.
+/// The capability list, in `receive-pack.c`'s emission order (`show_ref()`).
 ///
-/// `atomic` and `ofs-delta` default on, `push-options` defaults off.
-fn capabilities(repo: &gix::Repository) -> String {
-    let config = repo.config_snapshot();
-    let on = |key: &str, default: bool| config.boolean(key).unwrap_or(default);
+/// `atomic` and `ofs-delta` default on, `push-options` defaults off, and
+/// `push-cert=<nonce>` appears only when `receive.certNonceSeed` gave this
+/// session a nonce to hand out.
+fn capabilities(repo: &gix::Repository, config: &Config) -> String {
+    let snapshot = repo.config_snapshot();
 
     let mut caps = String::from("report-status report-status-v2 delete-refs side-band-64k quiet");
-    if on("receive.advertiseAtomic", true) {
+    if config.advertise_atomic {
         caps.push_str(" atomic");
     }
-    if on("repack.useDeltaBaseOffset", true) {
+    if snapshot.boolean("repack.useDeltaBaseOffset").unwrap_or(true) {
         caps.push_str(" ofs-delta");
     }
-    if on("receive.advertisePushOptions", false) {
+    if let Some(nonce) = &config.push_cert_nonce {
+        caps.push_str(&format!(" push-cert={nonce}"));
+    }
+    if config.advertise_push_options {
         caps.push_str(" push-options");
     }
     caps.push_str(&format!(" object-format={}", repo.object_hash()));
@@ -437,6 +501,101 @@ struct Command {
     old: gix::ObjectId,
     new: gix::ObjectId,
     name: String,
+    /// `cmd->error_string`: the `ng <ref> <reason>` the client is told, and the
+    /// flag that keeps this command out of every later phase.
+    error: Option<String>,
+    /// `cmd->did_not_exist`: a delete of a ref that was already gone. It keeps
+    /// the ref out of `post-receive`/`post-update` without being an error.
+    did_not_exist: bool,
+    /// `cmd->run_proc_receive`: `receive.procReceiveRefs` matched, so the
+    /// `proc-receive` hook owns this ref instead of the ref store. Cleared again
+    /// when the hook answers `option fall-through`.
+    proc_receive: bool,
+    /// `RUN_PROC_RECEIVE_RETURNED`: the hook reported a status for this ref.
+    proc_receive_returned: bool,
+    /// `cmd->report`: what the proc-receive hook wants reported instead of (or
+    /// as well as) the ref the client asked for. Only `report-status-v2` can
+    /// carry these.
+    reports: Vec<PushReport>,
+}
+
+/// git's `struct ref_push_report` — one `option`-decorated line of a
+/// `report-status-v2` reply, filled in by the `proc-receive` hook.
+#[derive(Default)]
+struct PushReport {
+    /// `option refname <name>`: the ref that really moved.
+    ref_name: Option<String>,
+    /// `option old-oid <oid>`.
+    old: Option<gix::ObjectId>,
+    /// `option new-oid <oid>`.
+    new: Option<gix::ObjectId>,
+    /// `option forced-update`.
+    forced_update: bool,
+}
+
+/// One `receive.procReceiveRefs` entry: `[adm!]*:<prefix>` or a bare `<prefix>`
+/// (which wants all three of add, delete and modify).
+struct ProcReceivePattern {
+    want_add: bool,
+    want_delete: bool,
+    want_modify: bool,
+    /// A leading `!` inverts the match: every command *not* under the prefix.
+    negative: bool,
+    /// The prefix, with trailing slashes stripped as git's parser strips them.
+    prefix: String,
+}
+
+impl ProcReceivePattern {
+    /// `proc_receive_ref_append()`.
+    fn parse(value: &str) -> Self {
+        let (flags, prefix) = match value.split_once(':') {
+            Some((flags, prefix)) => (Some(flags), prefix),
+            None => (None, value),
+        };
+        let (mut want_add, mut want_delete, mut want_modify, mut negative) =
+            (false, false, false, false);
+        match flags {
+            None => {
+                want_add = true;
+                want_delete = true;
+                want_modify = true;
+            }
+            Some(flags) => {
+                for c in flags.chars() {
+                    match c {
+                        'a' => want_add = true,
+                        'd' => want_delete = true,
+                        'm' => want_modify = true,
+                        '!' => negative = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Self {
+            want_add,
+            want_delete,
+            want_modify,
+            negative,
+            prefix: prefix.trim_end_matches('/').to_string(),
+        }
+    }
+
+    /// `proc_receive_ref_matches()`: the command kind has to be wanted, and then
+    /// the prefix has to match at a `/` boundary — or, for a `!` pattern, not.
+    fn matches(&self, name: &str, creating: bool, deleting: bool) -> bool {
+        if (!self.want_add && creating)
+            || (!self.want_delete && deleting)
+            || (!self.want_modify && !creating && !deleting)
+        {
+            return false;
+        }
+        let under = match name.strip_prefix(&self.prefix) {
+            Some(rest) => rest.is_empty() || rest.starts_with('/'),
+            None => false,
+        };
+        under != self.negative
+    }
 }
 
 /// `receive-pack.c`'s `enum deny_action`. `Unconfigured` is distinct from
@@ -499,18 +658,55 @@ struct Config {
     /// other way around, which is where this ordering can differ from git's
     /// (git keeps whatever order the config files produced).
     hide_refs: Vec<String>,
+    /// `receive.advertiseAtomic`, which gates both the advertised `atomic`
+    /// capability and whether a client asking for it is honoured.
+    advertise_atomic: bool,
+    /// `receive.advertisePushOptions`, likewise for `push-options`. It also
+    /// decides whether the push-option pkt-lines are read off the wire at all —
+    /// a client only sends them once the server advertised the capability.
+    advertise_push_options: bool,
+    /// `receive.certNonceSeed`: the HMAC key half that turns this session into a
+    /// signed-push server. Present means `push-cert=<nonce>` is advertised.
+    cert_nonce_seed: Option<String>,
+    /// `receive.certNonceSlop`: how many seconds a nonce issued by *another*
+    /// instance of this server may be off by and still count as ours. Zero (the
+    /// default) disables the tolerance entirely.
+    cert_nonce_slop: i64,
+    /// The nonce handed out in this session's advertisement, `<stamp>-<hmac>`;
+    /// `None` without `receive.certNonceSeed`.
+    push_cert_nonce: Option<String>,
+    /// git's `service_dir`: `<git-dir>` as spelled on the command line, the
+    /// other half of the nonce's HMAC key.
+    service_dir: String,
+    /// The repository's hash algorithm, which is also the nonce's HMAC.
+    hash_kind: gix::hash::Kind,
+    /// `receive.procReceiveRefs`, in configuration order — the patterns that
+    /// divert a command to the `proc-receive` hook instead of the ref store.
+    proc_receive_refs: Vec<ProcReceivePattern>,
+    /// `receive.keepAlive`: seconds of silence from a hook before an empty
+    /// band-1 packet goes out so the client's read does not time out. `0` or
+    /// below is git's `KEEPALIVE_NEVER`.
+    keep_alive: i64,
+    /// `receive.autogc`: run `git maintenance run --auto` once the refs have
+    /// moved and the report has been written.
+    auto_gc: bool,
 }
 
 impl Config {
     /// Read the whole family. The error is the complete `fatal: …` line git
     /// dies with before writing the advertisement.
-    fn read(repo: &gix::Repository) -> Result<Self, String> {
+    ///
+    /// `service_dir` is the `<git-dir>` operand exactly as spelled on the
+    /// command line; git uses that string, not a canonical path, as half of the
+    /// push-certificate nonce's HMAC key.
+    fn read(repo: &gix::Repository, service_dir: &str) -> Result<Self, String> {
         let config = repo.config_snapshot();
         let deny = |key: &str| match config.string(key) {
             Some(v) => DenyAction::parse(&v.to_string()),
             None => DenyAction::Unconfigured,
         };
         let hide_refs = hide_ref_patterns(&config, "receive.hideRefs");
+        let cert_nonce_seed = config.string("receive.certNonceSeed").map(|v| v.to_string());
         Ok(Self {
             deny_deletes: config.boolean("receive.denyDeletes").unwrap_or(false),
             deny_non_fast_forwards: config
@@ -534,6 +730,27 @@ impl Config {
                 .max(0) as u64,
             update_server_info: config.boolean("receive.updateServerInfo").unwrap_or(false),
             hide_refs,
+            advertise_atomic: config.boolean("receive.advertiseAtomic").unwrap_or(true),
+            advertise_push_options: config
+                .boolean("receive.advertisePushOptions")
+                .unwrap_or(false),
+            cert_nonce_seed: cert_nonce_seed.clone(),
+            cert_nonce_slop: config.integer("receive.certNonceSlop").unwrap_or(0),
+            // `cmd_receive_pack()` stamps the nonce right after the config read,
+            // so every ref line of one advertisement carries the same one.
+            push_cert_nonce: cert_nonce_seed.as_deref().map(|seed| {
+                prepare_push_cert_nonce(service_dir, now_seconds(), seed, repo.object_hash())
+            }),
+            service_dir: service_dir.to_string(),
+            hash_kind: repo.object_hash(),
+            proc_receive_refs: config
+                .raw_values("receive.procReceiveRefs")
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| ProcReceivePattern::parse(&v.to_string()))
+                .collect(),
+            keep_alive: config.integer("receive.keepAlive").unwrap_or(5),
+            auto_gc: config.boolean("receive.autogc").unwrap_or(true),
         })
     }
 
@@ -556,11 +773,6 @@ impl Config {
     ) -> Option<String> {
         let name = cmd.name.as_str();
         let deleting = cmd.new == zero;
-
-        // A hidden ref is refused with the status alone; git prints nothing.
-        if self.ref_is_hidden(name) {
-            return Some("deny updating a hidden ref".into());
-        }
 
         if !deleting && head == Some(name) && !repo.is_bare() {
             match self.deny_current_branch {
@@ -704,7 +916,7 @@ To squelch this message, you can set it to 'refuse'.
 /// `send-pack` speaks: pkt-line commands, then a flush, then a raw (non-pkt) pack,
 /// then a plain pkt-line `report-status`. An empty command list (immediate flush) is
 /// a no-op success, matching a client that connects and hangs up.
-fn receive(repo: &mut gix::Repository, config: &Config) -> Result<ExitCode> {
+fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool) -> Result<ExitCode> {
     // Each accepted ref update writes a reflog; a bare remote often has no configured
     // identity, so seed a synthesized system default (as git does) to keep the reflog
     // write from failing the push.
@@ -717,6 +929,8 @@ fn receive(repo: &mut gix::Repository, config: &Config) -> Result<ExitCode> {
     let zero = gix::ObjectId::null(hash);
     let mut cmds: Vec<Command> = Vec::new();
     let mut caps: Vec<u8> = Vec::new();
+    let mut cert: Vec<u8> = Vec::new();
+    let mut first_line = true;
     loop {
         // git's `packet_read()` failures are `die()`s, so they print `fatal: `
         // on receive-pack's own stderr and stop the session there.
@@ -728,26 +942,59 @@ fn receive(repo: &mut gix::Repository, config: &Config) -> Result<ExitCode> {
                 return Ok(ExitCode::from(128));
             }
         };
-        let (body, cap) = match (cmds.is_empty() && caps.is_empty(), line.iter().position(|&b| b == 0)) {
+        let (body, cap) = match (first_line, line.iter().position(|&b| b == 0)) {
             (true, Some(n)) => (&line[..n], Some(line[n + 1..].to_vec())),
             _ => (&line[..], None),
         };
+        first_line = false;
         if let Some(c) = cap {
             caps = c;
         }
         let text = std::str::from_utf8(body)
             .map_err(|_| anyhow!("protocol error: non-utf8 command"))?
             .trim_end();
-        let mut it = text.splitn(3, ' ');
-        let (o, n, name) = match (it.next(), it.next(), it.next()) {
-            (Some(o), Some(n), Some(name)) if !name.is_empty() => (o, n, name),
-            _ => bail!("protocol error: expected old/new/ref, got {text:?}"),
-        };
-        cmds.push(Command {
-            old: gix::ObjectId::from_hex(o.as_bytes()).map_err(|_| anyhow!("protocol error: bad old id"))?,
-            new: gix::ObjectId::from_hex(n.as_bytes()).map_err(|_| anyhow!("protocol error: bad new id"))?,
-            name: name.to_string(),
-        });
+
+        // `push-cert` opens the certificate block: pkt-lines with their newlines
+        // intact, up to `push-cert-end`. A flush inside the block ends the whole
+        // command list, exactly as git's `true_flush` does.
+        if text == "push-cert" {
+            match read_push_cert(&mut stdin, &mut cert) {
+                Ok(true) => break,
+                Ok(false) => continue,
+                Err(e) => {
+                    eprintln!("fatal: {e}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
+        // A shallow client announces its grafts before the commands. The shallow
+        // machinery is not ported, so the list is consumed and dropped rather
+        // than mis-parsed as a command.
+        if let Some(rest) = text.strip_prefix("shallow ") {
+            if gix::ObjectId::from_hex(rest.as_bytes()).is_err() {
+                eprintln!("fatal: protocol error: expected shallow sha, got '{rest}'");
+                return Ok(ExitCode::from(128));
+            }
+            continue;
+        }
+
+        cmds.push(parse_command(text)?);
+    }
+
+    // `queue_commands_from_cert()`: a signed push carries its commands *inside*
+    // the signed payload, and mixing the two forms is a protocol error.
+    if !cert.is_empty() {
+        if !cmds.is_empty() {
+            eprintln!("fatal: protocol error: got both push certificate and unsigned commands");
+            return Ok(ExitCode::from(128));
+        }
+        match commands_from_cert(&cert) {
+            Ok(parsed) => cmds = parsed,
+            Err(e) => {
+                eprintln!("fatal: {e}");
+                return Ok(ExitCode::from(128));
+            }
+        }
     }
     if cmds.is_empty() {
         return Ok(ExitCode::SUCCESS);
@@ -755,7 +1002,35 @@ fn receive(repo: &mut gix::Repository, config: &Config) -> Result<ExitCode> {
 
     // Everything git says back travels on band 2 when the client asked for
     // side-band-64k, and on receive-pack's own stderr otherwise.
-    let mut band = Band { sideband: cap_present(&caps, b"side-band-64k") };
+    let mut band = Band {
+        sideband: cap_present(&caps, b"side-band-64k"),
+        keep_alive: config.keep_alive,
+    };
+    let report_v2 = cap_present(&caps, b"report-status-v2");
+    let use_atomic = config.advertise_atomic && cap_present(&caps, b"atomic");
+    let use_push_options = config.advertise_push_options && cap_present(&caps, b"push-options");
+
+    // `read_push_options()`: one pkt-line per option, terminated by a flush. They
+    // arrive *before* the pack, so the stream desynchronises if they are skipped.
+    let mut push_options: Vec<String> = Vec::new();
+    if use_push_options {
+        loop {
+            match read_pkt_line(&mut stdin) {
+                Ok(Some(line)) => {
+                    push_options.push(String::from_utf8_lossy(&line).trim_end().to_string())
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+    }
+
+    // The certificate repeats the push options it was signed over; a mismatch
+    // means the options were tampered with in transit.
+    if !check_cert_push_options(&cert, &push_options) {
+        for cmd in &mut cmds {
+            cmd.error = Some("inconsistent push options".into());
+        }
+    }
 
     // --- ingest the pack (skipped when every command is a delete) -----------
     let mut unpack: Result<(), String> = Ok(());
@@ -767,46 +1042,74 @@ fn receive(repo: &mut gix::Repository, config: &Config) -> Result<ExitCode> {
         }
     }
 
-    // --- apply the ref updates ---------------------------------------------
-    let head = head_name(repo);
-    let mut verdicts: Vec<(String, Result<(), String>)> = Vec::with_capacity(cmds.len());
-    for c in &cmds {
-        let v = if unpack.is_err() {
-            Err("unpacker error".to_string())
-        } else {
-            match config.refuse(repo, c, zero, head.as_deref(), &mut band) {
-                Some(reason) => Err(reason),
-                None => apply_update(repo, &c.name, c.old, c.new, zero),
-            }
-        };
-        verdicts.push((c.name.clone(), v));
-    }
+    // `prepare_push_cert_sha1()`: store the certificate as a blob, check its
+    // signature, and grade the nonce it echoed back. Everything it learns is
+    // handed to the hooks as `GIT_PUSH_CERT*`.
+    let cert = PushCert::prepare(repo, cert, config, stateless_rpc);
+
+    // --- execute ------------------------------------------------------------
+    execute_commands(
+        repo,
+        config,
+        &mut cmds,
+        &unpack,
+        zero,
+        use_atomic,
+        use_push_options.then_some(&push_options[..]),
+        cert.as_ref(),
+        &mut band,
+    );
 
     // --- report-status ------------------------------------------------------
-    if cap_present(&caps, b"report-status") || cap_present(&caps, b"report-status-v2") {
+    if cap_present(&caps, b"report-status") || report_v2 {
         let mut report: Vec<u8> = Vec::new();
         match &unpack {
             Ok(()) => pkt_line(&mut report, b"unpack ok\n"),
             Err(e) => pkt_line(&mut report, format!("unpack {e}\n").as_bytes()),
         }
-        for (name, v) in &verdicts {
-            match v {
-                Ok(()) => pkt_line(&mut report, format!("ok {name}\n").as_bytes()),
-                Err(reason) => pkt_line(&mut report, format!("ng {name} {reason}\n").as_bytes()),
+        for cmd in &cmds {
+            match &cmd.error {
+                Some(reason) => {
+                    pkt_line(&mut report, format!("ng {} {reason}\n", cmd.name).as_bytes())
+                }
+                None => {
+                    pkt_line(&mut report, format!("ok {}\n", cmd.name).as_bytes());
+                    // `report_v2()`: the proc-receive hook's rewritten refs ride
+                    // along as `option` lines, one `ok` header per extra report.
+                    if report_v2 {
+                        for (n, r) in cmd.reports.iter().enumerate() {
+                            if n > 0 {
+                                pkt_line(&mut report, format!("ok {}\n", cmd.name).as_bytes());
+                            }
+                            if let Some(name) = &r.ref_name {
+                                pkt_line(&mut report, format!("option refname {name}\n").as_bytes());
+                            }
+                            if let Some(old) = &r.old {
+                                pkt_line(&mut report, format!("option old-oid {old}\n").as_bytes());
+                            }
+                            if let Some(new) = &r.new {
+                                pkt_line(&mut report, format!("option new-oid {new}\n").as_bytes());
+                            }
+                            if r.forced_update {
+                                pkt_line(&mut report, b"option forced-update\n");
+                            }
+                        }
+                    }
+                }
             }
         }
         flush_pkt(&mut report);
 
         let mut out: Vec<u8> = Vec::new();
         if band.sideband {
-            // The whole report-status stream is one band-1 payload, followed by
-            // the flush that ends the multiplexed stream itself.
+            // The report-status stream, its own flush included, is the band-1
+            // payload. The flush that ends the *multiplexed* stream comes last of
+            // all, once the post hooks have had their say on band 2.
             for chunk in report.chunks(MAX_SIDEBAND_PAYLOAD) {
                 let mut payload = vec![1u8];
                 payload.extend_from_slice(chunk);
                 pkt_line(&mut out, &payload);
             }
-            flush_pkt(&mut out);
         } else {
             out = report;
         }
@@ -815,11 +1118,227 @@ fn receive(repo: &mut gix::Repository, config: &Config) -> Result<ExitCode> {
         stdout.flush()?;
     }
 
+    // The two notification hooks run after the client has been told the outcome.
+    let env = hook_env(repo, &push_options, cert.as_ref());
+    run_receive_hook(repo, "post-receive", &cmds, true, &env, &mut band);
+    run_post_update_hook(repo, &cmds, &env, &mut band);
+
+    // `receive.autogc`: git 2.55 no longer forks `gc --auto` here — it builds a
+    // `maintenance run --auto` child through `prepare_auto_maintenance()`, whose
+    // own `maintenance.auto` / `gc.auto` gate decides whether it runs at all.
+    if config.auto_gc {
+        let _ = super::maintenance::run_auto_maintenance(repo, true);
+    }
+
     // `cmd_receive_pack()` refreshes the dumb-transport info files last of all.
-    if config.update_server_info && verdicts.iter().any(|(_, v)| v.is_ok()) {
+    if config.update_server_info && cmds.iter().any(|c| c.error.is_none()) {
         update_server_info(repo);
     }
+
+    // `if (use_sideband) packet_flush(1)`: the very last byte of the session,
+    // after every band-2 word the post hooks and the maintenance run produced.
+    if band.sideband {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(b"0000")?;
+        stdout.flush()?;
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `queue_command()`: one `<old> <new> <ref>` command line.
+fn parse_command(text: &str) -> Result<Command> {
+    let mut it = text.splitn(3, ' ');
+    let (o, n, name) = match (it.next(), it.next(), it.next()) {
+        (Some(o), Some(n), Some(name)) if !name.is_empty() => (o, n, name),
+        _ => bail!("protocol error: expected old/new/ref, got {text:?}"),
+    };
+    Ok(Command {
+        old: gix::ObjectId::from_hex(o.as_bytes())
+            .map_err(|_| anyhow!("protocol error: bad old id"))?,
+        new: gix::ObjectId::from_hex(n.as_bytes())
+            .map_err(|_| anyhow!("protocol error: bad new id"))?,
+        name: name.to_string(),
+        error: None,
+        did_not_exist: false,
+        proc_receive: false,
+        proc_receive_returned: false,
+        reports: Vec::new(),
+    })
+}
+
+/// `execute_commands()` — everything between "the pack is in" and "tell the
+/// client", in git's order: hidden refs, proc-receive scheduling, `pre-receive`,
+/// the proc-receive hook, then the ref updates themselves.
+#[allow(clippy::too_many_arguments)]
+fn execute_commands(
+    repo: &gix::Repository,
+    config: &Config,
+    cmds: &mut [Command],
+    unpack: &Result<(), String>,
+    zero: gix::ObjectId,
+    use_atomic: bool,
+    push_options: Option<&[String]>,
+    cert: Option<&PushCert>,
+    band: &mut Band,
+) {
+    if unpack.is_err() {
+        for cmd in cmds.iter_mut() {
+            cmd.error = Some("unpacker error".into());
+        }
+        return;
+    }
+
+    // `reject_updates_to_hidden()`: a ref the advertisement suppressed cannot be
+    // touched. The status is the whole message — git prints nothing else.
+    for cmd in cmds.iter_mut() {
+        if cmd.error.is_some() || !config.ref_is_hidden(&cmd.name) {
+            continue;
+        }
+        cmd.error = Some(if cmd.new == zero {
+            "deny deleting a hidden ref".into()
+        } else {
+            "deny updating a hidden ref".into()
+        });
+    }
+
+    // Commands whose ref name matches `receive.procReceiveRefs` never reach the
+    // ref store; the hook owns them.
+    let mut run_proc_receive = false;
+    if !config.proc_receive_refs.is_empty() {
+        for cmd in cmds.iter_mut() {
+            if cmd.error.is_some() {
+                continue;
+            }
+            if config
+                .proc_receive_refs
+                .iter()
+                .any(|p| p.matches(&cmd.name, cmd.old == zero, cmd.new == zero))
+            {
+                cmd.proc_receive = true;
+                run_proc_receive = true;
+            }
+        }
+    }
+
+    let env = hook_env(repo, push_options.unwrap_or_default(), cert);
+    if run_receive_hook(repo, "pre-receive", cmds, false, &env, band) {
+        for cmd in cmds.iter_mut() {
+            if cmd.error.is_none() {
+                cmd.error = Some("pre-receive hook declined".into());
+            }
+        }
+        return;
+    }
+    if cmds.iter().all(|c| c.error.is_some()) {
+        return;
+    }
+
+    let head = head_name(repo);
+
+    if run_proc_receive && run_proc_receive_hook(repo, cmds, push_options, use_atomic, band) {
+        for cmd in cmds.iter_mut() {
+            if cmd.error.is_none()
+                && !cmd.proc_receive_returned
+                && (cmd.proc_receive || use_atomic)
+            {
+                cmd.error = Some("fail to run proc-receive hook".into());
+            }
+        }
+    }
+
+    if use_atomic {
+        execute_commands_atomic(repo, config, cmds, zero, head.as_deref(), band);
+    } else {
+        execute_commands_non_atomic(repo, config, cmds, zero, head.as_deref(), band);
+    }
+}
+
+/// `update()`'s checks for one command, short of writing anything: the deny
+/// policies, then the `update` hook, then the compare-and-swap it would queue.
+fn check_command(
+    repo: &gix::Repository,
+    config: &Config,
+    cmd: &Command,
+    zero: gix::ObjectId,
+    head: Option<&str>,
+    band: &mut Band,
+) -> Result<RefEdit, String> {
+    if let Some(reason) = config.refuse(repo, cmd, zero, head, band) {
+        return Err(reason);
+    }
+    // The `update` hook is the last of `update()`'s checks, and a non-zero exit
+    // vetoes just this one ref.
+    if run_update_hook(repo, cmd, band) {
+        band.error(&format!("hook declined to update {}", cmd.name));
+        return Err("hook declined".into());
+    }
+    ref_edit(&cmd.name, cmd.old, cmd.new, zero)
+}
+
+/// `execute_commands_non_atomic()`: every command stands or falls alone.
+fn execute_commands_non_atomic(
+    repo: &gix::Repository,
+    config: &Config,
+    cmds: &mut [Command],
+    zero: gix::ObjectId,
+    head: Option<&str>,
+    band: &mut Band,
+) {
+    for i in 0..cmds.len() {
+        if cmds[i].error.is_some() || cmds[i].proc_receive {
+            continue;
+        }
+        let verdict = check_command(repo, config, &cmds[i], zero, head, band)
+            .and_then(|edit| repo.edit_references([edit]).map(|_| ()).map_err(|e| e.to_string()));
+        if let Err(reason) = verdict {
+            cmds[i].error = Some(reason);
+        }
+    }
+}
+
+/// `execute_commands_atomic()`: one transaction over every command, so a refusal
+/// anywhere leaves the whole push unwritten. The first command to fail keeps its
+/// own reason; the rest are told `atomic push failure`, or
+/// `atomic transaction failed` when it was the commit that would not go through.
+fn execute_commands_atomic(
+    repo: &gix::Repository,
+    config: &Config,
+    cmds: &mut [Command],
+    zero: gix::ObjectId,
+    head: Option<&str>,
+    band: &mut Band,
+) {
+    let mut edits = Vec::new();
+    let mut reported: Option<&str> = None;
+
+    for i in 0..cmds.len() {
+        if cmds[i].error.is_some() || cmds[i].proc_receive {
+            continue;
+        }
+        match check_command(repo, config, &cmds[i], zero, head, band) {
+            Ok(edit) => edits.push(edit),
+            Err(reason) => {
+                cmds[i].error = Some(reason);
+                reported = Some("atomic push failure");
+                break;
+            }
+        }
+    }
+
+    if reported.is_none() && !edits.is_empty() {
+        if let Err(e) = repo.edit_references(edits) {
+            band.error(&e.to_string());
+            reported = Some("atomic transaction failed");
+        }
+    }
+
+    if let Some(reported) = reported {
+        for cmd in cmds.iter_mut() {
+            if cmd.error.is_none() {
+                cmd.error = Some(reported.into());
+            }
+        }
+    }
 }
 
 /// The largest payload one side-band packet can carry: 65520 minus the 4-byte
@@ -831,6 +1350,9 @@ const MAX_SIDEBAND_PAYLOAD: usize = 65515;
 /// receive-pack's own stderr, which for a local push is the user's terminal.
 struct Band {
     sideband: bool,
+    /// `receive.keepAlive`, carried here because the hook relay is the only
+    /// place that can go quiet long enough for the client to give up.
+    keep_alive: i64,
 }
 
 impl Band {
@@ -852,18 +1374,40 @@ impl Band {
 
     /// A block of advice, already newline-terminated, sent verbatim.
     fn write(&mut self, text: &str) {
+        self.write_bytes(text.as_bytes());
+    }
+
+    /// [`Band::write`] for output that need not be UTF-8 — a hook's, say.
+    fn write_bytes(&mut self, text: &[u8]) {
+        if text.is_empty() {
+            return;
+        }
         if !self.sideband {
-            eprint!("{text}");
+            let mut stderr = std::io::stderr().lock();
+            let _ = stderr.write_all(text);
+            let _ = stderr.flush();
             return;
         }
         let mut out = Vec::new();
-        for chunk in text.as_bytes().chunks(MAX_SIDEBAND_PAYLOAD) {
+        for chunk in text.chunks(MAX_SIDEBAND_PAYLOAD) {
             let mut payload = vec![2u8];
             payload.extend_from_slice(chunk);
             pkt_line(&mut out, &payload);
         }
         let mut stdout = std::io::stdout().lock();
         let _ = stdout.write_all(&out);
+        let _ = stdout.flush();
+    }
+
+    /// `copy_to_sideband()`'s idle tick: an empty band-1 packet, sent when a hook
+    /// has produced nothing for `receive.keepAlive` seconds so the client's read
+    /// does not time out. Only meaningful on a multiplexed stream.
+    fn keep_alive_tick(&mut self) {
+        if !self.sideband {
+            return;
+        }
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(b"0005\x01");
         let _ = stdout.flush();
     }
 }
@@ -1203,15 +1747,15 @@ fn explode_pack(repo: &gix::Repository, received: &[gix::ObjectId]) -> Result<()
     Ok(())
 }
 
-/// Apply one ref update as a compare-and-swap against `old` (create when `old` is
-/// zero, delete when `new` is zero), returning the client-facing reason on failure.
-fn apply_update(
-    repo: &gix::Repository,
+/// Build the compare-and-swap `update()` queues for one command: create when
+/// `old` is zero, delete when `new` is zero, otherwise a swap that must find
+/// `old` in place.
+fn ref_edit(
     name: &str,
     old: gix::ObjectId,
     new: gix::ObjectId,
     zero: gix::ObjectId,
-) -> Result<(), String> {
+) -> Result<RefEdit, String> {
     let full = FullName::try_from(name).map_err(|_| "funny refname".to_string())?;
     let expected = if old == zero {
         PreviousValue::MustNotExist
@@ -1227,7 +1771,846 @@ fn apply_update(
             new: Target::Object(new),
         }
     };
-    repo.edit_reference(RefEdit { change, name: full, deref: false })
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    Ok(RefEdit { change, name: full, deref: false })
+}
+
+// ---------------------------------------------------------------------------
+// Push certificates
+// ---------------------------------------------------------------------------
+
+/// Seconds since the epoch, git's `time(NULL)`.
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// git's `hmac_hash()`: RFC 2104 over the repository's hash algorithm, with the
+/// 64-byte block size both SHA-1 and SHA-256 use.
+///
+/// The argument names follow git's, which are the *opposite* way round from the
+/// RFC at the one call site that matters: `prepare_push_cert_nonce` passes the
+/// `"<path>:<stamp>"` string as the key and the configured seed as the text.
+fn hmac_hash(kind: gix::hash::Kind, key_in: &[u8], text: &[u8]) -> Vec<u8> {
+    const BLOCK: usize = 64;
+    let digest = |bytes: &[&[u8]]| -> Vec<u8> {
+        let mut hasher = gix::hash::hasher(kind);
+        for b in bytes {
+            hasher.update(b);
+        }
+        match hasher.try_finalize() {
+            Ok(id) => id.as_slice().to_vec(),
+            // The only failure is SHA-1 collision detection, which reports the
+            // digest it computed anyway.
+            Err(gix::hash::hasher::Error::CollisionAttack { digest }) => {
+                digest.as_slice().to_vec()
+            }
+        }
+    };
+
+    let mut key = [0u8; BLOCK];
+    if key_in.len() > BLOCK {
+        let hashed = digest(&[key_in]);
+        key[..hashed.len()].copy_from_slice(&hashed);
+    } else {
+        key[..key_in.len()].copy_from_slice(key_in);
+    }
+    let mut ipad = [0u8; BLOCK];
+    let mut opad = [0u8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] = key[i] ^ 0x36;
+        opad[i] = key[i] ^ 0x5c;
+    }
+    let inner = digest(&[&ipad, text]);
+    digest(&[&opad, &inner])
+}
+
+/// `prepare_push_cert_nonce()`: `<stamp>-<hmac>`, where the HMAC is keyed by
+/// `"<service-dir>:<stamp>"` over the `receive.certNonceSeed` value. Tying the
+/// nonce to the directory and the clock is what lets a later process recognise
+/// its own nonce without keeping any state.
+fn prepare_push_cert_nonce(
+    service_dir: &str,
+    stamp: u64,
+    seed: &str,
+    kind: gix::hash::Kind,
+) -> String {
+    let key = format!("{service_dir}:{stamp}");
+    let mac = hmac_hash(kind, key.as_bytes(), seed.as_bytes());
+    let mut out = format!("{stamp}-");
+    for b in &mac {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Read the `push-cert` … `push-cert-end` block into `cert`. `Ok(true)` means the
+/// block ended at a flush packet, which ends the whole command list too — git's
+/// `true_flush`.
+///
+/// Newlines are kept: the certificate's bytes are what the signature covers, and
+/// the reader git uses here has `PACKET_READ_CHOMP_NEWLINE` switched off.
+fn read_push_cert(input: &mut impl Read, cert: &mut Vec<u8>) -> Result<bool> {
+    loop {
+        match read_pkt_line(input)? {
+            None => return Ok(true),
+            Some(line) => {
+                if line == b"push-cert-end\n" {
+                    return Ok(false);
+                }
+                cert.extend_from_slice(&line);
+            }
+        }
+    }
+}
+
+/// `queue_commands_from_cert()`: the command lines live between the
+/// certificate's blank line and the start of its signature.
+fn commands_from_cert(cert: &[u8]) -> Result<Vec<Command>> {
+    let Some(boc) = memchr::memmem::find(cert, b"\n\n").map(|i| i + 2) else {
+        bail!(
+            "malformed push certificate {}",
+            String::from_utf8_lossy(&cert[..cert.len().min(100)])
+        );
+    };
+    let eoc = super::verify_tag::parse_signed_buffer(cert);
+    let mut out = Vec::new();
+    let mut at = boc;
+    while at < eoc {
+        let end = cert[at..eoc]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| at + p)
+            .unwrap_or(eoc);
+        let text = std::str::from_utf8(&cert[at..end])
+            .map_err(|_| anyhow!("protocol error: non-utf8 command"))?;
+        out.push(parse_command(text)?);
+        at = if end < eoc { end + 1 } else { eoc };
+    }
+    Ok(out)
+}
+
+/// git's `find_commit_header()`: the value of the first `<key> ` line of the
+/// header block, i.e. before the first empty line. Returns every occurrence in
+/// order, which is what the repeated `push-option` lookup needs.
+fn header_values(buf: &[u8], key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    let prefix = format!("{key} ");
+    while at < buf.len() {
+        let end = buf[at..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| at + p)
+            .unwrap_or(buf.len());
+        if end == at {
+            break; // blank line: end of the header block
+        }
+        let line = &buf[at..end];
+        if line.starts_with(prefix.as_bytes()) {
+            out.push(String::from_utf8_lossy(&line[prefix.len()..]).into_owned());
+        }
+        at = end + 1;
+    }
+    out
+}
+
+/// `check_cert_push_options()`: the options the certificate was signed over must
+/// be exactly the options that arrived on the wire, in the same order. An
+/// unsigned push has nothing to disagree with and always passes.
+fn check_cert_push_options(cert: &[u8], push_options: &[String]) -> bool {
+    if cert.is_empty() {
+        return true;
+    }
+    header_values(cert, "push-option") == push_options
+}
+
+/// git's `NONCE_*` gradings of the nonce a certificate echoed back.
+const NONCE_UNSOLICITED: &str = "UNSOLICITED";
+const NONCE_BAD: &str = "BAD";
+const NONCE_MISSING: &str = "MISSING";
+const NONCE_OK: &str = "OK";
+const NONCE_SLOP: &str = "SLOP";
+
+/// Everything `prepare_push_cert_sha1()` works out about a received certificate,
+/// which is exactly what the hooks are told through `GIT_PUSH_CERT*`.
+struct PushCert {
+    /// The blob the certificate was stored as, `GIT_PUSH_CERT`.
+    oid: gix::ObjectId,
+    /// `sigc->signer`.
+    signer: String,
+    /// `sigc->key`.
+    key: String,
+    /// `sigc->result`, the `%G?` character.
+    status: char,
+    /// The nonce reported to the hook — the one this process issued, or (under
+    /// `receive.certNonceSlop`) the one the certificate echoed back.
+    nonce: Option<String>,
+    /// One of the `NONCE_*` gradings.
+    nonce_status: &'static str,
+    /// How many seconds stale the echoed nonce is; only reported for `SLOP`.
+    nonce_slop: i64,
+}
+
+impl PushCert {
+    /// `prepare_push_cert_sha1()`: write the certificate out as a blob, verify
+    /// its signature, and grade its nonce. `None` for an unsigned push, and also
+    /// when the blob cannot be written — git clears the oid there and then skips
+    /// every `GIT_PUSH_CERT*` variable.
+    fn prepare(
+        repo: &gix::Repository,
+        raw: Vec<u8>,
+        config: &Config,
+        stateless_rpc: bool,
+    ) -> Option<Self> {
+        if raw.is_empty() {
+            return None;
+        }
+        let oid = repo.write_blob(&raw).ok()?.detach();
+
+        let bogs = super::verify_tag::parse_signed_buffer(&raw);
+        let check = crate::gitsig::verify_full(&raw[bogs..], &raw[..bogs]);
+        let (nonce, nonce_status, nonce_slop) = check_nonce(&raw[..bogs], config, stateless_rpc);
+        Some(Self {
+            oid,
+            signer: check.signer,
+            key: check.key,
+            status: check.status.code(),
+            nonce,
+            nonce_status,
+            nonce_slop,
+        })
+    }
+}
+
+/// `check_nonce()`: grade the `nonce` header of a certificate's signed payload
+/// against the one this server handed out.
+///
+/// Outside `--stateless-rpc` the echoed nonce must be the very string this
+/// process issued. Under it the advertisement came from a *different* process,
+/// so a nonce that still verifies against `receive.certNonceSeed` is accepted
+/// when its timestamp is within `receive.certNonceSlop` seconds, and reported as
+/// `SLOP` (with the drift) when it is not.
+fn check_nonce(payload: &[u8], config: &Config, stateless_rpc: bool) -> (Option<String>, &'static str, i64) {
+    let issued = config.push_cert_nonce.clone();
+    let Some(received) = header_values(payload, "nonce").into_iter().next() else {
+        return (issued, NONCE_MISSING, 0);
+    };
+    let Some(issued) = issued else {
+        return (None, NONCE_UNSOLICITED, 0);
+    };
+    if issued == received {
+        return (Some(issued), NONCE_OK, 0);
+    }
+    if !stateless_rpc {
+        return (Some(issued), NONCE_BAD, 0);
+    }
+
+    // `<seconds-since-epoch>-<hmac>`, recomputed from the seed and this
+    // directory; anything that does not reproduce exactly is a forgery.
+    let bad = (Some(issued.clone()), NONCE_BAD, 0);
+    let Some((stamp, _)) = received.split_once('-') else { return bad };
+    let Ok(stamp) = stamp.parse::<u64>() else { return bad };
+    let Some(seed) = &config.cert_nonce_seed else { return bad };
+    let expect = prepare_push_cert_nonce(&config.service_dir, stamp, seed, config.hash_kind);
+    if expect.len() != received.len() || !constant_time_eq(expect.as_bytes(), received.as_bytes()) {
+        return bad;
+    }
+
+    // Negative drift means the other server's clock runs ahead of ours.
+    let ours: u64 = issued.split('-').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let slop = ours as i64 - stamp as i64;
+    if config.cert_nonce_slop != 0 && slop.abs() <= config.cert_nonce_slop {
+        // It passes the HMAC check, so it is ours in every way that matters:
+        // report it as the nonce we issued.
+        (Some(received), NONCE_OK, slop)
+    } else {
+        (Some(issued), NONCE_SLOP, slop)
+    }
+}
+
+/// `constant_memequal()`: no early exit, so a wrong nonce leaks nothing about
+/// how much of it was right.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ---------------------------------------------------------------------------
+// Hooks
+// ---------------------------------------------------------------------------
+
+/// The environment additions every receive-side hook gets: the push options, and
+/// — for a signed push — everything known about the certificate.
+struct HookEnv {
+    set: Vec<(String, String)>,
+}
+
+/// Build the hook environment: `run_receive_hook()`'s push-option block plus
+/// `prepare_push_cert_sha1()`'s certificate block.
+///
+/// `GIT_PUSH_OPTION_COUNT` is always set, `0` included: `execute_commands()`
+/// hands `run_receive_hook()` a real (if empty) option list, so the branch git
+/// has for a null list is unreachable from receive-pack. Verified against stock
+/// git 2.55.0, whose `pre-receive` sees `GIT_PUSH_OPTION_COUNT=0` on a push that
+/// negotiated no options at all.
+fn hook_env(repo: &gix::Repository, push_options: &[String], cert: Option<&PushCert>) -> HookEnv {
+    let mut set = Vec::new();
+    for (i, o) in push_options.iter().enumerate() {
+        set.push((format!("GIT_PUSH_OPTION_{i}"), o.clone()));
+    }
+    set.push(("GIT_PUSH_OPTION_COUNT".into(), push_options.len().to_string()));
+    if let Some(cert) = cert {
+        set.push(("GIT_PUSH_CERT".into(), cert.oid.to_string()));
+        set.push(("GIT_PUSH_CERT_SIGNER".into(), cert.signer.clone()));
+        set.push(("GIT_PUSH_CERT_KEY".into(), cert.key.clone()));
+        set.push(("GIT_PUSH_CERT_STATUS".into(), cert.status.to_string()));
+        if let Some(nonce) = &cert.nonce {
+            set.push(("GIT_PUSH_CERT_NONCE".into(), nonce.clone()));
+            set.push(("GIT_PUSH_CERT_NONCE_STATUS".into(), cert.nonce_status.into()));
+            if cert.nonce_status == NONCE_SLOP {
+                set.push(("GIT_PUSH_CERT_NONCE_SLOP".into(), cert.nonce_slop.to_string()));
+            }
+        }
+    }
+    let _ = repo;
+    HookEnv { set }
+}
+
+/// Spawn `<hooks-dir>/<name>` with git's receive-side wiring: `GIT_DIR` set, the
+/// hook's stdout folded into its stderr (`run_hooks_opt`'s default) and the pair
+/// relayed to the pusher on band 2.
+///
+/// `None` when no such hook is installed; otherwise whether it exited non-zero,
+/// which is the sense every caller here wants ("declined").
+fn spawn_hook(
+    repo: &gix::Repository,
+    name: &str,
+    args: &[String],
+    stdin: Option<&[u8]>,
+    env: &HookEnv,
+    band: &mut Band,
+) -> Option<bool> {
+    let path = crate::hooks::find(repo, name).ok().flatten()?;
+
+    let mut cmd = std::process::Command::new(&path);
+    cmd.args(args)
+        .current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()))
+        .env("GIT_DIR", repo.git_dir())
+        .stdin(if stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in &env.set {
+        cmd.env(k, v);
+    }
+
+    let Ok(mut child) = cmd.spawn() else {
+        band.error(&format!("cannot spawn hook '{name}'"));
+        return Some(true);
+    };
+    if let (Some(data), Some(mut sink)) = (stdin, child.stdin.take()) {
+        let _ = sink.write_all(data);
+        drop(sink);
+    }
+
+    relay_child_output(&mut child, band);
+    Some(!child.wait().map(|s| s.success()).unwrap_or(false))
+}
+
+/// `copy_to_sideband()`: pump the child's stdout and stderr onto band 2 as they
+/// arrive, emitting an empty band-1 keepalive whenever `receive.keepAlive`
+/// seconds pass with nothing to say.
+fn relay_child_output(child: &mut std::process::Child, band: &mut Band) {
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let mut pumps = Vec::new();
+    for stream in [
+        child.stdout.take().map(PipeEnd::Out),
+        child.stderr.take().map(PipeEnd::Err),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let tx = tx.clone();
+        pumps.push(std::thread::spawn(move || {
+            let mut reader: Box<dyn Read + Send> = match stream {
+                PipeEnd::Out(s) => Box::new(s),
+                PipeEnd::Err(s) => Box::new(s),
+            };
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+    drop(tx);
+
+    let timeout = (band.keep_alive > 0).then(|| std::time::Duration::from_secs(band.keep_alive as u64));
+    loop {
+        let received = match timeout {
+            Some(timeout) => match rx.recv_timeout(timeout) {
+                Ok(chunk) => Some(chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    band.keep_alive_tick();
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => None,
+            },
+            None => rx.recv().ok(),
+        };
+        match received {
+            Some(chunk) => band.write_bytes(&chunk),
+            None => break,
+        }
+    }
+    for pump in pumps {
+        let _ = pump.join();
+    }
+}
+
+/// One end of a child's output, so both pipes can share a single pump body.
+enum PipeEnd {
+    Out(std::process::ChildStdout),
+    Err(std::process::ChildStderr),
+}
+
+/// `run_receive_hook()`: feed `<old> <new> <ref>` lines for every command that is
+/// still in play. `skip_broken` drops the ones that already failed, which is what
+/// separates `post-receive`'s view from `pre-receive`'s.
+///
+/// Returns whether the hook declined.
+fn run_receive_hook(
+    repo: &gix::Repository,
+    name: &str,
+    cmds: &[Command],
+    skip_broken: bool,
+    env: &HookEnv,
+    band: &mut Band,
+) -> bool {
+    let mut payload = Vec::new();
+    for cmd in cmds {
+        if skip_broken && (cmd.error.is_some() || cmd.did_not_exist) {
+            continue;
+        }
+        // The proc-receive hook's rewritten refs are what `post-receive` sees,
+        // in place of the ref the client named.
+        if cmd.reports.is_empty() {
+            payload.extend_from_slice(
+                format!("{} {} {}\n", cmd.old, cmd.new, cmd.name).as_bytes(),
+            );
+            continue;
+        }
+        for report in &cmd.reports {
+            payload.extend_from_slice(
+                format!(
+                    "{} {} {}\n",
+                    report.old.unwrap_or(cmd.old),
+                    report.new.unwrap_or(cmd.new),
+                    report.ref_name.as_deref().unwrap_or(&cmd.name)
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    // "if there are no valid commands, don't invoke the hook at all."
+    if payload.is_empty() {
+        return false;
+    }
+    spawn_hook(repo, name, &[], Some(&payload), env, band).unwrap_or(false)
+}
+
+/// `run_update_hook()`: `update <ref> <old> <new>`, one run per ref.
+fn run_update_hook(repo: &gix::Repository, cmd: &Command, band: &mut Band) -> bool {
+    let args = [cmd.name.clone(), cmd.old.to_string(), cmd.new.to_string()];
+    let env = HookEnv { set: Vec::new() };
+    spawn_hook(repo, "update", &args, None, &env, band).unwrap_or(false)
+}
+
+/// `run_update_post_hook()`: `post-update <ref>…` for every ref that moved.
+fn run_post_update_hook(
+    repo: &gix::Repository,
+    cmds: &[Command],
+    env: &HookEnv,
+    band: &mut Band,
+) {
+    let args: Vec<String> = cmds
+        .iter()
+        .filter(|c| c.error.is_none() && !c.did_not_exist)
+        .map(|c| c.name.clone())
+        .collect();
+    if args.is_empty() {
+        return;
+    }
+    spawn_hook(repo, "post-update", &args, None, env, band);
+}
+
+// ---------------------------------------------------------------------------
+// The proc-receive hook
+// ---------------------------------------------------------------------------
+
+/// `run_proc_receive_hook()`: hand the scheduled commands to the `proc-receive`
+/// hook over a pkt-line conversation and fold its verdicts back into `cmds`.
+///
+/// The exchange is: a `version=1` line with the negotiated capabilities after a
+/// NUL, a flush, the hook's own `version=` reply, a flush; then the commands and
+/// a flush; then (only when the hook asked for `push-options`) the options and a
+/// flush; then the hook's `ok`/`ng`/`option` report.
+///
+/// Returns whether the exchange failed, which is what makes the caller mark
+/// every unanswered command `fail to run proc-receive hook`.
+fn run_proc_receive_hook(
+    repo: &gix::Repository,
+    cmds: &mut [Command],
+    push_options: Option<&[String]>,
+    use_atomic: bool,
+    band: &mut Band,
+) -> bool {
+    let Ok(Some(path)) = crate::hooks::find(repo, "proc-receive") else {
+        band.error("cannot find hook 'proc-receive'");
+        return true;
+    };
+
+    let mut child = match std::process::Command::new(&path)
+        .current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()))
+        .env("GIT_DIR", repo.git_dir())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => {
+            band.error("cannot spawn hook 'proc-receive'");
+            return true;
+        }
+    };
+    let mut to_hook = child.stdin.take().expect("stdin piped");
+    let mut from_hook = std::io::BufReader::new(child.stdout.take().expect("stdout piped"));
+    // The hook's stderr is its diagnostics channel; `copy_to_sideband()` relays
+    // it to the pusher on band 2, so it is collected alongside the conversation
+    // and flushed once the conversation is over.
+    let mut errors = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    // Version negotiation. The capability list rides after a NUL, and only the
+    // capabilities this session actually negotiated are offered.
+    let mut caps = String::new();
+    if use_atomic {
+        caps.push_str(" atomic");
+    }
+    if push_options.is_some() {
+        caps.push_str(" push-options");
+    }
+    let hello = if caps.is_empty() {
+        b"version=1\n".to_vec()
+    } else {
+        format!("version=1\0{}\n", &caps[1..]).into_bytes()
+    };
+    let mut greeting = Vec::new();
+    pkt_line(&mut greeting, &hello);
+    flush_pkt(&mut greeting);
+
+    let mut errmsg = String::new();
+    let mut version: Option<i32> = None;
+    let mut hook_push_options = false;
+    let handshake = to_hook.write_all(&greeting).and_then(|()| to_hook.flush());
+    if handshake.is_ok() {
+        loop {
+            match read_pkt_line(&mut from_hook) {
+                Ok(Some(line)) => {
+                    let nul = line.iter().position(|&b| b == 0).unwrap_or(line.len());
+                    let head = String::from_utf8_lossy(&line[..nul]).trim_end().to_string();
+                    if let Some(v) = head.strip_prefix("version=") {
+                        version = Some(v.trim().parse().unwrap_or(0));
+                        if nul < line.len() {
+                            let features = String::from_utf8_lossy(&line[nul + 1..]);
+                            hook_push_options =
+                                features.split([' ', '\n']).any(|f| f == "push-options");
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    version = None;
+                    break;
+                }
+            }
+        }
+    }
+    match version {
+        // A hook that says nothing is a version-0 hook, which git accepts.
+        None if handshake.is_ok() => {}
+        None => errmsg.push_str("fail to negotiate version with proc-receive hook"),
+        Some(0) | Some(1) => {}
+        Some(v) => errmsg.push_str(&format!("proc-receive version '{v}' is not supported")),
+    }
+
+    let mut failed = !errmsg.is_empty();
+    if !failed {
+        let mut request = Vec::new();
+        for cmd in cmds.iter() {
+            if !cmd.proc_receive || cmd.error.is_some() {
+                continue;
+            }
+            pkt_line(
+                &mut request,
+                format!("{} {} {}", cmd.old, cmd.new, cmd.name).as_bytes(),
+            );
+        }
+        flush_pkt(&mut request);
+        if let Some(options) = push_options.filter(|_| hook_push_options) {
+            for option in options {
+                pkt_line(&mut request, option.as_bytes());
+            }
+            flush_pkt(&mut request);
+        }
+        if to_hook.write_all(&request).and_then(|()| to_hook.flush()).is_err() {
+            errmsg.push_str("fail to write commands to proc-receive hook");
+            failed = true;
+        }
+    }
+    drop(to_hook);
+
+    if !failed {
+        failed = read_proc_receive_report(&mut from_hook, cmds, &mut errmsg);
+    }
+    let _ = child.wait();
+    if let Some(pump) = errors.take() {
+        if let Ok(text) = pump.join() {
+            band.write_bytes(&text);
+        }
+    }
+
+    if !errmsg.is_empty() {
+        band.error(errmsg.trim_end_matches('\n'));
+    }
+    failed
+}
+
+/// `read_proc_receive_report()`: apply the hook's `ok`/`ng`/`option` lines to the
+/// commands it was given.
+fn read_proc_receive_report(
+    from_hook: &mut impl BufRead,
+    cmds: &mut [Command],
+    errmsg: &mut String,
+) -> bool {
+    let mut failed = false;
+    let mut responded = false;
+    // The index of the command the last `ok`/`ng` named, which is where `option`
+    // lines attach. `new_report` means the next `option` opens a fresh report;
+    // `report_open` is git's non-NULL `report` pointer, i.e. one is already open.
+    let mut hint: Option<usize> = None;
+    let mut new_report = false;
+    let mut report_open = false;
+    let mut once = false;
+
+    loop {
+        let line = match read_pkt_line(from_hook) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(_) => {
+                if !responded {
+                    errmsg.push_str("proc-receive exited abnormally");
+                    return true;
+                }
+                break;
+            }
+        };
+        responded = true;
+        let text = String::from_utf8_lossy(&line).trim_end().to_string();
+        let Some((head, rest)) = text.split_once(' ') else {
+            errmsg.push_str(&format!(
+                "proc-receive reported incomplete status line: '{text}'\n"
+            ));
+            failed = true;
+            continue;
+        };
+
+        if head == "option" {
+            let Some(index) = hint.filter(|_| report_open || new_report) else {
+                if !once {
+                    once = true;
+                    errmsg.push_str(
+                        "proc-receive reported 'option' without a matching 'ok/ng' directive\n",
+                    );
+                }
+                failed = true;
+                continue;
+            };
+            if new_report {
+                cmds[index].reports.push(PushReport::default());
+                new_report = false;
+                report_open = true;
+            }
+            let (key, value) = match rest.split_once(' ') {
+                Some((key, value)) => (key, Some(value)),
+                None => (rest, None),
+            };
+            let report = cmds[index].reports.last_mut().expect("just pushed");
+            match (key, value) {
+                ("refname", Some(v)) => report.ref_name = Some(v.to_string()),
+                ("old-oid", Some(v)) => {
+                    report.old = gix::ObjectId::from_hex(v.as_bytes()).ok();
+                }
+                ("new-oid", Some(v)) => {
+                    report.new = gix::ObjectId::from_hex(v.as_bytes()).ok();
+                }
+                ("forced-update", _) => report.forced_update = true,
+                // "Fall through, let 'receive-pack' to execute it."
+                ("fall-through", _) => {
+                    cmds[index].proc_receive = false;
+                    cmds[index].proc_receive_returned = false;
+                    cmds[index].reports.clear();
+                    report_open = false;
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        report_open = false;
+        new_report = false;
+        let (refname, reason) = match rest.split_once(' ') {
+            Some((refname, reason)) => (refname, Some(reason)),
+            None => (rest, None),
+        };
+        if head != "ok" && head != "ng" {
+            errmsg.push_str(&format!(
+                "proc-receive reported bad status '{head}' on ref '{refname}'\n"
+            ));
+            failed = true;
+            continue;
+        }
+
+        // "first try searching at our hint, falling back to all refs"
+        let found = hint
+            .and_then(|from| cmds[from..].iter().position(|c| c.name == refname).map(|i| i + from))
+            .or_else(|| cmds.iter().position(|c| c.name == refname));
+        let Some(index) = found else {
+            errmsg.push_str(&format!(
+                "proc-receive reported status on unknown ref: {refname}\n"
+            ));
+            failed = true;
+            continue;
+        };
+        hint = Some(index);
+        if !cmds[index].proc_receive {
+            errmsg.push_str(&format!(
+                "proc-receive reported status on unexpected ref: {refname}\n"
+            ));
+            failed = true;
+            continue;
+        }
+        cmds[index].proc_receive_returned = true;
+        if head == "ng" {
+            cmds[index].error = Some(reason.unwrap_or("failed").to_string());
+            failed = true;
+            continue;
+        }
+        new_report = true;
+    }
+
+    for cmd in cmds.iter_mut() {
+        if cmd.proc_receive && cmd.error.is_none() && !cmd.proc_receive_returned {
+            cmd.error = Some("proc-receive failed to report status".into());
+            failed = true;
+        }
+    }
+    failed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The nonce formula, pinned against a value captured from stock git 2.55.0:
+    /// `receive.certNonceSeed=s3cr3t` in `/tmp/.../bare.git` at stamp
+    /// 1785129221 advertised `push-cert=1785129221-30796ff6…`. The HMAC is keyed
+    /// by `"<dir>:<stamp>"` over the *seed*, not the other way round.
+    #[test]
+    fn nonce_matches_stock_gits_hmac() {
+        let dir = "/private/tmp/claude-501/-Users-wizard-RustroverProjects-\
+                   MenkeTechnologiesMeta-zvcs/ee941629-6b7f-4b50-bcde-b9f8f4c4a62e/\
+                   scratchpad/t1/bare.git";
+        assert_eq!(
+            prepare_push_cert_nonce(dir, 1785129221, "s3cr3t", gix::hash::Kind::Sha1),
+            "1785129221-30796ff618100b3bf91d9d42bb8ba210d8c83687"
+        );
+    }
+
+    /// `proc_receive_ref_append` / `proc_receive_ref_matches`: the `adm` flags
+    /// select which command kinds divert, `!` inverts the prefix test, and a
+    /// prefix only matches at a `/` boundary.
+    #[test]
+    fn proc_receive_patterns_select_by_kind_and_prefix() {
+        let bare = ProcReceivePattern::parse("refs/for/");
+        assert!(bare.matches("refs/for/main", true, false));
+        assert!(bare.matches("refs/for/main", false, true));
+        assert!(!bare.matches("refs/formal", false, false));
+
+        let add_only = ProcReceivePattern::parse("a:refs/for");
+        assert!(add_only.matches("refs/for/main", true, false));
+        assert!(!add_only.matches("refs/for/main", false, false));
+        assert!(!add_only.matches("refs/for/main", false, true));
+
+        // `!` only inverts the *prefix* test; the `adm` letters still have to
+        // select the command kind. A bare `!:` therefore wants nothing and
+        // matches nothing — verified against stock git 2.55.0, where
+        // `receive.procReceiveRefs=!:refs/heads` leaves the hook unrun for a
+        // push to `refs/for/x` while `am!:refs/heads` runs it.
+        assert!(!ProcReceivePattern::parse("!:refs/heads").matches("refs/for/main", true, false));
+        let negated = ProcReceivePattern::parse("am!:refs/heads");
+        assert!(negated.matches("refs/for/main", true, false));
+        assert!(!negated.matches("refs/heads/main", true, false));
+    }
+
+    /// The certificate's own `push-option` headers have to be exactly the
+    /// options that arrived unsigned, in order.
+    #[test]
+    fn cert_push_options_must_match_the_wire() {
+        let cert = b"certificate version 0.1\npusher x\npush-option a\npush-option b\n\n\
+                     0000 1111 refs/heads/main\n"
+            .to_vec();
+        assert!(check_cert_push_options(&cert, &["a".into(), "b".into()]));
+        assert!(!check_cert_push_options(&cert, &["a".into()]));
+        assert!(!check_cert_push_options(&cert, &["b".into(), "a".into()]));
+        // An unsigned push has nothing to disagree with.
+        assert!(check_cert_push_options(b"", &["a".into()]));
+    }
+
+    /// The command list of a signed push comes from between the certificate's
+    /// blank line and the start of its signature — never from the wire.
+    #[test]
+    fn commands_come_from_inside_the_signed_payload() {
+        let zero = "0".repeat(40);
+        let one = "1".repeat(40);
+        let cert = format!(
+            "certificate version 0.1\npusher x\nnonce 1-2\n\n\
+             {zero} {one} refs/heads/main\n\
+             -----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n"
+        );
+        let cmds = commands_from_cert(cert.as_bytes()).expect("parses");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].name, "refs/heads/main");
+        assert_eq!(cmds[0].new.to_string(), one);
+    }
 }

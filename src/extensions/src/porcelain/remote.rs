@@ -1609,7 +1609,7 @@ fn query_ref_map(repo: &gix::Repository, name: &str) -> Result<gix::remote::fetc
 /// protocol v1's `symref` capability and v2's `ls-refs`), git peeks directly at
 /// its target and returns that single branch; otherwise it collects every
 /// `refs/heads/*` whose object matches HEAD's, which may be several.
-fn remote_head_names(map: &gix::remote::fetch::RefMap) -> Vec<String> {
+pub(super) fn remote_head_names(map: &gix::remote::fetch::RefMap) -> Vec<String> {
     use gix::protocol::handshake::Ref;
 
     let Some(head) = map.remote_refs.iter().find(|r| r.unpack().0 == "HEAD") else {
@@ -1660,7 +1660,7 @@ fn abbrev_branch(name: &BStr) -> String {
 /// git's `refs_update_symref_extended` reports it: `Some(symref target)` /
 /// `Some(hex oid)` with the bool marking a detached (direct object) ref, or
 /// `None` when the ref does not yet exist.
-fn symref_prev(repo: &gix::Repository, head: &str) -> Result<(Option<String>, bool)> {
+pub(super) fn symref_prev(repo: &gix::Repository, head: &str) -> Result<(Option<String>, bool)> {
     match repo.try_find_reference(head)? {
         None => Ok((None, false)),
         Some(reference) => match &reference.inner.target {

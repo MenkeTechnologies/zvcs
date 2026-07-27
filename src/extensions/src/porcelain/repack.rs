@@ -112,12 +112,14 @@
 //!   * `repack.writeBitmaps`, or its older spelling `pack.writeBitmaps`, turns
 //!     `-b` on by itself; `--no-write-bitmap-index` overrides either.
 //!   * `repack.useDeltaBaseOffset` *is* read, and picks `OBJ_OFS_DELTA` over
-//!     `OBJ_REF_DELTA`. `repack.packKeptObjects` and `repack.cruftWindow` /
-//!     `repack.cruftDepth` / `repack.cruftThreads` are not: they tune a
-//!     kept-object exclusion and a cruft pack this writer never produces, so
-//!     honouring them would change nothing. `repack.updateServerInfo` *is*
-//!     honoured, since the closing `update-server-info` it gates is real; see
-//!     [`execute`].
+//!     `OBJ_REF_DELTA`. `repack.packKeptObjects` is not: it tunes a kept-object
+//!     exclusion this writer does not perform. `repack.cruftWindow` /
+//!     `repack.cruftWindowMemory` / `repack.cruftDepth` / `repack.cruftThreads`
+//!     are not read *here* either, because `--cruft` writes no cruft pack in
+//!     this module — but they are not dead: git reaches a cruft pack through
+//!     `gc`, and [`super::gc`] does produce one and does tune its delta search
+//!     with all four. `repack.updateServerInfo` *is* honoured, since the closing
+//!     `update-server-info` it gates is real; see [`execute`].
 //!   * `--filter=sparse:oid=<rev>` is accepted on syntax alone — git's rejection
 //!     of it depends on resolving and parsing the named blob;
 //!   * `combine:` sub-specs are not percent-decoded;

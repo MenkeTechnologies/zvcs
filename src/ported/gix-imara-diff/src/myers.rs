@@ -21,10 +21,31 @@ mod slice;
 /// * `removed` - Output array marking removed tokens
 /// * `added` - Output array marking added tokens
 /// * `minimal` - If true, disables heuristics to guarantee a minimal diff
-pub fn diff(before: &[Token], after: &[Token], removed: &mut [bool], added: &mut [bool], minimal: bool) {
+/// * `untrimmed_before`, `untrimmed_after` - The sequences before the common prefix and suffix
+///   were stripped. Only the match counts and record counts are read from them; a token's
+///   number of matches has to be counted over the whole file the way git's
+///   `xdl_classify_record()` does, or records that only match inside the trimmed-away prefix
+///   or suffix look unmatched and get discarded.
+pub fn diff(
+    before: &[Token],
+    after: &[Token],
+    removed: &mut [bool],
+    added: &mut [bool],
+    minimal: bool,
+    untrimmed_before: &[Token],
+    untrimmed_after: &[Token],
+) {
     // Preprocess the files by removing parts of the file that are not contained in the other file at all.
     // This process remaps the token indices so we have to account for that during the rest of the diff
-    let (before, after) = preprocess::preprocess(before, after, removed, added);
+    let (before, after) = preprocess::preprocess(
+        before,
+        after,
+        removed,
+        added,
+        minimal,
+        untrimmed_before,
+        untrimmed_after,
+    );
 
     // Perform the actual diff
     Myers::new(before.tokens.len(), after.tokens.len()).run(
@@ -115,9 +136,12 @@ impl Myers {
         let mut backwards_search = unsafe { MiddleSnakeSearch::<true>::new(self.kbackward, file1, file2) };
         let is_odd = file2.len().wrapping_sub(file1.len()) & 1 != 0;
 
-        let mut ec = 0;
+        // git's `xdl_split()` counts the edit cost from 1, and both the heuristic trigger
+        // (`ec > xenv->heur_min`) and its scoring factor (`XDL_K_HEUR * ec`) read that value,
+        // so starting from 0 would shift every heuristic decision by one step.
+        let mut ec = 1;
 
-        while ec <= self.max_cost {
+        loop {
             let mut found_snake = false;
             forward_search.next_d();
             if is_odd {
@@ -165,6 +189,8 @@ impl Myers {
                 found_snake |= backwards_search.run(file1, file2, |_, _| false).is_some()
             };
 
+            // C: `if (need_min) continue;` — a minimal diff neither samples the heuristic nor
+            // gives up at `mxcost`; it searches until the two paths actually cross.
             if need_min {
                 ec += 1;
                 continue;
@@ -196,6 +222,12 @@ impl Myers {
                         minimized_hi: true,
                     };
                 }
+            }
+
+            // Enough is enough. We spent too much time here and now we collect the furthest
+            // reaching path using the (i1 + i2) measure.
+            if ec >= self.max_cost {
+                break;
             }
 
             ec += 1;

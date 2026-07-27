@@ -40,10 +40,18 @@
 //! `add` porcelain) or restoring the backup on failure. `main`'s multi-file loop —
 //! `prompt_after_failed_merge` and the `exit $rc` accounting — is ported around it.
 //!
+//! The same machinery serves a **built-in** tool whose `mergetools/<tool>`
+//! backend is ported: [`builtin_merge_cmd`] produces the shell line that backend
+//! would run, which then goes through the identical `( eval $cmd )` path. So far
+//! that is `meld` — including `check_meld_for_features`, i.e.
+//! `mergetool.meld.hasOutput` and `mergetool.meld.useAutoMerge` (both falling
+//! back to probing `meld --help`, as the shell backend does).
+//!
 //! What still bails, rather than fake a run:
-//!   * a **built-in** tool (no `.cmd`): its `merge_cmd` lives in a
-//!     `$(git --exec-path)/mergetools/<tool>` shell backend that the vendored
-//!     crates do not carry, so there is nothing faithful to exec;
+//!   * every other **built-in** tool (no `.cmd`, no ported backend): its
+//!     `merge_cmd` lives in a `$(git --exec-path)/mergetools/<tool>` shell
+//!     backend that the vendored crates do not carry, so there is nothing
+//!     faithful to exec;
 //!   * the interactive **resolve loops** for deleted/symlink/submodule conflicts
 //!     once an answer is actually given — their checkout-index/add/rm/update-index
 //!     mutation is not wired up. At stdin EOF these instead print their prompt and
@@ -219,10 +227,21 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
     let tool_cmd: Option<String> = if tool.is_empty() {
         None
     } else {
-        snapshot
+        match snapshot
             .string(&format!("mergetool.{tool}.cmd"))
             .map(|v| v.to_str_lossy().into_owned())
             .filter(|v| !v.is_empty())
+        {
+            Some(cmd) => Some(cmd),
+            // No user-defined `.cmd`: fall back to a ported `mergetools/` backend.
+            None => match builtin_merge_cmd(&tool, &snapshot) {
+                Ok(cmd) => cmd,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return Ok(ExitCode::from(1));
+                }
+            },
+        }
     };
     // `get_merge_tool_path` (merge mode): `mergetool.<tool>.path`, else the tool
     // name. `run_merge_tool` puts it in `merge_tool_path` for the `.cmd` eval.
@@ -670,7 +689,10 @@ fn temp_path(dir: Option<&Path>, stem: &str, kind: &str, pid: u32, ext: &str) ->
     let name = format!("{stem}_{kind}_{pid}{ext}");
     match dir {
         Some(d) => d.join(name),
-        None => PathBuf::from(name),
+        // `MERGETOOL_TMPDIR` is the literal `.` without `mergetool.writeToTemp`,
+        // and the script interpolates it as `"$MERGETOOL_TMPDIR/${BASE}_…"` — so
+        // the tool is handed `./<name>`, which is what it sees in its argv.
+        None => PathBuf::from(format!("./{name}")),
     }
 }
 
@@ -689,6 +711,90 @@ fn wait_status(status: std::process::ExitStatus) -> i32 {
     {
         128
     }
+}
+
+/// The `merge_cmd` of a `mergetools/` catalogue backend, as the shell line
+/// [`run_merge_cmd`] evaluates with `$BASE`/`$LOCAL`/`$REMOTE`/`$MERGED` and
+/// `$merge_tool_path` in scope — the same contract a user-defined
+/// `mergetool.<tool>.cmd` has, so the two share one execution path.
+///
+/// Only `mergetools/meld` is ported. Every other backend returns `None`, which
+/// leaves the run bailing on [`SUBSTRATE`] rather than inventing a command line.
+///
+/// The `Err` case is git's `die "unknown mergetool.meld.useAutoMerge: …"`.
+fn builtin_merge_cmd(
+    tool: &str,
+    snapshot: &gix::config::Snapshot<'_>,
+) -> Result<Option<String>, String> {
+    if tool != "meld" {
+        return Ok(None);
+    }
+    let (has_output, auto_merge) = check_meld_for_features(snapshot)?;
+    let option_auto_merge = if auto_merge { " --auto-merge" } else { "" };
+    Ok(Some(if has_output {
+        format!(
+            "\"$merge_tool_path\"{option_auto_merge} --output=\"$MERGED\" \
+             \"$LOCAL\" \"$BASE\" \"$REMOTE\""
+        )
+    } else {
+        format!("\"$merge_tool_path\"{option_auto_merge} \"$LOCAL\" \"$MERGED\" \"$REMOTE\"")
+    }))
+}
+
+/// Port of `check_meld_for_features` (`mergetools/meld`): decide whether this
+/// meld understands `--output` and whether `--auto-merge` should be passed.
+///
+/// `mergetool.meld.hasOutput` is read as a boolean; anything that is not a
+/// boolean (including unset) falls back to probing `meld --help`, where either
+/// `--output=` or the `[OPTION...]` banner of a modern build means yes.
+///
+/// `mergetool.meld.useAutoMerge` is a boolean *or* the string `auto`, which
+/// probes the same help text for `--auto-merge`. Unset means off; any other
+/// string is an error.
+fn check_meld_for_features(
+    snapshot: &gix::config::Snapshot<'_>,
+) -> Result<(bool, bool), String> {
+    // `git config --bool mergetool.meld.hasOutput`.
+    let has_output = match snapshot.boolean("mergetool.meld.hasOutput") {
+        Some(v) => v,
+        None => {
+            let help = meld_help_msg(snapshot);
+            help.contains("--output=") || help.contains("[OPTION...]")
+        }
+    };
+    // `git config --bool-or-str mergetool.meld.useAutoMerge`.
+    let raw = snapshot
+        .string("mergetool.meld.useAutoMerge")
+        .map(|v| v.to_str_lossy().into_owned());
+    let auto_merge = match snapshot.boolean("mergetool.meld.useAutoMerge") {
+        Some(v) => v,
+        None => match raw.as_deref() {
+            Some("auto") => {
+                let help = meld_help_msg(snapshot);
+                help.contains("--auto-merge") || help.contains("[OPTION...]")
+            }
+            None | Some("") => false,
+            Some(other) => return Err(format!("unknown mergetool.meld.useAutoMerge: {other}")),
+        },
+    };
+    Ok((has_output, auto_merge))
+}
+
+/// `init_meld_help_msg`: `"$(git config mergetool.meld.path || echo meld)" --help`
+/// with stderr folded into stdout. A meld that cannot be run yields an empty
+/// string, which is what the shell's command substitution leaves behind too.
+fn meld_help_msg(snapshot: &gix::config::Snapshot<'_>) -> String {
+    let path = snapshot
+        .string("mergetool.meld.path")
+        .map(|v| v.to_str_lossy().into_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "meld".to_string());
+    let Ok(out) = Command::new(&path).arg("--help").output() else {
+        return String::new();
+    };
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    text
 }
 
 /// Message shared by the substrate-not-ported bails.

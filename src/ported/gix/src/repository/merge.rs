@@ -57,23 +57,31 @@ impl Repository {
     /// Return options for use with [`gix_merge::blob::PlatformRef::merge()`], accessible through
     /// [merge_resource_cache()](Self::merge_resource_cache).
     pub fn blob_merge_options(&self) -> Result<gix_merge::blob::platform::merge::Options, blob_merge_options::Error> {
+        let style = self
+            .config
+            .resolved
+            .string(tree::Merge::CONFLICT_STYLE)
+            .map(|value| {
+                tree::Merge::CONFLICT_STYLE
+                    .try_into_conflict_style(value)
+                    .with_lenient_default(self.config.lenient_config)
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(gix_merge::blob::platform::merge::Options {
             is_virtual_ancestor: false,
             resolve_binary_with: None,
             text: gix_merge::blob::builtin_driver::text::Options {
+                // `merge-ll.c` fixes the level at `XDL_MERGE_ZEALOUS` for every
+                // caller that goes through the low-level merge driver.
+                level: text::Level::Zealous,
                 diff_algorithm: self.diff_algorithm()?,
+                // Kept here as well as in `conflict` because git's `xmp.style` is
+                // independent of `xmp.favor`: the union driver replaces the latter
+                // and must not lose the configured style along with it.
+                style: Some(style),
                 conflict: text::Conflict::Keep {
-                    style: self
-                        .config
-                        .resolved
-                        .string(tree::Merge::CONFLICT_STYLE)
-                        .map(|value| {
-                            tree::Merge::CONFLICT_STYLE
-                                .try_into_conflict_style(value)
-                                .with_lenient_default(self.config.lenient_config)
-                        })
-                        .transpose()?
-                        .unwrap_or_default(),
+                    style,
                     marker_size: text::Conflict::DEFAULT_MARKER_SIZE.try_into().unwrap(),
                 },
             },

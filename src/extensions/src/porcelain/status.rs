@@ -619,6 +619,15 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         });
     }
 
+    // `wt_status_collect_untracked` brackets the worktree walk with `getnanotime()`
+    // and keeps the elapsed time in `s->untracked_in_ms` — but only when
+    // `advice.statusUoption` is on, since that hint is its sole consumer. gix fuses
+    // the untracked walk into the same index↔worktree pass as the modification
+    // checks, so this bracket covers both rather than the walk alone.
+    let untracked_t0 = (untracked != Untracked::No
+        && crate::advice::Advice::StatusUoption.enabled_in(&repo))
+    .then(std::time::Instant::now);
+
     let patterns: Vec<BString> = pathspecs.to_vec();
     for item in platform.into_iter(patterns)? {
         match item? {
@@ -722,6 +731,8 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    let untracked_slow = uf_was_slow(untracked_t0);
+
     // git orders each section (and each short-format block) by path.
     staged.sort_by(|a, b| a.1.cmp(&b.1));
     unstaged.sort_by(|a, b| a.1.cmp(&b.1));
@@ -729,11 +740,15 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
     untracked_paths.sort();
     ignored_paths.sort();
 
+    // `wt_longstatus_print_tracking` times `format_tracking_info`, whose cost is
+    // the ahead/behind revision walk — [`tracking_info`] here.
+    let ab_t0 = std::time::Instant::now();
     let tracking = if unborn {
         None
     } else {
         tracking_info(&repo)?
     };
+    let ab_elapsed_ms = ab_t0.elapsed().as_millis() as u64;
 
     // git colors the human formats (long and short display) when `color.status`
     // (or `color.ui`) is on and stdout is a terminal; the porcelain machine format
@@ -778,11 +793,27 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
         // `--show-stash` appends a stash-count summary after the trailer; the count
         // is the number of `refs/stash` reflog entries (git's `count_stash_entries`).
         let stash_count = if show_stash { count_stash_entries(&repo) } else { 0 };
+        let mut tracking_block = tracking_lines(tracking.as_ref(), quick, hints);
+        // The ahead/behind warning is appended to the same strbuf
+        // `format_tracking_info` filled, so it only shows when that produced
+        // something, and only for the full counts `--no-ahead-behind` skips.
+        if !tracking_block.is_empty()
+            && !quick
+            && ab_elapsed_ms > AB_DELAY_WARNING_IN_MS
+            && crate::advice::Advice::StatusAheadBehindWarning.enabled_in(&repo)
+        {
+            tracking_block.push_str(&format!(
+                "\nIt took {:.2} seconds to compute the branch ahead/behind values.\n\
+                 You can use '--no-ahead-behind' to avoid this.\n",
+                ab_elapsed_ms as f64 / 1000.0
+            ));
+        }
         print!(
             "{}",
             render_long(
                 &head_state,
-                &tracking_lines(tracking.as_ref(), quick, hints),
+                &tracking_block,
+                untracked_slow,
                 hints,
                 unborn,
                 merging,
@@ -1783,6 +1814,27 @@ fn preload_index_threads(
 /// Resolve the upstream of the current branch and how far it has diverged.
 /// Returns `None` when no upstream is configured, matching git's "no tracking
 /// information at all" case.
+/// `AB_DELAY_WARNING_IN_MS` / `UF_DELAY_WARNING_IN_MS` (wt-status.c): both are two
+/// seconds, the point past which git decides the wait was worth a word.
+const AB_DELAY_WARNING_IN_MS: u64 = 2 * 1000;
+const UF_DELAY_WARNING_IN_MS: u64 = 2 * 1000;
+
+/// Port of `uf_was_slow()` (wt-status.c). `t0` is `Some` only when
+/// `advice.statusUoption` allowed the walk to be timed at all; the result is the
+/// elapsed seconds to name in the hint, or `None` to stay quiet.
+///
+/// `GIT_TEST_UF_DELAY_WARNING` pins the elapsed time to git's own 3250 ms so the
+/// hint can be exercised without a repository big enough to be genuinely slow.
+fn uf_was_slow(t0: Option<std::time::Instant>) -> Option<f64> {
+    let t0 = t0?;
+    let ms = if std::env::var_os("GIT_TEST_UF_DELAY_WARNING").is_some() {
+        3250
+    } else {
+        t0.elapsed().as_millis() as u64
+    };
+    (ms > UF_DELAY_WARNING_IN_MS).then(|| ms as f64 / 1000.0)
+}
+
 fn tracking_info(repo: &gix::Repository) -> Result<Option<Tracking>> {
     use gix::bstr::ByteSlice;
 
@@ -2006,6 +2058,10 @@ fn submodule_summary(workdir: Option<&std::path::Path>, uncommitted: bool, limit
 fn render_long(
     head_state: &HeadState,
     tracking: &str,
+    // `uf_was_slow`'s verdict: the elapsed seconds when the untracked-file
+    // enumeration crossed [`UF_DELAY_WARNING_IN_MS`] with `advice.statusUoption`
+    // on, else `None`.
+    untracked_slow: Option<f64>,
     hints: bool,
     unborn: bool,
     merging: bool,
@@ -2242,6 +2298,15 @@ fn render_long(
                     ));
                 }
             }
+            out.push('\n');
+        }
+        // `wt_longstatus_print_other`'s epilogue: when enumerating the untracked
+        // files was slow enough to notice, say so. Printed with `GIT_COLOR_NORMAL`
+        // — no `color.status.header` — but still inside the comment-prefix pass.
+        if let Some(seconds) = untracked_slow {
+            out.push('\n');
+            out.push_str(&format!("It took {seconds:.2} seconds to enumerate untracked files.\n"));
+            out.push_str("See 'git help status' for information on how to improve this.\n");
             out.push('\n');
         }
     }

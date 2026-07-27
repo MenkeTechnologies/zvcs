@@ -130,12 +130,17 @@ pub(crate) mod hero {
             /// Prepare fetching a [refmap](RefMap) if not present in the handshake.
             ///
             /// `server_options` are sent along with the `ls-refs` command if the server supports them.
+            ///
+            /// `promisor_remote` is the client's answer to the server's `promisor-remote` capability, which git
+            /// sends on this very request in `send_capabilities()`; `None` means it sends no such line.
             pub fn prepare_lsrefs_or_extract_refmap(
                 &mut self,
                 user_agent: Feature,
                 prefix_from_spec_as_filter_on_remote: bool,
                 refmap_context: crate::fetch::refmap::init::Context,
                 server_options: &[bstr::BString],
+                promisor_remote: Option<String>,
+                extra_ref_prefixes: &[bstr::BString],
             ) -> Result<ObtainRefMap<'_>, crate::fetch::refmap::init::Error> {
                 if let Some(refs) = self.refs.take() {
                     return Ok(ObtainRefMap::Existing(RefMap::from_refs(
@@ -147,10 +152,20 @@ pub(crate) mod hero {
 
                 let prefix_refs = prefix_from_spec_as_filter_on_remote.then(|| {
                     let all_refspecs = refmap_context.aggregate_refspecs();
-                    RefPrefixes::from_refspecs(&all_refspecs)
+                    let mut prefixes = RefPrefixes::from_refspecs(&all_refspecs);
+                    // git pushes literal prefixes onto the same list, which is how `builtin/fetch.c`
+                    // asks for `HEAD` when it intends to update `refs/remotes/<name>/HEAD`.
+                    prefixes.extend(extra_ref_prefixes.iter().cloned());
+                    prefixes
                 });
                 Ok(ObtainRefMap::LsRefsCommand(
-                    crate::LsRefsCommand::new(prefix_refs, &self.capabilities, user_agent, server_options),
+                    crate::LsRefsCommand::new(
+                        prefix_refs,
+                        &self.capabilities,
+                        user_agent,
+                        server_options,
+                        promisor_remote,
+                    ),
                     refmap_context,
                 ))
             }

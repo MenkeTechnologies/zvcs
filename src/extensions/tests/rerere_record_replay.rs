@@ -212,6 +212,13 @@ fn autoupdate_stages_the_replayed_resolution() {
 fn rerere_enabled_false_records_nothing() {
     let repo = fixture("disabled");
     git(&repo, &["config", "rerere.enabled", "false"]);
+    // The fixture enables rerere before its setup commits, and a plain commit
+    // under `rerere.enabled=true` already lays down `rr-cache`/`MERGE_RR` —
+    // stock git 2.55.0 does exactly the same. Clear them so the assertions
+    // below measure what this test is named for: that nothing is recorded
+    // *after* the key is turned off.
+    let _ = std::fs::remove_dir_all(repo.join(".git/rr-cache"));
+    let _ = std::fs::remove_file(repo.join(".git/MERGE_RR"));
 
     let out = run(&repo, &["merge", "side"]);
     assert_eq!(out.status.code(), Some(1));

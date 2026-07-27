@@ -3,9 +3,10 @@ use std::ops::Range;
 use gix_hash::ObjectId;
 
 use crate::file::UnblamedHunk;
+use crate::types::Suspect;
 
-impl From<(Range<u32>, ObjectId)> for UnblamedHunk {
-    fn from(value: (Range<u32>, ObjectId)) -> Self {
+impl From<(Range<u32>, Suspect)> for UnblamedHunk {
+    fn from(value: (Range<u32>, Suspect)) -> Self {
         let (range_in_blamed_file, suspect) = value;
         let range_in_destination = range_in_blamed_file.clone();
 
@@ -13,8 +14,8 @@ impl From<(Range<u32>, ObjectId)> for UnblamedHunk {
     }
 }
 
-impl From<(Range<u32>, ObjectId, Range<u32>)> for UnblamedHunk {
-    fn from(value: (Range<u32>, ObjectId, Range<u32>)) -> Self {
+impl From<(Range<u32>, Suspect, Range<u32>)> for UnblamedHunk {
+    fn from(value: (Range<u32>, Suspect, Range<u32>)) -> Self {
         let (range_in_blamed_file, suspect, range_in_destination) = value;
 
         assert!(
@@ -30,23 +31,22 @@ impl From<(Range<u32>, ObjectId, Range<u32>)> for UnblamedHunk {
         UnblamedHunk {
             range_in_blamed_file,
             suspects: [(suspect, range_in_destination)].into(),
-            source_file_name: None,
             ignored: false,
             unblamable: false,
         }
     }
 }
 
-fn zero_sha() -> ObjectId {
+fn zero_sha() -> Suspect {
     use std::str::FromStr;
 
-    ObjectId::from_str("0000000000000000000000000000000000000000").unwrap()
+    Suspect::new(ObjectId::from_str("0000000000000000000000000000000000000000").unwrap())
 }
 
-fn one_sha() -> ObjectId {
+fn one_sha() -> Suspect {
     use std::str::FromStr;
 
-    ObjectId::from_str("1111111111111111111111111111111111111111").unwrap()
+    Suspect::new(ObjectId::from_str("1111111111111111111111111111111111111111").unwrap())
 }
 
 mod process_change {

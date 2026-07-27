@@ -2321,6 +2321,69 @@ fn check_format(fmt: &str) -> Result<()> {
     Ok(())
 }
 
+/// Render one commit through a bare user format string, uncolored, undecorated
+/// and with the default date mode — git's `pretty_print_commit()` over a
+/// `pretty_print_context` that carries nothing but the format.
+///
+/// This is the entry point `git rebase -i` needs: `sequencer_make_script()`
+/// prints each instruction's oneline through `rebase.instructionFormat`, which
+/// is an ordinary `--pretty=format:` string.
+pub(crate) fn format_commit(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    fmt: &str,
+) -> Result<Vec<u8>> {
+    let abbrev = std::cell::RefCell::new(AbbrevCache::new(repo));
+    let colors = super::color::DecorateColors::disabled();
+    let ctx = RenderCtx {
+        abbrev_commit: false,
+        abbrev: &abbrev,
+        date_mode: DateMode::Default,
+        extra: Vec::new(),
+        want_color: false,
+        colors: &colors,
+        now: now_secs(),
+        decorations: None,
+        decorate: DecorateStyle::Off,
+        source: None,
+        mailmap: None,
+    };
+    let mut out = Vec::new();
+    expand_format(&mut out, commit, &unabbreviated(fmt), &ctx)?;
+    Ok(out)
+}
+
+/// The abbreviating placeholders rewritten to their full-length twins.
+///
+/// `pretty_print_context pp = {0}` leaves `pp.abbrev` at 0, and
+/// `repo_find_unique_abbrev_r()` answers a request for length 0 with the full
+/// hash — so `%h`, `%p` and `%t` render exactly what `%H`, `%P` and `%T` do
+/// under a zeroed context. `git rebase -i` is one such caller, which is why a
+/// `rebase.instructionFormat` of `%h %s` puts a *full* object id in the sheet.
+///
+/// `%%h` is an escaped percent followed by a literal `h` and is left alone.
+fn unabbreviated(fmt: &str) -> String {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut out = String::with_capacity(fmt.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' || i + 1 >= chars.len() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        out.push('%');
+        out.push(match chars[i + 1] {
+            'h' => 'H',
+            'p' => 'P',
+            't' => 'T',
+            other => other,
+        });
+        i += 2;
+    }
+    out
+}
+
 /// Expand the placeholders accepted by [`check_format`] for `commit`, using the
 /// render knobs in `ctx` (`--date=`, color enablement, decorations, and the clock
 /// for relative dates).

@@ -100,6 +100,12 @@
 //! `--aggressive` widening the search to `gc.aggressiveWindow` /
 //! `gc.aggressiveDepth`.
 //!
+//! The cruft pack is searched separately, under `repack.cruftWindow`,
+//! `repack.cruftWindowMemory`, `repack.cruftDepth` and `repack.cruftThreads`,
+//! each falling back to what the reachable pack used. git reaches the same
+//! split by running `repack --cruft`, which keeps a second set of
+//! `pack-objects` arguments for the cruft child; see [`cruft_delta_options`].
+//!
 //! The bytes still differ from git's, because objects are enumerated in this
 //! module's own order rather than git's `compute_write_order()` and no delta is
 //! ever reused from an existing pack — so the checksum embedded in a pack's
@@ -520,6 +526,52 @@ fn delta_options(
     options
 }
 
+/// How the *cruft* pack's writer is steered, which is not the same as the
+/// reachable pack's.
+///
+/// git gets here in two hops: `gc` runs `repack --cruft`, and `repack` keeps a
+/// second `struct pack_objects_args` for the cruft child. Each of the four
+/// `repack.cruft*` values goes into that second set, and any it does not set is
+/// copied from the first — so an unset key leaves the cruft pack searching
+/// exactly as the reachable pack does, and a set one overrides `pack.window`,
+/// `pack.depth`, `pack.windowMemory` or `pack.threads` for the cruft pack alone.
+///
+/// Why the split exists: a cruft pack is objects nobody references, rewritten
+/// on every `gc`. Spending the reachable pack's delta budget on it is waste, so
+/// git lets the two be tuned apart.
+fn cruft_delta_options(
+    repo: &gix::Repository,
+    base: super::pack_objects::WriteOptions,
+) -> super::pack_objects::WriteOptions {
+    let snapshot = repo.config_snapshot();
+    let mut options = base;
+    // git stores these as strings and lets the `pack-objects` child parse them,
+    // so a value it cannot read fails there rather than here. A negative window,
+    // depth or thread count is not a number `pack-objects` accepts, so it is
+    // left to the inherited value instead of being forced through.
+    let count = |key: &str| {
+        snapshot
+            .integer(key)
+            .and_then(|value| usize::try_from(value).ok())
+    };
+    if let Some(window) = count("repack.cruftWindow") {
+        options.window = Some(window);
+    }
+    if let Some(depth) = count("repack.cruftDepth") {
+        options.depth = Some(depth);
+    }
+    if let Some(threads) = count("repack.cruftThreads") {
+        options.threads = Some(threads);
+    }
+    if let Some(limit) = snapshot
+        .integer("repack.cruftWindowMemory")
+        .and_then(|value| u64::try_from(value).ok())
+    {
+        options.window_memory = Some(limit);
+    }
+    options
+}
+
 /// `git repack -ad`: rewrite the whole local object store into one pack holding
 /// every reachable object, then dispose of the rest as `unreachable` says.
 ///
@@ -614,7 +666,7 @@ fn repack_all(
                 (*id, stamp)
             })
             .collect();
-        if let Some(base) = write_bundle(repo, &pack_dir, &rest, Some(&mtimes), delta)? {
+        if let Some(base) = write_bundle(repo, &pack_dir, &rest, Some(&mtimes), cruft_delta_options(repo, delta))? {
             written.push(base);
         }
     }

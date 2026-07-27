@@ -1,5 +1,5 @@
 use gix_hash::ObjectId;
-use gix_object::bstr::BString;
+use gix_object::bstr::{BStr, BString};
 use smallvec::SmallVec;
 use std::ops::RangeInclusive;
 use std::{
@@ -182,6 +182,100 @@ pub struct Options {
     /// over for an ignored commit are matched against the parent's lines by similarity, and the
     /// ones that find a match are passed on to the parent as well. This is git's `sb->ignore_list`.
     pub ignore_revs: std::collections::HashSet<ObjectId>,
+    /// Also blame the parents for lines that were copied out of *another* file
+    /// (`git blame -C[<score>]`), i.e. git's `PICKAXE_BLAME_COPY`.
+    pub detect_copied: Option<CopyDetection>,
+}
+
+/// How hard `git blame -C` looks for the file a chunk was copied from, i.e. which of git's
+/// `PICKAXE_BLAME_COPY*` bits are set.
+///
+/// Each further `-C` widens the set of paths in the parent that a leftover chunk is compared
+/// against, as `blame_copy_callback()` describes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyDetection {
+    /// git's `sb->copy_score` (`BLAME_DEFAULT_COPY_SCORE`, 40, for a bare `-C`): the minimum score
+    /// a chunk must exceed before a parent is blamed for it.
+    pub score: u32,
+    /// `-C -C`: also compare against files the commit did *not* touch, but only while blaming a
+    /// path the parent does not have under the same name.
+    pub harder: bool,
+    /// `-C -C -C`: compare against every file in the parent, always.
+    pub hardest: bool,
+}
+
+/// Names a path the walk has seen, so that a [`Suspect`] stays `Copy`.
+///
+/// [`PathId::BLAMED`] is the path the blame was started on, which is the one git leaves out of the
+/// *Source File* column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PathId(u32);
+
+impl PathId {
+    /// The path that is being blamed, i.e. `sb->path`.
+    pub const BLAMED: PathId = PathId(0);
+}
+
+/// The paths [`PathId`]s refer to, in the order the walk first saw them.
+#[derive(Debug, Clone)]
+pub(crate) struct PathTable {
+    paths: Vec<BString>,
+}
+
+impl PathTable {
+    pub(crate) fn new(blamed_path: &BStr) -> Self {
+        Self {
+            paths: vec![blamed_path.to_owned()],
+        }
+    }
+
+    /// Return the id of `path`, adding it to the table if it is new.
+    pub(crate) fn intern(&mut self, path: &BStr) -> PathId {
+        match self.paths.iter().position(|known| known == path) {
+            Some(index) => PathId(index as u32),
+            None => {
+                self.paths.push(path.to_owned());
+                PathId((self.paths.len() - 1) as u32)
+            }
+        }
+    }
+
+    pub(crate) fn path(&self, id: PathId) -> &BStr {
+        self.paths[id.0 as usize].as_ref()
+    }
+
+    /// The *Source File* name a [`BlameEntry`] carries for `id`: `None` for the blamed path itself,
+    /// which is what git leaves out of its output.
+    pub(crate) fn source_file_name(&self, id: PathId) -> Option<BString> {
+        (id != PathId::BLAMED).then(|| self.paths[id.0 as usize].clone())
+    }
+}
+
+/// git's `blame_origin`: a commit *and* the path the *Source File* lives at in it.
+///
+/// The path is part of the identity because `-C` can make one commit responsible for chunks that
+/// came from several different files at once, each of which is a separate origin there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Suspect {
+    /// The commit the chunk is suspected to have come from.
+    pub commit_id: ObjectId,
+    /// The path the *Source File* has in `commit_id`.
+    pub path: PathId,
+}
+
+impl Suspect {
+    /// An origin for `commit_id` at the path that is being blamed.
+    pub fn new(commit_id: ObjectId) -> Self {
+        Self {
+            commit_id,
+            path: PathId::BLAMED,
+        }
+    }
+
+    /// The same commit, but with the *Source File* at `path`.
+    pub fn at(commit_id: ObjectId, path: PathId) -> Self {
+        Self { commit_id, path }
+    }
 }
 
 /// Represents a change during history traversal for blame. It is supposed to capture enough
@@ -417,12 +511,10 @@ impl LineRange for Range<u32> {
 pub struct UnblamedHunk {
     /// The range in the file that is being blamed that this hunk represents.
     pub range_in_blamed_file: Range<u32>,
-    /// Maps a commit to the range in a source file (i.e. *Blamed File* at a revision) that is
-    /// equal to `range_in_blamed_file`. Since `suspects` rarely contains more than 1 item, it can
-    /// efficiently be stored as a `SmallVec`.
-    pub suspects: SmallVec<[(ObjectId, Range<u32>); 1]>,
-    /// The *Source File*'s name, in case it differs from *Blamed File*'s name.
-    pub source_file_name: Option<BString>,
+    /// Maps an origin — a commit *and* the path the file has in it — to the range in that source
+    /// file that is equal to `range_in_blamed_file`. Since `suspects` rarely contains more than 1
+    /// item, it can efficiently be stored as a `SmallVec`.
+    pub suspects: SmallVec<[(Suspect, Range<u32>); 1]>,
     /// See [`BlameEntry::ignored`]. Sticky: it survives every later split of this hunk, as it does
     /// in git where `split_blame_at()` copies it onto the new entry.
     pub ignored: bool,
@@ -431,24 +523,34 @@ pub struct UnblamedHunk {
 }
 
 impl UnblamedHunk {
-    pub(crate) fn new(from_range_in_blamed_file: Range<u32>, suspect: ObjectId) -> Self {
+    pub(crate) fn new(from_range_in_blamed_file: Range<u32>, suspect: Suspect) -> Self {
         let range_start = from_range_in_blamed_file.start;
         let range_end = from_range_in_blamed_file.end;
 
         UnblamedHunk {
             range_in_blamed_file: range_start..range_end,
             suspects: [(suspect, range_start..range_end)].into(),
-            source_file_name: None,
             ignored: false,
             unblamable: false,
         }
     }
 
-    pub(crate) fn has_suspect(&self, suspect: &ObjectId) -> bool {
+    pub(crate) fn has_suspect(&self, suspect: &Suspect) -> bool {
         self.suspects.iter().any(|entry| entry.0 == *suspect)
     }
 
-    pub(crate) fn get_range(&self, suspect: &ObjectId) -> Option<&Range<u32>> {
+    /// The first origin of `commit_id` this hunk is suspected for, whatever path it names.
+    ///
+    /// This is what git's `assign_blame()` finds when it walks `get_blame_suspects(commit)` for the
+    /// next origin with entries left.
+    pub(crate) fn first_suspect_of(&self, commit_id: &ObjectId) -> Option<Suspect> {
+        self.suspects
+            .iter()
+            .find(|entry| entry.0.commit_id == *commit_id)
+            .map(|entry| entry.0)
+    }
+
+    pub(crate) fn get_range(&self, suspect: &Suspect) -> Option<&Range<u32>> {
         self.suspects
             .iter()
             .find(|entry| entry.0 == *suspect)

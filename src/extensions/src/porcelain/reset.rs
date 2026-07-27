@@ -838,6 +838,9 @@ fn remove_branch_state(git_dir: &std::path::Path) {
     let _ = std::fs::remove_dir_all(git_dir.join("sequencer"));
 }
 
+/// `REFRESH_INDEX_DELAY_WARNING_IN_MS` (builtin/reset.c): two seconds.
+const REFRESH_INDEX_DELAY_WARNING_IN_MS: u64 = 2 * 1000;
+
 /// Close out a `MIXED` reset: refresh the index against the worktree, report what is
 /// still unstaged, then persist. `--quiet`, `--no-refresh` and bare repositories skip
 /// the refresh, exactly as `cmd_reset()` does.
@@ -848,7 +851,23 @@ fn finish_mixed(
     refresh: bool,
 ) -> Result<()> {
     if !quiet && refresh && repo.workdir().is_some() {
+        // `cmd_reset` times the refresh and, past two seconds, points at the
+        // `--no-refresh` that would have skipped it.
+        let t0 = std::time::Instant::now();
         refresh_index_report(repo, index)?;
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        if elapsed_ms > REFRESH_INDEX_DELAY_WARNING_IN_MS
+            && crate::advice::Advice::ResetNoRefresh.enabled_in(repo)
+        {
+            crate::advice::Advice::ResetNoRefresh.advise_plain_in(
+                repo,
+                &format!(
+                    "It took {:.2} seconds to refresh the index after reset.  You can use\n\
+                     '--no-refresh' to avoid this.",
+                    elapsed_ms as f64 / 1000.0
+                ),
+            );
+        }
     }
     // Drop the stale cache-tree extension before persisting (see gix File::write).
     index.remove_tree();

@@ -235,10 +235,10 @@ mod with_io {
                             continue;
                         }
                         match *feature {
-                            // Neither is advertised as a value of the command's own capability: `agent` and
-                            // `object-format` are top-level, and `server-option` is gated on the top-level
-                            // capability of the same name before it is ever added.
-                            "agent" | "object-format" | "server-option" => {}
+                            // None is advertised as a value of the command's own capability: `agent` and
+                            // `object-format` are top-level, and `server-option` and `promisor-remote` are
+                            // gated on the top-level capability of the same name before either is ever added.
+                            "agent" | "object-format" | "server-option" | "promisor-remote" => {}
                             _ => {
                                 return Err(Error::UnsupportedCapability {
                                     command: self.as_str(),

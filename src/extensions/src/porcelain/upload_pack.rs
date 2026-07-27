@@ -17,9 +17,11 @@
 //! leaving the filtered objects out of the pack, and a spec that
 //! `uploadpackfilter.*` bans — or that this server cannot apply — is refused
 //! with an `ERR` pkt-line (see [`filter_ban_reason`]). Shallow/deepen is still
-//! not negotiated (ignored); stateless-RPC (smart-HTTP) beyond
-//! `--advertise-refs` is not modelled other than in that want policy. Argument
-//! parsing and repository resolution are checked against git 2.55.0 on Darwin:
+//! not negotiated (ignored). `--stateless-rpc` (the smart-HTTP POST half)
+//! suppresses the advertisement, which belongs to the separate
+//! `--advertise-refs` request, and relaxes the want policy to a reachability
+//! check. Argument parsing and repository resolution are checked against git
+//! 2.55.0 on Darwin:
 //!
 //!   * `-h` → the 368-byte usage block on **stdout**, exit 129, before any
 //!     repository is touched (so it works outside a repository).
@@ -42,29 +44,27 @@
 //!     not appear to be a git repository` on **stderr**, exit 128, quoting the
 //!     argument exactly as given.
 //!
+//! Protocol **v2** is served as well: `GIT_PROTOCOL=version=2` selects the
+//! `serve.c` capability advertisement and command loop instead of the v0
+//! advertisement, with the `ls-refs`, `fetch` and `object-info` commands (see
+//! [`serve_v2`]). Protocol v1 is v0 preceded by a `version 1` pkt-line, as
+//! `builtin/upload-pack.c` has it. Which v2 capabilities are advertised is
+//! documented on [`V2Config`]; `shallow` and `packfile-uris` are deliberately
+//! withheld because the honouring code for them is not written.
+//!
 //! What is *not* served, and why:
 //!
-//!   1. **Protocol v2.** `src/ported/gix-protocol/src/` is the client half only
-//!      — `handshake`, `fetch`, `ls_refs`, `command`, all gated behind
-//!      `blocking-client`/`async-client`, with no server feature and no server
-//!      module. The v0 `want`/`have`/`ACK`/`NAK` state machine above is written
-//!      here rather than taken from a crate; v2's `command=fetch`/`ls-refs`
-//!      framing is not, so `GIT_PROTOCOL=version=2` gets the v0 advertisement
-//!      and every client downgrades. Everything v2-only — `ref-in-want`,
-//!      `wait-for-done`, `server-option`, `uploadpack.allowSidebandAll`,
-//!      `uploadpack.blobPackfileURI` — is out of reach until it lands.
-//!   2. **The capability advertisement is a function of the git binary, not of
+//!   1. **The capability advertisement is a function of the git binary, not of
 //!      the repository.** Every advertisement line stock git emits ends with
 //!      `agent=git/2.55.0-Darwin` — the installed git's version string and
 //!      platform. It is not derivable from the repository or from the vendored
 //!      crates, and hardcoding one build's value would produce output that
 //!      matches on exactly one machine. Parts of the list are equally
 //!      environmental: `no-done` is advertised for `--advertise-refs` but not
-//!      for the full v0 exchange, and `ref-in-want` is protocol v2, which this
-//!      server does not speak. The two `allow-*-sha1-in-want` tokens and
+//!      for the full v0 exchange. The two `allow-*-sha1-in-want` tokens and
 //!      `filter` *are* ported — see [`WantPolicy`] — because each is a policy
 //!      this server can actually enforce.
-//!   3. **The pack is built in one piece, not streamed.**
+//!   2. **The pack is built in one piece, not streamed.**
 //!      `pack_objects::pack_bytes_for` returns a finished `Vec<u8>` before a
 //!      byte goes out, so there is no silent producer to interleave keepalives
 //!      with (`uploadpack.keepAlive`, upload-pack.c:382-498) and no progress on
@@ -74,7 +74,8 @@
 //!      repository's own `.git/config` from running commands on the serving
 //!      machine (upload-pack.c:1387, `git_protected_config`). Both keys are
 //!      therefore unread rather than half-honoured. The pack is also never
-//!      thin, and `include-tag` is advertised but not acted on.
+//!      thin. `include-tag` is acted on under v2 (see [`add_included_tags`]) but
+//!      is still only advertised, not applied, on the v0 path.
 //!
 //! These paths are deliberately not approximated. An `upload-pack` that exited 0
 //! having written a plausible-looking but wrong advertisement would corrupt the
@@ -321,7 +322,57 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
     // have chosen its wants from an advertisement a *different* process wrote, so
     // a non-tip want is checked for reachability instead of refused outright.
     let stateless_rpc = args.iter().any(|a| a == "--stateless-rpc");
-    serve(&repo, advertise_only, stateless_rpc)
+
+    // `cmd_upload_pack()`'s version switch (builtin/upload-pack.c:63-81). v1 is
+    // v0 with a `version 1` pkt-line in front of the advertisement, and that
+    // line is written on exactly the paths that go on to write one.
+    match protocol_version_from_env() {
+        2 => {
+            if advertise_only {
+                let mut out = std::io::stdout().lock();
+                out.write_all(&v2_advertisement(&repo)?)?;
+                out.flush()?;
+                Ok(ExitCode::SUCCESS)
+            } else {
+                serve_v2(&repo, stateless_rpc)
+            }
+        }
+        1 => {
+            if advertise_only || !stateless_rpc {
+                let mut out = std::io::stdout().lock();
+                write_pkt(&mut out, b"version 1\n")?;
+                out.flush()?;
+            }
+            serve(&repo, advertise_only, stateless_rpc)
+        }
+        _ => serve(&repo, advertise_only, stateless_rpc),
+    }
+}
+
+/// `determine_protocol_version_server()` (protocol.c:49-84): the greatest
+/// `version=<n>` the client listed in `GIT_PROTOCOL`, which is a `:`-separated
+/// key list. An unparseable or absent value means v0.
+fn protocol_version_from_env() -> u8 {
+    match std::env::var("GIT_PROTOCOL") {
+        Ok(value) => protocol_version_of(&value),
+        Err(_) => 0,
+    }
+}
+
+/// The parse behind [`protocol_version_from_env`], split out so it can be
+/// exercised without touching this process's environment.
+fn protocol_version_of(value: &str) -> u8 {
+    value
+        .split(':')
+        .filter_map(|item| item.strip_prefix("version="))
+        .filter_map(|v| match v {
+            "0" => Some(0),
+            "1" => Some(1),
+            "2" => Some(2),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -335,7 +386,10 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
 /// and stops. Shallow/deepen and object filters are not negotiated (ignored).
 fn serve(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool) -> Result<ExitCode> {
     let policy = WantPolicy::from_config(repo);
-    {
+    // `if (advertise_refs || !data.stateless_rpc)` (upload-pack.c:1418): a
+    // smart-HTTP POST body starts at the `want` lines, so writing an
+    // advertisement there would corrupt the response.
+    if advertise_only || !stateless_rpc {
         let adv = advertisement(repo, policy)?;
         let mut out = std::io::stdout().lock();
         out.write_all(&adv)?;
@@ -968,6 +1022,899 @@ fn expand_tilde(path: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Protocol v2: serve.c, ls-refs.c, protocol-caps.c and upload-pack.c's v2 half.
+// ---------------------------------------------------------------------------
+
+/// git's `die()` inside the v2 serve loop: the reason, which the caller reports
+/// as `fatal: <reason>` on stderr before exiting 128. Any `ERR` pkt-line the
+/// client is owed has already been written by then, exactly as
+/// `packet_writer_error()` + `die()` pair up in upload-pack.c.
+struct Die(String);
+
+impl From<std::io::Error> for Die {
+    fn from(e: std::io::Error) -> Self {
+        Die(e.to_string())
+    }
+}
+
+/// `die!` with `format!` syntax, for the many one-line protocol errors.
+macro_rules! die {
+    ($($arg:tt)*) => { return Err(Die(format!($($arg)*))) };
+}
+
+/// One pkt-line as `packet_reader_read()` classifies it.
+#[derive(PartialEq, Eq)]
+enum Pkt {
+    /// A normal line, with the trailing newline chomped
+    /// (`PACKET_READ_CHOMP_NEWLINE`).
+    Line(Vec<u8>),
+    /// `0000`.
+    Flush,
+    /// `0001`.
+    Delim,
+    /// `0002`.
+    ResponseEnd,
+    /// The peer closed the connection (`PACKET_READ_EOF`).
+    Eof,
+}
+
+/// A one-packet-lookahead reader, the shape `packet_reader_peek()` /
+/// `packet_reader_read()` give the v2 serve loop: `process_request` has to look
+/// at a flush without consuming it, so the command that follows sees the same
+/// terminator it would have seen after a delim.
+struct PktReader<R: Read> {
+    inner: R,
+    peeked: Option<Pkt>,
+}
+
+impl<R: Read> PktReader<R> {
+    fn new(inner: R) -> Self {
+        PktReader { inner, peeked: None }
+    }
+
+    fn peek(&mut self) -> Result<&Pkt, Die> {
+        if self.peeked.is_none() {
+            self.peeked = Some(self.read_raw()?);
+        }
+        Ok(self.peeked.as_ref().expect("just filled"))
+    }
+
+    fn read(&mut self) -> Result<Pkt, Die> {
+        match self.peeked.take() {
+            Some(p) => Ok(p),
+            None => self.read_raw(),
+        }
+    }
+
+    fn read_raw(&mut self) -> Result<Pkt, Die> {
+        let mut hdr = [0u8; 4];
+        let mut off = 0;
+        while off < 4 {
+            match self.inner.read(&mut hdr[off..])? {
+                // A clean EOF only at a packet boundary is `PACKET_READ_EOF`.
+                0 if off == 0 => return Ok(Pkt::Eof),
+                0 => die!("protocol error: bad line length character: {}", String::from_utf8_lossy(&hdr[..off])),
+                n => off += n,
+            }
+        }
+        let text = std::str::from_utf8(&hdr)
+            .map_err(|_| Die("protocol error: bad line length character".into()))?;
+        let len = u16::from_str_radix(text, 16)
+            .map_err(|_| Die(format!("protocol error: bad line length character: {text}")))?;
+        match len {
+            0 => Ok(Pkt::Flush),
+            1 => Ok(Pkt::Delim),
+            2 => Ok(Pkt::ResponseEnd),
+            3 => die!("protocol error: bad line length 3"),
+            4 => Ok(Pkt::Line(Vec::new())),
+            _ => {
+                let mut buf = vec![0u8; len as usize - 4];
+                read_exact(&mut self.inner, &mut buf)?;
+                if buf.last() == Some(&b'\n') {
+                    buf.pop();
+                }
+                Ok(Pkt::Line(buf))
+            }
+        }
+    }
+}
+
+/// `struct packet_writer`: every v2 response line goes through here so that a
+/// client which negotiated `sideband-all` gets the whole exchange multiplexed —
+/// section headers on band 1 and errors on band 3 — instead of only the pack.
+struct PktWriter<W: Write> {
+    out: W,
+    /// `writer->use_sideband`, set by the `sideband-all` fetch argument.
+    sideband: bool,
+}
+
+impl<W: Write> PktWriter<W> {
+    /// `packet_writer_write()`. The caller supplies the trailing newline, as
+    /// git's format strings do.
+    fn write(&mut self, line: &str) -> Result<(), Die> {
+        let mut payload = Vec::with_capacity(line.len() + 1);
+        if self.sideband {
+            payload.push(1);
+        }
+        payload.extend_from_slice(line.as_bytes());
+        write_pkt(&mut self.out, &payload)?;
+        Ok(())
+    }
+
+    /// `packet_writer_error()`: `ERR ` in front, or band 3 under `sideband-all`.
+    fn error(&mut self, msg: &str) -> Result<(), Die> {
+        let mut payload = Vec::with_capacity(msg.len() + 4);
+        if self.sideband {
+            payload.push(3);
+        } else {
+            payload.extend_from_slice(b"ERR ");
+        }
+        payload.extend_from_slice(msg.as_bytes());
+        write_pkt(&mut self.out, &payload)?;
+        self.out.flush()?;
+        Ok(())
+    }
+
+    /// One raw band of pack data. Never routed through `sideband`: in v2 the
+    /// pack is always multiplexed, `sideband-all` or not
+    /// (`data.use_sideband = LARGE_PACKET_MAX`, upload-pack.c:1778).
+    fn band(&mut self, band: u8, data: &[u8]) -> Result<(), Die> {
+        let mut framed = Vec::with_capacity(data.len() + 1);
+        framed.push(band);
+        framed.extend_from_slice(data);
+        write_pkt(&mut self.out, &framed)?;
+        Ok(())
+    }
+
+    fn delim(&mut self) -> Result<(), Die> {
+        self.out.write_all(b"0001")?;
+        Ok(())
+    }
+
+    fn flush_pkt(&mut self) -> Result<(), Die> {
+        self.out.write_all(b"0000")?;
+        self.out.flush()?;
+        Ok(())
+    }
+}
+
+/// `lsrefs.unborn` (ls-refs.c:16-42).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unborn {
+    /// Neither advertised nor honoured.
+    Ignore,
+    /// Honoured when the client asks, but not advertised.
+    Allow,
+    /// Honoured and advertised as `ls-refs=unborn`. The default.
+    Advertise,
+}
+
+/// The v2 capability set this server advertises, and the config behind it.
+///
+/// Every entry is a capability whose honouring code is in this module. Two of
+/// git's are deliberately withheld:
+///
+///   * **`shallow`** (which git advertises unconditionally as the first value of
+///     `fetch=`). Nothing here negotiates `deepen`/`deepen-since`/`deepen-not`,
+///     so advertising it would invite `deepen` lines that [`fetch_command`] can
+///     only reject. A client that sees no `shallow` reports "Server does not
+///     support shallow clients" up front instead. A repository that is *itself*
+///     shallow still gets a `shallow-info` section, which is not gated on the
+///     capability (upload-pack.c:1747-1761) and mirrors the `shallow` lines the
+///     v0 [`advertisement`] already writes.
+///   * **`packfile-uris`** (`uploadpack.blobPackfileURI`), which needs
+///     `pack-objects` to emit URI lines ahead of the pack; the pack here is one
+///     finished `Vec<u8>`.
+struct V2Config {
+    /// `lsrefs.unborn`.
+    unborn: Unborn,
+    /// The v0 want policy, reused for `uploadpack.allowFilter`. The three
+    /// `allow*SHA1InWant` bits it also carries are v0-only: git's `check_non_tip`
+    /// is called from `receive_needs()` alone (upload-pack.c:1181), so a v2
+    /// `want` is accepted for any object the repository has.
+    policy: WantPolicy,
+    /// `uploadpack.allowRefInWant` — accept `want-ref <ref>` and answer with a
+    /// `wanted-refs` section.
+    ref_in_want: bool,
+    /// `uploadpack.allowSidebandAll` — accept `sideband-all` and multiplex the
+    /// whole response, not just the pack.
+    sideband_all: bool,
+    /// `transfer.advertiseSID` — advertise this process's trace2 session id, and
+    /// accept the client's.
+    session_id: Option<String>,
+    /// `transfer.advertiseObjectInfo` — advertise and serve `object-info`.
+    object_info: bool,
+    /// The repository's hash algorithm, which the client must agree with.
+    object_format: String,
+}
+
+impl V2Config {
+    fn from_repo(repo: &gix::Repository) -> Self {
+        let config = repo.config_snapshot();
+        let unborn = match config.string("lsrefs.unborn").map(|v| v.to_string()).as_deref() {
+            Some("allow") => Unborn::Allow,
+            Some("ignore") => Unborn::Ignore,
+            // Missing, `advertise`, or — where git dies on a misconfigured
+            // server — anything else.
+            _ => Unborn::Advertise,
+        };
+        V2Config {
+            unborn,
+            policy: WantPolicy::from_config(repo),
+            ref_in_want: config.boolean("uploadpack.allowRefInWant").unwrap_or(false),
+            sideband_all: config.boolean("uploadpack.allowSidebandAll").unwrap_or(false),
+            session_id: config
+                .boolean("transfer.advertiseSID")
+                .unwrap_or(false)
+                .then(|| crate::trace2::session_id().to_owned()),
+            object_info: config.boolean("transfer.advertiseObjectInfo").unwrap_or(false),
+            object_format: repo.object_hash().to_string(),
+        }
+    }
+
+    /// The values of the `fetch=` capability, in git's order
+    /// (`upload_pack_advertise()`, upload-pack.c:1843-1857) minus the two
+    /// withheld ones.
+    fn fetch_values(&self) -> String {
+        let mut v = String::from("wait-for-done");
+        if self.policy.filter {
+            v.push_str(" filter");
+        }
+        if self.ref_in_want {
+            v.push_str(" ref-in-want");
+        }
+        if self.sideband_all {
+            v.push_str(" sideband-all");
+        }
+        v
+    }
+}
+
+/// `protocol_v2_advertise_capabilities()` (serve.c:186-216): `version 2`, then
+/// one pkt-line per advertised capability in table order, then a flush.
+fn v2_advertisement(repo: &gix::Repository) -> Result<Vec<u8>> {
+    let cfg = V2Config::from_repo(repo);
+    let mut out = Vec::new();
+    pkt_line(&mut out, b"version 2\n");
+    pkt_line(&mut out, b"agent=git/2.55.0-zvcs\n");
+    match cfg.unborn {
+        Unborn::Advertise => pkt_line(&mut out, b"ls-refs=unborn\n"),
+        _ => pkt_line(&mut out, b"ls-refs\n"),
+    }
+    pkt_line(&mut out, format!("fetch={}\n", cfg.fetch_values()).as_bytes());
+    pkt_line(&mut out, b"server-option\n");
+    pkt_line(&mut out, format!("object-format={}\n", cfg.object_format).as_bytes());
+    if let Some(sid) = &cfg.session_id {
+        pkt_line(&mut out, format!("session-id={sid}\n").as_bytes());
+    }
+    if cfg.object_info {
+        pkt_line(&mut out, b"object-info\n");
+    }
+    flush_pkt(&mut out);
+    Ok(out)
+}
+
+/// `protocol_v2_serve_loop()` (serve.c:356-372): advertise unless this is a
+/// stateless RPC, then serve one request (stateless) or requests until the
+/// client closes the connection.
+fn serve_v2(repo: &gix::Repository, stateless_rpc: bool) -> Result<ExitCode> {
+    if !stateless_rpc {
+        let adv = v2_advertisement(repo)?;
+        let mut out = std::io::stdout().lock();
+        out.write_all(&adv)?;
+        out.flush()?;
+    }
+    let cfg = V2Config::from_repo(repo);
+    let mut reader = PktReader::new(std::io::stdin());
+    let result = if stateless_rpc {
+        process_request(repo, &cfg, &mut reader).map(|_| ())
+    } else {
+        loop {
+            match process_request(repo, &cfg, &mut reader) {
+                Ok(true) => break Ok(()),
+                Ok(false) => continue,
+                Err(e) => break Err(e),
+            }
+        }
+    };
+    match result {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(Die(msg)) => {
+            eprintln!("fatal: {msg}");
+            Ok(ExitCode::from(128))
+        }
+    }
+}
+
+/// Which command a request selected.
+#[derive(Clone, Copy)]
+enum V2Command {
+    LsRefs,
+    Fetch,
+    ObjectInfo,
+}
+
+/// `process_request()` (serve.c:280-354): read `command=<name>` and the client's
+/// capability lines up to the delim (or flush), then run the command. Returns
+/// `true` when the client is done with the connection.
+fn process_request(
+    repo: &gix::Repository,
+    cfg: &V2Config,
+    reader: &mut PktReader<std::io::Stdin>,
+) -> Result<bool, Die> {
+    if matches!(reader.peek()?, Pkt::Eof) {
+        return Ok(true);
+    }
+
+    let mut command: Option<V2Command> = None;
+    let mut seen_capability_or_command = false;
+    // `client_hash_algo` starts at SHA-1, so a client that says nothing is held
+    // to it (serve.c:17).
+    let mut client_hash = String::from("sha1");
+
+    loop {
+        match reader.peek()? {
+            Pkt::Eof => die!("unexpected end of request"),
+            Pkt::Line(_) => {
+                let Pkt::Line(line) = reader.read()? else {
+                    unreachable!("just peeked a line")
+                };
+                let key = String::from_utf8_lossy(&line).into_owned();
+                if let Some(name) = key.strip_prefix("command=") {
+                    if command.is_some() {
+                        die!("command '{name}' requested after already requesting a command");
+                    }
+                    command = Some(match name {
+                        "ls-refs" => V2Command::LsRefs,
+                        "fetch" => V2Command::Fetch,
+                        "object-info" if cfg.object_info => V2Command::ObjectInfo,
+                        _ => die!("invalid command '{name}'"),
+                    });
+                } else if !receive_client_capability(cfg, &key, &mut client_hash) {
+                    die!("unknown capability '{key}'");
+                }
+                seen_capability_or_command = true;
+            }
+            // Not consumed: the command's own argument loop reads it as its
+            // terminating flush (serve.c:322-329).
+            Pkt::Flush => {
+                if !seen_capability_or_command {
+                    return Ok(true);
+                }
+                break;
+            }
+            Pkt::Delim => {
+                reader.read()?;
+                break;
+            }
+            Pkt::ResponseEnd => die!("unexpected response end packet"),
+        }
+    }
+
+    let Some(command) = command else {
+        die!("no command requested");
+    };
+    if client_hash != cfg.object_format {
+        die!(
+            "mismatched object format: server {}; client {client_hash}",
+            cfg.object_format
+        );
+    }
+
+    let mut writer = PktWriter { out: std::io::stdout(), sideband: false };
+    match command {
+        V2Command::LsRefs => ls_refs_command(repo, cfg, reader, &mut writer)?,
+        V2Command::Fetch => fetch_command(repo, cfg, reader, &mut writer)?,
+        V2Command::ObjectInfo => object_info_command(repo, reader, &mut writer)?,
+    }
+    Ok(false)
+}
+
+/// `receive_client_capability()` (serve.c:241-252): accept a non-command
+/// capability the server advertised, or report that it is unknown. `agent` and
+/// `server-option` carry no server-side effect; `object-format` picks the hash
+/// the client will be held to; `session-id` is only accepted when it was
+/// advertised.
+fn receive_client_capability(cfg: &V2Config, key: &str, client_hash: &mut String) -> bool {
+    let (name, value) = match key.split_once('=') {
+        Some((n, v)) => (n, Some(v)),
+        None => (key, None),
+    };
+    match name {
+        "agent" | "server-option" => true,
+        "object-format" => {
+            if let Some(v) = value {
+                v.clone_into(client_hash);
+            }
+            true
+        }
+        // git logs the client's id via trace2; there is nothing else to do with
+        // it, and it is refused outright when `transfer.advertiseSID` is off.
+        "session-id" => cfg.session_id.is_some(),
+        _ => false,
+    }
+}
+
+/// `ls_refs()` (ls-refs.c:161-216): HEAD (possibly unborn) first, then every ref
+/// that survives `uploadpack.hideRefs` and the client's `ref-prefix` filters.
+fn ls_refs_command(
+    repo: &gix::Repository,
+    cfg: &V2Config,
+    reader: &mut PktReader<std::io::Stdin>,
+    writer: &mut PktWriter<std::io::Stdout>,
+) -> Result<(), Die> {
+    /// `TOO_MANY_PREFIXES` (ls-refs.c:48): past this the prefix list can no
+    /// longer be the comprehensive list it is meant to be, so it is dropped.
+    const TOO_MANY_PREFIXES: usize = 65536;
+
+    let mut peel = false;
+    let mut symrefs = false;
+    let mut unborn = false;
+    let mut prefixes: Vec<String> = Vec::new();
+
+    loop {
+        match reader.read()? {
+            Pkt::Line(line) => {
+                let arg = String::from_utf8_lossy(&line).into_owned();
+                match arg.as_str() {
+                    "peel" => peel = true,
+                    "symrefs" => symrefs = true,
+                    "unborn" => unborn = cfg.unborn != Unborn::Ignore,
+                    _ => match arg.strip_prefix("ref-prefix ") {
+                        Some(p) if prefixes.len() < TOO_MANY_PREFIXES => prefixes.push(p.to_owned()),
+                        Some(_) => {}
+                        None => die!("unexpected line: '{arg}'"),
+                    },
+                }
+            }
+            Pkt::Flush => break,
+            _ => die!("expected flush after ls-refs arguments"),
+        }
+    }
+    if prefixes.len() >= TOO_MANY_PREFIXES {
+        prefixes.clear();
+    }
+
+    let config = repo.config_snapshot();
+    let hidden = super::receive_pack::hide_ref_patterns(&config, "uploadpack.hideRefs");
+    let matches = |name: &str| {
+        !super::receive_pack::ref_is_hidden(&hidden, name)
+            && (prefixes.is_empty() || prefixes.iter().any(|p| name.starts_with(p)))
+    };
+
+    // `send_possibly_unborn_head()` (ls-refs.c:123-146). An unborn HEAD is only
+    // reported when the client asked for both `unborn` and `symrefs`, because
+    // the target is the only useful part of that line.
+    if matches("HEAD") {
+        match repo.head().map(|h| h.kind) {
+            Ok(gix::head::Kind::Symbolic(r)) => {
+                let target = r.name.as_bstr().to_string();
+                let oid = repo
+                    .find_reference(r.name.as_ref())
+                    .ok()
+                    .and_then(|mut r| r.follow_to_object().ok())
+                    .map(|id| id.detach());
+                if let Some(oid) = oid {
+                    let peeled = peel.then(|| peeled_oid(repo, oid)).flatten();
+                    send_v2_ref(writer, Some(oid), "HEAD", symrefs.then_some(target.as_str()), peeled)?;
+                }
+            }
+            Ok(gix::head::Kind::Detached { target, .. }) => {
+                let peeled = peel.then(|| peeled_oid(repo, target)).flatten();
+                send_v2_ref(writer, Some(target), "HEAD", None, peeled)?;
+            }
+            Ok(gix::head::Kind::Unborn(name)) => {
+                if unborn && symrefs {
+                    let target = name.as_bstr().to_string();
+                    send_v2_ref(writer, None, "HEAD", Some(target.as_str()), None)?;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    let platform = repo.references().map_err(|e| Die(e.to_string()))?;
+    for reference in platform.all().map_err(|e| Die(e.to_string()))? {
+        let Ok(mut reference) = reference else { continue };
+        let name = reference.name().as_bstr().to_string();
+        if !matches(&name) {
+            continue;
+        }
+        let symref_target = match reference.target() {
+            gix::refs::TargetRef::Symbolic(target) => Some(target.as_bstr().to_string()),
+            gix::refs::TargetRef::Object(_) => None,
+        };
+        let Ok(id) = reference.follow_to_object() else { continue };
+        let oid = id.detach();
+        let peeled = peel.then(|| peeled_oid(repo, oid)).flatten();
+        send_v2_ref(
+            writer,
+            Some(oid),
+            &name,
+            symrefs.then(|| symref_target.as_deref()).flatten(),
+            peeled,
+        )?;
+    }
+
+    writer.flush_pkt()?;
+    Ok(())
+}
+
+/// `send_ref()`'s line format (ls-refs.c:78-121).
+fn send_v2_ref(
+    writer: &mut PktWriter<std::io::Stdout>,
+    oid: Option<ObjectId>,
+    name: &str,
+    symref_target: Option<&str>,
+    peeled: Option<ObjectId>,
+) -> Result<(), Die> {
+    let mut line = match oid {
+        Some(oid) => format!("{} {name}", oid.to_hex()),
+        None => format!("unborn {name}"),
+    };
+    if let Some(target) = symref_target {
+        line.push_str(&format!(" symref-target:{target}"));
+    }
+    if let Some(peeled) = peeled {
+        line.push_str(&format!(" peeled:{}", peeled.to_hex()));
+    }
+    line.push('\n');
+    writer.write(&line)
+}
+
+/// `reference_get_peeled_oid()`: the object a tag chain finally names, or `None`
+/// when `oid` is not a tag and so does not peel.
+fn peeled_oid(repo: &gix::Repository, oid: ObjectId) -> Option<ObjectId> {
+    let object = repo.find_object(oid).ok()?;
+    if object.kind != gix::objs::Kind::Tag {
+        return None;
+    }
+    object.peel_tags_to_end().ok().map(|o| o.id)
+}
+
+/// Everything one `command=fetch` request asked for (`process_args()`,
+/// upload-pack.c:1590-1684).
+#[derive(Default)]
+struct FetchArgs {
+    /// `want <oid>` and the ids behind `want-ref`.
+    wants: Vec<ObjectId>,
+    /// `want-ref <ref>`, answered with a `wanted-refs` section.
+    wanted_refs: Vec<(String, ObjectId)>,
+    /// The `have` ids this repository actually has — git's `have_obj`, which is
+    /// what gets ACKed. A `have` for an object we lack is counted but not kept.
+    haves: Vec<ObjectId>,
+    /// `data->seen_haves`: whether any `have` line arrived at all, however
+    /// useless, which is what decides between the ack round and the pack.
+    seen_haves: bool,
+    done: bool,
+    wait_for_done: bool,
+    include_tag: bool,
+    filter: Option<String>,
+}
+
+/// `upload_pack_v2()` (upload-pack.c:1770-1833): read the arguments, then run
+/// the three-state machine — no wants means nothing to do, `have` lines mean an
+/// acknowledgment round first, otherwise go straight to the pack.
+fn fetch_command(
+    repo: &gix::Repository,
+    cfg: &V2Config,
+    reader: &mut PktReader<std::io::Stdin>,
+    writer: &mut PktWriter<std::io::Stdout>,
+) -> Result<(), Die> {
+    let args = process_fetch_args(repo, cfg, reader, writer)?;
+
+    if args.wants.is_empty() && !args.wait_for_done {
+        return Ok(());
+    }
+    if args.seen_haves && !process_haves_and_send_acks(repo, &args, writer)? {
+        return Ok(());
+    }
+    send_pack_section(repo, &args, writer)
+}
+
+/// `process_args()`. An argument this server did not advertise support for is a
+/// protocol error, not something to ignore: a client that sent `deepen` and got
+/// a full pack back would record a shallow boundary it never received.
+fn process_fetch_args(
+    repo: &gix::Repository,
+    cfg: &V2Config,
+    reader: &mut PktReader<std::io::Stdin>,
+    writer: &mut PktWriter<std::io::Stdout>,
+) -> Result<FetchArgs, Die> {
+    let mut args = FetchArgs::default();
+    let config = repo.config_snapshot();
+    let hidden = super::receive_pack::hide_ref_patterns(&config, "uploadpack.hideRefs");
+
+    loop {
+        let line = match reader.read()? {
+            Pkt::Line(line) => line,
+            Pkt::Flush => break,
+            _ => die!("expected flush after fetch arguments"),
+        };
+        let arg = String::from_utf8_lossy(&line).into_owned();
+
+        // `parse_want()`: an oid we do not have is refused before anything else.
+        if let Some(hex) = arg.strip_prefix("want ") {
+            let Ok(id) = ObjectId::from_hex(hex.as_bytes()) else {
+                die!("git upload-pack: protocol error, expected to get oid, not '{arg}'");
+            };
+            if repo.find_object(id).is_err() {
+                writer.error(&format!("upload-pack: not our ref {}", id.to_hex()))?;
+                die!("git upload-pack: not our ref {}", id.to_hex());
+            }
+            if !args.wants.contains(&id) {
+                args.wants.push(id);
+            }
+            continue;
+        }
+
+        // `parse_want_ref()`, gated on `uploadpack.allowRefInWant`.
+        if cfg.ref_in_want {
+            if let Some(name) = arg.strip_prefix("want-ref ") {
+                let resolved = (!super::receive_pack::ref_is_hidden(&hidden, name))
+                    .then(|| repo.find_reference(name).ok())
+                    .flatten()
+                    .and_then(|mut r| r.follow_to_object().ok())
+                    .map(|id| id.detach());
+                let Some(oid) = resolved else {
+                    writer.error(&format!("unknown ref {name}"))?;
+                    die!("unknown ref {name}");
+                };
+                if args.wanted_refs.iter().any(|(r, _)| r == name) {
+                    writer.error(&format!("duplicate want-ref {name}"))?;
+                    die!("duplicate want-ref {name}");
+                }
+                args.wanted_refs.push((name.to_owned(), oid));
+                if !args.wants.contains(&oid) {
+                    args.wants.push(oid);
+                }
+                continue;
+            }
+        }
+
+        // `parse_have()`: only ids we have join `have_obj`, but any `have` line
+        // sets `seen_haves`.
+        if let Some(hex) = arg.strip_prefix("have ") {
+            args.seen_haves = true;
+            if let Ok(id) = ObjectId::from_hex(hex.as_bytes()) {
+                if repo.find_object(id).is_ok() && !args.haves.contains(&id) {
+                    args.haves.push(id);
+                }
+            }
+            continue;
+        }
+
+        match arg.as_str() {
+            // The pack this server builds is never thin and never uses offset
+            // deltas, both of which these two only *permit*.
+            "thin-pack" | "ofs-delta" => continue,
+            // No progress is ever written on band 2, so this is already true.
+            "no-progress" => continue,
+            "include-tag" => {
+                args.include_tag = true;
+                continue;
+            }
+            "done" => {
+                args.done = true;
+                continue;
+            }
+            "wait-for-done" => {
+                args.wait_for_done = true;
+                continue;
+            }
+            "sideband-all" if cfg.sideband_all => {
+                writer.sideband = true;
+                continue;
+            }
+            _ => {}
+        }
+
+        if cfg.policy.filter {
+            if let Some(spec) = arg.strip_prefix("filter ") {
+                if args.filter.is_some() {
+                    die!("multiple filter-specs cannot be combined");
+                }
+                if let Some(err) = filter_ban_reason(repo, spec) {
+                    writer.error(&err)?;
+                    die!("{err}");
+                }
+                args.filter = Some(spec.to_owned());
+                continue;
+            }
+        }
+
+        die!("unexpected line: '{arg}'");
+    }
+
+    Ok(args)
+}
+
+/// `process_haves_and_send_acks()` (upload-pack.c:1710-1726). `true` means go on
+/// to the pack, `false` means this round ends with a flush and the client will
+/// come back with more `have`s.
+fn process_haves_and_send_acks(
+    repo: &gix::Repository,
+    args: &FetchArgs,
+    writer: &mut PktWriter<std::io::Stdout>,
+) -> Result<bool, Die> {
+    if args.done {
+        return Ok(true);
+    }
+    // `send_acks()`.
+    writer.write("acknowledgments\n")?;
+    if args.haves.is_empty() {
+        writer.write("NAK\n")?;
+    }
+    for id in &args.haves {
+        writer.write(&format!("ACK {}\n", id.to_hex()))?;
+    }
+    if !args.wait_for_done && ok_to_give_up(repo, args) {
+        writer.write("ready\n")?;
+        writer.delim()?;
+        return Ok(true);
+    }
+    writer.flush_pkt()?;
+    Ok(false)
+}
+
+/// `ok_to_give_up()` (upload-pack.c:561-571): negotiation can stop once every
+/// `want` can reach one of the objects the client said it has, i.e. once the
+/// common history is deep enough to cut the pack at.
+fn ok_to_give_up(repo: &gix::Repository, args: &FetchArgs) -> bool {
+    if args.haves.is_empty() {
+        return false;
+    }
+    args.wants.iter().all(|want| {
+        let Some(want) = peel_to_commit(repo, *want) else {
+            return false;
+        };
+        args.haves.iter().any(|have| {
+            // `have` is an ancestor of `want` exactly when it is their merge base.
+            repo.merge_base(want, *have)
+                .map(|base| base.detach() == *have)
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// The `UPLOAD_SEND_PACK` state: the optional `wanted-refs` and `shallow-info`
+/// sections, then `packfile` and the pack itself multiplexed on band 1.
+fn send_pack_section(
+    repo: &gix::Repository,
+    args: &FetchArgs,
+    writer: &mut PktWriter<std::io::Stdout>,
+) -> Result<(), Die> {
+    // `send_wanted_ref_info()` (upload-pack.c:1728-1745).
+    if !args.wanted_refs.is_empty() {
+        writer.write("wanted-refs\n")?;
+        for (name, oid) in &args.wanted_refs {
+            writer.write(&format!("{} {name}\n", oid.to_hex()))?;
+        }
+        writer.delim()?;
+    }
+
+    // `send_shallow_info()` (upload-pack.c:1747-1761), reduced to the one case
+    // this server can answer: serving an already-shallow repository, whose
+    // boundary the client has to be told about. This is the same list the v0
+    // `advertisement` writes; without the `shallow` capability there is no
+    // client-requested deepening to compute on top of it.
+    let shallow: Vec<ObjectId> = repo
+        .shallow_commits()
+        .ok()
+        .flatten()
+        .map(|c| c.iter().copied().collect())
+        .unwrap_or_default();
+    if !shallow.is_empty() {
+        writer.write("shallow-info\n")?;
+        for id in &shallow {
+            writer.write(&format!("shallow {}\n", id.to_hex()))?;
+        }
+        writer.delim()?;
+    }
+
+    writer.write("packfile\n")?;
+
+    let mut objects = crate::porcelain::push_proto::objects_to_send(repo, &args.wants, &args.haves);
+    crate::porcelain::pack_objects::apply_filter(repo, args.filter.as_deref(), &mut objects);
+    if args.include_tag {
+        add_included_tags(repo, &mut objects);
+    }
+    let pack = crate::porcelain::pack_objects::pack_bytes_for(repo, &objects)
+        .map_err(|e| Die(format!("{e:#}")))?;
+    // The band byte eats one of the 65516 payload bytes a pkt-line can carry.
+    for chunk in pack.chunks(65515) {
+        writer.band(1, chunk)?;
+    }
+    writer.flush_pkt()?;
+    Ok(())
+}
+
+/// `pack-objects --include-tag`: an annotated tag whose target is already in the
+/// pack rides along, so the client ends up with the tag object it will need when
+/// it writes `refs/tags/*`. Hidden tags are left out, as they are everywhere else.
+fn add_included_tags(repo: &gix::Repository, objects: &mut Vec<ObjectId>) {
+    use std::collections::HashSet;
+    let present: HashSet<ObjectId> = objects.iter().copied().collect();
+    let config = repo.config_snapshot();
+    let hidden = super::receive_pack::hide_ref_patterns(&config, "uploadpack.hideRefs");
+    let Ok(refs) = repo.references() else { return };
+    let Ok(tags) = refs.prefixed("refs/tags/") else { return };
+    for reference in tags {
+        let Ok(reference) = reference else { continue };
+        let name = reference.name().as_bstr().to_string();
+        if super::receive_pack::ref_is_hidden(&hidden, &name) {
+            continue;
+        }
+        let gix::refs::TargetRef::Object(oid) = reference.target() else { continue };
+        let oid = oid.to_owned();
+        if present.contains(&oid) {
+            continue;
+        }
+        // Only a tag *object* is worth adding; a lightweight tag names the
+        // commit directly and is already covered by the reachability walk.
+        match peeled_oid(repo, oid) {
+            Some(peeled) if present.contains(&peeled) => objects.push(oid),
+            _ => {}
+        }
+    }
+}
+
+/// `cap_object_info()` (protocol-caps.c:78-113): answer `size` for each `oid`
+/// the client listed. An oid this repository does not have gets an empty size
+/// field rather than an error.
+fn object_info_command(
+    repo: &gix::Repository,
+    reader: &mut PktReader<std::io::Stdin>,
+    writer: &mut PktWriter<std::io::Stdout>,
+) -> Result<(), Die> {
+    let mut want_size = false;
+    let mut oids: Vec<String> = Vec::new();
+    loop {
+        match reader.read()? {
+            Pkt::Line(line) => {
+                let arg = String::from_utf8_lossy(&line).into_owned();
+                if arg == "size" {
+                    want_size = true;
+                } else if let Some(oid) = arg.strip_prefix("oid ") {
+                    oids.push(oid.to_owned());
+                } else {
+                    writer.error(&format!("object-info: unexpected line: '{arg}'"))?;
+                }
+            }
+            Pkt::Flush => break,
+            _ => {
+                writer.error("object-info: expected flush after arguments")?;
+                die!("object-info: expected flush after arguments");
+            }
+        }
+    }
+
+    if !oids.is_empty() {
+        if want_size {
+            writer.write("size")?;
+        }
+        for text in &oids {
+            let Ok(id) = ObjectId::from_hex(text.as_bytes()) else {
+                writer.error(&format!(
+                    "object-info: protocol error, expected to get oid, not '{text}'"
+                ))?;
+                continue;
+            };
+            let mut line = text.clone();
+            if want_size {
+                match repo.find_object(id) {
+                    Ok(object) => line.push_str(&format!(" {}", object.data.len())),
+                    Err(_) => line.push(' '),
+                }
+            }
+            writer.write(&line)?;
+        }
+    }
+    writer.flush_pkt()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,5 +1964,58 @@ mod tests {
         let policy = WantPolicy { filter: true, ..WantPolicy::default() };
         let on = capabilities(Some("refs/heads/main"), policy);
         assert!(on.contains(" symref=HEAD:refs/heads/main filter object-format=sha1 "), "{on}");
+    }
+
+    /// `determine_protocol_version_server()` takes the *greatest* version the
+    /// client listed, across a `:`-separated key list that may also carry keys
+    /// that are not versions at all. Getting this wrong either strands every
+    /// client on v0 or answers v2 to a client that only offered v0.
+    #[test]
+    fn git_protocol_env_selects_the_greatest_version_offered() {
+        assert_eq!(protocol_version_of("version=2"), 2);
+        assert_eq!(protocol_version_of("version=0"), 0);
+        assert_eq!(protocol_version_of("version=1"), 1);
+        // Multiple offers: the greatest wins regardless of the order they came in.
+        assert_eq!(protocol_version_of("version=0:version=2:version=1"), 2);
+        assert_eq!(protocol_version_of("version=2:version=1"), 2);
+        // Non-version keys are skipped, not treated as a version.
+        assert_eq!(protocol_version_of("key=value:version=2"), 2);
+        assert_eq!(protocol_version_of("key=value"), 0);
+        // Anything unparseable is v0, never a higher guess.
+        assert_eq!(protocol_version_of(""), 0);
+        assert_eq!(protocol_version_of("version=3"), 0);
+        assert_eq!(protocol_version_of("version=two"), 0);
+        assert_eq!(protocol_version_of("2"), 0);
+    }
+
+    /// The values of the v2 `fetch=` capability are the contract for what the
+    /// client may then send. Every token here has honouring code in
+    /// [`process_fetch_args`]; `shallow` and `packfile-uris` are absent because
+    /// theirs is not written, and a regression that adds either back would make
+    /// clients send `deepen`/`packfile-uris` lines this server can only reject.
+    #[test]
+    fn v2_fetch_capability_lists_only_honoured_tokens() {
+        let base = V2Config {
+            unborn: Unborn::Advertise,
+            policy: WantPolicy::default(),
+            ref_in_want: false,
+            sideband_all: false,
+            session_id: None,
+            object_info: false,
+            object_format: "sha1".into(),
+        };
+        assert_eq!(base.fetch_values(), "wait-for-done");
+
+        let all = V2Config {
+            policy: WantPolicy { filter: true, ..WantPolicy::default() },
+            ref_in_want: true,
+            sideband_all: true,
+            ..base
+        };
+        // git's own order: filter, then ref-in-want, then sideband-all
+        // (`upload_pack_advertise()`, upload-pack.c:1843-1857).
+        assert_eq!(all.fetch_values(), "wait-for-done filter ref-in-want sideband-all");
+        assert!(!all.fetch_values().contains("shallow"), "{}", all.fetch_values());
+        assert!(!all.fetch_values().contains("packfile-uris"), "{}", all.fetch_values());
     }
 }

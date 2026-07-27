@@ -100,7 +100,10 @@ impl Histogram {
                     // we are diffing two extremely large repetitive files
                     // this is a worst case for histogram diff with O(N^2) performance
                     // fallback to myers to maintain linear time complexity
-                    myers::diff(before, after, removed, added, false);
+                    // git's `xdl_fall_back_diff()` copies the sub-region into fresh mmfiles and
+                    // re-enters `xdl_do_diff()`, so the region *is* the whole file as far as
+                    // record classification is concerned — no wider sequence to count over.
+                    myers::diff(before, after, removed, added, false, before, after);
                     return;
                 }
             }

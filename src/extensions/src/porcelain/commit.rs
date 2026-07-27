@@ -79,6 +79,259 @@ struct DryRun {
     pathspecs: Vec<String>,
 }
 
+/// git's `enum commit_whence` (commit.h): where the commit being recorded came
+/// from. Anything but [`Whence::Commit`] means an operation is in progress and
+/// `git commit` is *concluding* it — which changes the parent list, the default
+/// message, which options are legal, and what state is torn down afterwards.
+///
+/// `FROM_CHERRY_PICK_MULTI` is deliberately absent: `sequencer_determine_whence()`
+/// assigns it when `.git/sequencer` exists and then unconditionally overwrites it
+/// from the `if/else` immediately below, so in git 2.55.0 the value can never
+/// reach `cmd_commit`. Porting the dead store would only add an unreachable arm.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Whence {
+    /// `FROM_COMMIT` — an ordinary commit.
+    Commit,
+    /// `FROM_MERGE` — `MERGE_HEAD` exists; this commit concludes a merge.
+    Merge,
+    /// `FROM_CHERRY_PICK_SINGLE` — `CHERRY_PICK_HEAD` exists (cherry-pick or revert).
+    CherryPick,
+    /// `FROM_REBASE_PICK` — `CHERRY_PICK_HEAD` exists and equals `REBASE_HEAD`
+    /// while a `rebase-merge` directory is present.
+    RebasePick,
+}
+
+impl Whence {
+    /// git's `is_from_cherry_pick()`.
+    fn is_cherry_pick(self) -> bool {
+        self == Whence::CherryPick
+    }
+
+    /// git's `is_from_rebase()`.
+    fn is_rebase(self) -> bool {
+        self == Whence::RebasePick
+    }
+
+    /// The noun git puts in "cannot do a partial commit during a %s.",
+    /// "You are in the middle of a %s -- cannot amend." and friends.
+    fn noun(self) -> &'static str {
+        match self {
+            Whence::Commit => "commit",
+            Whence::Merge => "merge",
+            Whence::CherryPick => "cherry-pick",
+            Whence::RebasePick => "rebase",
+        }
+    }
+}
+
+/// git's `determine_whence()` (builtin/commit.c) plus `sequencer_determine_whence()`.
+fn determine_whence(repo: &gix::Repository) -> Whence {
+    let git_dir = repo.git_dir();
+    if git_dir.join("MERGE_HEAD").exists() {
+        return Whence::Merge;
+    }
+    let cherry = match read_state_oid(repo, "CHERRY_PICK_HEAD") {
+        Some(id) => id,
+        None => return Whence::Commit,
+    };
+    // `file_exists(rebase_path())` is `.git/rebase-merge`; `REBASE_HEAD` must name
+    // the very commit being picked for this to be a rebase rather than a plain
+    // cherry-pick that happens to run inside one.
+    let in_rebase = git_dir.join("rebase-merge").exists()
+        && read_state_oid(repo, "REBASE_HEAD") == Some(cherry);
+    if in_rebase {
+        Whence::RebasePick
+    } else {
+        Whence::CherryPick
+    }
+}
+
+/// Resolve one of the sequencer's pseudo-refs (`CHERRY_PICK_HEAD`, `REVERT_HEAD`,
+/// `REBASE_HEAD`, `AUTO_MERGE`) to an object id, or `None` when it does not exist.
+///
+/// git reaches these through the ref store with `REF_NO_DEREF`, so a loose file
+/// holding a raw object id is the normal representation.
+fn read_state_oid(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
+    // These are written as a bare loose file holding the id (that is what the ref
+    // store produces for a root-level pseudo-ref, and what `cherry_pick` writes),
+    // so read the file first and only then ask the ref store.
+    if let Ok(text) = std::fs::read_to_string(repo.git_dir().join(name)) {
+        if let Ok(id) = gix::ObjectId::from_hex(text.trim().as_bytes()) {
+            return Some(id);
+        }
+    }
+    repo.find_reference(name)
+        .ok()
+        .and_then(|mut r| r.peel_to_id().ok())
+        .map(|id| id.detach())
+}
+
+/// Delete one of those pseudo-refs, reporting whether it had existed — git's
+/// `refs_delete_ref(..., REF_NO_DEREF)`.
+fn delete_state_ref(repo: &gix::Repository, name: &str) -> bool {
+    let mut removed = std::fs::remove_file(repo.git_dir().join(name)).is_ok();
+    if let Ok(reference) = repo.find_reference(name) {
+        let current = reference.target().into_owned();
+        removed |= repo
+            .edit_reference(gix::refs::transaction::RefEdit {
+                change: gix::refs::transaction::Change::Delete {
+                    expected: gix::refs::transaction::PreviousValue::MustExistAndMatch(current),
+                    log: gix::refs::transaction::RefLog::AndReference,
+                },
+                name: reference.name().to_owned(),
+                deref: false,
+            })
+            .is_ok();
+    }
+    removed
+}
+
+/// git's `sequencer_post_commit_cleanup()` (sequencer.c): drop the pseudo-refs a
+/// cherry-pick/revert left behind and, once the todo list is down to its final
+/// entry, the sequencer directory with it.
+fn sequencer_post_commit_cleanup(repo: &gix::Repository) -> Result<()> {
+    let mut need_cleanup = delete_state_ref(repo, "CHERRY_PICK_HEAD");
+    need_cleanup |= delete_state_ref(repo, "REVERT_HEAD");
+    delete_state_ref(repo, "AUTO_MERGE");
+    if !need_cleanup || !have_finished_the_last_pick(repo) {
+        return Ok(());
+    }
+    // `sequencer_remove_state()`: the whole `.git/sequencer` directory goes.
+    let dir = repo.git_dir().join("sequencer");
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    Ok(())
+}
+
+/// git's `have_finished_the_last_pick()`: true when `.git/sequencer/todo` holds
+/// at most one line (the pick just concluded), false when it is missing entirely.
+fn have_finished_the_last_pick(repo: &gix::Repository) -> bool {
+    let Ok(buf) = std::fs::read(repo.git_dir().join("sequencer").join("todo")) else {
+        return false;
+    };
+    match buf.iter().position(|&b| b == b'\n') {
+        None => true,
+        Some(eol) => eol + 1 >= buf.len(),
+    }
+}
+
+/// git's `refresh_cache_or_die()` → `die_resolve_conflict("commit")`: the exact
+/// output `git commit` produces while unmerged entries remain in the index.
+///
+/// The `U<TAB><path>` lines are `refresh_index()`'s `REFRESH_IN_PORCELAIN`
+/// report and go to **stdout**, one per conflicted path; the diagnosis and the
+/// `advice.resolveConflict` hint go to stderr, and the exit status is 128.
+fn die_resolve_conflict(index: &gix::index::File) -> ExitCode {
+    let backing = index.path_backing();
+    let mut last: Option<&gix::bstr::BStr> = None;
+    for entry in index.entries() {
+        if entry.stage() == gix::index::entry::Stage::Unconflicted {
+            continue;
+        }
+        let path = entry.path_in(backing);
+        // The index holds up to three stages per conflicted path; git skips
+        // forward over the run so each path is reported once.
+        if last == Some(path) {
+            continue;
+        }
+        println!("U\t{path}");
+        last = Some(path);
+    }
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    eprintln!("error: Committing is not possible because you have unmerged files.");
+    crate::advice::Advice::ResolveConflict.advise_plain(
+        "Fix them up in the work tree, and then use 'git add/rm <file>'\n\
+         as appropriate to mark resolution and make a commit.",
+    );
+    eprintln!("fatal: Exiting because of an unresolved conflict.");
+    ExitCode::from(128)
+}
+
+/// git's `apply_autostash_ref(r, "MERGE_AUTOSTASH", …)` — the last thing
+/// `cmd_commit` does. `git merge --autostash` that stopped on a conflict parked
+/// the dirty worktree under `MERGE_AUTOSTASH`; the commit that concludes the
+/// merge puts it back.
+///
+/// The ref goes away either way: a clean apply reports `Applied autostash.`, and
+/// a conflicting one hands the commit to `git stash store` so it stays reachable
+/// through `refs/stash` (`apply_save_autostash_oid()`).
+fn apply_merge_autostash(repo: &gix::Repository) -> Result<()> {
+    let Some(stash) = read_state_oid(repo, "MERGE_AUTOSTASH") else {
+        return Ok(());
+    };
+    let conflicts = super::stash::apply_autostash(repo, stash, true)?;
+    if conflicts.is_empty() {
+        eprintln!("Applied autostash.");
+    } else {
+        let args = ["store", "-m", "autostash", "-q", &stash.to_string()]
+            .map(str::to_string)
+            .to_vec();
+        if super::stash::stash(&args).is_err() {
+            eprintln!("error: cannot store {stash}");
+        } else {
+            eprintln!(
+                "Your local changes are stashed, however applying them\n\
+                 resulted in conflicts.  You can either resolve the conflicts\n\
+                 and then discard the stash with \"git stash drop\", or, if you\n\
+                 do not want to resolve them now, run \"git reset --hard\" and\n\
+                 apply the local changes later by running \"git stash pop\"."
+            );
+        }
+    }
+    delete_state_ref(repo, "MERGE_AUTOSTASH");
+    Ok(())
+}
+
+/// git's `get_merge_parent()` loop over `MERGE_HEAD`: one object id per line.
+fn read_merge_heads(repo: &gix::Repository) -> Result<Vec<ObjectId>> {
+    let path = repo.git_dir().join("MERGE_HEAD");
+    let text = std::fs::read_to_string(&path)?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let id = repo
+            .rev_parse_single(line)
+            .map_err(|_| anyhow::anyhow!("Corrupt MERGE_HEAD file ({line})"))?;
+        out.push(repo.find_commit(id.detach())?.id);
+    }
+    Ok(out)
+}
+
+/// git's `reduce_heads_replace()` on the parent list: drop every parent that is
+/// already an ancestor of another, keeping the first occurrence's order.
+///
+/// Skipped when `MERGE_MODE` says `no-ff`, because the user asked for a merge
+/// commit even where a fast-forward would have done.
+fn reduce_heads(repo: &gix::Repository, parents: Vec<ObjectId>) -> Result<Vec<ObjectId>> {
+    let mut kept: Vec<ObjectId> = Vec::new();
+    for (i, cand) in parents.iter().enumerate() {
+        if parents.iter().take(i).any(|p| p == cand) {
+            continue;
+        }
+        let redundant = parents.iter().enumerate().any(|(j, other)| {
+            i != j && other != cand && is_ancestor(repo, *cand, *other).unwrap_or(false)
+        });
+        if !redundant {
+            kept.push(*cand);
+        }
+    }
+    Ok(kept)
+}
+
+/// True when `ancestor` is reachable from `tip` (or is `tip` itself) — the same
+/// merge-base test `in_merge_bases()` performs, which stops at the common
+/// ancestor instead of walking the whole history.
+fn is_ancestor(repo: &gix::Repository, ancestor: ObjectId, tip: ObjectId) -> Result<bool> {
+    if ancestor == tip {
+        return Ok(true);
+    }
+    Ok(matches!(repo.merge_base(ancestor, tip), Ok(base) if base.detach() == ancestor))
+}
+
 /// `git commit` — record a commit from the staged index.
 ///
 /// Supported invocation forms (the ones the meta workflow relies on):
@@ -151,6 +404,21 @@ struct DryRun {
 ///
 /// `--fixup=reword:` is still not backed and fails with a precise message rather
 /// than silently doing the wrong thing.
+///
+/// A commit that *concludes an operation* — [`determine_whence`] — is not an
+/// ordinary commit. Concluding a merge takes `HEAD` plus every id in `MERGE_HEAD`
+/// as its parents (reduced with `reduce_heads_replace()` unless `MERGE_MODE` says
+/// `no-ff`), defaults its message to `MERGE_MSG` (behind `SQUASH_MSG`, when a
+/// `merge --squash` left one), is exempt from the nothing-to-commit guard, and
+/// prints no diffstat. Concluding a cherry-pick or rebase pick keeps the picked
+/// commit's authorship and writes a `commit (cherry-pick)`/`commit (rebase)`
+/// reflog line. Afterwards the state is torn down exactly as git tears it down:
+/// `CHERRY_PICK_HEAD`, `REVERT_HEAD` and `AUTO_MERGE` are deleted (with the
+/// `sequencer` directory once the last pick is in), then `MERGE_HEAD`,
+/// `MERGE_MSG`, `MERGE_MODE` and `SQUASH_MSG`; rerere records the resolutions;
+/// and `MERGE_AUTOSTASH` is put back. `--amend` and a pathspec-limited commit are
+/// both refused while an operation is in progress, and unmerged index entries
+/// refuse the commit with git's `U<TAB><path>` report and exit 128.
 pub fn commit(args: &[String]) -> Result<ExitCode> {
     // --- argument parsing ------------------------------------------------
     let mut messages: Vec<String> = Vec::new();
@@ -617,8 +885,32 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // --- repository + serialized read-modify-write -----------------------
     let repo = gix::discover(".")?;
     // Serialize tree build + commit + HEAD update through the repo coordinator so
-    // concurrent zvcs writers queue instead of racing. Held across the whole op.
-    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    // concurrent zvcs writers queue instead of racing. Held across the whole op —
+    // except that `-p`/`--interactive` must run the selector *outside* the lane,
+    // exactly as git's `prepare_index()` runs `interactive_add()` before it takes
+    // the index lock. The selector hands each accepted hunk to a `git apply`
+    // CHILD process, and a lane this process already holds is not reentrant across
+    // a process boundary: the child would find it busy, queue itself as a job and
+    // exit, and the whole selection would be silently dropped. It is re-taken the
+    // moment the selector returns.
+    let mut _lock = (!interactive).then(|| crate::lock::RepoLock::acquire(repo.git_dir()));
+
+    // --- `determine_whence()` --------------------------------------------
+    // A merge, cherry-pick, revert or rebase left in the index is what this
+    // commit concludes; everything downstream (parents, default message, which
+    // options are legal, what state is torn down) keys off this.
+    let whence = determine_whence(&repo);
+
+    // `parse_and_validate_options()`: an in-progress operation forbids `--amend`,
+    // because the commit being replaced is not the one the operation is building.
+    if amend && whence != Whence::Commit {
+        anyhow::bail!("You are in the middle of a {} -- cannot amend.", whence.noun());
+    }
+    // `prepare_index()`: a pathspec-limited commit builds a tree that ignores the
+    // rest of the index, which would silently drop the operation's other paths.
+    if only_mode && whence != Whence::Commit {
+        anyhow::bail!("cannot do a partial commit during a {}.", whence.noun());
+    }
 
     // --- `-p`/`--interactive`: hand staging to the hunk selector ----------
     // git's `prepare_index()` runs `interactive_add()` before anything reads the
@@ -644,6 +936,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             anyhow::bail!("interactive add failed");
         }
         interactive_stage = Some(guard);
+        // The selector is done and its `apply` children have exited, so the lane
+        // is safe to hold again for the tree build, the commit and the ref update.
+        _lock = Some(crate::lock::RepoLock::acquire(repo.git_dir()));
     }
 
     // `--dry-run` returns before any message is read, any hook fires and any
@@ -850,12 +1145,15 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         .then(|| repo.open_index())
         .transpose()?;
 
-    // Refuse while conflicts are staged, exactly as git does.
+    // Refuse while conflicts are staged, exactly as git does — `refresh_cache_or_die()`
+    // reports every unmerged path and then `die_resolve_conflict("commit")`.
     if let Some(index) = &index {
-        for entry in index.entries() {
-            if entry.stage() != gix::index::entry::Stage::Unconflicted {
-                anyhow::bail!("committing is not possible because you have unmerged files");
-            }
+        if index
+            .entries()
+            .iter()
+            .any(|e| e.stage() != gix::index::entry::Stage::Unconflicted)
+        {
+            return Ok(die_resolve_conflict(index));
         }
     }
 
@@ -914,11 +1212,28 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     } else {
         None
     };
+    // Concluding a merge appends every id in `MERGE_HEAD` after `HEAD`, so the
+    // commit records *both* sides. Without this the second parent is silently
+    // dropped and the merge never happened as far as history is concerned.
     let parents: Vec<ObjectId> = match &amend_head {
         Some(hc) => hc.parent_ids().map(|id| id.detach()).collect(),
+        None if whence == Whence::Merge => {
+            let mut p: Vec<ObjectId> = head_tip.into_iter().collect();
+            p.extend(read_merge_heads(&repo)?);
+            // `MERGE_MODE` holding `no-ff` means the user asked for a merge commit
+            // even where one side already contains the other, so the redundant
+            // parent is kept; otherwise `reduce_heads_replace()` prunes it.
+            let no_ff = std::fs::read(repo.git_dir().join("MERGE_MODE"))
+                .map(|b| b == b"no-ff")
+                .unwrap_or(false);
+            if no_ff { p } else { reduce_heads(&repo, p)? }
+        }
         None => head_tip.into_iter().collect(),
     };
     let is_root = parents.is_empty();
+    // git's `log_tree_commit()` prints no diff for a commit with several parents,
+    // so `print_commit_summary()` degenerates to the headline for a merge.
+    let is_merge_commit = parents.len() > 1;
 
     let parent_tree_id = match parents.first() {
         Some(p) => Some(repo.find_commit(*p)?.tree_id()?.detach()),
@@ -931,8 +1246,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         None => tree_id == ObjectId::empty_tree(hash),
     };
     // `--amend` always produces a new commit (a message- or author-only amend is
-    // valid), so it is exempt from the empty-change guard.
-    if unchanged && !allow_empty {
+    // valid), so it is exempt from the empty-change guard. So is concluding a
+    // merge — git's `!committable && whence != FROM_MERGE` — because resolving
+    // every conflict back to `HEAD`'s content still has to record the merge.
+    if unchanged && !allow_empty && whence != Whence::Merge {
         if amend {
             // git refuses an amend whose result would be empty (tree unchanged
             // from the parent) unless --allow-empty, with its own message.
@@ -941,6 +1258,24 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                  it empty. You can repeat your command with --allow-empty, or you can\n\
                  remove the commit entirely with \"git reset HEAD^\"."
             );
+        }
+        // A cherry-pick or rebase pick whose conflict resolution left nothing to
+        // record is a distinct situation from "you staged nothing": the pick has
+        // to be either recorded empty or skipped, and git says which.
+        if whence.is_cherry_pick() || whence.is_rebase() {
+            eprint!(
+                "The previous cherry-pick is now empty, possibly due to conflict resolution.\n\
+                 If you wish to commit it anyway, use:\n\
+                 \n    \
+                 git commit --allow-empty\n\
+                 \n"
+            );
+            if whence.is_rebase() {
+                eprintln!("Otherwise, please use 'git rebase --skip'");
+            } else {
+                eprintln!("Otherwise, please use 'git cherry-pick --skip'");
+            }
+            return Ok(ExitCode::from(1));
         }
         anyhow::bail!("nothing to commit (no changes staged)");
     }
@@ -968,6 +1303,21 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         None => snap.string("commit.template").map(|v| expand_tilde(&v.to_string())),
     };
 
+    // `prepare_to_commit()`'s message sources that sit below `-m`/`-F`/`-C`/
+    // `--fixup` and above `commit.template`: `MERGE_MSG` — git's own
+    // "Merge branch ..." headline plus the commented conflict list — with
+    // `SQUASH_MSG` prepended when a `merge --squash` produced one, or `SQUASH_MSG`
+    // on its own. Without this a concluded merge would be committed under an
+    // empty (or template) message rather than the one the merge prepared.
+    let merge_msg = std::fs::read_to_string(repo.git_dir().join("MERGE_MSG")).ok();
+    let squash_msg = std::fs::read_to_string(repo.git_dir().join("SQUASH_MSG")).ok();
+    let merge_msg_seed: Option<String> = match (&merge_msg, &squash_msg) {
+        (Some(m), Some(s)) => Some(format!("{s}{m}")),
+        (Some(m), None) => Some(m.clone()),
+        (None, Some(s)) => Some(s.clone()),
+        (None, None) => None,
+    };
+
     // The buffer git hands the editor (and, without one, the message itself).
     let mut buf = if from_flags {
         message.clone()
@@ -991,6 +1341,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             .expect("amend implies HEAD")
             .message_raw()?
             .to_string()
+    } else if let Some(m) = &merge_msg_seed {
+        m.clone()
     } else if let Some(path) = &template_file {
         std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("could not read commit template '{}': {e}", path.display()))?
@@ -1001,7 +1353,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // contents cleaned with the same mode, and only when it actually seeded `buf`.
     let template_seed: Option<String> = match (&template_file, from_flags) {
         (Some(path), false)
-            if squash_fixup_seed.is_none() && reuse_commit.is_none() && !amend =>
+            if squash_fixup_seed.is_none()
+                && reuse_commit.is_none()
+                && !amend
+                && merge_msg_seed.is_none() =>
         {
             Some(cleanup_message(
                 &std::fs::read_to_string(path).unwrap_or_default(),
@@ -1032,7 +1387,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         if !buf.is_empty() && !buf.ends_with('\n') {
             buf.push('\n');
         }
-        buf.push_str(&editor_status_block(&repo, is_root, &comment, cleanup)?);
+        buf.push_str(&editor_status_block(&repo, is_root, &comment, cleanup, whence)?);
     }
     std::fs::write(&msg_path, &buf)?;
     if use_editor && include_status && verbose {
@@ -1097,11 +1452,23 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `--author` then swaps name/email, `--date` the time. `None` means no
     // override — the plain `repo.commit()` fast path (config author + canonical
     // reflog) runs unchanged, so a bare `git commit` is byte-for-byte as before.
+    // Concluding a cherry-pick, revert or rebase pick keeps the *picked* commit's
+    // authorship — git's `author_message = "CHERRY_PICK_HEAD"`, which outranks
+    // `-C`/`-c` and is disarmed only by `--reset-author`.
+    let cherry_author: Option<gix::actor::Signature> =
+        match (whence.is_cherry_pick() || whence.is_rebase()) && !reset_author {
+            true => match read_state_oid(&repo, "CHERRY_PICK_HEAD") {
+                Some(id) => Some(repo.find_commit(id)?.author()?.to_owned()?),
+                None => None,
+            },
+            false => None,
+        };
     let needs_author = amend
         || reset_author
         || author_override.is_some()
         || date_override.is_some()
-        || reuse_commit.is_some();
+        || reuse_commit.is_some()
+        || cherry_author.is_some();
     let author_owned: Option<gix::actor::Signature> = if needs_author {
         let cfg_author = || -> Result<gix::actor::Signature> {
             Ok(repo
@@ -1112,6 +1479,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         };
         let mut base = if reset_author {
             cfg_author()?
+        } else if let Some(a) = &cherry_author {
+            a.clone()
         } else if let Some(rc) = &reuse_commit {
             rc.author()?.to_owned()?
         } else if let Some(hc) = &amend_head {
@@ -1147,6 +1516,18 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         GpgSign::Unset if snap.boolean("commit.gpgSign") != Some(true) => None,
         GpgSign::Unset => Some(Signer::resolve(&snap, None)),
         GpgSign::On(key) => Some(Signer::resolve(&snap, key)),
+    };
+
+    // git's `reflog_msg`: "commit", "commit (initial)", "commit (amend)",
+    // "commit (merge)", "commit (cherry-pick)" or "commit (rebase)". gix derives
+    // the first four from the parent count on its own, so only the sequencer's two
+    // need to be supplied — and supplying one forces the explicit write path below.
+    let reflog_override: Option<String> = if whence.is_cherry_pick() {
+        Some(format!("commit (cherry-pick): {subject}"))
+    } else if whence.is_rebase() {
+        Some(format!("commit (rebase): {subject}"))
+    } else {
+        None
     };
 
     // --- write the commit and advance HEAD -------------------------------
@@ -1186,11 +1567,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             deref: true,
         })?;
         new.attach(&repo)
-    } else if signer.is_some() {
+    } else if signer.is_some() || reflog_override.is_some() {
         // A signed commit needs the `gpgsig` header, which `Repository::commit`
-        // cannot carry, so the object is written here and `HEAD` advanced with
-        // gix's own `commit`/`commit (initial)` reflog line — the same wording and
-        // the same first-parent safety check the fast path uses.
+        // cannot carry, and a sequencer commit needs its own reflog wording; both
+        // write the object here and advance `HEAD` themselves, otherwise with
+        // gix's `commit`/`commit (initial)`/`commit (merge)` line — the same
+        // wording and the same first-parent safety check the fast path uses.
         let committer = committer_owned()?;
         let author = match &author_owned {
             Some(a) => a.clone(),
@@ -1216,11 +1598,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 log: gix::refs::transaction::LogChange {
                     mode: gix::refs::transaction::RefLog::AndReference,
                     force_create_reflog: false,
-                    message: gix::reference::log::message(
-                        "commit",
-                        message.as_str().into(),
-                        parent_count,
-                    ),
+                    message: match &reflog_override {
+                        Some(m) => m.as_str().into(),
+                        None => gix::reference::log::message(
+                            "commit",
+                            message.as_str().into(),
+                            parent_count,
+                        ),
+                    },
                 },
                 expected: match first_parent {
                     Some(p) => gix::refs::transaction::PreviousValue::MustExistAndMatch(
@@ -1264,6 +1649,34 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         stage.keep();
     }
 
+    // The operation this commit concluded is over: drop the sequencer pseudo-refs
+    // (and its todo directory once the last pick is in), then the merge state
+    // files. Leaving `MERGE_HEAD` behind is what makes the next `git merge` die
+    // with "You have not concluded your merge".
+    sequencer_post_commit_cleanup(&repo)?;
+    for name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG"] {
+        let path = repo.git_dir().join(name);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+    }
+
+    // `repo_rerere()` — the resolutions the user just staged become postimages, so
+    // the same conflict replays automatically next time. Run here, after the index
+    // is committed, exactly where `cmd_commit` calls it; `MERGE_RR` (which names
+    // the conflict ids) deliberately survives the teardown above so this can pair
+    // each resolved path with the preimage recorded when the conflict appeared.
+    //
+    // Guarded on the index file existing: git's `rerere()` reaches the index
+    // through `repo_read_index()`, which yields an *empty* index when the file is
+    // absent, while `rerere::repo_rerere` opens it and errors out. A repo with no
+    // index file has no unmerged entries and so nothing for rerere to do, which
+    // makes the guard the same no-op — but it belongs in `rerere.rs`, whose
+    // `open_index()` calls should tolerate a missing file the way git's do.
+    if repo.index_path().exists() {
+        super::rerere::repo_rerere(&repo, None)?;
+    }
+
     // `--amend` rewrites a commit, so git notifies `post-rewrite` with the
     // `amend` mode and one `<old-sha1> SP <new-sha1>` line on stdin;
     // `--no-post-rewrite` suppresses it. Its exit status is ignored.
@@ -1278,8 +1691,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `--no-verify`, and its exit status is ignored.
     let _ = crate::hooks::run(&repo, "post-commit", &[], None);
 
+    // `print_commit_summary()`, skipped by `-q`. It is the last thing before
+    // `apply_autostash_ref()`, so the block is exited rather than returned from.
+    'summary: {
     if quiet {
-        return Ok(ExitCode::SUCCESS);
+        break 'summary;
     }
 
     // --- summary line ----------------------------------------------------
@@ -1300,9 +1716,15 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if author.name != committer.name || author.email != committer.email {
         println!(" Author: {} <{}>", author.name, author.email);
     }
-    let a_time = author.time()?;
-    let c_time = committer.time()?;
-    if a_time.seconds != c_time.seconds || a_time.offset != c_time.offset {
+    // git's `author_date_is_interesting()` — `author_message || force_date`. The
+    // author date is shown whenever it came from somewhere other than the clock:
+    // a reused message (`-C`/`-c`), an amend, the commit a pick is replaying, or
+    // `--date`. It is *not* inferred from the two dates differing, so a pick whose
+    // author second happens to equal the committer's still prints the line.
+    let author_date_is_interesting = date_override.is_some()
+        || (!reset_author && (reuse_commit.is_some() || amend || cherry_author.is_some()));
+    if author_date_is_interesting {
+        let a_time = author.time()?;
         let dt = a_time
             .format(gix::date::time::format::DEFAULT)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1310,6 +1732,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- short-stat + create/delete/mode-change summary ------------------
+    // `log_tree_diff()` bails out on a commit with more than one parent unless a
+    // combined-diff mode is asked for, which `print_commit_summary()` never does,
+    // so a merge prints its headline and nothing else.
+    if is_merge_commit {
+        break 'summary;
+    }
     // Old file set (path -> mode, id) flattened from the parent tree; empty for
     // the root commit.
     let mut old_entries: HashMap<BString, (EntryMode, ObjectId)> = HashMap::new();
@@ -1387,6 +1815,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             println!(" {l}");
         }
     }
+    } // 'summary
+
+    // The merge is concluded, so the worktree `merge --autostash` put aside comes
+    // back — git's very last act in `cmd_commit`.
+    apply_merge_autostash(&repo)?;
 
     Ok(ExitCode::SUCCESS)
 }
@@ -1686,8 +2119,32 @@ fn editor_status_block(
     is_root: bool,
     comment: &str,
     cleanup: Cleanup,
+    whence: Whence,
 ) -> Result<String> {
-    let mut buf = String::from("\n");
+    let mut buf = String::new();
+    // `prepare_to_commit()` warns above everything else when an operation is being
+    // concluded, and moves the scissors line above the warning with it so the
+    // warning survives a `--cleanup=scissors` message.
+    if whence != Whence::Commit {
+        if cleanup == Cleanup::Scissors {
+            buf.push_str(&scissors_line(comment));
+        }
+        let (what, refname) = match whence {
+            Whence::Merge => ("merge", "MERGE_HEAD"),
+            _ => ("cherry-pick", "CHERRY_PICK_HEAD"),
+        };
+        // `status_printf_ln()` comments each line, indents nothing after a leading
+        // tab, and its `trail` adds the blank line before git's own `fprintf("\n")`.
+        buf.push_str(&format!(
+            "{comment}\n\
+             {comment} It looks like you may be committing a {what}.\n\
+             {comment} If this is not correct, please run\n\
+             {comment}\tgit update-ref -d {refname}\n\
+             {comment} and try again.\n\
+             \n"
+        ));
+    }
+    buf.push('\n');
     match cleanup {
         Cleanup::Strip => {
             buf.push_str(&format!(
@@ -1697,7 +2154,9 @@ fn editor_status_block(
                 "{comment} with '{comment}' will be ignored, and an empty message aborts the commit.\n"
             ));
         }
-        Cleanup::Scissors => buf.push_str(&scissors_line(comment)),
+        // Already emitted above when an operation is being concluded.
+        Cleanup::Scissors if whence == Whence::Commit => buf.push_str(&scissors_line(comment)),
+        Cleanup::Scissors => {}
         Cleanup::Whitespace | Cleanup::Verbatim => {
             buf.push_str(&format!(
                 "{comment} Please enter the commit message for your changes. Lines starting\n"

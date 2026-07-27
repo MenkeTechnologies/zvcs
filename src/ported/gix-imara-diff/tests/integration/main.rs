@@ -25,6 +25,9 @@ mod fuzzed {
         after_str: &'a str,
     }
 
+    /// Runs the historical fuzz target body and reports how long the cost-capped algorithms
+    /// took versus the uncapped `MyersMinimal` one, since only the former have a bounded
+    /// worst case (see [`timeout_regression`]).
     fn run_comprehensive_diff_fuzz_case(
         ComprehensiveDiffInput {
             before,
@@ -32,10 +35,13 @@ mod fuzzed {
             after,
             after_str,
         }: ComprehensiveDiffInput<'_>,
-    ) {
+    ) -> (Duration, Duration) {
         let input = InternedInput::new(before, after);
 
+        let mut capped = Duration::ZERO;
+        let mut minimal = Duration::ZERO;
         for algorithm in [Algorithm::Histogram, Algorithm::Myers, Algorithm::MyersMinimal] {
+            let start = Instant::now();
             let mut diff = Diff::compute(algorithm, &input);
 
             let _ = diff.count_additions();
@@ -49,16 +55,26 @@ mod fuzzed {
 
             diff.postprocess_no_heuristic(&input);
             diff.postprocess_lines(&input);
+
+            if algorithm == Algorithm::MyersMinimal {
+                minimal += start.elapsed();
+            } else {
+                capped += start.elapsed();
+            }
         }
 
         let input = InternedInput::new(before_str, after_str);
         let mut word_input = InternedInput::default();
         let mut word_diff = Diff::default();
 
+        let start = Instant::now();
         let diff = Diff::compute(Algorithm::Myers, &input);
         for hunk in diff.hunks() {
             hunk.latin_word_diff(&input, &mut word_input, &mut word_diff);
         }
+        capped += start.elapsed();
+
+        (capped, minimal)
     }
 
     #[test]
@@ -68,16 +84,32 @@ mod fuzzed {
         )))
         .expect("testcase matches the historical fuzz target input layout");
 
-        let start = Instant::now();
-        run_comprehensive_diff_fuzz_case(input);
-        let elapsed = start.elapsed();
+        let (capped, minimal) = run_comprehensive_diff_fuzz_case(input);
 
+        // Histogram and the default Myers both stop searching at `xenv->mxcost`, so this
+        // 95k-versus-2k-line fixture of 16 distinct lines has to stay fast no matter what.
         let expected = Duration::from_secs(3);
         assert!(
-            elapsed < expected,
-            "clusterfuzz regression took {:?}, expected less than {:?}",
-            elapsed,
-            expected
+            capped < expected,
+            "clusterfuzz regression took {capped:?} in the cost-capped algorithms, expected less than {expected:?}"
+        );
+
+        // `MyersMinimal` is git's `XDF_NEED_MINIMAL`, and git's `xdl_split()` deliberately
+        // skips both the snake heuristic and the `mxcost` cutoff for it -- it searches until
+        // the forward and backward paths actually cross. On this fixture that is real work
+        // that git itself pays: `git diff --no-index --text --minimal` over the two sides
+        // takes 1.93s against 0.02s without `--minimal`, and produces a different edit
+        // script. Capping the search would make the output diverge from git, so the budget
+        // has to accommodate the search rather than the other way round. Measured on this
+        // fixture: 1.40s built with optimizations, 83.4s without them.
+        let expected = if cfg!(debug_assertions) {
+            Duration::from_secs(240)
+        } else {
+            Duration::from_secs(10)
+        };
+        assert!(
+            minimal < expected,
+            "clusterfuzz regression took {minimal:?} in MyersMinimal, expected less than {expected:?}"
         );
     }
 }

@@ -119,13 +119,56 @@ pub fn resolve(sub: &str, rest: &[String], pager_forced: &mut Option<bool>) -> O
     }
 }
 
-/// Look up `alias.<name>` in the repository's resolved config (all scopes), or
-/// `None` when unset or outside a repository.
+/// Port of `alias_lookup`/`config_alias_cb` (alias.c): find the alias body for
+/// `name` in the repository's resolved config (all scopes), or `None` when unset
+/// or outside a repository.
+///
+/// git accepts two spellings and this scans for both, last match winning as its
+/// config callback does:
+///
+/// * `[alias] co = checkout` — the name is everything after `alias.`, matched
+///   **case-insensitively**, and may itself contain dots (`alias.foo.bar` names
+///   the alias `foo.bar`).
+/// * `[alias "co"] command = checkout` — the name is the subsection, matched
+///   **case-sensitively as raw bytes**, so it can hold spaces and non-ASCII.
+///
+/// An empty subsection (`[alias ""]`) counts as no subsection, and any *other*
+/// key inside a subsection falls back to the first form, which is what keeps
+/// `alias.foo.bar` working after the parser has split it.
 fn lookup(name: &str) -> Option<String> {
+    use gix::bstr::ByteSlice;
+
     let repo = gix::discover(".").ok()?;
-    repo.config_snapshot()
-        .string(&format!("alias.{name}"))
-        .map(|v| v.to_string())
+    let snapshot = repo.config_snapshot();
+    let sections = snapshot.plumbing().sections_by_name("alias")?;
+
+    let mut found: Option<String> = None;
+    for section in sections {
+        let subsection = section
+            .header()
+            .subsection_name()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_vec());
+        for key in section.value_names() {
+            let matches = match &subsection {
+                // `[alias "<name>"] command = …`: raw-byte comparison.
+                Some(sub) if key.eq_ignore_ascii_case("command") => sub == name.as_bytes(),
+                // Any other key under a subsection is re-read as the flat form
+                // `alias.<subsection>.<key>`.
+                Some(sub) => {
+                    let flat = format!("{}.{key}", sub.to_str_lossy());
+                    flat.eq_ignore_ascii_case(name)
+                }
+                None => key.eq_ignore_ascii_case(name),
+            };
+            if matches {
+                if let Some(v) = section.value(&key) {
+                    found = Some(v.to_string());
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Run a `!`-prefixed shell alias, git's `handle_alias` shell path: the alias

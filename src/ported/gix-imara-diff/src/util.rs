@@ -51,10 +51,25 @@ pub fn strip_common_postfix(file1: &mut &[Token], file2: &mut &[Token]) -> u32 {
     off
 }
 
-/// Computes an approximation of the square root using bit operations.
+/// Port of `xdl_bogosqrt()` from git's `xdiff/xutils.c`.
+///
+/// ```c
+/// uint64_t xdl_bogosqrt(uint64_t n) {
+///         uint64_t i;
+///         for (i = 1; n > 0; n >>= 2)
+///                 i <<= 1;
+///         return i;
+/// }
+/// ```
+///
+/// The loop runs once per two significant bits of `n`, rounding *up*, so the
+/// result is `1 << ceil(bits(n) / 2)`. Rounding down instead — which is what a
+/// plain `bits / 2` does — halves the value whenever `n` has an odd number of
+/// significant bits, which changes both the multi-match threshold used when
+/// discarding records and the cost cutoff of the split search.
 pub fn sqrt(val: usize) -> u32 {
-    let nbits = (usize::BITS - val.leading_zeros()) / 2;
-    1 << nbits
+    let nbits = usize::BITS - val.leading_zeros();
+    1 << nbits.div_ceil(2)
 }
 
 impl Hunk {

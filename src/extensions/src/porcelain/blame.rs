@@ -14,6 +14,18 @@ const MINIMUM_ABBREV: usize = 4;
 /// `BLAME_DEFAULT_MOVE_SCORE` (`blame.h:13`), the score a bare `-M` installs.
 pub(super) const BLAME_DEFAULT_MOVE_SCORE: u32 = 20;
 
+/// `BLAME_DEFAULT_COPY_SCORE` (`blame.h:14`), the score a bare `-C` installs.
+pub(super) const BLAME_DEFAULT_COPY_SCORE: u32 = 40;
+
+/// git's `parse_score()`: `strtoul` over the whole argument, where anything it cannot consume
+/// entirely yields 0.
+///
+/// A 0 is returned as `None` because git only overrides `sb->move_score` / `sb->copy_score`
+/// `if (blame_move_score)` / `if (blame_copy_score)`, leaving the default in place otherwise.
+fn parse_score(arg: &str) -> Option<u32> {
+    arg.parse::<u32>().ok().filter(|&score| score != 0)
+}
+
 /// Byte-for-byte reproduction of `git blame`'s usage text, printed on stderr with
 /// exit status 129 when no path is given (the only usage error we produce).
 const USAGE: &str = concat!(
@@ -309,6 +321,23 @@ fn approxidate(value: &str) -> i64 {
 /// The optional score is git's `sb->move_score` (20 by default) and, via
 /// `blame_entry_score()`, keeps trivial lines from being credited to a chance match.
 ///
+/// `-C[<score>]` is the `PICKAXE_BLAME_COPY` block, i.e. `find_copy_in_parent()`. Where
+/// `-M` only re-offers a chunk to the blob the same file has in a parent, `-C` offers it
+/// to *other* files there as well: a bare `-C` looks at the paths the commit changed or
+/// removed, `-C -C` also at the files it left alone while the blamed path is new to the
+/// parent, and `-C -C -C` at every file in every parent. Whichever file yields the least
+/// trivial match becomes the chunk's *Source File*, so one commit can be the suspect for
+/// chunks from several of its files at once — which is why `gix-blame`'s suspect is now a
+/// `(commit, path)` origin, as git's `blame_origin` is, and why `assign_blame()`'s
+/// one-origin-per-round loop is reproduced here. Any `-C` also turns `-M` on, as
+/// `blame_copy_callback()` does. `sb->copy_score` defaults to 40.
+///
+/// The score of `-M`/`-C` is an *attached* argument that `parse_score()` reads with
+/// `strtoul` over the whole of it, so `-CC` is a single `-C` whose score `"C"` reads as 0,
+/// and a 0 — from `-C0` or from an unparsable score — leaves the default in place. This
+/// was verified against git 2.55.0 rather than assumed: `git blame -C -C` finds a copy
+/// from an untouched file where `git blame -CC` does not.
+///
 /// Coloring follows `builtin/blame.c` exactly: `blame.coloring` supplies the
 /// default mode when neither color option is given, `color.blame.repeatedLines`
 /// (default cyan) paints the metadata of every line after the first in an entry,
@@ -323,9 +352,9 @@ fn approxidate(value: &str) -> i64 {
 /// bits, so it also cancels a preceding `-p`), and `--no-abbrev` (equivalent to
 /// `--abbrev=0`, i.e. the full hash). `--no-ignore-rev` / `--no-ignore-revs-file`
 /// clear their `OPT_STRING_LIST`s, config-supplied entries included. The `--no-`
-/// forms of the unimplemented options (`--no-incremental`, `--no-show-stats`,
-/// `--no-score-debug`) each select git's default, which this port already
-/// produces, so they are accepted as no-ops.
+/// forms of the unimplemented options (`--no-show-stats`, `--no-score-debug`)
+/// each select git's default, which this port already produces, so they are
+/// accepted as no-ops.
 ///
 /// `--ignore-rev <rev>`, `--ignore-revs-file <file>` and `blame.ignoreRevsFile`
 /// are implemented against a port of git's fingerprint matcher: once the ordinary
@@ -339,20 +368,24 @@ fn approxidate(value: &str) -> i64 {
 ///
 /// Flags that are not implemented are rejected with a terse message rather than
 /// emitting wrong output, each for a concrete reason:
-///   * `--incremental` — git streams *uncoalesced* entries in walk order
-///     (`blame_coalesce()` runs afterwards), while `gix-blame` only exposes the
-///     coalesced attribution, so the entry list would differ.
-///   * `--show-stats` — the counters are git's own walk instrumentation
-///     (`num_read_blob` / `num_get_patch` / `num_commits`); `gix-blame` counts
-///     different events and cannot be mapped onto them.
-///   * `--score-debug` — the second column is `ent->suspect->refcnt`, the live
-///     reference count of git's `blame_origin` graph, which depends on which
-///     origins the walk kept alive rather than on the attribution itself.
-///   * `-C` — `find_copy_in_parent()` diffs the leftover entries against *every*
-///     path the parent's tree diff turned up, so one commit can be the suspect for
-///     hunks that came from several different files at once; `gix-blame` keys a
-///     hunk's suspect by commit alone and carries a single source path, so there is
-///     nowhere to put the second path.
+///   * `--show-stats` — the three counters are `blame_scoreboard`'s own
+///     instrumentation and count *reads*, not attributions. `num commits` and
+///     `num get patch` are structural (one per `pass_blame()` that got past
+///     `pass_whole_blame()`, one per `pass_blame_to_parent()` that found entries
+///     left), but `num read blob` is one per `fill_origin_blob()` that found
+///     `blame_origin::file` empty — so it counts the *misses* of a per-origin blob
+///     cache whose lifetime is the `blame_origin` refcount graph:
+///     `pass_whole_blame()` hands the buffer to the parent origin rather than
+///     re-reading it, `fake_working_tree_commit()` seeds the starting origin's
+///     buffer from the worktree so a working-tree blame reads one blob fewer than
+///     the same blame at `HEAD` (verified: 2 versus 3 on the same file), and
+///     `find_copy_in_parent()` builds and drops a fresh origin per candidate path
+///     per round. Reproducing the number therefore means reproducing that graph,
+///     not the walk this port performs, whose per-parent structure differs.
+///   * `--score-debug` — the score column is reproducible (`blame_entry_score()`
+///     is one plus the entry's alphanumeric bytes, ported in
+///     `gix_blame::file::moved`), but the `%02d` column beside it is
+///     `ent->suspect->refcnt` — the same refcount graph, read at output time.
 ///   * `-S <revs-file>` — installs commit grafts that rewrite the ancestry the
 ///     walk follows.
 ///   * `--reverse`, regex/function `-L` forms, `--date=human` and the `-local`
@@ -568,6 +601,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         ignore_whitespace: opts.ignore_whitespace,
         detect_moved: opts.detect_moved,
         ignore_revs: ignore_revs.clone(),
+        detect_copied: opts.detect_copied,
     };
 
     // A blame of (commit, path) is a pure function of immutable objects, so the
@@ -589,8 +623,8 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     // `--incremental` is not cached either: it needs the walk-order, uncoalesced entries,
     // which the run encoding does not preserve.
     let algo_key = format!(
-        "{:?}|w={}|M={:?}",
-        opts.diff_algorithm, opts.ignore_whitespace, opts.detect_moved
+        "{:?}|w={}|M={:?}|C={:?}",
+        opts.diff_algorithm, opts.ignore_whitespace, opts.detect_moved, opts.detect_copied
     );
     let cache_key = (opts.ranges.is_empty()
         && ignore_revs.is_empty()
@@ -2194,6 +2228,9 @@ struct Options {
     ignore_whitespace: bool,
     /// `-M[<score>]`: the value is git's `sb->move_score`.
     detect_moved: Option<u32>,
+    /// `-C[<score>]`, `-C -C` and `-C -C -C`: git's `PICKAXE_BLAME_COPY*` bits together with
+    /// `sb->copy_score`.
+    detect_copied: Option<gix::blame::CopyDetection>,
     /// `--diff-algorithm=<algo>`; `None` falls back to `diff.algorithm`.
     diff_algorithm: Option<gix::diff::blob::Algorithm>,
     /// `--contents <file>`: use `<file>`'s contents (or stdin for `-`) as the
@@ -2263,6 +2300,11 @@ impl Options {
         let mut incremental = false;
         let mut ignore_whitespace = false;
         let mut detect_moved: Option<u32> = None;
+        // How many `-C`s were given and the last explicit `-C<score>` / `-M<score>`, which git
+        // keeps in `blame_copy_score` / `blame_move_score` and only applies when non-zero.
+        let mut copy_levels = 0u32;
+        let mut copy_score: Option<u32> = None;
+        let mut move_score: Option<u32> = None;
         let mut diff_algorithm: Option<gix::diff::blob::Algorithm> = None;
         let mut contents: Option<String> = None;
         let mut ignore_rev: Vec<String> = Vec::new();
@@ -2419,18 +2461,27 @@ impl Options {
                     ignore_revs_file.push(a["--ignore-revs-file=".len()..].to_string());
                 }
                 "--no-ignore-revs-file" => ignore_revs_file.clear(),
-                // The `--no-` forms of options whose positive form needs substrate
-                // this port does not have (`--incremental`, `--show-stats`,
-                // `--score-debug`). Each positive default is off, so the negated
-                // form requests exactly the behavior this port already produces;
-                // stock git emits byte-identical stdout for them (verified), so they
-                // are accepted as no-ops rather than rejected. The positive forms
-                // remain refused below.
+                // The `--no-` forms of `--show-stats` and `--score-debug`, whose
+                // positive forms need substrate this port does not have. Each
+                // positive default is off, so the negated form requests exactly the
+                // behavior this port already produces; stock git emits
+                // byte-identical stdout for them (verified), so they are accepted as
+                // no-ops rather than rejected. The positive forms remain refused.
                 // `-M[<score>]` (`blame_move_callback`): the score is an optional *attached*
                 // argument, and `parse_score` yields 0 for anything `strtoul` cannot consume whole.
-                "-M" => detect_moved = Some(BLAME_DEFAULT_MOVE_SCORE),
+                // git only overrides `sb->move_score` `if (blame_move_score)`, so a 0 — whether
+                // written as `-M0` or produced by an unparsable argument — keeps the default.
+                "-M" => detect_moved = Some(detect_moved.unwrap_or(BLAME_DEFAULT_MOVE_SCORE)),
                 _ if a.starts_with("-M") => {
-                    detect_moved = Some(a["-M".len()..].parse::<u32>().unwrap_or(0));
+                    move_score = parse_score(&a["-M".len()..]);
+                    detect_moved = Some(move_score.unwrap_or(BLAME_DEFAULT_MOVE_SCORE));
+                }
+                // `-C[<score>]` (`blame_copy_callback`): each further `-C` widens the search, and
+                // any `-C` also turns `-M` on.
+                "-C" => copy_levels += 1,
+                _ if a.starts_with("-C") => {
+                    copy_levels += 1;
+                    copy_score = parse_score(&a["-C".len()..]);
                 }
                 "--no-incremental" => incremental = false,
                 "--no-show-stats" | "--no-score-debug" => {}
@@ -2445,6 +2496,18 @@ impl Options {
                 _ => pre.push(a.to_string()),
             }
             i += 1;
+        }
+
+        // `blame_copy_callback`: the first `-C` turns on copy detection *and* `-M`, the second
+        // adds COPY_HARDER and the third COPY_HARDEST. `sb->copy_score` is only overridden by a
+        // non-zero `-C<score>`, exactly as `sb->move_score` is by `-M<score>`.
+        let detect_copied = (copy_levels > 0).then(|| gix::blame::CopyDetection {
+            score: copy_score.unwrap_or(BLAME_DEFAULT_COPY_SCORE),
+            harder: copy_levels >= 2,
+            hardest: copy_levels >= 3,
+        });
+        if detect_copied.is_some() {
+            detect_moved = Some(move_score.unwrap_or(BLAME_DEFAULT_MOVE_SCORE));
         }
 
         // The revision/path split and its validation happen against the repo in
@@ -2474,6 +2537,7 @@ impl Options {
             incremental,
             ignore_whitespace,
             detect_moved,
+            detect_copied,
             diff_algorithm,
             contents,
             ignore_rev,

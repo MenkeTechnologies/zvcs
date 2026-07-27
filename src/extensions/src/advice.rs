@@ -33,6 +33,9 @@ pub enum Advice {
     NestedTag,
     /// A command stopped because the index still carries unmerged entries.
     ResolveConflict,
+    /// The "here is how to finish resolving this" block a stopped sequencer
+    /// operation prints — `print_advice()`'s `ADVICE_MERGE_CONFLICT`.
+    MergeConflict,
     /// A sequencer operation refused to run over a dirty index
     /// (`error_dirty_index`).
     CommitBeforeMerge,
@@ -69,6 +72,18 @@ pub enum Advice {
     /// A pathspec selected only paths outside the sparse-checkout definition, so
     /// the command left the index alone (`advise_on_updating_sparse_paths`).
     UpdateSparsePath,
+    /// `git add` staged a directory that is itself a git repository, recording a
+    /// gitlink rather than the files inside it (`check_embedded_repo`).
+    AddEmbeddedRepo,
+    /// `git reset` (mixed) spent long enough refreshing the index to be worth
+    /// pointing at `--no-refresh`.
+    ResetNoRefresh,
+    /// `git status` spent long enough enumerating untracked files to be worth
+    /// pointing at `-uno` — and the slot that decides whether that is timed at all.
+    StatusUoption,
+    /// `git status` spent long enough computing the ahead/behind counts to be
+    /// worth pointing at `--no-ahead-behind`.
+    StatusAheadBehindWarning,
 }
 
 impl Advice {
@@ -80,6 +95,7 @@ impl Advice {
             Advice::StatusHints => "advice.statusHints",
             Advice::NestedTag => "advice.nestedTag",
             Advice::ResolveConflict => "advice.resolveConflict",
+            Advice::MergeConflict => "advice.mergeConflict",
             Advice::CommitBeforeMerge => "advice.commitBeforeMerge",
             Advice::RmHints => "advice.rmHints",
             Advice::PushUpdateRejected => "advice.pushUpdateRejected",
@@ -98,6 +114,10 @@ impl Advice {
             Advice::SuggestDetachingHead => "advice.suggestDetachingHead",
             Advice::ObjectNameWarning => "advice.objectNameWarning",
             Advice::UpdateSparsePath => "advice.updateSparsePath",
+            Advice::AddEmbeddedRepo => "advice.addEmbeddedRepo",
+            Advice::ResetNoRefresh => "advice.resetNoRefresh",
+            Advice::StatusUoption => "advice.statusUoption",
+            Advice::StatusAheadBehindWarning => "advice.statusAheadBehindWarning",
         }
     }
 

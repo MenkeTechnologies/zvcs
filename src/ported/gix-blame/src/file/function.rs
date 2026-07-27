@@ -9,8 +9,11 @@ use gix_object::{
 use gix_traverse::commit::find as find_commit;
 use smallvec::SmallVec;
 
-use super::{Change, UnblamedHunk, compact, moved, process_changes, process_ignored_changes};
-use crate::{BlameEntry, Error, Options, Outcome, Statistics, types::BlamePathEntry};
+use super::{Change, UnblamedHunk, compact, copied, moved, process_changes, process_ignored_changes};
+use crate::{
+    BlameEntry, Error, Options, Outcome, Statistics,
+    types::{BlamePathEntry, PathTable, Suspect},
+};
 
 /// Produce a list of consecutive [`BlameEntry`] instances to indicate in which commits the ranges of the file
 /// at `suspect:<file_path>` originated in.
@@ -96,10 +99,14 @@ pub fn file(
     // git's `sb->lineno`, which `-M` needs to cut the entry's lines out of the final image.
     let blamed_line_starts = moved::line_starts(&blamed_file_blob);
 
+    // git's `blame_origin` is a commit *and* a path; the path lives here so that a `Suspect` stays
+    // a cheap `Copy` id. Index 0 is the path being blamed.
+    let mut paths = PathTable::new(file_path);
+
     let ranges_to_blame = options.ranges.to_zero_based_exclusive_ranges(num_lines_in_blamed);
     let mut hunks_to_blame = ranges_to_blame
         .into_iter()
-        .map(|range| UnblamedHunk::new(range, suspect))
+        .map(|range| UnblamedHunk::new(range, Suspect::new(suspect)))
         .collect::<Vec<_>>();
 
     let (mut buf, mut buf2) = (Vec::new(), Vec::new());
@@ -110,97 +117,102 @@ pub fn file(
 
     let mut out = Vec::new();
     let mut diff_state = gix_diff::tree::State::default();
-    let mut previous_entry: Option<(ObjectId, ObjectId)> = None;
+    let mut previous_entry: Option<(Suspect, ObjectId)> = None;
     let mut blame_path = if options.debug_track_path {
         Some(Vec::new())
     } else {
         None
     };
 
-    'outer: while let Some(suspect) = queue.pop_value() {
+    'outer: while let Some(commit_id) = queue.pop_value() {
         stats.commits_traversed += 1;
         if hunks_to_blame.is_empty() {
             break;
         }
 
-        let first_hunk_for_suspect = hunks_to_blame.iter().find(|hunk| hunk.has_suspect(&suspect));
-        let Some(first_hunk_for_suspect) = first_hunk_for_suspect else {
-            // There are no `UnblamedHunk`s associated with this `suspect`, so we can continue with
-            // the next one.
-            continue 'outer;
-        };
-
-        let current_file_path = first_hunk_for_suspect
-            .source_file_name
-            .clone()
-            .unwrap_or_else(|| file_path.to_owned());
-
-        let commit = find_commit(cache.as_ref(), &odb, &suspect, &mut buf)?;
+        let commit = find_commit(cache.as_ref(), &odb, &commit_id, &mut buf)?;
         let commit_time = commit.commit_time()?;
-
-        if let Some(since) = options.since {
-            if commit_time < since.seconds {
-                if unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect) {
-                    break 'outer;
-                }
-
-                continue;
-            }
-        }
-
+        let target_tree_id = commit.tree_id()?;
         let parent_ids: ParentIds = collect_parents(commit, &odb, cache.as_ref(), &mut buf2)?;
 
-        if parent_ids.is_empty() {
-            if queue.is_empty() {
-                // I’m not entirely sure if this is correct yet. `suspect`, at this point, is the
-                // `id` of the last `item` that was yielded by `queue`, so it makes sense to assign
-                // the remaining lines to it, even though we don’t explicitly check whether that is
-                // true here. We could perhaps use diff-tree-to-tree to compare `suspect` against
-                // an empty tree to validate this assumption.
-                if unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect) {
-                    if let Some(ref mut blame_path) = blame_path {
-                        let entry = previous_entry
-                            .take()
-                            .filter(|(id, _)| *id == suspect)
-                            .map(|(_, entry)| entry);
+        // git's `assign_blame()` does not pop the commit while any of its origins still has
+        // entries: it picks one origin, runs `pass_blame()` for it, takes responsibility for
+        // whatever is left, and looks at the same commit again. With `-C` a commit really can be
+        // the suspect for chunks that came from several of its files, so each of those paths gets
+        // its own round here.
+        'origin: while let Some(suspect) = hunks_to_blame
+            .iter()
+            .find_map(|hunk| hunk.first_suspect_of(&commit_id))
+        {
+            let current_file_path = paths.path(suspect.path).to_owned();
 
-                        let blame_path_entry = BlamePathEntry {
-                            source_file_path: current_file_path.clone(),
-                            previous_source_file_path: None,
-                            commit_id: suspect,
-                            blob_id: entry.unwrap_or(gix_hash::Kind::shortest().null()),
-                            previous_blob_id: gix_hash::Kind::shortest().null(),
-                            parent_index: 0,
-                        };
-                        blame_path.push(blame_path_entry);
+            if let Some(since) = options.since {
+                if commit_time < since.seconds {
+                    if unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, &paths) {
+                        break 'outer;
                     }
 
-                    break 'outer;
+                    continue 'origin;
                 }
             }
-            // There is more, keep looking.
-            continue;
-        }
 
-        let mut entry = previous_entry
-            .take()
-            .filter(|(id, _)| *id == suspect)
-            .map(|(_, entry)| entry);
-        if entry.is_none() {
-            entry = find_path_entry_in_commit(
-                &odb,
-                &suspect,
-                current_file_path.as_ref(),
-                cache.as_ref(),
-                &mut buf,
-                &mut buf2,
-                &mut stats,
-            )?;
-        }
+            if parent_ids.is_empty() {
+                if queue.is_empty() {
+                    // I’m not entirely sure if this is correct yet. `suspect`, at this point, is the
+                    // `id` of the last `item` that was yielded by `queue`, so it makes sense to assign
+                    // the remaining lines to it, even though we don’t explicitly check whether that is
+                    // true here. We could perhaps use diff-tree-to-tree to compare `suspect` against
+                    // an empty tree to validate this assumption.
+                    if unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, &paths) {
+                        if let Some(ref mut blame_path) = blame_path {
+                            let entry = previous_entry
+                                .take()
+                                .filter(|(id, _)| *id == suspect)
+                                .map(|(_, entry)| entry);
 
-        let Some(entry_id) = entry else {
-            continue;
-        };
+                            let blame_path_entry = BlamePathEntry {
+                                source_file_path: current_file_path.clone(),
+                                previous_source_file_path: None,
+                                commit_id,
+                                blob_id: entry.unwrap_or(gix_hash::Kind::shortest().null()),
+                                previous_blob_id: gix_hash::Kind::shortest().null(),
+                                parent_index: 0,
+                            };
+                            blame_path.push(blame_path_entry);
+                        }
+
+                        break 'outer;
+                    }
+                }
+                // There is more, keep looking.
+                continue 'origin;
+            }
+
+            let mut entry = previous_entry
+                .take()
+                .filter(|(id, _)| *id == suspect)
+                .map(|(_, entry)| entry);
+            if entry.is_none() {
+                entry = find_path_entry_in_commit(
+                    &odb,
+                    &commit_id,
+                    current_file_path.as_ref(),
+                    cache.as_ref(),
+                    &mut buf,
+                    &mut buf2,
+                    &mut stats,
+                )?;
+            }
+
+            let Some(entry_id) = entry else {
+                // The origin's path is not in this commit's tree, so there is nothing to diff and
+                // nothing to pass on. git's `assign_blame()` then simply takes responsibility for
+                // the entries that are left.
+                if unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, &paths) {
+                    break 'outer;
+                }
+                continue 'origin;
+            };
 
         // This block asserts that, for every `UnblamedHunk`, all lines in the *Blamed File* are
         // identical to the corresponding lines in the *Source File*.
@@ -253,238 +265,277 @@ pub fn file(
             }
         }
 
-        for (pid, (parent_id, parent_commit_time)) in parent_ids.iter().enumerate() {
-            if let Some(parent_entry_id) = find_path_entry_in_commit(
-                &odb,
-                parent_id,
-                current_file_path.as_ref(),
-                cache.as_ref(),
-                &mut buf,
-                &mut buf2,
-                &mut stats,
-            )? {
-                let no_change_in_entry = entry_id == parent_entry_id;
-                if pid == 0 {
-                    previous_entry = Some((*parent_id, parent_entry_id));
-                }
-                if no_change_in_entry {
-                    pass_blame_from_to(suspect, *parent_id, &mut hunks_to_blame);
-                    queue.insert(*parent_commit_time, *parent_id);
-                    continue 'outer;
+            let mut passed_whole_blame = false;
+            for (pid, (parent_id, parent_commit_time)) in parent_ids.iter().enumerate() {
+                if let Some(parent_entry_id) = find_path_entry_in_commit(
+                    &odb,
+                    parent_id,
+                    current_file_path.as_ref(),
+                    cache.as_ref(),
+                    &mut buf,
+                    &mut buf2,
+                    &mut stats,
+                )? {
+                    let no_change_in_entry = entry_id == parent_entry_id;
+                    if pid == 0 {
+                        previous_entry = Some((Suspect::at(*parent_id, suspect.path), parent_entry_id));
+                    }
+                    if no_change_in_entry {
+                        // git's `pass_whole_blame()` followed by `goto finish`.
+                        pass_blame_from_to(suspect, Suspect::at(*parent_id, suspect.path), &mut hunks_to_blame);
+                        queue.insert(*parent_commit_time, *parent_id);
+                        passed_whole_blame = true;
+                        break;
+                    }
                 }
             }
-        }
+            if passed_whole_blame {
+                continue 'origin;
+            }
 
-        // git's `pass_blame()` runs the ordinary diff against every parent first, and only then, for
-        // an ignored commit, re-runs it against every parent with `ignore_diffs` set. What each of
-        // those second passes needs is recorded here as the first pass goes.
-        let suspect_is_ignored = options.ignore_revs.contains(&suspect);
-        // `(parent, changes, parent blob, target blob, source path if the parent renamed the file)`
-        type IgnoredPass = (ObjectId, Vec<Change>, Vec<u8>, Vec<u8>, Option<BString>);
-        let mut ignored_passes: Vec<IgnoredPass> = Vec::new();
-        // `sg_origin[]` in git's `pass_blame()`: the blob each parent holds the blamed file in, and
-        // the path it lives at there. `-M` re-diffs whatever is left over against these.
-        let mut move_parents: Vec<moved::ParentOrigin> = Vec::new();
+            // git's `pass_blame()` runs the ordinary diff against every parent first, and only then, for
+            // an ignored commit, re-runs it against every parent with `ignore_diffs` set. What each of
+            // those second passes needs is recorded here as the first pass goes.
+            let suspect_is_ignored = options.ignore_revs.contains(&commit_id);
+            // `(parent origin, changes, parent blob, target blob)`
+            type IgnoredPass = (Suspect, Vec<Change>, Vec<u8>, Vec<u8>);
+            let mut ignored_passes: Vec<IgnoredPass> = Vec::new();
+            // `sg_origin[]` in git's `pass_blame()`: the origin each parent holds the blamed file
+            // at, and the blob it has there. `-M` re-diffs whatever is left over against these.
+            let mut move_parents: Vec<moved::ParentOrigin> = Vec::new();
+            // What `find_copy_in_parent()` needs from every scapegoat, `porigin` included — unlike
+            // `-M`, `-C` also visits the parents that do not have the blamed file at all.
+            let mut copy_parents: Vec<copied::CopyParent> = Vec::new();
 
-        let more_than_one_parent = parent_ids.len() > 1;
-        for (index, (parent_id, parent_commit_time)) in parent_ids.iter().enumerate() {
-            queue.insert(*parent_commit_time, *parent_id);
-            let changes_for_file_path = tree_diff_at_file_path(
-                &odb,
-                current_file_path.as_ref(),
-                suspect,
-                *parent_id,
-                cache.as_ref(),
-                &mut stats,
-                &mut diff_state,
-                resource_cache,
-                &mut buf,
-                &mut buf2,
-                &mut buf3,
-                options.rewrites,
-            )?;
-            let Some(modification) = changes_for_file_path else {
-                if more_than_one_parent {
-                    // None of the changes affected the file we’re currently blaming.
-                    // Copy blame to parent.
-                    for unblamed_hunk in &mut hunks_to_blame {
-                        unblamed_hunk.clone_blame(suspect, *parent_id);
-                    }
-                } else {
-                    pass_blame_from_to(suspect, *parent_id, &mut hunks_to_blame);
+            let more_than_one_parent = parent_ids.len() > 1;
+            for (index, (parent_id, parent_commit_time)) in parent_ids.iter().enumerate() {
+                queue.insert(*parent_commit_time, *parent_id);
+                if options.detect_copied.is_some() {
+                    let tree_id = find_commit(cache.as_ref(), &odb, parent_id, &mut buf)?.tree_id()?;
+                    copy_parents.push(copied::CopyParent {
+                        commit_id: *parent_id,
+                        tree_id,
+                        porigin_path: None,
+                    });
                 }
-                continue;
-            };
-
-            match modification {
-                TreeDiffChange::Addition { id } => {
+                let changes_for_file_path = tree_diff_at_file_path(
+                    &odb,
+                    current_file_path.as_ref(),
+                    commit_id,
+                    *parent_id,
+                    cache.as_ref(),
+                    &mut stats,
+                    &mut diff_state,
+                    resource_cache,
+                    &mut buf,
+                    &mut buf2,
+                    &mut buf3,
+                    options.rewrites,
+                )?;
+                let Some(modification) = changes_for_file_path else {
                     if more_than_one_parent {
-                        // Do nothing under the assumption that this always (or almost always)
-                        // implies that the file comes from a different parent, compared to which
-                        // it was modified, not added.
-                    } else if unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect) {
+                        // None of the changes affected the file we’re currently blaming.
+                        // Copy blame to parent.
+                        for unblamed_hunk in &mut hunks_to_blame {
+                            unblamed_hunk.clone_blame(suspect, Suspect::at(*parent_id, suspect.path));
+                        }
+                    } else {
+                        pass_blame_from_to(suspect, Suspect::at(*parent_id, suspect.path), &mut hunks_to_blame);
+                    }
+                    continue;
+                };
+
+                match modification {
+                    TreeDiffChange::Addition { id } => {
+                        if more_than_one_parent {
+                            // Do nothing under the assumption that this always (or almost always)
+                            // implies that the file comes from a different parent, compared to which
+                            // it was modified, not added.
+                        } else if options.detect_copied.is_some() {
+                            // The file is new here, so no parent origin exists to pass anything to
+                            // — which is exactly the case `-C -C` widens the search for. Leave the
+                            // entries where they are and let the copy pass below have them; what it
+                            // does not place is finalized by the `retain_mut` at the end.
+                        } else if unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, &paths) {
+                            if let Some(ref mut blame_path) = blame_path {
+                                let blame_path_entry = BlamePathEntry {
+                                    source_file_path: current_file_path.clone(),
+                                    previous_source_file_path: None,
+                                    commit_id,
+                                    blob_id: id,
+                                    previous_blob_id: gix_hash::Kind::shortest().null(),
+                                    parent_index: index,
+                                };
+                                blame_path.push(blame_path_entry);
+                            }
+
+                            break 'outer;
+                        }
+                    }
+                    TreeDiffChange::Deletion => {
+                        unreachable!("We already found file_path in suspect^{{tree}}, so it can't be deleted")
+                    }
+                    TreeDiffChange::Modification { previous_id, id } => {
+                        let parent_origin = Suspect::at(*parent_id, suspect.path);
+                        push_move_parent(&mut move_parents, parent_origin, previous_id);
+                        if let Some(parent) = copy_parents.last_mut() {
+                            parent.porigin_path = Some(suspect.path);
+                        }
+                        let (changes, data) = blob_changes(
+                            &odb,
+                            resource_cache,
+                            id,
+                            previous_id,
+                            file_path,
+                            file_path,
+                            options.diff_algorithm,
+                            options.ignore_whitespace,
+                            &mut stats,
+                            suspect_is_ignored,
+                        )?;
+                        hunks_to_blame = process_changes(hunks_to_blame, changes.clone(), suspect, parent_origin);
+                        if let Some((old_data, new_data)) = data {
+                            ignored_passes.push((parent_origin, changes.clone(), old_data, new_data));
+                        }
                         if let Some(ref mut blame_path) = blame_path {
-                            let blame_path_entry = BlamePathEntry {
-                                source_file_path: current_file_path.clone(),
-                                previous_source_file_path: None,
-                                commit_id: suspect,
-                                blob_id: id,
-                                previous_blob_id: gix_hash::Kind::shortest().null(),
-                                parent_index: index,
-                            };
-                            blame_path.push(blame_path_entry);
-                        }
+                            let has_blame_been_passed =
+                                hunks_to_blame.iter().any(|hunk| hunk.has_suspect(&parent_origin));
 
-                        break 'outer;
-                    }
-                }
-                TreeDiffChange::Deletion => {
-                    unreachable!("We already found file_path in suspect^{{tree}}, so it can't be deleted")
-                }
-                TreeDiffChange::Modification { previous_id, id } => {
-                    push_move_parent(&mut move_parents, *parent_id, previous_id, &current_file_path);
-                    let (changes, data) = blob_changes(
-                        &odb,
-                        resource_cache,
-                        id,
-                        previous_id,
-                        file_path,
-                        file_path,
-                        options.diff_algorithm,
-                        options.ignore_whitespace,
-                        &mut stats,
-                        suspect_is_ignored,
-                    )?;
-                    hunks_to_blame = process_changes(hunks_to_blame, changes.clone(), suspect, *parent_id);
-                    if let Some((old_data, new_data)) = data {
-                        ignored_passes.push((*parent_id, changes.clone(), old_data, new_data, None));
-                    }
-                    if let Some(ref mut blame_path) = blame_path {
-                        let has_blame_been_passed = hunks_to_blame.iter().any(|hunk| hunk.has_suspect(parent_id));
-
-                        if has_blame_been_passed {
-                            let blame_path_entry = BlamePathEntry {
-                                source_file_path: current_file_path.clone(),
-                                previous_source_file_path: Some(current_file_path.clone()),
-                                commit_id: suspect,
-                                blob_id: id,
-                                previous_blob_id: previous_id,
-                                parent_index: index,
-                            };
-                            blame_path.push(blame_path_entry);
+                            if has_blame_been_passed {
+                                let blame_path_entry = BlamePathEntry {
+                                    source_file_path: current_file_path.clone(),
+                                    previous_source_file_path: Some(current_file_path.clone()),
+                                    commit_id,
+                                    blob_id: id,
+                                    previous_blob_id: previous_id,
+                                    parent_index: index,
+                                };
+                                blame_path.push(blame_path_entry);
+                            }
                         }
                     }
-                }
-                TreeDiffChange::Rewrite {
-                    source_location,
-                    source_id,
-                    id,
-                } => {
-                    push_move_parent(&mut move_parents, *parent_id, source_id, &source_location);
-                    let (changes, data) = blob_changes(
-                        &odb,
-                        resource_cache,
-                        id,
+                    TreeDiffChange::Rewrite {
+                        source_location,
                         source_id,
-                        file_path,
-                        source_location.as_ref(),
-                        options.diff_algorithm,
-                        options.ignore_whitespace,
-                        &mut stats,
-                        suspect_is_ignored,
-                    )?;
-                    hunks_to_blame = process_changes(hunks_to_blame, changes.clone(), suspect, *parent_id);
-                    if let Some((old_data, new_data)) = data {
-                        ignored_passes.push((
-                            *parent_id,
-                            changes,
-                            old_data,
-                            new_data,
-                            Some(source_location.clone()),
-                        ));
-                    }
-
-                    let mut has_blame_been_passed = false;
-
-                    for hunk in hunks_to_blame.iter_mut() {
-                        if hunk.has_suspect(parent_id) {
-                            hunk.source_file_name = Some(source_location.clone());
-
-                            has_blame_been_passed = true;
+                        id,
+                    } => {
+                        // The parent keeps the file under a different name, so its origin is a
+                        // different path — which is what makes the *Source File* column appear.
+                        let source_path = paths.intern(source_location.as_ref());
+                        let parent_origin = Suspect::at(*parent_id, source_path);
+                        push_move_parent(&mut move_parents, parent_origin, source_id);
+                        if let Some(parent) = copy_parents.last_mut() {
+                            parent.porigin_path = Some(source_path);
                         }
-                    }
+                        let (changes, data) = blob_changes(
+                            &odb,
+                            resource_cache,
+                            id,
+                            source_id,
+                            file_path,
+                            source_location.as_ref(),
+                            options.diff_algorithm,
+                            options.ignore_whitespace,
+                            &mut stats,
+                            suspect_is_ignored,
+                        )?;
+                        hunks_to_blame = process_changes(hunks_to_blame, changes.clone(), suspect, parent_origin);
+                        if let Some((old_data, new_data)) = data {
+                            ignored_passes.push((parent_origin, changes, old_data, new_data));
+                        }
 
-                    if has_blame_been_passed {
                         if let Some(ref mut blame_path) = blame_path {
-                            let blame_path_entry = BlamePathEntry {
-                                source_file_path: current_file_path.clone(),
-                                previous_source_file_path: Some(source_location.clone()),
-                                commit_id: suspect,
-                                blob_id: id,
-                                previous_blob_id: source_id,
-                                parent_index: index,
-                            };
-                            blame_path.push(blame_path_entry);
+                            let has_blame_been_passed =
+                                hunks_to_blame.iter().any(|hunk| hunk.has_suspect(&parent_origin));
+
+                            if has_blame_been_passed {
+                                let blame_path_entry = BlamePathEntry {
+                                    source_file_path: current_file_path.clone(),
+                                    previous_source_file_path: Some(source_location.clone()),
+                                    commit_id,
+                                    blob_id: id,
+                                    previous_blob_id: source_id,
+                                    parent_index: index,
+                                };
+                                blame_path.push(blame_path_entry);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // "Pass remaining suspects for ignored commits to their parents." (`blame.c`, `pass_blame`)
-        for (parent_id, changes, parent_blob, target_blob, source_file_name) in &ignored_passes {
-            if !hunks_to_blame.iter().any(|hunk| hunk.has_suspect(&suspect)) {
-                break;
-            }
-            hunks_to_blame = process_ignored_changes(
-                hunks_to_blame,
-                changes,
-                suspect,
-                *parent_id,
-                parent_blob,
-                target_blob,
-                source_file_name.as_ref(),
-            );
-        }
-
-        // "Optionally find moves in parents' files." (`blame.c`, `pass_blame`)
-        if let Some(move_score) = options.detect_moved {
-            hunks_to_blame = moved::find_moves_in_parents(
-                hunks_to_blame,
-                suspect,
-                &move_parents,
-                file_path,
-                move_score,
-                &blamed_file_blob,
-                &blamed_line_starts,
-                &odb,
-                options.diff_algorithm,
-                options.ignore_whitespace,
-                &mut stats,
-            )?;
-        }
-
-        // git's `assign_blame()` hands the entries a commit stayed responsible for to
-        // `found_guilty_entry()` right here, in `origin->suspects` order — which `blame_merge()`
-        // keeps sorted by the line in the *Blamed File*. `sort_batch_from` restores that order for
-        // the entries this iteration contributes, so `Outcome::uncoalesced_entries` matches the
-        // sequence git streams.
-        let batch_start = out.len();
-        hunks_to_blame.retain_mut(|unblamed_hunk| {
-            if unblamed_hunk.suspects.len() == 1 {
-                if let Some(entry) = BlameEntry::from_unblamed_hunk(unblamed_hunk, suspect) {
-                    // At this point, we have copied blame for every hunk to a parent. Hunks
-                    // that have only `suspect` left in `suspects` have not passed blame to any
-                    // parent, and so they can be converted to a `BlameEntry` and moved to
-                    // `out`.
-                    out.push(entry);
-                    return false;
+            // "Pass remaining suspects for ignored commits to their parents." (`blame.c`, `pass_blame`)
+            for (parent_origin, changes, parent_blob, target_blob) in &ignored_passes {
+                if !hunks_to_blame.iter().any(|hunk| hunk.has_suspect(&suspect)) {
+                    break;
                 }
+                hunks_to_blame = process_ignored_changes(
+                    hunks_to_blame,
+                    changes,
+                    suspect,
+                    *parent_origin,
+                    parent_blob,
+                    target_blob,
+                );
             }
-            unblamed_hunk.remove_blame(suspect);
-            true
-        });
-        sort_batch_from(&mut out, batch_start);
+
+            // "Optionally find moves in parents' files." (`blame.c`, `pass_blame`)
+            if let Some(move_score) = options.detect_moved {
+                hunks_to_blame = moved::find_moves_in_parents(
+                    hunks_to_blame,
+                    suspect,
+                    &move_parents,
+                    move_score,
+                    &blamed_file_blob,
+                    &blamed_line_starts,
+                    &odb,
+                    options.diff_algorithm,
+                    options.ignore_whitespace,
+                    &mut stats,
+                )?;
+            }
+
+            // "Optionally find copies from parents' files." (`blame.c`, `pass_blame`)
+            if let Some(copy) = options.detect_copied {
+                hunks_to_blame = copied::find_copies_in_parents(
+                    hunks_to_blame,
+                    suspect,
+                    target_tree_id,
+                    &copy_parents,
+                    copy,
+                    &blamed_file_blob,
+                    &blamed_line_starts,
+                    &mut paths,
+                    &odb,
+                    &mut diff_state,
+                    options.diff_algorithm,
+                    options.ignore_whitespace,
+                    &mut stats,
+                )?;
+            }
+
+            // git's `assign_blame()` hands the entries a commit stayed responsible for to
+            // `found_guilty_entry()` right here, in `origin->suspects` order — which `blame_merge()`
+            // keeps sorted by the line in the *Blamed File*. `sort_batch_from` restores that order for
+            // the entries this iteration contributes, so `Outcome::uncoalesced_entries` matches the
+            // sequence git streams.
+            let batch_start = out.len();
+            hunks_to_blame.retain_mut(|unblamed_hunk| {
+                if unblamed_hunk.suspects.len() == 1 {
+                    if let Some(entry) = BlameEntry::from_unblamed_hunk(unblamed_hunk, suspect, &paths) {
+                        // At this point, we have copied blame for every hunk to a parent. Hunks
+                        // that have only `suspect` left in `suspects` have not passed blame to any
+                        // parent, and so they can be converted to a `BlameEntry` and moved to
+                        // `out`.
+                        out.push(entry);
+                        return false;
+                    }
+                }
+                unblamed_hunk.remove_blame(suspect);
+                true
+            });
+            sort_batch_from(&mut out, batch_start);
+        }
     }
 
     debug_assert_eq!(
@@ -521,22 +572,17 @@ fn sort_batch_from(out: &mut [BlameEntry], batch_start: usize) {
 ///
 /// git skips a parent whose blob an earlier parent already contributed (`pass_blame`'s `same`
 /// check), so that a merge does not offer the same content twice.
-fn push_move_parent(
-    parents: &mut Vec<moved::ParentOrigin>,
-    parent_id: ObjectId,
-    blob_id: ObjectId,
-    path: &BString,
-) {
-    if parents.iter().any(|(_, blob, _)| *blob == blob_id) {
+fn push_move_parent(parents: &mut Vec<moved::ParentOrigin>, parent_origin: Suspect, blob_id: ObjectId) {
+    if parents.iter().any(|(_, blob)| *blob == blob_id) {
         return;
     }
-    parents.push((parent_id, blob_id, path.clone()));
+    parents.push((parent_origin, blob_id));
 }
 
 /// Pass ownership of each unblamed hunk of `from` to `to`.
 ///
 /// This happens when `from` didn't actually change anything in the blamed file.
-fn pass_blame_from_to(from: ObjectId, to: ObjectId, hunks_to_blame: &mut Vec<UnblamedHunk>) {
+fn pass_blame_from_to(from: Suspect, to: Suspect, hunks_to_blame: &mut Vec<UnblamedHunk>) {
     for unblamed_hunk in hunks_to_blame {
         unblamed_hunk.pass_blame(from, to);
     }
@@ -548,12 +594,13 @@ fn pass_blame_from_to(from: ObjectId, to: ObjectId, hunks_to_blame: &mut Vec<Unb
 fn unblamed_to_out_is_done(
     hunks_to_blame: &mut Vec<UnblamedHunk>,
     out: &mut Vec<BlameEntry>,
-    suspect: ObjectId,
+    suspect: Suspect,
+    paths: &PathTable,
 ) -> bool {
     let mut without_suspect = Vec::new();
     let batch_start = out.len();
     out.extend(hunks_to_blame.drain(..).filter_map(|hunk| {
-        BlameEntry::from_unblamed_hunk(&hunk, suspect).or_else(|| {
+        BlameEntry::from_unblamed_hunk(&hunk, suspect, paths).or_else(|| {
             without_suspect.push(hunk);
             None
         })

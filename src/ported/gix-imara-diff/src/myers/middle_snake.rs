@@ -27,6 +27,10 @@ pub struct MiddleSnakeSearch<const BACK: bool> {
     dmin: i32,
     /// Maximum possible k-diagonal value.
     dmax: i32,
+    /// The diagonal this search started from: git's `fmid` (`off1 - off2`, i.e. 0) for the
+    /// forward search and `bmid` (`lim1 - lim2`) for the backward one. The snake heuristic
+    /// penalizes a diagonal by its distance from this one.
+    kmid: i32,
 }
 
 impl<const BACK: bool> MiddleSnakeSearch<BACK> {
@@ -42,6 +46,7 @@ impl<const BACK: bool> MiddleSnakeSearch<BACK> {
             kmax: kmid,
             dmin,
             dmax,
+            kmid,
         };
         let init = if BACK { file1.len() as i32 } else { 0 };
         res.write_xpos_at_diagonal(kmid, init);
@@ -200,41 +205,54 @@ impl<const BACK: bool> MiddleSnakeSearch<BACK> {
         (best_distance, best_token_idx1)
     }
 
+    /// Port of the `got_snake && ec > xenv->heur_min` sampling loops in git's `xdl_split()`.
+    ///
+    /// Scores every live diagonal by how far it has reached from its corner, *penalized* by its
+    /// distance from the mid diagonal (`v = (i1 - off1) + (i2 - off2) - dd` going forward,
+    /// `v = (lim1 - i1) + (lim2 - i2) - dd` going backward), and returns the best-scoring
+    /// diagonal whose reach is backed by a run of at least `XDL_SNAKE_CNT` equal tokens.
     pub fn found_snake(&self, ec: u32, file1: &FileSlice, file2: &FileSlice) -> Option<(i32, i32)> {
-        let mut best_score = 0;
+        let snake_cnt = SNAKE_CNT as i32;
+        let (lim1, lim2) = (file1.len() as i32, file2.len() as i32);
+        let mut best_score = 0i64;
         let mut best_token_idx1 = 0;
         let mut best_token_idx2 = 0;
         let mut k = self.kmax;
         while k >= self.kmin {
             let (token_idx1, token_idx2) = self.pos_at_diagonal(k);
             if BACK {
-                if !(0..file1.len() as i32 - SNAKE_CNT as i32).contains(&token_idx1) {
+                // C: off1 < i1 && i1 <= lim1 - snake_cnt (and likewise for i2), with
+                // off1 == off2 == 0 in the coordinates of this slice.
+                if !(token_idx1 > 0 && token_idx1 <= lim1 - snake_cnt) {
                     k -= 2;
                     continue;
                 }
-                if !(0..file2.len() as i32 - SNAKE_CNT as i32).contains(&token_idx2) {
+                if !(token_idx2 > 0 && token_idx2 <= lim2 - snake_cnt) {
                     k -= 2;
                     continue;
                 }
             } else {
-                if !(SNAKE_CNT as i32..file1.len() as i32).contains(&token_idx1) {
+                // C: off1 + snake_cnt <= i1 && i1 < lim1 (and likewise for i2).
+                if !(snake_cnt..lim1).contains(&token_idx1) {
                     k -= 2;
                     continue;
                 }
-                if !(SNAKE_CNT as i32..file2.len() as i32).contains(&token_idx2) {
+                if !(snake_cnt..lim2).contains(&token_idx2) {
                     k -= 2;
                     continue;
                 }
             }
 
-            let main_diagonal_distance = k.unsigned_abs() as usize;
+            // C: dd = |d - fmid| forward, |d - bmid| backward. `bmid` is `lim1 - lim2`, not 0,
+            // so the penalty has to be measured against the search's own mid diagonal.
+            let main_diagonal_distance = (k - self.kmid).unsigned_abs() as i64;
             let distance = if BACK {
-                (file1.len() - token_idx1 as u32) + (file2.len() - token_idx2 as u32)
+                (lim1 - token_idx1) as i64 + (lim2 - token_idx2) as i64
             } else {
-                token_idx1 as u32 + token_idx2 as u32
+                token_idx1 as i64 + token_idx2 as i64
             };
-            let score = distance as usize + main_diagonal_distance;
-            if score > (K_HEUR * ec) as usize && score > best_score {
+            let score = distance - main_diagonal_distance;
+            if score > (K_HEUR * ec) as i64 && score > best_score {
                 let is_snake = if BACK {
                     file1.tokens[token_idx1 as usize..]
                         .iter()

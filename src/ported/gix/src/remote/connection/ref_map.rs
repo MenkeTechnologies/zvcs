@@ -5,7 +5,7 @@ use gix_transport::client::async_io::Transport;
 use gix_transport::client::blocking_io::Transport;
 
 use crate::{
-    bstr::BString,
+    bstr::{BString, ByteSlice},
     remote::{Connection, connection::ConnectionDetached, fetch},
 };
 
@@ -63,6 +63,11 @@ pub struct Options {
     ///
     /// See [`gix_protocol::fetch::refmap::init::Context::opportunistic_refspecs`].
     pub opportunistic_refspecs: Vec<gix_refspec::RefSpec>,
+    /// Ref prefixes to ask the server for beyond the ones the refspecs imply.
+    ///
+    /// git pushes literal entries onto the same `ref-prefix` list; `builtin/fetch.c` adds `HEAD`
+    /// when it is going to update `refs/remotes/<name>/HEAD` afterwards.
+    pub extra_ref_prefixes: Vec<BString>,
 }
 
 impl Default for Options {
@@ -72,6 +77,7 @@ impl Default for Options {
             handshake_parameters: Vec::new(),
             extra_refspecs: Vec::new(),
             opportunistic_refspecs: Vec::new(),
+            extra_ref_prefixes: Vec::new(),
         }
     }
 }
@@ -135,6 +141,7 @@ where
             handshake_parameters,
             mut extra_refspecs,
             opportunistic_refspecs,
+            extra_ref_prefixes,
         }: Options,
     ) -> Result<fetch::RefMap, Error> {
         let _span = gix_trace::coarse!("remote::Connection::ref_map()");
@@ -190,11 +197,24 @@ where
             opportunistic_refspecs,
         };
 
+        // git's `send_capabilities()` answers the server's `promisor-remote` advertisement on this very
+        // request, so the decision - and any `promisor.storeFields` write it triggers - happens here,
+        // before `ls-refs` goes out.
+        let advertised_promisors: Option<BString> = handshake
+            .capabilities
+            .capability("promisor-remote")
+            .and_then(|cap| cap.value().map(ToOwned::to_owned));
+        let promisor_remote = advertised_promisors
+            .as_ref()
+            .and_then(|info| crate::promisor::capability_reply(repo, info.to_str_lossy().as_ref()));
+
         let fetch_refmap = handshake.prepare_lsrefs_or_extract_refmap(
             repo.config.user_agent_tuple(),
             prefix_from_spec_as_filter_on_remote,
             context,
             &self.server_options,
+            promisor_remote,
+            &extra_ref_prefixes,
         )?;
 
         #[cfg(feature = "async-network-client")]

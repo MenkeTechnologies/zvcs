@@ -698,6 +698,12 @@ pub(crate) struct WriteOptions {
     /// Shadows `pack.depth`, as `gc --aggressive` does with
     /// `--depth=<gc.aggressiveDepth>`.
     pub(crate) depth: Option<usize>,
+    /// Shadows `pack.windowMemory`, as a cruft pack does with
+    /// `--window-memory=<repack.cruftWindowMemory>`.
+    pub(crate) window_memory: Option<u64>,
+    /// Shadows `pack.threads`, as a cruft pack does with
+    /// `--threads=<repack.cruftThreads>`.
+    pub(crate) threads: Option<usize>,
     /// Report the counting, compressing and writing phases on stderr the way
     /// git's progress meter does. See [`crate::progress`].
     pub(crate) progress: bool,
@@ -728,6 +734,12 @@ pub(crate) fn packed_for(
     }
     if let Some(depth) = options.depth {
         delta.search.depth = depth;
+    }
+    if let Some(limit) = options.window_memory {
+        delta.search.window_memory_limit = limit;
+    }
+    if let Some(threads) = options.threads {
+        delta.search.threads = threads;
     }
     write_pack(
         repo,
@@ -1573,6 +1585,10 @@ pub(crate) struct BitmapOptions {
     /// `pack.preferBitmapTips`: ref prefixes whose tips are pulled into the
     /// selection ahead of whatever the spacing rule would otherwise pick.
     pub(crate) preferred_tips: Vec<String>,
+    /// `bitmapPseudoMerge.<name>.*`: the groups that batch un-bitmapped ref tips
+    /// into shared bitmaps. Empty means the `.bitmap` carries no pseudo-merge
+    /// section at all, which is git's default.
+    pub(crate) pseudo_merges: Vec<PseudoMergeGroup>,
 }
 
 impl BitmapOptions {
@@ -1587,8 +1603,275 @@ impl BitmapOptions {
                 .strings("pack.preferBitmapTips")
                 .map(|values| values.iter().map(|v| v.to_string()).collect())
                 .unwrap_or_default(),
+            pseudo_merges: load_pseudo_merges_from_config(repo),
         }
     }
+}
+
+/// One `bitmapPseudoMerge.<name>.*` section; git's `struct pseudo_merge_group`.
+///
+/// The defaults are `pseudo_merge_group_init()`'s.
+#[derive(Debug, Clone)]
+pub(crate) struct PseudoMergeGroup {
+    /// `.pattern`, anchored at the start of a ref name because git anchors it —
+    /// it prepends a `^` to any value that does not already open with one.
+    pattern: regex::Regex,
+    /// `.decay`, the exponent `k` in the `f(n) = C * n^-k` series that sizes
+    /// each successive unstable merge, so a larger value front-loads them.
+    decay: f64,
+    /// `.maxMerges`, the ceiling on how many merges the unstable half produces.
+    max_merges: u32,
+    /// `.sampleRate`, the fraction of eligible unstable tips that actually
+    /// become parents. One in `1/sampleRate`, counted by position.
+    sample_rate: f64,
+    /// `.threshold`: a tip committed after this is too new to be worth merging
+    /// at all, since it is still likely to be walked directly.
+    threshold: i64,
+    /// `.stableThreshold`: a tip committed before this is unlikely to move
+    /// again, so it goes into a fixed-size merge that stays valid across
+    /// repacks instead of a decaying one.
+    stable_threshold: i64,
+    /// `.stableSize`, how many tips one stable merge takes.
+    stable_size: u32,
+}
+
+/// git's `MIN_PSEUDO_MERGE_SIZE`: below this the group stops decaying and takes
+/// everything that is left in one merge.
+const MIN_PSEUDO_MERGE_SIZE: usize = 8;
+
+/// git's `load_pseudo_merges_from_config()`.
+///
+/// # Deliberate departure from git
+///
+/// Five things take the whole of git's `pack-objects` down with an exit of 128:
+/// a group with no pattern, a pattern that will not compile, a `threshold`
+/// older than the group's own `stableThreshold`, an unparseable timestamp, and
+/// a value that is not a number where one is wanted. Here each is reported with
+/// git's wording and then drops its group, which costs the pack that group's
+/// pseudo-merges and nothing else — the same choice [`load_delta_islands`]
+/// already makes for a `pack.island` regex that will not compile. Dropping
+/// rather than defaulting is the point: a mistyped threshold must not quietly
+/// become the built-in one and fill the file with merges nobody asked for.
+///
+/// The out-of-range numeric values are not in that set. git only warns about
+/// those and carries on with the default, and so does this.
+fn load_pseudo_merges_from_config(repo: &gix::Repository) -> Vec<PseudoMergeGroup> {
+    /// What a group looks like before its pattern has been checked for.
+    struct Partial {
+        pattern: Option<regex::Regex>,
+        /// Set by anything git would `die()` over, which drops the group.
+        invalid: bool,
+        decay: f64,
+        max_merges: u32,
+        sample_rate: f64,
+        threshold: i64,
+        stable_threshold: i64,
+        stable_size: u32,
+    }
+
+    let now = std::time::SystemTime::now();
+    let seconds_now = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // `DEFAULT_PSEUDO_MERGE_*`. The two thresholds are `approxidate()` calls in
+    // git, so they move with the clock rather than being fixed offsets.
+    let default = |pattern| Partial {
+        pattern,
+        invalid: false,
+        decay: 1.0,
+        max_merges: 64,
+        sample_rate: 1.0,
+        threshold: seconds_now - 7 * 24 * 60 * 60,
+        stable_threshold: seconds_now - 30 * 24 * 60 * 60,
+        stable_size: 512,
+    };
+
+    let snapshot = repo.config_snapshot();
+    let Some(sections) = snapshot.plumbing().sections_by_name("bitmapPseudoMerge") else {
+        return Vec::new();
+    };
+
+    // Insertion-ordered so that a group keeps the position its first mention
+    // gave it, and later sections only overwrite values.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Partial> = std::collections::HashMap::new();
+
+    for section in sections {
+        // git's `parse_config_key()` requires a subsection; `bitmapPseudoMerge.decay`
+        // with no name in between matches nothing.
+        let Some(subsection) = section.header().subsection_name() else {
+            continue;
+        };
+        if subsection.is_empty() {
+            continue;
+        }
+        let name = subsection.to_string();
+        if !groups.contains_key(&name) {
+            order.push(name.clone());
+            groups.insert(name.clone(), default(None));
+        }
+        let group = groups.get_mut(&name).expect("just inserted");
+
+        let value = |key: &str| section.value(key).map(|v| v.to_string());
+        // git names the variable back at the user through `parse_config_key()`,
+        // which has already lowered the section and the key while leaving the
+        // subsection alone.
+        let var = |key: &str| format!("bitmappseudomerge.{name}.{}", key.to_lowercase());
+        let bad_number = |raw: &str, key: &str| {
+            eprintln!("fatal: bad numeric config value '{raw}' for '{}'", var(key));
+        };
+
+        if let Some(raw) = value("pattern") {
+            // git prepends the anchor itself unless the value carries one.
+            let anchored = if raw.starts_with('^') { raw.clone() } else { format!("^{raw}") };
+            match regex::Regex::new(&anchored) {
+                Ok(re) => group.pattern = Some(re),
+                Err(_) => {
+                    // git's `die()` here prints `sub` with `%s` rather than
+                    // `%.*s`, so the subsection runs on into the key it was
+                    // parsed out of and the name comes out as `<name>.pattern`.
+                    eprintln!("fatal: failed to load pseudo-merge regex for {name}.pattern: '{anchored}'");
+                    group.pattern = None;
+                    group.invalid = true;
+                }
+            }
+        }
+        if let Some(raw) = value("decay") {
+            match raw.parse::<f64>() {
+                Ok(decay) if decay >= 0.0 => group.decay = decay,
+                Ok(_) => {
+                    eprintln!("warning: {} must be non-negative, using default", var("decay"));
+                    group.decay = 1.0;
+                }
+                Err(_) => {
+                    bad_number(&raw, "decay");
+                    group.invalid = true;
+                }
+            }
+        }
+        if let Some(raw) = value("sampleRate") {
+            match raw.parse::<f64>() {
+                Ok(rate) if rate > 0.0 && rate <= 1.0 => group.sample_rate = rate,
+                Ok(_) => {
+                    eprintln!(
+                        "warning: {} must be between 0 (exclusive) and 1, using default",
+                        var("sampleRate")
+                    );
+                    group.sample_rate = 1.0;
+                }
+                Err(_) => {
+                    bad_number(&raw, "sampleRate");
+                    group.invalid = true;
+                }
+            }
+        }
+        if let Some(raw) = value("threshold") {
+            match parse_expiry_date(&raw, now) {
+                Some(at) => group.threshold = at,
+                None => {
+                    eprintln!("error: '{raw}' for '{}' is not a valid timestamp", var("threshold"));
+                    group.invalid = true;
+                }
+            }
+        }
+        if let Some(raw) = value("maxMerges") {
+            match raw.parse::<i64>() {
+                Ok(max) if max >= 0 => group.max_merges = max.min(i64::from(u32::MAX)) as u32,
+                Ok(_) => {
+                    eprintln!("warning: {} must be non-negative, using default", var("maxMerges"));
+                    group.max_merges = 64;
+                }
+                Err(_) => {
+                    bad_number(&raw, "maxMerges");
+                    group.invalid = true;
+                }
+            }
+        }
+        if let Some(raw) = value("stableThreshold") {
+            match parse_expiry_date(&raw, now) {
+                Some(at) => group.stable_threshold = at,
+                None => {
+                    eprintln!("error: '{raw}' for '{}' is not a valid timestamp", var("stableThreshold"));
+                    group.invalid = true;
+                }
+            }
+        }
+        if let Some(raw) = value("stableSize") {
+            match raw.parse::<i64>() {
+                Ok(size) if size > 0 => group.stable_size = size.min(i64::from(u32::MAX)) as u32,
+                Ok(_) => {
+                    eprintln!("warning: {} must be positive, using default", var("stableSize"));
+                    group.stable_size = 512;
+                }
+                Err(_) => {
+                    bad_number(&raw, "stableSize");
+                    group.invalid = true;
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for name in order {
+        let partial = groups.remove(&name).expect("named on the way in");
+        if partial.invalid {
+            continue;
+        }
+        let Some(pattern) = partial.pattern else {
+            eprintln!("fatal: pseudo-merge group '{name}' missing required pattern");
+            continue;
+        };
+        if partial.threshold < partial.stable_threshold {
+            eprintln!("fatal: pseudo-merge group '{name}' has unstable threshold before stable one");
+            continue;
+        }
+        out.push(PseudoMergeGroup {
+            pattern,
+            decay: partial.decay,
+            max_merges: partial.max_merges,
+            sample_rate: partial.sample_rate,
+            threshold: partial.threshold,
+            stable_threshold: partial.stable_threshold,
+            stable_size: partial.stable_size,
+        });
+    }
+    out
+}
+
+/// git's `parse_expiry_date()`, which is `approxidate_careful()` with two pairs
+/// of words taken over first.
+///
+/// # Deliberate departure from git
+///
+/// git's `approxidate_str()` is its own tokenizer: it walks the string, treats
+/// every non-alphanumeric byte as a separator, and folds each number-and-unit
+/// pair into a `struct tm`. That is why `1.week.ago` and `1 week ago` mean the
+/// same thing to it. [`gix::date::parse`] is this tree's port of the *other*
+/// half of `date.c`, `parse_date_basic()`, plus the spaced relative forms — so
+/// the dotted spelling is reduced to the spaced one here and handed to it,
+/// rather than the tokenizer being ported a second time.
+fn parse_expiry_date(value: &str, now: std::time::SystemTime) -> Option<i64> {
+    let trimmed = value.trim();
+    // git takes these over before approxidate ever sees them, so that "now"
+    // means "expire everything" rather than the current second.
+    if trimmed == "never" || trimmed == "false" {
+        return Some(0);
+    }
+    if trimmed == "all" || trimmed == "now" {
+        return Some(i64::MAX);
+    }
+    if let Ok(time) = gix::date::parse(trimmed, Some(now)) {
+        return Some(time.seconds);
+    }
+    // `1.week.ago`, `2.months.ago`: git's separators, spelled the way the
+    // spaced parser expects.
+    let spaced: String = trimmed
+        .chars()
+        .map(|c| if c == '.' || c == '_' { ' ' } else { c })
+        .collect();
+    let spaced = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    gix::date::parse(&spaced, Some(now)).ok().map(|time| time.seconds)
 }
 
 /// The `.bitmap` for a freshly written pack, or `None` when one cannot be
@@ -1686,6 +1969,39 @@ pub(crate) fn bitmap_file(
         computed.insert(*id, reachable);
     }
 
+    // git's `select_pseudo_merges()` runs at the tail of commit selection, so
+    // that it can tell which tips already got an entry of their own; and
+    // `build_pseudo_merge_bitmaps()` runs after the entries have been built, so
+    // the walks below can reuse everything already computed.
+    let bitmapped: HashSet<ObjectId> = selected_ids.iter().copied().collect();
+    let mut pseudo_merges: Vec<bitmap::PseudoMerge> = Vec::new();
+    for parents in select_pseudo_merges(repo, &options.pseudo_merges, &pack_position, &bitmapped) {
+        // git builds one bitmap by walking the synthetic merge, whose parents
+        // are these commits. Walking each parent and OR-ing reaches the same
+        // set, and leaves each parent memoised for the merges that follow.
+        let mut reachable = vec![0u64; words];
+        for parent in &parents {
+            if !computed.contains_key(parent) {
+                let Some(walked) = reachable_bitmap(repo, *parent, words, &pack_position, &computed) else {
+                    return None;
+                };
+                computed.insert(*parent, walked);
+            }
+            for (word, bits) in reachable.iter_mut().zip(&computed[parent]) {
+                *word |= bits;
+            }
+        }
+        let mut parent_bits = vec![0u64; words];
+        for parent in &parents {
+            let at = pack_position[parent] as usize;
+            parent_bits[at / 64] |= 1 << (at % 64);
+        }
+        pseudo_merges.push(bitmap::PseudoMerge {
+            parents: parent_bits,
+            reachable,
+        });
+    }
+
     let selected: Vec<bitmap::Commit> = order
         .iter()
         .map(|id| bitmap::Commit {
@@ -1701,12 +2017,221 @@ pub(crate) fn bitmap_file(
         &kinds,
         &name_hashes,
         selected,
+        &pseudo_merges,
         bitmap::Options {
             hash_cache: options.hash_cache,
             lookup_table: options.lookup_table,
         },
     )
     .ok()
+}
+
+/// The ref tips a group matched, split by how likely they are to move; git's
+/// `struct pseudo_merge_matches`.
+#[derive(Default)]
+struct PseudoMergeMatches {
+    /// Committed before `stableThreshold`. These go into fixed-size merges,
+    /// which the next repack can reproduce byte for byte and reuse.
+    stable: Vec<(ObjectId, i64)>,
+    /// Committed after `stableThreshold` but before `threshold`, and carrying no
+    /// bitmap of their own. These go into the decaying merges.
+    unstable: Vec<(ObjectId, i64)>,
+}
+
+/// git's `select_pseudo_merges()`: match every ref against every group, split
+/// the matches by age, and partition each split into merges.
+///
+/// Returns one parent list per merge, in the order the merges are written.
+/// `bitmapped` is the set of commits that already got an entry of their own,
+/// git's `bitmap_writer_has_bitmapped_object_id()`; a tip in there is not worth
+/// batching, since a reader will find its exact bitmap anyway.
+///
+/// # Deliberate departure from git
+///
+/// git holds a group's matches in a `strmap` and walks it with
+/// `strmap_for_each_entry()`, so the order the capture-group names are
+/// partitioned in is hash order and varies with the names present. This walks
+/// them in sorted order, which is the same set of merges in a fixed sequence.
+fn select_pseudo_merges(
+    repo: &gix::Repository,
+    groups: &[PseudoMergeGroup],
+    pack_position: &std::collections::HashMap<ObjectId, u32>,
+    bitmapped: &HashSet<ObjectId>,
+) -> Vec<Vec<ObjectId>> {
+    if groups.is_empty() {
+        return Vec::new();
+    }
+
+    let mut matched: Vec<std::collections::BTreeMap<String, PseudoMergeMatches>> =
+        groups.iter().map(|_| Default::default()).collect();
+
+    let Ok(platform) = repo.references() else {
+        return Vec::new();
+    };
+    let Ok(all) = platform.all() else {
+        return Vec::new();
+    };
+    for reference in all.flatten() {
+        let name = reference.name().as_bstr().to_string();
+        let mut reference = reference;
+        // git peels the ref first, since it is the commit a tag points at that
+        // can be a merge parent, not the tag object.
+        let Ok(id) = reference.peel_to_id_in_place() else {
+            continue;
+        };
+        let id = id.detach();
+        // git's `packlist_find()`: a tip the pack does not hold cannot be one.
+        if !pack_position.contains_key(&id) {
+            continue;
+        }
+        let Ok(commit) = repo.find_commit(id) else {
+            continue;
+        };
+        let date = commit.time().map(|time| time.seconds).unwrap_or(0);
+        let has_bitmap = bitmapped.contains(&id);
+
+        for (group, matches) in groups.iter().zip(&mut matched) {
+            let Some(captures) = group.pattern.captures(&name) else {
+                continue;
+            };
+            // git hands `regexec()` sixteen capture slots and joins every one
+            // that matched with a dash, so `refs/heads/(.*)/(.*)` buckets by
+            // both halves at once. The whole-match slot is skipped only when the
+            // pattern brought groups of its own.
+            if captures.len() > 15 && captures.get(15).is_some() {
+                eprintln!("warning: pseudo-merge regex from config has too many capture groups (max=14)");
+            }
+            let first = usize::from(captures.len() > 1);
+            let bucket = (first..captures.len().min(16))
+                .filter_map(|at| captures.get(at))
+                .map(|group| group.as_str())
+                .collect::<Vec<_>>()
+                .join("-");
+
+            let entry = matches.entry(bucket).or_default();
+            if date <= group.stable_threshold {
+                entry.stable.push((id, date));
+            } else if date <= group.threshold && !has_bitmap {
+                entry.unstable.push((id, date));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (group, matches) in groups.iter().zip(&mut matched) {
+        for entry in matches.values_mut() {
+            // git's `sort_pseudo_merge_matches()`: oldest first, so that the
+            // merges a repack reproduces stay aligned as history grows.
+            entry.stable.sort_by_key(|(_, date)| *date);
+            entry.unstable.sort_by_key(|(_, date)| *date);
+            partition_pseudo_merges(group, entry, &mut out);
+        }
+    }
+    out
+}
+
+/// git's `select_pseudo_merges_1()`: cut one group's matches into merges.
+///
+/// The stable half is cut into equal `stableSize` slices. The unstable half is
+/// cut into slices that shrink along a power series, so the newest tips — the
+/// ones most likely to be asked for — land in small merges that a reader
+/// satisfies easily, while old ones are swept up in bulk. Once a slice would
+/// fall below [`MIN_PSEUDO_MERGE_SIZE`] the remainder goes into one final merge,
+/// since a merge of two or three tips saves a reader almost nothing.
+fn partition_pseudo_merges(group: &PseudoMergeGroup, matches: &PseudoMergeMatches, out: &mut Vec<Vec<ObjectId>>) {
+    if matches.stable.is_empty() && matches.unstable.is_empty() {
+        return;
+    }
+
+    let stable_size = (group.stable_size as usize).max(1);
+    let mut stable_merges_nr = matches.stable.len() / stable_size;
+    if matches.stable.len() % stable_size != 0 {
+        stable_merges_nr += 1;
+    }
+
+    let mut at = 0usize;
+    for _ in 0..stable_merges_nr {
+        let mut parents = Vec::new();
+        // git's do-while: take one, then keep taking until the running count
+        // lands on a multiple of `stableSize`.
+        loop {
+            let Some((id, _)) = matches.stable.get(at) else {
+                break;
+            };
+            parents.push(*id);
+            at += 1;
+            if at % stable_size == 0 {
+                break;
+            }
+        }
+        if !parents.is_empty() {
+            out.push(parents);
+        }
+    }
+
+    // git's `j % (uint32_t)(1.0 / group->sample_rate)`: one tip in every
+    // `1/sampleRate`, counted by position rather than sampled at random, so two
+    // runs over the same history choose the same tips.
+    let stride = ((1.0 / group.sample_rate) as usize).max(1);
+
+    let mut at = 0usize;
+    for merge in 0..group.max_merges as usize {
+        let size = pseudo_merge_group_size(group, matches.unstable.len(), merge);
+        let end = if size < MIN_PSEUDO_MERGE_SIZE {
+            matches.unstable.len()
+        } else {
+            at + size
+        };
+        let mut parents = Vec::new();
+        while at < end && at < matches.unstable.len() {
+            if at % stride == 0 {
+                parents.push(matches.unstable[at].0);
+            }
+            at += 1;
+        }
+        if !parents.is_empty() {
+            out.push(parents);
+        }
+        if end >= matches.unstable.len() {
+            break;
+        }
+    }
+}
+
+/// git's `pseudo_merge_group_size()`: how many tips the `at`-th unstable merge
+/// takes.
+///
+/// Sizes follow `f(n) = C * n^-k`, with `k` the decay and `C` scaled so that the
+/// `maxMerges` sizes sum to the number of unstable tips.
+fn pseudo_merge_group_size(group: &PseudoMergeGroup, unstable_nr: usize, at: usize) -> usize {
+    // git's `gitexp()` declares its exponent `int` while `decay` is a `double`,
+    // so C truncates at the call site and a decay of 1.5 behaves as 1. Rounding
+    // here instead would size every merge differently from git.
+    let decay = group.decay as i32;
+    let mut scale = 0.0f64;
+    for n in 0..group.max_merges {
+        scale += 1.0 / gitexp(f64::from(n + 1), decay);
+    }
+    scale = unstable_nr as f64 / scale;
+    ((scale / gitexp((at + 1) as f64, decay)) + 0.5) as usize
+}
+
+/// git's `gitexp()`: exponentiation by squaring, for a non-negative integer
+/// power. `decay` is validated non-negative when it is read, so the loop always
+/// terminates.
+fn gitexp(mut base: f64, mut exp: i32) -> f64 {
+    let mut result = 1.0;
+    loop {
+        if exp % 2 != 0 {
+            result *= base;
+        }
+        exp >>= 1;
+        if exp == 0 {
+            break;
+        }
+        base *= base;
+    }
+    result
 }
 
 /// The commits every `pack.preferBitmapTips` prefix points at, git's

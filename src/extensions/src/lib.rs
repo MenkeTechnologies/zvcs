@@ -247,6 +247,12 @@ fn run_command() -> ExitCode {
     // `trace2.configParams` / `trace2.envVars` follow it.
     trace2::cmd_name(&sub);
 
+    // git's repository setup runs next, and its one refusal that is pure policy —
+    // `safe.bareRepository` — has to happen before the verb touches the repository.
+    if let Some(code) = disallowed_bare_repository(&sub) {
+        return code;
+    }
+
     // Install the pager (over stdout, and stderr when it is a tty) before the
     // command runs, so its output — and any error below — flows through it. Torn
     // down after the command and after error reporting, so the error lands in the
@@ -279,6 +285,118 @@ fn dashed_subcommand(arg0: &str) -> Option<String> {
     let base = std::path::Path::new(arg0).file_name()?.to_str()?;
     let verb = base.strip_prefix("git-")?;
     (!verb.is_empty()).then(|| verb.to_string())
+}
+
+/// The verbs that keep working when repository setup comes up empty — git's
+/// `RUN_SETUP_GENTLY` and no-setup entries in the `commands[]` table of `git.c`,
+/// minus the handful (`grep`, `rev-parse`, `archive`) that call
+/// `setup_git_directory()` themselves and therefore *do* die. Everything else
+/// needs a repository, which is what makes `safe.bareRepository` refuse it.
+const NO_SETUP_VERBS: &[&str] = &[
+    "apply",
+    "bugreport",
+    "bundle",
+    "check-ref-format",
+    "clone",
+    "column",
+    "config",
+    "credential",
+    "credential-cache",
+    "credential-cache--daemon",
+    "credential-store",
+    "diagnose",
+    "diff",
+    "difftool",
+    "for-each-repo",
+    "get-tar-commit-id",
+    "hash-object",
+    "help",
+    "hook",
+    "index-pack",
+    "init",
+    "init-db",
+    "interpret-trailers",
+    "ls-remote",
+    "mailinfo",
+    "mailsplit",
+    "merge-file",
+    "mergetool",
+    "patch-id",
+    "receive-pack",
+    "remote-ext",
+    "remote-fd",
+    "shortlog",
+    "show-index",
+    "stripspace",
+    "upload-archive",
+    "upload-archive--writer",
+    "upload-pack",
+    "url-parse",
+    "var",
+    "verify-pack",
+    "version",
+];
+
+/// Port of setup.c's `GIT_DIR_DISALLOWED_BARE` refusal: with
+/// `safe.bareRepository = explicit`, a repository that was *found by walking up
+/// from the current directory* and turns out to be bare is rejected, so a bare
+/// repository can only be used when it was named outright (`--git-dir`,
+/// `GIT_DIR`). `all` — the default — accepts every one.
+///
+/// Three parts of git's behaviour are reproduced, because each is observable:
+///
+/// * The value is read from *protected* configuration only (`git_protected_config`
+///   → system, `~/.gitconfig` and the command line), never from the repository's
+///   own `config`, so a bare repository cannot whitelist itself.
+/// * `is_implicit_bare_repo()` exempts the three paths that are bare only as an
+///   implementation detail: a `.git` directory, and `$GIT_DIR` of a secondary
+///   worktree or of a submodule.
+/// * Only commands that need a repository die; the ones git runs with
+///   `RUN_SETUP_GENTLY` (or no setup at all) carry on ([`NO_SETUP_VERBS`]).
+///
+/// Returns the exit code to leave with, or `None` to continue.
+fn disallowed_bare_repository(sub: &str) -> Option<ExitCode> {
+    if NO_SETUP_VERBS.contains(&sub) {
+        return None;
+    }
+    // `get_allowed_bare_repo()` defaults to `all`, so the walk below is skipped
+    // outright unless the user asked for `explicit`.
+    let allowed = config::global_config()
+        .string("safe.bareRepository")
+        .map(|v| v.to_string());
+    if allowed.as_deref() != Some("explicit") {
+        return None;
+    }
+    // `setup_git_directory_gently_1` returns `GIT_DIR_EXPLICIT` before ever
+    // reaching the bare check when `$GIT_DIR` names the repository.
+    if std::env::var_os("GIT_DIR").is_some() {
+        return None;
+    }
+    let repo = gix::discover(".").ok()?;
+    if repo.workdir().is_some() {
+        return None;
+    }
+    let git_dir = std::fs::canonicalize(repo.path()).unwrap_or_else(|_| repo.path().to_owned());
+    if is_implicit_bare_repo(&git_dir) {
+        return None;
+    }
+    eprintln!(
+        "fatal: cannot use bare repository '{}' (safe.bareRepository is 'explicit')",
+        git_dir.display()
+    );
+    Some(ExitCode::from(128))
+}
+
+/// Port of setup.c's `is_implicit_bare_repo()`: the gitdir paths that are bare
+/// without the user having made a bare repository — a work tree's own `.git`
+/// directory, and the `$GIT_DIR` of a secondary worktree or of a submodule of a
+/// non-bare superproject.
+fn is_implicit_bare_repo(path: &std::path::Path) -> bool {
+    if path.file_name().is_some_and(|n| n == ".git") {
+        return true;
+    }
+    let text = path.to_string_lossy();
+    text.contains("/.git/worktrees/") || text.contains("/.git/modules/")
 }
 
 /// Ensure a committer identity exists for reflog writes on paths that update refs

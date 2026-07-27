@@ -142,16 +142,25 @@ pub(crate) mod function {
         ///
         /// `server_options` are transmitted as `server-option=<value>` capability lines if the server advertised
         /// the `server-option` capability, which is how git's `get_remote_refs()` passes `--server-option` along.
+        ///
+        /// `promisor_remote` is the `<pr-names>` answer to the server's `promisor-remote` capability, sent as
+        /// `promisor-remote=<pr-names>` exactly as git's `send_capabilities()` does. Pass `None` when the server
+        /// did not advertise the capability or the client accepts none of what it advertised - git omits the
+        /// line entirely in both cases.
         pub fn new(
             ref_prefixes: Option<RefPrefixes>,
             capabilities: &'a Capabilities,
             agent: crate::command::Feature,
             server_options: &[BString],
+            promisor_remote: Option<String>,
         ) -> Self {
             let ls_refs = Command::LsRefs;
             let mut features = ls_refs.default_features(gix_transport::Protocol::V2, capabilities);
             features.push(agent);
             features.extend(crate::command::server_options(capabilities, server_options));
+            if let Some(names) = promisor_remote {
+                features.push(("promisor-remote", Some(names)));
+            }
             let mut arguments = ls_refs.initial_v2_arguments(&features);
             if capabilities
                 .capability("ls-refs")

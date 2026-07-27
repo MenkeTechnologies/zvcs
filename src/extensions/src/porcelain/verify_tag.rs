@@ -631,7 +631,7 @@ fn find_subpos(buf: &[u8]) -> SubPos {
 
 /// git's `parse_signed_buffer`: the offset of the last line that starts a
 /// signature block, or the buffer length when there is none.
-fn parse_signed_buffer(buf: &[u8]) -> usize {
+pub(crate) fn parse_signed_buffer(buf: &[u8]) -> usize {
     let size = buf.len();
     let mut len = 0;
     let mut m = size;

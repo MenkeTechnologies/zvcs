@@ -139,6 +139,7 @@ mod quiltimport;
 mod range_diff;
 mod read_tree;
 mod rebase;
+mod rebase_todo;
 mod receive_pack;
 mod reflog;
 mod refs;

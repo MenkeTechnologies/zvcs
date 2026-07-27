@@ -387,6 +387,10 @@ impl PrepareFetch {
                 message: reflog_message.clone(),
             })
             .with_shallow(self.shallow.clone())
+            // git's `update_shallow()` takes the `args->cloning` branch here: there is no local
+            // history a new shallow root could invalidate, so every root the pack brought along is
+            // accepted rather than rejected.
+            .with_shallow_update(remote::fetch::ShallowUpdate::Cloning)
             .receive(&repo, &mut progress, should_interrupt)
             .await?;
 

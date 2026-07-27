@@ -38,11 +38,12 @@ use std::process::ExitCode;
 ///   * Every flag `blame` ports is ported here, byte-for-byte identical.
 ///   * Every flag `blame` refuses is refused here, with `blame`'s own message.
 ///   * Every divergence documented on [`super::blame::blame`] applies here
-///     unchanged — notably that unsupported flags (`-p`/`--porcelain`,
-///     `--incremental`, `-M`/`-C`, `--reverse`, `-w`, regex/`:funcname` `-L`
-///     forms, …) exit via the anyhow error path instead of git's usage dump
-///     with exit code 129, and that a missing path operand bails
-///     `no path given` rather than printing the usage block.
+///     unchanged — notably that the flags `blame` still refuses (`--show-stats`,
+///     `--score-debug`, `-S <revs-file>`, `--reverse`, regex/`:funcname` `-L`
+///     forms, `--date=human` and the `-local` date variants) exit via the anyhow
+///     error path instead of git's usage dump with exit code 129, and that a
+///     missing path operand bails `no path given` rather than printing the usage
+///     block.
 ///
 /// No leading-subcommand strip is performed, matching
 /// [`super::init_db::init_db`]'s reasoning: `dispatch::run` passes only the

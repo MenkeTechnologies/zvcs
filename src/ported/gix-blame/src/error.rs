@@ -29,6 +29,8 @@ pub enum Error {
     DiffTree(#[from] gix_diff::tree::Error),
     #[error(transparent)]
     DiffTreeWithRewrites(#[from] gix_diff::tree_with_rewrites::Error),
+    #[error("Failed to list every file in a parent's tree for `-C` copy detection")]
+    TraverseTree(#[from] gix_traverse::tree::breadthfirst::Error),
     #[error(
         "Invalid line range was given, line range is expected to be a 1-based inclusive range in the format '<start>,<end>'"
     )]

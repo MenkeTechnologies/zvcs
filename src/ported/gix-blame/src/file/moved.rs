@@ -8,14 +8,14 @@
 use std::ops::Range;
 
 use gix_hash::ObjectId;
-use gix_object::{FindExt, bstr::BString};
+use gix_object::FindExt;
 
 use super::{compact, function::strip_whitespace_per_line, function::tokens_for_diffing};
-use crate::{Error, Statistics, types::UnblamedHunk};
+use crate::{Error, Statistics, types::{Suspect, UnblamedHunk}};
 
-/// One parent's contribution to `sg_origin[]` in git's `pass_blame()`: the commit, the blob the
-/// blamed file has in it, and the path it lives at there.
-pub(super) type ParentOrigin = (ObjectId, ObjectId, BString);
+/// One parent's contribution to `sg_origin[]` in git's `pass_blame()`: the origin — the parent
+/// commit and the path the blamed file lives at in it — plus the blob it has there.
+pub(super) type ParentOrigin = (Suspect, ObjectId);
 
 /// The byte offset of every line of the *Blamed File*, plus a final entry for its length, so that
 /// the bytes of lines `a..b` are `blob[starts[a]..starts[b]]` — git's `sb->lineno`.
@@ -35,7 +35,7 @@ pub(super) fn line_starts(blob: &[u8]) -> Vec<usize> {
 ///
 /// A line like `\t}` occurs everywhere in any ordinary program, and it is not worth saying it was
 /// moved from somewhere unrelated, so entries below the `-M` score are never offered to a parent.
-fn blame_entry_score(blob: &[u8], starts: &[usize], range: &Range<u32>) -> u32 {
+pub(super) fn blame_entry_score(blob: &[u8], starts: &[usize], range: &Range<u32>) -> u32 {
     let (from, to) = (starts[range.start as usize], starts[range.end as usize]);
     let mut score = 1;
     for &byte in &blob[from..to] {
@@ -49,7 +49,7 @@ fn blame_entry_score(blob: &[u8], starts: &[usize], range: &Range<u32>) -> u32 {
 /// `split_overlap()`: how one entry is cut into the part before the moved chunk, the moved chunk
 /// itself, and the part after it.
 #[derive(Clone, Copy)]
-struct Split {
+pub(super) struct Split {
     /// Lines at the front of the entry that stay with the current suspect.
     pre: u32,
     /// Lines that the parent is to be blamed for; never zero for a split that exists at all.
@@ -79,7 +79,7 @@ fn handle_split(num_lines: u32, tlno: u32, plno: u32, same: u32) -> Option<Split
 /// `copy_split_if_better()`: keep whichever split hands the parent the least trivial chunk.
 ///
 /// git compares with `<`, so a later candidate of equal score replaces the earlier one.
-fn copy_split_if_better(best: &mut Option<(Split, u32)>, candidate: Split, score: u32) {
+pub(super) fn copy_split_if_better(best: &mut Option<(Split, u32)>, candidate: Split, score: u32) {
     match best {
         Some((_, best_score)) if score < *best_score => {}
         _ => *best = Some((candidate, score)),
@@ -89,7 +89,7 @@ fn copy_split_if_better(best: &mut Option<(Split, u32)>, candidate: Split, score
 /// `find_copy_in_blob()`: diff the entry's lines, taken from the *Blamed File*, against the whole
 /// parent blob and return the best chunk the parent can be blamed for.
 #[expect(clippy::too_many_arguments)]
-fn find_copy_in_blob(
+pub(super) fn find_copy_in_blob(
     hunk: &UnblamedHunk,
     parent_blob: &[u8],
     blamed_blob: &[u8],
@@ -147,11 +147,10 @@ fn find_copy_in_blob(
 ///
 /// The parts that stay behind go to `unblamed` to be offered to the parent again on the next round,
 /// exactly as git requeues `split[0]` and `split[2]`.
-fn split_blame(
+pub(super) fn split_blame(
     hunk: UnblamedHunk,
-    suspect: ObjectId,
-    parent: ObjectId,
-    parent_path: Option<&BString>,
+    suspect: Suspect,
+    parent: Suspect,
     split: Split,
     blamed: &mut Vec<UnblamedHunk>,
     unblamed: &mut Vec<UnblamedHunk>,
@@ -179,18 +178,17 @@ fn split_blame(
         crate::types::Either::Left(whole) => whole,
     };
 
+    // `parent` already names the path the parent keeps the file at, so the *Source File* of the
+    // moved chunk follows from the origin it is handed to.
     if let Some(entry) = middle.suspects.iter_mut().find(|entry| entry.0 == suspect) {
         entry.0 = parent;
         entry.1 = split.parent_start..split.parent_start + split.mid;
     }
-    // The *Source File* of the moved chunk is the path the parent keeps the file at, which is
-    // only worth recording when it is not the blamed path itself.
-    middle.source_file_name = parent_path.cloned();
     blamed.push(middle);
 }
 
 /// `filter_small()`: move every entry whose score is at most `score_min` out of `source`.
-fn filter_small(
+pub(super) fn filter_small(
     blamed_blob: &[u8],
     starts: &[usize],
     small: &mut Vec<UnblamedHunk>,
@@ -213,9 +211,8 @@ fn filter_small(
 #[expect(clippy::too_many_arguments)]
 pub(super) fn find_moves_in_parents(
     hunks_to_blame: Vec<UnblamedHunk>,
-    suspect: ObjectId,
+    suspect: Suspect,
     parents: &[ParentOrigin],
-    blamed_path: &gix_object::bstr::BStr,
     move_score: u32,
     blamed_blob: &[u8],
     starts: &[usize],
@@ -238,13 +235,10 @@ pub(super) fn find_moves_in_parents(
     unblamed = filter_small(blamed_blob, starts, &mut toosmall, unblamed, move_score);
 
     let mut buf = Vec::new();
-    for (parent_id, parent_blob_id, parent_path) in parents {
+    for (parent_origin, parent_blob_id) in parents {
         if unblamed.is_empty() {
             break;
         }
-        // Only a parent that keeps the file somewhere else needs its path recorded on the hunks it
-        // takes over; the ordinary pass treats the blamed path itself as the absence of a name.
-        let source_file_name = (parent_path != blamed_path).then_some(parent_path);
         let parent_blob = odb.find_blob(parent_blob_id, &mut buf)?.data.to_vec();
 
         // Whatever a round hands to the parent leaves behind up to two smaller entries, and those
@@ -263,15 +257,9 @@ pub(super) fn find_moves_in_parents(
                     stats,
                 );
                 match best {
-                    Some((split, score)) if move_score < score => split_blame(
-                        hunk,
-                        suspect,
-                        *parent_id,
-                        source_file_name,
-                        split,
-                        &mut out,
-                        &mut requeued,
-                    ),
+                    Some((split, score)) if move_score < score => {
+                        split_blame(hunk, suspect, *parent_origin, split, &mut out, &mut requeued)
+                    }
                     _ => leftover.push(hunk),
                 }
             }

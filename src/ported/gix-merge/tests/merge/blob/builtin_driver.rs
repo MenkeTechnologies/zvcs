@@ -35,77 +35,17 @@ mod text {
     use pretty_assertions::assert_str_eq;
     use std::num::NonZero;
 
+    /// Cases where this build still differs from `git merge-file`, checked case by case:
+    /// all four are the histogram variants of one fixture, so what is left is a
+    /// difference between `imara-diff`'s histogram and git's, not between the merge
+    /// drivers — the same fixture's Myers variants match.
     const DIVERGING: &[&str] = &[
-        // Somehow, on in zdiff mode, it's different, and I wasn't able to figure out the rule properly.
-        // Now we prefer ancestor/before newlines and somewhat ignore our hunks. It's probably a minor issue in practice.
-        // gix: "1\r\n2\n<<<<<<< complex/marker-newline-handling-lf2/ours.blob\n4\r\n||||||| complex/marker-newline-handling-lf2/base.blob\r\n2\r\n3\n=======\n5\n>>>>>>> complex/marker-newline-handling-lf2/theirs.blob\n"
-        // git: "1\r\n2\n<<<<<<< complex/marker-newline-handling-lf2/ours.blob\n4  \n||||||| complex/marker-newline-handling-lf2/base.blob  \n2\r\n3\n=======\n5\n>>>>>>> complex/marker-newline-handling-lf2/theirs.blob\n"
-        "complex/marker-newline-handling-lf2/zdiff3.merged",
-        "complex/marker-newline-handling-lf2/zdiff3-histogram.merged",
-        // This is related to Git seemingly extending a hunk to increase overlap (see diff3)
-        "zdiff3-interesting/merge.merged",
-        "zdiff3-interesting/merge-ours.merged",
-        "zdiff3-interesting/diff3.merged",
-        "zdiff3-interesting/diff3-histogram.merged",
-        "zdiff3-interesting/zdiff3.merged",
-        "zdiff3-interesting/zdiff3-histogram.merged",
-        "zdiff3-interesting/merge-union.merged",
-        // Git can extend hunks, similar to above, but the effect is not as noticeable.
-        // Implementing this would be interesting, to figure out when the hunk processing should apply.
-        "zdiff3-evil/merge.merged",
-        "zdiff3-evil/merge-union.merged",
-        // Git seems to merge to hunks if they are close together to get a less noisy diff.
-        "zdiff3-middlecommon/merge.merged",
-        "zdiff3-middlecommon/merge-union.merged",
-        // Git has special character handling, which does magic to prevent conflicts
-        "complex/auto-simplification/merge.merged",
-        "complex/auto-simplification/merge-union.merged",
-        // Git has special newline handling when diffing,
-        // which auto-inserts a newline when it was removed, kind of.
-        "complex/missing-LF-at-EOF/merge.merged",
-        "complex/missing-LF-at-EOF/diff3.merged",
-        "complex/missing-LF-at-EOF/diff3-histogram.merged",
-        "complex/missing-LF-at-EOF/zdiff3.merged",
-        "complex/missing-LF-at-EOF/zdiff3-histogram.merged",
-        "complex/missing-LF-at-EOF/merge-ours.merged",
-        "complex/missing-LF-at-EOF/merge-theirs.merged",
-        "complex/missing-LF-at-EOF/merge-union.merged",
-        // Git has different diff-slider-heuristics so diffs can be different.
-        // See https://github.com/mhagger/diff-slider-tools.
-        "complex/spurious-c-conflicts/merge.merged",
-        "complex/spurious-c-conflicts/merge-union.merged",
         "complex/spurious-c-conflicts/diff3-histogram.merged",
         "complex/spurious-c-conflicts/zdiff3-histogram.merged",
     ];
 
     /// Should be a copy of `DIVERGING` once the reverse operation truly works like before
     const DIVERGING_REVERSED: &[&str] = &[
-        // expected cases
-        "zdiff3-middlecommon/merge.merged-reversed",
-        "zdiff3-middlecommon/merge-union.merged-reversed",
-        "zdiff3-interesting/merge.merged-reversed",
-        "zdiff3-interesting/merge-theirs.merged-reversed",
-        "zdiff3-interesting/diff3.merged-reversed",
-        "zdiff3-interesting/diff3-histogram.merged-reversed",
-        "zdiff3-interesting/zdiff3.merged-reversed",
-        "zdiff3-interesting/zdiff3-histogram.merged-reversed",
-        "zdiff3-interesting/merge-union.merged-reversed",
-        "zdiff3-evil/merge.merged-reversed",
-        "zdiff3-evil/merge-union.merged-reversed",
-        "complex/missing-LF-at-EOF/merge.merged-reversed",
-        "complex/missing-LF-at-EOF/diff3.merged-reversed",
-        "complex/missing-LF-at-EOF/diff3-histogram.merged-reversed",
-        "complex/missing-LF-at-EOF/zdiff3.merged-reversed",
-        "complex/missing-LF-at-EOF/zdiff3-histogram.merged-reversed",
-        "complex/missing-LF-at-EOF/merge-ours.merged-reversed",
-        "complex/missing-LF-at-EOF/merge-theirs.merged-reversed",
-        "complex/missing-LF-at-EOF/merge-union.merged-reversed",
-        "complex/auto-simplification/merge.merged-reversed",
-        "complex/auto-simplification/merge-union.merged-reversed",
-        "complex/marker-newline-handling-lf2/zdiff3.merged-reversed",
-        "complex/marker-newline-handling-lf2/zdiff3-histogram.merged-reversed",
-        "complex/spurious-c-conflicts/merge.merged-reversed",
-        "complex/spurious-c-conflicts/merge-union.merged-reversed",
         "complex/spurious-c-conflicts/diff3-histogram.merged-reversed",
         "complex/spurious-c-conflicts/zdiff3-histogram.merged-reversed",
     ];
@@ -125,6 +65,7 @@ mod text {
                 builtin_driver::text::Options {
                     conflict: Conflict::ResolveWithUnion,
                     diff_algorithm: imara_diff::Algorithm::Myers,
+                    ..Default::default()
                 },
             ),
             (
@@ -204,8 +145,9 @@ mod text {
     fn run_baseline() -> crate::Result {
         let root = gix_testtools::scripted_fixture_read_only("text-baseline.sh")?;
         for (baseline, diverging, expected_percentage) in [
-            ("baseline.cases", DIVERGING, 10),
-            ("baseline-reversed.cases", DIVERGING_REVERSED, 10),
+            // Down from 10% before `xdiff/xmerge.c` was ported.
+            ("baseline.cases", DIVERGING, 0),
+            ("baseline-reversed.cases", DIVERGING_REVERSED, 0),
         ] {
             let cases = std::fs::read_to_string(root.join(baseline))?;
             let mut out = Vec::new();
@@ -261,6 +203,230 @@ mod text {
             );
         }
         Ok(())
+    }
+
+    /// Every expectation here is the verbatim output of
+    /// `git merge-file -p -L ours -L base -L theirs ours base theirs` from git 2.55.0.
+    mod xdl_regions {
+        use super::{Resolution, builtin_driver};
+        use bstr::ByteSlice;
+        use builtin_driver::text::{Conflict, ConflictStyle, Labels, Level, Options};
+
+        fn run(ours: &[u8], base: &[u8], theirs: &[u8], conflict: Conflict, level: Level) -> (Vec<u8>, Resolution) {
+            run_styled(ours, base, theirs, conflict, level, None)
+        }
+
+        fn run_styled(
+            ours: &[u8],
+            base: &[u8],
+            theirs: &[u8],
+            conflict: Conflict,
+            level: Level,
+            style: Option<ConflictStyle>,
+        ) -> (Vec<u8>, Resolution) {
+            let mut input = imara_diff::InternedInput::default();
+            let mut out = Vec::new();
+            let labels = Labels {
+                ancestor: Some("base".into()),
+                current: Some("ours".into()),
+                other: Some("theirs".into()),
+            };
+            let resolution = builtin_driver::text(
+                &mut out,
+                &mut input,
+                labels,
+                ours,
+                base,
+                theirs,
+                Options {
+                    conflict,
+                    level,
+                    style,
+                    ..Default::default()
+                },
+            );
+            (out, resolution)
+        }
+
+        fn keep(style: ConflictStyle) -> Conflict {
+            Conflict::Keep {
+                style,
+                marker_size: 7.try_into().unwrap(),
+            }
+        }
+
+        /// Two changed regions with no unchanged ancestor line between them are one
+        /// region to `xdl_do_merge()`, whose independence test is the strict
+        /// `xscr1->i1 + xscr1->chg1 < xscr2->i1`.
+        ///
+        /// Resolving them independently instead yields `1\nTWO\nTHREE\n4\n` — a file
+        /// neither side ever wrote, reported as a clean merge.
+        #[test]
+        fn touching_changes_are_one_conflict() {
+            let (base, ours, theirs) = (&b"1\n2\n3\n4\n"[..], &b"1\n2\nTHREE\n4\n"[..], &b"1\nTWO\n3\n4\n"[..]);
+            for (style, expected) in [
+                (
+                    ConflictStyle::Merge,
+                    &b"1\n<<<<<<< ours\n2\nTHREE\n=======\nTWO\n3\n>>>>>>> theirs\n4\n"[..],
+                ),
+                (
+                    ConflictStyle::Diff3,
+                    &b"1\n<<<<<<< ours\n2\nTHREE\n||||||| base\n2\n3\n=======\nTWO\n3\n>>>>>>> theirs\n4\n"[..],
+                ),
+                (
+                    ConflictStyle::ZealousDiff3,
+                    &b"1\n<<<<<<< ours\n2\nTHREE\n||||||| base\n2\n3\n=======\nTWO\n3\n>>>>>>> theirs\n4\n"[..],
+                ),
+            ] {
+                let (out, resolution) = run(ours, base, theirs, keep(style), Level::Zealous);
+                assert_eq!(out.as_bstr(), expected.as_bstr(), "{style:?}");
+                assert_eq!(resolution, Resolution::Conflict, "{style:?}");
+            }
+
+            let (out, resolution) = run(ours, base, theirs, Conflict::ResolveWithOurs, Level::Zealous);
+            assert_eq!(out.as_bstr(), b"1\n2\nTHREE\n4\n".as_bstr());
+            assert_eq!(resolution, Resolution::CompleteWithAutoResolvedConflict);
+
+            let (out, _) = run(ours, base, theirs, Conflict::ResolveWithUnion, Level::Zealous);
+            assert_eq!(out.as_bstr(), b"1\n2\nTHREE\nTWO\n3\n4\n".as_bstr());
+        }
+
+        /// One unchanged line is all it takes for the two changes to stay independent,
+        /// which is the other half of the strict inequality above.
+        #[test]
+        fn a_single_unchanged_line_keeps_changes_independent() {
+            let (out, resolution) = run(
+                b"1\n2\n3\nFOUR\n5\n",
+                b"1\n2\n3\n4\n5\n",
+                b"1\nTWO\n3\n4\n5\n",
+                keep(ConflictStyle::Merge),
+                Level::Zealous,
+            );
+            assert_eq!(out.as_bstr(), b"1\nTWO\n3\nFOUR\n5\n".as_bstr());
+            assert_eq!(resolution, Resolution::Complete);
+        }
+
+        /// `xdl_simplify_non_conflicts()` folds at most three unchanged lines between
+        /// two conflicts into them, because doing so takes up no more lines.
+        #[test]
+        fn three_unchanged_lines_between_conflicts_are_folded_in() {
+            let (out, _) = run(
+                b"a\nO1\nc\nd\ne\nO2\ng\n",
+                b"a\nb\nc\nd\ne\nf\ng\n",
+                b"a\nT1\nc\nd\ne\nT2\ng\n",
+                keep(ConflictStyle::Merge),
+                Level::Zealous,
+            );
+            assert_eq!(
+                out.as_bstr(),
+                b"a\n<<<<<<< ours\nO1\nc\nd\ne\nO2\n=======\nT1\nc\nd\ne\nT2\n>>>>>>> theirs\ng\n".as_bstr()
+            );
+        }
+
+        #[test]
+        fn four_unchanged_lines_between_conflicts_stay_out() {
+            let (out, _) = run(
+                b"a\nO1\nc\nd\ne\nf\nO2\nh\n",
+                b"a\nb\nc\nd\ne\nf\ng\nh\n",
+                b"a\nT1\nc\nd\ne\nf\nT2\nh\n",
+                keep(ConflictStyle::Merge),
+                Level::Zealous,
+            );
+            assert_eq!(
+                out.as_bstr(),
+                b"a\n<<<<<<< ours\nO1\n=======\nT1\n>>>>>>> theirs\nc\nd\ne\nf\n<<<<<<< ours\nO2\n=======\nT2\n>>>>>>> theirs\nh\n".as_bstr()
+            );
+        }
+
+        /// The only difference between the two levels git uses: `ZealousAlnum`
+        /// (`builtin/merge-file.c`) folds a gap holding no letter or digit no matter how
+        /// long, `Zealous` (`merge-ll.c`, so `git merge`) does not. Both expectations
+        /// come from the corresponding stock command.
+        #[test]
+        fn alnum_free_gaps_are_folded_only_at_the_higher_level() {
+            let (ours, base, theirs) = (
+                &b"a\nO1\n{\n}\n(\n)\nO2\nh\n"[..],
+                &b"a\nb\n{\n}\n(\n)\ng\nh\n"[..],
+                &b"a\nT1\n{\n}\n(\n)\nT2\nh\n"[..],
+            );
+            let (out, _) = run(ours, base, theirs, keep(ConflictStyle::Merge), Level::ZealousAlnum);
+            assert_eq!(
+                out.as_bstr(),
+                b"a\n<<<<<<< ours\nO1\n{\n}\n(\n)\nO2\n=======\nT1\n{\n}\n(\n)\nT2\n>>>>>>> theirs\nh\n".as_bstr(),
+                "git merge-file folds it"
+            );
+            let (out, _) = run(ours, base, theirs, keep(ConflictStyle::Merge), Level::Zealous);
+            assert_eq!(
+                out.as_bstr(),
+                b"a\n<<<<<<< ours\nO1\n=======\nT1\n>>>>>>> theirs\n{\n}\n(\n)\n<<<<<<< ours\nO2\n=======\nT2\n>>>>>>> theirs\nh\n".as_bstr(),
+                "git merge does not"
+            );
+        }
+
+        /// `Minimal` conflicts over every overlap, even one where both sides made the
+        /// very same change, which `Eager` and up resolve silently.
+        #[test]
+        fn minimal_level_conflicts_over_identical_changes() {
+            let (ours, base, theirs) = (&b"1\nSAME\n3\n"[..], &b"1\n2\n3\n"[..], &b"1\nSAME\n3\n"[..]);
+            let (out, resolution) = run(ours, base, theirs, keep(ConflictStyle::Merge), Level::Minimal);
+            assert_eq!(
+                out.as_bstr(),
+                b"1\n<<<<<<< ours\nSAME\n=======\nSAME\n>>>>>>> theirs\n3\n".as_bstr()
+            );
+            assert_eq!(resolution, Resolution::Conflict);
+
+            let (out, resolution) = run(ours, base, theirs, keep(ConflictStyle::Merge), Level::Eager);
+            assert_eq!(out.as_bstr(), b"1\nSAME\n3\n".as_bstr());
+            assert_eq!(resolution, Resolution::Complete);
+        }
+
+        /// git keeps `xmp.style` independent of `xmp.favor`, so a union merge still gets
+        /// the region shapes the style implies: the diff3 styles clamp the level to
+        /// `Eager`, which leaves the two conflicts of `three_unchanged_lines_…` apart and
+        /// unions each one separately. Both expectations are
+        /// `git merge-file -p [--zdiff3] --union`.
+        #[test]
+        fn the_style_shapes_regions_even_when_conflicts_are_resolved() {
+            let (ours, base, theirs) = (
+                &b"a\nO1\nc\nd\ne\nO2\ng\n"[..],
+                &b"a\nb\nc\nd\ne\nf\ng\n"[..],
+                &b"a\nT1\nc\nd\ne\nT2\ng\n"[..],
+            );
+            let (out, _) = run_styled(
+                ours,
+                base,
+                theirs,
+                Conflict::ResolveWithUnion,
+                Level::ZealousAlnum,
+                Some(ConflictStyle::ZealousDiff3),
+            );
+            assert_eq!(out.as_bstr(), b"a\nO1\nT1\nc\nd\ne\nO2\nT2\ng\n".as_bstr());
+
+            let (out, _) = run_styled(
+                ours,
+                base,
+                theirs,
+                Conflict::ResolveWithUnion,
+                Level::ZealousAlnum,
+                Some(ConflictStyle::Merge),
+            );
+            assert_eq!(out.as_bstr(), b"a\nO1\nc\nd\ne\nO2\nT1\nc\nd\ne\nT2\ng\n".as_bstr());
+        }
+
+        /// `xdl_merge()` returns the other side's buffer verbatim when a side did not
+        /// change anything, so a file with no trailing newline keeps not having one.
+        #[test]
+        fn an_unchanged_side_is_copied_verbatim() {
+            let (out, resolution) = run(
+                b"1\n2\n3",
+                b"1\n2\n3",
+                b"1\nTWO\n3",
+                keep(ConflictStyle::Merge),
+                Level::Zealous,
+            );
+            assert_eq!(out.as_bstr(), b"1\nTWO\n3".as_bstr());
+            assert_eq!(resolution, Resolution::Complete);
+        }
     }
 
     #[test]
@@ -392,6 +558,7 @@ mod text {
                         style: builtin_driver::text::ConflictStyle::Merge,
                         marker_size: 7.try_into().unwrap(),
                     },
+                    ..Default::default()
                 };
                 let mut out = Vec::new();
                 let mut input = InternedInput::default();
@@ -410,6 +577,7 @@ mod text {
                         style: builtin_driver::text::ConflictStyle::Merge,
                         marker_size: 7.try_into().unwrap(),
                     },
+                    ..Default::default()
                 };
                 let mut out = Vec::new();
                 let mut input = InternedInput::default();
@@ -481,22 +649,40 @@ mod text {
 
                 let read = |rela_path: &str| read_blob(self.root, rela_path);
 
-                let mut options = gix_merge::blob::builtin_driver::text::Options::default();
+                let mut options = gix_merge::blob::builtin_driver::text::Options {
+                    // `text-baseline.sh` records the output of `git merge-file`, and
+                    // `builtin/merge-file.c` runs at `XDL_MERGE_ZEALOUS_ALNUM` — a level
+                    // above the `merge-ll.c` default these options otherwise carry.
+                    level: gix_merge::blob::builtin_driver::text::Level::ZealousAlnum,
+                    ..Default::default()
+                };
                 let marker_size = 7.try_into().unwrap();
                 for arg in words {
-                    options.conflict = match arg {
-                        "--diff3" => Conflict::Keep {
-                            style: ConflictStyle::Diff3,
-                            marker_size,
-                        },
-                        "--zdiff3" => Conflict::Keep {
-                            style: ConflictStyle::ZealousDiff3,
-                            marker_size,
-                        },
-                        "--ours" => Conflict::ResolveWithOurs,
-                        "--theirs" => Conflict::ResolveWithTheirs,
-                        "--union" => Conflict::ResolveWithUnion,
+                    let (conflict, style) = match arg {
+                        "--diff3" => (
+                            Conflict::Keep {
+                                style: ConflictStyle::Diff3,
+                                marker_size,
+                            },
+                            ConflictStyle::Diff3,
+                        ),
+                        "--zdiff3" => (
+                            Conflict::Keep {
+                                style: ConflictStyle::ZealousDiff3,
+                                marker_size,
+                            },
+                            ConflictStyle::ZealousDiff3,
+                        ),
+                        "--ours" => (Conflict::ResolveWithOurs, ConflictStyle::Merge),
+                        "--theirs" => (Conflict::ResolveWithTheirs, ConflictStyle::Merge),
+                        "--union" => (Conflict::ResolveWithUnion, ConflictStyle::Merge),
                         _ => panic!("Unknown argument to parse into options: '{arg}'"),
+                    };
+                    options.conflict = conflict;
+                    // The style flags and the favor flags are separate arguments on the
+                    // command line, so a later favor must not drop an earlier style.
+                    if !matches!(style, ConflictStyle::Merge) {
+                        options.style = Some(style);
                     }
                 }
                 if output.contains("histogram") {

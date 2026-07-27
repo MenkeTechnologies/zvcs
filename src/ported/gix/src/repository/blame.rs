@@ -26,6 +26,7 @@ impl Repository {
             ignore_whitespace,
             detect_moved,
             ignore_revs,
+            detect_copied,
         } = options;
         let diff_algorithm = match diff_algorithm {
             Some(diff_algorithm) => diff_algorithm,
@@ -41,6 +42,7 @@ impl Repository {
             ignore_whitespace,
             detect_moved,
             ignore_revs,
+            detect_copied,
         };
 
         let outcome = gix_blame::file(

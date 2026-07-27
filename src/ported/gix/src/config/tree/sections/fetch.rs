@@ -40,7 +40,11 @@ pub type RecurseSubmodules = keys::Any<validate::RecurseSubmodules>;
 mod algorithm {
     #[cfg(feature = "credentials")]
     impl crate::config::tree::sections::fetch::NegotiationAlgorithm {
-        /// Derive the negotiation algorithm identified by `name`, case-sensitively.
+        /// Derive the negotiation algorithm identified by `name`, case-insensitively.
+        ///
+        /// git compares this value with `strcasecmp` in `prepare_repo_settings()`
+        /// (`repo-settings.c`), so `Skipping` selects the skipping negotiator
+        /// there just as `skipping` does.
         pub fn try_into_negotiation_algorithm(
             &'static self,
             name: impl gix_utils::AsBStr,
@@ -48,7 +52,8 @@ mod algorithm {
             use crate::{bstr::ByteSlice, remote::fetch::negotiate::Algorithm};
 
             let name = name.as_bstr();
-            Ok(match name.as_bstr().as_bytes() {
+            let lower = name.to_ascii_lowercase();
+            Ok(match lower.as_slice() {
                 b"noop" => Algorithm::Noop,
                 b"consecutive" | b"default" => Algorithm::Consecutive,
                 b"skipping" => Algorithm::Skipping,

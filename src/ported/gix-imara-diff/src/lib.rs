@@ -271,6 +271,11 @@ impl Diff {
         self.added.clear();
         self.removed.resize(before.len(), false);
         self.added.resize(after.len(), false);
+        // git's `xdl_trim_ends()`. It narrows the range the record-discarding pass looks at,
+        // but the match counts that pass thresholds against are taken before any trimming
+        // (`xdl_classify_record()` runs over every record in `xdl_prepare_ctx()`), so the
+        // untrimmed sequences have to survive for `myers::diff` to classify against.
+        let (untrimmed_before, untrimmed_after) = (before, after);
         let common_prefix = strip_common_prefix(&mut before, &mut after) as usize;
         let common_postfix = strip_common_postfix(&mut before, &mut after);
         let range = common_prefix..self.removed.len() - common_postfix as usize;
@@ -279,8 +284,10 @@ impl Diff {
         let added = &mut self.added[range];
         match algorithm {
             Algorithm::Histogram => histogram::diff(before, after, removed, added, num_tokens),
-            Algorithm::Myers => myers::diff(before, after, removed, added, false),
-            Algorithm::MyersMinimal => myers::diff(before, after, removed, added, true),
+            Algorithm::Myers => myers::diff(before, after, removed, added, false, untrimmed_before, untrimmed_after),
+            Algorithm::MyersMinimal => {
+                myers::diff(before, after, removed, added, true, untrimmed_before, untrimmed_after)
+            }
         }
     }
 

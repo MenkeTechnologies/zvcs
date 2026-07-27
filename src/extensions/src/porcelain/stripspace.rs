@@ -259,7 +259,7 @@ fn usage_error(msg: &str) -> ExitCode {
 /// When `comment` is set, a line starting with it is skipped outright — without
 /// bumping the blank counter, so a comment between two paragraphs does not
 /// become a blank line.
-fn strip_space(input: &[u8], comment: Option<&[u8]>) -> Vec<u8> {
+pub(crate) fn strip_space(input: &[u8], comment: Option<&[u8]>) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() + 1);
     let mut empties = 0usize;
 
@@ -291,7 +291,7 @@ fn strip_space(input: &[u8], comment: Option<&[u8]>) -> Vec<u8> {
 /// Every line keeps its bytes verbatim and gains a prefix: `<comment> ` in
 /// general, or a bare `<comment>` when the line starts with `\n` (it is empty)
 /// or `\t`. `strbuf_complete_line()` then terminates a non-empty result.
-fn comment_lines(input: &[u8], comment: &[u8]) -> Vec<u8> {
+pub(crate) fn comment_lines(input: &[u8], comment: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() + input.len() / 8 + 1);
 
     for line in lines(input) {

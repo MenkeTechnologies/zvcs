@@ -166,6 +166,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `--also-filter-submodules` / `--no-also-filter-submodules`; `None` leaves the choice to
     // `clone.filterSubmodules`.
     let mut also_filter_submodules: Option<bool> = None;
+    // `--bundle-uri=<uri>`: a bundle (or bundle list) to bootstrap the object
+    // database from before the fetch. git's `OPT_STRING`, so `--no-bundle-uri`
+    // clears it.
+    let mut bundle_uri: Option<String> = None;
     let mut positionals: Vec<&str> = Vec::new();
 
     let mut i = 0;
@@ -282,6 +286,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // into (git's `option_also_filter_submodules`).
             "--also-filter-submodules" => also_filter_submodules = Some(true),
             "--no-also-filter-submodules" => also_filter_submodules = Some(false),
+            "--bundle-uri" => bundle_uri = Some(take_value!("--bundle-uri")),
+            "--no-bundle-uri" => bundle_uri = None,
             "--depth" => {
                 let v = take_value!("--depth");
                 let n: u32 = v
@@ -374,6 +380,15 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         if !recurse_submodules {
             bail!("the option '--also-filter-submodules' requires '--recurse-submodules'");
         }
+    }
+
+    // `builtin/clone.c`: bundles carry whole history, so they cannot be combined
+    // with a shallow request.
+    if bundle_uri.is_some() && (depth.is_some() || shallow_since.is_some() || !shallow_exclude.is_empty())
+    {
+        bail!(
+            "options '--bundle-uri' and '--depth/--shallow-since/--shallow-exclude' cannot be used together"
+        );
     }
 
     // git refuses to combine these (`builtin/clone.c`, verified against stock git:
@@ -640,6 +655,46 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         });
     }
 
+    // Before fetching from the remote, download and install bundle data from the
+    // `--bundle-uri` option. git does this after `create_reference_database()`
+    // and before the first fetch (`builtin/clone.c`), so the bundled objects and
+    // the `refs/bundles/*` tips they leave behind are already on disk when the
+    // remote is contacted.
+    //
+    // git persists `fetch.bundleURI` right here with `repo_config_set_gently`;
+    // this defers the write to `finalize_config` below because the fetch
+    // rewrites `.git/config` in between, which would drop a value written now.
+    // The end state is identical.
+    let mut persist_bundle_uri: Option<String> = None;
+    let mut persist_creation_token: Option<String> = None;
+    if let Some(uri) = bundle_uri.as_deref() {
+        match gix::open(&git_dir) {
+            Err(_) => eprintln!("warning: failed to initialize the repo, skipping bundle URI"),
+            Ok(bundle_repo) => {
+                let (failed, has_heuristic) =
+                    super::bundle::uri::fetch_bundle_uri(&bundle_repo, uri);
+                if failed {
+                    eprintln!("warning: failed to fetch objects from bundle URI '{uri}'");
+                } else if has_heuristic {
+                    // Only a list that advertised `bundle.heuristic` is worth
+                    // revisiting on every fetch, so only that one is recorded.
+                    persist_bundle_uri = Some(uri.to_string());
+                }
+                // `fetch_bundles_by_token` wrote `fetch.bundleCreationToken`
+                // straight into the config file; carry it across the rewrite the
+                // fetch performs, for the same reason `fetch.bundleURI` is
+                // deferred.
+                persist_creation_token = gix::open(&git_dir)
+                    .ok()
+                    .and_then(|r| {
+                        r.config_snapshot()
+                            .string("fetch.bundleCreationToken")
+                            .map(|v| v.to_string())
+                    });
+            }
+        }
+    }
+
     // Drive gitoxide's fetch/checkout through a prodash tree and render it to
     // stderr with the line renderer. The tree relays the remote's sideband
     // progress (Enumerating/Counting/Compressing objects, Total …) as well as the
@@ -763,6 +818,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     submodule_pathspecs.clone()
                 }
             }),
+            fetch_bundle_uri: persist_bundle_uri.clone(),
+            fetch_bundle_creation_token: persist_creation_token.clone(),
             config_pairs: &config_pairs,
         },
     )?;
@@ -1022,6 +1079,12 @@ struct ConfigFixups<'a> {
     promisor_filter: Option<String>,
     /// `submodule.active` values recorded by `--recurse-submodules[=<pathspec>]`.
     submodule_active: Option<Vec<String>>,
+    /// `fetch.bundleURI`, recorded by `--bundle-uri` when the list it fetched
+    /// advertised a `bundle.heuristic` so later fetches can revisit it.
+    fetch_bundle_uri: Option<String>,
+    /// `fetch.bundleCreationToken`, the largest `bundle.<id>.creationToken` the
+    /// bundle-URI client applied, so the next fetch downloads nothing older.
+    fetch_bundle_creation_token: Option<String>,
     /// `-c <key>=<value>` pairs, in command-line order.
     config_pairs: &'a [(String, String)],
 }
@@ -1040,6 +1103,8 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
         && !fixups.drop_branch_sections
         && fixups.submodule_active.is_none()
         && fixups.promisor_filter.is_none()
+        && fixups.fetch_bundle_uri.is_none()
+        && fixups.fetch_bundle_creation_token.is_none()
         && fixups.config_pairs.is_empty()
     {
         return Ok(());
@@ -1099,6 +1164,22 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         for pathspec in pathspecs {
             section.push("active", Some(pathspec.as_str().into()))?;
+        }
+    }
+
+    if fixups.fetch_bundle_uri.is_some() || fixups.fetch_bundle_creation_token.is_some() {
+        let mut section = file
+            .section_mut_or_create_new("fetch", None)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Key spelling and order follow stock git: `fetch_bundles_by_token()`
+        // writes `bundleCreationToken` first, then `builtin/clone.c` writes the
+        // URI under the all-lowercase `fetch.bundleuri` it passes to
+        // `repo_config_set_gently`.
+        if let Some(token) = &fixups.fetch_bundle_creation_token {
+            section.set("bundleCreationToken", token.as_str())?;
+        }
+        if let Some(uri) = &fixups.fetch_bundle_uri {
+            section.set("bundleuri", uri.as_str())?;
         }
     }
 

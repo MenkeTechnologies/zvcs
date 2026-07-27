@@ -813,6 +813,13 @@ fn sid() -> &'static str {
     SID.get_or_init(compute_sid)
 }
 
+/// This process's SID for callers outside tracing. `trace2_session_id()` is what
+/// `upload-pack` advertises under `transfer.advertiseSID`, and it returns the
+/// same id whether or not a trace target is active.
+pub(crate) fn session_id() -> &'static str {
+    sid()
+}
+
 /// The live event target, or `None` when tracing is off or not yet started.
 fn event() -> Option<&'static Event> {
     EVENT.get()?.as_ref()

@@ -19,10 +19,20 @@ impl Diff {
     /// * `after` - The token sequence from the second file, after changes
     /// * `heuristic` - The slider heuristic to use for positioning hunks
     pub fn postprocess_with(&mut self, before: &[Token], after: &[Token], mut heuristic: impl SliderHeuristic) {
+        // git compacts the *before* file first and the after file second:
+        //
+        //     xdl_change_compact(&xe.xdf1, &xe.xdf2, xpp->flags) ||
+        //     xdl_change_compact(&xe.xdf2, &xe.xdf1, xpp->flags)
+        //
+        // The order is load-bearing, not cosmetic: each pass rewrites the `changed` array it
+        // compacts, and the second pass reads the first one's output as the "other" file when
+        // it decides where a slidable group must land to stay aligned with a change on the
+        // other side. Compacting the after file first lands groups on the pre-compaction
+        // alignment and produces a different, git-incompatible split of the same edit script.
         Postprocessor {
-            added: &mut self.added,
-            removed: &mut self.removed,
-            tokens: after,
+            added: &mut self.removed,
+            removed: &mut self.added,
+            tokens: before,
             hunk: Hunk {
                 before: 0..0,
                 after: 0..0,
@@ -31,9 +41,9 @@ impl Diff {
         }
         .run();
         Postprocessor {
-            added: &mut self.removed,
-            removed: &mut self.added,
-            tokens: before,
+            added: &mut self.added,
+            removed: &mut self.removed,
+            tokens: after,
             hunk: Hunk {
                 before: 0..0,
                 after: 0..0,

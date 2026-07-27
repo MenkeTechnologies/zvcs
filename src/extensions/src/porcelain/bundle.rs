@@ -1,8 +1,13 @@
 //! `git bundle` — move objects and refs by archive.
 //!
-//! Two of the four subcommands are ported in full and are byte-verifiable
-//! against stock git (checked against git 2.55.0); the two that would have to
-//! *write* pack data bail with the concrete substrate that is missing.
+//! Three of the four subcommands are ported in full and are byte-verifiable
+//! against stock git (checked against git 2.55.0); the one that would have to
+//! *write* pack data bails with the concrete substrate that is missing.
+//!
+//! [`uri`] holds the bundle-URI client — `git clone --bundle-uri` and the
+//! `fetch.bundleURI` a `git fetch` follows — which is the only place the
+//! `bundle.*` key space is ever read, since those keys live in a downloaded
+//! bundle *list* and not in any repository config.
 //!
 //! Ported, byte-for-byte:
 //!   * `git bundle list-heads <file> [<refname>...]` — the bundle header's ref
@@ -16,6 +21,14 @@
 //!     (`could not open`, `does not look like a v2 or v3 bundle file`,
 //!     `Repository lacks these prerequisite commits:`) and the
 //!     not-connected-to-history diagnostic
+//!   * `git bundle unbundle [--progress] <file> [<refname>...]` — the
+//!     prerequisite check, then `index-pack --fix-thin --stdin` over the pack
+//!     that follows the header, then the ref list (filtered by exact name like
+//!     `list-heads`). git spawns that `index-pack` as a child process
+//!     (`ip.git_cmd = 1`, `ip.in = bundle_fd`, `ip.no_stdout = 1` in
+//!     `bundle.c`), and so does this, which is why the header is read one byte
+//!     at a time: the child inherits the very same descriptor, positioned at the
+//!     first byte of the pack
 //!   * `-h` for `bundle` itself and for each of the four subcommands (usage to
 //!     stdout, exit 129), plus `need a subcommand`, `unknown subcommand`,
 //!     `unknown option`/`unknown switch` and `need a <file> argument`
@@ -24,7 +37,13 @@
 //! Exit codes match git: 0 on success, 1 for a bundle that cannot be opened,
 //! parsed, or verified, 129 for usage errors.
 //!
-//! Not ported — these bail, naming the gap, rather than producing a pack that
+//! One caveat carries over from `porcelain/index_pack.rs`: a *thin* bundle's
+//! stored pack diverges from git's bytes because `gix` injects borrowed bases
+//! just before their first referencing delta rather than appending them
+//! (`index_pack.rs:60`). The objects and refs are identical; the pack hash on
+//! disk need not be.
+//!
+//! Not ported — this bails, naming the gap, rather than producing a pack that
 //! only looks right:
 //!   * `create` — needs a pack writer that can delta-compress and emit *thin*
 //!     packs. `gix-pack`'s writer has exactly one mode, documented as "Copy
@@ -34,25 +53,6 @@
 //!     built with a prerequisite is a thin pack, and a self-contained one would
 //!     differ from git's byte-for-byte — and since `create` writes nothing to
 //!     stdout and exits 0, a wrong bundle is indistinguishable from success.
-//!   * `unbundle` — git runs `index-pack --fix-thin --stdin` on the pack that
-//!     follows the header, then lists its refs. That `index-pack` is already
-//!     ported (`porcelain/index_pack.rs`): its stdin path drives
-//!     `gix_pack::Bundle::write_to_directory` with the odb as the thin-pack
-//!     resolver (`index_pack.rs:527`) and writes the `pack-*.rev` reverse index
-//!     itself (`index_pack.rs:643`), so the earlier "`gix` cannot write a
-//!     `.rev`" reason no longer holds. What blocks a faithful port *from this
-//!     file* is reuse, not a missing gix capability: that pack drive and `.rev`
-//!     writer (`index_from_stdin` / `write_rev_index`) are module-private, so a
-//!     non-duplicating port needs them promoted to a shared helper — a change
-//!     to another module this task forbids. Two obstacles survive even that:
-//!     handing the pack to `index-pack` needs the *same* stream left positioned
-//!     exactly at the pack start (git's `read_bundle_header_fd` reads the header
-//!     one byte at a time via `strbuf_getwholeline_fd` for precisely this),
-//!     whereas the look-ahead `BufReader` in the `read_header` shared with the
-//!     verified `list-heads`/`verify` paths consumes the stdin (`-`) pack bytes;
-//!     and a *thin* bundle's stored pack still diverges from git's bytes because
-//!     `gix` injects borrowed bases mid-pack rather than appending them
-//!     (`index_pack.rs:60`).
 //!
 //! Two further deliberate gaps, so this doc claims no more than the code does:
 //! a v3 bundle carrying any capability other than `@object-format` is rejected
@@ -65,11 +65,15 @@
 
 use anyhow::{bail, Result};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
-use std::process::ExitCode;
+use std::io::{self, IsTerminal, Read, Write};
+use std::mem::ManuallyDrop;
+use std::os::fd::FromRawFd;
+use std::process::{ExitCode, Stdio};
 
 use gix::hash::ObjectId;
 use gix::objs::Kind;
+
+pub(crate) mod uri;
 
 /// The top-level usage block, byte-for-byte as git 2.55 emits it.
 const TOP_USAGE: &str = "\
@@ -152,7 +156,7 @@ fn need_file(usage: &str) -> ExitCode {
 // ---------------------------------------------------------------- header ----
 
 /// A parsed bundle header: everything before the pack data.
-struct Header {
+pub(crate) struct Header {
     /// The value of the `@object-format` capability, or `sha1` when absent.
     /// Printed verbatim by `verify` as the hash algorithm.
     hash: String,
@@ -161,11 +165,11 @@ struct Header {
     prereqs: Vec<ObjectId>,
     /// `(object id, ref name)` pairs. Ref names are kept as raw bytes because
     /// they are echoed verbatim and are not required to be UTF-8.
-    refs: Vec<(ObjectId, Vec<u8>)>,
+    pub(crate) refs: Vec<(ObjectId, Vec<u8>)>,
 }
 
 /// The failures git reports itself, with its own wording and exit code 1.
-enum HeaderError {
+pub(crate) enum HeaderError {
     /// `error: could not open '<file>'`
     Open,
     /// `error: '<file>' does not look like a v2 or v3 bundle file`
@@ -189,28 +193,86 @@ fn report(path: &str, err: HeaderError) -> Result<ExitCode> {
     Ok(ExitCode::from(1))
 }
 
+/// The bundle byte stream, left at exactly the position the header parser
+/// stopped at — the first byte of the pack.
+///
+/// git reads bundle headers one byte at a time (`strbuf_getwholeline_fd`,
+/// `strbuf.c`, called from `read_bundle_header_fd` in `bundle.c`) for precisely
+/// this reason: `unbundle()` then hands the very same descriptor to
+/// `index-pack --stdin` as its `ip.in`. Any read-ahead buffer would swallow the
+/// leading pack bytes, so this type never buffers.
+pub(crate) enum BundleSource {
+    File(File),
+    /// `-`: the stream is descriptor 0 itself, which the child inherits in place.
+    Stdin,
+}
+
+impl Read for BundleSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            BundleSource::File(f) => f.read(buf),
+            // `io::Stdin` wraps a `BufReader` that would read past the header, so
+            // go to the descriptor directly. `ManuallyDrop` keeps fd 0 open.
+            BundleSource::Stdin => {
+                let mut fd = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
+                fd.read(buf)
+            }
+        }
+    }
+}
+
+impl BundleSource {
+    /// The stream as a child's stdin, still positioned at the pack. This is
+    /// git's `ip.in = bundle_fd`.
+    fn into_stdio(self) -> Stdio {
+        match self {
+            BundleSource::File(f) => Stdio::from(f),
+            BundleSource::Stdin => Stdio::inherit(),
+        }
+    }
+}
+
 /// Read one `\n`-terminated line, keeping the terminator. `Ok(None)` at EOF.
-fn read_line(input: &mut dyn BufRead) -> Result<Option<Vec<u8>>, HeaderError> {
+///
+/// One byte per `read`, as `strbuf_getwholeline_fd` does, so the stream stops on
+/// the terminator and not a byte later.
+fn read_line(input: &mut dyn Read) -> Result<Option<Vec<u8>>, HeaderError> {
     let mut line = Vec::new();
-    match input.read_until(b'\n', &mut line) {
-        Ok(0) => Ok(None),
-        Ok(_) => Ok(Some(line)),
-        Err(_) => Err(HeaderError::NotBundle),
+    let mut byte = [0u8; 1];
+    loop {
+        match input.read(&mut byte) {
+            Ok(0) => return Ok(if line.is_empty() { None } else { Some(line) }),
+            Ok(_) => {
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    return Ok(Some(line));
+                }
+            }
+            Err(_) => return Err(HeaderError::NotBundle),
+        }
     }
 }
 
 /// Parse the header of the bundle at `path` (`-` means stdin), stopping at the
 /// blank line that separates it from the pack data.
 fn read_header(path: &str) -> Result<Header, HeaderError> {
-    let mut input: Box<dyn BufRead> = if path == "-" {
-        Box::new(BufReader::new(io::stdin()))
-    } else {
-        Box::new(BufReader::new(
-            File::open(path).map_err(|_| HeaderError::Open)?,
-        ))
-    };
+    open_bundle(path).map(|(header, _)| header)
+}
 
-    let magic = read_line(&mut *input)?.ok_or(HeaderError::NotBundle)?;
+/// git's `open_bundle()` (`builtin/bundle.c`): the parsed header plus the stream
+/// positioned at the pack, ready to be handed to `index-pack --stdin`.
+pub(crate) fn open_bundle(path: &str) -> Result<(Header, BundleSource), HeaderError> {
+    let mut input = if path == "-" {
+        BundleSource::Stdin
+    } else {
+        BundleSource::File(File::open(path).map_err(|_| HeaderError::Open)?)
+    };
+    let header = read_header_from(&mut input)?;
+    Ok((header, input))
+}
+
+fn read_header_from(input: &mut BundleSource) -> Result<Header, HeaderError> {
+    let magic = read_line(input)?.ok_or(HeaderError::NotBundle)?;
     let version = match magic.as_slice() {
         b"# v2 git bundle\n" => 2u8,
         b"# v3 git bundle\n" => 3u8,
@@ -227,7 +289,7 @@ fn read_header(path: &str) -> Result<Header, HeaderError> {
     let mut pending: Option<Vec<u8>>;
     // Capabilities (v3 only) come first, each on its own `@key[=value]` line.
     loop {
-        let Some(line) = read_line(&mut *input)? else {
+        let Some(line) = read_line(input)? else {
             return Err(HeaderError::Malformed("truncated before the pack".into()));
         };
         if !line.starts_with(b"@") {
@@ -263,7 +325,7 @@ fn read_header(path: &str) -> Result<Header, HeaderError> {
     loop {
         let line = match pending.take() {
             Some(line) => line,
-            None => read_line(&mut *input)?
+            None => read_line(input)?
                 .ok_or_else(|| HeaderError::Malformed("truncated before the pack".into()))?,
         };
         let line = line.strip_suffix(b"\n").unwrap_or(&line);
@@ -378,22 +440,7 @@ fn verify(args: &[String]) -> Result<ExitCode> {
 
     let repo = gix::discover(".")?;
 
-    // A prerequisite is satisfied only if the object is present *and* is a
-    // commit — git adds non-commits to no pending list, so they read as missing.
-    let missing: Vec<&ObjectId> = header
-        .prereqs
-        .iter()
-        .filter(|oid| !matches!(repo.find_header(**oid).map(|h| h.kind()), Ok(Kind::Commit)))
-        .collect();
-
-    if !missing.is_empty() {
-        if !quiet {
-            eprintln!("error: Repository lacks these prerequisite commits:");
-            for oid in missing {
-                // git prints `<oid> <name>` with an empty name for prerequisites.
-                eprintln!("error: {oid} ");
-            }
-        }
+    if !report_missing_prereqs(&repo, &header, quiet) {
         return Ok(ExitCode::from(1));
     }
 
@@ -444,6 +491,51 @@ fn verify(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The prerequisite half of git's `verify_bundle()` (`bundle.c`): report every
+/// prerequisite commit the repository lacks and answer whether none were
+/// missing. `quiet` is git's `VERIFY_BUNDLE_QUIET`, which suppresses the report
+/// but not the verdict.
+///
+/// A prerequisite is satisfied only if the object is present *and* is a commit —
+/// git's `parse_object()` yields nothing else to its pending list, so a present
+/// blob or tree reads as missing.
+fn report_missing_prereqs(repo: &gix::Repository, header: &Header, quiet: bool) -> bool {
+    let missing: Vec<&ObjectId> = header
+        .prereqs
+        .iter()
+        .filter(|oid| !matches!(repo.find_header(**oid).map(|h| h.kind()), Ok(Kind::Commit)))
+        .collect();
+    if missing.is_empty() {
+        return true;
+    }
+    if !quiet {
+        eprintln!("error: Repository lacks these prerequisite commits:");
+        for oid in missing {
+            // git prints `<oid> <name>` with an empty name for prerequisites.
+            eprintln!("error: {oid} ");
+        }
+    }
+    false
+}
+
+/// git's `verify_bundle()` with neither `VERIFY_BUNDLE_VERBOSE` nor a
+/// reachability shortcut: the prerequisite presence check followed by the
+/// connectivity check. Answers whether the bundle may be applied.
+pub(crate) fn verify_bundle(repo: &gix::Repository, header: &Header, quiet: bool) -> bool {
+    if !report_missing_prereqs(repo, header, quiet) {
+        return false;
+    }
+    if !header.prereqs.is_empty() && !history_is_complete(repo, &header.prereqs) {
+        if !quiet {
+            eprintln!(
+                "error: some prerequisite commits exist in the object store, but are not connected to the repository's history"
+            );
+        }
+        return false;
+    }
+    true
+}
+
 /// Whether every commit reachable from `tips` is present in the object store.
 /// A traversal error means a parent (or one of its ancestors) is missing, which
 /// is exactly the "exists but is not connected" case git reports.
@@ -475,20 +567,102 @@ fn create(args: &[String]) -> Result<ExitCode> {
     )
 }
 
-/// `git bundle unbundle` is not ported; only `-h` is served.
+/// `git bundle unbundle [--progress] <file> [<refname>...]`
+///
+/// Port of `cmd_bundle_unbundle` (`builtin/bundle.c`) plus the `unbundle()` it
+/// calls (`bundle.c`): open the bundle, verify its prerequisites, then run
+/// `index-pack --fix-thin --stdin` over the pack that follows the header and
+/// list the bundle's refs. git spawns that `index-pack` as a child process with
+/// `ip.git_cmd = 1` and `ip.in = bundle_fd`; this does the same with the running
+/// binary, so `porcelain/index_pack.rs` is reused exactly as git reuses its own
+/// builtin rather than being duplicated here.
 fn unbundle(args: &[String]) -> Result<ExitCode> {
-    if args.iter().any(|a| a == "-h") {
-        print!("{UNBUNDLE_USAGE}");
-        return Ok(ExitCode::from(129));
+    // git's `int progress = isatty(2);`, overridable with `--progress`.
+    let mut progress = io::stderr().is_terminal();
+    let mut file: Option<&str> = None;
+    let mut filters: Vec<&[u8]> = Vec::new();
+
+    for a in args {
+        match a.as_str() {
+            "-h" => {
+                print!("{UNBUNDLE_USAGE}");
+                return Ok(ExitCode::from(129));
+            }
+            "--progress" => progress = true,
+            "--no-progress" => progress = false,
+            s if s.starts_with("--") && s.len() > 2 => {
+                return Ok(bad_option(&s[2..], UNBUNDLE_USAGE, false));
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                return Ok(bad_option(&s[1..], UNBUNDLE_USAGE, true));
+            }
+            s if file.is_none() => file = Some(s),
+            s => filters.push(s.as_bytes()),
+        }
     }
-    bail!(
-        "`bundle unbundle` is not ported here: git runs `index-pack --fix-thin --stdin`, which \
-         porcelain/index_pack.rs already implements (including the .rev reverse index and thin-pack \
-         completion), but its pack drive and .rev writer are module-private and cannot be reused \
-         without promoting them to a shared helper outside this file; handing the pack to index-pack \
-         also needs the same stream positioned at the pack start, which the look-ahead BufReader in \
-         the shared read_header (used by the verified list-heads/verify paths) does not preserve for \
-         stdin, and a thin bundle's stored pack diverges from git's bytes because gix injects bases \
-         mid-pack rather than appending them"
-    )
+
+    let Some(file) = file else {
+        return Ok(need_file(UNBUNDLE_USAGE));
+    };
+
+    // git's `if (!startup_info->have_repository) die(...)`, which exits 128.
+    let Ok(repo) = gix::discover(".") else {
+        eprintln!("fatal: Need a repository to unbundle.");
+        return Ok(ExitCode::from(128));
+    };
+
+    let (header, source) = match open_bundle(file) {
+        Ok(pair) => pair,
+        Err(e) => return report(file, e),
+    };
+
+    // `unbundle()` runs `verify_bundle()` first and gives up if it fails.
+    if !verify_bundle(&repo, &header, false) {
+        return Ok(ExitCode::from(1));
+    }
+
+    let extra: &[&str] = if progress {
+        &["-v", "--progress-title", "Unbundling objects"]
+    } else {
+        &[]
+    };
+    if !index_pack(source, &repo, extra)? {
+        eprintln!("error: index-pack died");
+        return Ok(ExitCode::from(1));
+    }
+
+    // `list_bundle_refs()`, which is `list_refs()` over the header's references —
+    // the same rendering `list-heads` uses.
+    let mut out = Vec::new();
+    write_refs(&mut out, &header.refs, &filters);
+    io::stdout().write_all(&out)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// git's `strvec_pushl(&ip.args, "index-pack", "--fix-thin", "--stdin", NULL)`
+/// child, fed the bundle stream as its stdin. `ip.no_stdout = 1` in git, so the
+/// `pack\t<hash>` line `index-pack` writes is discarded here too.
+///
+/// Answers whether the child succeeded.
+pub(crate) fn index_pack(
+    source: BundleSource,
+    repo: &gix::Repository,
+    extra_args: &[&str],
+) -> Result<bool> {
+    // The child must index into *this* repository even when the caller was
+    // invoked from elsewhere — the bundle-URI client runs from the directory
+    // `git clone` was started in, not from inside the new repository.
+    // `index-pack` resolves the repository with `gix::discover(".")`
+    // (`index_pack.rs:286`), which walks *upwards* and so does not recognise a
+    // `.git` directory it is standing inside; the work tree is the directory to
+    // hand it, falling back to the git dir itself for a bare repository.
+    let cwd = repo.workdir().unwrap_or_else(|| repo.git_dir());
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .current_dir(cwd)
+        .args(["index-pack", "--fix-thin", "--stdin"])
+        .args(extra_args)
+        .stdin(source.into_stdio())
+        .stdout(Stdio::null())
+        .status()?;
+    Ok(status.success())
 }

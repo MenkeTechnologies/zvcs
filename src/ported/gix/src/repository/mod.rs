@@ -109,6 +109,9 @@ pub mod blame_file {
         pub detect_moved: Option<u32>,
         /// Commits whose changes should not be attributed to them (`git blame --ignore-rev`).
         pub ignore_revs: std::collections::HashSet<gix_hash::ObjectId>,
+        /// Also blame parents for lines that were copied out of another file
+        /// (`git blame -C[<score>]`).
+        pub detect_copied: Option<gix_blame::CopyDetection>,
     }
 
     /// The error returned by [Repository::blame_file()](crate::Repository::blame_file()).

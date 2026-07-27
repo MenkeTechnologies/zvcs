@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 /// Locate `<hooks-dir>/<event>`, returning it only when it exists and is
 /// executable. A present-but-non-executable file draws git's `advice.ignoredHook`
 /// hint, matching `builtin/hook` behavior.
-fn find(repo: &gix::Repository, event: &str) -> Result<Option<PathBuf>> {
+pub(crate) fn find(repo: &gix::Repository, event: &str) -> Result<Option<PathBuf>> {
     let dir = match repo.config_snapshot().trusted_path("core.hooksPath")? {
         Some(p) => p.to_path_buf(),
         None => repo.common_dir().join("hooks"),

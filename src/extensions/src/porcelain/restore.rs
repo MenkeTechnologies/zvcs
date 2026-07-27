@@ -125,6 +125,8 @@ fn three_way_merge(
             style,
             marker_size: NonZeroU8::new(7).expect("7 != 0"),
         },
+        // `merge-ll.c`'s level, which is what every caller but `merge-file` uses.
+        ..Options::default()
     };
     // The free 3-way text merge is re-exported as the value `builtin_driver::text`
     // (a function that shares its name with the `text` module), so it is invoked

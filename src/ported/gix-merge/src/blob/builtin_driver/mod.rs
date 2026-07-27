@@ -27,4 +27,4 @@ pub use binary::function::merge as binary;
 
 ///
 pub mod text;
-pub use text::function::merge as text;
+pub use text::function::{merge as text, merge_counted as text_counted};

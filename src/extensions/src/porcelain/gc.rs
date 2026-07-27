@@ -625,6 +625,9 @@ fn repack_all(
             let _ = std::fs::remove_file(pack_dir.join(format!("{base}.{ext}")));
         }
     }
+    // The packs are gone; a multi-pack-index still naming them would answer every
+    // lookup for their objects with an offset into a file that no longer exists.
+    super::multi_pack_index::drop_stale_midx(&pack_dir);
     Ok(())
 }
 

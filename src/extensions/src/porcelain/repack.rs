@@ -445,6 +445,9 @@ fn execute(st: &State) -> Result<ExitCode> {
                 let _ = fs::remove_file(index_path.with_extension(ext));
             }
         }
+        // A multi-pack-index naming a pack this just deleted would keep sending
+        // lookups to a missing file, so git drops it along with the packs.
+        super::multi_pack_index::drop_stale_midx(&pack_dir);
         // git finishes `-d` by running `git prune-packed`, which is a real port.
         let _ = super::prune_packed::prune_packed(&["prune-packed".to_string(), "-q".to_string()])?;
     }

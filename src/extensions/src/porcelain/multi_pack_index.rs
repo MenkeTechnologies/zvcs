@@ -1163,6 +1163,28 @@ fn pack_indices(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Remove `<pack_dir>/multi-pack-index` when it still names a pack that is gone.
+///
+/// git's `repack -d` deletes the MIDX together with the packs it superseded, so
+/// the index never outlives them. A MIDX that does outlive them keeps answering
+/// object lookups with `(pack, offset)` pairs pointing at a file that no longer
+/// exists, and the object then reads as missing even though another pack holds
+/// it. `write_midx()` only ever writes the flat form, so that is the only layout
+/// checked here.
+pub(crate) fn drop_stale_midx(pack_dir: &Path) {
+    let midx = pack_dir.join("multi-pack-index");
+    let Ok(file) = multi_index::File::at(&midx, None) else {
+        return;
+    };
+    let stale = file.index_names().iter().any(|name| {
+        let idx = pack_dir.join(name);
+        !idx.is_file() || !idx.with_extension("pack").is_file()
+    });
+    if stale {
+        let _ = fs::remove_file(&midx);
+    }
+}
+
 /// Sorted UTF-8 entry names of `dir`; a missing or unreadable directory yields
 /// nothing, which is how git treats an object store with no `pack` directory.
 fn dir_names(dir: &Path) -> Vec<String> {

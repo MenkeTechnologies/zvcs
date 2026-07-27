@@ -110,10 +110,10 @@ where
             }
         }
 
-        'outer: loop {
+        loop {
             {
                 let marker = snapshot.marker;
-                for (idx, index) in snapshot.indices.iter_mut().enumerate() {
+                'indices: for (idx, index) in snapshot.indices.iter_mut().enumerate() {
                     if let Some(handle::index_lookup::Outcome {
                         object_index: handle::IndexForObjectInPack { pack_id, pack_offset },
                         index_file,
@@ -127,22 +127,14 @@ where
                                     *possibly_pack = Some(pack);
                                     possibly_pack.as_deref().expect("just put it in")
                                 }
-                                None => {
-                                    // The pack wasn't available anymore so we are supposed to try another round with a fresh index
-                                    match self.store.load_one_index(self.index_ctx(snapshot.marker))? {
-                                        Some(new_snapshot) => {
-                                            *snapshot = new_snapshot;
-                                            self.clear_cache();
-                                            continue 'outer;
-                                        }
-                                        None => {
-                                            // nothing new in the index, kind of unexpected to not have a pack but to also
-                                            // to have no new index yet. We set the new index before removing any slots, so
-                                            // this should be observable.
-                                            return Ok(None);
-                                        }
-                                    }
-                                }
+                                // The pack this index points at is gone. That happens transiently
+                                // while another process repacks, and permanently when a stale
+                                // multi-pack-index still names packs a repack deleted - git keeps
+                                // resolving those objects from whatever index still holds them, so
+                                // finish scanning the snapshot instead of giving up here. The loose
+                                // databases and the index refresh below still run afterwards, which
+                                // is what covers the concurrent-repack case.
+                                None => continue 'indices,
                             },
                         };
                         let entry = pack.entry(pack_offset)?;
@@ -371,10 +363,10 @@ where
 
         let mut snapshot = self.snapshot.borrow_mut();
         let mut inflate = self.inflate.borrow_mut();
-        'outer: loop {
+        loop {
             {
                 let marker = snapshot.marker;
-                for (idx, index) in snapshot.indices.iter_mut().enumerate() {
+                'indices: for (idx, index) in snapshot.indices.iter_mut().enumerate() {
                     if let Some(handle::index_lookup::Outcome {
                         object_index: handle::IndexForObjectInPack { pack_id, pack_offset },
                         index_file: _,
@@ -388,22 +380,9 @@ where
                                     *possibly_pack = Some(pack);
                                     possibly_pack.as_deref().expect("just put it in")
                                 }
-                                None => {
-                                    // The pack wasn't available anymore so we are supposed to try another round with a fresh index
-                                    match self.store.load_one_index(self.index_ctx(snapshot.marker)).ok()? {
-                                        Some(new_snapshot) => {
-                                            *snapshot = new_snapshot;
-                                            self.clear_cache();
-                                            continue 'outer;
-                                        }
-                                        None => {
-                                            // nothing new in the index, kind of unexpected to not have a pack but to also
-                                            // to have no new index yet. We set the new index before removing any slots, so
-                                            // this should be observable.
-                                            return None;
-                                        }
-                                    }
-                                }
+                                // Gone, exactly as in `try_find_cached_inner()`: keep scanning the
+                                // remaining indices, and only then fall through to the refresh.
+                                None => continue 'indices,
                             },
                         };
                         let entry = pack.entry(pack_offset).ok()?;

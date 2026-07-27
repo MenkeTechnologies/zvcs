@@ -293,6 +293,33 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
             raw_paths.extend(args[i + 1..].iter().cloned());
             break;
         }
+        // `--ws-error-highlight <kind>`, `--color-moved-ws <modes>` and
+        // `--word-diff-regex <re>` take their value as the next argument when it is
+        // not glued on with `=`. All three only steer *patch* rendering, which this
+        // command never produces, so the accepted value has no effect here — but
+        // parse-options still validates it, and it still has to be consumed so it is
+        // not left behind to be misread as a revision.
+        if a == "--ws-error-highlight" || super::diff_color::needs_separate_value(a) {
+            let Some(v) = args.get(i + 1).map(String::as_str) else {
+                eprintln!("error: {}", super::diff_color::missing_value(a));
+                return Ok(ExitCode::from(USAGE_ERROR));
+            };
+            if let Some(code) = validate_render_value(a, v) {
+                return Ok(code);
+            }
+            i += 2;
+            continue;
+        }
+        // The same three spelled with `=`, validated by the same callback.
+        if let Some((flag, v)) = a.split_once('=') {
+            if flag == "--ws-error-highlight" || super::diff_color::needs_separate_value(flag) {
+                if let Some(code) = validate_render_value(flag, v) {
+                    return Ok(code);
+                }
+                i += 1;
+                continue;
+            }
+        }
         if a.starts_with('-') && a != "-" {
             match a {
                 "-r" => opts.recurse = true,
@@ -747,6 +774,40 @@ fn valid_pretty_format(v: &str) -> bool {
 /// raw, `-t`, `--name-status` and commit-id-line forms before being listed here.
 /// Options that re-compare blob content (`-w`, `-b`, the `--ignore-*` family) are
 /// deliberately absent: they drop pairs from the raw output too.
+/// The value check parse-options runs for the patch-rendering options this command
+/// accepts but cannot act on. `--ws-error-highlight` and `--color-moved-ws` both
+/// validate their argument in the option callback, so a bad value is a 129 here even
+/// though no patch is ever emitted; `--word-diff-regex` takes any string, since git
+/// only compiles the pattern once a word diff actually runs.
+///
+/// `Some(code)` means the message was written and the command must exit with it.
+fn validate_render_value(flag: &str, value: &str) -> Option<ExitCode> {
+    match flag {
+        "--ws-error-highlight" => match super::diff_color::parse_ws_error_highlight(value) {
+            Ok(_) => None,
+            Err(accepted) => {
+                eprintln!(
+                    "error: unknown value after ws-error-highlight={}",
+                    &value[..accepted]
+                );
+                Some(ExitCode::from(USAGE_ERROR))
+            }
+        },
+        "--color-moved-ws" => {
+            let mut probe = super::diff_color::MoveWordOpts::default();
+            let mut when = None;
+            match probe.parse_flag(&format!("{flag}={value}"), &mut when) {
+                Some(Err(msg)) => {
+                    eprintln!("{msg}");
+                    Some(ExitCode::from(USAGE_ERROR))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn is_ignorable(a: &str) -> bool {
     const EXACT: &[&str] = &[
         "--no-prefix",
@@ -783,9 +844,7 @@ fn is_ignorable(a: &str) -> bool {
         "--output-indicator-new=",
         "--output-indicator-old=",
         "--output-indicator-context=",
-        "--ws-error-highlight=",
         "--word-diff=",
-        "--word-diff-regex=",
     ];
     EXACT.contains(&a) || PREFIX.iter().any(|p| a.starts_with(p))
 }

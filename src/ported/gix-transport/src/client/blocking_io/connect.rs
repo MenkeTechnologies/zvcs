@@ -42,10 +42,13 @@ pub(crate) mod function {
                 )
             }
             gix_url::Scheme::Ssh => Box::new({
+                let mut ssh = options.ssh;
+                // git's `--ipv4`/`--ipv6` becomes the `-4`/`-6` the ssh program is invoked with.
+                ssh.address_family = options.address_family;
                 crate::client::blocking_io::ssh::connect_with_program(
                     url,
                     options.version,
-                    options.ssh,
+                    ssh,
                     options.trace,
                     options.upload_pack,
                 )
@@ -66,6 +69,7 @@ pub(crate) mod function {
                         options.version,
                         url.port,
                         options.trace,
+                        options.address_family,
                     )
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
                 })
@@ -73,15 +77,18 @@ pub(crate) mod function {
             #[cfg(not(any(feature = "http-client-curl", feature = "http-client-reqwest")))]
             gix_url::Scheme::Https | gix_url::Scheme::Http => return Err(Error::CompiledWithoutHttp(url.scheme)),
             #[cfg(feature = "http-client-curl")]
-            gix_url::Scheme::Https | gix_url::Scheme::Http => Box::new(
-                crate::client::blocking_io::http::connect::<Curl>(url, options.version, options.trace),
-            ),
+            gix_url::Scheme::Https | gix_url::Scheme::Http => Box::new({
+                let mut transport = crate::client::blocking_io::http::connect::<Curl>(url, options.version, options.trace);
+                transport.set_address_family(options.address_family);
+                transport
+            }),
             #[cfg(all(feature = "http-client-reqwest", not(feature = "http-client-curl")))]
-            gix_url::Scheme::Https | gix_url::Scheme::Http => Box::new(crate::client::blocking_io::http::connect::<
-                Reqwest,
-            >(
-                url, options.version, options.trace
-            )),
+            gix_url::Scheme::Https | gix_url::Scheme::Http => Box::new({
+                let mut transport =
+                    crate::client::blocking_io::http::connect::<Reqwest>(url, options.version, options.trace);
+                transport.set_address_family(options.address_family);
+                transport
+            }),
         })
     }
 }

@@ -104,6 +104,9 @@ pub mod blame_file {
         pub rewrites: Option<gix_diff::Rewrites>,
         /// Ignore whitespace differences when diffing revisions (`git blame -w`).
         pub ignore_whitespace: bool,
+        /// Also blame parents for lines that moved within the file (`git blame -M[<score>]`),
+        /// carrying git's `sb->move_score`.
+        pub detect_moved: Option<u32>,
         /// Commits whose changes should not be attributed to them (`git blame --ignore-rev`).
         pub ignore_revs: std::collections::HashSet<gix_hash::ObjectId>,
     }

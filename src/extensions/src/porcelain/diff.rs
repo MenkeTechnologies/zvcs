@@ -374,23 +374,35 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut revs: Vec<String> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
     let mut in_rev_region = true;
-    // `--ws-error-highlight <kind>` also spells its value as the next argument;
-    // parse-options consumes it before anything else, `--` included.
-    let mut wseh_pending = false;
+    // `--ws-error-highlight <kind>`, `--color-moved-ws <modes>` and
+    // `--word-diff-regex <re>` all spell their value as the next argument when it is
+    // not glued on with `=`; parse-options consumes it before anything else, `--`
+    // included. This holds the flag still waiting for that value.
+    let mut pending_value: Option<String> = None;
 
     for a in args {
-        if wseh_pending {
-            wseh_pending = false;
-            match diff_color::parse_ws_error_highlight(a) {
-                Ok(v) => ws_error_highlight = v,
-                Err(accepted) => {
-                    eprintln!(
-                        "error: unknown value after ws-error-highlight={}",
-                        &a[..accepted]
-                    );
-                    return Ok(ExitCode::from(129));
+        if let Some(flag) = pending_value.take() {
+            if flag == "--ws-error-highlight" {
+                match diff_color::parse_ws_error_highlight(a) {
+                    Ok(v) => ws_error_highlight = v,
+                    Err(accepted) => {
+                        eprintln!(
+                            "error: unknown value after ws-error-highlight={}",
+                            &a[..accepted]
+                        );
+                        return Ok(ExitCode::from(129));
+                    }
                 }
+            } else if let Some(Err(msg)) =
+                move_word.parse_flag(&format!("{flag}={a}"), &mut color_when)
+            {
+                eprintln!("{msg}");
+                return Ok(ExitCode::from(129));
             }
+            continue;
+        }
+        if diff_color::needs_separate_value(a) {
+            pending_value = Some(a.clone());
             continue;
         }
         if after_dashdash {
@@ -502,7 +514,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-            "--ws-error-highlight" => wseh_pending = true,
+            "--ws-error-highlight" => pending_value = Some(a.to_string()),
             s if s == "--ignore-submodules" || s.starts_with("--ignore-submodules=") => {}
             s if s.starts_with("--diff-filter=") => {
                 diff_filter = Some(s.as_bytes()["--diff-filter=".len()..].to_vec());
@@ -700,6 +712,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 paths.push(s.to_string());
             }
         }
+    }
+    // A value-taking option left at the end of the command line never reaches its
+    // callback: parse-options reports it and exits 129 before any revision or
+    // pathspec is looked at.
+    if let Some(flag) = pending_value {
+        eprintln!("error: {}", diff_color::missing_value(&flag));
+        return Ok(ExitCode::from(129));
     }
     paths.extend(trailing_paths);
 

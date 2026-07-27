@@ -80,7 +80,12 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 /// header plus one aligned line per changed or pruned ref), or to stdout in the
 /// machine-readable layout under `--porcelain`. Options that require substrate
 /// gitoxide's high-level fetch does not expose are rejected rather than silently
-/// ignored: `--filter`, `--set-upstream`, `--update-shallow` and `--ipv4`/`--ipv6`.
+/// ignored: `--filter`, `--set-upstream` and `--update-shallow`.
+///
+/// `-4`/`--ipv4` and `-6`/`--ipv6` are git's `transport_family`: they restrict address
+/// resolution for `git://` and `http(s)://` and become `ssh`'s `-4`/`-6`, and are forwarded
+/// into a submodule fetch the way `add_options_to_argv()` forwards them. A `file://` remote
+/// opens no socket and ignores them, as git does.
 // The final `take_value!` expansion bumps the `i` cursor that no later arm reads;
 // the write is needed by every other expansion, so it can't be removed.
 #[allow(unused_assignments)]
@@ -312,6 +317,15 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             // All-or-nothing ref updates.
             "--atomic" => opts.atomic = true,
             "--no-atomic" => opts.atomic = false,
+
+            // git's `OPT_SET_INT` pair on one `family` slot: the last of `-4`/`-6` wins, and neither
+            // has a `--no-` form.
+            "-4" | "--ipv4" => {
+                opts.address_family = Some(gix::protocol::transport::AddressFamily::V4);
+            }
+            "-6" | "--ipv6" => {
+                opts.address_family = Some(gix::protocol::transport::AddressFamily::V6);
+            }
 
             // Ask for everything, negotiating nothing.
             "--refetch" => opts.refetch = true,
@@ -816,6 +830,8 @@ struct FetchOpts {
     refetch: bool,
     /// `--auto-maintenance`/`--auto-gc`, on by default: run `maintenance run --auto` on the way out.
     auto_maintenance: bool,
+    /// `-4`/`--ipv4` and `-6`/`--ipv6`, git's `transport_family`. `None` is `TRANSPORT_FAMILY_ALL`.
+    address_family: Option<gix::protocol::transport::AddressFamily>,
 }
 
 impl Default for FetchOpts {
@@ -850,6 +866,7 @@ impl Default for FetchOpts {
             refetch: false,
             // "This is enabled by default."
             auto_maintenance: true,
+            address_family: None,
         }
     }
 }
@@ -1348,6 +1365,7 @@ fn fetch_one(
 
     let connect_options = gix::remote::connect::Options {
         upload_pack: upload_pack_program(repo, remote_name.as_deref(), opts.upload_pack.as_deref()),
+        address_family: opts.address_family,
     };
     let server_options = server_options_for(repo, remote_name.as_deref(), &opts.server_options);
 
@@ -1896,6 +1914,12 @@ fn fetch_submodules(repo: &gix::Repository, opts: &FetchOpts) -> Result<bool> {
         forwarded.push("--no-tags".into());
     }
     forwarded.push(format!("--jobs={}", opts.jobs));
+    // `add_options_to_argv()` forwards the address family into the submodule fetch too.
+    match opts.address_family {
+        Some(gix::protocol::transport::AddressFamily::V4) => forwarded.push("--ipv4".into()),
+        Some(gix::protocol::transport::AddressFamily::V6) => forwarded.push("--ipv6".into()),
+        None => {}
+    }
 
     let failed = AtomicBool::new(false);
     let next = std::sync::atomic::AtomicUsize::new(0);

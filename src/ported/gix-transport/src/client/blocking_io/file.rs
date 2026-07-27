@@ -54,6 +54,8 @@ pub struct SpawnProcessOnDemand {
     /// The environment variables to set in the invoked command.
     envs: Vec<(&'static str, String)>,
     ssh_disallow_shell: bool,
+    /// git's `--ipv4`/`--ipv6`, passed on to `ssh` as `-4`/`-6`.
+    ssh_address_family: Option<crate::AddressFamily>,
     connection: Option<Connection<Box<dyn std::io::Read + Send>, process::ChildStdin>>,
     child: Option<process::Child>,
     trace: bool,
@@ -69,6 +71,7 @@ impl SpawnProcessOnDemand {
         version: Protocol,
         trace: bool,
         upload_pack: Option<BString>,
+        ssh_address_family: Option<crate::AddressFamily>,
     ) -> SpawnProcessOnDemand {
         SpawnProcessOnDemand {
             url,
@@ -77,6 +80,7 @@ impl SpawnProcessOnDemand {
             upload_pack,
             envs: Default::default(),
             ssh_disallow_shell,
+            ssh_address_family,
             child: None,
             connection: None,
             desired_version: version,
@@ -102,6 +106,7 @@ impl SpawnProcessOnDemand {
                 Default::default()
             },
             ssh_disallow_shell: false,
+            ssh_address_family: None,
             child: None,
             connection: None,
             desired_version: version,
@@ -128,7 +133,13 @@ impl SpawnProcessOnDemand {
         let program = program.to_os_str_lossy().into_owned();
         let (mut cmd, ssh_kind, cmd_name) = match &self.ssh_cmd {
             Some((command, kind)) => (
-                kind.prepare_invocation(command, &self.url, self.desired_version, self.ssh_disallow_shell)
+                kind.prepare_invocation(
+                    command,
+                    &self.url,
+                    self.desired_version,
+                    self.ssh_disallow_shell,
+                    self.ssh_address_family,
+                )
                     .map_err(client::Error::SshInvocation)?
                     .stderr(Stdio::piped()),
                 Some(*kind),

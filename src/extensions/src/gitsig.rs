@@ -16,8 +16,10 @@
 //! Nothing here shells out to `git`; verification is delegated to gpg/ssh-keygen,
 //! which is what git itself does (git has no in-process crypto either).
 
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 /// A commit's signature status, mapped to git's `%G?` single-character codes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -134,30 +136,8 @@ pub fn evaluate(raw: &[u8]) -> (GStatus, String) {
 
 /// Verify a `(signature, payload)` pair via the same tools git uses.
 pub fn verify(sig: &[u8], payload: &[u8]) -> (GStatus, String) {
-    if sig.starts_with(b"-----BEGIN SSH SIGNATURE-----") {
-        // SSH verification needs an allowed-signers file + the committer principal;
-        // without that config it cannot be checked, exactly as git reports.
-        return (GStatus::CannotCheck, String::new());
-    }
-    let Some(sigfile) = write_temp("sig", sig) else { return (GStatus::CannotCheck, String::new()) };
-    let Some(payfile) = write_temp("pay", payload) else {
-        let _ = std::fs::remove_file(&sigfile);
-        return (GStatus::CannotCheck, String::new());
-    };
-    let out = Command::new("gpg")
-        .args(["--batch", "--no-tty", "--status-fd=1", "--verify"])
-        .arg(&sigfile)
-        .arg(&payfile)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-    let _ = std::fs::remove_file(&sigfile);
-    let _ = std::fs::remove_file(&payfile);
-    match out {
-        Ok(o) => parse_gpg_status(&o.stdout),
-        Err(_) => (GStatus::CannotCheck, String::new()), // gpg not installed → E
-    }
+    let check = verify_full(sig, payload);
+    (check.status, check.key)
 }
 
 /// git's `enum signature_trust_level`, in the same order — the scale
@@ -210,8 +190,9 @@ pub fn verify_full(sig: &[u8], payload: &[u8]) -> SigCheck {
         signer: String::new(),
         trust: Trust::Undefined,
     };
+    // `get_format_by_sig()`: the armor header picks the backend.
     if sig.starts_with(b"-----BEGIN SSH SIGNATURE-----") {
-        return cannot_check();
+        return verify_ssh(sig, payload);
     }
     let Some(sigfile) = write_temp("sig", sig) else { return cannot_check() };
     let Some(payfile) = write_temp("pay", payload) else {
@@ -232,6 +213,300 @@ pub fn verify_full(sig: &[u8], payload: &[u8]) -> SigCheck {
         Ok(o) => parse_gpg_status_full(&o.stdout),
         Err(_) => cannot_check(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// SSH signatures (`gpg.format = ssh`)
+// ---------------------------------------------------------------------------
+
+/// git's `gpg_format` entry for `ssh` plus the two statics
+/// `gpg_interface_config()` fills for it.
+struct SshConfig {
+    /// `gpg.ssh.program`, defaulting to git's `"ssh-keygen"`.
+    program: String,
+    /// `gpg.ssh.allowedSignersFile`; without it nothing can be verified.
+    allowed_signers: Option<PathBuf>,
+    /// `gpg.ssh.revocationFile`, passed to `ssh-keygen -Y verify -r`.
+    revocation_file: Option<PathBuf>,
+}
+
+/// The ssh backend's configuration, read once per process.
+///
+/// git holds these in file-scope statics that `git_config()` fills during
+/// startup, so a single read for the whole process is the faithful shape; the
+/// repository is the one the process is running in.
+fn ssh_config() -> &'static SshConfig {
+    static CFG: OnceLock<SshConfig> = OnceLock::new();
+    CFG.get_or_init(|| {
+        let Ok(repo) = gix::discover(".") else {
+            return SshConfig {
+                program: "ssh-keygen".into(),
+                allowed_signers: None,
+                revocation_file: None,
+            };
+        };
+        let snapshot = repo.config_snapshot();
+        // `git_config_pathname()`: `~`/`~user` expansion, which `trusted_path`
+        // performs while resolving the value.
+        let path = |key: &str| -> Option<PathBuf> {
+            snapshot
+                .trusted_path(key)
+                .ok()
+                .flatten()
+                .map(PathBuf::from)
+        };
+        SshConfig {
+            program: snapshot
+                .string("gpg.ssh.program")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "ssh-keygen".into()),
+            allowed_signers: path("gpg.ssh.allowedSignersFile"),
+            revocation_file: path("gpg.ssh.revocationFile"),
+        }
+    })
+}
+
+/// `verify_ssh_signed_buffer()`: find the principals that could have signed the
+/// payload, then let `ssh-keygen -Y verify` judge each of them.
+///
+/// Without `gpg.ssh.allowedSignersFile` git prints its error and leaves
+/// `sigc->result` at its initial `'N'` — nothing was checked, so nothing is
+/// claimed — which is what the `NoSignature` return reproduces.
+fn verify_ssh(sig: &[u8], payload: &[u8]) -> SigCheck {
+    let unchecked = || SigCheck {
+        status: GStatus::NoSignature,
+        key: String::new(),
+        signer: String::new(),
+        trust: Trust::Undefined,
+    };
+    let cfg = ssh_config();
+    let Some(allowed) = cfg.allowed_signers.as_deref() else {
+        eprintln!(
+            "error: gpg.ssh.allowedSignersFile needs to be configured and exist \
+             for ssh signature verification"
+        );
+        return unchecked();
+    };
+    let Some(sigfile) = write_temp("vtag", sig) else { return unchecked() };
+
+    // `-Overify-time=<committer date>`: the key's validity window is judged as
+    // of when the payload was written, not now.
+    let verify_time = payload_timestamp(payload)
+        .map(|t| format!("-Overify-time={}", strftime_local(t)))
+        .unwrap_or_default();
+
+    let ssh = |args: &[&std::ffi::OsStr], stdin: &[u8]| -> Option<std::process::Output> {
+        run_with_stdin(&cfg.program, args, stdin)
+    };
+    let os = std::ffi::OsStr::new;
+
+    let principals = ssh(
+        &[
+            os("-Y"),
+            os("find-principals"),
+            os("-f"),
+            allowed.as_os_str(),
+            os("-s"),
+            sigfile.as_os_str(),
+            os(&verify_time),
+        ],
+        &[],
+    );
+    let Some(principals) = principals else {
+        let _ = std::fs::remove_file(&sigfile);
+        return unchecked();
+    };
+    if !principals.status.success() && String::from_utf8_lossy(&principals.stderr).contains("usage:")
+    {
+        eprintln!(
+            "error: ssh-keygen -Y find-principals/verify is needed for ssh signature \
+             verification (available in openssh version 8.2p1+)"
+        );
+        let _ = std::fs::remove_file(&sigfile);
+        return unchecked();
+    }
+
+    let mut out: Vec<u8> = Vec::new();
+    if !principals.status.success() || principals.stdout.is_empty() {
+        // No matching principal: `check-novalidate` still describes the
+        // signature, but an unknown key is a failure either way.
+        if let Some(o) = ssh(
+            &[
+                os("-Y"),
+                os("check-novalidate"),
+                os("-n"),
+                os("git"),
+                os("-s"),
+                sigfile.as_os_str(),
+                os(&verify_time),
+            ],
+            payload,
+        ) {
+            out = o.stdout;
+        }
+    } else {
+        // Try every principal `find-principals` reported, one per line, until
+        // one of them verifies.
+        for line in principals.stdout.split(|&b| b == b'\n') {
+            let principal = line.strip_suffix(b"\r").unwrap_or(line);
+            if principal.is_empty() {
+                continue;
+            }
+            let principal = String::from_utf8_lossy(principal).into_owned();
+            let mut args: Vec<&std::ffi::OsStr> = vec![
+                os("-Y"),
+                os("verify"),
+                os("-n"),
+                os("git"),
+                os("-f"),
+                allowed.as_os_str(),
+                os("-I"),
+                os(&principal),
+                os("-s"),
+                sigfile.as_os_str(),
+                os(&verify_time),
+            ];
+            match cfg.revocation_file.as_deref() {
+                Some(rev) if rev.exists() => {
+                    args.push(os("-r"));
+                    args.push(rev.as_os_str());
+                }
+                Some(rev) => eprintln!(
+                    "warning: ssh signing revocation file configured but not found: {}",
+                    rev.display()
+                ),
+                None => {}
+            }
+            let Some(o) = ssh(&args, payload) else { continue };
+            out = o.stdout;
+            if o.status.success() && out.starts_with(b"Good") {
+                break;
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(&sigfile);
+    parse_ssh_output(&out)
+}
+
+/// `parse_ssh_output()`: read `ssh-keygen -Y verify`'s first line.
+///
+/// It is either `Good "git" signature for <principal> with <alg> key <fpr>` or,
+/// for a valid signature by a key no allowed-signers entry claims,
+/// `Good "git" signature with <alg> key <fpr>`. The principal may itself contain
+/// ` with `, so the *last* occurrence delimits it. Anything else is a bad
+/// signature.
+fn parse_ssh_output(out: &[u8]) -> SigCheck {
+    let text = String::from_utf8_lossy(out);
+    let line = text.split('\n').next().unwrap_or("");
+    let bad = SigCheck {
+        status: GStatus::Bad,
+        key: String::new(),
+        signer: String::new(),
+        trust: Trust::Never,
+    };
+
+    let (rest, signer, trust) = if let Some(after) = line.strip_prefix("Good \"git\" signature for ")
+    {
+        let Some(at) = after.rfind(" with ") else {
+            return bad;
+        };
+        // `line = search + 1` leaves the cursor on the "with …" word, and the
+        // signer is everything before the space that precedes it.
+        (&after[at + 1..], after[..at].to_string(), Trust::Fully)
+    } else if let Some(after) = line.strip_prefix("Good \"git\" signature with ") {
+        (after, String::new(), Trust::Undefined)
+    } else {
+        return bad;
+    };
+
+    // `strstr(line, "key ")`: everything after it is the fingerprint, which is
+    // also what git reports as the key (`%GK`).
+    match rest.find("key ").map(|at| rest[at + 4..].to_string()) {
+        Some(key) => SigCheck {
+            // `pretty.c`'s `%G?`: a good signature whose trust is undefined or
+            // never prints `U`, which is what `GoodUnknown` carries here.
+            status: if trust >= Trust::Marginal {
+                GStatus::Good
+            } else {
+                GStatus::GoodUnknown
+            },
+            key,
+            signer,
+            trust,
+        },
+        // Output did not match what we expected: treat the signature as bad.
+        None => bad,
+    }
+}
+
+/// Run `program` with `args`, feeding `stdin` and capturing stdout and stderr.
+fn run_with_stdin(
+    program: &str,
+    args: &[&std::ffi::OsStr],
+    stdin: &[u8],
+) -> Option<std::process::Output> {
+    use std::io::Write as _;
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    // A closed pipe is not fatal: ssh-keygen exits before reading the payload on
+    // several of its error paths, which is why git ignores SIGPIPE around this.
+    let _ = child.stdin.as_mut()?.write_all(stdin);
+    drop(child.stdin.take());
+    child.wait_with_output().ok()
+}
+
+/// `parse_payload_metadata()`: the committer (or tagger) date of a signed
+/// payload, which dates the signature for `-Overify-time`.
+fn payload_timestamp(payload: &[u8]) -> Option<i64> {
+    for line in payload.split(|&b| b == b'\n') {
+        // Headers end at the first blank line.
+        if line.is_empty() {
+            return None;
+        }
+        let rest = if let Some(r) = line.strip_prefix(b"committer ".as_slice()) {
+            r
+        } else if let Some(r) = line.strip_prefix(b"tagger ".as_slice()) {
+            r
+        } else {
+            continue;
+        };
+        // `<name> <email> <seconds> <timezone>`: the date is the second-to-last
+        // whitespace-separated field.
+        let text = String::from_utf8_lossy(rest);
+        let mut fields = text.split_whitespace().rev();
+        let _tz = fields.next()?;
+        return fields.next()?.parse().ok();
+    }
+    None
+}
+
+/// `show_date()` in git's `DATE_STRFTIME` mode with `%Y%m%d%H%M%S` and
+/// `local = 1` — SSH key validity carries no timezone, so git uses this
+/// machine's.
+fn strftime_local(seconds: i64) -> String {
+    let t = seconds as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `localtime_r` writes into `tm` and reads `t`; both are live local
+    // variables of the right types, and the call is reentrant.
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return String::new();
+    }
+    format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
 }
 
 /// Map gpg's machine-readable `--status-fd` output to a [`GStatus`] and key,

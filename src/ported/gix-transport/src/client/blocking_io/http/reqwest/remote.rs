@@ -1,7 +1,7 @@
 use std::{
     any::Any,
     io::{Read, Write},
-    net::SocketAddr,
+    net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -79,6 +79,7 @@ struct ClientConfig {
     tcp_keepalive_interval_seconds: Option<u64>,
     tcp_keepalive_count: Option<u32>,
     min_sessions: Option<usize>,
+    address_family: Option<crate::AddressFamily>,
 }
 
 impl ClientConfig {
@@ -102,6 +103,7 @@ impl ClientConfig {
             tcp_keepalive_interval_seconds: opts.tcp_keepalive_interval_seconds,
             tcp_keepalive_count: opts.tcp_keepalive_count,
             min_sessions: opts.min_sessions,
+            address_family: opts.address_family,
         }
     }
 }
@@ -222,6 +224,31 @@ fn resolve_overrides(entries: &[String]) -> Vec<(String, Vec<SocketAddr>)> {
         }
     }
     out
+}
+
+/// A DNS resolver that answers like `getaddrinfo()` with `hints.ai_family` set: the system resolution,
+/// filtered down to one address family.
+///
+/// Resolution happens synchronously inside the future because the blocking `reqwest` client owns a
+/// dedicated single-client runtime and the git transport issues one request at a time, so there is no
+/// concurrent work to stall.
+struct FamilyRestrictedResolver {
+    family: crate::AddressFamily,
+}
+
+impl reqwest::dns::Resolve for FamilyRestrictedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let family = self.family;
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            // Port 0: `reqwest` substitutes the URL's port (or the scheme default) afterwards.
+            let addrs: Vec<std::net::SocketAddr> = (host.as_str(), 0u16)
+                .to_socket_addrs()?
+                .filter(|addr| family.matches(addr))
+                .collect();
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 /// Build a `reqwest` client that honors `config`, with `redirect_action`/`redirect_tail` driving the
@@ -369,6 +396,12 @@ fn build_client(
     // `http.minSessions` — the number of connections kept alive between requests.
     if let Some(sessions) = config.min_sessions {
         builder = builder.pool_max_idle_per_host(sessions);
+    }
+
+    // git's `--ipv4`/`--ipv6`, which curl implements with `CURLOPT_IPRESOLVE`. `reqwest` has no such
+    // knob, so the equivalent is a resolver that drops every address of the other family.
+    if let Some(family) = config.address_family {
+        builder = builder.dns_resolver(std::sync::Arc::new(FamilyRestrictedResolver { family }));
     }
 
     Ok(builder.build()?)

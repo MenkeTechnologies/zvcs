@@ -11,6 +11,9 @@ use gix::hash::ObjectId;
 /// git's smallest permitted abbreviation length.
 const MINIMUM_ABBREV: usize = 4;
 
+/// `BLAME_DEFAULT_MOVE_SCORE` (`blame.h:13`), the score a bare `-M` installs.
+pub(super) const BLAME_DEFAULT_MOVE_SCORE: u32 = 20;
+
 /// Byte-for-byte reproduction of `git blame`'s usage text, printed on stderr with
 /// exit status 129 when no path is given (the only usage error we produce).
 const USAGE: &str = concat!(
@@ -299,6 +302,13 @@ fn approxidate(value: &str) -> i64 {
 /// `-w`, `--date=relative`, `--color-lines`, `--color-by-age` and
 /// `--progress`/`--no-progress`.
 ///
+/// `-M[<score>]` is a port of `pass_blame()`'s `PICKAXE_BLAME_MOVE` block: once the
+/// ordinary diff has handed each parent what it can, every entry still held by the
+/// suspect is diffed against each parent's *whole* blob (`find_copy_in_blob()`), so
+/// lines that were moved around inside the file are credited to where they came from.
+/// The optional score is git's `sb->move_score` (20 by default) and, via
+/// `blame_entry_score()`, keeps trivial lines from being credited to a chance match.
+///
 /// Coloring follows `builtin/blame.c` exactly: `blame.coloring` supplies the
 /// default mode when neither color option is given, `color.blame.repeatedLines`
 /// (default cyan) paints the metadata of every line after the first in an entry,
@@ -338,10 +348,11 @@ fn approxidate(value: &str) -> i64 {
 ///   * `--score-debug` — the second column is `ent->suspect->refcnt`, the live
 ///     reference count of git's `blame_origin` graph, which depends on which
 ///     origins the walk kept alive rather than on the attribution itself.
-///   * `-M` / `-C` — line move/copy detection happens inside the walk
-///     (`find_move_in_parent` / `find_copy_in_parent`), splitting entries against
-///     *other* origins of the same commit; `gix-blame` tracks one source path per
-///     hunk and has no scoreboard of origins to split against.
+///   * `-C` — `find_copy_in_parent()` diffs the leftover entries against *every*
+///     path the parent's tree diff turned up, so one commit can be the suspect for
+///     hunks that came from several different files at once; `gix-blame` keys a
+///     hunk's suspect by commit alone and carries a single source path, so there is
+///     nowhere to put the second path.
 ///   * `-S <revs-file>` — installs commit grafts that rewrite the ancestry the
 ///     walk follows.
 ///   * `--reverse`, regex/function `-L` forms, `--date=human` and the `-local`
@@ -555,6 +566,7 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
         since: None,
         rewrites: Some(gix::diff::Rewrites::default()),
         ignore_whitespace: opts.ignore_whitespace,
+        detect_moved: opts.detect_moved,
         ignore_revs: ignore_revs.clone(),
     };
 
@@ -576,7 +588,10 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
     //
     // `--incremental` is not cached either: it needs the walk-order, uncoalesced entries,
     // which the run encoding does not preserve.
-    let algo_key = format!("{:?}|w={}", opts.diff_algorithm, opts.ignore_whitespace);
+    let algo_key = format!(
+        "{:?}|w={}|M={:?}",
+        opts.diff_algorithm, opts.ignore_whitespace, opts.detect_moved
+    );
     let cache_key = (opts.ranges.is_empty()
         && ignore_revs.is_empty()
         && !index_only
@@ -2177,6 +2192,8 @@ struct Options {
     incremental: bool,
     /// `-w`: ignore whitespace differences when diffing revisions.
     ignore_whitespace: bool,
+    /// `-M[<score>]`: the value is git's `sb->move_score`.
+    detect_moved: Option<u32>,
     /// `--diff-algorithm=<algo>`; `None` falls back to `diff.algorithm`.
     diff_algorithm: Option<gix::diff::blob::Algorithm>,
     /// `--contents <file>`: use `<file>`'s contents (or stdin for `-`) as the
@@ -2245,6 +2262,7 @@ impl Options {
         let mut show_progress: Option<bool> = None;
         let mut incremental = false;
         let mut ignore_whitespace = false;
+        let mut detect_moved: Option<u32> = None;
         let mut diff_algorithm: Option<gix::diff::blob::Algorithm> = None;
         let mut contents: Option<String> = None;
         let mut ignore_rev: Vec<String> = Vec::new();
@@ -2408,6 +2426,12 @@ impl Options {
                 // stock git emits byte-identical stdout for them (verified), so they
                 // are accepted as no-ops rather than rejected. The positive forms
                 // remain refused below.
+                // `-M[<score>]` (`blame_move_callback`): the score is an optional *attached*
+                // argument, and `parse_score` yields 0 for anything `strtoul` cannot consume whole.
+                "-M" => detect_moved = Some(BLAME_DEFAULT_MOVE_SCORE),
+                _ if a.starts_with("-M") => {
+                    detect_moved = Some(a["-M".len()..].parse::<u32>().unwrap_or(0));
+                }
                 "--no-incremental" => incremental = false,
                 "--no-show-stats" | "--no-score-debug" => {}
                 _ if a.starts_with("-L") => parse_line_range(&a[2..], &mut ranges)?,
@@ -2449,6 +2473,7 @@ impl Options {
             show_progress,
             incremental,
             ignore_whitespace,
+            detect_moved,
             diff_algorithm,
             contents,
             ignore_rev,

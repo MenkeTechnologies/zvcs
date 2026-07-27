@@ -588,6 +588,7 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
 
     let mut platform = repo
         .status(gix::progress::Discard)?
+        .index_worktree_options_mut(preload_index_threads(&repo))
         .untracked_files(match untracked {
             Untracked::No => gix::status::UntrackedFiles::None,
             Untracked::Normal => gix::status::UntrackedFiles::Collapsed,
@@ -1184,6 +1185,7 @@ fn porcelain_v2_output(
 
     let mut platform = repo
         .status(gix::progress::Discard)?
+        .index_worktree_options_mut(preload_index_threads(&repo))
         .untracked_files(match untracked {
             Untracked::No => gix::status::UntrackedFiles::None,
             Untracked::Normal => gix::status::UntrackedFiles::Collapsed,
@@ -1756,6 +1758,28 @@ fn quote_path(path: impl AsRef<[u8]>, prefix: Option<&[u8]>) -> String {
     out
 }
 
+/// `core.preloadIndex` (`read-cache.c`'s `preload_index()`): git fans the index
+/// refresh's `lstat()` pass out over threads unless the key is false, in which
+/// case `preload_index()` returns immediately and the refresh runs on one
+/// thread. Default is on.
+///
+/// The knob picks a code path, never a different answer — `git -c
+/// core.preloadIndex=false status` prints exactly what the threaded run prints,
+/// which is why the parity corpus sees no difference either.
+fn preload_index_threads(
+    repo: &gix::Repository,
+) -> impl FnOnce(&mut gix::status::index_worktree::Options) {
+    let preload = repo
+        .config_snapshot()
+        .boolean("core.preloadIndex")
+        .unwrap_or(true);
+    move |opts| {
+        if !preload {
+            opts.thread_limit = Some(1);
+        }
+    }
+}
+
 /// Resolve the upstream of the current branch and how far it has diverged.
 /// Returns `None` when no upstream is configured, matching git's "no tracking
 /// information at all" case.
@@ -2012,6 +2036,27 @@ fn render_long(
     let column_on = super::column::active(colopts);
     let mut blocks: Vec<String> = Vec::new();
 
+    // Everything git writes through `status_printf`/`status_printf_ln` with
+    // `color(WT_STATUS_HEADER, s)` — every section title, every `(use "git …")`
+    // hint, the leading `\t` of every change line, the in-progress-operation
+    // blocks, and the blank line that closes a section — is painted with
+    // `color.status.header`. `status_vprintf` colors one line at a time, so a
+    // multi-line hint gets one SGR/reset pair per line.
+    let h = |text: &str| -> String {
+        text.split_inclusive('\n')
+            .map(|line| match line.strip_suffix('\n') {
+                Some(body) => format!("{}\n", colors.paint(Slot::Header, body)),
+                None => colors.paint(Slot::Header, line),
+            })
+            .collect()
+    };
+    // git's `wt_longstatus_print_trailer`: an *empty* header-colored line, which
+    // still emits the SGR and its reset around nothing.
+    let trailer = || format!("{}\n", colors.paint(Slot::Header, ""));
+    // The `\t` that `wt_longstatus_print_change_data` writes before a change
+    // line is a header write of its own, closed before the per-file slot opens.
+    let tab = || colors.paint(Slot::Header, "\t");
+
     // git's long-format branch header (wt_longstatus_print): a leading empty
     // `header`-slot write, then the prefix — `header` for a real branch, `nobranch`
     // for detached HEAD — and finally the branch name / detached object name in the
@@ -2041,33 +2086,37 @@ fn render_long(
 
     if merging {
         if unmerged.is_empty() {
-            out.push_str("All conflicts fixed but you are still merging.\n");
+            out.push_str(&h("All conflicts fixed but you are still merging.\n"));
             if hints {
-                out.push_str("  (use \"git commit\" to conclude merge)\n");
+                out.push_str(&h("  (use \"git commit\" to conclude merge)\n"));
             }
         } else {
-            out.push_str("You have unmerged paths.\n");
+            out.push_str(&h("You have unmerged paths.\n"));
             if hints {
-                out.push_str("  (fix conflicts and run \"git commit\")\n");
-                out.push_str("  (use \"git merge --abort\" to abort the merge)\n");
+                out.push_str(&h("  (fix conflicts and run \"git commit\")\n"));
+                out.push_str(&h("  (use \"git merge --abort\" to abort the merge)\n"));
             }
         }
-        out.push('\n');
+        out.push_str(&trailer());
     }
 
     if unborn {
-        out.push_str("\nNo commits yet\n\n");
+        // `wt_longstatus_print`'s initial-commit block: a header-colored blank
+        // line, the notice, then another blank line — all three header writes.
+        out.push_str(&trailer());
+        out.push_str(&h("No commits yet\n"));
+        out.push_str(&trailer());
     }
 
     if !staged.is_empty() {
-        out.push_str("Changes to be committed:\n");
+        out.push_str(&h("Changes to be committed:\n"));
         // Mid-merge git offers no unstage hint, as `git restore --staged` is not
         // the right advice while `MERGE_HEAD` is around.
         if hints && !merging {
             if unborn {
-                out.push_str("  (use \"git rm --cached <file>...\" to unstage)\n");
+                out.push_str(&h("  (use \"git rm --cached <file>...\" to unstage)\n"));
             } else {
-                out.push_str("  (use \"git restore --staged <file>...\" to unstage)\n");
+                out.push_str(&h("  (use \"git restore --staged <file>...\" to unstage)\n"));
             }
         }
         for (kind, path, orig) in staged {
@@ -2076,42 +2125,42 @@ fn render_long(
                 Some(o) => format!("{label:<12}{} -> {}", quote_path(o, prefix), quote_path(path, prefix)),
                 None => format!("{label:<12}{}", quote_path(path, prefix)),
             };
-            out.push_str(&format!("\t{}\n", colors.paint(Slot::Added, &body)));
+            out.push_str(&format!("{}{}\n", tab(), colors.paint(Slot::Added, &body)));
         }
-        out.push('\n');
+        out.push_str(&trailer());
     }
 
     if !unmerged.is_empty() {
-        out.push_str("Unmerged paths:\n");
+        out.push_str(&h("Unmerged paths:\n"));
         if hints {
-            out.push_str(unmerged_hint(unmerged));
+            out.push_str(&h(unmerged_hint(unmerged)));
         }
         for (mask, path) in unmerged {
             let label = unmerged_label(*mask);
             let body = format!("{label:<17}{}", quote_path(path, prefix));
-            out.push_str(&format!("\t{}\n", colors.paint(Slot::Unmerged, &body)));
+            out.push_str(&format!("{}{}\n", tab(), colors.paint(Slot::Unmerged, &body)));
         }
-        out.push('\n');
+        out.push_str(&trailer());
     }
 
     if !unstaged.is_empty() {
         let any_deleted = unstaged.iter().any(|(k, _)| matches!(k, WorkKind::Deleted));
         let add_hint = if any_deleted { "git add/rm" } else { "git add" };
-        out.push_str("Changes not staged for commit:\n");
+        out.push_str(&h("Changes not staged for commit:\n"));
         if hints {
-            out.push_str(&format!(
+            out.push_str(&h(&format!(
                 "  (use \"{add_hint} <file>...\" to update what will be committed)\n"
-            ));
-            out.push_str(
+            )));
+            out.push_str(&h(
                 "  (use \"git restore <file>...\" to discard changes in working directory)\n",
-            );
+            ));
         }
         for (kind, path) in unstaged {
             let label = work_label(*kind);
             let body = format!("{label:<12}{}", quote_path(path, prefix));
-            out.push_str(&format!("\t{}\n", colors.paint(Slot::Changed, &body)));
+            out.push_str(&format!("{}{}\n", tab(), colors.paint(Slot::Changed, &body)));
         }
-        out.push('\n');
+        out.push_str(&trailer());
     }
 
     // `status.submoduleSummary`, between `wt_longstatus_print_changed` and the
@@ -2137,9 +2186,11 @@ fn render_long(
         }
     } else {
         if !untracked.is_empty() {
-            out.push_str("Untracked files:\n");
+            out.push_str(&h("Untracked files:\n"));
             if hints {
-                out.push_str("  (use \"git add <file>...\" to include in what will be committed)\n");
+                out.push_str(&h(
+                    "  (use \"git add <file>...\" to include in what will be committed)\n",
+                ));
             }
             if column_on {
                 out.push_str(&format!("\u{1}{}\u{1}\n", blocks.len()));
@@ -2153,19 +2204,23 @@ fn render_long(
             } else {
                 for path in untracked {
                     out.push_str(&format!(
-                        "\t{}\n",
+                        "{}{}\n",
+                        tab(),
                         colors.paint(Slot::Untracked, &quote_path(path, prefix))
                     ));
                 }
             }
+            // `wt_longstatus_print_other` closes with `GIT_COLOR_NORMAL`, not the
+            // header slot — this blank line stays unpainted even when
+            // `color.status.header` is set.
             out.push('\n');
         }
         if show_ignored && !ignored.is_empty() {
-            out.push_str("Ignored files:\n");
+            out.push_str(&h("Ignored files:\n"));
             if hints {
-                out.push_str(
+                out.push_str(&h(
                     "  (use \"git add -f <file>...\" to include in what will be committed)\n",
-                );
+                ));
             }
             // git colors ignored paths with the untracked slot — there is no
             // separate `color.status.ignored`.
@@ -2181,7 +2236,8 @@ fn render_long(
             } else {
                 for path in ignored {
                     out.push_str(&format!(
-                        "\t{}\n",
+                        "{}{}\n",
+                        tab(),
                         colors.paint(Slot::Untracked, &quote_path(path, prefix))
                     ));
                 }
@@ -2204,7 +2260,7 @@ fn render_long(
         // then apply to it, exactly as they do to `git diff --cached`.
         let labelled = verbose > 1 && committable;
         if labelled {
-            out.push_str("Changes to be committed:\n");
+            out.push_str(&h("Changes to be committed:\n"));
         }
         let mut staged_args: Vec<&str> = vec!["--cached"];
         if labelled {
@@ -2213,10 +2269,13 @@ fn render_long(
         out.push_str(&format!("\u{1}{}\u{1}\n", blocks.len()));
         blocks.push(verbose_patch(workdir, &staged_args));
 
-        let workdir_dirty = !unstaged.is_empty() || !unmerged.is_empty();
-        if verbose > 1 && workdir_dirty {
-            out.push_str(&format!("{}\n", "-".repeat(50)));
-            out.push_str("Changes not staged for commit:\n");
+        // git gates the second patch on `wt_status_check_worktree_changes()`,
+        // which skips every entry whose worktree status is `UNMERGED` — so a
+        // conflicted-but-otherwise-clean tree gets no `Changes not staged`
+        // section here, unlike the trailing summary's `workdir_dirty`.
+        if verbose > 1 && !unstaged.is_empty() {
+            out.push_str(&h(&format!("{}\n", "-".repeat(50))));
+            out.push_str(&h("Changes not staged for commit:\n"));
             out.push_str(&format!("\u{1}{}\u{1}\n", blocks.len()));
             blocks.push(verbose_patch(
                 workdir,

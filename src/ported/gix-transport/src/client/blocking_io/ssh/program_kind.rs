@@ -21,12 +21,16 @@ impl ProgramKind {
     }
 
     /// Prepare all information needed to invoke the ssh command
+    ///
+    /// `address_family` is git's `--ipv4`/`--ipv6`, which `push_ssh_options()` turns into the `-4`/`-6`
+    /// flag every variant but `simple` understands.
     pub(crate) fn prepare_invocation(
         &self,
         ssh_cmd: &OsStr,
         url: &gix_url::Url,
         desired_version: Protocol,
         disallow_shell: bool,
+        address_family: Option<crate::AddressFamily>,
     ) -> Result<gix_command::Prepare, ssh::invocation::Error> {
         let mut prepare = gix_command::prepare(ssh_cmd).command_may_be_shell_script();
         if disallow_shell {
@@ -39,11 +43,19 @@ impl ProgramKind {
                         .args(["-o", "SendEnv=GIT_PROTOCOL"])
                         .env("GIT_PROTOCOL", format!("version={}", desired_version as usize));
                 }
+                if let Some(family) = address_family {
+                    prepare = prepare.arg(family.as_ssh_flag());
+                }
                 if let Some(port) = url.port {
                     prepare = prepare.arg(format!("-p{port}"));
                 }
             }
             ProgramKind::Plink | ProgramKind::Putty | ProgramKind::TortoisePlink => {
+                // git emits the family flag before `-batch`, which is the order `push_ssh_options()`
+                // writes them in.
+                if let Some(family) = address_family {
+                    prepare = prepare.arg(family.as_ssh_flag());
+                }
                 if *self == ProgramKind::TortoisePlink {
                     prepare = prepare.arg("-batch");
                 }
@@ -53,6 +65,13 @@ impl ProgramKind {
                 }
             }
             ProgramKind::Simple => {
+                // `die(_("ssh variant 'simple' does not support -4"))`.
+                if address_family.is_some() {
+                    return Err(ssh::invocation::Error::Unsupported {
+                        command: ssh_cmd.into(),
+                        function: "restricting the address family",
+                    });
+                }
                 if url.port.is_some() {
                     return Err(ssh::invocation::Error::Unsupported {
                         command: ssh_cmd.into(),

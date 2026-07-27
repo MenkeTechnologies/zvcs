@@ -24,7 +24,7 @@ impl Repository {
             since,
             rewrites,
             ignore_whitespace,
-
+            detect_moved,
             ignore_revs,
         } = options;
         let diff_algorithm = match diff_algorithm {
@@ -39,6 +39,7 @@ impl Repository {
             rewrites,
             debug_track_path: false,
             ignore_whitespace,
+            detect_moved,
             ignore_revs,
         };
 

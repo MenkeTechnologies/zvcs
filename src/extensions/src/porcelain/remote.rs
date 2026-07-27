@@ -1588,7 +1588,11 @@ fn query_ref_map(repo: &gix::Repository, name: &str) -> Result<gix::remote::fetc
         .string_by("remote", Some(BStr::new(name)), "uploadpack");
     let connection = remote.connect_with_options(
         gix::remote::Direction::Fetch,
-        gix::remote::connect::Options { upload_pack },
+        // `git remote` has no `--ipv4`/`--ipv6`.
+        gix::remote::connect::Options {
+            upload_pack,
+            address_family: None,
+        },
     )?;
     let (map, _handshake) = connection.ref_map(
         gix::progress::Discard,

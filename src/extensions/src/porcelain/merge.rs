@@ -262,6 +262,10 @@ struct Opts {
     /// `user.signingKey` (and, failing that, the committer identity, as git's
     /// `get_signing_key()` does).
     sign: Option<String>,
+    /// `--rerere-autoupdate`/`--no-rerere-autoupdate` — git's `allow_rerere_auto`,
+    /// handed to `repo_rerere()` in `suggest_conflicts()`. `None` leaves
+    /// `rerere.autoupdate` in charge.
+    rerere_autoupdate: Option<bool>,
 }
 
 impl Default for Opts {
@@ -288,6 +292,7 @@ impl Default for Opts {
             edit: None,
             autostash: false,
             sign: None,
+            rerere_autoupdate: None,
         }
     }
 }
@@ -431,14 +436,19 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             // no such meter to force, so both spellings are accepted and change
             // nothing (see the module docs).
             "--progress" | "--no-progress" => {}
+            // `--[no-]rerere-autoupdate`: git's `OPT_RERERE_AUTOUPDATE`, passed to
+            // `repo_rerere()` from `suggest_conflicts()`. Set means "stage the
+            // replayed resolution", unset means "leave it conflicted in the index
+            // and say so"; neither spelling defers to `rerere.autoupdate`.
+            "--rerere-autoupdate" => opts.rerere_autoupdate = Some(true),
+            "--no-rerere-autoupdate" => opts.rerere_autoupdate = Some(false),
             // Flags whose git behaviour is already this build's default, accepted
             // as no-ops so they match stock git rather than erroring:
-            //  * `--no-rerere-autoupdate`: no rerere machinery runs here anyway.
             //  * `--overwrite-ignore`: ignored files are overwritten (git's default).
             //  * `--no-strategy`: git's `option_parse_strategy` returns early on
             //    `unset` without clearing the strategy list, so it is a no-op that
             //    leaves any earlier `-s` in force (default `ort` when none given).
-            "--no-rerere-autoupdate" | "--overwrite-ignore" | "--no-strategy" => {}
+            "--overwrite-ignore" | "--no-strategy" => {}
             // `--[no-]verify-signatures` / `merge.verifySignatures`: check every
             // head's signature before merging it. `None` leaves the config to
             // decide.
@@ -1031,6 +1041,11 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             merge_msg.push(b'\n');
         }
         std::fs::write(git_dir.join("MERGE_MSG"), &merge_msg)?;
+        // `suggest_conflicts()` runs rerere between the `# Conflicts:` hint and
+        // the notice: a known resolution is replayed into the worktree (and
+        // staged under `--rerere-autoupdate`/`rerere.autoupdate`), an unknown one
+        // has its preimage recorded for next time.
+        super::rerere::repo_rerere(&repo, opts.rerere_autoupdate)?;
         if !opts.quiet {
             println!("Automatic merge failed; fix conflicts and then commit the result.");
         }
@@ -1406,6 +1421,8 @@ fn do_octopus(
             std::fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
             std::fs::write(git_dir.join("MERGE_MODE"), b"")?;
             set_orig_head(repo, local_id)?;
+            // `suggest_conflicts()` again: record or replay before the notice.
+            super::rerere::repo_rerere(repo, opts.rerere_autoupdate)?;
             if !opts.quiet {
                 println!("Automatic merge failed; fix conflicts and then commit the result.");
             }
@@ -2761,6 +2778,28 @@ struct StatRow {
 /// `--compact-summary` folds into a diffstat name, in git's order — creation
 /// (`new`/`new +x`/`new +l`), deletion (`gone`), then the symlink and
 /// executable-bit mode transitions.
+/// Whether a tree-diff change names a directory rather than a leaf.
+///
+/// `for_each_to_obtain_tree` reports the changed tree object *and* recurses into
+/// it; git's diffstat comes from `diff-tree -r`, which reports leaves only.
+fn is_tree_change(change: &TreeChange<'_, '_, '_>) -> bool {
+    match change {
+        TreeChange::Addition { entry_mode, .. } | TreeChange::Deletion { entry_mode, .. } => {
+            entry_mode.is_tree()
+        }
+        TreeChange::Modification {
+            previous_entry_mode,
+            entry_mode,
+            ..
+        } => previous_entry_mode.is_tree() || entry_mode.is_tree(),
+        TreeChange::Rewrite {
+            source_entry_mode,
+            entry_mode,
+            ..
+        } => source_entry_mode.is_tree() || entry_mode.is_tree(),
+    }
+}
+
 fn compact_comment(old: Option<EntryKind>, new: Option<EntryKind>) -> Option<&'static str> {
     // DIFF_STATUS_ADDED.
     if old.is_none() {
@@ -2905,6 +2944,13 @@ fn collect(
         opts.track_rewrites(None);
     });
     let _rewrites = platform.for_each_to_obtain_tree(&new, |change| {
+        // The walk reports a changed directory alongside the files it recurses
+        // into; git's diffstat is over `diff-tree -r`, which names only the
+        // leaves. Without this a merge that touches `lib/lib.txt` also prints a
+        // bogus `lib | Bin <n> -> <n> bytes` row for the tree object itself.
+        if is_tree_change(&change) {
+            return Ok(Action::Continue(()));
+        }
         let path: BString = change.location().to_owned();
         let display = quote_path(&path[..]);
         let (old_id, new_id, compact) = match change {

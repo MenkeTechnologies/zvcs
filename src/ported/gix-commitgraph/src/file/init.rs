@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 use gix_error::{ErrorExt, Exn, Message, ResultExt, message};
 
 use crate::{
-    File,
+    File, bloom,
     file::{
-        BASE_GRAPHS_LIST_CHUNK_ID, COMMIT_DATA_CHUNK_ID, COMMIT_DATA_ENTRY_SIZE_SANS_HASH,
-        EXTENDED_EDGES_LIST_CHUNK_ID, FAN_LEN, HEADER_LEN, OID_FAN_CHUNK_ID, OID_LOOKUP_CHUNK_ID, SIGNATURE,
+        BASE_GRAPHS_LIST_CHUNK_ID, BLOOM_DATA_CHUNK_ID, BLOOM_DATA_HEADER_SIZE, BLOOM_INDEXES_CHUNK_ID,
+        COMMIT_DATA_CHUNK_ID, COMMIT_DATA_ENTRY_SIZE_SANS_HASH, EXTENDED_EDGES_LIST_CHUNK_ID, FAN_LEN, HEADER_LEN,
+        OID_FAN_CHUNK_ID, OID_LOOKUP_CHUNK_ID, SIGNATURE,
     },
 };
 
@@ -130,6 +131,31 @@ impl File {
 
         let extra_edges_list_range = chunks.usize_offset_by_id(EXTENDED_EDGES_LIST_CHUNK_ID).ok();
 
+        // Changed-path Bloom filters, git's pair of `read_chunk()` calls for
+        // `BIDX` and `BDAT`. The format says `BIDX` is ignored without `BDAT`,
+        // and `BDAT` shorter than its own header cannot be trusted, so either
+        // failing leaves both unset and the file simply carries no filters.
+        let (bloom_indexes_offset, bloom_data_range, bloom_filter_settings) = match (
+            chunks.usize_offset_by_id(BLOOM_INDEXES_CHUNK_ID).ok(),
+            chunks.usize_offset_by_id(BLOOM_DATA_CHUNK_ID).ok(),
+        ) {
+            (Some(indexes), Some(bloom_data)) if bloom_data.len() >= BLOOM_DATA_HEADER_SIZE => {
+                let header = &data[bloom_data.start..bloom_data.start + BLOOM_DATA_HEADER_SIZE];
+                let be32 = |at: usize| u32::from_be_bytes(header[at..at + 4].try_into().expect("4 bytes"));
+                (
+                    Some(indexes.start),
+                    Some(bloom_data),
+                    Some(bloom::Settings {
+                        hash_version: be32(0),
+                        num_hashes: be32(4),
+                        bits_per_entry: be32(8),
+                        max_changed_paths: bloom::DEFAULT_MAX_CHANGED_PATHS,
+                    }),
+                )
+            }
+            _ => (None, None, None),
+        };
+
         let trailer = &data[chunks.highest_offset() as usize..];
         if trailer.len() != object_hash.len_in_bytes() {
             return Err(message!(
@@ -170,6 +196,9 @@ impl File {
             path,
             hash_len: object_hash.len_in_bytes(),
             object_hash,
+            bloom_indexes_offset,
+            bloom_data_range,
+            bloom_filter_settings,
         })
     }
 }

@@ -1353,7 +1353,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
-        let out = render_graph(&nodes, &blocks)?;
+        let out = render_graph(&nodes, &blocks, graph_colors(&repo), want_color)?;
         match stdout.write_all(&out) {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
@@ -4565,10 +4565,40 @@ fn display_width(path: &[u8]) -> usize {
 // --graph
 // ---------------------------------------------------------------------------
 
+/// The palette `--graph` paints its branch lines with, in git's `column_colors`
+/// layout: the drawing colors followed by the reset that terminates each of them,
+/// so the last entry is both "the reset" and the sentinel index meaning "uncolored".
+///
+/// `git help config` calls the knob `log.graphColors`; git's `parse_graph_colors_config`
+/// splits it on commas, keeps the specs it can parse, and warns about the rest.
+fn graph_colors(repo: &gix::Repository) -> Vec<String> {
+    const RESET: &str = "\x1b[m";
+    let Some(spec) = repo.config_snapshot().string("log.graphColors") else {
+        // git's `column_colors_ansi`.
+        return [
+            "\x1b[31m", "\x1b[32m", "\x1b[33m", "\x1b[34m", "\x1b[35m", "\x1b[36m", "\x1b[1;31m",
+            "\x1b[1;32m", "\x1b[1;33m", "\x1b[1;34m", "\x1b[1;35m", "\x1b[1;36m", RESET,
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    };
+    let spec = spec.to_string();
+    let mut colors: Vec<String> = Vec::new();
+    for word in spec.split(',') {
+        match super::color::parse_color_spec(word) {
+            Some(code) => colors.push(code),
+            None => eprintln!("warning: ignored invalid color '{word}' in log.graphColors"),
+        }
+    }
+    colors.push(RESET.to_string());
+    colors
+}
+
 /// Prefix every line of every commit's block with git's ASCII graph, flushing the
 /// merge and collapse rows that fall between commits.
-fn render_graph(nodes: &[Node], blocks: &[Vec<u8>]) -> Result<Vec<u8>> {
-    let mut graph = Graph::default();
+fn render_graph(nodes: &[Node], blocks: &[Vec<u8>], colors: Vec<String>, want_color: bool) -> Result<Vec<u8>> {
+    let mut graph = Graph::new(colors, want_color);
     let mut out: Vec<u8> = Vec::new();
 
     for (i, node) in nodes.iter().enumerate() {
@@ -4614,41 +4644,130 @@ enum GraphState {
     Collapsing,
 }
 
+/// A branch line and the palette index it is drawn in — git's `struct column`.
+#[derive(Clone, Copy)]
+struct GraphColumn {
+    id: ObjectId,
+    color: usize,
+}
+
+/// A row under construction. The visible width is tracked separately from the
+/// buffer because the color escapes occupy bytes but no columns, and every row of
+/// a commit is padded to the same *visible* width so the text to its right aligns.
+struct GraphLine {
+    buf: Vec<u8>,
+    width: usize,
+}
+
+impl GraphLine {
+    fn new() -> Self {
+        GraphLine { buf: Vec::new(), width: 0 }
+    }
+
+    fn addch(&mut self, c: u8) {
+        self.buf.push(c);
+        self.width += 1;
+    }
+
+    /// Every graph row for one commit is the same width, so text to its right lines up.
+    fn pad_to(&mut self, width: usize) {
+        while self.width < width {
+            self.addch(b' ');
+        }
+    }
+}
+
 /// git's `graph.c` column state machine, for commits with at most two parents.
 struct Graph {
     /// Columns as of the previous commit.
-    columns: Vec<ObjectId>,
+    columns: Vec<GraphColumn>,
     /// Columns as of the current commit.
-    new_columns: Vec<ObjectId>,
+    new_columns: Vec<GraphColumn>,
     /// Screen-slot to new-column index, `-1` for an empty slot.
     mapping: Vec<i32>,
     old_mapping: Vec<i32>,
     commit: ObjectId,
+    /// The current commit's parents, in order — the post-merge row draws one edge
+    /// per parent and takes each edge's color from that parent's column.
+    parents: Vec<ObjectId>,
     num_parents: usize,
     width: usize,
     state: GraphState,
     prev_state: GraphState,
+    /// `log.graphColors`, with the reset appended; the last index means "uncolored".
+    colors: Vec<String>,
+    /// The color the next column to be opened is assigned, cycling through `colors`.
+    default_column_color: usize,
+    want_color: bool,
 }
 
-impl Default for Graph {
-    fn default() -> Self {
+impl Graph {
+    fn new(colors: Vec<String>, want_color: bool) -> Self {
+        // git starts one short of the wrap point, because the first column opened
+        // always increments first — which lands the first branch line on index 0.
+        let default_column_color = colors.len().saturating_sub(2);
         Graph {
             columns: Vec::new(),
             new_columns: Vec::new(),
             mapping: Vec::new(),
             old_mapping: Vec::new(),
             commit: ObjectId::null(gix::hash::Kind::Sha1),
+            parents: Vec::new(),
             num_parents: 0,
             width: 0,
             state: GraphState::Padding,
             prev_state: GraphState::Padding,
+            colors,
+            default_column_color,
+            want_color,
         }
     }
-}
 
-impl Graph {
+    /// The index that means "emit no escapes" — git's `column_colors_max`, which is
+    /// also where the reset lives.
+    fn uncolored(&self) -> usize {
+        self.colors.len() - 1
+    }
+
+    /// git's `graph_get_current_column_color`: the color a newly opened column takes,
+    /// or the uncolored sentinel when this run is not coloring at all.
+    fn current_column_color(&self) -> usize {
+        if self.want_color {
+            self.default_column_color
+        } else {
+            self.uncolored()
+        }
+    }
+
+    fn increment_column_color(&mut self) {
+        self.default_column_color = (self.default_column_color + 1) % self.uncolored();
+    }
+
+    /// git's `graph_find_commit_color`: a commit that already owns a column keeps its
+    /// color across the row, so a branch line does not change color as it descends.
+    fn commit_color(&self, id: ObjectId) -> usize {
+        self.columns
+            .iter()
+            .find(|c| c.id == id)
+            .map_or_else(|| self.current_column_color(), |c| c.color)
+    }
+
+    /// Draw one branch-line character in its column's color — git's
+    /// `graph_line_write_column`.
+    fn write_column(&self, line: &mut GraphLine, col: &GraphColumn, ch: u8) {
+        let uncolored = self.uncolored();
+        if col.color < uncolored {
+            line.buf.extend_from_slice(self.colors[col.color].as_bytes());
+        }
+        line.addch(ch);
+        if col.color < uncolored {
+            line.buf.extend_from_slice(self.colors[uncolored].as_bytes());
+        }
+    }
+
     fn update(&mut self, id: ObjectId, parents: &[ObjectId]) {
         self.commit = id;
+        self.parents = parents.to_vec();
         self.num_parents = parents.len();
         self.update_columns(parents);
         // Every commit's rows are fully flushed before the next one starts, so
@@ -4677,21 +4796,26 @@ impl Graph {
                 is_commit_in_columns = false;
                 self.commit
             } else {
-                self.columns[i]
+                self.columns[i].id
             };
 
             if col_commit == self.commit {
                 let old_mapping_idx = mapping_idx;
                 seen_this = true;
                 for parent in parents {
-                    insert_column(&mut self.new_columns, &mut self.mapping, *parent, &mut mapping_idx);
+                    // A merge fans out, and a commit no column was following starts a
+                    // fresh line: both open a lane that gets the next color in the cycle.
+                    if self.num_parents > 1 || !is_commit_in_columns {
+                        self.increment_column_color();
+                    }
+                    self.insert_column(*parent, &mut mapping_idx);
                 }
                 // A commit occupies at least two screen slots even with no parents.
                 if mapping_idx == old_mapping_idx {
                     mapping_idx += 2;
                 }
             } else {
-                insert_column(&mut self.new_columns, &mut self.mapping, col_commit, &mut mapping_idx);
+                self.insert_column(col_commit, &mut mapping_idx);
             }
             i += 1;
         }
@@ -4724,18 +4848,19 @@ impl Graph {
             GraphState::PostMerge => self.post_merge_line(),
             GraphState::Collapsing => self.collapsing_line(),
             GraphState::Padding => {
-                let mut line = Vec::new();
-                for _ in 0..self.new_columns.len() {
-                    line.extend_from_slice(b"| ");
+                let mut line = GraphLine::new();
+                for col in &self.new_columns {
+                    self.write_column(&mut line, col, b'|');
+                    line.addch(b' ');
                 }
-                pad_to(&mut line, self.width);
-                line
+                line.pad_to(self.width);
+                line.buf
             }
         }
     }
 
     fn commit_line(&mut self) -> Vec<u8> {
-        let mut line: Vec<u8> = Vec::new();
+        let mut line = GraphLine::new();
         let mut seen_this = false;
         let num_columns = self.columns.len();
         let mut i = 0usize;
@@ -4746,26 +4871,27 @@ impl Graph {
                 }
                 self.commit
             } else {
-                self.columns[i]
+                self.columns[i].id
             };
 
             if col_commit == self.commit {
                 seen_this = true;
-                line.push(b'*');
+                line.addch(b'*');
             } else if seen_this && self.num_parents > 1 {
-                line.push(b'\\');
+                self.write_column(&mut line, &self.columns[i], b'\\');
             } else if self.prev_state == GraphState::Collapsing
                 && self.old_mapping.get(2 * i + 1).copied().unwrap_or(-1) == i as i32
                 && self.mapping.get(2 * i).copied().unwrap_or(-1) < i as i32
             {
-                line.push(b'/');
+                self.write_column(&mut line, &self.columns[i], b'/');
             } else {
-                line.push(b'|');
+                self.write_column(&mut line, &self.columns[i], b'|');
             }
-            line.push(b' ');
+            line.addch(b' ');
             i += 1;
         }
-        pad_to(&mut line, self.width);
+        line.pad_to(self.width);
+        let line = line.buf;
 
         self.prev_state = GraphState::Commit;
         self.state = if self.num_parents > 1 {
@@ -4779,7 +4905,7 @@ impl Graph {
     }
 
     fn post_merge_line(&mut self) -> Vec<u8> {
-        let mut line: Vec<u8> = Vec::new();
+        let mut line = GraphLine::new();
         let mut seen_this = false;
         let num_columns = self.columns.len();
         let mut i = 0usize;
@@ -4790,21 +4916,32 @@ impl Graph {
                 }
                 self.commit
             } else {
-                self.columns[i]
+                self.columns[i].id
             };
 
             if col_commit == self.commit {
                 seen_this = true;
-                line.push(b'|');
-                line.extend((1..self.num_parents).map(|_| b'\\'));
+                // One edge per parent, each in the color of the lane that parent
+                // just took — git's `graph_output_post_merge_line`, which looks the
+                // parent up in `new_columns` for exactly this reason.
+                for (n, parent) in self.parents.clone().into_iter().enumerate() {
+                    let ch = if n == 0 { b'|' } else { b'\\' };
+                    match self.new_columns.iter().position(|c| c.id == parent) {
+                        Some(p) => self.write_column(&mut line, &self.new_columns[p], ch),
+                        None => line.addch(ch),
+                    }
+                }
             } else if seen_this {
-                line.extend_from_slice(b"\\ ");
+                self.write_column(&mut line, &self.columns[i], b'\\');
+                line.addch(b' ');
             } else {
-                line.extend_from_slice(b"| ");
+                self.write_column(&mut line, &self.columns[i], b'|');
+                line.addch(b' ');
             }
             i += 1;
         }
-        pad_to(&mut line, self.width);
+        line.pad_to(self.width);
+        let line = line.buf;
 
         self.prev_state = GraphState::PostMerge;
         self.state = if self.mapping_correct() {
@@ -4855,28 +4992,34 @@ impl Graph {
             self.mapping.pop();
         }
 
-        let mut line: Vec<u8> = Vec::new();
+        let mut line = GraphLine::new();
         let mut used_horizontal = false;
         for i in 0..self.mapping.len() {
             let target = self.mapping[i];
-            if target < 0 {
-                line.push(b' ');
-            } else if (target as usize) * 2 == i {
-                line.push(b'|');
+            // A collapsing edge is drawn in the color of the lane it is heading for,
+            // which is the new column the mapping points at.
+            let col = usize::try_from(target).ok().and_then(|t| self.new_columns.get(t)).copied();
+            let Some(col) = col else {
+                line.addch(b' ');
+                continue;
+            };
+            if (target as usize) * 2 == i {
+                self.write_column(&mut line, &col, b'|');
             } else if target == horizontal_edge_target && i as i32 != horizontal_edge - 1 {
                 if i != (target as usize) * 2 + 3 {
                     self.mapping[i] = -1;
                 }
                 used_horizontal = true;
-                line.push(b'_');
+                self.write_column(&mut line, &col, b'_');
             } else {
                 if used_horizontal && (i as i32) < horizontal_edge {
                     self.mapping[i] = -1;
                 }
-                line.push(b'/');
+                self.write_column(&mut line, &col, b'/');
             }
         }
-        pad_to(&mut line, self.width);
+        line.pad_to(self.width);
+        let line = line.buf;
 
         self.prev_state = GraphState::Collapsing;
         if self.mapping_correct() {
@@ -4886,31 +5029,24 @@ impl Graph {
     }
 }
 
-/// Record `id` in the new column list (reusing its column when it is already
-/// there) and point the next screen slot at it.
-fn insert_column(
-    new_columns: &mut Vec<ObjectId>,
-    mapping: &mut [i32],
-    id: ObjectId,
-    mapping_idx: &mut usize,
-) {
-    let col = match new_columns.iter().position(|c| *c == id) {
-        Some(i) => i,
-        None => {
-            new_columns.push(id);
-            new_columns.len() - 1
+impl Graph {
+    /// Record `id` in the new column list (reusing its column when it is already
+    /// there) and point the next screen slot at it. A column opened here takes the
+    /// color `id` already had elsewhere, or the current one — git's
+    /// `graph_insert_into_new_columns`.
+    fn insert_column(&mut self, id: ObjectId, mapping_idx: &mut usize) {
+        let col = match self.new_columns.iter().position(|c| c.id == id) {
+            Some(i) => i,
+            None => {
+                let color = self.commit_color(id);
+                self.new_columns.push(GraphColumn { id, color });
+                self.new_columns.len() - 1
+            }
+        };
+        if let Some(slot) = self.mapping.get_mut(*mapping_idx) {
+            *slot = col as i32;
         }
-    };
-    if let Some(slot) = mapping.get_mut(*mapping_idx) {
-        *slot = col as i32;
-    }
-    *mapping_idx += 2;
-}
-
-/// Every graph row for one commit is the same width, so text to its right lines up.
-fn pad_to(line: &mut Vec<u8>, width: usize) {
-    while line.len() < width {
-        line.push(b' ');
+        *mapping_idx += 2;
     }
 }
 

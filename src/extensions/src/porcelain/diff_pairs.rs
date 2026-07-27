@@ -60,7 +60,20 @@
 //!   `diff-pairs` is plumbing, so the status letters read off stdin survive untouched
 //!   (`builtin/diff-pairs.c` sets `skip_resolving_statuses` for exactly that reason).
 //! * `--color[=<when>]` / `--no-color` and `--ws-error-highlight=<kind>`, with the
-//!   `color.diff.*` slots and `core.whitespace` rules the emit layer paints from
+//!   `color.diff.*` slots and `core.whitespace` rules the emit layer paints from.
+//!   `--ws-error-highlight`, `--color-moved-ws` and `--word-diff-regex` all accept
+//!   their value as the next argument as well as glued on with `=`, and report
+//!   ``error: option `<name>' requires a value`` (exit 129) when it is missing
+//! * `--textconv` / `--no-textconv` (`DIFF_OPT_ALLOW_TEXTCONV`, off by default for
+//!   plumbing): each side's `diff.<driver>.textconv` program is resolved through the
+//!   `userdiff_find_by_path()` port in [`super::cat_file`] and its stdout is what the
+//!   patch body diffs. The substitution is patch-only, matching git: `builtin_diffstat()`
+//!   fills its buffers with `fill_mmfile()` rather than `fill_textconv()`, so
+//!   `--stat`/`--numstat` keep counting the raw blobs and a raw-binary path still
+//!   reports `Bin <a> -> <b> bytes` while its patch shows hunks; `--check` and the
+//!   pickaxe read the raw blobs for the same reason
+//! * `--no-ext-diff`, which asks for the state plumbing is already in — no
+//!   `diff.<driver>.command` is ever run
 //! * `--exit-code`, `--quiet` (implies `-s` and `--exit-code`)
 //! * `--abbrev[=<n>]` — accepted and ignored, which is what stock git does here.
 //!   `core.abbrev` itself *is* honoured.
@@ -73,16 +86,30 @@
 //! * Tree-object pairs (`040000` on either side) are rejected with `tree objects not
 //!   supported`, exit 128 — this matches stock git's `builtin/diff-pairs.c`, which dies
 //!   with the same message rather than recursing.
-//! * `--color-moved`, `--color-moved-ws`,
-//!   `--word-diff`, `--word-diff-regex`, `--color-words`, `--check`, `--binary`,
-//!   `--dirstat`/`--cumulative`/`--dirstat-by-file`, `--anchored`, `-O`/`--order`,
-//!   `--textconv`/`--ext-diff`, `--submodule`/`--ignore-submodules` and `--max-depth`:
-//!   each needs machinery this port does not have (moved-block detection, a word
-//!   splitter, zlib-exact binary patches, `diffcore-delta`'s spanhash damage estimate, a
-//!   patience differ, external filters, tree recursion) and is rejected rather than
-//!   accepted as a silent no-op.
+//! * `--binary`: the `GIT binary patch` payload is a base85-armoured *deflate* stream,
+//!   and parity means byte-identical output. The only deflate in this tree is `zlib-rs`
+//!   (through `gix-zlib`), which is not stream-compatible with the zlib git links
+//!   against at the level git uses. Measured on a 191544-byte blob: git's loose object
+//!   at `zlib_compression_level` (the `Z_BEST_SPEED` default `--binary` also uses) is
+//!   40832 bytes and byte-identical to `zlib.compress(raw, 1)`; `zlib-rs` at the same
+//!   nominal level produces 60060 bytes, diverging from the third byte. At level 6 it
+//!   is 27783 against zlib's 27989; only at level 9 do the two agree byte for byte.
+//!   Emitting a *valid* binary patch is easy and emitting git's is not, so this bails
+//!   rather than printing a payload that differs from stock on every input.
+//! * `--anchored=<text>`: git's own documentation states it "uses the "patience diff"
+//!   algorithm internally", and the vendored `gix-imara-diff` ships only `myers.rs` and
+//!   `histogram.rs`. Same floor as `--patience` below.
 //! * `--patience` / `--diff-algorithm=patience`: imara-diff has no patience variant, so
 //!   these bail rather than silently substituting Myers (the same floor `git diff` hits).
+//! * `--ext-diff`: honouring it means *running* `diff.<driver>.command` with git's
+//!   argument protocol (name, then a temp file / hex / mode triple per side), and the
+//!   driver's own stdout — which normally names those temp files — becomes the patch.
+//!   The negative form `--no-ext-diff` is accepted, since it asks for what already
+//!   happens.
+//! * `--submodule` and `--submodule=log` / `--submodule=diff`: both open the submodule's
+//!   own repository, walk it and (for `diff`) run a second diff inside it. Only
+//!   `--submodule=short`, the `Subproject commit <oid>` line diff a gitlink pair already
+//!   renders as, is ported.
 //! * `--find-copies-harder` is parsed and fed to `diffcore_rename`, but a `diff-pairs`
 //!   batch only ever contains the pairs stdin listed: git supplies the unmodified pairs
 //!   the option needs from a tree walk, and there is none here, so it behaves as plain
@@ -91,8 +118,9 @@
 //!   only steer a diff computed against the index, which this command never reads.
 //! * `--follow` is fatal (`--follow requires exactly one pathspec`), matching git — the
 //!   command takes no pathspec, so the option can never be satisfied.
-//! * `gitattributes` diff drivers: neither external commands nor custom `funcname`
-//!   patterns are applied, so hunk headers use git's built-in heuristic only.
+//! * `gitattributes` diff drivers: a driver's `textconv` is honoured under `--textconv`,
+//!   but its `command` (see `--ext-diff` above) and its custom `funcname` pattern are
+//!   not, so hunk headers use git's built-in `def_ff` heuristic only.
 //! * `--stat`/`--summary` file names are not C-quoted, so a path containing a byte that
 //!   git would escape is emitted verbatim.
 
@@ -596,6 +624,13 @@ enum SubmoduleFormat {
     Short,
 }
 
+/// `--textconv`'s resolved driver machinery, shared by every pair in a batch, or
+/// `None` when the flag was never given — plumbing has `DIFF_OPT_ALLOW_TEXTCONV`
+/// off by default. The `RefCell` is what lets the `&`-borrowed diff pipeline drive
+/// the attribute stack's mutable cursor, which `userdiff_find_by_path()` needs to
+/// answer one path at a time.
+type TextconvRef<'a, 'repo> = Option<&'a std::cell::RefCell<super::cat_file::Textconv<'repo>>>;
+
 /// One raw-format record: a pre-computed file pair.
 #[derive(Clone)]
 struct Pair {
@@ -650,6 +685,12 @@ struct Analysis {
     binary: bool,
     old_data: Vec<u8>,
     new_data: Vec<u8>,
+    /// The buffers `builtin_diff()` actually fed to xdiff when `--textconv` replaced a
+    /// side: `fill_textconv()`'s output. `None` whenever the raw blobs were diffed.
+    /// Only the hunk stream and `check_blank_at_eof()` read these — the pickaxe,
+    /// `--check`, `--dirstat` and the `Bin <a> -> <b>` stat sizes all read the raw
+    /// blobs, since none of those paths calls `fill_textconv()` in git either.
+    converted: Option<(Vec<u8>, Vec<u8>)>,
     hunks: Vec<u8>,
 }
 
@@ -715,6 +756,9 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
     let mut follow = false;
     // Deferred until the whole line is read so `--pickaxe-regex`/`--pickaxe-all`, which
     // may follow the `-S`/`-G`, can fold in. `b'S'` counts occurrences, `b'G'` greps.
+    // `--textconv` / `--no-textconv`: `o->flags.allow_textconv`. The driver machinery
+    // itself is only built once the repository is open, since it needs the index.
+    let mut allow_textconv = false;
     let mut pickaxe_pending: Option<(u8, Vec<u8>)> = None;
     let mut find_object_args: Vec<String> = Vec::new();
     let mut pickaxe_all = false;
@@ -737,12 +781,24 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
                         None => {
                             // parse-options' `error: option `x' requires a value` for a
                             // long name, `switch `x'` for a short one; exit 129 either way.
-                            eprintln!("error: {}", missing_value(s));
+                            eprintln!("error: {}", diff_color::missing_value(s));
                             return Ok(ExitCode::from(129));
                         }
                     }
                 }
             }};
+        }
+        // `--color-moved-ws <modes>` and `--word-diff-regex <re>` also spell their
+        // value as the next argument; parse-options consumes it and then hands the
+        // pair to the same callback the `=` form uses.
+        if diff_color::needs_separate_value(s) {
+            let glued = format!("{s}={}", want_value!(s.len()));
+            if let Some(Err(msg)) = move_word.parse_flag(&glued, &mut opts.color_when) {
+                eprintln!("{msg}");
+                return Ok(ExitCode::from(129));
+            }
+            i += 1;
+            continue;
         }
         // `--color-moved[=<mode>]`, `--color-moved-ws=<modes>`, `--word-diff[=<mode>]`,
         // `--word-diff-regex=<re>` and `--color-words[=<re>]`.
@@ -871,10 +927,11 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-            // `--ws-error-highlight=<kind>` (`diff_opt_ws_error_highlight()`), whose
-            // error tail is the prefix of the value git had already accepted.
-            _ if s.starts_with("--ws-error-highlight=") => {
-                let v = &s["--ws-error-highlight=".len()..];
+            // `--ws-error-highlight=<kind>` / `--ws-error-highlight <kind>`
+            // (`diff_opt_ws_error_highlight()`), whose error tail is the prefix of
+            // the value git had already accepted.
+            _ if s == "--ws-error-highlight" || s.starts_with("--ws-error-highlight=") => {
+                let v = &want_value!("--ws-error-highlight=".len());
                 match diff_color::parse_ws_error_highlight(v) {
                     Ok(val) => {
                         opts.ws_error_highlight = val;
@@ -1215,6 +1272,20 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
+            // `--textconv` / `--no-textconv` (`DIFF_OPT_ALLOW_TEXTCONV`). Off by
+            // default here: `diff_setup()` only turns textconv on for the porcelain
+            // commands, so plumbing needs the flag before a `diff.<driver>.textconv`
+            // program is ever consulted.
+            "--textconv" => allow_textconv = true,
+            "--no-textconv" => allow_textconv = false,
+            // `--no-ext-diff` (`DIFF_OPT_ALLOW_EXTERNAL` off) asks for the state this
+            // command is already in: `diff_setup()` leaves external drivers off for
+            // plumbing, and nothing here ever runs a `diff.<driver>.command`. Its
+            // positive form is refused below, since honouring *that* means running the
+            // driver. Verified against stock: `diff-pairs -p` and `diff-pairs -p
+            // --no-ext-diff` print the same internal patch for a path whose `diff`
+            // attribute names a driver with a `command`.
+            "--no-ext-diff" => {}
             // `--submodule[=<format>]` (`parse_submodule_params()`): the bare form is
             // `log`, matching `diff_opt_submodule()`'s `arg ? arg : "log"`. Only
             // `short` — the default `Subproject commit <oid>` line diff — is ported;
@@ -1302,6 +1373,17 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
             opts.ws_error_highlight = v;
         }
     }
+    // `--textconv`: the gitattributes stack and filter pipeline `userdiff_find_by_path()`
+    // and `prep_temp_blob()` need. Built once for the whole stream, as git builds its
+    // attribute check once and reuses it for every filespec.
+    let textconv = if allow_textconv {
+        match super::cat_file::Textconv::new(&repo) {
+            Ok(t) => Some(std::cell::RefCell::new(t)),
+            Err(e) => return Ok(fatal(&e.to_string())),
+        }
+    } else {
+        None
+    };
     // `git_diff_basic_config()`'s `diff.dirstat` arm parses the value and warns about
     // whatever it could not understand. It cannot change *this* command's behaviour:
     // `builtin/diff-pairs.c` runs `repo_init_revisions()` — which copies
@@ -1388,7 +1470,7 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         cursor += end + 1;
 
         if header.is_empty() {
-            match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed)? {
+            match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv.as_ref())? {
                 Ok(()) => {}
                 Err(code) => return Ok(code),
             }
@@ -1425,7 +1507,7 @@ pub fn diff_pairs(args: &[String]) -> Result<ExitCode> {
         batch.push(pair);
     }
 
-    match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed)? {
+    match flush(&mut out, &repo, &mut cache, &batch, &opts, base_abbrev, &colors, &extra, ws_rule, &mut warnings, &mut check_failed, textconv.as_ref())? {
         Ok(()) => {}
         Err(code) => return Ok(code),
     }
@@ -1526,15 +1608,6 @@ fn parse_git_int(value: &str) -> Option<i32> {
 fn fatal(msg: &str) -> ExitCode {
     eprintln!("fatal: {msg}");
     ExitCode::from(128)
-}
-
-/// parse-options' complaint about an option given without its value: a `--long-name`
-/// is an "option", a single-letter `-x` is a "switch", and the name loses its dashes.
-fn missing_value(flag: &str) -> String {
-    match flag.strip_prefix("--") {
-        Some(name) => format!("option `{name}' requires a value"),
-        None => format!("switch `{}' requires a value", flag.trim_start_matches('-')),
-    }
 }
 
 /// The bare `strerror` text of an I/O failure: Rust appends ` (os error <n>)` to the
@@ -1884,6 +1957,7 @@ fn flush(
     // `o->flags.check_failed`, accumulated across every batch — `diff_result_code()`
     // reads it once, after the whole stream has been written.
     check_failed: &mut bool,
+    tc: TextconvRef<'_, '_>,
 ) -> Result<std::result::Result<(), ExitCode>> {
     if batch.is_empty() || opts.formats.no_output {
         return Ok(Ok(()));
@@ -1920,7 +1994,7 @@ fn flush(
     if let Some(px) = &opts.pickaxe {
         let mut keep = Vec::with_capacity(pairs.len());
         for p in &pairs {
-            match pickaxe_hit(repo, cache, px, p, opts) {
+            match pickaxe_hit(repo, cache, px, p, opts, tc) {
                 Ok(hit) => keep.push(hit),
                 Err(code) => return Ok(Err(code)),
             }
@@ -2006,7 +2080,7 @@ fn flush(
     // `DIFF_FORMAT_CHECKDIFF` shares the name/raw loop's slot in `diff_flush()`, and
     // `diff_setup_done()` guarantees it is the only format left standing.
     if opts.formats.check {
-        match render_check(&mut buf, repo, cache, &pairs, opts, colors, ws_rule) {
+        match render_check(&mut buf, repo, cache, &pairs, opts, colors, ws_rule, tc) {
             Ok(failed) => *check_failed |= failed,
             Err(code) => {
                 out.write_all(&buf)?;
@@ -2028,7 +2102,7 @@ fn flush(
     let files: Vec<StatFile> = if stats_wanted {
         let mut analyses = Vec::with_capacity(pairs.len());
         for p in &pairs {
-            match analyze(repo, cache, p, opts) {
+            match analyze(repo, cache, p, opts, tc) {
                 Ok(a) => analyses.push(a),
                 Err(code) => {
                     out.write_all(&buf)?;
@@ -2079,7 +2153,7 @@ fn flush(
     // `show_dirstat()` sits outside the stat block and, unlike every other format,
     // never bumps `separator` — so `--dirstat -p` runs the two straight together.
     if opts.formats.dirstat && !dirstat_by_line {
-        let damage = match dirstat_damage(repo, cache, &pairs, opts) {
+        let damage = match dirstat_damage(repo, cache, &pairs, opts, tc) {
             Ok(d) => d,
             Err(code) => {
                 out.write_all(&buf)?;
@@ -2136,7 +2210,7 @@ fn flush(
         let mut failed = None;
         for p in &pairs {
             if let Err(code) =
-                render_patch(&mut plain, &mut files, repo, cache, p, opts, base_abbrev, ws_rule)
+                render_patch(&mut plain, &mut files, repo, cache, p, opts, base_abbrev, ws_rule, tc)
             {
                 failed = Some(code);
                 break;
@@ -2357,6 +2431,7 @@ fn dirstat_damage(
     cache: &mut gix::diff::blob::Platform,
     pairs: &[Pair],
     opts: &Opts,
+    tc: TextconvRef<'_, '_>,
 ) -> std::result::Result<Vec<(BString, u64)>, ExitCode> {
     let mut out = Vec::with_capacity(pairs.len());
     for p in pairs {
@@ -2371,7 +2446,7 @@ fn dirstat_damage(
             out.push((p.new_path.clone(), 1));
             continue;
         }
-        let an = analyze(repo, cache, p, opts)?;
+        let an = analyze(repo, cache, p, opts, tc)?;
         let damage = if p.old_valid() && p.new_valid() {
             // `hash_chars()` asks `diff_filespec_is_binary()` about each side on its
             // own, so the two `is_text` flags are derived separately.
@@ -2506,6 +2581,7 @@ fn render_check(
     opts: &Opts,
     colors: &diff_color::DiffColors,
     ws_cfg: u32,
+    tc: TextconvRef<'_, '_>,
 ) -> std::result::Result<bool, ExitCode> {
     let mut failed = false;
     let mut rules = WsRules::new(repo, ws_cfg);
@@ -2534,7 +2610,7 @@ fn render_check(
             ws_rule &= !diff_color::WS_INCOMPLETE_LINE;
         }
 
-        let an = analyze(repo, cache, p, opts)?;
+        let an = analyze(repo, cache, p, opts, tc)?;
         // Deliberately only the new side is tested for binaryness.
         if p.new_valid() && diffcore_rename::buffer_is_binary(&an.new_data) {
             continue;
@@ -2689,6 +2765,7 @@ fn analyze(
     cache: &mut gix::diff::blob::Platform,
     p: &Pair,
     opts: &Opts,
+    tc: TextconvRef<'_, '_>,
 ) -> std::result::Result<Analysis, ExitCode> {
     if is_gitlink(p) {
         let (add, del) = gitlink_counts(p);
@@ -2698,6 +2775,7 @@ fn analyze(
             binary: false,
             old_data: Vec::new(),
             new_data: Vec::new(),
+            converted: None,
             hunks: gitlink_hunks(p),
         });
     }
@@ -2751,8 +2829,51 @@ fn analyze(
         Some(d) => d.to_vec(),
         None => read_blob(repo, p.new_id, p.new_valid())?,
     };
+    // Whether gitoxide classified each side on its own as binary. `as_slice()` is `None`
+    // exactly for the content it refused to hand back, so this is `diff_filespec_is_binary()`
+    // per side — which is what the `--textconv` binary test needs, since a converted side
+    // is never binary no matter what the raw blob looked like.
+    let old_is_binary = p.old_valid() && prep.old.data.as_slice().is_none();
+    let new_is_binary = p.new_valid() && prep.new.data.as_slice().is_none();
 
-    match prep.operation {
+    // `builtin_diff()`'s `--textconv` path: resolve each side's `diff.<driver>.textconv`
+    // program and diff its stdout instead of the blob. A side that converted is never
+    // treated as binary here — git's test is
+    // `(!textconv_one && is_binary(one)) || (!textconv_two && is_binary(two))` — and a
+    // program that fails is `die("unable to read files to diff")`.
+    //
+    // This is a *patch-only* substitution. `builtin_diffstat()` resolves the drivers
+    // too but then fills its buffers with `fill_mmfile()`, not `fill_textconv()`, so
+    // `--stat`/`--numstat`/`--shortstat` keep counting the raw blobs and a raw-binary
+    // path still reports `Bin <a> -> <b> bytes` even while its patch shows hunks.
+    // `builtin_checkdiff()` and `diffcore_pickaxe()` never call `fill_textconv()` at
+    // all, so they read the raw blobs as well.
+    let converted = match tc {
+        Some(cell) => {
+            let mut conv = cell.borrow_mut();
+            let one = convert_side(&mut conv, p.old_path.as_bstr(), &old_data, p.old_valid())?;
+            let two = convert_side(&mut conv, p.new_path.as_bstr(), &new_data, p.new_valid())?;
+            match (&one, &two) {
+                // Neither path names a driver, so this is an ordinary diff.
+                (None, None) => None,
+                // Only a side git left unconverted can still veto with binary, and
+                // `-a`/`--text` skips that test outright as it does in `builtin_diff()`.
+                _ if !opts.text
+                    && ((one.is_none() && old_is_binary)
+                        || (two.is_none() && new_is_binary)) =>
+                {
+                    None
+                }
+                _ => Some((
+                    one.unwrap_or_else(|| old_data.clone()),
+                    two.unwrap_or_else(|| new_data.clone()),
+                )),
+            }
+        }
+        None => None,
+    };
+
+    let raw = match prep.operation {
         Operation::SourceOrDestinationIsBinary => {
             // `-a`/`--text` forces a textual diff even for content gitoxide flags as
             // binary. The `binary` flag itself stays set so `--stat`/`--numstat` still
@@ -2776,6 +2897,7 @@ fn analyze(
                 binary: true,
                 old_data,
                 new_data,
+                converted: None,
                 hunks,
             })
         }
@@ -2792,6 +2914,7 @@ fn analyze(
                     binary: false,
                     old_data,
                     new_data,
+                    converted: None,
                     hunks,
                 });
             }
@@ -2804,8 +2927,50 @@ fn analyze(
                 binary: false,
                 old_data,
                 new_data,
+                converted: None,
                 hunks,
             })
+        }
+    };
+    let mut raw = raw?;
+
+    // Re-render the patch body from the textconv output. Everything else the analysis
+    // carries — the counts, the binary verdict, the raw buffers the stat, pickaxe,
+    // `--check` and `--dirstat` paths read — stays exactly as the unconverted diff
+    // produced it, because none of those code paths calls `fill_textconv()` in git.
+    if let Some((old_txt, new_txt)) = converted {
+        let algorithm = opts.algo.unwrap_or(gix::diff::blob::Algorithm::Myers);
+        raw.hunks = if p.kind() == b'M' && p.score() != 0 {
+            emit_rewrite_diff(&old_txt, &new_txt, opts)
+        } else {
+            text_analysis(&old_txt, &new_txt, opts, algorithm)?.2
+        };
+        raw.converted = Some((old_txt, new_txt));
+    }
+    Ok(raw)
+}
+
+/// `get_textconv()` + `fill_textconv()` for one side of a pair: `Some(text)` when the
+/// path names a driver that configures `diff.<name>.textconv` and its program ran,
+/// `None` when no driver applies — which is `fill_textconv()`'s "hand back the blob
+/// unchanged" case. A side that does not exist has nothing to convert.
+///
+/// A program that could not be started or exited non-zero is `run_textconv()`'s NULL
+/// return, which `fill_textconv()` turns into `die(_("unable to read files to diff"))`.
+fn convert_side(
+    conv: &mut super::cat_file::Textconv<'_>,
+    path: &gix::bstr::BStr,
+    data: &[u8],
+    valid: bool,
+) -> std::result::Result<Option<Vec<u8>>, ExitCode> {
+    if !valid {
+        return Ok(None);
+    }
+    match conv.convert(path, data) {
+        Ok(super::cat_file::Converted::Text(t)) => Ok(Some(t)),
+        Ok(super::cat_file::Converted::NoDriver) => Ok(None),
+        Ok(super::cat_file::Converted::Failed) | Err(_) => {
+            Err(fatal("unable to read files to diff"))
         }
     }
 }
@@ -3281,6 +3446,7 @@ fn pickaxe_hit(
     px: &Pickaxe,
     p: &Pair,
     opts: &Opts,
+    tc: TextconvRef<'_, '_>,
 ) -> std::result::Result<bool, ExitCode> {
     if let PickaxeKind::ObjFind(ids) = &px.kind {
         return Ok((p.old_valid() && ids.contains(&p.old_id))
@@ -3289,7 +3455,7 @@ fn pickaxe_hit(
     if !p.old_valid() && !p.new_valid() {
         return Ok(false);
     }
-    let an = analyze(repo, cache, p, opts)?;
+    let an = analyze(repo, cache, p, opts, tc)?;
     Ok(match &px.kind {
         PickaxeKind::Occurrences(needle) => {
             if let Needle::Literal(n) = needle {
@@ -3843,6 +4009,7 @@ fn render_patch(
     opts: &Opts,
     base_abbrev: usize,
     ws_rule: u32,
+    tc: TextconvRef<'_, '_>,
 ) -> std::result::Result<(), ExitCode> {
     let steps: Vec<Pair> = if p.type_changed() {
         vec![as_deletion(p), as_creation(p)]
@@ -3850,15 +4017,22 @@ fn render_patch(
         vec![p.clone()]
     };
     for step in &steps {
-        let an = analyze(repo, cache, step, opts)?;
+        let an = analyze(repo, cache, step, opts, tc)?;
         let before = out.len();
         emit_patch(out, repo, step, &an, opts, base_abbrev);
         // A pair that renders nothing at all contributes no `diff --git` header, so
         // it must not consume a slot in the per-file state either.
         if out.len() != before {
+            // `builtin_diff()` runs `check_blank_at_eof()` on `mf1`/`mf2` — the buffers
+            // it just filled — so under `--textconv` the converted text is what decides
+            // whether a trailing blank line is newly added.
+            let (bof_old, bof_new) = match &an.converted {
+                Some((o, n)) => (o.as_slice(), n.as_slice()),
+                None => (an.old_data.as_slice(), an.new_data.as_slice()),
+            };
             files.push(diff_color::FilePaint {
                 ws_rule,
-                blank_at_eof: diff_color::check_blank_at_eof(&an.old_data, &an.new_data),
+                blank_at_eof: diff_color::check_blank_at_eof(bof_old, bof_new),
             });
         }
     }
@@ -3962,7 +4136,10 @@ fn emit_patch(
         return;
     }
 
-    if an.binary && !opts.text {
+    // A pair whose patch body came from `--textconv` is never rendered as binary, even
+    // when the raw blobs are: `builtin_diff()` only reaches its `Binary files … differ`
+    // arm for a side that has no textconv driver.
+    if an.binary && !opts.text && an.converted.is_none() {
         out.extend_from_slice(b"Binary files ");
         out.extend_from_slice(&old_label);
         out.extend_from_slice(b" and ");

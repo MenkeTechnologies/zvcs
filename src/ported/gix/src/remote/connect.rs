@@ -61,6 +61,11 @@ pub struct Options {
     /// Only `file://`/local and `ssh://` transports spawn the service themselves and can honour it, which is
     /// exactly where git applies it too.
     pub upload_pack: Option<crate::bstr::BString>,
+    /// Restrict the connection to one IP address family, from git's `--ipv4`/`--ipv6`.
+    ///
+    /// This is git's `transport_family`: it narrows address resolution for `git://` and `http(s)://`
+    /// and becomes `ssh`'s `-4`/`-6`. `file://` opens no socket and ignores it.
+    pub address_family: Option<gix_transport::AddressFamily>,
 }
 
 /// Establishing connections to remote hosts (without performing a git-handshake).
@@ -124,6 +129,7 @@ impl<'repo> Remote<'repo> {
                     .unwrap_or_default(),
                 trace: self.repo.config.trace_packet(),
                 upload_pack: options.upload_pack,
+                address_family: options.address_family,
             },
         )
         .await?;

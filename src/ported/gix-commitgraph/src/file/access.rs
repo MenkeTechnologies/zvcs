@@ -4,8 +4,8 @@ use std::{
 };
 
 use crate::{
-    File,
-    file::{self, COMMIT_DATA_ENTRY_SIZE_SANS_HASH, commit::Commit},
+    File, bloom,
+    file::{self, BLOOM_DATA_HEADER_SIZE, COMMIT_DATA_ENTRY_SIZE_SANS_HASH, commit::Commit},
 };
 
 /// Access
@@ -13,6 +13,52 @@ impl File {
     /// The number of base graphs that this file depends on.
     pub fn base_graph_count(&self) -> u8 {
         self.base_graph_count
+    }
+
+    /// How the changed-path Bloom filters in this file were built, or `None` if
+    /// it carries none.
+    ///
+    /// This is the `BDAT` header, and it is what a writer replacing this file
+    /// must match: filters built with different sizing or a different hash
+    /// version cannot share a chunk with these.
+    pub fn bloom_filter_settings(&self) -> Option<bloom::Settings> {
+        self.bloom_filter_settings
+    }
+
+    /// The changed-path Bloom filter for the commit at lexicographical position
+    /// `pos`, or `None` if this file has no filters or the entry is unusable.
+    ///
+    /// Port of git's `load_bloom_filter_from_graph()`. `BIDX[i]` is the *end* of
+    /// filter `i` within the data, so a filter runs from `BIDX[i-1]` to
+    /// `BIDX[i]` with `BIDX[-1]` taken as zero. git tolerates an offset equal to
+    /// the data size, because the last filter's end is one past the last byte,
+    /// but rejects anything beyond it and rejects a pair that decreases — both
+    /// of which mean a corrupt index rather than an absent filter.
+    pub fn bloom_filter_at(&self, pos: file::Position) -> Option<bloom::Filter> {
+        let indexes = self.bloom_indexes_offset?;
+        let data = self.bloom_data_range.clone()?;
+        if pos.0 >= self.num_commits() {
+            return None;
+        }
+
+        let payload = data.len() - BLOOM_DATA_HEADER_SIZE;
+        let end_at = indexes + 4 * pos.0 as usize;
+        let end = u32::from_be_bytes(self.data[end_at..end_at + 4].try_into().expect("4 bytes")) as usize;
+        let start = match pos.0.checked_sub(1) {
+            Some(prev) => {
+                let at = indexes + 4 * prev as usize;
+                u32::from_be_bytes(self.data[at..at + 4].try_into().expect("4 bytes")) as usize
+            }
+            None => 0,
+        };
+
+        if end > payload || start > payload || end < start {
+            return None;
+        }
+        let base = data.start + BLOOM_DATA_HEADER_SIZE;
+        Some(bloom::Filter {
+            data: self.data[base + start..base + end].to_vec(),
+        })
     }
 
     /// Returns the commit data for the commit located at the given lexicographical position.

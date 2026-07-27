@@ -247,6 +247,7 @@ pub fn annotate(args: &[String]) -> Result<ExitCode> {
         since: None,
         rewrites: Some(gix::diff::Rewrites::default()),
         ignore_whitespace: opts.ignore_whitespace,
+        detect_moved: opts.detect_moved,
         // `git annotate` has no `--ignore-rev`; it is `git blame -c` with the same
         // option set minus the blame-only flags.
         ignore_revs: Default::default(),
@@ -456,7 +457,9 @@ struct Options {
     incremental: bool,
     show_stats: bool,
     ignore_whitespace: bool,
-    find_moves: bool,
+    /// `-M[<score>]`: the value is git's `sb->move_score` (`BLAME_DEFAULT_MOVE_SCORE` for a
+    /// bare `-M`).
+    detect_moved: Option<u32>,
     find_copies: bool,
     contents: Option<String>,
     revs_file: Option<String>,
@@ -483,9 +486,6 @@ impl Options {
         }
         if self.revs_file.is_some() {
             return Some("-S <revs-file>");
-        }
-        if self.find_moves {
-            return Some("-M line-move detection");
         }
         if self.find_copies {
             return Some("-C line-copy detection");
@@ -520,7 +520,7 @@ impl Options {
             incremental: false,
             show_stats: false,
             ignore_whitespace: false,
-            find_moves: false,
+            detect_moved: None,
             find_copies: false,
             contents: None,
             revs_file: None,
@@ -616,7 +616,7 @@ impl Options {
 
                 // `-M`/`-C` take an optional attached score; `-C` repeats to
                 // widen the search (`-CC`, `-CCC`).
-                _ if is_move_or_copy(a, b'M') => o.find_moves = true,
+                _ if is_move_or_copy(a, b'M') => o.detect_moved = Some(move_score(a)),
                 _ if is_move_or_copy(a, b'C') => o.find_copies = true,
 
                 _ if a.starts_with("-L") => {
@@ -696,6 +696,14 @@ fn parse_diff_algorithm(name: &str) -> Option<gix::diff::blob::Algorithm> {
 }
 
 /// `-M[<score>]` / `-C[<score>]`, where `-C` may repeat to widen the search.
+/// `blame_move_callback`'s optional attached score: `parse_score()` for the digits after `-M`,
+/// or `BLAME_DEFAULT_MOVE_SCORE` when there are none.
+fn move_score(arg: &str) -> u32 {
+    arg[2..]
+        .parse::<u32>()
+        .unwrap_or(super::blame::BLAME_DEFAULT_MOVE_SCORE)
+}
+
 fn is_move_or_copy(arg: &str, letter: u8) -> bool {
     let bytes = arg.as_bytes();
     if bytes.len() < 2 || bytes[0] != b'-' || bytes[1] != letter {

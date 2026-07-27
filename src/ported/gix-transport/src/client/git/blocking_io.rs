@@ -186,6 +186,12 @@ pub mod connect {
         Io(#[from] std::io::Error),
         #[error("Could not parse {host:?} as virtual host with format <host>[:port]")]
         VirtualHostInvalid { host: String },
+        #[error("Unable to look up {host}:{port} with an {family} address")]
+        NoAddressOfFamily {
+            host: String,
+            port: u16,
+            family: &'static str,
+        },
     }
 
     impl crate::IsSpuriousError for Error {
@@ -213,26 +219,59 @@ pub mod connect {
     ///
     /// Use `desired_version` to specify a preferred protocol to use, knowing that it can be downgraded by a server not supporting it.
     /// If `trace` is `true`, all packetlines received or sent will be passed to the facilities of the `gix-trace` crate.
+    /// `address_family` restricts the addresses that may be used, like git's `--ipv4`/`--ipv6`.
     pub fn connect(
         host: &str,
         path: BString,
         desired_version: crate::Protocol,
         port: Option<u16>,
         trace: bool,
+        address_family: Option<crate::AddressFamily>,
     ) -> Result<Connection<TcpStream, TcpStream>, Error> {
-        let read = TcpStream::connect_timeout(
-            &(host, port.unwrap_or(9418))
-                .to_socket_addrs()?
-                .next()
-                .expect("after successful resolution there is an IP address"),
-            std::time::Duration::from_secs(5),
-        )?;
+        let vhost_port = port;
+        let port = port.unwrap_or(9418);
+        // git's `git_tcp_connect_sock()` narrows the resolution with `hints.ai_family` and then walks
+        // every remaining address, connecting to the first one that answers; only when all of them
+        // failed does it report an error. Both halves matter: without the walk a host whose first
+        // address is unreachable never connects.
+        let candidates: Vec<_> = (host, port)
+            .to_socket_addrs()?
+            .filter(|addr| address_family.is_none_or(|family| family.matches(addr)))
+            .collect();
+        let mut last_err = None;
+        let mut stream = None;
+        for addr in &candidates {
+            match TcpStream::connect_timeout(addr, std::time::Duration::from_secs(5)) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(err) => last_err = Some(err),
+            }
+        }
+        let read = match (stream, last_err) {
+            (Some(s), _) => s,
+            (None, Some(err)) => return Err(err.into()),
+            // Resolution succeeded but nothing of the requested family came back, which is what
+            // `getaddrinfo()` turns into a lookup failure for git.
+            (None, None) => {
+                return Err(Error::NoAddressOfFamily {
+                    host: host.to_owned(),
+                    port,
+                    family: match address_family {
+                        Some(crate::AddressFamily::V4) => "IPv4",
+                        Some(crate::AddressFamily::V6) => "IPv6",
+                        None => "IP",
+                    },
+                })
+            }
+        };
         let write = read.try_clone()?;
         let vhost = std::env::var("GIT_OVERRIDE_VIRTUAL_HOST")
             .ok()
             .map(parse_host)
             .transpose()?
-            .unwrap_or_else(|| (host.to_owned(), port));
+            .unwrap_or_else(|| (host.to_owned(), vhost_port));
         Ok(Connection::new(
             read,
             write,

@@ -312,7 +312,7 @@ where
     ///
     /// Must be called with no borrow held on `snapshot` or `inflate`, as the hook runs arbitrary code.
     /// Doing nothing is always a valid outcome; the caller's lookup then simply reports the object missing.
-    fn fetch_from_promisor(&self, id: &gix_hash::oid) {
+    pub(super) fn fetch_from_promisor(&self, id: &gix_hash::oid) {
         if !self.store.has_promisor() || gix_pack::Find::contains(self, id) {
             return;
         }

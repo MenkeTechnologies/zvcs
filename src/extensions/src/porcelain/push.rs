@@ -34,10 +34,17 @@ use super::push_proto::{self, Request};
 /// silently; inert or already-matched flags (`--thin`, `--receive-pack`,
 /// `-4/-6`, `--verify`, …) are accepted.
 ///
+/// `--force-if-includes` is honored for real: alongside a `--force-with-lease`
+/// whose expected value came from a remote-tracking ref, the tip the remote
+/// advertises must also be reachable from the pushed ref's reflog, or the update
+/// is rejected with `remote ref updated since checkout` (see
+/// [`super::push_proto`]).
+///
 /// The `push.*` defaults honored here are `push.recurseSubmodules`,
-/// `push.followTags`, `push.autoSetupRemote` (with `push.default`),
-/// `push.gpgSign` and `push.pushOption`; an explicit command-line flag always
-/// wins, because git reads config in `git_push_config` *before* `parse_options`.
+/// `push.followTags`, `push.useForceIfIncludes`, `push.autoSetupRemote` (with
+/// `push.default`), `push.gpgSign` and `push.pushOption`; an explicit
+/// command-line flag always wins, because git reads config in `git_push_config`
+/// *before* `parse_options`.
 pub fn push(args: &[String]) -> Result<ExitCode> {
     let mut f = Flags::default();
     let mut positionals: Vec<String> = Vec::new();
@@ -48,6 +55,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     let mut recurse_explicit = false;
     // Same for `--follow-tags`/`--no-follow-tags` against `push.followTags`.
     let mut follow_tags_explicit = false;
+    let mut force_if_includes_explicit = false;
     // Same for `--signed`/`--no-signed` against `push.gpgSign`.
     let mut signed_explicit = false;
     let mut i = 0;
@@ -105,10 +113,15 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             // `--force-if-includes` only ever does anything alongside a
             // `--force-with-lease` that takes its expected value from the
             // remote-tracking ref (`apply_cas()` sets `check_reachable` exactly
-            // there). Anywhere else git documents it as a no-op, so it is accepted;
-            // where it would bite, it is refused rather than silently dropped.
-            "--force-if-includes" => f.force_if_includes = true,
-            "--no-force-if-includes" => f.force_if_includes = false,
+            // there). Anywhere else git documents it as a no-op.
+            "--force-if-includes" => {
+                f.force_if_includes = true;
+                force_if_includes_explicit = true;
+            }
+            "--no-force-if-includes" => {
+                f.force_if_includes = false;
+                force_if_includes_explicit = true;
+            }
             "--no-signed" => {
                 f.signed = push_proto::Signed::Never;
                 signed_explicit = true;
@@ -200,6 +213,15 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             }
         }
 
+        // `push.useForceIfIncludes` — the default for `--force-if-includes`
+        // (`git_push_config`: `TRANSPORT_PUSH_FORCE_IF_INCLUDES`, builtin/push.c:537).
+        // The flag, in either direction, overrides it.
+        if !force_if_includes_explicit {
+            if let Some(on) = snap.boolean("push.useForceIfIncludes") {
+                f.force_if_includes = on;
+            }
+        }
+
         // `push.gpgSign` — the default for `--signed`. git's `git_push_config`
         // runs the value through `git_parse_maybe_bool` and maps false/true to
         // NEVER/ALWAYS, the literal `if-asked` to IF_ASKED, and dies on anything
@@ -285,18 +307,24 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             req.expected = lease_for(&repo, &remote, &f.lease, &req.name);
         }
         // `--force-if-includes` turns each of those leases into an additional
-        // reachability check (`check_if_includes_upstream`) over the *local*
-        // branch's reflog. That reverse mapping from remote ref back to the local
-        // branch is not retained here, so the flag is refused where it would
-        // change the outcome rather than being accepted and ignored.
-        if f.force_if_includes && requests.iter().any(|r| lease_uses_tracking(&f.lease, &r.name)) {
-            bail!(
-                "unsupported flag \"--force-if-includes\" alongside a --force-with-lease that reads \
-                 its expected value from the remote-tracking ref: it additionally requires the \
-                 remote tip to be reachable from the local branch's reflog, a check this port does \
-                 not perform — pass --no-force-if-includes, or give the lease an explicit \
-                 <ref>:<expect> value, which makes the flag a no-op in git too"
-            );
+        // reachability check (`check_if_includes_upstream`) over the reflog of the
+        // ref being pushed. `apply_cas()` arms it on exactly one branch: a lease
+        // whose expected value came from a remote-tracking ref that was actually
+        // read (remote.c:2837, :2851). An explicit `<ref>:<expect>`, or a tracking
+        // ref that does not exist, leaves it disarmed — which is why git documents
+        // the flag as a no-op there.
+        //
+        // The check itself needs the tip the remote advertises, so it runs in
+        // `push_proto`; all that is decided here is which tracking ref each
+        // request is measured against.
+        if f.force_if_includes {
+            for req in &mut requests {
+                if !lease_uses_tracking(&f.lease, &req.name) {
+                    continue;
+                }
+                req.check_reachable = tracking_ref_for(&remote, &req.name)
+                    .filter(|name| repo.find_reference(name.as_str()).is_ok());
+            }
         }
     }
 
@@ -637,7 +665,7 @@ fn build_requests(
                     new: id.detach(),
                     force: true,
                     expected: None,
-                    only_if_absent: false,
+                    only_if_absent: false, check_reachable: None,
                 });
             }
         }
@@ -653,7 +681,7 @@ fn build_requests(
             let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
             if let Some(id) = r.try_id() {
                 let short = short_ref(&name).to_string();
-                requests.push(Request { name: name.clone(), new: id.detach(), force: f.force, expected: None, only_if_absent: false });
+                requests.push(Request { name: name.clone(), new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None });
                 upstreams.push((short, name));
             }
         }
@@ -677,7 +705,7 @@ fn build_requests(
             // fetch reporting "would clobber existing tag" because the two sides
             // now name different objects.
             if let Some(id) = r.try_id() {
-                tag_requests.push(Request { name, new: id.detach(), force: f.force, expected: None, only_if_absent: false });
+                tag_requests.push(Request { name, new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None });
             }
         }
         // Only `--tags` on its own is complete here; with refspecs alongside, the
@@ -695,7 +723,7 @@ fn build_requests(
                 new: null(repo),
                 force: f.force,
                 expected: None,
-                only_if_absent: false,
+                only_if_absent: false, check_reachable: None,
             });
         }
         return Ok((requests, upstreams));
@@ -785,7 +813,7 @@ fn append_followed_tags(repo: &gix::Repository, requests: &mut Vec<Request>) -> 
         if tips.iter().any(|tip| reachable(repo, peeled, *tip)) {
             // Never forced: a followed tag is an addition, and git refuses to
             // clobber a differing remote tag here just as it does for `--tags`.
-            requests.push(Request { name, new: tag_object, force: false, expected: None, only_if_absent: true });
+            requests.push(Request { name, new: tag_object, force: false, expected: None, only_if_absent: true, check_reachable: None });
         }
     }
     Ok(())
@@ -847,7 +875,7 @@ fn parse_refspec(
             new,
             force,
             expected: None,
-            only_if_absent: false,
+            only_if_absent: false, check_reachable: None,
         },
         upstream,
     ))
@@ -873,7 +901,7 @@ fn current_branch_request(repo: &gix::Repository, force: bool) -> Result<(Reques
             new,
             force,
             expected: None,
-            only_if_absent: false,
+            only_if_absent: false, check_reachable: None,
         },
         (branch, name),
     ))
@@ -1130,8 +1158,23 @@ fn advise_rejections(rejected: &[(&str, &str)]) {
         .iter()
         .any(|(n, reason)| *reason == "non-fast-forward" && Some(*n) != head.as_deref());
     let fetch_first = rejected.iter().any(|(_, reason)| *reason == "fetch first");
+    let needs_update =
+        rejected.iter().any(|(_, reason)| *reason == "remote ref updated since checkout");
 
-    if non_ff_head {
+    // `message_advice_ref_needs_update` (builtin/push.c:316-320), the hint for a
+    // `--force-if-includes` rejection. git gates it on its own
+    // `advice.pushRefNeedsUpdate` slot as well as the umbrella
+    // `advice.pushUpdateRejected` checked above; there is no separate slot for it
+    // here yet, so only the umbrella silences it.
+    if needs_update {
+        Advice::PushUpdateRejected.advise_plain_in(
+            &repo,
+            "Updates were rejected because the tip of the remote-tracking branch has\n\
+             been updated since the last checkout. If you want to integrate the\n\
+             remote changes, use 'git pull' before pushing again.\n\
+             See the 'Note about fast-forwards' in 'git push --help' for details.",
+        );
+    } else if non_ff_head {
         Advice::PushNonFFCurrent.advise_plain_in(
             &repo,
             "Updates were rejected because the tip of your current branch is behind\n\
@@ -1392,7 +1435,7 @@ fn expand_pattern_refspec(
             new: id,
             force,
             expected: None,
-            only_if_absent: false,
+            only_if_absent: false, check_reachable: None,
         });
     }
     Ok(out)
@@ -1506,7 +1549,7 @@ mod tests {
             new: tip,
             force: false,
             expected: None,
-            only_if_absent: false,
+            only_if_absent: false, check_reachable: None,
         }];
         append_followed_tags(&repo, &mut requests).expect("append");
         requests.into_iter().skip(1).map(|r| r.name).collect()
@@ -1534,7 +1577,7 @@ mod tests {
             // Even under `--force`, a followed tag must not inherit the force bit.
             force: true,
             expected: None,
-            only_if_absent: false,
+            only_if_absent: false, check_reachable: None,
         }];
         append_followed_tags(&repo, &mut requests).expect("append");
 
@@ -1559,7 +1602,7 @@ mod tests {
             new: gix::hash::ObjectId::null(repo.object_hash()),
             force: false,
             expected: None,
-            only_if_absent: false,
+            only_if_absent: false, check_reachable: None,
         }];
         append_followed_tags(&repo, &mut requests).expect("append");
         assert_eq!(requests.len(), 1, "no tips to be reachable from, so no tags");

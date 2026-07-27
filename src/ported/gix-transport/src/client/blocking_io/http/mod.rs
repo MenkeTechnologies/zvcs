@@ -288,6 +288,11 @@ pub struct Options {
     pub http_version: Option<HttpVersion>,
     /// Backend specific options, if available.
     pub backend: Option<Arc<Mutex<dyn Any + Send + Sync + 'static>>>,
+    /// Restrict connections to one IP address family, git's `--ipv4`/`--ipv6` (`CURLOPT_IPRESOLVE`).
+    ///
+    /// This is not an `http.*` configuration key; it reaches the backend through the transport that
+    /// the connection was built with.
+    pub address_family: Option<crate::AddressFamily>,
 }
 
 impl Default for Options {
@@ -328,6 +333,7 @@ impl Default for Options {
             ssl_verify: true,
             http_version: None,
             backend: None,
+            address_family: None,
         }
     }
 }
@@ -351,6 +357,10 @@ pub struct Transport<H: Http> {
     /// The credential helper cascade for the server URL, invoked once before the first request when
     /// [`proactive_auth`][Self::proactive_auth] asks for it.
     authenticate: Option<(gix_credentials::helper::Action, Arc<Mutex<options::AuthenticateFn>>)>,
+    /// git's `--ipv4`/`--ipv6`. It arrives with the connection rather than with the `http.*` configuration,
+    /// so it is folded into the options on their way to the backend by
+    /// [`configure()`][client::TransportWithoutIO::configure()].
+    address_family: Option<crate::AddressFamily>,
 }
 
 impl<H: Http> Transport<H> {
@@ -379,7 +389,13 @@ impl<H: Http> Transport<H> {
             proactive_auth: Default::default(),
             empty_auth: Default::default(),
             authenticate: None,
+            address_family: None,
         }
+    }
+
+    /// Restrict connections to one IP address family, git's `--ipv4`/`--ipv6`.
+    pub fn set_address_family(&mut self, address_family: Option<crate::AddressFamily>) {
+        self.address_family = address_family;
     }
 }
 
@@ -492,6 +508,13 @@ impl<H: Http> client::TransportWithoutIO for Transport<H> {
             self.proactive_auth = options.proactive_auth;
             self.empty_auth = options.empty_auth;
             self.authenticate = options.authenticate.clone();
+            // `--ipv4`/`--ipv6` is not an `http.*` key, so it is not part of what the caller assembled;
+            // fold it in here so the backend sees one complete set of options.
+            if self.address_family.is_some() {
+                let mut options = options.clone();
+                options.address_family = self.address_family;
+                return self.http.configure(&options);
+            }
         }
         self.http.configure(config)
     }

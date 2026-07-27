@@ -201,6 +201,10 @@ struct Entry<'repo> {
     remote: bool,
     /// The detached-HEAD pseudo entry, which `--format` prints verbatim.
     detached: bool,
+    /// git's `%(worktreepath)`: the working tree that has this branch checked
+    /// out, if any (including the current one). Drives the `+` marker, the
+    /// `color.branch.worktree` slot and the `-vv` `(<path>)` field.
+    worktreepath: Option<String>,
     /// Precomputed `--sort` values, aligned positionally with the parsed sort
     /// keys. Empty when no sort is in effect (default refname order).
     keys: Vec<SortVal>,
@@ -490,6 +494,15 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
 
     let repo = gix::discover(".")?;
 
+    // `git_branch_config()` runs `color_parse()` on every `color.branch.<slot>`
+    // it recognizes while configuration is being read, so an unparseable spec is
+    // fatal for *every* `git branch` invocation — deletes and renames included,
+    // and even for the `plain` slot the listing never paints with.
+    if let Some((key, spec, meta)) = super::color::first_invalid_slot(&repo, "color.branch", &COLOR_SLOTS)
+    {
+        return Ok(super::color::invalid_color_fatal(&key, &spec, &meta));
+    }
+
     if o.rename {
         return rename_branch(&repo, &o);
     }
@@ -564,6 +577,7 @@ fn collect_entries<'repo>(
                 current: true,
                 remote: false,
                 detached: true,
+                worktreepath: None,
                 keys: Vec::new(),
             });
         }
@@ -572,6 +586,8 @@ fn collect_entries<'repo>(
     let mut refs: Vec<Entry<'repo>> = Vec::new();
 
     if o.mode != ListMode::Remotes {
+        // git's `ref_to_worktree_map`, built lazily by `%(worktreepath)`.
+        let wt_map = worktree_map(repo);
         for r in repo.references()?.local_branches()? {
             let r = r.map_err(|e| anyhow!("{e}"))?;
             let full = r.name().as_bstr().to_owned();
@@ -579,6 +595,7 @@ fn collect_entries<'repo>(
             let (id, symref) = target_of(&r);
             refs.push(Entry {
                 current: current_ref.as_ref() == Some(&full),
+                worktreepath: wt_map.get(&full).cloned(),
                 full,
                 display: short.clone(),
                 short,
@@ -613,6 +630,7 @@ fn collect_entries<'repo>(
                 current: false,
                 remote: true,
                 detached: false,
+                worktreepath: None,
                 keys: Vec::new(),
             });
         }
@@ -761,6 +779,114 @@ fn resolve_filter_commit(repo: &gix::Repository, spec: &str, peel: bool) -> Resu
     Ok(commit.id)
 }
 
+/// git's `ref_to_worktree_map` (`ref-filter.c`), the table `%(worktreepath)`
+/// looks a branch up in: every working tree whose `HEAD` is symbolic, keyed by
+/// the full refname it points at and valued by the tree's path.
+///
+/// Mirrors `get_worktrees()`: the main working tree (the common dir with a
+/// trailing `/.git` cut off, which leaves a bare repository untouched) followed
+/// by each `<common-dir>/worktrees/<id>`, whose path is the `gitdir` file's
+/// contents with the same suffix removed. A worktree with a detached or
+/// unreadable `HEAD` contributes nothing, so it never marks a branch.
+fn worktree_map(repo: &gix::Repository) -> std::collections::HashMap<BString, String> {
+    /// `<dir>/HEAD`'s symbolic target, or `None` when detached/unreadable.
+    fn head_ref(dir: &std::path::Path) -> Option<BString> {
+        let raw = std::fs::read(dir.join("HEAD")).ok()?;
+        let target = raw.strip_prefix(b"ref:".as_slice())?;
+        Some(BString::from(target.trim().to_owned()))
+    }
+    /// Drop the `/.git` a worktree's git dir ends in, leaving the checkout path.
+    fn checkout_of(git_dir: &std::path::Path) -> std::path::PathBuf {
+        match git_dir.file_name().and_then(|n| n.to_str()) {
+            Some(".git") => git_dir.parent().unwrap_or(git_dir).to_path_buf(),
+            _ => git_dir.to_path_buf(),
+        }
+    }
+
+    let mut map = std::collections::HashMap::new();
+    let common = gix::path::realpath(repo.common_dir()).unwrap_or_else(|_| repo.common_dir().into());
+    let mut add = |dir: &std::path::Path, path: std::path::PathBuf| {
+        if let Some(name) = head_ref(dir) {
+            map.entry(name)
+                .or_insert_with(|| gix::path::into_bstr(path).to_str_lossy().into_owned());
+        }
+    };
+    if !repo.is_bare() {
+        add(&common, checkout_of(&common));
+    }
+    let Ok(dir) = std::fs::read_dir(common.join("worktrees")) else {
+        return map;
+    };
+    // git sorts the linked worktrees by path before inserting, so a branch that
+    // is somehow checked out twice resolves to the same tree git would name.
+    let mut linked: Vec<std::path::PathBuf> = dir
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    linked.sort();
+    for wt in linked {
+        let Ok(raw) = std::fs::read(wt.join("gitdir")) else {
+            continue;
+        };
+        let git_dir = gix::path::from_byte_slice(raw.trim()).to_path_buf();
+        add(&wt, checkout_of(&git_dir));
+    }
+    map
+}
+
+/// git's `%(upstream:short)` for a local branch: the shortened name of the
+/// remote-tracking ref it is configured to track, or `None` when it tracks
+/// nothing (so the whole `-vv` tracking field is suppressed).
+fn upstream_short(repo: &gix::Repository, full: &BStr) -> Option<(FullName, String)> {
+    let name = FullName::try_from(full.to_owned()).ok()?;
+    // git's `set_merge`: a `branch.<name>.remote` of `.` means the upstream lives
+    // in this very repository, so `branch.<name>.merge` *is* the upstream ref and
+    // no fetch refspec is consulted.
+    let local_remote = repo
+        .config_snapshot()
+        .string(&format!("branch.{}.remote", name.shorten()))
+        .is_some_and(|v| v.as_bstr() == ".");
+    let up = if local_remote {
+        repo.branch_remote_ref_name(name.as_ref(), gix::remote::Direction::Fetch)?
+            .ok()?
+    } else {
+        repo.branch_remote_tracking_ref_name(name.as_ref(), gix::remote::Direction::Fetch)?
+            .ok()?
+    };
+    let short = up.shorten().to_string();
+    Some((up, short))
+}
+
+/// git's `%(upstream:track)` text, sans brackets — `gone` when the configured
+/// upstream ref no longer exists, `ahead N` / `behind N` / `ahead N, behind M`
+/// when the two tips have diverged, and the empty string when they agree
+/// (`fill_remote_ref_details`, `ref-filter.c`).
+fn upstream_track(repo: &gix::Repository, local: Option<gix::Id<'_>>, upstream: &FullName) -> String {
+    let resolved = repo
+        .try_find_reference(upstream.as_ref())
+        .ok()
+        .flatten()
+        .and_then(|r| r.into_fully_peeled_id().ok());
+    let (Some(local), Some(up)) = (local, resolved) else {
+        return "gone".into();
+    };
+    let count = |tip: ObjectId, hidden: ObjectId| -> usize {
+        match repo.rev_walk(Some(tip)).with_hidden(Some(hidden)).all() {
+            Ok(walk) => walk.take_while(Result::is_ok).count(),
+            Err(_) => 0,
+        }
+    };
+    let ours = count(local.detach(), up.detach());
+    let theirs = count(up.detach(), local.detach());
+    match (ours, theirs) {
+        (0, 0) => String::new(),
+        (0, t) => format!("behind {t}"),
+        (o, 0) => format!("ahead {o}"),
+        (o, t) => format!("ahead {o}, behind {t}"),
+    }
+}
+
 /// Split a reference's target into a commit id or a symbolic-ref short name.
 fn target_of<'repo>(r: &gix::Reference<'repo>) -> (Option<gix::Id<'repo>>, Option<String>) {
     match r.target() {
@@ -776,6 +902,13 @@ struct Colors {
     current: String,
     local: String,
     remote: String,
+    /// `color.branch.upstream` — the `[<upstream>` name inside the `-vv`
+    /// tracking field. git's default is blue.
+    upstream: String,
+    /// `color.branch.worktree` — the name of a branch checked out in some other
+    /// worktree (marked `+`), and the `(<path>)` field `-vv` prints for it.
+    /// git's default is cyan.
+    worktree: String,
     /// `color.branch.reset` — the sequence that closes a colored name. git makes
     /// this a slot of its own (`BRANCH_COLOR_RESET`), so a user can replace the
     /// plain `\e[m` with any spec.
@@ -783,18 +916,44 @@ struct Colors {
 }
 
 impl Colors {
-    /// The SGR to open a line's color, given its slot. Local branches default to
-    /// `normal`, which renders as an empty SGR — but git still emits the reset.
+    /// The SGR to open a line's color, given its slot, mirroring the branch
+    /// order in git's `build_format`: HEAD wins, then a branch checked out in
+    /// another worktree, then plain local. Remote refs take their own slot.
+    /// Local branches default to `normal`, which renders as an empty SGR — but
+    /// git still emits the reset.
     fn open(&self, e: &Entry<'_>) -> &str {
         if e.current || e.detached {
             &self.current
         } else if e.remote {
             &self.remote
+        } else if e.worktreepath.is_some() {
+            &self.worktree
         } else {
             &self.local
         }
     }
+
+    /// The two-character marker git puts in front of the name: `* ` for HEAD,
+    /// `+ ` for a branch checked out in another worktree, `  ` otherwise.
+    fn marker(&self, e: &Entry<'_>) -> &'static str {
+        if e.current || e.detached {
+            "* "
+        } else if !e.remote && e.worktreepath.is_some() {
+            "+ "
+        } else {
+            "  "
+        }
+    }
 }
+
+/// `color_branch_slots[]` — every name `git_branch_config()` accepts under
+/// `color.branch.`. `plain` is in the table because the callback runs
+/// `color_parse()` on it, even though `build_format()` never asks for
+/// `BRANCH_COLOR_PLAIN`: setting it to a spec git's parser rejects is fatal, and
+/// setting it to a valid one changes nothing.
+pub(crate) const COLOR_SLOTS: [&str; 7] = [
+    "reset", "plain", "remote", "local", "current", "upstream", "worktree",
+];
 
 /// Decide whether `git branch` colors its output and, if so, resolve every slot's
 /// SGR. Mirrors git: `--color` overrides, else `color.branch` falling back to
@@ -811,6 +970,8 @@ fn resolve_colors(repo: &gix::Repository, when: ColorWhen) -> Colors {
             current: String::new(),
             local: String::new(),
             remote: String::new(),
+            upstream: String::new(),
+            worktree: String::new(),
             reset: String::new(),
         };
     }
@@ -827,6 +988,9 @@ fn resolve_colors(repo: &gix::Repository, when: ColorWhen) -> Colors {
         current: slot("color.branch.current", "green"),
         local: slot("color.branch.local", "normal"),
         remote: slot("color.branch.remote", "red"),
+        // git's `BRANCH_COLOR_UPSTREAM` / `BRANCH_COLOR_WORKTREE` defaults.
+        upstream: slot("color.branch.upstream", "blue"),
+        worktree: slot("color.branch.worktree", "cyan"),
         // git's `BRANCH_COLOR_RESET` default is the bare reset, which
         // `color_sgr` renders from the `reset` attribute as `\e[0m`; git emits
         // `\e[m` for it, so the default is kept literal.
@@ -1008,10 +1172,10 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             .max()
             .unwrap_or(0);
         for e in &entries {
-            let marker = if e.current { "* " } else { "  " };
+            let marker = colors.marker(e);
             let info = match &e.symref {
                 Some(sym) => format!("-> {sym}"),
-                None => verbose_info(repo, e, o.abbrev),
+                None => verbose_info(repo, e, o.abbrev, o.verbose, &colors),
             };
             let pad = " ".repeat(width - e.display.chars().count());
             if colors.on {
@@ -1028,11 +1192,18 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // line directly.
     let mut cells: Vec<Vec<u8>> = Vec::new();
     for e in &entries {
-        let marker = if e.current { "* " } else { "  " };
+        let marker = colors.marker(e);
+        // Both non-verbose branches of `build_format` close the name with the
+        // reset and then append `%(if)%(symref)%(then) -> %(symref:short)`, so a
+        // symbolic ref such as `origin/HEAD` names its target here too.
+        let symref = match &e.symref {
+            Some(sym) => format!(" -> {sym}"),
+            None => String::new(),
+        };
         let line = if colors.on {
-            format!("{marker}{}{}{}", colors.open(e), e.display, colors.reset)
+            format!("{marker}{}{}{}{symref}", colors.open(e), e.display, colors.reset)
         } else {
-            format!("{marker}{}", e.display)
+            format!("{marker}{}{symref}", e.display)
         };
         if column_on {
             cells.push(line.into_bytes());
@@ -1079,23 +1250,70 @@ fn resolve_filters(repo: &gix::Repository, o: &Opts) -> Result<Filters, String> 
     })
 }
 
-/// The `-v` tail: abbreviated object name and the commit subject. A tip whose
-/// object cannot be read or is not a commit degrades to the abbreviation alone
-/// rather than failing the whole listing.
-fn verbose_info(repo: &gix::Repository, e: &Entry<'_>, abbrev: Option<usize>) -> String {
+/// The `-v` tail: abbreviated object name, the tracking field, and the commit
+/// subject. A tip whose object cannot be read or is not a commit degrades to the
+/// abbreviation alone rather than failing the whole listing.
+///
+/// The tracking field is git's `build_format` verbose tail. Under `-v` it is
+/// `%(if)%(upstream:track)%(then)%(upstream:track) %(end)` — the bracketed
+/// divergence alone. Under `-vv` it is the `(<worktreepath>) ` of a branch
+/// checked out in *another* working tree followed by
+/// `[<upstream:short>[: <track,nobracket>]] `, with `color.branch.upstream`
+/// painting the upstream name and `color.branch.worktree` the path.
+fn verbose_info(
+    repo: &gix::Repository,
+    e: &Entry<'_>,
+    abbrev: Option<usize>,
+    verbose: u8,
+    colors: &Colors,
+) -> String {
     let Some(id) = e.id else {
         return String::new();
     };
-    let short = abbrev_hex(repo, id, abbrev);
+    let mut out = abbrev_hex(repo, id, abbrev);
+
+    if !e.remote {
+        let upstream = upstream_short(repo, e.full.as_bstr());
+        if verbose > 1 {
+            // git guards this with `%(if:notequals=*)%(HEAD)`, so the tree the
+            // current branch is checked out in is never named.
+            if let Some(path) = e.worktreepath.as_ref().filter(|_| !e.current) {
+                out.push_str(&format!(
+                    " ({}{path}{})",
+                    colors.worktree,
+                    if colors.on { &colors.reset } else { "" }
+                ));
+            }
+            if let Some((full, short)) = upstream {
+                let track = upstream_track(repo, e.id, &full);
+                let track = if track.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {track}")
+                };
+                out.push_str(&format!(
+                    " [{}{short}{}{track}]",
+                    colors.upstream,
+                    if colors.on { &colors.reset } else { "" }
+                ));
+            }
+        } else if let Some((full, _)) = upstream {
+            let track = upstream_track(repo, e.id, &full);
+            if !track.is_empty() {
+                out.push_str(&format!(" [{track}]"));
+            }
+        }
+    }
+
     let Ok(object) = id.object() else {
-        return short;
+        return out;
     };
     let Ok(commit) = object.try_into_commit() else {
-        return short;
+        return out;
     };
     match commit.message() {
-        Ok(msg) => format!("{short} {}", msg.summary()),
-        Err(_) => short,
+        Ok(msg) => format!("{out} {}", msg.summary()),
+        Err(_) => out,
     }
 }
 

@@ -1210,6 +1210,10 @@ struct UpdateOpts {
     /// `update_default`; `None` means none was given and the config/.gitmodules
     /// value (else checkout) decides per submodule.
     update_default: Option<UpdateStrategy>,
+    /// git's `max_jobs`: how many submodule clones may run at once. `UPDATE_DATA_INIT`
+    /// starts at 1; `.gitmodules`' then the repository's `submodule.fetchJobs` raise it,
+    /// and `-j`/`--jobs` overrides both.
+    jobs: usize,
 }
 
 fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
@@ -1221,9 +1225,14 @@ fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
         nofetch: false,
         remote: false,
         update_default: None,
+        // `UPDATE_DATA_INIT`'s `.max_jobs = 1`, before the config below raises it.
+        jobs: 1,
     };
     let mut patterns: Vec<BString> = Vec::new();
     let mut no_more_opts = false;
+    // git reads the config into `max_jobs` before `parse_options`, so a command-line `-j`
+    // always wins; this repo is only discovered after parsing, hence the flag.
+    let mut jobs_from_cli = false;
     let mut i = 0;
 
     while let Some(a) = args.get(i) {
@@ -1244,11 +1253,27 @@ fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
             "-m" | "--merge" => opts.update_default = Some(UpdateStrategy::Merge),
             "-r" | "--rebase" => opts.update_default = Some(UpdateStrategy::Rebase),
             "--remote" => opts.remote = true,
-            // Clone/progress/parallelism knobs that do not change the result for
-            // an already-cloned checkout: accepted and ignored.
+            // Progress forcing has no effect here: the clone children are piped, so their
+            // progress is off either way, and nothing else in `update` reports progress.
             "--progress" => {}
-            "-j" | "--jobs" => i += 1,
-            s if s.starts_with("--jobs=") => {}
+            // `OPT_INTEGER('j', "jobs", &opt.max_jobs, ...)`: `-j5`, `-j 5`, `--jobs 5` and
+            // `--jobs=5` all set the same slot.
+            "-j" | "--jobs" => {
+                let Some(v) = args.get(i + 1) else {
+                    return usage_exit();
+                };
+                opts.jobs = parse_jobs(a, v)?;
+                jobs_from_cli = true;
+                i += 1;
+            }
+            s if s.starts_with("--jobs=") => {
+                opts.jobs = parse_jobs("--jobs", &s["--jobs=".len()..])?;
+                jobs_from_cli = true;
+            }
+            s if s.starts_with("-j") && s.len() > 2 => {
+                opts.jobs = parse_jobs("-j", &s[2..])?;
+                jobs_from_cli = true;
+            }
             // Clone-shaping options that need machinery this port does not carry —
             // the re-executed `git clone` cannot express them, so bail honestly.
             "--reference" | "--dissociate" => bail!(
@@ -1283,6 +1308,14 @@ fn update(args: &[String], quiet: bool) -> Result<ExitCode> {
     }
 
     let repo = gix::discover(".")?;
+    // `update_clone_config_from_gitmodules()` then `git_update_clone_config()`: `.gitmodules`
+    // supplies the default and the repository configuration overrides it, both before the
+    // command line is parsed — so an explicit `-j` still wins.
+    if !jobs_from_cli {
+        if let Some(n) = submodule_fetch_jobs(&repo)? {
+            opts.jobs = n;
+        }
+    }
     let prefix = repo_prefix(&repo)?;
     // `warn_if_uninitialized` is set only when a pathspec was given.
     let warn = !patterns.is_empty();
@@ -1331,6 +1364,12 @@ fn update_repo(
         return Ok(0);
     };
 
+    // git's `update_submodules` runs in two phases: `run_processes_parallel` clones every
+    // submodule that needs one, up to `max_jobs` at a time, and only then does a serial pass
+    // check each one out. The task *generator*
+    // (`update_clone_get_next_task` -> `prepare_to_clone_next_submodule`) still runs serially, so
+    // the skip ladder below and its messages keep git's order regardless of the job count.
+    let mut plans: Vec<Plan<'_>> = Vec::new();
     for entry in &entries {
         let display = match super_prefix {
             Some(sp) => format!("{sp}{}", entry.path),
@@ -1367,8 +1406,9 @@ fn update_repo(
         // "needs cloning"; a just-cloned submodule then gets `suboid = null` and a
         // forced checkout of the recorded commit.
         let sm_dir = workdir.join(&*gix::path::from_bstr(entry.path.as_bstr()));
-        let just_cloned = !sm_dir.join(".git").exists();
-        if just_cloned {
+        let clone_url = if sm_dir.join(".git").exists() {
+            None
+        } else {
             let sub_name = sub.name().to_owned();
             let sub_name = sub_name.as_bstr();
             // git reads `submodule.<name>.url` from config (an `init`/`update --init`
@@ -1386,13 +1426,37 @@ fn update_repo(
                     url.to_str_lossy()
                 );
             }
-            let code = clone_submodule(&url, &sm_dir, &workdir, opts.quiet)?;
-            if code != 0 {
-                return Ok(code);
-            }
-        }
+            Some(url.to_owned())
+        };
 
-        let Ok(sub_repo) = gix::open(&sm_dir) else {
+        plans.push(Plan {
+            entry,
+            display,
+            sm_dir,
+            cfg_strategy,
+            clone_url,
+        });
+    }
+
+    // Phase one: the clones, `opts.jobs` at a time. git buffers each child's output and
+    // replays it in task order once the phase is over ("We saved the output and put it out
+    // all at once now"), which is what keeps the transcript identical at any job count.
+    if let Some(code) = clone_submodules_in_parallel(&plans, &workdir, &opts)? {
+        return Ok(code);
+    }
+
+    for plan in &plans {
+        let Plan {
+            entry,
+            display,
+            sm_dir,
+            cfg_strategy,
+            clone_url,
+        } = plan;
+        let (display, sm_dir, cfg_strategy) = (display.as_str(), sm_dir.as_path(), cfg_strategy.clone());
+        let just_cloned = clone_url.is_some();
+
+        let Ok(sub_repo) = gix::open(sm_dir) else {
             bail!("submodule path '{display}' could not be opened after cloning");
         };
 
@@ -1436,7 +1500,9 @@ fn update_repo(
         // The target: the recorded gitlink commit, or — under `--remote` — the tip
         // of the submodule's remote-tracking branch, fetched fresh.
         let oid = if opts.remote {
-            match resolve_remote_oid(&repo, &sub_repo, sub, entry, &sm_dir, opts)? {
+            let sub = find_submodule(&submodules, &entry.path)
+                .expect("the planning pass already found this declaration");
+            match resolve_remote_oid(&repo, &sub_repo, sub, entry, sm_dir, opts)? {
                 Ok(oid) => oid,
                 Err(code) => return Ok(code),
             }
@@ -1449,7 +1515,7 @@ fn update_repo(
         let subforce = suboid.is_none() || opts.force;
         if Some(oid) != suboid || opts.force {
             let code =
-                run_update_procedure(&sub_repo, &sm_dir, &oid, &opts, &display, strategy, subforce)?;
+                run_update_procedure(&sub_repo, sm_dir, &oid, &opts, display, strategy, subforce)?;
             if code != 0 {
                 return Ok(code);
             }
@@ -1465,6 +1531,120 @@ fn update_repo(
     }
 
     Ok(0)
+}
+
+/// `OPT_INTEGER`'s value for `-j`/`--jobs`.
+///
+/// Unlike the config key below this is a plain integer with no `0` special case, so a `0` reaches
+/// `run_processes_parallel` and trips its `you must provide a non-zero number of processes!`
+/// assertion; refuse it here rather than substitute a count git never picks.
+fn parse_jobs(flag: &str, value: &str) -> Result<usize> {
+    let n: i64 = value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{flag} expects a numerical value"))?;
+    if n <= 0 {
+        bail!("you must provide a non-zero number of processes");
+    }
+    Ok(n as usize)
+}
+
+/// `parse_submodule_fetchjobs()`: a negative count is fatal and `0` means one job per CPU.
+fn parse_fetch_jobs_config(value: &str) -> Result<usize> {
+    let n: i64 = value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad numeric config value {value:?} for 'submodule.fetchjobs'"))?;
+    if n < 0 {
+        bail!("negative values not allowed for submodule.fetchJobs");
+    }
+    Ok(if n == 0 {
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    } else {
+        n as usize
+    })
+}
+
+/// `submodule.fetchJobs` as `update` reads it: the `.gitmodules` value first, then the
+/// repository configuration on top (`update_clone_config_from_gitmodules()` followed by
+/// `git_update_clone_config()`). `None` means neither set it.
+fn submodule_fetch_jobs(repo: &gix::Repository) -> Result<Option<usize>> {
+    let mut jobs = None;
+    if let Some(modules) = repo.open_modules_file()? {
+        if let Some(v) = modules.config().string("submodule.fetchJobs") {
+            jobs = Some(parse_fetch_jobs_config(&v.to_str_lossy())?);
+        }
+    }
+    if let Some(v) = repo.config_snapshot().string("submodule.fetchJobs") {
+        jobs = Some(parse_fetch_jobs_config(&v.to_str_lossy())?);
+    }
+    Ok(jobs)
+}
+
+/// One submodule that survived `prepare_to_clone_next_submodule`'s skip ladder, carried from
+/// the serial planning pass into the parallel clone phase and the serial update pass.
+struct Plan<'a> {
+    entry: &'a Entry,
+    display: String,
+    sm_dir: std::path::PathBuf,
+    cfg_strategy: gix::submodule::config::Update,
+    /// `submodule.<name>.url` when `<path>/.git` is missing and a clone has to run first.
+    clone_url: Option<BString>,
+}
+
+/// git's `run_processes_parallel` phase of `update_submodules`: clone every submodule whose
+/// worktree has no `.git` yet, at most `opts.jobs` at a time.
+///
+/// Each child's output is captured and replayed in task order once the phase is over, which is
+/// what git means by "We saved the output and put it out all at once now" — the transcript is
+/// then the same at any job count. Returns the exit code of the first failing clone in task
+/// order, which stops the caller before any checkout runs (git's `quickstop`).
+fn clone_submodules_in_parallel(
+    plans: &[Plan<'_>],
+    toplevel: &std::path::Path,
+    opts: &UpdateOpts,
+) -> Result<Option<u8>> {
+    let tasks: Vec<&Plan<'_>> = plans.iter().filter(|p| p.clone_url.is_some()).collect();
+    if tasks.is_empty() {
+        return Ok(None);
+    }
+
+    let mut results: Vec<Option<Result<CloneOutput>>> = (0..tasks.len()).map(|_| None).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = opts.jobs.min(tasks.len()).max(1);
+    let slots: Vec<std::sync::Mutex<Option<Result<CloneOutput>>>> =
+        (0..tasks.len()).map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let (next, tasks, slots) = (&next, &tasks, &slots);
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(task) = tasks.get(i) else { break };
+                let url = task.clone_url.as_ref().expect("filtered to cloning tasks");
+                *slots[i].lock().expect("no panic while cloning") =
+                    Some(clone_submodule(url, &task.sm_dir, toplevel, opts.quiet));
+            });
+        }
+    });
+    for (slot, out) in slots.into_iter().zip(results.iter_mut()) {
+        *out = slot.into_inner().expect("no panic while cloning");
+    }
+
+    let mut first_failure = None;
+    for out in results {
+        let out = out.expect("every task was claimed by a worker")?;
+        std::io::Write::write_all(&mut std::io::stdout(), &out.stdout)?;
+        std::io::Write::write_all(&mut std::io::stderr(), &out.stderr)?;
+        if out.code != 0 && first_failure.is_none() {
+            first_failure = Some(out.code);
+        }
+    }
+    Ok(first_failure)
+}
+
+/// What one buffered `clone` child produced.
+struct CloneOutput {
+    code: u8,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 /// git's `next_submodule_warn_missing`: only mentioned when paths were specified.
@@ -1656,7 +1836,7 @@ fn clone_submodule(
     sm_dir: &std::path::Path,
     toplevel: &std::path::Path,
     quiet: bool,
-) -> Result<u8> {
+) -> Result<CloneOutput> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("clone");
@@ -1669,8 +1849,14 @@ fn clone_submodule(
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_PREFIX");
-    let status = cmd.status()?;
-    Ok(child_code(status))
+    // Buffered rather than inherited: `run_processes_parallel` pipes every child so the
+    // transcript stays in task order no matter how many run at once.
+    let out = cmd.output()?;
+    Ok(CloneOutput {
+        code: child_code(out.status),
+        stdout: out.stdout,
+        stderr: out.stderr,
+    })
 }
 
 /// git's `update_submodule` `--remote` block: resolve the tip of the submodule's

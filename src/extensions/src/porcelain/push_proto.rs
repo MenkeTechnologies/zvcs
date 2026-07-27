@@ -66,6 +66,15 @@ pub struct Request {
     /// from the remote's would be sent, rejected non-fast-forward, and turn an
     /// otherwise clean push into a failure.
     pub only_if_absent: bool,
+    /// `--force-if-includes` / `push.useForceIfIncludes`: the remote-tracking ref
+    /// the lease in [`expected`][Self::expected] was read from, set only when the
+    /// lease actually came from one — git's `ref->check_reachable`, which
+    /// `apply_cas()` arms on exactly that branch (remote.c:2837, :2851).
+    ///
+    /// When set, a lease that passes is not enough: the tip the remote advertises
+    /// must also be reachable from the *local* ref's reflog, proving this
+    /// checkout has seen it.
+    pub check_reachable: Option<String>,
 }
 
 /// Which advertised refs a push may DELETE beyond the caller's explicit
@@ -378,11 +387,32 @@ pub fn send_pack(
             continue;
         }
 
+        // `--force-if-includes` (remote.c:1698-1711), checked before the
+        // fast-forward rules and after the lease itself. A lease that no longer
+        // matches what the remote advertises is left to the server's
+        // compare-and-swap, which is where this port does the staleness check;
+        // when it *does* match, the advertised tip must additionally be reachable
+        // from the local ref's reflog, or this checkout never saw the update.
+        // `--force` defeats the rejection, as it defeats every other one
+        // (remote.c:1750-1753).
+        let mut forced = false;
+        if let (Some(expected), Some(tracking)) = (req.expected, req.check_reachable.as_deref()) {
+            if remote_current == expected
+                && remote_current != null
+                && !is_reachable_in_reflog(repo, &req.name, tracking, remote_current)
+            {
+                if !req.force {
+                    statuses.push(reject("remote ref updated since checkout"));
+                    continue;
+                }
+                forced = true;
+            }
+        }
+
         // Fast-forward check: unless forced or creating/deleting, the new tip must
         // be a descendant of the old one. If we do not even have the old commit
         // locally, we cannot prove it — git rejects with "fetch first". A lease
         // (`--force-with-lease`) skips this and defers to the server's CAS.
-        let mut forced = false;
         if !deletion && remote_current != null && !force {
             match is_fast_forward(repo, remote_current, req.new) {
                 Some(true) => {}
@@ -397,7 +427,7 @@ pub fn send_pack(
             }
         } else if !deletion && remote_current != null && force {
             // Forced past a non-descendant is flagged with a leading '+' in output.
-            forced = is_fast_forward(repo, remote_current, req.new) == Some(false);
+            forced |= is_fast_forward(repo, remote_current, req.new) == Some(false);
         }
 
         wire.push(Wire {
@@ -644,6 +674,80 @@ fn read_pkt_text<'a>(
         Some(Ok(Err(e))) => Err(anyhow!("malformed packet line from remote: {e}")),
         Some(Err(e)) => Err(anyhow!("error reading from remote: {e}")),
     }
+}
+
+/// `is_reachable_in_reflog()` (remote.c:2752) — whether this checkout has ever
+/// seen `remote_tip`, the value the remote currently advertises for the ref
+/// being pushed.
+///
+/// Walks `local`'s reflog newest-first. An entry whose new value *is* the tip
+/// settles it. Otherwise every commit passed on the way is collected, and the
+/// walk stops once entries are older than the newest entry of `tracking`'s own
+/// reflog — nothing recorded before the tracking ref last moved can explain the
+/// tip. Finally the tip is accepted if it is an ancestor of any collected
+/// commit, which covers the tip having been merged in rather than checked out.
+///
+/// git batches that last test eight commits at a time purely to bound
+/// `repo_in_merge_bases_many`'s working set; `merge_bases_many` here takes the
+/// whole array, so the batching has nothing to do.
+fn is_reachable_in_reflog(
+    repo: &gix::Repository,
+    local: &str,
+    tracking: &str,
+    remote_tip: ObjectId,
+) -> bool {
+    // `lookup_commit_reference`: a tip that is not a commit we have is never
+    // reachable.
+    let Some(tip) = repo
+        .find_object(remote_tip)
+        .ok()
+        .and_then(|o| o.peel_to_kind(gix::objs::Kind::Commit).ok())
+        .map(|c| c.id)
+    else {
+        return false;
+    };
+
+    // `peek_reflog`: the timestamp of the newest entry of the tracking ref's
+    // reflog, or the beginning of time when it has none.
+    let newest_entry_time = |name: &str| -> i64 {
+        let Ok(mut reference) = repo.find_reference(name) else { return 0 };
+        let mut platform = reference.log_iter();
+        let Ok(Some(mut iter)) = platform.rev() else { return 0 };
+        match iter.next() {
+            Some(Ok(line)) => line.signature.time.seconds,
+            _ => 0,
+        }
+    };
+    let cutoff = newest_entry_time(tracking);
+
+    // `check_and_collect_until` over the local ref's reflog.
+    let Ok(mut reference) = repo.find_reference(local) else { return false };
+    let mut platform = reference.log_iter();
+    let Ok(Some(iter)) = platform.rev() else { return false };
+    let mut seen: Vec<ObjectId> = Vec::new();
+    for line in iter {
+        let Ok(line) = line else { break };
+        if line.new_oid == tip {
+            return true;
+        }
+        if let Some(commit) = repo
+            .find_object(line.new_oid)
+            .ok()
+            .and_then(|o| o.peel_to_kind(gix::objs::Kind::Commit).ok())
+        {
+            seen.push(commit.id);
+        }
+        if line.signature.time.seconds < cutoff {
+            break;
+        }
+    }
+
+    if seen.is_empty() {
+        return false;
+    }
+    repo.merge_bases_many(tip, &seen)
+        .map(|bases| bases.iter().any(|base| base.detach() == tip))
+        .unwrap_or(false)
 }
 
 /// Whether `new` is a descendant of `old` (a fast-forward). `None` when `old` is

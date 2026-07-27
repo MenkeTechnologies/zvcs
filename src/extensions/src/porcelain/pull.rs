@@ -8,7 +8,7 @@
 //! `-q`/`-v`, `--progress`/`--no-progress`, `--dry-run`, `-a`/`--append`,
 //! `--show-forced-updates`/`--no-show-forced-updates`,
 //! `-k`/`--keep`, `--recurse-submodules`, `-j`/`--jobs`, `--upload-pack`,
-//! `-o`/`--server-option`, `--refmap`,
+//! `-o`/`--server-option`, `--refmap`, `-4`/`--ipv4`, `-6`/`--ipv6`,
 //! `--negotiation-restrict`/`--negotiation-tip`/`--negotiation-include`, and the
 //! `From …` per-ref summary git prints to stderr.
 //!
@@ -21,7 +21,9 @@
 //! knobs to `rebase` — `-s`/`--strategy`, `-X`/`--strategy-option`, `--signoff`,
 //! `--autostash` (and `pull.autoStash`/`rebase.autoStash`), `--rebase-merges` (from
 //! `--rebase=merges`), `--stat`/`--no-stat`/`-n` — and rebases the current branch
-//! onto the fetched upstream.
+//! onto the fetched upstream. A rebase whose upstream is already a descendant of
+//! `HEAD` would replay nothing, so — as git's `can_ff`/`ran_ff` do — the merge runs
+//! with a forced `--ff-only` instead and the rebase never starts.
 //!
 //! Supported invocation forms:
 //!   * `git pull`                  — use the current branch's configured upstream.
@@ -40,10 +42,16 @@
 //! `--signoff` are honored on the *rebase* path), `--rebase=interactive`
 //! (interactive todo editing needs a TTY editor loop), `--autostash` over a
 //! dirty tree on the merge path (needs a 3-way stash apply the stash port lacks),
-//! `--set-upstream`, `--compact-summary` (the merge port has no compact-summary
-//! renderer), `--update-shallow` and `-4`/`-6` (no gitoxide substrate — see
-//! [`fetch`](super::fetch)), and
+//! `--set-upstream`, `--update-shallow` (see [`fetch`](super::fetch)), and
 //! `--gpg-sign`/`-S`/`--verify-signatures` (GPG is not vendored).
+//!
+//! The diffstat selectors `-n`, `--stat`/`--no-stat`, `--summary`/`--no-summary`
+//! and `--compact-summary`/`--no-compact-summary` are git's `OPT_PASSTHRU`
+//! `opt_diffstat` — a single slot, so the last one wins, and the flag git
+//! reconstructed from it is handed verbatim to the integration step
+//! (`run_merge()`/`run_rebase()` both push `opt_diffstat`). `git rebase` has no
+//! `--summary` or `--compact-summary`, so those combined with `--rebase` fail in
+//! the rebase step exactly as they do for git.
 
 use anyhow::{bail, Result};
 use std::process::ExitCode;
@@ -100,7 +108,12 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let mut rebase_cli: Option<RebaseMode> = None;
 
     // Integration knobs forwarded to `merge`/`rebase`.
-    let mut stat: Option<bool> = None; // --stat / --no-stat / -n
+    // git's `opt_diffstat` is a single `OPT_PASSTHRU` slot shared by `-n`,
+    // `--stat`/`--no-stat`, `--summary`/`--no-summary` and
+    // `--compact-summary`/`--no-compact-summary`: the last occurrence wins and
+    // `recreate_opt()` re-renders it, so the literal below is what reaches the
+    // integration step.
+    let mut diffstat: Option<&'static str> = None;
     let mut strategy: Option<String> = None; // -s / --strategy
     let mut strategy_opts: Vec<String> = Vec::new(); // -X / --strategy-option
     let mut signoff = false;
@@ -137,6 +150,8 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // fetch resolves them against the same repository.
     let mut f_negotiation_restrict: Vec<String> = Vec::new();
     let mut f_negotiation_include: Vec<String> = Vec::new();
+    // `-4`/`--ipv4` and `-6`/`--ipv6`, forwarded to the fetch as git's pull does.
+    let mut f_address_family: Option<&'static str> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -182,8 +197,13 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "-r" => rebase_cli = Some(RebaseMode::Plain),
 
             // Integration knobs forwarded to merge/rebase.
-            "--stat" | "--summary" => stat = Some(true),
-            "--no-stat" | "--no-summary" | "-n" => stat = Some(false),
+            "--stat" => diffstat = Some("--stat"),
+            "--no-stat" => diffstat = Some("--no-stat"),
+            "--summary" => diffstat = Some("--summary"),
+            "--no-summary" => diffstat = Some("--no-summary"),
+            "-n" => diffstat = Some("-n"),
+            "--compact-summary" => diffstat = Some("--compact-summary"),
+            "--no-compact-summary" => diffstat = Some("--no-compact-summary"),
             "-s" | "--strategy" => strategy = Some(take_value!("strategy")),
             "-X" | "--strategy-option" => strategy_opts.push(take_value!("strategy-option")),
             "--signoff" => signoff = true,
@@ -231,6 +251,8 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
                 f_negotiation_restrict.push(take_value!("negotiation-restrict"));
             }
             "--negotiation-include" => f_negotiation_include.push(take_value!("negotiation-include")),
+            "-4" | "--ipv4" => f_address_family = Some("--ipv4"),
+            "-6" | "--ipv6" => f_address_family = Some("--ipv6"),
 
             // `--verify` (default) / `--no-verify` reach the merge, which runs
             // the `pre-merge-commit` and `commit-msg` hooks.
@@ -401,6 +423,9 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     for t in &f_negotiation_include {
         fetch_args.push(format!("--negotiation-include={t}"));
     }
+    if let Some(f) = f_address_family {
+        fetch_args.push(f.into());
+    }
     // `--all` fans out over every configured remote and takes no repository
     // argument; otherwise git hands the whole `<remote> [<refspec>…]` tail to the
     // fetch (`run_fetch()` in `builtin/pull.c`). The refspecs select what is
@@ -445,7 +470,21 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    if rebasing {
+    // `builtin/pull.c`'s `can_ff`: `get_can_ff()` asks whether the fetched head is a
+    // descendant of `HEAD`. When it is, a rebase would replay nothing, so git forces
+    // `opt_ff = "--ff-only"` and runs the *merge* (`ran_ff`), never starting the rebase.
+    let can_ff = match (
+        repo.head_id().map(|id| id.detach()),
+        repo.rev_parse_single(target_ref.as_str()).map(|id| id.detach()),
+    ) {
+        (Ok(head), Ok(upstream)) => repo
+            .merge_base(upstream, head)
+            .map(|base| base.detach() == head)
+            .unwrap_or(false),
+        _ => false,
+    };
+
+    if rebasing && !can_ff {
         if rebase_mode == RebaseMode::Interactive {
             bail!(
                 "--rebase=interactive is not supported (interactive todo editing needs a TTY editor loop)"
@@ -485,10 +524,11 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         if want_autostash {
             rebase_args.push("--autostash".into());
         }
-        match stat {
-            Some(true) => rebase_args.push("--stat".into()),
-            Some(false) => rebase_args.push("--no-stat".into()),
-            None => {}
+        // `run_rebase()` pushes `opt_diffstat` verbatim. `git rebase` knows only
+        // `-n`/`--stat`/`--no-stat`, so `--summary`/`--compact-summary` reach it
+        // as unknown options and fail there, as they do for git.
+        if let Some(d) = diffstat {
+            rebase_args.push(d.to_string());
         }
         rebase_args.push(target_ref);
         return super::rebase(&rebase_args);
@@ -515,6 +555,9 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // a CLI flag wins; else pull.ff (which overrides merge.ff) is forwarded to
     // `merge`; else nothing is forwarded and `merge` reads merge.ff itself.
     let ff_flag: Option<&str> = match ff_cli {
+        // The `can_ff` short-circuit above overrides everything, as git's assignment to
+        // `opt_ff` right before `run_merge()` does.
+        _ if rebasing => Some("--ff-only"),
         Some(f) => Some(f),
         None => match repo
             .config_snapshot()
@@ -541,10 +584,9 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     if no_verify {
         merge_args.push("--no-verify".into());
     }
-    match stat {
-        Some(true) => merge_args.push("--stat".into()),
-        Some(false) => merge_args.push("--no-stat".into()),
-        None => {}
+    // `run_merge()` pushes `opt_diffstat` verbatim.
+    if let Some(d) = diffstat {
+        merge_args.push(d.to_string());
     }
     merge_args.push(target_ref);
     super::merge(&merge_args)

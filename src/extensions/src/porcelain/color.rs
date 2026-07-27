@@ -130,9 +130,19 @@ impl StatusColors {
                 .or_else(|| parse_color_spec(s.default_spec()))
                 .unwrap_or_default()
         };
+        // git's `color()` keeps `WT_STATUS_ONBRANCH` at the sentinel `GIT_COLOR_NIL`
+        // until `color.status.branch` is actually set, and substitutes the header
+        // color whenever it is still nil — so an unset `branch` slot inherits
+        // `color.status.header` rather than rendering plain. An explicit
+        // `color.status.branch = normal` is *not* nil and does stay plain.
+        let header = slot(Slot::Header);
+        let branch = match snapshot.string(Slot::Branch.config_key()) {
+            Some(_) => slot(Slot::Branch),
+            None => header.clone(),
+        };
         StatusColors {
             enabled: true,
-            header: slot(Slot::Header),
+            header,
             added: slot(Slot::Added),
             changed: slot(Slot::Changed),
             untracked: slot(Slot::Untracked),
@@ -140,7 +150,7 @@ impl StatusColors {
             nobranch: slot(Slot::Nobranch),
             local_branch: slot(Slot::LocalBranch),
             remote_branch: slot(Slot::RemoteBranch),
-            branch: slot(Slot::Branch),
+            branch,
         }
     }
 
@@ -200,6 +210,97 @@ fn status_updated_spec(snapshot: &gix::config::Snapshot<'_>) -> Option<String> {
     snapshot
         .string(&format!("color.status.{key}"))
         .map(|v| v.to_string())
+}
+
+/// Run git's `color_parse()` over every `<section>.<slot>` a command's config
+/// callback recognizes, reporting the first spec git's parser would reject.
+///
+/// git validates a color slot while *reading* configuration — before the command
+/// decides whether it will color anything, and regardless of whether that
+/// particular slot is ever printed. So a bogus value is fatal even for a slot
+/// the renderer has no use for (`color.branch.plain`, `color.interactive.plain`)
+/// and even for an invocation that produces no color at all.
+///
+/// Returns the offending key and its metadata; the caller turns that into git's
+/// two-line `error:`/`fatal:` diagnostic via [`invalid_color_fatal`].
+pub(crate) fn first_invalid_slot(
+    repo: &gix::Repository,
+    section: &str,
+    slots: &[&str],
+) -> Option<(String, String, gix::config::file::Metadata)> {
+    let snapshot = repo.config_snapshot();
+    for slot in slots {
+        let key = format!("{section}.{slot}");
+        let Some(spec) = snapshot.string(&key) else {
+            continue;
+        };
+        let spec = spec.to_string();
+        if parse_color_spec(&spec).is_some() {
+            continue;
+        }
+        let meta = slot_metadata(&snapshot, section, slot).unwrap_or_else(|| {
+            gix::config::file::Metadata::from(gix::config::Source::Local)
+        });
+        return Some((key, spec, meta));
+    }
+    None
+}
+
+/// Where the *last* assignment of `<section>.<slot>` came from — the one whose
+/// value `snapshot.string()` returns, and so the one git would name in its
+/// `fatal:`.
+fn slot_metadata(
+    snapshot: &gix::config::Snapshot<'_>,
+    section: &str,
+    slot: &str,
+) -> Option<gix::config::file::Metadata> {
+    let (name, subsection) = section.split_once('.')?;
+    let mut found = None;
+    for s in snapshot.plumbing().sections() {
+        let header = s.header();
+        if !header.name().eq_ignore_ascii_case(name.as_bytes())
+            || header
+                .subsection_name()
+                .is_none_or(|sub| !sub.eq_ignore_ascii_case(subsection.as_bytes()))
+        {
+            continue;
+        }
+        if s.value_names().any(|v| v.eq_ignore_ascii_case(slot)) {
+            found = Some(s.meta().clone());
+        }
+    }
+    found
+}
+
+/// git's `git_die_config()` after a failed `color_parse()`: the `error:` reason,
+/// then a `fatal:` naming where the value came from, then exit 128.
+///
+/// gix records no per-value line number, so the `at line <n>` tail git appends
+/// for a file-sourced value is omitted — the same limitation this crate's other
+/// config-fatal paths carry.
+pub(crate) fn invalid_color_fatal(
+    key: &str,
+    spec: &str,
+    meta: &gix::config::file::Metadata,
+) -> std::process::ExitCode {
+    eprintln!("error: invalid color value: {spec}");
+    let origin = match meta.source {
+        gix::config::Source::Cli | gix::config::Source::Env => {
+            format!("unable to parse '{key}' from command-line config")
+        }
+        _ => match &meta.path {
+            Some(path) => {
+                // git names the file as it resolved it; gix hands back the
+                // discovery-relative form, which carries a `./` git never prints.
+                let shown = path.display().to_string();
+                let shown = shown.strip_prefix("./").unwrap_or(&shown);
+                format!("bad config variable '{key}' in file '{shown}'")
+            }
+            None => format!("bad config variable '{key}'"),
+        },
+    };
+    eprintln!("fatal: {origin}");
+    std::process::ExitCode::from(128)
 }
 
 // ---------------------------------------------------------------------------

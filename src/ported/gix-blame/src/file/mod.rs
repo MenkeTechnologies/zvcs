@@ -11,7 +11,9 @@ use crate::{
     types::{BlameEntry, Change, Either, LineRange, Offset, UnblamedHunk},
 };
 
+pub(super) mod compact;
 pub(super) mod fingerprint;
+pub(super) mod moved;
 pub(super) mod function;
 
 /// Compare a section from a potential *Source File* (`hunk`) with a change from a diff and see if

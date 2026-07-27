@@ -7,6 +7,11 @@
 //!     module exactly as `builtin/refs.c` calls `cmd_for_each_ref()`.
 //!   * `git refs optimize ...` — an alias for `git pack-refs`, dispatched to that
 //!     module as `builtin/refs.c` calls `cmd_pack_refs()`.
+//!   * `git refs verify [--strict] [--verbose]` — ref-database consistency
+//!     checking, ported in [`super::fsck::fsck_refs`]: the loose-ref walk, the
+//!     root refs, and the `packed-refs` parse, each reporting through the
+//!     `fsck.<msg-id>` severities. `git fsck --references` runs this very
+//!     command in git, and reaches the same code here.
 //!   * the subcommand dispatch itself: `-h` (usage on stdout, exit 129), a
 //!     missing subcommand (`error: need a subcommand` + usage on stderr, 129),
 //!     an unknown subcommand, and each subcommand's own `-h` usage block.
@@ -14,12 +19,8 @@
 //! Not covered, and rejected with an error rather than approximated:
 //!   * `git refs migrate` — writing the reftable format. The vendored `gix-ref`
 //!     has no reftable backend at all (its `store/` holds only the loose+packed
-//!     files backend), so there is nothing to migrate to or from.
-//!   * `git refs verify` — ref-database consistency checking. The vendored
-//!     `gix-fsck` covers object-graph connectivity only (`Connectivity`,
-//!     `check_commit`); no ref-name, symref-target or packed-refs checker exists
-//!     in the vendored crates, and a `verify` that silently exits 0 would report
-//!     a healthy database it never inspected.
+//!     files backend), so there is nothing to migrate to or from. That same gap
+//!     is why `verify` never reports `badReftableTableName`.
 //!
 //! Known divergence: usage *errors* raised inside `optimize` are reported by the
 //! `pack-refs` module, so their usage block reads `usage: git pack-refs ...`
@@ -105,6 +106,15 @@ usage: git refs exists <ref>\n\
 \n\
 ";
 
+/// `git refs verify -h`, byte-for-byte.
+const USAGE_VERIFY: &str = "\
+usage: git refs verify [--strict] [--verbose]\n\
+\n\
+\x20   --[no-]verbose        be verbose\n\
+\x20   --[no-]strict         enable strict checking\n\
+\n\
+";
+
 /// Ref-name prefixes whose refs live in the per-worktree `$GIT_DIR` rather than
 /// in the shared `$GIT_COMMON_DIR`, per git's `is_per_worktree_ref()`.
 const PER_WORKTREE: [&str; 3] = ["refs/worktree/", "refs/bisect/", "refs/rewritten/"];
@@ -130,10 +140,7 @@ pub fn refs(args: &[String]) -> Result<ExitCode> {
             "unsupported subcommand \"migrate\": the vendored gix-ref has no reftable backend \
              (only the loose+packed files store), so there is no format to migrate to"
         ),
-        "verify" => bail!(
-            "unsupported subcommand \"verify\": the vendored crates have no ref-database \
-             consistency checker (gix-fsck covers object connectivity only)"
-        ),
+        "verify" => verify(&args[1..]),
         // git's option parser reports an unknown leading dashed argument before
         // it ever looks for a subcommand.
         s if s.starts_with("--") => {
@@ -245,6 +252,63 @@ fn lookup(repo: &gix::Repository, name: &str) -> Result<bool> {
         return Ok(false);
     };
     Ok(packed.try_find(name)?.is_some())
+}
+
+/// `git refs verify` — check the reference database for consistency.
+///
+/// `cmd_refs_verify()` reads `fsck.<msg-id>` and `fsck.skipList` through
+/// `git_fsck_config()`, then runs `refs_fsck()` over every worktree. The checks
+/// themselves live in [`super::fsck::fsck_refs`], which `git fsck` also reaches
+/// for `--references` — git spawns this very command there.
+///
+/// git returns `error()`'s `-1` from `cmd_refs()`, which the process truncates
+/// to an exit status of 255; a run whose only findings were warnings exits 0.
+fn verify(args: &[String]) -> Result<ExitCode> {
+    let mut verbose = false;
+    let mut strict = false;
+
+    for a in args {
+        match a.as_str() {
+            "-h" => {
+                print!("{USAGE_VERIFY}");
+                return Ok(ExitCode::from(129));
+            }
+            "--verbose" => verbose = true,
+            "--no-verbose" => verbose = false,
+            "--strict" => strict = true,
+            "--no-strict" => strict = false,
+            s if s.starts_with("--") => {
+                eprintln!("error: unknown option `{}'", &s[2..]);
+                eprint!("{USAGE_VERIFY}");
+                return Ok(ExitCode::from(129));
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                eprintln!("error: unknown switch `{}'", &s[1..2]);
+                eprint!("{USAGE_VERIFY}");
+                return Ok(ExitCode::from(129));
+            }
+            // `usage()`, not `die()`: no `fatal:` prefix and exit 129.
+            _ => {
+                eprintln!("usage: 'git refs verify' takes no arguments");
+                return Ok(ExitCode::from(129));
+            }
+        }
+    }
+
+    let repo = gix::discover(".")?;
+    let config = match super::fsck::MsgConfig::new(&repo, super::fsck::MsgSource::Fsck { strict }) {
+        Ok(config) => config,
+        // `git_fsck_config()` dies before any checking starts.
+        Err(fatal) => {
+            eprintln!("fatal: {fatal}");
+            return Ok(ExitCode::from(128));
+        }
+    };
+
+    if super::fsck::fsck_refs(&repo, &config, verbose) {
+        return Ok(ExitCode::from(255));
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `git refs list` — the documented alias for `git for-each-ref`.

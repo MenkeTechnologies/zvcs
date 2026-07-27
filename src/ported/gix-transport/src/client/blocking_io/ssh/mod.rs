@@ -80,6 +80,11 @@ pub mod connect {
         /// when invoking the program.
         /// If unset, the `program` basename determines the variant, or an invocation of the `command` itself.
         pub kind: Option<ProgramKind>,
+        /// Restrict the connection to one address family, from git's `--ipv4`/`--ipv6`.
+        ///
+        /// git's `push_ssh_options()` turns this into the `-4`/`-6` flag; the `simple` variant has no
+        /// such flag and refuses instead.
+        pub address_family: Option<crate::AddressFamily>,
     }
 
     impl Options {
@@ -143,6 +148,7 @@ pub fn connect_with_program(
         desired_version,
         trace,
         upload_pack,
+        options.address_family,
     ))
 }
 

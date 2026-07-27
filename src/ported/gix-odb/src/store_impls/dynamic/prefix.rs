@@ -144,6 +144,28 @@ where
         prefix: gix_hash::Prefix,
         mut candidates: Option<&mut HashSet<gix_hash::ObjectId>>,
     ) -> Result<Option<lookup::Outcome>, lookup::Error> {
+        let found = self.lookup_prefix_locally(prefix, candidates.as_deref_mut())?;
+        if found.is_some() {
+            return Ok(found);
+        }
+        // A *partial clone* names objects it does not have, so a full-length hex that matches nothing
+        // locally may still be obtainable from the promisor remote. `git` reaches the same outcome from
+        // the other direction: it never checks existence when parsing a full-length hex, and the read
+        // that follows calls `promisor_remote_get_direct()`. Asking here keeps the check but lets it
+        // succeed. A short prefix is left alone - it names no object the remote could be asked for.
+        if prefix.hex_len() != prefix.as_oid().kind().len_in_hex() {
+            return Ok(None);
+        }
+        self.fetch_from_promisor(prefix.as_oid());
+        self.lookup_prefix_locally(prefix, candidates)
+    }
+
+    /// [`lookup_prefix()`][Self::lookup_prefix()] restricted to the objects this store already has.
+    fn lookup_prefix_locally(
+        &self,
+        prefix: gix_hash::Prefix,
+        mut candidates: Option<&mut HashSet<gix_hash::ObjectId>>,
+    ) -> Result<Option<lookup::Outcome>, lookup::Error> {
         let mut candidate: Option<gix_hash::ObjectId> = None;
         loop {
             let snapshot = self.snapshot.borrow();

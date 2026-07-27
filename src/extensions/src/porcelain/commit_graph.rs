@@ -14,8 +14,9 @@
 //!   Collects the commit set the way git does — from every pack in the object
 //!   directory by default, from all refs under `--reachable`, from stdin under
 //!   `--stdin-commits` / `--stdin-packs` — closes it over all ancestors, then
-//!   serializes `OIDF`/`OIDL`/`CDAT`/`GDA2` (plus `GDO2` and `EDGE` when
-//!   needed) into `<object-dir>/info/commit-graph`. As in git, an empty commit
+//!   serializes `OIDF`/`OIDL`/`CDAT`/`GDA2` (plus `GDO2`, `EDGE` and the
+//!   changed-path `BIDX`/`BDAT` pair when needed) into
+//!   `<object-dir>/info/commit-graph`. As in git, an empty commit
 //!   set writes no file and exits 0, and a successful non-split write removes
 //!   any existing split chain.
 //!
@@ -26,8 +27,21 @@
 //! in the `CDAT` generation bits and omits the corrected-date chunks. git gates
 //! this on the value being exactly 2, and a non-numeric value is fatal.
 //!
-//! The vendored `gix-commitgraph` is read-only (`src/{init,access,verify}.rs`,
-//! `src/file/`), so the serializer here is written against git's
+//! `--changed-paths` writes the changed-path Bloom filters: for each commit, the
+//! paths it changed against its first parent — plus every leading directory of
+//! each — hashed by [`gix::commitgraph::bloom`], a port of git's `bloom.c`, into
+//! the `BIDX` offset table and the `BDAT` filter data. Four keys steer them, as
+//! in git: `commitGraph.changedPaths` turns them on without the flag,
+//! `commitGraph.changedPathsVersion` (-1, 0, 1 or 2) picks which murmur3 hashes
+//! them and, at 0, refuses to read existing ones at all,
+//! `commitGraph.readChangedPaths` is the deprecated boolean spelling of that
+//! last behavior, and `commitGraph.maxNewFilters` bounds how many filters one
+//! write may compute. A write that neither asks for filters nor forbids them
+//! keeps whatever the graph it replaces already had.
+//!
+//! The vendored `gix-commitgraph` writes nothing (`src/{init,access,verify}.rs`,
+//! `src/file/`, plus the `bloom` port it gained for the filters above), so the
+//! serializer here is written against git's
 //! `commit-graph-format.txt` layout and validated against files produced by
 //! stock git: header `CGPH`, version 1, `<hash-version>`, `<chunk-count>`,
 //! `<base-graph-count>`; a chunk lookup of `(id, u64 offset)` pairs terminated
@@ -36,16 +50,11 @@
 //! last-extra-edge marker both `0x80000000`; `GDA2` holding the corrected
 //! commit date *offset* per commit.
 //!
-//! Deliberately not implemented — these bail rather than writing a file that
+//! Deliberately not implemented — this bails rather than writing a file that
 //! only looks right:
-//!   * `--changed-paths`. Requires the changed-path Bloom filters (`BIDX` /
-//!     `BDAT`): a per-commit tree diff against the first parent, hashed with
-//!     git's seeded murmur3 into a 10-bits-per-entry, 7-hash filter. No
-//!     vendored crate computes those, and a filter with wrong bits set is worse
-//!     than none — readers trust it to answer "path definitely unchanged".
 //!   * `--split`. Needs the incremental chain protocol (chain file, base-graph
-//!     `BASE` chunk, merge/expiry strategies), none of which the read-only
-//!     vendored crate models.
+//!     `BASE` chunk, merge/expiry strategies), none of which the vendored crate
+//!     models.
 //!
 //! `--max-commits`, `--size-multiple` and `--expire-time` only steer split
 //! writes; git accepts and ignores them for a non-split write, and so does
@@ -398,7 +407,13 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
     let mut stdin_packs = false;
     let mut stdin_commits = false;
     let mut append = false;
-    let mut changed_paths = false;
+    // git's tri-state: `--[no-]changed-paths` always beats
+    // `commitGraph.changedPaths`, and "nobody said" additionally means "keep
+    // whatever the existing graph already has".
+    let mut changed_paths: Option<bool> = None;
+    // `--max-new-filters`, defaulting to `commitGraph.maxNewFilters`; git's
+    // `opts->max_new_filters`, where a negative value means "no bound".
+    let mut max_new_filters: Option<i64> = None;
     let mut split = false;
     let mut end_of_opts = false;
 
@@ -430,21 +445,24 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
             "--no-stdin-commits" => stdin_commits = false,
             "--append" => append = true,
             "--no-append" => append = false,
-            "--changed-paths" => changed_paths = true,
-            "--no-changed-paths" => changed_paths = false,
+            "--changed-paths" => changed_paths = Some(true),
+            "--no-changed-paths" => changed_paths = Some(false),
             "--progress" | "--no-progress" => {}
             "--split" => split = true,
-            // `--max-new-filters` takes a plain number and only bounds Bloom
-            // filter computation, which a non-`--changed-paths` write does not do.
-            "--no-max-new-filters" => {}
+            // `--max-new-filters` bounds how many filters one run may compute;
+            // git's `--no-max-new-filters` restores the unbounded default.
+            "--no-max-new-filters" => max_new_filters = None,
             "--max-new-filters" => {
                 i += 1;
                 let Some(v) = args.get(i) else {
                     return Ok(missing_value("max-new-filters"));
                 };
-                if v.parse::<i64>().is_err() {
-                    eprintln!("error: option `max-new-filters' expects a numerical value");
-                    return Ok(ExitCode::from(129));
+                match v.parse::<i64>() {
+                    Ok(n) => max_new_filters = Some(n),
+                    Err(_) => {
+                        eprintln!("error: option `max-new-filters' expects a numerical value");
+                        return Ok(ExitCode::from(129));
+                    }
                 }
             }
             // Split-only knobs: validated, then ignored, exactly as git does for
@@ -481,9 +499,12 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
             }
             s if long_value(s, "max-new-filters").is_some() => {
                 let v = long_value(s, "max-new-filters").unwrap_or_default();
-                if v.parse::<i64>().is_err() {
-                    eprintln!("error: option `max-new-filters' expects a numerical value");
-                    return Ok(ExitCode::from(129));
+                match v.parse::<i64>() {
+                    Ok(n) => max_new_filters = Some(n),
+                    Err(_) => {
+                        eprintln!("error: option `max-new-filters' expects a numerical value");
+                        return Ok(ExitCode::from(129));
+                    }
                 }
             }
             s if long_value(s, "max-commits").is_some() => {
@@ -519,14 +540,6 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         ));
     }
 
-    if changed_paths {
-        bail!(
-            "unsupported flag \"--changed-paths\": the changed-path Bloom filters (BIDX/BDAT) \
-             need git's seeded murmur3 over per-commit tree diffs, which no vendored crate \
-             computes; writing filters with wrong bits set would silently break readers \
-             (ported: --reachable, --stdin-packs, --stdin-commits, --append, --object-dir)"
-        );
-    }
     if split {
         bail!(
             "unsupported flag \"--split\": the incremental chain protocol (chain file, BASE \
@@ -559,10 +572,108 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         }
     };
 
+    // `commitGraph.readChangedPaths` is the deprecated spelling: true means
+    // `changedPathsVersion = -1`, false means `0`, and an explicit
+    // `changedPathsVersion` wins over either. git resolves both in
+    // `prepare_repo_settings()`.
+    let read_changed_paths = repo
+        .config_snapshot()
+        .boolean("commitGraph.readChangedPaths")
+        .unwrap_or(true);
+    let changed_paths_version = match repo
+        .config_snapshot()
+        .try_integer("commitGraph.changedPathsVersion")
+    {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            if read_changed_paths {
+                -1
+            } else {
+                0
+            }
+        }
+        Err(_) => {
+            let raw = repo
+                .config_snapshot()
+                .string("commitGraph.changedPathsVersion")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            return Ok(bad_numeric_config(&raw, "commitgraph.changedpathsversion"));
+        }
+    };
+
     let objects = match object_directory(&repo, object_dir.as_deref()) {
         Ok(p) => p,
         Err(code) => return Ok(code),
     };
+
+    // git's `write_commit_graph()` refuses to write at all — not just to write
+    // filters — when the version is outside the range it understands, and warns
+    // rather than failing.
+    if !(-1..=2).contains(&changed_paths_version) {
+        eprintln!(
+            "warning: attempting to write a commit-graph, but \
+             'commitGraph.changedPathsVersion' ({changed_paths_version}) is not supported"
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // `--max-new-filters` beats `commitGraph.maxNewFilters`, which git reads as
+    // the option's default in `git_commit_graph_write_config()`.
+    if max_new_filters.is_none() {
+        match repo.config_snapshot().try_integer("commitGraph.maxNewFilters") {
+            Ok(v) => max_new_filters = v,
+            Err(_) => {
+                let raw = repo
+                    .config_snapshot()
+                    .string("commitGraph.maxNewFilters")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                return Ok(bad_numeric_config(&raw, "commitgraph.maxnewfilters"));
+            }
+        }
+    }
+
+    // Whether this run carries filters. `--[no-]changed-paths` decides outright;
+    // failing that `commitGraph.changedPaths` does; failing that git keeps
+    // filters that the graph being replaced already had.
+    //
+    // Version 0 is "read no filters at all", and git enforces that by never
+    // looking at `BIDX`/`BDAT` — so a graph whose filters are invisible cannot
+    // pass them on, and rewriting it drops them.
+    let existing = gix::commitgraph::at(objects.join("info")).ok();
+    let inherited = if changed_paths_version == 0 {
+        None
+    } else {
+        existing.as_ref().and_then(bloom_settings_of)
+    };
+    let write_changed_paths = match changed_paths {
+        Some(explicit) => explicit,
+        None => {
+            repo.config_snapshot()
+                .boolean("commitGraph.changedPaths")
+                .unwrap_or(false)
+                || inherited.is_some()
+        }
+    };
+
+    // git only propagates the hash version from the old graph when nothing
+    // asked for one, but always inherits the sizing so that the filters already
+    // on disk and the ones about to be written can share a chunk.
+    let mut bloom_settings = gix::commitgraph::bloom::Settings::default();
+    if write_changed_paths {
+        let mut hash_version = changed_paths_version;
+        if let Some(old) = inherited {
+            if hash_version == -1 {
+                hash_version = i64::from(old.hash_version);
+            }
+            bloom_settings.bits_per_entry = old.bits_per_entry;
+            bloom_settings.num_hashes = old.num_hashes;
+        }
+        // git's final clamp: only 2 means version 2, and -1 or 0 both settle on
+        // 1, which is what an unconfigured repository writes.
+        bloom_settings.hash_version = if hash_version == 2 { 2 } else { 1 };
+    }
 
     let source = if reachable {
         Source::Reachable
@@ -598,12 +709,225 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
         return Ok(ExitCode::SUCCESS);
     }
 
-    let bytes = match serialize(repo.object_hash(), &entries, write_generation_data) {
+    // The filters must line up with the entries as they will be stored, and
+    // `serialize` writes them in the order it is given, so they are computed
+    // against the same slice.
+    let filters = if write_changed_paths {
+        // Filters can only be carried over from a graph this run was allowed to
+        // read, which version 0 forbids.
+        let reuse_from = inherited.is_some().then_some(existing.as_ref()).flatten();
+        Some(compute_bloom_filters(
+            &repo,
+            &entries,
+            &bloom_settings,
+            reuse_from,
+            max_new_filters,
+            write_generation_data,
+        ))
+    } else {
+        None
+    };
+
+    let bytes = match serialize(
+        repo.object_hash(),
+        &entries,
+        write_generation_data,
+        filters.as_ref().map(|f| (f.as_slice(), &bloom_settings)),
+    ) {
         Ok(b) => b,
         Err(code) => return Ok(code),
     };
     install(&objects, &bytes)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The `BDAT` header of the graph being replaced, which decides whether this
+/// run inherits filters and how they are sized.
+fn bloom_settings_of(graph: &gix::commitgraph::Graph) -> Option<gix::commitgraph::bloom::Settings> {
+    graph.bloom_filter_settings()
+}
+
+/// A changed-path Bloom filter for every entry, in the order `serialize` will
+/// store them; git's `compute_bloom_filters()`.
+///
+/// A commit's filter holds the paths it changed against its first parent, or
+/// against the empty tree when it is a root — git's `diff_tree_oid(NULL, ...)`.
+/// Rename detection is off and the diff is recursive, which is what
+/// `get_or_compute_bloom_filter()` sets up, because a filter is about paths and
+/// not about what happened to them.
+///
+/// `max_new_filters` bounds how many filters one run may *compute*, and git
+/// spends that budget in ascending generation order — oldest history first —
+/// rather than in the order the entries happen to be stored. A commit left
+/// unfiltered when the budget runs out is stored with a length of zero, which
+/// is how the format says "this commit has no filter": a reader sees an empty
+/// range and falls back to a real tree diff rather than trusting an answer.
+fn compute_bloom_filters(
+    repo: &gix::Repository,
+    entries: &[Entry],
+    settings: &gix::commitgraph::bloom::Settings,
+    existing: Option<&gix::commitgraph::Graph>,
+    max_new_filters: Option<i64>,
+    write_generation_data: bool,
+) -> Vec<gix::commitgraph::bloom::Filter> {
+    use gix::commitgraph::bloom;
+
+    // A negative bound is git's "no bound at all"; an absent one likewise,
+    // since `commitGraph.maxNewFilters` and `--max-new-filters` share this.
+    let budget = match max_new_filters {
+        Some(n) if n >= 0 => Some(n as usize),
+        _ => None,
+    };
+    // Filters already on disk can only be reused when they were built the same
+    // way, which is exactly what git checks before propagating them.
+    let reusable = existing.filter(|g| g.bloom_filter_settings().as_ref() == Some(settings));
+
+    // git's `commit_gen_cmp`: lowest generation first, with the commit date
+    // breaking ties. The generation it sorts on is the corrected commit date,
+    // which only exists when generation data is being written; without it every
+    // commit compares equal and the date alone decides.
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    let corrected = write_generation_data
+        .then(|| parent_positions(entries).ok().map(|p| generations(entries, &p).1))
+        .flatten();
+    order.sort_by_key(|&i| (corrected.as_ref().map_or(0, |c| c[i]), entries[i].time));
+
+    let mut computed = 0usize;
+    let mut out = vec![bloom::Filter { data: Vec::new() }; entries.len()];
+    for i in order {
+        let entry = &entries[i];
+        if let Some(filter) = reusable
+            .and_then(|g| g.lookup(entry.id))
+            .and_then(|pos| g_bloom_at(reusable, pos))
+        {
+            out[i] = filter;
+            continue;
+        }
+        // Out of budget: leave the zero-length filter already in place, which
+        // is what git writes for a commit it declined to compute.
+        if budget.is_some_and(|max| computed >= max) {
+            continue;
+        }
+        computed += 1;
+        out[i] = match changed_paths_of(repo, entry) {
+            Some(paths) => {
+                let refs: Vec<&[u8]> = paths.iter().map(|p| p.as_slice()).collect();
+                bloom::compute(&refs, settings)
+            }
+            // A diff we could not take is not a diff that found nothing, so the
+            // filter has to admit every path rather than deny them all.
+            None => bloom::Filter::truncated_large(),
+        };
+    }
+    out
+}
+
+/// The filter stored for `pos`, if the graph has one there.
+fn g_bloom_at(
+    graph: Option<&gix::commitgraph::Graph>,
+    pos: gix::commitgraph::Position,
+) -> Option<gix::commitgraph::bloom::Filter> {
+    graph?.bloom_filter_at(pos)
+}
+
+/// The paths one commit changed against its first parent, or `None` when the
+/// diff cannot be taken.
+///
+/// git diffs against the first parent only, and against the empty tree for a
+/// root commit, so a merge is described by what it changed along its first
+/// line of history.
+fn changed_paths_of(repo: &gix::Repository, entry: &Entry) -> Option<Vec<Vec<u8>>> {
+    let new_tree = repo.find_tree(entry.tree).ok()?;
+    let old_tree = match entry.parents.first() {
+        Some(parent) => Some(
+            repo.find_commit(*parent)
+                .ok()?
+                .tree()
+                .ok()?,
+        ),
+        None => None,
+    };
+    let changes = repo
+        .diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), gix::diff::Options::default())
+        .ok()?;
+    Some(changes.iter().map(|c| change_path(c).to_vec()).collect())
+}
+
+/// The post-image path of a change, which is the side git enters into the
+/// filter. Rename detection is off, so both sides always agree.
+fn change_path(change: &gix::object::tree::diff::ChangeDetached) -> &[u8] {
+    use gix::object::tree::diff::ChangeDetached;
+    match change {
+        ChangeDetached::Addition { location, .. }
+        | ChangeDetached::Deletion { location, .. }
+        | ChangeDetached::Modification { location, .. }
+        | ChangeDetached::Rewrite { location, .. } => location,
+    }
+}
+
+/// The topological level stored in `CDAT` and the corrected commit date stored
+/// in `GDA2`, for every entry; git's `compute_topological_levels()` and
+/// `compute_generation_numbers()`.
+///
+/// Both are "one more than the largest among my parents", differing only in
+/// what they count: the level counts commits, the corrected date counts from
+/// each commit's own timestamp so that it never decreases along a parent edge.
+/// An explicit stack keeps a deep history from overflowing the real one.
+fn generations(entries: &[Entry], parents: &[Vec<u32>]) -> (Vec<u32>, Vec<u64>) {
+    let n = entries.len();
+    let mut level = vec![0u32; n];
+    let mut corrected = vec![0u64; n];
+    let mut stack: Vec<(usize, bool)> = Vec::new();
+    for start in 0..n {
+        if level[start] != 0 {
+            continue;
+        }
+        stack.push((start, false));
+        while let Some((idx, expanded)) = stack.pop() {
+            if level[idx] != 0 {
+                continue;
+            }
+            if expanded {
+                let mut l = 1u32;
+                let mut c = entries[idx].time;
+                for &p in &parents[idx] {
+                    let p = p as usize;
+                    l = l.max(level[p].saturating_add(1));
+                    c = c.max(corrected[p].saturating_add(1));
+                }
+                level[idx] = l.min(GENERATION_MAX);
+                corrected[idx] = c;
+            } else {
+                stack.push((idx, true));
+                for &p in &parents[idx] {
+                    if level[p as usize] == 0 {
+                        stack.push((p as usize, false));
+                    }
+                }
+            }
+        }
+    }
+    (level, corrected)
+}
+
+/// Parent positions per commit, or the id of a parent that has no slot.
+///
+/// The format encodes a parent as a position within the same file, so a parent
+/// outside the entry set cannot be stored at all.
+fn parent_positions(entries: &[Entry]) -> std::result::Result<Vec<Vec<u32>>, ObjectId> {
+    let mut position: HashMap<ObjectId, u32> = HashMap::with_capacity(entries.len());
+    for (i, e) in entries.iter().enumerate() {
+        position.insert(e.id, i as u32);
+    }
+    entries
+        .iter()
+        .map(|e| {
+            e.parents
+                .iter()
+                .map(|p| position.get(p).copied().ok_or(*p))
+                .collect()
+        })
+        .collect()
 }
 
 /// A commit as it will be stored, before positions are assigned.
@@ -785,68 +1109,21 @@ fn serialize(
     hash: gix::hash::Kind,
     entries: &[Entry],
     write_generation_data: bool,
+    bloom: Option<(
+        &[gix::commitgraph::bloom::Filter],
+        &gix::commitgraph::bloom::Settings,
+    )>,
 ) -> std::result::Result<Vec<u8>, ExitCode> {
     let hash_len = hash.len_in_bytes();
     let n = entries.len();
 
-    let mut position: HashMap<ObjectId, u32> = HashMap::with_capacity(n);
-    for (i, e) in entries.iter().enumerate() {
-        position.insert(e.id, i as u32);
-    }
+    // A missing parent would be a bug in the ancestor closure, since the format
+    // cannot encode an absent parent.
+    let parents = parent_positions(entries).map_err(|missing| {
+        error_exit(&format!("commit has parent {missing} outside the graph"))
+    })?;
 
-    // Parent positions per commit; a missing parent would be a bug in the
-    // ancestor closure, since the format cannot encode an absent parent.
-    let mut parents: Vec<Vec<u32>> = Vec::with_capacity(n);
-    for e in entries {
-        let mut ps = Vec::with_capacity(e.parents.len());
-        for p in &e.parents {
-            match position.get(p) {
-                Some(pos) => ps.push(*pos),
-                None => {
-                    return Err(error_exit(&format!(
-                        "commit {} has parent {p} outside the graph",
-                        e.id
-                    )))
-                }
-            }
-        }
-        parents.push(ps);
-    }
-
-    // Topological level (`CDAT`) and corrected commit date (`GDA2`), computed
-    // with an explicit stack so deep histories cannot overflow the real one.
-    let mut level = vec![0u32; n];
-    let mut corrected = vec![0u64; n];
-    let mut stack: Vec<(usize, bool)> = Vec::new();
-    for start in 0..n {
-        if level[start] != 0 {
-            continue;
-        }
-        stack.push((start, false));
-        while let Some((idx, expanded)) = stack.pop() {
-            if level[idx] != 0 {
-                continue;
-            }
-            if expanded {
-                let mut l = 1u32;
-                let mut c = entries[idx].time;
-                for &p in &parents[idx] {
-                    let p = p as usize;
-                    l = l.max(level[p].saturating_add(1));
-                    c = c.max(corrected[p].saturating_add(1));
-                }
-                level[idx] = l.min(GENERATION_MAX);
-                corrected[idx] = c;
-            } else {
-                stack.push((idx, true));
-                for &p in &parents[idx] {
-                    if level[p as usize] == 0 {
-                        stack.push((p as usize, false));
-                    }
-                }
-            }
-        }
-    }
+    let (level, corrected) = generations(entries, &parents);
 
     // --- chunks ---
     let mut oidf = Vec::with_capacity(FAN_LEN * 4);
@@ -911,7 +1188,30 @@ fn serialize(
         (None, Vec::new())
     };
 
-    // git's chunk order: OIDF, OIDL, CDAT, GDA2, GDO2, EDGE.
+    // The changed-path Bloom filters. `BIDX` stores each filter's *end* as a
+    // running byte count, so filter `i` is found by subtracting `BIDX[i-1]`;
+    // `BDAT` opens with the three settings a reader needs to reproduce a key,
+    // then concatenates the filters in the same order. The format requires the
+    // two chunks to appear together, so they are built together.
+    let (bidx, bdat) = match bloom {
+        Some((filters, settings)) => {
+            let mut bidx = Vec::with_capacity(n * 4);
+            let mut bdat = Vec::with_capacity(12 + n);
+            bdat.extend_from_slice(&settings.hash_version.to_be_bytes());
+            bdat.extend_from_slice(&settings.num_hashes.to_be_bytes());
+            bdat.extend_from_slice(&settings.bits_per_entry.to_be_bytes());
+            let mut running = 0u32;
+            for filter in filters {
+                running += filter.data.len() as u32;
+                bidx.extend_from_slice(&running.to_be_bytes());
+                bdat.extend_from_slice(&filter.data);
+            }
+            (Some(bidx), Some(bdat))
+        }
+        None => (None, None),
+    };
+
+    // git's chunk order: OIDF, OIDL, CDAT, GDA2, GDO2, EDGE, BIDX, BDAT.
     let mut chunks: Vec<(&[u8; 4], Vec<u8>)> = vec![
         (b"OIDF", oidf),
         (b"OIDL", oidl),
@@ -925,6 +1225,10 @@ fn serialize(
     }
     if !edge.is_empty() {
         chunks.push((b"EDGE", edge));
+    }
+    if let (Some(bidx), Some(bdat)) = (bidx, bdat) {
+        chunks.push((b"BIDX", bidx));
+        chunks.push((b"BDAT", bdat));
     }
 
     // --- header, chunk lookup, data, trailer ---

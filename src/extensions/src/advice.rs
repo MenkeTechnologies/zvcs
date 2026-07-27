@@ -66,6 +66,9 @@ pub enum Advice {
     /// A full-length hex object name is also the name of a ref, which is almost
     /// always a ref created by mistake.
     ObjectNameWarning,
+    /// A pathspec selected only paths outside the sparse-checkout definition, so
+    /// the command left the index alone (`advise_on_updating_sparse_paths`).
+    UpdateSparsePath,
 }
 
 impl Advice {
@@ -94,6 +97,7 @@ impl Advice {
             Advice::IgnoredHook => "advice.ignoredHook",
             Advice::SuggestDetachingHead => "advice.suggestDetachingHead",
             Advice::ObjectNameWarning => "advice.objectNameWarning",
+            Advice::UpdateSparsePath => "advice.updateSparsePath",
         }
     }
 
@@ -210,6 +214,35 @@ pub fn ambiguous_remote_branch_name(repo: &Repository, cmdname: &str) {
              one remote, e.g. the 'origin' remote, consider setting\n\
              checkout.defaultRemote=origin in your config."
         ),
+    );
+}
+
+/// Port of `advise_on_updating_sparse_paths()` (`advice.c`): the report a command
+/// prints when a pathspec matched only paths outside the sparse-checkout
+/// definition, so nothing was updated in the index.
+///
+/// The three-line preamble and the path list are plain `stderr` writes that are
+/// *not* gated on any `advice.*` slot — only the closing suggestion is, through
+/// `advise_if_enabled(ADVICE_UPDATE_SPARSE_PATH, …)`, which is why its
+/// `Disable this message with …` trailer appears while the slot is unconfigured.
+/// Nothing is printed at all for an empty list.
+pub fn on_updating_sparse_paths(repo: &Repository, paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    eprintln!(
+        "The following paths and/or pathspecs matched paths that exist\n\
+         outside of your sparse-checkout definition, so will not be\n\
+         updated in the index:"
+    );
+    for p in paths {
+        eprintln!("{p}");
+    }
+    Advice::UpdateSparsePath.advise_in(
+        repo,
+        "If you intend to update such entries, try one of the following:\n\
+         * Use the --sparse option.\n\
+         * Disable or modify the sparsity rules.",
     );
 }
 

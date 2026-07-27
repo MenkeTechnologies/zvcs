@@ -23,9 +23,10 @@
 //! missing: `--no-reuse-delta` and `--no-reuse-object` (no pack entry is ever
 //! reused, so there is no reuse to switch off), `--delta-islands`,
 //! `--name-hash-version`, `--path-walk`, `--sparse` and `--shallow`. `--thin`
-//! and `--write-bitmap-index` are likewise accepted without effect: a thin pack
-//! needs bases outside the pack, and no EWAH bitmap writer exists in the
-//! vendored crates.
+//! is likewise accepted without effect, a thin pack needing bases outside the
+//! pack. `--write-bitmap-index` *does* write a `.bitmap` — see [`bitmap_file`] —
+//! unless the pack is missing part of the closure a bitmap must cover, in which
+//! case it warns as git does and writes none.
 //!
 //! # What is reproduced exactly
 //!
@@ -2297,7 +2298,7 @@ fn loose_objects(repo: &gix::Repository) -> Vec<ObjectId> {
 /// implemented here — `tree:0` removes all trees *and* all blobs, which is the
 /// same closure — and specs that need the walk (`sparse:oid=`, `combine:`) are
 /// left as no-ops rather than approximated.
-fn apply_filter(repo: &gix::Repository, spec: Option<&str>, ids: &mut Vec<ObjectId>) {
+pub(super) fn apply_filter(repo: &gix::Repository, spec: Option<&str>, ids: &mut Vec<ObjectId>) {
     use gix::object::Kind;
     let Some(spec) = spec else { return };
 
@@ -2330,7 +2331,7 @@ fn apply_filter(repo: &gix::Repository, spec: Option<&str>, ids: &mut Vec<Object
 }
 
 /// git's `k`/`m`/`g` magnitude grammar, as `blob:limit=` uses it.
-fn magnitude(v: &str) -> Option<u64> {
+pub(super) fn magnitude(v: &str) -> Option<u64> {
     let (body, scale) = match v.chars().last() {
         Some('k' | 'K') => (&v[..v.len() - 1], 1024),
         Some('m' | 'M') => (&v[..v.len() - 1], 1024 * 1024),

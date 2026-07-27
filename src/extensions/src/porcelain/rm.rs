@@ -10,7 +10,7 @@
 //!   * `-n`, `--dry-run`              — report what would be removed, change nothing
 //!   * `--ignore-unmatch`             — exit 0 even if a pathspec matched nothing
 //!   * `-q`, `--quiet`                — suppress the `rm '<path>'` lines
-//!   * `--sparse`                     — accepted (sparse-checkout cone; see note below)
+//!   * `--sparse`                     — also remove entries outside the sparse cone
 //!   * `--pathspec-from-file=<file>`  — read pathspecs from `<file>` (or stdin with `-`)
 //!   * `--pathspec-file-nul`          — NUL-separated pathspec file entries
 //!   * `--`, `--end-of-options`       — end option parsing
@@ -33,10 +33,19 @@
 //! Unmerged (conflicted) paths are removable without `-f` (all stages dropped),
 //! exactly as stock git does.
 //!
-//! Deviations kept honest: `--sparse` is accepted but the sparse-checkout *cone*
-//! exclusion it guards is not enforced here (a no-op outside a sparse checkout,
-//! which is the only place the flag changes behavior); pathspec files are not
-//! C-style unquoted (git-generated pathspec files are not quoted).
+//! Sparse-checkout, as in `builtin/rm.c`: without `--sparse` an index entry that
+//! lives outside the sparse-checkout definition is left out of the removal list
+//! entirely, and a pathspec that matched *only* such entries is not the fatal
+//! "did not match any files" — it is collected and reported through
+//! [`crate::advice::on_updating_sparse_paths`], which makes the command exit 1
+//! while still removing whatever the other pathspecs matched. `--sparse` puts
+//! those entries back in scope and the report never fires.
+//!
+//! Deviations kept honest: an entry counts as outside the definition when it
+//! carries the index `SKIP_WORKTREE` bit; git additionally re-checks the path
+//! against the sparse patterns (`path_in_sparse_checkout`), which only differs
+//! for an index left out of sync with an edited pattern file. Pathspec files are
+//! not C-style unquoted (git-generated pathspec files are not quoted).
 
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -61,6 +70,9 @@ struct Target {
     id: ObjectId,
     mode: Mode,
     stage: u32,
+    /// `ce_skip_worktree(ce)`: the entry sits outside the sparse-checkout
+    /// definition, so `git rm` ignores it unless `--sparse` was given.
+    sparse: bool,
 }
 
 /// Parsed option state.
@@ -72,7 +84,8 @@ struct Opts {
     dry_run: bool,
     ignore_unmatch: bool,
     quiet: bool,
-    #[allow(dead_code)]
+    /// `--sparse` (git's `include_sparse`): operate on entries outside the
+    /// sparse-checkout definition too.
     sparse: bool,
     pathspec_from_file: Option<String>,
     pathspec_file_nul: bool,
@@ -292,6 +305,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                 id: e.id,
                 mode: e.mode,
                 stage: e.stage_raw(),
+                sparse: e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE),
             })
             .collect()
     };
@@ -313,6 +327,10 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     )?;
 
     let mut seen: Vec<u8> = vec![0; pathspecs.len()];
+    // `find_pathspecs_matching_skip_worktree()` (pathspec.c): the parallel `seen[]`
+    // built from the entries the sparse-checkout definition excludes, consulted
+    // only when a pathspec matched nothing else.
+    let mut sparse_seen: Vec<bool> = vec![false; pathspecs.len()];
     // The synthetic "matched because nothing excludes it" case (all specs are
     // exclusions) reports sequence_number == pathspecs.len(); track it apart.
     let mut synthetic_seen: u8 = 0;
@@ -324,6 +342,16 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
             continue;
         };
         if m.is_excluded() {
+            continue;
+        }
+        // An entry outside the sparse-checkout definition is invisible to the
+        // removal (and to `seen[]`) unless `--sparse` was given; it only feeds
+        // the separate skip-worktree tally that turns "did not match any files"
+        // into the sparse-path report.
+        if t.sparse && !opts.sparse {
+            if m.sequence_number < sparse_seen.len() {
+                sparse_seen[m.sequence_number] = true;
+            }
             continue;
         }
         let rank = match m.kind {
@@ -346,6 +374,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                 id: t.id,
                 mode: t.mode,
                 stage: t.stage,
+                sparse: t.sparse,
             });
         }
     }
@@ -353,15 +382,22 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     // 7. Per-spec validation loop, in argument order, exactly like git: excludes
     //    are skipped; an unmatched positive spec is fatal unless --ignore-unmatch;
     //    a spec that matched only recursively is fatal without -r.
+    let mut seen_any = false;
+    let mut only_match_skip_worktree: Vec<String> = Vec::new();
     for (idx, raw) in pathspecs.iter().enumerate() {
         if is_exclude[idx] {
             continue;
         }
         let how = seen[idx];
-        if how == 0 {
-            if opts.ignore_unmatch {
-                continue;
-            }
+        if how != 0 {
+            seen_any = true;
+        } else if opts.ignore_unmatch {
+            continue;
+        } else if sparse_seen[idx] {
+            // Matched only entries the sparse-checkout definition excludes: git
+            // defers to `advise_on_updating_sparse_paths()` instead of dying.
+            only_match_skip_worktree.push(raw.clone());
+        } else {
             return Ok(fatal(format!("pathspec '{raw}' did not match any files")));
         }
         if !opts.recursive && how == RECURSIVELY {
@@ -372,10 +408,28 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     if is_exclude.iter().all(|&e| e) && synthetic_seen == RECURSIVELY && !opts.recursive {
         return Ok(fatal("not removing '.' recursively without -r"));
     }
+    // That implicit whole-tree match is still a match, so it counts toward
+    // git's `seen_any` even though no numbered pathspec recorded it.
+    seen_any |= synthetic_seen != 0;
 
-    if selected.is_empty() {
-        // Only reachable when every unmatched spec was ignored.
-        return Ok(ExitCode::SUCCESS);
+    // `ret` in `cmd_rm()`: the sparse-path report is the command's only non-fatal
+    // failure, and it survives to the final `return ret` — so a run that removed
+    // other paths still exits 1. `--dry-run` returns before that (git's
+    // `if (show_only) return 0;`), which is why `-n` always exits 0 here.
+    let sparse_report = !only_match_skip_worktree.is_empty();
+    if sparse_report {
+        crate::advice::on_updating_sparse_paths(&repo, &only_match_skip_worktree);
+    }
+    let ret = if sparse_report {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    };
+
+    if !seen_any || selected.is_empty() {
+        // git: `if (!seen_any) exit(ret);` — nothing to remove, but the sparse
+        // report (if any) still decides the status.
+        return Ok(ret);
     }
 
     // 8. Submodule removals need `.gitmodules` in a clean staging state, and the
@@ -568,7 +622,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     index.remove_tree();
     index.write(gix::index::write::Options::default())?;
 
-    Ok(ExitCode::SUCCESS)
+    Ok(ret)
 }
 
 /// Read pathspecs from `spec` (a file path, or `-` for stdin). Entries are split

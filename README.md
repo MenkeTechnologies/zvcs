@@ -483,14 +483,17 @@ widely per subcommand; some are byte-faithful across their documented flag set,
 others implement the common flags and bail terse on the rest. A few subcommands
 are honest skeletons that name the missing substrate instead of pretending:
 the foreign-SCM bridges (`p4`, `cvsimport`, `cvsserver`, `cvsexportcommit`,
-`archimport`) and `instaweb` have no gitoxide backing to port onto.
+`archimport`) have no gitoxide backing to port onto.
 
-`subtree` and `filter-branch` are ported directly from their stock shell
-scripts. `subtree add`, `split`, and `push` produce the same commits and object
-ids as stock; `merge` and `pull` refuse until `merge` accepts
-`-X subtree=<prefix>`, which is what both of them end in. `filter-branch`
+`subtree`, `filter-branch` and `instaweb` are ported directly from their stock
+shell scripts. `subtree add`, `merge`, `pull`, `split`, and `push` all produce
+the same commits and object ids as stock; only `-S`/`--gpg-sign` is refused.
+`filter-branch`
 rewrites history to the same commit ids as stock — a `--subdirectory-filter`
-run over the same input yields a byte-identical object.
+run over the same input yields a byte-identical object. `instaweb` generates
+the same daemon configuration as stock for whichever of lighttpd, apache2,
+mongoose, plackup, webrick or python is installed, and serves gitweb through
+it; like stock, it ships no web server of its own.
 
 Mutating subcommands are currently excluded from generated fuzz cases, so their
 parity rests on curated cases only. Treat their scores as less well covered than

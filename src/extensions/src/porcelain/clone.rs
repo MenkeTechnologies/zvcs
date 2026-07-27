@@ -44,6 +44,9 @@ use gix::remote::fetch::{Shallow, Tags};
 ///   * `--ref-format <format>`       → `files` accepted; `reftable` rejected (see below)
 ///   * `--recursive`/`--recurse-submodules[=<pathspec>]` → update submodules after
 ///     clone and record `submodule.active`
+///   * `-j`/`--jobs <n>`             → clone that many submodules at once (forwarded to
+///     the recursive `submodule update`, which otherwise reads `submodule.fetchJobs`)
+///   * `-4`/`--ipv4`, `-6`/`--ipv6`  → restrict the transport to one address family
 ///   * `--remote-submodules`         → submodules track their remote branch
 ///
 /// `init.defaultSubmodulePathConfig` is honored here as it is in `git init`.
@@ -130,6 +133,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `-u`/`--upload-pack <path>` and the repeatable `--server-option`, both handed to the transport.
     let mut upload_pack: Option<String> = None;
     let mut server_options: Vec<gix::bstr::BString> = Vec::new();
+    // `-j`/`--jobs`: how many submodules the recursive `submodule update` clones at once.
+    // git's `max_jobs` starts at `-1` meaning "not given", in which case nothing is forwarded
+    // and `submodule update` falls back to `submodule.fetchJobs` itself.
+    let mut jobs: Option<String> = None;
+    // `-4`/`--ipv4` and `-6`/`--ipv6`, git's `family`. `None` is `TRANSPORT_FAMILY_ALL`.
+    let mut address_family: Option<gix::protocol::transport::AddressFamily> = None;
     // `--single-branch` (`true`) / `--no-single-branch` (`false`); `None` leaves the
     // choice to gitoxide, which single-branches a shallow clone like git does.
     let mut single_branch: Option<bool> = None;
@@ -236,6 +245,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // Protocol-v2 server options, repeatable. `-o` is `--origin` for clone, so only the long form.
             "--server-option" => server_options.push(take_value!("--server-option").into()),
             "--no-server-option" => server_options.clear(),
+            "-j" | "--jobs" => jobs = Some(take_value!("--jobs")),
+            other if other.starts_with("-j") && other.len() > 2 => {
+                jobs = Some(other[2..].to_string())
+            }
+            // git's `OPT_SET_INT` pair writing one `family` slot: last wins, no `--no-` form.
+            "-4" | "--ipv4" => address_family = Some(gix::protocol::transport::AddressFamily::V4),
+            "-6" | "--ipv6" => address_family = Some(gix::protocol::transport::AddressFamily::V6),
             "--reject-shallow" => reject_shallow = Some(true),
             "--no-reject-shallow" => reject_shallow = Some(false),
             "--single-branch" => single_branch = Some(true),
@@ -562,9 +578,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // prefix (`refs/heads/`) that the filter handles correctly.
     // The transport-level knobs. `remote.<name>.uploadpack`/`serverOption` cannot apply here: the remote is
     // being created by this very clone, so only the command line can supply them.
-    if upload_pack.is_some() {
+    if upload_pack.is_some() || address_family.is_some() {
         prepare = prepare.with_connect_options(gix::remote::connect::Options {
             upload_pack: upload_pack.as_deref().map(Into::into),
+            address_family,
         });
     }
     if !server_options.is_empty() {
@@ -585,6 +602,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         let single_outcome = single_outcome.clone();
         let probe_connect = gix::remote::connect::Options {
             upload_pack: upload_pack.as_deref().map(Into::into),
+            address_family,
         };
         let probe_server_options = server_options.clone();
         prepare = prepare.configure_remote(move |r| {
@@ -802,10 +820,18 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // updates each submodule to its remote-tracking branch instead of the
     // superproject's recorded commit.
     if recurse_submodules && !bare && !no_checkout {
-        let mut sub: Vec<&str> = vec!["submodule", "update", "--init", "--recursive"];
-        if remote_submodules {
-            sub.push("--remote");
+        let mut sub: Vec<String> = ["submodule", "update", "--init", "--recursive"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        // `max_jobs != -1` is the only thing that makes git forward the count.
+        if let Some(j) = &jobs {
+            sub.push(format!("--jobs={j}"));
         }
+        if remote_submodules {
+            sub.push("--remote".into());
+        }
+        let sub: Vec<&str> = sub.iter().map(String::as_str).collect();
         let code = run_self(&dir, &sub)?;
         if code != 0 {
             return Ok(ExitCode::from(code));

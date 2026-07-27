@@ -167,6 +167,15 @@ pub struct Options {
     /// Ignore whitespace when diffing revisions (`git blame -w`): a line that changed only in
     /// whitespace is attributed to the earlier commit, not the whitespace-only change.
     pub ignore_whitespace: bool,
+    /// Also blame the parents for lines that moved within the file (`git blame -M[<score>]`).
+    ///
+    /// The value is git's `sb->move_score` (`BLAME_DEFAULT_MOVE_SCORE`, 20, for a bare `-M`): the
+    /// minimum [`blame_entry_score`] a chunk must exceed before it is handed to a parent it was
+    /// only found in by searching the whole blob. It keeps a line like `\t}` — which occurs
+    /// everywhere — from being credited to wherever it happens to also appear.
+    ///
+    /// [`blame_entry_score`]: https://github.com/git/git/blob/v2.55.0/blame.c#L1991
+    pub detect_moved: Option<u32>,
     /// Commits whose changes should not be attributed to them (`git blame --ignore-rev`).
     ///
     /// After the usual diff has passed everything it can to the parents, the lines that are left

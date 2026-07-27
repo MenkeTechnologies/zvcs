@@ -9,7 +9,7 @@ use gix_object::{
 use gix_traverse::commit::find as find_commit;
 use smallvec::SmallVec;
 
-use super::{Change, UnblamedHunk, process_changes, process_ignored_changes};
+use super::{Change, UnblamedHunk, compact, moved, process_changes, process_ignored_changes};
 use crate::{BlameEntry, Error, Options, Outcome, Statistics, types::BlamePathEntry};
 
 /// Produce a list of consecutive [`BlameEntry`] instances to indicate in which commits the ranges of the file
@@ -92,6 +92,9 @@ pub fn file(
     if num_lines_in_blamed == 0 {
         return Ok(Outcome::default());
     }
+
+    // git's `sb->lineno`, which `-M` needs to cut the entry's lines out of the final image.
+    let blamed_line_starts = moved::line_starts(&blamed_file_blob);
 
     let ranges_to_blame = options.ranges.to_zero_based_exclusive_ranges(num_lines_in_blamed);
     let mut hunks_to_blame = ranges_to_blame
@@ -279,6 +282,9 @@ pub fn file(
         // `(parent, changes, parent blob, target blob, source path if the parent renamed the file)`
         type IgnoredPass = (ObjectId, Vec<Change>, Vec<u8>, Vec<u8>, Option<BString>);
         let mut ignored_passes: Vec<IgnoredPass> = Vec::new();
+        // `sg_origin[]` in git's `pass_blame()`: the blob each parent holds the blamed file in, and
+        // the path it lives at there. `-M` re-diffs whatever is left over against these.
+        let mut move_parents: Vec<moved::ParentOrigin> = Vec::new();
 
         let more_than_one_parent = parent_ids.len() > 1;
         for (index, (parent_id, parent_commit_time)) in parent_ids.iter().enumerate() {
@@ -336,6 +342,7 @@ pub fn file(
                     unreachable!("We already found file_path in suspect^{{tree}}, so it can't be deleted")
                 }
                 TreeDiffChange::Modification { previous_id, id } => {
+                    push_move_parent(&mut move_parents, *parent_id, previous_id, &current_file_path);
                     let (changes, data) = blob_changes(
                         &odb,
                         resource_cache,
@@ -373,6 +380,7 @@ pub fn file(
                     source_id,
                     id,
                 } => {
+                    push_move_parent(&mut move_parents, *parent_id, source_id, &source_location);
                     let (changes, data) = blob_changes(
                         &odb,
                         resource_cache,
@@ -439,6 +447,23 @@ pub fn file(
             );
         }
 
+        // "Optionally find moves in parents' files." (`blame.c`, `pass_blame`)
+        if let Some(move_score) = options.detect_moved {
+            hunks_to_blame = moved::find_moves_in_parents(
+                hunks_to_blame,
+                suspect,
+                &move_parents,
+                file_path,
+                move_score,
+                &blamed_file_blob,
+                &blamed_line_starts,
+                &odb,
+                options.diff_algorithm,
+                options.ignore_whitespace,
+                &mut stats,
+            )?;
+        }
+
         // git's `assign_blame()` hands the entries a commit stayed responsible for to
         // `found_guilty_entry()` right here, in `origin->suspects` order — which `blame_merge()`
         // keeps sorted by the line in the *Blamed File*. `sort_batch_from` restores that order for
@@ -490,6 +515,22 @@ pub fn file(
 /// from `origin->suspects`, a list `blame_merge()` keeps sorted by that same position.
 fn sort_batch_from(out: &mut [BlameEntry], batch_start: usize) {
     out[batch_start..].sort_by_key(|entry| entry.start_in_blamed_file);
+}
+
+/// Record one parent's `sg_origin[]` entry for `-M`.
+///
+/// git skips a parent whose blob an earlier parent already contributed (`pass_blame`'s `same`
+/// check), so that a merge does not offer the same content twice.
+fn push_move_parent(
+    parents: &mut Vec<moved::ParentOrigin>,
+    parent_id: ObjectId,
+    blob_id: ObjectId,
+    path: &BString,
+) {
+    if parents.iter().any(|(_, blob, _)| *blob == blob_id) {
+        return;
+    }
+    parents.push((parent_id, blob_id, path.clone()));
 }
 
 /// Pass ownership of each unblamed hunk of `from` to `to`.
@@ -847,8 +888,6 @@ fn blob_changes(
     stats: &mut Statistics,
     collect_data: bool,
 ) -> Result<BlobChanges, Error> {
-    use gix_diff::blob::Hunk;
-
     resource_cache.set_resource(
         previous_oid,
         gix_object::tree::EntryKind::Blob,
@@ -882,35 +921,48 @@ fn blob_changes(
         gix_diff::blob::InternedInput::new(old_data, new_data)
     };
 
-    let mut diff = gix_diff::blob::Diff::compute(diff_algorithm, &input);
-    diff.postprocess_lines(&input);
+    let diff = gix_diff::blob::Diff::compute(diff_algorithm, &input);
+    // Which of several equally minimal placements a slider ends up in decides which commit a line
+    // is blamed on, so the edit script is compacted exactly as git's `xdl_change_compact()` does it
+    // rather than by `imara-diff`'s postprocessor. The indent heuristic measures the *original*
+    // lines even when `-w` had the compared ones stripped, as git's `get_indent()` reads
+    // `xdf->recs[i]->ptr`.
+    let compacted = compact::change_compact(
+        &diff,
+        diff_algorithm,
+        &input.before,
+        &input.after,
+        &compact::line_indents(old_data),
+        &compact::line_indents(new_data),
+    );
 
     let mut last_seen_after_end = 0;
-    let mut changes = diff.hunks().fold(Vec::new(), |mut hunks, hunk| {
-        let Hunk { before, after } = hunk;
-
-        // This checks for unchanged hunks.
-        if after.start > last_seen_after_end {
-            hunks.push(Change::Unchanged(last_seen_after_end..after.start));
-        }
-
-        match (!before.is_empty(), !after.is_empty()) {
-            (_, true) => {
-                hunks.push(Change::AddedOrReplaced(
-                    after.start..after.end,
-                    before.end - before.start,
-                ));
+    let mut changes = compacted
+        .hunks()
+        .into_iter()
+        .fold(Vec::new(), |mut hunks, (before, after)| {
+            // This checks for unchanged hunks.
+            if after.start > last_seen_after_end {
+                hunks.push(Change::Unchanged(last_seen_after_end..after.start));
             }
-            (true, false) => {
-                hunks.push(Change::Deleted(after.start, before.end - before.start));
+
+            match (!before.is_empty(), !after.is_empty()) {
+                (_, true) => {
+                    hunks.push(Change::AddedOrReplaced(
+                        after.start..after.end,
+                        before.end - before.start,
+                    ));
+                }
+                (true, false) => {
+                    hunks.push(Change::Deleted(after.start, before.end - before.start));
+                }
+                (false, false) => unreachable!("BUG: the edit script has no empty hunks"),
             }
-            (false, false) => unreachable!("BUG: imara-diff provided a non-change"),
-        }
 
-        last_seen_after_end = after.end;
+            last_seen_after_end = after.end;
 
-        hunks
-    });
+            hunks
+        });
 
     let total_number_of_lines = input.after.len() as u32;
     if input.after.len() > last_seen_after_end as usize {
@@ -985,7 +1037,7 @@ pub(crate) fn tokens_for_diffing(data: &[u8]) -> impl TokenSource<Token = &[u8]>
 /// `\n`, so `git blame -w` (`XDF_IGNORE_WHITESPACE`) treats a whitespace-only line change as no
 /// change. Keeping every `\n` preserves the line count, so a diff of the stripped data yields
 /// hunk line-indices that still map one-to-one onto the original lines.
-fn strip_whitespace_per_line(data: &[u8]) -> Vec<u8> {
+pub(super) fn strip_whitespace_per_line(data: &[u8]) -> Vec<u8> {
     data.iter()
         .copied()
         .filter(|&b| b == b'\n' || !matches!(b, b' ' | b'\t' | b'\r' | 0x0c | 0x0b))

@@ -346,16 +346,36 @@ fn load_config() -> Result<TrailerConfig> {
                 continue;
             }
             let idx = get_conf_item(&mut cfg, &alias);
-            let conf_key = format!("trailer.{}.{name}", String::from_utf8_lossy(&alias));
+            let alias = String::from_utf8_lossy(&alias).into_owned();
             let item = &mut cfg.items[idx];
 
-            let ok = match name.as_str() {
-                "key" => set_once(&mut item.key, value.clone(), &conf_key),
-                "command" => set_once(&mut item.command, value.clone(), &conf_key),
-                "cmd" => set_once(&mut item.cmd, value.clone(), &conf_key),
-                "where" => set_where(&mut item.where_, Some(value.as_slice())),
-                "ifexists" => set_if_exists(&mut item.if_exists, Some(value.as_slice())),
-                "ifmissing" => set_if_missing(&mut item.if_missing, Some(value.as_slice())),
+            // Each arm names the variable it consumes, so the key it honours is
+            // spelled out where it is read rather than reassembled from `name`.
+            let (ok, conf_key) = match name.as_str() {
+                "key" => {
+                    let k = format!("trailer.{alias}.key");
+                    (set_once(&mut item.key, value.clone(), &k), k)
+                }
+                "command" => {
+                    let k = format!("trailer.{alias}.command");
+                    (set_once(&mut item.command, value.clone(), &k), k)
+                }
+                "cmd" => {
+                    let k = format!("trailer.{alias}.cmd");
+                    (set_once(&mut item.cmd, value.clone(), &k), k)
+                }
+                "where" => (
+                    set_where(&mut item.where_, Some(value.as_slice())),
+                    format!("trailer.{alias}.where"),
+                ),
+                "ifexists" => (
+                    set_if_exists(&mut item.if_exists, Some(value.as_slice())),
+                    format!("trailer.{alias}.ifexists"),
+                ),
+                "ifmissing" => (
+                    set_if_missing(&mut item.if_missing, Some(value.as_slice())),
+                    format!("trailer.{alias}.ifmissing"),
+                ),
                 _ => unreachable!("filtered above"),
             };
             if !ok {

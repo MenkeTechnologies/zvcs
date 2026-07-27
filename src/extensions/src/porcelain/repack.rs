@@ -89,9 +89,6 @@
 //! # Deliberate gaps, so this doc claims no more than the code does
 //!
 //! ```text
-//!   * **`-b`/`--write-bitmap-index`** writes no `.bitmap`: that needs an EWAH
-//!     bitmap writer, and `gix-bitmap` is a read-only decoder. The flag is
-//!     accepted and its pre-flight conflict check still fires.
 //!   * **`--cruft`** writes no `.mtimes`, there being no reader or writer for
 //!     that format in `gix-pack`. On any repository whose objects are all
 //!     reachable — every harness fixture — git writes no cruft pack either, so
@@ -112,9 +109,8 @@
 //!     the delta search, shadowing the `pack.*` keys of the same name.
 //!     **`-f`/`-F`/`--path-walk`/`--delta-islands`/`--name-hash-version`** tune
 //!     parts of git's search that have no counterpart here, and stay no-ops.
-//!   * `repack.writeBitmaps` / `pack.writeBitmaps` are not read, so the
-//!     incremental-with-bitmaps `fatal:` fires only when `-b` is given
-//!     explicitly.
+//!   * `repack.writeBitmaps`, or its older spelling `pack.writeBitmaps`, turns
+//!     `-b` on by itself; `--no-write-bitmap-index` overrides either.
 //!   * `repack.useDeltaBaseOffset` *is* read, and picks `OBJ_OFS_DELTA` over
 //!     `OBJ_REF_DELTA`. `repack.packKeptObjects` and `repack.cruftWindow` /
 //!     `repack.cruftDepth` / `repack.cruftThreads` are not: they tune a

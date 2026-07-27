@@ -282,6 +282,17 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
+    // Same story for the `color.interactive.<slot>` table: `git_clean_config()`
+    // runs `color_parse()` on every slot it recognizes — including `plain`, which
+    // the UI never prints — so a spec git's parser rejects aborts even a plain
+    // `git clean -n`.
+    if let Some((key, spec, meta)) =
+        super::color::first_invalid_slot(&repo, "color.interactive", &CleanColors::SLOTS)
+    {
+        return Ok(super::color::invalid_color_fatal(&key, &spec, &meta));
+    }
+    let colors = CleanColors::resolve(&repo);
+
     // The prefix is the repo-relative current directory; it scopes the walk when
     // no pathspec is given, and every reported path is rendered relative to it.
     let prefix: BString = repo
@@ -410,7 +421,7 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
     // to the survivors that the removal pass below then deletes (or, with `-n`,
     // reports). With nothing to clean the loop is a no-op, matching git.
     if interactive {
-        targets = interactive_main_loop(&repo, targets, &prefix_parts, colopts);
+        targets = interactive_main_loop(&repo, targets, &prefix_parts, colopts, &colors);
     }
 
     let mut out = String::new();
@@ -739,10 +750,84 @@ fn quote_path(path: impl AsRef<[u8]>) -> String {
 // A candidate is the same `(sort-key, repo-relative path, is_dir)` triple the
 // non-interactive path builds. `interactive_main_loop` mutates the live list in
 // place and returns the survivors, which `clean` then deletes (or, under `-n`,
-// reports) exactly as before. Colour is deliberately omitted: git's colour is
-// `auto`, so it is off whenever stdout is not a TTY — which is the byte-for-byte
-// case that matters for pipes and CI.
+// reports) exactly as before.
 // ---------------------------------------------------------------------------
+
+/// `builtin/clean.c`'s `clean_colors[]`, resolved from `color.interactive` and
+/// the `color.interactive.<slot>` overrides. Every field is the empty string
+/// when coloring is off, matching `clean_get_color()`, so the call sites can
+/// interpolate unconditionally.
+///
+/// `git clean -i` is the only command that reads the full six-slot table:
+/// `add -i`/`add -p` share `header`/`help`/`prompt`/`error` but hard-code their
+/// reset, and neither reads `plain`.
+pub(crate) struct CleanColors {
+    /// `color.interactive.error`, default bold red — `Huh (…)?`, the
+    /// "cannot find items matched by" warning, "No more files to clean".
+    error: String,
+    /// `color.interactive.header`, default bold — `Would remove …` and
+    /// `*** Commands ***`.
+    header: String,
+    /// `color.interactive.help`, default bold red — both help screens.
+    help: String,
+    /// `color.interactive.prompt`, default bold blue — every prompt, and the
+    /// hotkey letter highlighted inside each menu entry.
+    prompt: String,
+    /// `color.interactive.reset`, default `\e[m` — the sequence that closes
+    /// every one of the above. git makes it a configurable slot of its own, so
+    /// setting it replaces the reset everywhere in the interactive UI.
+    reset: String,
+}
+
+impl CleanColors {
+    /// `color_interactive_slots[]` — every name `git_clean_config()` accepts
+    /// under `color.interactive.`. `plain` is in the table because the callback
+    /// parses (and so validates) it, even though `builtin/clean.c` never prints
+    /// the slot.
+    pub(crate) const SLOTS: [&'static str; 6] =
+        ["error", "header", "help", "plain", "prompt", "reset"];
+
+    /// Resolve the table to SGR sequences. The validation half of
+    /// `git_clean_config()` lives in `color::first_invalid_slot`, which the
+    /// caller runs first.
+    fn resolve(repo: &gix::Repository) -> Self {
+        let on = super::color::want_color_stdout(repo, "interactive");
+        let snap = repo.config_snapshot();
+        let slot = |name: &str, default: &str| -> String {
+            if !on {
+                return String::new();
+            }
+            let spec = snap
+                .string(&format!("color.interactive.{name}"))
+                .map(|v| v.to_string());
+            match spec {
+                // git's `reset` slot defaults to the literal `\e[m`, which the
+                // spec parser would render from the `reset` attribute as `\e[0m`.
+                None if name == "reset" => "\x1b[m".to_string(),
+                None => super::color::parse_color_spec(default).unwrap_or_default(),
+                Some(s) => super::color::parse_color_spec(&s).unwrap_or_default(),
+            }
+        };
+        CleanColors {
+            error: slot("error", "bold red"),
+            header: slot("header", "bold"),
+            help: slot("help", "bold red"),
+            prompt: slot("prompt", "bold blue"),
+            reset: slot("reset", "reset"),
+        }
+    }
+}
+
+/// `interactive_main_loop`'s `struct menu_item menus[]`: hotkey letter and title,
+/// in the order the menu numbers them.
+const MENU: [(u8, &str); 6] = [
+    (b'c', "clean"),
+    (b'f', "filter by pattern"),
+    (b's', "select by numbers"),
+    (b'a', "ask each"),
+    (b'q', "quit"),
+    (b'h', "help"),
+];
 
 const PROMPT_HELP_SINGLETON: &str = concat!(
     "Prompt help:\n",
@@ -881,6 +966,7 @@ fn parse_choice(
     input: &str,
     chosen: &mut [bool],
     find: impl Fn(&str) -> i64,
+    c: &CleanColors,
 ) {
     let is_sep = |c: char| {
         if is_single {
@@ -924,7 +1010,8 @@ fn parse_choice(
             || bottom > top
             || (is_single && bottom != top)
         {
-            println!("Huh ({s})?");
+            println!("{}Huh ({s})?", c.error);
+            print!("{}", c.reset);
             continue;
         }
         for i in bottom..=top {
@@ -937,14 +1024,6 @@ fn parse_choice(
 /// otherwise a case-insensitive unique title prefix. Returns a 1-based index, 0
 /// for none/ambiguous, or -1 for an ambiguous hotkey (both rejected downstream).
 fn find_unique_menu(choice: &str) -> i64 {
-    const MENU: [(u8, &str); 6] = [
-        (b'c', "clean"),
-        (b'f', "filter by pattern"),
-        (b's', "select by numbers"),
-        (b'a', "ask each"),
-        (b'q', "quit"),
-        (b'h', "help"),
-    ];
     let len = choice.len();
     let cb = choice.as_bytes();
     let mut found: i64 = 0;
@@ -988,50 +1067,71 @@ fn find_unique_strings(items: &[String], choice: &str) -> i64 {
 }
 
 /// git's `help_cmd`: the command reference, closed by the trailing newline
-/// `printf_ln` adds.
-fn help_cmd() {
-    print!(concat!(
-        "clean               - start cleaning\n",
-        "filter by pattern   - exclude items from deletion\n",
-        "select by numbers   - select items to be deleted by numbers\n",
-        "ask each            - confirm each deletion (like \"rm -i\")\n",
-        "quit                - stop cleaning\n",
-        "help                - this screen\n",
-        "?                   - help for prompt selection\n",
-    ));
+/// `printf_ln` adds and then by the reset slot.
+fn help_cmd(c: &CleanColors) {
+    print!(
+        concat!(
+            "{}",
+            "clean               - start cleaning\n",
+            "filter by pattern   - exclude items from deletion\n",
+            "select by numbers   - select items to be deleted by numbers\n",
+            "ask each            - confirm each deletion (like \"rm -i\")\n",
+            "quit                - stop cleaning\n",
+            "help                - this screen\n",
+            "?                   - help for prompt selection\n",
+            "{}",
+        ),
+        c.help, c.reset
+    );
 }
 
 /// git's singleton `list_and_choose` over the command menu. Reprints the header,
 /// the highlighted menu and the `What now> ` prompt until a command resolves;
 /// `?` prints prompt help, an empty line re-prompts, and EOF returns `None`.
-fn list_and_choose_menu(stdin: &mut impl std::io::BufRead) -> Option<usize> {
-    const MENU: [&str; 6] = [
-        "clean",
-        "filter by pattern",
-        "select by numbers",
-        "ask each",
-        "quit",
-        "help",
-    ];
+fn list_and_choose_menu(stdin: &mut impl std::io::BufRead, c: &CleanColors) -> Option<usize> {
     loop {
-        println!("*** Commands ***");
+        // `printf_ln("%s%s%s", HEADER, header, RESET)` — the reset precedes the
+        // newline here, unlike the `Would remove …` banner.
+        println!("{}*** Commands ***{}", c.header, c.reset);
         let disp: Vec<String> = MENU
             .iter()
             .enumerate()
-            .map(|(i, title)| format!(" {:2}: {}", i + 1, title))
+            .map(|(i, (hotkey, title))| {
+                format!(" {:2}: {}", i + 1, highlight_hotkey(title, *hotkey as char, c))
+            })
             .collect();
         print!("{}", print_menu_columns(&disp));
-        print!("What now> ");
+        print!("{}What now> {}", c.prompt, c.reset);
         let line = read_line_interactively(stdin)?;
         if line == "?" {
-            print!("{PROMPT_HELP_SINGLETON}");
+            print!("{}{PROMPT_HELP_SINGLETON}{}", c.help, c.reset);
             continue;
         }
         let mut chosen = [false; 6];
-        parse_choice(MENU.len(), true, &line, &mut chosen, find_unique_menu);
+        parse_choice(MENU.len(), true, &line, &mut chosen, find_unique_menu, c);
         if let Some(idx) = chosen.iter().position(|&c| c) {
             return Some(idx);
         }
+    }
+}
+
+/// git's `print_highlight_menu_stuff`: paint the first occurrence of the entry's
+/// hotkey letter with the prompt slot. With coloring off this is the title
+/// unchanged, so the plain layout (and its column widths) is untouched.
+fn highlight_hotkey(title: &str, hotkey: char, c: &CleanColors) -> String {
+    if c.prompt.is_empty() && c.reset.is_empty() {
+        return title.to_string();
+    }
+    match title.find(hotkey) {
+        Some(at) => format!(
+            "{}{}{}{}{}",
+            &title[..at],
+            c.prompt,
+            hotkey,
+            c.reset,
+            &title[at + hotkey.len_utf8()..]
+        ),
+        None => title.to_string(),
     }
 }
 
@@ -1043,6 +1143,7 @@ fn list_and_choose_strings(
     shown: &[String],
     prompt: &str,
     stdin: &mut impl std::io::BufRead,
+    c: &CleanColors,
 ) -> Vec<usize> {
     let nr = shown.len();
     let mut chosen = vec![false; nr];
@@ -1053,7 +1154,7 @@ fn list_and_choose_strings(
             .map(|(i, s)| format!("{}{:2}: {}", if chosen[i] { "*" } else { " " }, i + 1, s))
             .collect();
         print!("{}", print_menu_columns(&disp));
-        print!("{prompt}>> ");
+        print!("{}{prompt}>> {}", c.prompt, c.reset);
         let line = match read_line_interactively(stdin) {
             Some(l) => l,
             None => {
@@ -1063,15 +1164,20 @@ fn list_and_choose_strings(
             }
         };
         if line == "?" {
-            print!("{PROMPT_HELP_MULTI}");
+            print!("{}{PROMPT_HELP_MULTI}{}", c.help, c.reset);
             continue;
         }
         if line.is_empty() {
             break;
         }
-        parse_choice(nr, false, &line, &mut chosen, |s| {
-            find_unique_strings(shown, s)
-        });
+        parse_choice(
+            nr,
+            false,
+            &line,
+            &mut chosen,
+            |s| find_unique_strings(shown, s),
+            c,
+        );
     }
     (0..nr).filter(|&i| chosen[i]).collect()
 }
@@ -1081,10 +1187,11 @@ fn select_by_numbers_cmd(
     del: &mut Vec<(BString, BString, bool)>,
     prefix_parts: &[&[u8]],
     stdin: &mut impl std::io::BufRead,
+    c: &CleanColors,
 ) {
     let shown = shown_paths(del, prefix_parts);
     let keep: std::collections::HashSet<usize> =
-        list_and_choose_strings(&shown, "Select items to delete", stdin)
+        list_and_choose_strings(&shown, "Select items to delete", stdin, c)
             .into_iter()
             .collect();
     let mut i = 0usize;
@@ -1132,6 +1239,7 @@ fn filter_by_patterns_cmd(
     prefix_parts: &[&[u8]],
     stdin: &mut impl std::io::BufRead,
     colopts: u32,
+    c: &CleanColors,
 ) {
     let parse = gix::ignore::search::Ignore {
         support_precious: repo
@@ -1149,7 +1257,7 @@ fn filter_by_patterns_cmd(
             let shown = shown_paths(del, prefix_parts);
             print!("{}", print_dels_columns(colopts, &shown));
         }
-        print!("Input ignore patterns>> ");
+        print!("{}Input ignore patterns>> {}", c.prompt, c.reset);
         let line = match read_line_interactively(stdin) {
             Some(l) => l,
             None => {
@@ -1182,7 +1290,8 @@ fn filter_by_patterns_cmd(
             !excluded
         });
         if changed == 0 {
-            println!("WARNING: Cannot find items matched by: {line}");
+            println!("{}WARNING: Cannot find items matched by: {line}", c.error);
+            print!("{}", c.reset);
         }
     }
 }
@@ -1195,23 +1304,28 @@ fn interactive_main_loop(
     mut del: Vec<(BString, BString, bool)>,
     prefix_parts: &[&[u8]],
     colopts: u32,
+    c: &CleanColors,
 ) -> Vec<(BString, BString, bool)> {
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
 
     while !del.is_empty() {
+        // `clean_print_color(HEADER)`, `printf_ln(…)`, `clean_print_color(RESET)`
+        // — so the reset lands *after* the newline, not before it.
         if del.len() == 1 {
-            println!("Would remove the following item:");
+            println!("{}Would remove the following item:", c.header);
         } else {
-            println!("Would remove the following items:");
+            println!("{}Would remove the following items:", c.header);
         }
+        print!("{}", c.reset);
         let shown = shown_paths(&del, prefix_parts);
         print!("{}", print_dels_columns(colopts, &shown));
 
-        match list_and_choose_menu(&mut stdin) {
+        match list_and_choose_menu(&mut stdin, c) {
             // EOF at the command prompt behaves exactly like `quit`.
             None | Some(4) => {
                 del.clear();
+                // `quit_cmd()` is one of the few notices git leaves unpainted.
                 println!("Bye.");
                 break;
             }
@@ -1219,17 +1333,19 @@ fn interactive_main_loop(
             Some(0) => break,
             // filter by pattern.
             Some(1) => {
-                filter_by_patterns_cmd(repo, &mut del, prefix_parts, &mut stdin, colopts);
+                filter_by_patterns_cmd(repo, &mut del, prefix_parts, &mut stdin, colopts, c);
                 if del.is_empty() {
-                    println!("No more files to clean, exiting.");
+                    println!("{}No more files to clean, exiting.", c.error);
+                    print!("{}", c.reset);
                     break;
                 }
             }
             // select by numbers.
             Some(2) => {
-                select_by_numbers_cmd(&mut del, prefix_parts, &mut stdin);
+                select_by_numbers_cmd(&mut del, prefix_parts, &mut stdin, c);
                 if del.is_empty() {
-                    println!("No more files to clean, exiting.");
+                    println!("{}No more files to clean, exiting.", c.error);
+                    print!("{}", c.reset);
                     break;
                 }
             }
@@ -1239,7 +1355,7 @@ fn interactive_main_loop(
                 break;
             }
             // help, then re-display and loop.
-            Some(5) => help_cmd(),
+            Some(5) => help_cmd(c),
             Some(_) => unreachable!("the command menu has exactly six entries"),
         }
     }

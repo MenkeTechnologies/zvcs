@@ -33,6 +33,16 @@ pub struct File {
     path: std::path::PathBuf,
     hash_len: usize,
     object_hash: gix_hash::Kind,
+    /// The `BIDX` chunk: one big-endian `u32` per commit, in lexicographical
+    /// order, giving the end of that commit's filter as a byte offset into the
+    /// filter data. Present only alongside `bloom_data_range`.
+    bloom_indexes_offset: Option<usize>,
+    /// The `BDAT` chunk, including its twelve-byte header.
+    bloom_data_range: Option<std::ops::Range<usize>>,
+    /// The three `u32`s at the head of `BDAT`, which say how the filters after
+    /// it were built. `max_changed_paths` is not stored in the file and is
+    /// git's default.
+    bloom_filter_settings: Option<bloom::Settings>,
 }
 
 /// A complete commit graph.
@@ -50,6 +60,7 @@ pub fn at(path: impl AsRef<Path>) -> Result<Graph, Exn<Message>> {
 }
 
 mod access;
+pub mod bloom;
 pub mod file;
 ///
 pub mod init;

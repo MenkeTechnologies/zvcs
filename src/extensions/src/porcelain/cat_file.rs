@@ -660,7 +660,7 @@ fn resolve_transform_spec(
 /// of it: map a path to the driver named by its `diff` gitattribute, look up that
 /// driver's `diff.<name>.textconv` program, and run it over the blob's
 /// checked-out content.
-struct Textconv<'repo> {
+pub(crate) struct Textconv<'repo> {
     repo: &'repo gix::Repository,
     /// The gitattributes stack in git's default check-in direction (worktree
     /// `.gitattributes` first, index as the fallback), which is what
@@ -674,7 +674,7 @@ struct Textconv<'repo> {
 }
 
 /// Whether the blob was converted, and how it failed if it was not.
-enum Converted {
+pub(crate) enum Converted {
     /// The driver's stdout.
     Text(Vec<u8>),
     /// No `diff` attribute, no such driver, or the driver has no `textconv`:
@@ -686,7 +686,7 @@ enum Converted {
 }
 
 impl<'repo> Textconv<'repo> {
-    fn new(repo: &'repo gix::Repository) -> Result<Self> {
+    pub(crate) fn new(repo: &'repo gix::Repository) -> Result<Self> {
         let (pipeline, index) = repo.filter_pipeline(None)?;
         // The stack copies out the id-mappings it needs, so the index it was
         // built from does not have to outlive it.
@@ -735,7 +735,7 @@ impl<'repo> Textconv<'repo> {
 
     /// `textconv_object()`: run the path's textconv program over `blob`, or report
     /// that no driver applies.
-    fn convert(&mut self, path: &BStr, blob: &[u8]) -> Result<Converted> {
+    pub(crate) fn convert(&mut self, path: &BStr, blob: &[u8]) -> Result<Converted> {
         let Some(program) = self.program(path)? else {
             return Ok(Converted::NoDriver);
         };

@@ -12,10 +12,14 @@
 //! `ERR upload-pack: not our ref <oid>` and exit 128 unless
 //! `uploadpack.allowTipSHA1InWant`, `uploadpack.allowReachableSHA1InWant` or
 //! `uploadpack.allowAnySHA1InWant` widens it (see [`WantPolicy`]).
-//! Shallow/deepen and object filters are not negotiated (ignored); stateless-RPC
-//! (smart-HTTP) beyond `--advertise-refs` is not modelled other than in that want
-//! policy. Argument parsing and repository resolution are checked against git
-//! 2.55.0 on Darwin:
+//! Object filters *are* negotiated when `uploadpack.allowFilter` is on: the
+//! `filter` capability is advertised, a `filter <spec>` line is honoured by
+//! leaving the filtered objects out of the pack, and a spec that
+//! `uploadpackfilter.*` bans — or that this server cannot apply — is refused
+//! with an `ERR` pkt-line (see [`filter_ban_reason`]). Shallow/deepen is still
+//! not negotiated (ignored); stateless-RPC (smart-HTTP) beyond
+//! `--advertise-refs` is not modelled other than in that want policy. Argument
+//! parsing and repository resolution are checked against git 2.55.0 on Darwin:
 //!
 //!   * `-h` → the 368-byte usage block on **stdout**, exit 129, before any
 //!     repository is touched (so it works outside a repository).
@@ -38,18 +42,17 @@
 //!     not appear to be a git repository` on **stderr**, exit 128, quoting the
 //!     argument exactly as given.
 //!
-//! Once a repository *does* resolve, this bails. The missing substrate,
-//! concretely:
+//! What is *not* served, and why:
 //!
-//!   1. **There is no server-side protocol implementation in the vendored
-//!      crates.** `src/ported/gix-protocol/src/` contains `handshake`, `fetch`,
-//!      `ls_refs` and `command` — all of it the *client* talking to a remote.
-//!      Its `Cargo.toml` gates everything behind `blocking-client` /
-//!      `async-client`; there is no server feature and no server module. The
-//!      only mentions of "upload-pack" under `gix-transport/src` are call sites
-//!      that *spawn* someone else's `upload-pack`. Nothing implements the
-//!      `want`/`have`/`ACK`/`NAK` state machine from the serving side, shallow
-//!      /deepen handling, or `ref-in-want`.
+//!   1. **Protocol v2.** `src/ported/gix-protocol/src/` is the client half only
+//!      — `handshake`, `fetch`, `ls_refs`, `command`, all gated behind
+//!      `blocking-client`/`async-client`, with no server feature and no server
+//!      module. The v0 `want`/`have`/`ACK`/`NAK` state machine above is written
+//!      here rather than taken from a crate; v2's `command=fetch`/`ls-refs`
+//!      framing is not, so `GIT_PROTOCOL=version=2` gets the v0 advertisement
+//!      and every client downgrades. Everything v2-only — `ref-in-want`,
+//!      `wait-for-done`, `server-option`, `uploadpack.allowSidebandAll`,
+//!      `uploadpack.blobPackfileURI` — is out of reach until it lands.
 //!   2. **The capability advertisement is a function of the git binary, not of
 //!      the repository.** Every advertisement line stock git emits ends with
 //!      `agent=git/2.55.0-Darwin` — the installed git's version string and
@@ -57,15 +60,21 @@
 //!      crates, and hardcoding one build's value would produce output that
 //!      matches on exactly one machine. Parts of the list are equally
 //!      environmental: `no-done` is advertised for `--advertise-refs` but not
-//!      for the full v0 exchange, and `filter` and `ref-in-want` appear only
-//!      when the matching `uploadpack.*` config is set. The two
-//!      `allow-*-sha1-in-want` tokens *are* ported — see [`WantPolicy`] — because
-//!      they are a policy this server can actually enforce.
-//!   3. **Pack generation is not wired to a protocol.** `gix-pack` has
-//!      `data::output` (`count`, `entry`) for building a pack, but nothing
-//!      turns a negotiated want/have set into a side-band-multiplexed stream
-//!      with progress on band 2, and there is no thin-pack or `include-tag`
-//!      support on the sending side.
+//!      for the full v0 exchange, and `ref-in-want` is protocol v2, which this
+//!      server does not speak. The two `allow-*-sha1-in-want` tokens and
+//!      `filter` *are* ported — see [`WantPolicy`] — because each is a policy
+//!      this server can actually enforce.
+//!   3. **The pack is built in one piece, not streamed.**
+//!      `pack_objects::pack_bytes_for` returns a finished `Vec<u8>` before a
+//!      byte goes out, so there is no silent producer to interleave keepalives
+//!      with (`uploadpack.keepAlive`, upload-pack.c:382-498) and no progress on
+//!      band 2. It is also built in-process, so there is no `pack-objects`
+//!      argument vector to hand to `uploadpack.packObjectsHook` — which would
+//!      additionally need the protected-config scope that keeps a cloned
+//!      repository's own `.git/config` from running commands on the serving
+//!      machine (upload-pack.c:1387, `git_protected_config`). Both keys are
+//!      therefore unread rather than half-honoured. The pack is also never
+//!      thin, and `include-tag` is advertised but not acted on.
 //!
 //! These paths are deliberately not approximated. An `upload-pack` that exited 0
 //! having written a plausible-looking but wrong advertisement would corrupt the
@@ -341,6 +350,11 @@ fn serve(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool) -> R
     // --- wants (until flush); the first `want` carries the client's caps ---------
     let mut wants: Vec<ObjectId> = Vec::new();
     let mut want_caps: Vec<u8> = Vec::new();
+    // `data->filter_capability_requested` and `data->filter_options`. The first
+    // `want` carries the client's caps, and only a client that asked for
+    // `filter` there may send a `filter` line (upload-pack.c:1143-1145).
+    let mut filter_requested = false;
+    let mut filter_spec: Option<String> = None;
     while let Some(line) = read_pkt(&mut stdin)? {
         let text = String::from_utf8_lossy(&line);
         let text = text.trim_end();
@@ -354,10 +368,32 @@ fn serve(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool) -> R
             if want_caps.is_empty() {
                 if let Some(caps) = it.next() {
                     want_caps = caps.as_bytes().to_vec();
+                    filter_requested = policy.filter && cap_present(&want_caps, b"filter");
                 }
             }
+            continue;
         }
-        // `shallow`/`deepen*`/`filter` lines are ignored (not negotiated).
+        // `filter <spec>` (upload-pack.c:1109-1116).
+        if let Some(spec) = text.strip_prefix("filter ") {
+            if !filter_requested {
+                bail!("git upload-pack: filtering capability not negotiated");
+            }
+            // `list_objects_filter_die_if_populated()`.
+            if filter_spec.is_some() {
+                bail!("multiple filter-specs cannot be combined");
+            }
+            if let Some(err) = filter_ban_reason(repo, spec) {
+                // `send_err_and_die()`: the reason reaches the client as an
+                // `ERR` pkt-line before the command dies.
+                let mut out = std::io::stdout().lock();
+                write_pkt(&mut out, format!("ERR {err}").as_bytes())?;
+                out.flush()?;
+                bail!("{err}");
+            }
+            filter_spec = Some(spec.to_string());
+            continue;
+        }
+        // `shallow`/`deepen*` lines are ignored (not negotiated).
     }
     if wants.is_empty() {
         return Ok(ExitCode::SUCCESS); // client hung up after the advertisement (ls-remote)
@@ -413,7 +449,9 @@ fn serve(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool) -> R
     out.flush()?;
 
     // --- build + stream the pack -------------------------------------------------
-    let objects = crate::porcelain::push_proto::objects_to_send(repo, &wants, &common);
+    let mut objects = crate::porcelain::push_proto::objects_to_send(repo, &wants, &common);
+    // `--filter=<spec>` on the `pack-objects` git spawns (upload-pack.c:340-344).
+    crate::porcelain::pack_objects::apply_filter(repo, filter_spec.as_deref(), &mut objects);
     let pack = crate::porcelain::pack_objects::pack_bytes_for(repo, &objects)?;
     if cap_present(&want_caps, b"side-band-64k") || cap_present(&want_caps, b"side-band") {
         // Multiplex the pack on band 1 (≤ 65515 payload bytes per pkt-line), then a
@@ -515,8 +553,96 @@ fn capabilities(head_target: Option<&str>, policy: WantPolicy) -> String {
     if let Some(t) = head_target {
         caps.push_str(&format!(" symref=HEAD:{t}"));
     }
+    // `data->allow_filter ? " filter" : ""`, which `write_v0_ref()` places right
+    // after the symref info and before `object-format=` (upload-pack.c:1249-1261).
+    if policy.filter {
+        caps.push_str(" filter");
+    }
     caps.push_str(" object-format=sha1 agent=git/2.55.0-zvcs");
     caps
+}
+
+/// How a `filter <spec>` line is classified: the key it is allowed or banned
+/// under, whether this server can actually apply it, and the depth of a
+/// `tree:<n>`.
+struct FilterSpec {
+    /// `list_object_filter_config_name()` (list-objects-filter-options.c:17) —
+    /// the spec with its parameter dropped, which is what
+    /// `uploadpackfilter.<key>.allow` is keyed on.
+    key: &'static str,
+    /// Whether [`pack_objects::apply_filter`] removes the objects this spec
+    /// names. A spec it would silently ignore must be refused instead: a pack
+    /// that quietly contains everything the client asked to be left out is
+    /// worse than an error, because the client records the filter in
+    /// `remote.<name>.partialclonefilter` and treats the result as complete.
+    appliable: bool,
+    /// `opts->tree_exclude_depth`, for the `uploadpackfilter.tree.maxDepth` cap.
+    depth: Option<u64>,
+}
+
+/// `gently_parse_list_objects_filter()` — classify a filter spec, or `None`
+/// when it is not one.
+fn classify_filter(spec: &str) -> Option<FilterSpec> {
+    let simple = |key, appliable| Some(FilterSpec { key, appliable, depth: None });
+    match spec {
+        "blob:none" => simple("blob:none", true),
+        s if s.starts_with("sparse:oid=") => simple("sparse:oid", false),
+        s if s.starts_with("combine:") => simple("combine", false),
+        s => {
+            if let Some(limit) = s.strip_prefix("blob:limit=") {
+                // An unparseable magnitude is a spec error in git, and here it
+                // would make `apply_filter` a no-op.
+                return simple("blob:limit", super::pack_objects::magnitude(limit).is_some());
+            }
+            if let Some(kind) = s.strip_prefix("object:type=") {
+                let known = matches!(kind, "blob" | "tree" | "commit" | "tag");
+                return simple("object:type", known);
+            }
+            if let Some(depth) = s.strip_prefix("tree:") {
+                let depth = depth.parse::<u64>().ok()?;
+                // Only depth 0 is expressible without the walk's depth
+                // bookkeeping; see `apply_filter`.
+                return Some(FilterSpec { key: "tree", appliable: depth == 0, depth: Some(depth) });
+            }
+            None
+        }
+    }
+}
+
+/// `check_one_filter()` (upload-pack.c:1041) — why this server refuses to run
+/// `spec`, or `None` when it will.
+///
+/// Three things can refuse it. The spec may not parse. It may be banned by
+/// `uploadpackfilter.<key>.allow`, falling back to `uploadpackfilter.allow`,
+/// which itself defaults to true (`data->allow_filter_fallback = 1`,
+/// upload-pack.c:151); a `tree:<n>` is additionally capped by
+/// `uploadpackfilter.tree.maxDepth`, which defaults to zero. Or it may be one
+/// this server cannot apply, which git has no equivalent of — git implements
+/// every spec — and which reuses git's "not supported" wording because that is
+/// exactly what it means to the client.
+fn filter_ban_reason(repo: &gix::Repository, spec: &str) -> Option<String> {
+    // `gently_parse_list_objects_filter`'s catch-all.
+    let Some(parsed) = classify_filter(spec) else {
+        return Some(format!("invalid filter-spec '{spec}'"));
+    };
+    let config = repo.config_snapshot();
+
+    let fallback = config.boolean("uploadpackfilter.allow").unwrap_or(true);
+    let allowed =
+        config.boolean(format!("uploadpackfilter.{}.allow", parsed.key).as_str()).unwrap_or(fallback);
+    if !allowed || !parsed.appliable {
+        return Some(format!("filter '{}' not supported", parsed.key));
+    }
+    if let Some(depth) = parsed.depth {
+        let max = config
+            .integer("uploadpackfilter.tree.maxDepth")
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0);
+        if depth > max {
+            return Some(format!("tree filter allows max depth {max}, but got {depth}"));
+        }
+    }
+    None
 }
 
 /// git's `allow_uor` bitset: which object ids a client may name in a `want` line
@@ -535,6 +661,9 @@ struct WantPolicy {
     reachable: bool,
     /// `uploadpack.allowAnySHA1InWant` — a want may be any object in the repository.
     any: bool,
+    /// `uploadpack.allowFilter` — advertise `filter` and honour a `filter <spec>`
+    /// line by leaving the filtered objects out of the pack.
+    filter: bool,
 }
 
 impl WantPolicy {
@@ -550,6 +679,7 @@ impl WantPolicy {
                     .boolean("uploadpack.allowReachableSHA1InWant")
                     .unwrap_or(false),
             any,
+            filter: config.boolean("uploadpack.allowFilter").unwrap_or(false),
         }
     }
 
@@ -836,4 +966,56 @@ fn expand_tilde(path: &str) -> Result<PathBuf, String> {
         out.push(tail);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The four specs `apply_filter` implements are the four this server may
+    /// accept. Everything else has to be refused, because accepting it would
+    /// send a pack containing exactly what the client asked to be left out
+    /// while the client records the filter and treats the clone as complete.
+    #[test]
+    fn only_appliable_filter_specs_are_accepted() {
+        for spec in ["blob:none", "blob:limit=1k", "blob:limit=42", "tree:0", "object:type=blob"] {
+            let parsed = classify_filter(spec).unwrap_or_else(|| panic!("{spec} should parse"));
+            assert!(parsed.appliable, "{spec} is implemented by apply_filter");
+        }
+        for spec in [
+            "sparse:oid=main:paths",
+            "combine:blob:none+tree:0",
+            "tree:1",
+            "blob:limit=nonsense",
+            "object:type=nonsense",
+        ] {
+            let parsed = classify_filter(spec).unwrap_or_else(|| panic!("{spec} should parse"));
+            assert!(!parsed.appliable, "{spec} would be silently ignored, so it must be refused");
+        }
+        assert!(classify_filter("nonsense").is_none());
+        assert!(classify_filter("tree:notanumber").is_none());
+    }
+
+    /// The ban key drops the parameter, as `list_object_filter_config_name()`
+    /// does, so `uploadpackfilter.blob:limit.allow` covers every limit.
+    #[test]
+    fn filter_ban_key_drops_the_parameter() {
+        assert_eq!(classify_filter("blob:limit=1k").unwrap().key, "blob:limit");
+        assert_eq!(classify_filter("object:type=blob").unwrap().key, "object:type");
+        assert_eq!(classify_filter("tree:0").unwrap().key, "tree");
+        assert_eq!(classify_filter("blob:none").unwrap().key, "blob:none");
+    }
+
+    /// `filter` is advertised exactly when `uploadpack.allowFilter` is on, and
+    /// `write_v0_ref()` puts it after the symref info and before
+    /// `object-format=` (upload-pack.c:1249-1261).
+    #[test]
+    fn filter_capability_is_gated_and_positioned() {
+        let off = capabilities(Some("refs/heads/main"), WantPolicy::default());
+        assert!(!off.contains(" filter"), "{off}");
+
+        let policy = WantPolicy { filter: true, ..WantPolicy::default() };
+        let on = capabilities(Some("refs/heads/main"), policy);
+        assert!(on.contains(" symref=HEAD:refs/heads/main filter object-format=sha1 "), "{on}");
+    }
 }

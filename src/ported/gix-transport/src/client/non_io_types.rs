@@ -49,6 +49,12 @@ pub(crate) mod connect {
         /// Only the transports that spawn the service themselves honour it, which is `file://`/local paths and
         /// `ssh://` — the same ones git passes it to.
         pub upload_pack: Option<bstr::BString>,
+        /// Restrict connections to one IP address family, from git's `--ipv4`/`--ipv6`.
+        ///
+        /// `git://` narrows address resolution, `ssh://` passes `-4`/`-6` to the ssh program, and
+        /// `http(s)://` pins the resolver — the three places git's `transport_family` reaches.
+        /// `file://` has no socket and ignores it, as git does.
+        pub address_family: Option<crate::AddressFamily>,
     }
 
     /// The error used in `connect()`.

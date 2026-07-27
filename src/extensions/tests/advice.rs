@@ -264,6 +264,59 @@ fn push_rejection_advice_is_gated_by_slot_umbrella_and_alias() {
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
+/// `git rm <path-outside-the-sparse-checkout>`: `builtin/rm.c` leaves such an
+/// entry out of the removal list, so the pathspec matches nothing and git reports
+/// it through `advise_on_updating_sparse_paths()` instead of dying. The
+/// three-line preamble and the path list are ungated writes; only the closing
+/// suggestion is behind `advice.updateSparsePath`. Either way the entry survives
+/// and the command exits 1 — which `--sparse` reverses.
+#[test]
+fn update_sparse_path_report_is_gated_and_leaves_the_entry_alone() {
+    let (repo, home) = fixture("updatesparsepath");
+    std::fs::create_dir_all(repo.join("alpha")).unwrap();
+    std::fs::create_dir_all(repo.join("beta")).unwrap();
+    write(&repo, "alpha/f", "in\n");
+    write(&repo, "beta/f", "out\n");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "one"]);
+    git(&repo, &["sparse-checkout", "set", "--no-cone", "alpha"]);
+
+    const PREAMBLE: &str = "outside of your sparse-checkout definition";
+    const HINT: &str = "* Use the --sparse option.";
+    const TRAILER: &str =
+        "Disable this message with \"git config set advice.updateSparsePath false\"";
+
+    let out = run(&repo, &home, &["rm", "beta/f"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(1), "the report is a failure status:\n{err}");
+    assert!(err.contains(PREAMBLE), "preamble shows by default:\n{err}");
+    assert!(err.contains("\nbeta/f\n"), "the offending pathspec is listed:\n{err}");
+    assert!(err.contains(HINT), "the suggestion shows by default:\n{err}");
+    assert!(err.contains(TRAILER), "an unconfigured slot carries the trailer:\n{err}");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("rm '"),
+        "nothing may be removed"
+    );
+
+    let out = run(&repo, &home, &["-c", "advice.updateSparsePath=false", "rm", "beta/f"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(1), "the status does not depend on the slot:\n{err}");
+    assert!(err.contains(PREAMBLE), "the preamble is not gated on the slot:\n{err}");
+    assert!(!err.contains(HINT), "a false slot drops the suggestion:\n{err}");
+
+    // `--sparse` puts the entry back in scope: it is removed and nothing is said.
+    let out = run(&repo, &home, &["rm", "--sparse", "beta/f"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "--sparse succeeds:\n{err}");
+    assert!(err.is_empty(), "--sparse prints no report:\n{err}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("rm 'beta/f'"),
+        "--sparse removes the entry"
+    );
+
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
 /// `GIT_ADVICE=0` squelches every hint whatever the config says.
 #[test]
 fn git_advice_env_squelches_all_hints() {

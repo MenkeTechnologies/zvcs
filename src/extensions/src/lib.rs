@@ -29,13 +29,37 @@ pub mod rcache;
 pub mod revfilter;
 pub mod superset;
 pub mod threads;
+pub mod trace2;
 pub mod worktree;
 
 use std::process::ExitCode;
 
 /// Parse `argv`, dispatch the subcommand, and return the process exit code.
 /// Errors are reported terse on stderr as `zvcs: <command>: <reason>`.
+///
+/// Wraps [`run_command`] in Trace2's session bracket, so the `start` record is
+/// written before any argument is looked at and the `exit`/`atexit` pair covers
+/// every path out — including the ones that return early. Both calls are inert
+/// unless a Trace2 event target is configured.
 pub fn run() -> ExitCode {
+    trace2::start(&std::env::args().collect::<Vec<_>>());
+    let code = run_command();
+    trace2::exit(exit_status(code));
+    code
+}
+
+/// The numeric status an [`ExitCode`] will hand the shell.
+///
+/// `ExitCode` exposes no accessor on stable Rust — only `From<u8>` and equality
+/// — so the value is recovered by finding the one byte that constructs an equal
+/// code. There are 256 candidates and the scan runs once per process, at exit.
+fn exit_status(code: ExitCode) -> i32 {
+    (0u8..=255).find(|&n| code == ExitCode::from(n)).map_or(1, i32::from)
+}
+
+/// Parse `argv`, dispatch the subcommand, and return the process exit code.
+/// Errors are reported terse on stderr as `zvcs: <command>: <reason>`.
+fn run_command() -> ExitCode {
     // Dashed invocation: run as `git-<verb>` (a symlink in `~/.zvcs/bin`, or any
     // `git-*` on PATH) and git dispatches `<verb>` — git.c strips the `git-` prefix
     // from argv[0]. We fold it in by prepending the verb to the argument list;
@@ -189,9 +213,17 @@ pub fn run() -> ExitCode {
         // ourselves invoked AS `git-<verb>` — the matching external is this very
         // binary, so re-execing it would loop.
         if !from_dashed {
-            if let Some(code) = external::try_dashed(&sub, &rest) {
-                // The external existed and either was exec'd (never returns) or
-                // failed to exec (returns a failure code). `None` falls through.
+            // Trace2's `exec` record has to be written *before* the exec: a
+            // successful one never returns, so this is the session's last word.
+            // Only a failed exec comes back to report an `exec_result`.
+            let exec_id = trace2::exec(&format!("git-{sub}"), &rest);
+            // The external existed and either was exec'd (never returns) or
+            // failed to exec (returns a failure code). `None` falls through.
+            let outcome = external::try_dashed(&sub, &rest);
+            // Reaching here at all means the exec failed — a missing external
+            // and an unrunnable one alike — which is `execvp`'s -1 return.
+            trace2::exec_result(exec_id, -1);
+            if let Some(code) = outcome {
                 return code;
             }
         }
@@ -210,6 +242,11 @@ pub fn run() -> ExitCode {
         }
     };
 
+    // The verb is final here — aliases expanded, autocorrection applied — which
+    // is where git calls `trace2_cmd_name`, and where the `def_param` records for
+    // `trace2.configParams` / `trace2.envVars` follow it.
+    trace2::cmd_name(&sub);
+
     // Install the pager (over stdout, and stderr when it is a tty) before the
     // command runs, so its output — and any error below — flows through it. Torn
     // down after the command and after error reporting, so the error lands in the
@@ -218,7 +255,9 @@ pub fn run() -> ExitCode {
     let code = match dispatch::run(&sub, &rest) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("zvcs: {sub}: {e:#}");
+            let msg = format!("{sub}: {e:#}");
+            trace2::error(&msg);
+            eprintln!("zvcs: {msg}");
             ExitCode::FAILURE
         }
     };

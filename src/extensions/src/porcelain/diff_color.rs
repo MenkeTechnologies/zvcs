@@ -743,6 +743,28 @@ pub(crate) struct MoveWordOpts {
     word_regex: Option<String>,
 }
 
+/// parse-options' complaint about an option given without its value: a `--long-name`
+/// is an "option", a single-letter `-x` is a "switch", and the name loses its dashes.
+/// The caller prefixes `error: ` and exits 129.
+pub(crate) fn missing_value(flag: &str) -> String {
+    match flag.strip_prefix("--") {
+        Some(name) => format!("option `{name}' requires a value"),
+        None => format!("switch `{}' requires a value", flag.trim_start_matches('-')),
+    }
+}
+
+/// The options in this family that parse-options declares with a *required*
+/// argument (`OPT_STRING`/`OPT_CALLBACK` without `PARSE_OPT_OPTARG`), so a bare
+/// `--color-moved-ws` / `--word-diff-regex` takes the next argv entry as its value
+/// and, when there is none, dies with `option \`<name>' requires a value`.
+///
+/// `--color-moved` and `--word-diff` are `PARSE_OPT_OPTARG` and `--color-words`
+/// takes an optional regex, so none of those three belongs here — their bare form
+/// is meaningful on its own and [`MoveWordOpts::parse_flag`] already handles it.
+pub(crate) fn needs_separate_value(s: &str) -> bool {
+    matches!(s, "--color-moved-ws" | "--word-diff-regex")
+}
+
 impl MoveWordOpts {
     /// Handle one argument. `None` means the argument belongs to someone else;
     /// `Some(Err(msg))` is the text git writes to stderr before exiting 129.

@@ -261,7 +261,11 @@ fn collapse_slashes(refname: &[u8]) -> Vec<u8> {
 /// `refs.c::check_refname_format`, returning `true` when the name is well
 /// formed. `flags` is taken by value because the `*` budget it carries is
 /// consumed as the components are walked.
-fn check_refname_format(refname: &[u8], mut flags: u32) -> bool {
+///
+/// Shared with the reference-database check in [`super::fsck`], which is git's
+/// `git refs verify` and calls the same function for `badRefName` and
+/// `badReferentName`.
+pub(crate) fn check_refname_format(refname: &[u8], mut flags: u32) -> bool {
     if refname == b"@" {
         return false;
     }

@@ -728,6 +728,46 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             paths.push(a.into());
             continue;
         }
+        // `--ws-error-highlight <kind>`, `--color-moved-ws <modes>` and
+        // `--word-diff-regex <re>` spell their value as the next argument when it is
+        // not glued on with `=`; parse-options consumes it and then runs the very
+        // same callback the `=` form uses, so both spellings share one arm.
+        if a == "--ws-error-highlight" || diff_color::needs_separate_value(a) {
+            let Some(v) = args.get(i).map(String::as_str) else {
+                deferred.get_or_insert((
+                    cur,
+                    129,
+                    format!("error: {}\n", diff_color::missing_value(a)).into_bytes(),
+                ));
+                break;
+            };
+            i += 1;
+            if a == "--ws-error-highlight" {
+                match diff_color::parse_ws_error_highlight(v) {
+                    Ok(val) => {
+                        opts.ws_error_highlight = val;
+                        wseh_explicit = true;
+                    }
+                    Err(accepted) => {
+                        deferred.get_or_insert((
+                            cur,
+                            129,
+                            format!(
+                                "error: unknown value after ws-error-highlight={}\n",
+                                &v[..accepted]
+                            )
+                            .into_bytes(),
+                        ));
+                    }
+                }
+            } else if let Some(Err(msg)) = opts
+                .move_word
+                .parse_flag(&format!("{a}={v}"), &mut opts.color_when)
+            {
+                deferred.get_or_insert((cur, 129, format!("{msg}\n").into_bytes()));
+            }
+            continue;
+        }
         // `--color-moved[=<mode>]`, `--color-moved-ws=<modes>`, `--word-diff[=<mode>]`,
         // `--word-diff-regex=<re>` and `--color-words[=<re>]`. A bad argument is a
         // parse-options 129, deferred with its argv index like the other value checks

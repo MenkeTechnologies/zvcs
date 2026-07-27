@@ -807,19 +807,27 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
     // `setup_revisions()` records the first pathspec; from then on any dashed
     // option is rejected before it is even classified.
     let mut seen_non_option = false;
-    // `--ws-error-highlight <kind>` also spells its value as the next argument,
-    // which parse-options consumes before anything else — `--` included.
-    let mut wseh_pending = false;
+    // `--ws-error-highlight <kind>`, `--color-moved-ws <modes>` and
+    // `--word-diff-regex <re>` all spell their value as the next argument when it is
+    // not glued on with `=`, which parse-options consumes before anything else —
+    // `--` included. This holds the flag still waiting for that value.
+    let mut pending_value: Option<String> = None;
 
     for a in args {
         let s = a.as_str();
-        if wseh_pending {
-            wseh_pending = false;
-            opts.ws_error_highlight = parse_ws_error_highlight_opt(s)?;
+        if let Some(flag) = pending_value.take() {
+            if flag == "--ws-error-highlight" {
+                opts.ws_error_highlight = parse_ws_error_highlight_opt(s)?;
+            } else {
+                let Opts { move_word, color_when, .. } = &mut opts;
+                if let Some(res) = move_word.parse_flag(&format!("{flag}={s}"), color_when) {
+                    res.map_err(Fatal::OptionError)?;
+                }
+            }
             continue;
         }
-        if s == "--ws-error-highlight" {
-            wseh_pending = true;
+        if s == "--ws-error-highlight" || diff_color::needs_separate_value(s) {
+            pending_value = Some(s.to_string());
             continue;
         }
         if after_dashdash {
@@ -866,6 +874,15 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         }
         paths.push(s.into());
         seen_non_option = true;
+    }
+
+    // A value-taking option left at the end of the command line never reaches its
+    // callback: parse-options reports it and exits 129 before anything else runs.
+    if let Some(flag) = pending_value {
+        return Err(Fatal::OptionError(format!(
+            "error: {}",
+            diff_color::missing_value(&flag)
+        )));
     }
 
     // `diff_merges_setup_revs()`: `-c`/`--cc` set `merges_need_diff`, which forces

@@ -31,25 +31,17 @@
 //!   ancestry check.
 //! * `subtree push <repository> <refspec>`, which is `split` followed by
 //!   `git push <repository> <split>:refs/heads/<remoteref>`.
+//! * `subtree merge <rev> [<repository>]` and `subtree pull <repository> <ref>`,
+//!   with `--squash` and `-m`: `git merge --no-ff -Xsubtree=<prefix>` over the
+//!   revision (or, under `--squash`, over a fresh squash commit chained onto the
+//!   previous one). Both rest on `git merge`'s `-X`/`--strategy-option`, which
+//!   this build now accepts.
+//! * Consequently `split --rejoin` / `push --rejoin` complete the rejoin through
+//!   `cmd_merge` when a prior `git-subtree-dir:` join commit is already reachable
+//!   from `HEAD`, as well as through `cmd_add` when none is.
 //!
 //! Deliberate floors, refused rather than approximated:
 //!
-//! * **`subtree merge` and `subtree pull`.** Both end in
-//!   `git merge --no-ff -Xsubtree=<prefix>`, and this build's `git merge` rejects
-//!   `-X`/`--strategy-option` (see `porcelain/merge.rs`) because the blob- and
-//!   tree-merge options are not threaded through `merge_apply::three_way_merge`.
-//!   The tree-alignment half of the strategy *is* ported, in
-//!   `porcelain/merge_subtree.rs`, but the commit-creating wrapper (merge-base
-//!   selection, `Merge made by the 'ort' strategy.`, `MERGE_HEAD` on conflict)
-//!   lives in `merge`, so routing `cmd_merge` through it would mean
-//!   reimplementing `git merge` here. `pull` additionally needs `FETCH_HEAD`,
-//!   which this build's `git fetch` does not write.
-//! * Consequently `split --rejoin` / `push --rejoin` complete the rewrite and
-//!   then fail at the rejoin when the script would call `cmd_merge` — i.e. when
-//!   a prior `git-subtree-dir:` join commit is already reachable from `HEAD`,
-//!   which is the case after any earlier `add` or `--rejoin`. The `cmd_add`
-//!   branch of the rejoin (no prior join commit) is fully ported. Nothing is
-//!   written to a ref before the failure; only unreferenced objects remain.
 //! * `-S`/`--gpg-sign[=<key-id>]`. The script passes it through to
 //!   `git commit-tree`, which this build refuses for want of a signing driver
 //!   (`porcelain/commit_tree.rs`). `--no-gpg-sign` is accepted because it names
@@ -446,6 +438,9 @@ struct Ctx {
     debug: bool,
     /// `debug`'s two-spaces-per-level indent.
     indent: usize,
+    /// `$arg_prefix` exactly as given — what `cmd_merge` hands to
+    /// `git merge -Xsubtree=`, trailing slashes and all.
+    prefix: String,
     /// `$arg_prefix` with any trailing slashes removed — the spelling every
     /// message, trailer and `git ls-tree` lookup uses.
     dir: String,
@@ -1498,7 +1493,7 @@ fn cmd_split(ctx: &mut Ctx, args: &[String]) -> Result<String> {
         if find_latest_squash(ctx, None)?.is_none() {
             cmd_add(ctx, std::slice::from_ref(&latest_new))?;
         } else {
-            return cmd_merge_unported();
+            cmd_merge(ctx, std::slice::from_ref(&latest_new))?;
         }
     }
 
@@ -1578,18 +1573,69 @@ fn cmd_push(ctx: &mut Ctx, args: &[String]) -> Result<()> {
     )
 }
 
-/// The floor shared by `cmd_merge` and `cmd_pull`: both end in
-/// `git merge --no-ff -Xsubtree=<prefix>`, which this build's `git merge` does
-/// not offer. Reported rather than approximated, because both write a merge
-/// commit into the user's history.
-fn cmd_merge_unported<T>() -> Result<T> {
-    bail!(
-        "unsupported: the merge half of git subtree is not ported. It runs \
-         `git merge --no-ff -Xsubtree=<prefix>`, and this build's `git merge` rejects \
-         `-X`/`--strategy-option`; the tree-alignment half of the strategy exists as \
-         `git merge-subtree`, but the commit-creating wrapper does not. `add`, `split` \
-         and `push` are ported"
-    )
+/// `cmd_merge REV [REPOSITORY]`: merge a subtree revision into `$dir`.
+///
+/// Under `--squash` the revision is first collapsed to a single squash commit
+/// chained onto the previous one, so the mainline never gains the subtree's own
+/// history. Either way the merge itself is `git merge --no-ff -Xsubtree=<prefix>`,
+/// which reshapes the incoming tree to sit under the prefix.
+fn cmd_merge(ctx: &mut Ctx, args: &[String]) -> Result<()> {
+    if args.is_empty() || args.len() > 2 {
+        return die(&format!(
+            "fatal: you must provide exactly one revision, and optionally a repository. Got: '{}'",
+            args.join(" ")
+        ));
+    }
+    let Some(mut rev) = rev_parse_commit(&ctx.repo, &format!("{}^{{commit}}", args[0])) else {
+        return die(&format!("fatal: '{}' does not refer to a commit", args[0]));
+    };
+    let repository = args.get(1).cloned();
+    ensure_clean(ctx)?;
+
+    if ctx.addmerge_squash {
+        let Some((old, sub)) = find_latest_squash(ctx, repository.as_deref())? else {
+            return die(&format!(
+                "fatal: can't squash-merge: '{}' was never added.",
+                ctx.dir
+            ));
+        };
+        if sub == rev.to_string() {
+            ctx.say_err(&format!("Subtree is already at commit {rev}."));
+            return exit_with(0);
+        }
+        let old = ObjectId::from_hex(old.as_bytes()).ok();
+        let oldsub = ObjectId::from_hex(sub.as_bytes()).ok();
+        let new = new_squash_commit(ctx, old, oldsub, rev)?;
+        ctx.debug(&format!("New squash commit: {new}"));
+        rev = new;
+    }
+
+    // `$arg_gpg_sign` is only ever empty or `--no-gpg-sign` here (the parser
+    // refuses `-S`), and `--no-gpg-sign` is what an unsigned merge already does,
+    // so the merge is spelled without it.
+    let subtree = format!("-Xsubtree={}", ctx.prefix);
+    let rev = rev.to_string();
+    match ctx.addmerge_message.clone() {
+        Some(m) => git_run(
+            ctx,
+            &["merge", "--no-ff", &subtree, &format!("--message={m}"), &rev],
+        ),
+        None => git_run(ctx, &["merge", "--no-ff", &subtree, &rev]),
+    }
+}
+
+/// `cmd_pull REPOSITORY REF`: fetch the ref, then merge the fetched tip.
+fn cmd_pull(ctx: &mut Ctx, args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        return die("fatal: you must provide <repository> <ref>");
+    }
+    let (repository, refname) = (args[0].clone(), args[1].clone());
+    ensure_clean(ctx)?;
+    ensure_valid_ref_format(ctx, &refname)?;
+    git_run(ctx, &["fetch", &repository, &refname])?;
+    // Re-open so the pack and `FETCH_HEAD` the child just wrote are visible.
+    ctx.repo = gix::discover(".")?;
+    cmd_merge(ctx, &["FETCH_HEAD".to_string(), repository])
 }
 
 // ---------------------------------------------------------------------------
@@ -1815,6 +1861,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
         quiet,
         debug,
         indent: 0,
+        prefix: prefix.clone(),
         dir,
         split_branch,
         split_onto,
@@ -1849,7 +1896,8 @@ fn run(args: &[String]) -> Result<ExitCode> {
             println!("{latest}");
         }
         Cmd::Push => cmd_push(&mut ctx, &rest)?,
-        Cmd::Merge | Cmd::Pull => return cmd_merge_unported(),
+        Cmd::Merge => cmd_merge(&mut ctx, &rest)?,
+        Cmd::Pull => cmd_pull(&mut ctx, &rest)?,
     }
     Ok(ExitCode::SUCCESS)
 }

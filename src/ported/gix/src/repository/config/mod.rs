@@ -103,6 +103,9 @@ impl crate::Repository {
                 .and_then(|variant| Ssh::VARIANT.try_into_variant(variant).transpose())
                 .transpose()
                 .with_leniency(self.options.lenient_config)?,
+            // Not a configuration key: `--ipv4`/`--ipv6` arrives with the connection options and is
+            // folded in by `connect()`.
+            address_family: None,
         };
         Ok(opts)
     }

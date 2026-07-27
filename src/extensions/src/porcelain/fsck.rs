@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,8 @@ const ERROR_OBJECT: u8 = 1;
 const ERROR_REACHABLE: u8 = 2;
 /// `builtin/fsck.c`'s `ERROR_PACK` — a pack failed `verify_pack()` under `--full`.
 const ERROR_PACK: u8 = 4;
+/// `builtin/fsck.c`'s `ERROR_REFS` — the `git refs verify` child failed.
+const ERROR_REFS: u8 = 8;
 
 /// `git fsck` — verify connectivity of the object database.
 ///
@@ -105,12 +108,25 @@ const ERROR_PACK: u8 = 4;
 ///    via the gix pack verifier; the message layer runs over packed objects too,
 ///    since the object-directory scan below iterates the whole odb rather than
 ///    only its loose half.
-/// 2. **No `git refs verify`.** git checks the reference database by default
-///    (`--references`) by running `git refs verify`; there is no equivalent in the
-///    vendored crates. Both spellings of the flag are accepted because the check
-///    is skipped either way — only its `--progress` block differs.
+/// 2. **The reference-database check runs in-process.** git checks the
+///    reference database by default (`--references`) by *running* `git refs
+///    verify` as a child; [`fsck_refs`] is that check, called directly instead.
+///    Its findings, its `--verbose` trace and its `ERROR_REFS` exit bit are all
+///    reproduced. One message id of the family is missing —
+///    `badReftableTableName`, which only the reftable backend raises and the
+///    vendored `gix-ref` has no reftable backend.
 /// 3. **No re-hashing.** git recomputes each object's hash to catch a silent
 ///    `hash mismatch`; this port trusts the odb's own integrity checking.
+/// 3b. **A reference the ref store cannot resolve is fatal to the connectivity
+///    walk.** `snapshot_ref()` reports `error: <ref>: invalid sha1 pointer
+///    <oid>`, sets `ERROR_REACHABLE` and carries on with the remaining refs, so
+///    `git fsck` still reports the rest of the repository. Here the head
+///    collection propagates the ref store's error instead and the command
+///    exits. This is visible for exactly the defects the reference-database
+///    check below reports — an unparsable ref file, or an invalid refname —
+///    where git prints both its own `<msg-id>` line and the `invalid sha1
+///    pointer` line and this port prints only the first. The exit code differs
+///    with it: git ORs in `ERROR_REACHABLE` where this port does not.
 /// 4. **An object the odb cannot open at all still aborts.** git treats an
 ///    unreadable loose object as `error: <oid>: object corrupt or missing:
 ///    <path>`, sets `ERROR_OBJECT` and keeps going; this port reports `fatal:`
@@ -156,8 +172,11 @@ const ERROR_PACK: u8 = 4;
 ///      * git shells out to `git refs verify --verbose`, whose
 ///        `Checking references consistency` / `Checking <ref>` /
 ///        `Checking packed-refs file <path>` lines follow its own
-///        `Checking ref database`. Per divergence 2 that child is not run, so
-///        those lines are absent while `Checking ref database` is printed.
+///        `Checking ref database`. Per divergence 2 those lines are produced
+///        here too, but the refs of one directory are traced in
+///        `std::fs::read_dir` order rather than git's `readdir()` order — the
+///        same system call over the same directory, and so the same order in
+///        practice, but not a guarantee.
 ///
 /// ### Output ordering
 ///
@@ -247,12 +266,20 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     let mut state = State::default();
 
     // ---- 1. reference-database check ---------------------------------------
+    //
+    // `fsck_refs()` starts its progress, prints its own `--verbose` header, runs
+    // `git refs verify` as a child, and only then displays the progress — so
+    // every line the check itself emits lands between the header and the
+    // progress block. [`fsck_refs`] is that child, in-process.
     if opt.check_references {
-        if show_progress {
-            progress_block("Checking ref database", 1);
-        }
         if opt.verbose {
             eprintln!("Checking ref database");
+        }
+        if fsck_refs(&repo, &msg_config, opt.verbose) {
+            errors |= ERROR_REFS;
+        }
+        if show_progress {
+            progress_block("Checking ref database", 1);
         }
     }
 
@@ -1898,6 +1925,25 @@ macro_rules! msg_mktag {
     };
 }
 
+/// Build one row for a check only the reference-database walk reaches, so only
+/// `fsck.<id>` exists for it. See [`Msg::receive_key`].
+macro_rules! msg_refs {
+    ($konst:ident, $id:literal, $fsck:literal, $sev:ident) => {
+        #[doc = concat!("`", $id, "`, whose severity comes from `", $fsck, "`. Only ")]
+        #[doc = "the reference-database check reports it — `git refs verify`, which"]
+        #[doc = "`git fsck` runs for `--references`. A transfer never reaches it:"]
+        #[doc = "`receive-pack` fscks the objects the pusher sent, not the receiving"]
+        #[doc = "repository's ref files, so reading a `receive.fsck.<id>` spelling"]
+        #[doc = "would be claiming a check that cannot run."]
+        pub const $konst: Msg = Msg {
+            id: $id,
+            fsck_key: $fsck,
+            receive_key: None,
+            default: Severity::$sev,
+        };
+    };
+}
+
 // --- commit header checks (`verify_headers`, `fsck_commit`, `fsck_ident`) ---
 msg!(BAD_PARENT_SHA1, "badParentSha1", "fsck.badParentSha1", "receive.fsck.badParentSha1", Error);
 msg!(MISSING_AUTHOR, "missingAuthor", "fsck.missingAuthor", "receive.fsck.missingAuthor", Error);
@@ -1967,6 +2013,27 @@ msg!(GITMODULES_BLOB, "gitmodulesBlob", "fsck.gitmodulesBlob", "receive.fsck.git
 msg!(GITATTRIBUTES_MISSING, "gitattributesMissing", "fsck.gitattributesMissing", "receive.fsck.gitattributesMissing", Error);
 msg!(GITATTRIBUTES_BLOB, "gitattributesBlob", "fsck.gitattributesBlob", "receive.fsck.gitattributesBlob", Error);
 
+// --- the reference database (`refs_fsck`, `files_fsck`, `packed_fsck`) ------
+//
+// Reported against a *path* rather than an object id: a refname
+// (`refs/heads/x`, `worktrees/wt/HEAD`), or one of `packed-refs`,
+// `packed-refs.header`, `packed-refs line <n>`. See [`fsck_refs`].
+msg_refs!(BAD_REF_NAME, "badRefName", "fsck.badRefName", Error);
+msg_refs!(BAD_REF_FILETYPE, "badRefFiletype", "fsck.badRefFiletype", Error);
+msg_refs!(BAD_REF_CONTENT, "badRefContent", "fsck.badRefContent", Error);
+msg_refs!(BAD_REF_OID, "badRefOid", "fsck.badRefOid", Error);
+msg_refs!(BAD_HEAD_TARGET, "badHeadTarget", "fsck.badHeadTarget", Error);
+msg_refs!(BAD_REFERENT_NAME, "badReferentName", "fsck.badReferentName", Error);
+msg_refs!(REF_MISSING_NEWLINE, "refMissingNewline", "fsck.refMissingNewline", Info);
+msg_refs!(TRAILING_REF_CONTENT, "trailingRefContent", "fsck.trailingRefContent", Info);
+msg_refs!(SYMLINK_REF, "symlinkRef", "fsck.symlinkRef", Info);
+msg_refs!(SYMREF_TARGET_IS_NOT_A_REF, "symrefTargetIsNotARef", "fsck.symrefTargetIsNotARef", Info);
+msg_refs!(BAD_PACKED_REF_HEADER, "badPackedRefHeader", "fsck.badPackedRefHeader", Error);
+msg_refs!(BAD_PACKED_REF_ENTRY, "badPackedRefEntry", "fsck.badPackedRefEntry", Error);
+msg_refs!(PACKED_REF_ENTRY_NOT_TERMINATED, "packedRefEntryNotTerminated", "fsck.packedRefEntryNotTerminated", Error);
+msg_refs!(PACKED_REF_UNSORTED, "packedRefUnsorted", "fsck.packedRefUnsorted", Error);
+msg_refs!(EMPTY_PACKED_REFS_FILE, "emptyPackedRefsFile", "fsck.emptyPackedRefsFile", Info);
+
 /// Every row this port implements, for severity resolution and for telling a
 /// misspelled `fsck.<x>` key from a real one.
 pub const MSGS: &[Msg] = &[
@@ -2023,6 +2090,21 @@ pub const MSGS: &[Msg] = &[
     GITMODULES_BLOB,
     GITATTRIBUTES_MISSING,
     GITATTRIBUTES_BLOB,
+    BAD_REF_NAME,
+    BAD_REF_FILETYPE,
+    BAD_REF_CONTENT,
+    BAD_REF_OID,
+    BAD_HEAD_TARGET,
+    BAD_REFERENT_NAME,
+    REF_MISSING_NEWLINE,
+    TRAILING_REF_CONTENT,
+    SYMLINK_REF,
+    SYMREF_TARGET_IS_NOT_A_REF,
+    BAD_PACKED_REF_HEADER,
+    BAD_PACKED_REF_ENTRY,
+    PACKED_REF_ENTRY_NOT_TERMINATED,
+    PACKED_REF_UNSORTED,
+    EMPTY_PACKED_REFS_FILE,
 ];
 
 /// The rest of `FOREACH_FSCK_MSG_ID`: ids git knows and this port never
@@ -2032,14 +2114,17 @@ pub const MSGS: &[Msg] = &[
 /// and changes nothing, which is the honest outcome for a check that is not
 /// performed. Four groups:
 ///
-///   * **the reference-database ids** — `badHeadTarget`, `badPackedRefEntry`,
+///   * **one reference-database id.** `badHeadTarget`, `badPackedRefEntry`,
 ///     `badPackedRefHeader`, `badRefContent`, `badReferentName`,
-///     `badRefFiletype`, `badRefName`, `badRefOid`, `badReftableTableName`,
-///     `emptyPackedRefsFile`, `packedRefEntryNotTerminated`,
-///     `packedRefUnsorted`, `refMissingNewline`, `symlinkRef`,
-///     `symrefTargetIsNotARef`, `trailingRefContent` — all belong to
-///     `git refs verify`, which the vendored crates do not implement (see
-///     divergence 2 above);
+///     `badRefFiletype`, `badRefName`, `badRefOid`, `emptyPackedRefsFile`,
+///     `packedRefEntryNotTerminated`, `packedRefUnsorted`, `refMissingNewline`,
+///     `symlinkRef`, `symrefTargetIsNotARef` and `trailingRefContent` are now
+///     checked by [`fsck_refs`] below. What remains from that family is
+///     `badReftableTableName`, which
+///     `refs/reftable-backend.c::reftable_fsck_error_handler` raises: the
+///     vendored `gix-ref` has no reftable backend at all, so a reftable
+///     repository cannot be opened here, let alone have its table names
+///     checked;
 ///   * **the two commit ids no entry point can reach.** `missingTree` and
 ///     `badTreeSha1` are reported by `fsck_commit()` for a `tree` header that
 ///     `parse_commit_buffer()` has already rejected (`bogus commit object` /
@@ -2063,26 +2148,11 @@ pub const MSGS: &[Msg] = &[
 const UNPORTED_MSG_IDS: &[&str] = &[
     "badGpgsig",
     "badHeaderContinuation",
-    "badHeadTarget",
-    "badPackedRefEntry",
-    "badPackedRefHeader",
-    "badRefContent",
-    "badReferentName",
-    "badRefFiletype",
-    "badRefName",
-    "badRefOid",
     "badReftableTableName",
     "badTreeSha1",
     "emptyName",
-    "emptyPackedRefsFile",
     "gitmodulesLarge",
     "missingTree",
-    "packedRefEntryNotTerminated",
-    "packedRefUnsorted",
-    "refMissingNewline",
-    "symlinkRef",
-    "symrefTargetIsNotARef",
-    "trailingRefContent",
     "unknownType",
 ];
 
@@ -2222,11 +2292,19 @@ impl MsgConfig {
     /// `fsck.c::report()` minus the printing: the severity a finding about
     /// `oid` is reported at, or `Ignore` when it is suppressed.
     pub fn severity(&self, finding: &Finding, oid: &ObjectId) -> Severity {
-        let level = self.levels.get(finding.msg.id).copied().unwrap_or(finding.msg.default);
+        let level = self.severity_of(finding.msg);
         if level != Severity::Ignore && self.skip.contains(oid) {
             return Severity::Ignore;
         }
         level
+    }
+
+    /// `fsck.c::fsck_msg_type()` on its own, for the reference-database checks.
+    /// They report through `fsck_report_ref()`, which — unlike `report()` —
+    /// never consults the skip list: that list holds object ids, and a ref
+    /// finding names a path.
+    pub fn severity_of(&self, msg: &Msg) -> Severity {
+        self.levels.get(msg.id).copied().unwrap_or(msg.default)
     }
 }
 
@@ -2277,6 +2355,862 @@ fn read_skip_list(path: &str) -> Result<HashSet<ObjectId>, String> {
         out.insert(id);
     }
     Ok(out)
+}
+
+// ===========================================================================
+// The reference-database check — `git refs verify`
+// ===========================================================================
+//
+// `builtin/fsck.c::fsck_refs()` checks nothing itself: it runs `git refs verify`
+// as a child, forwarding `--verbose` and `--strict`, and ORs `ERROR_REFS` into
+// the exit code when that child fails. `cmd_refs_verify()` in turn calls
+// `refs_fsck()` once per worktree, which dispatches to the storage backend's
+// `fsck` — `files_fsck()` in `refs/files-backend.c`, which walks
+// `$GIT_DIR/refs`, then the root refs directly under `$GIT_DIR`, then hands
+// `packed-refs` to `packed_fsck()` in `refs/packed-backend.c`.
+//
+// All three are ported here, and both entry points reach them: [`fsck`] for
+// `--references`, and `git refs verify` itself. Unlike the object checks the
+// findings are reported against a *path* rather than an object id, through
+// `fsck_report_ref()`:
+//
+// ```text
+// error: refs/heads/x: badRefName: invalid refname format
+// warning: packed-refs: emptyPackedRefsFile: file is empty
+// ```
+//
+// `fsck_report_ref()` deliberately does not consult `fsck.skipList` — that list
+// holds object ids and these findings name a path — but it does go through the
+// same `fsck_msg_type()`, so `fsck.<msg-id>` behaves exactly as it does for the
+// object checks. `--strict` is accepted and changes nothing here: it only
+// promotes a *defaulted* `Warn`, and every ported reference id defaults to
+// `Error` or `Info`. The one id of this family that is not ported is
+// `badReftableTableName`; see [`UNPORTED_MSG_IDS`].
+//
+// ### Known divergences
+//
+//  1. **Report order within one directory follows `readdir()`.** git's
+//     `dir_iterator_begin(path, 0)` is unsorted, so it reports the refs of a
+//     directory in whatever order the filesystem returns them;
+//     `std::fs::read_dir` is the same `readdir()` over the same directory, so
+//     the two agree in practice, but neither order is guaranteed. Directories
+//     are descended into as they are met, which is git's pre-order traversal.
+//  2. **An I/O failure part way through a directory is skipped rather than
+//     reported.** git prints `failed to iterate over '<dir>'` and fails; here
+//     only the failure to open the top of `refs/` is reported, as
+//     `cannot open directory <dir>`.
+
+/// One worktree as `cmd_refs_verify()` sees it.
+/// `get_worktrees_without_reading_head()` yields the main worktree first and
+/// then each linked one.
+struct RefWorktree {
+    /// `wt->id`, `None` for the main worktree. Linked worktrees prefix every
+    /// refname they report with `worktrees/<id>/`.
+    id: Option<Vec<u8>>,
+    /// `refs->base.gitdir`: `$GIT_DIR` for the main worktree,
+    /// `$GIT_COMMON_DIR/worktrees/<id>` for a linked one. Both `refs/` and the
+    /// root refs are looked for here.
+    gitdir: PathBuf,
+}
+
+impl RefWorktree {
+    /// `is_main_worktree()`.
+    fn is_main(&self) -> bool {
+        self.id.is_none()
+    }
+
+    /// The `worktrees/<id>/` prefix `files_fsck_refs_dir()` and
+    /// `files_fsck_root_ref()` put in front of every refname of a linked
+    /// worktree.
+    fn refname_prefix(&self) -> Vec<u8> {
+        match &self.id {
+            None => Vec::new(),
+            Some(id) => {
+                let mut prefix = b"worktrees/".to_vec();
+                prefix.extend_from_slice(id);
+                prefix.push(b'/');
+                prefix
+            }
+        }
+    }
+}
+
+/// `refs.c::refs_fsck()` over every worktree — the whole of `git refs verify`.
+///
+/// Returns `true` when a finding was reported at error severity, which is what
+/// `fsck_refs()` turns into `ERROR_REFS` and what makes `git refs verify` fail.
+pub fn fsck_refs(repo: &gix::Repository, cfg: &MsgConfig, verbose: bool) -> bool {
+    let mut check = RefCheck {
+        cfg,
+        verbose,
+        common_dir: repo.common_dir().to_path_buf(),
+        workdir: repo.workdir().map(Path::to_path_buf),
+        hexsz: repo.object_hash().len_in_hex(),
+        failed: false,
+    };
+
+    for wt in ref_worktrees(repo) {
+        // `refs_fsck()` announces itself once per worktree, before dispatching
+        // to the backend.
+        if verbose {
+            eprintln!("Checking references consistency");
+        }
+        check.files_fsck(&wt);
+    }
+    check.failed
+}
+
+/// `get_worktrees_without_reading_head()`: the main worktree, then each linked
+/// one. A linked worktree whose working tree is gone still has its refs
+/// checked, which is why the proxy is never resolved into a repository here.
+fn ref_worktrees(repo: &gix::Repository) -> Vec<RefWorktree> {
+    let mut out = vec![RefWorktree {
+        id: None,
+        gitdir: repo.common_dir().to_path_buf(),
+    }];
+    if let Ok(worktrees) = repo.worktrees() {
+        for proxy in worktrees {
+            out.push(RefWorktree {
+                id: Some(proxy.id().to_vec()),
+                gitdir: proxy.git_dir().to_path_buf(),
+            });
+        }
+    }
+    out
+}
+
+/// `struct fsck_options` as the reference checks use it, plus the paths and the
+/// hash width they read back off the ref store.
+struct RefCheck<'a> {
+    /// Severities from `fsck.<msg-id>`, resolved once by [`MsgConfig`].
+    cfg: &'a MsgConfig,
+    /// `o->verbose`: the `Checking <ref>` trace on stderr.
+    verbose: bool,
+    /// `refs->gitcommondir`, which is where a root ref's *file* lives even when
+    /// the refname is prefixed with `worktrees/<id>/`, and where `packed-refs`
+    /// always lives.
+    common_dir: PathBuf,
+    /// The working directory, used only to render the `packed-refs` path in the
+    /// `--verbose` trace the way git does — relative to where the command runs.
+    workdir: Option<PathBuf>,
+    /// `the_hash_algo->hexsz`.
+    hexsz: usize,
+    /// Set once any finding is reported at error severity.
+    failed: bool,
+}
+
+impl RefCheck<'_> {
+    /// `fsck.c::fsck_report_ref()` plus `fsck_refs_error_function()`: resolve
+    /// the severity, drop the finding when it is `ignore`, and print
+    /// `error: <path>: <msg-id>: <text>` or the `warning:` form.
+    ///
+    /// Returns git's non-zero result, i.e. whether this was reported as an
+    /// error — several callers stop checking a ref once one fires. Everything
+    /// is written as bytes because a refname need not be valid UTF-8 and git
+    /// passes it through untouched.
+    fn report(&mut self, path: &[u8], msg: &'static Msg, text: &[u8]) -> bool {
+        // `fsck_vreport()`: FATAL is reported as ERROR and INFO as WARN.
+        let level = match self.cfg.severity_of(msg) {
+            Severity::Ignore => return false,
+            Severity::Info => Severity::Warn,
+            Severity::Fatal => Severity::Error,
+            other => other,
+        };
+        let warn = level == Severity::Warn;
+
+        let mut line = Vec::with_capacity(path.len() + text.len() + 32);
+        line.extend_from_slice(if warn {
+            b"warning: ".as_slice()
+        } else {
+            b"error: ".as_slice()
+        });
+        line.extend_from_slice(path);
+        line.extend_from_slice(b": ");
+        line.extend_from_slice(msg.id.as_bytes());
+        line.extend_from_slice(b": ");
+        line.extend_from_slice(text);
+        line.push(b'\n');
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), &line);
+
+        if warn {
+            return false;
+        }
+        self.failed = true;
+        true
+    }
+
+    /// `refs/files-backend.c::files_fsck()`.
+    fn files_fsck(&mut self, wt: &RefWorktree) {
+        self.files_fsck_refs_dir(wt);
+        self.for_each_root_ref(wt);
+        // `packed-refs` is shared, so only the main worktree checks it.
+        if wt.is_main() {
+            self.packed_fsck();
+        }
+    }
+
+    /// `files_fsck_refs_dir()`: every file below `$GIT_DIR/refs`, named
+    /// `refs/<relative path>` and prefixed with `worktrees/<id>/` for a linked
+    /// worktree. A missing directory is an error for the main worktree and
+    /// silently fine for a linked one, which need not have any per-worktree ref.
+    fn files_fsck_refs_dir(&mut self, wt: &RefWorktree) {
+        let root = wt.gitdir.join("refs");
+        let read = match std::fs::read_dir(&root) {
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !wt.is_main() => return,
+            Err(e) => {
+                eprintln!("error: cannot open directory {}: {e}", root.display());
+                self.failed = true;
+                return;
+            }
+        };
+        let mut prefix = wt.refname_prefix();
+        prefix.extend_from_slice(b"refs");
+        self.walk_refs_dir(read, &prefix);
+    }
+
+    /// One level of git's `dir_iterator`, which is unsorted and pre-order: an
+    /// entry is yielded as `readdir()` returns it, and a directory is descended
+    /// into immediately rather than after its siblings. `dir_iterator` `lstat`s,
+    /// so a symlink stays a symlink.
+    fn walk_refs_dir(&mut self, read: std::fs::ReadDir, refname: &[u8]) {
+        for entry in read {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            let Ok(meta) = path.symlink_metadata() else {
+                continue;
+            };
+            let name = entry.file_name();
+            let name = name.as_bytes();
+
+            let mut child = refname.to_vec();
+            child.push(b'/');
+            child.extend_from_slice(name);
+
+            if meta.is_dir() {
+                // `if (S_ISDIR(iter->st.st_mode)) continue;` — the directory is
+                // not itself a ref, but its contents are visited next.
+                if let Ok(read) = std::fs::read_dir(&path) {
+                    self.walk_refs_dir(read, &child);
+                }
+                continue;
+            }
+
+            // Lock files are skipped, but a name that *starts* with a dot is not
+            // a lock file — it is an invalid refname that must still be reported.
+            if name.first() != Some(&b'.') && name.ends_with(b".lock") {
+                continue;
+            }
+
+            self.files_fsck_ref(&child, &path, &meta);
+        }
+    }
+
+    /// `for_each_root_ref()` feeding `files_fsck_root_ref()`: the files directly
+    /// under `$GIT_DIR` whose names `is_root_ref()` accepts. Their *file* is
+    /// looked up under `gitcommondir` by the already-prefixed refname, which is
+    /// how a linked worktree's `HEAD` resolves to
+    /// `$GIT_COMMON_DIR/worktrees/<id>/HEAD`. Both the `get_dtype()` filter and
+    /// the `stat()` that follows it resolve symlinks, so a symlinked root ref is
+    /// read through rather than reported as a `symlinkRef`.
+    fn for_each_root_ref(&mut self, wt: &RefWorktree) {
+        let Ok(read) = std::fs::read_dir(&wt.gitdir) else {
+            return;
+        };
+        let prefix = wt.refname_prefix();
+        for entry in read {
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name();
+            let name = name.as_bytes();
+            if name.first() == Some(&b'.') || name.ends_with(b".lock") {
+                continue;
+            }
+            if !entry.path().is_file() || !super::for_each_ref::is_root_ref(name) {
+                continue;
+            }
+
+            let mut refname = prefix.clone();
+            refname.extend_from_slice(name);
+            let path = self.common_dir.join(OsStr::from_bytes(&refname));
+            let meta = match path.metadata() {
+                Ok(meta) => meta,
+                // Raced away between the readdir and the stat.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    eprintln!("error: failed to read ref: '{}': {e}", path.display());
+                    self.failed = true;
+                    continue;
+                }
+            };
+            self.files_fsck_ref(&refname, &path, &meta);
+        }
+    }
+
+    /// `files_fsck_ref()`: the two per-ref checks, gated on the file being a
+    /// regular file or a symlink.
+    fn files_fsck_ref(&mut self, refname: &[u8], path: &Path, meta: &std::fs::Metadata) {
+        if self.verbose {
+            let mut line = b"Checking ".to_vec();
+            line.extend_from_slice(refname);
+            line.push(b'\n');
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), &line);
+        }
+
+        let ty = meta.file_type();
+        if !ty.is_file() && !ty.is_symlink() {
+            self.report(refname, &BAD_REF_FILETYPE, b"unexpected file type");
+            return;
+        }
+
+        // git runs both functions and ORs their results; neither short-circuits
+        // the other, so a badly named ref still has its contents checked.
+        self.files_fsck_refs_name(refname);
+        self.files_fsck_refs_content(refname, path, ty.is_symlink());
+    }
+
+    /// `files_fsck_refs_name()`. Root refs are one-component names that
+    /// `check_refname_format()` would reject, so they are waived outright.
+    fn files_fsck_refs_name(&mut self, refname: &[u8]) {
+        if super::for_each_ref::is_root_ref(refname) {
+            return;
+        }
+        if !super::check_ref_format::check_refname_format(refname, 0) {
+            self.report(refname, &BAD_REF_NAME, b"invalid refname format");
+        }
+    }
+
+    /// `files_fsck_refs_content()`: parse the ref file the way
+    /// `parse_loose_ref_contents()` does and report what it rejects.
+    fn files_fsck_refs_content(&mut self, refname: &[u8], path: &Path, is_symlink: bool) {
+        if is_symlink {
+            self.report(
+                refname,
+                &SYMLINK_REF,
+                b"use deprecated symbolic link for symref",
+            );
+            // git resolves the link and, when it lands inside `$GIT_DIR`,
+            // reports the referent as the path relative to it — so a symlink to
+            // `.git/refs/heads/main` reads as the refname `refs/heads/main`.
+            // Anything outside is reported as the absolute path it resolved to,
+            // which `check_refname_format()` then rejects.
+            // The two sides are resolved differently on purpose, exactly as git
+            // does it: the link target through `strbuf_add_real_path()`, which
+            // follows symlinks, and the git directory through
+            // `strbuf_add_absolute_path()` + `strbuf_normalize_path()`, which do
+            // not. So a git directory reached through a symlinked path does not
+            // strip, and the referent is reported absolute.
+            let real = real_path(path, MAX_SYMLINKS);
+            let base = absolute_path(&self.common_dir);
+            let referent = real.strip_prefix(&base).unwrap_or(real.as_path());
+            let referent = referent.as_os_str().as_bytes().to_vec();
+            self.files_fsck_symref_target(refname, &referent, true);
+            return;
+        }
+
+        let content = match std::fs::read(path) {
+            Ok(content) => content,
+            // Removed by a concurrent process between the walk and the read.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                eprintln!("error: cannot read ref file '{}': {e}", path.display());
+                self.failed = true;
+                return;
+            }
+        };
+
+        match parse_loose_ref_contents(&content, self.hexsz) {
+            LooseRef::Symref { referent } => {
+                self.files_fsck_symref_target(refname, referent, false);
+            }
+            LooseRef::Oid { id, trailing } => {
+                // C reads a NUL-terminated buffer, so "nothing left" and "an
+                // empty rest" are the same thing.
+                if trailing.is_empty() {
+                    self.report(refname, &REF_MISSING_NEWLINE, b"misses LF at the end");
+                    return;
+                }
+                if trailing != b"\n".as_slice() {
+                    let mut text = b"has trailing garbage: '".to_vec();
+                    text.extend_from_slice(trailing);
+                    text.push(b'\'');
+                    self.report(refname, &TRAILING_REF_CONTENT, &text);
+                    return;
+                }
+                // `refs.c::refs_fsck_ref()`.
+                if id.is_null() {
+                    let text = format!("points to invalid object ID '{id}'");
+                    self.report(refname, &BAD_REF_OID, text.as_bytes());
+                }
+            }
+            // git prints the file's contents, right-trimmed, as the whole
+            // message.
+            LooseRef::Broken => {
+                let text = rtrim(&content).to_vec();
+                self.report(refname, &BAD_REF_CONTENT, &text);
+            }
+        }
+    }
+
+    /// `files_fsck_symref_target()` plus `refs.c::refs_fsck_symref()`.
+    ///
+    /// `referent` is the raw remainder of a `ref: ...` line, newline included;
+    /// a symlink's referent has no line terminator to check, which is what
+    /// `symbolic_link` selects.
+    fn files_fsck_symref_target(&mut self, refname: &[u8], referent: &[u8], symbolic_link: bool) {
+        let orig_len = referent.len();
+        let orig_last_byte = referent.last().copied().unwrap_or(0);
+        let target = if symbolic_link {
+            referent
+        } else {
+            rtrim(referent)
+        };
+
+        if !symbolic_link {
+            // Exactly one trailing LF is the well-formed case: anything else is
+            // either a missing terminator or trailing junk, and both can fire.
+            if target.len() == orig_len || (target.len() < orig_len && orig_last_byte != b'\n') {
+                self.report(refname, &REF_MISSING_NEWLINE, b"misses LF at the end");
+            }
+            if target.len() != orig_len && target.len() + 1 != orig_len {
+                self.report(
+                    refname,
+                    &TRAILING_REF_CONTENT,
+                    b"has trailing whitespaces or newlines",
+                );
+            }
+        }
+
+        // `parse_worktree_ref()`: a linked worktree's `worktrees/<id>/HEAD` is
+        // still HEAD as far as the target check is concerned.
+        if strip_worktree_prefix(refname) == b"HEAD".as_slice() && !target.starts_with(b"refs/heads/") {
+            let mut text = b"HEAD points to non-branch '".to_vec();
+            text.extend_from_slice(target);
+            text.push(b'\'');
+            if self.report(refname, &BAD_HEAD_TARGET, &text) {
+                return;
+            }
+        }
+
+        if super::for_each_ref::is_root_ref(target) {
+            return;
+        }
+
+        if !super::check_ref_format::check_refname_format(target, 0) {
+            let mut text = b"points to invalid refname '".to_vec();
+            text.extend_from_slice(target);
+            text.push(b'\'');
+            if self.report(refname, &BAD_REFERENT_NAME, &text) {
+                return;
+            }
+        }
+
+        if !target.starts_with(b"refs/") && !target.starts_with(b"worktrees/") {
+            let mut text = b"points to non-ref target '".to_vec();
+            text.extend_from_slice(target);
+            text.push(b'\'');
+            self.report(refname, &SYMREF_TARGET_IS_NOT_A_REF, &text);
+        }
+    }
+
+    /// `refs/packed-backend.c::packed_fsck()`.
+    fn packed_fsck(&mut self) {
+        let path = self.common_dir.join("packed-refs");
+        if self.verbose {
+            let label = self
+                .workdir
+                .as_deref()
+                .and_then(|work| path.strip_prefix(work).ok())
+                .unwrap_or(path.as_path());
+            eprintln!("Checking packed-refs file {}", label.display());
+        }
+
+        // `open_nofollow()`: a symlinked `packed-refs` is a finding, not
+        // something to follow.
+        let meta = match path.symlink_metadata() {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                eprintln!("error: unable to open '{}': {e}", path.display());
+                self.failed = true;
+                return;
+            }
+        };
+        if meta.file_type().is_symlink() {
+            self.report(
+                b"packed-refs",
+                &BAD_REF_FILETYPE,
+                b"not a regular file but a symlink",
+            );
+            return;
+        }
+        if !meta.is_file() {
+            self.report(b"packed-refs", &BAD_REF_FILETYPE, b"not a regular file");
+            return;
+        }
+
+        let buf = match std::fs::read(&path) {
+            Ok(buf) => buf,
+            Err(e) => {
+                eprintln!("error: unable to open '{}': {e}", path.display());
+                self.failed = true;
+                return;
+            }
+        };
+        // `allocate_snapshot_buffer()` fails on a zero-length file.
+        if buf.is_empty() {
+            self.report(b"packed-refs", &EMPTY_PACKED_REFS_FILE, b"file is empty");
+            return;
+        }
+
+        let mut sorted = false;
+        // The sortedness pass indexes past each line's hash, so git only runs it
+        // once the content pass has confirmed every line parses.
+        if !self.packed_fsck_ref_content(&buf, &mut sorted) && sorted {
+            self.packed_fsck_ref_sorted(&buf);
+        }
+    }
+
+    /// `packed_fsck_ref_content()`: the header line, then alternating main and
+    /// optional `^peeled` lines.
+    fn packed_fsck_ref_content(&mut self, buf: &[u8], sorted: &mut bool) -> bool {
+        let mut failed = false;
+        let mut at = 0usize;
+        let mut line_number = 1u64;
+
+        let mut eol = self.packed_fsck_ref_next_line(buf, at, line_number, &mut failed);
+        // Only a leading '#' is a header; anything else is read as an entry,
+        // which is why a headerless `packed-refs` reports `badPackedRefEntry`
+        // rather than `badPackedRefHeader`.
+        if buf[at] == b'#' {
+            failed |= self.packed_fsck_ref_header(&buf[at..eol], sorted);
+            at = eol + 1;
+            line_number += 1;
+        }
+
+        while at < buf.len() {
+            eol = self.packed_fsck_ref_next_line(buf, at, line_number, &mut failed);
+            failed |= self.packed_fsck_ref_main_line(&buf[at..eol], line_number);
+            at = eol + 1;
+            line_number += 1;
+            if at < buf.len() && buf[at] == b'^' {
+                eol = self.packed_fsck_ref_next_line(buf, at, line_number, &mut failed);
+                failed |= self.packed_fsck_ref_peeled_line(&buf[at..eol], line_number);
+                at = eol + 1;
+                line_number += 1;
+            }
+        }
+        failed
+    }
+
+    /// `packed_fsck_ref_next_line()`: the offset of the line's `\n`, or the end
+    /// of the buffer once the missing terminator has been reported.
+    fn packed_fsck_ref_next_line(
+        &mut self,
+        buf: &[u8],
+        at: usize,
+        line_number: u64,
+        failed: &mut bool,
+    ) -> usize {
+        match buf[at..].iter().position(|&b| b == b'\n') {
+            Some(off) => at + off,
+            None => {
+                let mut text = b"'".to_vec();
+                text.extend_from_slice(&buf[at..]);
+                text.extend_from_slice(b"' is not terminated with a newline");
+                *failed |= self.report(
+                    packed_entry(line_number).as_bytes(),
+                    &PACKED_REF_ENTRY_NOT_TERMINATED,
+                    &text,
+                );
+                buf.len()
+            }
+        }
+    }
+
+    /// `packed_fsck_ref_header()`, which also decides whether the sortedness
+    /// pass runs at all.
+    fn packed_fsck_ref_header(&mut self, line: &[u8], sorted: &mut bool) -> bool {
+        const PREFIX: &[u8] = b"# pack-refs with: ";
+        let Some(traits) = line.strip_prefix(PREFIX) else {
+            let mut text = b"'".to_vec();
+            text.extend_from_slice(line);
+            text.extend_from_slice(b"' does not start with '# pack-refs with: '");
+            return self.report(b"packed-refs.header", &BAD_PACKED_REF_HEADER, &text);
+        };
+        *sorted = traits.split(|&b| b == b' ').any(|t| t == b"sorted".as_slice());
+        false
+    }
+
+    /// `packed_fsck_ref_main_line()`: `<oid> SP <refname>`.
+    fn packed_fsck_ref_main_line(&mut self, line: &[u8], line_number: u64) -> bool {
+        let entry = packed_entry(line_number);
+        let path = entry.as_bytes();
+
+        let Some(id) = parse_oid_prefix(line, self.hexsz) else {
+            let mut text = b"'".to_vec();
+            text.extend_from_slice(line);
+            text.extend_from_slice(b"' has invalid oid");
+            return self.report(path, &BAD_PACKED_REF_ENTRY, &text);
+        };
+
+        let rest = &line[self.hexsz..];
+        if !rest.first().is_some_and(|b| is_space(*b)) {
+            let mut text = format!("has no space after oid '{id}' but with '").into_bytes();
+            text.extend_from_slice(rest);
+            text.push(b'\'');
+            return self.report(path, &BAD_PACKED_REF_ENTRY, &text);
+        }
+
+        // Both of the remaining checks run; git overwrites its result rather
+        // than returning after the first.
+        let refname = &rest[1..];
+        let mut failed = false;
+        if refname.contains(&0) {
+            let mut text = b"refname '".to_vec();
+            text.extend_from_slice(refname);
+            text.extend_from_slice(b"' contains NULL binaries");
+            failed |= self.report(path, &BAD_PACKED_REF_ENTRY, &text);
+        }
+        if !super::check_ref_format::check_refname_format(refname, 0) {
+            let mut text = b"has bad refname '".to_vec();
+            text.extend_from_slice(refname);
+            text.push(b'\'');
+            failed |= self.report(path, &BAD_REF_NAME, &text);
+        }
+        failed
+    }
+
+    /// `packed_fsck_ref_peeled_line()`: `^<oid>`, with nothing after it. Every
+    /// offset git reports is relative to what follows the `^`.
+    fn packed_fsck_ref_peeled_line(&mut self, line: &[u8], line_number: u64) -> bool {
+        let entry = packed_entry(line_number);
+        let path = entry.as_bytes();
+        let body = &line[1..];
+
+        if parse_oid_prefix(body, self.hexsz).is_none() {
+            let mut text = b"'".to_vec();
+            text.extend_from_slice(body);
+            text.extend_from_slice(b"' has invalid peeled oid");
+            return self.report(path, &BAD_PACKED_REF_ENTRY, &text);
+        }
+
+        let rest = &body[self.hexsz..];
+        if !rest.is_empty() {
+            let mut text = b"has trailing garbage after peeled oid '".to_vec();
+            text.extend_from_slice(rest);
+            text.push(b'\'');
+            return self.report(path, &BAD_PACKED_REF_ENTRY, &text);
+        }
+        false
+    }
+
+    /// `packed_fsck_ref_sorted()`: with the `sorted` trait advertised, every
+    /// refname must be strictly greater than the one before it. git reports the
+    /// first inversion and stops.
+    ///
+    /// `cmp_packed_refname()` compares raw bytes and treats the terminating
+    /// newline as lower than every other byte, which is exactly how Rust orders
+    /// the newline-free slices taken here.
+    fn packed_fsck_ref_sorted(&mut self, buf: &[u8]) {
+        let mut line_number = 1u64;
+        let mut at = 0usize;
+        let mut former: Option<&[u8]> = None;
+
+        if buf[at] == b'#' {
+            at = line_end(buf, at) + 1;
+            line_number += 1;
+        }
+
+        while at < buf.len() {
+            let eol = line_end(buf, at);
+            // A refname is only well defined once the hash and its separator
+            // are there; the content pass has normally proven that, but an
+            // `fsck.badPackedRefEntry=ignore` can let a short line through.
+            let Some(start) = at.checked_add(self.hexsz + 1).filter(|s| *s <= eol) else {
+                return;
+            };
+            if buf[at] != b'^' {
+                let current = &buf[start..eol];
+                if let Some(previous) = former {
+                    if previous >= current {
+                        let mut text = b"refname '".to_vec();
+                        text.extend_from_slice(current);
+                        text.extend_from_slice(b"' is less than previous refname '");
+                        text.extend_from_slice(previous);
+                        text.push(b'\'');
+                        self.report(
+                            packed_entry(line_number).as_bytes(),
+                            &PACKED_REF_UNSORTED,
+                            &text,
+                        );
+                        return;
+                    }
+                }
+                former = Some(current);
+            }
+            at = eol + 1;
+            line_number += 1;
+        }
+    }
+}
+
+/// `MAXSYMLINKS`, the hop budget `strbuf_realpath()` gives a chain of symlinks.
+const MAX_SYMLINKS: u32 = 32;
+
+/// `strbuf_add_absolute_path()` followed by `strbuf_normalize_path()`: absolute
+/// and lexically cleaned, with symlinks left alone.
+///
+/// The one surprising part is git's own: a relative path is joined onto `$PWD`
+/// rather than `getcwd()` whenever the two name the same directory, so a
+/// repository reached through a symlinked path keeps the symlinked spelling.
+/// That is what decides whether a symlinked ref's referent is reported as a
+/// refname or as an absolute path.
+fn absolute_path(path: &Path) -> PathBuf {
+    let mut out = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let base = match std::env::var_os("PWD") {
+            Some(pwd) if Path::new(&pwd) != cwd && same_dir(Path::new(&pwd), &cwd) => {
+                PathBuf::from(pwd)
+            }
+            _ => cwd,
+        };
+        base.join(path)
+    };
+
+    // `strbuf_normalize_path()`: purely lexical, so `..` is dropped along with
+    // the component before it without consulting the filesystem.
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for c in out.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            other => parts.push(other.as_os_str().to_os_string()),
+        }
+    }
+    out = parts.iter().collect();
+    out
+}
+
+/// Whether two paths name the same directory, by device and inode — git's
+/// `stat()` comparison in `strbuf_add_absolute_path()`.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// `strbuf_realpath()`: the absolute path with every symlink resolved, keeping
+/// whatever tail does not exist yet rather than failing on it.
+///
+/// That last part is the whole reason `std::fs::canonicalize` is not enough: a
+/// ref symlinked to a branch that has not been created resolves to the refname
+/// it *would* have, and git reports no finding for it. Returning an empty
+/// referent there would instead be an invalid refname.
+fn real_path(path: &Path, hops: u32) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    // A link whose target is missing: follow it by hand and resolve the target.
+    if hops > 0 {
+        if let Ok(target) = std::fs::read_link(path) {
+            let joined = match path.parent() {
+                Some(parent) if target.is_relative() => parent.join(target),
+                _ => target,
+            };
+            return real_path(&joined, hops - 1);
+        }
+    }
+    // Not a link either, so the tail simply does not exist; resolve the parent
+    // and keep the name.
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            real_path(parent, hops).join(name)
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The `packed-refs line <n>` path a `packed-refs` finding is reported against.
+fn packed_entry(line_number: u64) -> String {
+    format!("packed-refs line {line_number}")
+}
+
+/// The offset of the `\n` ending the line at `at`, or the end of the buffer.
+fn line_end(buf: &[u8], at: usize) -> usize {
+    buf[at..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(buf.len(), |off| at + off)
+}
+
+/// C's `isspace()` over the C locale, which counts one byte `u8::is_ascii_whitespace`
+/// leaves out: the vertical tab.
+fn is_space(b: u8) -> bool {
+    b == b' ' || (0x09..=0x0d).contains(&b)
+}
+
+/// `strbuf_rtrim()`.
+fn rtrim(buf: &[u8]) -> &[u8] {
+    let end = buf.iter().rposition(|b| !is_space(*b)).map_or(0, |i| i + 1);
+    &buf[..end]
+}
+
+/// A full object id at the start of `buf`, as `parse_oid_hex_algop()` reads one:
+/// exactly `hexsz` hex digits, with whatever follows left to the caller.
+fn parse_oid_prefix(buf: &[u8], hexsz: usize) -> Option<ObjectId> {
+    ObjectId::from_hex(buf.get(..hexsz)?).ok()
+}
+
+/// What `parse_loose_ref_contents()` made of a loose ref file.
+enum LooseRef<'a> {
+    /// A `ref: <target>` line; `referent` is everything after the whitespace
+    /// that follows the prefix, newline included.
+    Symref { referent: &'a [u8] },
+    /// A hex object id; `trailing` is the rest of the buffer.
+    Oid { id: ObjectId, trailing: &'a [u8] },
+    /// Neither — git's `REF_ISBROKEN`.
+    Broken,
+}
+
+/// `refs/files-backend.c::parse_loose_ref_contents()`.
+fn parse_loose_ref_contents(buf: &[u8], hexsz: usize) -> LooseRef<'_> {
+    if let Some(rest) = buf.strip_prefix(b"ref:".as_slice()) {
+        let start = rest.iter().position(|b| !is_space(*b)).unwrap_or(rest.len());
+        return LooseRef::Symref {
+            referent: &rest[start..],
+        };
+    }
+    let Some(id) = parse_oid_prefix(buf, hexsz) else {
+        return LooseRef::Broken;
+    };
+    // `FETCH_HEAD` carries more data after the hash, so whitespace — or the end
+    // of the buffer — is the only acceptable separator.
+    let trailing = &buf[hexsz..];
+    match trailing.first() {
+        Some(b) if !is_space(*b) => LooseRef::Broken,
+        _ => LooseRef::Oid { id, trailing },
+    }
+}
+
+/// `refs.c::parse_worktree_ref()` reduced to what the symref check needs: the
+/// bare refname, with a `worktrees/<id>/` or `main-worktree/` prefix removed.
+fn strip_worktree_prefix(refname: &[u8]) -> &[u8] {
+    if let Some(rest) = refname.strip_prefix(b"main-worktree/".as_slice()) {
+        return rest;
+    }
+    let Some(rest) = refname.strip_prefix(b"worktrees/".as_slice()) else {
+        return refname;
+    };
+    match rest.iter().position(|&b| b == b'/') {
+        Some(slash) => &rest[slash + 1..],
+        None => refname,
+    }
 }
 
 /// What one `fsck_object()` call produced: the findings about the object

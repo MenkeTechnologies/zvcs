@@ -24,6 +24,25 @@ impl Graph {
         Some(r.file.commit_at(r.file_pos))
     }
 
+    /// How the changed-path Bloom filters in this graph were built, or `None`
+    /// if no file in it carries any.
+    ///
+    /// Port of git's `get_bloom_filter_settings()`, which walks the chain and
+    /// answers with the first settings it finds.
+    pub fn bloom_filter_settings(&self) -> Option<crate::bloom::Settings> {
+        self.files.iter().find_map(File::bloom_filter_settings)
+    }
+
+    /// The changed-path Bloom filter for the commit at graph position `pos`, or
+    /// `None` if the file holding it carries no filters.
+    ///
+    /// # Panics
+    /// If `pos` is greater or equal to [`num_commits()`][Graph::num_commits()].
+    pub fn bloom_filter_at(&self, pos: Position) -> Option<crate::bloom::Filter> {
+        let r = self.lookup_by_pos(pos);
+        r.file.bloom_filter_at(r.pos)
+    }
+
     /// Returns the `hash` at the given position `pos`.
     ///
     /// # Panics

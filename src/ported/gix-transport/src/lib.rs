@@ -33,6 +33,40 @@ pub enum Protocol {
     V2 = 2,
 }
 
+/// Restrict the IP addresses a connection may use, from git's `--ipv4`/`--ipv6`.
+///
+/// This is git's `enum transport_family` minus its `TRANSPORT_FAMILY_ALL`, which every API here
+/// spells as `None` instead. The transports that open a socket themselves honour it directly, the
+/// ones that spawn a program pass the equivalent flag on; `file://` has no socket and ignores it,
+/// exactly as git's `connect.c` does.
+#[derive(PartialEq, Eq, Debug, Hash, Ord, PartialOrd, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AddressFamily {
+    /// `TRANSPORT_FAMILY_IPV4`: only use IPv4 addresses (`AF_INET`).
+    V4,
+    /// `TRANSPORT_FAMILY_IPV6`: only use IPv6 addresses (`AF_INET6`).
+    V6,
+}
+
+impl AddressFamily {
+    /// The `ssh` command-line flag git's `push_ssh_options()` appends for this family.
+    pub fn as_ssh_flag(&self) -> &'static str {
+        match self {
+            AddressFamily::V4 => "-4",
+            AddressFamily::V6 => "-6",
+        }
+    }
+
+    /// Whether `addr` belongs to this family, the check `getaddrinfo`'s `hints.ai_family` performs
+    /// for git.
+    pub fn matches(&self, addr: &std::net::SocketAddr) -> bool {
+        match self {
+            AddressFamily::V4 => addr.is_ipv4(),
+            AddressFamily::V6 => addr.is_ipv6(),
+        }
+    }
+}
+
 /// The kind of service to invoke on the client or the server side.
 #[derive(PartialEq, Eq, Debug, Hash, Ord, PartialOrd, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

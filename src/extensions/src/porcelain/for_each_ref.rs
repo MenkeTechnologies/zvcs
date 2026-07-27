@@ -2094,7 +2094,11 @@ fn fold_subject(subject: &[u8]) -> Vec<u8> {
 /// be one of the special multi-valued refs the ref backend never iterates
 /// (`FETCH_HEAD`, `MERGE_HEAD`), and must then be `HEAD`, end with `_HEAD`, or
 /// be one of the irregular pseudorefs git lists explicitly.
-fn is_root_ref(name: &[u8]) -> bool {
+///
+/// Shared with the reference-database check in [`super::fsck`]: `files_fsck` in
+/// `refs/files-backend.c` uses it both to pick the root refs it walks and to
+/// waive the refname-format check on them.
+pub(crate) fn is_root_ref(name: &[u8]) -> bool {
     const IRREGULAR: [&[u8]; 5] = [
         b"AUTO_MERGE",
         b"BISECT_EXPECTED_REV",

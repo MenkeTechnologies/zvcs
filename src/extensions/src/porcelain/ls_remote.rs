@@ -212,6 +212,8 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
     let remote_name = remote.name().map(|n| n.as_bstr().to_string());
     let connect_options = gix::remote::connect::Options {
         upload_pack: super::fetch::upload_pack_program(&repo, remote_name.as_deref(), opts.upload_pack.as_deref()),
+        // `git ls-remote` has no `--ipv4`/`--ipv6`.
+        address_family: None,
     };
     let server_options = super::fetch::server_options_for(&repo, remote_name.as_deref(), &opts.server_options);
     let connection = match remote.connect_with_options(gix::remote::Direction::Fetch, connect_options) {
